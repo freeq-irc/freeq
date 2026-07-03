@@ -18,22 +18,33 @@ struct MainView: View {
                         SidebarView()
                             .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 300)
                     } detail: {
-                        if appState.activeChannel != nil {
-                            HStack(spacing: 0) {
-                                ChatView()
-                                if let threadRoot = appState.threadRootMessage,
-                                   let channel = appState.activeChannel {
-                                    Divider().overlay(Theme.borderSoft)
-                                    ThreadView(rootMessage: threadRoot, channel: channel)
-                                }
-                                if appState.showDetailPanel {
-                                    Divider().overlay(Theme.borderSoft)
-                                    DetailPanel()
-                                        .frame(width: 260)
-                                }
+                        VStack (spacing: 0) {
+                            // Reconnect banner
+                            if appState.connectionState == .disconnected && appState.hasSavedSession {
+                                ReconnectBanner()
                             }
-                        } else {
-                            emptyState
+
+                            // Guest upgrade banner
+                            if appState.connectionState == .registered && appState.authenticatedDID == nil {
+                                GuestUpgradeBanner()
+                            }
+                            if appState.activeChannel != nil {
+                                HStack(spacing: 0) {
+                                    ChatView()
+                                    if let threadRoot = appState.threadRootMessage,
+                                       let channel = appState.activeChannel {
+                                        Divider().overlay(Theme.borderSoft)
+                                        ThreadView(rootMessage: threadRoot, channel: channel)
+                                    }
+                                    if appState.showDetailPanel {
+                                        Divider().overlay(Theme.borderSoft)
+                                        DetailPanel()
+                                            .frame(width: 260)
+                                    }
+                                }
+                            } else {
+                                emptyState
+                            }
                         }
                     }
                     .toolbar {
@@ -42,15 +53,7 @@ struct MainView: View {
                         }
                     }
 
-                    // Reconnect banner
-                    if appState.connectionState == .disconnected && appState.hasSavedSession {
-                        ReconnectBanner()
-                    }
 
-                    // Guest upgrade banner
-                    if appState.connectionState == .registered && appState.authenticatedDID == nil {
-                        GuestUpgradeBanner()
-                    }
                 }
                 .background(Theme.appBackground)
             }
