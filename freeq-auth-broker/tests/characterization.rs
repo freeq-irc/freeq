@@ -126,6 +126,7 @@ async fn seed_session(
             refresh_token: refresh_token.to_string(),
             dpop_key_b64: DpopKey::generate().to_base64url(),
             dpop_nonce: None,
+            client_id: "https://auth.test.example/client-metadata.json".to_string(),
             created_at: 0,
             updated_at: 0,
         })

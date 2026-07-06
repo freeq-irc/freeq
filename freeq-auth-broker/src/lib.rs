@@ -298,6 +298,12 @@ pub struct BrokerSessionRecord {
     pub refresh_token: String,
     pub dpop_key_b64: String,
     pub dpop_nonce: Option<String>,
+    /// The OAuth `client_id` this grant was issued to. Refresh must reuse it.
+    /// Empty for sessions created before this field existed — refresh then
+    /// falls back to rebuilding it from broker config (standalone's origin is
+    /// static, so that matches). Embedded sessions always store it, because
+    /// the origin is per-request.
+    pub client_id: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -350,7 +356,7 @@ impl SessionStore for SqliteStore {
         let db = self.conn.lock().await;
         let enc_key = &self.enc_key;
         let mut stmt = db.prepare(
-            "SELECT broker_token, did, handle, pds_url, token_endpoint, refresh_token, dpop_key_b64, dpop_nonce, created_at, updated_at FROM sessions WHERE broker_token = ?1"
+            "SELECT broker_token, did, handle, pds_url, token_endpoint, refresh_token, dpop_key_b64, dpop_nonce, created_at, updated_at, client_id FROM sessions WHERE broker_token = ?1"
         ).ok()?;
         let mut rows = stmt.query(rusqlite::params![broker_token]).ok()?;
         let row = rows.next().ok().flatten()?;
@@ -380,6 +386,8 @@ impl SessionStore for SqliteStore {
             dpop_nonce,
             created_at: row.get(8).ok()?,
             updated_at: row.get(9).ok()?,
+            // Empty for pre-migration rows (column default '').
+            client_id: row.get::<_, Option<String>>(10).ok()?.unwrap_or_default(),
         })
     }
 
@@ -390,12 +398,13 @@ impl SessionStore for SqliteStore {
         let encrypted_nonce = rec.dpop_nonce.as_deref().map(|n| encrypt_field(enc_key, n));
         let db = self.conn.lock().await;
         db.execute(
-            "INSERT INTO sessions (broker_token, did, handle, pds_url, token_endpoint, refresh_token, dpop_key_b64, dpop_nonce, created_at, updated_at)\
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)\
+            "INSERT INTO sessions (broker_token, did, handle, pds_url, token_endpoint, refresh_token, dpop_key_b64, dpop_nonce, created_at, updated_at, client_id)\
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)\
              ON CONFLICT(broker_token) DO UPDATE SET refresh_token=excluded.refresh_token, updated_at=excluded.updated_at",
             rusqlite::params![
                 rec.broker_token, rec.did, rec.handle, rec.pds_url, rec.token_endpoint,
                 encrypted_refresh, encrypted_dpop, encrypted_nonce, rec.created_at, rec.updated_at,
+                rec.client_id,
             ],
         )?;
         Ok(())
@@ -806,6 +815,7 @@ async fn auth_callback(
             refresh_token: refresh_token.to_string(),
             dpop_key_b64: pending.dpop_key_b64.clone(),
             dpop_nonce: dpop_nonce.clone(),
+            client_id: pending.client_id.clone(),
             created_at: now,
             updated_at: now,
         })
@@ -1187,17 +1197,24 @@ use freeq_oauth::flow::RefreshError;
 
 /// Refresh a stored broker session's PDS access token.
 ///
-/// Thin adapter over [`freeq_oauth::flow::refresh_access_token`]: builds the
-/// grant's `client_id` from broker config and injects the broker's bounded
-/// HTTP client, then returns the tuple the `/session` and graph handlers
-/// expect. Returns `(access_token, refresh_token, dpop_nonce, granted_scope)`.
+/// Thin adapter over [`freeq_oauth::flow::refresh_access_token`]: reuses the
+/// grant's stored `client_id` and injects the broker's bounded HTTP client,
+/// then returns the tuple the `/session` and graph handlers expect. Returns
+/// `(access_token, refresh_token, dpop_nonce, granted_scope)`.
 async fn refresh_access_token(
     config: &BrokerConfig,
     record: &BrokerSessionRecord,
 ) -> Result<(String, String, Option<String>, String), RefreshError> {
     let dpop_key = DpopKey::from_base64url(&record.dpop_key_b64)?;
-    let redirect_uri = format!("{}/auth/callback", config.public_url.trim_end_matches('/'));
-    let client_id = build_client_id(&config.public_url, &redirect_uri);
+    // Reuse the client_id the grant was issued to. Pre-migration rows have
+    // none, so fall back to rebuilding from config (standalone's origin is
+    // static, so it matches what login used).
+    let client_id = if record.client_id.is_empty() {
+        let redirect_uri = format!("{}/auth/callback", config.public_url.trim_end_matches('/'));
+        build_client_id(&config.public_url, &redirect_uri)
+    } else {
+        record.client_id.clone()
+    };
     let client = upstream_client()?;
     let t = freeq_oauth::flow::refresh_access_token(
         &client,
@@ -1403,9 +1420,18 @@ pub fn init_db(db: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
             dpop_key_b64 TEXT NOT NULL,
             dpop_nonce TEXT,
             created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
+            updated_at INTEGER NOT NULL,
+            client_id TEXT NOT NULL DEFAULT ''
         );",
     )?;
+    // Migration for DBs created before `client_id` existed. SQLite has no
+    // ADD COLUMN IF NOT EXISTS, so ignore the duplicate-column error.
+    if let Err(e) =
+        db.execute("ALTER TABLE sessions ADD COLUMN client_id TEXT NOT NULL DEFAULT ''", [])
+        && !e.to_string().contains("duplicate column")
+    {
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -1476,6 +1502,7 @@ mod tests {
             refresh_token: refresh.into(),
             dpop_key_b64: DpopKey::generate().to_base64url(),
             dpop_nonce: None,
+            client_id: "cid".into(),
             created_at: 0,
             updated_at: 0,
         }
@@ -1517,5 +1544,23 @@ mod tests {
         assert_ne!(stored, "SECRET");
         assert_eq!(decrypt_field(&key, &stored).unwrap(), "SECRET");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_migrates_legacy_schema_without_client_id() {
+        // A DB created before the client_id column existed.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (broker_token TEXT PRIMARY KEY, did TEXT NOT NULL, handle TEXT NOT NULL,
+             pds_url TEXT NOT NULL, token_endpoint TEXT NOT NULL, refresh_token TEXT NOT NULL,
+             dpop_key_b64 TEXT NOT NULL, dpop_nonce TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);",
+        ).unwrap();
+        // init_db (via from_connection? no — call it directly) adds the column.
+        init_db(&conn).unwrap();
+        let store = SqliteStore::from_connection(conn, derive_encryption_key("k"));
+        store.insert(&record("R")).await.unwrap();
+        let got = store.get("BT").await.unwrap();
+        assert_eq!(got.refresh_token, "R");
+        assert_eq!(got.client_id, "cid");
     }
 }
