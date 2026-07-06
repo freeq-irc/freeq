@@ -410,19 +410,28 @@ discovery + PAR. Committed increments on `refactor/auth-broker-unification`:
 Green throughout: freeq-oauth 8, broker 3+23, sdk oauth 40, server lib 310 +
 broker_auth 20 + embedded_auth 4 + oauth_scope 21 + oauth_ssrf 7.
 
-**Remaining in Phase 1 — discovery + PAR.** Still duplicated across the
-broker's `auth_login`, the server's `auth_login` AND `auth_step_up` (two
-near-identical SSRF-guarded copies in one file), and the SDK's
-`discover_auth_server` / `push_authorization_request`. Deferred deliberately:
-this is the **least-covered leg** — the broker's `auth_login` resolves
-handles against hardcoded public hosts and has no hermetic test, and it is
-the **most SSRF-sensitive** code (CTF-07/08/09 pin the server side). The
-correct next step, per the coverage-first rule, is to (a) add a mock-resolver
-/ mock-well-known seam so the broker's `auth_login` is testable, then (b)
-extract discovery + PAR behind the injected-client-provider abstraction
-(the server needs a fresh DNS-pinned client per hop; broker/SDK reuse one).
-Server-internal dedup of `auth_login` vs `auth_step_up` is a safe intermediate
-(oauth_ssrf + oauth_scope already cover both).
+**Discovery + PAR — DONE (aa217ea8, beaa278a).** `freeq_oauth::discovery`
+now owns `discover_auth_server` and `pushed_authorization_request` (PAR +
+DPoP nonce dance, retrying only on the canonical `use_dpop_nonce`, returning
+the nonce for callers that carry it forward). Coverage gap closed: the
+previously-untested leg has 8 hermetic engine tests against mock
+well-known/PAR servers.
+- SDK: `discover_auth_server` + `push_authorization_request` delegate.
+- Broker `auth_login`: discovery + PAR both use the engine over its bounded
+  client.
+- Server `auth_login` + `auth_step_up`: PAR routed through the engine over
+  the SSRF-validated `par_client` (errors mapped generically to preserve
+  info-leak hardening).
+
+**One deferred item (optional, server-internal).** The server's per-hop
+SSRF *discovery* (the two well-known fetches with a fresh DNS-pinned client
+per URL) stays inline and is still duplicated between `auth_login` and
+`auth_step_up`. The engine's single-client `discover_auth_server` can't
+replace it without a client-provider abstraction, and the code is
+security-critical (CTF-07/08/09). Deduping the two copies into one
+server-local helper is a safe cleanup (oauth_ssrf covers both) but does not
+advance the cross-crate unification, so it's parked. Everything that can be
+shared between the standalone broker and the embedded server now is.
 
 Pre-existing, unrelated: `cargo build --workspace` is red on `main` because
 `freeq-tui` and `freeq-windows-core` don't match the new `Event::ReadMarker`
