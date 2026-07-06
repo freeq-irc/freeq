@@ -27,7 +27,7 @@ use crate::server::SharedState;
 // is re-exported because `crate::web::generate_random_string` is referenced from
 // connection::login; `urlencod` is the local alias for the engine's `urlencode`.
 pub use freeq_oauth::generate_random_string;
-use freeq_oauth::{build_client_id, generate_pkce, urlencode as urlencod};
+use freeq_oauth::{ClientProvider, build_client_id, generate_pkce, urlencode as urlencod};
 
 // ── WebSocket ↔ IRC bridge ─────────────────────────────────────────────
 
@@ -2192,6 +2192,47 @@ async fn safe_outbound_client(
     Ok((parsed, client))
 }
 
+/// An outbound refusal carrying the exact `(status, message)`
+/// [`safe_outbound_client`] would have returned, so the engine's generic
+/// `anyhow` error can be mapped back to the original response at the handler
+/// boundary (preserving the CTF-07/08/09 4xx-fast-generic behavior).
+#[derive(Debug, thiserror::Error)]
+#[error("{msg}")]
+struct OutboundRefused {
+    status: StatusCode,
+    msg: &'static str,
+}
+
+/// [`freeq_oauth::ClientProvider`] backed by [`safe_outbound_client`]: SSRF
+/// validation + DNS pinning per URL. Used for OAuth discovery, where every hop
+/// (PDS → auth server) is attacker-influenced.
+struct SsrfClients {
+    timeout: std::time::Duration,
+}
+
+impl freeq_oauth::ClientProvider for SsrfClients {
+    async fn client_for(&self, url: &str) -> anyhow::Result<reqwest::Client> {
+        match safe_outbound_client(url, self.timeout).await {
+            Ok((_parsed, client)) => Ok(client),
+            Err((status, msg)) => Err(OutboundRefused { status, msg }.into()),
+        }
+    }
+}
+
+/// Map an engine discovery/validation error back to an HTTP response. An SSRF
+/// refusal keeps its original `(status, message)`; a metadata fetch/parse
+/// failure (which happens over an already-validated client) is a generic 502.
+fn map_outbound_err(e: anyhow::Error) -> (StatusCode, String) {
+    if let Some(r) = e.downcast_ref::<OutboundRefused>() {
+        (r.status, r.msg.to_string())
+    } else {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Upstream metadata fetch failed".to_string(),
+        )
+    }
+}
+
 fn derive_web_origin(headers: &axum::http::HeaderMap) -> (String, String) {
     let raw_host = headers
         .get("host")
@@ -2329,97 +2370,39 @@ async fn auth_login(
         )
     })?;
 
-    // Discover authorization server. SSRF-guard every external URL the
-    // DID document points us at — the document is attacker-controlled.
-    // CTF-07/08/09 regression tests pin this.
-    let pr_url = format!(
-        "{}/.well-known/oauth-protected-resource",
-        pds_url.trim_end_matches('/')
-    );
-    let (_pr_parsed, pr_client) = safe_outbound_client(&pr_url, std::time::Duration::from_secs(8))
+    // Discover the authorization server through the shared engine. Every hop
+    // (PDS → auth server) is attacker-influenced via the DID document, so the
+    // provider SSRF-validates + DNS-pins a fresh client per URL. CTF-07/08/09
+    // regression tests pin this.
+    let provider = SsrfClients {
+        timeout: std::time::Duration::from_secs(8),
+    };
+    let auth_meta = freeq_oauth::discovery::discover_auth_server(&provider, &pds_url)
         .await
-        .map_err(|(s, m)| (s, m.to_string()))?;
-    let pr_meta: serde_json::Value = pr_client
-        .get(&pr_url)
-        .send()
+        .map_err(map_outbound_err)?;
+    let authorization_endpoint = auth_meta.authorization_endpoint.as_str();
+    let token_endpoint = auth_meta.token_endpoint.as_str();
+    let par_endpoint = auth_meta
+        .pushed_authorization_request_endpoint
+        .as_deref()
+        .ok_or((StatusCode::BAD_GATEWAY, "No PAR endpoint".to_string()))?;
+    // Validate the endpoints the auth-server metadata named — these go straight
+    // from PDS-controlled JSON into URLs we redirect to / POST credentials to,
+    // so the SSRF surface extends past the metadata fetches.
+    provider
+        .client_for(authorization_endpoint)
         .await
-        .map_err(|_| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "PDS metadata fetch failed".to_string(),
-            )
-        })?
-        .json()
+        .map_err(map_outbound_err)?;
+    provider
+        .client_for(token_endpoint)
         .await
-        .map_err(|_| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "PDS metadata parse failed".to_string(),
-            )
-        })?;
-
-    let auth_server = pr_meta["authorization_servers"][0]
-        .as_str()
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "No authorization server".to_string(),
-            )
-        })?;
-
-    let as_url = format!(
-        "{}/.well-known/oauth-authorization-server",
-        auth_server.trim_end_matches('/')
-    );
-    let (_as_parsed, as_client) = safe_outbound_client(&as_url, std::time::Duration::from_secs(8))
-        .await
-        .map_err(|(s, m)| (s, m.to_string()))?;
-    let auth_meta: serde_json::Value = as_client
-        .get(&as_url)
-        .send()
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "Auth server metadata failed".to_string(),
-            )
-        })?
-        .json()
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "Auth server metadata parse failed".to_string(),
-            )
-        })?;
-
-    let authorization_endpoint = auth_meta["authorization_endpoint"]
-        .as_str()
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "No authorization_endpoint".to_string(),
-            )
-        })?;
-    let token_endpoint = auth_meta["token_endpoint"]
-        .as_str()
-        .ok_or_else(|| (StatusCode::BAD_GATEWAY, "No token_endpoint".to_string()))?;
-    let par_endpoint = auth_meta["pushed_authorization_request_endpoint"]
-        .as_str()
-        .ok_or_else(|| (StatusCode::BAD_GATEWAY, "No PAR endpoint".to_string()))?;
-    // Validate every endpoint the auth-server metadata named — these go
-    // straight from PDS-controlled JSON into URLs we POST credentials
-    // to, so the SSRF surface extends past the metadata fetches.
-    let _ = safe_outbound_client(authorization_endpoint, std::time::Duration::from_secs(8))
-        .await
-        .map_err(|(s, m)| (s, m.to_string()))?;
-    let _ = safe_outbound_client(token_endpoint, std::time::Duration::from_secs(8))
-        .await
-        .map_err(|(s, m)| (s, m.to_string()))?;
-    let (_par_parsed, par_client) =
-        safe_outbound_client(par_endpoint, std::time::Duration::from_secs(10))
-            .await
-            .map_err(|(s, m)| (s, m.to_string()))?;
+        .map_err(map_outbound_err)?;
+    let par_client = SsrfClients {
+        timeout: std::time::Duration::from_secs(10),
+    }
+    .client_for(par_endpoint)
+    .await
+    .map_err(map_outbound_err)?;
 
     // Build redirect URI and client_id. Default purpose for `/auth/login`
     // is `Login` — narrow `atproto` scope only. Phase-2 step-up flows
@@ -2560,86 +2543,36 @@ async fn auth_step_up(
     // URL they like), so without these the server happily fetches from
     // 127.0.0.1, 169.254.169.254 (cloud metadata service), 10.x.x.x,
     // etc. CTF-07 regression test pins this.
-    let pr_url = format!(
-        "{}/.well-known/oauth-protected-resource",
-        pds_url.trim_end_matches('/')
-    );
-    let (_pr_parsed, pr_client) = safe_outbound_client(&pr_url, std::time::Duration::from_secs(8))
+    // Discover through the shared engine; the provider SSRF-validates + pins
+    // each attacker-influenced hop. Same path as auth_login. CTF-07 pins this.
+    let provider = SsrfClients {
+        timeout: std::time::Duration::from_secs(8),
+    };
+    let auth_meta = freeq_oauth::discovery::discover_auth_server(&provider, &pds_url)
         .await
-        .map_err(|(s, m)| (s, m.to_string()))?;
-    let pr_meta: serde_json::Value = pr_client
-        .get(&pr_url)
-        .send()
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "PDS metadata fetch failed".to_string(),
-            )
-        })?
-        .json()
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "PDS metadata parse failed".to_string(),
-            )
-        })?;
-    let auth_server = pr_meta["authorization_servers"][0].as_str().ok_or((
-        StatusCode::BAD_GATEWAY,
-        "No authorization server".to_string(),
-    ))?;
-    let as_url = format!(
-        "{}/.well-known/oauth-authorization-server",
-        auth_server.trim_end_matches('/')
-    );
-    let (_as_parsed, as_client) = safe_outbound_client(&as_url, std::time::Duration::from_secs(8))
-        .await
-        .map_err(|(s, m)| (s, m.to_string()))?;
-    let auth_meta: serde_json::Value = as_client
-        .get(&as_url)
-        .send()
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "Auth server metadata failed".to_string(),
-            )
-        })?
-        .json()
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "Auth server metadata parse failed".to_string(),
-            )
-        })?;
-    let authorization_endpoint = auth_meta["authorization_endpoint"].as_str().ok_or((
-        StatusCode::BAD_GATEWAY,
-        "No authorization_endpoint".to_string(),
-    ))?;
-    let token_endpoint = auth_meta["token_endpoint"]
-        .as_str()
-        .ok_or((StatusCode::BAD_GATEWAY, "No token_endpoint".to_string()))?;
-    let par_endpoint = auth_meta["pushed_authorization_request_endpoint"]
-        .as_str()
+        .map_err(map_outbound_err)?;
+    let authorization_endpoint = auth_meta.authorization_endpoint.as_str();
+    let token_endpoint = auth_meta.token_endpoint.as_str();
+    let par_endpoint = auth_meta
+        .pushed_authorization_request_endpoint
+        .as_deref()
         .ok_or((StatusCode::BAD_GATEWAY, "No PAR endpoint".to_string()))?;
-    // The auth-server metadata is fully attacker-controlled too — the
-    // PDS could point at evil.com for token / par. Validate before we
-    // POST credentials there. We don't need to keep the
-    // `_authorize_parsed` since the user-redirect is built from the
-    // string verbatim — but we DO need to confirm it's safe to redirect
-    // to (we won't 30x a user to localhost either).
-    let _ = safe_outbound_client(authorization_endpoint, std::time::Duration::from_secs(8))
+    // The auth-server metadata is attacker-controlled too — validate the
+    // endpoints it named before we redirect a user to / POST credentials to them.
+    provider
+        .client_for(authorization_endpoint)
         .await
-        .map_err(|(s, m)| (s, m.to_string()))?;
-    let _ = safe_outbound_client(token_endpoint, std::time::Duration::from_secs(8))
+        .map_err(map_outbound_err)?;
+    provider
+        .client_for(token_endpoint)
         .await
-        .map_err(|(s, m)| (s, m.to_string()))?;
-    let (_par_parsed, par_client) =
-        safe_outbound_client(par_endpoint, std::time::Duration::from_secs(10))
-            .await
-            .map_err(|(s, m)| (s, m.to_string()))?;
+        .map_err(map_outbound_err)?;
+    let par_client = SsrfClients {
+        timeout: std::time::Duration::from_secs(10),
+    }
+    .client_for(par_endpoint)
+    .await
+    .map_err(map_outbound_err)?;
 
     let redirect_uri = format!("{web_origin}/auth/callback");
     let scope = purpose.requested_scope();
