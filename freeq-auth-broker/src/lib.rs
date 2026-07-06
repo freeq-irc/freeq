@@ -30,6 +30,10 @@ pub struct BrokerConfig {
 
 pub struct BrokerState {
     pub config: BrokerConfig,
+    /// Where minted sessions are published. Standalone uses [`RemoteSink`]
+    /// (HMAC push to the freeq-server); an embedding server supplies its own
+    /// in-process sink.
+    pub sink: Arc<dyn SessionSink>,
     pub pending: Mutex<std::collections::HashMap<String, PendingAuth>>,
     pub db: Mutex<rusqlite::Connection>,
     /// Per-broker-token refresh serialization. AT Proto refresh tokens are
@@ -641,14 +645,32 @@ async fn auth_callback(
     // a standalone broker (not trusted by irc.freeq.at's shared secret) just
     // can't mint one — the verified DID + handle + broker_token are enough for
     // identity-only consumers, so degrade gracefully instead of failing login.
-    let (web_token, nick) = mint_web_token(&state.config, &pending.did, &pending.handle)
+    let (web_token, nick) = state
+        .sink
+        .mint_web_token(&pending.did, &pending.handle)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, "web-token mint failed — continuing identity-only");
             (String::new(), pending.handle.clone())
         });
 
-    if let Err(e) = push_web_session(&state.config, &pending, &token_resp, dpop_nonce.clone()).await
+    // Read the actually-granted scope from the token response; older PDSes may
+    // downgrade to `transition:generic`. Default to `atproto` (what the broker
+    // requests at /authorize) when the response omits it.
+    let granted_scope = token_resp["scope"].as_str().unwrap_or("atproto");
+    let access_token = token_resp["access_token"].as_str().unwrap_or_default();
+    if let Err(e) = state
+        .sink
+        .push_session(&SessionPush {
+            did: &pending.did,
+            handle: &pending.handle,
+            pds_url: &pending.pds_url,
+            access_token,
+            dpop_key_b64: &pending.dpop_key_b64,
+            dpop_nonce: dpop_nonce.as_deref(),
+            granted_scope,
+        })
+        .await
     {
         tracing::warn!(error = %e, "Failed to push web session to server");
     }
@@ -749,38 +771,29 @@ async fn session(
         ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
     }
 
-    let (web_token, nick) = mint_web_token(&state.config, &record.did, &record.handle)
+    let (web_token, nick) = state
+        .sink
+        .mint_web_token(&record.did, &record.handle)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, "web-token mint failed — continuing identity-only");
             (String::new(), record.handle.clone())
         });
 
-    let pending = PendingAuth {
-        handle: record.handle.clone(),
-        did: record.did.clone(),
-        pds_url: record.pds_url.clone(),
-        code_verifier: String::new(),
-        redirect_uri: String::new(),
-        client_id: String::new(),
-        token_endpoint: record.token_endpoint.clone(),
-        dpop_key_b64: record.dpop_key_b64.clone(),
-        dpop_nonce: dpop_nonce.clone(),
-        mobile: true,
-        return_to: None,
-        popup: false,
-    };
-    if let Err(e) = push_web_session_with_token(
-        &state.config,
-        &pending,
-        &access_token,
-        dpop_nonce.clone(),
-        // Forward the actually-granted scope from the refresh response so
-        // the freeq-server's per-purpose checks see the truth, not a
-        // hard-coded narrow assumption.
-        &granted_scope,
-    )
-    .await
+    // Forward the actually-granted scope from the refresh response so the
+    // server's per-purpose checks see the truth, not a hard-coded assumption.
+    if let Err(e) = state
+        .sink
+        .push_session(&SessionPush {
+            did: &record.did,
+            handle: &record.handle,
+            pds_url: &record.pds_url,
+            access_token: &access_token,
+            dpop_key_b64: &record.dpop_key_b64,
+            dpop_nonce: dpop_nonce.as_deref(),
+            granted_scope: &granted_scope,
+        })
+        .await
     {
         tracing::warn!(error = %e, "Failed to refresh web session on server");
     }
@@ -1076,91 +1089,100 @@ async fn refresh_access_token(
     Ok((t.access_token, t.refresh_token, t.dpop_nonce, t.granted_scope))
 }
 
-async fn mint_web_token(
-    config: &BrokerConfig,
-    did: &str,
-    handle: &str,
-) -> Result<(String, String), anyhow::Error> {
-    let body = serde_json::json!({"did": did, "handle": handle});
-    let (sig, ts) = sign_body(&config.shared_secret, &body)?;
-    let url = format!(
-        "{}/auth/broker/web-token",
-        config.freeq_server_url.trim_end_matches('/')
-    );
-    let client = upstream_client()?;
-    let resp = client
-        .post(&url)
-        .header("X-Broker-Signature", sig)
-        .header("X-Broker-Timestamp", ts)
-        .json(&body)
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "web-token failed: {}",
-            resp.text().await.unwrap_or_default()
-        ));
-    }
-    let json: serde_json::Value = resp.json().await?;
-    let token = json["token"].as_str().unwrap_or_default().to_string();
-    let nick = json["nick"].as_str().unwrap_or_default().to_string();
-    Ok((token, nick))
+/// The server-side web session a sink installs: a fresh PDS access token plus
+/// the DPoP key bound to it, for server-proxied PDS operations.
+pub struct SessionPush<'a> {
+    pub did: &'a str,
+    pub handle: &'a str,
+    pub pds_url: &'a str,
+    pub access_token: &'a str,
+    pub dpop_key_b64: &'a str,
+    pub dpop_nonce: Option<&'a str>,
+    pub granted_scope: &'a str,
 }
 
-async fn push_web_session(
-    config: &BrokerConfig,
-    pending: &PendingAuth,
-    token_resp: &serde_json::Value,
-    dpop_nonce: Option<String>,
-) -> Result<(), anyhow::Error> {
-    let access_token = token_resp["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("No access_token"))?;
-    // Read the actually-granted scope from the token response. Older
-    // PDSes may downgrade us to `transition:generic`. Defaults to
-    // `atproto` only when missing — that's the scope this broker now
-    // requests at /authorize, so it's the right narrow assumption for
-    // a code-exchange where the response forgot to echo the scope.
-    let granted_scope = token_resp["scope"].as_str().unwrap_or("atproto");
-    push_web_session_with_token(config, pending, access_token, dpop_nonce, granted_scope).await
+/// How a freshly-minted session reaches the freeq-server. Standalone pushes
+/// over HTTP+HMAC ([`RemoteSink`]); an embedding server writes in-process.
+#[async_trait::async_trait]
+pub trait SessionSink: Send + Sync {
+    /// Mint a one-time SASL web-token for this identity → `(token, nick)`.
+    async fn mint_web_token(&self, did: &str, handle: &str)
+    -> Result<(String, String), anyhow::Error>;
+    /// Install / refresh the server-side web session for proxied PDS ops.
+    async fn push_session(&self, push: &SessionPush<'_>) -> Result<(), anyhow::Error>;
 }
 
-async fn push_web_session_with_token(
-    config: &BrokerConfig,
-    pending: &PendingAuth,
-    access_token: &str,
-    dpop_nonce: Option<String>,
-    granted_scope: &str,
-) -> Result<(), anyhow::Error> {
-    let body = serde_json::json!({
-        "did": pending.did,
-        "handle": pending.handle,
-        "pds_url": pending.pds_url,
-        "access_token": access_token,
-        "dpop_key_b64": pending.dpop_key_b64,
-        "dpop_nonce": dpop_nonce,
-        "granted_scope": granted_scope,
-    });
-    let (sig, ts) = sign_body(&config.shared_secret, &body)?;
-    let url = format!(
-        "{}/auth/broker/session",
-        config.freeq_server_url.trim_end_matches('/')
-    );
-    let client = upstream_client()?;
-    let resp = client
-        .post(&url)
-        .header("X-Broker-Signature", sig)
-        .header("X-Broker-Timestamp", ts)
-        .json(&body)
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "session push failed: {}",
-            resp.text().await.unwrap_or_default()
-        ));
+/// [`SessionSink`] for the standalone broker: HMAC-signed HTTP POSTs to the
+/// freeq-server's `/auth/broker/*` receiver endpoints.
+pub struct RemoteSink {
+    pub freeq_server_url: String,
+    pub shared_secret: String,
+}
+
+#[async_trait::async_trait]
+impl SessionSink for RemoteSink {
+    async fn mint_web_token(
+        &self,
+        did: &str,
+        handle: &str,
+    ) -> Result<(String, String), anyhow::Error> {
+        let body = serde_json::json!({"did": did, "handle": handle});
+        let (sig, ts) = sign_body(&self.shared_secret, &body)?;
+        let url = format!(
+            "{}/auth/broker/web-token",
+            self.freeq_server_url.trim_end_matches('/')
+        );
+        let client = upstream_client()?;
+        let resp = client
+            .post(&url)
+            .header("X-Broker-Signature", sig)
+            .header("X-Broker-Timestamp", ts)
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "web-token failed: {}",
+                resp.text().await.unwrap_or_default()
+            ));
+        }
+        let json: serde_json::Value = resp.json().await?;
+        let token = json["token"].as_str().unwrap_or_default().to_string();
+        let nick = json["nick"].as_str().unwrap_or_default().to_string();
+        Ok((token, nick))
     }
-    Ok(())
+
+    async fn push_session(&self, push: &SessionPush<'_>) -> Result<(), anyhow::Error> {
+        let body = serde_json::json!({
+            "did": push.did,
+            "handle": push.handle,
+            "pds_url": push.pds_url,
+            "access_token": push.access_token,
+            "dpop_key_b64": push.dpop_key_b64,
+            "dpop_nonce": push.dpop_nonce,
+            "granted_scope": push.granted_scope,
+        });
+        let (sig, ts) = sign_body(&self.shared_secret, &body)?;
+        let url = format!(
+            "{}/auth/broker/session",
+            self.freeq_server_url.trim_end_matches('/')
+        );
+        let client = upstream_client()?;
+        let resp = client
+            .post(&url)
+            .header("X-Broker-Signature", sig)
+            .header("X-Broker-Timestamp", ts)
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "session push failed: {}",
+                resp.text().await.unwrap_or_default()
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Derive a 256-bit encryption key from the shared secret using HKDF-SHA256.

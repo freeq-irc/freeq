@@ -16,6 +16,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", features = ["json"] }
 freeq-oauth = { path = "../freeq-oauth" }
 freeq-ssrf = { path = "../freeq-ssrf" }
+async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 base64 = "0.22"
