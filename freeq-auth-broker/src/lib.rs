@@ -674,102 +674,38 @@ async fn auth_callback(
         )
     })?;
 
-    let params = [
-        ("grant_type", "authorization_code"),
-        ("code", code),
-        ("redirect_uri", pending.redirect_uri.as_str()),
-        ("client_id", pending.client_id.as_str()),
-        ("code_verifier", pending.code_verifier.as_str()),
-    ];
-
+    // Shared engine performs the code exchange + DPoP nonce-retry dance.
+    // We pass the PAR-step nonce as `initial_nonce`: the PDS consumes the
+    // auth code even on a `use_dpop_nonce` failure, so sending the known
+    // nonce up front avoids a retry landing on `invalid_grant: Invalid code`.
+    // On failure, render the caller-specific page/redirect (mobile clients
+    // need a `freeq://` custom-scheme redirect, not HTML).
     let client = reqwest::Client::new();
-    // CRITICAL: include any nonce we already have from the PAR step on the FIRST
-    // attempt. The PDS consumes the auth code on a failed token request even when
-    // the failure is "use_dpop_nonce", so a retry with a fresh nonce gets
-    // `invalid_grant: Invalid code`. Sending the known nonce up front avoids this.
-    let dpop_proof = dpop_key
-        .proof(
-            "POST",
-            &pending.token_endpoint,
-            pending.dpop_nonce.as_deref(),
-            None,
-        )
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DPoP proof failed: {e}"),
-            )
-        })?;
-    let resp = client
-        .post(&pending.token_endpoint)
-        .header("DPoP", &dpop_proof)
-        .form(&params)
-        .send()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Token exchange failed: {e}"),
-            )
-        })?;
-
-    let status = resp.status();
-    let dpop_nonce = resp
-        .headers()
-        .get("dpop-nonce")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .or(pending.dpop_nonce.clone());
-
-    let token_resp: serde_json::Value = if (status.as_u16() == 400 || status.as_u16() == 401)
-        && dpop_nonce.is_some()
+    let exchanged = match freeq_oauth::flow::exchange_code(
+        &client,
+        &pending.token_endpoint,
+        code,
+        &pending.code_verifier,
+        &pending.redirect_uri,
+        &pending.client_id,
+        &dpop_key,
+        pending.dpop_nonce.as_deref(),
+    )
+    .await
     {
-        let nonce = dpop_nonce.as_deref().unwrap();
-        tracing::info!(nonce = %nonce, "DPoP nonce retry for token exchange");
-        let dpop_proof2 = dpop_key
-            .proof("POST", &pending.token_endpoint, Some(nonce), None)
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("DPoP retry failed: {e}"),
-                )
-            })?;
-        let resp2 = client
-            .post(&pending.token_endpoint)
-            .header("DPoP", &dpop_proof2)
-            .form(&params)
-            .send()
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Token retry failed: {e}")))?;
-        let resp2_status = resp2.status();
-        if !resp2_status.is_success() {
-            let text = resp2.text().await.unwrap_or_default();
-            tracing::error!(status = %resp2_status, body = %text, "Token exchange retry failed");
-            let err_msg = format!("Token exchange failed: {text}");
+        Ok(t) => t,
+        Err(e) => {
+            let err_msg = e.to_string();
+            tracing::error!(error = %err_msg, "Token exchange failed");
             if pending.mobile {
                 let redirect = format!("freeq://auth?error={}", urlencod(&err_msg));
                 return Ok(axum::response::Redirect::to(&redirect).into_response());
             }
             return Ok(Html(oauth_result_page(&err_msg, None)).into_response());
         }
-        resp2
-            .json()
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Token parse failed: {e}")))?
-    } else if status.is_success() {
-        resp.json()
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Token parse failed: {e}")))?
-    } else {
-        let text = resp.text().await.unwrap_or_default();
-        tracing::error!(status = %status, body = %text, "Token exchange failed");
-        let err_msg = format!("Token exchange failed ({status}): {text}");
-        if pending.mobile {
-            let redirect = format!("freeq://auth?error={}", urlencod(&err_msg));
-            return Ok(axum::response::Redirect::to(&redirect).into_response());
-        }
-        return Ok(Html(oauth_result_page(&err_msg, None)).into_response());
     };
+    let token_resp = exchanged.token_response;
+    let dpop_nonce = exchanged.dpop_nonce;
 
     let refresh_token = token_resp["refresh_token"]
         .as_str()

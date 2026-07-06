@@ -595,66 +595,21 @@ async fn exchange_code(
     client_id: &str,
     dpop_key: &DpopKey,
 ) -> Result<(String, Option<String>)> {
-    let client = reqwest::Client::new();
-
-    let params = [
-        ("grant_type", "authorization_code"),
-        ("code", code),
-        ("redirect_uri", redirect_uri),
-        ("client_id", client_id),
-        ("code_verifier", code_verifier),
-    ];
-
-    // First attempt
-    let dpop_proof = dpop_key.proof("POST", token_endpoint, None, None)?;
-    let resp = client
-        .post(token_endpoint)
-        .header("DPoP", &dpop_proof)
-        .form(&params)
-        .send()
-        .await
-        .context("Token exchange request failed")?;
-
-    let status = resp.status();
-    let dpop_nonce = resp
-        .headers()
-        .get("dpop-nonce")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    // Retry with DPoP nonce if needed
-    if (status.as_u16() == 400 || status.as_u16() == 401) && dpop_nonce.is_some() {
-        let nonce = dpop_nonce.as_deref().unwrap();
-        let dpop_proof_retry = dpop_key.proof("POST", token_endpoint, Some(nonce), None)?;
-        let resp2 = client
-            .post(token_endpoint)
-            .header("DPoP", &dpop_proof_retry)
-            .form(&params)
-            .send()
-            .await
-            .context("Token exchange retry failed")?;
-
-        if !resp2.status().is_success() {
-            let status = resp2.status();
-            let text = resp2.text().await.unwrap_or_default();
-            bail!("Token exchange failed ({status}): {text}");
-        }
-
-        let token_resp: TokenResponse = resp2
-            .json()
-            .await
-            .context("Failed to parse token response")?;
-        return Ok((token_resp.access_token, token_resp.sub));
-    }
-
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        bail!("Token exchange failed ({status}): {text}");
-    }
-
-    let token_resp: TokenResponse = resp
-        .json()
-        .await
+    // Shared engine handles the DPoP nonce-retry dance; the loopback CLI
+    // flow has no SSRF concern (it talks to the user's own PDS) so a plain
+    // client is fine.
+    let exchanged = freeq_oauth::flow::exchange_code(
+        &reqwest::Client::new(),
+        token_endpoint,
+        code,
+        code_verifier,
+        redirect_uri,
+        client_id,
+        dpop_key,
+        None,
+    )
+    .await?;
+    let token_resp: TokenResponse = serde_json::from_value(exchanged.token_response)
         .context("Failed to parse token response")?;
     Ok((token_resp.access_token, token_resp.sub))
 }

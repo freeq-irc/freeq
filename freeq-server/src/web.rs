@@ -2889,84 +2889,29 @@ async fn auth_callback(
             )
         })?;
 
+    // Shared engine performs the code exchange + DPoP nonce-retry dance.
+    // No SSRF client here: the token_endpoint was already SSRF-validated in
+    // auth_login/auth_step_up before it was stored in `pending`. On failure
+    // render the OAuth result page (this handler has no mobile-redirect
+    // branch — that happens later, after the identity is known).
     let client = reqwest::Client::new();
-    let params = [
-        ("grant_type", "authorization_code"),
-        ("code", code),
-        ("redirect_uri", pending.redirect_uri.as_str()),
-        ("client_id", pending.client_id.as_str()),
-        ("code_verifier", pending.code_verifier.as_str()),
-    ];
-
-    // Try without nonce
-    let dpop_proof = dpop_key
-        .proof("POST", &pending.token_endpoint, None, None)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DPoP proof failed: {e}"),
-            )
-        })?;
-    let resp = client
-        .post(&pending.token_endpoint)
-        .header("DPoP", &dpop_proof)
-        .form(&params)
-        .send()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Token exchange failed: {e}"),
-            )
-        })?;
-
-    let status = resp.status();
-    let dpop_nonce = resp
-        .headers()
-        .get("dpop-nonce")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    let token_resp: serde_json::Value =
-        if (status.as_u16() == 400 || status.as_u16() == 401) && dpop_nonce.is_some() {
-            let nonce = dpop_nonce.as_deref().unwrap();
-            let dpop_proof2 = dpop_key
-                .proof("POST", &pending.token_endpoint, Some(nonce), None)
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("DPoP retry failed: {e}"),
-                    )
-                })?;
-            let resp2 = client
-                .post(&pending.token_endpoint)
-                .header("DPoP", &dpop_proof2)
-                .form(&params)
-                .send()
-                .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Token retry failed: {e}")))?;
-            if !resp2.status().is_success() {
-                let text = resp2.text().await.unwrap_or_default();
-                return Ok(oauth_result_page(
-                    &format!("Token exchange failed: {text}"),
-                    None,
-                ));
-            }
-            resp2
-                .json()
-                .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Token parse failed: {e}")))?
-        } else if status.is_success() {
-            resp.json()
-                .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Token parse failed: {e}")))?
-        } else {
-            let text = resp.text().await.unwrap_or_default();
-            return Ok(oauth_result_page(
-                &format!("Token exchange failed ({status}): {text}"),
-                None,
-            ));
-        };
+    let exchanged = match freeq_oauth::flow::exchange_code(
+        &client,
+        &pending.token_endpoint,
+        code,
+        &pending.code_verifier,
+        &pending.redirect_uri,
+        &pending.client_id,
+        &dpop_key,
+        None,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => return Ok(oauth_result_page(&e.to_string(), None)),
+    };
+    let token_resp = exchanged.token_response;
+    let dpop_nonce = exchanged.dpop_nonce;
 
     let access_token = token_resp["access_token"]
         .as_str()

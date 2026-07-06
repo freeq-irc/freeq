@@ -69,6 +69,95 @@ pub fn is_invalid_grant(body: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Outcome of an authorization-code exchange: the raw token-endpoint JSON
+/// (callers extract `access_token` / `sub` / `refresh_token` / `scope` as
+/// they need) plus the DPoP nonce in force after the exchange.
+pub struct ExchangedTokens {
+    pub token_response: serde_json::Value,
+    pub dpop_nonce: Option<String>,
+}
+
+/// Exchange an authorization code for tokens, performing the DPoP
+/// `use_dpop_nonce` retry dance (retry once on 400/401 when the response
+/// carries a nonce).
+///
+/// `initial_nonce` is any DPoP nonce the caller already holds from an earlier
+/// step (e.g. the PAR response). Passing it makes the FIRST attempt carry the
+/// nonce — important because the PDS consumes the auth code even on a
+/// `use_dpop_nonce` failure, so a naive retry-with-fresh-nonce gets
+/// `invalid_grant: Invalid code`. It is also the fallback nonce if the
+/// responses carry none.
+///
+/// On any non-success terminal response the error carries the endpoint's
+/// body text so the caller can render its own page / redirect.
+#[allow(clippy::too_many_arguments)]
+pub async fn exchange_code(
+    client: &reqwest::Client,
+    token_endpoint: &str,
+    code: &str,
+    code_verifier: &str,
+    redirect_uri: &str,
+    client_id: &str,
+    dpop_key: &DpopKey,
+    initial_nonce: Option<&str>,
+) -> anyhow::Result<ExchangedTokens> {
+    use anyhow::Context;
+
+    let params = [
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("client_id", client_id),
+        ("code_verifier", code_verifier),
+    ];
+
+    let dpop_proof = dpop_key.proof("POST", token_endpoint, initial_nonce, None)?;
+    let resp = client
+        .post(token_endpoint)
+        .header("DPoP", &dpop_proof)
+        .form(&params)
+        .send()
+        .await
+        .context("Token exchange request failed")?;
+
+    let status = resp.status();
+    let dpop_nonce = resp
+        .headers()
+        .get("dpop-nonce")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| initial_nonce.map(str::to_string));
+
+    let token_response: serde_json::Value =
+        if (status.as_u16() == 400 || status.as_u16() == 401) && dpop_nonce.is_some() {
+            let nonce = dpop_nonce.as_deref().unwrap();
+            let dpop_proof2 = dpop_key.proof("POST", token_endpoint, Some(nonce), None)?;
+            let resp2 = client
+                .post(token_endpoint)
+                .header("DPoP", &dpop_proof2)
+                .form(&params)
+                .send()
+                .await
+                .context("Token exchange retry failed")?;
+            if !resp2.status().is_success() {
+                let status = resp2.status();
+                let text = resp2.text().await.unwrap_or_default();
+                anyhow::bail!("Token exchange failed ({status}): {text}");
+            }
+            resp2.json().await.context("Failed to parse token response")?
+        } else if status.is_success() {
+            resp.json().await.context("Failed to parse token response")?
+        } else {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Token exchange failed ({status}): {text}");
+        };
+
+    Ok(ExchangedTokens {
+        token_response,
+        dpop_nonce,
+    })
+}
+
 /// Exchange a refresh token for a fresh access token, performing the DPoP
 /// `use_dpop_nonce` retry dance. `client_id` and `dpop_key` must match the
 /// original grant; `current_nonce` is the last DPoP nonce the caller holds
