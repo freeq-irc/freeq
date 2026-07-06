@@ -17,6 +17,7 @@
 //! reason this crate exists.
 
 mod dpop;
+pub mod flow;
 
 pub use dpop::DpopKey;
 

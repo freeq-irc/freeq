@@ -1212,64 +1212,15 @@ async fn get_session(state: &Arc<BrokerState>, broker_token: &str) -> Option<Bro
     }
 }
 
-/// Returns `(access_token, refresh_token, dpop_nonce, granted_scope)`.
+// Refresh + dead-vs-transient classification now live in the shared engine.
+use freeq_oauth::flow::RefreshError;
+
+/// Refresh a stored broker session's PDS access token.
 ///
-/// `granted_scope` is read from the refresh response's `scope` field
-/// when present. When the PDS omits it (some implementations do for
-/// refreshes), we default to `transition:generic`. That is intentionally
-/// conservative: the only refresh tokens the broker holds today were
-/// originally granted under `atproto transition:generic` (the broker
-/// only started narrowing to `atproto` in this same release), so the
-/// pre-existing grant is wide. After this release, every NEW broker
-/// session's first refresh response will carry the narrow scope
-/// explicitly and we'll record it correctly.
-/// Distinguishes a permanently-dead session from a transient failure so the
-/// `/session` handler can return the right status. Mapping every failure to
-/// 502 (as the old code did) made a revoked/expired refresh token
-/// indistinguishable from "PDS briefly down" — clients retried a dead token
-/// forever and never reached sign-in (the 2026-07-03 "Reconnecting… forever"
-/// bug).
-enum RefreshError {
-    /// The refresh token is revoked/expired (OAuth `invalid_grant`). The user
-    /// MUST re-authenticate — surface as 401 so the client drops to sign-in.
-    InvalidGrant,
-    /// Network error, PDS 5xx, malformed response, etc. — retryable; 502.
-    Transient(anyhow::Error),
-}
-
-impl std::fmt::Display for RefreshError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RefreshError::InvalidGrant => write!(f, "refresh token invalid_grant (re-auth required)"),
-            RefreshError::Transient(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl From<anyhow::Error> for RefreshError {
-    fn from(e: anyhow::Error) -> Self {
-        RefreshError::Transient(e)
-    }
-}
-
-impl From<reqwest::Error> for RefreshError {
-    fn from(e: reqwest::Error) -> Self {
-        RefreshError::Transient(e.into())
-    }
-}
-
-/// True when an OAuth token-endpoint error body signals a permanently-dead
-/// grant: `{"error":"invalid_grant"}` (RFC 6749 §5.2). Also treats an
-/// explicit `invalid_request`/`unauthorized_client` on the refresh grant as
-/// dead, since retrying won't help.
-fn is_invalid_grant(body: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
-        .map(|err| matches!(err.as_str(), "invalid_grant" | "unauthorized_client"))
-        .unwrap_or(false)
-}
-
+/// Thin adapter over [`freeq_oauth::flow::refresh_access_token`]: builds the
+/// grant's `client_id` from broker config and injects the broker's bounded
+/// HTTP client, then returns the tuple the `/session` and graph handlers
+/// expect. Returns `(access_token, refresh_token, dpop_nonce, granted_scope)`.
 async fn refresh_access_token(
     config: &BrokerConfig,
     record: &BrokerSessionRecord,
@@ -1277,82 +1228,17 @@ async fn refresh_access_token(
     let dpop_key = DpopKey::from_base64url(&record.dpop_key_b64)?;
     let redirect_uri = format!("{}/auth/callback", config.public_url.trim_end_matches('/'));
     let client_id = build_client_id(&config.public_url, &redirect_uri);
-    let params = [
-        ("grant_type", "refresh_token"),
-        ("refresh_token", record.refresh_token.as_str()),
-        ("client_id", client_id.as_str()),
-    ];
-
     let client = upstream_client()?;
-    let dpop_proof = dpop_key.proof("POST", &record.token_endpoint, None, None)?;
-    let resp = client
-        .post(&record.token_endpoint)
-        .header("DPoP", &dpop_proof)
-        .form(&params)
-        .send()
-        .await?;
-    let status = resp.status();
-    let mut dpop_nonce = resp
-        .headers()
-        .get("dpop-nonce")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .or(record.dpop_nonce.clone());
-
-    let token_resp: serde_json::Value =
-        if (status.as_u16() == 400 || status.as_u16() == 401) && dpop_nonce.is_some() {
-            let nonce = dpop_nonce.as_deref().unwrap();
-            let dpop_proof2 = dpop_key.proof("POST", &record.token_endpoint, Some(nonce), None)?;
-            let resp2 = client
-                .post(&record.token_endpoint)
-                .header("DPoP", &dpop_proof2)
-                .form(&params)
-                .send()
-                .await?;
-            if !resp2.status().is_success() {
-                let body = resp2.text().await.unwrap_or_default();
-                if is_invalid_grant(&body) {
-                    return Err(RefreshError::InvalidGrant);
-                }
-                return Err(RefreshError::Transient(anyhow::anyhow!("Refresh failed: {body}")));
-            }
-            resp2.json().await.map_err(|e| RefreshError::Transient(e.into()))?
-        } else if status.is_success() {
-            resp.json().await.map_err(|e| RefreshError::Transient(e.into()))?
-        } else {
-            // Read the error body to classify. A dead refresh token comes back
-            // as 400 invalid_grant on the FIRST try when no DPoP nonce dance
-            // is needed (or the nonce was already fresh).
-            let body = resp.text().await.unwrap_or_default();
-            if is_invalid_grant(&body) {
-                return Err(RefreshError::InvalidGrant);
-            }
-            return Err(RefreshError::Transient(anyhow::anyhow!("Refresh failed ({status}): {body}")));
-        };
-
-    let access_token = token_resp["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("No access_token"))?
-        .to_string();
-    let refresh_token = token_resp["refresh_token"]
-        .as_str()
-        .unwrap_or(&record.refresh_token)
-        .to_string();
-    dpop_nonce = token_resp
-        .get("dpop_nonce")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or(dpop_nonce);
-    // Conservative default explained on the function signature: refresh
-    // tokens stored in the broker today were originally granted under
-    // `transition:generic`, so a missing `scope` in the response means
-    // "preserve the existing wide grant".
-    let granted_scope = token_resp["scope"]
-        .as_str()
-        .unwrap_or("atproto transition:generic")
-        .to_string();
-
-    Ok((access_token, refresh_token, dpop_nonce, granted_scope))
+    let t = freeq_oauth::flow::refresh_access_token(
+        &client,
+        &record.token_endpoint,
+        &client_id,
+        &dpop_key,
+        &record.refresh_token,
+        record.dpop_nonce.as_deref(),
+    )
+    .await?;
+    Ok((t.access_token, t.refresh_token, t.dpop_nonce, t.granted_scope))
 }
 
 async fn mint_web_token(
@@ -1559,31 +1445,6 @@ fn oauth_result_page(message: &str, _result: Option<&serde_json::Value>) -> Stri
 pub use freeq_oauth::{build_client_id, generate_random_string};
 use freeq_oauth::{generate_pkce, urlencode as urlencod};
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn invalid_grant_body_is_detected() {
-        // A dead/revoked refresh token → PDS returns this → must be 401, not 502.
-        assert!(is_invalid_grant(r#"{"error":"invalid_grant","error_description":"token has been revoked"}"#));
-        assert!(is_invalid_grant(r#"{"error":"unauthorized_client"}"#));
-    }
-
-    #[test]
-    fn transient_bodies_are_not_invalid_grant() {
-        // Retryable conditions must NOT trip the sign-in path.
-        assert!(!is_invalid_grant(r#"{"error":"use_dpop_nonce"}"#));
-        assert!(!is_invalid_grant(r#"{"error":"server_error"}"#));
-        assert!(!is_invalid_grant(r#"{"error":"temporarily_unavailable"}"#));
-        assert!(!is_invalid_grant("Bad Gateway"));       // non-JSON upstream error page
-        assert!(!is_invalid_grant(""));                   // empty body
-        assert!(!is_invalid_grant("{}"));                 // JSON without error field
-        assert!(!is_invalid_grant(r#"{"error":123}"#));   // error not a string
-    }
-
-    #[test]
-    fn refresh_error_maps_display() {
-        assert!(RefreshError::InvalidGrant.to_string().contains("re-auth"));
-    }
-}
+// The refresh-classification unit tests (invalid_grant detection, RefreshError
+// display) moved with their code into freeq-oauth's `flow` module. This crate's
+// coverage lives in tests/characterization.rs (full request-path integration).
