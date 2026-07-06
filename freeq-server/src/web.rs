@@ -2435,84 +2435,23 @@ async fn auth_login(
     let (code_verifier, code_challenge) = generate_pkce();
     let oauth_state = generate_random_string(16);
 
-    // PAR request
-    let params = [
-        ("response_type", "code"),
-        ("client_id", &client_id),
-        ("redirect_uri", &redirect_uri),
-        ("code_challenge", &code_challenge),
-        ("code_challenge_method", "S256"),
-        ("scope", scope),
-        ("state", &oauth_state),
-        ("login_hint", &handle),
-    ];
-
-    // Try without nonce first
-    let dpop_proof = dpop_key
-        .proof("POST", par_endpoint, None, None)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DPoP proof failed: {e}"),
-            )
-        })?;
-    // Use the SSRF-validated par_client (DNS-pinned + timeout). Error
-    // strings are deliberately generic — the PDS body could otherwise
-    // be reflected into our error response.
-    let resp = par_client
-        .post(par_endpoint)
-        .header("DPoP", &dpop_proof)
-        .form(&params)
-        .send()
-        .await
-        .map_err(|_| (StatusCode::BAD_GATEWAY, "PAR failed".to_string()))?;
-
-    let status = resp.status();
-    let dpop_nonce = resp
-        .headers()
-        .get("dpop-nonce")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    let par_resp: serde_json::Value = if status.as_u16() == 400 && dpop_nonce.is_some() {
-        // Retry with nonce
-        let nonce = dpop_nonce.as_deref().unwrap();
-        let dpop_proof2 = dpop_key
-            .proof("POST", par_endpoint, Some(nonce), None)
-            .map_err(|_| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "DPoP retry failed".to_string(),
-                )
-            })?;
-        let resp2 = par_client
-            .post(par_endpoint)
-            .header("DPoP", &dpop_proof2)
-            .form(&params)
-            .send()
-            .await
-            .map_err(|_| (StatusCode::BAD_GATEWAY, "PAR retry failed".to_string()))?;
-        if !resp2.status().is_success() {
-            return Err((StatusCode::BAD_GATEWAY, "PAR retry failed".to_string()));
-        }
-        resp2
-            .json()
-            .await
-            .map_err(|_| (StatusCode::BAD_GATEWAY, "PAR parse failed".to_string()))?
-    } else if status.is_success() {
-        resp.json()
-            .await
-            .map_err(|_| (StatusCode::BAD_GATEWAY, "PAR parse failed".to_string()))?
-    } else {
-        return Err((StatusCode::BAD_GATEWAY, format!("PAR failed ({status})")));
-    };
-
-    let request_uri = par_resp["request_uri"].as_str().ok_or_else(|| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "No request_uri in PAR response".to_string(),
-        )
-    })?;
+    // Shared engine performs the PAR + DPoP nonce dance over the
+    // SSRF-validated par_client (DNS-pinned + timeout). The error is mapped to
+    // a generic string — the PDS body must not be reflected into our response.
+    let par = freeq_oauth::discovery::pushed_authorization_request(
+        &par_client,
+        par_endpoint,
+        &client_id,
+        &redirect_uri,
+        &code_challenge,
+        &oauth_state,
+        &handle,
+        scope,
+        &dpop_key,
+    )
+    .await
+    .map_err(|_| (StatusCode::BAD_GATEWAY, "PAR failed".to_string()))?;
+    let request_uri = par.request_uri.as_str();
 
     // Store pending session
     let now = SystemTime::now()
@@ -2710,79 +2649,23 @@ async fn auth_step_up(
     let (code_verifier, code_challenge) = generate_pkce();
     let oauth_state = generate_random_string(16);
 
-    let params = [
-        ("response_type", "code"),
-        ("client_id", &client_id),
-        ("redirect_uri", &redirect_uri),
-        ("code_challenge", &code_challenge),
-        ("code_challenge_method", "S256"),
-        ("scope", scope),
-        ("state", &oauth_state),
-        ("login_hint", &login_session.handle),
-    ];
-
-    // PAR with DPoP (handles nonce retry the same way as auth_login).
-    // Use the SSRF-validated `par_client` instead of a fresh
-    // reqwest::Client::new() — the client is DNS-pinned + has a
-    // timeout. Error messages are deliberately generic so we don't
-    // reflect attacker-controlled URLs back in the response body.
-    let dpop_proof = dpop_key
-        .proof("POST", par_endpoint, None, None)
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "DPoP proof failed".to_string(),
-            )
-        })?;
-    let resp = par_client
-        .post(par_endpoint)
-        .header("DPoP", &dpop_proof)
-        .form(&params)
-        .send()
-        .await
-        .map_err(|_| (StatusCode::BAD_GATEWAY, "PAR failed".to_string()))?;
-    let status = resp.status();
-    let dpop_nonce = resp
-        .headers()
-        .get("dpop-nonce")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    let par_resp: serde_json::Value = if status.as_u16() == 400 && dpop_nonce.is_some() {
-        let nonce = dpop_nonce.as_deref().unwrap();
-        let dpop_proof2 = dpop_key
-            .proof("POST", par_endpoint, Some(nonce), None)
-            .map_err(|_| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "DPoP retry failed".to_string(),
-                )
-            })?;
-        let resp2 = par_client
-            .post(par_endpoint)
-            .header("DPoP", &dpop_proof2)
-            .form(&params)
-            .send()
-            .await
-            .map_err(|_| (StatusCode::BAD_GATEWAY, "PAR retry failed".to_string()))?;
-        if !resp2.status().is_success() {
-            return Err((StatusCode::BAD_GATEWAY, "PAR retry failed".to_string()));
-        }
-        resp2
-            .json()
-            .await
-            .map_err(|_| (StatusCode::BAD_GATEWAY, "PAR parse failed".to_string()))?
-    } else if status.is_success() {
-        resp.json()
-            .await
-            .map_err(|_| (StatusCode::BAD_GATEWAY, "PAR parse failed".to_string()))?
-    } else {
-        return Err((StatusCode::BAD_GATEWAY, format!("PAR failed ({status})")));
-    };
-    let request_uri = par_resp["request_uri"].as_str().ok_or((
-        StatusCode::BAD_GATEWAY,
-        "No request_uri in PAR response".to_string(),
-    ))?;
+    // Shared engine performs the PAR + DPoP nonce dance over the
+    // SSRF-validated par_client (DNS-pinned + timeout). The error is mapped to
+    // a generic string so we don't reflect attacker-controlled body/URLs back.
+    let par = freeq_oauth::discovery::pushed_authorization_request(
+        &par_client,
+        par_endpoint,
+        &client_id,
+        &redirect_uri,
+        &code_challenge,
+        &oauth_state,
+        &login_session.handle,
+        scope,
+        &dpop_key,
+    )
+    .await
+    .map_err(|_| (StatusCode::BAD_GATEWAY, "PAR failed".to_string()))?;
+    let request_uri = par.request_uri.as_str();
 
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
