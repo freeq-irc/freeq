@@ -423,15 +423,39 @@ well-known/PAR servers.
   the SSRF-validated `par_client` (errors mapped generically to preserve
   info-leak hardening).
 
-**One deferred item (optional, server-internal).** The server's per-hop
-SSRF *discovery* (the two well-known fetches with a fresh DNS-pinned client
-per URL) stays inline and is still duplicated between `auth_login` and
-`auth_step_up`. The engine's single-client `discover_auth_server` can't
-replace it without a client-provider abstraction, and the code is
-security-critical (CTF-07/08/09). Deduping the two copies into one
-server-local helper is a safe cleanup (oauth_ssrf covers both) but does not
-advance the cross-crate unification, so it's parked. Everything that can be
-shared between the standalone broker and the embedded server now is.
+**Phase 1e — full discovery uniformity (DONE).** The engine's discovery is
+no longer half-adopted; all three callers use it. Two structural pieces:
+
+1. **`freeq-ssrf` crate (ae127f06).** `freeq_sdk::ssrf` promoted to its own
+   single-purpose crate (charter: SSRF-safe outbound — private/reserved-IP
+   rejection + DNS pinning; nothing else) so the broker can reach it without
+   depending on freeq-sdk. It sits *below* OAuth: already used by non-OAuth
+   consumers (media fetch, did:web resolution, blob/OG proxy), which is why
+   it isn't inside freeq-oauth. freeq-sdk re-exports it.
+2. **`ClientProvider` seam (ca617925, e7bed68f).** `freeq_oauth::ClientProvider`
+   — the engine asks for a client per outbound URL and stays agnostic about
+   how it's built (freeq-oauth remains pure OAuth). `discover_auth_server`
+   takes a provider. Callers:
+   - SDK → `SharedClient` passthrough (loopback, no SSRF exposure).
+   - Broker → `SsrfClients` via freeq-ssrf: discovery + PAR now DNS-pin a
+     fresh client per user-controlled host, **closing audit M-8**. PAR
+     nonce-retry still reuses one connection (engine reuses the client). 3
+     provider unit tests cover the policy on the otherwise-untestable path.
+     (Sent chad a question re: whether the Miren keepalive tuning in
+     `upstream_client` was load-bearing; the reuse property is preserved
+     regardless.)
+   - Server → `SsrfClients` wrapping `safe_outbound_client`; both `auth_login`
+     and `auth_step_up` now use engine discovery, **deduping the two inline
+     copies**. `OutboundRefused` carries the original `(status,msg)` so SSRF
+     refusals keep their exact 4xx-fast-generic response — oauth_ssrf
+     (CTF-07/08/09) green, unchanged.
+
+Everything shareable between the standalone broker and the embedded server is
+now shared. Next meaningful extraction (separate, own charter): **`freeq-atproto`**
+— DID/handle resolution is duplicated four ways (broker's own copies, two in
+the server's verifiers, the SDK's `DidResolver`); pulling it out lets the
+broker drop its hardcoded resolvers. Not `freeq-net`: it's AT Proto identity,
+not generic networking.
 
 Pre-existing, unrelated: `cargo build --workspace` is red on `main` because
 `freeq-tui` and `freeq-windows-core` don't match the new `Event::ReadMarker`
