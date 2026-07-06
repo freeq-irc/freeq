@@ -17,6 +17,8 @@ path = "src/main.rs"
 aes-gcm = { workspace = true }
 freeq-sdk = { path = "../freeq-sdk" }
 freeq-oauth = { workspace = true }
+freeq-auth-broker = { path = "../freeq-auth-broker" }
+async-trait = "0.1"
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
@@ -68,6 +70,7 @@ av-native = ["iroh-live", "moq-relay", "moq-native", "moq-lite", "moq-token", "q
 
 [dev-dependencies]
 freeq-sdk = { path = "../freeq-sdk" }
+serde_urlencoded = "0.7"
 rcgen = "0.13"
 tempfile = "3"
 x25519-dalek = { version = "2", features = ["static_secrets"] }

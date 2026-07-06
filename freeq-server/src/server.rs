@@ -202,6 +202,10 @@ pub struct OAuthResult {
     /// One-time token for SASL web-token auth (consumed on first use).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web_token: Option<String>,
+    /// Long-lived broker token for durable `/session` refresh. `Some` only in
+    /// embedded mode where a session was persisted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broker_token: Option<String>,
     /// When this result was created (Unix timestamp seconds).
     #[serde(skip)]
     pub created_at: u64,
@@ -770,6 +774,10 @@ pub struct SharedState {
     pub session_client_info: Mutex<HashMap<String, String>>,
     /// Upload tokens: token → (DID, created_at). Short-lived proof of upload authorization.
     pub upload_tokens: Mutex<HashMap<String, (String, std::time::Instant)>>,
+    /// Embedded broker session store (durable-ish `/session` refresh) — `Some`
+    /// only in embedded mode (no separate broker). Shared by `auth_callback`
+    /// (which persists the session) and the mounted broker `/session` handler.
+    pub embedded_session_store: Option<Arc<dyn freeq_auth_broker::SessionStore>>,
     /// Ghost sessions: DID users who disconnected recently.
     /// If they reconnect within the grace period, suppress QUIT/JOIN churn.
     /// Key: DID, Value: (nick, hostmask, channels_with_modes, disconnect_time, cancel_sender)
@@ -1591,6 +1599,13 @@ impl Server {
             did_msg_keys: Mutex::new(HashMap::new()),
             session_client_info: Mutex::new(HashMap::new()),
             upload_tokens: Mutex::new(HashMap::new()),
+            // Embedded mode (no separate broker) gets an ephemeral in-memory
+            // broker session store so /session refresh works within uptime.
+            embedded_session_store: if self.config.broker_shared_secret.is_none() {
+                Some(Arc::new(freeq_auth_broker::InMemoryStore::new()))
+            } else {
+                None
+            },
             ghost_sessions: Mutex::new(HashMap::new()),
             spawned_agents: Mutex::new(HashMap::new()),
             // 30 requests per 60-second window per IP for expensive REST endpoints
@@ -4866,6 +4881,7 @@ mod s2s_adversarial_tests {
             did_msg_keys: Mutex::new(HashMap::new()),
             session_client_info: Mutex::new(HashMap::new()),
             upload_tokens: Mutex::new(HashMap::new()),
+            embedded_session_store: None,
             ghost_sessions: Mutex::new(HashMap::new()),
             spawned_agents: Mutex::new(HashMap::new()),
             rest_rate_limiter: crate::web::IpRateLimiter::new(30, 60),

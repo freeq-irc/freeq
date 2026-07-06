@@ -1,6 +1,6 @@
 //! Characterization of the embedded server's `/auth/callback` behaviors
 //! that have no standalone-broker counterpart and must survive the auth
-//! unification (see docs/AUTH-BROKER-UNIFICATION.md, Phase 0c):
+//! unification (see docs/AUTH-BROKER-UNIFICATION.md):
 //!
 //!   - mobile callback → `freeq://auth?...` custom-scheme redirect,
 //!   - IRC `/login` completion via the `irc_state` back-channel,

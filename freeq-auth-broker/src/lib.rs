@@ -474,7 +474,7 @@ impl SessionStore for InMemoryStore {
 
 /// Build the broker's axum router over shared state. Used by the
 /// standalone binary and by the characterization tests; embedding
-/// servers mount this in the unification plan's Phase 3.
+/// servers mount this when embedding the broker in-process.
 /// The durable-session routes an embedding server lacks: `/session` (refresh)
 /// and Bluesky graph delegation. Returned un-stated so a host can `.merge()` it
 /// into its own router (its layers/CORS then apply); the standalone [`router`]

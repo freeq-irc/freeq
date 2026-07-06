@@ -1,13 +1,12 @@
 //! Characterization tests for the standalone auth broker.
 //!
 //! These pin the broker's CURRENT behavior — it is the reference
-//! implementation for the auth unification work (see
-//! docs/AUTH-BROKER-UNIFICATION.md, Phase 0b). They must stay green,
-//! unchanged, through every later refactor phase.
+//! implementation for the auth unification work. They must stay green,
+//! unchanged, through every later refactor.
 //!
 //! `/auth/login`'s discovery+PAR chain resolves handles/DIDs against
 //! hardcoded public hosts and is not reachable from a hermetic test;
-//! its behavior gets characterized at the engine boundary in Phase 1.
+//! its behavior gets characterized at the engine boundary (freeq-oauth tests).
 //! Everything downstream of resolution (callback, session refresh,
 //! graph delegation, push contract) is covered here against mock
 //! upstreams.

@@ -903,6 +903,7 @@ mod tests {
             did_msg_keys: Mutex::new(HashMap::new()),
             session_client_info: Mutex::new(HashMap::new()),
             upload_tokens: Mutex::new(HashMap::new()),
+            embedded_session_store: None,
             ghost_sessions: Mutex::new(HashMap::new()),
             spawned_agents: Mutex::new(HashMap::new()),
             rest_rate_limiter: crate::web::IpRateLimiter::new(30, 60),

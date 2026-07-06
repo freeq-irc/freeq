@@ -331,9 +331,32 @@ pub fn router(state: Arc<SharedState>) -> Router {
     }
 
     // Apply state, then merge verifier (which has its own state already applied)
-    let mut final_app = app.with_state(state);
+    let mut final_app = app.with_state(state.clone());
     if let Some(vr) = verifier_router {
         final_app = final_app.merge(vr);
+    }
+    // Embedded broker: with no separate broker configured (BROKER_SHARED_SECRET
+    // unset), serve the broker's /session + graph endpoints in-process, backed
+    // by an ephemeral in-memory store and a LocalWriter into our own state. A
+    // separate broker (secret set) uses the /auth/broker/* receiver path instead.
+    if let Some(store) = state.embedded_session_store.clone() {
+        let broker_state = Arc::new(freeq_auth_broker::BrokerState {
+            // client_id is stored per-session, so these are unused by the
+            // /session + graph paths.
+            config: freeq_auth_broker::BrokerConfig {
+                public_url: String::new(),
+                freeq_server_url: String::new(),
+                shared_secret: String::new(),
+            },
+            writer: Arc::new(LocalWriter {
+                state: state.clone(),
+            }),
+            // Same store instance auth_callback persists into.
+            store,
+            pending: tokio::sync::Mutex::new(Default::default()),
+            refresh_locks: tokio::sync::Mutex::new(Default::default()),
+        });
+        final_app = final_app.merge(freeq_auth_broker::session_router(broker_state));
     }
     // Security headers as outermost layer so they apply to all responses
     // including static files served via fallback_service
@@ -1991,6 +2014,56 @@ async fn auth_broker_web_token(
     }))
 }
 
+/// [`freeq_auth_broker::SessionWriter`] that writes into this server's own
+/// in-process state — the embedded equivalent of the standalone broker's
+/// HMAC push. Mirrors the `/auth/broker/*` receiver bodies.
+pub struct LocalWriter {
+    pub state: Arc<SharedState>,
+}
+
+#[async_trait::async_trait]
+impl freeq_auth_broker::SessionWriter for LocalWriter {
+    async fn mint_web_token(
+        &self,
+        did: &str,
+        handle: &str,
+    ) -> Result<(String, String), anyhow::Error> {
+        let token = generate_random_string(32);
+        self.state.web_auth_tokens.lock().insert(
+            token.clone(),
+            (did.to_string(), handle.to_string(), std::time::Instant::now()),
+        );
+        Ok((token, mobile_nick_from_handle(handle)))
+    }
+
+    async fn push_session(
+        &self,
+        p: &freeq_auth_broker::SessionPush<'_>,
+    ) -> Result<(), anyhow::Error> {
+        self.state.web_sessions.lock().insert(
+            (p.did.to_string(), crate::server::OauthPurpose::Login),
+            crate::server::WebSession {
+                did: p.did.to_string(),
+                handle: p.handle.to_string(),
+                pds_url: p.pds_url.to_string(),
+                access_token: p.access_token.to_string(),
+                dpop_key_b64: p.dpop_key_b64.to_string(),
+                dpop_nonce: p.dpop_nonce.map(str::to_string),
+                created_at: std::time::Instant::now(),
+                granted_scope: p.granted_scope.to_string(),
+            },
+        );
+        // Upload token for mobile clients that can't prove session ownership
+        // via WebSocket session_dids (stored server-side, 5-min TTL).
+        let upload_token = generate_random_string(32);
+        self.state
+            .upload_tokens
+            .lock()
+            .insert(upload_token, (p.did.to_string(), std::time::Instant::now()));
+        Ok(())
+    }
+}
+
 async fn auth_broker_session(
     State(state): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
@@ -2761,12 +2834,51 @@ async fn auth_callback(
         Some(token)
     };
 
+    // Embedded durable session (Login only): persist the broker session
+    // (refresh token + client_id) into the in-process store and issue a
+    // broker_token, so /session can silently refresh without a re-login.
+    let broker_token = match (is_step_up, state.embedded_session_store.as_ref()) {
+        (false, Some(store)) => {
+            if let Some(refresh_token) = token_resp["refresh_token"].as_str() {
+                let bt = generate_random_string(32);
+                let now = SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let rec = freeq_auth_broker::BrokerSessionRecord {
+                    broker_token: bt.clone(),
+                    did: pending.did.clone(),
+                    handle: pending.handle.clone(),
+                    pds_url: pending.pds_url.clone(),
+                    token_endpoint: pending.token_endpoint.clone(),
+                    refresh_token: refresh_token.to_string(),
+                    dpop_key_b64: pending.dpop_key_b64.clone(),
+                    dpop_nonce: dpop_nonce.clone(),
+                    client_id: pending.client_id.clone(),
+                    created_at: now,
+                    updated_at: now,
+                };
+                match store.insert(&rec).await {
+                    Ok(()) => Some(bt),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "embedded session persist failed");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
     let result = crate::server::OAuthResult {
         did: pending.did.clone(),
         handle: pending.handle.clone(),
         access_jwt: access_token.to_string(),
         pds_url: pending.pds_url.clone(),
         web_token,
+        broker_token,
         created_at: SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2873,8 +2985,9 @@ p {{ color: #a0a0b0; margin: 8px 0; }}
     if pending.mobile {
         let nick = mobile_nick_from_handle(&pending.handle);
         let redirect = format!(
-            "freeq://auth?token={}&nick={}&did={}&handle={}",
+            "freeq://auth?token={}&broker_token={}&nick={}&did={}&handle={}",
             urlencod(result.web_token.as_deref().unwrap_or("")),
+            urlencod(result.broker_token.as_deref().unwrap_or("")),
             urlencod(&nick),
             urlencod(&result.did),
             urlencod(&result.handle),
