@@ -392,6 +392,43 @@ Findings to carry forward:
   fails to compile that target. Unrelated to auth. Baseline was taken by
   running the auth-relevant targets explicitly. Worth filing separately.
 
+### 2.4b Phase 1 status (2026-07-06)
+
+`freeq-oauth` crate created; the shared engine now owns everything except
+discovery + PAR. Committed increments on `refactor/auth-broker-unification`:
+- **1a** (b3e8ef5e) — DpopKey + PKCE/random/urlencode + build_client_id +
+  scope constant. All three consumers rewired; `freeq_sdk::oauth::DpopKey`
+  and `crate::web::generate_random_string` kept as re-exports.
+- **1b** (5641c209) — refresh flow (`RefreshError`, `is_invalid_grant`,
+  `refresh_access_token`) into `freeq_oauth::flow`, injected client. Broker
+  keeps a thin config→primitives adapter.
+- **1c** (dd283bb0) — authorization-code `exchange_code` into the engine
+  (injected client, optional initial_nonce). Broker, server, and SDK
+  callbacks all delegate; each keeps its own error rendering.
+- **1c-sec** (89717a0a) — return_to open-redirect fixed (C-6, above).
+
+Green throughout: freeq-oauth 8, broker 3+23, sdk oauth 40, server lib 310 +
+broker_auth 20 + embedded_auth 4 + oauth_scope 21 + oauth_ssrf 7.
+
+**Remaining in Phase 1 — discovery + PAR.** Still duplicated across the
+broker's `auth_login`, the server's `auth_login` AND `auth_step_up` (two
+near-identical SSRF-guarded copies in one file), and the SDK's
+`discover_auth_server` / `push_authorization_request`. Deferred deliberately:
+this is the **least-covered leg** — the broker's `auth_login` resolves
+handles against hardcoded public hosts and has no hermetic test, and it is
+the **most SSRF-sensitive** code (CTF-07/08/09 pin the server side). The
+correct next step, per the coverage-first rule, is to (a) add a mock-resolver
+/ mock-well-known seam so the broker's `auth_login` is testable, then (b)
+extract discovery + PAR behind the injected-client-provider abstraction
+(the server needs a fresh DNS-pinned client per hop; broker/SDK reuse one).
+Server-internal dedup of `auth_login` vs `auth_step_up` is a safe intermediate
+(oauth_ssrf + oauth_scope already cover both).
+
+Pre-existing, unrelated: `cargo build --workspace` is red on `main` because
+`freeq-tui` and `freeq-windows-core` don't match the new `Event::ReadMarker`
+variant (added on main, commit cfbe14ee). Not caused by this work; flagged
+for a separate fix.
+
 ### 2.5 Testing
 
 - **Phase 0 characterization suite is the safety net** — it pins the
