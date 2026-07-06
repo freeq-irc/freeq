@@ -29,3 +29,6 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 
 
+
+[dev-dependencies]
+serde_urlencoded = "0.7"
