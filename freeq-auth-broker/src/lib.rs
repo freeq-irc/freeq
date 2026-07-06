@@ -111,6 +111,34 @@ fn upstream_client() -> Result<reqwest::Client, anyhow::Error> {
         .build()?)
 }
 
+/// [`ClientProvider`] for the login flow's discovery + PAR hops, which all
+/// reach user-controlled PDS / auth-server hosts. Validates each URL against
+/// SSRF policy and DNS-pins a fresh client to the resolved addresses. The PAR
+/// nonce-retry still shares one connection because the engine reuses the
+/// single client we hand it (pinned clients keep reqwest's default pooling).
+struct SsrfClients;
+
+impl ClientProvider for SsrfClients {
+    async fn client_for(&self, url: &str) -> anyhow::Result<reqwest::Client> {
+        let parsed = url::Url::parse(url)?;
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            anyhow::bail!("unsupported URL scheme");
+        }
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("URL has no host"))?;
+        let port = parsed
+            .port()
+            .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+        let addrs = freeq_ssrf::resolve_and_check(host, port).await?;
+        Ok(freeq_ssrf::pinned_client(
+            host,
+            &addrs,
+            std::time::Duration::from_secs(30),
+        )?)
+    }
+}
+
 async fn resolve_handle(handle: &str) -> Result<String, anyhow::Error> {
     let client = upstream_client()?;
     // Try HTTPS well-known first
@@ -381,15 +409,11 @@ async fn auth_login(
         )
     })?;
 
-    // Bounded HTTP client (the broker's Miren egress needs tight timeouts +
-    // connection reuse); the shared engine performs discovery over it.
-    let client = upstream_client().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("upstream client init: {e}"),
-        )
-    })?;
-    let auth_meta = freeq_oauth::discovery::discover_auth_server(&client, &pds_url)
+    // Discovery + PAR reach user-controlled PDS / auth-server hosts, so each
+    // hop goes through the SSRF-validating, DNS-pinning provider (closes audit
+    // M-8). The PAR nonce-retry still reuses its connection: the engine reuses
+    // the single client we hand it.
+    let auth_meta = freeq_oauth::discovery::discover_auth_server(&SsrfClients, &pds_url)
         .await
         .map_err(|e| {
             (
@@ -419,12 +443,15 @@ async fn auth_login(
     let (code_verifier, code_challenge) = generate_pkce();
     let oauth_state = generate_random_string(16);
 
-    // Shared engine performs the PAR + DPoP nonce dance over the same bounded
-    // client (retries only on the canonical use_dpop_nonce error). The nonce
-    // it returns is carried into `pending` so the code exchange can send it up
-    // front (the code-consumption caveat).
+    // PAR over an SSRF-validated, DNS-pinned client for the auth-server host.
+    // One client is reused for the initial POST and the nonce-retry (the
+    // engine reuses it), preserving the connection-reuse the PAR retry needs.
+    let par_client = SsrfClients
+        .client_for(par_endpoint)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("PAR client init: {e}")))?;
     let par = freeq_oauth::discovery::pushed_authorization_request(
-        &client,
+        &par_client,
         par_endpoint,
         &client_id,
         &redirect_uri,
@@ -1020,6 +1047,7 @@ async fn get_session(state: &Arc<BrokerState>, broker_token: &str) -> Option<Bro
 }
 
 // Refresh + dead-vs-transient classification now live in the shared engine.
+use freeq_oauth::ClientProvider;
 use freeq_oauth::flow::RefreshError;
 
 /// Refresh a stored broker session's PDS access token.
@@ -1258,4 +1286,39 @@ use freeq_oauth::{generate_pkce, urlencode as urlencod};
 
 // The refresh-classification unit tests (invalid_grant detection, RefreshError
 // display) moved with their code into freeq-oauth's `flow` module. This crate's
-// coverage lives in tests/characterization.rs (full request-path integration).
+// request-path coverage lives in tests/characterization.rs.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The SSRF provider guards the (hermetically-untestable) auth_login
+    // discovery/PAR hops; pin its policy here.
+    #[tokio::test]
+    async fn ssrf_provider_refuses_private_targets() {
+        for url in [
+            "http://127.0.0.1:1/",
+            "http://10.0.0.1/",
+            "http://localhost:9999/",
+            "http://169.254.169.254/", // cloud metadata
+        ] {
+            assert!(
+                SsrfClients.client_for(url).await.is_err(),
+                "must refuse private target {url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ssrf_provider_rejects_bad_urls() {
+        assert!(SsrfClients.client_for("not a url").await.is_err());
+        assert!(SsrfClients.client_for("ftp://example.com").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn ssrf_provider_allows_public_host() {
+        // An IP literal that is public passes validation and yields a client
+        // (no network I/O — resolution short-circuits on the literal).
+        assert!(SsrfClients.client_for("https://8.8.8.8/").await.is_ok());
+    }
+}

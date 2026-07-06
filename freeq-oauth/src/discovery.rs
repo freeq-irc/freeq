@@ -1,14 +1,15 @@
 //! Authorization-server discovery + Pushed Authorization Request (PAR).
 //!
-//! Both take an injected `reqwest::Client`. Callers that need per-hop SSRF
-//! validation with a fresh DNS-pinned client per URL (the server) drive the
-//! metadata fetches themselves; the single-client form here fits the broker
-//! and the loopback SDK, which resolve only the user's own PDS.
+//! Discovery walks two attacker-influenced URLs, so it takes a
+//! [`ClientProvider`](crate::ClientProvider) and asks for a client per URL —
+//! multi-tenant callers return a fresh SSRF-validated, DNS-pinned client each
+//! time; loopback callers reuse one. PAR hits a single endpoint the caller has
+//! already validated, so it takes that client directly.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::DpopKey;
+use crate::{ClientProvider, DpopKey};
 
 /// Authorization server metadata (RFC 8414 / AT Protocol extensions).
 #[derive(Debug, Clone, Deserialize)]
@@ -30,15 +31,21 @@ struct ProtectedResourceMetadata {
 /// Discover a PDS's authorization server: fetch its
 /// `.well-known/oauth-protected-resource`, then that server's
 /// `.well-known/oauth-authorization-server`.
-pub async fn discover_auth_server(
-    client: &reqwest::Client,
+///
+/// Both URLs are attacker-influenced (the PDS is named by a user-controlled
+/// DID document, and it in turn names the auth server), so the client for
+/// each hop comes from `provider` — a multi-tenant caller returns a fresh
+/// SSRF-validated, DNS-pinned client per URL; a loopback caller reuses one.
+pub async fn discover_auth_server<P: ClientProvider>(
+    provider: &P,
     pds_url: &str,
 ) -> Result<AuthServerMetadata> {
     let pr_url = format!(
         "{}/.well-known/oauth-protected-resource",
         pds_url.trim_end_matches('/')
     );
-    let pr_meta: ProtectedResourceMetadata = client
+    let pr_client = provider.client_for(&pr_url).await?;
+    let pr_meta: ProtectedResourceMetadata = pr_client
         .get(&pr_url)
         .send()
         .await
@@ -58,7 +65,8 @@ pub async fn discover_auth_server(
         "{}/.well-known/oauth-authorization-server",
         auth_server.trim_end_matches('/')
     );
-    let auth_meta: AuthServerMetadata = client
+    let as_client = provider.client_for(&as_url).await?;
+    let auth_meta: AuthServerMetadata = as_client
         .get(&as_url)
         .send()
         .await
@@ -218,7 +226,7 @@ mod tests {
             "pushed_authorization_request_endpoint": "https://as.example/par",
         })))
         .await;
-        let meta = discover_auth_server(&client(), &base).await.unwrap();
+        let meta = discover_auth_server(&crate::SharedClient(client()), &base).await.unwrap();
         assert_eq!(meta.issuer, "https://as.example");
         assert_eq!(meta.token_endpoint, "https://as.example/token");
         assert_eq!(
@@ -234,14 +242,14 @@ mod tests {
             get(|| async { axum::Json(serde_json::json!({ "authorization_servers": [] })) }),
         ))
         .await;
-        assert!(discover_auth_server(&client(), &base).await.is_err());
+        assert!(discover_auth_server(&crate::SharedClient(client()), &base).await.is_err());
     }
 
     #[tokio::test]
     async fn protected_resource_http_error_is_error() {
         // No routes → 404 on the well-known fetch.
         let base = spawn(Router::new()).await;
-        assert!(discover_auth_server(&client(), &base).await.is_err());
+        assert!(discover_auth_server(&crate::SharedClient(client()), &base).await.is_err());
     }
 
     #[tokio::test]
@@ -251,7 +259,7 @@ mod tests {
             get(|| async { "not json" }),
         ))
         .await;
-        assert!(discover_auth_server(&client(), &base).await.is_err());
+        assert!(discover_auth_server(&crate::SharedClient(client()), &base).await.is_err());
     }
 
     // ── pushed_authorization_request ────────────────────────────────────

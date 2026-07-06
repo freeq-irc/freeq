@@ -368,7 +368,11 @@ fn check_token_did(resolved_did: &str, token_did: Option<&str>) -> Result<()> {
 /// engine; the loopback CLI flow talks only to the user's own PDS, so a plain
 /// client (no SSRF guard) is fine.
 async fn discover_auth_server(pds_url: &str) -> Result<freeq_oauth::discovery::AuthServerMetadata> {
-    freeq_oauth::discovery::discover_auth_server(&reqwest::Client::new(), pds_url).await
+    freeq_oauth::discovery::discover_auth_server(
+        &freeq_oauth::SharedClient(reqwest::Client::new()),
+        pds_url,
+    )
+    .await
 }
 
 /// Pushed Authorization Request (PAR). Delegates the request + DPoP nonce

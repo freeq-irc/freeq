@@ -16,10 +16,12 @@
 //! e2ee/ratchet/av modules) into the slim broker binary, defeating the
 //! reason this crate exists.
 
+mod client;
 pub mod discovery;
 mod dpop;
 pub mod flow;
 
+pub use client::{ClientProvider, SharedClient};
 pub use dpop::DpopKey;
 
 use base64::Engine;
