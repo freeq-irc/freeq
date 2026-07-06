@@ -125,15 +125,15 @@ the standalone broker duplicates them.
 - Allowlists (CORS origins, `return_to`) are **hardcoded** in the broker
   (`main.rs:432-439`, `1010-1016`, `1650-1659`) — self-hosters must edit
   source and rebuild.
-- **Open redirect still live in the reference (found during Phase 0b).**
-  `is_valid_return_to` prefix-matches (`url.starts_with(prefix)`), so
-  `https://irc.freeq.at.evil.example` passes the allowlist and the
-  token-bearing `#oauth=` fragment is redirected to an attacker origin.
-  This is residual SECURITY-AUDIT C-6. Pinned (as a documented bug) by
-  `characterization::return_to_allowlist`. Fix belongs in the shared
-  engine: parse the URL and exact-match the host/origin; flip the test
-  assertion when it lands. Deliberately NOT fixed mid-characterization —
-  Phase 0 only pins behavior.
+- **Open redirect (was SECURITY-AUDIT C-6) — FIXED in Phase 1c.**
+  `is_valid_return_to` prefix-matched (`url.starts_with(prefix)`), so
+  `https://irc.freeq.at.evil.example` passed the allowlist and the
+  token-bearing `#oauth=` fragment could be redirected to an attacker
+  origin. Now matches the parsed scheme + host exactly and rejects
+  protocol-relative (`//host`) / backslash (`/\host`) tricks.
+  `characterization::return_to_allowlist` asserts the fixed behavior.
+  (Still broker-local; moves into the shared service with an
+  env-configurable allowlist in Phase 2.)
 
 ### 1.7 The wire contracts that must not break
 

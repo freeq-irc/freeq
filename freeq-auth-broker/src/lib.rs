@@ -1306,22 +1306,26 @@ pub fn decrypt_field(key: &[u8; 32], encoded: &str) -> Result<String, anyhow::Er
 }
 
 /// Validate return_to against an allowlist to prevent open redirects.
+///
+/// Matches on the parsed URL's scheme + host (exactly), not a string prefix.
+/// A prefix match let `https://irc.freeq.at.evil.example` through — it starts
+/// with `https://irc.freeq.at` — sending the token-bearing `#oauth=` fragment
+/// to an attacker origin (residual SECURITY-AUDIT C-6).
 pub fn is_valid_return_to(url: &str) -> bool {
-    // Allow relative URLs
+    // Relative, same-origin URLs. Reject protocol-relative (`//host`) and the
+    // `/\host` backslash trick, which browsers treat as off-origin.
     if url.starts_with('/') {
-        return true;
+        return !(url.starts_with("//") || url.starts_with("/\\"));
     }
-    // Allow known origins
-    let allowed = [
-        "https://irc.freeq.at",
-        "https://staging.freeq.at",
-        "https://revenant-watch.boxd.sh",
-        "http://localhost:",
-        "http://localhost/",
-        "http://127.0.0.1:",
-        "http://127.0.0.1/",
-    ];
-    allowed.iter().any(|prefix| url.starts_with(prefix))
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    match (parsed.scheme(), parsed.host_str()) {
+        ("https", Some("irc.freeq.at" | "staging.freeq.at" | "revenant-watch.boxd.sh")) => true,
+        // Loopback dev origins, any port.
+        ("http", Some("localhost" | "127.0.0.1")) => true,
+        _ => false,
+    }
 }
 
 /// Sign a request body with HMAC-SHA256. Returns (signature, timestamp) pair.

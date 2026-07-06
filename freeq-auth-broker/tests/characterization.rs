@@ -380,19 +380,13 @@ fn return_to_allowlist() {
     assert!(!is_valid_return_to("https://evil.example"));
     assert!(!is_valid_return_to("http://irc.freeq.at"));
 
-    // ⚠️ CHARACTERIZATION OF A BUG, NOT DESIRED BEHAVIOR.
-    // The allowlist is prefix-matched (`url.starts_with(prefix)`), so a
-    // suffix attack passes: `https://irc.freeq.at.evil.example` starts
-    // with `https://irc.freeq.at` and is wrongly accepted → open redirect
-    // (the token-bearing #oauth= fragment goes to evil.example). This is
-    // the residue of SECURITY-AUDIT C-6. Pinned here so the unification
-    // work is aware of it; the fix (parse origin, exact-match host) belongs
-    // in the shared engine and this assertion flips to `!is_valid...` then.
-    assert!(
-        is_valid_return_to("https://irc.freeq.at.evil.example"),
-        "if this now returns false the prefix-match open-redirect was fixed — \
-         flip this assertion and update AUTH-BROKER-UNIFICATION.md"
-    );
+    // Open-redirect fix (was SECURITY-AUDIT C-6): the suffix attack that
+    // passed a prefix match must now be rejected — matching is on the parsed
+    // scheme+host, not a string prefix.
+    assert!(!is_valid_return_to("https://irc.freeq.at.evil.example"));
+    // Protocol-relative and backslash tricks are off-origin.
+    assert!(!is_valid_return_to("//evil.example"));
+    assert!(!is_valid_return_to("/\\evil.example"));
 }
 
 #[test]
