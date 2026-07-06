@@ -1,0 +1,19 @@
+[package]
+name = "freeq-ssrf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SSRF-safe outbound HTTP: reject private/reserved IPs, DNS-pin clients against rebinding"
+
+# Charter: ONE responsibility — safety of outbound requests to user-controlled
+# hosts (private/loopback/link-local/CGNAT/metadata IP rejection + DNS pinning).
+# Do NOT add retries, auth, URL parsing, or general "networking" here; those
+# belong to their own crates. Keep this crate boring and single-purpose.
+
+[dependencies]
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

@@ -7,6 +7,7 @@ description = "Client SDK for IRC servers with AT Protocol SASL authentication"
 
 [dependencies]
 freeq-oauth = { workspace = true }
+freeq-ssrf = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { version = "0.26", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }

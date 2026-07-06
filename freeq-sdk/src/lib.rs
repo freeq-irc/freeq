@@ -33,6 +33,8 @@ pub mod oauth;
 pub mod p2p;
 pub mod pds;
 pub mod ratchet;
-pub mod ssrf;
+// SSRF-safe outbound HTTP now lives in its own single-purpose crate; re-export
+// so the `freeq_sdk::ssrf::` path stays stable for existing consumers.
+pub use freeq_ssrf as ssrf;
 pub mod streaming;
 pub mod x3dh;

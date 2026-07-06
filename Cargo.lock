@@ -2430,6 +2430,7 @@ name = "freeq-oauth"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64",
  "chrono",
  "p256",
@@ -2439,6 +2440,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tokio",
  "tracing",
  "url",
 ]
@@ -2457,6 +2459,7 @@ dependencies = [
  "dirs 5.0.1",
  "ed25519-dalek 2.2.0",
  "freeq-oauth",
+ "freeq-ssrf",
  "futures-util",
  "hkdf",
  "hmac",
@@ -2562,6 +2565,15 @@ dependencies = [
  "url",
  "urlencoding",
  "x25519-dalek",
+]
+
+[[package]]
+name = "freeq-ssrf"
+version = "0.1.0"
+dependencies = [
+ "reqwest 0.12.28",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
