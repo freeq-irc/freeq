@@ -19,7 +19,7 @@ use axum::body::Bytes;
 use axum::http::HeaderMap;
 use base64::Engine;
 use freeq_auth_broker::{
-    BrokerConfig, BrokerState, DpopKey, PendingAuth, RemoteSink, build_client_id, decrypt_field,
+    BrokerConfig, BrokerState, DpopKey, PendingAuth, RemoteWriter, build_client_id, decrypt_field,
     derive_encryption_key, encrypt_field, init_db, is_valid_return_to, router, sign_body,
 };
 use tokio::sync::Mutex;
@@ -46,7 +46,7 @@ fn broker_state(freeq_server_url: &str) -> Arc<BrokerState> {
             _db_path: String::new(),
             encryption_key: derive_encryption_key(SECRET),
         },
-        sink: Arc::new(RemoteSink {
+        writer: Arc::new(RemoteWriter {
             freeq_server_url: freeq_server_url.to_string(),
             shared_secret: SECRET.to_string(),
         }),

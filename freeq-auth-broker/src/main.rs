@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use freeq_auth_broker::{
-    BrokerConfig, BrokerState, RemoteSink, derive_encryption_key, init_db, router,
+    BrokerConfig, BrokerState, RemoteWriter, derive_encryption_key, init_db, router,
 };
 use tokio::sync::Mutex;
 
@@ -63,7 +63,7 @@ async fn main() {
     };
     init_db(&db).expect("Failed to init db");
 
-    let sink = Arc::new(RemoteSink {
+    let writer = Arc::new(RemoteWriter {
         freeq_server_url: freeq_server_url.clone(),
         shared_secret: shared_secret.clone(),
     });
@@ -75,7 +75,7 @@ async fn main() {
             _db_path: db_path,
             encryption_key,
         },
-        sink,
+        writer,
         pending: Mutex::new(std::collections::HashMap::new()),
         db: Mutex::new(db),
         refresh_locks: Mutex::new(std::collections::HashMap::new()),

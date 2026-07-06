@@ -30,10 +30,10 @@ pub struct BrokerConfig {
 
 pub struct BrokerState {
     pub config: BrokerConfig,
-    /// Where minted sessions are published. Standalone uses [`RemoteSink`]
+    /// Where minted sessions are published. Standalone uses [`RemoteWriter`]
     /// (HMAC push to the freeq-server); an embedding server supplies its own
-    /// in-process sink.
-    pub sink: Arc<dyn SessionSink>,
+    /// in-process writer.
+    pub writer: Arc<dyn SessionWriter>,
     pub pending: Mutex<std::collections::HashMap<String, PendingAuth>>,
     pub db: Mutex<rusqlite::Connection>,
     /// Per-broker-token refresh serialization. AT Proto refresh tokens are
@@ -646,7 +646,7 @@ async fn auth_callback(
     // can't mint one — the verified DID + handle + broker_token are enough for
     // identity-only consumers, so degrade gracefully instead of failing login.
     let (web_token, nick) = state
-        .sink
+        .writer
         .mint_web_token(&pending.did, &pending.handle)
         .await
         .unwrap_or_else(|e| {
@@ -660,7 +660,7 @@ async fn auth_callback(
     let granted_scope = token_resp["scope"].as_str().unwrap_or("atproto");
     let access_token = token_resp["access_token"].as_str().unwrap_or_default();
     if let Err(e) = state
-        .sink
+        .writer
         .push_session(&SessionPush {
             did: &pending.did,
             handle: &pending.handle,
@@ -772,7 +772,7 @@ async fn session(
     }
 
     let (web_token, nick) = state
-        .sink
+        .writer
         .mint_web_token(&record.did, &record.handle)
         .await
         .unwrap_or_else(|e| {
@@ -783,7 +783,7 @@ async fn session(
     // Forward the actually-granted scope from the refresh response so the
     // server's per-purpose checks see the truth, not a hard-coded assumption.
     if let Err(e) = state
-        .sink
+        .writer
         .push_session(&SessionPush {
             did: &record.did,
             handle: &record.handle,
@@ -1089,7 +1089,7 @@ async fn refresh_access_token(
     Ok((t.access_token, t.refresh_token, t.dpop_nonce, t.granted_scope))
 }
 
-/// The server-side web session a sink installs: a fresh PDS access token plus
+/// The server-side web session a writer installs: a fresh PDS access token plus
 /// the DPoP key bound to it, for server-proxied PDS operations.
 pub struct SessionPush<'a> {
     pub did: &'a str,
@@ -1102,9 +1102,9 @@ pub struct SessionPush<'a> {
 }
 
 /// How a freshly-minted session reaches the freeq-server. Standalone pushes
-/// over HTTP+HMAC ([`RemoteSink`]); an embedding server writes in-process.
+/// over HTTP+HMAC ([`RemoteWriter`]); an embedding server writes in-process.
 #[async_trait::async_trait]
-pub trait SessionSink: Send + Sync {
+pub trait SessionWriter: Send + Sync {
     /// Mint a one-time SASL web-token for this identity → `(token, nick)`.
     async fn mint_web_token(&self, did: &str, handle: &str)
     -> Result<(String, String), anyhow::Error>;
@@ -1112,15 +1112,15 @@ pub trait SessionSink: Send + Sync {
     async fn push_session(&self, push: &SessionPush<'_>) -> Result<(), anyhow::Error>;
 }
 
-/// [`SessionSink`] for the standalone broker: HMAC-signed HTTP POSTs to the
+/// [`SessionWriter`] for the standalone broker: HMAC-signed HTTP POSTs to the
 /// freeq-server's `/auth/broker/*` receiver endpoints.
-pub struct RemoteSink {
+pub struct RemoteWriter {
     pub freeq_server_url: String,
     pub shared_secret: String,
 }
 
 #[async_trait::async_trait]
-impl SessionSink for RemoteSink {
+impl SessionWriter for RemoteWriter {
     async fn mint_web_token(
         &self,
         did: &str,

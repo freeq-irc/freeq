@@ -192,40 +192,40 @@ freeq-auth-service (NEW lib crate — axum Router + session logic)
     │  routes: /auth/login /auth/callback /session /client-metadata.json
     │          /api/graph/follow /api/graph/unfollow /health /health-v3
     │  SessionStore trait  ── SqliteStore (encrypted, per-token locks)
-    │  SessionSink trait   ── how minted tokens reach the IRC server
+    │  SessionWriter trait   ── how minted tokens reach the IRC server
     │  AuthConfig          ── public_url, allowed origins/return_to (CONFIG,
     │                         not hardcoded), encryption key, flow hooks
     ├──────────────────────────────┬─────────────────────────────────┐
     ▼                              ▼                                 │
 freeq-auth-broker (bin)        freeq-server (embedded mount)         │
   thin main.rs:                  .merge(auth_service::router(...))   │
-  env config +                   LocalSink: writes web_auth_tokens / │
-  RemoteSink (HTTP+HMAC          web_sessions / upload_tokens        │
+  env config +                   LocalWriter: writes web_auth_tokens / │
+  RemoteWriter (HTTP+HMAC          web_sessions / upload_tokens        │
   to FREEQ_SERVER_URL)           directly into SharedState;          │
                                  completes irc_state logins in-proc  │
 ```
 
-**`SessionSink`** is the pivot abstraction. It carries exactly what the
+**`SessionWriter`** is the pivot abstraction. It carries exactly what the
 broker→server push carries today:
 
 ```rust
 #[async_trait]
-trait SessionSink: Send + Sync {
+trait SessionWriter: Send + Sync {
     /// Mint a one-time SASL web-token for this identity.
     async fn mint_web_token(&self, did: &str, handle: &str) -> Result<(String, String)>; // (token, nick)
     /// Install/refresh a web session (access token + DPoP key) for
     /// server-proxied PDS operations. Returns optional upload_token.
     async fn push_session(&self, s: &SessionPush) -> Result<Option<String>>;
     /// Hook: a login flow carrying `irc_state` completed (embedded only;
-    /// RemoteSink returns Unsupported and the flow falls back to web).
+    /// RemoteWriter returns Unsupported and the flow falls back to web).
     async fn complete_irc_login(&self, irc_state: &str, did: &str, handle: &str) -> Result<bool>;
 }
 ```
 
-- `RemoteSink` = today's `mint_web_token` / `push_web_session` HTTP+HMAC
+- `RemoteWriter` = today's `mint_web_token` / `push_web_session` HTTP+HMAC
   calls, verbatim. The server keeps its `/auth/broker/*` receivers unchanged
   — old broker binaries keep working against new servers and vice versa.
-- `LocalSink` = direct insertion into `SharedState` (no HMAC, no HTTP hop),
+- `LocalWriter` = direct insertion into `SharedState` (no HMAC, no HTTP hop),
   plus `complete_irc_login` wired to `connection::login::complete_irc_login`.
 
 **`SessionStore`** starts with one impl (SQLite, current broker schema +
@@ -343,11 +343,11 @@ enable everything.
   primitives). Behavior identical; the broker binary silently gains SSRF
   hardening. No wire changes.
 - **Phase 2 — service crate.** `freeq-auth-broker` becomes lib+bin;
-  `SessionStore`/`SessionSink`/`AuthConfig` introduced; standalone bin is a
-  thin wrapper with `RemoteSink`. Allowlists become env-configurable with
+  `SessionStore`/`SessionWriter`/`AuthConfig` introduced; standalone bin is a
+  thin wrapper with `RemoteWriter`. Allowlists become env-configurable with
   current values as defaults. freeq.at redeploy is a no-op behaviorally.
 - **Phase 3 — embedded mount.** `freeq-server` merges the service router
-  with `LocalSink` + SQLite store; deletes its hand-rolled
+  with `LocalWriter` + SQLite store; deletes its hand-rolled
   `auth_login`/`auth_callback`/`auth_step_up` bodies (handlers become the
   shared ones); mobile redirect gains `broker_token`. Zerosum gets durable
   sessions. `/auth/broker/*` receivers unchanged.
@@ -470,7 +470,7 @@ is *additive capability*: it gives the embedded server durable sessions +
 OAuth when a web-token expires. Standalone deployments are untouched (see
 "impact" below). Do this only if the durable-embedded UX is wanted.
 
-**Two traits.** `SessionSink` (how a minted session is published) and
+**Two traits.** `SessionWriter` (how a minted session is published) and
 `SessionStore` (where broker sessions — `broker_token → refresh_token/dpop` —
 are kept). Three-tier storage: default embedded is **in-memory** (ephemeral,
 zero config, no files, no key); opt-in `--session-db <path>` makes embedded
@@ -480,14 +480,14 @@ map holds short-lived access tokens keyed by DID — a different thing), so
 `InMemoryStore` is new (~40 lines); `SqliteStore` is the standalone broker's
 existing code wrapped in the trait.
 
-#### `SessionSink` (in `freeq-auth-broker`)
+#### `SessionWriter` (in `freeq-auth-broker`)
 
 How a freshly-minted session is published to the freeq-server. Trait object
-(`Arc<dyn SessionSink>`, via `async-trait`) held in `BrokerState`.
+(`Arc<dyn SessionWriter>`, via `async-trait`) held in `BrokerState`.
 
 ```rust
 #[async_trait]
-pub trait SessionSink: Send + Sync {
+pub trait SessionWriter: Send + Sync {
     /// Mint a one-time SASL web-token for this identity → (token, nick).
     async fn mint_web_token(&self, did: &str, handle: &str) -> anyhow::Result<(String, String)>;
     /// Install/refresh the server-side web session for proxied PDS ops.
@@ -502,15 +502,15 @@ pub struct SessionPush<'a> {
 }
 ```
 
-- **`RemoteSink`** (standalone, `freeq-auth-broker`): today's HMAC POSTs to
+- **`RemoteWriter`** (standalone, `freeq-auth-broker`): today's HMAC POSTs to
   `{server}/auth/broker/web-token` and `/auth/broker/session`. Pure move of
   the existing `mint_web_token` / `push_web_session_with_token`.
-- **`LocalSink`** (embedded, lives in `freeq-server` — it needs `SharedState`):
+- **`LocalWriter`** (embedded, lives in `freeq-server` — it needs `SharedState`):
   `mint_web_token` → insert into `web_auth_tokens`, return
   `(token, mobile_nick_from_handle(handle))`; `push_session` → insert into
   `web_sessions` + `upload_tokens`. This is exactly what the existing
   `auth_broker_web_token` / `auth_broker_session` receiver bodies do — they
-  get refactored to call `LocalSink` so there's one implementation.
+  get refactored to call `LocalWriter` so there's one implementation.
 
 #### `SessionStore` trait + two impls (in `freeq-auth-broker`)
 
@@ -543,7 +543,7 @@ someone opts into durability (they've already chosen disk):
 #### Wiring (crate edges, no cycles)
 
 - `freeq-server` gains a dependency on `freeq-auth-broker` (one-directional;
-  the broker never depends on the server). `LocalSink` lives server-side and
+  the broker never depends on the server). `LocalWriter` lives server-side and
   implements the broker's trait.
 - **Route-conflict finding:** the broker's full `router()` includes
   `/auth/login`, `/auth/callback`, `/client-metadata.json` — which the server
@@ -556,9 +556,9 @@ someone opts into durability (they've already chosen disk):
   `SqliteStore` and mints a `broker_token`, adding it to the result payload —
   so a later `/session` has something to refresh. Everything else in the
   handler is unchanged; step-up / `irc_state` paths don't persist.
-- **Mode gate:** `BROKER_SHARED_SECRET` set → receiver/RemoteSink topology
+- **Mode gate:** `BROKER_SHARED_SECRET` set → receiver/RemoteWriter topology
   (separate broker), local store never instantiated. Unset → embedded, mount
-  `session_router` with `LocalSink` and a store chosen by `--session-db`:
+  `session_router` with `LocalWriter` and a store chosen by `--session-db`:
   absent → `InMemoryStore` (default), present → `SqliteStore` at that path.
 
 #### Impact on standalone-broker deployments: none
@@ -571,16 +571,16 @@ opens the embedded store. Shared *code*, never shared *data* or schema;
 
 #### Phasing (each green, wire-compatible)
 
-- **2a.** Extract `SessionSink` trait + `SessionPush`; refactor the broker's
-  existing HTTP+HMAC into `RemoteSink`. Standalone behavior identical
+- **2a.** Extract `SessionWriter` trait + `SessionPush`; refactor the broker's
+  existing HTTP+HMAC into `RemoteWriter`. Standalone behavior identical
   (characterization covers it). No server changes.
 - **2b.** Extract `SessionStore` trait; refactor the broker's inline SQLite +
   field-crypto into `SqliteStore`; add `InMemoryStore`. Broker handlers call
   the trait. Standalone behavior identical.
 - **2c.** `session_router(store, sink) -> Router` (only `/session` +
   `/api/graph/*`); standalone `router()` builds it with `SqliteStore` +
-  `RemoteSink`. No behavior change.
-- **2d.** Server: `LocalSink` impl (refactor the two receiver bodies onto it);
+  `RemoteWriter`. No behavior change.
+- **2d.** Server: `LocalWriter` impl (refactor the two receiver bodies onto it);
   `--session-db` flag → `InMemoryStore` default or `SqliteStore` (+ load-or-
   generate `session-key.secret`); mount `session_router`; teach `auth_callback`
   to persist + issue a `broker_token`. New tests: embedded `/session` round-trip
@@ -598,7 +598,7 @@ freeq.at (standalone) and zerosum (embedded) can update independently.
 - Engine: unit tests in `freeq-sdk` (mock PDS router pattern already exists
   in `oauth.rs` tests) + ported CTF regression tests.
 - Service: the Phase 0 suite re-targets the shared router unchanged; both
-  sinks (`RemoteSink` with a mock server, `LocalSink` with real
+  sinks (`RemoteWriter` with a mock server, `LocalWriter` with real
   `SharedState`) run against the same suite.
 - Server: existing web.rs broker/auth acceptance tests must pass unchanged —
   they pin the wire contracts in §1.7.
