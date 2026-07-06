@@ -466,6 +466,24 @@ impl SessionStore for InMemoryStore {
 /// Build the broker's axum router over shared state. Used by the
 /// standalone binary and by the characterization tests; embedding
 /// servers mount this in the unification plan's Phase 3.
+/// The durable-session routes an embedding server lacks: `/session` (refresh)
+/// and Bluesky graph delegation. Returned un-stated so a host can `.merge()` it
+/// into its own router (its layers/CORS then apply); the standalone [`router`]
+/// includes these plus the login endpoints.
+fn session_routes() -> Router<Arc<BrokerState>> {
+    Router::new()
+        .route("/session", post(session))
+        .route("/api/graph/follow", post(graph_follow))
+        .route("/api/graph/unfollow", post(graph_unfollow))
+}
+
+/// Ready-to-mount `/session` + `/api/graph/*` router for an embedding server.
+/// The host supplies a [`BrokerState`] with its own writer + store and applies
+/// its own CORS.
+pub fn session_router(state: Arc<BrokerState>) -> Router {
+    session_routes().with_state(state)
+}
+
 pub fn router(state: Arc<BrokerState>) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -473,9 +491,7 @@ pub fn router(state: Arc<BrokerState>) -> Router {
         .route("/client-metadata.json", get(client_metadata))
         .route("/auth/login", get(auth_login))
         .route("/auth/callback", get(auth_callback))
-        .route("/session", post(session))
-        .route("/api/graph/follow", post(graph_follow))
-        .route("/api/graph/unfollow", post(graph_unfollow))
+        .merge(session_routes())
         .layer(
             CorsLayer::new()
                 .allow_origin(AllowOrigin::list([
