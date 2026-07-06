@@ -381,79 +381,27 @@ async fn auth_login(
         )
     })?;
 
+    // Bounded HTTP client (the broker's Miren egress needs tight timeouts +
+    // connection reuse); the shared engine performs discovery over it.
     let client = upstream_client().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("upstream client init: {e}"),
         )
     })?;
-    let pr_url = format!(
-        "{}/.well-known/oauth-protected-resource",
-        pds_url.trim_end_matches('/')
-    );
-    let pr_meta: serde_json::Value = client
-        .get(&pr_url)
-        .send()
+    let auth_meta = freeq_oauth::discovery::discover_auth_server(&client, &pds_url)
         .await
         .map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
-                format!("PDS metadata fetch failed: {e}"),
-            )
-        })?
-        .json()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("PDS metadata parse failed: {e}"),
+                format!("Auth server discovery failed: {e}"),
             )
         })?;
-    let auth_server = pr_meta["authorization_servers"][0]
-        .as_str()
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "No authorization server".to_string(),
-            )
-        })?;
-
-    let as_url = format!(
-        "{}/.well-known/oauth-authorization-server",
-        auth_server.trim_end_matches('/')
-    );
-    let as_resp = client.get(&as_url).send().await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("Auth server metadata failed: {e:#?}"),
-        )
-    })?;
-    let as_status = as_resp.status();
-    let as_body = as_resp.text().await.unwrap_or_default();
-    let auth_meta: serde_json::Value = serde_json::from_str(&as_body).map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!(
-                "Auth server metadata parse failed: {e} (status={as_status}, body_len={}, body_preview={:?})",
-                as_body.len(),
-                as_body.chars().take(200).collect::<String>(),
-            ),
-        )
-    })?;
-
-    let authorization_endpoint = auth_meta["authorization_endpoint"]
-        .as_str()
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "No authorization_endpoint".to_string(),
-            )
-        })?;
-    let token_endpoint = auth_meta["token_endpoint"]
-        .as_str()
-        .ok_or_else(|| (StatusCode::BAD_GATEWAY, "No token_endpoint".to_string()))?;
-    let par_endpoint = auth_meta["pushed_authorization_request_endpoint"]
-        .as_str()
+    let authorization_endpoint = auth_meta.authorization_endpoint.as_str();
+    let token_endpoint = auth_meta.token_endpoint.as_str();
+    let par_endpoint = auth_meta
+        .pushed_authorization_request_endpoint
+        .as_deref()
         .ok_or_else(|| (StatusCode::BAD_GATEWAY, "No PAR endpoint".to_string()))?;
 
     let redirect_uri = format!(
@@ -471,102 +419,25 @@ async fn auth_login(
     let (code_verifier, code_challenge) = generate_pkce();
     let oauth_state = generate_random_string(16);
 
-    let params = [
-        ("response_type", "code"),
-        ("client_id", &client_id),
-        ("redirect_uri", &redirect_uri),
-        ("code_challenge", &code_challenge),
-        ("code_challenge_method", "S256"),
-        ("scope", scope),
-        ("state", &oauth_state),
-        ("login_hint", &handle),
-    ];
-
-    let dpop_proof = dpop_key
-        .proof("POST", par_endpoint, None, None)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DPoP proof failed: {e}"),
-            )
-        })?;
-    let resp = client
-        .post(par_endpoint)
-        .header("DPoP", &dpop_proof)
-        .form(&params)
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("PAR failed: {e}")))?;
-
-    let status = resp.status();
-    let dpop_nonce = resp
-        .headers()
-        .get("dpop-nonce")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    // Surface the first-PAR response body in logs and require the
-    // canonical `use_dpop_nonce` error code before retrying — a 400
-    // with an incidental DPoP-Nonce header but a different error
-    // (e.g. invalid_client_metadata) should NOT be retried into a
-    // timeout; the underlying problem isn't going to resolve.
-    let first_body = resp.text().await.unwrap_or_default();
-    let body_preview = first_body.chars().take(300).collect::<String>();
-    tracing::info!(
-        status = %status,
-        has_nonce = dpop_nonce.is_some(),
-        body = %body_preview,
-        "first PAR response"
-    );
-    let par_resp: serde_json::Value = if status.as_u16() == 400
-        && dpop_nonce.is_some()
-        && first_body.contains("use_dpop_nonce")
-    {
-        let nonce = dpop_nonce.as_deref().unwrap();
-        let dpop_proof2 = dpop_key
-            .proof("POST", par_endpoint, Some(nonce), None)
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("DPoP retry failed: {e}"),
-                )
-            })?;
-        // Reuse the SAME client for the retry. Miren's egress couldn't
-        // open a second TCP connection to bsky.social within 30s, so
-        // we lean on HTTP/2 multiplexing over the first call's still-
-        // open connection. Connection pooling is enabled in
-        // `upstream_client`.
-        let resp2 = client
-            .post(par_endpoint)
-            .header("DPoP", &dpop_proof2)
-            .form(&params)
-            .send()
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("PAR retry failed: {e:#?}")))?;
-        if !resp2.status().is_success() {
-            let text = resp2.text().await.unwrap_or_default();
-            return Err((StatusCode::BAD_GATEWAY, format!("PAR failed: {text}")));
-        }
-        resp2
-            .json()
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("PAR parse failed: {e}")))?
-    } else if status.is_success() {
-        serde_json::from_str(&first_body)
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("PAR parse failed: {e}")))?
-    } else {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            format!("PAR failed ({status}): {first_body}"),
-        ));
-    };
-
-    let request_uri = par_resp["request_uri"].as_str().ok_or_else(|| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "No request_uri in PAR response".to_string(),
-        )
-    })?;
+    // Shared engine performs the PAR + DPoP nonce dance over the same bounded
+    // client (retries only on the canonical use_dpop_nonce error). The nonce
+    // it returns is carried into `pending` so the code exchange can send it up
+    // front (the code-consumption caveat).
+    let par = freeq_oauth::discovery::pushed_authorization_request(
+        &client,
+        par_endpoint,
+        &client_id,
+        &redirect_uri,
+        &code_challenge,
+        &oauth_state,
+        &handle,
+        scope,
+        &dpop_key,
+    )
+    .await
+    .map_err(|e| (StatusCode::BAD_GATEWAY, format!("PAR failed: {e}")))?;
+    let request_uri = par.request_uri.as_str();
+    let dpop_nonce = par.dpop_nonce;
 
     let _now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)

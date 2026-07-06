@@ -22,5 +22,10 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 url = "2"
 
+[dev-dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"] }
+
 [lints]
 workspace = true

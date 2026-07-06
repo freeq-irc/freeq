@@ -16,6 +16,7 @@
 //! e2ee/ratchet/av modules) into the slim broker binary, defeating the
 //! reason this crate exists.
 
+pub mod discovery;
 mod dpop;
 pub mod flow;
 

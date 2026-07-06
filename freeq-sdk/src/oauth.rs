@@ -235,23 +235,6 @@ pub fn derive_session_key(machine_secret: &[u8], did: &str) -> [u8; 32] {
     key
 }
 
-/// Authorization server metadata (RFC 8414 / AT Protocol extensions).
-#[derive(Debug, Clone, Deserialize)]
-struct AuthServerMetadata {
-    issuer: String,
-    authorization_endpoint: String,
-    token_endpoint: String,
-    #[serde(default)]
-    pushed_authorization_request_endpoint: Option<String>,
-}
-
-/// Protected resource metadata for discovering the authorization server.
-#[derive(Debug, Clone, Deserialize)]
-struct ProtectedResourceMetadata {
-    #[serde(default)]
-    authorization_servers: Vec<String>,
-}
-
 /// Token response from the authorization server.
 #[derive(Debug, Clone, Deserialize)]
 struct TokenResponse {
@@ -381,49 +364,15 @@ fn check_token_did(resolved_did: &str, token_did: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Discover the authorization server for a PDS.
-async fn discover_auth_server(pds_url: &str) -> Result<AuthServerMetadata> {
-    let client = reqwest::Client::new();
-
-    let pr_url = format!(
-        "{}/.well-known/oauth-protected-resource",
-        pds_url.trim_end_matches('/')
-    );
-    let pr_meta: ProtectedResourceMetadata = client
-        .get(&pr_url)
-        .send()
-        .await
-        .context("Failed to fetch protected resource metadata")?
-        .error_for_status()
-        .context("Protected resource metadata request failed")?
-        .json()
-        .await
-        .context("Failed to parse protected resource metadata")?;
-
-    let auth_server = pr_meta
-        .authorization_servers
-        .first()
-        .context("No authorization servers listed")?;
-
-    let as_url = format!(
-        "{}/.well-known/oauth-authorization-server",
-        auth_server.trim_end_matches('/')
-    );
-    let auth_meta: AuthServerMetadata = client
-        .get(&as_url)
-        .send()
-        .await
-        .context("Failed to fetch authorization server metadata")?
-        .error_for_status()
-        .context("Authorization server metadata request failed")?
-        .json()
-        .await
-        .context("Failed to parse authorization server metadata")?;
-
-    Ok(auth_meta)
+/// Discover the authorization server for a PDS. Thin wrapper over the shared
+/// engine; the loopback CLI flow talks only to the user's own PDS, so a plain
+/// client (no SSRF guard) is fine.
+async fn discover_auth_server(pds_url: &str) -> Result<freeq_oauth::discovery::AuthServerMetadata> {
+    freeq_oauth::discovery::discover_auth_server(&reqwest::Client::new(), pds_url).await
 }
 
-/// Pushed Authorization Request (PAR).
+/// Pushed Authorization Request (PAR). Delegates the request + DPoP nonce
+/// dance to the shared engine, then builds the authorization URL to open.
 #[allow(clippy::too_many_arguments)]
 async fn push_authorization_request(
     par_endpoint: &str,
@@ -435,84 +384,24 @@ async fn push_authorization_request(
     login_hint: &str,
     dpop_key: &DpopKey,
 ) -> Result<String> {
-    let client = reqwest::Client::new();
-
-    let params = [
-        ("response_type", "code"),
-        ("client_id", client_id),
-        ("redirect_uri", redirect_uri),
-        ("code_challenge", code_challenge),
-        ("code_challenge_method", "S256"),
-        // Narrow scope. SDK callers that need PDS write access do a
-        // separate auth round with a wider scope rather than asking for
-        // it on every login.
-        ("scope", "atproto"),
-        ("state", state),
-        ("login_hint", login_hint),
-    ];
-
-    // Try without DPoP nonce first
-    let dpop_proof = dpop_key.proof("POST", par_endpoint, None, None)?;
-    let resp = client
-        .post(par_endpoint)
-        .header("DPoP", &dpop_proof)
-        .form(&params)
-        .send()
-        .await
-        .context("PAR request failed")?;
-
-    let status = resp.status();
-    let dpop_nonce = resp
-        .headers()
-        .get("dpop-nonce")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    // If we got a use_dpop_nonce error, retry with the nonce
-    if status.as_u16() == 400
-        && let Some(ref nonce) = dpop_nonce
-    {
-        let dpop_proof_retry = dpop_key.proof("POST", par_endpoint, Some(nonce), None)?;
-        let resp2 = client
-            .post(par_endpoint)
-            .header("DPoP", &dpop_proof_retry)
-            .form(&params)
-            .send()
-            .await
-            .context("PAR retry request failed")?;
-
-        if !resp2.status().is_success() {
-            let status = resp2.status();
-            let text = resp2.text().await.unwrap_or_default();
-            bail!("PAR failed ({status}): {text}");
-        }
-
-        let par_resp: serde_json::Value = resp2.json().await?;
-        let request_uri = par_resp["request_uri"]
-            .as_str()
-            .context("No request_uri in PAR response")?;
-
-        return Ok(format!(
-            "{authorization_endpoint}?client_id={}&request_uri={}",
-            urlencod(client_id),
-            urlencod(request_uri),
-        ));
-    }
-
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        bail!("PAR failed ({status}): {text}");
-    }
-
-    let par_resp: serde_json::Value = resp.json().await?;
-    let request_uri = par_resp["request_uri"]
-        .as_str()
-        .context("No request_uri in PAR response")?;
-
+    let par = freeq_oauth::discovery::pushed_authorization_request(
+        &reqwest::Client::new(),
+        par_endpoint,
+        client_id,
+        redirect_uri,
+        code_challenge,
+        state,
+        login_hint,
+        // Narrow scope; SDK callers that need PDS write access do a separate
+        // wider-scope auth round rather than asking for it on every login.
+        "atproto",
+        dpop_key,
+    )
+    .await?;
     Ok(format!(
         "{authorization_endpoint}?client_id={}&request_uri={}",
         urlencod(client_id),
-        urlencod(request_uri),
+        urlencod(&par.request_uri),
     ))
 }
 
