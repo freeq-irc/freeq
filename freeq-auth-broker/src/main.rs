@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use freeq_auth_broker::{
-    BrokerConfig, BrokerState, RemoteWriter, derive_encryption_key, init_db, router,
+    BrokerConfig, BrokerState, RemoteWriter, SqliteStore, derive_encryption_key, router,
 };
 use tokio::sync::Mutex;
 
@@ -61,7 +61,7 @@ async fn main() {
             Err(e) => panic!("Failed to open broker db after 60s of retries: {e}"),
         }
     };
-    init_db(&db).expect("Failed to init db");
+    let store = Arc::new(SqliteStore::from_connection(db, encryption_key));
 
     let writer = Arc::new(RemoteWriter {
         freeq_server_url: freeq_server_url.clone(),
@@ -72,12 +72,10 @@ async fn main() {
             public_url,
             freeq_server_url,
             shared_secret,
-            _db_path: db_path,
-            encryption_key,
         },
         writer,
+        store,
         pending: Mutex::new(std::collections::HashMap::new()),
-        db: Mutex::new(db),
         refresh_locks: Mutex::new(std::collections::HashMap::new()),
     });
 

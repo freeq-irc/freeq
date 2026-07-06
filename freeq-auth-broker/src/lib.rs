@@ -24,8 +24,6 @@ pub struct BrokerConfig {
     pub public_url: String,
     pub freeq_server_url: String,
     pub shared_secret: String,
-    pub _db_path: String,
-    pub encryption_key: [u8; 32],
 }
 
 pub struct BrokerState {
@@ -34,8 +32,10 @@ pub struct BrokerState {
     /// (HMAC push to the freeq-server); an embedding server supplies its own
     /// in-process writer.
     pub writer: Arc<dyn SessionWriter>,
+    /// Where broker sessions are kept: [`SqliteStore`] (standalone) or
+    /// [`InMemoryStore`] (embedded default).
+    pub store: Arc<dyn SessionStore>,
     pub pending: Mutex<std::collections::HashMap<String, PendingAuth>>,
-    pub db: Mutex<rusqlite::Connection>,
     /// Per-broker-token refresh serialization. AT Proto refresh tokens are
     /// single-use (rotating): the PDS invalidates the old one when it issues a
     /// new one. Concurrent `/session` calls for the same token — which the
@@ -286,18 +286,181 @@ struct BrokerSessionResponse {
     handle: String,
 }
 
-#[derive(Serialize)]
-struct BrokerSessionRecord {
-    broker_token: String,
-    did: String,
-    handle: String,
-    pds_url: String,
-    token_endpoint: String,
-    refresh_token: String,
-    dpop_key_b64: String,
-    dpop_nonce: Option<String>,
-    created_at: i64,
-    updated_at: i64,
+/// A durable broker session — the record `/session` refreshes from. Fields
+/// are plaintext here; `SqliteStore` encrypts the sensitive ones at rest.
+#[derive(Serialize, Clone)]
+pub struct BrokerSessionRecord {
+    pub broker_token: String,
+    pub did: String,
+    pub handle: String,
+    pub pds_url: String,
+    pub token_endpoint: String,
+    pub refresh_token: String,
+    pub dpop_key_b64: String,
+    pub dpop_nonce: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Where broker sessions (`broker_token → refresh_token/dpop`) are kept.
+/// [`SqliteStore`] is durable (standalone; or embedded opt-in);
+/// [`InMemoryStore`] is ephemeral (embedded default).
+#[async_trait::async_trait]
+pub trait SessionStore: Send + Sync {
+    async fn get(&self, broker_token: &str) -> Option<BrokerSessionRecord>;
+    async fn insert(&self, rec: &BrokerSessionRecord) -> anyhow::Result<()>;
+    /// Persist a rotated refresh token + DPoP nonce (single-use rotation).
+    async fn update_refresh(
+        &self,
+        broker_token: &str,
+        refresh_token: &str,
+        dpop_nonce: Option<&str>,
+    ) -> anyhow::Result<()>;
+}
+
+/// Durable SQLite store with AES-GCM field encryption at rest. Owns the key.
+pub struct SqliteStore {
+    conn: Mutex<rusqlite::Connection>,
+    enc_key: [u8; 32],
+}
+
+impl SqliteStore {
+    pub fn open(path: &str, enc_key: [u8; 32]) -> anyhow::Result<Self> {
+        let conn = rusqlite::Connection::open(path)?;
+        init_db(&conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            enc_key,
+        })
+    }
+
+    /// Wrap an already-open connection (the standalone binary opens it with a
+    /// mount-retry loop; tests pass `:memory:`).
+    pub fn from_connection(conn: rusqlite::Connection, enc_key: [u8; 32]) -> Self {
+        Self {
+            conn: Mutex::new(conn),
+            enc_key,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionStore for SqliteStore {
+    async fn get(&self, broker_token: &str) -> Option<BrokerSessionRecord> {
+        let db = self.conn.lock().await;
+        let enc_key = &self.enc_key;
+        let mut stmt = db.prepare(
+            "SELECT broker_token, did, handle, pds_url, token_endpoint, refresh_token, dpop_key_b64, dpop_nonce, created_at, updated_at FROM sessions WHERE broker_token = ?1"
+        ).ok()?;
+        let mut rows = stmt.query(rusqlite::params![broker_token]).ok()?;
+        let row = rows.next().ok().flatten()?;
+        let encrypted_refresh: String = row.get(5).ok()?;
+        let encrypted_dpop: String = row.get(6).ok()?;
+        let encrypted_nonce: Option<String> = row.get(7).ok()?;
+        // C-5: decrypt sensitive fields after reading from DB.
+        let refresh_token = decrypt_field(enc_key, &encrypted_refresh)
+            .map_err(|e| tracing::error!("Failed to decrypt refresh_token: {e}"))
+            .ok()?;
+        let dpop_key_b64 = decrypt_field(enc_key, &encrypted_dpop)
+            .map_err(|e| tracing::error!("Failed to decrypt dpop_key_b64: {e}"))
+            .ok()?;
+        let dpop_nonce = encrypted_nonce
+            .map(|n| decrypt_field(enc_key, &n))
+            .transpose()
+            .map_err(|e| tracing::error!("Failed to decrypt dpop_nonce: {e}"))
+            .ok()?;
+        Some(BrokerSessionRecord {
+            broker_token: row.get(0).ok()?,
+            did: row.get(1).ok()?,
+            handle: row.get(2).ok()?,
+            pds_url: row.get(3).ok()?,
+            token_endpoint: row.get(4).ok()?,
+            refresh_token,
+            dpop_key_b64,
+            dpop_nonce,
+            created_at: row.get(8).ok()?,
+            updated_at: row.get(9).ok()?,
+        })
+    }
+
+    async fn insert(&self, rec: &BrokerSessionRecord) -> anyhow::Result<()> {
+        let enc_key = &self.enc_key;
+        let encrypted_refresh = encrypt_field(enc_key, &rec.refresh_token);
+        let encrypted_dpop = encrypt_field(enc_key, &rec.dpop_key_b64);
+        let encrypted_nonce = rec.dpop_nonce.as_deref().map(|n| encrypt_field(enc_key, n));
+        let db = self.conn.lock().await;
+        db.execute(
+            "INSERT INTO sessions (broker_token, did, handle, pds_url, token_endpoint, refresh_token, dpop_key_b64, dpop_nonce, created_at, updated_at)\
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)\
+             ON CONFLICT(broker_token) DO UPDATE SET refresh_token=excluded.refresh_token, updated_at=excluded.updated_at",
+            rusqlite::params![
+                rec.broker_token, rec.did, rec.handle, rec.pds_url, rec.token_endpoint,
+                encrypted_refresh, encrypted_dpop, encrypted_nonce, rec.created_at, rec.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    async fn update_refresh(
+        &self,
+        broker_token: &str,
+        refresh_token: &str,
+        dpop_nonce: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let enc_key = &self.enc_key;
+        let encrypted_refresh = encrypt_field(enc_key, refresh_token);
+        let encrypted_nonce = dpop_nonce.map(|n| encrypt_field(enc_key, n));
+        let now = chrono::Utc::now().timestamp();
+        let db = self.conn.lock().await;
+        db.execute(
+            "UPDATE sessions SET refresh_token = ?1, dpop_nonce = ?2, updated_at = ?3 WHERE broker_token = ?4",
+            rusqlite::params![encrypted_refresh, encrypted_nonce, now, broker_token],
+        )?;
+        Ok(())
+    }
+}
+
+/// Ephemeral in-memory store — no persistence, no at-rest encryption (never
+/// leaves RAM). Default for embedded mode: `/session` works within the
+/// server's uptime, resets on restart.
+#[derive(Default)]
+pub struct InMemoryStore {
+    sessions: Mutex<std::collections::HashMap<String, BrokerSessionRecord>>,
+}
+
+impl InMemoryStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionStore for InMemoryStore {
+    async fn get(&self, broker_token: &str) -> Option<BrokerSessionRecord> {
+        self.sessions.lock().await.get(broker_token).cloned()
+    }
+
+    async fn insert(&self, rec: &BrokerSessionRecord) -> anyhow::Result<()> {
+        self.sessions
+            .lock()
+            .await
+            .insert(rec.broker_token.clone(), rec.clone());
+        Ok(())
+    }
+
+    async fn update_refresh(
+        &self,
+        broker_token: &str,
+        refresh_token: &str,
+        dpop_nonce: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if let Some(r) = self.sessions.lock().await.get_mut(broker_token) {
+            r.refresh_token = refresh_token.to_string();
+            r.dpop_nonce = dpop_nonce.map(str::to_string);
+            r.updated_at = chrono::Utc::now().timestamp();
+        }
+        Ok(())
+    }
 }
 
 /// Build the broker's axum router over shared state. Used by the
@@ -615,31 +778,23 @@ async fn auth_callback(
 
     let broker_token = generate_random_string(32);
     let now = chrono::Utc::now().timestamp();
-    // C-5: Encrypt sensitive fields before storing in DB
-    let enc_key = &state.config.encryption_key;
-    let encrypted_refresh = encrypt_field(enc_key, refresh_token);
-    let encrypted_dpop = encrypt_field(enc_key, &pending.dpop_key_b64);
-    let encrypted_nonce = dpop_nonce.as_deref().map(|n| encrypt_field(enc_key, n));
-    {
-        let db = state.db.lock().await;
-        db.execute(
-            "INSERT INTO sessions (broker_token, did, handle, pds_url, token_endpoint, refresh_token, dpop_key_b64, dpop_nonce, created_at, updated_at)\
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)\
-             ON CONFLICT(broker_token) DO UPDATE SET refresh_token=excluded.refresh_token, updated_at=excluded.updated_at",
-            rusqlite::params![
-                broker_token,
-                pending.did,
-                pending.handle,
-                pending.pds_url,
-                pending.token_endpoint,
-                encrypted_refresh,
-                encrypted_dpop,
-                encrypted_nonce,
-                now,
-                now
-            ],
-        ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
-    }
+    // Persist the durable session; the store encrypts sensitive fields at rest.
+    state
+        .store
+        .insert(&BrokerSessionRecord {
+            broker_token: broker_token.clone(),
+            did: pending.did.clone(),
+            handle: pending.handle.clone(),
+            pds_url: pending.pds_url.clone(),
+            token_endpoint: pending.token_endpoint.clone(),
+            refresh_token: refresh_token.to_string(),
+            dpop_key_b64: pending.dpop_key_b64.clone(),
+            dpop_nonce: dpop_nonce.clone(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
 
     // Mint a one-time web-token + web session on the freeq server. Optional:
     // a standalone broker (not trusted by irc.freeq.at's shared secret) just
@@ -739,8 +894,10 @@ async fn session(
     let _refresh_guard = token_lock.lock().await;
 
     // Read the record INSIDE the lock — a caller we queued behind may have just
-    // rotated the refresh token, so the on-disk copy is the one to use.
-    let record = get_session(&state, &req.broker_token)
+    // rotated the refresh token, so the stored copy is the one to use.
+    let record = state
+        .store
+        .get(&req.broker_token)
         .await
         .ok_or((StatusCode::UNAUTHORIZED, "Invalid broker token".to_string()))?;
 
@@ -758,18 +915,12 @@ async fn session(
                 }
             })?;
 
-    // Update stored refresh token + nonce (C-5: encrypt before storing)
-    let now = chrono::Utc::now().timestamp();
-    let enc_key = &state.config.encryption_key;
-    let encrypted_refresh = encrypt_field(enc_key, &refresh_token);
-    let encrypted_nonce = dpop_nonce.as_deref().map(|n| encrypt_field(enc_key, n));
-    {
-        let db = state.db.lock().await;
-        db.execute(
-            "UPDATE sessions SET refresh_token = ?1, dpop_nonce = ?2, updated_at = ?3 WHERE broker_token = ?4",
-            rusqlite::params![encrypted_refresh, encrypted_nonce, now, record.broker_token],
-        ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
-    }
+    // Persist the rotated refresh token + nonce (store encrypts at rest).
+    state
+        .store
+        .update_refresh(&record.broker_token, &refresh_token, dpop_nonce.as_deref())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
 
     let (web_token, nick) = state
         .writer
@@ -840,7 +991,9 @@ async fn authed_access_token(
     };
     let _refresh_guard = token_lock.lock().await;
 
-    let record = get_session(state, broker_token)
+    let record = state
+        .store
+        .get(broker_token)
         .await
         .ok_or((StatusCode::UNAUTHORIZED, "Invalid broker token".to_string()))?;
 
@@ -857,18 +1010,11 @@ async fn authed_access_token(
                 }
             })?;
 
-    let now = chrono::Utc::now().timestamp();
-    let enc_key = &state.config.encryption_key;
-    let encrypted_refresh = encrypt_field(enc_key, &refresh_token);
-    let encrypted_nonce = dpop_nonce.as_deref().map(|n| encrypt_field(enc_key, n));
-    {
-        let db = state.db.lock().await;
-        db.execute(
-            "UPDATE sessions SET refresh_token = ?1, dpop_nonce = ?2, updated_at = ?3 WHERE broker_token = ?4",
-            rusqlite::params![encrypted_refresh, encrypted_nonce, now, record.broker_token],
-        )
+    state
+        .store
+        .update_refresh(&record.broker_token, &refresh_token, dpop_nonce.as_deref())
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
-    }
 
     Ok((record, access_token, dpop_nonce))
 }
@@ -1016,46 +1162,6 @@ async fn graph_unfollow(
             StatusCode::BAD_REQUEST,
             "follow_uri must be an app.bsky.graph.follow record in your own repo".to_string(),
         )),
-    }
-}
-
-async fn get_session(state: &Arc<BrokerState>, broker_token: &str) -> Option<BrokerSessionRecord> {
-    let db = state.db.lock().await;
-    let enc_key = &state.config.encryption_key;
-    let mut stmt = db.prepare(
-        "SELECT broker_token, did, handle, pds_url, token_endpoint, refresh_token, dpop_key_b64, dpop_nonce, created_at, updated_at FROM sessions WHERE broker_token = ?1"
-    ).ok()?;
-    let mut rows = stmt.query(rusqlite::params![broker_token]).ok()?;
-    if let Some(row) = rows.next().ok().flatten() {
-        let encrypted_refresh: String = row.get(5).ok()?;
-        let encrypted_dpop: String = row.get(6).ok()?;
-        let encrypted_nonce: Option<String> = row.get(7).ok()?;
-        // C-5: Decrypt sensitive fields after reading from DB
-        let refresh_token = decrypt_field(enc_key, &encrypted_refresh)
-            .map_err(|e| tracing::error!("Failed to decrypt refresh_token: {e}"))
-            .ok()?;
-        let dpop_key_b64 = decrypt_field(enc_key, &encrypted_dpop)
-            .map_err(|e| tracing::error!("Failed to decrypt dpop_key_b64: {e}"))
-            .ok()?;
-        let dpop_nonce = encrypted_nonce
-            .map(|n| decrypt_field(enc_key, &n))
-            .transpose()
-            .map_err(|e| tracing::error!("Failed to decrypt dpop_nonce: {e}"))
-            .ok()?;
-        Some(BrokerSessionRecord {
-            broker_token: row.get(0).ok()?,
-            did: row.get(1).ok()?,
-            handle: row.get(2).ok()?,
-            pds_url: row.get(3).ok()?,
-            token_endpoint: row.get(4).ok()?,
-            refresh_token,
-            dpop_key_b64,
-            dpop_nonce,
-            created_at: row.get(8).ok()?,
-            updated_at: row.get(9).ok()?,
-        })
-    } else {
-        None
     }
 }
 
@@ -1342,5 +1448,58 @@ mod tests {
         // An IP literal that is public passes validation and yields a client
         // (no network I/O — resolution short-circuits on the literal).
         assert!(SsrfClients.client_for("https://8.8.8.8/").await.is_ok());
+    }
+
+    fn record(refresh: &str) -> BrokerSessionRecord {
+        BrokerSessionRecord {
+            broker_token: "BT".into(),
+            did: "did:plc:x".into(),
+            handle: "h".into(),
+            pds_url: "https://pds".into(),
+            token_endpoint: "https://pds/token".into(),
+            refresh_token: refresh.into(),
+            dpop_key_b64: DpopKey::generate().to_base64url(),
+            dpop_nonce: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_roundtrips_and_updates() {
+        let store = InMemoryStore::new();
+        assert!(store.get("BT").await.is_none());
+        store.insert(&record("R0")).await.unwrap();
+        assert_eq!(store.get("BT").await.unwrap().refresh_token, "R0");
+        store.update_refresh("BT", "R1", Some("N1")).await.unwrap();
+        let r = store.get("BT").await.unwrap();
+        assert_eq!(r.refresh_token, "R1");
+        assert_eq!(r.dpop_nonce.as_deref(), Some("N1"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_encrypts_refresh_token_at_rest() {
+        let key = derive_encryption_key("k");
+        let path = std::env::temp_dir().join(format!("freeq-broker-test-{}.db", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        let path_str = path.to_str().unwrap();
+        {
+            let store = SqliteStore::open(path_str, key).unwrap();
+            store.insert(&record("SECRET")).await.unwrap();
+            // Round-trips through decryption.
+            assert_eq!(store.get("BT").await.unwrap().refresh_token, "SECRET");
+        }
+        // A separate raw connection sees ciphertext, not the plaintext token.
+        let raw = rusqlite::Connection::open(path_str).unwrap();
+        let stored: String = raw
+            .query_row(
+                "SELECT refresh_token FROM sessions WHERE broker_token='BT'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(stored, "SECRET");
+        assert_eq!(decrypt_field(&key, &stored).unwrap(), "SECRET");
+        std::fs::remove_file(&path).ok();
     }
 }

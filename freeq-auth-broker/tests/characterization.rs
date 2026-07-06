@@ -19,8 +19,9 @@ use axum::body::Bytes;
 use axum::http::HeaderMap;
 use base64::Engine;
 use freeq_auth_broker::{
-    BrokerConfig, BrokerState, DpopKey, PendingAuth, RemoteWriter, build_client_id, decrypt_field,
-    derive_encryption_key, encrypt_field, init_db, is_valid_return_to, router, sign_body,
+    BrokerConfig, BrokerSessionRecord, BrokerState, DpopKey, PendingAuth, RemoteWriter, SqliteStore,
+    build_client_id, decrypt_field, derive_encryption_key, encrypt_field, is_valid_return_to,
+    router, sign_body,
 };
 use tokio::sync::Mutex;
 
@@ -36,22 +37,19 @@ async fn spawn(app: axum::Router) -> String {
 }
 
 fn broker_state(freeq_server_url: &str) -> Arc<BrokerState> {
-    let db = rusqlite::Connection::open_in_memory().unwrap();
-    init_db(&db).unwrap();
+    let store = Arc::new(SqliteStore::open(":memory:", derive_encryption_key(SECRET)).unwrap());
     Arc::new(BrokerState {
         config: BrokerConfig {
             public_url: "https://auth.test.example".to_string(),
             freeq_server_url: freeq_server_url.to_string(),
             shared_secret: SECRET.to_string(),
-            _db_path: String::new(),
-            encryption_key: derive_encryption_key(SECRET),
         },
         writer: Arc::new(RemoteWriter {
             freeq_server_url: freeq_server_url.to_string(),
             shared_secret: SECRET.to_string(),
         }),
+        store,
         pending: Mutex::new(std::collections::HashMap::new()),
-        db: Mutex::new(db),
         refresh_locks: Mutex::new(std::collections::HashMap::new()),
     })
 }
@@ -117,24 +115,22 @@ async fn seed_session(
     token_endpoint: &str,
     pds_url: &str,
 ) {
-    let key = &state.config.encryption_key;
-    let enc_refresh = encrypt_field(key, refresh_token);
-    let enc_dpop = encrypt_field(key, &DpopKey::generate().to_base64url());
-    let db = state.db.lock().await;
-    db.execute(
-        "INSERT INTO sessions (broker_token, did, handle, pds_url, token_endpoint, refresh_token, dpop_key_b64, dpop_nonce, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 0, 0)",
-        rusqlite::params![
-            broker_token,
-            "did:plc:alice123",
-            "alice.test",
-            pds_url,
-            token_endpoint,
-            enc_refresh,
-            enc_dpop,
-        ],
-    )
-    .unwrap();
+    state
+        .store
+        .insert(&BrokerSessionRecord {
+            broker_token: broker_token.to_string(),
+            did: "did:plc:alice123".to_string(),
+            handle: "alice.test".to_string(),
+            pds_url: pds_url.to_string(),
+            token_endpoint: token_endpoint.to_string(),
+            refresh_token: refresh_token.to_string(),
+            dpop_key_b64: DpopKey::generate().to_base64url(),
+            dpop_nonce: None,
+            created_at: 0,
+            updated_at: 0,
+        })
+        .await
+        .unwrap();
 }
 
 // ── Mock freeq-server (broker push receiver) ───────────────────────────
@@ -552,22 +548,12 @@ async fn callback_happy_path_web() {
         assert_eq!(c.session_bodies[0]["granted_scope"], "atproto");
     }
 
-    // The session row persisted with the refresh token ENCRYPTED at rest.
+    // The session persisted and round-trips through the store (encryption at
+    // rest is pinned separately by the SqliteStore unit test in lib.rs).
     {
-        let db = state.db.lock().await;
-        let (bt, raw_refresh): (String, String) = db
-            .query_row(
-                "SELECT broker_token, refresh_token FROM sessions",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(bt, broker_token);
-        assert_ne!(raw_refresh, "REFRESH1");
-        assert_eq!(
-            decrypt_field(&state.config.encryption_key, &raw_refresh).unwrap(),
-            "REFRESH1"
-        );
+        let rec = state.store.get(&broker_token).await.expect("session stored");
+        assert_eq!(rec.refresh_token, "REFRESH1");
+        assert_eq!(rec.did, "did:plc:alice123");
     }
 
     // One-time state: replaying the same callback must fail.
