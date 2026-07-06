@@ -14,11 +14,17 @@ use std::collections::HashMap;
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Nonce};
 use anyhow::{Context, Result, bail};
+// base64 + Digest are only used by the test helpers now that DpopKey/PKCE
+// moved to freeq-oauth; Sha256 is still used at module level (HKDF).
+#[cfg(test)]
 use base64::Engine;
+#[cfg(test)]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+#[cfg(test)]
+use sha2::Digest;
+use sha2::Sha256;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -254,88 +260,10 @@ struct TokenResponse {
     sub: Option<String>,
 }
 
-/// A DPoP (Demonstrating Proof-of-Possession) key pair.
-#[derive(Debug, Clone)]
-pub struct DpopKey {
-    signing_key: p256::ecdsa::SigningKey,
-}
-
-impl DpopKey {
-    pub fn generate() -> Self {
-        let signing_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
-        Self { signing_key }
-    }
-
-    /// Serialize the private key as base64url for caching.
-    pub fn to_base64url(&self) -> String {
-        URL_SAFE_NO_PAD.encode(self.signing_key.to_bytes())
-    }
-
-    /// Deserialize from base64url.
-    pub fn from_base64url(s: &str) -> Result<Self> {
-        let bytes = URL_SAFE_NO_PAD.decode(s)?;
-        let signing_key = p256::ecdsa::SigningKey::from_slice(&bytes)
-            .map_err(|e| anyhow::anyhow!("Invalid DPoP key: {e}"))?;
-        Ok(Self { signing_key })
-    }
-
-    fn jwk(&self) -> serde_json::Value {
-        let verifying_key = self.signing_key.verifying_key();
-        let point = verifying_key.to_encoded_point(false);
-        let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
-        let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
-        serde_json::json!({
-            "kty": "EC",
-            "crv": "P-256",
-            "x": x,
-            "y": y,
-        })
-    }
-
-    /// Create a DPoP proof JWT for a request.
-    ///
-    /// When `access_token` is provided, includes the `ath` (access token hash)
-    /// claim as required by RFC 9449 §4.2 when the proof accompanies a token.
-    pub fn proof(
-        &self,
-        method: &str,
-        url: &str,
-        nonce: Option<&str>,
-        access_token: Option<&str>,
-    ) -> Result<String> {
-        use p256::ecdsa::{Signature, signature::Signer};
-
-        let header = serde_json::json!({
-            "typ": "dpop+jwt",
-            "alg": "ES256",
-            "jwk": self.jwk(),
-        });
-
-        let mut payload = serde_json::json!({
-            "jti": generate_random_string(16),
-            "htm": method,
-            "htu": url,
-            "iat": chrono::Utc::now().timestamp(),
-        });
-        if let Some(nonce) = nonce {
-            payload["nonce"] = serde_json::Value::String(nonce.to_string());
-        }
-        if let Some(token) = access_token {
-            // ath = base64url(SHA-256(access_token))
-            let hash = Sha256::digest(token.as_bytes());
-            payload["ath"] = serde_json::Value::String(URL_SAFE_NO_PAD.encode(hash));
-        }
-
-        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header)?);
-        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload)?);
-        let signing_input = format!("{header_b64}.{payload_b64}");
-
-        let sig: Signature = self.signing_key.sign(signing_input.as_bytes());
-        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
-
-        Ok(format!("{signing_input}.{sig_b64}"))
-    }
-}
+// DPoP key + proof now live in the shared engine crate. Re-exported so the
+// `freeq_sdk::oauth::DpopKey` path stays stable for downstream consumers
+// (freeq-server, freeq-sdk-ffi, etc.).
+pub use freeq_oauth::DpopKey;
 
 /// Perform the full OAuth login flow for a Bluesky/AT Protocol handle.
 ///
@@ -733,19 +661,11 @@ async fn exchange_code(
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-fn generate_pkce() -> (String, String) {
-    let verifier = generate_random_string(32);
-    let hash = Sha256::digest(verifier.as_bytes());
-    let challenge = URL_SAFE_NO_PAD.encode(hash);
-    (verifier, challenge)
-}
-
-fn generate_random_string(len: usize) -> String {
-    use rand::RngCore;
-    let mut bytes = vec![0u8; len];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(&bytes)
-}
+// PKCE + random-string generation are byte-identical to the shared engine;
+// re-use them. (This file keeps its own `urlencod` for now — it preserves
+// `-_.~` where the engine's percent-encodes them, and this flow's exact wire
+// output isn't covered by the characterization suite yet.)
+use freeq_oauth::{generate_pkce, generate_random_string};
 
 /// Probe the PDS getSession endpoint to discover the required DPoP nonce.
 /// Returns None if no nonce is required or if the probe fails.
@@ -901,9 +821,9 @@ mod tests {
         let encoded = key.to_base64url();
         let decoded = DpopKey::from_base64url(&encoded).expect("roundtrip");
         assert_eq!(
-            key.jwk(),
-            decoded.jwk(),
-            "public JWK must survive roundtrip"
+            key.to_base64url(),
+            decoded.to_base64url(),
+            "private key must survive roundtrip"
         );
     }
 
@@ -1034,7 +954,7 @@ mod tests {
         assert_eq!(loaded.handle, session.handle);
         assert_eq!(loaded.access_token, session.access_token);
         assert_eq!(loaded.pds_url, session.pds_url);
-        assert_eq!(loaded.dpop_key.jwk(), session.dpop_key.jwk());
+        assert_eq!(loaded.dpop_key.to_base64url(), session.dpop_key.to_base64url());
         let _ = std::fs::remove_file(&path);
     }
 

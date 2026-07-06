@@ -17,7 +17,6 @@ use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::Engine;
 use hkdf::Hkdf;
-use p256::ecdsa::SigningKey;
 use sha2::Sha256;
 
 #[derive(Clone)]
@@ -60,88 +59,9 @@ pub struct PendingAuth {
     pub popup: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct DpopKey {
-    signing_key: SigningKey,
-}
-
-impl DpopKey {
-    pub fn generate() -> Self {
-        let signing_key = SigningKey::random(&mut rand::thread_rng());
-        Self { signing_key }
-    }
-
-    pub fn to_base64url(&self) -> String {
-        use base64::Engine;
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.signing_key.to_bytes())
-    }
-
-    pub fn from_base64url(s: &str) -> Result<Self, anyhow::Error> {
-        use base64::Engine;
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s)?;
-        let signing_key =
-            SigningKey::from_slice(&bytes).map_err(|e| anyhow::anyhow!("Invalid DPoP key: {e}"))?;
-        Ok(Self { signing_key })
-    }
-
-    fn jwk(&self) -> serde_json::Value {
-        let verifying_key = self.signing_key.verifying_key();
-        let point = verifying_key.to_encoded_point(false);
-        let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(point.x().unwrap());
-        let y = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(point.y().unwrap());
-        serde_json::json!({
-            "kty": "EC",
-            "crv": "P-256",
-            "x": x,
-            "y": y,
-        })
-    }
-
-    pub fn proof(
-        &self,
-        method: &str,
-        url: &str,
-        nonce: Option<&str>,
-        access_token: Option<&str>,
-    ) -> Result<String, anyhow::Error> {
-        use base64::Engine;
-        use p256::ecdsa::{Signature, signature::Signer};
-        use sha2::{Digest, Sha256};
-
-        let header = serde_json::json!({
-            "typ": "dpop+jwt",
-            "alg": "ES256",
-            "jwk": self.jwk(),
-        });
-
-        let mut payload = serde_json::json!({
-            "jti": generate_random_string(16),
-            "htm": method,
-            "htu": url,
-            "iat": chrono::Utc::now().timestamp(),
-        });
-        if let Some(nonce) = nonce {
-            payload["nonce"] = serde_json::Value::String(nonce.to_string());
-        }
-        if let Some(token) = access_token {
-            let hash = Sha256::digest(token.as_bytes());
-            payload["ath"] = serde_json::Value::String(
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash),
-            );
-        }
-
-        let header_b64 =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header)?);
-        let payload_b64 =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload)?);
-        let signing_input = format!("{header_b64}.{payload_b64}");
-
-        let sig: Signature = self.signing_key.sign(signing_input.as_bytes());
-        let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes());
-
-        Ok(format!("{signing_input}.{sig_b64}"))
-    }
-}
+// DPoP key + proof now live in the shared engine crate. Re-exported so
+// this crate's `DpopKey` path (and the characterization tests) stay stable.
+pub use freeq_oauth::DpopKey;
 
 #[derive(Debug, Deserialize)]
 struct DidDocument {
@@ -1633,46 +1553,11 @@ fn oauth_result_page(message: &str, _result: Option<&serde_json::Value>) -> Stri
     )
 }
 
-fn generate_pkce() -> (String, String) {
-    use base64::Engine;
-    use sha2::{Digest, Sha256};
-    let verifier = generate_random_string(32);
-    let hash = Sha256::digest(verifier.as_bytes());
-    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
-    (verifier, challenge)
-}
-
-pub fn generate_random_string(len: usize) -> String {
-    use base64::Engine;
-    use rand::RngCore;
-    let mut bytes = vec![0u8; len];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes)
-}
-
-fn urlencod(s: &str) -> String {
-    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-    utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
-}
-
-pub fn build_client_id(web_origin: &str, redirect_uri: &str) -> String {
-    if web_origin.starts_with("http://127.")
-        || web_origin.starts_with("http://192.168.")
-        || web_origin.starts_with("http://10.")
-    {
-        // Loopback client_id advertises the union of scopes the broker
-        // could ever use, including the legacy transition:generic for
-        // refresh-token grace period. Actual login asks for "atproto".
-        let scope = "atproto blob:image/* repo:blue.irc.media?action=create repo:app.bsky.feed.post transition:generic";
-        format!(
-            "http://localhost?redirect_uri={}&scope={}",
-            urlencod(redirect_uri),
-            urlencod(scope),
-        )
-    } else {
-        format!("{web_origin}/client-metadata.json")
-    }
-}
+// PKCE, random strings, URL encoding, and client_id construction now live
+// in the shared engine crate. Kept as thin re-exports/aliases so call sites
+// in this file don't churn.
+pub use freeq_oauth::{build_client_id, generate_random_string};
+use freeq_oauth::{generate_pkce, urlencode as urlencod};
 
 #[cfg(test)]
 mod tests {

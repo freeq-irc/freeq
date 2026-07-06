@@ -157,6 +157,29 @@ Anything shipped must be additive against:
 
 ## 2. Design
 
+### 2.0 Engine home: a dedicated `freeq-oauth` crate (decided 2026-07-06)
+
+The original plan put the engine in `freeq_sdk::oauth`. On inspection that
+fails a hard requirement: only `p2p` is feature-gated in `freeq-sdk`;
+`e2ee`, `ratchet`, `x3dh`, `av`, `client`, `streaming` all compile
+unconditionally. Depending on `freeq-sdk` just to reach `oauth` would drag
+that entire surface (and its crypto deps) into the slim broker binary —
+defeating the broker's reason to exist as a small standalone service.
+
+Decision: a new **`freeq-oauth`** workspace crate holding the pure protocol
+engine. `freeq-sdk`, `freeq-server`, and `freeq-auth-broker` all depend on
+it. `freeq_sdk::oauth::DpopKey` becomes `pub use freeq_oauth::DpopKey`, so
+downstream import paths (freeq-server, freeq-sdk-ffi) don't change.
+
+Hard rule: **`freeq-oauth` must never depend on `freeq-sdk`** (that would
+re-introduce the bloat transitively). Consequence — the engine takes an
+**injected `reqwest::Client`** rather than building its own, so the SSRF /
+timeout / DNS-pinning policy stays the caller's: the server injects its
+DNS-pinned SSRF-guarded client, the broker its bounded client, the SDK a
+plain one. This is strictly better than today (network policy is explicit
+at every hop) and keeps DID resolution (which lives in `freeq_sdk::did`) on
+the caller side — the engine starts from a resolved `pds_url`.
+
 ### 2.1 Shape: engine in the SDK, service as a library crate, two mounts
 
 ```

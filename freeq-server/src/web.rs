@@ -23,6 +23,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tower_http::cors::CorsLayer;
 
 use crate::server::SharedState;
+// OAuth primitives now live in the shared engine crate. `generate_random_string`
+// is re-exported because `crate::web::generate_random_string` is referenced from
+// connection::login; `urlencod` is the local alias for the engine's `urlencode`.
+pub use freeq_oauth::generate_random_string;
+use freeq_oauth::{build_client_id, generate_pkce, urlencode as urlencod};
 
 // ── WebSocket ↔ IRC bridge ─────────────────────────────────────────────
 
@@ -2216,28 +2221,6 @@ fn derive_web_origin_from_config(config: &crate::config::ServerConfig) -> (Strin
     (format!("{scheme}://{host}"), scheme.to_string())
 }
 
-/// Build OAuth client_id. Loopback uses http://localhost?... form;
-/// production uses {origin}/client-metadata.json.
-fn build_client_id(web_origin: &str, redirect_uri: &str) -> String {
-    if web_origin.starts_with("http://127.")
-        || web_origin.starts_with("http://192.168.")
-        || web_origin.starts_with("http://10.")
-    {
-        // Loopback client — use http://localhost form per AT Protocol spec.
-        // Same union as the production client-metadata.json (with the
-        // legacy transition:generic kept for refresh-token grace period).
-        let scope = "atproto blob:image/* repo:blue.irc.media?action=create repo:app.bsky.feed.post transition:generic";
-        format!(
-            "http://localhost?redirect_uri={}&scope={}",
-            urlencod(redirect_uri),
-            urlencod(scope),
-        )
-    } else {
-        // Production — client_id is the URL of the client-metadata.json document
-        format!("{web_origin}/client-metadata.json")
-    }
-}
-
 // ── OAuth endpoints for web client ─────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -3309,28 +3292,6 @@ p {{ color: #a6adc8; }}
 {script}
 </body></html>"#
     )
-}
-
-fn generate_pkce() -> (String, String) {
-    use base64::Engine;
-    use sha2::{Digest, Sha256};
-    let verifier = generate_random_string(32);
-    let hash = Sha256::digest(verifier.as_bytes());
-    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
-    (verifier, challenge)
-}
-
-pub fn generate_random_string(len: usize) -> String {
-    use base64::Engine;
-    use rand::RngCore;
-    let mut bytes = vec![0u8; len];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes)
-}
-
-fn urlencod(s: &str) -> String {
-    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-    utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
 }
 
 /// Derive an IRC nick from an AT Protocol handle.

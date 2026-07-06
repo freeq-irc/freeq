@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "freeq-server",
     "freeq-sdk",
+    "freeq-oauth",
     "freeq-sdk-ffi",
     "freeq-tui",
     "freeq-bots",
@@ -49,6 +50,7 @@ webpki-roots = "1"
 p256 = { version = "0.13", features = ["ecdsa"] }
 sha2 = "0.10"
 percent-encoding = "2"
+freeq-oauth = { path = "freeq-oauth" }
 open = "5"
 dirs = "5"
 rusqlite = { version = "0.38", features = ["bundled"] }

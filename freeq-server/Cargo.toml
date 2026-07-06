@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 aes-gcm = { workspace = true }
 freeq-sdk = { path = "../freeq-sdk" }
+freeq-oauth = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }

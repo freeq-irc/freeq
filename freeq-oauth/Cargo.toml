@@ -1,0 +1,26 @@
+[package]
+name = "freeq-oauth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AT Protocol OAuth engine (DPoP, PAR, code exchange, refresh) shared by the freeq server, broker, and SDK"
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+chrono = { workspace = true }
+p256 = { workspace = true }
+sha2 = { workspace = true }
+percent-encoding = { workspace = true }
+tracing = { workspace = true }
+# The engine never builds its own HTTP client — callers inject one so the
+# SSRF / timeout policy stays their choice (see docs/AUTH-BROKER-UNIFICATION.md).
+# reqwest is therefore a pure type dependency with no TLS backend of its own.
+reqwest = { workspace = true }
+url = "2"
+
+[lints]
+workspace = true
