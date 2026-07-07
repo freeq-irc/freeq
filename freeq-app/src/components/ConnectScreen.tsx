@@ -225,12 +225,10 @@ export function ConnectScreen() {
     if (brokerAutoAttempts >= MAX_BROKER_AUTO_ATTEMPTS) return;
     const brokerToken = localStorage.getItem(LS_BROKER_TOKEN);
     if (!brokerToken) return;
-    // If brokerOrigin is the same as webOrigin, there's no external broker —
-    // the server handles auth directly via /auth/login. Don't try /session.
-    if (brokerOrigin === webOrigin) {
-      localStorage.removeItem(LS_BROKER_TOKEN); // stale token from a different server
-      return;
-    }
+    // Refresh via `${brokerOrigin}/session` regardless of deployment: for a
+    // standalone broker brokerOrigin is the separate auth host; for an embedded
+    // server it equals webOrigin (the server serves /session in-process). A
+    // stale/cross-server token simply 401s below and is cleared there.
 
     brokerAutoAttempts++;
     setAutoConnecting(true);
