@@ -337,7 +337,7 @@ impl SessionStore for SqliteStore {
         let db = self.conn.lock().await;
         let enc_key = &self.enc_key;
         let mut stmt = db.prepare(
-            "SELECT broker_token, did, handle, pds_url, token_endpoint, refresh_token, dpop_key_b64, dpop_nonce, created_at, updated_at, client_id FROM sessions WHERE broker_token = ?1"
+            "SELECT broker_token, did, handle, pds_url, token_endpoint, refresh_token, dpop_key_b64, dpop_nonce, created_at, updated_at FROM sessions WHERE broker_token = ?1"
         ).ok()?;
         let mut rows = stmt.query(rusqlite::params![broker_token]).ok()?;
         let row = rows.next().ok().flatten()?;
@@ -367,8 +367,12 @@ impl SessionStore for SqliteStore {
             dpop_nonce,
             created_at: row.get(8).ok()?,
             updated_at: row.get(9).ok()?,
-            // Empty for pre-migration rows (column default '').
-            client_id: row.get::<_, Option<String>>(10).ok()?.unwrap_or_default(),
+            // Not persisted — the standalone broker (the only SqliteStore user)
+            // rebuilds client_id from its static config on refresh, so it never
+            // reads a stored one. Only the embedded InMemoryStore needs it (its
+            // origin is per-request). A future durable-embedded SQLite store
+            // would add the column then.
+            client_id: String::new(),
         })
     }
 
@@ -378,14 +382,14 @@ impl SessionStore for SqliteStore {
         let encrypted_dpop = encrypt_field(enc_key, &rec.dpop_key_b64);
         let encrypted_nonce = rec.dpop_nonce.as_deref().map(|n| encrypt_field(enc_key, n));
         let db = self.conn.lock().await;
+        // client_id is intentionally not persisted (see `get`).
         db.execute(
-            "INSERT INTO sessions (broker_token, did, handle, pds_url, token_endpoint, refresh_token, dpop_key_b64, dpop_nonce, created_at, updated_at, client_id)\
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)\
+            "INSERT INTO sessions (broker_token, did, handle, pds_url, token_endpoint, refresh_token, dpop_key_b64, dpop_nonce, created_at, updated_at)\
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)\
              ON CONFLICT(broker_token) DO UPDATE SET refresh_token=excluded.refresh_token, updated_at=excluded.updated_at",
             rusqlite::params![
                 rec.broker_token, rec.did, rec.handle, rec.pds_url, rec.token_endpoint,
                 encrypted_refresh, encrypted_dpop, encrypted_nonce, rec.created_at, rec.updated_at,
-                rec.client_id,
             ],
         )?;
         Ok(())
@@ -1401,18 +1405,9 @@ pub fn init_db(db: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
             dpop_key_b64 TEXT NOT NULL,
             dpop_nonce TEXT,
             created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL,
-            client_id TEXT NOT NULL DEFAULT ''
+            updated_at INTEGER NOT NULL
         );",
     )?;
-    // Migration for DBs created before `client_id` existed. SQLite has no
-    // ADD COLUMN IF NOT EXISTS, so ignore the duplicate-column error.
-    if let Err(e) =
-        db.execute("ALTER TABLE sessions ADD COLUMN client_id TEXT NOT NULL DEFAULT ''", [])
-        && !e.to_string().contains("duplicate column")
-    {
-        return Err(e);
-    }
     Ok(())
 }
 
@@ -1528,20 +1523,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_store_migrates_legacy_schema_without_client_id() {
-        // A DB created before the client_id column existed.
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE sessions (broker_token TEXT PRIMARY KEY, did TEXT NOT NULL, handle TEXT NOT NULL,
-             pds_url TEXT NOT NULL, token_endpoint TEXT NOT NULL, refresh_token TEXT NOT NULL,
-             dpop_key_b64 TEXT NOT NULL, dpop_nonce TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);",
-        ).unwrap();
-        // init_db (via from_connection? no — call it directly) adds the column.
-        init_db(&conn).unwrap();
-        let store = SqliteStore::from_connection(conn, derive_encryption_key("k"));
-        store.insert(&record("R")).await.unwrap();
-        let got = store.get("BT").await.unwrap();
-        assert_eq!(got.refresh_token, "R");
-        assert_eq!(got.client_id, "cid");
+    async fn in_memory_store_keeps_client_id_but_sqlite_does_not() {
+        // Embedded (in-memory) needs the stored client_id; standalone (SQLite)
+        // rebuilds it from config, so SqliteStore deliberately drops it.
+        let mem = InMemoryStore::new();
+        mem.insert(&record("R")).await.unwrap();
+        assert_eq!(mem.get("BT").await.unwrap().client_id, "cid");
+
+        let sql = SqliteStore::open(":memory:", derive_encryption_key("k")).unwrap();
+        sql.insert(&record("R")).await.unwrap();
+        assert_eq!(sql.get("BT").await.unwrap().client_id, "");
     }
 }
