@@ -81,34 +81,15 @@ struct DidService {
     service_endpoint: String,
 }
 
-/// Hard-bounded client for every upstream call the broker makes during
-/// `/auth/login`. Default reqwest waits forever; if bsky.social or a
-/// user's `.well-known` server is slow we'd accumulate stuck requests
-/// until the platform's gateway times out — and meanwhile the user
-/// stares at a spinner with no actionable error.
-///
-/// `pool_max_idle_per_host(0)` disables connection reuse — the
-/// observed failure mode was the *second* POST to bsky.social/oauth/par
-/// (DPoP nonce retry) consistently dying with "error sending request"
-/// while the first POST on the same client succeeded. Each call now
-/// uses a fresh TCP/TLS connection, which dodges that.
-///
-/// `http1_only()` similarly avoids HTTP/2 stream-state weirdness; the
-/// request volume from this endpoint is tiny so the perf cost is
-/// irrelevant.
+/// Hard-bounded client for the broker's PDS calls (session refresh, graph
+/// writes). Default reqwest waits forever; a slow PDS would otherwise pile up
+/// stuck requests until the gateway times out. Connection pooling + keep-alive
+/// are left on so a request and its DPoP `use_dpop_nonce` retry reuse one
+/// connection to the same host rather than opening a second socket.
 fn upstream_client() -> Result<reqwest::Client, anyhow::Error> {
     Ok(reqwest::Client::builder()
-        // 30s overall. Individual calls to bsky.social are normally
-        // fast (~600ms from a healthy network) but Miren's egress can
-        // be slow, so we keep headroom.
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(8))
-        // Miren's egress can't reliably open a SECOND TCP connection
-        // to bsky.social inside the same login flow — the connect
-        // phase consistently `TimedOut`. Reusing the first connection
-        // via HTTP/2 multiplexing avoids opening a second TCP socket
-        // at all. We explicitly enable keep-alive idle pooling so the
-        // second POST piggybacks on the open connection from the first.
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .pool_max_idle_per_host(32)
         .tcp_keepalive(std::time::Duration::from_secs(30))
