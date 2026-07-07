@@ -133,9 +133,12 @@ async fn embedded_session_full_roundtrip() {
     assert!(!broker_token.is_empty(), "callback must issue a broker_token");
 
     // 2. /session with the broker_token: refreshes against the PDS and mints a
-    //    fresh web-token — no re-login.
+    //    fresh web-token — no re-login. Sends a same-origin `Origin` header, as
+    //    a browser does, to exercise the CSRF guard (the embedded web client is
+    //    always same-origin).
     let resp = http()
         .post(format!("http://{web}/session"))
+        .header("origin", format!("http://{web}"))
         .json(&serde_json::json!({ "broker_token": broker_token }))
         .send()
         .await

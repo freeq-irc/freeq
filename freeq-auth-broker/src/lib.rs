@@ -879,16 +879,30 @@ const ALLOWED_ORIGINS: &[&str] = &[
     "http://127.0.0.1:5173",
 ];
 
+/// M-13 CSRF guard. A request is allowed when it has no `Origin` (non-browser
+/// clients — curl, native apps), when the `Origin` is same-origin as the
+/// request's own `Host` (the embedded case — a same-origin POST is not a CSRF
+/// vector), or when it's in the cross-origin allowlist (a standalone broker
+/// serving a web client on a different host, e.g. irc.freeq.at → auth.freeq.at).
+fn origin_allowed(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    if let Some(host) = headers.get("host").and_then(|v| v.to_str().ok())
+        && (origin == format!("https://{host}") || origin == format!("http://{host}"))
+    {
+        return true;
+    }
+    ALLOWED_ORIGINS.contains(&origin)
+}
+
 async fn session(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
     Json(req): Json<BrokerSessionRequest>,
 ) -> Result<Json<BrokerSessionResponse>, (StatusCode, String)> {
-    // M-13: CSRF protection — reject requests from disallowed origins
-    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok())
-        && !ALLOWED_ORIGINS.contains(&origin)
-    {
-        tracing::warn!(origin = %origin, "Rejected /session request from disallowed origin");
+    if !origin_allowed(&headers) {
+        tracing::warn!("Rejected /session request from disallowed origin");
         return Err((StatusCode::FORBIDDEN, "Origin not allowed".to_string()));
     }
 
@@ -1086,9 +1100,7 @@ async fn graph_follow(
     headers: HeaderMap,
     Json(req): Json<GraphFollowRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok())
-        && !ALLOWED_ORIGINS.contains(&origin)
-    {
+    if !origin_allowed(&headers) {
         return Err((StatusCode::FORBIDDEN, "Origin not allowed".to_string()));
     }
     let subject = req
@@ -1131,9 +1143,7 @@ async fn graph_unfollow(
     headers: HeaderMap,
     Json(req): Json<GraphFollowRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok())
-        && !ALLOWED_ORIGINS.contains(&origin)
-    {
+    if !origin_allowed(&headers) {
         return Err((StatusCode::FORBIDDEN, "Origin not allowed".to_string()));
     }
     let uri = req
@@ -1520,6 +1530,43 @@ mod tests {
         assert_ne!(stored, "SECRET");
         assert_eq!(decrypt_field(&key, &stored).unwrap(), "SECRET");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn origin_guard_allows_same_origin_and_no_origin() {
+        use axum::http::HeaderMap;
+        let h = |pairs: &[(&str, &str)]| {
+            let mut m = HeaderMap::new();
+            for (k, v) in pairs {
+                m.insert(
+                    k.parse::<axum::http::HeaderName>().unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            m
+        };
+        // No Origin (curl / native app) → allowed.
+        assert!(origin_allowed(&h(&[("host", "irc.zerosum.org")])));
+        // Same-origin (embedded web client) → allowed, even though it's not in
+        // the hardcoded freeq.at allowlist. This is the case the browser hits.
+        assert!(origin_allowed(&h(&[
+            ("host", "irc.zerosum.org"),
+            ("origin", "https://irc.zerosum.org"),
+        ])));
+        assert!(origin_allowed(&h(&[
+            ("host", "127.0.0.1:8080"),
+            ("origin", "http://127.0.0.1:8080"),
+        ])));
+        // Cross-origin in the allowlist (standalone: irc.freeq.at web client) → allowed.
+        assert!(origin_allowed(&h(&[
+            ("host", "auth.freeq.at"),
+            ("origin", "https://irc.freeq.at"),
+        ])));
+        // Cross-origin, not same-origin, not allowlisted → rejected.
+        assert!(!origin_allowed(&h(&[
+            ("host", "irc.zerosum.org"),
+            ("origin", "https://evil.example"),
+        ])));
     }
 
     #[tokio::test]
