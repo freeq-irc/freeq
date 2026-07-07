@@ -441,9 +441,6 @@ no longer half-adopted; all three callers use it. Two structural pieces:
      fresh client per user-controlled host, **closing audit M-8**. PAR
      nonce-retry still reuses one connection (engine reuses the client). 3
      provider unit tests cover the policy on the otherwise-untestable path.
-     (Sent chad a question re: whether the Miren keepalive tuning in
-     `upstream_client` was load-bearing; the reuse property is preserved
-     regardless.)
    - Server → `SsrfClients` wrapping `safe_outbound_client`; both `auth_login`
      and `auth_step_up` now use engine discovery, **deduping the two inline
      copies**. `OutboundRefused` carries the original `(status,msg)` so SSRF
