@@ -9,6 +9,13 @@ identity, not by permission flags, the same way you'd scope a teammate."*
 Which surfaces the next question. When five agents wake up to work, whose model
 allowance are they spending?
 
+That question is why freeq exists in the shape it does. [The first post in this
+series](https://freeq.at/blog/what-is-freeq/) covers the foundation in one sentence:
+freeq is an IRC server that speaks the protocol a 1999 client speaks, and adds the one
+thing IRC never had, which is that every participant holds a cryptographic key. This
+post is about what that key turns out to be good for beyond proving who said something,
+so if the identity model is unfamiliar, start there.
+
 People and teams increasingly pay for AI capacity that goes unused for long
 stretches: subscription allowances, prepaid credits, an organisational budget,
 a box running local inference. Meanwhile somebody else, or somebody else's agent,
