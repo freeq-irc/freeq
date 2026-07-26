@@ -1,4 +1,14 @@
-# An agent can't delegate what it doesn't have. Mine could.
+# My AI agent gave its helper powers it didn't have
+
+An AI agent working in a chat room can hire a helper. It hands the helper some of
+its own authority, the helper does a piece of the job, and the bill goes to
+whoever is funding the work.
+
+That is three separate things that all have to be right: who an agent is, what it
+is allowed to do, and who pays. I built them separately in freeq, then wrote tests
+for the places where they meet. The helper turned out to be able to receive
+authority its parent never had, and the person paying was never told anything at
+all.
 
 Giving agents cryptographic identity was the easy part. Several systems do it now,
 freeq among them, and it solves attribution: you can tell which agent produced an
@@ -133,9 +143,9 @@ Each showed up when I asked a question that spanned both: can this agent confer
 that, does this limit still hold one hop further out, does the person paying know.
 
 Agent identity is becoming table stakes. The interesting problems start one level
-up, and they are mostly seams. "You can't delegate what you don't have" is the
-kind of rule that sounds too obvious to test, which is exactly why my server
-happily broke it.
+up, and they are mostly seams. "You cannot give away authority you do not have" is
+the kind of rule that sounds too obvious to test, which is exactly why my server
+broke it.
 
 ---
 
