@@ -9,13 +9,6 @@ identity, not by permission flags, the same way you'd scope a teammate."*
 Which surfaces the next question. When five agents wake up to work, whose model
 allowance are they spending?
 
-That question is why freeq exists in the shape it does. [The first post in this
-series](https://freeq.at/blog/what-is-freeq/) covers the foundation in one sentence:
-freeq is an IRC server that speaks the protocol a 1999 client speaks, and adds the one
-thing IRC never had, which is that every participant holds a cryptographic key. This
-post is about what that key turns out to be good for beyond proving who said something,
-so if the identity model is unfamiliar, start there.
-
 People and teams increasingly pay for AI capacity that goes unused for long
 stretches: subscription allowances, prepaid credits, an organisational budget,
 a box running local inference. Meanwhile somebody else, or somebody else's agent,
@@ -26,6 +19,17 @@ prohibited and reckless.
 So the missing primitive isn't another shared API key. It's the ability to delegate
 a bounded amount of capacity to a person or an agent you choose, and keep
 attribution, revocation, and control while they use it.
+
+freeq is unusually well-shaped for that problem. [The first post in this
+series](https://freeq.at/blog/what-is-freeq/) explains the foundation: it's an IRC
+server that speaks the protocol a 1999 client speaks, except every participant holds a
+cryptographic key. This post is about what those keys become useful for once agents
+start consuming resources on somebody else's behalf.
+
+(If protocol machinery is not your idea of a good time, the same substrate is rendered
+at [FreeqWorld](https://world.freeq.at/) as a multiplayer town: rooms are live
+channels, people and agents keep their DID-derived characters, and federation appears
+as travel between independently operated towns.)
 
 ## What a loan of capacity would require
 
@@ -114,7 +118,7 @@ server*, charged to a channel budget:
 
 ```
 Authorization: Bearer <session>
-{ "channel": "#research", "model": "gpt-4o-mini",
+{ "channel": "#research", "model": "provider/small",
   "messages": [{ "role": "user", "content": "…" }] }
 ```
 
@@ -129,8 +133,8 @@ The charge is computed from the provider's own token counts rather than the call
 claim, priced per model, and recorded against the budget:
 
 ```json
-"freeq": { "charged": 4.0, "unit": "usd", "channel": "#research",
-           "sponsor": "did:plc:…", "spent_after": 4.0 }
+"freeq": { "charged": 4, "unit": "credits", "channel": "#research",
+           "sponsor": "did:plc:…", "spent_after": 17 }
 ```
 
 Two details that took a test to get right. An unpriced model is not free — it falls
@@ -144,6 +148,12 @@ what the test pins.
 The credential never leaves the server. So withdrawing capacity means editing a
 budget, not rotating a key and breaking everything else that used it.
 
+The proxy is not the protocol. It is where the protocol's decision becomes
+enforceable. Anyone can put a metering proxy in front of a model; what makes this one
+answer "should this call happen" is everything upstream of it — the identities, the
+delegation graph, the named sponsor, the narrowing, the channel membership, and the
+signed context of the job being paid for.
+
 ## What is still missing
 
 Three gaps, all found by writing tests rather than reading designs:
@@ -154,10 +164,14 @@ operator can stand up a channel, name an unrelated person as its funder, and hav
 every agent's spend attributed to them, and since sponsors are now notified, send
 them the warnings too. Lending is something you agree to.
 
-**Spend is self-reported.** An agent decides whether to send `SPEND` at all, what
-amount to claim, and whether to obey the stop signal. Nothing meters what a call
-actually cost and no provider receipt is verified. These controls defend against
-implementation errors and honest drift, not a malicious runtime.
+**Externally incurred spend is still self-reported.** Calls through freeq's model
+endpoint are mediated, measured from the provider's token counts, and refused before
+dispatch when the budget is exhausted. An agent can still call a model somewhere else
+and file a `SPEND` report afterwards, and freeq cannot verify that report, detect an
+omitted one, or prevent the external call. So the two paths have genuinely different
+guarantees: the mediated path enforces a budget, and `SPEND` is accounting for
+cooperative runtimes. `hard=true` means "no provider call" on the first and "please
+stop" on the second.
 
 **Capabilities don't gate operations.** They narrow correctly on delegation now, but
 nothing consults one before allowing an action, so holding a capability isn't yet the
@@ -184,45 +198,34 @@ sponsored task into a durable obligation.
 
 | | Status |
 |---|---|
-| Human identity via AT Protocol DID | Working |
-| Creator-to-agent certificate | Working, 4 rejection paths tested |
-| Per-message signatures, verified and relayed unchanged | Working |
-| Signing keys retained append-only by `(did, kid)` | Working |
-| Named sponsor on a channel budget | Working |
-| Reported-spend limits, warn and stop signal | Working |
-| Spend rollup across the delegation chain | Working |
-| Budget inheritance by spawned children | Working |
-| Capability narrowing on delegation | Working, as of this week |
-| Operator grant / withdrawal of capabilities | Working |
-| `act` signing primitives | In the SDK, 14 tests |
+| Identity rails: DID auth, creator-to-agent certificate, per-message signatures, keys kept by `(did, kid)` | Working |
 | Metered model path, credential held server-side | Working |
 | Budget refuses before any upstream call | Working, verified by hit count |
 | Cost from the provider's token counts | Working |
+| Named sponsor, spend rollup, budget inheritance by children | Working |
+| Capability narrowing on delegation, operator grant and withdrawal | Working |
 | Consent before naming someone as sponsor | Not built |
 | Lending a *lender's own* capacity, not the operator's | Not built |
 | Capability checks gating operations | Not built |
-| `act` lifecycle and identity-addressed delivery | Specified, not built |
+| Durable signed jobs (`act` lifecycle, identity-addressed delivery) | Specified, primitives in the SDK |
 | Verifying a historical action's signature | Not wired, though keys are kept |
 
 ## The last mile, and whose pool it is
 
-So: share the tokens, not the API key. That now works in the literal sense. A caller
-gets model output without ever holding a credential, the budget decides before any
-money moves, the charge comes from the provider's counts rather than an honour-system
-report, and the whole thing is attributed to an identity and a sponsor.
+So: share the tokens, not the API key. freeq can now delegate bounded access to model
+capacity without exposing the provider credential. The caller authenticates as its own
+identity, the budget is checked before dispatch, usage is measured from the provider's
+response, and an exhausted budget stops the upstream call from happening.
 
-With one honest qualification, which is the next piece of work rather than a caveat to
-bury: the pool being shared is the *server operator's*. There is one provider
-credential, held by the server. So what exists is bounded, attributable, revocable
-access to the operator's capacity — real delegation, but not yet me lending you my own
-subscription. For that, a lender registers their own credential and calls charged to
-their budget go out under it, which turns "your budget authorised this" into "your
-capacity paid for this".
+The capacity being shared today belongs to the server operator. There is one provider
+credential and the server holds it. So this is real, revocable delegation of an
+operator-funded pool, and not yet a general mechanism for me to lend you capacity from
+my own account.
 
-That plus sponsor consent, since being named as a funder should require agreeing to it,
-and operation-level capability checks, since narrowing what can be delegated is not the
-same as gating what can be done. Three concrete things. None of them needs another
-identity system.
+Making the pool personal needs three more pieces: a lender can register a credential or
+funding source under their own control, naming that lender as a sponsor requires their
+signed consent, and the resulting capability gates the model operation itself. Then
+"your budget authorised this" becomes "your capacity paid for this".
 
 ---
 
