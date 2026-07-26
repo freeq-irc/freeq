@@ -1,7 +1,14 @@
-# Handing work to an agent that can prove who asked
+# An agent can use my tokens. Can it prove I asked?
 
-You tell an AI agent to do something. How does the agent know the instruction came
-from you?
+People are starting to run several agents against AI capacity they already pay for:
+a pool of API credits, an underused subscription, a budget shared across a team.
+The obvious way to let an agent draw on it is to give the agent the same
+credential everyone else uses. That does share the capacity. It also erases who
+authorised each use, and hands every agent the full authority of the account
+holder.
+
+Which turns a billing question into an identity one. You tell an AI agent to do
+something. How does the agent know the instruction came from you?
 
 In most setups it doesn't, and doesn't ask. The instruction arrives through an API
 call or a chat webhook, and the agent trusts it because of where it arrived from.
@@ -107,6 +114,7 @@ An HTTP inbox cannot do that.
 | `act` lifecycle: transition validation, state view | Specified, not built |
 | Delivery addressed to an identity across servers | Specified, not built |
 | Capability checks gating individual operations | Not built |
+| Metering on the mediated model path | Not built |
 | Verification of a *historical* action's signature | Not wired, though the keys are kept |
 
 The last two are worth being blunt about. Capabilities constrain what can be
@@ -116,9 +124,23 @@ the log to verify an action signed last week — the live path verifies against 
 sender's current session key. An offer accepted next Tuesday needs that walk-back,
 and it doesn't exist yet.
 
-There is also a cost-reporting layer, where agents report what work cost and
-channels set budgets. I'm leaving it out of this post, because it deserves its own
-and because what it does today is observe rather than enforce.
+## The part where I have to be careful
+
+freeq has an early cost-reporting layer: agents report what work cost, channels set
+budgets with warnings and limits, and a sponsor can be named as the identity funding
+the work. It does not mediate model access and it does not settle credits, so it
+cannot honestly claim to enforce shared AI spending. Agents report their own costs
+and are asked to stop when they exceed a limit.
+
+There is a sharper version of that admission. The one place freeq *does* put itself
+between a caller and a paid model is its diagnostic interface, where the server
+holds the provider key, callers are authenticated by DID, and nobody is handed the
+credential. That path is mediated and unmetered. The budget system is metered and
+unmediated. The resource freeq controls is the one it does not count.
+
+Both halves are the same missing idea, and it is the one this post is actually
+about: knowing which principal authorised an agent to consume a shared resource
+comes before counting what it consumed.
 
 ## Why bother with signatures at all
 
@@ -131,6 +153,11 @@ acceptance.
 
 freeq has the identity and signing rails for that today, and a design for the
 durable part. The gap between those two sentences is the interesting work.
+
+If you are going to let agents draw on capacity you pay for, the thing to hand them
+is bounded, attributable authority, and not your credential. That is a smaller
+claim than "share your tokens safely," and it is the one I can currently back with
+code.
 
 ---
 
