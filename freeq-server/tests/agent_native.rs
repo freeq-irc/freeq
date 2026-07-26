@@ -3494,3 +3494,61 @@ async fn revoking_a_parent_tears_down_its_children() {
     parent.quit(None).await.ok();
     server_handle.abort();
 }
+
+/// Being someone's sponsor has to be opt-in.
+///
+/// `BUDGET ... sponsor=<did>` accepts any DID. The sponsor defaults to the issuer,
+/// but naming somebody else takes only channel op, and that DID is never asked.
+/// So an op can stand up a channel, name an unrelated identity as the sponsor, and
+/// have every agent's reported spend attributed to them — and, since sponsors are
+/// now notified, send them the warnings too.
+///
+/// Lending capacity is the whole point of a sponsor field, and lending is a thing
+/// you agree to. The fix needs a consent record (or a capability the sponsor grants
+/// to the issuer), which is a design decision rather than a patch, so this is kept
+/// executable instead of written down somewhere.
+#[tokio::test]
+#[ignore = "unimplemented: naming another DID as budget sponsor requires no consent"]
+async fn naming_someone_else_as_sponsor_requires_their_consent() {
+    start_deadlock_detector();
+    let (addr, server_handle) = start_test_server_with_db(empty_resolver(), true).await;
+
+    let (victim_did, victim, _victim_ev) = connect_did_key(addr, "generous").await;
+    let (_op_did, op, mut op_ev) = connect_did_key(addr, "opportunist").await;
+    op.join("#freeloading").await.unwrap();
+    expect_event(&mut op_ev, 2000, |e| matches!(e, Event::Joined { .. }), "op joined").await;
+
+    // The op names an unrelated identity as the one funding this channel.
+    op.raw(&format!(
+        "BUDGET #freeloading amount=100;unit=usd;period=day;sponsor={victim_did}"
+    ))
+    .await
+    .unwrap();
+
+    // Match the budget confirmation specifically. An earlier attempt keyed on the
+    // channel name and matched the MODE +o line instead, so it passed while the
+    // budget was set — a test that proved nothing.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(2000);
+    let mut confirmed: Option<String> = None;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(400), op_ev.recv()).await {
+            Ok(Some(e)) => {
+                let line = format!("{e:?}");
+                if line.contains("Budget set for") {
+                    confirmed = Some(line);
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        confirmed.is_none(),
+        "budget was set naming an unconsenting sponsor: {}",
+        confirmed.unwrap_or_default()
+    );
+
+    victim.quit(None).await.ok();
+    op.quit(None).await.ok();
+    server_handle.abort();
+}

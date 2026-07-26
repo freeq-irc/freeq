@@ -1,27 +1,48 @@
-# Your agents are spending your tokens
+# Share the tokens, not the API key
 
-People are starting to run several agents against AI capacity they already pay for:
-a pool of API credits, an underused subscription, a budget shared across a team.
-The obvious way to let an agent draw on it is to give the agent the same
-credential everyone else uses. That does share the capacity. It also erases who
-authorised each use, and hands every agent the full authority of the account
-holder.
+Most people paying for AI capacity are not using all of it. A Max subscription
+sits idle overnight. A team's API credits reset monthly whether or not anyone spent
+them. Meanwhile somebody else, or somebody else's agent, needs capacity right now
+and doesn't have any.
 
-Which turns a billing question into an identity one. Something spent your tokens.
-Which agent was it, who told it to, and were they allowed to?
+The obvious way to share it is to hand over the credential. That works, and it also
+gives the recipient your full authority, forever, with no record of which jobs were
+theirs, and no way to take it back except rotating the key and breaking everything
+else that uses it. You haven't lent them capacity. You've made them you.
 
-In most setups it doesn't, and doesn't ask. The instruction arrives through an API
-call or a chat webhook, and the agent trusts it because of where it arrived from.
-Whoever holds the token can issue orders, the agent has no way to tell a real
-instruction from an injected one, and afterwards there is nothing to point at
-except a log line saying the agent did it.
+Lending capacity properly means the authority to spend has to be its own object:
+bounded by an amount and a period, attached to an identity rather than a secret,
+attributable per job, revocable without collateral damage, and narrowing rather
+than widening when it gets passed along. That is a delegation problem, not a
+billing problem, and delegation is the part freeq is actually built around.
 
-freeq treats an instruction as a signed object instead of a message in a room. The
-agent can check who signed it, whether that signer was authorised, and — when the
-work is handed off rather than done immediately — whether the authorisation still
-holds. Some of that is built and running. The part that makes an instruction
-survive time is specified and not yet built, and that gap is most of what this
-post is about.
+## How lending looks on the wire
+
+An operator sets a budget in a channel and names who is funding it. The sponsor
+defaults to whoever issues the command, so lending your own capacity is the
+default case:
+
+```
+BUDGET #research amount=50;unit=usd;period=day;warn=0.8;hard=true
+```
+
+Agents working in that channel report what their work cost, signed, against that
+budget:
+
+```
+@+freeq.at/sig=ed25519:kid:9f2c…:BASE64
+ SPEND #research :amount=0.03;unit=usd;desc=claude-sonnet-4:1.2k-tokens;task=01JQ…
+```
+
+Spend aggregates across the delegation chain rather than resetting at each new
+identity, so an agent that spawns helpers cannot multiply its allowance by
+delegating, and a child inherits its parent's limit rather than falling through to
+the channel default. Both of those took tests to establish, and one of them I got
+wrong in an interesting way (below).
+
+That is the shape of lending: your budget, someone else's work, bounded and
+attributed. The next question is the one that matters, because a budget is only
+meaningful if the jobs charged against it are really the jobs you authorised.
 
 ## Four things that have to be provable
 
@@ -115,6 +136,8 @@ An HTTP inbox cannot do that.
 | Delivery addressed to an identity across servers | Specified, not built |
 | Capability checks gating individual operations | Not built |
 | Metering on the mediated model path | Not built |
+| Consent before naming someone as sponsor | Not built |
+| Debiting a sponsor's actual capacity | Not built |
 | Verification of a *historical* action's signature | Not wired, though the keys are kept |
 
 The last two are worth being blunt about. Capabilities constrain what can be
@@ -124,23 +147,35 @@ the log to verify an action signed last week — the live path verifies against 
 sender's current session key. An offer accepted next Tuesday needs that walk-back,
 and it doesn't exist yet.
 
-## The part where I have to be careful
+## Three things that would have to be true before I'd lend you my capacity
 
-freeq has an early cost-reporting layer: agents report what work cost, channels set
-budgets with warnings and limits, and a sponsor can be named as the identity funding
-the work. It does not mediate model access and it does not settle credits, so it
-cannot honestly claim to enforce shared AI spending. Agents report their own costs
-and are asked to stop when they exceed a limit.
+**Being a sponsor has to be something you agreed to.** It isn't. `sponsor=<did>`
+accepts any identity, and naming somebody other than yourself takes only channel
+op. That DID is never asked. So an operator can stand up a channel, name an
+unrelated person as the one funding it, and have every agent's spend attributed to
+them. Since sponsors now get notified, they'd receive the warnings too. Lending is
+a thing you consent to, and there is no consent step. The fix needs a consent
+record or a capability the sponsor grants, which is a design decision rather than a
+patch, so for now it's a failing test with a reason attached.
 
-There is a sharper version of that admission. The one place freeq *does* put itself
-between a caller and a paid model is its diagnostic interface, where the server
-holds the provider key, callers are authenticated by DID, and nobody is handed the
-credential. That path is mediated and unmetered. The budget system is metered and
-unmediated. The resource freeq controls is the one it does not count.
+**The tokens have to actually come out of the sponsor's capacity.** They don't.
+An agent makes its own model calls with whatever credential it already has, then
+reports what it spent. Nothing debits the sponsor, so the accounting says one thing
+and the money says another. This is the honest limit of the current system: it can
+express and bound a loan of capacity, and it cannot yet make one.
 
-Both halves are the same missing idea, and it is the one this post is actually
-about: knowing which principal authorised an agent to consume a shared resource
-comes before counting what it consumed.
+Which points at where the work goes, and here the seam is almost funny. freeq does
+mediate model access in exactly one place, its diagnostic interface, where the
+server holds the provider key and callers are authenticated by DID so nobody is
+handed the credential. That path is mediated and unmetered. The budget system is
+metered and unmediated. The one paid resource freeq controls is the one it doesn't
+count. A metered proxy sitting on the rails that already exist — DID-authenticated
+callers, a server-held key, per-DID budgets, spend rollup — is what turns "your
+budget authorised this" into "your capacity paid for this."
+
+**Capabilities have to gate something.** They narrow correctly on delegation now,
+but nothing consults one before allowing an operation, so holding a capability is
+not yet the same as being permitted.
 
 ## Why bother with signatures at all
 
@@ -154,10 +189,10 @@ acceptance.
 freeq has the identity and signing rails for that today, and a design for the
 durable part. The gap between those two sentences is the interesting work.
 
-If you are going to let agents draw on capacity you pay for, the thing to hand them
-is bounded, attributable authority, and not your credential. That is a smaller
-claim than "share your tokens safely," and it is the one I can currently back with
-code.
+So: share the tokens, not the API key. freeq can express that loan today, bound it,
+attribute it, roll it up across delegation, and prove who authorised each job in it.
+It cannot yet make the tokens themselves flow, and the thing standing between those
+two is a metered proxy rather than a new protocol.
 
 ---
 
