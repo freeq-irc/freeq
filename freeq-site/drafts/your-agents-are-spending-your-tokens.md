@@ -1,4 +1,4 @@
-# An agent can use my tokens. Can it prove I asked?
+# Your agents are spending your tokens
 
 People are starting to run several agents against AI capacity they already pay for:
 a pool of API credits, an underused subscription, a budget shared across a team.
@@ -7,8 +7,8 @@ credential everyone else uses. That does share the capacity. It also erases who
 authorised each use, and hands every agent the full authority of the account
 holder.
 
-Which turns a billing question into an identity one. You tell an AI agent to do
-something. How does the agent know the instruction came from you?
+Which turns a billing question into an identity one. Something spent your tokens.
+Which agent was it, who told it to, and were they allowed to?
 
 In most setups it doesn't, and doesn't ask. The instruction arrives through an API
 call or a chat webhook, and the agent trusts it because of where it arrived from.
