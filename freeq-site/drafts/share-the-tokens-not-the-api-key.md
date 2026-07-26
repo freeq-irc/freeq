@@ -90,14 +90,56 @@ the sharpest one is a two-line observation:
 > The budget system is metered and unmediated. The model path is mediated and
 > unmetered.
 
-freeq does put itself between a caller and a paid model in exactly one place, its
-diagnostic interface, where the server holds the provider key and callers are
-authenticated by session bearer to DID, so nobody is handed the credential. That path
-records no spend and checks no budget. Meanwhile the budget system counts carefully,
-over numbers agents report about calls freeq never saw. **The one paid resource freeq
-controls is the one it doesn't count.**
+That was the state when I started writing this. freeq put itself between a caller and
+a paid model in exactly one place, its diagnostic interface, where the server holds
+the provider key and callers are authenticated by session bearer to DID, so nobody is
+handed the credential. That path recorded no spend and checked no budget. Meanwhile
+the budget system counted carefully, over numbers agents reported about calls freeq
+never saw. **The one paid resource freeq controlled was the one it didn't count.**
 
-Three more gaps, all of them found by writing tests rather than reading designs:
+Writing that sentence down made it impossible to leave alone, so the two halves are
+now joined.
+
+## The join, now that it exists
+
+`POST /api/v1/model/chat/completions` is an OpenAI-compatible call made *by the
+server*, charged to a channel budget:
+
+```
+Authorization: Bearer <session>
+{ "channel": "#research", "model": "gpt-4o-mini",
+  "messages": [{ "role": "user", "content": "…" }] }
+```
+
+The caller authenticates as a DID and must be in the channel it names. The budget is
+resolved through the delegation chain, spend for the period is totalled, and the
+decision happens *before* dispatch. If the budget is exhausted, the response is `402`
+and **no upstream request is made at all** — which is the difference between a limit
+and a request to stop. The tests assert that by counting hits on a mock provider, so
+"we refused" cannot quietly mean "we asked nicely and it went ahead".
+
+The charge is computed from the provider's own token counts rather than the caller's
+claim, priced per model, and recorded against the budget:
+
+```json
+"freeq": { "charged": 4.0, "unit": "usd", "channel": "#research",
+           "sponsor": "did:plc:…", "spent_after": 4.0 }
+```
+
+Two details that took a test to get right. An unpriced model is not free — it falls
+back to a deliberately expensive default, because "ask for a model nobody priced" is
+the obvious way to get unlimited capacity. And a declared `max_tokens` is billed as
+output in the pre-call estimate, so the last call before a ceiling can't overshoot it
+by an unbounded amount. Without a declared maximum, the limit is enforced at call
+granularity and can be passed by one call's cost, which is the honest bound and is
+what the test pins.
+
+The credential never leaves the server. So withdrawing capacity means editing a
+budget, not rotating a key and breaking everything else that used it.
+
+## What is still missing
+
+Three gaps, all found by writing tests rather than reading designs:
 
 **Being a sponsor requires no consent.** `sponsor=<did>` accepts any identity, and
 naming someone other than yourself takes only channel op. That DID is never asked. An
@@ -146,24 +188,34 @@ sponsored task into a durable obligation.
 | Capability narrowing on delegation | Working, as of this week |
 | Operator grant / withdrawal of capabilities | Working |
 | `act` signing primitives | In the SDK, 14 tests |
+| Metered model path, credential held server-side | Working |
+| Budget refuses before any upstream call | Working, verified by hit count |
+| Cost from the provider's token counts | Working |
 | Consent before naming someone as sponsor | Not built |
-| Metering on the mediated model path | Not built |
-| Debiting a sponsor's real capacity | Not built |
+| Lending a *lender's own* capacity, not the operator's | Not built |
 | Capability checks gating operations | Not built |
 | `act` lifecycle and identity-addressed delivery | Specified, not built |
 | Verifying a historical action's signature | Not wired, though keys are kept |
 
-## The last mile
+## The last mile, and whose pool it is
 
-So: share the tokens, not the API key. freeq can already represent a sponsor,
-authenticate the participants, sign the messages around the work, account for
-reported spend, and keep that accounting from resetting when an agent delegates to
-children. It cannot yet turn that representation into a real loan of capacity.
+So: share the tokens, not the API key. That now works in the literal sense. A caller
+gets model output without ever holding a credential, the budget decides before any
+money moves, the charge comes from the provider's counts rather than an honour-system
+report, and the whole thing is attributed to an identity and a sponsor.
 
-The missing pieces are concrete: sponsor consent, operation-level capability checks,
-and a metered model path that holds the provider credential and debits the authorised
-budget. Nothing here needs another identity system. It needs the last mile where
-authority becomes spend.
+With one honest qualification, which is the next piece of work rather than a caveat to
+bury: the pool being shared is the *server operator's*. There is one provider
+credential, held by the server. So what exists is bounded, attributable, revocable
+access to the operator's capacity — real delegation, but not yet me lending you my own
+subscription. For that, a lender registers their own credential and calls charged to
+their budget go out under it, which turns "your budget authorised this" into "your
+capacity paid for this".
+
+That plus sponsor consent, since being named as a funder should require agreeing to it,
+and operation-level capability checks, since narrowing what can be delegated is not the
+same as gating what can be done. Three concrete things. None of them needs another
+identity system.
 
 ---
 
