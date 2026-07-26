@@ -3189,3 +3189,118 @@ async fn budget_sponsor_is_notified_when_the_threshold_is_crossed() {
     sponsor.quit(None).await.ok();
     server_handle.abort();
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// Known gaps, kept executable
+// ══════════════════════════════════════════════════════════════════════
+//
+// These encode behaviour the design documents specify and the code does not
+// implement. They are #[ignore]d so they don't fail the suite, but they run on
+// demand and will pass the day the feature lands:
+//
+//     cargo test -p freeq-server --test agent_native -- --ignored
+//
+// Prose in a design doc drifts silently. A test that is ignored for a stated
+// reason does not.
+
+/// PHASE-4 step 5: "Grants narrowed capabilities (intersection of parent's caps
+/// and requested caps)."
+///
+/// The spawn handler stores the requested list verbatim. There is no lookup of
+/// the parent's own capabilities and no intersection, so a child can be recorded
+/// with any capability its parent names — including ones the parent does not hold.
+#[tokio::test]
+#[ignore = "unimplemented: spawn does not intersect capabilities with the parent's"]
+async fn spawned_capabilities_are_narrowed_to_the_parents() {
+    start_deadlock_detector();
+    let (addr, server_handle) = start_test_server_with_db(empty_resolver(), true).await;
+
+    let (_did, parent, mut parent_ev) = connect_did_key(addr, "capparent").await;
+    parent.register_agent("agent").await.unwrap();
+    expect_raw_line(&mut parent_ev, 2000, "registered as agent", "AGENT REGISTER").await;
+    parent.join("#capnarrow").await.unwrap();
+    expect_event(
+        &mut parent_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "parent joined",
+    )
+    .await;
+
+    // The parent holds no capabilities at all, and asks for a privileged one.
+    parent
+        .spawn_agent("#capnarrow", "overreach", &["deploy", "admin"], None, None)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // WHOIS is where the child's recorded capabilities surface.
+    parent.raw("WHOIS overreach").await.unwrap();
+    let line = expect_raw_line(
+        &mut parent_ev,
+        2000,
+        "capabilities=",
+        "child's capabilities in WHOIS",
+    )
+    .await;
+    assert!(
+        !line.contains("admin") && !line.contains("deploy"),
+        "child was granted capabilities its parent never held: {line}"
+    );
+
+    parent.quit(None).await.ok();
+    server_handle.abort();
+}
+
+/// A recorded capability should gate something. Nothing reads
+/// `agent_capability_grants` to decide whether an action is allowed — the rows
+/// are only rendered in WHOIS and the REST endpoints — and nothing writes to it
+/// either, since `grant_capability()` has no callers.
+#[tokio::test]
+#[ignore = "unimplemented: capabilities are recorded for display, never enforced"]
+async fn a_capability_grant_is_actually_enforced() {
+    start_deadlock_detector();
+    let (addr, server_handle) = start_test_server_with_db(empty_resolver(), true).await;
+
+    let (_did, op, mut op_ev) = connect_did_key(addr, "capop").await;
+    op.join("#capenforce").await.unwrap();
+    expect_event(
+        &mut op_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "op joined",
+    )
+    .await;
+
+    // An agent with no granted capabilities attempts a capability-gated action.
+    let (_bot_did, bot, mut bot_ev) = connect_did_key(addr, "capbot").await;
+    bot.register_agent("agent").await.unwrap();
+    expect_raw_line(&mut bot_ev, 2000, "registered as agent", "AGENT REGISTER").await;
+    bot.join("#capenforce").await.unwrap();
+    expect_event(
+        &mut bot_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "bot joined",
+    )
+    .await;
+
+    // Spawning is itself listed as a capability in the design (step 1: "check the
+    // parent holds spawn_agent"). With no grant, it should be refused.
+    bot.spawn_agent("#capenforce", "unauthorised", &[], None, None)
+        .await
+        .unwrap();
+    // Match the spawn outcome specifically, not any line mentioning the channel.
+    let reply = expect_raw_line(
+        &mut bot_ev,
+        2000,
+        "Spawned agent",
+        "server response to an ungranted spawn",
+    )
+    .await;
+    panic!("ungranted spawn succeeded instead of being refused: {reply}");
+
+    op.quit(None).await.ok();
+    bot.quit(None).await.ok();
+    server_handle.abort();
+}
