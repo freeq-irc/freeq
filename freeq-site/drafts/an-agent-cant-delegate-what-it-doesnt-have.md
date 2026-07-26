@@ -1,8 +1,8 @@
-# Giving agents keys was the easy part
+# An agent can't delegate what it doesn't have. Mine could.
 
-Several systems now give software agents their own cryptographic identities, and
-freeq is one of them. That solves attribution: you can tell which agent produced
-an action, and prove a human authorised the key.
+Giving agents cryptographic identity was the easy part. Several systems do it now,
+freeq among them, and it solves attribution: you can tell which agent produced an
+action, and prove a human authorised its key.
 
 It does not solve what happens next. Once agents have identities they start
 delegating to each other, spawning helpers, and consuming resources that somebody
@@ -133,7 +133,9 @@ Each showed up when I asked a question that spanned both: can this agent confer
 that, does this limit still hold one hop further out, does the person paying know.
 
 Agent identity is becoming table stakes. The interesting problems start one level
-up, and they are mostly seams.
+up, and they are mostly seams. "You can't delegate what you don't have" is the
+kind of rule that sounds too obvious to test, which is exactly why my server
+happily broke it.
 
 ---
 
