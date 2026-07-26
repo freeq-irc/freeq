@@ -1,5 +1,7 @@
 # Share the tokens, not the API key
 
+*2026-07-26*
+
 Block's [Buzz](https://github.com/block/buzz) made the multi-agent workspace legible
 this month: humans and agents in the same room, every message and workflow step a
 signed event in one log, and agents holding their own keys rather than borrowing a
