@@ -20,6 +20,16 @@ async fn main() -> Result<()> {
     }
 
     let mut config = freeq_server::config::ServerConfig::parse();
+
+    // Fold --model-price flags into the price table the metered proxy charges from.
+    if !config.model_price_args.is_empty() {
+        config.model_prices = freeq_server::model_proxy::parse_price_args(&config.model_price_args);
+        tracing::info!(
+            models = config.model_prices.len(),
+            "Model prices configured for the metered proxy"
+        );
+    }
+
     tracing::info!("Starting IRC server on {}", config.listen_addr);
     if config.tls_enabled() {
         tracing::info!("TLS enabled on {}", config.tls_listen_addr);

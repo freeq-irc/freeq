@@ -33,6 +33,7 @@ let package = Package(
                 "ChannelCrypto.swift",
                 "ChannelE2eeState.swift",
                 "ChannelAccessNotice.swift",
+                "SelfPartResolve.swift",
                 "ChannelState.swift",
                 "DidDisplay.swift",
                 "MessageActions.swift",

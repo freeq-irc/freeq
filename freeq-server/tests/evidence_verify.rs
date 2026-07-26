@@ -62,7 +62,8 @@ fn run_verify(bundle: &serde_json::Value) -> std::process::Output {
     use std::io::Write;
     // Unique per call — tests run in parallel and must not share a path.
     let mut f = tempfile::NamedTempFile::new().unwrap();
-    f.write_all(serde_json::to_string(bundle).unwrap().as_bytes()).unwrap();
+    f.write_all(serde_json::to_string(bundle).unwrap().as_bytes())
+        .unwrap();
     f.flush().unwrap();
     Command::new(env!("CARGO_BIN_EXE_freeq-verify"))
         .arg("--verbose")
@@ -75,7 +76,14 @@ fn run_verify(bundle: &serde_json::Value) -> std::process::Output {
 fn valid_bundle_verifies() {
     let server = SigningKey::generate(&mut rand::rngs::OsRng);
     let client = SigningKey::generate(&mut rand::rngs::OsRng);
-    let bundle = build_bundle(&server, &client, "did:plc:alice", "#freeq", "hello world", 1_700_000_000);
+    let bundle = build_bundle(
+        &server,
+        &client,
+        "did:plc:alice",
+        "#freeq",
+        "hello world",
+        1_700_000_000,
+    );
 
     let out = run_verify(&bundle);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -88,7 +96,14 @@ fn valid_bundle_verifies() {
 fn tampered_message_fails() {
     let server = SigningKey::generate(&mut rand::rngs::OsRng);
     let client = SigningKey::generate(&mut rand::rngs::OsRng);
-    let mut bundle = build_bundle(&server, &client, "did:plc:alice", "#freeq", "hello world", 1_700_000_000);
+    let mut bundle = build_bundle(
+        &server,
+        &client,
+        "did:plc:alice",
+        "#freeq",
+        "hello world",
+        1_700_000_000,
+    );
 
     // Alter the message text AFTER signing — the message signature no longer
     // matches, and (because message_count/messages changed) so does the bundle
@@ -98,14 +113,24 @@ fn tampered_message_fails() {
     let out = run_verify(&bundle);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(!out.status.success(), "expected failure, got: {stdout}");
-    assert!(stdout.contains("TAMPERED") || stdout.contains("INVALID"), "got: {stdout}");
+    assert!(
+        stdout.contains("TAMPERED") || stdout.contains("INVALID"),
+        "got: {stdout}"
+    );
 }
 
 #[test]
 fn tampered_bundle_signature_fails() {
     let server = SigningKey::generate(&mut rand::rngs::OsRng);
     let client = SigningKey::generate(&mut rand::rngs::OsRng);
-    let mut bundle = build_bundle(&server, &client, "did:plc:alice", "#freeq", "hi", 1_700_000_000);
+    let mut bundle = build_bundle(
+        &server,
+        &client,
+        "did:plc:alice",
+        "#freeq",
+        "hi",
+        1_700_000_000,
+    );
 
     // Corrupt the bundle signature only — messages still individually verify,
     // but the bundle-integrity check must fail.

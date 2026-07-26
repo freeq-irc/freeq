@@ -77,7 +77,8 @@ pub struct SfuState {
     /// class-C asymmetry (see docs/AV-SESSION-AUDIT.md F6). Cooperative
     /// attribution (self-declared) — malicious clients are the token flag's
     /// concern, not this registry's.
-    pub media_conns: parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
+    pub media_conns:
+        parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
 }
 
 #[cfg(feature = "av-native")]

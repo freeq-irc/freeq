@@ -246,6 +246,15 @@ class AppState {
     // MARK: - Names accumulator (353 lines come in multiple events)
     var pendingNames: [String: [MemberInfo]] = [:]
 
+    /// Channels this client asked to leave, and when.
+    ///
+    /// A PART echo identifies the leaver by nick, which every device signed in as
+    /// this identity shares. Intent is therefore the only way to tell our own PART
+    /// from a sibling device's, and without it another device leaving a channel
+    /// would remove that channel here and unsubscribe it durably.
+    /// See `SelfPartResolve`.
+    var pendingPartRequests: [String: Date] = [:]
+
     // MARK: - Profile cache
     var profileCache = ProfileCache.shared
 
@@ -786,6 +795,10 @@ class AppState {
 
     func partChannel(_ channel: String) {
         do {
+            // Record the intent before sending. The echoed PART carries only a
+            // nick, which every device of this identity shares, so intent is the
+            // only way to tell our own PART from another device's.
+            pendingPartRequests[channel.lowercased()] = Date()
             try client?.part(channel: channel)
             channels.removeAll { $0.name.lowercased() == channel.lowercased() }
             autoJoinChannels.removeAll { $0.lowercased() == channel.lowercased() }
@@ -806,6 +819,7 @@ class AppState {
         guard !targets.isEmpty else { return }
         for name in names {
             do {
+                pendingPartRequests[name.lowercased()] = Date()
                 try client?.part(channel: name)
             } catch {
                 errorMessage = "Part failed for \(name): \(error.localizedDescription)"
@@ -1547,6 +1561,9 @@ extension AppState {
                 ch.accessDeniedReason = nil
                 ch.messages.removeAll { $0.id.hasPrefix("channel-access-denied-\(channel)-") }
                 pendingNames[channel.lowercased()] = []
+                // Rejoining spends any earlier intent to leave, so a later foreign
+                // PART cannot be matched against it.
+                pendingPartRequests.removeValue(forKey: channel.lowercased())
                 if activeChannel == nil || activeChannel == "server" {
                     activeChannel = ch.name
                 }
@@ -1593,19 +1610,38 @@ extension AppState {
             }
 
         case .parted(let channel, let partNick):
-            if partNick.lowercased() == nick.lowercased() {
+            // A PART names a nick, and all of this identity's devices share it, so
+            // "the nick is mine" does not mean "I left". Deciding it does was how a
+            // browser tab or a FreeqWorld session could delete a channel from the
+            // Mac — and, because the removal was written to the auto-join list,
+            // delete it permanently.
+            switch SelfPartResolve.decide(
+                channel: channel,
+                partNick: partNick,
+                myNick: nick,
+                pendingRequests: pendingPartRequests
+            ) {
+            case .leaveChannel:
+                pendingPartRequests.removeValue(forKey: channel.lowercased())
                 channels.removeAll { $0.name.lowercased() == channel.lowercased() }
                 autoJoinChannels.removeAll { $0.lowercased() == channel.lowercased() }
                 UserDefaults.standard.set(autoJoinChannels, forKey: "freeq.channels")
                 if activeChannel?.lowercased() == channel.lowercased() {
                     activeChannel = channels.first?.name
                 }
-            } else {
+
+            case .ignoreOtherDevice:
+                Log.roster.notice("""
+                    PART for my nick in \(channel, privacy: .public) that I did not \
+                    request — another device left; keeping the channel
+                    """)
+
+            case .removeMember(let who):
                 if let ch = channels.first(where: { $0.name.lowercased() == channel.lowercased() }) {
-                    ch.members.removeAll { $0.nick.lowercased() == partNick.lowercased() }
+                    ch.members.removeAll { $0.nick.lowercased() == who.lowercased() }
                     ch.appendIfNew(ChatMessage(
                         id: UUID().uuidString, from: "",
-                        text: "\(partNick) left",
+                        text: "\(who) left",
                         isAction: false, timestamp: Date(), replyTo: nil
                     ))
                 }

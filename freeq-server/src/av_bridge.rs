@@ -42,8 +42,16 @@ pub fn start_bridge(
     let bridged_set = bridged_broadcasts.clone();
     let jwt2 = jwt.clone();
     let moq_to_room = tokio::spawn(async move {
-        if let Err(e) =
-            run_moq_to_room(&sid, &cluster2, &auth2, jwt2, &room2, &mut rx1, &bridged_set).await
+        if let Err(e) = run_moq_to_room(
+            &sid,
+            &cluster2,
+            &auth2,
+            jwt2,
+            &room2,
+            &mut rx1,
+            &bridged_set,
+        )
+        .await
         {
             tracing::warn!(session = %sid, error = %e, "MoQ→Room bridge ended");
         }
@@ -54,9 +62,16 @@ pub fn start_bridge(
     let mut rx2 = shutdown.1.clone();
     let bridged_set2 = bridged_broadcasts;
     let room_to_moq = tokio::spawn(async move {
-        if let Err(e) =
-            run_room_to_moq(&sid2, &cluster, &auth, jwt, room_events, &mut rx2, &bridged_set2)
-                .await
+        if let Err(e) = run_room_to_moq(
+            &sid2,
+            &cluster,
+            &auth,
+            jwt,
+            room_events,
+            &mut rx2,
+            &bridged_set2,
+        )
+        .await
         {
             tracing::warn!(session = %sid2, error = %e, "Room→MoQ bridge ended");
         }

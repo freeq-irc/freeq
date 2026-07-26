@@ -395,7 +395,10 @@ pub(super) fn attach_same_did(
                     continue;
                 };
                 let nick_lower = member_nick.to_lowercase();
-                match grouped.iter_mut().find(|(k, _)| k.to_lowercase() == nick_lower) {
+                match grouped
+                    .iter_mut()
+                    .find(|(k, _)| k.to_lowercase() == nick_lower)
+                {
                     Some((_, sids)) => sids.push(member_sid.clone()),
                     None => {
                         seen_nicks.insert(nick_lower);

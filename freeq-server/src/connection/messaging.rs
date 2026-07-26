@@ -1962,7 +1962,11 @@ pub(super) fn dm_canonical_key(
     let recipient_did = if target.starts_with("did:") {
         target.to_string()
     } else {
-        state.nick_owners.lock().get(&target.to_lowercase()).cloned()?
+        state
+            .nick_owners
+            .lock()
+            .get(&target.to_lowercase())
+            .cloned()?
     };
     Some(crate::db::canonical_dm_key(sender_did, &recipient_did))
 }
@@ -2023,10 +2027,7 @@ fn find_original_message(
         // "not found" so no cross-target mutation happens. `Some(None)` keeps
         // the "DB present, no row" contract the callers already handle.
         Some(Some(row))
-            if !dm_fallback_row_is_addressable(
-                &row.channel,
-                conn.authenticated_did.as_deref(),
-            ) =>
+            if !dm_fallback_row_is_addressable(&row.channel, conn.authenticated_did.as_deref()) =>
         {
             Some(None)
         }
@@ -3638,7 +3639,10 @@ mod av_state_tag_tests {
             tags.get("+freeq.at/av-actor").map(String::as_str),
             Some("chadfowler.com")
         );
-        assert_eq!(tags.get("+freeq.at/av-state").map(String::as_str), Some("left"));
+        assert_eq!(
+            tags.get("+freeq.at/av-state").map(String::as_str),
+            Some("left")
+        );
     }
 
     #[test]
@@ -3667,8 +3671,14 @@ mod av_state_tag_tests {
     #[test]
     fn instance_does_not_leak_into_unrelated_tags() {
         let tags = av_state_tag_map("started", "s", "nick", "inst9", 1, "standup");
-        assert_eq!(tags.get("+freeq.at/av-title").map(String::as_str), Some("standup"));
-        assert_eq!(tags.get("+freeq.at/av-participants").map(String::as_str), Some("1"));
+        assert_eq!(
+            tags.get("+freeq.at/av-title").map(String::as_str),
+            Some("standup")
+        );
+        assert_eq!(
+            tags.get("+freeq.at/av-participants").map(String::as_str),
+            Some("1")
+        );
     }
 }
 

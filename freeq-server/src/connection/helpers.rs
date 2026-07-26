@@ -327,8 +327,9 @@ mod folded_membership_tests {
     fn did_authority_counts_even_with_no_session_flag() {
         // Persistent ops survive reconnects via did_ops; permission checks
         // already honour this, so the member list must too.
-        let dids: HashMap<String, String> =
-            [("s1".to_string(), "did:plc:bob".to_string())].into_iter().collect();
+        let dids: HashMap<String, String> = [("s1".to_string(), "did:plc:bob".to_string())]
+            .into_iter()
+            .collect();
         let (op, _) = folded_membership(
             &["s1".into()],
             &HashSet::new(),
@@ -342,8 +343,9 @@ mod folded_membership_tests {
 
     #[test]
     fn founder_is_always_an_op() {
-        let dids: HashMap<String, String> =
-            [("s1".to_string(), "did:plc:alice".to_string())].into_iter().collect();
+        let dids: HashMap<String, String> = [("s1".to_string(), "did:plc:alice".to_string())]
+            .into_iter()
+            .collect();
         let (op, _) = folded_membership(
             &["s1".into()],
             &HashSet::new(),

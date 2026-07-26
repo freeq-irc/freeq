@@ -57,7 +57,11 @@ impl C {
         let s = TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).ok();
         let w = s.try_clone().unwrap();
-        let mut c = Self { reader: BufReader::new(s), writer: w, seen: Vec::new() };
+        let mut c = Self {
+            reader: BufReader::new(s),
+            writer: w,
+            seen: Vec::new(),
+        };
         c.tx("CAP LS 302");
         c.tx(&format!("NICK {nick}"));
         c.tx(&format!("USER {nick} 0 * :test"));
@@ -80,7 +84,11 @@ impl C {
         let s = TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).ok();
         let w = s.try_clone().unwrap();
-        let mut c = Self { reader: BufReader::new(s), writer: w, seen: Vec::new() };
+        let mut c = Self {
+            reader: BufReader::new(s),
+            writer: w,
+            seen: Vec::new(),
+        };
         c.tx("CAP LS 302");
         c.tx(&format!("NICK {nick}"));
         c.tx(&format!("USER {nick} 0 * :test"));
@@ -90,7 +98,9 @@ impl C {
         let ch = c.rx(|l| l.starts_with("AUTHENTICATE "), "challenge");
         let bytes =
             auth::decode_challenge_bytes(ch.strip_prefix("AUTHENTICATE ").unwrap()).unwrap();
-        let resp = KeySigner::new(did.to_string(), key).respond(&bytes).unwrap();
+        let resp = KeySigner::new(did.to_string(), key)
+            .respond(&bytes)
+            .unwrap();
         c.tx(&format!("AUTHENTICATE {}", auth::encode_response(&resp)));
         c.rx(|l| l.split_whitespace().nth(1) == Some("903"), "903");
         c.tx("CAP END");
@@ -140,7 +150,9 @@ impl C {
     }
 
     fn drain(&mut self, ms: u64) {
-        self.writer.set_read_timeout(Some(Duration::from_millis(ms))).ok();
+        self.writer
+            .set_read_timeout(Some(Duration::from_millis(ms)))
+            .ok();
         let mut b = String::new();
         loop {
             b.clear();
@@ -148,7 +160,11 @@ impl C {
                 Ok(0) => break,
                 Ok(_) => {
                     if b.starts_with("PING") {
-                        let t = b.trim_end().strip_prefix("PING ").unwrap_or(":x").to_string();
+                        let t = b
+                            .trim_end()
+                            .strip_prefix("PING ")
+                            .unwrap_or(":x")
+                            .to_string();
                         let _ = writeln!(self.writer, "PONG {t}\r");
                         let _ = self.writer.flush();
                     }
@@ -156,7 +172,9 @@ impl C {
                 Err(_) => break,
             }
         }
-        self.writer.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        self.writer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .ok();
     }
 }
 
@@ -167,20 +185,32 @@ async fn auto_op_mode_arrives_after_the_join() {
         // Alice creates the channel, so she is founder + op.
         let (mut alice, _alice_did) = C::sasl(addr, "alice");
         alice.tx("JOIN #ops");
-        alice.rx(|l| l.split_whitespace().nth(1) == Some("366"), "alice names end");
+        alice.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "alice names end",
+        );
 
         // Bob joins and is granted ops by Alice, which persists his DID in did_ops.
         let (mut bob, _bob_did) = C::sasl(addr, "bob");
         bob.tx("JOIN #ops");
-        bob.rx(|l| l.split_whitespace().nth(1) == Some("366"), "bob names end");
+        bob.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "bob names end",
+        );
         alice.tx("MODE #ops +o bob");
-        bob.rx(|l| l.contains("MODE") && l.contains("+o") && l.contains("bob"), "bob opped");
+        bob.rx(
+            |l| l.contains("MODE") && l.contains("+o") && l.contains("bob"),
+            "bob opped",
+        );
         alice.drain(300);
 
         // Bob leaves and rejoins. Now the auto-op path fires: his DID is in
         // did_ops, so the server re-ops him as part of the join.
         bob.tx("PART #ops");
-        alice.rx(|l| l.contains("PART") && l.contains("bob"), "alice sees part");
+        alice.rx(
+            |l| l.contains("PART") && l.contains("bob"),
+            "alice sees part",
+        );
         alice.drain(300);
         bob.tx("JOIN #ops");
 
@@ -239,7 +269,9 @@ async fn creator_sees_their_own_op_after_their_own_join() {
             |l| l.split_whitespace().nth(1) == Some("366"),
             "alice's own join completes",
         );
-        let join_at = lines.iter().position(|l| l.contains("JOIN") && l.contains("alice"));
+        let join_at = lines
+            .iter()
+            .position(|l| l.contains("JOIN") && l.contains("alice"));
         let mode_at = lines
             .iter()
             .position(|l| l.contains("MODE") && l.contains("+o") && l.contains("alice"));
@@ -269,7 +301,10 @@ async fn rejoining_op_is_told_about_their_own_op() {
     tokio::task::spawn_blocking(move || {
         let (mut alice, _) = C::sasl(addr, "alice");
         alice.tx("JOIN #selfop");
-        alice.rx(|l| l.split_whitespace().nth(1) == Some("366"), "alice joined");
+        alice.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "alice joined",
+        );
 
         let (mut bob, _) = C::sasl(addr, "bob");
         bob.tx("JOIN #selfop");
@@ -285,7 +320,9 @@ async fn rejoining_op_is_told_about_their_own_op() {
             "bob's rejoin completes",
         );
         assert!(
-            lines.iter().any(|l| l.contains("MODE") && l.contains("+o") && l.contains("bob")),
+            lines
+                .iter()
+                .any(|l| l.contains("MODE") && l.contains("+o") && l.contains("bob")),
             "bob was re-opped server-side but his own client was never told:\n  {}",
             lines.join("\n  ")
         );
@@ -305,11 +342,12 @@ async fn joiner_sees_its_own_join_before_names() {
     tokio::task::spawn_blocking(move || {
         let (mut alice, _) = C::sasl(addr, "alice");
         alice.tx("JOIN #order");
-        let lines = alice.collect_until(
-            |l| l.split_whitespace().nth(1) == Some("366"),
-            "names end",
-        );
-        let join_at = lines.iter().position(|l| l.contains("JOIN")).expect("self JOIN");
+        let lines =
+            alice.collect_until(|l| l.split_whitespace().nth(1) == Some("366"), "names end");
+        let join_at = lines
+            .iter()
+            .position(|l| l.contains("JOIN"))
+            .expect("self JOIN");
         let names_at = lines
             .iter()
             .position(|l| l.split_whitespace().nth(1) == Some("353"))
@@ -334,12 +372,18 @@ async fn auto_op_mode_does_not_leak_to_non_members() {
     tokio::task::spawn_blocking(move || {
         let (mut alice, _) = C::sasl(addr, "alice");
         alice.tx("JOIN #private-room");
-        alice.rx(|l| l.split_whitespace().nth(1) == Some("366"), "alice joined");
+        alice.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "alice joined",
+        );
 
         // Carol is elsewhere and must hear nothing about #private-room.
         let (mut carol, _) = C::sasl(addr, "carol");
         carol.tx("JOIN #somewhere-else");
-        carol.rx(|l| l.split_whitespace().nth(1) == Some("366"), "carol joined");
+        carol.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "carol joined",
+        );
         carol.drain(200);
 
         let (mut bob, _) = C::sasl(addr, "bob");
@@ -350,10 +394,16 @@ async fn auto_op_mode_does_not_leak_to_non_members() {
         bob.tx("PART #private-room");
         bob.drain(200);
         bob.tx("JOIN #private-room");
-        alice.rx(|l| l.contains("MODE") && l.contains("+o") && l.contains("bob"), "alice sees it");
+        alice.rx(
+            |l| l.contains("MODE") && l.contains("+o") && l.contains("bob"),
+            "alice sees it",
+        );
 
         // Carol should have received nothing mentioning the other channel.
-        carol.writer.set_read_timeout(Some(std::time::Duration::from_millis(600))).ok();
+        carol
+            .writer
+            .set_read_timeout(Some(std::time::Duration::from_millis(600)))
+            .ok();
         let mut leaked = String::new();
         let mut buf = String::new();
         loop {
@@ -394,7 +444,10 @@ async fn opping_a_multi_device_user_ops_all_their_devices() {
         // Alice creates the channel: founder + op.
         let (mut alice, _) = C::sasl(addr, "alice");
         alice.tx("JOIN #multi");
-        alice.rx(|l| l.split_whitespace().nth(1) == Some("366"), "alice joined");
+        alice.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "alice joined",
+        );
 
         // Bob signs in on two devices BEFORE being opped, sharing one DID.
         // PrivateKey isn't Clone; round-trip the secret so both devices use the
@@ -404,18 +457,28 @@ async fn opping_a_multi_device_user_ops_all_their_devices() {
         let secret = key.secret_bytes();
         let mut bob_a = C::sasl_with(addr, "bob", &did, key);
         bob_a.tx("JOIN #multi");
-        bob_a.rx(|l| l.split_whitespace().nth(1) == Some("366"), "bob device A joined");
+        bob_a.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "bob device A joined",
+        );
         // Device B is auto-attached to the DID's channels at registration (the
         // server synthesises the JOIN), so there is no second 366 to wait for.
-        let mut bob_b =
-            C::sasl_with(addr, "bob", &did, PrivateKey::ed25519_from_bytes(&secret).unwrap());
+        let mut bob_b = C::sasl_with(
+            addr,
+            "bob",
+            &did,
+            PrivateKey::ed25519_from_bytes(&secret).unwrap(),
+        );
         bob_b.drain(500);
         bob_a.drain(200);
         bob_b.drain(200);
 
         // Alice ops bob (the person).
         alice.tx("MODE #multi +o bob");
-        alice.rx(|l| l.contains("MODE") && l.contains("+o") && l.contains("bob"), "bob opped");
+        alice.rx(
+            |l| l.contains("MODE") && l.contains("+o") && l.contains("bob"),
+            "bob opped",
+        );
         bob_a.drain(300);
         bob_b.drain(300);
 
@@ -458,7 +521,10 @@ async fn names_shows_op_for_a_multi_device_user() {
     tokio::task::spawn_blocking(move || {
         let (mut alice, _) = C::sasl(addr, "alice");
         alice.tx("JOIN #namesmulti");
-        alice.rx(|l| l.split_whitespace().nth(1) == Some("366"), "alice joined");
+        alice.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "alice joined",
+        );
 
         // Four devices for bob; at most one session will carry the mode.
         let key = PrivateKey::generate_ed25519();
@@ -470,7 +536,9 @@ async fn names_shows_op_for_a_multi_device_user() {
         let mut extra: Vec<C> = (0..3)
             .map(|_| {
                 let mut c = C::sasl_with(
-                    addr, "bob", &did,
+                    addr,
+                    "bob",
+                    &did,
                     PrivateKey::ed25519_from_bytes(&secret).unwrap(),
                 );
                 c.drain(300);
@@ -511,7 +579,10 @@ async fn deop_clears_the_prefix_for_a_multi_device_user() {
     tokio::task::spawn_blocking(move || {
         let (mut alice, _) = C::sasl(addr, "alice");
         alice.tx("JOIN #deopmulti");
-        alice.rx(|l| l.split_whitespace().nth(1) == Some("366"), "alice joined");
+        alice.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "alice joined",
+        );
 
         let key = PrivateKey::generate_ed25519();
         let did = format!("did:key:{}", key.public_key_multibase());
@@ -522,7 +593,9 @@ async fn deop_clears_the_prefix_for_a_multi_device_user() {
         let mut extra: Vec<C> = (0..3)
             .map(|_| {
                 let mut c = C::sasl_with(
-                    addr, "bob", &did,
+                    addr,
+                    "bob",
+                    &did,
                     PrivateKey::ed25519_from_bytes(&secret).unwrap(),
                 );
                 c.drain(300);
@@ -570,7 +643,10 @@ async fn who_lists_a_multi_device_user_once() {
     tokio::task::spawn_blocking(move || {
         let (mut alice, _) = C::sasl(addr, "alice");
         alice.tx("JOIN #whodup");
-        alice.rx(|l| l.split_whitespace().nth(1) == Some("366"), "alice joined");
+        alice.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "alice joined",
+        );
 
         let key = PrivateKey::generate_ed25519();
         let did = format!("did:key:{}", key.public_key_multibase());
@@ -578,16 +654,18 @@ async fn who_lists_a_multi_device_user_once() {
         let mut bob = C::sasl_with(addr, "bob", &did, key);
         bob.tx("JOIN #whodup");
         bob.rx(|l| l.split_whitespace().nth(1) == Some("366"), "bob joined");
-        let mut bob2 =
-            C::sasl_with(addr, "bob", &did, PrivateKey::ed25519_from_bytes(&secret).unwrap());
+        let mut bob2 = C::sasl_with(
+            addr,
+            "bob",
+            &did,
+            PrivateKey::ed25519_from_bytes(&secret).unwrap(),
+        );
         bob2.drain(400);
         alice.drain(300);
 
         alice.tx("WHO #whodup");
-        let lines = alice.collect_until(
-            |l| l.split_whitespace().nth(1) == Some("315"),
-            "end of WHO",
-        );
+        let lines =
+            alice.collect_until(|l| l.split_whitespace().nth(1) == Some("315"), "end of WHO");
         let bob_rows: Vec<&String> = lines
             .iter()
             .filter(|l| l.split_whitespace().nth(1) == Some("352") && l.contains(" bob "))
@@ -597,7 +675,11 @@ async fn who_lists_a_multi_device_user_once() {
             1,
             "bob is one person on two devices but WHO returned {} rows for him:\n  {}",
             bob_rows.len(),
-            bob_rows.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n  ")
+            bob_rows
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("\n  ")
         );
 
         alice.tx("QUIT");
@@ -616,7 +698,10 @@ async fn who_shows_op_flag_for_a_multi_device_op() {
     tokio::task::spawn_blocking(move || {
         let (mut alice, _) = C::sasl(addr, "alice");
         alice.tx("JOIN #whoop");
-        alice.rx(|l| l.split_whitespace().nth(1) == Some("366"), "alice joined");
+        alice.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "alice joined",
+        );
 
         let key = PrivateKey::generate_ed25519();
         let did = format!("did:key:{}", key.public_key_multibase());
@@ -627,7 +712,9 @@ async fn who_shows_op_flag_for_a_multi_device_op() {
         let mut extra: Vec<C> = (0..3)
             .map(|_| {
                 let mut c = C::sasl_with(
-                    addr, "bob", &did,
+                    addr,
+                    "bob",
+                    &did,
                     PrivateKey::ed25519_from_bytes(&secret).unwrap(),
                 );
                 c.drain(300);
@@ -640,10 +727,8 @@ async fn who_shows_op_flag_for_a_multi_device_op() {
         alice.drain(300);
 
         alice.tx("WHO #whoop");
-        let lines = alice.collect_until(
-            |l| l.split_whitespace().nth(1) == Some("315"),
-            "end of WHO",
-        );
+        let lines =
+            alice.collect_until(|l| l.split_whitespace().nth(1) == Some("315"), "end of WHO");
         let bob_row = lines
             .iter()
             .find(|l| l.split_whitespace().nth(1) == Some("352") && l.contains(" bob "))
@@ -673,7 +758,10 @@ async fn whois_lists_channels_for_a_local_user() {
     tokio::task::spawn_blocking(move || {
         let (mut alice, _) = C::sasl(addr, "alice");
         alice.tx("JOIN #whoischan");
-        alice.rx(|l| l.split_whitespace().nth(1) == Some("366"), "alice joined");
+        alice.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "alice joined",
+        );
 
         let (mut bob, _) = C::sasl(addr, "bob");
         bob.tx("JOIN #whoischan");
@@ -722,16 +810,26 @@ async fn whois_lists_channels_for_a_local_user() {
 fn multi_device_op(addr: SocketAddr, channel: &str) -> (C, C, C) {
     let (mut alice, _) = C::sasl(addr, "alice");
     alice.tx(&format!("JOIN {channel}"));
-    alice.rx(|l| l.split_whitespace().nth(1) == Some("366"), "alice joined");
+    alice.rx(
+        |l| l.split_whitespace().nth(1) == Some("366"),
+        "alice joined",
+    );
 
     let key = PrivateKey::generate_ed25519();
     let did = format!("did:key:{}", key.public_key_multibase());
     let secret = key.secret_bytes();
     let mut bob_a = C::sasl_with(addr, "bob", &did, key);
     bob_a.tx(&format!("JOIN {channel}"));
-    bob_a.rx(|l| l.split_whitespace().nth(1) == Some("366"), "bob A joined");
-    let mut bob_b =
-        C::sasl_with(addr, "bob", &did, PrivateKey::ed25519_from_bytes(&secret).unwrap());
+    bob_a.rx(
+        |l| l.split_whitespace().nth(1) == Some("366"),
+        "bob A joined",
+    );
+    let mut bob_b = C::sasl_with(
+        addr,
+        "bob",
+        &did,
+        PrivateKey::ed25519_from_bytes(&secret).unwrap(),
+    );
     bob_b.drain(400);
 
     alice.tx(&format!("MODE {channel} +o bob"));
@@ -815,7 +913,10 @@ async fn op_can_kick_from_a_second_device() {
         let (mut alice, mut bob_a, mut bob_b) = multi_device_op(addr, "#kickdev");
         let (mut carol, _) = C::sasl(addr, "carol");
         carol.tx("JOIN #kickdev");
-        carol.rx(|l| l.split_whitespace().nth(1) == Some("366"), "carol joined");
+        carol.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "carol joined",
+        );
         bob_b.drain(300);
 
         bob_b.tx("KICK #kickdev carol :bye");
@@ -849,20 +950,30 @@ async fn attaching_device_sees_correct_prefixes() {
     tokio::task::spawn_blocking(move || {
         let (mut alice, _) = C::sasl(addr, "alice");
         alice.tx("JOIN #attachpfx");
-        alice.rx(|l| l.split_whitespace().nth(1) == Some("366"), "alice joined");
+        alice.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "alice joined",
+        );
 
         let key = PrivateKey::generate_ed25519();
         let did = format!("did:key:{}", key.public_key_multibase());
         let secret = key.secret_bytes();
         let mut bob_a = C::sasl_with(addr, "bob", &did, key);
         bob_a.tx("JOIN #attachpfx");
-        bob_a.rx(|l| l.split_whitespace().nth(1) == Some("366"), "bob A joined");
+        bob_a.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "bob A joined",
+        );
         alice.tx("MODE #attachpfx +o bob");
         alice.rx(|l| l.contains("+o"), "bob opped");
 
         // Second device attaches; the synthesised join carries a member list.
-        let mut bob_b =
-            C::sasl_with(addr, "bob", &did, PrivateKey::ed25519_from_bytes(&secret).unwrap());
+        let mut bob_b = C::sasl_with(
+            addr,
+            "bob",
+            &did,
+            PrivateKey::ed25519_from_bytes(&secret).unwrap(),
+        );
         bob_b.drain(400);
         // The attach happens during registration, so its 353 arrives before 001.
         let names = bob_b
@@ -903,7 +1014,10 @@ async fn attach_list_folds_other_members_sessions() {
     tokio::task::spawn_blocking(move || {
         let (mut alice, _) = C::sasl(addr, "alice");
         alice.tx("JOIN #attachfold");
-        alice.rx(|l| l.split_whitespace().nth(1) == Some("366"), "alice joined");
+        alice.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "alice joined",
+        );
 
         // Carol: four devices, opped once.
         let ckey = PrivateKey::generate_ed25519();
@@ -911,11 +1025,16 @@ async fn attach_list_folds_other_members_sessions() {
         let csecret = ckey.secret_bytes();
         let mut carol = C::sasl_with(addr, "carol", &cdid, ckey);
         carol.tx("JOIN #attachfold");
-        carol.rx(|l| l.split_whitespace().nth(1) == Some("366"), "carol joined");
+        carol.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "carol joined",
+        );
         let mut carol_extra: Vec<C> = (0..3)
             .map(|_| {
                 let mut c = C::sasl_with(
-                    addr, "carol", &cdid,
+                    addr,
+                    "carol",
+                    &cdid,
                     PrivateKey::ed25519_from_bytes(&csecret).unwrap(),
                 );
                 c.drain(250);
@@ -933,9 +1052,16 @@ async fn attach_list_folds_other_members_sessions() {
         let bsecret = bkey.secret_bytes();
         let mut bob_a = C::sasl_with(addr, "bob", &bdid, bkey);
         bob_a.tx("JOIN #attachfold");
-        bob_a.rx(|l| l.split_whitespace().nth(1) == Some("366"), "bob A joined");
-        let mut bob_b =
-            C::sasl_with(addr, "bob", &bdid, PrivateKey::ed25519_from_bytes(&bsecret).unwrap());
+        bob_a.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "bob A joined",
+        );
+        let mut bob_b = C::sasl_with(
+            addr,
+            "bob",
+            &bdid,
+            PrivateKey::ed25519_from_bytes(&bsecret).unwrap(),
+        );
         bob_b.drain(400);
 
         let names = bob_b
@@ -944,7 +1070,10 @@ async fn attach_list_folds_other_members_sessions() {
             .find(|l| l.split_whitespace().nth(1) == Some("353") && l.contains("attachfold"))
             .cloned()
             .unwrap_or_else(|| {
-                panic!("no 353 in the attach preamble:\n  {}", bob_b.seen.join("\n  "))
+                panic!(
+                    "no 353 in the attach preamble:\n  {}",
+                    bob_b.seen.join("\n  ")
+                )
             });
         assert!(
             names.contains("@carol"),
@@ -980,7 +1109,10 @@ async fn a_rendered_op_can_act_as_op_from_any_device() {
         // Alice creates the channel and leaves, so it exists with no members.
         let (mut alice, _) = C::sasl(addr, "alice");
         alice.tx("JOIN #orphan");
-        alice.rx(|l| l.split_whitespace().nth(1) == Some("366"), "alice joined");
+        alice.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "alice joined",
+        );
         alice.tx("PART #orphan");
         alice.drain(300);
 
@@ -990,9 +1122,16 @@ async fn a_rendered_op_can_act_as_op_from_any_device() {
         let secret = key.secret_bytes();
         let mut bob_a = C::sasl_with(addr, "bob", &did, key);
         bob_a.tx("JOIN #orphan");
-        bob_a.rx(|l| l.split_whitespace().nth(1) == Some("366"), "bob A joined");
-        let mut bob_b =
-            C::sasl_with(addr, "bob", &did, PrivateKey::ed25519_from_bytes(&secret).unwrap());
+        bob_a.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "bob A joined",
+        );
+        let mut bob_b = C::sasl_with(
+            addr,
+            "bob",
+            &did,
+            PrivateKey::ed25519_from_bytes(&secret).unwrap(),
+        );
         bob_b.drain(400);
 
         // What the member list claims.
@@ -1044,7 +1183,10 @@ async fn names_completes_while_registrations_churn() {
     let done = tokio::task::spawn_blocking(move || {
         let (mut alice, _) = C::sasl(addr, "alice");
         alice.tx("JOIN #race");
-        alice.rx(|l| l.split_whitespace().nth(1) == Some("366"), "alice joined");
+        alice.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "alice joined",
+        );
 
         // Churn: sessions registering and attaching against the same channel.
         let churn = std::thread::spawn(move || {
@@ -1058,7 +1200,9 @@ async fn names_completes_while_registrations_churn() {
                 // A second device for the same DID exercises attach_same_did,
                 // which is the half that holds session_dids first.
                 let mut b = C::sasl_with(
-                    addr, &format!("churn{i}"), &did,
+                    addr,
+                    &format!("churn{i}"),
+                    &did,
                     PrivateKey::ed25519_from_bytes(&secret).unwrap(),
                 );
                 b.drain(60);
@@ -1101,12 +1245,18 @@ async fn join_racing_who_still_delivers_the_member_list() {
         // A populated channel, so both paths have real work to do.
         let (mut host, _) = C::sasl(addr, "host");
         host.tx("JOIN #joinrace");
-        host.rx(|l| l.split_whitespace().nth(1) == Some("366"), "host joined");
+        host.rx(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "host joined",
+        );
         let mut squatters: Vec<C> = (0..6)
             .map(|i| {
                 let (mut c, _) = C::sasl(addr, &format!("squat{i}"));
                 c.tx("JOIN #joinrace");
-                c.rx(|l| l.split_whitespace().nth(1) == Some("366"), "squatter joined");
+                c.rx(
+                    |l| l.split_whitespace().nth(1) == Some("366"),
+                    "squatter joined",
+                );
                 c
             })
             .collect();
@@ -1115,7 +1265,10 @@ async fn join_racing_who_still_delivers_the_member_list() {
         let who = std::thread::spawn(move || {
             for _ in 0..40 {
                 host.tx("WHO #joinrace");
-                host.rx(|l| l.split_whitespace().nth(1) == Some("315"), "WHO completed");
+                host.rx(
+                    |l| l.split_whitespace().nth(1) == Some("315"),
+                    "WHO completed",
+                );
             }
             host
         });

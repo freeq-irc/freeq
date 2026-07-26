@@ -1905,20 +1905,56 @@ pub(super) fn handle_part(
     let hostmask = conn.hostmask();
     let part_msg = format!(":{hostmask} PART {channel}\r\n");
 
-    let members: Vec<String> = state
-        .channels
-        .lock()
-        .get(channel)
-        .map(|ch| ch.members.iter().cloned().collect())
-        .unwrap_or_default();
-
-    let conns = state.connections.lock();
-    for member_session in &members {
-        if let Some(tx) = conns.get(member_session) {
-            let _ = tx.try_send(part_msg.clone());
+    // Is the *identity* leaving, or just this device?
+    //
+    // A PART names the leaver by nick, and every session signed in as one identity
+    // shares that nick. So announcing a device's PART to the channel while another
+    // of that identity's sessions is still a member states something false: the nick
+    // is still present. Everyone's roster drops a user who is still there, and the
+    // user's own other devices are told they left a channel they are still in —
+    // which they then act on, because a self-nick PART is indistinguishable from
+    // their own.
+    //
+    // The same reasoning already governs the auto-rejoin row below. This applies it
+    // to the wire.
+    let sibling_still_member = match conn.authenticated_did {
+        Some(ref did) => {
+            let did_sessions = state.did_sessions.lock();
+            let channels = state.channels.lock();
+            match (did_sessions.get(did), channels.get(channel)) {
+                (Some(sessions), Some(ch)) => sessions
+                    .iter()
+                    .any(|sid| sid != session_id && ch.members.contains(sid)),
+                _ => false,
+            }
         }
+        None => false,
+    };
+
+    if sibling_still_member {
+        // Echo to the asking client only: it needs to know the request was honoured,
+        // and nobody else's view of the channel has changed.
+        tracing::debug!(
+            session = %session_id, channel = %channel,
+            "PART not announced: another session for this DID remains in the channel"
+        );
+        send(state, session_id, part_msg.clone());
+    } else {
+        let members: Vec<String> = state
+            .channels
+            .lock()
+            .get(channel)
+            .map(|ch| ch.members.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let conns = state.connections.lock();
+        for member_session in &members {
+            if let Some(tx) = conns.get(member_session) {
+                let _ = tx.try_send(part_msg.clone());
+            }
+        }
+        drop(conns);
     }
-    drop(conns);
 
     state
         .channels
@@ -1954,18 +1990,22 @@ pub(super) fn handle_part(
         }
     }
 
-    // Broadcast PART to S2S peers
-    let event_id = s2s_next_event_id(state);
-    let origin = state.server_iroh_id.lock().clone().unwrap_or_default();
-    s2s_broadcast(
-        state,
-        crate::s2s::S2sMessage::Part {
-            event_id,
-            nick: conn.nick.as_deref().unwrap_or("*").to_string(),
-            channel: channel.to_string(),
-            origin,
-        },
-    );
+    // Broadcast PART to S2S peers — unless this identity is still in the channel on
+    // another session here, in which case peers would remove a nick from their
+    // remote_members while it is still present locally.
+    if !sibling_still_member {
+        let event_id = s2s_next_event_id(state);
+        let origin = state.server_iroh_id.lock().clone().unwrap_or_default();
+        s2s_broadcast(
+            state,
+            crate::s2s::S2sMessage::Part {
+                event_id,
+                nick: conn.nick.as_deref().unwrap_or("*").to_string(),
+                channel: channel.to_string(),
+                origin,
+            },
+        );
+    }
 }
 
 pub(super) fn handle_names(
@@ -2023,11 +2063,9 @@ pub(super) fn handle_names(
             let Some(n) = nicks.get_nick(s) else { continue };
             let is_op = ops.contains(s)
                 || session_dids.get(s).is_some_and(|d| {
-                    ch_did_authority
-                        .as_ref()
-                        .is_some_and(|(founder, did_ops)| {
-                            founder.as_deref() == Some(d.as_str()) || did_ops.contains(d)
-                        })
+                    ch_did_authority.as_ref().is_some_and(|(founder, did_ops)| {
+                        founder.as_deref() == Some(d.as_str()) || did_ops.contains(d)
+                    })
                 });
             let is_voiced = voiced.contains(s);
             let nick_lower = n.to_lowercase();

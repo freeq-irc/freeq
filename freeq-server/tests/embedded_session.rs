@@ -130,7 +130,10 @@ async fn embedded_session_full_roundtrip() {
     assert_eq!(resp.status(), 200);
     let html = resp.text().await.unwrap();
     let broker_token = broker_token_from_html(&html);
-    assert!(!broker_token.is_empty(), "callback must issue a broker_token");
+    assert!(
+        !broker_token.is_empty(),
+        "callback must issue a broker_token"
+    );
 
     // 2. /session with the broker_token: refreshes against the PDS and mints a
     //    fresh web-token — no re-login. Sends a same-origin `Origin` header, as
@@ -150,7 +153,10 @@ async fn embedded_session_full_roundtrip() {
     assert_eq!(session["did"], "did:plc:embedded1");
     assert_eq!(session["handle"], "alice.bsky.social");
     let web_token = session["token"].as_str().unwrap();
-    assert!(!web_token.is_empty(), "/session must mint a fresh web-token");
+    assert!(
+        !web_token.is_empty(),
+        "/session must mint a fresh web-token"
+    );
     // The minted web-token is installed for SASL.
     assert!(state.web_auth_tokens.lock().contains_key(web_token));
 }
@@ -177,5 +183,9 @@ async fn session_endpoint_absent_when_not_embedded() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 404, "/session must not be mounted in broker mode");
+    assert_eq!(
+        resp.status(),
+        404,
+        "/session must not be mounted in broker mode"
+    );
 }

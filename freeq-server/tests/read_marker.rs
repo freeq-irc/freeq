@@ -440,11 +440,7 @@ async fn dm_marker_keys_by_conversation_not_alias() {
     let key_b = PrivateKey::generate_ed25519();
     let ka = key_a.secret_bytes();
     let kb = key_b.secret_bytes();
-    let (addr, _h) = start(resolver_with(vec![
-        (DID_ALICE, &key_a),
-        (DID_BOB, &key_b),
-    ]))
-    .await;
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &key_a), (DID_BOB, &key_b)])).await;
     run(addr, move |addr| {
         // Bob connects so the server learns his nick<->DID binding.
         let mut bob = C::sasl(addr, "bob", DID_BOB, &kb);
@@ -456,7 +452,9 @@ async fn dm_marker_keys_by_conversation_not_alias() {
         alice.drain();
 
         // Set the marker addressing Bob by his DID.
-        alice.tx(&format!("MARKREAD {DID_BOB} timestamp=2026-07-02T21:00:00.000Z"));
+        alice.tx(&format!(
+            "MARKREAD {DID_BOB} timestamp=2026-07-02T21:00:00.000Z"
+        ));
         alice.rx(|l| l.starts_with("MARKREAD"), "set by DID");
 
         // Read it back addressing Bob by his nick — same conversation.

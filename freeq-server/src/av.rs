@@ -778,7 +778,10 @@ mod tests {
     fn instance_claimed_detects_rejoin() {
         let mut per_conn: HashMap<String, HashSet<String>> = HashMap::new();
         per_conn.insert("stream-1".into(), HashSet::from(["devA".to_string()]));
-        per_conn.insert("stream-2".into(), HashSet::from(["devB".to_string(), "devC".to_string()]));
+        per_conn.insert(
+            "stream-2".into(),
+            HashSet::from(["devB".to_string(), "devC".to_string()]),
+        );
 
         // Instance present on some live connection → rejoined, keep the slot.
         assert!(instance_claimed_by_live_conn(&per_conn, "devA"));
@@ -1137,8 +1140,7 @@ mod tests {
             [("did:plc:bob".to_string(), Some("web1".to_string()))]
                 .into_iter()
                 .collect();
-        let grace: std::collections::HashSet<String> =
-            ["mac1".to_string()].into_iter().collect();
+        let grace: std::collections::HashSet<String> = ["mac1".to_string()].into_iter().collect();
         mgr.reap_orphan_slots(&id, &live, &grace);
 
         assert_eq!(

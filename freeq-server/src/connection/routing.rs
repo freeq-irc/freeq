@@ -172,7 +172,11 @@ pub(crate) fn recipient_did_for_target(state: &SharedState, target: &str) -> Opt
         // stamped onto a broadcast.
         return looks_like_did(target).then(|| target.to_string());
     }
-    state.nick_owners.lock().get(&target.to_lowercase()).cloned()
+    state
+        .nick_owners
+        .lock()
+        .get(&target.to_lowercase())
+        .cloned()
 }
 
 /// Cheap syntactic DID check (no network): a known method prefix and a
@@ -193,10 +197,7 @@ fn looks_like_did(s: &str) -> bool {
 /// - only one present → use it (stamp honored when we can't resolve; local
 ///   resolution used when an older peer sent no stamp).
 /// - neither → `None`.
-pub(crate) fn reconcile_recipient_did(
-    stamp: Option<&str>,
-    local: Option<&str>,
-) -> Option<String> {
+pub(crate) fn reconcile_recipient_did(stamp: Option<&str>, local: Option<&str>) -> Option<String> {
     match (stamp, local) {
         (Some(s), Some(l)) if s == l => Some(s.to_string()),
         (Some(_), Some(_)) => None, // mismatch → don't persist on an unverified stamp

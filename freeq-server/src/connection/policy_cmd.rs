@@ -628,7 +628,10 @@ pub(super) fn handle_policy(
                         let reply = Message::from_server(
                             server_name,
                             "NOTICE",
-                            vec![nick, "This policy has no rules text (no ACCEPT requirement)"],
+                            vec![
+                                nick,
+                                "This policy has no rules text (no ACCEPT requirement)",
+                            ],
                         );
                         send_fn(state, session_id, format!("{reply}\r\n"));
                     }

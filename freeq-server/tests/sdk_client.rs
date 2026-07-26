@@ -549,9 +549,7 @@ async fn incoming_dm_keys_by_sender_did_and_announces_binding_once() {
     .await;
     // Drain B's history: exactly one MemberDid for the peer.
     let mut member_dids = 0;
-    while let Ok(Some(e)) =
-        tokio::time::timeout(Duration::from_millis(300), rxb.recv()).await
-    {
+    while let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(300), rxb.recv()).await {
         if matches!(&e, Event::MemberDid { did, .. } if did == DID_A) {
             member_dids += 1;
         }
@@ -562,9 +560,7 @@ async fn incoming_dm_keys_by_sender_did_and_announces_binding_once() {
     // that no NEW MemberDid is emitted.
     ha.privmsg("dmguest", "third").await.unwrap();
     let mut saw_third = false;
-    while let Ok(Some(e)) =
-        tokio::time::timeout(Duration::from_millis(500), rxb.recv()).await
-    {
+    while let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(500), rxb.recv()).await {
         match &e {
             Event::MemberDid { did, .. } if did == DID_A => member_dids += 1,
             Event::Message { text, .. } if text == "third" => {
@@ -653,12 +649,18 @@ async fn chathistory_targets_carry_partner_did() {
     // Both DID-authed so the DM persists; exchange one message.
     let (ha, mut rxa) = client::connect(
         cfg(addr, "hista"),
-        Some(signer_for(DID_A, PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap())),
+        Some(signer_for(
+            DID_A,
+            PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap(),
+        )),
     );
     wait(&mut rxa, |e| matches!(e, Event::Registered { .. }), "reg A").await;
     let (_hc, mut rxc) = client::connect(
         cfg(addr, "histc"),
-        Some(signer_for(DID_C, PrivateKey::ed25519_from_bytes(&key_c.secret_bytes()).unwrap())),
+        Some(signer_for(
+            DID_C,
+            PrivateKey::ed25519_from_bytes(&key_c.secret_bytes()).unwrap(),
+        )),
     );
     wait(&mut rxc, |e| matches!(e, Event::Registered { .. }), "reg C").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -674,9 +676,17 @@ async fn chathistory_targets_carry_partner_did() {
     // A reconnects fresh and asks for its conversation list.
     let (ha2, mut rxa2) = client::connect(
         cfg(addr, "hista2"),
-        Some(signer_for(DID_A, PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap())),
+        Some(signer_for(
+            DID_A,
+            PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap(),
+        )),
     );
-    wait(&mut rxa2, |e| matches!(e, Event::Registered { .. }), "reg A2").await;
+    wait(
+        &mut rxa2,
+        |e| matches!(e, Event::Registered { .. }),
+        "reg A2",
+    )
+    .await;
     ha2.raw("CHATHISTORY TARGETS * * 50").await.unwrap();
     let t = wait(
         &mut rxa2,
@@ -706,7 +716,13 @@ async fn chathistory_targets_carry_partner_did() {
         "echo of the follow-up",
     )
     .await;
-    if let Event::Message { from, target, dm_key, .. } = echo {
+    if let Event::Message {
+        from,
+        target,
+        dm_key,
+        ..
+    } = echo
+    {
         // A and A2 are two live sessions of the SAME DID; which session's
         // nick the echo carries is legitimately ambiguous (both are DID_A)
         // and not the subject here. Accept either — the split under test is
@@ -715,7 +731,10 @@ async fn chathistory_targets_carry_partner_did() {
             from == "hista2" || from == "hista",
             "echo from a DID_A session, got {from}"
         );
-        assert_eq!(target, "histc", "display binding must not become a wire target");
+        assert_eq!(
+            target, "histc",
+            "display binding must not become a wire target"
+        );
         assert_eq!(
             dm_key.as_deref(),
             Some(DID_C),
@@ -737,12 +756,18 @@ async fn dm_delete_persists_across_history_replay() {
 
     let (ha, mut rxa) = client::connect(
         cfg(addr, "dela"),
-        Some(signer_for(DID_A, PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap())),
+        Some(signer_for(
+            DID_A,
+            PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap(),
+        )),
     );
     wait(&mut rxa, |e| matches!(e, Event::Registered { .. }), "reg A").await;
     let (_hc, mut rxc) = client::connect(
         cfg(addr, "delc"),
-        Some(signer_for(DID_C, PrivateKey::ed25519_from_bytes(&key_c.secret_bytes()).unwrap())),
+        Some(signer_for(
+            DID_C,
+            PrivateKey::ed25519_from_bytes(&key_c.secret_bytes()).unwrap(),
+        )),
     );
     wait(&mut rxc, |e| matches!(e, Event::Registered { .. }), "reg C").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -776,9 +801,17 @@ async fn dm_delete_persists_across_history_replay() {
     // gone, the other one present.
     let (ha2, mut rxa2) = client::connect(
         cfg(addr, "dela2"),
-        Some(signer_for(DID_A, PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap())),
+        Some(signer_for(
+            DID_A,
+            PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap(),
+        )),
     );
-    wait(&mut rxa2, |e| matches!(e, Event::Registered { .. }), "reg A2").await;
+    wait(
+        &mut rxa2,
+        |e| matches!(e, Event::Registered { .. }),
+        "reg A2",
+    )
+    .await;
     ha2.raw("CHATHISTORY LATEST delc * 50").await.unwrap();
     let mut saw_keep = false;
     let mut saw_deleted = false;
@@ -806,12 +839,18 @@ async fn dm_edit_persists_across_history_replay() {
 
     let (ha, mut rxa) = client::connect(
         cfg(addr, "edia"),
-        Some(signer_for(DID_A, PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap())),
+        Some(signer_for(
+            DID_A,
+            PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap(),
+        )),
     );
     wait(&mut rxa, |e| matches!(e, Event::Registered { .. }), "reg A").await;
     let (_hc, mut rxc) = client::connect(
         cfg(addr, "edic"),
-        Some(signer_for(DID_C, PrivateKey::ed25519_from_bytes(&key_c.secret_bytes()).unwrap())),
+        Some(signer_for(
+            DID_C,
+            PrivateKey::ed25519_from_bytes(&key_c.secret_bytes()).unwrap(),
+        )),
     );
     wait(&mut rxc, |e| matches!(e, Event::Registered { .. }), "reg C").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -828,16 +867,28 @@ async fn dm_edit_persists_across_history_replay() {
         Event::Message { tags, .. } => tags.get("msgid").cloned().expect("echo has msgid"),
         _ => unreachable!(),
     };
-    ha.edit_message(DID_C, &msgid, "corrected text").await.unwrap();
+    ha.edit_message(DID_C, &msgid, "corrected text")
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     // Fresh session replays the conversation: the edited text must be there.
     let (ha2, mut rxa2) = client::connect(
         cfg(addr, "edia2"),
-        Some(signer_for(DID_A, PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap())),
+        Some(signer_for(
+            DID_A,
+            PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap(),
+        )),
     );
-    wait(&mut rxa2, |e| matches!(e, Event::Registered { .. }), "reg A2").await;
-    ha2.raw(&format!("CHATHISTORY LATEST {DID_C} * 50")).await.unwrap();
+    wait(
+        &mut rxa2,
+        |e| matches!(e, Event::Registered { .. }),
+        "reg A2",
+    )
+    .await;
+    ha2.raw(&format!("CHATHISTORY LATEST {DID_C} * 50"))
+        .await
+        .unwrap();
     let mut saw_corrected = false;
     while let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(800), rxa2.recv()).await {
         if matches!(&e, Event::Message { text, .. } if text == "corrected text") {
@@ -863,11 +914,19 @@ async fn guest_dm_edit_relays_without_persistence() {
 
     let (ha, mut rxa) = client::connect(
         cfg(addr, "geda"),
-        Some(signer_for(DID_A, PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap())),
+        Some(signer_for(
+            DID_A,
+            PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap(),
+        )),
     );
     wait(&mut rxa, |e| matches!(e, Event::Registered { .. }), "reg A").await;
     let (_hg, mut rxg) = client::connect(cfg(addr, "gedguest"), None);
-    wait(&mut rxg, |e| matches!(e, Event::Registered { .. }), "reg guest").await;
+    wait(
+        &mut rxg,
+        |e| matches!(e, Event::Registered { .. }),
+        "reg guest",
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     ha.privmsg("gedguest", "hello guest").await.unwrap();
@@ -888,21 +947,27 @@ async fn guest_dm_edit_relays_without_persistence() {
     )
     .await;
 
-    ha.edit_message("gedguest", &msgid, "hello guest - edited").await.unwrap();
+    ha.edit_message("gedguest", &msgid, "hello guest - edited")
+        .await
+        .unwrap();
 
     // Guest sees the edit…
     wait(
         &mut rxg,
-        |e| matches!(e, Event::Message { text, tags, .. }
-            if text == "hello guest - edited" && tags.get("+draft/edit").is_some()),
+        |e| {
+            matches!(e, Event::Message { text, tags, .. }
+            if text == "hello guest - edited" && tags.get("+draft/edit").is_some())
+        },
         "guest got edit",
     )
     .await;
     // …and the sender gets the echo (not a silent FAIL).
     wait(
         &mut rxa,
-        |e| matches!(e, Event::Message { text, tags, .. }
-            if text == "hello guest - edited" && tags.get("+draft/edit").is_some()),
+        |e| {
+            matches!(e, Event::Message { text, tags, .. }
+            if text == "hello guest - edited" && tags.get("+draft/edit").is_some())
+        },
         "A got edit echo",
     )
     .await;
@@ -916,11 +981,19 @@ async fn guest_dm_delete_relays_without_persistence() {
 
     let (ha, mut rxa) = client::connect(
         cfg(addr, "gdda"),
-        Some(signer_for(DID_A, PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap())),
+        Some(signer_for(
+            DID_A,
+            PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap(),
+        )),
     );
     wait(&mut rxa, |e| matches!(e, Event::Registered { .. }), "reg A").await;
     let (_hg, mut rxg) = client::connect(cfg(addr, "gddguest"), None);
-    wait(&mut rxg, |e| matches!(e, Event::Registered { .. }), "reg guest").await;
+    wait(
+        &mut rxg,
+        |e| matches!(e, Event::Registered { .. }),
+        "reg guest",
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     ha.privmsg("gddguest", "delete me").await.unwrap();
@@ -944,8 +1017,10 @@ async fn guest_dm_delete_relays_without_persistence() {
     ha.delete_message("gddguest", &msgid).await.unwrap();
     wait(
         &mut rxg,
-        |e| matches!(e, Event::TagMsg { tags, .. }
-            if tags.get("+draft/delete").map(|v| v == &msgid).unwrap_or(false)),
+        |e| {
+            matches!(e, Event::TagMsg { tags, .. }
+            if tags.get("+draft/delete").map(|v| v == &msgid).unwrap_or(false))
+        },
         "guest got delete",
     )
     .await;
@@ -961,17 +1036,36 @@ async fn dm_edit_reaches_sender_other_session() {
 
     let (ha, mut rxa) = client::connect(
         cfg(addr, "fo1"),
-        Some(signer_for(DID_A, PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap())),
+        Some(signer_for(
+            DID_A,
+            PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap(),
+        )),
     );
-    wait(&mut rxa, |e| matches!(e, Event::Registered { .. }), "reg A1").await;
+    wait(
+        &mut rxa,
+        |e| matches!(e, Event::Registered { .. }),
+        "reg A1",
+    )
+    .await;
     let (_ha2, mut rxa2) = client::connect(
         cfg(addr, "fo2"),
-        Some(signer_for(DID_A, PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap())),
+        Some(signer_for(
+            DID_A,
+            PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap(),
+        )),
     );
-    wait(&mut rxa2, |e| matches!(e, Event::Registered { .. }), "reg A2").await;
+    wait(
+        &mut rxa2,
+        |e| matches!(e, Event::Registered { .. }),
+        "reg A2",
+    )
+    .await;
     let (_hc, mut rxc) = client::connect(
         cfg(addr, "foc"),
-        Some(signer_for(DID_C, PrivateKey::ed25519_from_bytes(&key_c.secret_bytes()).unwrap())),
+        Some(signer_for(
+            DID_C,
+            PrivateKey::ed25519_from_bytes(&key_c.secret_bytes()).unwrap(),
+        )),
     );
     wait(&mut rxc, |e| matches!(e, Event::Registered { .. }), "reg C").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -988,11 +1082,15 @@ async fn dm_edit_reaches_sender_other_session() {
         _ => unreachable!(),
     };
 
-    ha.edit_message(DID_C, &msgid, "fan out - edited").await.unwrap();
+    ha.edit_message(DID_C, &msgid, "fan out - edited")
+        .await
+        .unwrap();
     wait(
         &mut rxa2,
-        |e| matches!(e, Event::Message { text, tags, .. }
-            if text == "fan out - edited" && tags.get("+draft/edit").is_some()),
+        |e| {
+            matches!(e, Event::Message { text, tags, .. }
+            if text == "fan out - edited" && tags.get("+draft/edit").is_some())
+        },
         "A2 (sender's other session) got the edit",
     )
     .await;
@@ -1007,17 +1105,36 @@ async fn dm_reaction_reaches_sender_other_session() {
 
     let (ha, mut rxa) = client::connect(
         cfg(addr, "rf1"),
-        Some(signer_for(DID_A, PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap())),
+        Some(signer_for(
+            DID_A,
+            PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap(),
+        )),
     );
-    wait(&mut rxa, |e| matches!(e, Event::Registered { .. }), "reg A1").await;
+    wait(
+        &mut rxa,
+        |e| matches!(e, Event::Registered { .. }),
+        "reg A1",
+    )
+    .await;
     let (_ha2, mut rxa2) = client::connect(
         cfg(addr, "rf2"),
-        Some(signer_for(DID_A, PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap())),
+        Some(signer_for(
+            DID_A,
+            PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap(),
+        )),
     );
-    wait(&mut rxa2, |e| matches!(e, Event::Registered { .. }), "reg A2").await;
+    wait(
+        &mut rxa2,
+        |e| matches!(e, Event::Registered { .. }),
+        "reg A2",
+    )
+    .await;
     let (hc, mut rxc) = client::connect(
         cfg(addr, "rfc"),
-        Some(signer_for(DID_C, PrivateKey::ed25519_from_bytes(&key_c.secret_bytes()).unwrap())),
+        Some(signer_for(
+            DID_C,
+            PrivateKey::ed25519_from_bytes(&key_c.secret_bytes()).unwrap(),
+        )),
     );
     wait(&mut rxc, |e| matches!(e, Event::Registered { .. }), "reg C").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1037,8 +1154,10 @@ async fn dm_reaction_reaches_sender_other_session() {
     ha.react(DID_C, "🔥", &msgid).await.unwrap();
     wait(
         &mut rxa2,
-        |e| matches!(e, Event::TagMsg { tags, .. }
-            if tags.get("+react").map(|v| v == "🔥").unwrap_or(false)),
+        |e| {
+            matches!(e, Event::TagMsg { tags, .. }
+            if tags.get("+react").map(|v| v == "🔥").unwrap_or(false))
+        },
         "A2 (sender's other session) got the reaction",
     )
     .await;
@@ -1054,13 +1173,18 @@ async fn channel_edit_unknown_msgid_still_fails() {
 
     let (ha, mut rxa) = client::connect(
         cfg(addr, "cefa"),
-        Some(signer_for(DID_A, PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap())),
+        Some(signer_for(
+            DID_A,
+            PrivateKey::ed25519_from_bytes(&key_a.secret_bytes()).unwrap(),
+        )),
     );
     wait(&mut rxa, |e| matches!(e, Event::Registered { .. }), "reg A").await;
     ha.join("#editfail").await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    ha.edit_message("#editfail", "01BOGUSMSGID0000000000000", "nope").await.unwrap();
+    ha.edit_message("#editfail", "01BOGUSMSGID0000000000000", "nope")
+        .await
+        .unwrap();
     wait(
         &mut rxa,
         |e| matches!(e, Event::ServerNotice { text, .. } if text.contains("MESSAGE_NOT_FOUND") || text.contains("not found")),

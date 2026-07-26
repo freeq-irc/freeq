@@ -179,7 +179,11 @@ async fn get_policy_rules(
             text,
         })
         .into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, "No stored rules text for this policy").into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            "No stored rules text for this policy",
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

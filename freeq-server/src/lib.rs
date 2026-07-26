@@ -15,6 +15,7 @@ pub mod irc;
 pub mod iroh;
 pub mod manifest;
 pub mod media_store;
+pub mod model_proxy;
 pub mod msgid;
 pub mod plugin;
 pub mod policy;

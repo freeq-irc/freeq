@@ -188,6 +188,12 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .route("/client-metadata.json", get(client_metadata))
         // REST API (read-only, v1)
         .route("/api/v1/health", get(api_health))
+        // The mediated, metered model path: the server holds the provider
+        // credential, the caller holds only an identity and a budget.
+        .route(
+            "/api/v1/model/chat/completions",
+            post(crate::model_proxy::chat_completions),
+        )
         .route("/metrics", get(api_metrics))
         .route("/api/v1/channels", get(api_channels))
         .route("/api/v1/channels/{name}/history", get(api_channel_history))
@@ -222,7 +228,10 @@ pub fn router(state: Arc<SharedState>) -> Router {
             get(api_did_signing_key_by_kid),
         )
         .route("/api/v1/verify/{msgid}", get(api_verify_message))
-        .route("/api/v1/channels/{name}/evidence", get(api_channel_evidence))
+        .route(
+            "/api/v1/channels/{name}/evidence",
+            get(api_channel_evidence),
+        )
         .route("/api/v1/actors/{did}", get(api_actor_identity))
         .route(
             "/api/v1/channels/{name}/agent-capabilities",
@@ -1216,8 +1225,12 @@ async fn api_channel_evidence(
         "messages": messages,
     });
 
-    let canonical = freeq_sdk::canonical::canonicalize(&bundle)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("canonicalize: {e}")))?;
+    let canonical = freeq_sdk::canonical::canonicalize(&bundle).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("canonicalize: {e}"),
+        )
+    })?;
     let sig = {
         use ed25519_dalek::Signer;
         state.msg_signing_key.sign(canonical.as_bytes())
@@ -1441,7 +1454,10 @@ async fn api_get_favorites(
     let favs = state
         .with_db(|db| db.get_user_favorites(&did))
         .unwrap_or_default();
-    (StatusCode::OK, Json(serde_json::json!({ "favorites": favs })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "favorites": favs })),
+    )
 }
 
 /// PUT /api/v1/favorites {"favorites": ["#a", "#b", ...]} — replace the
@@ -1475,11 +1491,14 @@ async fn api_set_favorites(
         .unwrap_or_default()
         .as_secs();
     state.with_db(|db| db.set_user_favorites(&did, &favs, now));
-    (StatusCode::OK, Json(serde_json::json!({ "favorites": favs })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "favorites": favs })),
+    )
 }
 
 /// Resolve the authenticated caller DID from a `Bearer <session-id>` header.
-fn caller_did_from_bearer(
+pub(crate) fn caller_did_from_bearer(
     state: &crate::server::SharedState,
     headers: &axum::http::HeaderMap,
 ) -> Option<String> {
@@ -2151,7 +2170,11 @@ impl freeq_auth_broker::SessionWriter for LocalWriter {
         let token = generate_random_string(32);
         self.state.web_auth_tokens.lock().insert(
             token.clone(),
-            (did.to_string(), handle.to_string(), std::time::Instant::now()),
+            (
+                did.to_string(),
+                handle.to_string(),
+                std::time::Instant::now(),
+            ),
         );
         Ok((token, mobile_nick_from_handle(handle)))
     }
@@ -4563,9 +4586,8 @@ async fn api_create_artifact(
     if !is_participant {
         match session_channel.as_deref() {
             Some(channel) => {
-                authorize_channel_read(&state, channel, &headers).map_err(|status| {
-                    (status, "not authorized for this session".to_string())
-                })?;
+                authorize_channel_read(&state, channel, &headers)
+                    .map_err(|status| (status, "not authorized for this session".to_string()))?;
             }
             None => {
                 return Err((
@@ -4839,8 +4861,7 @@ mod signing_key_endpoint_tests {
         assert_eq!(miss_kid.unwrap_err(), axum::http::StatusCode::NOT_FOUND);
 
         // Unknown DID → 404.
-        let miss_did =
-            api_did_signing_key(State(state), Path("did:plc:nobody".to_string())).await;
+        let miss_did = api_did_signing_key(State(state), Path("did:plc:nobody".to_string())).await;
         assert_eq!(miss_did.unwrap_err(), axum::http::StatusCode::NOT_FOUND);
     }
 }

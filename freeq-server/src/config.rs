@@ -204,6 +204,27 @@ pub struct ServerConfig {
     /// Hard ceiling on each LLM HTTP call, in seconds. Default 8.
     #[arg(long, env = "FREEQ_LLM_TIMEOUT_SECS", default_value = "8")]
     pub llm_timeout_secs: u64,
+
+    /// Price per 1k tokens per model, for the metered model proxy.
+    ///
+    /// A loan of capacity has to be denominated in something, and the provider
+    /// reports tokens while a budget is set in a unit like usd. This is the
+    /// conversion, and it is configuration rather than a hardcoded table because
+    /// provider pricing changes without asking us.
+    #[arg(skip)]
+    pub model_prices: std::collections::HashMap<String, crate::model_proxy::ModelPrice>,
+
+    /// Price applied to a model with no entry in `model_prices`.
+    ///
+    /// Not zero. An unpriced model is the easiest way to get free capacity, so the
+    /// default must be expensive enough to be safe rather than convenient.
+    #[arg(skip)]
+    pub model_price_default: crate::model_proxy::ModelPrice,
+
+    /// Price a model for the metered proxy: `--model-price gpt-4o-mini=0.15,0.60`
+    /// (input,output per 1k tokens). Repeatable.
+    #[arg(long = "model-price", value_name = "MODEL=IN,OUT")]
+    pub model_price_args: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -247,6 +268,12 @@ impl Default for ServerConfig {
             llm_api_key: None,
             llm_model: None,
             llm_timeout_secs: 8,
+            model_prices: std::collections::HashMap::new(),
+            model_price_args: Vec::new(),
+            model_price_default: crate::model_proxy::ModelPrice {
+                input_per_1k: 5.0,
+                output_per_1k: 15.0,
+            },
         }
     }
 }

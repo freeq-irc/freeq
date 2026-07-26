@@ -646,7 +646,10 @@ mod tests {
             credentials: vec![],
             proofs: HashSet::new(),
         };
-        match engine.process_join("#lobby", "did:plc:stranger", &empty).unwrap() {
+        match engine
+            .process_join("#lobby", "did:plc:stranger", &empty)
+            .unwrap()
+        {
             JoinResult::Confirmed { attestation, .. } => assert_eq!(attestation.role, "member"),
             other => panic!("open join should confirm as member, got {:?}", other),
         }
@@ -660,7 +663,10 @@ mod tests {
             }],
             proofs: HashSet::new(),
         };
-        match engine.process_join("#lobby", "did:plc:collab", &with_cred).unwrap() {
+        match engine
+            .process_join("#lobby", "did:plc:collab", &with_cred)
+            .unwrap()
+        {
             JoinResult::Confirmed { attestation, .. } => assert_eq!(attestation.role, "op"),
             other => panic!("collaborator should be opped, got {:?}", other),
         }
@@ -701,7 +707,11 @@ mod tests {
             )
             .err(); // no existing policy yet — create one first
         engine
-            .create_channel_policy("#c", Requirement::Accept { hash: "v1".into() }, role_reqs.clone())
+            .create_channel_policy(
+                "#c",
+                Requirement::Accept { hash: "v1".into() },
+                role_reqs.clone(),
+            )
             .unwrap();
         // Now change the rules gate while preserving roles + endpoints.
         let updated = engine
@@ -713,7 +723,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(updated.requirements, Requirement::Accept { hash: "v2".into() });
+        assert_eq!(
+            updated.requirements,
+            Requirement::Accept { hash: "v2".into() }
+        );
         assert!(updated.role_requirements.contains_key("op"));
         assert!(updated.credential_endpoints.contains_key("github_repo"));
     }

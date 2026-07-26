@@ -18,8 +18,8 @@ use std::sync::Arc;
 use freeq_sdk::auth::{ChallengeSigner, KeySigner};
 use freeq_sdk::client::{self, ConnectConfig};
 use freeq_sdk::crypto::PrivateKey;
-use freeq_sdk::event::Event;
 use freeq_sdk::did::DidResolver;
+use freeq_sdk::event::Event;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -363,7 +363,9 @@ async fn creating_a_session_artifact_requires_auth() {
     // Anonymous caller forges an artifact attributed to someone else, with text
     // it controls, into a channel it is not even a member of.
     let resp = reqwest::Client::new()
-        .post(format!("http://{web}/api/v1/sessions/{session_id}/artifacts"))
+        .post(format!(
+            "http://{web}/api/v1/sessions/{session_id}/artifacts"
+        ))
         .json(&serde_json::json!({
             "kind": "summary",
             "content_ref": "https://evil.example/payload",

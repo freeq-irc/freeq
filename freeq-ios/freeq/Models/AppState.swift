@@ -239,6 +239,12 @@ class AppState: ObservableObject {
     @Published var authenticatedDID: String? = nil
     @Published var dmBuffers: [ChannelState] = []
     @Published var autoJoinChannels: [String] = ["#general"]
+
+    /// Channels this device asked to leave, and when.
+    ///
+    /// A PART echo identifies the leaver by nick, shared by every device of this
+    /// identity, so intent is the only way to attribute it. See `SelfPartResolve`.
+    var pendingPartRequests: [String: Date] = [:]
     @Published var unreadCounts: [String: Int] = [:] {
         didSet { UserDefaults.standard.set(unreadCounts, forKey: "freeq.unreadCounts") }
     }
@@ -1697,6 +1703,10 @@ class AppState: ObservableObject {
     }
 
     func partChannel(_ channel: String) {
+        // Record intent before sending: the echoed PART names only a nick, which
+        // every device of this identity shares, so this is the only way to tell our
+        // own PART from a sibling device's. See `SelfPartResolve`.
+        pendingPartRequests[channel.lowercased()] = Date()
         try? client?.part(channel: channel)
         // Optimistically remove from UI — don't wait for server confirmation
         channels.removeAll { $0.name.lowercased() == channel.lowercased() }
@@ -2576,13 +2586,26 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
             }
 
         case .parted(let channel, let nick):
-            if nick.lowercased() == state.nick.lowercased() {
+            // A PART names a nick, and all of this identity's devices share it, so
+            // "the nick is mine" does not mean "I left". Treating it as such let a
+            // browser tab or a game session delete a channel here, durably, because
+            // the removal was written to the auto-join list.
+            let partDecision = SelfPartResolve.decide(
+                channel: channel,
+                partNick: nick,
+                myNick: state.nick,
+                pendingRequests: state.pendingPartRequests
+            )
+            if partDecision == .leaveChannel {
+                state.pendingPartRequests.removeValue(forKey: channel.lowercased())
                 state.channels.removeAll { $0.name == channel }
                 state.autoJoinChannels.removeAll { $0.lowercased() == channel.lowercased() }
                 UserDefaults.standard.set(state.autoJoinChannels, forKey: "freeq.channels")
                 if state.activeChannel == channel {
                     state.activeChannel = state.channels.first?.name
                 }
+            } else if partDecision == .ignoreOtherDevice {
+                // Another of this identity's devices left. Keep the channel.
             } else {
                 let ch = state.getOrCreateChannel(channel)
                 ch.appendIfNew(ChatMessage(

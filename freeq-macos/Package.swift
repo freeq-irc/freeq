@@ -48,6 +48,7 @@ let package = Package(
                 "ChannelPolicy.swift",
                 "AvStartRace.swift",
                 "AvLeftResolve.swift",
+                "SelfPartResolve.swift",
                 "AvRejoin.swift",
                 "ChannelCrypto.swift",
                 "ChannelE2eeState.swift",

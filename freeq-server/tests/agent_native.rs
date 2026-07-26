@@ -3216,7 +3216,13 @@ async fn spawned_capabilities_are_narrowed_to_the_parents() {
 
     let (_did, parent, mut parent_ev) = connect_did_key(addr, "capparent").await;
     parent.register_agent("agent").await.unwrap();
-    expect_raw_line(&mut parent_ev, 2000, "registered as agent", "AGENT REGISTER").await;
+    expect_raw_line(
+        &mut parent_ev,
+        2000,
+        "registered as agent",
+        "AGENT REGISTER",
+    )
+    .await;
     parent.join("#capnarrow").await.unwrap();
     expect_event(
         &mut parent_ev,
@@ -3426,10 +3432,22 @@ async fn granting_requires_op() {
 
     let (_a_did, a, mut a_ev) = connect_did_key(addr, "plainuser").await;
     a.join("#nogrant").await.unwrap();
-    expect_event(&mut a_ev, 2000, |e| matches!(e, Event::Joined { .. }), "joined").await;
+    expect_event(
+        &mut a_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "joined",
+    )
+    .await;
     let (_b_did, b, mut b_ev) = connect_did_key(addr, "otherbot").await;
     b.join("#nogrant").await.unwrap();
-    expect_event(&mut b_ev, 2000, |e| matches!(e, Event::Joined { .. }), "joined").await;
+    expect_event(
+        &mut b_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "joined",
+    )
+    .await;
 
     // plainuser is not an op in #nogrant (otherbot created it, so holds ops).
     a.raw("AGENT GRANT otherbot deploy").await.unwrap();
@@ -3462,13 +3480,31 @@ async fn revoking_a_parent_tears_down_its_children() {
 
     let (_op_did, op, mut op_ev) = connect_did_key(addr, "govop").await;
     op.join("#govcascade").await.unwrap();
-    expect_event(&mut op_ev, 2000, |e| matches!(e, Event::Joined { .. }), "op joined").await;
+    expect_event(
+        &mut op_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "op joined",
+    )
+    .await;
 
     let (_p_did, parent, mut parent_ev) = connect_did_key(addr, "govparent").await;
     parent.register_agent("agent").await.unwrap();
-    expect_raw_line(&mut parent_ev, 2000, "registered as agent", "AGENT REGISTER").await;
+    expect_raw_line(
+        &mut parent_ev,
+        2000,
+        "registered as agent",
+        "AGENT REGISTER",
+    )
+    .await;
     parent.join("#govcascade").await.unwrap();
-    expect_event(&mut parent_ev, 2000, |e| matches!(e, Event::Joined { .. }), "parent joined").await;
+    expect_event(
+        &mut parent_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "parent joined",
+    )
+    .await;
 
     parent
         .spawn_agent("#govcascade", "govchild", &[], None, None)
@@ -3516,7 +3552,13 @@ async fn naming_someone_else_as_sponsor_requires_their_consent() {
     let (victim_did, victim, _victim_ev) = connect_did_key(addr, "generous").await;
     let (_op_did, op, mut op_ev) = connect_did_key(addr, "opportunist").await;
     op.join("#freeloading").await.unwrap();
-    expect_event(&mut op_ev, 2000, |e| matches!(e, Event::Joined { .. }), "op joined").await;
+    expect_event(
+        &mut op_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "op joined",
+    )
+    .await;
 
     // The op names an unrelated identity as the one funding this channel.
     op.raw(&format!(

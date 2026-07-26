@@ -200,7 +200,9 @@ async fn callback(
         Ok(j) => j,
         Err(e) => return error_page(&format!("Could not fetch the IdP signing keys: {e}")),
     };
-    let expected_nonce = pending.provider_params["nonce"].as_str().map(str::to_string);
+    let expected_nonce = pending.provider_params["nonce"]
+        .as_str()
+        .map(str::to_string);
     let claims = match verify_with_jwks(
         &jwks,
         &id_token,
@@ -473,9 +475,8 @@ W3K0eJYUi/dwfH6BmLOf9bjPDuMkwaDakGhul0d54zTPL5j6vvaQATc=
     #[test]
     fn accepts_properly_signed_token() {
         let token = sign_claims(&good_claims());
-        let claims =
-            verify_with_jwks(&test_jwks(), &token, CLIENT_ID, ISSUER, Some("nonce-123"))
-                .expect("valid token verifies");
+        let claims = verify_with_jwks(&test_jwks(), &token, CLIENT_ID, ISSUER, Some("nonce-123"))
+            .expect("valid token verifies");
         assert_eq!(claims["email"], "jane@acme.com");
         assert_eq!(claims["hd"], "acme.com");
     }
@@ -489,12 +490,11 @@ W3K0eJYUi/dwfH6BmLOf9bjPDuMkwaDakGhul0d54zTPL5j6vvaQATc=
         let mut evil = good_claims();
         evil["email"] = serde_json::json!("mallory@acme.com");
         let parts: Vec<&str> = token.split('.').collect();
-        let forged_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(evil.to_string().as_bytes());
+        let forged_payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(evil.to_string().as_bytes());
         let forged = format!("{}.{}.{}", parts[0], forged_payload, parts[2]);
         assert!(
-            verify_with_jwks(&test_jwks(), &forged, CLIENT_ID, ISSUER, Some("nonce-123"))
-                .is_err()
+            verify_with_jwks(&test_jwks(), &forged, CLIENT_ID, ISSUER, Some("nonce-123")).is_err()
         );
     }
 
@@ -519,17 +519,14 @@ W3K0eJYUi/dwfH6BmLOf9bjPDuMkwaDakGhul0d54zTPL5j6vvaQATc=
     fn rejects_expired_token() {
         let mut c = good_claims();
         c["exp"] = serde_json::json!(now() - 600);
-        assert!(
-            verify_with_jwks(&test_jwks(), &sign_claims(&c), CLIENT_ID, ISSUER, None).is_err()
-        );
+        assert!(verify_with_jwks(&test_jwks(), &sign_claims(&c), CLIENT_ID, ISSUER, None).is_err());
     }
 
     #[test]
     fn rejects_nonce_mismatch_and_missing_nonce() {
         let token = sign_claims(&good_claims());
         assert!(
-            verify_with_jwks(&test_jwks(), &token, CLIENT_ID, ISSUER, Some("other-nonce"))
-                .is_err(),
+            verify_with_jwks(&test_jwks(), &token, CLIENT_ID, ISSUER, Some("other-nonce")).is_err(),
             "nonce mismatch must fail"
         );
 

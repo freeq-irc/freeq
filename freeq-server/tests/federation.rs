@@ -217,7 +217,11 @@ async fn wait_port(addr: &str) {
 
 // ── client helpers (mirrors multi_device.rs) ─────────────────────
 
-fn connect(server: &TestServer, id: &TestId, nick: &str) -> (client::ClientHandle, mpsc::Receiver<Event>) {
+fn connect(
+    server: &TestServer,
+    id: &TestId,
+    nick: &str,
+) -> (client::ClientHandle, mpsc::Receiver<Event>) {
     let config = ConnectConfig {
         server_addr: server.irc_addr.clone(),
         nick: nick.to_string(),
@@ -247,7 +251,12 @@ async fn wait_event(
 }
 
 async fn wait_auth_and_register(rx: &mut mpsc::Receiver<Event>) {
-    wait_event(rx, |e| matches!(e, Event::Authenticated { .. }), "Authenticated").await;
+    wait_event(
+        rx,
+        |e| matches!(e, Event::Authenticated { .. }),
+        "Authenticated",
+    )
+    .await;
     wait_event(rx, |e| matches!(e, Event::Registered { .. }), "Registered").await;
 }
 
@@ -261,9 +270,9 @@ async fn try_recv_message(
     timeout(dur, async {
         loop {
             match rx.recv().await {
-                Some(Event::Message { text: t, target, .. }) if t == text => {
-                    return Some(target)
-                }
+                Some(Event::Message {
+                    text: t, target, ..
+                }) if t == text => return Some(target),
                 Some(_) => continue,
                 None => return None,
             }
@@ -278,7 +287,11 @@ async fn try_recv_message(
 /// elapses), asserting the recipient sees the DID echoed as the target. Returns
 /// once delivery is confirmed — the shared "the S2S link is up" gate, with no
 /// fixed pre-sleep. Drains the delivered probe(s) from `rx`.
-async fn warm_link(sender: &client::ClientHandle, target_did: &str, rx: &mut mpsc::Receiver<Event>) {
+async fn warm_link(
+    sender: &client::ClientHandle,
+    target_did: &str,
+    rx: &mut mpsc::Receiver<Event>,
+) {
     let probe = "link-warmup-probe";
     let deadline = tokio::time::Instant::now() + S2S_SETTLE;
     while tokio::time::Instant::now() < deadline {
@@ -417,9 +430,7 @@ async fn did_dm_persists_on_receiver_under_dm_key() {
     // resolution, and persisted. Poll — the write follows delivery.
     let dm_key = freeq_server::db::canonical_dm_key(&alice.did, &bob.did);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while dm_row_count(&srv_b.db_path, &dm_key) == 0
-        && tokio::time::Instant::now() < deadline
-    {
+    while dm_row_count(&srv_b.db_path, &dm_key) == 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(
@@ -530,7 +541,7 @@ async fn tagmsg_to_remote_did_relays_as_structured_tagmsg() {
                 loop {
                     match rxb.recv().await {
                         Some(Event::TagMsg { tags, .. }) if tags.contains_key("+react") => {
-                            return Some(())
+                            return Some(());
                         }
                         Some(_) => continue,
                         None => return None,

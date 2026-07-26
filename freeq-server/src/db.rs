@@ -1236,9 +1236,9 @@ impl Db {
     fn revision_family(&self, channel: &str, msgid: &str) -> SqlResult<Vec<String>> {
         let mut root = msgid.to_string();
         for _ in 0..64 {
-            let mut stmt = self.conn.prepare(
-                "SELECT replaces_msgid FROM messages WHERE channel = ?1 AND msgid = ?2",
-            )?;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT replaces_msgid FROM messages WHERE channel = ?1 AND msgid = ?2")?;
             let parent: Option<String> = stmt
                 .query_map(params![channel, &root], |r| r.get::<_, Option<String>>(0))?
                 .next()
@@ -1899,7 +1899,12 @@ impl Db {
 
     /// Replace the user's favorites with `channels` (order = slice order).
     /// Atomic replace-all so a device's PUT is the authority for its DID.
-    pub fn set_user_favorites(&self, did: &str, channels: &[String], updated_at: u64) -> SqlResult<()> {
+    pub fn set_user_favorites(
+        &self,
+        did: &str,
+        channels: &[String],
+        updated_at: u64,
+    ) -> SqlResult<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM user_favorites WHERE did = ?1", params![did])?;
         for (i, ch) in channels.iter().enumerate() {
@@ -2103,9 +2108,21 @@ mod tests {
     fn granted_capabilities_are_held_and_revocation_removes_them() {
         let db = Db::open_memory().unwrap();
         let id = db
-            .grant_capability("#c", "did:key:bot", "deploy", None, 0, false, 0, "did:plc:op")
+            .grant_capability(
+                "#c",
+                "did:key:bot",
+                "deploy",
+                None,
+                0,
+                false,
+                0,
+                "did:plc:op",
+            )
             .unwrap();
-        assert_eq!(db.effective_capabilities("#c", "did:key:bot"), caps(&["deploy"]));
+        assert_eq!(
+            db.effective_capabilities("#c", "did:key:bot"),
+            caps(&["deploy"])
+        );
         db.revoke_capability(id).unwrap();
         assert!(db.effective_capabilities("#c", "did:key:bot").is_empty());
     }
@@ -2116,12 +2133,21 @@ mod tests {
         // narrowed list it was created with.
         let db = Db::open_memory().unwrap();
         db.save_manifest(
-            "did:key:child", r#"{"capabilities":{"default":["admin"]}}"#, None, "did:plc:op",
+            "did:key:child",
+            r#"{"capabilities":{"default":["admin"]}}"#,
+            None,
+            "did:plc:op",
         )
         .unwrap();
         db.record_spawn(
-            "did:key:child", "did:key:parent", "s", "kid", "#c",
-            &["post_message".to_string()], None, None,
+            "did:key:child",
+            "did:key:parent",
+            "s",
+            "kid",
+            "#c",
+            &["post_message".to_string()],
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2180,8 +2206,14 @@ mod tests {
     fn a_childs_spend_counts_against_its_parent() {
         let db = Db::open_memory().unwrap();
         db.record_spawn(
-            "did:key:child", "did:plc:parent", "sess-1", "worker", "#factory",
-            &["llm".to_string()], None, None,
+            "did:key:child",
+            "did:plc:parent",
+            "sess-1",
+            "worker",
+            "#factory",
+            &["llm".to_string()],
+            None,
+            None,
         )
         .unwrap();
         spend(&db, "#factory", "did:plc:parent", 6.0);
@@ -2193,8 +2225,14 @@ mod tests {
             12.0
         );
         // Direct attribution is unchanged: the breakdown still shows who spent.
-        assert_eq!(db.sum_spend("#factory", Some("did:plc:parent"), "usd", 0), 6.0);
-        assert_eq!(db.sum_spend("#factory", Some("did:key:child"), "usd", 0), 6.0);
+        assert_eq!(
+            db.sum_spend("#factory", Some("did:plc:parent"), "usd", 0),
+            6.0
+        );
+        assert_eq!(
+            db.sum_spend("#factory", Some("did:key:child"), "usd", 0),
+            6.0
+        );
     }
 
     #[test]
@@ -2202,23 +2240,44 @@ mod tests {
         // parent -> child -> grandchild. A grandchild cannot escape the limit by
         // being one more hop away.
         let db = Db::open_memory().unwrap();
-        db.record_spawn("did:key:c", "did:plc:p", "s", "c", "#f", &[], None, None).unwrap();
-        db.record_spawn("did:key:g", "did:key:c", "s", "g", "#f", &[], None, None).unwrap();
+        db.record_spawn("did:key:c", "did:plc:p", "s", "c", "#f", &[], None, None)
+            .unwrap();
+        db.record_spawn("did:key:g", "did:key:c", "s", "g", "#f", &[], None, None)
+            .unwrap();
         spend(&db, "#f", "did:plc:p", 1.0);
         spend(&db, "#f", "did:key:c", 2.0);
         spend(&db, "#f", "did:key:g", 4.0);
-        assert_eq!(db.sum_spend_with_descendants("#f", "did:plc:p", "usd", 0), 7.0);
-        assert_eq!(db.sum_spend_with_descendants("#f", "did:key:c", "usd", 0), 6.0);
+        assert_eq!(
+            db.sum_spend_with_descendants("#f", "did:plc:p", "usd", 0),
+            7.0
+        );
+        assert_eq!(
+            db.sum_spend_with_descendants("#f", "did:key:c", "usd", 0),
+            6.0
+        );
     }
 
     #[test]
     fn unrelated_agents_do_not_roll_up() {
         let db = Db::open_memory().unwrap();
-        db.record_spawn("did:key:mine", "did:plc:me", "s", "m", "#f", &[], None, None).unwrap();
+        db.record_spawn(
+            "did:key:mine",
+            "did:plc:me",
+            "s",
+            "m",
+            "#f",
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
         spend(&db, "#f", "did:plc:me", 1.0);
         spend(&db, "#f", "did:key:mine", 1.0);
         spend(&db, "#f", "did:plc:someone-else", 50.0);
-        assert_eq!(db.sum_spend_with_descendants("#f", "did:plc:me", "usd", 0), 2.0);
+        assert_eq!(
+            db.sum_spend_with_descendants("#f", "did:plc:me", "usd", 0),
+            2.0
+        );
     }
 
     #[test]
@@ -2226,21 +2285,30 @@ mod tests {
         // Killing the child must not erase what it already spent, or a hard limit
         // could be reset by despawning and respawning.
         let db = Db::open_memory().unwrap();
-        db.record_spawn("did:key:c", "did:plc:p", "s", "c", "#f", &[], None, None).unwrap();
+        db.record_spawn("did:key:c", "did:plc:p", "s", "c", "#f", &[], None, None)
+            .unwrap();
         spend(&db, "#f", "did:key:c", 9.0);
         db.record_despawn("did:key:c").unwrap();
-        assert_eq!(db.sum_spend_with_descendants("#f", "did:plc:p", "usd", 0), 9.0);
+        assert_eq!(
+            db.sum_spend_with_descendants("#f", "did:plc:p", "usd", 0),
+            9.0
+        );
     }
 
     #[test]
     fn a_cycle_in_the_spawn_graph_terminates() {
         // Defensive: a malformed parent chain must not spin forever.
         let db = Db::open_memory().unwrap();
-        db.record_spawn("did:key:a", "did:key:b", "s", "a", "#f", &[], None, None).unwrap();
-        db.record_spawn("did:key:b", "did:key:a", "s", "b", "#f", &[], None, None).unwrap();
+        db.record_spawn("did:key:a", "did:key:b", "s", "a", "#f", &[], None, None)
+            .unwrap();
+        db.record_spawn("did:key:b", "did:key:a", "s", "b", "#f", &[], None, None)
+            .unwrap();
         spend(&db, "#f", "did:key:a", 1.0);
         spend(&db, "#f", "did:key:b", 1.0);
-        assert_eq!(db.sum_spend_with_descendants("#f", "did:key:a", "usd", 0), 2.0);
+        assert_eq!(
+            db.sum_spend_with_descendants("#f", "did:key:a", "usd", 0),
+            2.0
+        );
     }
 
     #[test]
@@ -2248,10 +2316,24 @@ mod tests {
         // The child has no budget of its own. Without inheritance it falls through
         // to the channel default (or nothing), and the parent's limit is bypassed.
         let db = Db::open_memory().unwrap();
-        db.record_spawn("did:key:child", "did:plc:parent", "s", "w", "#f", &[], None, None)
-            .unwrap();
-        db.set_budget("#f", Some("did:plc:parent"), r#"{"max_amount":10.0}"#, "did:plc:owner")
-            .unwrap();
+        db.record_spawn(
+            "did:key:child",
+            "did:plc:parent",
+            "s",
+            "w",
+            "#f",
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        db.set_budget(
+            "#f",
+            Some("did:plc:parent"),
+            r#"{"max_amount":10.0}"#,
+            "did:plc:owner",
+        )
+        .unwrap();
         let inherited = db.get_budget_inherited("#f", "did:key:child");
         assert!(
             inherited.as_deref() == Some(r#"{"max_amount":10.0}"#),
@@ -2262,10 +2344,21 @@ mod tests {
     #[test]
     fn a_childs_own_budget_wins_over_the_inherited_one() {
         let db = Db::open_memory().unwrap();
-        db.record_spawn("did:key:child", "did:plc:parent", "s", "w", "#f", &[], None, None)
+        db.record_spawn(
+            "did:key:child",
+            "did:plc:parent",
+            "s",
+            "w",
+            "#f",
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        db.set_budget("#f", Some("did:plc:parent"), r#"{"max_amount":10.0}"#, "o")
             .unwrap();
-        db.set_budget("#f", Some("did:plc:parent"), r#"{"max_amount":10.0}"#, "o").unwrap();
-        db.set_budget("#f", Some("did:key:child"), r#"{"max_amount":2.0}"#, "o").unwrap();
+        db.set_budget("#f", Some("did:key:child"), r#"{"max_amount":2.0}"#, "o")
+            .unwrap();
         assert_eq!(
             db.get_budget_inherited("#f", "did:key:child").as_deref(),
             Some(r#"{"max_amount":2.0}"#)
@@ -2321,7 +2414,13 @@ mod tests {
         let db = Db::open_memory().unwrap();
         msg(&db, "#c", "v1", 100, "id-1");
         db.insert_edit(
-            "#c", "alice!a@host", "v2", 110, &HashMap::new(), "id-2", "id-1",
+            "#c",
+            "alice!a@host",
+            "v2",
+            110,
+            &HashMap::new(),
+            "id-2",
+            "id-1",
             Some("did:plc:alice"),
         )
         .unwrap();
@@ -2383,7 +2482,13 @@ mod tests {
         let db = Db::open_memory().unwrap();
         msg(&db, "#c", "v1", 100, "id-1");
         db.insert_edit(
-            "#c", "alice!a@host", "v2", 110, &HashMap::new(), "id-2", "id-1",
+            "#c",
+            "alice!a@host",
+            "v2",
+            110,
+            &HashMap::new(),
+            "id-2",
+            "id-1",
             Some("did:plc:alice"),
         )
         .unwrap();
@@ -2436,12 +2541,24 @@ mod tests {
         let db = Db::open_memory().unwrap();
         msg(&db, "#c", "v1", 100, "id-1");
         db.insert_edit(
-            "#c", "alice!a@host", "v2", 110, &HashMap::new(), "id-2", "id-1",
+            "#c",
+            "alice!a@host",
+            "v2",
+            110,
+            &HashMap::new(),
+            "id-2",
+            "id-1",
             Some("did:plc:alice"),
         )
         .unwrap();
         db.insert_edit(
-            "#c", "alice!a@host", "v3", 120, &HashMap::new(), "id-3", "id-2",
+            "#c",
+            "alice!a@host",
+            "v3",
+            120,
+            &HashMap::new(),
+            "id-3",
+            "id-2",
             Some("did:plc:alice"),
         )
         .unwrap();
@@ -3100,17 +3217,24 @@ mod tests {
     fn user_favorites_roundtrip_preserves_order() {
         let db = Db::open_memory().unwrap();
         assert!(db.get_user_favorites("did:plc:a").unwrap().is_empty());
-        db.set_user_favorites("did:plc:a", &["#z".into(), "#a".into(), "#m".into()], 100).unwrap();
-        assert_eq!(db.get_user_favorites("did:plc:a").unwrap(), vec!["#z", "#a", "#m"]);
+        db.set_user_favorites("did:plc:a", &["#z".into(), "#a".into(), "#m".into()], 100)
+            .unwrap();
+        assert_eq!(
+            db.get_user_favorites("did:plc:a").unwrap(),
+            vec!["#z", "#a", "#m"]
+        );
     }
 
     #[test]
     fn user_favorites_replace_is_atomic_and_scoped_per_did() {
         let db = Db::open_memory().unwrap();
-        db.set_user_favorites("did:plc:a", &["#a".into(), "#b".into()], 100).unwrap();
-        db.set_user_favorites("did:plc:b", &["#x".into()], 100).unwrap();
+        db.set_user_favorites("did:plc:a", &["#a".into(), "#b".into()], 100)
+            .unwrap();
+        db.set_user_favorites("did:plc:b", &["#x".into()], 100)
+            .unwrap();
         // Replace a's list entirely; b is untouched.
-        db.set_user_favorites("did:plc:a", &["#c".into()], 200).unwrap();
+        db.set_user_favorites("did:plc:a", &["#c".into()], 200)
+            .unwrap();
         assert_eq!(db.get_user_favorites("did:plc:a").unwrap(), vec!["#c"]);
         assert_eq!(db.get_user_favorites("did:plc:b").unwrap(), vec!["#x"]);
     }
@@ -3118,7 +3242,8 @@ mod tests {
     #[test]
     fn user_favorites_empty_clears() {
         let db = Db::open_memory().unwrap();
-        db.set_user_favorites("did:plc:a", &["#a".into()], 100).unwrap();
+        db.set_user_favorites("did:plc:a", &["#a".into()], 100)
+            .unwrap();
         db.set_user_favorites("did:plc:a", &[], 200).unwrap();
         assert!(db.get_user_favorites("did:plc:a").unwrap().is_empty());
     }
@@ -3165,7 +3290,11 @@ mod tests {
             .remove_reaction("msg001", "alia", Some("did:plc:aaa"), "👍")
             .unwrap();
         assert_eq!(removed, 1, "DID match must remove regardless of nick");
-        assert!(db.get_reactions_for_messages(&["msg001"]).unwrap().is_empty());
+        assert!(
+            db.get_reactions_for_messages(&["msg001"])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4293,7 +4422,8 @@ impl Db {
     /// budget of its own falls through to the channel default and the parent's
     /// limit simply does not apply to it.
     pub fn get_budget_inherited(&self, channel: &str, agent_did: &str) -> Option<String> {
-        if let Some(own) = self.conn
+        if let Some(own) = self
+            .conn
             .query_row(
                 "SELECT budget_json FROM channel_budgets WHERE channel = ?1 AND agent_did = ?2",
                 params![channel, agent_did],
@@ -4307,7 +4437,8 @@ impl Db {
         let mut current = agent_did.to_string();
         let mut seen = vec![current.clone()];
         for _ in 0..64 {
-            let parent: Option<String> = self.conn
+            let parent: Option<String> = self
+                .conn
                 .query_row(
                     "SELECT parent_did FROM spawned_agents WHERE channel = ?1 AND child_did = ?2",
                     params![channel, &current],
@@ -4318,7 +4449,8 @@ impl Db {
             if seen.contains(&parent) {
                 break; // cycle
             }
-            if let Some(b) = self.conn
+            if let Some(b) = self
+                .conn
                 .query_row(
                     "SELECT budget_json FROM channel_budgets WHERE channel = ?1 AND agent_did = ?2",
                     params![channel, &parent],

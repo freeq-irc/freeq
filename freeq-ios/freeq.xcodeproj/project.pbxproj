@@ -93,6 +93,7 @@
 		B851BB1F9C23ED67884D5621 /* CallMicCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 17EDADA552C222EC7D8D3F34 /* CallMicCapture.swift */; };
 		BA97D2705780ACE7D35F1B5A /* AudioToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 652094AB12E394FEA901DE7E /* AudioToolbox.framework */; };
 		BBBACE23B6893E0329291726 /* BlueskyEmbed.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58407D4C1041AA5F085B8CDC /* BlueskyEmbed.swift */; };
+		BC3B8AF779F672071F306EB2 /* SelfPartResolve.swift in Sources */ = {isa = PBXBuildFile; fileRef = B848E491B8944927766305C4 /* SelfPartResolve.swift */; };
 		BDDF0B841D6BE174B3422E91 /* MediaCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEAD9DB0C1ADE514854C57B0 /* MediaCapture.swift */; };
 		BDE5C52E5FD4C024CDA4D798 /* EmptyStateView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8A70269A0B1FFBA4A6B8F51 /* EmptyStateView.swift */; };
 		C188CB44680B51C598EEDA18 /* BlueskyGraph.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5C23A0B4E13C09B1E12EA8F /* BlueskyGraph.swift */; };
@@ -253,6 +254,7 @@
 		B46D635B8FB436FDCECA93FE /* FreeqLogo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FreeqLogo.swift; sourceTree = "<group>"; };
 		B5C23A0B4E13C09B1E12EA8F /* BlueskyGraph.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlueskyGraph.swift; sourceTree = "<group>"; };
 		B685C15E30EA5AD6D0999DB7 /* QuickSwitcherSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickSwitcherSheet.swift; sourceTree = "<group>"; };
+		B848E491B8944927766305C4 /* SelfPartResolve.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfPartResolve.swift; sourceTree = "<group>"; };
 		B911F97D1975D8B4F98A4647 /* ChannelAccessNotice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelAccessNotice.swift; sourceTree = "<group>"; };
 		C01B51AD480FA3889B5B5D29 /* ChatDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatDetailView.swift; sourceTree = "<group>"; };
 		C24850A65B3ED49F5C323EEA /* MessageActions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageActions.swift; sourceTree = "<group>"; };
@@ -458,6 +460,7 @@
 				5DDE25216F85C26CCEE21C66 /* NetworkMonitor.swift */,
 				D528FB66B3A58A4A06E4379C /* Notifications.swift */,
 				7A31629FF3AFE028388F95C8 /* PhoneWatchBridge.swift */,
+				B848E491B8944927766305C4 /* SelfPartResolve.swift */,
 				A968D5C7244372A54881C91E /* ServerConfig.swift */,
 				C5A82F11FAB31980C3BD38DB /* StepUpAuth.swift */,
 				7D7683ED921B13F8CF675C3D /* VoiceTranscriber.swift */,
@@ -792,6 +795,7 @@
 				DF1C8C4E7B84DAD909DCA71B /* QuickSwitcherSheet.swift in Sources */,
 				E51D087B116EE63A4FA6AAF9 /* Safety.swift in Sources */,
 				B792746D241CB91D4B15E377 /* SearchSheet.swift in Sources */,
+				BC3B8AF779F672071F306EB2 /* SelfPartResolve.swift in Sources */,
 				7CE09F1FC8607BC12D448A0D /* ServerConfig.swift in Sources */,
 				E54F6F22FE39E885EFCBE309 /* SettingsTab.swift in Sources */,
 				90E36A9344A176609A6BFAB1 /* SharedStore.swift in Sources */,

@@ -1262,7 +1262,10 @@ fn load_attestation_key(data_dir: &str) -> [u8; 32] {
     if let Err(e) = crate::secrets::write_secret(&key_path, &key) {
         tracing::error!("Failed to persist attestation key: {e}");
     } else {
-        tracing::info!("Generated attestation signing key at {}", key_path.display());
+        tracing::info!(
+            "Generated attestation signing key at {}",
+            key_path.display()
+        );
     }
     key
 }
@@ -1379,7 +1382,6 @@ fn resolver_from_config(config: &ServerConfig) -> DidResolver {
 }
 
 impl Server {
-
     /// Build SharedState, opening the database and loading persisted data.
     fn build_state(&self) -> Result<Arc<SharedState>> {
         // Install the agent-assist LLM provider (idempotent; no-op if
@@ -3485,9 +3487,8 @@ pub(crate) async fn process_s2s_message(
                 let did = state.nick_owners.lock().get(&nick.to_lowercase()).cloned();
                 let emoji = emoji.clone();
                 let target_msgid = target_msgid.clone();
-                state.with_db(|db| {
-                    db.remove_reaction(&target_msgid, &nick, did.as_deref(), &emoji)
-                });
+                state
+                    .with_db(|db| db.remove_reaction(&target_msgid, &nick, did.as_deref(), &emoji));
             }
 
             // Wire forms — identical for channel and DM delivery.
@@ -4933,7 +4934,11 @@ mod nickmap_tests {
         m.insert("chadfowler.com", "A"); // A primary
         m.insert("chadfowler.com", "B"); // B now primary, A still tracked
         m.remove_by_session("A"); // secondary leaves
-        assert_eq!(m.get_nick("B"), Some("chadfowler.com"), "live sibling lost its nick");
+        assert_eq!(
+            m.get_nick("B"),
+            Some("chadfowler.com"),
+            "live sibling lost its nick"
+        );
         assert_eq!(m.get_nick("A"), None);
         assert_eq!(m.get_session("chadfowler.com"), Some("B"));
     }
@@ -4945,7 +4950,11 @@ mod nickmap_tests {
         m.insert("chadfowler.com", "B"); // B primary
         m.remove_by_session("B"); // primary leaves
         assert_eq!(m.get_nick("A"), Some("chadfowler.com"));
-        assert_eq!(m.get_session("chadfowler.com"), Some("A"), "sibling not promoted");
+        assert_eq!(
+            m.get_session("chadfowler.com"),
+            Some("A"),
+            "sibling not promoted"
+        );
         assert_eq!(m.get_nick("B"), None);
     }
 
@@ -6485,7 +6494,11 @@ mod s2s_adversarial_tests {
         let stored = state
             .with_db(|db| db.get_reactions_for_messages(&["01MSGID"]))
             .expect("db present");
-        assert_eq!(stored.get("01MSGID").map(|v| v.len()), Some(1), "react persisted");
+        assert_eq!(
+            stored.get("01MSGID").map(|v| v.len()),
+            Some(1),
+            "react persisted"
+        );
 
         let mut unreact = HashMap::new();
         unreact.insert("+freeq.at/unreact".to_string(), "🎉".to_string());

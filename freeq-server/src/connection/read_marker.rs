@@ -186,9 +186,7 @@ fn load_marker(
 ) -> Option<String> {
     if let Some(ref did) = conn.authenticated_did {
         let key = marker_storage_key(conn, target, state);
-        state
-            .with_db(|db| db.get_read_marker(did, &key))
-            .flatten()
+        state.with_db(|db| db.get_read_marker(did, &key)).flatten()
     } else {
         state
             .session_read_markers

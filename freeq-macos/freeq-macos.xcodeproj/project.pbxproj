@@ -59,6 +59,7 @@
 		80AAB9C3511F63855AFF87FF /* AudioLevelMeter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F52BF9F99E9D9772373AA39 /* AudioLevelMeter.swift */; };
 		814109482C3020E4DFB6F5DC /* FreeqSDK.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4BCCB41ADB5F3934945B6E85 /* FreeqSDK.xcframework */; };
 		82F06962C82E36993AC3F92C /* AppKitMessageList.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2FF7FE3348FFE303622668A /* AppKitMessageList.swift */; };
+		86DD4B8F48BBEA4F40BE6D9D /* SelfPartResolve.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7244978703DC2ECAD43DFEB1 /* SelfPartResolve.swift */; };
 		87278B03BA72D53ADC27DB97 /* MainView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61EB9E0F12CF280B8BADFA41 /* MainView.swift */; };
 		87EDC9A9B0E1957D0BFEE7AD /* ShareViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38E7280ECF55468ACAA820E4 /* ShareViewController.swift */; };
 		8AA52D2329AF515F98602EDF /* AvStartRace.swift in Sources */ = {isa = PBXBuildFile; fileRef = 50E8C4C51998A707446B885B /* AvStartRace.swift */; };
@@ -185,6 +186,7 @@
 		6AD26F0F8B6173EE7643F964 /* NotificationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationManager.swift; sourceTree = "<group>"; };
 		6D0D657E5F637E5EFD232E19 /* KeychainHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainHelper.swift; sourceTree = "<group>"; };
 		71D02469D6C6FADFE295A523 /* ReconnectPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReconnectPolicy.swift; sourceTree = "<group>"; };
+		7244978703DC2ECAD43DFEB1 /* SelfPartResolve.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfPartResolve.swift; sourceTree = "<group>"; };
 		7340BE5C80B24DD16B066ABC /* ChannelSettingsSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelSettingsSheet.swift; sourceTree = "<group>"; };
 		746E6E96E986EB369B491948 /* CameraEffects.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraEffects.swift; sourceTree = "<group>"; };
 		7B5CC4E0945A336F1B9303AF /* QuickSendPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickSendPanel.swift; sourceTree = "<group>"; };
@@ -439,6 +441,7 @@
 				71D02469D6C6FADFE295A523 /* ReconnectPolicy.swift */,
 				568A6384EFD5C7CA0D2820AF /* Safety.swift */,
 				00BBD649F1BBDEBFC67FE0CE /* ScreenSharePicker.swift */,
+				7244978703DC2ECAD43DFEB1 /* SelfPartResolve.swift */,
 				C89E834D837706F1C070EF33 /* SelfStatus.swift */,
 				E71A46E52B4FC4C2F32D7F34 /* ServerConfig.swift */,
 				BBD9C5F061044C8E1FF937DE /* ShareURL.swift */,
@@ -672,6 +675,7 @@
 				3C18EEA13CDA87B9091E35DF /* SafetySettings.swift in Sources */,
 				72BBEFA4E10C0E98C945A987 /* ScreenSharePicker.swift in Sources */,
 				F804DF96FC5F782461D42394 /* SearchView.swift in Sources */,
+				86DD4B8F48BBEA4F40BE6D9D /* SelfPartResolve.swift in Sources */,
 				341D5363784AC7C54DE95234 /* SelfStatus.swift in Sources */,
 				6655210E4022992BD99591D9 /* ServerConfig.swift in Sources */,
 				B0C4859CFAA8548B0B74CFD2 /* SettingsView.swift in Sources */,

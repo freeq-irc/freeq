@@ -3167,7 +3167,10 @@ async fn dm_tagmsg_echoes_to_sender() {
         emoji: "🔥".to_string(),
         msgid: None,
     };
-    handle1.send_tagmsg("bob", reaction.to_tags()).await.unwrap();
+    handle1
+        .send_tagmsg("bob", reaction.to_tags())
+        .await
+        .unwrap();
 
     // Recipient delivery (already worked).
     expect_event(
@@ -4872,9 +4875,11 @@ async fn cross_target_delete_does_not_desync_channel_views() {
         "chathistory batch start",
     )
     .await;
-    let in_chathistory = saw_event(&mut events_alice, 1500, |e| {
-        matches!(e, Event::Message { text, .. } if text == "resurrect me")
-    })
+    let in_chathistory = saw_event(
+        &mut events_alice,
+        1500,
+        |e| matches!(e, Event::Message { text, .. } if text == "resurrect me"),
+    )
     .await;
 
     // View 2 — a fresh joiner's replay, served from in-memory ch.history.
@@ -4887,9 +4892,11 @@ async fn cross_target_delete_does_not_desync_channel_views() {
     )
     .await;
     handle_carol.join("#xdelete").await.unwrap();
-    let in_join_replay = saw_event(&mut events_carol, 2000, |e| {
-        matches!(e, Event::Message { text, .. } if text == "resurrect me")
-    })
+    let in_join_replay = saw_event(
+        &mut events_carol,
+        2000,
+        |e| matches!(e, Event::Message { text, .. } if text == "resurrect me"),
+    )
     .await;
 
     // The invariant: the DB and every live view must tell the same story.
@@ -5025,9 +5032,11 @@ async fn delete_honours_case_insensitive_channel_names() {
     )
     .await;
     handle_carol.join("#case").await.unwrap();
-    let replayed_to_new_joiner = saw_event(&mut events_carol, 2000, |e| {
-        matches!(e, Event::Message { text, .. } if text == "delete me")
-    })
+    let replayed_to_new_joiner = saw_event(
+        &mut events_carol,
+        2000,
+        |e| matches!(e, Event::Message { text, .. } if text == "delete me"),
+    )
     .await;
 
     assert!(
@@ -5108,10 +5117,7 @@ async fn deleting_an_edited_message_removes_the_edit_revision() {
     .await;
 
     // v1 → capture the identity the client will keep using.
-    handle_alice
-        .privmsg("#editdel", "secret v1")
-        .await
-        .unwrap();
+    handle_alice.privmsg("#editdel", "secret v1").await.unwrap();
     let first = expect_event(
         &mut events_bob,
         2000,
@@ -5155,9 +5161,11 @@ async fn deleting_an_edited_message_removes_the_edit_revision() {
         "chathistory batch start",
     )
     .await;
-    let v1_survives = saw_event(&mut events_alice, 1200, |e| {
-        matches!(e, Event::Message { text, .. } if text == "secret v1")
-    })
+    let v1_survives = saw_event(
+        &mut events_alice,
+        1200,
+        |e| matches!(e, Event::Message { text, .. } if text == "secret v1"),
+    )
     .await;
     drain_events(&mut events_alice).await;
     handle_alice.history_latest("#editdel", 50).await.unwrap();
@@ -5168,9 +5176,11 @@ async fn deleting_an_edited_message_removes_the_edit_revision() {
         "chathistory batch start (2)",
     )
     .await;
-    let v2_survives = saw_event(&mut events_alice, 1200, |e| {
-        matches!(e, Event::Message { text, .. } if text == "secret v2")
-    })
+    let v2_survives = saw_event(
+        &mut events_alice,
+        1200,
+        |e| matches!(e, Event::Message { text, .. } if text == "secret v2"),
+    )
     .await;
 
     assert!(

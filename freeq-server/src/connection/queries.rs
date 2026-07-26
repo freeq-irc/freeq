@@ -425,7 +425,9 @@ pub(super) fn handle_who(
             // with whichever flags each socket happened to carry.
             let mut by_nick: Vec<(String, Vec<String>)> = Vec::new();
             for session in &ch.members {
-                let Some(n) = n2s.get_nick(session) else { continue };
+                let Some(n) = n2s.get_nick(session) else {
+                    continue;
+                };
                 let lower = n.to_lowercase();
                 match by_nick.iter_mut().find(|(k, _)| k.to_lowercase() == lower) {
                     Some((_, sessions)) => sessions.push(session.clone()),
@@ -438,8 +440,7 @@ pub(super) fn handle_who(
                     let member_nick = member_nick.as_str();
                     let session = &sessions[0];
                     let user = "~u";
-                    let host =
-                        super::cloak_for_did(dids_snapshot.get(session).map(|s| s.as_str()));
+                    let host = super::cloak_for_did(dids_snapshot.get(session).map(|s| s.as_str()));
                     // Away only when every device is away: reachable on one
                     // device means reachable.
                     let away_flag = if sessions.iter().all(|s| away.contains_key(s)) {
@@ -676,16 +677,19 @@ mod tests {
     use std::cell::RefCell;
 
     /// Run handle_whois against a test state, capturing every line sent.
-    fn whois_lines(
-        state: &Arc<SharedState>,
-        requester: &Connection,
-        target: &str,
-    ) -> Vec<String> {
+    fn whois_lines(state: &Arc<SharedState>, requester: &Connection, target: &str) -> Vec<String> {
         let out = RefCell::new(Vec::new());
         let send = |_s: &Arc<SharedState>, _sid: &str, line: String| {
             out.borrow_mut().push(line);
         };
-        handle_whois(requester, target, state, "test-server", &requester.id, &send);
+        handle_whois(
+            requester,
+            target,
+            state,
+            "test-server",
+            &requester.id,
+            &send,
+        );
         out.into_inner()
     }
 
@@ -773,6 +777,9 @@ mod tests {
             .iter()
             .find(|l| l.contains(" 330 "))
             .expect("330 present");
-        assert!(l330.contains("did:key:z6MkRemoteBot"), "330 carries the DID: {l330}");
+        assert!(
+            l330.contains("did:key:z6MkRemoteBot"),
+            "330 carries the DID: {l330}"
+        );
     }
 }

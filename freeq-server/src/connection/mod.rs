@@ -2431,7 +2431,8 @@ where
                     // authority in a channel is a moderation act.
                     "GRANT" | "UNGRANT" => {
                         let granting = subcmd == "GRANT";
-                        let (Some(target), Some(capability)) = (msg.params.get(1), msg.params.get(2))
+                        let (Some(target), Some(capability)) =
+                            (msg.params.get(1), msg.params.get(2))
                         else {
                             let reply = Message::from_server(
                                 &server_name,
@@ -2499,7 +2500,11 @@ where
                         let target_did = if target.starts_with("did:") {
                             Some(target.clone())
                         } else {
-                            let sid = state.nick_to_session.lock().get_session(target).map(|s| s.to_string());
+                            let sid = state
+                                .nick_to_session
+                                .lock()
+                                .get_session(target)
+                                .map(|s| s.to_string());
                             sid.and_then(|sid| state.session_dids.lock().get(&sid).cloned())
                         };
                         let Some(target_did) = target_did else {
@@ -3534,7 +3539,14 @@ where
                         mgr.leave_for_did_instance(&did2, Some(inst))
                     };
                     for (av_sid, channel, av_nick, should_end) in &left {
-                        finish_av_slot_teardown(&state2, av_sid, channel, av_nick, *should_end, inst);
+                        finish_av_slot_teardown(
+                            &state2,
+                            av_sid,
+                            channel,
+                            av_nick,
+                            *should_end,
+                            inst,
+                        );
                     }
                     if !left.is_empty() {
                         tracing::info!(instance = %inst, did = %did2, "AV: grace expired — not rejoined, torn down");
@@ -3557,7 +3569,8 @@ where
                 } else {
                     let mut out = Vec::new();
                     for inst in &instances {
-                        for (sid, ch, nick, end) in mgr.leave_for_did_instance(&did_for_av, Some(inst))
+                        for (sid, ch, nick, end) in
+                            mgr.leave_for_did_instance(&did_for_av, Some(inst))
                         {
                             out.push((sid, ch, nick, end, Some(inst.clone())));
                         }
