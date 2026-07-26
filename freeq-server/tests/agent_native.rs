@@ -3128,3 +3128,64 @@ async fn commit_reveal_commit_not_found_e2e() {
     observer.quit(None).await.unwrap();
     server_handle.abort();
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// Phase 5 seam: the budget sponsor
+// ══════════════════════════════════════════════════════════════════════
+
+/// `BudgetPolicy.sponsor_did` is documented as "DID of the budget sponsor (who
+/// gets notified and pays)".
+///
+/// It is parsed from the BUDGET command and stored in the policy JSON, and then
+/// never read again. Nobody is notified and nothing is charged to them — so the
+/// one field that expresses "these are someone else's credits" is inert. Budget
+/// warnings go to the channel, which is where the funder often is not.
+#[tokio::test]
+async fn budget_sponsor_is_notified_when_the_threshold_is_crossed() {
+    start_deadlock_detector();
+    let (addr, server_handle) = start_test_server_with_db(empty_resolver(), true).await;
+
+    // The sponsor is a real connected identity, not in the channel: they are
+    // funding the work, not watching it.
+    let (sponsor_did, sponsor, mut sponsor_ev) = connect_did_key(addr, "thesponsor").await;
+
+    let (_bot_did, bot, mut bot_ev) = connect_did_key(addr, "spendbot").await;
+    bot.register_agent("agent").await.unwrap();
+    expect_raw_line(&mut bot_ev, 2000, "registered as agent", "AGENT REGISTER").await;
+    bot.join("#sponsored").await.unwrap();
+    expect_event(
+        &mut bot_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "bot joined",
+    )
+    .await;
+
+    bot.set_budget("#sponsored", 10.0, "usd", "per_day", &sponsor_did)
+        .await
+        .unwrap();
+    expect_raw_line(&mut bot_ev, 2000, "Budget set", "budget set").await;
+
+    // Cross the 80% warn threshold.
+    bot.report_spend("#sponsored", 7.0, "usd", "claude call", None)
+        .await
+        .unwrap();
+    expect_raw_line(&mut bot_ev, 2000, "Recorded", "spend 1").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    bot.report_spend("#sponsored", 2.0, "usd", "claude call", None)
+        .await
+        .unwrap();
+
+    // The sponsor is paying; they must hear about it.
+    expect_raw_line(
+        &mut sponsor_ev,
+        3000,
+        "sponsored",
+        "sponsor is notified that their budget is nearly spent",
+    )
+    .await;
+
+    bot.quit(None).await.ok();
+    sponsor.quit(None).await.ok();
+    server_handle.abort();
+}

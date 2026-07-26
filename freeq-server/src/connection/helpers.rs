@@ -381,3 +381,39 @@ mod folded_membership_tests {
         assert!(!op && !voiced);
     }
 }
+
+/// Deliver a budget notice to every live session of `sponsor_did`.
+///
+/// A budget names a sponsor — the identity whose credits fund the agent. They
+/// are usually not in the channel where the spending happens (that is rather the
+/// point of sponsoring), so channel broadcasts never reach them. Silent when the
+/// sponsor is offline or is a placeholder DID with no session.
+pub(super) fn notify_sponsor(
+    state: &Arc<SharedState>,
+    server_name: &str,
+    sponsor_did: &str,
+    text: &str,
+) {
+    if sponsor_did.is_empty() {
+        return;
+    }
+    let sessions: Vec<String> = state
+        .session_dids
+        .lock()
+        .iter()
+        .filter(|(_, did)| did.as_str() == sponsor_did)
+        .map(|(sid, _)| sid.clone())
+        .collect();
+    if sessions.is_empty() {
+        return;
+    }
+    let nicks = state.nick_to_session.lock();
+    let conns = state.connections.lock();
+    for sid in &sessions {
+        let target = nicks.get_nick(sid).unwrap_or("*").to_string();
+        let line = format!(":{server_name} NOTICE {target} :{text}\r\n");
+        if let Some(tx) = conns.get(sid) {
+            let _ = tx.try_send(line);
+        }
+    }
+}

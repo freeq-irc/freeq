@@ -2649,18 +2649,35 @@ where
                         )
                     });
 
-                    // Check budget and enforce
+                    // Check budget and enforce.
+                    //
+                    // Inherited, not just own: a spawned agent holds a narrowed
+                    // subset of its parent's authority, so the parent's limit
+                    // applies to it. Otherwise a parent at its hard limit could
+                    // spawn a child and keep spending.
                     let budget_json = state
-                        .with_db(|db| Ok(db.get_budget(&channel, Some(did))))
+                        .with_db(|db| Ok(db.get_budget_inherited(&channel, did)))
                         .flatten();
                     if let Some(ref bj) = budget_json
                         && let Ok(budget) =
                             serde_json::from_str::<crate::policy::types::BudgetPolicy>(bj)
                     {
                         let period_start = budget_period_start(&budget.period);
+                        // Roll the delegated subtree up. Spend stays attributed
+                        // to whoever spent it (the breakdown stays honest), but
+                        // the limit question is about the whole subtree.
+                        let budget_owner = state
+                            .with_db(|db| Ok(db.budget_owner_for(&channel, did)))
+                            .flatten()
+                            .unwrap_or_else(|| did.clone());
                         let total_spent = state
                             .with_db(|db| {
-                                Ok(db.sum_spend(&channel, Some(did), &budget.unit, period_start))
+                                Ok(db.sum_spend_with_descendants(
+                                    &channel,
+                                    &budget_owner,
+                                    &budget.unit,
+                                    period_start,
+                                ))
                             })
                             .unwrap_or(0.0);
                         let ratio = total_spent / budget.max_amount;
@@ -2675,7 +2692,22 @@ where
                                 budget.max_amount
                             );
                             helpers::broadcast_to_channel(&state, &channel, &warn);
-                            tracing::info!(channel = %channel, agent = %nick, pct = ratio * 100.0, "Budget warning threshold hit");
+                            // The sponsor is the one whose credits these are, and
+                            // they are frequently not in the channel. `sponsor_did`
+                            // is documented as "who gets notified and pays"; the
+                            // notifying half lives here.
+                            helpers::notify_sponsor(
+                                &state,
+                                &server_name,
+                                &budget.sponsor_did,
+                                &format!(
+                                    "\u{26a0} Budget {:.0}% used by {nick} in {channel} ({:.2}/{:.2} {unit})",
+                                    ratio * 100.0,
+                                    total_spent,
+                                    budget.max_amount
+                                ),
+                            );
+                            tracing::info!(channel = %channel, agent = %nick, pct = ratio * 100.0, sponsor = %budget.sponsor_did, "Budget warning threshold hit");
                         }
 
                         // Block at limit
@@ -2685,6 +2717,15 @@ where
                                 total_spent, budget.max_amount
                             );
                             helpers::broadcast_to_channel(&state, &channel, &block);
+                            helpers::notify_sponsor(
+                                &state,
+                                &server_name,
+                                &budget.sponsor_did,
+                                &format!(
+                                    "\u{1f6d1} {nick} blocked in {channel}: budget exceeded ({:.2}/{:.2} {unit})",
+                                    total_spent, budget.max_amount
+                                ),
+                            );
 
                             // Send governance signal to agent
                             let gov_line = format!(

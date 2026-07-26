@@ -2047,6 +2047,119 @@ mod tests {
         .unwrap();
     }
 
+    // ── Spawned agents and budgets: the seam between PHASE-4 and PHASE-5 ──
+    //
+    // A spawned child gets a narrowed subset of its parent's capabilities and
+    // dies with the parent (PHASE-4). Budgets are per (channel, agent_did)
+    // (PHASE-5). Neither document mentions the other, so the join between them
+    // was never specified: a child spends against its OWN did, which means a
+    // parent under a hard limit can spawn a child and keep spending.
+    //
+    // These pin the intended semantics: attribute spend to whoever spent it (so
+    // the breakdown stays honest), but roll descendants up when asking what a
+    // parent has spent, and let a child inherit the parent's budget.
+
+    fn spend(db: &Db, channel: &str, did: &str, amount: f64) {
+        db.record_spend(channel, did, amount, "usd", Some("claude call"), None)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_childs_spend_counts_against_its_parent() {
+        let db = Db::open_memory().unwrap();
+        db.record_spawn(
+            "did:key:child", "did:plc:parent", "sess-1", "worker", "#factory",
+            &["llm".to_string()], None, None,
+        )
+        .unwrap();
+        spend(&db, "#factory", "did:plc:parent", 6.0);
+        spend(&db, "#factory", "did:key:child", 6.0);
+
+        // The child spent the parent's credits; the parent's total must reflect it.
+        assert_eq!(
+            db.sum_spend_with_descendants("#factory", "did:plc:parent", "usd", 0),
+            12.0
+        );
+        // Direct attribution is unchanged: the breakdown still shows who spent.
+        assert_eq!(db.sum_spend("#factory", Some("did:plc:parent"), "usd", 0), 6.0);
+        assert_eq!(db.sum_spend("#factory", Some("did:key:child"), "usd", 0), 6.0);
+    }
+
+    #[test]
+    fn descendants_roll_up_through_a_chain() {
+        // parent -> child -> grandchild. A grandchild cannot escape the limit by
+        // being one more hop away.
+        let db = Db::open_memory().unwrap();
+        db.record_spawn("did:key:c", "did:plc:p", "s", "c", "#f", &[], None, None).unwrap();
+        db.record_spawn("did:key:g", "did:key:c", "s", "g", "#f", &[], None, None).unwrap();
+        spend(&db, "#f", "did:plc:p", 1.0);
+        spend(&db, "#f", "did:key:c", 2.0);
+        spend(&db, "#f", "did:key:g", 4.0);
+        assert_eq!(db.sum_spend_with_descendants("#f", "did:plc:p", "usd", 0), 7.0);
+        assert_eq!(db.sum_spend_with_descendants("#f", "did:key:c", "usd", 0), 6.0);
+    }
+
+    #[test]
+    fn unrelated_agents_do_not_roll_up() {
+        let db = Db::open_memory().unwrap();
+        db.record_spawn("did:key:mine", "did:plc:me", "s", "m", "#f", &[], None, None).unwrap();
+        spend(&db, "#f", "did:plc:me", 1.0);
+        spend(&db, "#f", "did:key:mine", 1.0);
+        spend(&db, "#f", "did:plc:someone-else", 50.0);
+        assert_eq!(db.sum_spend_with_descendants("#f", "did:plc:me", "usd", 0), 2.0);
+    }
+
+    #[test]
+    fn a_despawned_childs_spend_still_counts_for_the_period() {
+        // Killing the child must not erase what it already spent, or a hard limit
+        // could be reset by despawning and respawning.
+        let db = Db::open_memory().unwrap();
+        db.record_spawn("did:key:c", "did:plc:p", "s", "c", "#f", &[], None, None).unwrap();
+        spend(&db, "#f", "did:key:c", 9.0);
+        db.record_despawn("did:key:c").unwrap();
+        assert_eq!(db.sum_spend_with_descendants("#f", "did:plc:p", "usd", 0), 9.0);
+    }
+
+    #[test]
+    fn a_cycle_in_the_spawn_graph_terminates() {
+        // Defensive: a malformed parent chain must not spin forever.
+        let db = Db::open_memory().unwrap();
+        db.record_spawn("did:key:a", "did:key:b", "s", "a", "#f", &[], None, None).unwrap();
+        db.record_spawn("did:key:b", "did:key:a", "s", "b", "#f", &[], None, None).unwrap();
+        spend(&db, "#f", "did:key:a", 1.0);
+        spend(&db, "#f", "did:key:b", 1.0);
+        assert_eq!(db.sum_spend_with_descendants("#f", "did:key:a", "usd", 0), 2.0);
+    }
+
+    #[test]
+    fn a_child_inherits_its_parents_budget() {
+        // The child has no budget of its own. Without inheritance it falls through
+        // to the channel default (or nothing), and the parent's limit is bypassed.
+        let db = Db::open_memory().unwrap();
+        db.record_spawn("did:key:child", "did:plc:parent", "s", "w", "#f", &[], None, None)
+            .unwrap();
+        db.set_budget("#f", Some("did:plc:parent"), r#"{"max_amount":10.0}"#, "did:plc:owner")
+            .unwrap();
+        let inherited = db.get_budget_inherited("#f", "did:key:child");
+        assert!(
+            inherited.as_deref() == Some(r#"{"max_amount":10.0}"#),
+            "child should inherit the parent's budget, got {inherited:?}"
+        );
+    }
+
+    #[test]
+    fn a_childs_own_budget_wins_over_the_inherited_one() {
+        let db = Db::open_memory().unwrap();
+        db.record_spawn("did:key:child", "did:plc:parent", "s", "w", "#f", &[], None, None)
+            .unwrap();
+        db.set_budget("#f", Some("did:plc:parent"), r#"{"max_amount":10.0}"#, "o").unwrap();
+        db.set_budget("#f", Some("did:key:child"), r#"{"max_amount":2.0}"#, "o").unwrap();
+        assert_eq!(
+            db.get_budget_inherited("#f", "did:key:child").as_deref(),
+            Some(r#"{"max_amount":2.0}"#)
+        );
+    }
+
     /// Deleting a message must remove every revision of it.
     ///
     /// An edit is a separate row carrying `replaces_msgid`, and clients keep the
@@ -3884,6 +3997,161 @@ impl Db {
             params![channel, did_key, budget_json, set_by, now],
         )?;
         Ok(())
+    }
+
+    /// Every DID spawned (transitively) by `parent_did` in this channel.
+    ///
+    /// Bounded, and tolerant of a malformed spawn graph: a cycle terminates
+    /// because a DID is only expanded once.
+    pub fn descendant_dids(&self, channel: &str, parent_did: &str) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        let mut frontier = vec![parent_did.to_string()];
+        while let Some(current) = frontier.pop() {
+            let mut stmt = match self.conn.prepare(
+                "SELECT child_did FROM spawned_agents WHERE channel = ?1 AND parent_did = ?2",
+            ) {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            let kids: Vec<String> = match stmt.query_map(params![channel, &current], |r| r.get(0)) {
+                Ok(rows) => rows.filter_map(Result::ok).collect(),
+                Err(_) => Vec::new(),
+            };
+            for k in kids {
+                if k != parent_did && !found.contains(&k) {
+                    found.push(k.clone());
+                    frontier.push(k);
+                }
+            }
+            if found.len() > 256 {
+                break; // safety valve; no legitimate agent spawns 256 descendants
+            }
+        }
+        found
+    }
+
+    /// What `agent_did` has spent, including everything its spawned agents spent.
+    ///
+    /// Spend is attributed to whoever spent it, so the per-agent breakdown stays
+    /// honest — but a budget question is about the whole delegated subtree. A
+    /// parent under a hard limit must not be able to spawn a child and carry on
+    /// spending, which is what happens if you only sum the parent's own rows.
+    pub fn sum_spend_with_descendants(
+        &self,
+        channel: &str,
+        agent_did: &str,
+        unit: &str,
+        since: i64,
+    ) -> f64 {
+        let mut total = self.sum_spend(channel, Some(agent_did), unit, since);
+        for child in self.descendant_dids(channel, agent_did) {
+            total += self.sum_spend(channel, Some(&child), unit, since);
+        }
+        total
+    }
+
+    /// Which DID's budget governs `agent_did` — itself, or the nearest ancestor
+    /// that has one. Needed so the subtree total is summed from the right root:
+    /// charging a child against the parent's limit means totalling the parent's
+    /// subtree, not the child's.
+    pub fn budget_owner_for(&self, channel: &str, agent_did: &str) -> Option<String> {
+        if self
+            .conn
+            .query_row(
+                "SELECT 1 FROM channel_budgets WHERE channel = ?1 AND agent_did = ?2",
+                params![channel, agent_did],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok()
+        {
+            return Some(agent_did.to_string());
+        }
+        let mut current = agent_did.to_string();
+        let mut seen = vec![current.clone()];
+        for _ in 0..64 {
+            let parent: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT parent_did FROM spawned_agents WHERE channel = ?1 AND child_did = ?2",
+                    params![channel, &current],
+                    |row| row.get(0),
+                )
+                .ok();
+            let Some(parent) = parent else { break };
+            if seen.contains(&parent) {
+                break;
+            }
+            if self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM channel_budgets WHERE channel = ?1 AND agent_did = ?2",
+                    params![channel, &parent],
+                    |row| row.get::<_, i64>(0),
+                )
+                .is_ok()
+            {
+                return Some(parent);
+            }
+            seen.push(parent.clone());
+            current = parent;
+        }
+        None
+    }
+
+    /// The budget that applies to `agent_did`: its own, else the nearest
+    /// ancestor's, else the channel default.
+    ///
+    /// A spawned agent holds a narrowed subset of its parent's authority, so it
+    /// inherits the parent's spending limit too. Without this a child with no
+    /// budget of its own falls through to the channel default and the parent's
+    /// limit simply does not apply to it.
+    pub fn get_budget_inherited(&self, channel: &str, agent_did: &str) -> Option<String> {
+        if let Some(own) = self.conn
+            .query_row(
+                "SELECT budget_json FROM channel_budgets WHERE channel = ?1 AND agent_did = ?2",
+                params![channel, agent_did],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        {
+            return Some(own);
+        }
+        // Walk up the spawn chain, nearest ancestor first.
+        let mut current = agent_did.to_string();
+        let mut seen = vec![current.clone()];
+        for _ in 0..64 {
+            let parent: Option<String> = self.conn
+                .query_row(
+                    "SELECT parent_did FROM spawned_agents WHERE channel = ?1 AND child_did = ?2",
+                    params![channel, &current],
+                    |row| row.get(0),
+                )
+                .ok();
+            let Some(parent) = parent else { break };
+            if seen.contains(&parent) {
+                break; // cycle
+            }
+            if let Some(b) = self.conn
+                .query_row(
+                    "SELECT budget_json FROM channel_budgets WHERE channel = ?1 AND agent_did = ?2",
+                    params![channel, &parent],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+            {
+                return Some(b);
+            }
+            seen.push(parent.clone());
+            current = parent;
+        }
+        // Channel default.
+        self.conn
+            .query_row(
+                "SELECT budget_json FROM channel_budgets WHERE channel = ?1 AND agent_did = '*'",
+                params![channel],
+                |row| row.get(0),
+            )
+            .ok()
     }
 
     pub fn get_budget(&self, channel: &str, agent_did: Option<&str>) -> Option<String> {
