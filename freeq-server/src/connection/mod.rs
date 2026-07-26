@@ -2276,6 +2276,47 @@ where
                             .clone()
                             .unwrap_or_else(|| nick.clone());
 
+                        // Narrow to what the parent actually holds (PHASE-4 step 5).
+                        //
+                        // You cannot delegate authority you do not have. Without
+                        // this the requested list was recorded verbatim, so a
+                        // parent holding nothing could create a child holding
+                        // "deploy, admin". A parent that declares no capabilities
+                        // confers none.
+                        let requested = capabilities.clone();
+                        let capabilities = state
+                            .with_db(|db| {
+                                Ok(db.narrow_capabilities(&channel, &parent_did, &requested))
+                            })
+                            .unwrap_or_default();
+                        let refused: Vec<&String> = requested
+                            .iter()
+                            .filter(|r| !capabilities.contains(r))
+                            .collect();
+                        if !refused.is_empty() {
+                            tracing::info!(
+                                parent = %parent_did, child = %child_nick, channel = %channel,
+                                refused = ?refused,
+                                "Spawn capabilities narrowed: parent does not hold these"
+                            );
+                            let notice = Message::from_server(
+                                &server_name,
+                                "NOTICE",
+                                vec![
+                                    &nick,
+                                    &format!(
+                                        "Not conferred (you do not hold): {}",
+                                        refused
+                                            .iter()
+                                            .map(|s| s.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    ),
+                                ],
+                            );
+                            send(&state, &session_id, format!("{notice}\r\n"));
+                        }
+
                         // Record spawn
                         state.with_db(|db| {
                             db.record_spawn(
@@ -2373,6 +2414,157 @@ where
                         );
                         send(&state, &session_id, format!("{reply}\r\n"));
                         tracing::info!(parent = %nick, child = %child_nick, channel = %channel, "AGENT SPAWN");
+                    }
+
+                    // AGENT GRANT   <nick|did> <capability> [ttl=<secs>]
+                    // AGENT UNGRANT <nick|did> <capability>
+                    //
+                    // UNGRANT, not REVOKE: `AGENT REVOKE` already exists and
+                    // means the governance kill-switch for a whole agent
+                    // (PHASE-2, alongside PAUSE/RESUME). Withdrawing one
+                    // capability is a different act and needs its own verb.
+                    //
+                    // The writer `agent_capability_grants` never had. Without it
+                    // the table's TTLs, scopes and rate limits described grants
+                    // that could not be made, and an agent could only ever hold
+                    // what its own manifest claimed. Operator-only: conferring
+                    // authority in a channel is a moderation act.
+                    "GRANT" | "UNGRANT" => {
+                        let granting = subcmd == "GRANT";
+                        let (Some(target), Some(capability)) = (msg.params.get(1), msg.params.get(2))
+                        else {
+                            let reply = Message::from_server(
+                                &server_name,
+                                irc::ERR_NEEDMOREPARAMS,
+                                vec![
+                                    &nick,
+                                    "AGENT",
+                                    "Usage: AGENT GRANT|UNGRANT <nick> <capability> [ttl=<secs>]",
+                                ],
+                            );
+                            send(&state, &session_id, format!("{reply}\r\n"));
+                            continue;
+                        };
+                        // The channel the grant applies to: the one this session
+                        // is in. Ambiguous with several, so require exactly one,
+                        // matching how the other AGENT subcommands scope.
+                        let joined: Vec<String> = {
+                            let channels = state.channels.lock();
+                            channels
+                                .iter()
+                                .filter(|(_, ch)| ch.members.contains(&session_id))
+                                .map(|(name, _)| name.clone())
+                                .collect()
+                        };
+                        let channel = match joined.first().cloned() {
+                            Some(c) => c,
+                            None => {
+                                let reply = Message::from_server(
+                                    &server_name,
+                                    "NOTICE",
+                                    vec![&nick, "AGENT GRANT: join a channel first"],
+                                );
+                                send(&state, &session_id, format!("{reply}\r\n"));
+                                continue;
+                            }
+                        };
+
+                        // Operator check, by DID so any of an op's devices works.
+                        let granter_did = conn.authenticated_did.clone();
+                        let is_op = {
+                            let channels = state.channels.lock();
+                            channels
+                                .get(&channel)
+                                .map(|ch| {
+                                    ch.ops.contains(&session_id)
+                                        || granter_did.as_ref().is_some_and(|d| {
+                                            ch.founder_did.as_deref() == Some(d.as_str())
+                                                || ch.did_ops.contains(d)
+                                        })
+                                })
+                                .unwrap_or(false)
+                        };
+                        if !is_op {
+                            let reply = Message::from_server(
+                                &server_name,
+                                irc::ERR_CHANOPRIVSNEEDED,
+                                vec![&nick, &channel, "You're not channel operator"],
+                            );
+                            send(&state, &session_id, format!("{reply}\r\n"));
+                            continue;
+                        }
+
+                        // Resolve the target to a DID: a nick if it is online,
+                        // otherwise treat the argument as a DID directly.
+                        let target_did = if target.starts_with("did:") {
+                            Some(target.clone())
+                        } else {
+                            let sid = state.nick_to_session.lock().get_session(target).map(|s| s.to_string());
+                            sid.and_then(|sid| state.session_dids.lock().get(&sid).cloned())
+                        };
+                        let Some(target_did) = target_did else {
+                            let reply = Message::from_server(
+                                &server_name,
+                                "NOTICE",
+                                vec![&nick, &format!("AGENT GRANT: no DID for {target}")],
+                            );
+                            send(&state, &session_id, format!("{reply}\r\n"));
+                            continue;
+                        };
+
+                        let mut ttl: u64 = 0;
+                        for p in msg.params.iter().skip(3) {
+                            if let Some(v) = p.strip_prefix("ttl=") {
+                                ttl = v.parse().unwrap_or(0);
+                            }
+                        }
+
+                        let granted_by = granter_did.unwrap_or_else(|| nick.clone());
+                        let ok = if granting {
+                            state
+                                .with_db(|db| {
+                                    db.grant_capability(
+                                        &channel,
+                                        &target_did,
+                                        capability,
+                                        None,
+                                        ttl,
+                                        false,
+                                        0,
+                                        &granted_by,
+                                    )
+                                    .map(|_| ())
+                                })
+                                .is_some()
+                        } else {
+                            state
+                                .with_db(|db| {
+                                    for g in db.get_capabilities(&channel, &target_did) {
+                                        if &g.capability == capability {
+                                            db.revoke_capability(g.id)?;
+                                        }
+                                    }
+                                    Ok(())
+                                })
+                                .is_some()
+                        };
+
+                        let word = if granting { "Granted" } else { "Ungranted" };
+                        let text = if ok {
+                            format!("{word} {capability} for {target} in {channel}")
+                        } else {
+                            format!("AGENT {subcmd}: no database configured")
+                        };
+                        let reply =
+                            Message::from_server(&server_name, "NOTICE", vec![&nick, &text]);
+                        send(&state, &session_id, format!("{reply}\r\n"));
+                        if ok {
+                            tracing::info!(
+                                channel = %channel, target = %target_did,
+                                capability = %capability.as_str(), by = %granted_by, granting,
+                                "Agent capability grant changed"
+                            );
+                        }
                     }
 
                     // AGENT DESPAWN <nick>

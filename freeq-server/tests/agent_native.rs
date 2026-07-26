@@ -3191,7 +3191,7 @@ async fn budget_sponsor_is_notified_when_the_threshold_is_crossed() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Known gaps, kept executable
+// Capability delegation, and the gap that remains
 // ══════════════════════════════════════════════════════════════════════
 //
 // These encode behaviour the design documents specify and the code does not
@@ -3210,7 +3210,6 @@ async fn budget_sponsor_is_notified_when_the_threshold_is_crossed() {
 /// the parent's own capabilities and no intersection, so a child can be recorded
 /// with any capability its parent names — including ones the parent does not hold.
 #[tokio::test]
-#[ignore = "unimplemented: spawn does not intersect capabilities with the parent's"]
 async fn spawned_capabilities_are_narrowed_to_the_parents() {
     start_deadlock_detector();
     let (addr, server_handle) = start_test_server_with_db(empty_resolver(), true).await;
@@ -3302,5 +3301,145 @@ async fn a_capability_grant_is_actually_enforced() {
 
     op.quit(None).await.ok();
     bot.quit(None).await.ok();
+    server_handle.abort();
+}
+
+/// A channel op can confer a capability, and the agent then holds it.
+///
+/// `agent_capability_grants` had no writer at all: `grant_capability()` existed
+/// with zero callers, so the TTLs, scopes and rate limits in that schema
+/// described grants that could never be made. `AGENT GRANT` is that writer, and
+/// what it writes is what `narrow_capabilities` reads when a parent delegates.
+#[tokio::test]
+async fn an_op_can_grant_a_capability_and_it_is_then_delegable() {
+    start_deadlock_detector();
+    let (addr, server_handle) = start_test_server_with_db(empty_resolver(), true).await;
+
+    let (_op_did, op, mut op_ev) = connect_did_key(addr, "grantop").await;
+    op.join("#grants").await.unwrap();
+    expect_event(
+        &mut op_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "op joined",
+    )
+    .await;
+
+    let (_bot_did, bot, mut bot_ev) = connect_did_key(addr, "grantbot").await;
+    bot.register_agent("agent").await.unwrap();
+    expect_raw_line(&mut bot_ev, 2000, "registered as agent", "AGENT REGISTER").await;
+    bot.join("#grants").await.unwrap();
+    expect_event(
+        &mut bot_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "bot joined",
+    )
+    .await;
+    op.raw("MODE #grants +o grantbot").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Before the grant, the bot holds nothing, so it can confer nothing.
+    bot.spawn_agent("#grants", "before", &["call_tool"], None, None)
+        .await
+        .unwrap();
+    let before = expect_raw_line(&mut bot_ev, 2000, "Spawned before", "spawn before grant").await;
+    assert!(
+        !before.contains("call_tool"),
+        "conferred a capability the parent did not hold: {before}"
+    );
+
+    // The op grants it.
+    op.raw("AGENT GRANT grantbot call_tool").await.unwrap();
+    expect_raw_line(&mut op_ev, 2000, "Granted", "grant confirmed").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Now the same spawn confers it.
+    bot.spawn_agent("#grants", "after", &["call_tool"], None, None)
+        .await
+        .unwrap();
+    let after = expect_raw_line(&mut bot_ev, 2000, "Spawned after", "spawn after grant").await;
+    assert!(
+        after.contains("call_tool"),
+        "granted capability was not delegable: {after}"
+    );
+
+    op.quit(None).await.ok();
+    bot.quit(None).await.ok();
+    server_handle.abort();
+}
+
+/// A grant must be withdrawable, and withdrawing it must take the capability away.
+#[tokio::test]
+async fn ungranting_removes_the_capability() {
+    start_deadlock_detector();
+    let (addr, server_handle) = start_test_server_with_db(empty_resolver(), true).await;
+
+    let (_op_did, op, mut op_ev) = connect_did_key(addr, "revop").await;
+    op.join("#revokes").await.unwrap();
+    expect_event(
+        &mut op_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "op joined",
+    )
+    .await;
+    let (_bot_did, bot, mut bot_ev) = connect_did_key(addr, "revbot").await;
+    bot.register_agent("agent").await.unwrap();
+    expect_raw_line(&mut bot_ev, 2000, "registered as agent", "AGENT REGISTER").await;
+    bot.join("#revokes").await.unwrap();
+    expect_event(
+        &mut bot_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "bot joined",
+    )
+    .await;
+
+    op.raw("AGENT GRANT revbot deploy").await.unwrap();
+    expect_raw_line(&mut op_ev, 2000, "Granted", "granted").await;
+    // UNGRANT, not REVOKE: `AGENT REVOKE` is the governance kill-switch for a
+    // whole agent, which is a different act from withdrawing one capability.
+    op.raw("AGENT UNGRANT revbot deploy").await.unwrap();
+    expect_raw_line(&mut op_ev, 2000, "Ungranted", "ungranted").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    bot.spawn_agent("#revokes", "child", &["deploy"], None, None)
+        .await
+        .unwrap();
+    let line = expect_raw_line(&mut bot_ev, 2000, "Spawned child", "spawn after revoke").await;
+    assert!(
+        !line.contains("deploy"),
+        "revoked capability was still delegable: {line}"
+    );
+
+    op.quit(None).await.ok();
+    bot.quit(None).await.ok();
+    server_handle.abort();
+}
+
+/// Granting is an operator action.
+#[tokio::test]
+async fn granting_requires_op() {
+    start_deadlock_detector();
+    let (addr, server_handle) = start_test_server_with_db(empty_resolver(), true).await;
+
+    let (_a_did, a, mut a_ev) = connect_did_key(addr, "plainuser").await;
+    a.join("#nogrant").await.unwrap();
+    expect_event(&mut a_ev, 2000, |e| matches!(e, Event::Joined { .. }), "joined").await;
+    let (_b_did, b, mut b_ev) = connect_did_key(addr, "otherbot").await;
+    b.join("#nogrant").await.unwrap();
+    expect_event(&mut b_ev, 2000, |e| matches!(e, Event::Joined { .. }), "joined").await;
+
+    // plainuser is not an op in #nogrant (otherbot created it, so holds ops).
+    a.raw("AGENT GRANT otherbot deploy").await.unwrap();
+    let reply = expect_raw_line(&mut a_ev, 2000, "nogrant", "grant refusal").await;
+    assert!(
+        !reply.contains("Granted"),
+        "a non-op granted a capability: {reply}"
+    );
+
+    a.quit(None).await.ok();
+    b.quit(None).await.ok();
     server_handle.abort();
 }

@@ -2047,6 +2047,118 @@ mod tests {
         .unwrap();
     }
 
+    // ── Effective capabilities ────────────────────────────────────────────
+    //
+    // PHASE-4 says a spawned child gets "the intersection of the parent's caps
+    // and requested caps". To intersect, the parent's set has to be knowable, so
+    // this is where "what does this agent actually hold" is answered: a spawned
+    // agent holds what it was recorded with, and a top-level agent holds what its
+    // manifest declares plus whatever has been granted to it in the channel.
+
+    fn caps(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn an_agent_with_nothing_declared_holds_nothing() {
+        let db = Db::open_memory().unwrap();
+        assert!(db.effective_capabilities("#c", "did:key:nobody").is_empty());
+    }
+
+    #[test]
+    fn manifest_default_capabilities_are_held() {
+        let db = Db::open_memory().unwrap();
+        db.save_manifest(
+            "did:key:bot",
+            r#"{"capabilities":{"default":["post_message","read_channel"]}}"#,
+            None,
+            "did:plc:op",
+        )
+        .unwrap();
+        let mut held = db.effective_capabilities("#c", "did:key:bot");
+        held.sort();
+        assert_eq!(held, caps(&["post_message", "read_channel"]));
+    }
+
+    #[test]
+    fn per_channel_manifest_capabilities_are_added_for_that_channel_only() {
+        let db = Db::open_memory().unwrap();
+        db.save_manifest(
+            "did:key:bot",
+            r##"{"capabilities":{"default":["post_message"],"channels":{"#ops":["deploy"]}}}"##,
+            None,
+            "did:plc:op",
+        )
+        .unwrap();
+        let mut in_ops = db.effective_capabilities("#ops", "did:key:bot");
+        in_ops.sort();
+        assert_eq!(in_ops, caps(&["deploy", "post_message"]));
+        assert_eq!(
+            db.effective_capabilities("#other", "did:key:bot"),
+            caps(&["post_message"])
+        );
+    }
+
+    #[test]
+    fn granted_capabilities_are_held_and_revocation_removes_them() {
+        let db = Db::open_memory().unwrap();
+        let id = db
+            .grant_capability("#c", "did:key:bot", "deploy", None, 0, false, 0, "did:plc:op")
+            .unwrap();
+        assert_eq!(db.effective_capabilities("#c", "did:key:bot"), caps(&["deploy"]));
+        db.revoke_capability(id).unwrap();
+        assert!(db.effective_capabilities("#c", "did:key:bot").is_empty());
+    }
+
+    #[test]
+    fn a_spawned_agent_holds_exactly_what_it_was_recorded_with() {
+        // Not its parent's set, and not a manifest's: a child's authority is the
+        // narrowed list it was created with.
+        let db = Db::open_memory().unwrap();
+        db.save_manifest(
+            "did:key:child", r#"{"capabilities":{"default":["admin"]}}"#, None, "did:plc:op",
+        )
+        .unwrap();
+        db.record_spawn(
+            "did:key:child", "did:key:parent", "s", "kid", "#c",
+            &["post_message".to_string()], None, None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.effective_capabilities("#c", "did:key:child"),
+            caps(&["post_message"])
+        );
+    }
+
+    #[test]
+    fn narrowing_keeps_only_what_the_parent_holds() {
+        let db = Db::open_memory().unwrap();
+        db.save_manifest(
+            "did:key:parent",
+            r#"{"capabilities":{"default":["post_message","call_tool"]}}"#,
+            None,
+            "did:plc:op",
+        )
+        .unwrap();
+        let granted = db.narrow_capabilities(
+            "#c",
+            "did:key:parent",
+            &["post_message".into(), "deploy".into(), "admin".into()],
+        );
+        assert_eq!(granted, caps(&["post_message"]));
+    }
+
+    #[test]
+    fn narrowing_from_nothing_grants_nothing() {
+        // You cannot delegate authority you do not hold. This is the case that
+        // let a parent with no capabilities spawn a child with "deploy, admin".
+        let db = Db::open_memory().unwrap();
+        assert!(
+            db.narrow_capabilities("#c", "did:key:parent", &["deploy".into(), "admin".into()])
+                .is_empty()
+        );
+    }
+
     // ── Spawned agents and budgets: the seam between PHASE-4 and PHASE-5 ──
     //
     // A spawned child gets a narrowed subset of its parent's capabilities and
@@ -3397,6 +3509,81 @@ impl Db {
         .unwrap()
         .filter_map(|r| r.ok())
         .collect()
+    }
+
+    /// What `agent_did` actually holds in `channel`.
+    ///
+    /// A spawned agent holds exactly the narrowed list it was created with. Its
+    /// own manifest is deliberately ignored: a child's authority comes from its
+    /// parent, not from what it claims about itself, or delegation would be a
+    /// formality anyone could widen by publishing a manifest.
+    ///
+    /// A top-level agent holds its manifest's channel-specific capabilities, plus
+    /// its manifest defaults, plus every live grant in `agent_capability_grants`.
+    /// Declaring nothing means holding nothing.
+    pub fn effective_capabilities(&self, channel: &str, agent_did: &str) -> Vec<String> {
+        // Spawned agents: exactly what was recorded for them.
+        if let Ok(caps_json) = self.conn.query_row(
+            "SELECT capabilities_json FROM spawned_agents
+             WHERE child_did = ?1 AND despawned_at IS NULL",
+            params![agent_did],
+            |row| row.get::<_, String>(0),
+        ) {
+            return serde_json::from_str::<Vec<String>>(&caps_json).unwrap_or_default();
+        }
+
+        let mut held: Vec<String> = Vec::new();
+        let mut add = |c: String| {
+            if !c.is_empty() && !held.contains(&c) {
+                held.push(c);
+            }
+        };
+
+        if let Some(manifest_json) = self.get_manifest(agent_did)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&manifest_json)
+        {
+            let caps = &v["capabilities"];
+            if let Some(list) = caps["channels"][channel].as_array() {
+                for c in list {
+                    if let Some(sc) = c.as_str() {
+                        add(sc.to_string());
+                    }
+                }
+            }
+            if let Some(list) = caps["default"].as_array() {
+                for c in list {
+                    if let Some(sc) = c.as_str() {
+                        add(sc.to_string());
+                    }
+                }
+            }
+        }
+
+        for g in self.get_capabilities(channel, agent_did) {
+            add(g.capability);
+        }
+        held
+    }
+
+    /// The capabilities a parent may confer: `requested`, minus anything the
+    /// parent does not hold. Order follows `requested` so the result reads back
+    /// the way it was asked for.
+    ///
+    /// This is the intersection PHASE-4 specifies. Without it a parent holding
+    /// nothing could record a child holding anything, which is what the server
+    /// used to do.
+    pub fn narrow_capabilities(
+        &self,
+        channel: &str,
+        parent_did: &str,
+        requested: &[String],
+    ) -> Vec<String> {
+        let held = self.effective_capabilities(channel, parent_did);
+        requested
+            .iter()
+            .filter(|r| held.iter().any(|h| h == *r))
+            .cloned()
+            .collect()
     }
 
     pub fn revoke_capability(&self, grant_id: i64) -> SqlResult<()> {
