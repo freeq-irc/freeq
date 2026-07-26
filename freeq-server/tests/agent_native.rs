@@ -3443,3 +3443,54 @@ async fn granting_requires_op() {
     b.quit(None).await.ok();
     server_handle.abort();
 }
+
+/// Governance actions are advisory, and so is their propagation.
+///
+/// `AGENT REVOKE` writes the governance log and sends the agent a signal. It sets
+/// no server state, so nothing stops a revoked agent from continuing to send, and
+/// its spawned children are not torn down. Children *are* despawned on TTL
+/// expiry, on explicit despawn, and when the parent's connection drops — but a
+/// revoked-yet-connected parent keeps its descendants.
+///
+/// Enforcing this needs a server-side agent state that the message path consults,
+/// which does not exist yet. Kept executable so the gap is not just prose.
+#[tokio::test]
+#[ignore = "unimplemented: governance revoke is advisory and does not cascade to children"]
+async fn revoking_a_parent_tears_down_its_children() {
+    start_deadlock_detector();
+    let (addr, server_handle) = start_test_server_with_db(empty_resolver(), true).await;
+
+    let (_op_did, op, mut op_ev) = connect_did_key(addr, "govop").await;
+    op.join("#govcascade").await.unwrap();
+    expect_event(&mut op_ev, 2000, |e| matches!(e, Event::Joined { .. }), "op joined").await;
+
+    let (_p_did, parent, mut parent_ev) = connect_did_key(addr, "govparent").await;
+    parent.register_agent("agent").await.unwrap();
+    expect_raw_line(&mut parent_ev, 2000, "registered as agent", "AGENT REGISTER").await;
+    parent.join("#govcascade").await.unwrap();
+    expect_event(&mut parent_ev, 2000, |e| matches!(e, Event::Joined { .. }), "parent joined").await;
+
+    parent
+        .spawn_agent("#govcascade", "govchild", &[], None, None)
+        .await
+        .unwrap();
+    expect_raw_line(&mut parent_ev, 2000, "Spawned govchild", "spawned").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Revoke the parent. The child's authority derives entirely from the parent's,
+    // so it must not outlive it.
+    op.raw("AGENT REVOKE govparent :compromised").await.unwrap();
+    expect_raw_line(&mut op_ev, 2000, "revoked", "revoke issued").await;
+
+    expect_raw_line(
+        &mut op_ev,
+        3000,
+        "govchild",
+        "child is torn down when its parent is revoked",
+    )
+    .await;
+
+    op.quit(None).await.ok();
+    parent.quit(None).await.ok();
+    server_handle.abort();
+}
