@@ -246,6 +246,28 @@ class AppState {
     // MARK: - Names accumulator (353 lines come in multiple events)
     var pendingNames: [String: [MemberInfo]] = [:]
 
+    /// Remove a channel from the sidebar, recording why.
+    ///
+    /// Channels vanishing without explanation has cost real debugging time: the
+    /// server still had the subscription and no PART or KICK in its logs, so the
+    /// removal had to be local, and nothing said which branch did it. Every local
+    /// removal goes through here.
+    func removeChannelLocally(_ channel: String, reason: String, persist: Bool) {
+        let existed = channels.contains { $0.name.lowercased() == channel.lowercased() }
+        Log.roster.notice("""
+            removing channel \(channel, privacy: .public) reason=\(reason, privacy: .public) \
+            existed=\(existed) persist=\(persist)
+            """)
+        channels.removeAll { $0.name.lowercased() == channel.lowercased() }
+        if persist {
+            autoJoinChannels.removeAll { $0.lowercased() == channel.lowercased() }
+            UserDefaults.standard.set(autoJoinChannels, forKey: "freeq.channels")
+        }
+        if activeChannel?.lowercased() == channel.lowercased() {
+            activeChannel = channels.first?.name
+        }
+    }
+
     /// Channels this client asked to leave, and when.
     ///
     /// A PART echo identifies the leaver by nick, which every device signed in as
@@ -1623,12 +1645,7 @@ extension AppState {
             ) {
             case .leaveChannel:
                 pendingPartRequests.removeValue(forKey: channel.lowercased())
-                channels.removeAll { $0.name.lowercased() == channel.lowercased() }
-                autoJoinChannels.removeAll { $0.lowercased() == channel.lowercased() }
-                UserDefaults.standard.set(autoJoinChannels, forKey: "freeq.channels")
-                if activeChannel?.lowercased() == channel.lowercased() {
-                    activeChannel = channels.first?.name
-                }
+                removeChannelLocally(channel, reason: "PART we requested", persist: true)
 
             case .ignoreOtherDevice:
                 Log.roster.notice("""
@@ -1931,12 +1948,12 @@ extension AppState {
 
         case .kicked(let channel, let kickedNick, let by, let reason):
             if kickedNick.lowercased() == nick.lowercased() {
-                channels.removeAll { $0.name.lowercased() == channel.lowercased() }
-                autoJoinChannels.removeAll { $0.lowercased() == channel.lowercased() }
-                UserDefaults.standard.set(autoJoinChannels, forKey: "freeq.channels")
-                if activeChannel?.lowercased() == channel.lowercased() {
-                    activeChannel = channels.first?.name
-                }
+                // NOTE: same multi-device ambiguity as PART. A KICK names a nick,
+                // but the server kicks one *session*, so another device of this
+                // identity may still be in the channel. Unlike PART there is no
+                // intent to match against, so this still acts on the kick; the log
+                // line records it in case a sibling device was the real target.
+                removeChannelLocally(channel, reason: "KICK by \(by)", persist: true)
                 errorMessage = "Kicked from \(channel) by \(by): \(reason)"
                 // Being removed from a channel is worth a notification even
                 // in the foreground — no target (the channel is gone).
