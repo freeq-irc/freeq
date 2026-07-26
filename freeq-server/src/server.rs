@@ -364,8 +364,13 @@ pub struct HistoryMessage {
     pub timestamp: u64,
     /// IRCv3 tags from the original message (for rich media replay).
     pub tags: HashMap<String, String>,
-    /// ULID message ID (IRCv3 `msgid` tag).
+    /// ULID message ID (IRCv3 `msgid` tag). Stays the *original* id across
+    /// edits — a message's identity for life.
     pub msgid: Option<String>,
+    /// The text has been edited since it was sent. Join replay carries one
+    /// entry per logical message, so this is the only thing that tells a late
+    /// joiner the version they're reading isn't the original.
+    pub edited: bool,
 }
 
 /// Maximum number of history messages to keep per channel.
@@ -1476,17 +1481,44 @@ impl Server {
                 let messages = db
                     .get_messages(name, crate::server::MAX_HISTORY, None)
                     .map_err(|e| anyhow::anyhow!("Failed to load messages for {name}: {e}"))?;
+                // An edit is a separate row, so a revised message comes back as
+                // several rows. In-memory history holds one entry per logical
+                // message, keyed by its root id and carrying the newest text —
+                // otherwise every restart turns an edited message into two
+                // entries in the next joiner's replay.
+                let mut by_root: HashMap<String, usize> = HashMap::new();
                 for msg in messages {
                     let mut tags = msg.tags;
                     if let Some(ref did) = msg.sender_did {
                         tags.insert("account".to_string(), did.clone());
+                    }
+                    // Replay presents the collapsed entry as the message
+                    // itself, not as an edit of something the joiner never saw.
+                    tags.remove("+draft/edit");
+                    let root = msg.root_msgid.clone().or_else(|| msg.msgid.clone());
+                    // Newest text under the entry the message already has —
+                    // the same in-place swap the live edit path makes, so a
+                    // restart reproduces the state it left.
+                    if let Some(ref root) = root
+                        && let Some(&idx) = by_root.get(root)
+                        && let Some(existing) = ch.history.get_mut(idx)
+                    {
+                        existing.text = msg.text;
+                        existing.edited = true;
+                        continue;
+                    }
+                    if let Some(ref root) = root {
+                        by_root.insert(root.clone(), ch.history.len());
                     }
                     ch.history.push_back(HistoryMessage {
                         from: msg.sender,
                         text: msg.text,
                         timestamp: msg.timestamp,
                         tags,
-                        msgid: msg.msgid,
+                        // Identity is the root; a revision row's own id is
+                        // audit trail, never the key clients hold.
+                        msgid: root,
+                        edited: msg.replaces_msgid.is_some(),
                     });
                 }
             }
@@ -3187,6 +3219,7 @@ pub(crate) async fn process_s2s_message(
                             timestamp,
                             tags: tags.clone(),
                             msgid: Some(msgid.clone()),
+                            edited: false,
                         });
                         while ch.history.len() > MAX_HISTORY {
                             ch.history.pop_front();
@@ -3389,7 +3422,9 @@ pub(crate) async fn process_s2s_message(
             ..
         } => {
             let channel = sanitize_s2s_str(&channel, 200).to_lowercase();
-            let msgid = sanitize_s2s_str(&msgid, 100);
+            // The peer may name a revision we know under its root.
+            let msgid =
+                crate::connection::helpers::root_msgid(state, &sanitize_s2s_str(&msgid, 100));
             let pinned_by = sanitize_s2s_str(&pinned_by, 64);
 
             let mut channels = state.channels.lock();
@@ -3458,6 +3493,15 @@ pub(crate) async fn process_s2s_message(
                 if let Some(v) = tags.remove(draft) {
                     tags.entry(canonical.to_string()).or_insert(v);
                 }
+            }
+            // …and the message being acted on to its root, so a peer naming a
+            // revision still files and fans out under the one identity our
+            // clients hold the message under.
+            if (tags.contains_key("+react") || tags.contains_key("+freeq.at/unreact"))
+                && let Some(target_msgid) = tags.get("+reply")
+            {
+                let root = crate::connection::helpers::root_msgid(state, target_msgid);
+                tags.insert("+reply".to_string(), root);
             }
 
             // Persist reactions

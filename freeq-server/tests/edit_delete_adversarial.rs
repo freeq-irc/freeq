@@ -1091,3 +1091,479 @@ async fn multi_line_edit_delivers_line1_only_to_non_multiline_receiver() {
     })
     .await;
 }
+
+// ═══════════════════════════════════════════════════════════════
+// MESSAGE IDENTITY ACROSS REVISIONS
+//
+// A message's identity is its original msgid, for life. An edit changes
+// content, never identity: it still travels as a new wire id carrying
+// `+draft/edit=<original>`, but everything the server files and looks up —
+// reactions, pins, deletes, in-memory history — keys on the original.
+//
+// The tests below name operations by BOTH ids on purpose. Clients differ in
+// which one they hold (older builds re-keyed to the newest revision), and a
+// federated peer may relay either, so both must land on the same message.
+// ═══════════════════════════════════════════════════════════════
+
+impl C {
+    fn send_react(&mut self, target: &str, msgid: &str, emoji: &str) {
+        self.tx(&format!("@+react={emoji};+reply={msgid} TAGMSG {target}"));
+    }
+    fn send_unreact(&mut self, target: &str, msgid: &str, emoji: &str) {
+        self.tx(&format!(
+            "@+freeq.at/unreact={emoji};+reply={msgid} TAGMSG {target}"
+        ));
+    }
+    /// Send a message and an edit of it; returns (original id, edit's own id).
+    fn say_then_edit(
+        &mut self,
+        watcher: &mut C,
+        target: &str,
+        v1: &str,
+        v2: &str,
+    ) -> (String, String) {
+        self.tx(&format!("PRIVMSG {target} :{v1}"));
+        let first = watcher.rx(|l| l.contains("PRIVMSG") && l.contains(v1), "v1");
+        let original = C::extract_msgid(&first);
+        self.send_edit(target, &original, v2);
+        let edit = watcher.rx(|l| l.contains("PRIVMSG") && l.contains(v2), "v2");
+        let edit_id = C::extract_msgid(&edit);
+        assert_ne!(original, edit_id, "an edit travels under its own wire id");
+        assert!(
+            edit.contains(&format!("+draft/edit={original}")),
+            "the edit must point at the identity clients hold: {edit}"
+        );
+        (original, edit_id)
+    }
+}
+
+/// Join fresh and return the replayed line for `text`, or None.
+fn replayed_line(addr: SocketAddr, nick: &str, channel: &str, text: &str) -> Option<String> {
+    let mut joiner = C::with_caps(addr, nick);
+    joiner.reg();
+    joiner.drain();
+    joiner.tx(&format!("JOIN {channel}"));
+    joiner.maybe(|l| l.contains("PRIVMSG") && l.contains(text), 1500)
+}
+
+/// React on one revision, un-react on the other: both name the same message,
+/// so the reaction must be gone. A joiner's replay is the honest view — it
+/// reads what the server stored, not what a live client happened to render.
+#[tokio::test]
+async fn unreacting_by_the_original_clears_a_reaction_made_on_the_edit() {
+    let resolver = resolver_with(vec![]);
+    let (addr, _h) = start(resolver).await;
+    run(addr, |addr| {
+        let mut alice = C::with_caps(addr, "rid_a");
+        alice.reg();
+        alice.drain();
+        let mut bob = C::with_caps(addr, "rid_b");
+        bob.reg();
+        bob.drain();
+        alice.tx("JOIN #rid1");
+        alice.num("366");
+        alice.drain();
+        bob.tx("JOIN #rid1");
+        bob.num("366");
+        bob.drain();
+
+        let (original, edit_id) = alice.say_then_edit(&mut bob, "#rid1", "v1", "v2");
+
+        bob.send_react("#rid1", &edit_id, "🔥");
+        std::thread::sleep(Duration::from_millis(300));
+        let with_reaction =
+            replayed_line(addr, "rid_c", "#rid1", "v2").expect("joiner replays the edited message");
+        assert!(
+            with_reaction.contains("+freeq.at/reactions=🔥:rid_b"),
+            "a reaction filed against the edit id must ride the replayed \
+             message, which is keyed by the original: {with_reaction}"
+        );
+
+        bob.send_unreact("#rid1", &original, "🔥");
+        std::thread::sleep(Duration::from_millis(300));
+        let after = replayed_line(addr, "rid_d", "#rid1", "v2").expect("still replayed");
+        assert!(
+            !after.contains("+freeq.at/reactions"),
+            "un-reacting by the original id left the reaction behind: {after}"
+        );
+    })
+    .await;
+}
+
+/// …and the same in the other order: reacted before the edit, cleared by the
+/// edit's id afterwards.
+#[tokio::test]
+async fn unreacting_by_the_edit_id_clears_a_reaction_made_on_the_original() {
+    let resolver = resolver_with(vec![]);
+    let (addr, _h) = start(resolver).await;
+    run(addr, |addr| {
+        let mut alice = C::with_caps(addr, "rid2_a");
+        alice.reg();
+        alice.drain();
+        let mut bob = C::with_caps(addr, "rid2_b");
+        bob.reg();
+        bob.drain();
+        alice.tx("JOIN #rid2");
+        alice.num("366");
+        alice.drain();
+        bob.tx("JOIN #rid2");
+        bob.num("366");
+        bob.drain();
+
+        alice.tx("PRIVMSG #rid2 :v1");
+        let first = bob.rx(|l| l.contains("PRIVMSG") && l.contains("v1"), "v1");
+        let original = C::extract_msgid(&first);
+
+        bob.send_react("#rid2", &original, "🔥");
+        std::thread::sleep(Duration::from_millis(200));
+
+        alice.send_edit("#rid2", &original, "v2");
+        let edit = bob.rx(|l| l.contains("PRIVMSG") && l.contains("v2"), "v2");
+        let edit_id = C::extract_msgid(&edit);
+
+        bob.send_unreact("#rid2", &edit_id, "🔥");
+        std::thread::sleep(Duration::from_millis(300));
+
+        let after = replayed_line(addr, "rid2_c", "#rid2", "v2").expect("still replayed");
+        assert!(
+            !after.contains("+freeq.at/reactions"),
+            "un-reacting by the edit id left the reaction behind: {after}"
+        );
+    })
+    .await;
+}
+
+/// One person, one reaction — even when their two clients name two different
+/// revisions of the message.
+#[tokio::test]
+async fn two_ids_never_split_a_reaction_tally() {
+    let resolver = resolver_with(vec![]);
+    let (addr, _h) = start(resolver).await;
+    run(addr, |addr| {
+        let mut alice = C::with_caps(addr, "tal_a");
+        alice.reg();
+        alice.drain();
+        let mut bob = C::with_caps(addr, "tal_b");
+        bob.reg();
+        bob.drain();
+        alice.tx("JOIN #tally");
+        alice.num("366");
+        alice.drain();
+        bob.tx("JOIN #tally");
+        bob.num("366");
+        bob.drain();
+
+        let (original, edit_id) = alice.say_then_edit(&mut bob, "#tally", "v1", "v2");
+        bob.send_react("#tally", &original, "🔥");
+        bob.send_react("#tally", &edit_id, "🔥");
+        std::thread::sleep(Duration::from_millis(300));
+
+        let line = replayed_line(addr, "tal_c", "#tally", "v2").expect("replayed");
+        // Tag order is not stable, so the tally may be the first tag and carry
+        // the leading `@`.
+        let tally = line
+            .split(';')
+            .map(|t| t.trim_start_matches('@'))
+            .find(|t| t.starts_with("+freeq.at/reactions="))
+            .expect("reaction tally present");
+        assert_eq!(
+            tally.matches("tal_b").count(),
+            1,
+            "the same person reacting once must not be counted twice: {tally}"
+        );
+    })
+    .await;
+}
+
+/// A delete naming the edit's id must take the message with it — including out
+/// of the in-memory history a later joiner is replayed from.
+#[tokio::test]
+async fn deleting_by_the_edit_id_does_not_resurrect_for_a_joiner() {
+    let resolver = resolver_with(vec![]);
+    let (addr, _h) = start(resolver).await;
+    run(addr, |addr| {
+        let mut alice = C::with_caps(addr, "del_a");
+        alice.reg();
+        alice.drain();
+        let mut bob = C::with_caps(addr, "del_b");
+        bob.reg();
+        bob.drain();
+        alice.tx("JOIN #delrid");
+        alice.num("366");
+        alice.drain();
+        bob.tx("JOIN #delrid");
+        bob.num("366");
+        bob.drain();
+
+        let (_original, edit_id) =
+            alice.say_then_edit(&mut bob, "#delrid", "secret v1", "secret v2");
+        alice.send_delete("#delrid", &edit_id);
+        bob.rx(
+            |l| l.contains("TAGMSG") && l.contains("draft/delete"),
+            "delete",
+        );
+        std::thread::sleep(Duration::from_millis(300));
+
+        assert!(
+            replayed_line(addr, "del_c", "#delrid", "secret v2").is_none(),
+            "the deleted message came back for a joiner"
+        );
+        assert!(
+            replayed_line(addr, "del_d", "#delrid", "secret v1").is_none(),
+            "the pre-edit text came back for a joiner"
+        );
+    })
+    .await;
+}
+
+/// Join replay collapses revisions into one message, so nothing in the wire
+/// form says it was ever edited — hence the marker.
+#[tokio::test]
+async fn join_replay_marks_an_edited_message() {
+    let resolver = resolver_with(vec![]);
+    let (addr, _h) = start(resolver).await;
+    run(addr, |addr| {
+        let mut alice = C::with_caps(addr, "mrk_a");
+        alice.reg();
+        alice.drain();
+        let mut bob = C::with_caps(addr, "mrk_b");
+        bob.reg();
+        bob.drain();
+        alice.tx("JOIN #marked");
+        alice.num("366");
+        alice.drain();
+        bob.tx("JOIN #marked");
+        bob.num("366");
+        bob.drain();
+
+        alice.tx("PRIVMSG #marked :untouched");
+        bob.rx(|l| l.contains("untouched"), "plain message");
+        alice.say_then_edit(&mut bob, "#marked", "v1", "v2");
+        std::thread::sleep(Duration::from_millis(200));
+
+        let edited = replayed_line(addr, "mrk_c", "#marked", "v2").expect("replayed");
+        assert!(
+            edited.contains("+freeq.at/edited=1"),
+            "a late joiner can't tell this text isn't what was sent: {edited}"
+        );
+        let plain = replayed_line(addr, "mrk_d", "#marked", "untouched").expect("replayed");
+        assert!(
+            !plain.contains("+freeq.at/edited"),
+            "an unedited message must not be marked: {plain}"
+        );
+    })
+    .await;
+}
+
+/// Pinning before an edit and after it is one pin, and either id unpins it.
+#[tokio::test]
+async fn a_pin_follows_the_message_across_an_edit() {
+    let resolver = resolver_with(vec![]);
+    let (addr, _h) = start(resolver).await;
+    run(addr, |addr| {
+        let mut alice = C::with_caps(addr, "pin_a");
+        alice.reg();
+        alice.drain();
+        let mut bob = C::with_caps(addr, "pin_b");
+        bob.reg();
+        bob.drain();
+        // Alice creates the channel, so she is op and may pin.
+        alice.tx("JOIN #pinrid");
+        alice.num("366");
+        alice.drain();
+        bob.tx("JOIN #pinrid");
+        bob.num("366");
+        bob.drain();
+
+        let (original, edit_id) = alice.say_then_edit(&mut bob, "#pinrid", "v1", "v2");
+        alice.tx(&format!("PIN #pinrid {original}"));
+        alice.drain();
+        alice.tx(&format!("PIN #pinrid {edit_id}"));
+        std::thread::sleep(Duration::from_millis(200));
+
+        alice.drain();
+        alice.tx("PINS #pinrid");
+        let mut pins = Vec::new();
+        while let Some(l) = alice.maybe(|l| l.contains("PIN #pinrid"), 800) {
+            pins.push(l);
+        }
+        assert_eq!(pins.len(), 1, "one message must not pin twice: {pins:?}");
+        assert!(
+            pins[0].contains(&original),
+            "the pin must name the identity clients hold: {}",
+            pins[0]
+        );
+
+        // Unpin naming the revision — the same message, so it must clear.
+        alice.tx(&format!("UNPIN #pinrid {edit_id}"));
+        std::thread::sleep(Duration::from_millis(200));
+        alice.drain();
+        alice.tx("PINS #pinrid");
+        let none = alice.maybe(|l| l.contains("No pinned messages"), 1000);
+        assert!(
+            none.is_some(),
+            "unpinning by the edit's id left the pin in place"
+        );
+    })
+    .await;
+}
+
+/// A DM lives under a canonical `dm:` key rather than the wire target, so
+/// resolving a reaction to its message is a lookup by id, not by channel. Both
+/// ends must still agree.
+#[tokio::test]
+async fn a_dm_reaction_survives_an_edit() {
+    let key_a = PrivateKey::generate_ed25519();
+    let key_b = PrivateKey::generate_ed25519();
+    let resolver = resolver_with(vec![(DID_ALICE, &key_a), (DID_BOB, &key_b)]);
+    let (addr, _h) = start(resolver).await;
+    run(addr, move |addr| {
+        let mut alice = C::with_sasl(addr, "dmrid_a", DID_ALICE, key_a);
+        alice.reg();
+        alice.drain();
+        let mut bob = C::with_sasl(addr, "dmrid_b", DID_BOB, key_b);
+        bob.reg();
+        bob.drain();
+
+        alice.tx("PRIVMSG dmrid_b :dm v1");
+        let first = bob.rx(|l| l.contains("PRIVMSG") && l.contains("dm v1"), "dm v1");
+        let original = C::extract_msgid(&first);
+        alice.send_edit("dmrid_b", &original, "dm v2");
+        let edit = bob.rx(|l| l.contains("PRIVMSG") && l.contains("dm v2"), "dm v2");
+        let edit_id = C::extract_msgid(&edit);
+        assert_ne!(original, edit_id);
+
+        bob.send_react("dmrid_a", &edit_id, "🔥");
+        std::thread::sleep(Duration::from_millis(300));
+        bob.drain();
+        bob.tx("CHATHISTORY LATEST dmrid_a * 50");
+        let reacted = bob.maybe(|l| l.contains("+freeq.at/reactions"), 1500);
+        assert!(
+            reacted.is_some(),
+            "a DM reaction filed against the edit id vanished from history"
+        );
+
+        bob.send_unreact("dmrid_a", &original, "🔥");
+        std::thread::sleep(Duration::from_millis(300));
+        bob.drain();
+        bob.tx("CHATHISTORY LATEST dmrid_a * 50");
+        let still = bob.maybe(|l| l.contains("+freeq.at/reactions"), 1500);
+        assert!(
+            still.is_none(),
+            "un-reacting by the original id left the DM reaction behind: {still:?}"
+        );
+    })
+    .await;
+}
+
+/// Guest DMs are never persisted, so their ids resolve to no row at all. An
+/// unknown id is its own root: the events must relay exactly as before.
+#[tokio::test]
+async fn unpersisted_guest_dm_ids_pass_through_unchanged() {
+    let resolver = resolver_with(vec![]);
+    let (addr, _h) = start(resolver).await;
+    run(addr, |addr| {
+        let mut alice = C::with_caps(addr, "gst_a");
+        alice.reg();
+        alice.drain();
+        let mut bob = C::with_caps(addr, "gst_b");
+        bob.reg();
+        bob.drain();
+
+        alice.tx("PRIVMSG gst_b :ghost dm");
+        let dm = bob.rx(|l| l.contains("PRIVMSG") && l.contains("ghost dm"), "dm");
+        let msgid = C::extract_msgid(&dm);
+        assert!(!msgid.is_empty());
+
+        bob.send_react("gst_a", &msgid, "🔥");
+        let react = alice.maybe(|l| l.contains("TAGMSG") && l.contains("+react"), 1500);
+        assert!(react.is_some(), "guest DM reaction was not relayed");
+        assert!(
+            react.unwrap().contains(&format!("+reply={msgid}")),
+            "an id with no row must relay untouched"
+        );
+
+        alice.send_delete("gst_b", &msgid);
+        let del = bob.maybe(|l| l.contains("TAGMSG") && l.contains("draft/delete"), 1500);
+        assert!(
+            del.is_some_and(|l| l.contains(&msgid)),
+            "guest DM delete was not relayed with the id it named"
+        );
+    })
+    .await;
+}
+
+/// After a restart, in-memory history is rebuilt from the DB — where an edit is
+/// a separate row. The rebuild has to collapse the revisions the way the live
+/// edit path does, or the next joiner is replayed the same message twice: once
+/// as sent, once as revised.
+#[tokio::test]
+async fn an_edited_message_replays_once_after_a_restart() {
+    use freeq_server::db::Db;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("restart.db");
+    {
+        let db = Db::open(&path).unwrap();
+        db.save_channel("#restart", &freeq_server::server::ChannelState::default())
+            .unwrap();
+        db.insert_message(
+            "#restart",
+            "alice!a@host",
+            "before",
+            100,
+            &HashMap::new(),
+            Some("rst-1"),
+            None,
+        )
+        .unwrap();
+        db.insert_edit(
+            "#restart",
+            "alice!a@host",
+            "after",
+            110,
+            &HashMap::new(),
+            "rst-2",
+            "rst-1",
+            None,
+        )
+        .unwrap();
+    }
+
+    let config = freeq_server::config::ServerConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        server_name: "test-edit".to_string(),
+        challenge_timeout_secs: 60,
+        db_path: Some(path.to_str().unwrap().to_string()),
+        ..Default::default()
+    };
+    let (addr, _h) = freeq_server::server::Server::with_resolver(config, resolver_with(vec![]))
+        .start()
+        .await
+        .unwrap();
+
+    run(addr, |addr| {
+        let mut c = C::with_caps(addr, "rst_a");
+        c.reg();
+        c.drain();
+        c.tx("JOIN #restart");
+
+        let replayed = c
+            .maybe(|l| l.contains("PRIVMSG") && l.contains("after"), 2000)
+            .expect("the current text is replayed");
+        assert!(
+            replayed.contains("msgid=rst-1"),
+            "replay must key on the identity clients hold: {replayed}"
+        );
+        assert!(
+            replayed.contains("+freeq.at/edited=1"),
+            "a message revised before the restart is still an edited message: {replayed}"
+        );
+        assert!(
+            c.maybe(|l| l.contains("PRIVMSG") && l.contains("before"), 800)
+                .is_none(),
+            "the pre-edit text was replayed as a second message"
+        );
+    })
+    .await;
+}

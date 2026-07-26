@@ -215,6 +215,24 @@ pub(super) fn handle_tagmsg(
             tags.entry(canonical.to_string()).or_insert(v);
         }
     }
+    // Resolve the message being acted on to its root id before anything —
+    // persistence, local fan-out and the S2S relay all read this map, so
+    // rewriting here is what makes every receiver of any revision hear the one
+    // identity the message keeps for life.
+    {
+        let acts_on_a_message =
+            tags.contains_key("+react") || tags.contains_key("+freeq.at/unreact");
+        if acts_on_a_message
+            && let Some(target_msgid) = tags.get("+reply")
+        {
+            let root = super::helpers::root_msgid(state, target_msgid);
+            tags.insert("+reply".to_string(), root);
+        }
+        if let Some(deleted) = tags.get("+draft/delete") {
+            let root = super::helpers::root_msgid(state, deleted);
+            tags.insert("+draft/delete".to_string(), root);
+        }
+    }
     let tags = &tags;
 
     // ── Message deletion (+draft/delete=<msgid>) ──
@@ -871,6 +889,7 @@ pub(super) fn handle_privmsg_with_multiline(
                     timestamp,
                     tags: history_tags,
                     msgid: Some(msgid.clone()),
+                    edited: false,
                 });
                 while ch.history.len() > MAX_HISTORY {
                     ch.history.pop_front();
@@ -2058,6 +2077,13 @@ fn handle_edit(
     let nick = conn.nick_or_star();
     let is_channel = target.starts_with('#') || target.starts_with('&');
 
+    // An edit changes content, never identity. Anchor to the root so the
+    // stored row, the in-memory entry and the `+draft/edit` tag every receiver
+    // sees all name the same message, whichever revision the editor's client
+    // held.
+    let root_msgid = super::helpers::root_msgid(state, original_msgid);
+    let original_msgid: &str = &root_msgid;
+
     // Verify authorship: look up original message by msgid, resolving the
     // canonical dm_key for DMs (target may be a nick or a DID).
     let original = find_original_message(conn, target, original_msgid, is_channel, state);
@@ -2131,7 +2157,9 @@ fn handle_edit(
     // Build tags with edit reference + new msgid
     let mut full_tags = tags.clone();
     full_tags.insert("msgid".to_string(), edit_msgid.clone());
-    // Keep the +draft/edit tag so clients know this is an edit
+    // Keep the +draft/edit tag so clients know this is an edit — pointing at
+    // the root, which is the id they hold the message under.
+    full_tags.insert("+draft/edit".to_string(), original_msgid.to_string());
 
     // Verify/sign edited message
     let edit_timestamp = std::time::SystemTime::now()
@@ -2216,11 +2244,12 @@ fn handle_edit(
     };
 
     // Store in DB
-    let store_tags: std::collections::HashMap<String, String> = tags
+    let mut store_tags: std::collections::HashMap<String, String> = tags
         .iter()
         .filter(|(k, _)| *k != "msgid")
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    store_tags.insert("+draft/edit".to_string(), original_msgid.to_string());
     // For DMs, store under the canonical dm_key (not the nick) so
     // edits appear in CHATHISTORY alongside the original message.
     // store_channel was captured from the original row above.
@@ -2252,6 +2281,9 @@ fn handle_edit(
                 if hist.msgid.as_deref() == Some(original_msgid) {
                     hist.text = new_text.to_string();
                     // Don't change hist.msgid — keep original stable for chained edits
+                    // Join replay collapses revisions into this one entry, so
+                    // without the flag a late joiner can't tell it was edited.
+                    hist.edited = true;
                     break;
                 }
             }

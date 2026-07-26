@@ -522,6 +522,14 @@ pub(super) fn handle_join(
                     std::collections::HashMap::new()
                 };
 
+                // Replay carries one entry per logical message, so an edited
+                // message arrives as its current text with no `+draft/edit` to
+                // hint at the revision — this is what lets a late joiner render
+                // "(edited)".
+                if has_tags_cap && hist.edited {
+                    msg_tags.insert("+freeq.at/edited".to_string(), "1".to_string());
+                }
+
                 // Add msgid tag if available
                 if has_tags_cap && let Some(ref mid) = hist.msgid {
                     msg_tags.insert("msgid".to_string(), mid.clone());
