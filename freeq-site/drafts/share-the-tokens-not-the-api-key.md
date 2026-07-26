@@ -3,8 +3,8 @@
 Block's [Buzz](https://github.com/block/buzz) made the multi-agent workspace legible
 this month: humans and agents in the same room, every message and workflow step a
 signed event in one log, and agents holding their own keys rather than borrowing a
-human's. Its README puts the principle better than most specs do: *"scoped by
-identity, not by permission flags, the same way you'd scope a teammate."*
+human's. Its README puts the principle better than most specs do: *"Scoped by identity, not by
+permission flags — the same way you'd scope a teammate."*
 
 Which surfaces the next question. When five agents wake up to work, whose model
 allowance are they spending?
@@ -49,26 +49,27 @@ A real loan needs the authority to spend to be its own object:
 
 That is a delegation problem, not a billing problem.
 
-## What freeq has today
+## The pieces freeq already had
 
 An operator sets a budget in a channel and names who funds it. The sponsor defaults
 to whoever issues the command:
 
 ```
-BUDGET #research amount=50;unit=usd;period=day;warn=0.8;hard=true
+BUDGET #research amount=500;unit=credits;period=day;warn=0.8;hard=true
 ```
 
 Agents working there report what their work cost, signed, against that budget:
 
 ```
 @+freeq.at/sig=ed25519:kid:9f2c…:BASE64
- SPEND #research :amount=0.03;unit=usd;desc=claude-sonnet-4:1.2k-tokens;task=01JQ…
+ SPEND #research :amount=3;unit=credits;desc=claude-sonnet-4:1.2k-tokens;task=01JQ…
 ```
 
 That is the protocol shape a loan needs: a named sponsor, someone else's attributed
-work, and a limit that follows the delegation chain. Today freeq enforces that limit
-over *reported* spend. It does not mediate or debit the underlying model capacity, and that
-gap is what this post is really about.
+work, and a limit that follows the delegation chain. At the start of this work freeq
+enforced that limit only over *reported* spend. It did not mediate or debit the
+underlying model capacity. Joining those two systems is what changed while I was
+writing this post.
 
 Around it, the identity rails are real:
 
@@ -93,7 +94,7 @@ Around it, the identity rails are real:
   whatever was requested, so an agent holding nothing could create a helper recorded
   as holding anything.
 
-## The seam where it stops
+## The seam where it stopped
 
 Testing the joins between those systems is where the interesting findings were, and
 the sharpest one is a two-line observation:
@@ -108,8 +109,8 @@ handed the credential. That path recorded no spend and checked no budget. Meanwh
 the budget system counted carefully, over numbers agents reported about calls freeq
 never saw. **The one paid resource freeq controlled was the one it didn't count.**
 
-Writing that sentence down made it impossible to leave alone, so the two halves are
-now joined.
+Once stated that plainly, the separation was impossible to justify. So the two halves
+are now joined.
 
 ## The join, now that it exists
 
@@ -149,10 +150,10 @@ The credential never leaves the server. So withdrawing capacity means editing a
 budget, not rotating a key and breaking everything else that used it.
 
 The proxy is not the protocol. It is where the protocol's decision becomes
-enforceable. Anyone can put a metering proxy in front of a model; what makes this one
-answer "should this call happen" is everything upstream of it — the identities, the
-delegation graph, the named sponsor, the narrowing, the channel membership, and the
-signed context of the job being paid for.
+enforceable. Anyone can put a metering proxy in front of a model. What makes this one
+answer "should this call happen" is the context upstream of it: the caller's identity,
+channel membership, the delegation graph, the named sponsor, and the inherited budget.
+The remaining step is to bind the call to the signed job being paid for.
 
 ## What is still missing
 
@@ -217,6 +218,9 @@ capacity without exposing the provider credential. The caller authenticates as i
 identity, the budget is checked before dispatch, usage is measured from the provider's
 response, and an exhausted budget stops the upstream call from happening.
 
+What it cannot yet prove is which durable, signed job authorised that particular call.
+That is where the handoff work meets the metering path.
+
 The capacity being shared today belongs to the server operator. There is one provider
 credential and the server holds it. So this is real, revocable delegation of an
 operator-funded pool, and not yet a general mechanism for me to lend you capacity from
@@ -229,6 +233,7 @@ signed consent, and the resulting capability gates the model operation itself. T
 
 ---
 
-*Code: `github.com/freeq-irc/freeq`. The gaps above are `#[ignore]`d tests with
-their reasons attached, so they run on demand rather than living in a document:*
+*Code: [github.com/freeq-irc/freeq](https://github.com/freeq-irc/freeq). The unbuilt
+rows above are represented by ignored tests with the reasons attached:*
+
 `cargo test -p freeq-server --test agent_native -- --ignored`
