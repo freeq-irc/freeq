@@ -1205,6 +1205,19 @@ class AppState {
             }
         }
         dmBuffers.append(dm)
+        // Ask the server for this thread's history. The local cache above only
+        // has what this device saw; without this, anything sent while you were
+        // logged out — and every server-persisted reaction — was missing until
+        // something else happened to refetch. Channels have always done this
+        // from the NAMES-END path; DM threads never did.
+        //
+        // Only when the request can actually succeed: the server refuses an
+        // unauthenticated requester (ACCOUNT_REQUIRED) and a target it can't
+        // resolve to an account (INVALID_TARGET). Asking anyway trades a round
+        // trip for a FAIL and a console error.
+        if authenticatedDID != nil, DidDisplay.isDid(nick) || didForNick(nick) != nil {
+            requestHistory(channel: nick)
+        }
         attemptRestoreLastChannel()
         return dm
     }
@@ -1717,7 +1730,10 @@ extension AppState {
                 isAction: msg.isAction,
                 timestamp: Date(timeIntervalSince1970: Double(msg.timestampMs) / 1000.0),
                 replyTo: msg.replyTo,
-                isEdited: msg.editOf != nil,
+                // `edited` covers both signals: a live edit (`edit_of`) and one
+                // the server already collapsed into join replay, which carries
+                // no `+draft/edit` and would otherwise read as the original.
+                isEdited: msg.edited,
                 isSigned: msg.isSigned,
                 isEncrypted: wasEncrypted,
                 origin: msg.origin,
@@ -1738,7 +1754,7 @@ extension AppState {
                         batch.messages[idx].text = displayText
                         batch.messages[idx].isEdited = true
                         batch.messages[idx].editOf = batch.messages[idx].editOf ?? editOf
-                        if let newId = msg.msgid { batch.messages[idx].id = newId }
+                        // Keeps the id it was born with — see ChannelState.applyEdit.
                     } else {
                         batch.messages.append(message)
                     }

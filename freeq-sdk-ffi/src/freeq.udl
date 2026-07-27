@@ -17,6 +17,7 @@ dictionary IrcMessage {
     string? account;
     string? origin;
     sequence<ReactionTally> reactions;
+    boolean edited;
     string? dm_key;
     CoordinationEvent? coordination;
 };
