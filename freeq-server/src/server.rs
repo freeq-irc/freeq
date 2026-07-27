@@ -2753,6 +2753,58 @@ fn federated_delete_authorized(
     })
 }
 
+/// May a federated actor edit this message here?
+///
+/// **Author only.** Unlike a delete there is no op route: an op may remove
+/// content, but rewriting it would put the op's words under another user's name.
+/// This is the same authorship rule `handle_edit` applies to a local edit,
+/// including its refusal to edit an already-deleted message; a federated edit
+/// arrived without any check at all, so a peer could revise anyone's message.
+///
+/// That mattered more than it looks: the receiving history path revises the
+/// *existing* entry in place, leaving its `from` untouched, so an unauthorized
+/// edit rewrote the author's words under the author's name for every later
+/// joiner, and `current_revision` (what a pin renders) followed.
+///
+/// A message we hold no row for is nothing to protect — an edit of something
+/// that predates us, or in an unpersisted guest DM thread, still arrives.
+/// `channel_history_key` (lowercase, channels only) is checked in that case:
+/// with no database at all the in-memory history is the only record of who
+/// wrote a message, and it must still be honoured.
+fn federated_edit_authorized(
+    state: &Arc<SharedState>,
+    channel_history_key: Option<&str>,
+    root_msgid: &str,
+    actor_nick: &str,
+    actor_did: Option<&str>,
+) -> bool {
+    if let Some(Some(row)) = state.with_db(|db| db.message_authorship(root_msgid)) {
+        // A deleted message has no editable text; a revision of it would
+        // resurrect nothing and confuse every client's view.
+        return !row.deleted && federated_actor_is_author(&row, actor_nick, actor_did);
+    }
+
+    let Some(key) = channel_history_key else {
+        return true;
+    };
+    let channels = state.channels.lock();
+    let Some(entry) = channels.get(key).and_then(|ch| {
+        ch.history
+            .iter()
+            .find(|h| h.msgid.as_deref() == Some(root_msgid))
+    }) else {
+        return true;
+    };
+    // History carries no DID, so nick is all there is here. Weaker than the
+    // row check, and only ever reached when there is no row to do better with.
+    entry
+        .from
+        .split('!')
+        .next()
+        .unwrap_or("")
+        .eq_ignore_ascii_case(actor_nick)
+}
+
 /// Process an incoming S2S message. Exposed as pub(crate) for adversarial testing.
 pub(crate) async fn process_s2s_message(
     state: &Arc<SharedState>,
@@ -3198,6 +3250,30 @@ pub(crate) async fn process_s2s_message(
                 .filter(|r| !r.is_empty())
                 .map(|r| crate::connection::helpers::root_msgid(state, &r));
 
+            // An edit may only come from the author. Dropped rather than
+            // downgraded to a plain message: a local edit that fails the same
+            // check is not delivered either (FAIL AUTHOR_MISMATCH), and relaying
+            // it as new text would put words in the channel that the origin's
+            // user never asked to send as a new message.
+            let actor_nick = from.split('!').next().unwrap_or(&from).to_string();
+            if let Some(ref root) = edit_of {
+                let history_key = (target.starts_with('#') || target.starts_with('&'))
+                    .then(|| target.to_lowercase());
+                if !federated_edit_authorized(
+                    state,
+                    history_key.as_deref(),
+                    root,
+                    &actor_nick,
+                    account.as_deref(),
+                ) {
+                    tracing::warn!(
+                        target = %target, msgid = %root, by = %actor_nick,
+                        "S2S edit rejected: actor is not the author"
+                    );
+                    return;
+                }
+            }
+
             // Peer-provided coordination tags. Re-filter on receipt (never
             // trust the sending peer to have filtered correctly): keep only
             // `+freeq.at/*` minus `+freeq.at/sig` (re-attested locally),
@@ -3301,12 +3377,25 @@ pub(crate) async fn process_s2s_message(
                         // twice, permanently.
                         let revised = edit_of.as_ref().and_then(|root| {
                             ch.history
-                                .iter_mut()
-                                .find(|h| h.msgid.as_deref() == Some(root.as_str()))
+                                .iter()
+                                .position(|h| h.msgid.as_deref() == Some(root.as_str()))
                         });
-                        if let Some(hist) = revised {
-                            hist.text = text.clone();
-                            hist.edited = true;
+                        // Second lock on the door `federated_edit_authorized`
+                        // shut: revising leaves `from` as it was, so writing one
+                        // user's text into another's entry publishes the editor's
+                        // words under the author's name. Never do it, whatever
+                        // the gate concluded.
+                        let author_matches = revised.is_some_and(|i| {
+                            ch.history[i].from.split('!').next() == from.split('!').next()
+                        });
+                        if let (Some(i), true) = (revised, author_matches) {
+                            ch.history[i].text = text.clone();
+                            ch.history[i].edited = true;
+                        } else if revised.is_some() {
+                            tracing::warn!(
+                                channel = %target, from = %from,
+                                "S2S edit dropped: would rewrite another user's history entry"
+                            );
                         } else {
                             ch.history.push_back(HistoryMessage {
                                 from: from.clone(),
@@ -7866,7 +7955,7 @@ mod s2s_adversarial_tests {
 
     const AUTHOR_DID: &str = "did:plc:fedauthor";
 
-    /// Relay a channel message from the peer. Returns its msgid.
+    /// Relay a channel message from the peer, as alice (the author).
     async fn relay_message(
         state: &Arc<SharedState>,
         mgr: &Arc<S2sManager>,
@@ -7875,19 +7964,46 @@ mod s2s_adversarial_tests {
         text: &str,
         replaces: Option<&str>,
     ) {
+        relay_message_as(
+            state,
+            mgr,
+            channel,
+            msgid,
+            text,
+            replaces,
+            "alice!a@remote",
+            Some(AUTHOR_DID),
+        )
+        .await;
+    }
+
+    /// As `relay_message`, with the actor spelled out — the peer chooses both
+    /// the nick and the `account` DID it stamps, so a test of who may act on a
+    /// message has to be able to choose them too.
+    #[allow(clippy::too_many_arguments)]
+    async fn relay_message_as(
+        state: &Arc<SharedState>,
+        mgr: &Arc<S2sManager>,
+        channel: &str,
+        msgid: &str,
+        text: &str,
+        replaces: Option<&str>,
+        from: &str,
+        account: Option<&str>,
+    ) {
         process_s2s_message(
             state,
             mgr,
             PEER,
             S2sMessage::Privmsg {
                 event_id: format!("{PEER}:{msgid}"),
-                from: "alice!a@remote".to_string(),
+                from: from.to_string(),
                 target: channel.to_string(),
                 text: text.to_string(),
                 origin: PEER.to_string(),
                 msgid: Some(msgid.to_string()),
                 sig: None,
-                account: Some(AUTHOR_DID.to_string()),
+                account: account.map(|a| a.to_string()),
                 recipient_did: None,
                 replaces_msgid: replaces.map(|r| r.to_string()),
                 tags: HashMap::new(),
@@ -8068,6 +8184,202 @@ mod s2s_adversarial_tests {
                 .unwrap_or_default()
                 .is_empty(),
             "a revision survived a delete naming the other one"
+        );
+    }
+
+    /// An edit may only come from the author. This is the forgery the gate
+    /// exists for: the history entry is revised in place and keeps its `from`,
+    /// so an accepted stranger's edit would show every later joiner the author
+    /// saying words the author never wrote.
+    #[tokio::test]
+    async fn s2s_edit_from_a_stranger_is_rejected() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#fedforge2");
+
+        relay_message(&state, &mgr, "#fedforge2", "id-1", "alice original", None).await;
+        relay_message_as(
+            &state,
+            &mgr,
+            "#fedforge2",
+            "id-forge",
+            "I never said that",
+            Some("id-1"),
+            "mallory!m@remote",
+            Some("did:plc:mallory"),
+        )
+        .await;
+
+        assert_eq!(
+            history_of(&state, "#fedforge2"),
+            vec![(
+                Some("id-1".to_string()),
+                "alice original".to_string(),
+                false
+            )],
+            "a stranger rewrote the author's message under the author's name"
+        );
+        let current = state
+            .with_db(|db| db.current_revision("id-1"))
+            .flatten()
+            .expect("row");
+        assert_eq!(current.text, "alice original");
+        assert_eq!(current.sender, "alice!a@remote");
+    }
+
+    /// A nick alone is never evidence: the row names a DID, so an actor without
+    /// one cannot be its author no matter what nick the peer asserts.
+    #[tokio::test]
+    async fn s2s_edit_without_an_actor_did_is_rejected() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#fednodid2");
+
+        relay_message(&state, &mgr, "#fednodid2", "id-1", "alice original", None).await;
+        relay_message_as(
+            &state,
+            &mgr,
+            "#fednodid2",
+            "id-forge",
+            "impersonated",
+            Some("id-1"),
+            "alice!a@remote",
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            history_of(&state, "#fednodid2"),
+            vec![(
+                Some("id-1".to_string()),
+                "alice original".to_string(),
+                false
+            )],
+            "nick-only matching would let any peer rewrite anything"
+        );
+    }
+
+    /// An op may delete content but not rewrite it — deleting removes words,
+    /// editing would put new ones in someone else's mouth. Deliberately
+    /// stricter than the delete gate.
+    #[tokio::test]
+    async fn s2s_edit_from_an_op_is_rejected() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#fedopedit");
+        add_remote_member(&state, "#fedopedit", "moderator", true);
+
+        relay_message(&state, &mgr, "#fedopedit", "id-1", "alice original", None).await;
+        relay_message_as(
+            &state,
+            &mgr,
+            "#fedopedit",
+            "id-forge",
+            "moderated for you",
+            Some("id-1"),
+            "moderator!m@remote",
+            Some("did:plc:mod"),
+        )
+        .await;
+
+        assert_eq!(
+            history_of(&state, "#fedopedit"),
+            vec![(
+                Some("id-1".to_string()),
+                "alice original".to_string(),
+                false
+            )],
+            "an op rewrote another user's words"
+        );
+    }
+
+    /// The author's own edit still lands — the gate must not cost the feature
+    /// it protects.
+    #[tokio::test]
+    async fn s2s_edit_from_the_author_is_accepted() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#fedauthoredit");
+
+        relay_message(&state, &mgr, "#fedauthoredit", "id-1", "v1", None).await;
+        relay_message(&state, &mgr, "#fedauthoredit", "id-2", "v2", Some("id-1")).await;
+
+        assert_eq!(
+            history_of(&state, "#fedauthoredit"),
+            vec![(Some("id-1".to_string()), "v2".to_string(), true)],
+            "the author's edit must revise the message it names"
+        );
+    }
+
+    /// A deleted message has no text to revise, matching `handle_edit`'s local
+    /// refusal — otherwise an edit re-seeds content the author asked to remove.
+    #[tokio::test]
+    async fn s2s_edit_of_a_deleted_message_is_rejected() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#feddeleted");
+
+        relay_message(&state, &mgr, "#feddeleted", "id-1", "gone", None).await;
+        relay_delete(
+            &state,
+            &mgr,
+            "#feddeleted",
+            "id-1",
+            "alice!a@remote",
+            Some(AUTHOR_DID),
+        )
+        .await;
+        relay_message(
+            &state,
+            &mgr,
+            "#feddeleted",
+            "id-2",
+            "back again",
+            Some("id-1"),
+        )
+        .await;
+
+        assert!(
+            history_of(&state, "#feddeleted").is_empty(),
+            "an edit resurrected a deleted message"
+        );
+    }
+
+    /// With no database the in-memory history is the only record of who wrote
+    /// what, and it still has to be honoured.
+    #[tokio::test]
+    async fn s2s_edit_from_a_stranger_is_rejected_without_a_database() {
+        let state = test_state();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#fednodb");
+
+        relay_message(&state, &mgr, "#fednodb", "id-1", "alice original", None).await;
+        relay_message_as(
+            &state,
+            &mgr,
+            "#fednodb",
+            "id-forge",
+            "I never said that",
+            Some("id-1"),
+            "mallory!m@remote",
+            Some("did:plc:mallory"),
+        )
+        .await;
+
+        assert_eq!(
+            history_of(&state, "#fednodb"),
+            vec![(
+                Some("id-1".to_string()),
+                "alice original".to_string(),
+                false
+            )],
+            "with no row to check, history authorship is the only defense"
         );
     }
 
