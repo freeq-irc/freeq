@@ -709,7 +709,10 @@ describe('mergeHistory edit reconciliation', () => {
     ]);
     const msgs = s().channels.get(ch)!.messages;
     expect(msgs).toHaveLength(1);
-    expect(msgs[0].id).toBe('e1');
+    // The held id survives the reconciliation: an edit changes the text, not
+    // which message this is. Re-keying to the revision's id was what made
+    // reactions and pending deletes stop resolving after a reload.
+    expect(msgs[0].id).toBe('m0');
     expect(msgs[0].text).toBe('original - edited');
     expect(msgs[0].editOf).toBe('m0');
   });
@@ -722,23 +725,41 @@ describe('mergeHistory edit reconciliation', () => {
     ]);
     const msgs = s().channels.get(ch)!.messages;
     expect(msgs).toHaveLength(1);
-    expect(msgs[0].id).toBe('e1');
+    expect(msgs[0].id).toBe('m0');
     expect(msgs[0].text).toBe('original - edited');
   });
 
-  it('chained live edits still match a root-anchored replayed row', () => {
+  it('repeated live edits still match a root-anchored replayed row', () => {
     s().addMessage(ch, at('2026-07-20T14:35:00Z', 'm0', 'original'));
-    // Two live edits, chained references (iOS behavior): e2 edits e1.
+    // Every edit names the identity the client holds — which never moves, so
+    // there is no chain to follow. (The server also normalizes `+draft/edit`
+    // to the root before broadcasting, so this is what arrives on the wire.)
     (s() as any).editMessage(ch, 'm0', 'edited once', 'e1');
-    (s() as any).editMessage(ch, 'e1', 'edited twice', 'e2');
+    (s() as any).editMessage(ch, 'm0', 'edited twice', 'e2');
     // Replay delivers the final collapsed row root-anchored to m0.
     (s() as any).mergeHistory(ch, [
       at('2026-07-20T14:37:00Z', 'e2', 'edited twice', 'm0'),
     ]);
     const msgs = s().channels.get(ch)!.messages;
     expect(msgs).toHaveLength(1);
-    expect(msgs[0].id).toBe('e2');
+    expect(msgs[0].id).toBe('m0');
     expect(msgs[0].text).toBe('edited twice');
+  });
+
+  it('a replayed edit carries its reactions onto the held row', () => {
+    // Reactions arrive attached to whichever revision they were filed
+    // against. Dropping them on reconciliation is what made reactions on an
+    // edited message disappear on every reload.
+    s().addMessage(ch, at('2026-07-20T14:35:00Z', 'm0', 'original'));
+    const incoming = {
+      ...at('2026-07-20T14:36:00Z', 'e1', 'original - edited', 'm0'),
+      reactions: new Map([['🔥', new Set(['alice'])]]),
+    };
+    s().mergeHistory(ch, [incoming]);
+    const msgs = s().channels.get(ch)!.messages;
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].id).toBe('m0');
+    expect([...(msgs[0].reactions?.get('🔥') ?? [])]).toEqual(['alice']);
   });
 
   it('edit row with no held original still lands as a single row', () => {
@@ -782,7 +803,8 @@ describe('edit/delete authorship gate', () => {
     s().addMessage(ch, at('m3', 'alice', 'v1'));
     (s() as any).editMessage(ch, 'm3', 'v2', 'e3', false, 'alice', undefined);
     expect(s().channels.get(ch)!.messages[0].text).toBe('v2');
-    (s() as any).deleteMessage(ch, 'e3', 'ALICE', undefined);
+    // The delete names the identity the message keeps, not the revision.
+    (s() as any).deleteMessage(ch, 'm3', 'ALICE', undefined);
     expect(s().channels.get(ch)!.messages[0].deleted).toBe(true);
   });
 });
@@ -793,21 +815,18 @@ describe('edit/delete authorship gate', () => {
 
 describe('delete after edit', () => {
   it('marks an edited message deleted when the delete names the ORIGINAL msgid', () => {
-    // editMessage re-keys the message to the edit's msgid (`id: newMsgId`) and
-    // keeps the chain root in `editOf`. Deletes always name the ORIGINAL msgid —
-    // that is the identity clients hold and what the server relays in
-    // +draft/delete. deleteMessage matched only `m.id === msgId`, so after an
-    // edit the delete found nothing and the message stayed visible, even though
-    // the server had removed it. editMessage already matches id OR editOf;
-    // deleteMessage must too.
+    // Deletes always name the ORIGINAL msgid — that is the identity clients
+    // hold and what the server relays in +draft/delete. A delete of an edited
+    // message used to find nothing and leave it visible after the server had
+    // removed it.
     ensureChannel('#test');
     useStore.getState().addMessage('#test', mkMsg({ id: 'orig', text: 'secret v1' }));
     useStore.getState().editMessage('#test', 'orig', 'secret v2', 'edit1');
 
-    // Sanity: the edit re-keyed the row and recorded the chain root.
+    // Sanity: the edit changed the text and left the identity alone.
     const afterEdit = useStore.getState().channels.get('#test')!
       .messages.find((m) => m.editOf === 'orig');
-    expect(afterEdit?.id).toBe('edit1');
+    expect(afterEdit?.id).toBe('orig');
     expect(afterEdit?.text).toBe('secret v2');
 
     useStore.getState().deleteMessage('#test', 'orig');
@@ -818,15 +837,41 @@ describe('delete after edit', () => {
     expect(m?.text).toBe('');
   });
 
-  it('still deletes when the delete names the edit revision', () => {
-    // The other end of the same chain: whichever id the caller holds must work.
+  it('still deletes a row an older build re-keyed to the edit revision', () => {
+    // Rows written by a build that re-keyed on edit are still in IndexedDB and
+    // still on screen: id = the revision, editOf = the root. The server names
+    // the root, so the `editOf` arm of the match is what reaches them. This is
+    // the transition cover; it can go once such rows can't be around.
+    ensureChannel('#test');
+    useStore.getState().addMessage(
+      '#test',
+      mkMsg({ id: 'edit1', text: 'v2', editOf: 'orig' }),
+    );
+    useStore.getState().deleteMessage('#test', 'orig');
+    const m = useStore.getState().channels.get('#test')!
+      .messages.find((x) => x.id === 'edit1');
+    expect(m?.deleted).toBe(true);
+  });
+
+  it('a reaction outlives an edit and is removed by the same id', () => {
+    // The reason the key has to be stable. Reacting, then editing, then
+    // un-reacting: every one of those names the message. When the edit moved
+    // the key, the un-react (and the reaction chip itself) stopped resolving —
+    // the tally kept a reaction the user had already taken back.
     ensureChannel('#test');
     useStore.getState().addMessage('#test', mkMsg({ id: 'orig', text: 'v1' }));
+    useStore.getState().addReaction('#test', 'orig', '🔥', 'alice');
     useStore.getState().editMessage('#test', 'orig', 'v2', 'edit1');
-    useStore.getState().deleteMessage('#test', 'edit1');
-    const m = useStore.getState().channels.get('#test')!
-      .messages.find((x) => x.id === 'edit1' || x.editOf === 'orig');
-    expect(m?.deleted).toBe(true);
+
+    const edited = useStore.getState().channels.get('#test')!
+      .messages.find((m) => m.id === 'orig');
+    expect(edited?.text).toBe('v2');
+    expect([...(edited?.reactions?.get('🔥') ?? [])]).toEqual(['alice']);
+
+    useStore.getState().removeReaction('#test', 'orig', '🔥', 'alice');
+    const after = useStore.getState().channels.get('#test')!
+      .messages.find((m) => m.id === 'orig');
+    expect(after?.reactions?.get('🔥')).toBeUndefined();
   });
 
   it('does not delete unrelated messages', () => {
