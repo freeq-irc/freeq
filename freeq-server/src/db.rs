@@ -116,6 +116,20 @@ pub struct ReactionRow {
     pub timestamp: u64,
 }
 
+/// Who wrote a message, and where it is filed — the minimum needed to
+/// authorize an operation on a message without reading its contents.
+#[derive(Debug, Clone)]
+pub struct MessageAuthorship {
+    /// The channel key the row is filed under, spelled as it was stored.
+    pub channel: String,
+    /// Full hostmask of the author, as stored.
+    pub sender: String,
+    /// Author's DID, when they were authenticated at send time.
+    pub sender_did: Option<String>,
+    /// Whether the message is already soft-deleted.
+    pub deleted: bool,
+}
+
 /// A persisted message row.
 #[derive(Debug, Clone)]
 pub struct MessageRow {
@@ -1429,6 +1443,38 @@ impl Db {
             }
             None => Ok(None),
         }
+    }
+
+    /// Who wrote the logical message `msgid` names, and where it is filed.
+    ///
+    /// Keyed on `msgid` alone, deliberately. A msgid is a globally unique ULID
+    /// and `root_of` already resolves identity without a channel, whereas a
+    /// channel name arrives from a peer spelled the way its user typed it and is
+    /// stored that way, while the in-memory channel map is keyed lowercase.
+    /// Scoping an *authorization* lookup by channel therefore made the answer
+    /// depend on that casing — a miss reads as "no such message", which is the
+    /// permissive answer. There is no casing of a ULID that finds someone
+    /// else's message.
+    ///
+    /// Resolves to the root first, so naming any revision answers for the
+    /// message. Soft-deleted rows are included: an operation on an
+    /// already-deleted message still has an author, and callers that must
+    /// refuse a deleted target need to be able to see that it is deleted.
+    pub fn message_authorship(&self, msgid: &str) -> SqlResult<Option<MessageAuthorship>> {
+        let root = self.root_of(msgid);
+        let mut stmt = self.conn.prepare(
+            "SELECT channel, sender, sender_did, deleted_at FROM messages
+             WHERE msgid = ?1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![root], |r| {
+            Ok(MessageAuthorship {
+                channel: r.get(0)?,
+                sender: r.get(1)?,
+                sender_did: r.get(2).unwrap_or(None),
+                deleted: r.get::<_, Option<i64>>(3).unwrap_or(None).is_some(),
+            })
+        })?;
+        rows.next().transpose()
     }
 
     /// The current text of the logical message `msgid` names — the newest

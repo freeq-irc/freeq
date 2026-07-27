@@ -2687,32 +2687,17 @@ fn sanitize_s2s_str(s: &str, max_len: usize) -> String {
         .collect()
 }
 
-/// May a federated actor delete this message here?
+/// Is a federated actor the author of the message this row records?
 ///
-/// Two ways in, mirroring what a local delete accepts:
-/// - **The author.** DID against the stored row's `sender_did`. A nick match is
-///   accepted only when the row has no DID at all (a guest's message) — for a
-///   row that names a DID, a nick is not evidence, and a peer can assert any
-///   nick it likes.
-/// - **A channel op**, via the same roster check the federated Kick/Mode path
-///   uses. Channels only: a DM has no roster, so authorship is the only route.
-///
-/// A message we hold no row for is nothing to protect — let it through so the
-/// TAGMSG still reaches clients, exactly as an unpersisted local delete does.
-fn federated_delete_authorized(
-    state: &Arc<SharedState>,
-    storage_key: &str,
-    root_msgid: &str,
+/// DID against the stored row's `sender_did`. A nick match is accepted only when
+/// the row has no DID at all (a guest's message) — for a row that names a DID, a
+/// nick is not evidence, and a peer can assert any nick it likes.
+fn federated_actor_is_author(
+    row: &crate::db::MessageAuthorship,
     actor_nick: &str,
     actor_did: Option<&str>,
-    is_channel: bool,
 ) -> bool {
-    let row = state.with_db(|db| db.get_message_by_msgid(storage_key, root_msgid));
-    let Some(Some(row)) = row else {
-        return true;
-    };
-
-    let is_author = match (row.sender_did.as_deref(), actor_did) {
+    match (row.sender_did.as_deref(), actor_did) {
         (Some(row_did), Some(actor)) => row_did == actor,
         (Some(_), None) => false,
         (None, _) => row
@@ -2721,8 +2706,36 @@ fn federated_delete_authorized(
             .next()
             .unwrap_or("")
             .eq_ignore_ascii_case(actor_nick),
+    }
+}
+
+/// May a federated actor delete this message here?
+///
+/// Two ways in, mirroring what a local delete accepts:
+/// - **The author**, per [`federated_actor_is_author`].
+/// - **A channel op**, via the same roster check the federated Kick/Mode path
+///   uses. Channels only: a DM has no roster, so authorship is the only route.
+///
+/// A message we hold no row for is nothing to protect — let it through so the
+/// TAGMSG still reaches clients, exactly as an unpersisted local delete does.
+///
+/// `roster_key` is the lowercase in-memory channel key (the roster map is keyed
+/// that way); the authorship lookup takes no channel at all, so this gate can't
+/// be defeated by the casing a peer happens to send.
+fn federated_delete_authorized(
+    state: &Arc<SharedState>,
+    roster_key: &str,
+    root_msgid: &str,
+    actor_nick: &str,
+    actor_did: Option<&str>,
+    is_channel: bool,
+) -> bool {
+    let row = state.with_db(|db| db.message_authorship(root_msgid));
+    let Some(Some(row)) = row else {
+        return true;
     };
-    if is_author {
+
+    if federated_actor_is_author(&row, actor_nick, actor_did) {
         return true;
     }
     if !is_channel {
@@ -2730,7 +2743,7 @@ fn federated_delete_authorized(
     }
 
     let channels = state.channels.lock();
-    channels.get(storage_key).is_some_and(|ch| {
+    channels.get(roster_key).is_some_and(|ch| {
         ch.remote_member(actor_nick).is_some_and(|rm| {
             rm.is_op
                 || rm.did.as_ref().is_some_and(|d| {
@@ -3684,7 +3697,18 @@ pub(crate) async fn process_s2s_message(
 
                 if federated_delete_authorized(state, &storage_key, &root, &actor_nick, actor_did.as_deref(), is_channel)
                 {
-                    state.with_db(|db| db.soft_delete_message(&storage_key, &root));
+                    // Sweep under the key the row is actually filed beneath. A
+                    // peer sends the channel spelled the way its user typed it
+                    // and that spelling is what got stored, while `storage_key`
+                    // is lowercased for the in-memory map — so a mixed-case
+                    // channel had its history entry dropped here while the row
+                    // survived in the database, and came back on restart.
+                    let db_key = state
+                        .with_db(|db| db.message_authorship(&root))
+                        .flatten()
+                        .map(|a| a.channel)
+                        .unwrap_or_else(|| storage_key.clone());
+                    state.with_db(|db| db.soft_delete_message(&db_key, &root));
                     if is_channel {
                         let mut channels = state.channels.lock();
                         if let Some(ch) = channels.get_mut(&storage_key) {
@@ -8044,6 +8068,64 @@ mod s2s_adversarial_tests {
                 .unwrap_or_default()
                 .is_empty(),
             "a revision survived a delete naming the other one"
+        );
+    }
+
+    /// A peer sends a channel spelled the way its user typed it. Authorization
+    /// must not depend on that casing: scoping the lookup by channel turned a
+    /// miss into "no such message", which is the permissive answer.
+    #[tokio::test]
+    async fn s2s_delete_gate_holds_for_a_mixed_case_channel() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#fedcase");
+
+        relay_message(&state, &mgr, "#FedCase", "id-1", "keep me", None).await;
+        relay_delete(
+            &state,
+            &mgr,
+            "#FedCase",
+            "id-1",
+            "stranger!s@remote",
+            Some("did:plc:stranger"),
+        )
+        .await;
+
+        assert_eq!(
+            history_of(&state, "#fedcase").len(),
+            1,
+            "a stranger dropped the message from the live view of a mixed-case channel"
+        );
+    }
+
+    /// …and the author's delete reaches storage there, instead of clearing the
+    /// live view while leaving the row to come back on the next restart.
+    #[tokio::test]
+    async fn s2s_delete_in_a_mixed_case_channel_reaches_storage() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#fedcase2");
+
+        relay_message(&state, &mgr, "#FedCase2", "id-1", "secret", None).await;
+        relay_delete(
+            &state,
+            &mgr,
+            "#FedCase2",
+            "id-1",
+            "alice!a@remote",
+            Some(AUTHOR_DID),
+        )
+        .await;
+
+        assert!(history_of(&state, "#fedcase2").is_empty());
+        assert!(
+            state
+                .with_db(|db| db.get_messages("#FedCase2", 50, None))
+                .unwrap_or_default()
+                .is_empty(),
+            "the row survived the delete and would return on restart"
         );
     }
 
