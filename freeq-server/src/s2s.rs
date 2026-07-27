@@ -271,6 +271,18 @@ pub enum S2sMessage {
         /// → older peers omit it (wire back-compat).
         #[serde(default)]
         recipient_did: Option<String>,
+        /// When this message is an edit, the identity of the message it
+        /// revises — the **root** msgid, the id that message keeps for life.
+        ///
+        /// Without it a relayed edit is indistinguishable from a new message,
+        /// so the receiving peer files a second row and shows its users a
+        /// duplicate that never links back to the original. The local wire
+        /// carries this as `+draft/edit`, which cannot ride in `tags`: that map
+        /// is filtered to `+freeq.at/*` on both send and receive. `serde(default)`
+        /// → older peers omit it and the receiver treats the message as new,
+        /// which is exactly today's behavior.
+        #[serde(default)]
+        replaces_msgid: Option<String>,
         /// Application coordination tags (`+freeq.at/event` etc.) that ride
         /// with the message so federated clients render the same card the
         /// origin shows. `serde(default)` → older peers omit it, deserialize
@@ -347,6 +359,18 @@ pub enum S2sMessage {
         /// IRCv3 tags (e.g. +react, +reply, +typing).
         tags: HashMap<String, String>,
         origin: String,
+        /// Acting user's DID — the value of the IRCv3 `account` tag, stamped by
+        /// the origin from its authenticated session, never client-set (the
+        /// same trust shape as `Privmsg.account`).
+        ///
+        /// A remote actor is not in the receiver's `nick_owners` (that map is
+        /// seeded from identities that authenticated *here*), so without this
+        /// the receiver can only identify a federated actor by nick. That is
+        /// enough for a reaction, but not for authorizing a delete — a nick is
+        /// peer-assertable. `serde(default)` → older peers omit it, and the
+        /// receiver falls back to the nick lookup exactly as before.
+        #[serde(default)]
+        account: Option<String>,
     },
 
     /// A user joined a channel.
@@ -1581,6 +1605,7 @@ mod tests {
             sig: None,
             account: None,
             recipient_did: None,
+            replaces_msgid: None,
             tags: HashMap::new(),
             multiline_lines: None,
         };
@@ -1684,6 +1709,7 @@ mod tests {
             sig: None,
             account: None,
             recipient_did: None,
+            replaces_msgid: None,
             tags: HashMap::new(),
             multiline_lines: None,
         };
@@ -1706,6 +1732,7 @@ mod tests {
                     sig: None,
                     account: None,
                     recipient_did: None,
+                    replaces_msgid: None,
                     tags: HashMap::new(),
                     multiline_lines: None,
                 };
@@ -2051,6 +2078,7 @@ mod tests {
             sig: None,
             account: None,
             recipient_did: None,
+            replaces_msgid: None,
             tags: tags.clone(),
             multiline_lines: None,
         };

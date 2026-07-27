@@ -546,6 +546,7 @@ pub(super) fn handle_tagmsg(
                 target: target.to_string(),
                 tags: tags.clone(),
                 origin: state.server_iroh_id.lock().clone().unwrap_or_default(),
+                account: conn.authenticated_did.clone(),
             },
         );
     } else {
@@ -602,6 +603,7 @@ pub(super) fn handle_tagmsg(
                 target: target.to_string(),
                 tags: tags.clone(),
                 origin: state.server_iroh_id.lock().clone().unwrap_or_default(),
+                account: conn.authenticated_did.clone(),
             },
         );
     }
@@ -1039,6 +1041,7 @@ pub(super) fn handle_privmsg_with_multiline(
                     sig,
                     account: conn.authenticated_did.clone(),
                     recipient_did: super::routing::recipient_did_for_target(state, target),
+                    replaces_msgid: None,
                     tags: s2s_tags,
                     // When this message originated as a draft/multiline
                     // batch, ship the per-line breakdown so the peer
@@ -1189,6 +1192,7 @@ pub(super) fn handle_privmsg_with_multiline(
                         sig: pm_tags.get("+freeq.at/sig").cloned(),
                         account: conn.authenticated_did.clone(),
                         recipient_did: super::routing::recipient_did_for_target(state, target),
+                        replaces_msgid: None,
                         tags: s2s_tags,
                         multiline_lines: multiline_lines.map(|lines| {
                             lines
@@ -2373,6 +2377,10 @@ fn handle_edit(
                 sig,
                 account: conn.authenticated_did.clone(),
                 recipient_did: super::routing::recipient_did_for_target(state, target),
+                // Tells the peer this revises a message it already has, rather
+                // than being one. `+draft/edit` can't carry it: the relayed tag
+                // map is filtered to `+freeq.at/*`.
+                replaces_msgid: Some(original_msgid.to_string()),
                 tags: s2s_tags,
                 // Multi-line edit: pass the per-line breakdown so peer
                 // servers can re-emit BATCH frames to their own
@@ -2652,6 +2660,29 @@ fn handle_delete(conn: &Connection, target: &str, original_msgid: &str, state: &
                 let _ = tx.try_send(tagged_line.clone());
             }
         }
+        drop(conns);
+        drop(tag_caps);
+
+        // Relay to peers. This has to be an explicit broadcast: `handle_tagmsg`
+        // dispatches here and returns, so the generic TAGMSG relay below it
+        // never runs for a delete — which is why deletes used to stop at the
+        // origin, leaving the message readable on every other server.
+        s2s_broadcast(
+            state,
+            crate::s2s::S2sMessage::Tagmsg {
+                event_id: s2s_next_event_id(state),
+                from: nick.to_string(),
+                target: target.to_string(),
+                tags: std::collections::HashMap::from([(
+                    "+draft/delete".to_string(),
+                    original_msgid.to_string(),
+                )]),
+                origin: state.server_iroh_id.lock().clone().unwrap_or_default(),
+                // The peer authorizes the delete against the message's author;
+                // a nick alone would let any peer assert its way to one.
+                account: conn.authenticated_did.clone(),
+            },
+        );
     } else {
         // DM: deliver the delete to every local session bound to the target
         // (a nick or a `did:`), fanning out across the DID's devices — and

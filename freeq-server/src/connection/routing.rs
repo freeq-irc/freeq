@@ -101,6 +101,7 @@ pub(crate) fn relay_to_nick(
                 sig: None,   // PM relay — sig not available at routing layer
                 account: account.map(|a| a.to_string()),
                 recipient_did: recipient_did_for_target(state, target),
+                replaces_msgid: None,
                 tags: s2s_tags,
                 multiline_lines: multiline_lines.map(|lines| {
                     lines

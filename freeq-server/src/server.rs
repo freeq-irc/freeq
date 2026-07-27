@@ -2687,6 +2687,59 @@ fn sanitize_s2s_str(s: &str, max_len: usize) -> String {
         .collect()
 }
 
+/// May a federated actor delete this message here?
+///
+/// Two ways in, mirroring what a local delete accepts:
+/// - **The author.** DID against the stored row's `sender_did`. A nick match is
+///   accepted only when the row has no DID at all (a guest's message) — for a
+///   row that names a DID, a nick is not evidence, and a peer can assert any
+///   nick it likes.
+/// - **A channel op**, via the same roster check the federated Kick/Mode path
+///   uses. Channels only: a DM has no roster, so authorship is the only route.
+///
+/// A message we hold no row for is nothing to protect — let it through so the
+/// TAGMSG still reaches clients, exactly as an unpersisted local delete does.
+fn federated_delete_authorized(
+    state: &Arc<SharedState>,
+    storage_key: &str,
+    root_msgid: &str,
+    actor_nick: &str,
+    actor_did: Option<&str>,
+    is_channel: bool,
+) -> bool {
+    let row = state.with_db(|db| db.get_message_by_msgid(storage_key, root_msgid));
+    let Some(Some(row)) = row else {
+        return true;
+    };
+
+    let is_author = match (row.sender_did.as_deref(), actor_did) {
+        (Some(row_did), Some(actor)) => row_did == actor,
+        (Some(_), None) => false,
+        (None, _) => row
+            .sender
+            .split('!')
+            .next()
+            .unwrap_or("")
+            .eq_ignore_ascii_case(actor_nick),
+    };
+    if is_author {
+        return true;
+    }
+    if !is_channel {
+        return false;
+    }
+
+    let channels = state.channels.lock();
+    channels.get(storage_key).is_some_and(|ch| {
+        ch.remote_member(actor_nick).is_some_and(|rm| {
+            rm.is_op
+                || rm.did.as_ref().is_some_and(|d| {
+                    ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d)
+                })
+        })
+    })
+}
+
 /// Process an incoming S2S message. Exposed as pub(crate) for adversarial testing.
 pub(crate) async fn process_s2s_message(
     state: &Arc<SharedState>,
@@ -3101,6 +3154,7 @@ pub(crate) async fn process_s2s_message(
             sig,
             account,
             recipient_did: stamped_recipient_did,
+            replaces_msgid,
             tags: relayed_tags,
             multiline_lines,
             ..
@@ -3121,6 +3175,15 @@ pub(crate) async fn process_s2s_message(
 
             // Generate a local msgid if the remote didn't send one
             let msgid = msgid.unwrap_or_else(crate::msgid::generate);
+
+            // An edit names the message it revises. Resolve to our own root:
+            // the peer names the root too, but an id we've never seen is its
+            // own root, so this is also what makes an edit of a message that
+            // predates us behave sanely instead of vanishing.
+            let edit_of: Option<String> = replaces_msgid
+                .map(|r| sanitize_s2s_str(&r, 100))
+                .filter(|r| !r.is_empty())
+                .map(|r| crate::connection::helpers::root_msgid(state, &r));
 
             // Peer-provided coordination tags. Re-filter on receipt (never
             // trust the sending peer to have filtered correctly): keep only
@@ -3150,6 +3213,11 @@ pub(crate) async fn process_s2s_message(
                 let mut tags = HashMap::new();
                 tags.extend(relay_tags.iter().map(|(k, v)| (k.clone(), v.clone())));
                 tags.insert("msgid".to_string(), msgid.clone());
+                // Restore the linkage the `+freeq.at/*` tag filter drops on the
+                // wire, so our clients see an edit rather than a new message.
+                if let Some(ref root) = edit_of {
+                    tags.insert("+draft/edit".to_string(), root.clone());
+                }
                 if let Some(ref sig) = sig {
                     tags.insert("+freeq.at/sig".to_string(), sig.clone());
                 }
@@ -3213,16 +3281,34 @@ pub(crate) async fn process_s2s_message(
                     }
                     let mut channels = state.channels.lock();
                     if let Some(ch) = channels.get_mut(&channel_key) {
-                        ch.history.push_back(HistoryMessage {
-                            from: from.clone(),
-                            text: text.clone(),
-                            timestamp,
-                            tags: tags.clone(),
-                            msgid: Some(msgid.clone()),
-                            edited: false,
+                        // An edit revises the entry we already hold; only a
+                        // brand-new message gets a new one. Appending an edit
+                        // instead — which is what happened before the wire
+                        // carried the linkage — showed our users the message
+                        // twice, permanently.
+                        let revised = edit_of.as_ref().and_then(|root| {
+                            ch.history
+                                .iter_mut()
+                                .find(|h| h.msgid.as_deref() == Some(root.as_str()))
                         });
-                        while ch.history.len() > MAX_HISTORY {
-                            ch.history.pop_front();
+                        if let Some(hist) = revised {
+                            hist.text = text.clone();
+                            hist.edited = true;
+                        } else {
+                            ch.history.push_back(HistoryMessage {
+                                from: from.clone(),
+                                text: text.clone(),
+                                timestamp,
+                                tags: tags.clone(),
+                                // An edit of a message we never saw still keys
+                                // on the root — the identity everyone else
+                                // holds it under.
+                                msgid: Some(edit_of.clone().unwrap_or_else(|| msgid.clone())),
+                                edited: edit_of.is_some(),
+                            });
+                            while ch.history.len() > MAX_HISTORY {
+                                ch.history.pop_front();
+                            }
                         }
                     }
                     drop(channels);
@@ -3234,8 +3320,20 @@ pub(crate) async fn process_s2s_message(
                         .or_else(|| state.nick_owners.lock().get(sender_nick).cloned());
                     // Persist the coordination tags (incl. +freeq.at/origin) so
                     // CHATHISTORY replay carries them, like the DM persist path.
-                    state.with_db(|db| {
-                        db.insert_message(
+                    state.with_db(|db| match edit_of {
+                        // Same shape as a local edit: a new row that carries
+                        // the root, so the pair reads as one message here too.
+                        Some(ref root) => db.insert_edit(
+                            &target,
+                            &from,
+                            &text,
+                            timestamp,
+                            &relay_tags,
+                            &msgid,
+                            root,
+                            s2s_sender_did.as_deref(),
+                        ),
+                        None => db.insert_message(
                             &target,
                             &from,
                             &text,
@@ -3243,7 +3341,7 @@ pub(crate) async fn process_s2s_message(
                             &relay_tags,
                             Some(&msgid),
                             s2s_sender_did.as_deref(),
-                        )
+                        ),
                     });
                 }
 
@@ -3482,10 +3580,25 @@ pub(crate) async fn process_s2s_message(
         }
 
         S2sMessage::Tagmsg {
-            from, target, tags, ..
+            from,
+            target,
+            tags,
+            account,
+            ..
         } => {
             let from = sanitize_s2s_str(&from, 512);
             let target = sanitize_s2s_str(&target, 200);
+            // Actor DID, origin-stamped. Older peers send none, so keep the
+            // nick lookup as the fallback — it resolves for anyone who has
+            // authenticated here, which is what we relied on before.
+            let actor_nick = from.split('!').next().unwrap_or(&from).to_string();
+            let actor_did = account.map(|a| sanitize_s2s_str(&a, 512)).or_else(|| {
+                state
+                    .nick_owners
+                    .lock()
+                    .get(&actor_nick.to_lowercase())
+                    .cloned()
+            });
 
             // Normalize draft tags
             let mut tags = tags.clone();
@@ -3506,8 +3619,8 @@ pub(crate) async fn process_s2s_message(
 
             // Persist reactions
             if let (Some(emoji), Some(target_msgid)) = (tags.get("+react"), tags.get("+reply")) {
-                let nick = from.split('!').next().unwrap_or(&from).to_string();
-                let did = state.nick_owners.lock().get(&nick.to_lowercase()).cloned();
+                let nick = actor_nick.clone();
+                let did = actor_did.clone();
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -3527,12 +3640,52 @@ pub(crate) async fn process_s2s_message(
             if let (Some(emoji), Some(target_msgid)) =
                 (tags.get("+freeq.at/unreact"), tags.get("+reply"))
             {
-                let nick = from.split('!').next().unwrap_or(&from).to_string();
-                let did = state.nick_owners.lock().get(&nick.to_lowercase()).cloned();
+                let nick = actor_nick.clone();
+                let did = actor_did.clone();
                 let emoji = emoji.clone();
                 let target_msgid = target_msgid.clone();
                 state
                     .with_db(|db| db.remove_reaction(&target_msgid, &nick, did.as_deref(), &emoji));
+            }
+
+            // Apply a federated delete to our own state. Relaying it to live
+            // clients is not enough — without this the row survives here, so
+            // the message returns on the next join or restart.
+            if let Some(deleted_msgid) = tags.get("+draft/delete").cloned() {
+                let root = crate::connection::helpers::root_msgid(state, &deleted_msgid);
+                let is_channel = target.starts_with('#') || target.starts_with('&');
+                let storage_key = if is_channel {
+                    target.to_lowercase()
+                } else {
+                    // A DM lives under the canonical key of the two DIDs, not
+                    // the wire target.
+                    match (
+                        actor_did.as_deref(),
+                        crate::connection::routing::recipient_did_for_target(state, &target)
+                            .as_deref(),
+                    ) {
+                        (Some(a), Some(b)) => crate::db::canonical_dm_key(a, b),
+                        _ => target.clone(),
+                    }
+                };
+
+                if federated_delete_authorized(state, &storage_key, &root, &actor_nick, actor_did.as_deref(), is_channel)
+                {
+                    state.with_db(|db| db.soft_delete_message(&storage_key, &root));
+                    if is_channel {
+                        let mut channels = state.channels.lock();
+                        if let Some(ch) = channels.get_mut(&storage_key) {
+                            ch.history.retain(|h| h.msgid.as_deref() != Some(root.as_str()));
+                            ch.pins.retain(|p| p.msgid != root);
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        target = %target, msgid = %root, by = %actor_nick,
+                        "S2S delete rejected: actor is neither the author nor an op"
+                    );
+                    return;
+                }
             }
 
             // Wire forms — identical for channel and DM delivery.
@@ -5313,6 +5466,7 @@ mod s2s_adversarial_tests {
                 sig: None,
                 account: None,
                 recipient_did: None,
+                replaces_msgid: None,
                 tags: HashMap::new(),
                 multiline_lines: None,
             },
@@ -5367,6 +5521,7 @@ mod s2s_adversarial_tests {
                     sig: None,
                     account: None,
                     recipient_did: None,
+                    replaces_msgid: None,
                     tags: HashMap::new(),
                     multiline_lines: None,
                 },
@@ -5454,6 +5609,7 @@ mod s2s_adversarial_tests {
                 sig: None,
                 account: None,
                 recipient_did: None,
+                replaces_msgid: None,
                 tags: HashMap::new(),
                 multiline_lines: Some(s2s_multiline_lines(&["first", "second", "third"])),
             },
@@ -5506,6 +5662,7 @@ mod s2s_adversarial_tests {
                 sig: None,
                 account: None,
                 recipient_did: None,
+                replaces_msgid: None,
                 tags: HashMap::new(),
                 multiline_lines: None,
             },
@@ -5570,6 +5727,7 @@ mod s2s_adversarial_tests {
                 sig: None,
                 account: Some("did:plc:alice".to_string()),
                 recipient_did: None,
+                replaces_msgid: None,
                 tags: HashMap::new(),
                 multiline_lines: None,
             },
@@ -5625,6 +5783,7 @@ mod s2s_adversarial_tests {
                 sig: None,
                 account: Some("did:plc:alice".to_string()),
                 recipient_did: None,
+                replaces_msgid: None,
                 tags: HashMap::new(),
                 multiline_lines: None,
             },
@@ -5682,6 +5841,7 @@ mod s2s_adversarial_tests {
                 sig: None,
                 account: Some("did:plc:alice".to_string()),
                 recipient_did: None,
+                replaces_msgid: None,
                 tags: HashMap::new(),
                 multiline_lines: None,
             },
@@ -5738,6 +5898,7 @@ mod s2s_adversarial_tests {
                 sig: None,
                 account: None,
                 recipient_did: None,
+                replaces_msgid: None,
                 tags: HashMap::new(),
                 multiline_lines: None,
             },
@@ -5787,6 +5948,7 @@ mod s2s_adversarial_tests {
                 sig: None,
                 account: None,
                 recipient_did: None,
+                replaces_msgid: None,
                 tags: HashMap::new(),
                 multiline_lines: Some(s2s_multiline_lines(&["first", "second"])),
             },
@@ -6027,6 +6189,7 @@ mod s2s_adversarial_tests {
                 sig: None,
                 account: None,
                 recipient_did: None,
+                replaces_msgid: None,
                 tags: HashMap::new(),
                 multiline_lines: None,
             },
@@ -6216,6 +6379,7 @@ mod s2s_adversarial_tests {
                     sig: None,
                     account: None,
                     recipient_did: None,
+                    replaces_msgid: None,
                     tags: HashMap::new(),
                     multiline_lines: None,
                 },
@@ -6323,6 +6487,7 @@ mod s2s_adversarial_tests {
                     sig: None,
                     account: None,
                     recipient_did: None,
+                    replaces_msgid: None,
                     tags: HashMap::new(),
                     multiline_lines: None,
                 },
@@ -6494,6 +6659,7 @@ mod s2s_adversarial_tests {
                 target: "#react-test".to_string(),
                 tags,
                 origin: PEER.to_string(),
+                account: None,
             },
         )
         .await;
@@ -6532,6 +6698,7 @@ mod s2s_adversarial_tests {
                 target: "#s2s-unreact".to_string(),
                 tags: react,
                 origin: PEER.to_string(),
+                account: None,
             },
         )
         .await;
@@ -6557,6 +6724,7 @@ mod s2s_adversarial_tests {
                 target: "#s2s-unreact".to_string(),
                 tags: unreact,
                 origin: PEER.to_string(),
+                account: None,
             },
         )
         .await;
@@ -6609,6 +6777,7 @@ mod s2s_adversarial_tests {
                 target: "#draft-test".to_string(),
                 tags,
                 origin: PEER.to_string(),
+                account: None,
             },
         )
         .await;
@@ -6660,6 +6829,7 @@ mod s2s_adversarial_tests {
                 sig: None,
                 account: None,
                 recipient_did: None,
+                replaces_msgid: None,
                 tags: HashMap::new(),
                 multiline_lines: None,
             },
@@ -6709,6 +6879,7 @@ mod s2s_adversarial_tests {
                 sig: None,
                 account: Some("did:plc:alice".to_string()),
                 recipient_did: None,
+                replaces_msgid: None,
                 tags: HashMap::new(),
                 multiline_lines: None,
             },
@@ -6755,6 +6926,7 @@ mod s2s_adversarial_tests {
                 sig: None,
                 account: Some("did:plc:alice".to_string()),
                 recipient_did: None,
+                replaces_msgid: None,
                 tags: HashMap::new(),
                 multiline_lines: None,
             },
@@ -6797,6 +6969,7 @@ mod s2s_adversarial_tests {
                 sig: None,
                 account: None,
                 recipient_did: None,
+                replaces_msgid: None,
                 tags: HashMap::new(),
                 multiline_lines: None,
             },
@@ -6840,6 +7013,7 @@ mod s2s_adversarial_tests {
                 sig: None,
                 account: Some("did:plc:alice".to_string()),
                 recipient_did: None,
+                replaces_msgid: None,
                 tags: HashMap::new(),
                 multiline_lines: None,
             },
@@ -7643,6 +7817,348 @@ mod s2s_adversarial_tests {
             crdt.map(|(t, _)| t),
             Some("welcome to tchan".to_string()),
             "sync-adopted topic must be seeded into the CRDT"
+        );
+    }
+
+    // ── Federated edits and deletes ────────────────────────────────
+    //
+    // A message's identity is its original msgid on every server that holds
+    // it. These cover the wire carrying enough for a peer to honour that:
+    // `replaces_msgid` so an edit revises rather than duplicates, and a
+    // `+draft/delete` Tagmsg so a delete actually deletes.
+
+    const AUTHOR_DID: &str = "did:plc:fedauthor";
+
+    /// Relay a channel message from the peer. Returns its msgid.
+    async fn relay_message(
+        state: &Arc<SharedState>,
+        mgr: &Arc<S2sManager>,
+        channel: &str,
+        msgid: &str,
+        text: &str,
+        replaces: Option<&str>,
+    ) {
+        process_s2s_message(
+            state,
+            mgr,
+            PEER,
+            S2sMessage::Privmsg {
+                event_id: format!("{PEER}:{msgid}"),
+                from: "alice!a@remote".to_string(),
+                target: channel.to_string(),
+                text: text.to_string(),
+                origin: PEER.to_string(),
+                msgid: Some(msgid.to_string()),
+                sig: None,
+                account: Some(AUTHOR_DID.to_string()),
+                recipient_did: None,
+                replaces_msgid: replaces.map(|r| r.to_string()),
+                tags: HashMap::new(),
+                multiline_lines: None,
+            },
+        )
+        .await;
+    }
+
+    async fn relay_delete(
+        state: &Arc<SharedState>,
+        mgr: &Arc<S2sManager>,
+        channel: &str,
+        msgid: &str,
+        from: &str,
+        account: Option<&str>,
+    ) {
+        let mut tags = HashMap::new();
+        tags.insert("+draft/delete".to_string(), msgid.to_string());
+        process_s2s_message(
+            state,
+            mgr,
+            PEER,
+            S2sMessage::Tagmsg {
+                event_id: format!("{PEER}:del-{msgid}-{from}"),
+                from: from.to_string(),
+                target: channel.to_string(),
+                tags,
+                origin: PEER.to_string(),
+                account: account.map(|a| a.to_string()),
+            },
+        )
+        .await;
+    }
+
+    fn history_of(state: &Arc<SharedState>, channel: &str) -> Vec<(Option<String>, String, bool)> {
+        state
+            .channels
+            .lock()
+            .get(channel)
+            .map(|ch| {
+                ch.history
+                    .iter()
+                    .map(|h| (h.msgid.clone(), h.text.clone(), h.edited))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A federated edit revises the message we already hold. Before the wire
+    /// carried the linkage the peer filed it as a new message, so every user
+    /// on this side saw the message twice — permanently, in CHATHISTORY.
+    #[tokio::test]
+    async fn s2s_edit_revises_in_place_instead_of_duplicating() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#fedit");
+
+        relay_message(&state, &mgr, "#fedit", "id-orig", "v1", None).await;
+        relay_message(&state, &mgr, "#fedit", "id-edit", "v2", Some("id-orig")).await;
+
+        assert_eq!(
+            history_of(&state, "#fedit"),
+            vec![(Some("id-orig".to_string()), "v2".to_string(), true)],
+            "one logical message, keyed by the id everyone holds it under, \
+             carrying the newest text and marked edited"
+        );
+        // The DB keeps both revisions, joined by the root — the same shape a
+        // local edit produces.
+        assert_eq!(state.with_db(|db| Ok(db.root_of("id-edit"))), Some("id-orig".to_string()));
+        assert_eq!(
+            state
+                .with_db(|db| db.current_revision("id-orig"))
+                .flatten()
+                .map(|r| r.text),
+            Some("v2".to_string())
+        );
+    }
+
+    /// An edit of a message this server never saw (it joined late, or the
+    /// original predates the linkage) must still show up, keyed by the root.
+    #[tokio::test]
+    async fn s2s_edit_of_an_unseen_message_still_arrives() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#fedunseen");
+
+        relay_message(&state, &mgr, "#fedunseen", "id-edit", "v2", Some("id-never")).await;
+
+        assert_eq!(
+            history_of(&state, "#fedunseen"),
+            vec![(Some("id-never".to_string()), "v2".to_string(), true)],
+            "an edit whose original we never saw must not vanish"
+        );
+    }
+
+    /// The local wire carries edit linkage in `+draft/edit`, which the S2S tag
+    /// filter drops — the receiver has to put it back or its own clients see a
+    /// new message.
+    #[tokio::test]
+    async fn s2s_edit_restores_the_edit_tag_for_local_clients() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#fedtag");
+
+        let (tx, mut rx) = mpsc::channel(16);
+        state.connections.lock().insert("s-1".to_string(), tx);
+        state.nick_to_session.lock().insert("watcher", "s-1");
+        state
+            .channels
+            .lock()
+            .get_mut("#fedtag")
+            .unwrap()
+            .members
+            .insert("s-1".to_string());
+        state.cap_message_tags.lock().insert("s-1".to_string());
+
+        relay_message(&state, &mgr, "#fedtag", "id-1", "v1", None).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await;
+        relay_message(&state, &mgr, "#fedtag", "id-2", "v2", Some("id-1")).await;
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert!(
+            line.contains("+draft/edit=id-1"),
+            "clients must be told this revises id-1: {line}"
+        );
+    }
+
+    /// A federated delete has to reach this server's own storage. Relaying it
+    /// live is not enough — the row outlives the event, so the message returns
+    /// on the next join and after every restart.
+    #[tokio::test]
+    async fn s2s_delete_applies_to_local_storage() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#feddel");
+
+        relay_message(&state, &mgr, "#feddel", "id-1", "secret", None).await;
+        relay_delete(&state, &mgr, "#feddel", "id-1", "alice!a@remote", Some(AUTHOR_DID)).await;
+
+        assert!(
+            history_of(&state, "#feddel").is_empty(),
+            "deleted message still in memory — a joiner would be replayed it"
+        );
+        assert!(
+            state
+                .with_db(|db| db.get_messages("#feddel", 50, None))
+                .unwrap_or_default()
+                .is_empty(),
+            "deleted message still readable in history"
+        );
+    }
+
+    /// …and a delete naming the *edit* still takes the whole message, because
+    /// both ids are the same message.
+    #[tokio::test]
+    async fn s2s_delete_by_the_edit_id_removes_every_revision() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#feddel2");
+
+        relay_message(&state, &mgr, "#feddel2", "id-1", "v1", None).await;
+        relay_message(&state, &mgr, "#feddel2", "id-2", "v2", Some("id-1")).await;
+        relay_delete(&state, &mgr, "#feddel2", "id-2", "alice!a@remote", Some(AUTHOR_DID)).await;
+
+        assert!(history_of(&state, "#feddel2").is_empty());
+        assert!(
+            state
+                .with_db(|db| db.get_messages("#feddel2", 50, None))
+                .unwrap_or_default()
+                .is_empty(),
+            "a revision survived a delete naming the other one"
+        );
+    }
+
+    /// A nick is peer-assertable, so a stranger's delete must not land.
+    #[tokio::test]
+    async fn s2s_delete_from_a_stranger_is_rejected() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#fedforge");
+
+        relay_message(&state, &mgr, "#fedforge", "id-1", "keep me", None).await;
+        relay_delete(
+            &state,
+            &mgr,
+            "#fedforge",
+            "id-1",
+            "mallory!m@remote",
+            Some("did:plc:mallory"),
+        )
+        .await;
+
+        assert_eq!(
+            history_of(&state, "#fedforge").len(),
+            1,
+            "a non-author non-op deleted someone else's message"
+        );
+    }
+
+    /// The row names a DID, so an actor who can't produce one is not the
+    /// author — no matter what nick the peer asserts.
+    #[tokio::test]
+    async fn s2s_delete_without_an_actor_did_is_rejected() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#fednodid");
+
+        relay_message(&state, &mgr, "#fednodid", "id-1", "keep me", None).await;
+        // Same nick as the author, no DID — the shape an old peer sends.
+        relay_delete(&state, &mgr, "#fednodid", "id-1", "alice!a@remote", None).await;
+
+        assert_eq!(
+            history_of(&state, "#fednodid").len(),
+            1,
+            "nick-only matching would make any peer able to delete anything"
+        );
+    }
+
+    /// Ops moderate across the federation, the same way Kick and Mode do.
+    #[tokio::test]
+    async fn s2s_delete_from_a_remote_op_is_accepted() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#fedop");
+        add_remote_member(&state, "#fedop", "moderator", true);
+
+        relay_message(&state, &mgr, "#fedop", "id-1", "spam", None).await;
+        relay_delete(
+            &state,
+            &mgr,
+            "#fedop",
+            "id-1",
+            "moderator!m@remote",
+            Some("did:plc:mod"),
+        )
+        .await;
+
+        assert!(
+            history_of(&state, "#fedop").is_empty(),
+            "a federated op must be able to delete in the channel they moderate"
+        );
+    }
+
+    /// The stamped actor DID is what makes a remote user's reaction removable
+    /// by identity rather than by nick.
+    #[tokio::test]
+    async fn s2s_reaction_records_the_stamped_actor_did() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#fedreact");
+
+        let mut tags = HashMap::new();
+        tags.insert("+react".to_string(), "🔥".to_string());
+        tags.insert("+reply".to_string(), "id-1".to_string());
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Tagmsg {
+                event_id: format!("{PEER}:react-did"),
+                from: "alice!a@remote".to_string(),
+                target: "#fedreact".to_string(),
+                tags,
+                origin: PEER.to_string(),
+                account: Some(AUTHOR_DID.to_string()),
+            },
+        )
+        .await;
+
+        let stored = state
+            .with_db(|db| db.get_reactions_for_messages(&["id-1"]))
+            .expect("db present");
+        assert_eq!(
+            stored.get("id-1").and_then(|v| v.first()).and_then(|r| r.reactor_did.clone()),
+            Some(AUTHOR_DID.to_string()),
+            "a remote reactor with no local identity was stored nick-only"
+        );
+    }
+
+    /// An older peer sends neither field. Both must degrade to exactly what
+    /// happened before they existed.
+    #[tokio::test]
+    async fn old_peer_without_the_new_fields_behaves_as_before() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#fedold");
+
+        // No replaces_msgid → a new message, appended, not a revision.
+        relay_message(&state, &mgr, "#fedold", "id-1", "v1", None).await;
+        relay_message(&state, &mgr, "#fedold", "id-2", "v2", None).await;
+        assert_eq!(
+            history_of(&state, "#fedold").len(),
+            2,
+            "two unlinked messages must stay two messages"
         );
     }
 }
