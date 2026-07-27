@@ -132,10 +132,10 @@ pub struct BufferLine {
     pub is_deleted: bool,
     /// Parent message ID this is a reply to (from IRCv3 `+reply` tag).
     pub reply_to: Option<String>,
-    /// Root msgid of this message's edit chain, once an edit has rewritten
-    /// `msgid`. Deletes name the ORIGINAL msgid, so lookups must be able to
-    /// reach the line by it; `edit_aliases` only records that an id was seen,
-    /// not which line it belongs to.
+    /// Root msgid of this message's edit chain. A message keeps its original
+    /// msgid for life — an edit changes `text`, never `msgid` — so this is
+    /// set purely as a marker that an edit was applied (and it equals
+    /// `msgid` for lines edited in place).
     pub edit_of: Option<String>,
 }
 
@@ -190,12 +190,6 @@ pub struct Buffer {
     /// True once we've seen an empty CHATHISTORY batch — no older messages
     /// exist on the server, so we should stop firing requests.
     pub history_exhausted: bool,
-    /// Original msgids of lines that were rewritten by a `+draft/edit`
-    /// (apply_edit swaps the line's msgid to the EDIT's msgid). A racing
-    /// second CHATHISTORY replay re-sends the original row under the old
-    /// msgid; without this alias set the dedup in `end_batch` misses it and
-    /// the buffer shows both the edited and the pre-edit copy.
-    pub edit_aliases: HashSet<String>,
 }
 
 /// In-progress BATCH buffer (e.g., CHATHISTORY).
@@ -208,10 +202,6 @@ pub struct BatchBuffer {
     /// the buffer's history as exhausted. Without this, an empty batch
     /// of an unrelated type would permanently disable scroll-up fetch.
     pub batch_type: String,
-    /// Original msgids rewritten by an in-batch `+draft/edit` (the line now
-    /// carries the edit's msgid). Merged into the target buffer's
-    /// `edit_aliases` at flush so later replays of the pre-edit row dedup.
-    pub edit_aliases: HashSet<String>,
 }
 
 impl BatchBuffer {
@@ -223,7 +213,7 @@ impl BatchBuffer {
         &mut self,
         editor_nick: &str,
         original_msgid: &str,
-        new_msgid: Option<&str>,
+        _new_msgid: Option<&str>,
         new_text: &str,
     ) -> bool {
         for (_, line) in self.lines.iter_mut() {
@@ -233,10 +223,9 @@ impl BatchBuffer {
                 }
                 line.text = sanitize_text(new_text);
                 line.is_edited = true;
-                if let Some(id) = new_msgid {
-                    line.msgid = Some(id.to_string());
-                }
-                self.edit_aliases.insert(original_msgid.to_string());
+                // The line keeps the msgid it was born with — the identity
+                // the server files reactions, pins and deletes under. The
+                // edit's own wire id is not this message's name.
                 return true;
             }
         }
@@ -274,7 +263,6 @@ impl Buffer {
             pinned: HashSet::new(),
             history_in_flight: false,
             history_exhausted: false,
-            edit_aliases: HashSet::new(),
         }
     }
 
@@ -282,14 +270,12 @@ impl Buffer {
         // Dedup by msgid at the single chokepoint: the server replays
         // history BOTH unbatched on JOIN and via CHATHISTORY batches, and a
         // message can arrive live first. Without this, a rejoin doubles the
-        // buffer. `edit_aliases` covers lines whose msgid was rewritten by a
-        // `+draft/edit` (the pre-edit row replays under the ORIGINAL id).
-        if let Some(ref id) = line.msgid {
-            if self.edit_aliases.contains(id)
-                || self.messages.iter().any(|l| l.msgid.as_deref() == Some(id))
-            {
-                return;
-            }
+        // buffer. A line keeps its msgid across edits, so the id alone is
+        // enough — replayed pre-edit rows carry the same id the line holds.
+        if let Some(ref id) = line.msgid
+            && self.messages.iter().any(|l| l.msgid.as_deref() == Some(id))
+        {
+            return;
         }
         // SECURITY: a hostile peer can put ANSI escapes (cursor moves, color
         // resets, screen clears) into their nick or message body. We render
@@ -415,7 +401,7 @@ impl Buffer {
         &mut self,
         editor_nick: &str,
         original_msgid: &str,
-        new_msgid: Option<&str>,
+        _new_msgid: Option<&str>,
         new_text: &str,
     ) -> bool {
         if let Some(line) = self.find_by_msgid_mut(original_msgid) {
@@ -430,21 +416,11 @@ impl Buffer {
             if line.edit_of.is_none() {
                 line.edit_of = Some(original_msgid.to_string());
             }
-            if let Some(id) = new_msgid {
-                line.msgid = Some(id.to_string());
-            }
-            // Keep the ORIGINAL id recognizable as "already present" so a
-            // later history replay of the pre-edit row dedups instead of
-            // resurrecting the old text alongside the edited line.
-            self.edit_aliases.insert(original_msgid.to_string());
-            // Carry pin through the msgid swap. Without this the
-            // renderer's `msg.msgid in buffer.pinned` check silently
-            // drops the 📌 marker after every edit of a pinned message.
-            if let Some(id) = new_msgid
-                && self.pinned.remove(original_msgid)
-            {
-                self.pinned.insert(id.to_string());
-            }
+            // The line keeps the msgid it was born with. That id is what the
+            // server files reactions, pins and deletes under, what replay
+            // returns the message under, and what every other client holds —
+            // so pins need no re-keying and replayed pre-edit rows dedup on
+            // the id alone. The edit's own wire id is audit trail, not a name.
             true
         } else {
             false
@@ -637,7 +613,11 @@ pub fn shorten_did(s: &str) -> String {
         return s.to_string();
     }
     let mut parts = s.splitn(3, ':');
-    let (_, method, id) = (parts.next(), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    let (_, method, id) = (
+        parts.next(),
+        parts.next().unwrap_or(""),
+        parts.next().unwrap_or(""),
+    );
     let chars: Vec<char> = id.chars().collect();
     if chars.len() <= 12 {
         format!("{method}:{id}")
@@ -904,7 +884,6 @@ impl App {
                 target: target.to_string(),
                 lines: Vec::new(),
                 batch_type: batch_type.to_string(),
-                edit_aliases: HashSet::new(),
             },
         );
     }
@@ -929,25 +908,17 @@ impl App {
                 return;
             }
             let buf = self.buffer_mut(&batch.target);
-            // Aliases learned inside the batch (in-batch edit rewrote a
-            // line's msgid) must survive into the buffer, or the NEXT replay
-            // resurrects the pre-edit row.
-            buf.edit_aliases.extend(batch.edit_aliases.drain());
             batch.lines.sort_by_key(|a| a.0);
             let was_empty = batch.lines.is_empty();
             let was_chathistory = batch.batch_type.eq_ignore_ascii_case("chathistory");
             // Skip lines already in the buffer by msgid. A CHATHISTORY LATEST
             // fetch (used to backfill a DM on open) overlaps messages that
             // arrived live, which would otherwise double them.
-            let mut present: HashSet<String> = buf
+            let present: HashSet<String> = buf
                 .messages
                 .iter()
                 .filter_map(|l| l.msgid.clone())
                 .collect();
-            // Edited lines carry the EDIT's msgid; their original ids live in
-            // `edit_aliases`. Both count as present, or a second replay
-            // duplicates every edited message (the pre-edit row sneaks past).
-            present.extend(buf.edit_aliases.iter().cloned());
             // Prepend in order (oldest first)
             for (_, line) in batch.lines.into_iter().rev() {
                 if let Some(ref id) = line.msgid
@@ -1261,11 +1232,12 @@ mod tests {
         let ok = buf.apply_edit("alice", "01ABC", Some("01DEF"), "hello world");
         assert!(ok);
 
-        let edited = buf.find_by_msgid("01DEF").expect("new id should resolve");
+        // The message keeps the id it was born with; the edit's own wire id
+        // never becomes a name anything can be looked up by.
+        let edited = buf.find_by_msgid("01ABC").expect("original id resolves");
         assert_eq!(edited.text, "hello world");
         assert!(edited.is_edited);
-        // Original id no longer points anywhere since the line's msgid swapped.
-        assert!(buf.find_by_msgid("01ABC").is_none());
+        assert!(buf.find_by_msgid("01DEF").is_none());
     }
 
     #[test]
@@ -1456,22 +1428,20 @@ mod tests {
     /// from the pinned message. Fix: when swapping msgid, also move
     /// the pin entry.
     #[test]
-    fn apply_edit_carries_pin_through_msgid_swap() {
+    fn apply_edit_leaves_a_pin_where_it_is() {
+        // Pins key on the message's lifelong id, so an edit needs no pin
+        // bookkeeping at all — the marker survives because nothing moved.
         let mut buf = Buffer::new("#test");
         buf.push(line("important", "alice", Some("01OLD")));
         buf.add_pinned("01OLD");
-        assert!(buf.pinned.contains("01OLD"));
 
         assert!(buf.apply_edit("alice", "01OLD", Some("01NEW"), "important (refined)"));
         assert!(
-            !buf.pinned.contains("01OLD"),
-            "old msgid should be removed from pin set"
-        );
-        assert!(
-            buf.pinned.contains("01NEW"),
-            "new msgid should carry the pin: {:?}",
+            buf.pinned.contains("01OLD"),
+            "the pin stays under the message's id: {:?}",
             buf.pinned
         );
+        assert!(!buf.pinned.contains("01NEW"));
     }
 
     /// CORRECTNESS: `end_batch` set `history_exhausted = true` for
@@ -1855,7 +1825,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_apply_edit_rewrites_within_batch() {
+    fn batch_apply_edit_updates_text_in_place() {
         let mut batch = BatchBuffer {
             target: "#test".into(),
             lines: vec![
@@ -1863,12 +1833,13 @@ mod tests {
                 (2, line_with_msgid("unrelated", Some("01BBB"))),
             ],
             batch_type: "chathistory".into(),
-            edit_aliases: HashSet::new(),
         };
         assert!(batch.apply_edit("alice", "01AAA", Some("01CCC"), "v2"));
         assert_eq!(batch.lines[0].1.text, "v2");
         assert!(batch.lines[0].1.is_edited);
-        assert_eq!(batch.lines[0].1.msgid.as_deref(), Some("01CCC"));
+        // The line keeps the id it was born with; the edit's wire id is
+        // never a message's name.
+        assert_eq!(batch.lines[0].1.msgid.as_deref(), Some("01AAA"));
         // Other line untouched.
         assert_eq!(batch.lines[1].1.text, "unrelated");
         assert!(!batch.lines[1].1.is_edited);
@@ -1880,7 +1851,6 @@ mod tests {
             target: "#test".into(),
             lines: vec![(1, line_with_msgid("secret", Some("01AAA")))],
             batch_type: "chathistory".into(),
-            edit_aliases: HashSet::new(),
         };
         assert!(batch.apply_delete("alice", "01AAA"));
         assert!(batch.lines[0].1.is_deleted);
@@ -1936,7 +1906,8 @@ mod tests {
     #[test]
     fn member_did_rekeys_a_lone_nick_thread() {
         let mut app = App::new("me", false);
-        app.buffer_mut("Alice").push(line("hi", "alice", Some("01A")));
+        app.buffer_mut("Alice")
+            .push(line("hi", "alice", Some("01A")));
         app.active_buffer = "alice".to_string();
 
         app.record_member_did("alice", DID);
@@ -1973,7 +1944,8 @@ mod tests {
     #[test]
     fn member_did_moves_e2ee_key_with_the_thread() {
         let mut app = App::new("me", false);
-        app.buffer_mut("alice").push(line("hi", "alice", Some("01A")));
+        app.buffer_mut("alice")
+            .push(line("hi", "alice", Some("01A")));
         app.channel_keys.insert("alice".to_string(), [7u8; 32]);
 
         app.record_member_did("alice", DID);
@@ -1985,7 +1957,8 @@ mod tests {
     #[test]
     fn member_did_ignores_channels_and_self_bindings() {
         let mut app = App::new("me", false);
-        app.buffer_mut("#general").push(line("hi", "alice", Some("01A")));
+        app.buffer_mut("#general")
+            .push(line("hi", "alice", Some("01A")));
 
         app.record_member_did("#general", DID);
         assert!(app.buffers.contains_key("#general"));
@@ -1996,24 +1969,27 @@ mod tests {
         assert!(!app.did_names.contains_key("not-a-did"));
     }
 
-
     #[test]
     fn push_dedups_unbatched_join_replay() {
         // The server replays history unbatched on JOIN; a line that already
         // arrived (live or via a batch) must not double when pushed again.
         let mut app = App::new("me", false);
-        app.buffer_mut("#ship").push(line("hello", "ana", Some("01A")));
-        app.buffer_mut("#ship").push(line("hello", "ana", Some("01A")));
+        app.buffer_mut("#ship")
+            .push(line("hello", "ana", Some("01A")));
+        app.buffer_mut("#ship")
+            .push(line("hello", "ana", Some("01A")));
         assert_eq!(app.buffers.get("#ship").unwrap().messages.len(), 1);
 
-        // Pre-edit row replayed unbatched after a live edit: alias dedup.
-        app.buffer_mut("#ship").push(line("v1", "chad", Some("01B")));
+        // Pre-edit row replayed unbatched after a live edit: the line kept
+        // its id, so plain msgid dedup covers it.
+        app.buffer_mut("#ship")
+            .push(line("v1", "chad", Some("01B")));
         app.apply_edit("chad", None, "#ship", "01B", Some("01C"), "v2");
-        app.buffer_mut("#ship").push(line("v1", "chad", Some("01B")));
+        app.buffer_mut("#ship")
+            .push(line("v1", "chad", Some("01B")));
         let buf = app.buffers.get("#ship").unwrap();
         assert_eq!(buf.messages.len(), 2, "{:?}", buf.messages);
     }
-
 
     #[test]
     fn edit_in_batch_also_rewrites_live_buffer_row() {
@@ -2021,7 +1997,8 @@ mod tests {
         // arrives inside a CHATHISTORY batch. The edit must rewrite the
         // buffer's copy too, or the flush appends an edited duplicate.
         let mut app = App::new("me", false);
-        app.buffer_mut("#ship").push(line("v1", "chad", Some("01A")));
+        app.buffer_mut("#ship")
+            .push(line("v1", "chad", Some("01A")));
 
         app.start_batch_typed("h1", "#ship", "chathistory");
         app.add_batch_line("h1", 1, line("v1", "chad", Some("01A")));
@@ -2030,14 +2007,18 @@ mod tests {
 
         let buf = app.buffers.get("#ship").unwrap();
         assert_eq!(
-            buf.messages.len(), 1,
+            buf.messages.len(),
+            1,
             "one row after batch edit over join-replayed original: {:?}",
-            buf.messages.iter().map(|l| (&l.text, &l.msgid)).collect::<Vec<_>>()
+            buf.messages
+                .iter()
+                .map(|l| (&l.text, &l.msgid))
+                .collect::<Vec<_>>()
         );
         let row = buf.messages.front().unwrap();
         assert_eq!(row.text, "v2");
         assert!(row.is_edited);
-        assert_eq!(row.msgid.as_deref(), Some("01B"));
+        assert_eq!(row.msgid.as_deref(), Some("01A"));
     }
 
     #[test]
@@ -2052,19 +2033,33 @@ mod tests {
         // Batch 1: original + in-batch edit.
         app.start_batch_typed("h1", "#ship", "chathistory");
         app.add_batch_line("h1", 1, line("shipping it aa", "chad", Some("01A")));
-        app.apply_edit("chad", Some("h1"), "#ship", "01A", Some("01B"), "shipping it 🚀");
+        app.apply_edit(
+            "chad",
+            Some("h1"),
+            "#ship",
+            "01A",
+            Some("01B"),
+            "shipping it 🚀",
+        );
         app.end_batch("h1");
         {
             let buf = app.buffers.get("#ship").unwrap();
             assert_eq!(buf.messages.len(), 1);
-            assert_eq!(buf.messages.front().unwrap().msgid.as_deref(), Some("01B"));
+            assert_eq!(buf.messages.front().unwrap().msgid.as_deref(), Some("01A"));
             assert!(buf.messages.front().unwrap().is_edited);
         }
 
         // Batch 2 (racing duplicate request): same two rows again.
         app.start_batch_typed("h2", "#ship", "chathistory");
         app.add_batch_line("h2", 1, line("shipping it aa", "chad", Some("01A")));
-        app.apply_edit("chad", Some("h2"), "#ship", "01A", Some("01B"), "shipping it 🚀");
+        app.apply_edit(
+            "chad",
+            Some("h2"),
+            "#ship",
+            "01A",
+            Some("01B"),
+            "shipping it 🚀",
+        );
         app.end_batch("h2");
 
         let buf = app.buffers.get("#ship").unwrap();
@@ -2072,7 +2067,10 @@ mod tests {
             buf.messages.len(),
             1,
             "pre-edit row must not resurrect on a second replay: {:?}",
-            buf.messages.iter().map(|l| (&l.text, &l.msgid)).collect::<Vec<_>>()
+            buf.messages
+                .iter()
+                .map(|l| (&l.text, &l.msgid))
+                .collect::<Vec<_>>()
         );
         assert_eq!(buf.messages.front().unwrap().text, "shipping it 🚀");
     }
@@ -2082,7 +2080,8 @@ mod tests {
         // Live path variant: message arrived live (01A), a live edit rewrote
         // it to 01B, then a CHATHISTORY backfill replays the original row.
         let mut app = App::new("me", false);
-        app.buffer_mut("#ship").push(line("v1", "chad", Some("01A")));
+        app.buffer_mut("#ship")
+            .push(line("v1", "chad", Some("01A")));
         app.apply_edit("chad", None, "#ship", "01A", Some("01B"), "v2");
 
         app.start_batch_typed("h1", "#ship", "chathistory");
@@ -2090,7 +2089,11 @@ mod tests {
         app.end_batch("h1");
 
         let buf = app.buffers.get("#ship").unwrap();
-        assert_eq!(buf.messages.len(), 1, "original row must dedup via edit alias");
+        assert_eq!(
+            buf.messages.len(),
+            1,
+            "original row must dedup via edit alias"
+        );
         assert_eq!(buf.messages.front().unwrap().text, "v2");
     }
 
@@ -2099,7 +2102,8 @@ mod tests {
         // A DM's CHATHISTORY LATEST backfill overlaps messages already shown
         // live; the flush must not double them.
         let mut app = App::new("me", false);
-        app.buffer_mut("bob").push(line("live", "bob", Some("01LIVE")));
+        app.buffer_mut("bob")
+            .push(line("live", "bob", Some("01LIVE")));
 
         app.start_batch("h1", "bob");
         // History returns an older message plus the one already present.
@@ -2110,8 +2114,14 @@ mod tests {
         let buf = app.buffers.get("bob").unwrap();
         assert_eq!(buf.messages.len(), 2, "duplicate msgid must be skipped");
         // Older prepended, the live one kept its single copy.
-        assert_eq!(buf.messages.front().unwrap().msgid.as_deref(), Some("01OLD"));
-        assert_eq!(buf.messages.back().unwrap().msgid.as_deref(), Some("01LIVE"));
+        assert_eq!(
+            buf.messages.front().unwrap().msgid.as_deref(),
+            Some("01OLD")
+        );
+        assert_eq!(
+            buf.messages.back().unwrap().msgid.as_deref(),
+            Some("01LIVE")
+        );
     }
 
     #[test]
@@ -2181,12 +2191,10 @@ pub fn evict_image_cache(cache: &ImageCache) {
 mod delete_after_edit_tests {
     //! Deleting an *edited* message must still work.
     //!
-    //! `apply_edit` rewrites `line.msgid` to the edit's msgid (so subsequent
-    //! streaming edits and history dedup line up), recording the original only in
-    //! the buffer-level `edit_aliases` set. Deletes always name the ORIGINAL
-    //! msgid — the identity clients hold, and what the server relays in
-    //! `+draft/delete` — so `apply_delete`'s `find_by_msgid_mut` lookup missed and
-    //! the line stayed on screen after the server had removed it.
+    //! Deletes always name the ORIGINAL msgid — the identity clients hold,
+    //! and what the server relays in `+draft/delete`. A line keeps that id
+    //! across edits, so the delete resolves by plain id lookup; these tests
+    //! pin that an edit never breaks the delete path.
     use super::*;
 
     fn line(msgid: &str, from: &str, text: &str) -> BufferLine {
@@ -2220,12 +2228,21 @@ mod delete_after_edit_tests {
     }
 
     #[test]
-    fn delete_by_edit_msgid_still_works() {
+    fn an_edit_never_changes_the_line_id() {
+        // The invariant everything else here rests on: reactions, pins,
+        // deletes and replay dedup all key on the id the message was born
+        // with, so an edit must leave it alone.
         let mut buf = Buffer::new("#t");
         buf.messages.push_back(line("orig", "alice", "v1"));
-        buf.apply_edit("alice", "orig", Some("edit1"), "v2");
-        assert!(buf.apply_delete("alice", "edit1"));
-        assert!(buf.messages.back().unwrap().is_deleted);
+        assert!(buf.apply_edit("alice", "orig", Some("edit1"), "v2"));
+        let l = buf.messages.back().unwrap();
+        assert_eq!(l.msgid.as_deref(), Some("orig"));
+        assert_eq!(l.text, "v2");
+        assert!(l.is_edited);
+        // A pin on the message needs no re-keying to survive the edit.
+        buf.pinned.insert("orig".into());
+        assert!(buf.apply_edit("alice", "orig", Some("edit2"), "v3"));
+        assert!(buf.pinned.contains("orig"));
     }
 
     #[test]
