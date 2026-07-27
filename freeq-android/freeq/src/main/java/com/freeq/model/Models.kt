@@ -128,29 +128,44 @@ class ChannelState(val name: String) {
         messages[idx] = messages[idx].copy(isDeleted = true, text = "")
     }
 
-    fun applyReaction(msgId: String, emoji: String, from: String): Boolean {
-        val idx = findMessage(msgId) ?: return true
+    /// Add `from` to this emoji's reactors. Idempotent: `+react` is an
+    /// explicit op, not a toggle, so a re-delivered or duplicated one is a
+    /// no-op rather than a removal.
+    fun addReaction(msgId: String, emoji: String, from: String) {
+        mutateReactions(msgId, emoji) { nicks -> nicks.add(from) }
+    }
+
+    /// Remove `from` from this emoji's reactors — what `+freeq.at/unreact`
+    /// means. Dropping the emoji entirely once nobody is left on it.
+    fun removeReaction(msgId: String, emoji: String, from: String) {
+        mutateReactions(msgId, emoji) { nicks -> nicks.remove(from) }
+    }
+
+    /// True when `from` has already reacted with `emoji` — lets the send path
+    /// decide which explicit op to transmit without inferring it from a
+    /// mutation's return value.
+    fun hasReaction(msgId: String, emoji: String, from: String): Boolean {
+        val idx = findMessage(msgId) ?: return false
+        return messages[idx].reactions[emoji]?.contains(from) == true
+    }
+
+    private fun mutateReactions(
+        msgId: String,
+        emoji: String,
+        change: (MutableSet<String>) -> Unit,
+    ) {
+        val idx = findMessage(msgId) ?: return
         val msg = messages[idx]
         // Build entirely new collections — mutating in place causes old.equals(new)
         // to be true on the data class, so LazyColumn skips recomposition.
         val newReactions = mutableMapOf<String, MutableSet<String>>()
-        var added = true
         for ((e, nicks) in msg.reactions) {
-            if (e == emoji) {
-                val newNicks = nicks.toMutableSet()
-                if (from in newNicks) { newNicks.remove(from); added = false }
-                else { newNicks.add(from); added = true }
-                if (newNicks.isNotEmpty()) newReactions[e] = newNicks
-            } else {
-                newReactions[e] = nicks.toMutableSet()
-            }
+            if (e != emoji) newReactions[e] = nicks.toMutableSet()
         }
-        if (emoji !in msg.reactions) {
-            newReactions[emoji] = mutableSetOf(from)
-            added = true
-        }
+        val target = msg.reactions[emoji]?.toMutableSet() ?: mutableSetOf()
+        change(target)
+        if (target.isNotEmpty()) newReactions[emoji] = target
         messages[idx] = msg.copy(reactions = newReactions)
-        return added
     }
 }
 
@@ -674,13 +689,20 @@ class AppState(application: Application) : AndroidViewModel(application) {
         } catch (_: Exception) {}
     }
 
+    /// Toggle our own reaction: which explicit op to send is decided from the
+    /// current state, then applied locally and transmitted. Removing used to
+    /// update the screen and send nothing at all, so an un-react never left
+    /// the device — the reaction stayed for everyone else.
     fun sendReaction(target: String, msgId: String, emoji: String) {
         val ch = channels.firstOrNull { it.name.equals(target, ignoreCase = true) }
             ?: dmBuffers.firstOrNull { it.name.equals(target, ignoreCase = true) }
-        val added = ch?.applyReaction(msgId, emoji, nick.value) ?: true
-        if (added) {
-            sendRaw("@+react=$emoji;+reply=$msgId TAGMSG $target")
+        val alreadyReacted = ch?.hasReaction(msgId, emoji, nick.value) ?: false
+        if (alreadyReacted) {
+            ch?.removeReaction(msgId, emoji, nick.value)
+        } else {
+            ch?.addReaction(msgId, emoji, nick.value)
         }
+        sendRaw(ReactionOp.line(target, msgId, emoji, alreadyReacted))
     }
 
     fun deleteMessage(target: String, msgId: String) {
@@ -1373,14 +1395,19 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                     lookupBuffer(bufferName)?.applyDelete(deleteId)
                 }
 
-                // Reactions (self-echo already applied optimistically by sendReaction)
-                val emoji = tags["+react"]
+                // Reactions (self-echo already applied optimistically by
+                // sendReaction). Explicit ops, never a toggle: a re-delivered
+                // `+react` must be a no-op, and an unreact must remove —
+                // unreact wasn't handled here at all, so a reaction someone
+                // took back stayed on screen until a history refetch.
                 val replyId = tags["+reply"]
-                if (emoji != null && replyId != null) {
+                val addEmoji = tags["+react"]
+                val removeEmoji = tags["+freeq.at/unreact"]
+                if (replyId != null && (addEmoji != null || removeEmoji != null)) {
                     val bufferName = TagMsgRouter.routeTo(target, from, state.nick.value, event.msg.dmKey)
-                    if (bufferName != null) {
-                        lookupBuffer(bufferName)?.applyReaction(replyId, emoji, from)
-                    }
+                    val buf = if (bufferName != null) lookupBuffer(bufferName) else null
+                    if (addEmoji != null) buf?.addReaction(replyId, addEmoji, from)
+                    if (removeEmoji != null) buf?.removeReaction(replyId, removeEmoji, from)
                 }
             }
 

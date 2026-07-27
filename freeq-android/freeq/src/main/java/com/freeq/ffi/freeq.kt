@@ -3302,6 +3302,54 @@ public object FfiConverterTypeChannelTopic: FfiConverterRustBuffer<ChannelTopic>
 
 
 
+data class CoordinationEvent (
+    var `eventType`: kotlin.String, 
+    var `taskId`: kotlin.String?, 
+    var `phase`: kotlin.String?, 
+    var `evidenceType`: kotlin.String?, 
+    var `reference`: kotlin.String?, 
+    var `payload`: kotlin.String?
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeCoordinationEvent: FfiConverterRustBuffer<CoordinationEvent> {
+    override fun read(buf: ByteBuffer): CoordinationEvent {
+        return CoordinationEvent(
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: CoordinationEvent) = (
+            FfiConverterString.allocationSize(value.`eventType`) +
+            FfiConverterOptionalString.allocationSize(value.`taskId`) +
+            FfiConverterOptionalString.allocationSize(value.`phase`) +
+            FfiConverterOptionalString.allocationSize(value.`evidenceType`) +
+            FfiConverterOptionalString.allocationSize(value.`reference`) +
+            FfiConverterOptionalString.allocationSize(value.`payload`)
+    )
+
+    override fun write(value: CoordinationEvent, buf: ByteBuffer) {
+            FfiConverterString.write(value.`eventType`, buf)
+            FfiConverterOptionalString.write(value.`taskId`, buf)
+            FfiConverterOptionalString.write(value.`phase`, buf)
+            FfiConverterOptionalString.write(value.`evidenceType`, buf)
+            FfiConverterOptionalString.write(value.`reference`, buf)
+            FfiConverterOptionalString.write(value.`payload`, buf)
+    }
+}
+
+
+
 data class IrcMember (
     var `nick`: kotlin.String, 
     var `isOp`: kotlin.Boolean, 
@@ -3363,7 +3411,9 @@ data class IrcMessage (
     var `account`: kotlin.String?, 
     var `origin`: kotlin.String?, 
     var `reactions`: List<ReactionTally>, 
-    var `dmKey`: kotlin.String?
+    var `edited`: kotlin.Boolean, 
+    var `dmKey`: kotlin.String?, 
+    var `coordination`: CoordinationEvent?
 ) {
     
     companion object
@@ -3391,7 +3441,9 @@ public object FfiConverterTypeIrcMessage: FfiConverterRustBuffer<IrcMessage> {
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterSequenceTypeReactionTally.read(buf),
+            FfiConverterBoolean.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalTypeCoordinationEvent.read(buf),
         )
     }
 
@@ -3412,7 +3464,9 @@ public object FfiConverterTypeIrcMessage: FfiConverterRustBuffer<IrcMessage> {
             FfiConverterOptionalString.allocationSize(value.`account`) +
             FfiConverterOptionalString.allocationSize(value.`origin`) +
             FfiConverterSequenceTypeReactionTally.allocationSize(value.`reactions`) +
-            FfiConverterOptionalString.allocationSize(value.`dmKey`)
+            FfiConverterBoolean.allocationSize(value.`edited`) +
+            FfiConverterOptionalString.allocationSize(value.`dmKey`) +
+            FfiConverterOptionalTypeCoordinationEvent.allocationSize(value.`coordination`)
     )
 
     override fun write(value: IrcMessage, buf: ByteBuffer) {
@@ -3432,7 +3486,9 @@ public object FfiConverterTypeIrcMessage: FfiConverterRustBuffer<IrcMessage> {
             FfiConverterOptionalString.write(value.`account`, buf)
             FfiConverterOptionalString.write(value.`origin`, buf)
             FfiConverterSequenceTypeReactionTally.write(value.`reactions`, buf)
+            FfiConverterBoolean.write(value.`edited`, buf)
             FfiConverterOptionalString.write(value.`dmKey`, buf)
+            FfiConverterOptionalTypeCoordinationEvent.write(value.`coordination`, buf)
     }
 }
 
@@ -4930,6 +4986,38 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         } else {
             buf.put(1)
             FfiConverterString.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeCoordinationEvent: FfiConverterRustBuffer<CoordinationEvent?> {
+    override fun read(buf: ByteBuffer): CoordinationEvent? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeCoordinationEvent.read(buf)
+    }
+
+    override fun allocationSize(value: CoordinationEvent?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeCoordinationEvent.allocationSize(value)
+        }
+    }
+
+    override fun write(value: CoordinationEvent?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeCoordinationEvent.write(value, buf)
         }
     }
 }
