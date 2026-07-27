@@ -1161,16 +1161,24 @@ pub(super) fn handle_privmsg_with_multiline(
 
         // Route through the federation routing layer.
         // See routing.rs for why we NEVER gate on remote_members here.
-        use super::routing::{RouteResult, relay_to_nick};
+        use super::routing::{RelayIdentity, RouteResult, relay_to_nick};
         let from_nick = conn.nick.as_deref().unwrap_or("*").to_string();
         match relay_to_nick(
             state,
             &from_nick,
-            conn.authenticated_did.as_deref(),
             target,
             text,
             s2s_next_event_id(state),
             multiline_lines,
+            RelayIdentity {
+                account: conn.authenticated_did.as_deref(),
+                // The id this server assigned. A peer that mints its own leaves
+                // the two servers unable to name the same message.
+                msgid: Some(&pm_msgid),
+                sig: pm_tags.get("+freeq.at/sig").map(|s| s.as_str()),
+                replaces_msgid: None,
+                tags: crate::s2s::relay_coordination_tags(&pm_tags),
+            },
         ) {
             RouteResult::Local(ref session) => {
                 // Target is local — deliver to ALL sessions for target's DID (multi-device).
@@ -2450,11 +2458,19 @@ fn handle_edit(
         match relay_to_nick(
             state,
             &from_nick,
-            conn.authenticated_did.as_deref(),
             target,
             new_text,
             s2s_next_event_id(state),
             multiline_lines.as_deref(),
+            super::routing::RelayIdentity {
+                account: conn.authenticated_did.as_deref(),
+                msgid: Some(&edit_msgid),
+                sig: full_tags.get("+freeq.at/sig").map(|s| s.as_str()),
+                // What makes this an edit on the far side rather than a second
+                // message in the thread.
+                replaces_msgid: Some(original_msgid),
+                tags: crate::s2s::relay_coordination_tags(&full_tags),
+            },
         ) {
             RouteResult::Local(ref session) => {
                 // Find all sessions for target's DID (multi-device support)
@@ -2704,7 +2720,27 @@ fn handle_delete(conn: &Connection, target: &str, original_msgid: &str, state: &
                 let _ = tx.try_send(tagged_line.clone());
             }
         }
-        // Note: For federated DM deletes, we'd need S2S support — not implemented yet
+        drop(conns);
+        drop(tag_caps);
+
+        // The recipient may be on another server, or be reading this thread
+        // from one. Relay unconditionally, the same way the DM PRIVMSG path
+        // does — peers dedup by event_id, and one with no local session for
+        // the target simply no-ops.
+        s2s_broadcast(
+            state,
+            crate::s2s::S2sMessage::Tagmsg {
+                event_id: s2s_next_event_id(state),
+                from: nick.to_string(),
+                target: target.to_string(),
+                tags: std::collections::HashMap::from([(
+                    "+draft/delete".to_string(),
+                    original_msgid.to_string(),
+                )]),
+                origin: state.server_iroh_id.lock().clone().unwrap_or_default(),
+                account: conn.authenticated_did.clone(),
+            },
+        );
     }
 }
 

@@ -3497,8 +3497,21 @@ pub(crate) async fn process_s2s_message(
                     if let Some(ref acct) = account {
                         tags.insert("account".to_string(), acct.clone());
                     }
-                    state.with_db(|db| {
-                        db.insert_message(
+                    // A DM edit is a revision of a row we already hold, keyed
+                    // by the root — same as the channel path. Storing it as a
+                    // new message would leave the thread showing both versions.
+                    state.with_db(|db| match edit_of {
+                        Some(ref root) => db.insert_edit(
+                            &dm_key,
+                            &from,
+                            &text,
+                            timestamp,
+                            &tags,
+                            &msgid,
+                            root,
+                            sender_did.as_deref(),
+                        ),
+                        None => db.insert_message(
                             &dm_key,
                             &from,
                             &text,
@@ -3506,7 +3519,7 @@ pub(crate) async fn process_s2s_message(
                             &tags,
                             Some(&msgid),
                             sender_did.as_deref(),
-                        )
+                        ),
                     });
                 }
             }
@@ -6026,7 +6039,7 @@ mod s2s_adversarial_tests {
         // way to split it back into BATCH-wrappable chunks. Now the
         // breakdown rides along on the relayed Privmsg event.
         use crate::connection::draft_multiline::BatchLine;
-        use crate::connection::routing::{RouteResult, relay_to_nick};
+        use crate::connection::routing::{RelayIdentity, RouteResult, relay_to_nick};
 
         let state = test_state();
         let (mgr, mut broadcast_rx) = test_manager_with_broadcast_rx();
@@ -6056,11 +6069,11 @@ mod s2s_adversarial_tests {
         let outcome = relay_to_nick(
             &state,
             "sender!u@h",
-            None,
             "ghost",
             "chunk one\nchunk twotail",
             "evt-1".to_string(),
             Some(&lines),
+            RelayIdentity::default(),
         );
         assert!(matches!(outcome, RouteResult::Relayed));
 
@@ -6109,7 +6122,7 @@ mod s2s_adversarial_tests {
         // PRIVMSG path) must still relay with multiline_lines = None
         // so peer servers go through their existing single-PRIVMSG
         // broadcast (no synthetic chunking).
-        use crate::connection::routing::{RouteResult, relay_to_nick};
+        use crate::connection::routing::{RelayIdentity, RouteResult, relay_to_nick};
 
         let state = test_state();
         let (mgr, mut broadcast_rx) = test_manager_with_broadcast_rx();
@@ -6118,11 +6131,11 @@ mod s2s_adversarial_tests {
         let outcome = relay_to_nick(
             &state,
             "sender!u@h",
-            None,
             "ghost",
             "ordinary text",
             "evt-2".to_string(),
             None,
+            RelayIdentity::default(),
         );
         assert!(matches!(outcome, RouteResult::Relayed));
 
@@ -8140,6 +8153,133 @@ mod s2s_adversarial_tests {
             stored.get("id-1").and_then(|v| v.first()).and_then(|r| r.reactor_did.clone()),
             Some(AUTHOR_DID.to_string()),
             "a remote reactor with no local identity was stored nick-only"
+        );
+    }
+
+    /// Relay a DM from the peer, addressed to a local nick.
+    async fn relay_dm(
+        state: &Arc<SharedState>,
+        mgr: &Arc<S2sManager>,
+        to_nick: &str,
+        msgid: &str,
+        text: &str,
+        replaces: Option<&str>,
+    ) {
+        process_s2s_message(
+            state,
+            mgr,
+            PEER,
+            S2sMessage::Privmsg {
+                event_id: format!("{PEER}:dm-{msgid}"),
+                from: "alice!a@remote".to_string(),
+                target: to_nick.to_string(),
+                text: text.to_string(),
+                origin: PEER.to_string(),
+                msgid: Some(msgid.to_string()),
+                sig: None,
+                account: Some(AUTHOR_DID.to_string()),
+                recipient_did: None,
+                replaces_msgid: replaces.map(|r| r.to_string()),
+                tags: HashMap::new(),
+                multiline_lines: None,
+            },
+        )
+        .await;
+    }
+
+    /// Bind a local nick to a DID so a DM addressed to it resolves a recipient
+    /// and therefore persists.
+    fn bind_local_nick(state: &Arc<SharedState>, nick: &str, did: &str) -> String {
+        state
+            .nick_owners
+            .lock()
+            .insert(nick.to_string(), did.to_string());
+        crate::db::canonical_dm_key(AUTHOR_DID, did)
+    }
+
+    fn live_dm_texts(state: &Arc<SharedState>, dm_key: &str) -> Vec<String> {
+        state
+            .with_db(|db| db.get_messages(dm_key, 50, None))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.text)
+            .collect()
+    }
+
+    /// A DM edit crossing the hop revises the thread rather than adding to it.
+    #[tokio::test]
+    async fn s2s_dm_edit_revises_the_thread() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let dm_key = bind_local_nick(&state, "bob", "did:plc:bobdm");
+
+        relay_dm(&state, &mgr, "bob", "dm-1", "v1", None).await;
+        relay_dm(&state, &mgr, "bob", "dm-2", "v2", Some("dm-1")).await;
+
+        // Both revisions are on file, joined by the root — one logical message
+        // in two rows, not a message plus an unlinked stranger.
+        assert_eq!(
+            live_dm_texts(&state, &dm_key),
+            vec!["v1".to_string(), "v2".to_string()]
+        );
+        assert_eq!(
+            state.with_db(|db| Ok(db.root_of("dm-2"))),
+            Some("dm-1".to_string())
+        );
+        assert_eq!(
+            state
+                .with_db(|db| db.current_revision("dm-1"))
+                .flatten()
+                .map(|r| r.text),
+            Some("v2".to_string())
+        );
+    }
+
+    /// A DM delete has to reach the recipient's server, or the message stays
+    /// in their history forever.
+    #[tokio::test]
+    async fn s2s_dm_delete_applies_to_local_storage() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let dm_key = bind_local_nick(&state, "bob", "did:plc:bobdel");
+
+        relay_dm(&state, &mgr, "bob", "dm-1", "regrettable", None).await;
+        assert_eq!(live_dm_texts(&state, &dm_key).len(), 1, "dm persisted");
+
+        relay_delete(&state, &mgr, "bob", "dm-1", "alice!a@remote", Some(AUTHOR_DID)).await;
+
+        assert!(
+            live_dm_texts(&state, &dm_key).is_empty(),
+            "the federated DM delete never reached storage"
+        );
+    }
+
+    /// A DM has no roster to appeal to, so authorship is the only way in —
+    /// and a persisted DM row always names its sender's DID.
+    #[tokio::test]
+    async fn s2s_dm_delete_from_a_stranger_is_rejected() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let dm_key = bind_local_nick(&state, "bob", "did:plc:bobkeep");
+
+        relay_dm(&state, &mgr, "bob", "dm-1", "keep me", None).await;
+        relay_delete(
+            &state,
+            &mgr,
+            "bob",
+            "dm-1",
+            "alice!a@remote",
+            Some("did:plc:someoneelse"),
+        )
+        .await;
+
+        assert_eq!(
+            live_dm_texts(&state, &dm_key).len(),
+            1,
+            "someone who is not the author deleted a DM"
         );
     }
 

@@ -783,3 +783,210 @@ async fn channel_delete_crosses_the_hop() {
     hb.quit(None).await.ok();
     drop((srv_a, srv_b));
 }
+
+/// Every msgid stored under a DM key on this server, oldest first.
+fn dm_msgids(db_path: &str, dm_key: &str) -> Vec<String> {
+    let conn = rusqlite::Connection::open(db_path).expect("open server db");
+    let mut stmt = conn
+        .prepare(
+            "SELECT msgid FROM messages
+             WHERE channel = ?1 AND msgid IS NOT NULL
+             ORDER BY id",
+        )
+        .expect("prepare");
+    let rows = stmt
+        .query_map(rusqlite::params![dm_key], |r| r.get::<_, String>(0))
+        .expect("query");
+    rows.collect::<Result<Vec<_>, _>>().expect("collect msgids")
+}
+
+/// Rows belonging to ONE logical message — every revision shares the root.
+/// Scoped this way because `warm_link` leaves its own probe messages in the
+/// same thread; a thread-wide count would answer a different question.
+fn rows_for_root(db_path: &str, dm_key: &str, root: &str, live_only: bool) -> i64 {
+    let conn = rusqlite::Connection::open(db_path).expect("open server db");
+    let sql = if live_only {
+        "SELECT COUNT(*) FROM messages
+         WHERE channel = ?1 AND root_msgid = ?2 AND deleted_at IS NULL"
+    } else {
+        "SELECT COUNT(*) FROM messages WHERE channel = ?1 AND root_msgid = ?2"
+    };
+    conn.query_row(sql, rusqlite::params![dm_key, root], |r| r.get(0))
+        .expect("count rows for root")
+}
+
+/// Rows under a DM key that a delete hasn't struck.
+#[allow(dead_code)]
+fn live_dm_row_count(db_path: &str, dm_key: &str) -> i64 {
+    let conn = rusqlite::Connection::open(db_path).expect("open server db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE channel = ?1 AND deleted_at IS NULL",
+        rusqlite::params![dm_key],
+        |r| r.get(0),
+    )
+    .expect("count live dm rows")
+}
+
+/// Poll until both servers have `want` rows under the DM key.
+async fn wait_dm_rows(a: &TestServer, b: &TestServer, dm_key: &str, want: i64) -> bool {
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        if dm_row_count(&a.db_path, dm_key) >= want && dm_row_count(&b.db_path, dm_key) >= want {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    false
+}
+
+/// The same DM must be one message on both servers.
+///
+/// The relay used to send no msgid at all for a recipient who isn't local, so
+/// the receiving server minted its own. Nothing that names a message across
+/// servers — an edit, a delete, a reaction — can work while the two ends
+/// disagree about what the message *is*.
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn cross_server_dm_keeps_one_identity() {
+    let alice = TestId::new("did:plc:aliceid");
+    let bob = TestId::new("did:plc:bobid");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.privmsg(&bob.did, "one identity").await.unwrap();
+    assert!(
+        try_recv_message(&mut rxb, "one identity", EVENT_TIMEOUT)
+            .await
+            .is_some(),
+        "bob must receive the DM"
+    );
+
+    let dm_key = freeq_server::db::canonical_dm_key(&alice.did, &bob.did);
+    assert!(
+        wait_dm_rows(&srv_a, &srv_b, &dm_key, 1).await,
+        "both servers must persist the DM"
+    );
+
+    let sender_side = dm_msgids(&srv_a.db_path, &dm_key);
+    let peer_side = dm_msgids(&srv_b.db_path, &dm_key);
+    assert!(
+        peer_side.iter().any(|id| sender_side.contains(id)),
+        "the two servers hold this DM under different ids — sender {sender_side:?}, \
+         peer {peer_side:?}. Every later edit, delete or reaction names an id \
+         the other end cannot resolve."
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+/// A DM edit crossing the hop revises the recipient's copy.
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn dm_edit_crosses_with_linkage_intact() {
+    let alice = TestId::new("did:plc:alicedmed");
+    let bob = TestId::new("did:plc:bobdmed");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.privmsg(&bob.did, "dm before").await.unwrap();
+    let msgid = recv_channel_msgid(&mut rxb, "dm before", EVENT_TIMEOUT)
+        .await
+        .expect("bob received the DM with a msgid");
+
+    ha.edit_message(&bob.did, &msgid, "dm after").await.unwrap();
+    let edit_msgid = recv_channel_msgid(&mut rxb, "dm after", EVENT_TIMEOUT)
+        .await
+        .expect("the DM edit never crossed");
+    assert_ne!(edit_msgid, msgid, "an edit travels under its own wire id");
+
+    let dm_key = freeq_server::db::canonical_dm_key(&alice.did, &bob.did);
+    // Two rows under ONE identity: the original and its revision.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    while tokio::time::Instant::now() < deadline
+        && rows_for_root(&srv_b.db_path, &dm_key, &msgid, false) < 2
+    {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        rows_for_root(&srv_b.db_path, &dm_key, &msgid, false),
+        2,
+        "the peer must hold the original and its revision under {msgid}"
+    );
+    assert_eq!(
+        rows_for_root(&srv_b.db_path, &dm_key, &edit_msgid, false),
+        0,
+        "the peer filed the edit as its own message instead of a revision \
+         of {msgid}"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+/// A DM delete has to cross too, or it only ever hides the message from the
+/// author's own client.
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn dm_delete_crosses_the_hop() {
+    let alice = TestId::new("did:plc:alicedmdel");
+    let bob = TestId::new("did:plc:bobdmdel");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.privmsg(&bob.did, "regrettable dm").await.unwrap();
+    let msgid = recv_channel_msgid(&mut rxb, "regrettable dm", EVENT_TIMEOUT)
+        .await
+        .expect("bob received the DM with a msgid");
+
+    let dm_key = freeq_server::db::canonical_dm_key(&alice.did, &bob.did);
+    assert!(
+        wait_dm_rows(&srv_a, &srv_b, &dm_key, 1).await,
+        "both servers must persist the DM first"
+    );
+
+    // The rest of the thread (warm-up probes) must survive — a delete acts on
+    // one message, not on a conversation.
+    let thread_before = dm_msgids(&srv_b.db_path, &dm_key).len();
+    ha.delete_message(&bob.did, &msgid).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut cleared = false;
+    while tokio::time::Instant::now() < deadline {
+        if rows_for_root(&srv_b.db_path, &dm_key, &msgid, true) == 0 {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        cleared,
+        "the deleted DM is still readable on the recipient's server"
+    );
+    assert_eq!(
+        dm_msgids(&srv_b.db_path, &dm_key).len(),
+        thread_before,
+        "the delete removed rows other than the message it named"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
