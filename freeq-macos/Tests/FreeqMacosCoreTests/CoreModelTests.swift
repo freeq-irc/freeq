@@ -61,7 +61,7 @@ final class CoreModelTests: XCTestCase {
         ch.applyEdit(originalId: "orig", newId: "edit-1", newText: "fixed")
         XCTAssertEqual(ch.messages[0].text, "fixed")
         XCTAssertTrue(ch.messages[0].isEdited)
-        XCTAssertEqual(ch.messages[0].id, "edit-1")
+        XCTAssertEqual(ch.messages[0].id, "orig", "an edit changes text, not identity")
         // The replacement id is now known — its echo must not re-append.
         ch.appendIfNew(msg("edit-1", "echo"))
         XCTAssertEqual(ch.messages.count, 1)
@@ -101,7 +101,7 @@ final class CoreModelTests: XCTestCase {
         ch.applyEdit(originalId: "orig", newId: "edit-2", newText: "second")
         XCTAssertEqual(ch.messages.count, 1)
         XCTAssertEqual(ch.messages[0].text, "second")
-        XCTAssertEqual(ch.messages[0].id, "edit-2")
+        XCTAssertEqual(ch.messages[0].id, "orig", "repeated edits keep the original id")
     }
 
     func testApplyEditOnUnknownIdIsNoop() {

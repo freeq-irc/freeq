@@ -41,14 +41,16 @@ final class EditDedupTests: XCTestCase {
         ch.applyEdit(originalId: "01A", newId: "01C", newText: "v3")
         XCTAssertEqual(ch.messages.count, 1)
         XCTAssertEqual(ch.messages[0].text, "v3")
-        XCTAssertEqual(ch.messages[0].id, "01C")
+        XCTAssertEqual(ch.messages[0].id, "01A", "edits change text, not identity")
     }
 
-    func testApplyEditReindexesByCurrentId() {
+    func testApplyEditLeavesTheIndexOnTheOriginalId() {
         let ch = ChannelState(name: "#ship")
         ch.appendIfNew(msg("01A", "v1", at: 1))
         ch.applyEdit(originalId: "01A", newId: "01B", newText: "v2")
-        // The index must resolve the CURRENT id after the swap.
-        XCTAssertNotNil(ch.findMessage(byId: "01B"))
+        // The message is still itself: the index resolves the id it was born
+        // with, and a revision id resolves to nothing (clients never hold one).
+        XCTAssertNotNil(ch.findMessage(byId: "01A"))
+        XCTAssertNil(ch.findMessage(byId: "01B"))
     }
 }
