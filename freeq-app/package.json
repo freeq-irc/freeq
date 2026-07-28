@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "prebuild": "cd ../freeq-sdk-js && npm install --silent && npm run build",
+    "prebuild": "cd ../freeq-sdk-js && npm install --no-save --silent && npm run build",
     "build": "tsc -b && vite build && node -e \"const fs=require('fs'),h=Date.now().toString(36);let s=fs.readFileSync('dist/sw.js','utf8');s=s.replace('__BUILD_HASH__',h);fs.writeFileSync('dist/sw.js',s);console.log('SW cache:',h)\"",
     "lint": "eslint .",
     "preview": "vite preview",
