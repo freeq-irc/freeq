@@ -122,6 +122,27 @@ async fn ctf_07_step_up_refuses_loopback_pds_url() {
     // internal address back to the attacker.
     let (http, _state, _h) = start_server_with_malicious_pds("http://127.0.0.1:1/").await;
 
+    // Warm the process first. The refusal itself takes well under a
+    // millisecond, but the *first* outbound-client construction in a process
+    // pays a one-time cost (on macOS, loading the system TLS trust store) of
+    // seconds. Measuring that made this assertion a coin flip against its own 3s
+    // budget — it failed under load while the code under test was doing exactly
+    // the right thing, sub-millisecond. Warmed, the same request is ~0.5ms, so
+    // the budget below can be tight enough to actually catch a connect-then-fail.
+    let warm = reqwest::Client::new()
+        .get(url(
+            http,
+            &format!("/auth/step-up?purpose=blob_upload&did={VICTIM_DID}"),
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        warm.status().is_client_error(),
+        "warm-up request should already be refused: {}",
+        warm.status()
+    );
+
     let started = Instant::now();
     let resp = reqwest::Client::new()
         .get(url(
@@ -141,7 +162,7 @@ async fn ctf_07_step_up_refuses_loopback_pds_url() {
         "step-up to a loopback PDS must be refused with a 4xx; got {status}: {body}"
     );
     assert!(
-        elapsed < Duration::from_secs(3),
+        elapsed < Duration::from_millis(500),
         "step-up to a loopback PDS must fail fast (URL validation, not connect-then-fail); \
          elapsed = {elapsed:?}"
     );
