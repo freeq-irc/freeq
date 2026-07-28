@@ -173,6 +173,8 @@ impl AsyncWrite for WsBridge {
 
 /// Build the axum router with WebSocket and REST endpoints.
 pub fn router(state: Arc<SharedState>) -> Router {
+    // Stamp boot time before serving anything, so `uptime_secs` measures uptime.
+    let _ = START_TIME.get_or_init(SystemTime::now);
     let mut app = Router::new()
         // WebSocket IRC transport
         .route("/irc", get(ws_upgrade))
@@ -493,7 +495,13 @@ struct WhoisResponse {
 
 // ── REST handlers ──────────────────────────────────────────────────────
 
-/// Server start time (set once on first call).
+/// Server start time, stamped when the HTTP router is built — i.e. at boot.
+///
+/// It used to be initialized by `api_health` itself, which made `uptime_secs`
+/// mean "seconds since someone first asked", not seconds since start: after a
+/// restart the first poll always read 0 and the counter began from whenever
+/// monitoring happened to notice. Stamping it at router construction is the
+/// answer the field claims to give.
 static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
 
 /// Public endpoint: returns the server's message signing public key.
@@ -1392,6 +1400,7 @@ async fn api_verify_message(
 }
 
 async fn api_health(State(state): State<Arc<SharedState>>) -> Json<HealthResponse> {
+    // Initialized in `router`; the fallback keeps a hand-built app (tests) sane.
     let start = START_TIME.get_or_init(SystemTime::now);
     let uptime = start.elapsed().unwrap_or_default().as_secs();
     let connections = state.connections.lock().len();
