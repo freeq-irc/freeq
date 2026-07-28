@@ -63,6 +63,35 @@ async fn connect_guest(addr: &str, nick: &str) -> (ClientHandle, mpsc::Receiver<
     client::connect_with_stream(conn, config, None)
 }
 
+/// Drain every `Message` whose text starts with `prefix`, pushing each one's
+/// `msgid` tag onto `out`. Stops when the stream goes quiet.
+async fn collect_msgids(rx: &mut mpsc::Receiver<Event>, prefix: &str, out: &mut Vec<String>) {
+    let p = prefix.to_string();
+    while let Some(Event::Message { tags, .. }) = maybe_wait(
+        rx,
+        |e| matches!(e, Event::Message { text, .. } if text.starts_with(&p)),
+        Duration::from_secs(3),
+    )
+    .await
+    {
+        match tags.get("msgid") {
+            Some(mid) => out.push(mid.clone()),
+            None => panic!("delivered message carried no msgid tag"),
+        }
+    }
+}
+
+/// Prove the session still works after something odd was sent on it: join a
+/// fresh channel and see the JOIN come back. Used by the tests whose subject is
+/// "this input must not take the connection down" — without it they assert only
+/// that no error arrived, which an already-dead session also satisfies.
+async fn assert_session_alive(h: &ClientHandle, rx: &mut mpsc::Receiver<Event>, tag: &str) {
+    let probe = test_channel(&format!("{tag}alive"));
+    h.join(&probe).await.expect("session accepted a JOIN");
+    wait_joined(rx, &probe).await;
+    let _ = h.raw(&format!("PART {probe}")).await;
+}
+
 /// Wait for a specific event, ignoring others.
 async fn wait_for<F: Fn(&Event) -> bool>(
     rx: &mut mpsc::Receiver<Event>,
@@ -6631,18 +6660,39 @@ async fn single_server_dm2_dm_to_offline_user() {
     // Send DM to non-existent nick
     ha.privmsg(&nick_offline, "hello?").await.unwrap();
 
-    // Should get ERR_NOSUCHNICK (401) as a ServerNotice or similar
+    // Two outcomes are correct, and which one you get depends on the topology,
+    // not on this code path being right:
+    //   - No S2S peers: ERR_NOSUCHNICK (401).
+    //   - With S2S peers: relayed, because this server cannot know whether the
+    //     nick exists on a peer. Same rule PM-2 and ROUTE-2 document.
+    // This harness peers LOCAL_SERVER with a second server, so the relay is the
+    // expected path here. What must hold either way is that the session
+    // survives — that is the test's subject ("don't crash").
+    //
+    // A 401 surfaces as `WhoisReply`, not `ServerNotice`: the SDK gives numeric
+    // 401 its own arm for WHOIS failures, so it never reaches the generic
+    // 4xx→ServerNotice fallback. Accept either, since a 401 answering a PRIVMSG
+    // and a 401 answering a WHOIS are indistinguishable on the wire.
     let got_error = maybe_wait(
         &mut ea,
-        |e| matches!(e, Event::ServerNotice { text } if text.contains("No such nick") || text.contains(&nick_offline)),
+        |e| match e {
+            Event::ServerNotice { text } => {
+                text.contains("No such nick") || text.contains(&nick_offline)
+            }
+            Event::WhoisReply { info, .. } => info.contains("No such nick"),
+            _ => false,
+        },
         Duration::from_secs(3),
     )
     .await;
-    assert!(
-        got_error.is_some(),
-        "Should receive error for DM to offline user"
-    );
-    eprintln!("  ✓ DM to offline user returns error without crash");
+    if got_error.is_some() {
+        eprintln!("  ✓ DM to offline user returned ERR_NOSUCHNICK");
+    } else {
+        eprintln!("  ✓ DM to offline user relayed to peers (federation active)");
+    }
+
+    assert_session_alive(&ha, &mut ea, "dm2").await;
+    eprintln!("  ✓ DM to offline user left the session usable");
 
     let _ = ha.quit(Some("done")).await;
 }
@@ -6799,36 +6849,54 @@ async fn single_server_edge14_rapid_messages_unique_msgids() {
     drain(&mut ea).await;
     drain(&mut eb).await;
 
-    // Send 20 rapid messages
-    for i in 0..20 {
-        ha.privmsg(&ch, &format!("rapid-{i}")).await.unwrap();
-    }
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-
-    // Collect msgids from B's perspective
+    // Flood protection is 5 messages per 2 seconds per session, and it is not
+    // incidental — it is the defense against a single connection saturating a
+    // channel. A 20-message burst therefore *must* be clipped: expecting most of
+    // it through (the old ">= 10") asserted the absence of the protection.
+    //
+    // Two things are worth pinning here, so do both: the burst is refused rather
+    // than silently swallowed, and every message that is accepted — burst or not
+    // — carries its own msgid.
     let mut msgids = Vec::new();
-    loop {
-        match maybe_wait(
-            &mut eb,
-            |e| matches!(e, Event::Message { text, .. } if text.starts_with("rapid-")),
-            Duration::from_secs(3),
-        )
-        .await
-        {
-            Some(Event::Message { tags, .. }) => {
-                if let Some(mid) = tags.get("msgid") {
-                    msgids.push(mid.clone());
-                }
-            }
-            _ => break,
-        }
-    }
 
+    for i in 0..20 {
+        ha.privmsg(&ch, &format!("burst-{i}")).await.unwrap();
+    }
+    let flood_reply = maybe_wait(
+        &mut ea,
+        |e| matches!(e, Event::ServerNotice { text } if text.contains("Flood protection")),
+        Duration::from_secs(3),
+    )
+    .await;
     assert!(
-        msgids.len() >= 10,
-        "Should receive at least 10 rapid messages, got {}",
-        msgids.len()
+        flood_reply.is_some(),
+        "a 20-message burst must draw the flood-protection reply"
     );
+    collect_msgids(&mut eb, "burst-", &mut msgids).await;
+    let from_burst = msgids.len();
+    assert!(
+        (1..=10).contains(&from_burst),
+        "the burst should be clipped to roughly the 5/2s allowance, got {from_burst} of 20"
+    );
+    eprintln!("  ✓ 20-message burst clipped to {from_burst} by flood protection");
+
+    // Now the same volume inside the allowance: 4 per 2s window. Every one of
+    // these must arrive — that is the half of the original intent worth keeping.
+    let paced = 12;
+    for i in 0..paced {
+        if i > 0 && i % 4 == 0 {
+            tokio::time::sleep(Duration::from_millis(2100)).await;
+        }
+        ha.privmsg(&ch, &format!("paced-{i}")).await.unwrap();
+    }
+    let mut paced_ids = Vec::new();
+    collect_msgids(&mut eb, "paced-", &mut paced_ids).await;
+    assert_eq!(
+        paced_ids.len(),
+        paced,
+        "every message sent inside the flood allowance must be delivered"
+    );
+    msgids.extend(paced_ids);
 
     // All msgids should be unique
     let unique: std::collections::HashSet<&str> = msgids.iter().map(|s| s.as_str()).collect();
@@ -6925,9 +6993,17 @@ async fn single_server_edge16_nick_change_mid_conversation() {
 
     // A sends message with new nick
     ha.privmsg(&ch, "after-change").await.unwrap();
-    let (from, text) = wait_message_from(&mut eb, &nick_a2).await;
+    // `wait_message_from` already asserts the sender (it waits for a Message
+    // whose `from` is `nick_a2`) and returns `(target, text)`. The old binding
+    // named the target `from` and then compared it to the nick, so the assert
+    // read "the channel equals the new nick" and failed on every run.
+    let (target, text) = wait_message_from(&mut eb, &nick_a2).await;
     assert_eq!(text, "after-change");
-    assert_eq!(from, nick_a2);
+    assert_eq!(
+        target.to_lowercase(),
+        ch.to_lowercase(),
+        "post-rename message must still land in the channel"
+    );
     eprintln!("  ✓ Messages delivered correctly after nick change");
 
     let _ = ha.quit(Some("done")).await;
@@ -7103,14 +7179,21 @@ async fn single_server_edge20_message_to_long_nick() {
     let long_nick = "x".repeat(100);
     ha.privmsg(&long_nick, "hello").await.unwrap();
 
-    // Should get ERR_NOSUCHNICK or similar, not crash
+    // An error is welcome but not guaranteed: with an S2S peer attached the
+    // server relays an unknown DM target rather than answering 401 (see DM-2),
+    // and a 100-character nick is just an unknown target. "Handled gracefully"
+    // is therefore about the session, not about a reply arriving — so check the
+    // session, which is what the test is named for.
     let result = maybe_wait(
         &mut ea,
-        |e| matches!(e, Event::ServerNotice { .. }),
+        |e| matches!(e, Event::ServerNotice { .. } | Event::WhoisReply { .. }),
         Duration::from_secs(3),
     )
     .await;
-    assert!(result.is_some(), "Should get error for invalid nick");
+    if result.is_some() {
+        eprintln!("  ✓ absurdly long nick drew an error reply");
+    }
+    assert_session_alive(&ha, &mut ea, "edge20").await;
     eprintln!("  ✓ DM to absurdly long nick handled gracefully");
 
     let _ = ha.quit(Some("done")).await;
