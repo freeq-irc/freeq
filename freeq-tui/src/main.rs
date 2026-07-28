@@ -935,7 +935,9 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
             target,
             text,
             tags,
-            dm_key, .. } => {
+            dm_key,
+            ..
+        } => {
             // DID is the identity. Render our own messages under our current
             // nick no matter which client alias sent them — a TUI as `-n nap`,
             // a web session as the handle nick `zapnap` — so one DID reads as
@@ -1012,6 +1014,10 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                 .get("+reply")
                 .filter(|v| crate::app::is_valid_msgid(v))
                 .cloned();
+            // Join replay collapses an edited message into one row with no
+            // `+draft/edit`; the server's `+freeq.at/edited` tag is the only
+            // thing that says the text isn't the original.
+            let replay_edited = tags.get("+freeq.at/edited").is_some_and(|v| v == "1");
 
             // Pin/unpin: server sends a NOTICE CTCP ACTION with a tag. Update
             // the channel's pin set; let the action message itself fall through
@@ -1035,7 +1041,7 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                 .get("+draft/edit")
                 .filter(|v| crate::app::is_valid_msgid(v))
             {
-                app.apply_edit(
+                let applied = app.apply_edit(
                     &from,
                     batch_id.map(|s| s.as_str()),
                     &buf_name,
@@ -1043,6 +1049,31 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                     msgid.as_deref(),
                     &text,
                 );
+                // Original nowhere on screen (outside the replay window, or
+                // we joined after it was sent): show the current text as its
+                // own line rather than dropping the content — keyed by the
+                // message's identity, the original msgid, never the
+                // revision's wire id.
+                if !applied {
+                    push_line_to_buffer(
+                        app,
+                        batch_id,
+                        &buf_name,
+                        timestamp_ms,
+                        crate::app::BufferLine {
+                            timestamp: timestamp.clone(),
+                            from: from.clone(),
+                            text: text.clone(),
+                            is_system: false,
+                            image_url: None,
+                            msgid: Some(original_msgid.clone()),
+                            is_edited: true,
+                            is_deleted: false,
+                            reply_to: reply_to.clone(),
+                            edit_of: Some(original_msgid.clone()),
+                        },
+                    );
+                }
                 return;
             }
 
@@ -1065,7 +1096,7 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                             is_system: true,
                             image_url: None,
                             msgid: msgid.clone(),
-                            is_edited: false,
+                            is_edited: replay_edited,
                             is_deleted: false,
                             reply_to: reply_to.clone(),
                             edit_of: None,
@@ -1096,7 +1127,7 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                         is_system: false,
                         image_url: img_url,
                         msgid: msgid.clone(),
-                        is_edited: false,
+                        is_edited: replay_edited,
                         is_deleted: false,
                         reply_to: reply_to.clone(),
                         edit_of: None,
@@ -1119,7 +1150,7 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                             is_system: false,
                             image_url: None,
                             msgid: msgid.clone(),
-                            is_edited: false,
+                            is_edited: replay_edited,
                             is_deleted: false,
                             reply_to: reply_to.clone(),
                             edit_of: None,
@@ -1138,7 +1169,7 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                             is_system: false,
                             image_url: None,
                             msgid: msgid.clone(),
-                            is_edited: false,
+                            is_edited: replay_edited,
                             is_deleted: false,
                             reply_to: reply_to.clone(),
                             edit_of: None,
@@ -1162,7 +1193,13 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
         Event::BatchEnd { id } => {
             app.end_batch(&id);
         }
-        Event::TagMsg { from, target, tags, dm_key, .. } => {
+        Event::TagMsg {
+            from,
+            target,
+            tags,
+            dm_key,
+            ..
+        } => {
             // Same conversation keying as Event::Message.
             let buf_name = if target.starts_with('#') || target.starts_with('&') {
                 target.clone()
@@ -1189,7 +1226,11 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                 let target_msgid = tags.get("+reply").cloned();
                 let target_preview = target_msgid
                     .as_deref()
-                    .and_then(|id| app.buffers.get(&crate::app::buffer_key(&buf_name))?.find_by_msgid(id))
+                    .and_then(|id| {
+                        app.buffers
+                            .get(&crate::app::buffer_key(&buf_name))?
+                            .find_by_msgid(id)
+                    })
                     .map(|line| {
                         let snippet: String = line.text.chars().take(40).collect();
                         if line.text.chars().count() > 40 {

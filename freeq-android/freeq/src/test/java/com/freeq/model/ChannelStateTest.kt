@@ -121,35 +121,64 @@ class ChannelStateTest {
         assertFalse(ch.messages[0].isDeleted)
     }
 
-    // ── applyReaction ──
+    // ── reactions ──
+    //
+    // Two explicit ops, never a toggle. The sender's intent toggles (see
+    // ReactionOpTest); what arrives on the wire is an add or a remove, and
+    // applying one twice must not undo it.
 
-    @Test fun applyReaction_adds_first_reaction() {
+    @Test fun addReaction_adds_first_reaction() {
         val ch = ChannelState("#test")
         ch.appendIfNew(msg(id = "a"))
-        val added = ch.applyReaction("a", "👍", "alice")
-        assertTrue(added)
-        assertEquals(setOf("alice"), ch.messages[0].reactions["👍"])
+        ch.addReaction("a", "\uD83D\uDC4D", "alice")
+        assertEquals(setOf("alice"), ch.messages[0].reactions["\uD83D\uDC4D"])
     }
 
-    @Test fun applyReaction_toggles_off_when_same_user_reacts_again() {
+    @Test fun addReaction_is_idempotent_on_redelivery() {
+        // A duplicated or re-delivered `+react` used to toggle the reaction
+        // back off, silently removing something nobody took back.
         val ch = ChannelState("#test")
         ch.appendIfNew(msg(id = "a"))
-        ch.applyReaction("a", "👍", "alice")
-        val secondAdd = ch.applyReaction("a", "👍", "alice")
-        assertFalse("toggling off must report `added=false`", secondAdd)
-        assertNull(ch.messages[0].reactions["👍"])
+        ch.addReaction("a", "\uD83D\uDC4D", "alice")
+        ch.addReaction("a", "\uD83D\uDC4D", "alice")
+        assertEquals(setOf("alice"), ch.messages[0].reactions["\uD83D\uDC4D"])
     }
 
-    @Test fun applyReaction_keeps_other_users_reactions_when_one_toggles_off() {
+    @Test fun removeReaction_drops_the_emoji_when_nobody_is_left() {
         val ch = ChannelState("#test")
         ch.appendIfNew(msg(id = "a"))
-        ch.applyReaction("a", "👍", "alice")
-        ch.applyReaction("a", "👍", "bob")
-        ch.applyReaction("a", "👍", "alice") // alice toggles off
-        assertEquals(setOf("bob"), ch.messages[0].reactions["👍"])
+        ch.addReaction("a", "\uD83D\uDC4D", "alice")
+        ch.removeReaction("a", "\uD83D\uDC4D", "alice")
+        assertNull(ch.messages[0].reactions["\uD83D\uDC4D"])
     }
 
-    @Test fun applyReaction_replaces_message_object_so_compose_recomposes() {
+    @Test fun removeReaction_keeps_other_users_on_the_same_emoji() {
+        val ch = ChannelState("#test")
+        ch.appendIfNew(msg(id = "a"))
+        ch.addReaction("a", "\uD83D\uDC4D", "alice")
+        ch.addReaction("a", "\uD83D\uDC4D", "bob")
+        ch.removeReaction("a", "\uD83D\uDC4D", "alice")
+        assertEquals(setOf("bob"), ch.messages[0].reactions["\uD83D\uDC4D"])
+    }
+
+    @Test fun removeReaction_for_someone_who_never_reacted_is_a_noop() {
+        val ch = ChannelState("#test")
+        ch.appendIfNew(msg(id = "a"))
+        ch.addReaction("a", "\uD83D\uDC4D", "alice")
+        ch.removeReaction("a", "\uD83D\uDC4D", "bob")
+        assertEquals(setOf("alice"), ch.messages[0].reactions["\uD83D\uDC4D"])
+    }
+
+    @Test fun hasReaction_reports_whether_this_user_already_reacted() {
+        val ch = ChannelState("#test")
+        ch.appendIfNew(msg(id = "a"))
+        assertFalse(ch.hasReaction("a", "\uD83D\uDC4D", "alice"))
+        ch.addReaction("a", "\uD83D\uDC4D", "alice")
+        assertTrue(ch.hasReaction("a", "\uD83D\uDC4D", "alice"))
+        assertFalse(ch.hasReaction("a", "\uD83D\uDC4D", "bob"))
+    }
+
+    @Test fun addReaction_replaces_message_object_so_compose_recomposes() {
         // A LazyColumn reading via mutableStateListOf only recomposes when
         // the element identity changes (data class .equals would otherwise
         // make pre-/post- look identical to Compose). Verify the message
@@ -157,19 +186,20 @@ class ChannelStateTest {
         val ch = ChannelState("#test")
         ch.appendIfNew(msg(id = "a"))
         val before = ch.messages[0]
-        ch.applyReaction("a", "👍", "alice")
+        ch.addReaction("a", "\uD83D\uDC4D", "alice")
         val after = ch.messages[0]
-        assertNotNull(after.reactions["👍"])
+        assertNotNull(after.reactions["\uD83D\uDC4D"])
         // Different instance — the helper builds a new map.
         assertFalse(before === after)
     }
 
-    @Test fun applyReaction_returns_true_for_unknown_message() {
-        // Existing behavior: unknown msg id returns true (no-op,
-        // documented in the helper). Documenting it here so future
-        // changes go through a deliberate decision.
+    @Test fun reactions_on_an_unknown_message_are_a_noop() {
+        // Reacting to something this buffer doesn't hold must not create it.
         val ch = ChannelState("#test")
-        assertTrue(ch.applyReaction("missing", "👍", "alice"))
+        ch.addReaction("missing", "\uD83D\uDC4D", "alice")
+        ch.removeReaction("missing", "\uD83D\uDC4D", "alice")
+        assertTrue(ch.messages.isEmpty())
+        assertFalse(ch.hasReaction("missing", "\uD83D\uDC4D", "alice"))
     }
 
     // ── findMessage ──

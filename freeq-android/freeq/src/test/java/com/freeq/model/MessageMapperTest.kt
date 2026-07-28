@@ -36,6 +36,7 @@ class MessageMapperTest {
         account: String? = null,
         origin: String? = null,
         reactions: List<ReactionTally> = emptyList(),
+        edited: Boolean = false,
     ) = IrcMessage(
         fromNick = fromNick,
         target = target,
@@ -53,7 +54,9 @@ class MessageMapperTest {
         account = account,
         origin = origin,
         reactions = reactions,
+        edited = edited,
         dmKey = null,
+        coordination = null,
     )
 
     @Test fun preserves_basic_fields() {
@@ -110,6 +113,15 @@ class MessageMapperTest {
         assertTrue(out.reactions.isEmpty())
         assertFalse(out.isEdited)
         assertFalse(out.isDeleted)
+    }
+
+    @Test fun edited_flag_carries_through_from_the_server() {
+        // Join replay collapses every revision into one row and sends no
+        // `+draft/edit`, so the server's `+freeq.at/edited` (surfaced as
+        // `edited`) is the only signal that a message was ever revised.
+        // Without this a message edited before you arrived read as original.
+        assertTrue(MessageMapper.fromIrc(ircMsg(edited = true)).isEdited)
+        assertFalse(MessageMapper.fromIrc(ircMsg(edited = false)).isEdited)
     }
 
     @Test fun reactions_persisted_on_history_message_populate_into_chat_message() {

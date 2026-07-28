@@ -1768,12 +1768,13 @@ public struct IrcMessage {
     public var account: String?
     public var origin: String?
     public var reactions: [ReactionTally]
+    public var edited: Bool
     public var dmKey: String?
     public var coordination: CoordinationEvent?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(fromNick: String, target: String, text: String, msgid: String?, replyTo: String?, replacesMsgid: String?, editOf: String?, batchId: String?, pinMsgid: String?, unpinMsgid: String?, isAction: Bool, isSigned: Bool, timestampMs: Int64, account: String?, origin: String?, reactions: [ReactionTally], dmKey: String?, coordination: CoordinationEvent?) {
+    public init(fromNick: String, target: String, text: String, msgid: String?, replyTo: String?, replacesMsgid: String?, editOf: String?, batchId: String?, pinMsgid: String?, unpinMsgid: String?, isAction: Bool, isSigned: Bool, timestampMs: Int64, account: String?, origin: String?, reactions: [ReactionTally], edited: Bool, dmKey: String?, coordination: CoordinationEvent?) {
         self.fromNick = fromNick
         self.target = target
         self.text = text
@@ -1790,6 +1791,7 @@ public struct IrcMessage {
         self.account = account
         self.origin = origin
         self.reactions = reactions
+        self.edited = edited
         self.dmKey = dmKey
         self.coordination = coordination
     }
@@ -1850,6 +1852,9 @@ extension IrcMessage: Equatable, Hashable {
         if lhs.reactions != rhs.reactions {
             return false
         }
+        if lhs.edited != rhs.edited {
+            return false
+        }
         if lhs.dmKey != rhs.dmKey {
             return false
         }
@@ -1876,6 +1881,7 @@ extension IrcMessage: Equatable, Hashable {
         hasher.combine(account)
         hasher.combine(origin)
         hasher.combine(reactions)
+        hasher.combine(edited)
         hasher.combine(dmKey)
         hasher.combine(coordination)
     }
@@ -1906,6 +1912,7 @@ public struct FfiConverterTypeIrcMessage: FfiConverterRustBuffer {
                 account: FfiConverterOptionString.read(from: &buf), 
                 origin: FfiConverterOptionString.read(from: &buf), 
                 reactions: FfiConverterSequenceTypeReactionTally.read(from: &buf), 
+                edited: FfiConverterBool.read(from: &buf), 
                 dmKey: FfiConverterOptionString.read(from: &buf), 
                 coordination: FfiConverterOptionTypeCoordinationEvent.read(from: &buf)
         )
@@ -1928,6 +1935,7 @@ public struct FfiConverterTypeIrcMessage: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.account, into: &buf)
         FfiConverterOptionString.write(value.origin, into: &buf)
         FfiConverterSequenceTypeReactionTally.write(value.reactions, into: &buf)
+        FfiConverterBool.write(value.edited, into: &buf)
         FfiConverterOptionString.write(value.dmKey, into: &buf)
         FfiConverterOptionTypeCoordinationEvent.write(value.coordination, into: &buf)
     }

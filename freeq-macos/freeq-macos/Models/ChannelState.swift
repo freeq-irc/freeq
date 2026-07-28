@@ -105,20 +105,20 @@ class ChannelState: Identifiable {
     }
 
     func applyEdit(originalId: String, newId: String?, newText: String) {
-        // Match on the current id OR a prior editOf: chained edits keep
-        // referencing the original msgid even after the first edit rewrote
-        // the in-memory id.
+        // Match on the current id OR a prior editOf. `editOf` covers rows a
+        // previous build re-keyed to a revision's msgid and cached locally.
         if let idx = messages.firstIndex(where: { $0.id == originalId || $0.editOf == originalId }) {
             messages[idx].text = newText
             messages[idx].isEdited = true
             messages[idx].editOf = messages[idx].editOf ?? originalId
-            // Keep the original id registered so a later cache-loaded copy
-            // keyed under it is recognized as a duplicate.
+            // The id does NOT move to the revision's. A message keeps the id
+            // it was born with — the one the server files reactions, pins and
+            // deletes under, and the one replay returns it under. Moving it
+            // was what left reactions stranded on an edited message.
             messageIds.insert(originalId)
-            if let newId {
-                messages[idx].id = newId
-                messageIds.insert(newId)
-            }
+            // The revision's id still counts as seen, so a later replay of
+            // that row isn't mistaken for a new message.
+            if let newId { messageIds.insert(newId) }
         }
     }
 

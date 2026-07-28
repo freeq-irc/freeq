@@ -2672,6 +2672,10 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                 isAction: ircMsg.isAction,
                 timestamp: Date(timeIntervalSince1970: Double(ircMsg.timestampMs) / 1000.0),
                 replyTo: ircMsg.replyTo,
+                // Covers both signals: a live edit (`edit_of`) and one the
+                // server already collapsed into join replay, which carries no
+                // `+draft/edit` and would otherwise read as the original.
+                isEdited: ircMsg.edited,
                 isSigned: ircMsg.isSigned,
                 isEncrypted: wasEncrypted,
                 origin: ircMsg.origin,
@@ -2694,7 +2698,7 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                         batch.messages[idx].text = displayText
                         batch.messages[idx].isEdited = true
                         batch.messages[idx].editOf = batch.messages[idx].editOf ?? editOf
-                        if let newId = ircMsg.msgid { batch.messages[idx].id = newId }
+                        // Keeps the id it was born with — see ChannelState.applyEdit.
                         // Reactions attach to the msgid the user reacted to —
                         // usually the latest edit id — so replay delivers
                         // them ON the edit row. Merge them or reactions on

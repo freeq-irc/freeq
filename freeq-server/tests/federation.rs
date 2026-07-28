@@ -20,7 +20,7 @@
 //! - waits are event/DB-driven with a timeout; never a fixed sleep.
 
 use std::process::{Child, Command};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use freeq_sdk::auth::{ChallengeSigner, KeySigner};
@@ -65,11 +65,19 @@ impl TestId {
 // ── server process management ────────────────────────────────────
 
 /// A running `freeq-server` subprocess. `Drop` kills it and removes its tempdir.
+/// One test at a time: each test boots two servers, and running the file in
+/// parallel (22 servers at once) starves the machine — clients time out before
+/// first auth and the whole batch fails. Taken in `spawn_pair`, which every
+/// test goes through, so they queue regardless of cargo's `--test-threads`.
+static ONE_TEST_AT_A_TIME: Mutex<()> = Mutex::new(());
+
 struct TestServer {
     _dir: tempfile::TempDir,
     child: Child,
     irc_addr: String,
     db_path: String,
+    /// Held by server A for the test's lifetime; see `ONE_TEST_AT_A_TIME`.
+    serial: Option<MutexGuard<'static, ()>>,
 }
 
 impl Drop for TestServer {
@@ -175,12 +183,18 @@ fn spawn_server(plan: ServerPlan, peer: &PeerRef, resolver_entries: &str) -> Tes
         child,
         irc_addr,
         db_path,
+        serial: None,
     }
 }
 
 /// Boot two mutually-peered servers, both resolving every `ids` DID offline.
 /// Blocks until both IRC ports accept connections.
 async fn spawn_pair(ids: &[&TestId]) -> (TestServer, TestServer) {
+    // A failed test poisons the lock; the next test's servers are unaffected,
+    // so take it anyway.
+    let serial = ONE_TEST_AT_A_TIME
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let a_plan = plan_server(0xA1);
     let b_plan = plan_server(0xB2);
     let resolver: String = ids
@@ -193,8 +207,9 @@ async fn spawn_pair(ids: &[&TestId]) -> (TestServer, TestServer) {
     // two can cross-reference for peering.
     let a_ref = PeerRef::of(&a_plan);
     let b_ref = PeerRef::of(&b_plan);
-    let a = spawn_server(a_plan, &b_ref, &resolver);
+    let mut a = spawn_server(a_plan, &b_ref, &resolver);
     let b = spawn_server(b_plan, &a_ref, &resolver);
+    a.serial = Some(serial);
 
     wait_port(&a.irc_addr).await;
     wait_port(&b.irc_addr).await;
@@ -597,6 +612,393 @@ async fn single_send_delivered_exactly_once() {
             .await
             .is_none(),
         "the single send must not be delivered twice"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── federated edits and deletes ──────────────────────────────────
+//
+// A message's identity is its original msgid on BOTH servers. These cover the
+// two halves that used to stop at the origin: an edit arriving as linked
+// revision rather than a second message, and a delete actually deleting.
+
+/// Wait for a channel message whose text matches, returning its `msgid` tag.
+async fn recv_channel_msgid(
+    rx: &mut mpsc::Receiver<Event>,
+    text: &str,
+    dur: Duration,
+) -> Option<String> {
+    timeout(dur, async {
+        loop {
+            match rx.recv().await {
+                Some(Event::Message { text: t, tags, .. }) if t == text => {
+                    return tags.get("msgid").cloned();
+                }
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Rows for `channel` on this server that a delete hasn't struck. Like
+/// `dm_row_count`, this reads the plaintext `channel` column, so it needs no
+/// decryption key.
+fn live_row_count(db_path: &str, channel: &str) -> i64 {
+    let conn = rusqlite::Connection::open(db_path).expect("open server db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE channel = ?1 AND deleted_at IS NULL",
+        rusqlite::params![channel],
+        |r| r.get(0),
+    )
+    .expect("count live rows")
+}
+
+/// Wait for a server's stored copy of `channel` to go empty. Poll rather than
+/// sleep: how long a delete takes to cross is exactly what we can't assume.
+async fn wait_rows_cleared(db_path: &str, channel: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        if live_row_count(db_path, channel) == 0 {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    false
+}
+
+/// Everything a fresh joiner on this server is replayed for `channel`.
+async fn replayed_texts(server: &TestServer, id: &TestId, nick: &str, channel: &str) -> Vec<String> {
+    let (h, mut rx) = connect(server, id, nick);
+    wait_auth_and_register(&mut rx).await;
+    h.join(channel).await.unwrap();
+    let mut seen = Vec::new();
+    // Replay arrives before the NAMES reply; collect until it goes quiet.
+    while let Ok(Some(e)) = timeout(Duration::from_secs(2), rx.recv()).await {
+        if let Event::Message { text, target, .. } = e
+            && target.eq_ignore_ascii_case(channel)
+        {
+            seen.push(text);
+        }
+    }
+    h.quit(None).await.ok();
+    seen
+}
+
+/// An edit that crosses the hop must revise the peer's copy, not add a second
+/// message to it.
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn channel_edit_crosses_without_duplicating() {
+    let alice = TestId::new("did:plc:aliceedit");
+    let bob = TestId::new("did:plc:bobedit");
+    let carol = TestId::new("did:plc:caroledit");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob, &carol]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#fedit").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#fedit").await.unwrap();
+
+    // Send until Bob's server has it, then capture the identity Alice's server
+    // assigned — the id both servers must agree on.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut msgid = None;
+    while tokio::time::Instant::now() < deadline {
+        ha.privmsg("#fedit", "before").await.ok();
+        if let Some(id) = recv_channel_msgid(&mut rxb, "before", Duration::from_secs(2)).await {
+            msgid = Some(id);
+            break;
+        }
+    }
+    let msgid = msgid.expect("bob's server received the channel message");
+
+    ha.edit_message("#fedit", &msgid, "after").await.unwrap();
+    assert!(
+        try_recv_message(&mut rxb, "after", EVENT_TIMEOUT)
+            .await
+            .is_some(),
+        "the edit never crossed the hop"
+    );
+
+    // The peer holds ONE message, carrying the newest text.
+    let replayed = replayed_texts(&srv_b, &carol, "carol", "#fedit").await;
+    let versions: Vec<&String> = replayed
+        .iter()
+        .filter(|t| *t == "before" || *t == "after")
+        .collect();
+    assert_eq!(
+        versions,
+        vec![&"after".to_string()],
+        "a joiner on the peer must see the edited message once, not both \
+         revisions: {replayed:?}"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+/// A delete has to cross too — relaying it only to the origin's own clients
+/// left the message readable on every other server, forever.
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn channel_delete_crosses_the_hop() {
+    let alice = TestId::new("did:plc:alicedel");
+    let bob = TestId::new("did:plc:bobdel");
+    let carol = TestId::new("did:plc:caroldel");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob, &carol]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#feddel").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#feddel").await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut msgid = None;
+    while tokio::time::Instant::now() < deadline {
+        ha.privmsg("#feddel", "regrettable").await.ok();
+        if let Some(id) = recv_channel_msgid(&mut rxb, "regrettable", Duration::from_secs(2)).await
+        {
+            msgid = Some(id);
+            break;
+        }
+    }
+    let msgid = msgid.expect("bob's server received the channel message");
+
+    ha.delete_message("#feddel", &msgid).await.unwrap();
+    assert!(
+        wait_rows_cleared(&srv_b.db_path, "#feddel").await,
+        "the delete never reached the peer's storage — it stays readable there \
+         through CHATHISTORY and every restart"
+    );
+
+    // …and it's out of the memory a joiner is replayed from, too.
+    let replayed = replayed_texts(&srv_b, &carol, "carol", "#feddel").await;
+    assert!(
+        !replayed.iter().any(|t| t == "regrettable"),
+        "the deleted message survived on the peer: {replayed:?}"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+/// Every msgid stored under a DM key on this server, oldest first.
+fn dm_msgids(db_path: &str, dm_key: &str) -> Vec<String> {
+    let conn = rusqlite::Connection::open(db_path).expect("open server db");
+    let mut stmt = conn
+        .prepare(
+            "SELECT msgid FROM messages
+             WHERE channel = ?1 AND msgid IS NOT NULL
+             ORDER BY id",
+        )
+        .expect("prepare");
+    let rows = stmt
+        .query_map(rusqlite::params![dm_key], |r| r.get::<_, String>(0))
+        .expect("query");
+    rows.collect::<Result<Vec<_>, _>>().expect("collect msgids")
+}
+
+/// Rows belonging to ONE logical message — every revision shares the root.
+/// Scoped this way because `warm_link` leaves its own probe messages in the
+/// same thread; a thread-wide count would answer a different question.
+fn rows_for_root(db_path: &str, dm_key: &str, root: &str, live_only: bool) -> i64 {
+    let conn = rusqlite::Connection::open(db_path).expect("open server db");
+    let sql = if live_only {
+        "SELECT COUNT(*) FROM messages
+         WHERE channel = ?1 AND root_msgid = ?2 AND deleted_at IS NULL"
+    } else {
+        "SELECT COUNT(*) FROM messages WHERE channel = ?1 AND root_msgid = ?2"
+    };
+    conn.query_row(sql, rusqlite::params![dm_key, root], |r| r.get(0))
+        .expect("count rows for root")
+}
+
+/// Rows under a DM key that a delete hasn't struck.
+#[allow(dead_code)]
+fn live_dm_row_count(db_path: &str, dm_key: &str) -> i64 {
+    let conn = rusqlite::Connection::open(db_path).expect("open server db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE channel = ?1 AND deleted_at IS NULL",
+        rusqlite::params![dm_key],
+        |r| r.get(0),
+    )
+    .expect("count live dm rows")
+}
+
+/// Poll until both servers have `want` rows under the DM key.
+async fn wait_dm_rows(a: &TestServer, b: &TestServer, dm_key: &str, want: i64) -> bool {
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        if dm_row_count(&a.db_path, dm_key) >= want && dm_row_count(&b.db_path, dm_key) >= want {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    false
+}
+
+/// The same DM must be one message on both servers.
+///
+/// The relay used to send no msgid at all for a recipient who isn't local, so
+/// the receiving server minted its own. Nothing that names a message across
+/// servers — an edit, a delete, a reaction — can work while the two ends
+/// disagree about what the message *is*.
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn cross_server_dm_keeps_one_identity() {
+    let alice = TestId::new("did:plc:aliceid");
+    let bob = TestId::new("did:plc:bobid");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.privmsg(&bob.did, "one identity").await.unwrap();
+    assert!(
+        try_recv_message(&mut rxb, "one identity", EVENT_TIMEOUT)
+            .await
+            .is_some(),
+        "bob must receive the DM"
+    );
+
+    let dm_key = freeq_server::db::canonical_dm_key(&alice.did, &bob.did);
+    assert!(
+        wait_dm_rows(&srv_a, &srv_b, &dm_key, 1).await,
+        "both servers must persist the DM"
+    );
+
+    let sender_side = dm_msgids(&srv_a.db_path, &dm_key);
+    let peer_side = dm_msgids(&srv_b.db_path, &dm_key);
+    assert!(
+        peer_side.iter().any(|id| sender_side.contains(id)),
+        "the two servers hold this DM under different ids — sender {sender_side:?}, \
+         peer {peer_side:?}. Every later edit, delete or reaction names an id \
+         the other end cannot resolve."
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+/// A DM edit crossing the hop revises the recipient's copy.
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn dm_edit_crosses_with_linkage_intact() {
+    let alice = TestId::new("did:plc:alicedmed");
+    let bob = TestId::new("did:plc:bobdmed");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.privmsg(&bob.did, "dm before").await.unwrap();
+    let msgid = recv_channel_msgid(&mut rxb, "dm before", EVENT_TIMEOUT)
+        .await
+        .expect("bob received the DM with a msgid");
+
+    ha.edit_message(&bob.did, &msgid, "dm after").await.unwrap();
+    let edit_msgid = recv_channel_msgid(&mut rxb, "dm after", EVENT_TIMEOUT)
+        .await
+        .expect("the DM edit never crossed");
+    assert_ne!(edit_msgid, msgid, "an edit travels under its own wire id");
+
+    let dm_key = freeq_server::db::canonical_dm_key(&alice.did, &bob.did);
+    // Two rows under ONE identity: the original and its revision.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    while tokio::time::Instant::now() < deadline
+        && rows_for_root(&srv_b.db_path, &dm_key, &msgid, false) < 2
+    {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        rows_for_root(&srv_b.db_path, &dm_key, &msgid, false),
+        2,
+        "the peer must hold the original and its revision under {msgid}"
+    );
+    assert_eq!(
+        rows_for_root(&srv_b.db_path, &dm_key, &edit_msgid, false),
+        0,
+        "the peer filed the edit as its own message instead of a revision \
+         of {msgid}"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+/// A DM delete has to cross too, or it only ever hides the message from the
+/// author's own client.
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn dm_delete_crosses_the_hop() {
+    let alice = TestId::new("did:plc:alicedmdel");
+    let bob = TestId::new("did:plc:bobdmdel");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.privmsg(&bob.did, "regrettable dm").await.unwrap();
+    let msgid = recv_channel_msgid(&mut rxb, "regrettable dm", EVENT_TIMEOUT)
+        .await
+        .expect("bob received the DM with a msgid");
+
+    let dm_key = freeq_server::db::canonical_dm_key(&alice.did, &bob.did);
+    assert!(
+        wait_dm_rows(&srv_a, &srv_b, &dm_key, 1).await,
+        "both servers must persist the DM first"
+    );
+
+    // The rest of the thread (warm-up probes) must survive — a delete acts on
+    // one message, not on a conversation.
+    let thread_before = dm_msgids(&srv_b.db_path, &dm_key).len();
+    ha.delete_message(&bob.did, &msgid).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut cleared = false;
+    while tokio::time::Instant::now() < deadline {
+        if rows_for_root(&srv_b.db_path, &dm_key, &msgid, true) == 0 {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        cleared,
+        "the deleted DM is still readable on the recipient's server"
+    );
+    assert_eq!(
+        dm_msgids(&srv_b.db_path, &dm_key).len(),
+        thread_before,
+        "the delete removed rows other than the message it named"
     );
 
     ha.quit(None).await.ok();

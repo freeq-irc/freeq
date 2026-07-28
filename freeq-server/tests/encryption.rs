@@ -242,16 +242,28 @@ mod encryption_at_rest {
             None,
         )
         .unwrap();
-        db.edit_message("msg001", "alice", "edited text", Some("msg002"))
-            .unwrap();
+        // An edit is a new row that revises the original.
+        db.insert_edit(
+            "#test",
+            "alice",
+            "edited text",
+            1001,
+            &HashMap::new(),
+            "msg002",
+            "msg001",
+            None,
+        )
+        .unwrap();
 
-        let msgs = db.get_messages("#test", 10, None).unwrap();
-        // The edited message should show new text
-        let edited = msgs
-            .iter()
-            .find(|m| m.msgid.as_deref() == Some("msg001"))
-            .unwrap();
-        assert_eq!(edited.text, "edited text");
+        // Asked for by the identity the client holds — the original id — the
+        // current text comes back decrypted.
+        let current = db.current_revision("msg001").unwrap().unwrap();
+        assert_eq!(current.text, "edited text");
+        assert!(
+            db.get_raw_message_text("#test", 1001)
+                .unwrap()
+                .starts_with("EAR1:")
+        );
     }
 
     #[test]

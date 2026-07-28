@@ -476,7 +476,7 @@ final class DMSelfEchoRoutingTests: XCTestCase {
             fromNick: me, target: peer, text: "hi bob", msgid: "m1",
             replyTo: nil, replacesMsgid: nil, editOf: nil, batchId: nil,
             pinMsgid: nil, unpinMsgid: nil, isAction: false, isSigned: false,
-            timestampMs: Int64(Date().timeIntervalSince1970 * 1000), account: nil, origin: nil, reactions: [], dmKey: nil)
+            timestampMs: Int64(Date().timeIntervalSince1970 * 1000), account: nil, origin: nil, reactions: [], edited: false, dmKey: nil, coordination: nil)
         handler(s).handleEvent(.message(msg: irc))
 
         let dm = s.dmBuffers.first(where: { $0.name == peer })
@@ -495,7 +495,7 @@ final class DMSelfEchoRoutingTests: XCTestCase {
             fromNick: me, target: peer, text: "fixed", msgid: "m1-v2",
             replyTo: nil, replacesMsgid: "m1", editOf: "m1", batchId: nil,
             pinMsgid: nil, unpinMsgid: nil, isAction: false, isSigned: false,
-            timestampMs: Int64(Date().timeIntervalSince1970 * 1000), account: nil, origin: nil, reactions: [], dmKey: nil)
+            timestampMs: Int64(Date().timeIntervalSince1970 * 1000), account: nil, origin: nil, reactions: [], edited: true, dmKey: nil, coordination: nil)
         handler(s).handleEvent(.message(msg: editIrc))
 
         XCTAssertEqual(dm.messages.first?.text, "fixed")
@@ -564,14 +564,14 @@ final class DMSelfEchoRoutingTests: XCTestCase {
             fromNick: me, target: peer, text: "one", msgid: "m1",
             replyTo: nil, replacesMsgid: nil, editOf: nil, batchId: nil,
             pinMsgid: nil, unpinMsgid: nil, isAction: false, isSigned: false,
-            timestampMs: Int64(Date().timeIntervalSince1970 * 1000), account: nil, origin: nil, reactions: [], dmKey: nil)
+            timestampMs: Int64(Date().timeIntervalSince1970 * 1000), account: nil, origin: nil, reactions: [], edited: false, dmKey: nil, coordination: nil)
         h.handleEvent(.message(msg: send))
 
         let edit = IrcMessage(
             fromNick: me, target: peer, text: "two", msgid: "m1-v2",
             replyTo: nil, replacesMsgid: "m1", editOf: "m1", batchId: nil,
             pinMsgid: nil, unpinMsgid: nil, isAction: false, isSigned: false,
-            timestampMs: Int64(Date().timeIntervalSince1970 * 1000), account: nil, origin: nil, reactions: [], dmKey: nil)
+            timestampMs: Int64(Date().timeIntervalSince1970 * 1000), account: nil, origin: nil, reactions: [], edited: true, dmKey: nil, coordination: nil)
         h.handleEvent(.message(msg: edit))
 
         XCTAssertNil(s.dmBuffers.first(where: { $0.name.lowercased() == me }))

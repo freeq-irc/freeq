@@ -104,25 +104,22 @@ class ChannelState: ObservableObject, Identifiable {
     }
 
     func applyEdit(originalId: String, newId: String?, newText: String) {
-        // Match the current id OR a prior editOf: chained edits keep
-        // referencing the original msgid after the first edit rewrote the
-        // in-memory id (parity with macOS).
+        // Match the current id OR a prior editOf. `editOf` covers rows a
+        // previous build re-keyed to a revision's msgid and cached locally.
         if let idx = findMessage(byId: originalId)
             ?? messages.firstIndex(where: { $0.editOf == originalId }) {
             messages[idx].text = newText
             messages[idx].isEdited = true
             messages[idx].editOf = messages[idx].editOf ?? originalId
-            // Keep the original id registered so a replayed pre-edit row
-            // dedups instead of resurrecting alongside the edited one.
+            // The id does NOT move to the revision's. A message keeps the id
+            // it was born with — the one the server files reactions, pins and
+            // deletes under, and the one replay returns it under. The row
+            // still rebuilds on screen: `renderKey` folds in the text and the
+            // edited flag, so the identity the list diffs on changes anyway.
             messageIds.insert(originalId)
-            if let newId = newId {
-                let oldId = messages[idx].id
-                messages[idx].id = newId
-                messageIds.insert(newId)
-                // Re-key the index: the slot is unchanged, only its id moved.
-                messageIndex.removeValue(forKey: oldId)
-                messageIndex[newId] = idx
-            }
+            // The revision's id still counts as seen, so a later replay of
+            // that row isn't mistaken for a new message.
+            if let newId = newId { messageIds.insert(newId) }
         }
     }
 

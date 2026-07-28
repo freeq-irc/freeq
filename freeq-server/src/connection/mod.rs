@@ -1079,7 +1079,6 @@ where
                     continue;
                 }
                 let channel = normalize_channel(&msg.params[0]);
-                let msgid = &msg.params[1];
                 let is_pin = msg.command == "PIN";
 
                 // Check op status (or server oper)
@@ -1099,6 +1098,10 @@ where
                     send(&state, &session_id, format!("{reply}\r\n"));
                     continue;
                 }
+
+                // Pin the message, not a revision of it: an op pinning after an
+                // edit must land on the same entry as one pinning before.
+                let msgid = &helpers::root_msgid(&state, &msg.params[1]);
 
                 let mut channels = state.channels.lock();
                 if let Some(ch) = channels.get_mut(&channel) {

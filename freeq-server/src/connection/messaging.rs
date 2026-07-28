@@ -215,6 +215,24 @@ pub(super) fn handle_tagmsg(
             tags.entry(canonical.to_string()).or_insert(v);
         }
     }
+    // Resolve the message being acted on to its root id before anything —
+    // persistence, local fan-out and the S2S relay all read this map, so
+    // rewriting here is what makes every receiver of any revision hear the one
+    // identity the message keeps for life.
+    {
+        let acts_on_a_message =
+            tags.contains_key("+react") || tags.contains_key("+freeq.at/unreact");
+        if acts_on_a_message
+            && let Some(target_msgid) = tags.get("+reply")
+        {
+            let root = super::helpers::root_msgid(state, target_msgid);
+            tags.insert("+reply".to_string(), root);
+        }
+        if let Some(deleted) = tags.get("+draft/delete") {
+            let root = super::helpers::root_msgid(state, deleted);
+            tags.insert("+draft/delete".to_string(), root);
+        }
+    }
     let tags = &tags;
 
     // ── Message deletion (+draft/delete=<msgid>) ──
@@ -528,6 +546,7 @@ pub(super) fn handle_tagmsg(
                 target: target.to_string(),
                 tags: tags.clone(),
                 origin: state.server_iroh_id.lock().clone().unwrap_or_default(),
+                account: conn.authenticated_did.clone(),
             },
         );
     } else {
@@ -584,6 +603,7 @@ pub(super) fn handle_tagmsg(
                 target: target.to_string(),
                 tags: tags.clone(),
                 origin: state.server_iroh_id.lock().clone().unwrap_or_default(),
+                account: conn.authenticated_did.clone(),
             },
         );
     }
@@ -871,6 +891,7 @@ pub(super) fn handle_privmsg_with_multiline(
                     timestamp,
                     tags: history_tags,
                     msgid: Some(msgid.clone()),
+                    edited: false,
                 });
                 while ch.history.len() > MAX_HISTORY {
                     ch.history.pop_front();
@@ -1020,6 +1041,7 @@ pub(super) fn handle_privmsg_with_multiline(
                     sig,
                     account: conn.authenticated_did.clone(),
                     recipient_did: super::routing::recipient_did_for_target(state, target),
+                    replaces_msgid: None,
                     tags: s2s_tags,
                     // When this message originated as a draft/multiline
                     // batch, ship the per-line breakdown so the peer
@@ -1139,16 +1161,24 @@ pub(super) fn handle_privmsg_with_multiline(
 
         // Route through the federation routing layer.
         // See routing.rs for why we NEVER gate on remote_members here.
-        use super::routing::{RouteResult, relay_to_nick};
+        use super::routing::{RelayIdentity, RouteResult, relay_to_nick};
         let from_nick = conn.nick.as_deref().unwrap_or("*").to_string();
         match relay_to_nick(
             state,
             &from_nick,
-            conn.authenticated_did.as_deref(),
             target,
             text,
             s2s_next_event_id(state),
             multiline_lines,
+            RelayIdentity {
+                account: conn.authenticated_did.as_deref(),
+                // The id this server assigned. A peer that mints its own leaves
+                // the two servers unable to name the same message.
+                msgid: Some(&pm_msgid),
+                sig: pm_tags.get("+freeq.at/sig").map(|s| s.as_str()),
+                replaces_msgid: None,
+                tags: crate::s2s::relay_coordination_tags(&pm_tags),
+            },
         ) {
             RouteResult::Local(ref session) => {
                 // Target is local — deliver to ALL sessions for target's DID (multi-device).
@@ -1170,6 +1200,7 @@ pub(super) fn handle_privmsg_with_multiline(
                         sig: pm_tags.get("+freeq.at/sig").cloned(),
                         account: conn.authenticated_did.clone(),
                         recipient_did: super::routing::recipient_did_for_target(state, target),
+                        replaces_msgid: None,
                         tags: s2s_tags,
                         multiline_lines: multiline_lines.map(|lines| {
                             lines
@@ -1589,6 +1620,14 @@ pub(super) fn handle_search(
     // search_messages returns newest-first; replay oldest-first so the
     // batch reads like CHATHISTORY output.
     messages.reverse();
+    // A search hit is a pointer, not a replay event: address it by the root —
+    // the id clients hold the message under. This also keys the reactions
+    // lookup in replay_rows_as_batch, which files reactions by root.
+    for row in &mut messages {
+        if row.root_msgid.is_some() {
+            row.msgid = row.root_msgid.clone();
+        }
+    }
 
     let has_tags = state.cap_message_tags.lock().contains(session_id);
     let has_time = state.cap_server_time.lock().contains(session_id);
@@ -2058,6 +2097,13 @@ fn handle_edit(
     let nick = conn.nick_or_star();
     let is_channel = target.starts_with('#') || target.starts_with('&');
 
+    // An edit changes content, never identity. Anchor to the root so the
+    // stored row, the in-memory entry and the `+draft/edit` tag every receiver
+    // sees all name the same message, whichever revision the editor's client
+    // held.
+    let root_msgid = super::helpers::root_msgid(state, original_msgid);
+    let original_msgid: &str = &root_msgid;
+
     // Verify authorship: look up original message by msgid, resolving the
     // canonical dm_key for DMs (target may be a nick or a DID).
     let original = find_original_message(conn, target, original_msgid, is_channel, state);
@@ -2131,7 +2177,9 @@ fn handle_edit(
     // Build tags with edit reference + new msgid
     let mut full_tags = tags.clone();
     full_tags.insert("msgid".to_string(), edit_msgid.clone());
-    // Keep the +draft/edit tag so clients know this is an edit
+    // Keep the +draft/edit tag so clients know this is an edit — pointing at
+    // the root, which is the id they hold the message under.
+    full_tags.insert("+draft/edit".to_string(), original_msgid.to_string());
 
     // Verify/sign edited message
     let edit_timestamp = std::time::SystemTime::now()
@@ -2216,11 +2264,12 @@ fn handle_edit(
     };
 
     // Store in DB
-    let store_tags: std::collections::HashMap<String, String> = tags
+    let mut store_tags: std::collections::HashMap<String, String> = tags
         .iter()
         .filter(|(k, _)| *k != "msgid")
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    store_tags.insert("+draft/edit".to_string(), original_msgid.to_string());
     // For DMs, store under the canonical dm_key (not the nick) so
     // edits appear in CHATHISTORY alongside the original message.
     // store_channel was captured from the original row above.
@@ -2252,6 +2301,9 @@ fn handle_edit(
                 if hist.msgid.as_deref() == Some(original_msgid) {
                     hist.text = new_text.to_string();
                     // Don't change hist.msgid — keep original stable for chained edits
+                    // Join replay collapses revisions into this one entry, so
+                    // without the flag a late joiner can't tell it was edited.
+                    hist.edited = true;
                     break;
                 }
             }
@@ -2341,6 +2393,10 @@ fn handle_edit(
                 sig,
                 account: conn.authenticated_did.clone(),
                 recipient_did: super::routing::recipient_did_for_target(state, target),
+                // Tells the peer this revises a message it already has, rather
+                // than being one. `+draft/edit` can't carry it: the relayed tag
+                // map is filtered to `+freeq.at/*`.
+                replaces_msgid: Some(original_msgid.to_string()),
                 tags: s2s_tags,
                 // Multi-line edit: pass the per-line breakdown so peer
                 // servers can re-emit BATCH frames to their own
@@ -2410,11 +2466,19 @@ fn handle_edit(
         match relay_to_nick(
             state,
             &from_nick,
-            conn.authenticated_did.as_deref(),
             target,
             new_text,
             s2s_next_event_id(state),
             multiline_lines.as_deref(),
+            super::routing::RelayIdentity {
+                account: conn.authenticated_did.as_deref(),
+                msgid: Some(&edit_msgid),
+                sig: full_tags.get("+freeq.at/sig").map(|s| s.as_str()),
+                // What makes this an edit on the far side rather than a second
+                // message in the thread.
+                replaces_msgid: Some(original_msgid),
+                tags: crate::s2s::relay_coordination_tags(&full_tags),
+            },
         ) {
             RouteResult::Local(ref session) => {
                 // Find all sessions for target's DID (multi-device support)
@@ -2620,6 +2684,29 @@ fn handle_delete(conn: &Connection, target: &str, original_msgid: &str, state: &
                 let _ = tx.try_send(tagged_line.clone());
             }
         }
+        drop(conns);
+        drop(tag_caps);
+
+        // Relay to peers. This has to be an explicit broadcast: `handle_tagmsg`
+        // dispatches here and returns, so the generic TAGMSG relay below it
+        // never runs for a delete — which is why deletes used to stop at the
+        // origin, leaving the message readable on every other server.
+        s2s_broadcast(
+            state,
+            crate::s2s::S2sMessage::Tagmsg {
+                event_id: s2s_next_event_id(state),
+                from: nick.to_string(),
+                target: target.to_string(),
+                tags: std::collections::HashMap::from([(
+                    "+draft/delete".to_string(),
+                    original_msgid.to_string(),
+                )]),
+                origin: state.server_iroh_id.lock().clone().unwrap_or_default(),
+                // The peer authorizes the delete against the message's author;
+                // a nick alone would let any peer assert its way to one.
+                account: conn.authenticated_did.clone(),
+            },
+        );
     } else {
         // DM: deliver the delete to every local session bound to the target
         // (a nick or a `did:`), fanning out across the DID's devices — and
@@ -2641,7 +2728,27 @@ fn handle_delete(conn: &Connection, target: &str, original_msgid: &str, state: &
                 let _ = tx.try_send(tagged_line.clone());
             }
         }
-        // Note: For federated DM deletes, we'd need S2S support — not implemented yet
+        drop(conns);
+        drop(tag_caps);
+
+        // The recipient may be on another server, or be reading this thread
+        // from one. Relay unconditionally, the same way the DM PRIVMSG path
+        // does — peers dedup by event_id, and one with no local session for
+        // the target simply no-ops.
+        s2s_broadcast(
+            state,
+            crate::s2s::S2sMessage::Tagmsg {
+                event_id: s2s_next_event_id(state),
+                from: nick.to_string(),
+                target: target.to_string(),
+                tags: std::collections::HashMap::from([(
+                    "+draft/delete".to_string(),
+                    original_msgid.to_string(),
+                )]),
+                origin: state.server_iroh_id.lock().clone().unwrap_or_default(),
+                account: conn.authenticated_did.clone(),
+            },
+        );
     }
 }
 

@@ -1709,16 +1709,19 @@ export class FreeqClient extends EventEmitter {
               editBatch.messages[idx] = {
                 ...prev,
                 text: displayText,
-                id: msg.tags['msgid'] || prev.id,
+                // The id does NOT move to the edit's. A message keeps the id
+                // it was born with, so anything holding a reference to it —
+                // a reaction, a pending delete, a reply — still resolves.
                 editOf: prev.editOf ?? editOf,
                 ...(mergedReactions ? { reactions: mergedReactions } : {}),
               };
               break;
             }
             // Original row absent from this batch window — deliver the
-            // edit as its own row rather than losing the content.
+            // edit as its own row rather than losing the content, keyed by
+            // the message's identity rather than this revision's wire id.
             editBatch.messages.push({
-              id: msg.tags['msgid'] || crypto.randomUUID(),
+              id: editOf,
               from,
               text: displayText,
               timestamp: msg.tags['time'] ? new Date(msg.tags['time']) : new Date(),

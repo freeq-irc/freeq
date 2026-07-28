@@ -209,6 +209,52 @@ async fn search_finds_channel_messages_for_member() {
     .await;
 }
 
+/// A hit on an edited message is addressed by the root msgid — the id every
+/// client holds the message under — not the matching revision's own id.
+#[tokio::test]
+async fn search_hit_for_edited_message_carries_the_root_msgid() {
+    let (addr, _h) = start(DidResolver::static_map(HashMap::new())).await;
+    run(addr, |addr| {
+        let mut alice = C::with_caps(addr, "alice");
+        let mut bob = C::with_caps(addr, "bob");
+        alice.reg();
+        bob.reg();
+        alice.tx("JOIN #edits");
+        bob.tx("JOIN #edits");
+        settle();
+        alice.drain();
+        bob.drain();
+
+        alice.tx("PRIVMSG #edits :original wording here");
+        // bob's copy carries the server-assigned msgid — the root.
+        let line = bob.rx(|l| l.contains("original wording here"), "original at bob");
+        let root = line
+            .split("msgid=")
+            .nth(1)
+            .expect("broadcast carries msgid")
+            .split([';', ' '])
+            .next()
+            .unwrap()
+            .to_string();
+
+        alice.tx(&format!("@+draft/edit={root} PRIVMSG #edits :revised wording here"));
+        settle();
+        alice.drain();
+        bob.drain();
+
+        alice.tx("SEARCH #edits :revised");
+        let msgs = alice.collect_batch_messages();
+        assert_eq!(msgs.len(), 1, "one hit for the current text: {msgs:?}");
+        assert!(msgs[0].contains("revised wording here"));
+        assert!(
+            msgs[0].contains(&format!("msgid={root}")),
+            "hit must be addressed by the root id {root}: {}",
+            msgs[0]
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn search_uses_dedicated_batch_type() {
     let (addr, _h) = start(DidResolver::static_map(HashMap::new())).await;

@@ -6,12 +6,41 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, Result as SqlResult, params};
+use rusqlite::{Connection, OptionalExtension, Result as SqlResult, Transaction, params};
+use rusqlite_migration::{HookResult, M, Migrations};
 
 use crate::server::{BanEntry, ChannelState, TopicInfo};
 
 /// Prefix for encrypted-at-rest message content.
 const EAR_PREFIX: &str = "EAR1:";
+
+/// The one-time migration ladder, tracked in SQLite's `PRAGMA user_version`
+/// (its application-owned version slot). Append-only: a new migration is a new
+/// entry at the end of this list. `rusqlite_migration` runs each pending entry
+/// and its version stamp inside one transaction — a crash leaves the database
+/// exactly at the previous rung, so migrations need not be idempotent — and
+/// refuses to open a database stamped newer than this list knows.
+///
+/// Slot 1 is an empty placeholder, deliberately reserved for the schema
+/// baseline: the idempotent CREATE/ALTER statements `init()` replays on every
+/// boot are meant to move here verbatim in a follow-up, making this ladder the
+/// single schema authority. Reserving the slot now keeps that refactor a
+/// content swap instead of a renumbering, which stamped databases in the wild
+/// could never tolerate. (`migrate_signing_keys_to_kid_history` predates the
+/// ladder and keeps its own shape-based guard.)
+fn migration_ladder() -> Migrations<'static> {
+    Migrations::new(vec![
+        // 1: reserved for the schema baseline — see above.
+        M::up(""),
+        // 2: a message's identity is its original msgid for life — stamp
+        //    `root_msgid` on rows that predate the column and re-file
+        //    reactions and pins under the root they annotate.
+        M::up_with_hook("", |tx: &Transaction| -> HookResult {
+            Db::backfill_root_msgids(tx)?;
+            Ok(())
+        }),
+    ])
+}
 
 /// Encrypt text with AES-256-GCM for storage at rest.
 /// Panics on encryption failure — this indicates a broken key or AES implementation
@@ -116,6 +145,20 @@ pub struct ReactionRow {
     pub timestamp: u64,
 }
 
+/// Who wrote a message, and where it is filed — the minimum needed to
+/// authorize an operation on a message without reading its contents.
+#[derive(Debug, Clone)]
+pub struct MessageAuthorship {
+    /// The channel key the row is filed under, spelled as it was stored.
+    pub channel: String,
+    /// Full hostmask of the author, as stored.
+    pub sender: String,
+    /// Author's DID, when they were authenticated at send time.
+    pub sender_did: Option<String>,
+    /// Whether the message is already soft-deleted.
+    pub deleted: bool,
+}
+
 /// A persisted message row.
 #[derive(Debug, Clone)]
 pub struct MessageRow {
@@ -129,6 +172,10 @@ pub struct MessageRow {
     pub msgid: Option<String>,
     /// If this is an edit, the msgid of the original message it replaces.
     pub replaces_msgid: Option<String>,
+    /// The identity of the logical message this row is a revision of — the
+    /// original msgid, and equal to `msgid` for an original. NULL only on rows
+    /// old enough to have no msgid at all.
+    pub root_msgid: Option<String>,
     /// Unix timestamp when this message was deleted (soft delete).
     pub deleted_at: Option<u64>,
     /// DID of the sender (if authenticated at send time).
@@ -162,7 +209,7 @@ impl Db {
     /// Open (or create) the database at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> SqlResult<Self> {
         let conn = Connection::open(path)?;
-        let db = Self {
+        let mut db = Self {
             conn,
             encryption_key: None,
         };
@@ -173,7 +220,7 @@ impl Db {
     /// Open a database with encryption at rest for message content.
     pub fn open_encrypted<P: AsRef<Path>>(path: P, key: [u8; 32]) -> SqlResult<Self> {
         let conn = Connection::open(path)?;
-        let db = Self {
+        let mut db = Self {
             conn,
             encryption_key: Some(key),
         };
@@ -184,7 +231,7 @@ impl Db {
     /// Open an in-memory database (for testing).
     pub fn open_memory() -> SqlResult<Self> {
         let conn = Connection::open_in_memory()?;
-        let db = Self {
+        let mut db = Self {
             conn,
             encryption_key: None,
         };
@@ -195,7 +242,7 @@ impl Db {
     /// Open an in-memory database with encryption at rest (for testing).
     pub fn open_encrypted_memory(key: [u8; 32]) -> SqlResult<Self> {
         let conn = Connection::open_in_memory()?;
-        let db = Self {
+        let mut db = Self {
             conn,
             encryption_key: Some(key),
         };
@@ -220,7 +267,7 @@ impl Db {
             "INSERT INTO signing_keys (did, pubkey, registered_at) VALUES ('did:plc:legacy', ?1, 0)",
             params![&[7u8; 32][..]],
         )?;
-        let db = Self {
+        let mut db = Self {
             conn,
             encryption_key: None,
         };
@@ -286,7 +333,187 @@ impl Db {
         Ok(())
     }
 
-    fn init(&self) -> SqlResult<()> {
+    /// Walk `replaces_msgid` back-pointers to the oldest revision. Upgrade-only:
+    /// rows written since `root_msgid` exists are stamped at insert time, so
+    /// this runs solely over rows that predate the column. Bounded — a
+    /// malformed back-pointer cycle must not spin.
+    fn migration_root_of(conn: &Connection, channel: &str, msgid: &str) -> SqlResult<String> {
+        let mut root = msgid.to_string();
+        for _ in 0..64 {
+            let mut stmt = conn
+                .prepare("SELECT replaces_msgid FROM messages WHERE channel = ?1 AND msgid = ?2")?;
+            let parent: Option<String> = stmt
+                .query_map(params![channel, &root], |r| r.get::<_, Option<String>>(0))?
+                .next()
+                .transpose()?
+                .flatten();
+            match parent {
+                Some(p) if !p.is_empty() && p != root => root = p,
+                _ => break,
+            }
+        }
+        Ok(root)
+    }
+
+    /// One-time upgrade: stamp `root_msgid` on rows that predate the column,
+    /// then re-file reactions and pins under the root they annotate.
+    ///
+    /// A message's identity is its original msgid for life; an edit changes
+    /// content, not identity. Before `root_msgid` existed, an operation could
+    /// name either end of an edit chain, so the same logical message could
+    /// collect reactions and pins under two different ids. Re-filing them under
+    /// the root is what makes those tallies agree afterwards.
+    ///
+    /// Idempotent (`WHERE root_msgid IS NULL`, and the re-file is a no-op once
+    /// every id is already a root), so re-running is safe. A fresh database is
+    /// born with the column and stamps every row at insert, so the guard
+    /// matches zero rows and none of this executes.
+    ///
+    /// An id with no message row — an unpersisted guest-DM message — is its own
+    /// root and is left untouched everywhere.
+    fn backfill_root_msgids(conn: &Connection) -> SqlResult<()> {
+        // Originals: identity is the msgid itself.
+        conn.execute(
+            "UPDATE messages SET root_msgid = msgid
+             WHERE root_msgid IS NULL AND msgid IS NOT NULL
+               AND (replaces_msgid IS NULL OR replaces_msgid = '')",
+            [],
+        )?;
+
+        // Edits: walk the back-pointers.
+        let pending: Vec<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT channel, msgid FROM messages
+                 WHERE root_msgid IS NULL AND msgid IS NOT NULL",
+            )?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<SqlResult<Vec<_>>>()?
+        };
+        for (channel, msgid) in pending {
+            let root = Self::migration_root_of(conn, &channel, &msgid)?;
+            conn.execute(
+                "UPDATE messages SET root_msgid = ?1 WHERE channel = ?2 AND msgid = ?3",
+                params![root, channel, msgid],
+            )?;
+        }
+
+        Self::backfill_reaction_roots(conn)?;
+        Self::backfill_pin_roots(conn)?;
+        Ok(())
+    }
+
+    /// Re-file reactions under the root of the message they annotate.
+    /// `reactions` is `UNIQUE(target_msgid, reactor_nick, emoji)`, so one person
+    /// who reacted against two revisions of the same message has two rows that
+    /// would collide on rewrite — the earlier row wins and the later is dropped,
+    /// which is the same tally the two rows were always meant to represent.
+    fn backfill_reaction_roots(conn: &Connection) -> SqlResult<()> {
+        let rewrites: Vec<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT r.target_msgid, m.root_msgid
+                 FROM reactions r JOIN messages m ON m.msgid = r.target_msgid
+                 WHERE m.root_msgid IS NOT NULL AND m.root_msgid <> r.target_msgid",
+            )?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<SqlResult<Vec<_>>>()?
+        };
+        for (old_id, root) in rewrites {
+            // Of a colliding pair, drop the later row. The `<=` / `<` split
+            // means a tie drops the revision row, never both.
+            conn.execute(
+                "DELETE FROM reactions WHERE target_msgid = ?1 AND EXISTS (
+                     SELECT 1 FROM reactions keep
+                     WHERE keep.target_msgid = ?2
+                       AND keep.reactor_nick = reactions.reactor_nick
+                       AND keep.emoji = reactions.emoji
+                       AND keep.timestamp <= reactions.timestamp
+                 )",
+                params![old_id, root],
+            )?;
+            conn.execute(
+                "DELETE FROM reactions WHERE target_msgid = ?2 AND EXISTS (
+                     SELECT 1 FROM reactions keep
+                     WHERE keep.target_msgid = ?1
+                       AND keep.reactor_nick = reactions.reactor_nick
+                       AND keep.emoji = reactions.emoji
+                       AND keep.timestamp < reactions.timestamp
+                 )",
+                params![old_id, root],
+            )?;
+            // OR IGNORE + sweep: a surviving collision must not abort startup.
+            conn.execute(
+                "UPDATE OR IGNORE reactions SET target_msgid = ?1 WHERE target_msgid = ?2",
+                params![root, old_id],
+            )?;
+            conn.execute(
+                "DELETE FROM reactions WHERE target_msgid = ?1",
+                params![old_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Re-file pins under the root of the message they pin. `pins` is
+    /// `UNIQUE(channel, msgid)`; a message pinned under two revisions keeps the
+    /// earliest `pinned_at` — the moment it was actually first pinned.
+    fn backfill_pin_roots(conn: &Connection) -> SqlResult<()> {
+        let rewrites: Vec<(String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT p.channel, p.msgid, m.root_msgid
+                 FROM pins p JOIN messages m ON m.msgid = p.msgid
+                 WHERE m.root_msgid IS NOT NULL AND m.root_msgid <> p.msgid",
+            )?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<SqlResult<Vec<_>>>()?
+        };
+        for (channel, old_id, root) in rewrites {
+            conn.execute(
+                "UPDATE pins SET pinned_at = (
+                     SELECT MIN(pinned_at) FROM pins
+                     WHERE channel = ?1 AND msgid IN (?2, ?3)
+                 )
+                 WHERE channel = ?1 AND msgid = ?3",
+                params![channel, old_id, root],
+            )?;
+            conn.execute(
+                "UPDATE OR IGNORE pins SET msgid = ?1 WHERE channel = ?2 AND msgid = ?3",
+                params![root, channel, old_id],
+            )?;
+            conn.execute(
+                "DELETE FROM pins WHERE channel = ?1 AND msgid = ?2",
+                params![channel, old_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The root msgid of the logical message `msgid` belongs to — its identity
+    /// for life, unchanged by edits. An id with no row (an unpersisted guest-DM
+    /// message) is its own root.
+    ///
+    /// This is the single definition of "the same message"; reactions, pins and
+    /// deletes all file and look up by what it returns.
+    ///
+    /// Deliberately not channel-scoped: a ULID is globally unique, so the id
+    /// alone identifies the row. `migration_root_of` is channel-scoped only
+    /// because the backfill iterates per channel.
+    pub fn root_of(&self, msgid: &str) -> String {
+        self.conn
+            .query_row(
+                "SELECT root_msgid, msgid FROM messages WHERE msgid = ?1 LIMIT 1",
+                params![msgid],
+                |r| {
+                    let root: Option<String> = r.get(0)?;
+                    let own: Option<String> = r.get(1)?;
+                    Ok(root.or(own))
+                },
+            )
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| msgid.to_string())
+    }
+
+    fn init(&mut self) -> SqlResult<()> {
         self.conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         self.conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         self.conn.execute_batch(
@@ -417,6 +644,7 @@ impl Db {
             "ALTER TABLE channels ADD COLUMN encrypted_only INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE messages ADD COLUMN msgid TEXT",
             "ALTER TABLE messages ADD COLUMN replaces_msgid TEXT",
+            "ALTER TABLE messages ADD COLUMN root_msgid TEXT",
             "ALTER TABLE messages ADD COLUMN deleted_at INTEGER",
             "ALTER TABLE messages ADD COLUMN sender_did TEXT",
             "ALTER TABLE identities ADD COLUMN last_auth_at INTEGER",
@@ -434,6 +662,17 @@ impl Db {
         // whole messages table under the global DB lock.
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_sender_did ON messages(sender_did)",
+            [],
+        )?;
+        // `root_of` runs on every reaction, pin and delete, and the delete
+        // sweep selects a whole revision family by root — both would otherwise
+        // full-scan `messages` under the global DB lock.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_msgid ON messages(msgid)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_root_msgid ON messages(root_msgid)",
             [],
         )?;
 
@@ -640,6 +879,19 @@ impl Db {
             ",
         )?;
 
+        // Last: the migration ladder, after every statement above, so a
+        // pending migration sees fully-shaped tables (the root_msgid backfill
+        // re-files `reactions` and `pins` rows, so both have to exist by now).
+        migration_ladder()
+            .to_latest(&mut self.conn)
+            .map_err(|e| match e {
+                rusqlite_migration::Error::RusqliteError { err, .. } => err,
+                other => rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                    Some(other.to_string()),
+                ),
+            })?;
+
         Ok(())
     }
 
@@ -706,14 +958,30 @@ impl Db {
             }
             let before_ts = before.map(|b| b as i64).unwrap_or(i64::MAX);
             let mut stmt = self.conn.prepare(
+                // Rows come back as themselves (`msgid` = the row's own id,
+                // like every other query); the SEARCH and REST handlers
+                // re-address hits by `root_msgid` — the id clients hold the
+                // message under — when they emit.
+                //
+                // Superseded revisions are excluded, matching the
+                // decrypt-and-scan path below. An edit made since the upgrade
+                // leaves the index on its own, but rows indexed before it are
+                // still there, and returning them alongside the current one
+                // yields two hits for one logical message.
                 "SELECT m.id, m.channel, m.sender, m.text, m.timestamp, m.tags_json,
-                        m.msgid, m.replaces_msgid, m.deleted_at, m.sender_did
+                        m.msgid, m.replaces_msgid, m.deleted_at, m.sender_did, m.root_msgid
                  FROM messages_fts
                  JOIN messages m ON m.id = messages_fts.rowid
                  WHERE messages_fts MATCH ?1
                    AND m.channel = ?2
                    AND m.deleted_at IS NULL
                    AND m.timestamp < ?3
+                   AND NOT EXISTS (
+                       SELECT 1 FROM messages newer
+                       WHERE newer.channel = m.channel
+                         AND newer.root_msgid = m.root_msgid
+                         AND newer.id > m.id
+                   )
                  ORDER BY m.timestamp DESC, m.id DESC
                  LIMIT ?4",
             )?;
@@ -733,9 +1001,15 @@ impl Db {
         let before_ts = before.map(|b| b as i64).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(
             "SELECT id, channel, sender, text, timestamp, tags_json,
-                    msgid, replaces_msgid, deleted_at, sender_did
-             FROM messages
+                    msgid, replaces_msgid, deleted_at, sender_did, root_msgid
+             FROM messages m
              WHERE channel = ?1 AND deleted_at IS NULL AND timestamp < ?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM messages newer
+                   WHERE newer.channel = m.channel
+                     AND newer.root_msgid = m.root_msgid
+                     AND newer.id > m.id
+               )
              ORDER BY timestamp DESC, id DESC
              LIMIT ?3",
         )?;
@@ -1011,9 +1285,10 @@ impl Db {
         } else {
             text.to_string()
         };
+        // An original message is its own root — its identity for life.
         self.conn.execute(
-            "INSERT INTO messages (channel, sender, text, timestamp, tags_json, msgid, sender_did)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO messages (channel, sender, text, timestamp, tags_json, msgid, root_msgid, sender_did)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
             params![
                 channel,
                 sender,
@@ -1051,7 +1326,7 @@ impl Db {
     ) -> SqlResult<Vec<MessageRow>> {
         let mut rows_vec = if let Some(before_ts) = before {
             let mut stmt = self.conn.prepare(
-                "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did
+                "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did, root_msgid
                  FROM messages
                  WHERE channel = ?1 AND deleted_at IS NULL AND timestamp < ?2
                  ORDER BY timestamp DESC, id DESC
@@ -1064,7 +1339,7 @@ impl Db {
             rows.collect::<SqlResult<Vec<_>>>()?
         } else {
             let mut stmt = self.conn.prepare(
-                "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did
+                "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did, root_msgid
                  FROM messages
                  WHERE channel = ?1 AND deleted_at IS NULL
                  ORDER BY timestamp DESC, id DESC
@@ -1092,7 +1367,7 @@ impl Db {
         limit: usize,
     ) -> SqlResult<Vec<MessageRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did
+            "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did, root_msgid
              FROM messages
              WHERE channel = ?1 AND deleted_at IS NULL AND timestamp > ?2
              ORDER BY timestamp ASC, id ASC
@@ -1120,7 +1395,7 @@ impl Db {
         limit: usize,
     ) -> SqlResult<Vec<MessageRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did
+            "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did, root_msgid
              FROM messages
              WHERE channel = ?1 AND deleted_at IS NULL AND timestamp > ?2 AND timestamp < ?3
              ORDER BY timestamp ASC, id ASC
@@ -1186,7 +1461,7 @@ impl Db {
         msgid: &str,
     ) -> SqlResult<Option<MessageRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did
+            "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did, root_msgid
              FROM messages
              WHERE channel = ?1 AND msgid = ?2
              LIMIT 1"
@@ -1207,7 +1482,7 @@ impl Db {
     /// Find a message by msgid across all channels.
     pub fn find_message_by_msgid(&self, msgid: &str) -> SqlResult<Option<MessageRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did
+            "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did, root_msgid
              FROM messages
              WHERE msgid = ?1 AND deleted_at IS NULL
              LIMIT 1",
@@ -1225,82 +1500,107 @@ impl Db {
         }
     }
 
-    /// Soft-delete a message by setting deleted_at timestamp.
-    /// Every msgid belonging to the same logical message as `msgid`.
+    /// Who wrote the logical message `msgid` names, and where it is filed.
     ///
-    /// An edit is stored as a *new* row carrying `replaces_msgid`, so one
-    /// logical message can span several rows. This walks up to the root
-    /// revision and then collects everything that (transitively) replaces it,
-    /// so callers can act on the message rather than on one revision of it.
-    /// Both walks are bounded: a malformed `replaces_msgid` cycle must not spin.
-    fn revision_family(&self, channel: &str, msgid: &str) -> SqlResult<Vec<String>> {
-        let mut root = msgid.to_string();
-        for _ in 0..64 {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT replaces_msgid FROM messages WHERE channel = ?1 AND msgid = ?2")?;
-            let parent: Option<String> = stmt
-                .query_map(params![channel, &root], |r| r.get::<_, Option<String>>(0))?
-                .next()
-                .transpose()?
-                .flatten();
-            match parent {
-                Some(p) if !p.is_empty() && p != root => root = p,
-                _ => break,
-            }
-        }
+    /// Keyed on `msgid` alone, deliberately. A msgid is a globally unique ULID
+    /// and `root_of` already resolves identity without a channel, whereas a
+    /// channel name arrives from a peer spelled the way its user typed it and is
+    /// stored that way, while the in-memory channel map is keyed lowercase.
+    /// Scoping an *authorization* lookup by channel therefore made the answer
+    /// depend on that casing — a miss reads as "no such message", which is the
+    /// permissive answer. There is no casing of a ULID that finds someone
+    /// else's message.
+    ///
+    /// Resolves to the root first, so naming any revision answers for the
+    /// message. Soft-deleted rows are included: an operation on an
+    /// already-deleted message still has an author, and callers that must
+    /// refuse a deleted target need to be able to see that it is deleted.
+    pub fn message_authorship(&self, msgid: &str) -> SqlResult<Option<MessageAuthorship>> {
+        let root = self.root_of(msgid);
+        let mut stmt = self.conn.prepare(
+            "SELECT channel, sender, sender_did, deleted_at FROM messages
+             WHERE msgid = ?1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![root], |r| {
+            Ok(MessageAuthorship {
+                channel: r.get(0)?,
+                sender: r.get(1)?,
+                sender_did: r.get(2).unwrap_or(None),
+                deleted: r.get::<_, Option<i64>>(3).unwrap_or(None).is_some(),
+            })
+        })?;
+        rows.next().transpose()
+    }
 
-        let mut family = vec![root.clone()];
-        let mut frontier = vec![root];
-        while let Some(current) = frontier.pop() {
-            let mut stmt = self.conn.prepare(
-                "SELECT msgid FROM messages
-                 WHERE channel = ?1 AND replaces_msgid = ?2 AND msgid IS NOT NULL",
-            )?;
-            let children: Vec<String> = stmt
-                .query_map(params![channel, &current], |r| r.get(0))?
-                .collect::<SqlResult<Vec<String>>>()?;
-            for child in children {
-                if !family.contains(&child) {
-                    family.push(child.clone());
-                    frontier.push(child);
+    /// The current text of the logical message `msgid` names — the newest
+    /// revision, whichever revision was asked for.
+    ///
+    /// Displays that quote a message (pins, most visibly) need the version the
+    /// author last wrote, not the one whose id happens to be on file.
+    pub fn current_revision(&self, msgid: &str) -> SqlResult<Option<MessageRow>> {
+        let root = self.root_of(msgid);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did, root_msgid
+             FROM messages
+             WHERE root_msgid = ?1 AND deleted_at IS NULL
+             ORDER BY timestamp DESC, id DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![root], map_message_row)?;
+        match rows.next() {
+            Some(row) => {
+                let mut msg = row?;
+                if let Some(ref key) = self.encryption_key {
+                    msg.text = decrypt_at_rest(key, &msg.text);
                 }
+                Ok(Some(msg))
             }
-            if family.len() > 512 {
-                break; // safety valve; no legitimate message has 512 revisions
-            }
+            None => Ok(None),
         }
-        Ok(family)
     }
 
     /// Soft-delete a message *and every revision of it*.
     ///
-    /// Clients keep the ORIGINAL msgid as a message's identity (that's the point
-    /// of `+draft/edit=<original>`), so a delete names the original while the
+    /// A message's identity is its original msgid for life (that's the point of
+    /// `+draft/edit=<original>`), so a delete names the original while the
     /// current text may live in a later edit row. Marking only the exact msgid
     /// left the newest text — the version the author most wants gone — readable
-    /// in CHATHISTORY and in FTS search. Either end of the family may be named.
+    /// in CHATHISTORY and in FTS search. Either end of the family may be named:
+    /// every row of one logical message carries the same `root_msgid`.
     pub fn soft_delete_message(&self, channel: &str, msgid: &str) -> SqlResult<usize> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let family = self.revision_family(channel, msgid)?;
+        let root = self.root_of(msgid);
+
+        // The msgids of every revision. Pins and reactions are filed under the
+        // root, but a row written before that was true may still name a
+        // revision, so the sweeps below clear the whole set.
+        let family: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT msgid FROM messages
+                 WHERE channel = ?1 AND root_msgid = ?2 AND msgid IS NOT NULL",
+            )?;
+            let mut rows: Vec<String> = stmt
+                .query_map(params![channel, &root], |r| r.get(0))?
+                .collect::<SqlResult<Vec<String>>>()?;
+            if !rows.iter().any(|m| m == &root) {
+                rows.push(root.clone());
+            }
+            rows
+        };
 
         // Resolve to row ids first so the FTS delete and the UPDATE act on
         // exactly the same set, with uniformly-typed bind parameters.
         let ph = family.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let ids: Vec<i64> = {
-            let sql = format!(
+            let mut stmt = self.conn.prepare(
                 "SELECT id FROM messages
-                 WHERE channel = ? AND deleted_at IS NULL AND msgid IN ({ph})"
-            );
-            let mut binds: Vec<String> = Vec::with_capacity(family.len() + 1);
-            binds.push(channel.to_string());
-            binds.extend(family.iter().cloned());
-            let mut stmt = self.conn.prepare(&sql)?;
-            stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get(0))?
+                 WHERE channel = ?1 AND deleted_at IS NULL AND root_msgid = ?2",
+            )?;
+            stmt.query_map(params![channel, &root], |r| r.get(0))?
                 .collect::<SqlResult<Vec<i64>>>()?
         };
         if ids.is_empty() {
@@ -1424,6 +1724,11 @@ impl Db {
     }
 
     /// Store an edit (a new message that replaces an old one).
+    ///
+    /// The new row carries the *root* of what it replaces, so every revision of
+    /// one logical message shares an identity no matter which revision the
+    /// editor named. Only the newest revision stays in the search index —
+    /// otherwise a search for pre-edit text surfaces superseded revisions.
     pub fn insert_edit(
         &self,
         channel: &str,
@@ -1441,18 +1746,31 @@ impl Db {
         } else {
             text.to_string()
         };
+        let root = self.root_of(replaces_msgid);
         self.conn.execute(
-            "INSERT INTO messages (channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, sender_did)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![channel, sender, stored_text, timestamp as i64, tags_json, msgid, replaces_msgid, sender_did],
+            "INSERT INTO messages (channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, root_msgid, sender_did)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![channel, sender, stored_text, timestamp as i64, tags_json, msgid, replaces_msgid, root, sender_did],
         )?;
-        self.fts_index(self.conn.last_insert_rowid(), text)?;
+        let rowid = self.conn.last_insert_rowid();
+        if self.fts_enabled() {
+            self.conn.execute(
+                "DELETE FROM messages_fts WHERE rowid IN (
+                     SELECT id FROM messages WHERE channel = ?1 AND root_msgid = ?2 AND id <> ?3
+                 )",
+                params![channel, root, rowid],
+            )?;
+        }
+        self.fts_index(rowid, text)?;
         Ok(())
     }
 
     // ── Reactions ──────────────────────────────────────────────────────
 
     /// Store a reaction. Upsert — duplicate (msgid, nick, emoji) is ignored.
+    ///
+    /// Filed against the root, so reacting to an edited message lands on the
+    /// same row whichever revision the reactor's client named.
     pub fn store_reaction(
         &self,
         target_msgid: &str,
@@ -1462,6 +1780,7 @@ impl Db {
         emoji: &str,
         timestamp: u64,
     ) -> SqlResult<()> {
+        let target_msgid = &self.root_of(target_msgid);
         self.conn.execute(
             "INSERT OR IGNORE INTO reactions (target_msgid, channel, reactor_nick, reactor_did, emoji, timestamp)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1486,6 +1805,7 @@ impl Db {
         reactor_did: Option<&str>,
         emoji: &str,
     ) -> SqlResult<usize> {
+        let target_msgid = &self.root_of(target_msgid);
         let changed = match reactor_did {
             Some(did) => self.conn.execute(
                 "DELETE FROM reactions WHERE target_msgid = ?1 AND emoji = ?2
@@ -1547,6 +1867,9 @@ impl Db {
     // ── Pins ──────────────────────────────────────────────────────────
 
     /// Store a pin. Duplicate (channel, msgid) is ignored.
+    ///
+    /// Filed against the root, so a message can't end up pinned twice by being
+    /// pinned once before an edit and once after.
     pub fn store_pin(
         &self,
         channel: &str,
@@ -1554,6 +1877,7 @@ impl Db {
         pinned_by: &str,
         pinned_at: u64,
     ) -> SqlResult<()> {
+        let msgid = &self.root_of(msgid);
         self.conn.execute(
             "INSERT OR IGNORE INTO pins (channel, msgid, pinned_by, pinned_at)
              VALUES (?1, ?2, ?3, ?4)",
@@ -1564,6 +1888,7 @@ impl Db {
 
     /// Remove a pin.
     pub fn remove_pin(&self, channel: &str, msgid: &str) -> SqlResult<usize> {
+        let msgid = &self.root_of(msgid);
         let changed = self.conn.execute(
             "DELETE FROM pins WHERE channel = ?1 AND msgid = ?2",
             params![channel, msgid],
@@ -1617,40 +1942,6 @@ impl Db {
             Ok((channel, ts as u64))
         })?;
         rows.collect()
-    }
-
-    /// Edit a message (update text by msgid).
-    pub fn edit_message(
-        &self,
-        msgid: &str,
-        _sender: &str,
-        new_text: &str,
-        new_msgid: Option<&str>,
-    ) -> SqlResult<()> {
-        let stored_text = if let Some(ref key) = self.encryption_key {
-            encrypt_at_rest(key, new_text)
-        } else {
-            new_text.to_string()
-        };
-        if let Some(new_id) = new_msgid {
-            self.conn.execute(
-                "UPDATE messages SET text = ?1, replaces_msgid = ?2 WHERE msgid = ?3",
-                params![stored_text, new_id, msgid],
-            )?;
-        } else {
-            self.conn.execute(
-                "UPDATE messages SET text = ?1 WHERE msgid = ?2",
-                params![stored_text, msgid],
-            )?;
-        }
-        if self.fts_enabled() {
-            self.conn.execute(
-                "INSERT OR REPLACE INTO messages_fts (rowid, text)
-                 SELECT id, ?1 FROM messages WHERE msgid = ?2",
-                params![new_text, msgid],
-            )?;
-        }
-        Ok(())
     }
 
     // ── Pre-key bundles (E2EE) ────────────────────────────────────────
@@ -2020,6 +2311,7 @@ fn map_message_row(row: &rusqlite::Row) -> SqlResult<MessageRow> {
         .unwrap_or(None)
         .map(|v| v as u64);
     let sender_did: Option<String> = row.get(9).unwrap_or(None);
+    let root_msgid: Option<String> = row.get(10).unwrap_or(None);
     Ok(MessageRow {
         id: row.get(0)?,
         channel: row.get(1)?,
@@ -2029,6 +2321,7 @@ fn map_message_row(row: &rusqlite::Row) -> SqlResult<MessageRow> {
         tags,
         msgid,
         replaces_msgid,
+        root_msgid,
         deleted_at,
         sender_did,
     })
@@ -2365,6 +2658,22 @@ mod tests {
         );
     }
 
+    /// Store an edit of `replaces` as the client sends one: a new row with its
+    /// own msgid, pointing back at the message it revises.
+    fn edit(db: &Db, channel: &str, text: &str, ts: u64, msgid: &str, replaces: &str) {
+        db.insert_edit(
+            channel,
+            "alice!a@host",
+            text,
+            ts,
+            &HashMap::new(),
+            msgid,
+            replaces,
+            Some("did:plc:alice"),
+        )
+        .unwrap();
+    }
+
     /// Deleting a message must remove every revision of it.
     ///
     /// An edit is a separate row carrying `replaces_msgid`, and clients keep the
@@ -2579,6 +2888,262 @@ mod tests {
         );
     }
 
+    // ── Message identity: one root id per logical message ──────────────
+
+    /// Simulate a database written before `root_msgid` existed: clear the
+    /// stamps so the next backfill has to derive them from the back-pointers.
+    fn strip_root_ids(db: &Db) {
+        db.conn
+            .execute("UPDATE messages SET root_msgid = NULL", [])
+            .unwrap();
+    }
+
+    fn reaction_rows(db: &Db, msgid: &str) -> Vec<(String, String, u64)> {
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT reactor_nick, emoji, timestamp FROM reactions
+                 WHERE target_msgid = ?1 ORDER BY timestamp",
+            )
+            .unwrap();
+        stmt.query_map(params![msgid], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u64))
+        })
+        .unwrap()
+        .collect::<SqlResult<Vec<_>>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn an_edit_inherits_the_original_identity() {
+        let db = Db::open_memory().unwrap();
+        msg(&db, "#c", "v1", 100, "id-1");
+        edit(&db, "#c", "v2", 110, "id-2", "id-1");
+        edit(&db, "#c", "v3", 120, "id-3", "id-2");
+
+        // Every revision resolves to the id the client has held since v1 —
+        // including one named by the id of an intermediate revision.
+        assert_eq!(db.root_of("id-1"), "id-1");
+        assert_eq!(db.root_of("id-2"), "id-1");
+        assert_eq!(db.root_of("id-3"), "id-1");
+        // An id with no row is its own root (unpersisted guest-DM messages).
+        assert_eq!(db.root_of("id-nowhere"), "id-nowhere");
+    }
+
+    #[test]
+    fn backfill_roots_a_three_deep_chain() {
+        let db = Db::open_memory().unwrap();
+        msg(&db, "#c", "v1", 100, "id-1");
+        edit(&db, "#c", "v2", 110, "id-2", "id-1");
+        edit(&db, "#c", "v3", 120, "id-3", "id-2");
+        msg(&db, "#c", "unrelated", 130, "id-other");
+        strip_root_ids(&db);
+
+        Db::backfill_root_msgids(&db.conn).unwrap();
+
+        assert_eq!(db.root_of("id-3"), "id-1");
+        assert_eq!(db.root_of("id-2"), "id-1");
+        assert_eq!(db.root_of("id-other"), "id-other");
+        // Re-running must not disturb what the first pass settled.
+        Db::backfill_root_msgids(&db.conn).unwrap();
+        assert_eq!(db.root_of("id-3"), "id-1");
+    }
+
+    /// Two revisions of one message could each collect the same person's
+    /// reaction. Re-filing both under the root collides on
+    /// `UNIQUE(target_msgid, reactor_nick, emoji)`; the earliest survives,
+    /// whichever revision it was filed against.
+    #[test]
+    fn backfill_dedups_reactions_across_revisions() {
+        let db = Db::open_memory().unwrap();
+        msg(&db, "#c", "v1", 100, "id-1");
+        edit(&db, "#c", "v2", 110, "id-2", "id-1");
+        msg(&db, "#c", "v1", 100, "id-a");
+        edit(&db, "#c", "v2", 110, "id-b", "id-a");
+        strip_root_ids(&db);
+
+        // Reacted before the edit and again after it — the double-file the
+        // root id exists to prevent.
+        for (target, ts) in [("id-1", 105u64), ("id-2", 115)] {
+            db.conn
+                .execute(
+                    "INSERT INTO reactions (target_msgid, channel, reactor_nick, reactor_did, emoji, timestamp)
+                     VALUES (?1, '#c', 'bob', NULL, '🔥', ?2)",
+                    params![target, ts as i64],
+                )
+                .unwrap();
+        }
+        // Same, with the revision carrying the *earlier* of the two.
+        for (target, ts) in [("id-a", 205u64), ("id-b", 105)] {
+            db.conn
+                .execute(
+                    "INSERT INTO reactions (target_msgid, channel, reactor_nick, reactor_did, emoji, timestamp)
+                     VALUES (?1, '#c', 'bob', NULL, '👍', ?2)",
+                    params![target, ts as i64],
+                )
+                .unwrap();
+        }
+
+        Db::backfill_root_msgids(&db.conn).unwrap();
+
+        assert_eq!(
+            reaction_rows(&db, "id-1"),
+            vec![("bob".to_string(), "🔥".to_string(), 105)],
+            "one person reacting once must not read as two"
+        );
+        assert!(reaction_rows(&db, "id-2").is_empty());
+        assert_eq!(
+            reaction_rows(&db, "id-a"),
+            vec![("bob".to_string(), "👍".to_string(), 105)],
+            "the earliest reaction survives even when it named the revision"
+        );
+    }
+
+    #[test]
+    fn backfill_dedups_pins_across_revisions() {
+        let db = Db::open_memory().unwrap();
+        msg(&db, "#c", "v1", 100, "id-1");
+        edit(&db, "#c", "v2", 110, "id-2", "id-1");
+        strip_root_ids(&db);
+        // Pinned before the edit, and again after it under the revision's id.
+        db.conn
+            .execute(
+                "INSERT INTO pins (channel, msgid, pinned_by, pinned_at) VALUES
+                 ('#c', 'id-1', 'alice', 101), ('#c', 'id-2', 'alice', 111)",
+                [],
+            )
+            .unwrap();
+
+        Db::backfill_root_msgids(&db.conn).unwrap();
+
+        let pins = db.get_pins("#c").unwrap();
+        assert_eq!(pins.len(), 1, "one message, one pin");
+        assert_eq!(pins[0].msgid, "id-1");
+        assert_eq!(pins[0].pinned_at, 101, "keeps when it was first pinned");
+    }
+
+    /// At-rest encryption covers message text only — the ids the backfill walks
+    /// are stored plaintext — so an encrypted database upgrades identically.
+    #[test]
+    fn backfill_runs_on_an_encrypted_database() {
+        let db = Db::open_encrypted_memory([3u8; 32]).unwrap();
+        msg(&db, "#c", "v1", 100, "enc-1");
+        edit(&db, "#c", "v2", 110, "enc-2", "enc-1");
+        db.conn
+            .execute(
+                "INSERT INTO reactions (target_msgid, channel, reactor_nick, reactor_did, emoji, timestamp)
+                 VALUES ('enc-2', '#c', 'bob', NULL, '🔥', 115)",
+                [],
+            )
+            .unwrap();
+        strip_root_ids(&db);
+
+        Db::backfill_root_msgids(&db.conn).unwrap();
+
+        assert_eq!(db.root_of("enc-2"), "enc-1");
+        assert_eq!(reaction_rows(&db, "enc-1").len(), 1);
+        assert_eq!(db.current_revision("enc-1").unwrap().unwrap().text, "v2");
+    }
+
+    /// Reacting to an edited message must land on the message, whichever
+    /// revision the reactor's client named — and un-reacting must find it
+    /// again from the other end.
+    #[test]
+    fn reactions_file_and_clear_under_the_root() {
+        let db = Db::open_memory().unwrap();
+        msg(&db, "#c", "v1", 100, "id-1");
+        edit(&db, "#c", "v2", 110, "id-2", "id-1");
+
+        db.store_reaction("id-2", "#c", "bob", Some("did:plc:bob"), "🔥", 111)
+            .unwrap();
+        assert_eq!(reaction_rows(&db, "id-1").len(), 1, "filed under the root");
+
+        // A second client of the same person naming the other id must not
+        // double the tally.
+        db.store_reaction("id-1", "#c", "bob", Some("did:plc:bob"), "🔥", 112)
+            .unwrap();
+        assert_eq!(reaction_rows(&db, "id-1").len(), 1, "one person, one row");
+
+        assert_eq!(
+            db.remove_reaction("id-1", "bob", Some("did:plc:bob"), "🔥")
+                .unwrap(),
+            1,
+            "un-reacting by the original id clears a reaction made on the edit"
+        );
+        assert!(reaction_rows(&db, "id-1").is_empty());
+    }
+
+    #[test]
+    fn pins_file_and_clear_under_the_root() {
+        let db = Db::open_memory().unwrap();
+        msg(&db, "#c", "v1", 100, "id-1");
+        edit(&db, "#c", "v2", 110, "id-2", "id-1");
+
+        db.store_pin("#c", "id-1", "alice", 101).unwrap();
+        db.store_pin("#c", "id-2", "alice", 111).unwrap();
+        let pins = db.get_pins("#c").unwrap();
+        assert_eq!(pins.len(), 1, "pinning before and after an edit is one pin");
+        assert_eq!(pins[0].msgid, "id-1");
+
+        // Unpinned by the revision's id — the same message, so it must clear.
+        assert_eq!(db.remove_pin("#c", "id-2").unwrap(), 1);
+        assert!(db.get_pins("#c").unwrap().is_empty());
+    }
+
+    /// What a pin quotes is the message, so it must follow the edits.
+    #[test]
+    fn current_revision_returns_the_newest_text() {
+        let db = Db::open_memory().unwrap();
+        msg(&db, "#c", "v1", 100, "id-1");
+        edit(&db, "#c", "v2", 110, "id-2", "id-1");
+        edit(&db, "#c", "v3", 120, "id-3", "id-2");
+
+        for named in ["id-1", "id-2", "id-3"] {
+            assert_eq!(
+                db.current_revision(named).unwrap().unwrap().text,
+                "v3",
+                "asked by {named}"
+            );
+        }
+        assert!(db.current_revision("id-nowhere").unwrap().is_none());
+    }
+
+    /// A DM lives under a canonical `dm:` key rather than a channel name;
+    /// resolution is by message lookup, so it must work there identically.
+    #[test]
+    fn root_resolution_works_in_a_dm_thread() {
+        let db = Db::open_memory().unwrap();
+        let dm = "dm:did:plc:alice,did:plc:bob";
+        msg(&db, dm, "v1", 100, "dm-1");
+        edit(&db, dm, "v2", 110, "dm-2", "dm-1");
+
+        db.store_reaction("dm-2", dm, "bob", Some("did:plc:bob"), "🔥", 111)
+            .unwrap();
+        assert_eq!(reaction_rows(&db, "dm-1").len(), 1);
+        assert_eq!(
+            db.remove_reaction("dm-1", "bob", Some("did:plc:bob"), "🔥")
+                .unwrap(),
+            1
+        );
+    }
+
+    /// An id nobody has a row for — an unpersisted guest DM — is its own root
+    /// and must pass through every path untouched.
+    #[test]
+    fn unknown_ids_pass_through_unchanged() {
+        let db = Db::open_memory().unwrap();
+        db.store_reaction("ghost", "#c", "bob", None, "🔥", 100)
+            .unwrap();
+        assert_eq!(reaction_rows(&db, "ghost").len(), 1);
+        assert_eq!(db.remove_reaction("ghost", "bob", None, "🔥").unwrap(), 1);
+
+        db.store_pin("#c", "ghost", "alice", 100).unwrap();
+        assert_eq!(db.get_pins("#c").unwrap()[0].msgid, "ghost");
+        assert_eq!(db.remove_pin("#c", "ghost").unwrap(), 1);
+
+        assert_eq!(db.soft_delete_message("#c", "ghost").unwrap(), 0);
+    }
+
     #[test]
     fn recent_nick_for_did_recovers_bare_nick_from_history() {
         let db = Db::open_memory().unwrap();
@@ -2771,8 +3336,7 @@ mod tests {
     fn search_reflects_edits() {
         let db = Db::open_memory().unwrap();
         msg(&db, "#dev", "original wording", 100, "m1");
-        db.edit_message("m1", "alice!a@host", "revised phrasing", Some("m2"))
-            .unwrap();
+        edit(&db, "#dev", "revised phrasing", 200, "m2", "m1");
 
         assert!(
             db.search_messages("#dev", "original", 50, None)
@@ -2781,6 +3345,139 @@ mod tests {
         );
         let hits = db.search_messages("#dev", "revised", 50, None).unwrap();
         assert_eq!(hits.len(), 1);
+        // The row comes back as itself; the root rides alongside for the
+        // handlers to address the hit by.
+        assert_eq!(hits[0].msgid.as_deref(), Some("m2"));
+        assert_eq!(hits[0].root_msgid.as_deref(), Some("m1"));
+    }
+
+    /// Encrypted databases search by decrypt-and-scan rather than FTS; a
+    /// superseded revision must not surface there either.
+    #[test]
+    fn search_reflects_edits_on_encrypted_database() {
+        let db = Db::open_encrypted_memory([9u8; 32]).unwrap();
+        msg(&db, "#dev", "original wording", 100, "m1");
+        edit(&db, "#dev", "revised phrasing", 200, "m2", "m1");
+
+        assert!(
+            db.search_messages("#dev", "original", 50, None)
+                .unwrap()
+                .is_empty()
+        );
+        let hits = db.search_messages("#dev", "revised", 50, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].msgid.as_deref(), Some("m2"));
+        assert_eq!(hits[0].root_msgid.as_deref(), Some("m1"));
+    }
+
+    /// A revision indexed before the upgrade is still in the FTS table —
+    /// nothing rewrites existing index rows. Searching a word both revisions
+    /// share must not return the message twice, since both hits would carry
+    /// the same root id: one message, two results, which is the duplicate
+    /// identity the root keying exists to prevent.
+    #[test]
+    fn search_returns_one_hit_when_an_old_revision_is_still_indexed() {
+        let db = Db::open_memory().unwrap();
+        msg(&db, "#dev", "shared word original", 100, "m1");
+        edit(&db, "#dev", "shared word revised", 200, "m2", "m1");
+
+        // Undo the edit-time index prune to stand in for a row indexed before
+        // the upgrade, then confirm the stale revision really is searchable.
+        let old_rowid: i64 = db
+            .conn
+            .query_row(
+                "SELECT id FROM messages WHERE msgid = 'm1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT OR REPLACE INTO messages_fts (rowid, text) VALUES (?1, 'shared word original')",
+                params![old_rowid],
+            )
+            .unwrap();
+        let indexed: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE rowid = ?1",
+                params![old_rowid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1, "precondition: the old revision is indexed");
+
+        let hits = db.search_messages("#dev", "shared", 50, None).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "one message, one hit: {:?}",
+            hits.iter().map(|h| (&h.text, &h.msgid)).collect::<Vec<_>>()
+        );
+        assert_eq!(hits[0].text, "shared word revised");
+        assert_eq!(hits[0].msgid.as_deref(), Some("m2"));
+        assert_eq!(hits[0].root_msgid.as_deref(), Some("m1"));
+    }
+
+    /// The data migration runs once and stamps the schema, instead of
+    /// re-scanning `reactions` and `pins` on every start to conclude there is
+    /// nothing to move.
+    #[test]
+    fn the_root_msgid_migration_runs_once_and_stamps_the_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("freeq.db");
+        {
+            let db = Db::open(&path).unwrap();
+            msg(&db, "#c", "v1", 100, "id-1");
+            edit(&db, "#c", "v2", 110, "id-2", "id-1");
+            assert_eq!(
+                db.conn
+                    .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                2,
+                "first open stamps the schema"
+            );
+        }
+
+        // Reopening finds the stamp and skips the backfill; the identities it
+        // established are still the ones on file.
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(db.root_of("id-2"), "id-1");
+        assert_eq!(db.current_revision("id-1").unwrap().unwrap().text, "v2");
+    }
+
+    /// A database written before the stamp existed still gets migrated: the
+    /// gate is a floor, not a marker that only new databases carry.
+    #[test]
+    fn an_unstamped_database_is_migrated_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("freeq.db");
+        {
+            let db = Db::open(&path).unwrap();
+            msg(&db, "#c", "v1", 100, "id-1");
+            edit(&db, "#c", "v2", 110, "id-2", "id-1");
+            // Roll back to what an older build left behind: roots unstamped,
+            // schema version never set.
+            db.conn
+                .execute("UPDATE messages SET root_msgid = NULL", [])
+                .unwrap();
+            db.conn.execute_batch("PRAGMA user_version = 0").unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.root_of("id-2"), "id-1", "the backfill ran on open");
+        assert_eq!(
+            db.conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 
     #[test]

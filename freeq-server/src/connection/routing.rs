@@ -47,6 +47,30 @@ pub(crate) enum RouteResult {
     Unreachable,
 }
 
+/// Who a relayed DM is and what it does — everything beyond the body that has
+/// to survive the hop.
+///
+/// Grouped rather than passed positionally because the relay used to drop all
+/// of it: a DM to a user on another server crossed with no msgid, so the peer
+/// minted its own and the two servers held the same message under two
+/// identities. Nothing that names a message across servers — an edit, a
+/// delete, a reaction — can work while that is true.
+#[derive(Default)]
+pub(crate) struct RelayIdentity<'a> {
+    /// Sender's DID (the `account` tag), origin-stamped.
+    pub account: Option<&'a str>,
+    /// The message's own id. `None` makes the receiver mint one.
+    pub msgid: Option<&'a str>,
+    /// `+freeq.at/sig`. Origin attestation only — the peer cannot verify it
+    /// (the signed timestamp doesn't cross the hop), so it travels for parity
+    /// with channel messages, not as proof.
+    pub sig: Option<&'a str>,
+    /// Set when this message is an edit: the root id of what it revises.
+    pub replaces_msgid: Option<&'a str>,
+    /// Coordination tags, already filtered by `relay_coordination_tags`.
+    pub tags: std::collections::HashMap<String, String>,
+}
+
 /// Route a PRIVMSG/NOTICE to a nick. Checks local first, then relays
 /// to all S2S peers if federation is active. Never gates on
 /// `remote_members` — that's a display cache, not a routing table.
@@ -60,11 +84,11 @@ pub(crate) enum RouteResult {
 pub(crate) fn relay_to_nick(
     state: &Arc<SharedState>,
     from: &str,
-    account: Option<&str>,
     target: &str,
     text: &str,
     event_id: String,
     multiline_lines: Option<&[crate::connection::draft_multiline::BatchLine]>,
+    identity: RelayIdentity<'_>,
 ) -> RouteResult {
     // 1. Local delivery. A `did:` target resolves through `did_sessions`
     //    (any one bound session — the caller's fan-out reaches the rest via
@@ -90,17 +114,21 @@ pub(crate) fn relay_to_nick(
         let manager = state.s2s_manager.lock().clone();
         if let Some(m) = manager {
             let (s2s_text, s2s_tags) =
-                crate::s2s::encode_privmsg_text_for_s2s(text, std::collections::HashMap::new());
+                crate::s2s::encode_privmsg_text_for_s2s(text, identity.tags);
             m.broadcast(crate::s2s::S2sMessage::Privmsg {
                 event_id,
                 from: from.to_string(),
                 target: target.to_string(),
                 text: s2s_text,
                 origin,
-                msgid: None, // PM relay — no msgid (recipient server assigns)
-                sig: None,   // PM relay — sig not available at routing layer
-                account: account.map(|a| a.to_string()),
+                // The origin's id, so both servers hold this message under one
+                // identity. Without it the receiver mints its own and every
+                // later edit, delete or reaction names something it can't find.
+                msgid: identity.msgid.map(|m| m.to_string()),
+                sig: identity.sig.map(|s| s.to_string()),
+                account: identity.account.map(|a| a.to_string()),
                 recipient_did: recipient_did_for_target(state, target),
+                replaces_msgid: identity.replaces_msgid.map(|r| r.to_string()),
                 tags: s2s_tags,
                 multiline_lines: multiline_lines.map(|lines| {
                     lines
@@ -329,11 +357,14 @@ mod tests {
         match relay_to_nick(
             &state,
             "alice",
-            Some("did:plc:alice"),
             "did:plc:bob",
             "hi",
             "evt-1".to_string(),
             None,
+            RelayIdentity {
+                account: Some("did:plc:alice"),
+                ..Default::default()
+            },
         ) {
             RouteResult::Local(sid) => assert_eq!(sid, "sess-b1"),
             _ => panic!("expected Local for a DID with a local session"),

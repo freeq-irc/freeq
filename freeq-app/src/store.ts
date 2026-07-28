@@ -770,9 +770,22 @@ export const useStore = create<Store>((set, get) => ({
           (e) => e.id === anchor || e.editOf === anchor,
         );
         if (idx >= 0) {
-          ch.messages = ch.messages.map((e, i) =>
-            i === idx ? { ...e, text: m.text, id: m.id, editOf: e.editOf ?? anchor } : e,
-          );
+          ch.messages = ch.messages.map((e, i) => {
+            if (i !== idx) return e;
+            // Keep the held id: the message is the same message. Reactions
+            // come back attached to whichever revision they were filed
+            // against, so carry them onto the row we keep — otherwise every
+            // reload dropped the reactions on an edited message.
+            const reactions = m.reactions
+              ? new Map([...(e.reactions ?? new Map()), ...m.reactions])
+              : e.reactions;
+            return {
+              ...e,
+              text: m.text,
+              editOf: e.editOf ?? anchor,
+              ...(reactions ? { reactions } : {}),
+            };
+          });
           reconciled = true;
           continue;
         }
@@ -808,7 +821,10 @@ export const useStore = create<Store>((set, get) => ({
     get().addMessage(channel, msg);
   },
 
-  editMessage: (channel, originalMsgId, newText, newMsgId, isStreaming, editorNick, editorAccount) => set((s) => {
+  // `_newMsgId` — the revision's own wire id — is deliberately unused: the
+  // message keeps the id it was born with. Still accepted because the wire
+  // and the SDK event carry it; droppable once no caller passes it.
+  editMessage: (channel, originalMsgId, newText, _newMsgId, isStreaming, editorNick, editorAccount) => set((s) => {
     // Authorship gate: only the original sender may edit. The server
     // enforces this when the thread is persisted; for unpersisted (guest)
     // threads it relays without a check, so the client is the authority.
@@ -826,13 +842,14 @@ export const useStore = create<Store>((set, get) => ({
     const channels = new Map(s.channels);
     const ch = channels.get(channel.toLowerCase());
     if (ch) {
-      // Match on id OR editOf — handles chained edits (e.g., streaming)
-      // where the first edit changes id but subsequent edits still reference the original
+      // An edit changes the text, never the key. The message keeps the id it
+      // was born with — which is the id the server files reactions, pins and
+      // deletes under, and the id a reload replays it under.
+      // `editOf` records that it was edited (the "(edited)" marker) and, for
+      // the transition, still matches events that name a superseded id.
       ch.messages = ch.messages.map((m) =>
         (m.id === originalMsgId || m.editOf === originalMsgId) && authorOk(m)
-          // editOf keeps the ROOT of the edit chain so chained edits and
-          // replayed collapsed rows keep matching each other.
-          ? { ...m, text: displayText, id: newMsgId || m.id, editOf: m.editOf ?? originalMsgId, isStreaming: !!isStreaming }
+          ? { ...m, text: displayText, editOf: m.editOf ?? originalMsgId, isStreaming: !!isStreaming }
           : m
       );
       channels.set(channel.toLowerCase(), { ...ch });
@@ -844,7 +861,7 @@ export const useStore = create<Store>((set, get) => ({
       if (batch.target.toLowerCase() !== channel.toLowerCase()) continue;
       batch.messages = batch.messages.map((m) =>
         (m.id === originalMsgId || m.editOf === originalMsgId) && authorOk(m)
-          ? { ...m, text: displayText, id: newMsgId || m.id, editOf: m.editOf ?? originalMsgId, isStreaming: !!isStreaming }
+          ? { ...m, text: displayText, editOf: m.editOf ?? originalMsgId, isStreaming: !!isStreaming }
           : m
       );
       batches.set(id, batch);
@@ -865,12 +882,10 @@ export const useStore = create<Store>((set, get) => ({
       if (deleterNick) return deleterNick.toLowerCase() === m.from.toLowerCase();
       return true;
     };
-    // Match on id OR editOf, exactly as editMessage does. An edit re-keys the
-    // message to the edit's msgid and records the chain root in editOf, while a
-    // delete always names the ORIGINAL msgid — that's the identity clients hold
-    // and what the server relays in +draft/delete. Matching only on id meant a
-    // delete of an edited message found nothing and left it on screen after the
-    // server had removed it.
+    // Match on id OR editOf. Ids are stable now, so `id` alone would do for
+    // anything this build wrote — the `editOf` arm is transition cover for
+    // rows a previous build re-keyed to an edit's msgid, which are still in
+    // IndexedDB and still on screen. Removable once those can't be around.
     ch.messages = ch.messages.map((m) =>
       (m.id === msgId || m.editOf === msgId) && authorOk(m)
         ? { ...m, deleted: true, text: '' }

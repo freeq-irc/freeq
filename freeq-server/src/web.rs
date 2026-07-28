@@ -1279,6 +1279,7 @@ async fn api_verify_message(
             timestamp: row.timestamp,
             tags: row.tags,
             msgid: row.msgid,
+            edited: row.replaces_msgid.is_some(),
         });
         found_channel = row.channel;
     }
@@ -1923,7 +1924,9 @@ async fn api_search(
                 sender: r.sender,
                 text: r.text,
                 timestamp: r.timestamp,
-                msgid: r.msgid,
+                // A hit is addressed by its root — the id clients hold the
+                // message under — not the matching revision's own id.
+                msgid: r.root_msgid.or(r.msgid),
                 tags: r.tags,
             })
             .collect(),
@@ -1980,8 +1983,10 @@ async fn api_channel_pins(
             })
         }
         .or_else(|| {
+            // The pin names the message, not a revision of it: quote the text
+            // the author last wrote, not whichever row carries the pinned id.
             state
-                .with_db(|db| db.find_message_by_msgid(&p.msgid))
+                .with_db(|db| db.current_revision(&p.msgid))
                 .flatten()
                 .map(|row| (row.sender, row.text, row.timestamp))
         })
@@ -4746,6 +4751,7 @@ mod export_tests {
             tags: HashMap::new(),
             msgid: Some(msgid.into()),
             replaces_msgid: None,
+            root_msgid: Some(msgid.into()),
             deleted_at: None,
             sender_did: None,
         }

@@ -63,6 +63,7 @@ toml = "0.8"
 # moq-token's backend choice — enabling BOTH jsonwebtoken backends makes
 # the crate panic at runtime until a provider is installed manually.
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+rusqlite_migration = "2.4"
 
 [features]
 default = []

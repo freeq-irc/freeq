@@ -22,6 +22,19 @@ pub fn cloaked_host_for_did(did: Option<&str>) -> String {
 }
 use super::Connection;
 
+/// The id a message keeps for life: its original msgid, unchanged by edits.
+///
+/// Reactions, pins and deletes may name any revision — clients differ, and a
+/// federated peer may relay whichever one it holds. Resolving to the root here
+/// means the DB, the in-memory history and every receiver of the relayed event
+/// agree on one identity per logical message. An id with no row (an unpersisted
+/// guest-DM message) is its own root.
+pub fn root_msgid(state: &Arc<SharedState>, msgid: &str) -> String {
+    state
+        .with_db(|db| Ok(db.root_of(msgid)))
+        .unwrap_or_else(|| msgid.to_string())
+}
+
 /// Resolved target of a nick within a channel's roster.
 ///
 /// This is the canonical way to resolve a nick for any operation that

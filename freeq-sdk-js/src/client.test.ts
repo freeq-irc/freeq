@@ -1436,7 +1436,10 @@ describe('onNickCollision policy', () => {
     expect(batches).toHaveLength(1);
     const msgs = batches[0][1];
     expect(msgs).toHaveLength(1);
-    expect(msgs[0].id).toBe('E1');
+    // The collapsed row keeps the ORIGINAL id. An edit changes the text, not
+    // which message this is — and the id it keeps is the one the server files
+    // reactions, pins and deletes under.
+    expect(msgs[0].id).toBe('M0');
     expect(msgs[0].text).toBe('original - edited');
     const nicks = msgs[0].reactions?.get('🔥');
     expect(nicks && [...nicks].sort()).toEqual(['alice', 'bob']);
