@@ -81,26 +81,30 @@ freeq-site/      Marketing site (freeq.at)
 
 ## Database migrations
 
-The server's SQLite database has two change mechanisms, and which one you
-use depends on what you're changing:
+All durable database changes — schema and data alike — go through the
+migration ladder in `freeq-server/src/migrations/`, tracked in SQLite's
+`PRAGMA user_version` (the integer version slot SQLite reserves for the
+application) via `rusqlite_migration`.
 
-- **Schema shape** (new tables, new columns): add an idempotent
-  `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE` to the statement list in
-  `Db::init()` (`freeq-server/src/db.rs`). These replay on every boot and
-  converge any database to the current shape.
-- **One-time data changes** (backfills, rewrites, anything that moves rows):
-  add an entry to `migration_ladder()` in the same file. The ladder is
-  `rusqlite_migration`, tracked in SQLite's `PRAGMA user_version` — the
-  integer version slot SQLite reserves for the application. Migrations are
-  numbered by list position, run in order, and each commits atomically with
-  its version stamp, so they run exactly once per database and don't need to
-  be idempotent. The ladder is **append-only**: never insert, reorder, or
-  renumber entries — databases in the wild are stamped with the versions
-  they've passed.
+One migration per numbered file: `001_schema_baseline.rs`,
+`002_root_msgid_backfill.rs`, … Each exposes `migration() -> M` describing
+itself completely — the up step (plain SQL via a sibling `.sql` file, or a
+Rust hook when the migration needs code) and the down step where one
+meaningfully exists. A data migration with no inverse defines no down and
+documents itself as irreversible; migrating below it fails loudly. To add
+migration N: create `00N_name.rs`, declare it in `migrations/mod.rs`, and
+append one line to the ladder list there.
 
-Slot 1 of the ladder is an empty placeholder deliberately reserved for
-moving the `init()` schema statements into the ladder (see the comment on
-`migration_ladder()`). Don't put anything else there.
+Migrations run in list order at server boot, and each commits atomically
+with its version stamp — exactly once per database, no idempotency
+required. The ladder is **append-only**: never insert, reorder, renumber,
+or edit a shipped migration — databases in the wild are stamped with the
+versions they've passed.
+
+`Db::init()` itself keeps only per-connection pragmas and two deliberate
+exceptions documented at their call sites (a legacy shape-guarded
+signing-keys migration that manages its own transaction, and the FTS
+index, whose existence depends on the at-rest encryption key).
 
 ## License
 

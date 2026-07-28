@@ -6,41 +6,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, Result as SqlResult, Transaction, params};
-use rusqlite_migration::{HookResult, M, Migrations};
+use rusqlite::{Connection, OptionalExtension, Result as SqlResult, params};
 
 use crate::server::{BanEntry, ChannelState, TopicInfo};
 
 /// Prefix for encrypted-at-rest message content.
 const EAR_PREFIX: &str = "EAR1:";
-
-/// The one-time migration ladder, tracked in SQLite's `PRAGMA user_version`
-/// (its application-owned version slot). Append-only: a new migration is a new
-/// entry at the end of this list. `rusqlite_migration` runs each pending entry
-/// and its version stamp inside one transaction — a crash leaves the database
-/// exactly at the previous rung, so migrations need not be idempotent — and
-/// refuses to open a database stamped newer than this list knows.
-///
-/// Slot 1 is an empty placeholder, deliberately reserved for the schema
-/// baseline: the idempotent CREATE/ALTER statements `init()` replays on every
-/// boot are meant to move here verbatim in a follow-up, making this ladder the
-/// single schema authority. Reserving the slot now keeps that refactor a
-/// content swap instead of a renumbering, which stamped databases in the wild
-/// could never tolerate. (`migrate_signing_keys_to_kid_history` predates the
-/// ladder and keeps its own shape-based guard.)
-fn migration_ladder() -> Migrations<'static> {
-    Migrations::new(vec![
-        // 1: reserved for the schema baseline — see above.
-        M::up(""),
-        // 2: a message's identity is its original msgid for life — stamp
-        //    `root_msgid` on rows that predate the column and re-file
-        //    reactions and pins under the root they annotate.
-        M::up_with_hook("", |tx: &Transaction| -> HookResult {
-            Db::backfill_root_msgids(tx)?;
-            Ok(())
-        }),
-    ])
-}
 
 /// Encrypt text with AES-256-GCM for storage at rest.
 /// Panics on encryption failure — this indicates a broken key or AES implementation
@@ -333,160 +304,6 @@ impl Db {
         Ok(())
     }
 
-    /// Walk `replaces_msgid` back-pointers to the oldest revision. Upgrade-only:
-    /// rows written since `root_msgid` exists are stamped at insert time, so
-    /// this runs solely over rows that predate the column. Bounded — a
-    /// malformed back-pointer cycle must not spin.
-    fn migration_root_of(conn: &Connection, channel: &str, msgid: &str) -> SqlResult<String> {
-        let mut root = msgid.to_string();
-        for _ in 0..64 {
-            let mut stmt = conn
-                .prepare("SELECT replaces_msgid FROM messages WHERE channel = ?1 AND msgid = ?2")?;
-            let parent: Option<String> = stmt
-                .query_map(params![channel, &root], |r| r.get::<_, Option<String>>(0))?
-                .next()
-                .transpose()?
-                .flatten();
-            match parent {
-                Some(p) if !p.is_empty() && p != root => root = p,
-                _ => break,
-            }
-        }
-        Ok(root)
-    }
-
-    /// One-time upgrade: stamp `root_msgid` on rows that predate the column,
-    /// then re-file reactions and pins under the root they annotate.
-    ///
-    /// A message's identity is its original msgid for life; an edit changes
-    /// content, not identity. Before `root_msgid` existed, an operation could
-    /// name either end of an edit chain, so the same logical message could
-    /// collect reactions and pins under two different ids. Re-filing them under
-    /// the root is what makes those tallies agree afterwards.
-    ///
-    /// Idempotent (`WHERE root_msgid IS NULL`, and the re-file is a no-op once
-    /// every id is already a root), so re-running is safe. A fresh database is
-    /// born with the column and stamps every row at insert, so the guard
-    /// matches zero rows and none of this executes.
-    ///
-    /// An id with no message row — an unpersisted guest-DM message — is its own
-    /// root and is left untouched everywhere.
-    fn backfill_root_msgids(conn: &Connection) -> SqlResult<()> {
-        // Originals: identity is the msgid itself.
-        conn.execute(
-            "UPDATE messages SET root_msgid = msgid
-             WHERE root_msgid IS NULL AND msgid IS NOT NULL
-               AND (replaces_msgid IS NULL OR replaces_msgid = '')",
-            [],
-        )?;
-
-        // Edits: walk the back-pointers.
-        let pending: Vec<(String, String)> = {
-            let mut stmt = conn.prepare(
-                "SELECT channel, msgid FROM messages
-                 WHERE root_msgid IS NULL AND msgid IS NOT NULL",
-            )?;
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<SqlResult<Vec<_>>>()?
-        };
-        for (channel, msgid) in pending {
-            let root = Self::migration_root_of(conn, &channel, &msgid)?;
-            conn.execute(
-                "UPDATE messages SET root_msgid = ?1 WHERE channel = ?2 AND msgid = ?3",
-                params![root, channel, msgid],
-            )?;
-        }
-
-        Self::backfill_reaction_roots(conn)?;
-        Self::backfill_pin_roots(conn)?;
-        Ok(())
-    }
-
-    /// Re-file reactions under the root of the message they annotate.
-    /// `reactions` is `UNIQUE(target_msgid, reactor_nick, emoji)`, so one person
-    /// who reacted against two revisions of the same message has two rows that
-    /// would collide on rewrite — the earlier row wins and the later is dropped,
-    /// which is the same tally the two rows were always meant to represent.
-    fn backfill_reaction_roots(conn: &Connection) -> SqlResult<()> {
-        let rewrites: Vec<(String, String)> = {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT r.target_msgid, m.root_msgid
-                 FROM reactions r JOIN messages m ON m.msgid = r.target_msgid
-                 WHERE m.root_msgid IS NOT NULL AND m.root_msgid <> r.target_msgid",
-            )?;
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<SqlResult<Vec<_>>>()?
-        };
-        for (old_id, root) in rewrites {
-            // Of a colliding pair, drop the later row. The `<=` / `<` split
-            // means a tie drops the revision row, never both.
-            conn.execute(
-                "DELETE FROM reactions WHERE target_msgid = ?1 AND EXISTS (
-                     SELECT 1 FROM reactions keep
-                     WHERE keep.target_msgid = ?2
-                       AND keep.reactor_nick = reactions.reactor_nick
-                       AND keep.emoji = reactions.emoji
-                       AND keep.timestamp <= reactions.timestamp
-                 )",
-                params![old_id, root],
-            )?;
-            conn.execute(
-                "DELETE FROM reactions WHERE target_msgid = ?2 AND EXISTS (
-                     SELECT 1 FROM reactions keep
-                     WHERE keep.target_msgid = ?1
-                       AND keep.reactor_nick = reactions.reactor_nick
-                       AND keep.emoji = reactions.emoji
-                       AND keep.timestamp < reactions.timestamp
-                 )",
-                params![old_id, root],
-            )?;
-            // OR IGNORE + sweep: a surviving collision must not abort startup.
-            conn.execute(
-                "UPDATE OR IGNORE reactions SET target_msgid = ?1 WHERE target_msgid = ?2",
-                params![root, old_id],
-            )?;
-            conn.execute(
-                "DELETE FROM reactions WHERE target_msgid = ?1",
-                params![old_id],
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Re-file pins under the root of the message they pin. `pins` is
-    /// `UNIQUE(channel, msgid)`; a message pinned under two revisions keeps the
-    /// earliest `pinned_at` — the moment it was actually first pinned.
-    fn backfill_pin_roots(conn: &Connection) -> SqlResult<()> {
-        let rewrites: Vec<(String, String, String)> = {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT p.channel, p.msgid, m.root_msgid
-                 FROM pins p JOIN messages m ON m.msgid = p.msgid
-                 WHERE m.root_msgid IS NOT NULL AND m.root_msgid <> p.msgid",
-            )?;
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .collect::<SqlResult<Vec<_>>>()?
-        };
-        for (channel, old_id, root) in rewrites {
-            conn.execute(
-                "UPDATE pins SET pinned_at = (
-                     SELECT MIN(pinned_at) FROM pins
-                     WHERE channel = ?1 AND msgid IN (?2, ?3)
-                 )
-                 WHERE channel = ?1 AND msgid = ?3",
-                params![channel, old_id, root],
-            )?;
-            conn.execute(
-                "UPDATE OR IGNORE pins SET msgid = ?1 WHERE channel = ?2 AND msgid = ?3",
-                params![root, channel, old_id],
-            )?;
-            conn.execute(
-                "DELETE FROM pins WHERE channel = ?1 AND msgid = ?2",
-                params![channel, old_id],
-            )?;
-        }
-        Ok(())
-    }
-
     /// The root msgid of the logical message `msgid` belongs to — its identity
     /// for life, unchanged by edits. An id with no row (an unpersisted guest-DM
     /// message) is its own root.
@@ -516,373 +333,11 @@ impl Db {
     fn init(&mut self) -> SqlResult<()> {
         self.conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         self.conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-        self.conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS channels (
-                name        TEXT PRIMARY KEY,
-                topic_text  TEXT,
-                topic_set_by TEXT,
-                topic_set_at INTEGER,
-                topic_locked INTEGER NOT NULL DEFAULT 0,
-                invite_only  INTEGER NOT NULL DEFAULT 0,
-                no_ext_msg   INTEGER NOT NULL DEFAULT 0,
-                moderated    INTEGER NOT NULL DEFAULT 0,
-                key          TEXT,
-                founder_did  TEXT,
-                did_ops_json TEXT NOT NULL DEFAULT '[]'
-            );
-
-            CREATE TABLE IF NOT EXISTS bans (
-                id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel  TEXT NOT NULL,
-                mask     TEXT NOT NULL,
-                set_by   TEXT NOT NULL,
-                set_at   INTEGER NOT NULL,
-                UNIQUE(channel, mask)
-            );
-
-            CREATE TABLE IF NOT EXISTS invite_exceptions (
-                id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel  TEXT NOT NULL,
-                mask     TEXT NOT NULL,
-                set_by   TEXT NOT NULL,
-                set_at   INTEGER NOT NULL,
-                UNIQUE(channel, mask)
-            );
-
-            CREATE TABLE IF NOT EXISTS messages (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel   TEXT NOT NULL,
-                sender    TEXT NOT NULL,
-                text      TEXT NOT NULL,
-                timestamp INTEGER NOT NULL,
-                tags_json TEXT NOT NULL DEFAULT '{}'
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_messages_channel_ts
-                ON messages(channel, timestamp DESC);
-
-            CREATE TABLE IF NOT EXISTS identities (
-                did  TEXT PRIMARY KEY,
-                nick TEXT NOT NULL UNIQUE
-            );
-
-            CREATE TABLE IF NOT EXISTS prekey_bundles (
-                did         TEXT PRIMARY KEY,
-                bundle_json TEXT NOT NULL,
-                updated_at  INTEGER NOT NULL
-            );
-
-            -- Sealed group keys for VC-bootstrapped E2E channels (EG1/EGK1).
-            -- Each row is a group secret sealed to ONE member's X25519 key at
-            -- ONE epoch. The server stores/relays these opaque blobs but can
-            -- never open them (see freeq-sdk::e2ee_group). Multiple epochs are
-            -- retained so a member can decrypt channel history across rotations.
-            CREATE TABLE IF NOT EXISTS group_keys (
-                channel     TEXT NOT NULL,
-                member_did  TEXT NOT NULL,
-                epoch       INTEGER NOT NULL,
-                sealed_wire TEXT NOT NULL,      -- EGK1:... opaque sealed blob
-                updated_at  INTEGER NOT NULL,
-                PRIMARY KEY (channel, member_did, epoch)
-            );
-
-            -- Append-only history of client message-signing keys. Keyed by
-            -- (did, kid) so re-registering never overwrites — every key a DID
-            -- has used stays verifiable after a reconnect. kid is
-            -- base64url(sha256(pubkey)[..16]) (freeq_sdk::act::derive_kid_bytes).
-            -- get_signing_key(did) returns the latest; get_signing_key_by_kid
-            -- fetches a specific one. Legacy did-keyed rows are migrated below.
-            CREATE TABLE IF NOT EXISTS signing_keys (
-                did            TEXT NOT NULL,
-                kid            TEXT NOT NULL,
-                pubkey         BLOB NOT NULL,         -- raw 32-byte ed25519 public key
-                registered_at  INTEGER NOT NULL,
-                PRIMARY KEY (did, kid)
-            );
-
-            CREATE TABLE IF NOT EXISTS user_channels (
-                did     TEXT NOT NULL,
-                channel TEXT NOT NULL,
-                PRIMARY KEY (did, channel)
-            );
-
-            -- Cross-device read markers (IRCv3 draft/read-marker). One row per
-            -- (DID, target) — the last-read timestamp a user's clients have
-            -- converged on. The marker only ever moves forward (enforced by the
-            -- MARKREAD handler); `updated_at` records when the server last wrote
-            -- it. Guests (no DID) never land here — their markers are
-            -- session-local and never persisted.
-            CREATE TABLE IF NOT EXISTS read_markers (
-                did        TEXT NOT NULL,
-                target     TEXT NOT NULL,
-                timestamp  TEXT NOT NULL,      -- ISO 8601, as in server-time
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY (did, target)
-            );
-
-            -- Per-DID favorite channels, so a user's favorites roam across
-            -- their devices (synced via the REST /api/v1/favorites endpoint).
-            -- `ord` preserves the user's ordering (Favorites section + ⌃⌘1-9).
-            CREATE TABLE IF NOT EXISTS user_favorites (
-                did        TEXT NOT NULL,
-                channel    TEXT NOT NULL,
-                ord        INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY (did, channel)
-            );
-            ",
-        )?;
-
-        // Migrate existing databases: add columns that may not exist yet.
-        // ALTER TABLE ADD COLUMN is idempotent-safe via error suppression.
-        let migrations = [
-            "ALTER TABLE channels ADD COLUMN no_ext_msg INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE channels ADD COLUMN moderated INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE channels ADD COLUMN founder_did TEXT",
-            "ALTER TABLE channels ADD COLUMN did_ops_json TEXT NOT NULL DEFAULT '[]'",
-            "ALTER TABLE channels ADD COLUMN encrypted_only INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE messages ADD COLUMN msgid TEXT",
-            "ALTER TABLE messages ADD COLUMN replaces_msgid TEXT",
-            "ALTER TABLE messages ADD COLUMN root_msgid TEXT",
-            "ALTER TABLE messages ADD COLUMN deleted_at INTEGER",
-            "ALTER TABLE messages ADD COLUMN sender_did TEXT",
-            "ALTER TABLE identities ADD COLUMN last_auth_at INTEGER",
-        ];
-        for sql in &migrations {
-            // Ignore "duplicate column name" errors — means column already exists
-            let _ = self.conn.execute(sql, []);
-        }
-
-        self.migrate_signing_keys_to_kid_history()?;
-        // Index the DID column added by the migration above. Created here (not
-        // in the initial schema block) because `sender_did` doesn't exist until
-        // the ALTER runs. Backs the DID→last-nick history lookup, whose miss
-        // case (a partner who never posted here) would otherwise full-scan the
-        // whole messages table under the global DB lock.
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_messages_sender_did ON messages(sender_did)",
-            [],
-        )?;
-        // `root_of` runs on every reaction, pin and delete, and the delete
-        // sweep selects a whole revision family by root — both would otherwise
-        // full-scan `messages` under the global DB lock.
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_messages_msgid ON messages(msgid)",
-            [],
-        )?;
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_messages_root_msgid ON messages(root_msgid)",
-            [],
-        )?;
-
-        self.init_fts()?;
-
-        // Phase 2: agent governance tables
-        self.conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS agent_capability_grants (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel TEXT NOT NULL,
-                agent_did TEXT NOT NULL,
-                capability TEXT NOT NULL,
-                scope TEXT,
-                ttl_seconds INTEGER DEFAULT 0,
-                requires_approval INTEGER DEFAULT 0,
-                rate_limit INTEGER DEFAULT 0,
-                granted_by TEXT NOT NULL,
-                granted_at INTEGER NOT NULL,
-                expires_at INTEGER,
-                revoked_at INTEGER,
-                UNIQUE(channel, agent_did, capability, scope)
-            );
-
-            CREATE TABLE IF NOT EXISTS governance_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel TEXT,
-                target_did TEXT NOT NULL,
-                action TEXT NOT NULL,
-                issued_by TEXT NOT NULL,
-                reason TEXT,
-                timestamp INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS pending_approvals (
-                id TEXT PRIMARY KEY,
-                channel TEXT NOT NULL,
-                agent_did TEXT NOT NULL,
-                capability TEXT NOT NULL,
-                resource TEXT,
-                requested_at INTEGER NOT NULL,
-                granted_by TEXT,
-                granted_at INTEGER,
-                denied_by TEXT,
-                denied_at INTEGER,
-                deny_reason TEXT,
-                expires_at INTEGER
-            );
-            ",
-        )?;
-
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS agent_manifests (
-                agent_did TEXT PRIMARY KEY,
-                manifest_json TEXT NOT NULL,
-                manifest_url TEXT,
-                registered_by TEXT NOT NULL,
-                registered_at INTEGER NOT NULL,
-                active INTEGER DEFAULT 1
-            );
-            CREATE TABLE IF NOT EXISTS spawned_agents (
-                child_did TEXT PRIMARY KEY,
-                parent_did TEXT NOT NULL,
-                parent_session TEXT NOT NULL,
-                nick TEXT NOT NULL,
-                channel TEXT NOT NULL,
-                capabilities_json TEXT NOT NULL DEFAULT '[]',
-                ttl_seconds INTEGER,
-                task_ref TEXT,
-                spawned_at INTEGER NOT NULL,
-                despawned_at INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_spawn_parent ON spawned_agents(parent_did);
-            CREATE INDEX IF NOT EXISTS idx_spawn_channel ON spawned_agents(channel);
-            ",
-        )?;
-
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS agent_spend (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel TEXT NOT NULL,
-                agent_did TEXT NOT NULL,
-                amount REAL NOT NULL,
-                unit TEXT NOT NULL,
-                description TEXT,
-                task_ref TEXT,
-                timestamp INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_spend_channel_agent ON agent_spend(channel, agent_did, timestamp);
-            CREATE INDEX IF NOT EXISTS idx_spend_period ON agent_spend(channel, agent_did, unit, timestamp);
-
-            CREATE TABLE IF NOT EXISTS channel_budgets (
-                channel TEXT NOT NULL,
-                agent_did TEXT,
-                budget_json TEXT NOT NULL,
-                set_by TEXT NOT NULL,
-                set_at INTEGER NOT NULL,
-                PRIMARY KEY(channel, agent_did)
-            );
-            ",
-        )?;
-
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS coordination_events (
-                event_id TEXT PRIMARY KEY,
-                event_type TEXT NOT NULL,
-                actor_did TEXT NOT NULL,
-                channel TEXT NOT NULL,
-                ref_id TEXT,
-                payload_json TEXT NOT NULL DEFAULT '{}',
-                signature TEXT,
-                timestamp INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_coord_channel ON coordination_events(channel, timestamp);
-            CREATE INDEX IF NOT EXISTS idx_coord_ref ON coordination_events(ref_id);
-            CREATE INDEX IF NOT EXISTS idx_coord_actor ON coordination_events(actor_did, timestamp);
-            ",
-        )?;
-
-        // Phase 3: reactions + pins tables
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS pins (
-                channel      TEXT NOT NULL,
-                msgid        TEXT NOT NULL,
-                pinned_by    TEXT NOT NULL,
-                pinned_at    INTEGER NOT NULL,
-                UNIQUE(channel, msgid)
-            );
-            CREATE INDEX IF NOT EXISTS idx_pins_channel ON pins(channel, pinned_at DESC);
-            ",
-        )?;
-        // Private media: metadata for blobs stored encrypted-at-rest on local
-        // disk and served via signed capability URLs. The bytes live on disk
-        // (see `media_store`), not in this table — only metadata is recorded.
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS media (
-                id           TEXT PRIMARY KEY,
-                uploader_did TEXT NOT NULL,
-                scope        TEXT NOT NULL,   -- channel name or canonical_dm_key
-                mime         TEXT NOT NULL,
-                size         INTEGER NOT NULL,
-                alt          TEXT,
-                filename     TEXT NOT NULL,
-                created_at   INTEGER NOT NULL,
-                deleted_at   INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_media_scope ON media(scope, created_at DESC);
-            ",
-        )?;
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS reactions (
-                target_msgid TEXT NOT NULL,
-                channel      TEXT NOT NULL,
-                reactor_nick TEXT NOT NULL,
-                reactor_did  TEXT,
-                emoji        TEXT NOT NULL,
-                timestamp    INTEGER NOT NULL,
-                UNIQUE(target_msgid, reactor_nick, emoji)
-            );
-            CREATE INDEX IF NOT EXISTS idx_reactions_msgid ON reactions(target_msgid);
-            CREATE INDEX IF NOT EXISTS idx_reactions_channel ON reactions(channel);
-            ",
-        )?;
-
-        // AV sessions tables
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS av_sessions (
-                id               TEXT PRIMARY KEY,
-                channel          TEXT,
-                created_by       TEXT NOT NULL,
-                created_at       INTEGER NOT NULL,
-                ended_at         INTEGER,
-                ended_by         TEXT,
-                title            TEXT,
-                iroh_ticket      TEXT,
-                backend          TEXT NOT NULL DEFAULT '\"iroh-live\"',
-                recording        BOOLEAN NOT NULL DEFAULT FALSE,
-                max_participants INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_av_sessions_channel ON av_sessions(channel, created_at DESC);
-
-            CREATE TABLE IF NOT EXISTS av_participants (
-                session_id  TEXT NOT NULL REFERENCES av_sessions(id),
-                did         TEXT NOT NULL,
-                nick        TEXT NOT NULL,
-                joined_at   INTEGER NOT NULL,
-                left_at     INTEGER,
-                role        TEXT NOT NULL DEFAULT '\"speaker\"',
-                PRIMARY KEY (session_id, did)
-            );
-
-            CREATE TABLE IF NOT EXISTS av_artifacts (
-                id           TEXT PRIMARY KEY,
-                session_id   TEXT NOT NULL REFERENCES av_sessions(id),
-                kind         TEXT NOT NULL,
-                created_at   INTEGER NOT NULL,
-                created_by   TEXT,
-                content_ref  TEXT NOT NULL,
-                content_type TEXT NOT NULL,
-                visibility   TEXT NOT NULL DEFAULT '\"participants\"',
-                title        TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_av_artifacts_session ON av_artifacts(session_id);
-            ",
-        )?;
-
-        // Last: the migration ladder, after every statement above, so a
-        // pending migration sees fully-shaped tables (the root_msgid backfill
-        // re-files `reactions` and `pins` rows, so both have to exist by now).
-        migration_ladder()
+        // The migration ladder owns everything durable: the schema baseline
+        // (migration 1) and one-time data migrations (2+). It runs right
+        // after the per-connection pragmas; everything below may assume
+        // fully-shaped tables.
+        crate::migrations::migration_ladder()
             .to_latest(&mut self.conn)
             .map_err(|e| match e {
                 rusqlite_migration::Error::RusqliteError { err, .. } => err,
@@ -891,6 +346,15 @@ impl Db {
                     Some(other.to_string()),
                 ),
             })?;
+
+        // Outside the ladder on purpose: it manages its own transaction,
+        // which the ladder's per-migration transaction cannot nest.
+        self.migrate_signing_keys_to_kid_history()?;
+
+        // Outside the ladder on purpose: whether the FTS index exists
+        // depends on the at-rest encryption key (opening encrypted drops a
+        // stale plaintext index) — state, not schema.
+        self.init_fts()?;
 
         Ok(())
     }
@@ -2939,13 +2403,13 @@ mod tests {
         msg(&db, "#c", "unrelated", 130, "id-other");
         strip_root_ids(&db);
 
-        Db::backfill_root_msgids(&db.conn).unwrap();
+        crate::migrations::backfill_root_msgids(&db.conn).unwrap();
 
         assert_eq!(db.root_of("id-3"), "id-1");
         assert_eq!(db.root_of("id-2"), "id-1");
         assert_eq!(db.root_of("id-other"), "id-other");
         // Re-running must not disturb what the first pass settled.
-        Db::backfill_root_msgids(&db.conn).unwrap();
+        crate::migrations::backfill_root_msgids(&db.conn).unwrap();
         assert_eq!(db.root_of("id-3"), "id-1");
     }
 
@@ -2984,7 +2448,7 @@ mod tests {
                 .unwrap();
         }
 
-        Db::backfill_root_msgids(&db.conn).unwrap();
+        crate::migrations::backfill_root_msgids(&db.conn).unwrap();
 
         assert_eq!(
             reaction_rows(&db, "id-1"),
@@ -3014,7 +2478,7 @@ mod tests {
             )
             .unwrap();
 
-        Db::backfill_root_msgids(&db.conn).unwrap();
+        crate::migrations::backfill_root_msgids(&db.conn).unwrap();
 
         let pins = db.get_pins("#c").unwrap();
         assert_eq!(pins.len(), 1, "one message, one pin");
@@ -3038,7 +2502,7 @@ mod tests {
             .unwrap();
         strip_root_ids(&db);
 
-        Db::backfill_root_msgids(&db.conn).unwrap();
+        crate::migrations::backfill_root_msgids(&db.conn).unwrap();
 
         assert_eq!(db.root_of("enc-2"), "enc-1");
         assert_eq!(reaction_rows(&db, "enc-1").len(), 1);
@@ -3472,6 +2936,49 @@ mod tests {
 
         let db = Db::open(&path).unwrap();
         assert_eq!(db.root_of("id-2"), "id-1", "the backfill ran on open");
+        assert_eq!(
+            db.conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    /// A database from before some ALTER-era columns existed still converges:
+    /// the baseline's CREATE IF NOT EXISTS no-ops over its tables and the
+    /// ALTER loop adds what's missing — the old boot-time replay's semantics,
+    /// now inside migration 1. Guards against ever folding the ALTER columns
+    /// into the baseline CREATEs, which would leave such a database stamped
+    /// but missing columns.
+    #[test]
+    fn an_ancient_database_gains_the_altered_columns_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("freeq.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE messages (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel   TEXT NOT NULL,
+                    sender    TEXT NOT NULL,
+                    text      TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    tags_json TEXT NOT NULL DEFAULT '{}'
+                );",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        // The ALTER-era columns now exist and are writable.
+        db.conn
+            .execute(
+                "INSERT INTO messages (channel, sender, text, timestamp, msgid, root_msgid)
+                 VALUES ('#c', 'a', 't', 1, 'm1', 'm1')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.root_of("m1"), "m1");
         assert_eq!(
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))

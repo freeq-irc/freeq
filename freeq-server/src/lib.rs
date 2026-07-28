@@ -14,6 +14,7 @@ pub mod db;
 pub mod irc;
 pub mod iroh;
 pub mod manifest;
+mod migrations;
 pub mod media_store;
 pub mod model_proxy;
 pub mod msgid;
