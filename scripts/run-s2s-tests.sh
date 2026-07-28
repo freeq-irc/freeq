@@ -43,6 +43,11 @@ cargo build --release --bin freeq-server 2>&1 | tail -3
 
 BINARY="$(pwd)/target/release/freeq-server"
 
+# Both servers run with a database. Editing or deleting a channel message is
+# authorized against the stored row's author, so a server started without one
+# refuses every edit and delete — a configuration no deployment runs, and one
+# that made the history tests read as product bugs.
+#
 # ── Start Server A (iroh enabled, no peers yet — will accept incoming) ──
 echo ""
 echo "═══ Starting Server A on port $PORT_A ═══"
@@ -50,6 +55,7 @@ RUST_LOG=freeq_server=info "$BINARY" \
     --listen-addr "127.0.0.1:$PORT_A" \
     --server-name "server-a" \
     --data-dir "$DIR_A" \
+    --db-path "$DIR_A/irc.db" \
     --iroh \
     >> "$LOG_A" 2>&1 &
 PID_A=$!
@@ -79,6 +85,7 @@ RUST_LOG=freeq_server=info "$BINARY" \
     --listen-addr "127.0.0.1:$PORT_B" \
     --server-name "server-b" \
     --data-dir "$DIR_B" \
+    --db-path "$DIR_B/irc.db" \
     --iroh \
     --s2s-peers "$IROH_ID_A" \
     --s2s-allowed-peers "$IROH_ID_A" \
