@@ -2829,7 +2829,8 @@ fn s2s_channel_entry<'a>(
         ch.no_ext_msg = true;
         ch.topic_locked = true;
     }
-    ch}
+    ch
+}
 
 /// Process an incoming S2S message. Exposed as pub(crate) for adversarial testing.
 pub(crate) async fn process_s2s_message(
@@ -6560,7 +6561,12 @@ mod s2s_adversarial_tests {
         (ch.no_ext_msg, ch.topic_locked)
     }
 
-    async fn relay_join(state: &Arc<SharedState>, mgr: &Arc<S2sManager>, channel: &str, nick: &str) {
+    async fn relay_join(
+        state: &Arc<SharedState>,
+        mgr: &Arc<S2sManager>,
+        channel: &str,
+        nick: &str,
+    ) {
         process_s2s_message(
             state,
             mgr,

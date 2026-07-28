@@ -1547,7 +1547,10 @@ mod tests {
 
         // And each discards the other one — again, one connection, two ends.
         assert!(!duplicate_link_wins(low, high, true), "low drops incoming");
-        assert!(!duplicate_link_wins(high, low, false), "high drops outgoing");
+        assert!(
+            !duplicate_link_wins(high, low, false),
+            "high drops outgoing"
+        );
     }
 
     /// Exactly one of the two ends survives, for any pair of ids in any order.

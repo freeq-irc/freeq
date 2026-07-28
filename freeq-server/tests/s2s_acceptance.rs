@@ -63,18 +63,66 @@ const S2S_SETTLE: Duration = Duration::from_secs(3);
 /// `scripts/run-s2s-tests.sh`, which has to pass these to the servers before any
 /// test runs; `static_identities_match_the_harness` fails if they drift.
 const TEST_IDS: [(&str, u8, &str); 12] = [
-    ("tsync", 0x51, "z6MksPykuQeYh4zgthFRFBExrgo1dwFWWenY2TEJ9SvT9jn1"),
-    ("rtop", 0x52, "z6MkgcTiPMbTofzVghWywkKDM7SeNYnG4jPbFxerG2rVnV8A"),
-    ("toppers", 0x53, "z6Mkw9YUWaWMuG7ZMhwtpfEytLaMZjiaxYnXe9SxDQHN64sy"),
-    ("top1", 0x54, "z6MkqB3fVxzXFbVUK2q1GPrLQzaxgwDGGVuxkDzaf5tsLnpo"),
-    ("top3", 0x55, "z6Mksp9sfVKVpWAi43niHLXfGQ5NdCTEoiycLmrLPehquVqK"),
-    ("sy2", 0x56, "z6MkofZ1WuSJkd6UMyevdzsBVrhCtmpcq53cWATRc3jRYAxJ"),
-    ("sy3", 0x57, "z6MksvxZ2oR6ogBgsCwsDSiPi3F84SDNn1yCQdVDHf5zKtKp"),
-    ("inv2", 0x58, "z6MkuBDVJTuuJUJSC4XSVeHU6ZgTqcUZM6CkCYxSJ2jNRFSr"),
-    ("inv3", 0x59, "z6MkqzWvFQiKjiXi57aaSdAkYE7WbxVw8ymXA4BMshHYghPh"),
-    ("inv7", 0x5a, "z6MkfMo6gxqdBhaHMNnmfhgZFBjpCDTkmJMJLoypsBZS9PwD"),
-    ("inv10", 0x5b, "z6MkmghdggH9iwAwmMypZmN9EsfPGwsbvmum2HkFWXVzrAeE"),
-    ("sinv", 0x5c, "z6MkvS2fUtMaVsmMNMMgGzvgSCu7j11e1cvvykBcEvyvz3xW"),
+    (
+        "tsync",
+        0x51,
+        "z6MksPykuQeYh4zgthFRFBExrgo1dwFWWenY2TEJ9SvT9jn1",
+    ),
+    (
+        "rtop",
+        0x52,
+        "z6MkgcTiPMbTofzVghWywkKDM7SeNYnG4jPbFxerG2rVnV8A",
+    ),
+    (
+        "toppers",
+        0x53,
+        "z6Mkw9YUWaWMuG7ZMhwtpfEytLaMZjiaxYnXe9SxDQHN64sy",
+    ),
+    (
+        "top1",
+        0x54,
+        "z6MkqB3fVxzXFbVUK2q1GPrLQzaxgwDGGVuxkDzaf5tsLnpo",
+    ),
+    (
+        "top3",
+        0x55,
+        "z6Mksp9sfVKVpWAi43niHLXfGQ5NdCTEoiycLmrLPehquVqK",
+    ),
+    (
+        "sy2",
+        0x56,
+        "z6MkofZ1WuSJkd6UMyevdzsBVrhCtmpcq53cWATRc3jRYAxJ",
+    ),
+    (
+        "sy3",
+        0x57,
+        "z6MksvxZ2oR6ogBgsCwsDSiPi3F84SDNn1yCQdVDHf5zKtKp",
+    ),
+    (
+        "inv2",
+        0x58,
+        "z6MkuBDVJTuuJUJSC4XSVeHU6ZgTqcUZM6CkCYxSJ2jNRFSr",
+    ),
+    (
+        "inv3",
+        0x59,
+        "z6MkqzWvFQiKjiXi57aaSdAkYE7WbxVw8ymXA4BMshHYghPh",
+    ),
+    (
+        "inv7",
+        0x5a,
+        "z6MkfMo6gxqdBhaHMNnmfhgZFBjpCDTkmJMJLoypsBZS9PwD",
+    ),
+    (
+        "inv10",
+        0x5b,
+        "z6MkmghdggH9iwAwmMypZmN9EsfPGwsbvmum2HkFWXVzrAeE",
+    ),
+    (
+        "sinv",
+        0x5c,
+        "z6MkvS2fUtMaVsmMNMMgGzvgSCu7j11e1cvvykBcEvyvz3xW",
+    ),
 ];
 
 /// One of the fixed test identities. `did:key:<multibase>` — self-certifying, so
@@ -129,7 +177,8 @@ fn static_identities_match_the_harness() {
     let before = seeds.len();
     seeds.dedup();
     assert_eq!(
-        seeds.len(), before,
+        seeds.len(),
+        before,
         "two tests share a seed, so they share a DID, so they are one identity with two devices"
     );
 }
