@@ -6,12 +6,41 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, Result as SqlResult, params};
+use rusqlite::{Connection, OptionalExtension, Result as SqlResult, Transaction, params};
+use rusqlite_migration::{HookResult, M, Migrations};
 
 use crate::server::{BanEntry, ChannelState, TopicInfo};
 
 /// Prefix for encrypted-at-rest message content.
 const EAR_PREFIX: &str = "EAR1:";
+
+/// The one-time migration ladder, tracked in SQLite's `PRAGMA user_version`
+/// (its application-owned version slot). Append-only: a new migration is a new
+/// entry at the end of this list. `rusqlite_migration` runs each pending entry
+/// and its version stamp inside one transaction — a crash leaves the database
+/// exactly at the previous rung, so migrations need not be idempotent — and
+/// refuses to open a database stamped newer than this list knows.
+///
+/// Slot 1 is an empty placeholder, deliberately reserved for the schema
+/// baseline: the idempotent CREATE/ALTER statements `init()` replays on every
+/// boot are meant to move here verbatim in a follow-up, making this ladder the
+/// single schema authority. Reserving the slot now keeps that refactor a
+/// content swap instead of a renumbering, which stamped databases in the wild
+/// could never tolerate. (`migrate_signing_keys_to_kid_history` predates the
+/// ladder and keeps its own shape-based guard.)
+fn migration_ladder() -> Migrations<'static> {
+    Migrations::new(vec![
+        // 1: reserved for the schema baseline — see above.
+        M::up(""),
+        // 2: a message's identity is its original msgid for life — stamp
+        //    `root_msgid` on rows that predate the column and re-file
+        //    reactions and pins under the root they annotate.
+        M::up_with_hook("", |tx: &Transaction| -> HookResult {
+            Db::backfill_root_msgids(tx)?;
+            Ok(())
+        }),
+    ])
+}
 
 /// Encrypt text with AES-256-GCM for storage at rest.
 /// Panics on encryption failure — this indicates a broken key or AES implementation
@@ -180,7 +209,7 @@ impl Db {
     /// Open (or create) the database at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> SqlResult<Self> {
         let conn = Connection::open(path)?;
-        let db = Self {
+        let mut db = Self {
             conn,
             encryption_key: None,
         };
@@ -191,7 +220,7 @@ impl Db {
     /// Open a database with encryption at rest for message content.
     pub fn open_encrypted<P: AsRef<Path>>(path: P, key: [u8; 32]) -> SqlResult<Self> {
         let conn = Connection::open(path)?;
-        let db = Self {
+        let mut db = Self {
             conn,
             encryption_key: Some(key),
         };
@@ -202,7 +231,7 @@ impl Db {
     /// Open an in-memory database (for testing).
     pub fn open_memory() -> SqlResult<Self> {
         let conn = Connection::open_in_memory()?;
-        let db = Self {
+        let mut db = Self {
             conn,
             encryption_key: None,
         };
@@ -213,7 +242,7 @@ impl Db {
     /// Open an in-memory database with encryption at rest (for testing).
     pub fn open_encrypted_memory(key: [u8; 32]) -> SqlResult<Self> {
         let conn = Connection::open_in_memory()?;
-        let db = Self {
+        let mut db = Self {
             conn,
             encryption_key: Some(key),
         };
@@ -238,7 +267,7 @@ impl Db {
             "INSERT INTO signing_keys (did, pubkey, registered_at) VALUES ('did:plc:legacy', ?1, 0)",
             params![&[7u8; 32][..]],
         )?;
-        let db = Self {
+        let mut db = Self {
             conn,
             encryption_key: None,
         };
@@ -308,11 +337,10 @@ impl Db {
     /// rows written since `root_msgid` exists are stamped at insert time, so
     /// this runs solely over rows that predate the column. Bounded — a
     /// malformed back-pointer cycle must not spin.
-    fn migration_root_of(&self, channel: &str, msgid: &str) -> SqlResult<String> {
+    fn migration_root_of(conn: &Connection, channel: &str, msgid: &str) -> SqlResult<String> {
         let mut root = msgid.to_string();
         for _ in 0..64 {
-            let mut stmt = self
-                .conn
+            let mut stmt = conn
                 .prepare("SELECT replaces_msgid FROM messages WHERE channel = ?1 AND msgid = ?2")?;
             let parent: Option<String> = stmt
                 .query_map(params![channel, &root], |r| r.get::<_, Option<String>>(0))?
@@ -343,9 +371,9 @@ impl Db {
     ///
     /// An id with no message row — an unpersisted guest-DM message — is its own
     /// root and is left untouched everywhere.
-    fn backfill_root_msgids(&self) -> SqlResult<()> {
+    fn backfill_root_msgids(conn: &Connection) -> SqlResult<()> {
         // Originals: identity is the msgid itself.
-        self.conn.execute(
+        conn.execute(
             "UPDATE messages SET root_msgid = msgid
              WHERE root_msgid IS NULL AND msgid IS NOT NULL
                AND (replaces_msgid IS NULL OR replaces_msgid = '')",
@@ -354,7 +382,7 @@ impl Db {
 
         // Edits: walk the back-pointers.
         let pending: Vec<(String, String)> = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = conn.prepare(
                 "SELECT channel, msgid FROM messages
                  WHERE root_msgid IS NULL AND msgid IS NOT NULL",
             )?;
@@ -362,15 +390,15 @@ impl Db {
                 .collect::<SqlResult<Vec<_>>>()?
         };
         for (channel, msgid) in pending {
-            let root = self.migration_root_of(&channel, &msgid)?;
-            self.conn.execute(
+            let root = Self::migration_root_of(conn, &channel, &msgid)?;
+            conn.execute(
                 "UPDATE messages SET root_msgid = ?1 WHERE channel = ?2 AND msgid = ?3",
                 params![root, channel, msgid],
             )?;
         }
 
-        self.backfill_reaction_roots()?;
-        self.backfill_pin_roots()?;
+        Self::backfill_reaction_roots(conn)?;
+        Self::backfill_pin_roots(conn)?;
         Ok(())
     }
 
@@ -379,9 +407,9 @@ impl Db {
     /// who reacted against two revisions of the same message has two rows that
     /// would collide on rewrite — the earlier row wins and the later is dropped,
     /// which is the same tally the two rows were always meant to represent.
-    fn backfill_reaction_roots(&self) -> SqlResult<()> {
+    fn backfill_reaction_roots(conn: &Connection) -> SqlResult<()> {
         let rewrites: Vec<(String, String)> = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = conn.prepare(
                 "SELECT DISTINCT r.target_msgid, m.root_msgid
                  FROM reactions r JOIN messages m ON m.msgid = r.target_msgid
                  WHERE m.root_msgid IS NOT NULL AND m.root_msgid <> r.target_msgid",
@@ -392,7 +420,7 @@ impl Db {
         for (old_id, root) in rewrites {
             // Of a colliding pair, drop the later row. The `<=` / `<` split
             // means a tie drops the revision row, never both.
-            self.conn.execute(
+            conn.execute(
                 "DELETE FROM reactions WHERE target_msgid = ?1 AND EXISTS (
                      SELECT 1 FROM reactions keep
                      WHERE keep.target_msgid = ?2
@@ -402,7 +430,7 @@ impl Db {
                  )",
                 params![old_id, root],
             )?;
-            self.conn.execute(
+            conn.execute(
                 "DELETE FROM reactions WHERE target_msgid = ?2 AND EXISTS (
                      SELECT 1 FROM reactions keep
                      WHERE keep.target_msgid = ?1
@@ -413,11 +441,11 @@ impl Db {
                 params![old_id, root],
             )?;
             // OR IGNORE + sweep: a surviving collision must not abort startup.
-            self.conn.execute(
+            conn.execute(
                 "UPDATE OR IGNORE reactions SET target_msgid = ?1 WHERE target_msgid = ?2",
                 params![root, old_id],
             )?;
-            self.conn.execute(
+            conn.execute(
                 "DELETE FROM reactions WHERE target_msgid = ?1",
                 params![old_id],
             )?;
@@ -428,9 +456,9 @@ impl Db {
     /// Re-file pins under the root of the message they pin. `pins` is
     /// `UNIQUE(channel, msgid)`; a message pinned under two revisions keeps the
     /// earliest `pinned_at` — the moment it was actually first pinned.
-    fn backfill_pin_roots(&self) -> SqlResult<()> {
+    fn backfill_pin_roots(conn: &Connection) -> SqlResult<()> {
         let rewrites: Vec<(String, String, String)> = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = conn.prepare(
                 "SELECT DISTINCT p.channel, p.msgid, m.root_msgid
                  FROM pins p JOIN messages m ON m.msgid = p.msgid
                  WHERE m.root_msgid IS NOT NULL AND m.root_msgid <> p.msgid",
@@ -439,7 +467,7 @@ impl Db {
                 .collect::<SqlResult<Vec<_>>>()?
         };
         for (channel, old_id, root) in rewrites {
-            self.conn.execute(
+            conn.execute(
                 "UPDATE pins SET pinned_at = (
                      SELECT MIN(pinned_at) FROM pins
                      WHERE channel = ?1 AND msgid IN (?2, ?3)
@@ -447,11 +475,11 @@ impl Db {
                  WHERE channel = ?1 AND msgid = ?3",
                 params![channel, old_id, root],
             )?;
-            self.conn.execute(
+            conn.execute(
                 "UPDATE OR IGNORE pins SET msgid = ?1 WHERE channel = ?2 AND msgid = ?3",
                 params![root, channel, old_id],
             )?;
-            self.conn.execute(
+            conn.execute(
                 "DELETE FROM pins WHERE channel = ?1 AND msgid = ?2",
                 params![channel, old_id],
             )?;
@@ -465,6 +493,10 @@ impl Db {
     ///
     /// This is the single definition of "the same message"; reactions, pins and
     /// deletes all file and look up by what it returns.
+    ///
+    /// Deliberately not channel-scoped: a ULID is globally unique, so the id
+    /// alone identifies the row. `migration_root_of` is channel-scoped only
+    /// because the backfill iterates per channel.
     pub fn root_of(&self, msgid: &str) -> String {
         self.conn
             .query_row(
@@ -481,7 +513,7 @@ impl Db {
             .unwrap_or_else(|| msgid.to_string())
     }
 
-    fn init(&self) -> SqlResult<()> {
+    fn init(&mut self) -> SqlResult<()> {
         self.conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         self.conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         self.conn.execute_batch(
@@ -847,9 +879,18 @@ impl Db {
             ",
         )?;
 
-        // Last: it re-files `reactions` and `pins` rows, so both tables have to
-        // exist by now.
-        self.backfill_root_msgids()?;
+        // Last: the migration ladder, after every statement above, so a
+        // pending migration sees fully-shaped tables (the root_msgid backfill
+        // re-files `reactions` and `pins` rows, so both have to exist by now).
+        migration_ladder()
+            .to_latest(&mut self.conn)
+            .map_err(|e| match e {
+                rusqlite_migration::Error::RusqliteError { err, .. } => err,
+                other => rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                    Some(other.to_string()),
+                ),
+            })?;
 
         Ok(())
     }
@@ -919,6 +960,13 @@ impl Db {
             let mut stmt = self.conn.prepare(
                 // Results carry the root id: a hit on an edited message must be
                 // addressable by the identity every client holds it under.
+                //
+                // Superseded revisions are excluded, matching the
+                // decrypt-and-scan path below. An edit made since the upgrade
+                // leaves the index on its own, but rows indexed before it are
+                // still there, and returning them alongside the current one
+                // yields two hits carrying the same root id — the duplicate
+                // identity this keying exists to prevent.
                 "SELECT m.id, m.channel, m.sender, m.text, m.timestamp, m.tags_json,
                         COALESCE(m.root_msgid, m.msgid), m.replaces_msgid, m.deleted_at, m.sender_did, m.root_msgid
                  FROM messages_fts
@@ -927,6 +975,12 @@ impl Db {
                    AND m.channel = ?2
                    AND m.deleted_at IS NULL
                    AND m.timestamp < ?3
+                   AND NOT EXISTS (
+                       SELECT 1 FROM messages newer
+                       WHERE newer.channel = m.channel
+                         AND newer.root_msgid = m.root_msgid
+                         AND newer.id > m.id
+                   )
                  ORDER BY m.timestamp DESC, m.id DESC
                  LIMIT ?4",
             )?;
@@ -2884,13 +2938,13 @@ mod tests {
         msg(&db, "#c", "unrelated", 130, "id-other");
         strip_root_ids(&db);
 
-        db.backfill_root_msgids().unwrap();
+        Db::backfill_root_msgids(&db.conn).unwrap();
 
         assert_eq!(db.root_of("id-3"), "id-1");
         assert_eq!(db.root_of("id-2"), "id-1");
         assert_eq!(db.root_of("id-other"), "id-other");
         // Re-running must not disturb what the first pass settled.
-        db.backfill_root_msgids().unwrap();
+        Db::backfill_root_msgids(&db.conn).unwrap();
         assert_eq!(db.root_of("id-3"), "id-1");
     }
 
@@ -2929,7 +2983,7 @@ mod tests {
                 .unwrap();
         }
 
-        db.backfill_root_msgids().unwrap();
+        Db::backfill_root_msgids(&db.conn).unwrap();
 
         assert_eq!(
             reaction_rows(&db, "id-1"),
@@ -2959,7 +3013,7 @@ mod tests {
             )
             .unwrap();
 
-        db.backfill_root_msgids().unwrap();
+        Db::backfill_root_msgids(&db.conn).unwrap();
 
         let pins = db.get_pins("#c").unwrap();
         assert_eq!(pins.len(), 1, "one message, one pin");
@@ -2983,7 +3037,7 @@ mod tests {
             .unwrap();
         strip_root_ids(&db);
 
-        db.backfill_root_msgids().unwrap();
+        Db::backfill_root_msgids(&db.conn).unwrap();
 
         assert_eq!(db.root_of("enc-2"), "enc-1");
         assert_eq!(reaction_rows(&db, "enc-1").len(), 1);
@@ -3311,6 +3365,115 @@ mod tests {
         let hits = db.search_messages("#dev", "revised", 50, None).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].msgid.as_deref(), Some("m1"));
+    }
+
+    /// A revision indexed before the upgrade is still in the FTS table —
+    /// nothing rewrites existing index rows. Searching a word both revisions
+    /// share must not return the message twice, since both hits would carry
+    /// the same root id: one message, two results, which is the duplicate
+    /// identity the root keying exists to prevent.
+    #[test]
+    fn search_returns_one_hit_when_an_old_revision_is_still_indexed() {
+        let db = Db::open_memory().unwrap();
+        msg(&db, "#dev", "shared word original", 100, "m1");
+        edit(&db, "#dev", "shared word revised", 200, "m2", "m1");
+
+        // Undo the edit-time index prune to stand in for a row indexed before
+        // the upgrade, then confirm the stale revision really is searchable.
+        let old_rowid: i64 = db
+            .conn
+            .query_row(
+                "SELECT id FROM messages WHERE msgid = 'm1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT OR REPLACE INTO messages_fts (rowid, text) VALUES (?1, 'shared word original')",
+                params![old_rowid],
+            )
+            .unwrap();
+        let indexed: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE rowid = ?1",
+                params![old_rowid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1, "precondition: the old revision is indexed");
+
+        let hits = db.search_messages("#dev", "shared", 50, None).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "one message, one hit: {:?}",
+            hits.iter().map(|h| (&h.text, &h.msgid)).collect::<Vec<_>>()
+        );
+        assert_eq!(hits[0].text, "shared word revised");
+        assert_eq!(hits[0].msgid.as_deref(), Some("m1"));
+    }
+
+    /// The data migration runs once and stamps the schema, instead of
+    /// re-scanning `reactions` and `pins` on every start to conclude there is
+    /// nothing to move.
+    #[test]
+    fn the_root_msgid_migration_runs_once_and_stamps_the_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("freeq.db");
+        {
+            let db = Db::open(&path).unwrap();
+            msg(&db, "#c", "v1", 100, "id-1");
+            edit(&db, "#c", "v2", 110, "id-2", "id-1");
+            assert_eq!(
+                db.conn
+                    .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                2,
+                "first open stamps the schema"
+            );
+        }
+
+        // Reopening finds the stamp and skips the backfill; the identities it
+        // established are still the ones on file.
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(db.root_of("id-2"), "id-1");
+        assert_eq!(db.current_revision("id-1").unwrap().unwrap().text, "v2");
+    }
+
+    /// A database written before the stamp existed still gets migrated: the
+    /// gate is a floor, not a marker that only new databases carry.
+    #[test]
+    fn an_unstamped_database_is_migrated_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("freeq.db");
+        {
+            let db = Db::open(&path).unwrap();
+            msg(&db, "#c", "v1", 100, "id-1");
+            edit(&db, "#c", "v2", 110, "id-2", "id-1");
+            // Roll back to what an older build left behind: roots unstamped,
+            // schema version never set.
+            db.conn
+                .execute("UPDATE messages SET root_msgid = NULL", [])
+                .unwrap();
+            db.conn.execute_batch("PRAGMA user_version = 0").unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.root_of("id-2"), "id-1", "the backfill ran on open");
+        assert_eq!(
+            db.conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
