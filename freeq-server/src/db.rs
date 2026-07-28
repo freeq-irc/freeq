@@ -4626,15 +4626,11 @@ impl Db {
     /// budget of its own falls through to the channel default and the parent's
     /// limit simply does not apply to it.
     pub fn get_budget_inherited(&self, channel: &str, agent_did: &str) -> Option<String> {
-        if let Some(own) = self
-            .conn
-            .query_row(
-                "SELECT budget_json FROM channel_budgets WHERE channel = ?1 AND agent_did = ?2",
-                params![channel, agent_did],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-        {
+        if let Ok(own) = self.conn.query_row(
+            "SELECT budget_json FROM channel_budgets WHERE channel = ?1 AND agent_did = ?2",
+            params![channel, agent_did],
+            |row| row.get::<_, String>(0),
+        ) {
             return Some(own);
         }
         // Walk up the spawn chain, nearest ancestor first.
@@ -4653,15 +4649,11 @@ impl Db {
             if seen.contains(&parent) {
                 break; // cycle
             }
-            if let Some(b) = self
-                .conn
-                .query_row(
-                    "SELECT budget_json FROM channel_budgets WHERE channel = ?1 AND agent_did = ?2",
-                    params![channel, &parent],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok()
-            {
+            if let Ok(b) = self.conn.query_row(
+                "SELECT budget_json FROM channel_budgets WHERE channel = ?1 AND agent_did = ?2",
+                params![channel, &parent],
+                |row| row.get::<_, String>(0),
+            ) {
                 return Some(b);
             }
             seen.push(parent.clone());

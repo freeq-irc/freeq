@@ -292,7 +292,7 @@ pub fn open_best(
     my_secret: &StaticSecret,
 ) -> Result<GroupState, GroupError> {
     let mut sorted: Vec<&(u64, String)> = candidates.iter().collect();
-    sorted.sort_by(|a, b| b.0.cmp(&a.0)); // newest epoch first
+    sorted.sort_by_key(|c| std::cmp::Reverse(c.0)); // newest epoch first
     for (_epoch, wire) in sorted {
         if let Ok(sealed) = SealedGroupKey::from_wire(wire)
             && let Ok(state) = GroupState::open(&sealed, my_secret)

@@ -2028,7 +2028,7 @@ impl Server {
                         ticks += 1;
 
                         // Retention: prune messages older than N days, hourly.
-                        if retention_days > 0 && ticks % 60 == 0 {
+                        if retention_days > 0 && ticks.is_multiple_of(60) {
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -2047,7 +2047,7 @@ impl Server {
                         // Identity re-verification (offboarding). SAFE: only acts
                         // when a DID resolves successfully but has NO valid auth
                         // key; never disconnects on a resolution error (outage).
-                        if reverify_mins > 0 && ticks % reverify_mins == 0 {
+                        if reverify_mins > 0 && ticks.is_multiple_of(reverify_mins) {
                             let did_sessions: std::collections::HashMap<String, Vec<String>> = {
                                 let sd = maint_state.session_dids.lock();
                                 let mut m: std::collections::HashMap<String, Vec<String>> =

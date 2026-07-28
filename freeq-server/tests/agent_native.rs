@@ -3265,7 +3265,7 @@ async fn spawned_capabilities_are_narrowed_to_the_parents() {
 #[ignore = "unimplemented: capabilities are recorded for display, never enforced"]
 async fn a_capability_grant_is_actually_enforced() {
     start_deadlock_detector();
-    let (addr, server_handle) = start_test_server_with_db(empty_resolver(), true).await;
+    let (addr, _server_handle) = start_test_server_with_db(empty_resolver(), true).await;
 
     let (_did, op, mut op_ev) = connect_did_key(addr, "capop").await;
     op.join("#capenforce").await.unwrap();
@@ -3303,11 +3303,11 @@ async fn a_capability_grant_is_actually_enforced() {
         "server response to an ungranted spawn",
     )
     .await;
+    // Reaching this line *is* the failure: the spawn was allowed. No cleanup
+    // follows, because none of it can run — the ignored-test marker is the
+    // panic. When capabilities are enforced this becomes an assertion that the
+    // spawn was refused, and the teardown below it comes back with it.
     panic!("ungranted spawn succeeded instead of being refused: {reply}");
-
-    op.quit(None).await.ok();
-    bot.quit(None).await.ok();
-    server_handle.abort();
 }
 
 /// A channel op can confer a capability, and the agent then holds it.

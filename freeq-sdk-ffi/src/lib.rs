@@ -1181,6 +1181,13 @@ pub trait AvEventHandler: Send + Sync + 'static {
 
 /// Pure mic jitter-buffer logic (producer cap + consumer drain). Always
 /// compiled — and unit-tested — independent of the heavy `av` media stack.
+///
+/// Its callers all live in `av_impl`, which is `#[cfg(feature = "av")]`, so
+/// without that feature the only thing exercising these items is this module's
+/// own tests — which dead-code analysis does not count as use. That made
+/// `cargo check --workspace` fail under CI's `-D warnings` on the default
+/// feature set, for code that is deliberately feature-independent.
+#[cfg_attr(not(feature = "av"), allow(dead_code))]
 mod audio_buffer;
 
 #[cfg(feature = "av")]

@@ -478,6 +478,11 @@ fn finish_av_slot_teardown(
     }
 }
 
+/// One AV participant slot that went away when a connection dropped:
+/// `(channel, did, nick, was_publishing, instance)`. The instance is what
+/// clients key teardown on, so it has to ride along with the rest.
+type AvLeftSession = (String, Option<String>, String, bool, Option<String>);
+
 async fn handle_io_with_meta<R, W>(
     mut reader: BufReader<R>,
     writer: W,
@@ -3560,7 +3565,7 @@ where
             // Immediate teardown. Each entry carries the per-device instance so
             // the `left` signal names the exact device that dropped — clients
             // key teardown on the instance (matches the media path), not nick.
-            let left_sessions: Vec<(String, Option<String>, String, bool, Option<String>)> = {
+            let left_sessions: Vec<AvLeftSession> = {
                 let mut mgr = state.av_sessions.lock();
                 if instances.is_empty() {
                     // Legacy path — no per-instance bookkeeping for this

@@ -349,10 +349,10 @@ fn verify_with_jwks(
     let data = decode::<serde_json::Value>(id_token, &key, &validation)
         .map_err(|e| format!("signature/claims validation failed: {e}"))?;
 
-    if let Some(want) = expected_nonce {
-        if data.claims["nonce"].as_str() != Some(want) {
-            return Err("nonce mismatch — token was not minted for this request".into());
-        }
+    if let Some(want) = expected_nonce
+        && data.claims["nonce"].as_str() != Some(want)
+    {
+        return Err("nonce mismatch — token was not minted for this request".into());
     }
 
     Ok(data.claims)

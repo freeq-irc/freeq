@@ -2147,7 +2147,7 @@ mod tests {
 
         // No symmetric salt when the peer DID is unknown, or we're a guest.
         assert!(a.dm_e2ee_salt("someguest").is_none(), "unknown peer DID");
-        let mut guest = App::new("g", false);
+        let guest = App::new("g", false);
         assert!(guest.dm_e2ee_salt(bob).is_none(), "guest has no own DID");
     }
 

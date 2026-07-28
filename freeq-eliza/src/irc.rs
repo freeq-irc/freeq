@@ -1191,14 +1191,14 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     // it here. Opt-in (external_brain_text): this being's brain
                     // IS the seam, so forward typed text too; the reply posts back
                     // as channel text (see brain_seam::speak_inbound).
-                    if cfg.external_brain_text {
-                        if let Some(seam) = cfg.brain_seam.get() {
-                            tracing::info!(%from, %question, "external-brain(text): forwarding typed question to brain");
-                            seam.send(crate::brain_seam::Outbound::Utterance {
-                                nick: from.clone(),
-                                text: question.clone(),
-                            });
-                        }
+                    if cfg.external_brain_text
+                        && let Some(seam) = cfg.brain_seam.get()
+                    {
+                        tracing::info!(%from, %question, "external-brain(text): forwarding typed question to brain");
+                        seam.send(crate::brain_seam::Outbound::Utterance {
+                            nick: from.clone(),
+                            text: question.clone(),
+                        });
                     }
                     continue;
                 }

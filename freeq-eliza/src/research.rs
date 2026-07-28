@@ -11,6 +11,7 @@
 //! It never speaks. It is the sibling of:
 //!   - [`crate::proactive`] — decides *when to speak*,
 //!   - [`crate::ambient`]   — decides *how the tile looks*.
+//!
 //! Research decides *what helpful reference to drop in chat*.
 //!
 //! Guardrails (anti-spam is the whole game):
@@ -278,10 +279,10 @@ Be concise and factual. No greeting, no preamble, no 'here is', just the note.",
             // Append the search source as a link when the model didn't already
             // inline one — Chad wants links, the compound model emits them
             // inconsistently in-text.
-            if let Some(src) = a.source {
-                if !body.contains(&src.url) {
-                    body.push_str(&format!("\n🔗 {} — {}", src.title, src.url));
-                }
+            if let Some(src) = a.source
+                && !body.contains(&src.url)
+            {
+                body.push_str(&format!("\n🔗 {} — {}", src.title, src.url));
             }
             Some(body)
         }
