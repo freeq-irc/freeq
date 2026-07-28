@@ -6753,36 +6753,67 @@ mod s2s_adversarial_tests {
             .members
             .insert("rl-sess".to_string());
 
-        for i in 0..101u64 {
-            process_s2s_message(
-                &state,
-                &mgr,
-                RL_PEER,
-                S2sMessage::Privmsg {
-                    event_id: format!("{RL_PEER}:{}", 200 + i),
-                    from: "spammer!u@s2s".to_string(),
-                    target: "#ratelimit".to_string(),
-                    text: format!("spam {i}"),
-                    origin: RL_PEER.to_string(),
-                    msgid: None,
-                    sig: None,
-                    account: None,
-                    recipient_did: None,
-                    replaces_msgid: None,
-                    tags: HashMap::new(),
-                    multiline_lines: None,
-                },
-            )
-            .await;
+        // The limiter's window is a wall-clock second: the counter resets when
+        // `SystemTime::now().as_secs()` ticks. A burst that straddles that tick
+        // is *legitimately* allowed more than the limit, so send the burst inside
+        // one window or the assertion is about the clock, not the limiter. This
+        // failed on CI for exactly that reason, having passed locally.
+        let secs_now = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        };
+        let count;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            assert!(attempts <= 5, "never landed a burst inside one window");
+
+            // Start near the top of a second, so 101 sends have a whole one.
+            let start_window = secs_now();
+            S2S_RATE_LIMITS.lock().remove(RL_PEER);
+
+            for i in 0..101u64 {
+                process_s2s_message(
+                    &state,
+                    &mgr,
+                    RL_PEER,
+                    S2sMessage::Privmsg {
+                        // A fresh event id per attempt: dedup would otherwise
+                        // drop the retry's messages before the limiter sees them.
+                        event_id: format!("{RL_PEER}:{}-{attempts}", 200 + i),
+                        from: "spammer!u@s2s".to_string(),
+                        target: "#ratelimit".to_string(),
+                        text: format!("spam {i}"),
+                        origin: RL_PEER.to_string(),
+                        msgid: None,
+                        sig: None,
+                        account: None,
+                        recipient_did: None,
+                        replaces_msgid: None,
+                        tags: HashMap::new(),
+                        multiline_lines: None,
+                    },
+                )
+                .await;
+            }
+            let straddled = secs_now() != start_window;
+
+            let mut received = 0;
+            while let Ok(Some(_)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+            {
+                received += 1;
+            }
+            if !straddled {
+                count = received;
+                break;
+            }
+            // Drain and retry: this burst spanned a counter reset.
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
         }
 
-        // Count received messages
-        let mut count = 0;
-        while let Ok(Some(_)) =
-            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
-        {
-            count += 1;
-        }
         assert!(
             count <= 100,
             "S2S rate limit breached: received {count} messages (limit 100/sec)"

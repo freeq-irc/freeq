@@ -2121,7 +2121,7 @@ async fn process_input(app: &mut App, handle: &client::ClientHandle, input: &str
                         if let Some(ref h) = app.p2p_handle {
                             let h = h.clone();
                             let peer_id = p2p_parts[1].to_string();
-                            app.status_msg(&format!("Connecting to peer {}...", &peer_id));
+                            app.status_msg(&format!("Connecting to peer {}...", peer_id));
                             tokio::spawn(async move {
                                 if let Err(e) = h.connect_peer(&peer_id).await {
                                     tracing::error!("P2P connect error: {e}");
