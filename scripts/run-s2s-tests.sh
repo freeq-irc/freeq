@@ -17,6 +17,18 @@ set -euo pipefail
 
 PORT_A=16667
 PORT_B=16668
+
+# Test identities, resolvable offline so the suite can authenticate without the
+# network. Channel authority in freeq is DID-anchored (see C-2 in
+# docs/SECURITY-AUDIT-2026-03-29.md: a peer's `is_op` claim is never trusted, op
+# status is derived from founder_did / did_ops), so any test about ops, modes,
+# topics or invites crossing a hop has to log in as a DID, not as a guest.
+#
+# Each entry is `did=<publicKeyMultibase>` for an ed25519 key seeded with a fixed
+# byte, so the values are reproducible. They are duplicated in
+# freeq-server/tests/s2s_acceptance.rs (`TEST_IDS`, one identity per test), and
+# `static_identities_match_the_harness` fails if the two ever drift.
+STATIC_DIDS="did:key:z6MksPykuQeYh4zgthFRFBExrgo1dwFWWenY2TEJ9SvT9jn1=z6MksPykuQeYh4zgthFRFBExrgo1dwFWWenY2TEJ9SvT9jn1,did:key:z6MkgcTiPMbTofzVghWywkKDM7SeNYnG4jPbFxerG2rVnV8A=z6MkgcTiPMbTofzVghWywkKDM7SeNYnG4jPbFxerG2rVnV8A,did:key:z6Mkw9YUWaWMuG7ZMhwtpfEytLaMZjiaxYnXe9SxDQHN64sy=z6Mkw9YUWaWMuG7ZMhwtpfEytLaMZjiaxYnXe9SxDQHN64sy,did:key:z6MkqB3fVxzXFbVUK2q1GPrLQzaxgwDGGVuxkDzaf5tsLnpo=z6MkqB3fVxzXFbVUK2q1GPrLQzaxgwDGGVuxkDzaf5tsLnpo,did:key:z6Mksp9sfVKVpWAi43niHLXfGQ5NdCTEoiycLmrLPehquVqK=z6Mksp9sfVKVpWAi43niHLXfGQ5NdCTEoiycLmrLPehquVqK,did:key:z6MkofZ1WuSJkd6UMyevdzsBVrhCtmpcq53cWATRc3jRYAxJ=z6MkofZ1WuSJkd6UMyevdzsBVrhCtmpcq53cWATRc3jRYAxJ,did:key:z6MksvxZ2oR6ogBgsCwsDSiPi3F84SDNn1yCQdVDHf5zKtKp=z6MksvxZ2oR6ogBgsCwsDSiPi3F84SDNn1yCQdVDHf5zKtKp,did:key:z6MkuBDVJTuuJUJSC4XSVeHU6ZgTqcUZM6CkCYxSJ2jNRFSr=z6MkuBDVJTuuJUJSC4XSVeHU6ZgTqcUZM6CkCYxSJ2jNRFSr,did:key:z6MkqzWvFQiKjiXi57aaSdAkYE7WbxVw8ymXA4BMshHYghPh=z6MkqzWvFQiKjiXi57aaSdAkYE7WbxVw8ymXA4BMshHYghPh,did:key:z6MkfMo6gxqdBhaHMNnmfhgZFBjpCDTkmJMJLoypsBZS9PwD=z6MkfMo6gxqdBhaHMNnmfhgZFBjpCDTkmJMJLoypsBZS9PwD,did:key:z6MkmghdggH9iwAwmMypZmN9EsfPGwsbvmum2HkFWXVzrAeE=z6MkmghdggH9iwAwmMypZmN9EsfPGwsbvmum2HkFWXVzrAeE,did:key:z6MkvS2fUtMaVsmMNMMgGzvgSCu7j11e1cvvykBcEvyvz3xW=z6MkvS2fUtMaVsmMNMMgGzvgSCu7j11e1cvvykBcEvyvz3xW"
 DIR_A=$(mktemp -d)
 DIR_B=$(mktemp -d)
 LOG_A="$DIR_A/server.log"
@@ -56,6 +68,7 @@ RUST_LOG=freeq_server=info "$BINARY" \
     --server-name "server-a" \
     --data-dir "$DIR_A" \
     --db-path "$DIR_A/irc.db" \
+    --did-resolver-static "$STATIC_DIDS" \
     --iroh \
     >> "$LOG_A" 2>&1 &
 PID_A=$!
@@ -86,6 +99,7 @@ RUST_LOG=freeq_server=info "$BINARY" \
     --server-name "server-b" \
     --data-dir "$DIR_B" \
     --db-path "$DIR_B/irc.db" \
+    --did-resolver-static "$STATIC_DIDS" \
     --iroh \
     --s2s-peers "$IROH_ID_A" \
     --s2s-allowed-peers "$IROH_ID_A" \

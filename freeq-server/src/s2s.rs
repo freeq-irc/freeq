@@ -1223,6 +1223,31 @@ async fn handle_s2s_connection_from_manager(
     .await;
 }
 
+/// Which of two simultaneous links between the same pair of servers survives.
+///
+/// When both servers list each other in `--s2s-peers` — the natural
+/// configuration — each dials the other and the pair ends up holding two QUIC
+/// connections. Both must independently pick the *same* one to keep, or each
+/// keeps the one the other is tearing down: the loser's link task ends, its
+/// retry loop dials again, that new connection displaces the peer's entry, and
+/// the two servers trade teardowns forever. (Observed: 39 connection
+/// generations in 20 seconds, with no link stable long enough to carry a
+/// message.)
+///
+/// The rule is a total order on the pair, so it needs no negotiation: **the
+/// server with the lower endpoint ID keeps its outgoing connection**, and the
+/// one with the higher ID keeps its incoming. Both sides evaluate this and
+/// arrive at the same surviving connection.
+///
+/// Applied only when a duplicate actually exists. A server that is dialed but
+/// does not dial back has exactly one link, and must keep it whichever side of
+/// the ID comparison it falls on.
+fn duplicate_link_wins(my_id: &str, peer_id: &str, incoming: bool) -> bool {
+    // Lower ID keeps outgoing → for that side, an incoming duplicate loses.
+    // Higher ID keeps incoming → for that side, an outgoing duplicate loses.
+    incoming != (my_id < peer_id)
+}
+
 /// Handle an S2S connection (both incoming and outgoing).
 async fn handle_s2s_connection(
     conn: iroh::endpoint::Connection,
@@ -1257,17 +1282,25 @@ async fn handle_s2s_connection(
         }
     };
 
-    // Write channel — with duplicate connection tie-breaking.
-    // When both servers have each other in --s2s-peers, we get two QUIC
-    // connections (one outgoing, one incoming).  Deterministic rule:
-    //   The peer with the LOWER endpoint ID keeps its OUTGOING connection.
-    //   The peer with the HIGHER endpoint ID keeps the INCOMING connection.
-    // This means: drop if `incoming == (our_id < peer_id)`.
+    // Write channel — with duplicate connection tie-breaking. See
+    // `duplicate_link_wins`: both servers apply the same total order, so they
+    // keep the same connection instead of tearing down each other's.
     let (write_tx, mut write_rx) = mpsc::channel::<S2sMessage>(256);
     let my_gen = conn_gen.fetch_add(1, Ordering::Relaxed);
     {
         let mut peers_guard = peers.lock().await;
         if peers_guard.contains_key(&peer_id) {
+            if !duplicate_link_wins(&server_id, &peer_id, incoming) {
+                tracing::info!(
+                    peer = %peer_id, incoming, gen = my_gen,
+                    "S2S duplicate connection — yielding to the link both sides keep"
+                );
+                // Leave the map untouched: the surviving entry is the peer's,
+                // and the retry loop skips reconnecting while it is there.
+                drop(peers_guard);
+                conn.close(0u32.into(), b"duplicate link");
+                return;
+            }
             tracing::info!(
                 peer = %peer_id, incoming, gen = my_gen,
                 "S2S duplicate connection — replacing existing (generation-safe cleanup)"
@@ -1500,6 +1533,38 @@ async fn handle_s2s_connection(
 
 #[cfg(test)]
 mod tests {
+    /// Both sides of a duplicate must choose the same surviving link, or they
+    /// trade teardowns until one of them is restarted.
+    #[test]
+    fn duplicate_links_are_resolved_the_same_way_by_both_servers() {
+        let low = "aaaa";
+        let high = "bbbb";
+
+        // The low-ID server keeps its outgoing; the high-ID server keeps its
+        // incoming. Those are the same connection, seen from the two ends.
+        assert!(duplicate_link_wins(low, high, false), "low keeps outgoing");
+        assert!(duplicate_link_wins(high, low, true), "high keeps incoming");
+
+        // And each discards the other one — again, one connection, two ends.
+        assert!(!duplicate_link_wins(low, high, true), "low drops incoming");
+        assert!(!duplicate_link_wins(high, low, false), "high drops outgoing");
+    }
+
+    /// Exactly one of the two ends survives, for any pair of ids in any order.
+    #[test]
+    fn exactly_one_end_of_a_duplicate_survives() {
+        for (a, b) in [("aaa", "bbb"), ("bbb", "aaa"), ("a", "ab"), ("zz", "zza")] {
+            // The connection a→b: outgoing at `a`, incoming at `b`.
+            let a_to_b = duplicate_link_wins(a, b, false) && duplicate_link_wins(b, a, true);
+            // The connection b→a: outgoing at `b`, incoming at `a`.
+            let b_to_a = duplicate_link_wins(b, a, false) && duplicate_link_wins(a, b, true);
+            assert!(
+                a_to_b ^ b_to_a,
+                "({a}, {b}): exactly one direction must survive, got a→b={a_to_b} b→a={b_to_a}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

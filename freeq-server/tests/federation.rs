@@ -195,8 +195,15 @@ async fn spawn_pair(ids: &[&TestId]) -> (TestServer, TestServer) {
     let serial = ONE_TEST_AT_A_TIME
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let a_plan = plan_server(0xA1);
-    let b_plan = plan_server(0xB2);
+    // A fresh iroh identity per pair. Every pair used to boot as the same two
+    // node IDs, so two pairs alive at once — the previous test's servers still
+    // exiting, or anything that runs this file without the lock above — were, to
+    // iroh, the same two nodes reachable at two addresses. The lock makes that
+    // rare rather than impossible; distinct identities make it harmless.
+    static NEXT_SEED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+    let n = NEXT_SEED.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+    let a_plan = plan_server(n);
+    let b_plan = plan_server(n.wrapping_add(1));
     let resolver: String = ids
         .iter()
         .map(|i| i.resolver_entry())

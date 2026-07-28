@@ -2805,6 +2805,32 @@ fn federated_edit_authorized(
         .eq_ignore_ascii_case(actor_nick)
 }
 
+/// The channel entry for an S2S-learned channel, created with the mode set a
+/// channel is born with everywhere else (+nt: no external messages, topic
+/// locked to ops) if this is the first we have heard of it.
+///
+/// Four S2S handlers can bring a channel into existence — `Join`, `Topic`,
+/// `ChannelCreated`, `SyncResponse` — and only the last two applied the
+/// defaults. Worse, the origin sends `Join` *before* `ChannelCreated`, so by the
+/// time the explicit defaults arrived the channel already existed and they were
+/// skipped: in practice a peer-learned channel had no +n and no +t at all.
+/// A channel's protections must not depend on which event won a race, so every
+/// creation path goes through here.
+///
+/// Existing channels are returned untouched: a mode deliberately turned off
+/// stays off.
+fn s2s_channel_entry<'a>(
+    channels: &'a mut HashMap<String, ChannelState>,
+    channel: &str,
+) -> &'a mut ChannelState {
+    let is_new = !channels.contains_key(channel);
+    let ch = channels.entry(channel.to_string()).or_default();
+    if is_new {
+        ch.no_ext_msg = true;
+        ch.topic_locked = true;
+    }
+    ch}
+
 /// Process an incoming S2S message. Exposed as pub(crate) for adversarial testing.
 pub(crate) async fn process_s2s_message(
     state: &Arc<SharedState>,
@@ -3917,7 +3943,7 @@ pub(crate) async fn process_s2s_message(
             // Idempotent: set-based, don't assume not present
             {
                 let mut channels = state.channels.lock();
-                let ch = channels.entry(channel.clone()).or_default();
+                let ch = s2s_channel_entry(&mut channels, &channel);
                 // Consume invite (all forms: DID, nick)
                 if let Some(ref d) = did {
                     ch.invites.remove(d);
@@ -4035,7 +4061,7 @@ pub(crate) async fn process_s2s_message(
             // Apply locally for immediate UX (CRDT is authoritative if they diverge)
             {
                 let mut channels = state.channels.lock();
-                let ch = channels.entry(channel.clone()).or_default();
+                let ch = s2s_channel_entry(&mut channels, &channel);
                 ch.topic = Some(TopicInfo::new(topic.clone(), set_by.clone()));
             }
 
@@ -4054,13 +4080,7 @@ pub(crate) async fn process_s2s_message(
             let has_local_members;
             {
                 let mut channels = state.channels.lock();
-                let is_new = !channels.contains_key(&channel);
-                let ch = channels.entry(channel.clone()).or_default();
-                // New channels get +nt defaults
-                if is_new {
-                    ch.no_ext_msg = true;
-                    ch.topic_locked = true;
-                }
+                let ch = s2s_channel_entry(&mut channels, &channel);
 
                 // ── Authority gating ───────────────────────────────────
                 // Founder: only adopt if we have no local founder.
@@ -4261,13 +4281,7 @@ pub(crate) async fn process_s2s_message(
                 }
 
                 for info in remote_channels {
-                    let is_new = !channels.contains_key(&info.name);
-                    let ch = channels.entry(info.name.clone()).or_default();
-                    // New channels created via sync get +nt by default
-                    if is_new {
-                        ch.no_ext_msg = true;
-                        ch.topic_locked = true;
-                    }
+                    let ch = s2s_channel_entry(&mut channels, &info.name);
 
                     // ── Authority gating on sync ──────────────────────
                     // Merge founder: only adopt if we don't have one AND it's a valid DID
@@ -6529,6 +6543,141 @@ mod s2s_adversarial_tests {
     // ═══════════════════════════════════════════════════════════
     // S2S CHANNEL LENGTH LIMIT
     // ═══════════════════════════════════════════════════════════
+
+    // ── Channel defaults on S2S-learned channels ───────────────────
+    //
+    // A channel comes into existence with +nt everywhere. `ChannelCreated` and
+    // `SyncResponse` say so explicitly; `Join` and `Topic` can create a channel
+    // too, and left it with `ChannelState::default()` — no +n, no +t. Which
+    // meant the modes a channel had on a peer depended on which event happened
+    // to arrive first, and on the peer's copy anyone could set the topic and a
+    // non-member could talk.
+
+    /// The mode set a channel is born with, on any server that learns of it.
+    fn modes_of(state: &Arc<SharedState>, channel: &str) -> (bool, bool) {
+        let channels = state.channels.lock();
+        let ch = channels.get(channel).expect("channel exists");
+        (ch.no_ext_msg, ch.topic_locked)
+    }
+
+    async fn relay_join(state: &Arc<SharedState>, mgr: &Arc<S2sManager>, channel: &str, nick: &str) {
+        process_s2s_message(
+            state,
+            mgr,
+            PEER,
+            S2sMessage::Join {
+                event_id: format!("{PEER}:join-{channel}-{nick}"),
+                nick: nick.to_string(),
+                channel: channel.to_string(),
+                did: None,
+                handle: None,
+                is_op: false,
+                actor_class: None,
+                origin: PEER.to_string(),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn s2s_join_creating_a_channel_applies_default_modes() {
+        let state = test_state();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+
+        relay_join(&state, &mgr, "#fedjoinmodes", "alice").await;
+
+        assert_eq!(
+            modes_of(&state, "#fedjoinmodes"),
+            (true, true),
+            "a channel learned from a peer's JOIN must be +nt, like one created here"
+        );
+    }
+
+    /// The order the origin actually sends in: `Join` first, then
+    /// `ChannelCreated`. So `ChannelCreated`'s own defaults never applied — by
+    /// the time it arrived the channel existed, and `is_new` was false.
+    #[tokio::test]
+    async fn s2s_join_before_channel_created_still_locks_the_topic() {
+        let state = test_state();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+
+        relay_join(&state, &mgr, "#fedorder", "alice").await;
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::ChannelCreated {
+                event_id: format!("{PEER}:created"),
+                channel: "#fedorder".to_string(),
+                founder_did: None,
+                did_ops: vec![],
+                created_at: 0,
+                origin: PEER.to_string(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            modes_of(&state, "#fedorder"),
+            (true, true),
+            "the JOIN-then-ChannelCreated order left the channel with no protections"
+        );
+    }
+
+    /// A `Topic` for a channel we have never seen creates it too. Same rule.
+    #[tokio::test]
+    async fn s2s_topic_creating_a_channel_applies_default_modes() {
+        let state = test_state();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Topic {
+                event_id: format!("{PEER}:topic"),
+                channel: "#fedtopicmodes".to_string(),
+                topic: "hello".to_string(),
+                set_by: "alice".to_string(),
+                origin: PEER.to_string(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            modes_of(&state, "#fedtopicmodes"),
+            (true, true),
+            "a channel learned from a peer's TOPIC must be +nt"
+        );
+    }
+
+    /// The defaults are for *new* channels only — a channel we already hold
+    /// keeps the modes it has, including ones deliberately turned off.
+    #[tokio::test]
+    async fn s2s_join_does_not_reimpose_defaults_on_an_existing_channel() {
+        let state = test_state();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+
+        setup_channel(&state, "#fedexisting");
+        {
+            let mut channels = state.channels.lock();
+            let ch = channels.get_mut("#fedexisting").unwrap();
+            ch.no_ext_msg = false;
+            ch.topic_locked = false;
+        }
+
+        relay_join(&state, &mgr, "#fedexisting", "alice").await;
+
+        assert_eq!(
+            modes_of(&state, "#fedexisting"),
+            (false, false),
+            "an existing channel's modes must not be reset by a peer's JOIN"
+        );
+    }
 
     #[tokio::test]
     async fn s2s_join_long_channel_name_truncated() {
