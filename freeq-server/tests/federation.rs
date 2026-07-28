@@ -20,7 +20,7 @@
 //! - waits are event/DB-driven with a timeout; never a fixed sleep.
 
 use std::process::{Child, Command};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use freeq_sdk::auth::{ChallengeSigner, KeySigner};
@@ -65,11 +65,19 @@ impl TestId {
 // ── server process management ────────────────────────────────────
 
 /// A running `freeq-server` subprocess. `Drop` kills it and removes its tempdir.
+/// One test at a time: each test boots two servers, and running the file in
+/// parallel (22 servers at once) starves the machine — clients time out before
+/// first auth and the whole batch fails. Taken in `spawn_pair`, which every
+/// test goes through, so they queue regardless of cargo's `--test-threads`.
+static ONE_TEST_AT_A_TIME: Mutex<()> = Mutex::new(());
+
 struct TestServer {
     _dir: tempfile::TempDir,
     child: Child,
     irc_addr: String,
     db_path: String,
+    /// Held by server A for the test's lifetime; see `ONE_TEST_AT_A_TIME`.
+    serial: Option<MutexGuard<'static, ()>>,
 }
 
 impl Drop for TestServer {
@@ -175,12 +183,18 @@ fn spawn_server(plan: ServerPlan, peer: &PeerRef, resolver_entries: &str) -> Tes
         child,
         irc_addr,
         db_path,
+        serial: None,
     }
 }
 
 /// Boot two mutually-peered servers, both resolving every `ids` DID offline.
 /// Blocks until both IRC ports accept connections.
 async fn spawn_pair(ids: &[&TestId]) -> (TestServer, TestServer) {
+    // A failed test poisons the lock; the next test's servers are unaffected,
+    // so take it anyway.
+    let serial = ONE_TEST_AT_A_TIME
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let a_plan = plan_server(0xA1);
     let b_plan = plan_server(0xB2);
     let resolver: String = ids
@@ -193,8 +207,9 @@ async fn spawn_pair(ids: &[&TestId]) -> (TestServer, TestServer) {
     // two can cross-reference for peering.
     let a_ref = PeerRef::of(&a_plan);
     let b_ref = PeerRef::of(&b_plan);
-    let a = spawn_server(a_plan, &b_ref, &resolver);
+    let mut a = spawn_server(a_plan, &b_ref, &resolver);
     let b = spawn_server(b_plan, &a_ref, &resolver);
+    a.serial = Some(serial);
 
     wait_port(&a.irc_addr).await;
     wait_port(&b.irc_addr).await;
