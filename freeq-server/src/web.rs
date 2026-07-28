@@ -1924,7 +1924,9 @@ async fn api_search(
                 sender: r.sender,
                 text: r.text,
                 timestamp: r.timestamp,
-                msgid: r.msgid,
+                // A hit is addressed by its root — the id clients hold the
+                // message under — not the matching revision's own id.
+                msgid: r.root_msgid.or(r.msgid),
                 tags: r.tags,
             })
             .collect(),

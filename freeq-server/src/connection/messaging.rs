@@ -1620,6 +1620,14 @@ pub(super) fn handle_search(
     // search_messages returns newest-first; replay oldest-first so the
     // batch reads like CHATHISTORY output.
     messages.reverse();
+    // A search hit is a pointer, not a replay event: address it by the root —
+    // the id clients hold the message under. This also keys the reactions
+    // lookup in replay_rows_as_batch, which files reactions by root.
+    for row in &mut messages {
+        if row.root_msgid.is_some() {
+            row.msgid = row.root_msgid.clone();
+        }
+    }
 
     let has_tags = state.cap_message_tags.lock().contains(session_id);
     let has_time = state.cap_server_time.lock().contains(session_id);

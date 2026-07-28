@@ -958,17 +958,18 @@ impl Db {
             }
             let before_ts = before.map(|b| b as i64).unwrap_or(i64::MAX);
             let mut stmt = self.conn.prepare(
-                // Results carry the root id: a hit on an edited message must be
-                // addressable by the identity every client holds it under.
+                // Rows come back as themselves (`msgid` = the row's own id,
+                // like every other query); the SEARCH and REST handlers
+                // re-address hits by `root_msgid` — the id clients hold the
+                // message under — when they emit.
                 //
                 // Superseded revisions are excluded, matching the
                 // decrypt-and-scan path below. An edit made since the upgrade
                 // leaves the index on its own, but rows indexed before it are
                 // still there, and returning them alongside the current one
-                // yields two hits carrying the same root id — the duplicate
-                // identity this keying exists to prevent.
+                // yields two hits for one logical message.
                 "SELECT m.id, m.channel, m.sender, m.text, m.timestamp, m.tags_json,
-                        COALESCE(m.root_msgid, m.msgid), m.replaces_msgid, m.deleted_at, m.sender_did, m.root_msgid
+                        m.msgid, m.replaces_msgid, m.deleted_at, m.sender_did, m.root_msgid
                  FROM messages_fts
                  JOIN messages m ON m.id = messages_fts.rowid
                  WHERE messages_fts MATCH ?1
@@ -1000,7 +1001,7 @@ impl Db {
         let before_ts = before.map(|b| b as i64).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(
             "SELECT id, channel, sender, text, timestamp, tags_json,
-                    COALESCE(root_msgid, msgid), replaces_msgid, deleted_at, sender_did, root_msgid
+                    msgid, replaces_msgid, deleted_at, sender_did, root_msgid
              FROM messages m
              WHERE channel = ?1 AND deleted_at IS NULL AND timestamp < ?2
                AND NOT EXISTS (
@@ -3344,9 +3345,10 @@ mod tests {
         );
         let hits = db.search_messages("#dev", "revised", 50, None).unwrap();
         assert_eq!(hits.len(), 1);
-        // The hit is addressable by the id every client holds the message
-        // under — the original, not the revision's own id.
-        assert_eq!(hits[0].msgid.as_deref(), Some("m1"));
+        // The row comes back as itself; the root rides alongside for the
+        // handlers to address the hit by.
+        assert_eq!(hits[0].msgid.as_deref(), Some("m2"));
+        assert_eq!(hits[0].root_msgid.as_deref(), Some("m1"));
     }
 
     /// Encrypted databases search by decrypt-and-scan rather than FTS; a
@@ -3364,7 +3366,8 @@ mod tests {
         );
         let hits = db.search_messages("#dev", "revised", 50, None).unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].msgid.as_deref(), Some("m1"));
+        assert_eq!(hits[0].msgid.as_deref(), Some("m2"));
+        assert_eq!(hits[0].root_msgid.as_deref(), Some("m1"));
     }
 
     /// A revision indexed before the upgrade is still in the FTS table —
@@ -3412,7 +3415,8 @@ mod tests {
             hits.iter().map(|h| (&h.text, &h.msgid)).collect::<Vec<_>>()
         );
         assert_eq!(hits[0].text, "shared word revised");
-        assert_eq!(hits[0].msgid.as_deref(), Some("m1"));
+        assert_eq!(hits[0].msgid.as_deref(), Some("m2"));
+        assert_eq!(hits[0].root_msgid.as_deref(), Some("m1"));
     }
 
     /// The data migration runs once and stamps the schema, instead of
