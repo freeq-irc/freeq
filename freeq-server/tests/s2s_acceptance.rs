@@ -18,11 +18,14 @@
 //! Channel names use `#_zqtest_` prefix + timestamp to avoid collisions
 //! with real channels on live servers.
 
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+use freeq_sdk::auth::{ChallengeSigner, KeySigner};
 use freeq_sdk::client::{self, ClientHandle, ConnectConfig};
+use freeq_sdk::crypto::PrivateKey;
 use freeq_sdk::event::Event;
 
 /// How long to wait for an event before considering it failed.
@@ -34,7 +37,139 @@ const S2S_TIMEOUT: Duration = Duration::from_secs(30);
 /// Time to let S2S state propagate after a JOIN/PART/etc.
 const S2S_SETTLE: Duration = Duration::from_secs(3);
 
+// ── Test identities ──────────────────────────────────────────────
+//
+// Channel authority in freeq is DID-anchored. A peer's `is_op` claim is never
+// trusted across a hop (C-2 in docs/SECURITY-AUDIT-2026-03-29.md: "Never trust
+// `is_op` from peers … derive op status from local channel state"), and the
+// state that *does* cross is `founder_did` / `did_ops`. A guest has no DID, so a
+// guest cannot hold authority anywhere but on the server they are connected to.
+//
+// Every test whose subject is an op action crossing a hop — topic on +t, MODE,
+// invites — therefore has to authenticate. `connect_guest` is still right for
+// tests about plain messaging, presence, and history.
+
+/// One authenticated identity per test that needs one, keyed by the test's own
+/// tag. Fixed ed25519 seeds, so the DIDs and their public keys are reproducible
+/// and can be handed to the servers on the command line before the tests start.
+///
+/// One per test, not a shared pool: two sessions on the same DID are *one*
+/// identity with two devices, which is correct behavior and exactly wrong for a
+/// test. Sharing a DID made a test see the previous test's nick in NAMES, and
+/// only when the suite ran in order — the kind of failure that looks like
+/// flakiness.
+///
+/// `(tag, seed, publicKeyMultibase)`. The multibase is duplicated in
+/// `scripts/run-s2s-tests.sh`, which has to pass these to the servers before any
+/// test runs; `static_identities_match_the_harness` fails if they drift.
+const TEST_IDS: [(&str, u8, &str); 12] = [
+    ("tsync", 0x51, "z6MksPykuQeYh4zgthFRFBExrgo1dwFWWenY2TEJ9SvT9jn1"),
+    ("rtop", 0x52, "z6MkgcTiPMbTofzVghWywkKDM7SeNYnG4jPbFxerG2rVnV8A"),
+    ("toppers", 0x53, "z6Mkw9YUWaWMuG7ZMhwtpfEytLaMZjiaxYnXe9SxDQHN64sy"),
+    ("top1", 0x54, "z6MkqB3fVxzXFbVUK2q1GPrLQzaxgwDGGVuxkDzaf5tsLnpo"),
+    ("top3", 0x55, "z6Mksp9sfVKVpWAi43niHLXfGQ5NdCTEoiycLmrLPehquVqK"),
+    ("sy2", 0x56, "z6MkofZ1WuSJkd6UMyevdzsBVrhCtmpcq53cWATRc3jRYAxJ"),
+    ("sy3", 0x57, "z6MksvxZ2oR6ogBgsCwsDSiPi3F84SDNn1yCQdVDHf5zKtKp"),
+    ("inv2", 0x58, "z6MkuBDVJTuuJUJSC4XSVeHU6ZgTqcUZM6CkCYxSJ2jNRFSr"),
+    ("inv3", 0x59, "z6MkqzWvFQiKjiXi57aaSdAkYE7WbxVw8ymXA4BMshHYghPh"),
+    ("inv7", 0x5a, "z6MkfMo6gxqdBhaHMNnmfhgZFBjpCDTkmJMJLoypsBZS9PwD"),
+    ("inv10", 0x5b, "z6MkmghdggH9iwAwmMypZmN9EsfPGwsbvmum2HkFWXVzrAeE"),
+    ("sinv", 0x5c, "z6MkvS2fUtMaVsmMNMMgGzvgSCu7j11e1cvvykBcEvyvz3xW"),
+];
+
+/// One of the fixed test identities. `did:key:<multibase>` — self-certifying, so
+/// the static resolver entry is just the key repeated.
+struct TestId {
+    did: String,
+    seed: u8,
+}
+
+impl TestId {
+    /// The identity belonging to `tag` — use the test's own channel tag, so each
+    /// test has its own user and no two tests can collide on one DID.
+    fn for_test(tag: &str) -> Self {
+        let (_, seed, multibase) = TEST_IDS
+            .iter()
+            .find(|(t, _, _)| *t == tag)
+            .unwrap_or_else(|| panic!("no test identity registered for {tag:?}; add one to TEST_IDS and to scripts/run-s2s-tests.sh"));
+        TestId {
+            did: format!("did:key:{multibase}"),
+            seed: *seed,
+        }
+    }
+
+    /// A fresh signer over the same key (`KeySigner` consumes the key).
+    fn signer(&self) -> Arc<dyn ChallengeSigner> {
+        let key = PrivateKey::ed25519_from_bytes(&[self.seed; 32]).unwrap();
+        Arc::new(KeySigner::new(self.did.clone(), key))
+    }
+}
+
+/// The identities above are duplicated in `scripts/run-s2s-tests.sh`, which has
+/// to pass them to the servers before any test runs. Nothing prevents the two
+/// from drifting except this.
+#[test]
+fn static_identities_match_the_harness() {
+    let script = include_str!("../../scripts/run-s2s-tests.sh");
+    for (tag, seed, multibase) in TEST_IDS {
+        let key = PrivateKey::ed25519_from_bytes(&[seed; 32]).unwrap();
+        assert_eq!(
+            &key.public_key_multibase(),
+            multibase,
+            "TEST_IDS[{tag}] no longer matches seed {seed:#04x}; update scripts/run-s2s-tests.sh too"
+        );
+        assert!(
+            script.contains(multibase),
+            "scripts/run-s2s-tests.sh does not pass {tag}'s key ({multibase}) to the servers"
+        );
+    }
+
+    let mut seeds: Vec<u8> = TEST_IDS.iter().map(|(_, s, _)| *s).collect();
+    seeds.sort_unstable();
+    let before = seeds.len();
+    seeds.dedup();
+    assert_eq!(
+        seeds.len(), before,
+        "two tests share a seed, so they share a DID, so they are one identity with two devices"
+    );
+}
+
 // ── Helpers ──────────────────────────────────────────────────────
+
+/// Connect a DID-authenticated user, returning handle + event receiver.
+/// Waits for SASL success, so the caller knows authority is in place.
+async fn connect_authed(
+    addr: &str,
+    nick: &str,
+    id: &TestId,
+) -> (ClientHandle, mpsc::Receiver<Event>) {
+    let config = ConnectConfig {
+        server_addr: addr.to_string(),
+        nick: nick.to_string(),
+        user: nick.to_string(),
+        realname: format!("S2S Test ({nick})"),
+        tls: false,
+        tls_insecure: false,
+        ..Default::default()
+    };
+    let (h, mut rx) = client::connect(config, Some(id.signer()));
+    // SASL completes during registration, so `Authenticated` precedes
+    // `Registered`. Wait for both: authority is in place at the first, and the
+    // session accepts commands at the second.
+    let authed = maybe_wait(
+        &mut rx,
+        |e| matches!(e, Event::Authenticated { .. }),
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(
+        authed.is_some(),
+        "{nick} never authenticated as {} — is --did-resolver-static set on this server?",
+        id.did
+    );
+    wait_registered(&mut rx).await;
+    (h, rx)
+}
 
 /// Connect a guest user to a server, returning handle + event receiver.
 async fn connect_guest(addr: &str, nick: &str) -> (ClientHandle, mpsc::Receiver<Event>) {
@@ -1165,10 +1300,11 @@ async fn s2s_topic_syncs() {
     let nick_a = test_nick("tsync", "a");
     let nick_b = test_nick("tsync", "b");
 
-    let (h1, mut e1) = connect_guest(&local, &nick_a).await;
+    // A authenticates: the topic is being set on a +t channel and has to be
+    // honoured on the far side, which only a DID-anchored op can do (C-2).
+    let (h1, mut e1) = connect_authed(&local, &nick_a, &TestId::for_test("tsync")).await;
     let (h2, mut e2) = connect_guest(&remote, &nick_b).await;
 
-    wait_registered(&mut e1).await;
     wait_registered(&mut e2).await;
 
     h1.join(&channel).await.unwrap();
@@ -1632,9 +1768,9 @@ async fn s2s_topic_persists_across_reconnect() {
     let nick_b = test_nick("tp", "b");
     let nick_c = test_nick("tp", "c");
 
-    let (ha, mut ea) = connect_guest(&local, &nick_a).await;
+    // A sets the topic, so A authenticates (see C-2).
+    let (ha, mut ea) = connect_authed(&local, &nick_a, &TestId::for_test("toppers")).await;
     let (hb, mut eb) = connect_guest(&remote, &nick_b).await;
-    wait_registered(&mut ea).await;
     wait_registered(&mut eb).await;
 
     ha.join(&channel).await.unwrap();
@@ -1786,10 +1922,11 @@ async fn s2s_topic_set_from_remote() {
     let nick_a = test_nick("rtop", "a");
     let nick_b = test_nick("rtop", "b");
 
+    // B sets the topic on a +t channel, so B needs a DID: op authority is
+    // DID-anchored and does not cross a hop for a guest (C-2).
     let (ha, mut ea) = connect_guest(&local, &nick_a).await;
-    let (hb, mut eb) = connect_guest(&remote, &nick_b).await;
+    let (hb, mut eb) = connect_authed(&remote, &nick_b, &TestId::for_test("rtop")).await;
     wait_registered(&mut ea).await;
-    wait_registered(&mut eb).await;
 
     ha.join(&channel).await.unwrap();
     hb.join(&channel).await.unwrap();
@@ -2264,9 +2401,12 @@ async fn s2s_inv3_creator_is_op_everywhere() {
     let nick_a = test_nick("inv3", "a");
     let nick_b = test_nick("inv3", "b");
 
-    // A creates channel on local
-    let (ha, mut ea) = connect_guest(&local, &nick_a).await;
-    wait_registered(&mut ea).await;
+    // A creates the channel on local, authenticated: a creator is op on the
+    // *other* server only through their DID. `ChannelCreated` carries
+    // `founder_did`, and the peer derives op from it; a guest creator has no DID
+    // to carry, and a peer-asserted `is_op` is never trusted (C-2). So this
+    // test is only meaningful for an authenticated creator.
+    let (ha, mut ea) = connect_authed(&local, &nick_a, &TestId::for_test("inv3")).await;
     ha.join(&channel).await.unwrap();
     wait_joined(&mut ea, &channel).await;
 
@@ -2470,8 +2610,9 @@ async fn s2s_inv7_mode_propagates() {
     let nick_a = test_nick("inv7", "a");
     let nick_b = test_nick("inv7", "b");
 
-    let (ha, mut ea) = connect_guest(&local, &nick_a).await;
-    wait_registered(&mut ea).await;
+    // A sets a mode, so A authenticates: a MODE from a guest "op" is refused on
+    // the far server (C-2).
+    let (ha, mut ea) = connect_authed(&local, &nick_a, &TestId::for_test("inv7")).await;
     ha.join(&channel).await.unwrap();
     wait_joined(&mut ea, &channel).await;
 
@@ -2615,9 +2756,11 @@ async fn s2s_inv10_remote_creator_sole_op_local_joiner_no_ops() {
     let nick_a = test_nick("inv10", "a");
     let nick_b = test_nick("inv10", "b");
 
-    // A creates channel on REMOTE server (A is founder/op)
-    let (ha, mut ea) = connect_guest(&remote, &nick_a).await;
-    wait_registered(&mut ea).await;
+    // A creates the channel on REMOTE (A is founder/op) and authenticates: the
+    // assertion below is that A's op status is visible on the *local* server,
+    // which travels as `founder_did`. A guest founder has no DID to travel, and
+    // a peer's `is_op` claim is never trusted (C-2).
+    let (ha, mut ea) = connect_authed(&remote, &nick_a, &TestId::for_test("top1")).await;
     ha.join(&channel).await.unwrap();
     wait_joined(&mut ea, &channel).await;
 
@@ -3514,7 +3657,9 @@ async fn s2s_sync2_remote_topic_visible_locally() {
     // B sets the topic — A should see it.
     //
     // Note: B must be an op to set topic (channels default to +t).
-    // We make B the creator so B is op on their home server.
+    // We make B the creator so B is op on their home server — and B
+    // authenticates, because an op's authority reaches the other server only
+    // through their DID (C-2).
     let Some((local, remote)) = get_servers() else {
         return;
     };
@@ -3523,8 +3668,7 @@ async fn s2s_sync2_remote_topic_visible_locally() {
     let nick_b = test_nick("sy2", "b");
 
     // B creates channel on remote (B is op)
-    let (hb, mut eb) = connect_guest(&remote, &nick_b).await;
-    wait_registered(&mut eb).await;
+    let (hb, mut eb) = connect_authed(&remote, &nick_b, &TestId::for_test("sy2")).await;
     hb.join(&channel).await.unwrap();
     wait_joined(&mut eb, &channel).await;
 
@@ -3571,9 +3715,9 @@ async fn s2s_sync3_remote_mode_propagates() {
     let nick_a = test_nick("sy3", "a");
     let nick_b = test_nick("sy3", "b");
 
-    // B creates channel on remote (gets ops)
-    let (hb, mut eb) = connect_guest(&remote, &nick_b).await;
-    wait_registered(&mut eb).await;
+    // B creates the channel on remote and sets a mode on it, so B needs a DID:
+    // a MODE from a guest "op" is refused on the far server (C-2).
+    let (hb, mut eb) = connect_authed(&remote, &nick_b, &TestId::for_test("sy3")).await;
     hb.join(&channel).await.unwrap();
     wait_joined(&mut eb, &channel).await;
 
@@ -4610,9 +4754,10 @@ async fn s2s_topic1_remote_op_sets_topic_on_plus_t() {
     let nick_a = test_nick("top1", "a");
     let nick_b = test_nick("top1", "b");
 
-    // A creates channel on remote (gets ops, channel defaults to +t)
-    let (ha, mut ea) = connect_guest(&remote, &nick_a).await;
-    wait_registered(&mut ea).await;
+    // A creates channel on remote (gets ops, channel defaults to +t) and
+    // authenticates — the topic has to be honoured on the *other* server, and
+    // only a DID-anchored op carries authority across a hop (C-2).
+    let (ha, mut ea) = connect_authed(&remote, &nick_a, &TestId::for_test("inv10")).await;
     ha.join(&channel).await.unwrap();
     wait_joined(&mut ea, &channel).await;
 
@@ -4721,8 +4866,8 @@ async fn s2s_topic3_topic_visible_to_late_joiner() {
     let nick_a = test_nick("top3", "a");
     let nick_b = test_nick("top3", "b");
 
-    let (ha, mut ea) = connect_guest(&local, &nick_a).await;
-    wait_registered(&mut ea).await;
+    // A sets the topic, so A authenticates (see C-2).
+    let (ha, mut ea) = connect_authed(&local, &nick_a, &TestId::for_test("top3")).await;
     ha.join(&channel).await.unwrap();
     wait_joined(&mut ea, &channel).await;
 
@@ -5332,9 +5477,11 @@ async fn s2s_inv2_remote_guest_blocked_from_invite_only_without_invite() {
     let nick_b = format!("InvD{ts}");
     let channel = format!("#inv2{ts}");
 
-    // A creates +i channel on local
-    let (ha, mut ea) = connect_guest(&local, &nick_a).await;
-    wait_registered(&mut ea).await;
+    // A creates the +i channel on local, authenticated: +i only protects the
+    // channel on the *other* server if the MODE crosses, and a mode set by a
+    // guest "op" is refused there (C-2). Unauthenticated, this test asserts a
+    // block that cannot happen.
+    let (ha, mut ea) = connect_authed(&local, &nick_a, &TestId::for_test("inv2")).await;
     ha.join(&channel).await.unwrap();
     wait_for(&mut ea, |evt| matches!(evt, Event::Joined { .. }), "A join").await;
     drain(&mut ea).await;
@@ -7546,11 +7693,25 @@ async fn s2s_invite_syncs_across_servers() {
     let nick_op = test_nick("sinv", "op");
     let nick_guest = test_nick("sinv", "g");
 
-    // Op connects to local server, guest to remote
-    let (h_op, mut e_op) = connect_guest(&local, &nick_op).await;
+    // Op connects to local server, guest to remote. The op authenticates: both
+    // halves of this test cross a hop (the +i mode, then the invite), and
+    // neither is honoured on the far side for a guest "op" (C-2).
+    let (h_op, mut e_op) = connect_authed(&local, &nick_op, &TestId::for_test("sinv")).await;
     let (h_g, mut e_g) = connect_guest(&remote, &nick_guest).await;
-    wait_registered(&mut e_op).await;
     wait_registered(&mut e_g).await;
+
+    // A server can only invite a nick it has heard of: `resolve_network_target`
+    // knows local sessions and the remote members of channels it holds, and
+    // nothing else — there is no network-wide nick directory to consult. A
+    // remote user who has never shared a channel is `Unknown`, and INVITE
+    // answers 401. So give the two a shared channel first, which is also how
+    // this happens in practice: you invite someone you have seen.
+    let lobby = test_channel("sinvlobby");
+    h_op.join(&lobby).await.unwrap();
+    wait_joined(&mut e_op, &lobby).await;
+    h_g.join(&lobby).await.unwrap();
+    wait_joined(&mut e_g, &lobby).await;
+    tokio::time::sleep(S2S_SETTLE).await;
 
     // Op creates channel and sets +i
     h_op.join(&channel).await.unwrap();
