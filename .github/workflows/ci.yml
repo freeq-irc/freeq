@@ -77,7 +77,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
 
       - name: npm audit (web client)
         working-directory: freeq-app
@@ -93,9 +93,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Node 24: the version this repo is developed on. npm 10 (Node 20) and
+      # npm 11+ disagree about whether a peer-only optional dependency belongs
+      # hoisted in the lock file — `@emnapi/runtime`, via
+      # `@napi-rs/wasm-runtime` — so `npm ci` on Node 20 rejected a lock file
+      # any current dev machine regenerates, and whoever ran `npm install` last
+      # decided whether CI passed. Matching the local toolchain removes the
+      # disagreement (and Node 20 is deprecated on the runners besides).
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: |
             freeq-app/package-lock.json
