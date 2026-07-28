@@ -79,6 +79,29 @@ freeq-auth-broker/ OAuth broker for AT Protocol
 freeq-site/      Marketing site (freeq.at)
 ```
 
+## Database migrations
+
+The server's SQLite database has two change mechanisms, and which one you
+use depends on what you're changing:
+
+- **Schema shape** (new tables, new columns): add an idempotent
+  `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE` to the statement list in
+  `Db::init()` (`freeq-server/src/db.rs`). These replay on every boot and
+  converge any database to the current shape.
+- **One-time data changes** (backfills, rewrites, anything that moves rows):
+  add an entry to `migration_ladder()` in the same file. The ladder is
+  `rusqlite_migration`, tracked in SQLite's `PRAGMA user_version` — the
+  integer version slot SQLite reserves for the application. Migrations are
+  numbered by list position, run in order, and each commits atomically with
+  its version stamp, so they run exactly once per database and don't need to
+  be idempotent. The ladder is **append-only**: never insert, reorder, or
+  renumber entries — databases in the wild are stamped with the versions
+  they've passed.
+
+Slot 1 of the ladder is an empty placeholder deliberately reserved for
+moving the `init()` schema statements into the ladder (see the comment on
+`migration_ladder()`). Don't put anything else there.
+
 ## License
 
 By contributing, you agree that your contributions will be licensed under
