@@ -688,6 +688,34 @@ async fn health_endpoint_returns_json() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body.get("connections").is_some());
     assert!(body.get("channels").is_some());
+
+    // Whether calls can be placed has to be visible here. A binary built
+    // without `--features av-native` serves IRC, history and the web client
+    // perfectly while every AV endpoint answers 503 — that reached production
+    // once and the only signal was a user failing to join a call.
+    let av = body
+        .get("av")
+        .expect("health must report AV availability")
+        .as_bool()
+        .expect("`av` must be a bool");
+    // False here whichever way this is built, and for two different reasons: no
+    // `av-native` means no AV at all, and *with* it the SFU still only comes up
+    // behind `--iroh`, which this harness does not enable. Both are exactly the
+    // states that make the AV endpoints answer 503, so reporting false is
+    // correct — the point of the assertion is that the field exists, is a bool,
+    // and does not claim AV works when it does not. The true path is covered by
+    // the deploy check against a real server (`/api/v1/health` on a server built
+    // by deploy.sh reports `"av":true`).
+    assert!(
+        !av,
+        "no --iroh and/or no av-native in this harness, so AV cannot be available"
+    );
+
+    // uptime_secs is stamped when the router is built, not on the first poll.
+    assert!(
+        body.get("uptime_secs").and_then(|v| v.as_u64()).is_some(),
+        "health must report uptime"
+    );
 }
 
 #[tokio::test]

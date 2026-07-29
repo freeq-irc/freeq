@@ -434,6 +434,14 @@ struct HealthResponse {
     connections: usize,
     channels: usize,
     uptime_secs: u64,
+    /// Whether calls can actually be placed: the binary was built with
+    /// `--features av-native` *and* the SFU came up.
+    ///
+    /// Reported because there is no other cheap way to tell from outside. A
+    /// server built without the feature looks entirely healthy — IRC, history
+    /// and the web client all work — while every AV endpoint answers 503. That
+    /// shipped to production once, and the only signal was a user trying a call.
+    av: bool,
 }
 
 #[derive(Serialize)]
@@ -1399,6 +1407,20 @@ async fn api_verify_message(
     })))
 }
 
+/// Can this server carry a call? Both halves have to hold: the `av-native`
+/// feature was compiled in, and `init_sfu` succeeded at boot. Either one missing
+/// means the AV endpoints answer 503, which is invisible from every other
+/// endpoint.
+#[cfg(feature = "av-native")]
+fn av_available(state: &Arc<SharedState>) -> bool {
+    state.sfu_state.lock().is_some()
+}
+
+#[cfg(not(feature = "av-native"))]
+fn av_available(_state: &Arc<SharedState>) -> bool {
+    false
+}
+
 async fn api_health(State(state): State<Arc<SharedState>>) -> Json<HealthResponse> {
     // Initialized in `router`; the fallback keeps a hand-built app (tests) sane.
     let start = START_TIME.get_or_init(SystemTime::now);
@@ -1418,6 +1440,7 @@ async fn api_health(State(state): State<Arc<SharedState>>) -> Json<HealthRespons
         connections,
         channels,
         uptime_secs: uptime,
+        av: av_available(&state),
     })
 }
 

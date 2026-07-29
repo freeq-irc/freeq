@@ -1917,6 +1917,19 @@ impl Server {
         }
         #[cfg(not(feature = "av-native"))]
         {
+            // Say so, loudly. Without `av-native` every AV endpoint answers 503
+            // ("AV not enabled"), and nothing else about the server looks wrong —
+            // it serves IRC, chat and history normally. A production deploy built
+            // with a plain `cargo build` (instead of deploy.sh, which passes
+            // `--features av-native`) took calls down for hours before anyone
+            // connected the 503 to the build. One line at boot makes that
+            // diagnosable from the journal.
+            tracing::warn!(
+                "AV disabled: this binary was built without --features av-native. \
+                 /av/moq, /av/call and every other AV endpoint will answer 503. \
+                 Build with `cargo build --release --bin freeq-server --features av-native` \
+                 (or use deploy/deploy.sh) if calls are meant to work."
+            );
             *state.av_media.lock() = Some(crate::av_media::init_backend_stub());
         }
 
