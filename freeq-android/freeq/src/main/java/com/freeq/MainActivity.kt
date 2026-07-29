@@ -35,6 +35,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStop() {
+        super.onStop()
+        // Backgrounding is the last reliable moment before Android may kill
+        // the process; snapshot the conversations so the next launch has them.
+        appState?.flushBuffersToCache()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         intent.data?.let { uri ->

@@ -115,6 +115,9 @@ dependencies {
 
     // Unit tests (pure JVM, plain JUnit — no Robolectric on aarch64 Linux).
     testImplementation("junit:junit:4.13.2")
+    // android.jar stubs org.json to throw "not mocked"; this supplies a real
+    // implementation to the host JVM so JSON code paths are testable.
+    testImplementation("org.json:json:20240303")
 
     // Instrumented tests (run on a device/emulator).
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

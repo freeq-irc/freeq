@@ -12,6 +12,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.lifecycle.AndroidViewModel
 import com.freeq.ffi.*
 import kotlinx.coroutines.*
+import java.io.File
 import java.util.*
 
 // ── Data models ──
@@ -387,6 +388,10 @@ class AppState(application: Application) : AndroidViewModel(application) {
         // Restore custom status
         customStatus.value = prefs.getString("customStatus", "") ?: ""
 
+        // Hydrate channels/DMs from the on-disk cache so the UI renders the
+        // last session's context before any network round-trip completes.
+        hydrateBuffersFromCache()
+
         // Prune stale typing indicators every 3 seconds
         scope.launch {
             while (isActive) {
@@ -469,8 +474,39 @@ class AppState(application: Application) : AndroidViewModel(application) {
         return true
     }
 
+    // ── Buffer cache ──
+
+    private val bufferCacheDir: File
+        get() = getApplication<Application>().filesDir
+
+    /**
+     * Read cached channels/DMs from disk into the live buffers. Replayed
+     * CHATHISTORY dedups against this through `appendIfNew`.
+     */
+    private fun hydrateBuffersFromCache() {
+        val cached = BufferCache.load(bufferCacheDir) ?: return
+        for (buf in cached) {
+            val target = if (buf.isDM) getOrCreateDM(buf.name) else getOrCreateChannel(buf.name)
+            buf.topic?.let { target.topic.value = it }
+            buf.messages.forEach { target.appendIfNew(it) }
+            // Sort the chat list the way the user last saw it rather than
+            // dropping every restored buffer to the bottom.
+            target.messages.lastOrNull()?.let {
+                target.lastActivityTime.value = it.timestamp.time
+            }
+        }
+    }
+
+    /** Snapshot every buffer to disk. Safe to call when nothing is connected. */
+    fun flushBuffersToCache() {
+        BufferCache.save(bufferCacheDir, BufferCache.snapshot(channels + dmBuffers))
+    }
+
     fun disconnect() {
         intentionalDisconnect = true
+        // Persist before tearing down: a manual disconnect or transport
+        // retry otherwise drops the session the next launch would restore.
+        flushBuffersToCache()
         client?.disconnect()
         client = null  // Clear reference so reconnect creates fresh client
         connectionState.value = ConnectionState.Disconnected
@@ -509,6 +545,9 @@ class AppState(application: Application) : AndroidViewModel(application) {
         prefs.edit().remove("nick").remove("webTokenExpiry").remove("lastLoginTime").apply()
         nick.value = ""
         disconnect()
+        // After disconnect, which flushes: never leave one account's
+        // messages on disk for whoever signs in next.
+        BufferCache.clear(bufferCacheDir)
     }
 
     fun reconnectSavedSession() {
