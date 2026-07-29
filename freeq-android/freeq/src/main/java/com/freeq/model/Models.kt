@@ -1186,7 +1186,12 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                         val bufferName = if (isSelf) ircMsg.target else ircMsg.fromNick
                         state.dmBuffers.firstOrNull { it.name.equals(bufferName, ignoreCase = true) }
                     }
-                    ch?.applyEdit(editTarget, ircMsg.msgid, ircMsg.text)
+                    if (ch != null && MessageAuthorship.actorIsAuthor(
+                            ch, editTarget, ircMsg.fromNick, ircMsg.account, state::didForNick
+                        )
+                    ) {
+                        ch.applyEdit(editTarget, ircMsg.msgid, ircMsg.text)
+                    }
                     ch?.typingUsers?.remove(ircMsg.fromNick)
                     return
                 }
@@ -1392,7 +1397,14 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                 // Message deletion (self-echo already applied optimistically by deleteMessage)
                 tags["+draft/delete"]?.let { deleteId ->
                     val bufferName = TagMsgRouter.routeTo(target, from, state.nick.value, event.msg.dmKey) ?: return@let
-                    lookupBuffer(bufferName)?.applyDelete(deleteId)
+                    val buf = lookupBuffer(bufferName) ?: return@let
+                    val account = tags["account"] ?: tags["+freeq.at/account"]
+                    if (MessageAuthorship.actorIsAuthor(
+                            buf, deleteId, from, account, state::didForNick
+                        )
+                    ) {
+                        buf.applyDelete(deleteId)
+                    }
                 }
 
                 // Reactions (self-echo already applied optimistically by
