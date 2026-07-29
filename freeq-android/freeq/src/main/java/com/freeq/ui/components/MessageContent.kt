@@ -35,6 +35,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import coil.compose.SubcomposeAsyncImage
+import com.freeq.model.Jumbomoji
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -227,6 +228,20 @@ fun MessageContent(
 ) {
     val uriHandler = LocalUriHandler.current
     val displayText = replaceEmojiShortcodes(text)
+
+    // Jumbomoji: a message of just 1–3 emoji renders large. Checked after
+    // shortcode expansion so `:tada:` jumbos like the emoji it becomes.
+    val jumboSize = if (isAction) null else Jumbomoji.size(displayText)
+    if (jumboSize != null) {
+        SelectionContainer {
+            Text(
+                text = displayText.trim(),
+                fontSize = jumboSize.sp,
+                color = MaterialTheme.colorScheme.onBackground
+            )
+        }
+        return
+    }
 
     // Priority: image > Bluesky post > YouTube > generic link
     val imageUrl = IMAGE_PATTERN.find(displayText)?.value ?: CDN_PATTERN.find(displayText)?.value
