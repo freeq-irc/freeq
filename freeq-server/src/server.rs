@@ -3868,14 +3868,27 @@ pub(crate) async fn process_s2s_message(
                 }
             }
 
-            // Wire forms — identical for channel and DM delivery.
-            let tag_msg = crate::irc::Message {
-                tags: tags.clone(),
-                prefix: Some(from.clone()),
-                command: "TAGMSG".to_string(),
-                params: vec![target.clone()],
+            // Wire forms — identical for channel and DM delivery. The account
+            // variant carries the DID the *origin* stamped, never the one the
+            // nick fallback produced: that fallback resolves against our own
+            // nick map, and stamping its answer would present a DID this
+            // server inferred as one the origin attested. Same rule the S2S
+            // PRIVMSG path follows.
+            let build_tagged = |with_account: bool| -> String {
+                let mut t = tags.clone();
+                if with_account && let Some(ref did) = peer_account {
+                    t.insert("account".to_string(), did.clone());
+                }
+                let tag_msg = crate::irc::Message {
+                    tags: t,
+                    prefix: Some(from.clone()),
+                    command: "TAGMSG".to_string(),
+                    params: vec![target.clone()],
+                };
+                format!("{tag_msg}\r\n")
             };
-            let tagged_line = format!("{tag_msg}\r\n");
+            let tagged_line = build_tagged(false);
+            let tagged_line_account = peer_account.as_ref().map(|_| build_tagged(true));
             let plain_fallback = tags.get("+react").map(|emoji| {
                 format!(":{from} PRIVMSG {target} :\x01ACTION reacted with {emoji}\x01\r\n")
             });
@@ -3906,11 +3919,17 @@ pub(crate) async fn process_s2s_message(
             };
 
             let tag_caps = state.cap_message_tags.lock();
+            let acct_caps = state.cap_account_tag.lock();
             let conns = state.connections.lock();
             for sid in &recipients {
                 if let Some(tx) = conns.get(sid) {
                     if tag_caps.contains(sid) {
-                        let _ = tx.try_send(tagged_line.clone());
+                        let line = if acct_caps.contains(sid) {
+                            tagged_line_account.as_ref().unwrap_or(&tagged_line)
+                        } else {
+                            &tagged_line
+                        };
+                        let _ = tx.try_send(line.clone());
                     } else if let Some(ref fallback) = plain_fallback {
                         let _ = tx.try_send(fallback.clone());
                     }
@@ -6969,6 +6988,76 @@ mod s2s_adversarial_tests {
     // ═══════════════════════════════════════════════════════════
     // S2S TAGMSG: reaction delivery to local users
     // ═══════════════════════════════════════════════════════════
+
+    /// A federated actor is not in our nick map, so `account` is the only way
+    /// a local client learns who acted. Relayed to receivers that asked for
+    /// account-tag, and only from the DID the origin stamped.
+    #[tokio::test]
+    async fn s2s_tagmsg_carries_the_origin_stamped_account() {
+        const REMOTE_DID: &str = "did:plc:remoteactor";
+        let state = test_state();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#acct-test");
+
+        // Two local members: one asked for account-tag, one did not.
+        let (tx_with, mut rx_with) = mpsc::channel(16);
+        let (tx_without, mut rx_without) = mpsc::channel(16);
+        {
+            let mut conns = state.connections.lock();
+            conns.insert("with-sess".to_string(), tx_with);
+            conns.insert("without-sess".to_string(), tx_without);
+        }
+        {
+            let mut channels = state.channels.lock();
+            let ch = channels.get_mut("#acct-test").unwrap();
+            ch.members.insert("with-sess".to_string());
+            ch.members.insert("without-sess".to_string());
+        }
+        {
+            let mut tags = state.cap_message_tags.lock();
+            tags.insert("with-sess".to_string());
+            tags.insert("without-sess".to_string());
+        }
+        state.cap_account_tag.lock().insert("with-sess".to_string());
+
+        let mut tags = HashMap::new();
+        tags.insert("+react".to_string(), "👍".to_string());
+        tags.insert("+reply".to_string(), "msg001".to_string());
+
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Tagmsg {
+                event_id: format!("{PEER}:acct1"),
+                from: "remote!r@remote".to_string(),
+                target: "#acct-test".to_string(),
+                tags,
+                origin: PEER.to_string(),
+                account: Some(REMOTE_DID.to_string()),
+            },
+        )
+        .await;
+
+        let with = tokio::time::timeout(std::time::Duration::from_secs(1), rx_with.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert!(
+            with.contains(&format!("account={REMOTE_DID}")),
+            "a receiver that negotiated account-tag must be told who acted, got: {with}"
+        );
+
+        let without = tokio::time::timeout(std::time::Duration::from_secs(1), rx_without.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert!(
+            !without.contains("account="),
+            "a receiver that never asked for account-tag must not be sent one, got: {without}"
+        );
+    }
 
     #[tokio::test]
     async fn s2s_tagmsg_reaction_delivered_to_local_user() {

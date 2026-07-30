@@ -182,6 +182,68 @@ pub(crate) fn verify_commit_reveal(
     Ok(())
 }
 
+/// The TAGMSG wire forms a sender's event takes, one per combination of the
+/// two caps that change the line: `server-time` and `account-tag`.
+///
+/// `account` belongs on a TAGMSG for the same reason it belongs on a PRIVMSG.
+/// It was originally scoped to PRIVMSG/NOTICE, when nothing about a TAGMSG was
+/// a trust decision; a client that now has to decide whether the sender of a
+/// delete may delete the message reads it off the event, and a nick is not an
+/// identity. The IRCv3 account-tag spec asks for the tag on "all commands sent
+/// by a user", so the narrower scope was the deviation.
+///
+/// The account forms are `None` for a guest — no DID, nothing to name — and
+/// such a sender's events fall back to the forms without it.
+struct TagmsgLines {
+    plain: String,
+    with_time: String,
+    account: Option<String>,
+    time_account: Option<String>,
+}
+
+impl TagmsgLines {
+    fn build(
+        tags: &std::collections::HashMap<String, String>,
+        hostmask: &str,
+        target: &str,
+        time_tag: &str,
+        sender_did: Option<&str>,
+    ) -> Self {
+        let render = |with_time: bool, with_account: bool| -> String {
+            let mut t = tags.clone();
+            if with_time {
+                t.insert("time".to_string(), time_tag.to_string());
+            }
+            if with_account && let Some(did) = sender_did {
+                t.insert("account".to_string(), did.to_string());
+            }
+            let msg = irc::Message {
+                tags: t,
+                prefix: Some(hostmask.to_string()),
+                command: "TAGMSG".to_string(),
+                params: vec![target.to_string()],
+            };
+            format!("{msg}\r\n")
+        };
+        TagmsgLines {
+            plain: render(false, false),
+            with_time: render(true, false),
+            account: sender_did.map(|_| render(false, true)),
+            time_account: sender_did.map(|_| render(true, true)),
+        }
+    }
+
+    /// The form this receiver negotiated.
+    fn pick(&self, has_time: bool, wants_account: bool) -> &str {
+        match (has_time, wants_account) {
+            (true, true) => self.time_account.as_deref().unwrap_or(&self.with_time),
+            (true, false) => &self.with_time,
+            (false, true) => self.account.as_deref().unwrap_or(&self.plain),
+            (false, false) => &self.plain,
+        }
+    }
+}
+
 pub(super) fn handle_tagmsg(
     conn: &Connection,
     target: &str,
@@ -436,23 +498,15 @@ pub(super) fn handle_tagmsg(
         .format("%Y-%m-%dT%H:%M:%S.000Z")
         .to_string();
 
-    let tag_msg = irc::Message {
-        tags: tags.clone(),
-        prefix: Some(hostmask.clone()),
-        command: "TAGMSG".to_string(),
-        params: vec![target.to_string()],
-    };
-    let tagged_line = format!("{tag_msg}\r\n");
-
-    let mut tags_with_time = tags.clone();
-    tags_with_time.insert("time".to_string(), time_tag);
-    let tag_msg_with_time = irc::Message {
-        tags: tags_with_time,
-        prefix: Some(hostmask.clone()),
-        command: "TAGMSG".to_string(),
-        params: vec![target.to_string()],
-    };
-    let tagged_line_with_time = format!("{tag_msg_with_time}\r\n");
+    // `server-time` and `account-tag` are negotiated independently, so there
+    // are four wire forms and each receiver gets the one it asked for.
+    let lines = TagmsgLines::build(
+        tags,
+        &hostmask,
+        target,
+        &time_tag,
+        conn.authenticated_did.as_deref(),
+    );
 
     // Generate a PRIVMSG fallback for plain clients (server-side downgrade).
     // Only for known tag types — unknown TAGMSGs are silently dropped for plain clients.
@@ -516,6 +570,7 @@ pub(super) fn handle_tagmsg(
 
         let tag_caps = state.cap_message_tags.lock();
         let time_caps = state.cap_server_time.lock();
+        let acct_caps = state.cap_account_tag.lock();
         let echo_caps = state.cap_echo_message.lock();
         let conns = state.connections.lock();
         for member_session in &members {
@@ -525,12 +580,11 @@ pub(super) fn handle_tagmsg(
             }
             if let Some(tx) = conns.get(member_session) {
                 if tag_caps.contains(member_session) {
-                    let line = if time_caps.contains(member_session) {
-                        &tagged_line_with_time
-                    } else {
-                        &tagged_line
-                    };
-                    let _ = tx.try_send(line.clone());
+                    let line = lines.pick(
+                        time_caps.contains(member_session),
+                        acct_caps.contains(member_session),
+                    );
+                    let _ = tx.try_send(line.to_string());
                 } else if let Some(ref fallback) = plain_fallback {
                     let _ = tx.try_send(fallback.clone());
                 }
@@ -577,16 +631,14 @@ pub(super) fn handle_tagmsg(
         {
             let tag_caps = state.cap_message_tags.lock();
             let time_caps = state.cap_server_time.lock();
+            let acct_caps = state.cap_account_tag.lock();
             let conns = state.connections.lock();
             for session in &sessions {
                 if let Some(tx) = conns.get(session) {
                     if tag_caps.contains(session) {
-                        let line = if time_caps.contains(session) {
-                            &tagged_line_with_time
-                        } else {
-                            &tagged_line
-                        };
-                        let _ = tx.try_send(line.clone());
+                        let line =
+                            lines.pick(time_caps.contains(session), acct_caps.contains(session));
+                        let _ = tx.try_send(line.to_string());
                     } else if let Some(ref fallback) = plain_fallback {
                         let _ = tx.try_send(fallback.clone());
                     }
@@ -2649,18 +2701,32 @@ fn handle_delete(conn: &Connection, target: &str, original_msgid: &str, state: &
         }
     }
 
-    // Build TAGMSG with +draft/delete for tag-capable clients
+    // Build TAGMSG with +draft/delete for tag-capable clients. A recipient
+    // that negotiated account-tag also gets the deleter's DID: deciding
+    // whether this delete may act on the message is exactly what a client
+    // cannot do from a nick.
     let mut del_tags = std::collections::HashMap::new();
     del_tags.insert("+draft/delete".to_string(), original_msgid.to_string());
-    let tagged_line = {
+    let build_delete_line = |with_account: bool| -> String {
+        let mut t = del_tags.clone();
+        if with_account && let Some(ref did) = conn.authenticated_did {
+            t.insert("account".to_string(), did.clone());
+        }
         let tag_msg = irc::Message {
-            tags: del_tags,
+            tags: t,
             prefix: Some(hostmask.clone()),
             command: "TAGMSG".to_string(),
             params: vec![target.to_string()],
         };
         format!("{tag_msg}\r\n")
     };
+    let tagged_line = build_delete_line(false);
+    // `None` for a guest — no DID to name, so those recipients get the
+    // plain form.
+    let tagged_line_account = conn
+        .authenticated_did
+        .as_ref()
+        .map(|_| build_delete_line(true));
 
     // Deliver delete notification
     if is_channel {
@@ -2673,6 +2739,7 @@ fn handle_delete(conn: &Connection, target: &str, original_msgid: &str, state: &
             .unwrap_or_default();
 
         let tag_caps = state.cap_message_tags.lock();
+        let acct_caps = state.cap_account_tag.lock();
         let conns = state.connections.lock();
         for sid in &members {
             if sid == &conn.id {
@@ -2681,10 +2748,16 @@ fn handle_delete(conn: &Connection, target: &str, original_msgid: &str, state: &
             if tag_caps.contains(sid)
                 && let Some(tx) = conns.get(sid)
             {
-                let _ = tx.try_send(tagged_line.clone());
+                let line = if acct_caps.contains(sid) {
+                    tagged_line_account.as_ref().unwrap_or(&tagged_line)
+                } else {
+                    &tagged_line
+                };
+                let _ = tx.try_send(line.clone());
             }
         }
         drop(conns);
+        drop(acct_caps);
         drop(tag_caps);
 
         // Relay to peers. This has to be an explicit broadcast: `handle_tagmsg`
@@ -2720,15 +2793,22 @@ fn handle_delete(conn: &Connection, target: &str, original_msgid: &str, state: &
             }
         }
         let tag_caps = state.cap_message_tags.lock();
+        let acct_caps = state.cap_account_tag.lock();
         let conns = state.connections.lock();
         for target_session in &target_sessions {
             if tag_caps.contains(target_session)
                 && let Some(tx) = conns.get(target_session)
             {
-                let _ = tx.try_send(tagged_line.clone());
+                let line = if acct_caps.contains(target_session) {
+                    tagged_line_account.as_ref().unwrap_or(&tagged_line)
+                } else {
+                    &tagged_line
+                };
+                let _ = tx.try_send(line.clone());
             }
         }
         drop(conns);
+        drop(acct_caps);
         drop(tag_caps);
 
         // The recipient may be on another server, or be reading this thread
