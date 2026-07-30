@@ -8,7 +8,14 @@
  * Anything with letters/numbers/punctuation is a normal message.
  */
 
-const EMOJI_RE = /\p{Extended_Pictographic}/u;
+// Emoji presentation by default (this is what makes flags jumbo — regional
+// indicators carry it, but ❤ and ☺ don't), or an explicit emoji variation
+// selector (❤️, #️⃣). Matches the iOS/macOS/Android rule so all four clients
+// agree; the previous \p{Extended_Pictographic} test missed flags and
+// keycaps and let bare text-presentation symbols through.
+const EMOJI_PRESENTATION_RE = /\p{Emoji_Presentation}/u;
+const isEmojiGrapheme = (g: string): boolean =>
+  EMOJI_PRESENTATION_RE.test(g) || g.includes('\uFE0F');
 
 /** Count emoji graphemes if the text is emoji-only; else null. */
 function emojiOnlyCount(text: string): number | null {
@@ -25,8 +32,8 @@ function emojiOnlyCount(text: string): number | null {
 
   let count = 0;
   for (const g of graphemes) {
-    if (/^\s+$/.test(g)) continue;       // spaces between emoji are fine
-    if (!EMOJI_RE.test(g)) return null;  // any non-emoji grapheme → not jumbo
+    if (/^\s+$/.test(g)) continue;            // spaces between emoji are fine
+    if (!isEmojiGrapheme(g)) return null;     // any non-emoji grapheme → not jumbo
     count += 1;
   }
   return count > 0 ? count : null;

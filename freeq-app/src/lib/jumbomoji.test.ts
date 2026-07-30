@@ -35,4 +35,32 @@ describe('jumbomoji', () => {
     expect(jumbomojiSize('')).toBeNull();
     expect(jumbomojiSize('   ')).toBeNull();
   });
+
+  // Cross-client parity vectors — these shapes diverged between web and
+  // the native clients until the rule was unified; the same cases are
+  // pinned in the iOS, macOS, and Android suites.
+
+  it('flags are one emoji', () => {
+    expect(jumbomojiSize('🇺🇸')).toBe(48);
+    expect(jumbomojiSize('🇺🇸🇯🇵')).toBe(40);
+  });
+
+  it('tag-sequence flags are one emoji', () => {
+    expect(jumbomojiSize('🏴󠁧󠁢󠁥󠁮󠁧󠁿')).toBe(48);
+  });
+
+  it('keycaps are one emoji', () => {
+    expect(jumbomojiSize('#️⃣')).toBe(48);
+    expect(jumbomojiSize('1️⃣2️⃣')).toBe(40);
+  });
+
+  it('variation-selector sequences are emoji; bare symbols are not', () => {
+    expect(jumbomojiSize('❤️')).toBe(48);
+    expect(jumbomojiSize('❤')).toBeNull();
+    expect(jumbomojiSize('#')).toBeNull();
+  });
+
+  it('zwj family with skin tones is one emoji', () => {
+    expect(jumbomojiSize('👩🏽‍❤️‍💋‍👨🏻')).toBe(48);
+  });
 });
