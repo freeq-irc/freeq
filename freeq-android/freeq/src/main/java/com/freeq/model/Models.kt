@@ -487,6 +487,16 @@ class AppState(application: Application) : AndroidViewModel(application) {
         val cached = BufferCache.load(bufferCacheDir) ?: return
         for (buf in cached) {
             val target = if (buf.isDM) getOrCreateDM(buf.name) else getOrCreateChannel(buf.name)
+            // Re-teach the display label a DID-keyed thread had when it was
+            // snapshotted, or a cold launch renders the compacted DID until
+            // the peer's next live event. Display-direction map ONLY —
+            // knownDids feeds authorship checks and addressing, and a stale
+            // cache must never reach those.
+            if (buf.displayName != null && DidDisplay.isDid(buf.name) &&
+                !didDisplayNames.containsKey(buf.name)
+            ) {
+                didDisplayNames[buf.name] = buf.displayName
+            }
             buf.topic?.let { target.topic.value = it }
             buf.messages.forEach { target.appendIfNew(it) }
             // Sort the chat list the way the user last saw it rather than
@@ -499,7 +509,10 @@ class AppState(application: Application) : AndroidViewModel(application) {
 
     /** Snapshot every buffer to disk. Safe to call when nothing is connected. */
     fun flushBuffersToCache() {
-        BufferCache.save(bufferCacheDir, BufferCache.snapshot(channels + dmBuffers))
+        BufferCache.save(
+            bufferCacheDir,
+            BufferCache.snapshot(channels + dmBuffers, ::displayNameForKey),
+        )
     }
 
     fun disconnect() {

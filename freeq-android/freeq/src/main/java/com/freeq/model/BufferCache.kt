@@ -11,6 +11,13 @@ internal data class CachedBuffer(
     val isDM: Boolean,
     val topic: String?,
     val messages: List<ChatMessage>,
+    // Resolved human label captured at snapshot time, for DID-keyed DM
+    // buffers whose name would otherwise render as a compacted DID on a
+    // cold launch (the nick↔DID binding maps are in-memory and die with
+    // the process). Display-direction only: hydrate seeds DID→nick, never
+    // nick→DID, so a stale cache can label a thread but can never feed
+    // authorship checks or addressing.
+    val displayName: String? = null,
 )
 
 /**
@@ -23,7 +30,7 @@ internal data class CachedBuffer(
  * keeps the whole thing unit-testable.
  */
 internal object BufferCache {
-    const val VERSION = 1
+    const val VERSION = 2
     const val MAX_MESSAGES_PER_BUFFER = 50
     const val FILE_NAME = "buffers.json"
 
@@ -39,14 +46,26 @@ internal object BufferCache {
      */
     fun isLocallyMintedId(id: String): Boolean = UUID_SHAPE.matches(id)
 
-    /** Snapshot live buffers, newest [MAX_MESSAGES_PER_BUFFER] each. */
-    fun snapshot(buffers: List<ChannelState>): List<CachedBuffer> = buffers.map { buf ->
+    /**
+     * Snapshot live buffers, newest [MAX_MESSAGES_PER_BUFFER] each.
+     * [displayNameFor] resolves a buffer name to its human label
+     * (`AppState.displayNameForKey`); the label is stored only when it
+     * differs from the name, i.e. for DID-keyed DM buffers.
+     */
+    fun snapshot(
+        buffers: List<ChannelState>,
+        displayNameFor: (String) -> String = { it },
+    ): List<CachedBuffer> = buffers.map { buf ->
         val persistable = buf.messages.filterNot { isLocallyMintedId(it.id) }
         CachedBuffer(
             name = buf.name,
             isDM = !(buf.name.startsWith("#") || buf.name.startsWith("&")),
             topic = buf.topic.value.takeIf { it.isNotEmpty() },
             messages = persistable.takeLast(MAX_MESSAGES_PER_BUFFER),
+            // A real learned name only — the resolver's compacted-DID
+            // fallback is recomputable and not worth teaching to anyone.
+            displayName = displayNameFor(buf.name)
+                .takeIf { it != buf.name && it != DidDisplay.shorten(buf.name) },
         )
     }
 
@@ -79,6 +98,7 @@ internal object BufferCache {
                     .put("name", buf.name)
                     .put("isDM", buf.isDM)
                     .put("topic", buf.topic)
+                    .put("displayName", buf.displayName)
                     .put("messages", messages)
             )
         }
@@ -102,6 +122,7 @@ internal object BufferCache {
                     name = obj.getString("name"),
                     isDM = obj.optBoolean("isDM"),
                     topic = obj.optString("topic").takeIf { it.isNotEmpty() },
+                    displayName = obj.optString("displayName").takeIf { it.isNotEmpty() },
                     messages = (0 until messages.length()).map { decodeMessage(messages.getJSONObject(it)) },
                 )
             }

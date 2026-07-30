@@ -139,6 +139,42 @@ class BufferCacheTest {
         assertEquals("did:plc:abc", restored.single().name)
     }
 
+    // ── display label for DID-keyed threads ──
+
+    @Test fun snapshot_captures_the_resolved_label_for_a_did_keyed_buffer() {
+        val snap = BufferCache.snapshot(listOf(channel("did:key:z6Mkabc", msg("01A")))) { key ->
+            if (key == "did:key:z6Mkabc") "echo-bot" else key
+        }
+        assertEquals("echo-bot", snap.single().displayName)
+    }
+
+    @Test fun snapshot_stores_no_label_when_the_resolver_has_no_name() {
+        // Resolver falls back to the key itself or its compacted form:
+        // nothing worth persisting — the compacted form is recomputable.
+        val identity = BufferCache.snapshot(listOf(channel("did:key:z6Mkabc", msg("01A"))))
+        assertNull(identity.single().displayName)
+        val compacted = BufferCache.snapshot(listOf(channel("did:key:z6Mkabc", msg("01A")))) {
+            DidDisplay.shorten(it)
+        }
+        assertNull(compacted.single().displayName)
+        val plainNick = BufferCache.snapshot(listOf(channel("guest123", msg("01A")))) { it }
+        assertNull(plainNick.single().displayName)
+    }
+
+    @Test fun round_trip_preserves_the_display_label() {
+        val restored = BufferCache.decode(
+            BufferCache.encode(
+                BufferCache.snapshot(listOf(channel("did:key:z6Mkabc", msg("01A")))) { "echo-bot" }
+            )
+        )!!
+        assertEquals("echo-bot", restored.single().displayName)
+    }
+
+    @Test fun a_version_one_cache_is_discarded_not_migrated() {
+        val v1 = """{"version":1,"buffers":[{"name":"did:key:z6Mkabc","isDM":true,"messages":[]}]}"""
+        assertNull(BufferCache.decode(v1))
+    }
+
     // ── version + damage ──
 
     @Test fun version_mismatch_decodes_to_null() {
