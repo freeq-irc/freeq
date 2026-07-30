@@ -58,6 +58,21 @@ class JumbomojiTest {
         assertEquals(40, Jumbomoji.size("🇺🇸🇯🇵"))
     }
 
+    @Test fun tag_sequence_flags_are_one_grapheme() {
+        // 🏴󠁧󠁢󠁥󠁮󠁧󠁿 = black flag + tag characters + cancel tag.
+        assertEquals(48, Jumbomoji.size("🏴󠁧󠁢󠁥󠁮󠁧󠁿"))
+    }
+
+    @Test fun keycaps_are_one_emoji() {
+        // base + FE0F + combining enclosing keycap (20E3).
+        assertEquals(48, Jumbomoji.size("#️⃣"))
+        assertEquals(40, Jumbomoji.size("1️⃣2️⃣"))
+    }
+
+    @Test fun zwj_family_with_skin_tones_is_one_emoji() {
+        assertEquals(48, Jumbomoji.size("👩🏽‍❤️‍💋‍👨🏻"))
+    }
+
     @Test fun variation_selector_sequences_are_emoji() {
         // ❤️ and ☺️ are text-presentation characters asking for emoji
         // presentation; without the selector they are ordinary symbols.

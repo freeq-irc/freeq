@@ -1,7 +1,5 @@
 package com.freeq.model
 
-import java.text.BreakIterator
-
 /**
  * Jumbomoji: a message that is nothing but 1–3 emoji renders large. Shared
  * policy with the web and Apple clients so every client agrees on what is
@@ -35,24 +33,61 @@ internal object Jumbomoji {
     fun isJumbomoji(text: String): Boolean = size(text) != null
 
     /**
-     * Grapheme clusters, so a ZWJ sequence, a skin-tone modifier, a flag or
-     * a keycap counts as one unit. `java.text.BreakIterator` rather than
-     * `android.icu` — the ICU classes are stubbed out of the unit-test
-     * classpath, and the tests are the cross-client parity contract.
+     * Emoji-aware cluster segmentation, so a ZWJ sequence, a skin-tone
+     * modifier, a flag or a keycap counts as one unit. Hand-rolled rather
+     * than `java.text.BreakIterator` because that class's clustering
+     * varies by JDK — green on one JDK, red on another (CI runs 17, dev
+     * machines 21, the device is ICU-backed) — and these clusters are a
+     * cross-client parity contract that must not depend on who runs the
+     * tests. Only the emoji domain needs to be right: any cluster this
+     * gets "wrong" for ordinary text is non-emoji either way and the
+     * message is rejected as jumbo regardless.
+     *
+     * Rules: a regional-indicator pair is one cluster (a flag); otherwise
+     * a base code point absorbs variation selectors (FE0E/FE0F), skin
+     * tones (1F3FB–1F3FF), the combining keycap (20E3), tag characters
+     * (E0020–E007F, tag-sequence flags), and ZWJ + the joined code point,
+     * repeatedly.
      */
     private fun graphemes(text: String): List<String> {
-        val it = BreakIterator.getCharacterInstance()
-        it.setText(text)
         val out = mutableListOf<String>()
-        var start = it.first()
-        var end = it.next()
-        while (end != BreakIterator.DONE) {
-            out.add(text.substring(start, end))
-            start = end
-            end = it.next()
+        var i = 0
+        while (i < text.length) {
+            val start = i
+            val first = text.codePointAt(i)
+            i += Character.charCount(first)
+            if (isRegionalIndicator(first) &&
+                i < text.length && isRegionalIndicator(text.codePointAt(i))
+            ) {
+                i += Character.charCount(text.codePointAt(i))
+            } else {
+                while (i < text.length) {
+                    val next = text.codePointAt(i)
+                    if (isClusterExtender(next)) {
+                        i += Character.charCount(next)
+                    } else if (next == ZERO_WIDTH_JOINER && i + 1 < text.length) {
+                        i += Character.charCount(next)
+                        val joined = text.codePointAt(i)
+                        i += Character.charCount(joined)
+                    } else {
+                        break
+                    }
+                }
+            }
+            out.add(text.substring(start, i))
         }
         return out
     }
+
+    private const val ZERO_WIDTH_JOINER = 0x200D
+
+    private fun isRegionalIndicator(cp: Int): Boolean = cp in 0x1F1E6..0x1F1FF
+
+    private fun isClusterExtender(cp: Int): Boolean =
+        cp == 0xFE0E || cp == 0xFE0F ||      // variation selectors
+            cp in 0x1F3FB..0x1F3FF ||        // skin-tone modifiers
+            cp == 0x20E3 ||                  // combining enclosing keycap
+            cp in 0xE0020..0xE007F           // tag characters (tag-sequence flags)
 
     /**
      * A cluster is emoji when it carries emoji presentation by default, or
