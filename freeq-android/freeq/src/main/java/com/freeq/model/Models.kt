@@ -721,6 +721,12 @@ class AppState(application: Application) : AndroidViewModel(application) {
     }
 
     fun requestHistory(channel: String) {
+        // Channel history is served to any member, guests included —
+        // membership is the server's only check. DM history requires an
+        // authenticated DID; unauthenticated requests draw a FAIL the
+        // notice handler then has to swallow. Gate only the DM case.
+        val isChannel = channel.startsWith("#") || channel.startsWith("&")
+        if (!isChannel && authenticatedDID.value == null) return
         sendRaw("CHATHISTORY LATEST $channel * 100")
     }
 
