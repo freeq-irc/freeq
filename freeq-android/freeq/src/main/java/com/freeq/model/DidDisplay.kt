@@ -15,6 +15,19 @@ internal object DidDisplay {
     fun isDid(s: String): Boolean =
         Regex("^did:[a-z0-9]+:.+", RegexOption.IGNORE_CASE).matches(s)
 
+    /**
+     * Canonical DM thread key for a typed or tapped target: a DID passes
+     * through; a nick resolves to its DID when known, else stays a nick.
+     * Opening threads by this key stops a typed nick from forking a
+     * second, empty thread beside the DID-keyed one the same person
+     * already has (mirrors iOS `canonicalDmKey`).
+     */
+    fun canonicalDmKey(raw: String, nickToDid: (String) -> String?): String {
+        val trimmed = raw.trim()
+        if (isDid(trimmed)) return trimmed
+        return nickToDid(trimmed) ?: trimmed
+    }
+
     /** Compact a DID for display: `did:plc:k2n3e2vsihf3farequ44t5j7` →
      *  `plc:k2n3…t5j7`. Non-DIDs pass through unchanged. */
     fun shorten(s: String): String {

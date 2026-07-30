@@ -135,4 +135,20 @@ class DmEchoTest {
         org.junit.Assert.assertNull(DmEcho.recipientBinding(true, "coldbot", null))
         org.junit.Assert.assertNull(DmEcho.recipientBinding(true, "coldbot", "not-a-did"))
     }
+
+    // ── canonicalDmKey ──
+
+    @org.junit.Test
+    fun `canonical dm key resolves a known nick to its did`() {
+        val nickToDid = { n: String -> if (n == "echo-bot") "did:key:z6MkBot" else null }
+        org.junit.Assert.assertEquals("did:key:z6MkBot", DidDisplay.canonicalDmKey("echo-bot", nickToDid))
+        org.junit.Assert.assertEquals("did:key:z6MkBot", DidDisplay.canonicalDmKey("  echo-bot  ", nickToDid))
+    }
+
+    @org.junit.Test
+    fun `canonical dm key passes dids through and keeps unknown nicks`() {
+        val none = { _: String -> null }
+        org.junit.Assert.assertEquals("did:plc:abc", DidDisplay.canonicalDmKey("did:plc:abc", none))
+        org.junit.Assert.assertEquals("gamma", DidDisplay.canonicalDmKey("gamma", none))
+    }
 }

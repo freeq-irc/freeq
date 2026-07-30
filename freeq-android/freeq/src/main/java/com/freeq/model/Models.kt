@@ -971,12 +971,16 @@ class AppState(application: Application) : AndroidViewModel(application) {
             BufferRouter.Target.CHANNEL -> getOrCreateChannel(trimmed)
             BufferRouter.Target.INVALID -> ChannelState("_empty")
             BufferRouter.Target.DM -> {
-                dmBuffers.firstOrNull { it.name.equals(trimmed, ignoreCase = true) }
+                // Key by resolved identity: a typed nick whose DID is known
+                // must land in the existing DID-keyed thread, not fork a
+                // second one that only merges on the next inbound event.
+                val key = DidDisplay.canonicalDmKey(trimmed, ::didForNick)
+                dmBuffers.firstOrNull { it.name.equals(key, ignoreCase = true) }
                     ?.let { return it }
-                val dm = ChannelState(trimmed)
+                val dm = ChannelState(key)
                 dm.lastActivityTime.value = 0L // Don't appear as recent until a message arrives.
                 dmBuffers.add(dm)
-                requestHistory(trimmed)
+                requestHistory(key)
                 dm
             }
         }

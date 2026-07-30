@@ -24,6 +24,7 @@ import androidx.compose.ui.unit.sp
 import com.freeq.model.AppState
 import com.freeq.model.ChannelState
 import com.freeq.model.ChatMessage
+import com.freeq.model.PeoplePicker
 import com.freeq.ui.components.UserAvatar
 import com.freeq.ui.theme.FreeqColors
 import com.freeq.ui.theme.Theme
@@ -38,6 +39,7 @@ fun ChatsTab(
 ) {
     var searchText by remember { mutableStateOf("") }
     var showJoinDialog by remember { mutableStateOf(false) }
+    var showNewMessageDialog by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
 
     val allConversations by remember {
@@ -70,10 +72,22 @@ fun ChatsTab(
             TopAppBar(
                 title = { Text("Chats") },
                 actions = {
+                    // Two explicit entries, mirroring the platform family:
+                    // join-a-channel (iOS's pencil sheet, bare names get a
+                    // "#") and new-message-by-name (macOS's NewDMSheet).
+                    // One combined guess-which dialog mis-filed bare
+                    // channel names as people.
                     IconButton(onClick = { showJoinDialog = true }) {
                         Icon(
+                            Icons.Default.Add,
+                            contentDescription = "Join channel",
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    IconButton(onClick = { showNewMessageDialog = true }) {
+                        Icon(
                             Icons.Default.Edit,
-                            contentDescription = "New chat",
+                            contentDescription = "New message",
                             tint = MaterialTheme.colorScheme.primary
                         )
                     }
@@ -240,6 +254,13 @@ fun ChatsTab(
         JoinChannelDialog(
             appState = appState,
             onDismiss = { showJoinDialog = false }
+        )
+    }
+    if (showNewMessageDialog) {
+        NewMessageDialog(
+            appState = appState,
+            onDismiss = { showNewMessageDialog = false },
+            onOpenDm = { name -> onChannelClick(appState.getOrCreateDM(name).name) }
         )
     }
 }
@@ -428,12 +449,14 @@ private fun JoinChannelDialog(
         confirmButton = {
             TextButton(
                 onClick = {
-                    if (channelName.isNotEmpty()) {
-                        appState.joinChannel(channelName)
+                    if (channelName.isNotBlank()) {
+                        // joinChannel normalizes a bare name to "#name",
+                        // matching iOS's join sheet.
+                        appState.joinChannel(channelName.trim())
                         onDismiss()
                     }
                 },
-                enabled = channelName.isNotEmpty()
+                enabled = channelName.isNotBlank()
             ) {
                 Text("Join")
             }
@@ -444,6 +467,97 @@ private fun JoinChannelDialog(
             }
         }
     )
+}
+
+/** New message — the macOS `NewDMSheet` flow: a people picker over
+ *  everyone you share a channel or DM thread with, live-filtered as you
+ *  type, with a free-form row so a name nobody matches can still be
+ *  messaged. Channel joining is deliberately a separate dialog. */
+@Composable
+private fun NewMessageDialog(
+    appState: AppState,
+    onDismiss: () -> Unit,
+    onOpenDm: (String) -> Unit
+) {
+    var query by remember { mutableStateOf("") }
+    val candidates = remember {
+        PeoplePicker.candidates(
+            memberNicks = appState.channels.flatMap { ch -> ch.members.map { it.nick } },
+            dmThreads = appState.dmBuffers.map { it.name },
+            selfNick = appState.nick.value,
+            nickToDid = appState::didForNick,
+            displayName = appState::displayNameForKey,
+        )
+    }
+    val filtered = PeoplePicker.filter(candidates, query)
+    val freeform = PeoplePicker.freeform(query, candidates)
+
+    fun open(key: String) {
+        onOpenDm(key)
+        onDismiss()
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("New message") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedTextField(
+                    value = query,
+                    onValueChange = { query = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    placeholder = { Text("Type a name…") },
+                    singleLine = true,
+                    shape = RoundedCornerShape(10.dp)
+                )
+                LazyColumn(modifier = Modifier.heightIn(max = 320.dp)) {
+                    if (freeform != null) {
+                        item(key = "freeform") {
+                            PersonRow(
+                                label = freeform,
+                                subtitle = "Send a new message",
+                                onClick = { open(freeform) }
+                            )
+                        }
+                    }
+                    items(filtered.size, key = { filtered[it].key }) { i ->
+                        val person = filtered[i]
+                        PersonRow(
+                            label = person.label,
+                            subtitle = if (person.online) "Online" else null,
+                            onClick = { open(person.key) }
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
+@Composable
+private fun PersonRow(label: String, subtitle: String?, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 4.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        UserAvatar(nick = label, size = 36.dp)
+        Column {
+            Text(label, fontSize = 15.sp, color = MaterialTheme.colorScheme.onSurface)
+            if (subtitle != null) {
+                Text(subtitle, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
 }
 
 private fun formatTime(date: Date): String {
