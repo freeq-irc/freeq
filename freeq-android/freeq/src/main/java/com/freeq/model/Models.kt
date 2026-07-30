@@ -1449,18 +1449,22 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                     else
                         state.dmBuffers.firstOrNull { it.name.equals(name, ignoreCase = true) }
 
-                // Typing indicators
+                // Typing indicators. Our own typing — echo or another of
+                // our devices — never renders as "someone is typing".
                 tags["+typing"]?.let { typing ->
-                    val bufferName = TagMsgRouter.routeTo(target, from, state.nick.value, event.msg.dmKey) ?: return@let
+                    if (from.equals(state.nick.value, ignoreCase = true)) return@let
+                    val bufferName = TagMsgRouter.routeTo(target, from, state.nick.value, event.msg.dmKey)
                     lookupBuffer(bufferName)?.let { ch ->
                         if (typing == "active") ch.typingUsers[from] = Date()
                         else if (typing == "done") ch.typingUsers.remove(from)
                     }
                 }
 
-                // Message deletion (self-echo already applied optimistically by deleteMessage)
+                // Message deletion. Applies for self events too: our own
+                // other device's deletes arrive under our nick, and
+                // applyDelete is idempotent so a true echo is harmless.
                 tags["+draft/delete"]?.let { deleteId ->
-                    val bufferName = TagMsgRouter.routeTo(target, from, state.nick.value, event.msg.dmKey) ?: return@let
+                    val bufferName = TagMsgRouter.routeTo(target, from, state.nick.value, event.msg.dmKey)
                     val buf = lookupBuffer(bufferName) ?: return@let
                     val account = tags["account"] ?: tags["+freeq.at/account"]
                     if (MessageAuthorship.actorIsAuthor(
@@ -1481,7 +1485,7 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                 val removeEmoji = tags["+freeq.at/unreact"]
                 if (replyId != null && (addEmoji != null || removeEmoji != null)) {
                     val bufferName = TagMsgRouter.routeTo(target, from, state.nick.value, event.msg.dmKey)
-                    val buf = if (bufferName != null) lookupBuffer(bufferName) else null
+                    val buf = lookupBuffer(bufferName)
                     if (addEmoji != null) buf?.addReaction(replyId, addEmoji, from)
                     if (removeEmoji != null) buf?.removeReaction(replyId, removeEmoji, from)
                 }
