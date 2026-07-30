@@ -35,6 +35,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        // Coming back to the foreground with a dead connection: retry now.
+        // The connectivity callback alone can't be relied on — a dozed
+        // process misses it, and a reconnect that exhausted its retries
+        // while the radio was still down never tries again on its own.
+        appState?.let { state ->
+            if (state.connectionState.value == com.freeq.model.ConnectionState.Disconnected &&
+                !state.intentionalDisconnect
+            ) {
+                if (state.hasSavedSession) state.reconnectSavedSession()
+                else if (state.nick.value.isNotEmpty()) state.connect(state.nick.value)
+            }
+        }
+    }
+
     override fun onStop() {
         super.onStop()
         // Backgrounding is the last reliable moment before Android may kill

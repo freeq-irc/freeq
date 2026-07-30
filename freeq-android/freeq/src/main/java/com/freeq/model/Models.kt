@@ -550,8 +550,14 @@ class AppState(application: Application) : AndroidViewModel(application) {
         BufferCache.clear(bufferCacheDir)
     }
 
-    fun reconnectSavedSession() {
+    /**
+     * @param fresh a new reconnect episode (user action, network restored,
+     * disconnect event) — resets the broker retry budget. The internal
+     * backoff recursion passes false so one episode still caps at 5 tries.
+     */
+    fun reconnectSavedSession(fresh: Boolean = true) {
         if (!hasSavedSession || connectionState.value != ConnectionState.Disconnected) return
+        if (fresh) brokerRetryCount = 0
         if (pendingWebToken != null) { connect(nick.value); return }
 
         // Reuse cached web token if still within TTL (avoids broker round-trip)
@@ -587,7 +593,7 @@ class AppState(application: Application) : AndroidViewModel(application) {
                     connectionState.value = ConnectionState.Disconnected
                     delay(delayMs)
                     if (connectionState.value == ConnectionState.Disconnected) {
-                        reconnectSavedSession()
+                        reconnectSavedSession(fresh = false)
                     }
                 } else {
                     connectionState.value = ConnectionState.Disconnected
