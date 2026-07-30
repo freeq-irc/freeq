@@ -235,6 +235,43 @@ pub(crate) fn reconcile_recipient_did(stamp: Option<&str>, local: Option<&str>) 
     }
 }
 
+/// Local sessions belonging to the *sender* of an inbound federated DM.
+///
+/// A DM event reaches the sender's own other devices via the origin server's
+/// send path. A server receiving that event over S2S runs different code, and
+/// it resolves only the addressed user — so when the sender is signed in here
+/// too (the same person, two servers), their session on this side saw nothing
+/// until its next history refetch. Union this with the addressed user's
+/// sessions at every S2S DM delivery site.
+///
+/// `account` is looked up strictly as an identity in `did_sessions`, never
+/// resolved as a nick. The value is peer-asserted: routing a nick-shaped one
+/// through the nick map would let a peer address whoever holds that nick here.
+pub(crate) fn sender_sessions_for_account(
+    state: &SharedState,
+    account: Option<&str>,
+) -> Vec<String> {
+    let Some(did) = account else {
+        return Vec::new();
+    };
+    state
+        .did_sessions
+        .lock()
+        .get(did)
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Append `extra` to `sessions`, skipping anything already there. The two sets
+/// overlap whenever someone DMs themselves across servers.
+pub(crate) fn merge_sessions(sessions: &mut Vec<String>, extra: Vec<String>) {
+    for sid in extra {
+        if !sessions.contains(&sid) {
+            sessions.push(sid);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

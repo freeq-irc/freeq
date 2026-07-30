@@ -1012,3 +1012,83 @@ async fn dm_delete_crosses_the_hop() {
     hb.quit(None).await.ok();
     drop((srv_a, srv_b));
 }
+
+// ── the sender's own other device, on the server that receives ────
+
+/// One person signed in on both servers. When they DM a third party from
+/// server A, their session on server B has to see it live.
+///
+/// The origin fans a DM out to the sender's own devices on its send path.
+/// A server receiving that DM over S2S runs different code, and it used to
+/// resolve only the addressed user — so the sender's other device, sitting on
+/// the receiving server, learned nothing until its next history refetch. The
+/// same gap applied to reactions, which travel as a separate S2S event.
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_dm_reaches_the_senders_own_session_on_the_receiving_server() {
+    let alice = TestId::new("did:plc:alicesib");
+    let bob = TestId::new("did:plc:bobsib");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    // Bob — the person being written to — is on server B.
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+
+    // Alice is signed in on both. The device on B is what this test is about:
+    // she never sends from it, and it must still see what she sends from A.
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    let (ha_b, mut rxa_b) = connect(&srv_b, &alice, "alice");
+    wait_auth_and_register(&mut rxa_b).await;
+
+    warm_link(&ha, &bob.did, &mut rxb).await;
+
+    const TEXT: &str = "sent from my other device";
+    ha.privmsg(&bob.did, TEXT).await.unwrap();
+
+    let msgid = recv_channel_msgid(&mut rxb, TEXT, EVENT_TIMEOUT)
+        .await
+        .expect("bob received the DM");
+    assert!(
+        try_recv_message(&mut rxa_b, TEXT, EVENT_TIMEOUT)
+            .await
+            .is_some(),
+        "alice's own session on the receiving server never saw the DM she \
+         sent from the other one"
+    );
+
+    // A reaction crosses as its own event and needs the same fan-out.
+    ha.raw(&format!(
+        "@+react=\u{1F44D};+reply={msgid} TAGMSG {}",
+        bob.did
+    ))
+    .await
+    .unwrap();
+
+    assert!(saw_reaction(&mut rxb).await, "bob never saw the reaction");
+    assert!(
+        saw_reaction(&mut rxa_b).await,
+        "alice's own session on the receiving server never saw the reaction \
+         she made from the other one"
+    );
+
+    ha.quit(None).await.ok();
+    ha_b.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+/// Did a reaction TAGMSG arrive on this session within the event timeout?
+async fn saw_reaction(rx: &mut mpsc::Receiver<Event>) -> bool {
+    timeout(EVENT_TIMEOUT, async {
+        loop {
+            match rx.recv().await {
+                Some(Event::TagMsg { tags, .. }) if tags.contains_key("+react") => return true,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}

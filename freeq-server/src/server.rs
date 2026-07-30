@@ -3582,7 +3582,17 @@ pub(crate) async fn process_s2s_message(
                 // bound to the recipient (DID fan-out) — a federated DID-addressed
                 // DM must reach the same person here, with no per-server nick
                 // interpretation.
-                let sids = crate::connection::routing::local_sessions_for_target(state, &target);
+                let mut sids = crate::connection::routing::local_sessions_for_target(state, &target);
+                // …and the sender's own sessions here, if they have any. The
+                // origin fanned this out to their other devices on its send
+                // path; that code never runs on this side of the link.
+                crate::connection::routing::merge_sessions(
+                    &mut sids,
+                    crate::connection::routing::sender_sessions_for_account(
+                        state,
+                        account.as_deref(),
+                    ),
+                );
                 let tag_caps = state.cap_message_tags.lock();
                 let acct_caps = state.cap_account_tag.lock();
                 let conns = state.connections.lock();
@@ -3747,7 +3757,11 @@ pub(crate) async fn process_s2s_message(
             // nick lookup as the fallback — it resolves for anyone who has
             // authenticated here, which is what we relied on before.
             let actor_nick = from.split('!').next().unwrap_or(&from).to_string();
-            let actor_did = account.map(|a| sanitize_s2s_str(&a, 512)).or_else(|| {
+            // The DID the peer stamped, kept separate from `actor_did` below:
+            // this one the origin asserts about its own authenticated session,
+            // the other may have come from our nick map instead.
+            let peer_account = account.map(|a| sanitize_s2s_str(&a, 512));
+            let actor_did = peer_account.clone().or_else(|| {
                 state
                     .nick_owners
                     .lock()
@@ -3877,7 +3891,18 @@ pub(crate) async fn process_s2s_message(
                     .map(|ch| ch.members.iter().cloned().collect())
                     .unwrap_or_default()
             } else {
-                crate::connection::routing::local_sessions_for_target(state, &target)
+                // Plus the sender's own sessions here — a reaction or delete
+                // they made from another server has to reach their other
+                // devices, the same as the DM PRIVMSG path.
+                let mut sids = crate::connection::routing::local_sessions_for_target(state, &target);
+                crate::connection::routing::merge_sessions(
+                    &mut sids,
+                    crate::connection::routing::sender_sessions_for_account(
+                        state,
+                        peer_account.as_deref(),
+                    ),
+                );
+                sids
             };
 
             let tag_caps = state.cap_message_tags.lock();
