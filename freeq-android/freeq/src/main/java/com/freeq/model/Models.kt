@@ -482,9 +482,22 @@ class AppState(application: Application) : AndroidViewModel(application) {
     /**
      * Read cached channels/DMs from disk into the live buffers. Replayed
      * CHATHISTORY dedups against this through `appendIfNew`.
+     *
+     * The read + JSON decode run off the main thread — done inline in
+     * `AppState` init they froze the first frame for ~720 ms at ~47
+     * buffers. Applying late is safe: `appendIfNew` inserts by timestamp
+     * and dedups by id, so buffers filling a beat after launch (possibly
+     * after live traffic) land identically.
      */
     private fun hydrateBuffersFromCache() {
-        val cached = BufferCache.load(bufferCacheDir) ?: return
+        scope.launch {
+            val cached = withContext(Dispatchers.IO) { BufferCache.load(bufferCacheDir) }
+                ?: return@launch
+            applyCachedBuffers(cached)
+        }
+    }
+
+    private fun applyCachedBuffers(cached: List<CachedBuffer>) {
         for (buf in cached) {
             val target = if (buf.isDM) getOrCreateDM(buf.name) else getOrCreateChannel(buf.name)
             // Re-teach the display label a DID-keyed thread had when it was
