@@ -82,6 +82,18 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 
 pub use crate::sigtag::SigError;
 
+/// The tag carrying the id the **signer** minted for this event.
+///
+/// A signed event signs its own id, so the id cannot be the server-stamped
+/// `msgid` (minted after the fact, and unknown to the signer). A server that
+/// accepts this id files the event under it, which is what makes the signed
+/// value and the stored value the same value.
+pub const EVENT_ID_TAG: &str = "+freeq.at/eventid";
+
+/// [`EVENT_ID_TAG`] without the client-tag `+`, accepted for symmetry with the
+/// rest of the tag handling.
+pub const EVENT_ID_TAG_BARE: &str = "freeq.at/eventid";
+
 /// The client-authored coordination tags covered by a message document, as
 /// canonical keys (the wire names are these with a `+freeq.at/` prefix).
 ///

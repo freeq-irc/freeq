@@ -13,6 +13,81 @@ use std::sync::Mutex;
 
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
+/// How far a client-minted id's embedded timestamp may sit from this server's
+/// clock. Federated machines do not have synchronized clocks (we have the
+/// drifted-NTP scars to prove it), so the bound is generous — it exists to
+/// keep a wildly future-dated id out of the log, not to measure anything.
+/// Same ±120s grace the act RFC uses for the one other wall-clock comparison
+/// in the system.
+pub const MAX_CLIENT_SKEW_MS: u64 = 120_000;
+
+/// Why a client-minted message id was refused. Each variant is a reason a
+/// client can act on, which is why they're distinct: the fix for a malformed
+/// id is different from the fix for a reused one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdRejection {
+    /// Not a 26-character Crockford base32 ULID.
+    NotUlid,
+    /// The embedded timestamp is further than [`MAX_CLIENT_SKEW_MS`] from now.
+    Skewed,
+}
+
+impl IdRejection {
+    /// The machine-readable code carried in the `FAIL` reply.
+    pub fn code(self) -> &'static str {
+        match self {
+            IdRejection::NotUlid => "INVALID_EVENTID",
+            IdRejection::Skewed => "EVENTID_CLOCK_SKEW",
+        }
+    }
+
+    /// The human-readable half of the `FAIL` reply.
+    pub fn description(self) -> &'static str {
+        match self {
+            IdRejection::NotUlid => "Event id must be a 26-character Crockford base32 ULID",
+            IdRejection::Skewed => "Event id timestamp is too far from server time",
+        }
+    }
+}
+
+/// Whether `id` is a well-formed ULID as this server mints them: 26 characters
+/// of uppercase Crockford base32.
+pub fn is_wellformed(id: &str) -> bool {
+    id.len() == 26
+        && id
+            .bytes()
+            .all(|b| CROCKFORD.contains(&b.to_ascii_uppercase()) && !b.is_ascii_lowercase())
+}
+
+/// The millisecond timestamp a ULID embeds in its first 10 characters.
+///
+/// `None` for anything not well-formed, so callers get one answer for "this is
+/// not one of our ids" instead of a plausible-looking number decoded from
+/// nonsense.
+pub fn timestamp_ms(id: &str) -> Option<u64> {
+    if !is_wellformed(id) {
+        return None;
+    }
+    let mut ts: u64 = 0;
+    for b in id.bytes().take(10) {
+        let value = CROCKFORD.iter().position(|c| *c == b)? as u64;
+        ts = (ts << 5) | value;
+    }
+    Some(ts)
+}
+
+/// Check an id a *client* minted, before this server files anything under it.
+///
+/// Shape and clock only — uniqueness needs storage and is checked by the
+/// caller, which is the only place that knows whether an id is already taken.
+pub fn check_client_minted(id: &str, now_ms: u64) -> Result<(), IdRejection> {
+    let ts = timestamp_ms(id).ok_or(IdRejection::NotUlid)?;
+    if ts.abs_diff(now_ms) > MAX_CLIENT_SKEW_MS {
+        return Err(IdRejection::Skewed);
+    }
+    Ok(())
+}
+
 /// Monotonic state: last timestamp and random component.
 static LAST: Mutex<(u64, u128)> = Mutex::new((0, 0));
 
@@ -85,6 +160,54 @@ mod tests {
                 "Invalid Crockford char: {c}"
             );
         }
+    }
+
+    #[test]
+    fn a_generated_id_passes_the_client_minted_check() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let id = generate();
+        assert!(is_wellformed(&id));
+        assert!(timestamp_ms(&id).unwrap().abs_diff(now) < 1_000);
+        assert_eq!(check_client_minted(&id, now), Ok(()));
+    }
+
+    #[test]
+    fn malformed_ids_are_not_ulids() {
+        for bad in [
+            "",
+            "tooshort",
+            "01KYVT5Z8Q000000000000000",   // 25 chars
+            "01KYVT5Z8Q00000000000000000", // 27 chars
+            "01kyvt5z8q0000000000000000",  // lowercase
+            "01KYVT5Z8Q000000000000000I",  // I, L, O, U are not Crockford
+            "01KYVT5Z8Q000000000000000!",
+        ] {
+            assert!(!is_wellformed(bad), "{bad} should not be well-formed");
+            assert_eq!(timestamp_ms(bad), None);
+            assert_eq!(check_client_minted(bad, 0), Err(IdRejection::NotUlid));
+        }
+    }
+
+    #[test]
+    fn a_clock_far_from_ours_is_skew_not_malformed() {
+        let id = generate();
+        let ts = timestamp_ms(&id).unwrap();
+        // Inside the grace window, in both directions — a client whose clock
+        // is a minute out still gets its own id.
+        assert_eq!(check_client_minted(&id, ts + MAX_CLIENT_SKEW_MS), Ok(()));
+        assert_eq!(check_client_minted(&id, ts - MAX_CLIENT_SKEW_MS), Ok(()));
+        // Outside it, in both directions.
+        assert_eq!(
+            check_client_minted(&id, ts + MAX_CLIENT_SKEW_MS + 1),
+            Err(IdRejection::Skewed)
+        );
+        assert_eq!(
+            check_client_minted(&id, ts - MAX_CLIENT_SKEW_MS - 1),
+            Err(IdRejection::Skewed)
+        );
     }
 
     #[test]

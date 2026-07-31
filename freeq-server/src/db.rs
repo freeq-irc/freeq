@@ -997,6 +997,24 @@ impl Db {
         rows.next().transpose()
     }
 
+    /// Whether any row already claims `msgid` — soft-deleted rows and every
+    /// revision included.
+    ///
+    /// The uniqueness half of accepting a **client-minted** id. Deleted rows
+    /// count: an id that has been used is spent forever, or a client could
+    /// resurrect a deleted message's identity and everything that references
+    /// it (a reaction, a pin, a reply) would silently re-point at new text.
+    pub fn msgid_taken(&self, msgid: &str) -> SqlResult<bool> {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM messages WHERE msgid = ?1 LIMIT 1",
+                params![msgid],
+                |_| Ok(true),
+            )
+            .optional()
+            .map(|found| found.unwrap_or(false))
+    }
+
     /// The current text of the logical message `msgid` names — the newest
     /// revision, whichever revision was asked for.
     ///

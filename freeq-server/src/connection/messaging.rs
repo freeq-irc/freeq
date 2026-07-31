@@ -14,6 +14,95 @@ static PRUNE_COUNTERS: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, u3
     std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 const PRUNE_INTERVAL: u32 = 256;
 
+/// The event id a message is filed under: the one the **client** minted if it
+/// sent one and it holds up, otherwise one this server mints.
+///
+/// A signed event signs its own id, and a client cannot sign an id the server
+/// invents after the fact — which is why `+freeq.at/eventid` exists. Adopting
+/// it is what makes the signed value and the filed value the same value, all
+/// the way down to the reactions and edits that reference it.
+///
+/// Adoption is guarded, because an id is an identity:
+///
+/// - **Authenticated senders only.** A guest has no durable identity to sign
+///   with, so a guest-minted id buys nothing and costs a spoofing surface.
+/// - **Well-formed, and near our clock** ([`crate::msgid::check_client_minted`]).
+/// - **Not already taken** — `messages.msgid` carries no UNIQUE constraint, so
+///   without this check a client could mint the id of an existing message and
+///   every lookup that resolves an id (an edit, a delete, a pin, a reaction)
+///   could land on the wrong row.
+///
+/// On refusal the message is **not** filed under a substitute id: the sender
+/// believes it sent a signed event, and filing that event under an id its
+/// signature doesn't cover would produce history that looks tampered with. The
+/// caller reports `FAIL` and drops the message instead.
+fn resolve_event_msgid(
+    conn: &Connection,
+    tags: &HashMap<String, String>,
+    state: &Arc<SharedState>,
+) -> Result<String, (&'static str, String)> {
+    let Some(claimed) = tags
+        .get(freeq_sdk::chatsig::EVENT_ID_TAG)
+        .or_else(|| tags.get(freeq_sdk::chatsig::EVENT_ID_TAG_BARE))
+    else {
+        return Ok(crate::msgid::generate());
+    };
+
+    if conn.authenticated_did.is_none() {
+        return Err((
+            "EVENTID_NOT_AUTHENTICATED",
+            "Only an authenticated identity may mint its own event ids".to_string(),
+        ));
+    }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    if let Err(rejection) = crate::msgid::check_client_minted(claimed, now_ms) {
+        return Err((rejection.code(), rejection.description().to_string()));
+    }
+
+    // `with_db` returns None when no database is attached, which is not
+    // evidence that the id is free — but with no durable store there is
+    // nothing for a duplicate to corrupt either, so treat it as available.
+    let taken = state.with_db(|db| db.msgid_taken(claimed)).unwrap_or(false);
+    if taken {
+        return Err((
+            "EVENTID_IN_USE",
+            "That event id is already on file".to_string(),
+        ));
+    }
+
+    Ok(claimed.to_string())
+}
+
+/// Drop `+freeq.at/eventid` from the tags that go out on the wire.
+///
+/// Once adopted, the id *is* the `msgid` tag, and a verifier rebuilds the
+/// signed document from that. Relaying both would create two tags that must
+/// agree forever and no rule for which one wins when they don't — exactly the
+/// ambiguity signing is supposed to remove.
+fn strip_event_id_tag(tags: &mut HashMap<String, String>) {
+    tags.remove(freeq_sdk::chatsig::EVENT_ID_TAG);
+    tags.remove(freeq_sdk::chatsig::EVENT_ID_TAG_BARE);
+}
+
+/// Tell the sender its event id was refused, naming the id so a client with
+/// several in flight knows which one.
+fn send_eventid_fail(
+    conn: &Connection,
+    command: &str,
+    code: &str,
+    description: &str,
+    state: &Arc<SharedState>,
+) {
+    let reply = Message::from_server(&state.server_name, "FAIL", vec![command, code, description]);
+    if let Some(tx) = state.connections.lock().get(&conn.id) {
+        let _ = tx.try_send(format!("{reply}\r\n"));
+    }
+}
+
 /// Verify a client-provided signature, or server-sign as fallback.
 ///
 /// If the client included `+freeq.at/sig` AND has a registered session key,
@@ -853,11 +942,19 @@ pub(super) fn handle_privmsg_with_multiline(
         }
         let text = msg_result.rewrite_text.as_deref().unwrap_or(text);
 
-        // Generate msgid for every PRIVMSG/NOTICE
-        let msgid = crate::msgid::generate();
+        // The id this message is filed under — the sender's own if it minted
+        // one and it holds up (see `resolve_event_msgid`).
+        let msgid = match resolve_event_msgid(conn, tags, state) {
+            Ok(id) => id,
+            Err((code, description)) => {
+                send_eventid_fail(conn, command, code, &description, state);
+                return;
+            }
+        };
 
         // Build tags with msgid injected (for tag-capable clients)
         let mut full_tags = tags.clone();
+        strip_event_id_tag(&mut full_tags);
         full_tags.insert("msgid".to_string(), msgid.clone());
 
         // Verify client signature or server-sign as fallback
@@ -1114,8 +1211,15 @@ pub(super) fn handle_privmsg_with_multiline(
         }
     } else {
         // Private message — check RPL_AWAY and deliver
-        let pm_msgid = crate::msgid::generate();
+        let pm_msgid = match resolve_event_msgid(conn, tags, state) {
+            Ok(id) => id,
+            Err((code, description)) => {
+                send_eventid_fail(conn, command, code, &description, state);
+                return;
+            }
+        };
         let mut pm_tags = tags.clone();
+        strip_event_id_tag(&mut pm_tags);
         pm_tags.insert("msgid".to_string(), pm_msgid.clone());
 
         // Verify client signature or server-sign DMs
