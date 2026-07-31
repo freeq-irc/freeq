@@ -3171,11 +3171,10 @@ pub(crate) async fn process_s2s_message(
                 let _ = entry.tx.send(ack).await;
             }
 
-            // Phase 3: Record the trust level the peer offers us (informational)
-            if let Some(ref lvl) = trust_level {
-                let level = crate::s2s::TrustLevel::parse_level(lvl);
-                manager.set_trust(authenticated_peer_id, level).await;
-            }
+            // The peer's declared trust_level is informational only (logged
+            // above). It is deliberately NOT adopted: the operator's
+            // --s2s-peer-trust config is the sole authority, so a peer cannot
+            // declare its own level and escape a configured restriction.
 
             // Phase 1: Mark peer as authenticated
             manager
@@ -5477,6 +5476,10 @@ mod s2s_adversarial_tests {
 
     /// Build a minimal S2sManager for testing.
     fn test_manager() -> Arc<S2sManager> {
+        test_manager_with_trust(HashMap::new())
+    }
+
+    fn test_manager_with_trust(trust_config: HashMap<String, TrustLevel>) -> Arc<S2sManager> {
         let (event_tx, _event_rx) = mpsc::channel(1024);
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1024);
         let mut key_bytes = [0u8; 32];
@@ -5493,8 +5496,7 @@ mod s2s_adversarial_tests {
             broadcast_tx,
             conn_gen: Arc::new(AtomicU64::new(0)),
             signing_key: Arc::new(secret_key),
-            trust_config: HashMap::new(),
-            peer_trust: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            trust_config,
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         })
@@ -5508,11 +5510,7 @@ mod s2s_adversarial_tests {
             .lock()
             .await
             .insert(PEER.to_string());
-        manager
-            .peer_trust
-            .lock()
-            .await
-            .insert(PEER.to_string(), TrustLevel::Full);
+        // Trust defaults to Full for unconfigured peers, so no seed is needed.
         *state.s2s_manager.lock() = Some(manager.clone());
         // S2S_RATE_LIMITS is process-static; all tests share PEER, so
         // parallel-run counters trip the 100/sec cap mid-suite without
@@ -5538,6 +5536,47 @@ mod s2s_adversarial_tests {
                 },
             );
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // S2S trust: configured trust is authoritative
+    // ═══════════════════════════════════════════════════════════
+
+    /// A peer cannot escalate itself by declaring a higher trust level in its
+    /// Hello. The operator's --s2s-peer-trust config is the sole authority, so
+    /// a peer configured `readonly` stays `readonly` even after announcing
+    /// `full`.
+    #[tokio::test]
+    async fn configured_trust_is_not_overridden_by_peer_declared_hello() {
+        let state = test_state();
+        // Configure PEER as readonly so there is a restriction to try to escape.
+        let manager = test_manager_with_trust(
+            [(PEER.to_string(), TrustLevel::Readonly)]
+                .into_iter()
+                .collect(),
+        );
+        *state.s2s_manager.lock() = Some(manager.clone());
+
+        assert_eq!(
+            manager.get_trust(PEER).await,
+            TrustLevel::Readonly,
+            "precondition: PEER should start readonly"
+        );
+
+        // The peer announces full trust in its Hello.
+        let hello = S2sMessage::Hello {
+            peer_id: PEER.to_string(),
+            server_name: "liar".to_string(),
+            protocol_version: 2,
+            trust_level: Some("full".to_string()),
+        };
+        process_s2s_message(&state, &manager, PEER, hello).await;
+
+        assert_eq!(
+            manager.get_trust(PEER).await,
+            TrustLevel::Readonly,
+            "a peer's declared Hello trust must not override configured trust"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -6208,7 +6247,6 @@ mod s2s_adversarial_tests {
             conn_gen: Arc::new(AtomicU64::new(0)),
             signing_key: Arc::new(secret_key),
             trust_config: HashMap::new(),
-            peer_trust: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         });
@@ -6792,10 +6830,6 @@ mod s2s_adversarial_tests {
             .lock()
             .await
             .insert(RL_PEER.to_string());
-        mgr.peer_trust
-            .lock()
-            .await
-            .insert(RL_PEER.to_string(), TrustLevel::Full);
         *state.s2s_manager.lock() = Some(mgr.clone());
         S2S_RATE_LIMITS.lock().remove(RL_PEER);
         setup_channel(&state, "#ratelimit");

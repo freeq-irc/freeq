@@ -788,9 +788,9 @@ pub struct S2sManager {
     /// Phase 2: Signing key for message envelopes.
     pub signing_key: Arc<iroh::SecretKey>,
     /// Phase 3: Trust levels per peer (from --s2s-peer-trust config).
+    /// This is the sole authority for peer trust — a peer's own declared level
+    /// is informational and never adopted, so it cannot escalate itself.
     pub trust_config: HashMap<String, TrustLevel>,
-    /// Phase 3: Runtime trust levels (includes Hello-negotiated levels).
-    pub peer_trust: Arc<tokio::sync::Mutex<HashMap<String, TrustLevel>>>,
     /// Phase 4: Pending key rotations announced by peers (old_id → new_id).
     pub pending_rotations: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     /// Phase 1: Peers that have completed mutual HelloAck handshake.
@@ -898,24 +898,14 @@ impl S2sManager {
 
     // ── Phase 3: Trust level management ─────────────────────────
 
-    /// Get the trust level for a peer. Checks runtime state first,
-    /// then config, defaults to Full for allowed peers.
+    /// Get the trust level for a peer. Read from the operator's configured
+    /// trust only; a peer's self-declared level is never consulted. Defaults
+    /// to Full for peers with no explicit config (open federation).
     pub async fn get_trust(&self, peer_id: &str) -> TrustLevel {
-        if let Some(level) = self.peer_trust.lock().await.get(peer_id) {
-            return *level;
-        }
         self.trust_config
             .get(peer_id)
             .copied()
             .unwrap_or(TrustLevel::Full)
-    }
-
-    /// Set the runtime trust level for a peer (from HelloAck negotiation).
-    pub async fn set_trust(&self, peer_id: &str, level: TrustLevel) {
-        self.peer_trust
-            .lock()
-            .await
-            .insert(peer_id.to_string(), level);
     }
 
     // ── Phase 4: Key rotation ───────────────────────────────────
@@ -1026,7 +1016,6 @@ pub async fn start(
         conn_gen: Arc::new(AtomicU64::new(0)),
         signing_key: Arc::new(signing_key),
         trust_config,
-        peer_trust: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
     });
@@ -1657,7 +1646,6 @@ mod tests {
             conn_gen: Arc::new(AtomicU64::new(0)),
             signing_key: Arc::new(secret),
             trust_config,
-            peer_trust: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         };
@@ -1720,7 +1708,6 @@ mod tests {
             conn_gen: Arc::new(AtomicU64::new(0)),
             signing_key: Arc::new(secret),
             trust_config: HashMap::new(),
-            peer_trust: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         };
@@ -1762,7 +1749,6 @@ mod tests {
             conn_gen: Arc::new(AtomicU64::new(0)),
             signing_key: Arc::new(secret),
             trust_config: HashMap::new(),
-            peer_trust: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         };
@@ -1837,7 +1823,6 @@ mod tests {
             conn_gen: Arc::new(AtomicU64::new(0)),
             signing_key: Arc::new(secret),
             trust_config: HashMap::new(),
-            peer_trust: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         };
@@ -1880,7 +1865,6 @@ mod tests {
             conn_gen: Arc::new(AtomicU64::new(0)),
             signing_key: Arc::new(secret),
             trust_config: HashMap::new(),
-            peer_trust: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         };
@@ -1922,7 +1906,6 @@ mod tests {
             conn_gen: Arc::new(AtomicU64::new(0)),
             signing_key: Arc::new(secret.clone()),
             trust_config: HashMap::new(),
-            peer_trust: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         };
