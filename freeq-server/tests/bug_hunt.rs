@@ -246,6 +246,35 @@ async fn names_visible_on_public_channel() {
     .await;
 }
 
+/// NAMES is channel-only. Asking about a person must be refused rather than
+/// answered with an empty roster, which clients read as "an empty channel"
+/// (and used to turn into a phantom channel buffer).
+#[tokio::test]
+async fn names_on_a_nick_is_refused() {
+    run(|a| {
+        let mut target = C::new(a, "namestarget");
+        target.reg();
+        target.drain();
+
+        let mut c = C::new(a, "namesasker");
+        c.reg();
+        c.drain();
+        c.tx("NAMES namestarget");
+
+        let err = c.maybe(|l| l.split_whitespace().nth(1) == Some("403"), 1000);
+        assert!(
+            err.is_some(),
+            "NAMES on a nick should be refused with 403, got no 403"
+        );
+        let roster = c.maybe(|l| l.split_whitespace().nth(1) == Some("353"), 300);
+        assert!(
+            roster.is_none(),
+            "NAMES on a nick must not answer with a 353 roster"
+        );
+    })
+    .await;
+}
+
 /// BUG: NAMES with no parameter — should list something or error
 #[tokio::test]
 async fn names_no_param() {

@@ -2025,6 +2025,20 @@ pub(super) fn handle_names(
     send: &impl Fn(&Arc<SharedState>, &str, String),
 ) {
     let nick = conn.nick_or_star();
+
+    // NAMES is channel-only. Answering for a nick with an empty roster reads
+    // as "that person is an empty room", which is how clients ended up minting
+    // phantom channel buffers from a DM target.
+    if !channel.starts_with('#') && !channel.starts_with('&') {
+        let err = irc::Message::from_server(
+            server_name,
+            irc::ERR_NOSUCHCHANNEL,
+            vec![nick, channel, "No such channel"],
+        );
+        send(state, session_id, format!("{err}\r\n"));
+        return;
+    }
+
     let multi_prefix = state.cap_multi_prefix.lock().contains(session_id);
 
     // Snapshot session→DID FIRST and release the lock immediately.
