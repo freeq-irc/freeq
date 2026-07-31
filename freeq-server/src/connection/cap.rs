@@ -22,8 +22,15 @@ pub(super) fn handle_cap(
         Some("LS") => {
             conn.cap_negotiating = true;
             // Build capability list, including iroh endpoint ID if available
+            // `freeq.at/msgsig` says this server verifies the chat signing
+            // document (JCS over an enumerated per-kind document, signed over
+            // the sender's own event id — see `freeq_sdk::chatsig`). Clients
+            // use it to decide which canonical to sign: without it, signing
+            // the document form would be verified by nobody. The server needs
+            // no per-session state for it, because the signature tag says
+            // which form it is (`ed25519:<kid>:<sig>` vs a bare blob).
             let mut caps = String::from(
-                "sasl message-tags multi-prefix echo-message server-time batch draft/chathistory account-notify account-tag extended-join away-notify draft/read-marker",
+                "sasl message-tags multi-prefix echo-message server-time batch draft/chathistory account-notify account-tag extended-join away-notify draft/read-marker freeq.at/msgsig",
             );
             // Advertise draft/multiline with our policy limits (spec requires
             // max-bytes; max-lines is recommended). See `draft_multiline` module
@@ -76,6 +83,13 @@ pub(super) fn handle_cap(
                             conn.cap_batch = true;
                             state.cap_batch.lock().insert(session_id.to_string());
                             acked.push("batch");
+                        }
+                        "freeq.at/msgsig" => {
+                            // Acknowledged so a client can confirm the server
+                            // understands document signatures; nothing to
+                            // track, since each signature declares its own
+                            // format.
+                            acked.push("freeq.at/msgsig");
                         }
                         "draft/multiline" => {
                             // Per spec, `draft/multiline` depends on `batch`.

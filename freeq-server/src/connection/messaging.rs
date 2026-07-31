@@ -77,6 +77,29 @@ fn resolve_event_msgid(
     Ok(claimed.to_string())
 }
 
+/// Put the resolved signature on the outgoing tags — or make sure no
+/// signature rides along at all.
+///
+/// The removal is the point. The client's own `+freeq.at/sig` is in the tag
+/// map we're about to relay, so a signature that failed verification (or a
+/// guest's invented one) would travel untouched and every client would draw a
+/// lock beside it. A signature the server did not stand behind must not leave
+/// the server.
+fn set_signature(tags: &mut HashMap<String, String>, resolved: Option<String>) {
+    tags.remove("+freeq.at/sig");
+    tags.remove("freeq.at/sig");
+    if let Some(sig) = resolved {
+        tags.insert("+freeq.at/sig".to_string(), sig);
+    }
+}
+
+/// The root msgid a message replies to, from either spelling of the reply tag.
+fn reply_reference(tags: &HashMap<String, String>) -> Option<&str> {
+    tags.get("+reply")
+        .or_else(|| tags.get("+draft/reply"))
+        .map(|s| s.as_str())
+}
+
 /// Drop `+freeq.at/eventid` from the tags that go out on the wire.
 ///
 /// Once adopted, the id *is* the `msgid` tag, and a verifier rebuilds the
@@ -103,54 +126,176 @@ fn send_eventid_fail(
     }
 }
 
-/// Verify a client-provided signature, or server-sign as fallback.
+/// The fields of a message that its signature covers, beyond the sender and
+/// the venue (which the resolver works out for itself).
+pub(crate) struct SignedFields<'a> {
+    /// The wire body — ciphertext on an encrypted channel, the assembled body
+    /// for a multiline batch. Hashed, never inlined.
+    pub body: &'a str,
+    /// The event's own id, as adopted by `resolve_event_msgid`.
+    pub msgid: &'a str,
+    /// Root msgid this message replies to, if any.
+    pub reply: Option<&'a str>,
+    /// Root msgid this message revises, if any.
+    pub edit: Option<&'a str>,
+    /// True when a plugin rewrote the body after the client signed it. The
+    /// signature then cannot match, and the cause is this server, not the
+    /// sender — so it must read *unverifiable*, never invalid.
+    pub body_rewritten: bool,
+}
+
+/// The venue a signed document binds, or `None` when this server cannot work
+/// it out (an unresolvable DM recipient), which makes the message's signature
+/// unverifiable rather than wrong.
 ///
-/// If the client included `+freeq.at/sig` AND has a registered session key,
-/// verify it. If valid, return the client's signature (true non-repudiation).
-/// If the client didn't sign but is DID-authenticated, server-sign as fallback.
-/// Returns None for guests.
+/// Never the wire target: a channel is folded (the server folds it too, so a
+/// client signing `#Ops` as typed would fail at its own origin), and a DM
+/// binds the sorted DID pair, because a DM's wire target is a nick or a `did:`
+/// and history is replayed under whichever the *reader* asked for.
+fn signing_venue(state: &Arc<SharedState>, sender_did: &str, target: &str) -> Option<String> {
+    if target.starts_with('#') || target.starts_with('&') {
+        return Some(freeq_sdk::chatsig::channel_venue(target));
+    }
+    let recipient = super::routing::recipient_did_for_target(state, target)?;
+    Some(freeq_sdk::chatsig::dm_venue(sender_did, &recipient))
+}
+
+/// Build the document a chat message's signature covers.
+fn message_document<'a>(
+    did: &'a str,
+    venue: &'a str,
+    fields: &SignedFields<'a>,
+    tags: &'a HashMap<String, String>,
+) -> freeq_sdk::chatsig::ChatDoc<'a> {
+    let mut doc = freeq_sdk::chatsig::ChatDoc::message(did, fields.msgid, venue, fields.body);
+    // References always name root msgids — the only ids a client is ever told,
+    // since a message keeps its identity through every revision.
+    if let Some(reply) = fields.reply {
+        doc = doc.with_reply(reply);
+    }
+    if let Some(edit) = fields.edit {
+        doc = doc.with_edit(edit);
+    }
+    doc.with_coord(tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+}
+
+/// Verify the sender's own signature, or sign on its behalf.
 ///
-/// Canonical form: `{sender_did}\0{target}\0{text}\0{timestamp}`
+/// Returns the value for the outgoing `+freeq.at/sig` tag:
+///
+/// - **The client's signature**, when it verifies against the key its `kid`
+///   names — the only case that carries real non-repudiation, because the
+///   server never held the private key.
+/// - **A server signature** over the same document, when the client didn't
+///   sign or when its signature was *unverifiable* (no key on file for that
+///   kid, an algorithm we don't know, a legacy-format signature, or a body
+///   this server's plugins rewrote). Attaching ours says only what it means:
+///   this server vouches that this identity sent this.
+/// - **Nothing**, for a guest — and for a signature that *failed* against the
+///   key it named. That is the one case we refuse to paper over: quietly
+///   replacing a failed signature with the server's own would turn a signature
+///   that didn't check into a badge that says it did.
 fn resolve_signature(
     conn: &Connection,
     target: &str,
-    text: &str,
-    timestamp: u64,
+    fields: &SignedFields<'_>,
+    tags: &HashMap<String, String>,
     client_sig: Option<&str>,
     state: &Arc<SharedState>,
 ) -> Option<String> {
     let did = conn.authenticated_did.as_ref()?;
-    let canonical = format!("{did}\0{target}\0{text}\0{timestamp}");
+    let venue = signing_venue(state, did, target);
 
-    // If client provided a signature, verify it against their registered key
-    if let Some(sig_b64) = client_sig
-        && let Some(vk) = state.session_msg_keys.lock().get(&conn.id).cloned()
+    if let (Some(sig_tag), Some(venue)) = (client_sig, venue.as_deref())
+        && !fields.body_rewritten
     {
-        use base64::Engine;
-        if let Ok(sig_bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig_b64)
-            && sig_bytes.len() == 64
-        {
-            let sig_array: [u8; 64] = sig_bytes.try_into().unwrap();
-            let sig = ed25519_dalek::Signature::from_bytes(&sig_array);
-            use ed25519_dalek::Verifier;
-            if vk.verify(canonical.as_bytes(), &sig).is_ok() {
-                // Client signature valid — use it (true non-repudiation)
-                return Some(sig_b64.to_string());
-            } else {
+        let doc = message_document(did, venue, fields, tags);
+        match verify_client_signature(&doc, sig_tag, did, &conn.id, state) {
+            ClientSigOutcome::Verified => return Some(sig_tag.to_string()),
+            ClientSigOutcome::Failed => {
                 tracing::warn!(
-                    session = %conn.id,
-                    did = %did,
-                    "Client message signature verification failed — falling back to server signing"
+                    session = %conn.id, did = %did, msgid = %fields.msgid,
+                    "Client signature did not verify against the key it names — \
+                     relaying the message unsigned rather than substituting ours"
+                );
+                return None;
+            }
+            ClientSigOutcome::Unverifiable(why) => {
+                tracing::debug!(
+                    session = %conn.id, did = %did, msgid = %fields.msgid, why = %why,
+                    "Client signature not verifiable here — server-signing instead"
                 );
             }
         }
+    } else if client_sig.is_some() {
+        tracing::debug!(
+            session = %conn.id, did = %did, msgid = %fields.msgid,
+            rewritten = fields.body_rewritten,
+            "Client signature not verifiable here (no venue, or body rewritten \
+             after signing) — server-signing instead"
+        );
     }
 
-    // Fallback: server signs on behalf of authenticated user
-    use ed25519_dalek::Signer;
-    let sig = state.msg_signing_key.sign(canonical.as_bytes());
-    use base64::Engine;
-    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes()))
+    // Server signature over the same document. Without a venue there is no
+    // document to sign, and inventing one would produce a signature nobody
+    // could rebuild — the exact failure this canonical exists to end.
+    let venue = venue?;
+    let doc = message_document(did, &venue, fields, tags);
+    Some(doc.sign(&state.msg_signing_key))
+}
+
+/// What happened when we checked a client's signature — three outcomes, not
+/// two, because "cannot check" and "does not check out" are different facts.
+enum ClientSigOutcome {
+    Verified,
+    /// The named key was found and the signature is wrong: tampering, forgery,
+    /// or a client whose canonical disagrees with ours.
+    Failed,
+    /// We cannot reach a verdict, and must not pretend to. Carries the reason
+    /// for the log.
+    Unverifiable(&'static str),
+}
+
+fn verify_client_signature(
+    doc: &freeq_sdk::chatsig::ChatDoc<'_>,
+    sig_tag: &str,
+    did: &str,
+    session: &str,
+    state: &Arc<SharedState>,
+) -> ClientSigOutcome {
+    // A legacy signature is a bare base64 blob over the retired canonical,
+    // which folded a client-minted wall clock this server cannot reproduce.
+    // It was never checkable; it is not evidence of anything.
+    let Ok((kid, _)) = freeq_sdk::sigtag::parse(sig_tag) else {
+        return ClientSigOutcome::Unverifiable("unparseable or legacy signature format");
+    };
+
+    // The session's registered key first (the common case: sign, then send),
+    // then the durable per-(DID, kid) history, which is what keeps a signature
+    // checkable after the session that made it has ended.
+    let session_key = state
+        .session_msg_keys
+        .lock()
+        .get(session)
+        .copied()
+        .filter(|vk| freeq_sdk::sigtag::derive_kid(vk) == kid);
+    let key = match session_key {
+        Some(vk) => vk,
+        None => match state
+            .with_db(|db| db.get_signing_key_by_kid(did, kid))
+            .flatten()
+            .and_then(|bytes| ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok())
+        {
+            Some(vk) => vk,
+            None => return ClientSigOutcome::Unverifiable("no key on file for that kid"),
+        },
+    };
+
+    match doc.verify(sig_tag, &key) {
+        Ok(()) => ClientSigOutcome::Verified,
+        Err(e) if e.is_unverifiable() => ClientSigOutcome::Unverifiable("unusable signature tag"),
+        Err(_) => ClientSigOutcome::Failed,
+    }
 }
 
 /// Verify a commit-reveal binding declared on a PRIVMSG carrying
@@ -959,9 +1104,17 @@ pub(super) fn handle_privmsg_with_multiline(
 
         // Verify client signature or server-sign as fallback
         let client_sig = tags.get("+freeq.at/sig").map(|s| s.as_str());
-        if let Some(sig) = resolve_signature(conn, target, text, timestamp, client_sig, state) {
-            full_tags.insert("+freeq.at/sig".to_string(), sig);
-        }
+        let signed = SignedFields {
+            body: text,
+            msgid: &msgid,
+            reply: reply_reference(tags),
+            edit: None,
+            body_rewritten: msg_result.rewrite_text.is_some(),
+        };
+        set_signature(
+            &mut full_tags,
+            resolve_signature(conn, target, &signed, tags, client_sig, state),
+        );
 
         // If this PRIVMSG is a commit-reveal `reveal` event, verify the
         // binding against the prior commit and stamp the outcome onto
@@ -1224,9 +1377,17 @@ pub(super) fn handle_privmsg_with_multiline(
 
         // Verify client signature or server-sign DMs
         let client_sig = tags.get("+freeq.at/sig").map(|s| s.as_str());
-        if let Some(sig) = resolve_signature(conn, target, text, timestamp, client_sig, state) {
-            pm_tags.insert("+freeq.at/sig".to_string(), sig);
-        }
+        let signed = SignedFields {
+            body: text,
+            msgid: &pm_msgid,
+            reply: reply_reference(tags),
+            edit: None,
+            body_rewritten: false,
+        };
+        set_signature(
+            &mut pm_tags,
+            resolve_signature(conn, target, &signed, tags, client_sig, state),
+        );
 
         let mut pm_tags_with_time = pm_tags.clone();
         pm_tags_with_time.insert("time".to_string(), time_tag.clone());
@@ -2327,26 +2488,39 @@ fn handle_edit(
     }
     let persisted = matches!(original, Some(Some(_)));
 
-    // Generate new msgid for the edit
-    let edit_msgid = crate::msgid::generate();
+    // The edit is its own event and gets its own id — the sender's, if it
+    // minted one (an edit is signed like any other message).
+    let edit_msgid = match resolve_event_msgid(conn, tags, state) {
+        Ok(id) => id,
+        Err((code, description)) => {
+            send_eventid_fail(conn, "EDIT", code, &description, state);
+            return;
+        }
+    };
 
     // Build tags with edit reference + new msgid
     let mut full_tags = tags.clone();
+    strip_event_id_tag(&mut full_tags);
     full_tags.insert("msgid".to_string(), edit_msgid.clone());
     // Keep the +draft/edit tag so clients know this is an edit — pointing at
     // the root, which is the id they hold the message under.
     full_tags.insert("+draft/edit".to_string(), original_msgid.to_string());
 
-    // Verify/sign edited message
-    let edit_timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    // Verify/sign edited message. The document covers `edit`, so a revision
+    // cannot be detached from the message it revises without breaking the
+    // signature.
     let client_sig = tags.get("+freeq.at/sig").map(|s| s.as_str());
-    if let Some(sig) = resolve_signature(conn, target, new_text, edit_timestamp, client_sig, state)
-    {
-        full_tags.insert("+freeq.at/sig".to_string(), sig);
-    }
+    let signed = SignedFields {
+        body: new_text,
+        msgid: &edit_msgid,
+        reply: reply_reference(tags),
+        edit: Some(original_msgid),
+        body_rewritten: false,
+    };
+    set_signature(
+        &mut full_tags,
+        resolve_signature(conn, target, &signed, tags, client_sig, state),
+    );
 
     // Multi-line breakdown for BATCH-wrapped outbound. Two sources, in
     // priority order:

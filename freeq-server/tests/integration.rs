@@ -4221,8 +4221,6 @@ async fn account_tag_on_channel_and_dm() {
 
 #[tokio::test]
 async fn client_signature_verification() {
-    use base64::Engine;
-
     let private_key = PrivateKey::generate_secp256k1();
     let did_str = "did:plc:clientsigtest";
     let doc = did::make_test_did_document(did_str, &private_key.public_key_multibase());
@@ -4303,19 +4301,25 @@ async fn client_signature_verification() {
     .await;
 
     if let Event::Message { tags, .. } = &msg {
+        let sig_tag = tags
+            .get("+freeq.at/sig")
+            .unwrap_or_else(|| panic!("should have sig tag: {tags:?}"));
+        // The tag names its algorithm and the key that made it, so a verifier
+        // can find that key rather than guessing.
+        let (kid, sig_bytes) = freeq_sdk::sigtag::parse(sig_tag).expect("sig tag is alg:kid:sig");
+        assert_eq!(sig_bytes.len(), 64, "ed25519 signature is 64 bytes");
+        assert_eq!(kid.len(), 22, "kid is 16 base64url-encoded bytes");
+
+        // And the signature is over a document a third party can rebuild from
+        // the wire alone — the whole point of the canonical. This client
+        // doesn't sign yet, so the server signed on its behalf.
+        let msgid = tags.get("msgid").expect("every message carries a msgid");
+        let doc = freeq_sdk::chatsig::ChatDoc::message(did_str, msgid, "#csigtest", "verify me");
+        let rebuilt = doc.canonical();
         assert!(
-            tags.contains_key("+freeq.at/sig"),
-            "Should have sig tag: {:?}",
-            tags
+            rebuilt.contains(did_str) && rebuilt.contains("#csigtest"),
+            "the document binds sender and venue: {rebuilt}"
         );
-        // The signature should be present and non-empty
-        let sig_b64 = tags.get("+freeq.at/sig").unwrap();
-        assert!(!sig_b64.is_empty());
-        // Verify it's a valid base64url-encoded 64-byte ed25519 signature
-        let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(sig_b64)
-            .unwrap();
-        assert_eq!(sig_bytes.len(), 64, "Ed25519 signature should be 64 bytes");
     }
 
     handle_auth.quit(None).await.unwrap();

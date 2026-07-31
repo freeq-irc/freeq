@@ -1261,34 +1261,91 @@ async fn api_channel_evidence(
     Ok(Json(bundle))
 }
 
+/// Classify a stored message's signature: `(verdict, verified_by, client key)`.
+///
+/// Three verdicts, never two. `invalid` is a statement about the bytes — the
+/// key the signature names was found and the signature does not check out. A
+/// signature this server merely *cannot* check is `unverifiable`, and the
+/// distinction is not academic here: the two commonest cases are a legacy
+/// signature over the retired canonical (never checkable by anyone, ours
+/// included) and a key we don't hold. Reporting either as invalid would
+/// present our own history, or a missing key, as forgery.
+fn classify_message_signature(
+    state: &Arc<SharedState>,
+    sender_did: Option<&str>,
+    canonical: Option<&str>,
+    sig_tag: Option<&str>,
+) -> (&'static str, &'static str, Option<String>) {
+    let Some(sig_tag) = sig_tag else {
+        return ("unverifiable", "unsigned", None);
+    };
+    // No sender DID means no document: the signature covers who sent it, and
+    // we cannot rebuild a document around an unknown signer.
+    let Some(canonical) = canonical else {
+        return ("unverifiable", "unverifiable-unknown-sender", None);
+    };
+    let kid = match freeq_sdk::sigtag::parse(sig_tag) {
+        Ok((kid, _)) => kid,
+        // A signer using an algorithm this build doesn't know is a newer
+        // client, not a forger.
+        Err(freeq_sdk::sigtag::SigError::UnsupportedAlgorithm(_)) => {
+            return ("unverifiable", "unverifiable-unknown-algorithm", None);
+        }
+        // Otherwise: a legacy signature, a bare base64 blob over
+        // `did\0target\0text\0timestamp`, whose timestamp the client minted
+        // and never transmitted. Never checkable, by anyone.
+        Err(_) => return ("unverifiable", "unverifiable-legacy-format", None),
+    };
+
+    let server_vk = state.msg_signing_key.verifying_key();
+    let key = if kid == freeq_sdk::sigtag::derive_kid(&server_vk) {
+        Some((server_vk, "server-key"))
+    } else {
+        sender_did
+            .and_then(|did| {
+                state
+                    .with_db(|db| db.get_signing_key_by_kid(did, kid))
+                    .flatten()
+            })
+            .and_then(|bytes| ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok())
+            .map(|vk| (vk, "client-session-key"))
+    };
+    let Some((vk, which)) = key else {
+        return ("unverifiable", "unverifiable-unknown-key", None);
+    };
+
+    use base64::Engine;
+    let client_public_key = (which == "client-session-key")
+        .then(|| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.as_bytes()));
+    match freeq_sdk::sigtag::verify_canonical(canonical, sig_tag, &vk) {
+        Ok(()) => ("valid", which, client_public_key),
+        Err(e) if e.is_unverifiable() => (
+            "unverifiable",
+            "unverifiable-unusable-signature",
+            client_public_key,
+        ),
+        Err(_) => ("invalid", which, client_public_key),
+    }
+}
+
 async fn api_verify_message(
     State(state): State<Arc<SharedState>>,
     axum::extract::Path(msgid): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    // Search all channel histories for this msgid
-    let channels = state.channels.lock();
-    let mut found = None;
-    let mut found_channel = String::new();
-    for (ch_name, ch) in channels.iter() {
-        for msg in ch.history.iter() {
-            if msg.msgid.as_deref() == Some(&msgid) {
-                found = Some(msg.clone());
-                found_channel = ch_name.clone();
-                break;
-            }
-        }
-        if found.is_some() {
-            break;
-        }
-    }
-    drop(channels);
+    use freeq_sdk::chatsig;
 
-    // Fall back to database if not in memory
-    if found.is_none()
-        && let Some(row) = state
-            .with_db(|db| db.find_message_by_msgid(&msgid))
-            .flatten()
+    // The database first: its row is authoritative about the venue and the
+    // sender's DID, both of which the signed document covers. In-memory
+    // history is the fallback for a server running without a database.
+    let mut venue = String::new();
+    let mut sender_did: Option<String> = None;
+    let mut found: Option<crate::server::HistoryMessage> = None;
+    if let Some(row) = state
+        .with_db(|db| db.find_message_by_msgid(&msgid))
+        .flatten()
     {
+        venue = row.channel.clone();
+        sender_did = row.sender_did.clone();
         found = Some(crate::server::HistoryMessage {
             from: row.sender,
             text: row.text,
@@ -1297,113 +1354,101 @@ async fn api_verify_message(
             msgid: row.msgid,
             edited: row.replaces_msgid.is_some(),
         });
-        found_channel = row.channel;
+    }
+    if found.is_none() {
+        let channels = state.channels.lock();
+        for (ch_name, ch) in channels.iter() {
+            if let Some(msg) = ch
+                .history
+                .iter()
+                .find(|m| m.msgid.as_deref() == Some(msgid.as_str()))
+            {
+                venue = ch_name.clone();
+                found = Some(msg.clone());
+                break;
+            }
+        }
     }
 
     let msg = found.ok_or((
         axum::http::StatusCode::NOT_FOUND,
         format!("Message {msgid} not found"),
     ))?;
+    let sig_tag = msg.tags.get(freeq_sdk::sigtag::SIG_TAG).cloned();
 
-    let sig_b64 = msg.tags.get("+freeq.at/sig").cloned();
-    let sender_nick = msg.from.split('!').next().unwrap_or(&msg.from);
-
-    // Resolve sender's DID
-    let sender_did = state
-        .nick_owners
-        .lock()
-        .iter()
-        .find(|(_, did)| {
+    // The `account` tag is the origin's own statement of who sent this, which
+    // is what the document binds; the nick map is a last resort for rows
+    // predating it.
+    let sender_nick = msg.from.split('!').next().unwrap_or(&msg.from).to_string();
+    if sender_did.is_none() {
+        sender_did = msg.tags.get("account").cloned().or_else(|| {
             state
-                .did_nicks
+                .nick_owners
                 .lock()
-                .get(*did)
-                .map(|n| n == sender_nick)
-                .unwrap_or(false)
-        })
-        .map(|(_, did)| did.clone())
-        // Also check active sessions
-        .or_else(|| {
-            let n2s = state.nick_to_session.lock();
-            let session = n2s.get_session(sender_nick).map(|s| s.to_string());
-            session.and_then(|s| state.session_dids.lock().get(&s).cloned())
+                .get(&sender_nick.to_lowercase())
+                .cloned()
         });
-
-    let canonical = sender_did
-        .as_ref()
-        .map(|did| format!("{did}\0{found_channel}\0{}\0{}", msg.text, msg.timestamp));
-
-    // Try to verify: first against client session key, then server key
-    let mut verification = serde_json::json!(null);
-    if let (Some(sig_b64), Some(canonical_str)) = (&sig_b64, &canonical) {
-        use base64::Engine;
-        if let Ok(sig_bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig_b64)
-            && sig_bytes.len() == 64
-        {
-            let sig_array: [u8; 64] = sig_bytes.try_into().unwrap();
-            let sig = ed25519_dalek::Signature::from_bytes(&sig_array);
-            let canonical_bytes = canonical_str.as_bytes();
-
-            // Try client session key first
-            let mut verified_by = "none";
-            if let Some(ref did) = sender_did
-                && let Some(pubkey_b64) = state.did_msg_keys.lock().get(did)
-                && let Ok(pk_bytes) =
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(pubkey_b64)
-                && pk_bytes.len() == 32
-            {
-                let pk_arr: [u8; 32] = pk_bytes.try_into().unwrap();
-                if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&pk_arr) {
-                    use ed25519_dalek::Verifier;
-                    if vk.verify(canonical_bytes, &sig).is_ok() {
-                        verified_by = "client-session-key";
-                    }
-                }
-            }
-
-            // Fall back to server key
-            if verified_by == "none" {
-                use ed25519_dalek::Verifier;
-                let server_vk = state.msg_signing_key.verifying_key();
-                if server_vk.verify(canonical_bytes, &sig).is_ok() {
-                    verified_by = "server-key";
-                }
-            }
-
-            let server_pubkey = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(state.msg_signing_key.verifying_key().as_bytes());
-            let client_pubkey = sender_did
-                .as_ref()
-                .and_then(|did| state.did_msg_keys.lock().get(did).cloned());
-
-            verification = serde_json::json!({
-                "valid": verified_by != "none",
-                "verified_by": verified_by,
-                "server_public_key": server_pubkey,
-                "client_public_key": client_pubkey,
-            });
-        }
     }
 
-    let canonical_hex = canonical.as_ref().map(|c| {
+    // Rebuild the exact document the signer signed (see `chatsig`): the venue
+    // is the stored channel key — a folded channel name, or the sorted DID
+    // pair a DM is filed under — never a reader-perspective target.
+    let canonical = sender_did.as_ref().map(|did| {
+        let mut doc = chatsig::ChatDoc::message(did, &msgid, &venue, &msg.text);
+        if let Some(reply) = msg
+            .tags
+            .get("+reply")
+            .or_else(|| msg.tags.get("+draft/reply"))
+        {
+            doc = doc.with_reply(reply);
+        }
+        if let Some(edit) = msg.tags.get("+draft/edit") {
+            doc = doc.with_edit(edit);
+        }
+        doc.with_coord(msg.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .canonical()
+    });
+
+    let (verdict, verified_by, client_public_key) = classify_message_signature(
+        &state,
+        sender_did.as_deref(),
+        canonical.as_deref(),
+        sig_tag.as_deref(),
+    );
+    let server_vk = state.msg_signing_key.verifying_key();
+
+    let server_pubkey = {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(server_vk.as_bytes())
+    };
+    let verification = serde_json::json!({
+        // `valid` stays for older clients; `verdict` is the honest three-way.
+        "valid": verdict == "valid",
+        "verdict": verdict,
+        "verified_by": verified_by,
+        "server_public_key": server_pubkey,
+        "client_public_key": client_public_key,
+    });
+
+    let canonical_hex = canonical.as_ref().map(|c: &String| {
         c.as_bytes()
             .iter()
-            .map(|b| format!("{:02x}", b))
+            .map(|b| format!("{b:02x}"))
             .collect::<String>()
     });
 
     Ok(Json(serde_json::json!({
         "msgid": msgid,
-        "channel": found_channel,
+        "channel": venue,
         "from": msg.from,
         "text": msg.text,
         "timestamp": msg.timestamp,
         "sender_did": sender_did,
-        "signature": sig_b64,
+        "signature": sig_tag,
         "canonical_form": canonical,
         "canonical_hex": canonical_hex,
         "verification": verification,
-        "how_to_verify": "echo -n '<canonical_form>' | openssl dgst -ed25519 -verify <pubkey.pem> -signature <sig.bin>"
+        "how_to_verify": "The canonical_form is JCS over the signed document; the signature tag is ed25519:<kid>:<base64url sig> over its UTF-8 bytes"
     })))
 }
 
@@ -4901,5 +4946,145 @@ mod signing_key_endpoint_tests {
         // Unknown DID → 404.
         let miss_did = api_did_signing_key(State(state), Path("did:plc:nobody".to_string())).await;
         assert_eq!(miss_did.unwrap_err(), axum::http::StatusCode::NOT_FOUND);
+    }
+}
+
+#[cfg(test)]
+mod signature_verdict_tests {
+    use super::classify_message_signature;
+    use crate::server::test_state_with_db;
+    use ed25519_dalek::SigningKey;
+    use freeq_sdk::chatsig::ChatDoc;
+
+    const DID: &str = "did:plc:verdict";
+    const MSGID: &str = "01KYVT5Z8Q0000000000000000";
+
+    fn doc() -> ChatDoc<'static> {
+        ChatDoc::message(DID, MSGID, "#freeq", "the original text")
+    }
+
+    /// A device signature over the document verifies, and is reported as the
+    /// sender's own — the only outcome that carries non-repudiation.
+    #[test]
+    fn a_device_signature_over_the_document_is_valid() {
+        let state = test_state_with_db();
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        state
+            .with_db(|db| db.save_signing_key(DID, key.verifying_key().as_bytes()))
+            .expect("test state has a database");
+
+        let canonical = doc().canonical();
+        let sig = doc().sign(&key);
+        let (verdict, by, client_key) =
+            classify_message_signature(&state, Some(DID), Some(&canonical), Some(&sig));
+        assert_eq!((verdict, by), ("valid", "client-session-key"));
+        assert!(client_key.is_some(), "the key that verified is reported");
+    }
+
+    /// The server's own fallback signature verifies too, and is labelled as
+    /// what it is: this server vouching, not the sender's device.
+    #[test]
+    fn a_server_signature_is_valid_but_labelled_as_the_servers() {
+        let state = test_state_with_db();
+        let canonical = doc().canonical();
+        let sig = doc().sign(&state.msg_signing_key);
+        let (verdict, by, client_key) =
+            classify_message_signature(&state, Some(DID), Some(&canonical), Some(&sig));
+        assert_eq!((verdict, by), ("valid", "server-key"));
+        assert_eq!(client_key, None);
+    }
+
+    /// Altered text is the one case that is a verdict about the bytes.
+    #[test]
+    fn altered_text_is_invalid_not_unverifiable() {
+        let state = test_state_with_db();
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        state
+            .with_db(|db| db.save_signing_key(DID, key.verifying_key().as_bytes()))
+            .expect("test state has a database");
+
+        let sig = doc().sign(&key);
+        let tampered = ChatDoc::message(DID, MSGID, "#freeq", "the edited text").canonical();
+        let (verdict, by, _) =
+            classify_message_signature(&state, Some(DID), Some(&tampered), Some(&sig));
+        assert_eq!((verdict, by), ("invalid", "client-session-key"));
+    }
+
+    /// Re-venuing is caught for exactly the same reason: the venue is inside
+    /// the document, so presenting a private line as public breaks the sig.
+    #[test]
+    fn a_re_venued_message_is_invalid() {
+        let state = test_state_with_db();
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        state
+            .with_db(|db| db.save_signing_key(DID, key.verifying_key().as_bytes()))
+            .expect("test state has a database");
+
+        let sig = ChatDoc::message(DID, MSGID, "#private-team", "the number is 12").sign(&key);
+        let elsewhere = ChatDoc::message(DID, MSGID, "#public", "the number is 12").canonical();
+        let (verdict, _, _) =
+            classify_message_signature(&state, Some(DID), Some(&elsewhere), Some(&sig));
+        assert_eq!(verdict, "invalid");
+    }
+
+    /// Everything we cannot check reads as unverifiable, each with its own
+    /// reason — a legacy signature, an unknown key, an unknown sender, no
+    /// signature at all. None of these may be reported as forgery.
+    #[test]
+    fn what_cannot_be_checked_is_unverifiable_with_a_reason() {
+        let state = test_state_with_db();
+        let canonical = doc().canonical();
+
+        // Pre-cutover history: a bare base64 blob over the retired canonical.
+        let legacy =
+            "Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZg";
+        assert_eq!(
+            classify_message_signature(&state, Some(DID), Some(&canonical), Some(legacy)).0,
+            "unverifiable"
+        );
+        assert_eq!(
+            classify_message_signature(&state, Some(DID), Some(&canonical), Some(legacy)).1,
+            "unverifiable-legacy-format"
+        );
+
+        // A key we don't hold — the signer's session ended before we saw it.
+        let stranger = SigningKey::from_bytes(&[11u8; 32]);
+        let sig = doc().sign(&stranger);
+        assert_eq!(
+            classify_message_signature(&state, Some(DID), Some(&canonical), Some(&sig)),
+            (
+                "unverifiable",
+                "unverifiable-unknown-key",
+                None::<String>.clone()
+            )
+        );
+
+        // No sender DID → no document to rebuild.
+        assert_eq!(
+            classify_message_signature(&state, None, None, Some(&sig)).1,
+            "unverifiable-unknown-sender"
+        );
+
+        // And an unsigned message is not a failed one.
+        assert_eq!(
+            classify_message_signature(&state, Some(DID), Some(&canonical), None),
+            ("unverifiable", "unsigned", None)
+        );
+    }
+
+    /// A signer using an algorithm this build doesn't know is a newer client,
+    /// not a forger.
+    #[test]
+    fn an_unknown_algorithm_is_unverifiable() {
+        let state = test_state_with_db();
+        let canonical = doc().canonical();
+        let (verdict, by, _) = classify_message_signature(
+            &state,
+            Some(DID),
+            Some(&canonical),
+            Some("ml-dsa-44:somekid:c2ln"),
+        );
+        assert_eq!(verdict, "unverifiable");
+        assert_eq!(by, "unverifiable-unknown-algorithm");
     }
 }

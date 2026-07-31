@@ -899,8 +899,14 @@ function ViaBadge({ origin }: { origin: string }) {
   );
 }
 
-/** Result of checking a signature against GET /api/v1/verify/{msgid}. */
-type VerifyOutcome = 'device' | 'server' | 'failed';
+/** Result of checking a signature against GET /api/v1/verify/{msgid}.
+ *
+ *  Four outcomes, because "we couldn't check this" and "this doesn't check
+ *  out" are different facts and only one of them is an accusation:
+ *  `unverifiable` covers a signature from before the current canonical, or one
+ *  made with a key the server no longer holds; `invalid` means the key the
+ *  signature names was found and the signature does not match. */
+type VerifyOutcome = 'device' | 'server' | 'unverifiable' | 'invalid';
 
 // Cache checked results per msgid so re-opening the popover (or the same
 // badge in another render) doesn't re-fetch. Definitive server answers are
@@ -915,20 +921,30 @@ async function verifySignature(msgid: string): Promise<VerifyOutcome> {
     if (!r.ok) return 'failed';
     const j = await r.json();
     const v = j?.verification;
-    let outcome: VerifyOutcome = 'failed';
-    if (v?.valid && v.verified_by === 'client-session-key') outcome = 'device';
-    else if (v?.valid && v.verified_by === 'server-key') outcome = 'server';
+    // `verdict` is the server's three-way answer; fall back to the older
+    // boolean for a server that predates it.
+    const verdict: string = v?.verdict ?? (v?.valid ? 'valid' : 'unverifiable');
+    let outcome: VerifyOutcome;
+    if (verdict === 'valid') {
+      outcome = v.verified_by === 'client-session-key' ? 'device' : 'server';
+    } else if (verdict === 'invalid') {
+      outcome = 'invalid';
+    } else {
+      outcome = 'unverifiable';
+    }
     verifyCache.set(msgid, outcome);
     return outcome;
   } catch {
-    return 'failed';
+    // A network failure says nothing about the signature.
+    return 'unverifiable';
   }
 }
 
 const VERIFY_LABELS: Record<VerifyOutcome, { text: string; tone: string }> = {
   device: { text: 'Verified — signed on the sender’s device', tone: 'text-success' },
   server: { text: 'Verified — signed by the server on the sender’s behalf', tone: 'text-success' },
-  failed: { text: 'Signature could not be verified', tone: 'text-warning' },
+  unverifiable: { text: 'Could not be checked here — not a claim either way', tone: 'text-warning' },
+  invalid: { text: 'Does not match its signing key — treat with suspicion', tone: 'text-danger' },
 };
 
 /** Signed message badge — message carries a cryptographic signature.
@@ -978,7 +994,9 @@ function SignedBadge({ msgid }: { msgid: string }) {
             </div>
           ) : outcome && (
             <div className={`text-[11px] font-medium mb-1 ${VERIFY_LABELS[outcome].tone}`}>
-              {outcome !== 'failed' && '✓ '}{VERIFY_LABELS[outcome].text}
+              {(outcome === 'device' || outcome === 'server') && '✓ '}
+              {outcome === 'invalid' && '⚠ '}
+              {VERIFY_LABELS[outcome].text}
             </div>
           )}
           <p className="text-[11px] text-fg-muted leading-relaxed">

@@ -11,8 +11,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+use ed25519_dalek::SigningKey;
 use freeq_sdk::auth::{self, ChallengeSigner, KeySigner};
-use freeq_sdk::chatsig::EVENT_ID_TAG;
+use freeq_sdk::chatsig::{ChatDoc, EVENT_ID_TAG, channel_venue};
 use freeq_sdk::crypto::PrivateKey;
 use freeq_sdk::did::{self, DidResolver};
 
@@ -175,6 +176,31 @@ impl C {
 
     fn send_with_id(&mut self, id: &str, target: &str, text: &str) {
         self.tx(&format!("@{EVENT_ID_TAG}={id} PRIVMSG {target} :{text}"));
+    }
+
+    /// Register a message-signing key for this session, as every signing
+    /// client does once after auth.
+    fn msgsig(&mut self, key: &SigningKey) {
+        use base64::Engine;
+        let pubkey =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
+        self.tx(&format!("MSGSIG {pubkey}"));
+        self.rx(|l| l.contains("MSGSIG"), "MSGSIG ack");
+    }
+
+    fn send_signed(&mut self, id: &str, target: &str, text: &str, sig_tag: &str) {
+        self.tx(&format!(
+            "@{EVENT_ID_TAG}={id};+freeq.at/sig={sig_tag} PRIVMSG {target} :{text}"
+        ));
+    }
+
+    fn sig_of(line: &str) -> Option<String> {
+        line.strip_prefix('@')
+            .and_then(|s| s.split_once(' ').map(|(t, _)| t))
+            .and_then(|tags| {
+                tags.split(';')
+                    .find_map(|t| t.strip_prefix("+freeq.at/sig=").map(|v| v.to_string()))
+            })
     }
 
     fn msgid_of(line: &str) -> Option<String> {
@@ -406,6 +432,157 @@ async fn a_dm_is_filed_under_the_senders_own_id() {
             C::msgid_of(&delivered).as_deref(),
             Some(minted.as_str()),
             "a DM crosses under the sender's id too: {delivered}"
+        );
+    })
+    .await;
+}
+
+// ── The signature itself ────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_signature_the_sender_made_travels_exactly_as_the_sender_made_it() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#sig");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#sig");
+
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
+
+        let id = freeq_server::msgid::generate();
+        let body = "signed on my own device";
+        let sig = ChatDoc::message(DID_ALICE, &id, &channel_venue("#sig"), body).sign(&signing);
+        alice.send_signed(&id, "#sig", body, &sig);
+
+        let seen = bob.rx(|l| l.contains(body), "delivery");
+        assert_eq!(
+            C::sig_of(&seen).as_deref(),
+            Some(sig.as_str()),
+            "the sender's signature must be relayed byte-for-byte, not re-made: {seen}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_signature_that_fails_is_not_quietly_replaced_with_the_servers() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#sig");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#sig");
+
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
+
+        // A signature over a *different* body than the one sent — what a
+        // tampering relay, or a client with the wrong canonical, produces.
+        let id = freeq_server::msgid::generate();
+        let sig = ChatDoc::message(DID_ALICE, &id, &channel_venue("#sig"), "what I signed")
+            .sign(&signing);
+        alice.send_signed(&id, "#sig", "what I sent", &sig);
+
+        let seen = bob.rx(|l| l.contains("what I sent"), "delivery");
+        assert_eq!(
+            C::sig_of(&seen),
+            None,
+            "a signature that didn't check out must not be laundered into a \
+             server signature: {seen}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_signed_venue_is_the_folded_channel_not_the_case_the_sender_typed() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#sig");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#sig");
+
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
+
+        // Sent with the case the user typed, signed with the folded venue:
+        // verifies, because that is the rule.
+        let id = freeq_server::msgid::generate();
+        let folded = ChatDoc::message(DID_ALICE, &id, "#sig", "typed in mixed case").sign(&signing);
+        alice.send_signed(&id, "#SIG", "typed in mixed case", &folded);
+        let seen = bob.rx(|l| l.contains("typed in mixed case"), "delivery");
+        assert_eq!(C::sig_of(&seen).as_deref(), Some(folded.as_str()));
+
+        // Signing the unfolded name does not, so the rule is unambiguous
+        // rather than "whatever the sender happened to type".
+        let id2 = freeq_server::msgid::generate();
+        let unfolded =
+            ChatDoc::message(DID_ALICE, &id2, "#SIG", "signed the wrong venue").sign(&signing);
+        alice.send_signed(&id2, "#SIG", "signed the wrong venue", &unfolded);
+        let seen2 = bob.rx(|l| l.contains("signed the wrong venue"), "delivery");
+        assert_eq!(
+            C::sig_of(&seen2),
+            None,
+            "a venue that isn't the folded one is not the venue: {seen2}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_unsigned_message_from_an_identity_is_signed_by_the_server_instead() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#sig");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#sig");
+
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
+        alice.tx("PRIVMSG #sig :I didn't sign this");
+
+        let seen = bob.rx(|l| l.contains("I didn't sign this"), "delivery");
+        let sig = C::sig_of(&seen).expect("the server signs on an identity's behalf");
+        let (kid, _) = freeq_sdk::sigtag::parse(&sig).expect("sig tag is alg:kid:sig");
+        assert_ne!(
+            kid,
+            freeq_sdk::sigtag::derive_kid(&signing.verifying_key()),
+            "a server signature must not claim to be the sender's key: {seen}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_guests_message_is_not_signed_by_anyone() {
+    let (addr, _h) = start(DidResolver::static_map(HashMap::new())).await;
+    run(addr, move |addr| {
+        let mut watcher = C::guest(addr, "watcher");
+        watcher.join("#sig");
+        let mut guest = C::guest(addr, "nobody");
+        guest.join("#sig");
+        // Even a guest that *invents* a signature tag must not have it relayed:
+        // an unverifiable signature on the wire is a lock badge for free.
+        guest.tx(
+            "@+freeq.at/sig=ed25519:AAAAAAAAAAAAAAAAAAAAAA:AAAA PRIVMSG #sig :no identity, no signature",
+        );
+        let seen = watcher.rx(|l| l.contains("no identity, no signature"), "delivery");
+        assert_eq!(
+            C::sig_of(&seen),
+            None,
+            "there is nothing to vouch for: {seen}"
         );
     })
     .await;
