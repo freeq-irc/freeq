@@ -9,6 +9,9 @@
 //! - [`client`] — Async IRC client with SASL support
 //! - [`auth`] — Challenge signing traits and implementations
 //! - [`canonical`] — JCS (RFC 8785) canonicalization for hashing/signing
+//! - [`sigtag`] — the `+freeq.at/sig` tag format shared by every signing profile
+//! - [`chatsig`] — signing profile for chat events (messages, deletes, reactions)
+//! - [`act`] — signing profile for `freeq.at/act` action messages
 //! - [`crypto`] — secp256k1 and ed25519 key operations
 //! - [`did`] — DID document resolution (did:plc, did:web)
 //! - [`pds`] — AT Protocol PDS client (session creation/verification)
@@ -21,6 +24,7 @@ pub mod auth;
 pub mod av;
 pub mod bot;
 pub mod canonical;
+pub mod chatsig;
 pub mod client;
 pub mod crypto;
 pub mod did;
@@ -35,6 +39,7 @@ pub mod oauth;
 pub mod p2p;
 pub mod pds;
 pub mod ratchet;
+pub mod sigtag;
 // SSRF-safe outbound HTTP now lives in its own single-purpose crate; re-export
 // so the `freeq_sdk::ssrf::` path stays stable for existing consumers.
 pub use freeq_ssrf as ssrf;

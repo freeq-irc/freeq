@@ -22,17 +22,19 @@
 //! - The canonical bytes are the UTF-8 of `canonical::canonicalize` over
 //!   that string→string map.
 //!
-//! The sig tag value is `ed25519:<kid>:<base64url sig>`, where `kid` is the
-//! base64url (unpadded) of the first 16 bytes of SHA-256 over the raw 32-byte
-//! ed25519 public key — self-certifying, so a looked-up key is checkable
-//! against the kid that named it.
+//! The sig tag value is `ed25519:<kid>:<base64url sig>` — the format shared
+//! by every freeq signing profile, which lives in [`crate::sigtag`] (kid
+//! derivation, parsing, the raw sign/verify over canonical bytes) so the act
+//! and chat profiles cannot disagree about it.
 
 use std::collections::BTreeMap;
 
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 
-/// Wire name of the signature tag (also accepted without the `+`).
-pub const SIG_TAG: &str = "+freeq.at/sig";
+// The kid rule is shared, not act-specific: re-exported here so existing
+// `freeq_sdk::act::derive_kid*` callers (the server's key store, the fixtures)
+// keep working while there is exactly one implementation.
+pub use crate::sigtag::{SIG_TAG, derive_kid, derive_kid_bytes};
 
 const CLIENT_TAG_PREFIX: &str = "+freeq.at/";
 const TAG_PREFIX: &str = "freeq.at/";
@@ -71,6 +73,19 @@ impl std::fmt::Display for ActSigError {
 
 impl std::error::Error for ActSigError {}
 
+impl From<crate::sigtag::SigError> for ActSigError {
+    fn from(e: crate::sigtag::SigError) -> Self {
+        match e {
+            crate::sigtag::SigError::BadFormat => ActSigError::BadSigFormat,
+            crate::sigtag::SigError::UnsupportedAlgorithm(a) => {
+                ActSigError::UnsupportedAlgorithm(a)
+            }
+            crate::sigtag::SigError::KidMismatch => ActSigError::KidMismatch,
+            crate::sigtag::SigError::Invalid => ActSigError::SigInvalid,
+        }
+    }
+}
+
 /// Strip the client-tag vendor prefix from a tag name, if present.
 fn stripped_name(tag_name: &str) -> &str {
     tag_name
@@ -106,56 +121,18 @@ where
     Some(crate::canonical::canonicalize(&covered).expect("string map serializes"))
 }
 
-/// Derive the key id from a raw ed25519 public key: base64url (unpadded) of
-/// the first 16 bytes of SHA-256 over the raw key bytes.
-///
-/// Takes raw bytes (not a parsed `VerifyingKey`) so the server's key store can
-/// derive the same kid for any stored 32-byte blob without curve validation —
-/// the single kid source shared by the canonical, the store, and the fixtures.
-pub fn derive_kid_bytes(pubkey: &[u8]) -> String {
-    use base64::Engine;
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(pubkey);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..16])
-}
-
-/// Derive the key id for a public key (see [`derive_kid_bytes`]).
-pub fn derive_kid(key: &VerifyingKey) -> String {
-    derive_kid_bytes(key.as_bytes())
-}
-
 /// Sign the act tags in `tags` with `key`. Returns the sig tag value
 /// (`ed25519:<kid>:<base64url sig>`), or `None` if no act tags are present.
 pub fn sign_act<'a, I>(tags: I, key: &SigningKey) -> Option<String>
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
-    use base64::Engine;
-    let canonical = act_canonical(tags)?;
-    let sig = key.sign(canonical.as_bytes());
-    let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes());
-    Some(format!(
-        "ed25519:{}:{}",
-        derive_kid(&key.verifying_key()),
-        sig_b64
-    ))
+    Some(crate::sigtag::sign_canonical(&act_canonical(tags)?, key))
 }
 
 /// Parse a sig tag value into (kid, signature bytes).
 pub fn parse_sig_tag(sig_tag: &str) -> Result<(&str, [u8; 64]), ActSigError> {
-    use base64::Engine;
-    let mut parts = sig_tag.splitn(3, ':');
-    let alg = parts.next().ok_or(ActSigError::BadSigFormat)?;
-    let kid = parts.next().ok_or(ActSigError::BadSigFormat)?;
-    let sig_b64 = parts.next().ok_or(ActSigError::BadSigFormat)?;
-    if alg != "ed25519" {
-        return Err(ActSigError::UnsupportedAlgorithm(alg.to_string()));
-    }
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(sig_b64)
-        .map_err(|_| ActSigError::BadSigFormat)?;
-    let sig: [u8; 64] = bytes.try_into().map_err(|_| ActSigError::BadSigFormat)?;
-    Ok((kid, sig))
+    crate::sigtag::parse(sig_tag).map_err(ActSigError::from)
 }
 
 /// Verify an act signature over the act tags in `tags` against `key`.
@@ -163,14 +140,11 @@ pub fn verify_act<'a, I>(tags: I, sig_tag: &str, key: &VerifyingKey) -> Result<(
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
-    let (kid, sig_bytes) = parse_sig_tag(sig_tag)?;
-    if derive_kid(key) != kid {
-        return Err(ActSigError::KidMismatch);
-    }
+    // Shape and kid first, so a missing canonical isn't reported as a format
+    // problem and a wrong key isn't reported as tampering.
+    crate::sigtag::parse(sig_tag).map_err(ActSigError::from)?;
     let canonical = act_canonical(tags).ok_or(ActSigError::NoActTags)?;
-    let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    key.verify(canonical.as_bytes(), &sig)
-        .map_err(|_| ActSigError::SigInvalid)
+    crate::sigtag::verify_canonical(&canonical, sig_tag, key).map_err(ActSigError::from)
 }
 
 #[cfg(test)]

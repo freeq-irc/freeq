@@ -1,0 +1,187 @@
+{
+  "bodyRule": "body = \"sha256:\" + lowercase hex of SHA-256 over the UTF-8 wire body — ciphertext under E2EE, and the assembled body (real newlines) for a draft/multiline batch.",
+  "coordRule": "coord covers exactly the client-authored coordination tags event, payload, ref, task-id (canonical keys; wire names carry a +freeq.at/ prefix), IRC-unescaped, verbatim. Every other tag — server stamps, tallies, verdicts, provenance, ephemera, framing — is excluded.",
+  "description": "Worked signing examples for freeq chat events (messages, deletes, reactions). Every implementation must reproduce `canonical` and `sigTag` byte-for-byte from `input` + `seed`, and must reach `expected` for each negative when checking that vector's sigTag against `tamperedCanonical`.",
+  "documentRule": "JCS (RFC 8785) over an enumerated per-kind document. Mandatory: from, msgid, target. A message carries no `kind` (its absence is the kind) and covers body/reply?/edit?/coord?; a mutation carries kind and subject, plus emoji for react|unreact. Optional fields are omitted entirely when absent.",
+  "kidRule": "base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16])",
+  "negatives": [
+    {
+      "expected": "invalid",
+      "name": "altered-body",
+      "tamperedCanonical": "{\"body\":\"sha256:d34c234175b04f1a17d8ff2c905891306859db043ccef93e323f8264f36c6f86\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"target\":\"#freeq\"}",
+      "vector": "message-plain"
+    },
+    {
+      "expected": "invalid",
+      "name": "stripped-edit",
+      "tamperedCanonical": "{\"body\":\"sha256:c352bca280a44e8756406fd05bbec5824caff00b4eae2c7cdfbedf1396c2f9a9\",\"coord\":{\"event\":\"task_result\",\"payload\":\"%7B%22ok%22%3Atrue%7D\",\"ref\":\"01KYVT2BBB0000000000000000\",\"task-id\":\"01KYVT2AAA0000000000000000\"},\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"reply\":\"01KYVT1W2P0000000000000000\",\"target\":\"#swarm\"}",
+      "vector": "message-reply-edit-and-coord"
+    },
+    {
+      "expected": "invalid",
+      "name": "sanitized-coord-tag",
+      "tamperedCanonical": "{\"body\":\"sha256:c352bca280a44e8756406fd05bbec5824caff00b4eae2c7cdfbedf1396c2f9a9\",\"coord\":{\"event\":\"task_result\",\"payload\":\"%7B%22ok%22%3Afalse%7D\",\"ref\":\"01KYVT2BBB0000000000000000\",\"task-id\":\"01KYVT2AAA0000000000000000\"},\"edit\":\"01KYVT1W2P0000000000000000\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"reply\":\"01KYVT1W2P0000000000000000\",\"target\":\"#swarm\"}",
+      "vector": "message-reply-edit-and-coord"
+    },
+    {
+      "expected": "invalid",
+      "name": "re-venued-target",
+      "tamperedCanonical": "{\"body\":\"sha256:bef4261f394bf71fd2b565cd76396ac9ed7953f9110c69ee49d7a82871238fbf\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"target\":\"#public\"}",
+      "vector": "message-plain"
+    },
+    {
+      "expected": "invalid",
+      "name": "swapped-subject",
+      "tamperedCanonical": "{\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kind\":\"delete\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"subject\":\"01KYVT9ZZZ0000000000000000\",\"target\":\"#freeq\"}",
+      "vector": "delete"
+    },
+    {
+      "expected": "invalid",
+      "name": "verb-swap-react-to-unreact",
+      "tamperedCanonical": "{\"emoji\":\"👍\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kind\":\"unreact\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"subject\":\"01KYVT1W2P0000000000000000\",\"target\":\"#freeq\"}",
+      "vector": "react"
+    }
+  ],
+  "referenceRule": "edit, reply and subject always name root msgids. A signed event naming a revision is refused, never rewritten.",
+  "sigTagFormat": "ed25519:<kid>:<base64url-nopad signature over the UTF-8 canonical bytes>",
+  "vectors": [
+    {
+      "canonical": "{\"body\":\"sha256:bef4261f394bf71fd2b565cd76396ac9ed7953f9110c69ee49d7a82871238fbf\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"target\":\"#freeq\"}",
+      "input": {
+        "bodyText": "ship it",
+        "from": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "kind": "message",
+        "msgid": "01KYVT5Z8Q0000000000000000",
+        "target": "#freeq"
+      },
+      "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+      "name": "message-plain",
+      "publicKey": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+      "seed": "0101010101010101010101010101010101010101010101010101010101010101",
+      "sigTag": "ed25519:NHUPmL1Z_PyUbaRaqr6TOw:_82Len7Z3lcnJsRKEZ9fYPfR4UqC0KhkxW01m9LTeqXN36TPPNdN-jROTIWYFvjiPyEXZUH7ZCyEJC4f0JH_BQ"
+    },
+    {
+      "canonical": "{\"body\":\"sha256:430895907c1c54070187fda0b4487636c73b5bfabaa562cc76ac93c58649686e\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"target\":\"#ops\"}",
+      "input": {
+        "bodyText": "deploying",
+        "from": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "kind": "message",
+        "msgid": "01KYVT5Z8Q0000000000000000",
+        "rawTarget": "#Ops",
+        "target": "#ops"
+      },
+      "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+      "name": "message-channel-venue-is-folded",
+      "publicKey": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+      "seed": "0101010101010101010101010101010101010101010101010101010101010101",
+      "sigTag": "ed25519:NHUPmL1Z_PyUbaRaqr6TOw:XkpIX8FrqrOeg2LPue3D9j3Br4XZ3ECQBsLBqRnct9aLA6lrhbRPEQkfuirI28lv-qOkho_Jh8egSDxppagQCg"
+    },
+    {
+      "canonical": "{\"body\":\"sha256:954b74a438480a69ff473f74b8ff8b0b45ec32cd862f3f66a0c6ff5af3ec545a\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"target\":\"dm:did:plc:aaa,did:plc:k2n3e2vsihf3farequ44t5j7\"}",
+      "input": {
+        "bodyText": "just between us",
+        "dmParticipants": [
+          "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "did:plc:aaa"
+        ],
+        "from": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "kind": "message",
+        "msgid": "01KYVT5Z8Q0000000000000000",
+        "target": "dm:did:plc:aaa,did:plc:k2n3e2vsihf3farequ44t5j7"
+      },
+      "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+      "name": "message-dm-venue",
+      "publicKey": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+      "seed": "0101010101010101010101010101010101010101010101010101010101010101",
+      "sigTag": "ed25519:NHUPmL1Z_PyUbaRaqr6TOw:AS6ErT7buTOWui9_C_dt26oO6mMow0MRNn00yEjDPKPHda8bAB-w93rs4V6yTR6xnkaL7x6BxcV1epB4J3dRBQ"
+    },
+    {
+      "canonical": "{\"body\":\"sha256:c352bca280a44e8756406fd05bbec5824caff00b4eae2c7cdfbedf1396c2f9a9\",\"coord\":{\"event\":\"task_result\",\"payload\":\"%7B%22ok%22%3Atrue%7D\",\"ref\":\"01KYVT2BBB0000000000000000\",\"task-id\":\"01KYVT2AAA0000000000000000\"},\"edit\":\"01KYVT1W2P0000000000000000\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"reply\":\"01KYVT1W2P0000000000000000\",\"target\":\"#swarm\"}",
+      "input": {
+        "bodyText": "revised: use the cached index",
+        "edit": "01KYVT1W2P0000000000000000",
+        "from": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "kind": "message",
+        "msgid": "01KYVT5Z8Q0000000000000000",
+        "reply": "01KYVT1W2P0000000000000000",
+        "tags": {
+          "+freeq.at/event": "task_result",
+          "+freeq.at/payload": "%7B%22ok%22%3Atrue%7D",
+          "+freeq.at/reactions": "👍:3",
+          "+freeq.at/ref": "01KYVT2BBB0000000000000000",
+          "+freeq.at/task-id": "01KYVT2AAA0000000000000000"
+        },
+        "target": "#swarm"
+      },
+      "kid": "ajgD1fBZkCocba-8m6Rykg",
+      "name": "message-reply-edit-and-coord",
+      "publicKey": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+      "seed": "0202020202020202020202020202020202020202020202020202020202020202",
+      "sigTag": "ed25519:ajgD1fBZkCocba-8m6Rykg:HB0V8hB-5M0VyHTR_orTsI3YRkv3syCRcgK9mN5GD47nUZG3sBS7L2bLpo9NN4eCV53nwUzUDkAmHSFD-Xv9Cw"
+    },
+    {
+      "canonical": "{\"body\":\"sha256:bd99281b6236112d2c1ed3776230493ccc9a31b4a8c12393d5d946c91663bcad\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"target\":\"#freeq\"}",
+      "input": {
+        "bodyText": "line one\nline two — \"quoted\" ✓\nline three",
+        "from": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "kind": "message",
+        "msgid": "01KYVT5Z8Q0000000000000000",
+        "target": "#freeq"
+      },
+      "kid": "ti6Gf6LzOv5i1daxZC4WIQ",
+      "name": "message-multiline-and-escaping",
+      "publicKey": "7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E",
+      "seed": "0303030303030303030303030303030303030303030303030303030303030303",
+      "sigTag": "ed25519:ti6Gf6LzOv5i1daxZC4WIQ:j5a0sMW-Bn5pagSvgekMtVNqBmfEErcZDBi14AbpiUI-jbYW34ROXhiPW0YS2FQO7IFQCPi7kWIXewMP14QkDg"
+    },
+    {
+      "canonical": "{\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kind\":\"delete\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"subject\":\"01KYVT1W2P0000000000000000\",\"target\":\"#freeq\"}",
+      "input": {
+        "from": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "kind": "delete",
+        "msgid": "01KYVT5Z8Q0000000000000000",
+        "subject": "01KYVT1W2P0000000000000000",
+        "target": "#freeq"
+      },
+      "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+      "name": "delete",
+      "publicKey": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+      "seed": "0101010101010101010101010101010101010101010101010101010101010101",
+      "sigTag": "ed25519:NHUPmL1Z_PyUbaRaqr6TOw:myslrRKBJadXkUOP9WqPhDv_alF9nHF71YntNlameYVq9DwuK89RT4q7RAwOJvuYbeEE4_Vm6cpkc_s_dgQrCA"
+    },
+    {
+      "canonical": "{\"emoji\":\"👍\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kind\":\"react\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"subject\":\"01KYVT1W2P0000000000000000\",\"target\":\"#freeq\"}",
+      "input": {
+        "emoji": "👍",
+        "from": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "kind": "react",
+        "msgid": "01KYVT5Z8Q0000000000000000",
+        "subject": "01KYVT1W2P0000000000000000",
+        "target": "#freeq"
+      },
+      "kid": "xblA7T9lw5GWXegpX8XSXw",
+      "name": "react",
+      "publicKey": "ypOsFwUYcHHWe4PH_w7-gQjo7EUwV113JoeTM9vavnw",
+      "seed": "0404040404040404040404040404040404040404040404040404040404040404",
+      "sigTag": "ed25519:xblA7T9lw5GWXegpX8XSXw:znxupU1zCG1NAqowsnqDX3jHxanMQfi1K5MmBdsrGbgqBGrg4pprra5mj1kX-fJY7gY9pQGd6NEwgO0tlHs3AQ"
+    },
+    {
+      "canonical": "{\"emoji\":\"👍\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kind\":\"unreact\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"subject\":\"01KYVT1W2P0000000000000000\",\"target\":\"#freeq\"}",
+      "input": {
+        "emoji": "👍",
+        "from": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "kind": "unreact",
+        "msgid": "01KYVT5Z8Q0000000000000000",
+        "subject": "01KYVT1W2P0000000000000000",
+        "target": "#freeq"
+      },
+      "kid": "xblA7T9lw5GWXegpX8XSXw",
+      "name": "unreact",
+      "publicKey": "ypOsFwUYcHHWe4PH_w7-gQjo7EUwV113JoeTM9vavnw",
+      "seed": "0404040404040404040404040404040404040404040404040404040404040404",
+      "sigTag": "ed25519:xblA7T9lw5GWXegpX8XSXw:jUj6OnweFd-BMliw3PrGrDRfs7Y8b_xB07csz36ZWcag4vkhPufw7SiotS-Rx3joEGZIKbFHo7R49V8kCsDTBg"
+    }
+  ],
+  "venueRule": "target is the normalized venue, never the wire target: a channel lowercased, or `dm:<did_a>,<did_b>` with the two DIDs sorted ascending.",
+  "verdictRule": "Only a signature that fails against the key its kid names is `invalid`. An unknown algorithm, a kid we cannot resolve, or a malformed tag is `unverifiable` — never reported as forgery."
+}

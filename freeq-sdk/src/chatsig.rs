@@ -1,0 +1,856 @@
+//! Signing and verification for chat events — messages, deletes, reactions.
+//!
+//! The chat profile of freeq's one signing model (see [`crate::sigtag`] for the
+//! tag format and [`crate::act`] for the action profile). It replaces the
+//! original PRIVMSG canonical, `{did}\0{target}\0{text}\0{timestamp}`, which
+//! could not work: the timestamp was minted by the *client* and verified
+//! against the *server's* clock, so a signature only verified when both landed
+//! in the same second, and it never crossed S2S at all (the signed timestamp
+//! is not on the wire, so a receiving server cannot rebuild the bytes).
+//!
+//! ## The documents
+//!
+//! Each event kind signs an **enumerated document**, JCS-canonicalized
+//! (RFC 8785). Enumerated rather than act's sign-every-`act-*`-tag rule
+//! because chat's tag space is *mixed*: the server stamps `account`, `time`,
+//! `msgid`, `+freeq.at/reactions`, `+freeq.at/origin` and the commit verdicts
+//! into the same namespaces clients write, so "sign what's present" would
+//! cover the server's own tags and break the moment it stamped one.
+//!
+//! ```text
+//! message:  {"body":"sha256:<hex>", "coord":{…}?, "edit":"<root msgid>"?,
+//!            "from":"<DID>", "msgid":"<ULID>", "reply":"<root msgid>"?,
+//!            "target":"<venue>"}
+//!
+//! delete:   {"from":"<DID>", "kind":"delete", "msgid":"<event ULID>",
+//!            "subject":"<root msgid>", "target":"<venue>"}
+//!
+//! react:    {"emoji":"<emoji>", "from":"<DID>", "kind":"react"|"unreact",
+//!            "msgid":"<event ULID>", "subject":"<root msgid>",
+//!            "target":"<venue>"}
+//! ```
+//!
+//! Optional fields appear only when present, so a plain message reduces to
+//! four keys. A message carries no `kind`: every other kind has one, so its
+//! **absence is the message kind** — and because the field sets are disjoint
+//! (`body` vs `kind`), no document of one kind can be reread as another.
+//!
+//! Field rules, each with a reason:
+//!
+//! - **`body`** is `sha256:<lowercase hex>` over the UTF-8 **wire** body — the
+//!   ciphertext under E2EE, so encryption and verification stay orthogonal,
+//!   and the *assembled* body for a `draft/multiline` batch (the bytes the
+//!   server stores), because the S2S hop re-escapes `\n` and the far side
+//!   re-splits the frames. Hashed rather than inlined so the canonical stays
+//!   small and a signature can be checked against a body held elsewhere.
+//! - **`target`** is the **normalized venue**, not the wire target. See
+//!   [`channel_venue`] and [`dm_venue`]: the server lowercases channel targets
+//!   before anything else sees them, and DM history is replayed under the
+//!   *reader's* view of the conversation, so "the target exactly as
+//!   transmitted" is not reproducible by a verifier. The venue is bound
+//!   because the channel is the queue: without it a server can present a line
+//!   written in one room as written in another with every signature intact.
+//! - **`msgid`** is the id the **signer** minted — the thing signed over, in
+//!   place of a wall clock (a ULID embeds its own creation time and travels as
+//!   a tag, so a receiver rebuilds the exact signed bytes instead of guessing
+//!   a timestamp it cannot match).
+//! - **`edit`/`reply`/`subject`** always name **root** msgids (the identity a
+//!   message keeps for life). A signed event naming a revision is refused
+//!   rather than rewritten, so the signed value is always the filed value.
+//! - **`coord`** covers the client-authored coordination tags
+//!   ([`COVERED_COORD_TAGS`], a **closed** set — an open rule would swallow
+//!   future server-written `+freeq.at/*` tags). They're what bots act on, so
+//!   receive-side sanitizing should break a signature exactly when it altered
+//!   something.
+//!
+//! Excluded, each for its own reason: `+freeq.at/sig` (cannot cover itself);
+//! `account`, `time`, the server-stamped `msgid` (server attestations);
+//! `+freeq.at/origin` (provenance); the commit verdicts (the client's claim
+//! rides the signed `coord` tags — the verdict is the server's);
+//! `+freeq.at/reactions` (a server-computed tally); `+typing` and
+//! `+freeq.at/av-*` (ephemera — durable state under a user's name gets
+//! signed, ephemera don't); `batch`/`label`/`+freeq.at/multiline` (framing,
+//! and the last is added by the sending server).
+//!
+//! The fixtures in `spec/chat-signing-vectors.json` freeze all of the above:
+//! every implementation (server, TS bot-kit, Swift, Kotlin) must reproduce
+//! each `canonical` and `sigTag` byte-for-byte from the `input`.
+
+use std::collections::BTreeMap;
+
+use ed25519_dalek::{SigningKey, VerifyingKey};
+
+pub use crate::sigtag::SigError;
+
+/// The client-authored coordination tags covered by a message document, as
+/// canonical keys (the wire names are these with a `+freeq.at/` prefix).
+///
+/// Closed on purpose: a rule like "every `+freeq.at/*` tag" would cover tags
+/// the *server* writes, and every new server-side tag would then invalidate
+/// signatures that were fine.
+pub const COVERED_COORD_TAGS: [&str; 4] = ["event", "payload", "ref", "task-id"];
+
+const CLIENT_TAG_PREFIX: &str = "+freeq.at/";
+const TAG_PREFIX: &str = "freeq.at/";
+
+/// What a mutation event does to the message it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mutation {
+    /// Retract a message. Authorship (or channel op) is checked separately;
+    /// the signature only attests who *asked*.
+    Delete,
+    /// Add a reaction.
+    React,
+    /// Remove a previously added reaction.
+    Unreact,
+}
+
+impl Mutation {
+    /// The `kind` value in the canonical document.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mutation::Delete => "delete",
+            Mutation::React => "react",
+            Mutation::Unreact => "unreact",
+        }
+    }
+}
+
+/// A chat event's signed document, before canonicalization.
+///
+/// Built through [`ChatDoc::message`] / [`ChatDoc::mutation`] so a document is
+/// impossible to construct without the mandatory fields — a missing `from`,
+/// `msgid` or `target` is a programming error, not a runtime verdict.
+#[derive(Debug, Clone)]
+pub struct ChatDoc<'a> {
+    from: &'a str,
+    msgid: &'a str,
+    target: &'a str,
+    kind: Option<Mutation>,
+    /// Message only: the raw wire body. Hashed on canonicalization.
+    body: Option<&'a str>,
+    /// Message only.
+    reply: Option<&'a str>,
+    /// Message only.
+    edit: Option<&'a str>,
+    /// Message only.
+    coord: BTreeMap<&'a str, &'a str>,
+    /// Mutation only: the root msgid being acted on.
+    subject: Option<&'a str>,
+    /// Reactions only.
+    emoji: Option<&'a str>,
+}
+
+impl<'a> ChatDoc<'a> {
+    /// A PRIVMSG/NOTICE document. `body` is the wire body (ciphertext under
+    /// E2EE, assembled body for a multiline batch) and is hashed, never
+    /// inlined. `target` must already be a normalized venue — see
+    /// [`channel_venue`] / [`dm_venue`].
+    pub fn message(from: &'a str, msgid: &'a str, target: &'a str, body: &'a str) -> Self {
+        ChatDoc {
+            from,
+            msgid,
+            target,
+            kind: None,
+            body: Some(body),
+            reply: None,
+            edit: None,
+            coord: BTreeMap::new(),
+            subject: None,
+            emoji: None,
+        }
+    }
+
+    /// A mutation document (delete / react / unreact). `subject` is the
+    /// **root** msgid of the message being acted on; `msgid` is this event's
+    /// own signer-minted id.
+    pub fn mutation(
+        kind: Mutation,
+        from: &'a str,
+        msgid: &'a str,
+        target: &'a str,
+        subject: &'a str,
+    ) -> Self {
+        ChatDoc {
+            from,
+            msgid,
+            target,
+            kind: Some(kind),
+            body: None,
+            reply: None,
+            edit: None,
+            coord: BTreeMap::new(),
+            subject: Some(subject),
+            emoji: None,
+        }
+    }
+
+    /// Mark this message as a reply to `root_msgid`. Covered so that adding or
+    /// stripping the reply in flight — which changes what the message *is* —
+    /// cannot happen without breaking the signature.
+    pub fn with_reply(mut self, root_msgid: &'a str) -> Self {
+        self.reply = Some(root_msgid);
+        self
+    }
+
+    /// Mark this message as an edit of `root_msgid`.
+    pub fn with_edit(mut self, root_msgid: &'a str) -> Self {
+        self.edit = Some(root_msgid);
+        self
+    }
+
+    /// The emoji a react/unreact carries. Ignored for other kinds.
+    pub fn with_emoji(mut self, emoji: &'a str) -> Self {
+        self.emoji = Some(emoji);
+        self
+    }
+
+    /// Cover the coordination tags in `tags` (see [`COVERED_COORD_TAGS`]).
+    ///
+    /// Accepts wire names with or without the `+freeq.at/` prefix; values must
+    /// be IRC-**unescaped** already, and are covered verbatim (any app-level
+    /// encoding inside a value is opaque bytes to the signature).
+    pub fn with_coord<I>(mut self, tags: I) -> Self
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        for (name, value) in tags {
+            let key = stripped_name(name);
+            if COVERED_COORD_TAGS.contains(&key) {
+                self.coord.insert(key, value);
+            }
+        }
+        self
+    }
+
+    /// The exact UTF-8 string that gets signed.
+    pub fn canonical(&self) -> String {
+        let mut doc = serde_json::Map::new();
+        let mut put = |k: &str, v: &str| {
+            doc.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+        };
+        put("from", self.from);
+        put("msgid", self.msgid);
+        put("target", self.target);
+        if let Some(kind) = self.kind {
+            put("kind", kind.as_str());
+        }
+        if let Some(body) = self.body {
+            put("body", &body_hash(body));
+        }
+        if let Some(reply) = self.reply {
+            put("reply", reply);
+        }
+        if let Some(edit) = self.edit {
+            put("edit", edit);
+        }
+        if let Some(subject) = self.subject {
+            put("subject", subject);
+        }
+        if let Some(emoji) = self.emoji
+            && matches!(self.kind, Some(Mutation::React) | Some(Mutation::Unreact))
+        {
+            put("emoji", emoji);
+        }
+        if !self.coord.is_empty() {
+            let coord: serde_json::Map<String, serde_json::Value> = self
+                .coord
+                .iter()
+                .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+                .collect();
+            doc.insert("coord".to_string(), serde_json::Value::Object(coord));
+        }
+        crate::canonical::canonicalize(&doc).expect("string map serializes")
+    }
+
+    /// Sign this document, returning the `+freeq.at/sig` tag value.
+    pub fn sign(&self, key: &SigningKey) -> String {
+        crate::sigtag::sign_canonical(&self.canonical(), key)
+    }
+
+    /// Verify `sig_tag` over this document. Rebuild the document from what was
+    /// received — never from what was sent — so an altered field shows up as
+    /// [`SigError::Invalid`].
+    pub fn verify(&self, sig_tag: &str, key: &VerifyingKey) -> Result<(), SigError> {
+        crate::sigtag::verify_canonical(&self.canonical(), sig_tag, key)
+    }
+}
+
+/// `sha256:<lowercase hex>` over the UTF-8 bytes of a wire body.
+pub fn body_hash(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(body.as_bytes());
+    let mut out = String::with_capacity(7 + digest.len() * 2);
+    out.push_str("sha256:");
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// The venue of a channel event: the channel name, lowercased.
+///
+/// Not cosmetic. freeq's server normalizes a channel target to lowercase
+/// before persistence, relay, or signature checking, so a client that signed
+/// `#Ops` while sending `PRIVMSG #Ops` would fail verification at its own
+/// origin. Normalizing in the canonical makes the venue reproducible by every
+/// verifier, including one replaying history years later.
+pub fn channel_venue(channel: &str) -> String {
+    channel.to_lowercase()
+}
+
+/// The venue of a direct message: `dm:<did_a>,<did_b>` with the DIDs sorted.
+///
+/// A DM's wire target is a nick (mutable, and unique only per server) or a
+/// `did:`, and history is replayed under whichever of those the *reader*
+/// asked for — so the wire target is not a venue a verifier can reproduce.
+/// The sorted DID pair is: both participants and any peer derive the same
+/// string, and it is already the key the conversation is persisted under.
+pub fn dm_venue(did_a: &str, did_b: &str) -> String {
+    if did_a <= did_b {
+        format!("dm:{did_a},{did_b}")
+    } else {
+        format!("dm:{did_b},{did_a}")
+    }
+}
+
+/// Strip the client-tag vendor prefix from a tag name, if present.
+fn stripped_name(tag_name: &str) -> &str {
+    tag_name
+        .strip_prefix(CLIENT_TAG_PREFIX)
+        .or_else(|| tag_name.strip_prefix(TAG_PREFIX))
+        .unwrap_or(tag_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_key(byte: u8) -> SigningKey {
+        SigningKey::from_bytes(&[byte; 32])
+    }
+
+    const ALICE: &str = "did:plc:k2n3e2vsihf3farequ44t5j7";
+    const MSGID: &str = "01KYVT5Z8Q0000000000000000";
+    const ROOT: &str = "01KYVT1W2P0000000000000000";
+
+    #[test]
+    fn a_plain_message_reduces_to_four_keys() {
+        let doc = ChatDoc::message(ALICE, MSGID, "#freeq", "hello");
+        assert_eq!(
+            doc.canonical(),
+            format!(
+                r##"{{"body":"{}","from":"{ALICE}","msgid":"{MSGID}","target":"#freeq"}}"##,
+                body_hash("hello")
+            )
+        );
+    }
+
+    /// The exact bytes published in the RFC thread for a delete.
+    #[test]
+    fn the_delete_canonical_is_the_published_string() {
+        let doc = ChatDoc::mutation(Mutation::Delete, ALICE, MSGID, "#freeq", ROOT);
+        assert_eq!(
+            doc.canonical(),
+            r##"{"from":"did:plc:k2n3e2vsihf3farequ44t5j7","kind":"delete","msgid":"01KYVT5Z8Q0000000000000000","subject":"01KYVT1W2P0000000000000000","target":"#freeq"}"##
+        );
+    }
+
+    #[test]
+    fn optional_message_fields_appear_only_when_present() {
+        let plain = ChatDoc::message(ALICE, MSGID, "#freeq", "hi").canonical();
+        assert!(!plain.contains("reply"), "no reply key on a plain message");
+        assert!(!plain.contains("edit"));
+        assert!(!plain.contains("coord"));
+
+        let full = ChatDoc::message(ALICE, MSGID, "#freeq", "hi")
+            .with_reply(ROOT)
+            .with_edit(ROOT)
+            .with_coord([("+freeq.at/event", "task_request")])
+            .canonical();
+        assert!(full.contains(r#""reply":"#));
+        assert!(full.contains(r#""edit":"#));
+        assert!(full.contains(r#""coord":{"event":"task_request"}"#));
+    }
+
+    #[test]
+    fn coord_covers_the_closed_set_and_nothing_else() {
+        let doc = ChatDoc::message(ALICE, MSGID, "#freeq", "hi").with_coord([
+            ("+freeq.at/event", "task_request"),
+            ("+freeq.at/payload", "%7B%7D"),
+            ("freeq.at/task-id", "01HZ"),
+            ("ref", "01HY"),
+            // Not client-authored: a server tally, a verdict, provenance,
+            // ephemera. None may enter a signed document.
+            ("+freeq.at/reactions", "👍:2"),
+            ("+freeq.at/commit-verified", "true"),
+            ("+freeq.at/origin", "peer.example"),
+            ("+freeq.at/av-state", "live"),
+            ("account", "did:plc:someone-else"),
+        ]);
+        assert_eq!(
+            doc.canonical(),
+            format!(
+                r##"{{"body":"{}","coord":{{"event":"task_request","payload":"%7B%7D","ref":"01HY","task-id":"01HZ"}},"from":"{ALICE}","msgid":"{MSGID}","target":"#freeq"}}"##,
+                body_hash("hi")
+            )
+        );
+    }
+
+    #[test]
+    fn a_reaction_covers_its_emoji_and_a_delete_has_none() {
+        let react = ChatDoc::mutation(Mutation::React, ALICE, MSGID, "#freeq", ROOT)
+            .with_emoji("👍")
+            .canonical();
+        assert!(react.contains(r#""emoji":"👍""#));
+        assert!(react.contains(r#""kind":"react""#));
+
+        // An emoji on a delete is meaningless and must not silently change the
+        // bytes — otherwise a client that sets it and one that doesn't sign
+        // different documents for the same event.
+        let delete = ChatDoc::mutation(Mutation::Delete, ALICE, MSGID, "#freeq", ROOT);
+        assert_eq!(
+            delete.clone().with_emoji("👍").canonical(),
+            delete.canonical()
+        );
+    }
+
+    #[test]
+    fn react_and_unreact_are_different_documents() {
+        let react =
+            ChatDoc::mutation(Mutation::React, ALICE, MSGID, "#freeq", ROOT).with_emoji("👍");
+        let unreact =
+            ChatDoc::mutation(Mutation::Unreact, ALICE, MSGID, "#freeq", ROOT).with_emoji("👍");
+        assert_ne!(react.canonical(), unreact.canonical());
+
+        // A verb swap in flight is tampering, and reads as such.
+        let key = test_key(1);
+        let sig = react.sign(&key);
+        assert_eq!(
+            unreact.verify(&sig, &key.verifying_key()),
+            Err(SigError::Invalid)
+        );
+    }
+
+    #[test]
+    fn message_and_mutation_documents_cannot_be_confused() {
+        // Disjoint field sets: a message has `body` and no `kind`.
+        let msg = ChatDoc::message(ALICE, MSGID, "#freeq", "hi").canonical();
+        let del = ChatDoc::mutation(Mutation::Delete, ALICE, MSGID, "#freeq", ROOT).canonical();
+        assert!(msg.contains(r#""body""#) && !msg.contains(r#""kind""#));
+        assert!(del.contains(r#""kind""#) && !del.contains(r#""body""#));
+    }
+
+    #[test]
+    fn body_is_hashed_over_wire_bytes_including_multiline_and_unicode() {
+        // Known-answer: sha256("") — proves the hex encoding and the prefix.
+        assert_eq!(
+            body_hash(""),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        // An assembled multiline body hashes as the bytes the server stores,
+        // real newlines and all — not the `\n`-escaped S2S form.
+        assert_ne!(body_hash("a\nb"), body_hash("a\\nb"));
+        // Non-ASCII is hashed as UTF-8, not as anything IRC-escaped.
+        assert_eq!(body_hash("ok — ✓").len(), "sha256:".len() + 64);
+    }
+
+    #[test]
+    fn altering_the_body_breaks_the_signature() {
+        let key = test_key(1);
+        let sent = ChatDoc::message(ALICE, MSGID, "#freeq", "ship it");
+        let sig = sent.sign(&key);
+        let tampered = ChatDoc::message(ALICE, MSGID, "#freeq", "ship it tomorrow");
+        assert_eq!(
+            tampered.verify(&sig, &key.verifying_key()),
+            Err(SigError::Invalid)
+        );
+        verify_roundtrip(&sent, &sig, &key);
+    }
+
+    #[test]
+    fn stripping_an_edit_or_reply_breaks_the_signature() {
+        let key = test_key(1);
+        for sent in [
+            ChatDoc::message(ALICE, MSGID, "#freeq", "hi").with_edit(ROOT),
+            ChatDoc::message(ALICE, MSGID, "#freeq", "hi").with_reply(ROOT),
+        ] {
+            let sig = sent.sign(&key);
+            let stripped = ChatDoc::message(ALICE, MSGID, "#freeq", "hi");
+            assert_eq!(
+                stripped.verify(&sig, &key.verifying_key()),
+                Err(SigError::Invalid),
+                "stripping a covered field is tampering"
+            );
+        }
+    }
+
+    #[test]
+    fn re_venuing_breaks_the_signature() {
+        let key = test_key(1);
+        let sent = ChatDoc::message(ALICE, MSGID, "#private-team", "the number is 12");
+        let sig = sent.sign(&key);
+        let re_venued = ChatDoc::message(ALICE, MSGID, "#public", "the number is 12");
+        assert_eq!(
+            re_venued.verify(&sig, &key.verifying_key()),
+            Err(SigError::Invalid),
+            "a sealed letter needs a sealed envelope"
+        );
+    }
+
+    #[test]
+    fn swapping_the_subject_of_a_mutation_breaks_the_signature() {
+        let key = test_key(1);
+        let sent = ChatDoc::mutation(Mutation::Delete, ALICE, MSGID, "#freeq", ROOT);
+        let sig = sent.sign(&key);
+        let other = ChatDoc::mutation(
+            Mutation::Delete,
+            ALICE,
+            MSGID,
+            "#freeq",
+            "01KYVT9ZZZ0000000000000000",
+        );
+        assert_eq!(
+            other.verify(&sig, &key.verifying_key()),
+            Err(SigError::Invalid)
+        );
+    }
+
+    #[test]
+    fn a_channel_venue_is_case_folded_the_way_the_server_folds_it() {
+        assert_eq!(channel_venue("#Ops"), "#ops");
+        assert_eq!(channel_venue("#ops"), "#ops");
+        // …so a client that types mixed case and one that types lower case
+        // sign the same document for the same room.
+        let key = test_key(1);
+        let (as_typed, as_folded) = (channel_venue("#Ops"), channel_venue("#ops"));
+        let typed = ChatDoc::message(ALICE, MSGID, &as_typed, "hi");
+        let sig = typed.sign(&key);
+        let seen = ChatDoc::message(ALICE, MSGID, &as_folded, "hi");
+        seen.verify(&sig, &key.verifying_key()).unwrap();
+    }
+
+    #[test]
+    fn a_dm_venue_is_the_sorted_did_pair_from_either_end() {
+        let (a, b) = ("did:plc:aaa", "did:plc:bbb");
+        assert_eq!(dm_venue(a, b), "dm:did:plc:aaa,did:plc:bbb");
+        assert_eq!(dm_venue(b, a), dm_venue(a, b), "sender and recipient agree");
+    }
+
+    #[test]
+    fn a_wrong_key_or_unknown_algorithm_is_unverifiable_never_invalid() {
+        let doc = ChatDoc::message(ALICE, MSGID, "#freeq", "hi");
+        let sig = doc.sign(&test_key(1));
+        let err = doc.verify(&sig, &test_key(2).verifying_key()).unwrap_err();
+        assert_eq!(err, SigError::KidMismatch);
+        assert!(err.is_unverifiable());
+
+        let future = doc
+            .verify("ml-dsa-44:kid:c2ln", &test_key(1).verifying_key())
+            .unwrap_err();
+        assert!(future.is_unverifiable(), "a newer signer is not a forger");
+    }
+
+    fn verify_roundtrip(doc: &ChatDoc<'_>, sig: &str, key: &SigningKey) {
+        doc.verify(sig, &key.verifying_key()).unwrap();
+    }
+
+    // ---------------------------------------------------------------
+    // Cross-language vectors. Same pattern as spec/act-signing-vectors.json:
+    // generated here, checked here, reproduced byte-for-byte by every other
+    // implementation.
+    // ---------------------------------------------------------------
+
+    struct Case {
+        name: &'static str,
+        seed: u8,
+        doc: ChatDoc<'static>,
+        /// The document input as the fixture publishes it, so another
+        /// implementation builds the canonical from data rather than from
+        /// this file's Rust.
+        input: serde_json::Value,
+    }
+
+    fn cases() -> Vec<Case> {
+        use serde_json::json;
+        vec![
+            Case {
+                name: "message-plain",
+                seed: 1,
+                doc: ChatDoc::message(ALICE, MSGID, "#freeq", "ship it"),
+                input: json!({
+                    "kind": "message", "from": ALICE, "msgid": MSGID,
+                    "target": "#freeq", "bodyText": "ship it",
+                }),
+            },
+            Case {
+                name: "message-channel-venue-is-folded",
+                seed: 1,
+                doc: ChatDoc::message(ALICE, MSGID, "#ops", "deploying"),
+                input: json!({
+                    "kind": "message", "from": ALICE, "msgid": MSGID,
+                    // The raw target as typed; the venue rule folds it.
+                    "rawTarget": "#Ops", "target": "#ops", "bodyText": "deploying",
+                }),
+            },
+            Case {
+                name: "message-dm-venue",
+                seed: 1,
+                doc: ChatDoc::message(
+                    ALICE,
+                    MSGID,
+                    "dm:did:plc:aaa,did:plc:k2n3e2vsihf3farequ44t5j7",
+                    "just between us",
+                ),
+                input: json!({
+                    "kind": "message", "from": ALICE, "msgid": MSGID,
+                    "dmParticipants": [ALICE, "did:plc:aaa"],
+                    "target": "dm:did:plc:aaa,did:plc:k2n3e2vsihf3farequ44t5j7",
+                    "bodyText": "just between us",
+                }),
+            },
+            Case {
+                name: "message-reply-edit-and-coord",
+                seed: 2,
+                doc: ChatDoc::message(ALICE, MSGID, "#swarm", "revised: use the cached index")
+                    .with_reply(ROOT)
+                    .with_edit(ROOT)
+                    .with_coord([
+                        ("+freeq.at/event", "task_result"),
+                        ("+freeq.at/payload", "%7B%22ok%22%3Atrue%7D"),
+                        ("+freeq.at/task-id", "01KYVT2AAA0000000000000000"),
+                        ("+freeq.at/ref", "01KYVT2BBB0000000000000000"),
+                        // Must not be covered — a server tally.
+                        ("+freeq.at/reactions", "👍:3"),
+                    ]),
+                input: json!({
+                    "kind": "message", "from": ALICE, "msgid": MSGID,
+                    "target": "#swarm", "bodyText": "revised: use the cached index",
+                    "reply": ROOT, "edit": ROOT,
+                    "tags": {
+                        "+freeq.at/event": "task_result",
+                        "+freeq.at/payload": "%7B%22ok%22%3Atrue%7D",
+                        "+freeq.at/task-id": "01KYVT2AAA0000000000000000",
+                        "+freeq.at/ref": "01KYVT2BBB0000000000000000",
+                        "+freeq.at/reactions": "👍:3",
+                    },
+                }),
+            },
+            Case {
+                name: "message-multiline-and-escaping",
+                seed: 3,
+                doc: ChatDoc::message(
+                    ALICE,
+                    MSGID,
+                    "#freeq",
+                    "line one\nline two — \"quoted\" ✓\nline three",
+                ),
+                input: json!({
+                    "kind": "message", "from": ALICE, "msgid": MSGID, "target": "#freeq",
+                    // The assembled body, real newlines — not the S2S-escaped form.
+                    "bodyText": "line one\nline two — \"quoted\" ✓\nline three",
+                }),
+            },
+            Case {
+                name: "delete",
+                seed: 1,
+                doc: ChatDoc::mutation(Mutation::Delete, ALICE, MSGID, "#freeq", ROOT),
+                input: json!({
+                    "kind": "delete", "from": ALICE, "msgid": MSGID,
+                    "target": "#freeq", "subject": ROOT,
+                }),
+            },
+            Case {
+                name: "react",
+                seed: 4,
+                doc: ChatDoc::mutation(Mutation::React, ALICE, MSGID, "#freeq", ROOT)
+                    .with_emoji("👍"),
+                input: json!({
+                    "kind": "react", "from": ALICE, "msgid": MSGID,
+                    "target": "#freeq", "subject": ROOT, "emoji": "👍",
+                }),
+            },
+            Case {
+                name: "unreact",
+                seed: 4,
+                doc: ChatDoc::mutation(Mutation::Unreact, ALICE, MSGID, "#freeq", ROOT)
+                    .with_emoji("👍"),
+                input: json!({
+                    "kind": "unreact", "from": ALICE, "msgid": MSGID,
+                    "target": "#freeq", "subject": ROOT, "emoji": "👍",
+                }),
+            },
+        ]
+    }
+
+    /// Negative vectors: each takes a positive vector's signature and a
+    /// tampered document, and states the verdict every implementation must
+    /// reach. `invalid` is evidence about the bytes; `unverifiable` never is.
+    fn negatives() -> Vec<(&'static str, &'static str, ChatDoc<'static>, &'static str)> {
+        vec![
+            (
+                "altered-body",
+                "message-plain",
+                ChatDoc::message(ALICE, MSGID, "#freeq", "ship it tomorrow"),
+                "invalid",
+            ),
+            (
+                "stripped-edit",
+                "message-reply-edit-and-coord",
+                ChatDoc::message(ALICE, MSGID, "#swarm", "revised: use the cached index")
+                    .with_reply(ROOT)
+                    .with_coord([
+                        ("+freeq.at/event", "task_result"),
+                        ("+freeq.at/payload", "%7B%22ok%22%3Atrue%7D"),
+                        ("+freeq.at/task-id", "01KYVT2AAA0000000000000000"),
+                        ("+freeq.at/ref", "01KYVT2BBB0000000000000000"),
+                    ]),
+                "invalid",
+            ),
+            (
+                "sanitized-coord-tag",
+                "message-reply-edit-and-coord",
+                ChatDoc::message(ALICE, MSGID, "#swarm", "revised: use the cached index")
+                    .with_reply(ROOT)
+                    .with_edit(ROOT)
+                    .with_coord([
+                        ("+freeq.at/event", "task_result"),
+                        ("+freeq.at/payload", "%7B%22ok%22%3Afalse%7D"),
+                        ("+freeq.at/task-id", "01KYVT2AAA0000000000000000"),
+                        ("+freeq.at/ref", "01KYVT2BBB0000000000000000"),
+                    ]),
+                "invalid",
+            ),
+            (
+                "re-venued-target",
+                "message-plain",
+                ChatDoc::message(ALICE, MSGID, "#public", "ship it"),
+                "invalid",
+            ),
+            (
+                "swapped-subject",
+                "delete",
+                ChatDoc::mutation(
+                    Mutation::Delete,
+                    ALICE,
+                    MSGID,
+                    "#freeq",
+                    "01KYVT9ZZZ0000000000000000",
+                ),
+                "invalid",
+            ),
+            (
+                "verb-swap-react-to-unreact",
+                "react",
+                ChatDoc::mutation(Mutation::Unreact, ALICE, MSGID, "#freeq", ROOT).with_emoji("👍"),
+                "invalid",
+            ),
+        ]
+    }
+
+    fn fixtures_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../spec/chat-signing-vectors.json")
+    }
+
+    fn hex_seed(byte: u8) -> String {
+        (0..32).map(|_| format!("{byte:02x}")).collect()
+    }
+
+    fn build_fixtures_json() -> serde_json::Value {
+        use crate::sigtag::derive_kid;
+        use base64::Engine;
+
+        let vectors: Vec<serde_json::Value> = cases()
+            .into_iter()
+            .map(|case| {
+                let key = test_key(case.seed);
+                serde_json::json!({
+                    "name": case.name,
+                    "seed": hex_seed(case.seed),
+                    "publicKey": base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .encode(key.verifying_key().as_bytes()),
+                    "kid": derive_kid(&key.verifying_key()),
+                    "input": case.input,
+                    "canonical": case.doc.canonical(),
+                    "sigTag": case.doc.sign(&key),
+                })
+            })
+            .collect();
+
+        let negatives: Vec<serde_json::Value> = negatives()
+            .into_iter()
+            .map(|(name, of, tampered, expected)| {
+                serde_json::json!({
+                    "name": name,
+                    "vector": of,
+                    "tamperedCanonical": tampered.canonical(),
+                    "expected": expected,
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "description": "Worked signing examples for freeq chat events (messages, deletes, reactions). Every implementation must reproduce `canonical` and `sigTag` byte-for-byte from `input` + `seed`, and must reach `expected` for each negative when checking that vector's sigTag against `tamperedCanonical`.",
+            "documentRule": "JCS (RFC 8785) over an enumerated per-kind document. Mandatory: from, msgid, target. A message carries no `kind` (its absence is the kind) and covers body/reply?/edit?/coord?; a mutation carries kind and subject, plus emoji for react|unreact. Optional fields are omitted entirely when absent.",
+            "bodyRule": "body = \"sha256:\" + lowercase hex of SHA-256 over the UTF-8 wire body — ciphertext under E2EE, and the assembled body (real newlines) for a draft/multiline batch.",
+            "venueRule": "target is the normalized venue, never the wire target: a channel lowercased, or `dm:<did_a>,<did_b>` with the two DIDs sorted ascending.",
+            "coordRule": "coord covers exactly the client-authored coordination tags event, payload, ref, task-id (canonical keys; wire names carry a +freeq.at/ prefix), IRC-unescaped, verbatim. Every other tag — server stamps, tallies, verdicts, provenance, ephemera, framing — is excluded.",
+            "referenceRule": "edit, reply and subject always name root msgids. A signed event naming a revision is refused, never rewritten.",
+            "kidRule": "base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16])",
+            "sigTagFormat": "ed25519:<kid>:<base64url-nopad signature over the UTF-8 canonical bytes>",
+            "verdictRule": "Only a signature that fails against the key its kid names is `invalid`. An unknown algorithm, a kid we cannot resolve, or a malformed tag is `unverifiable` — never reported as forgery.",
+            "vectors": vectors,
+            "negatives": negatives,
+        })
+    }
+
+    /// Regenerate spec/chat-signing-vectors.json. Run manually:
+    /// `cargo test -p freeq-sdk generate_chat_signing_vectors -- --ignored`
+    #[test]
+    #[ignore]
+    fn generate_chat_signing_vectors() {
+        let json = serde_json::to_string_pretty(&build_fixtures_json()).unwrap();
+        std::fs::create_dir_all(fixtures_path().parent().unwrap()).unwrap();
+        std::fs::write(fixtures_path(), json + "\n").unwrap();
+    }
+
+    /// The committed fixture file must be exactly what this implementation
+    /// produces — the cross-language byte-compatibility contract.
+    #[test]
+    fn committed_chat_signing_vectors_are_reproducible() {
+        let on_disk = std::fs::read_to_string(fixtures_path())
+            .expect("spec/chat-signing-vectors.json missing — run generate_chat_signing_vectors");
+        let on_disk: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(on_disk, build_fixtures_json());
+    }
+
+    /// Every positive vector verifies, and every negative reaches its stated
+    /// verdict — so the fixture file can't drift from the semantics.
+    #[test]
+    fn every_vector_verifies_and_every_negative_reaches_its_verdict() {
+        for case in cases() {
+            let key = test_key(case.seed);
+            let sig = case.doc.sign(&key);
+            case.doc
+                .verify(&sig, &key.verifying_key())
+                .unwrap_or_else(|e| panic!("vector {} failed to verify: {e}", case.name));
+        }
+        for (name, of, tampered, expected) in negatives() {
+            let case = cases()
+                .into_iter()
+                .find(|c| c.name == of)
+                .unwrap_or_else(|| panic!("negative {name} names unknown vector {of}"));
+            let key = test_key(case.seed);
+            let sig = case.doc.sign(&key);
+            let err = tampered
+                .verify(&sig, &key.verifying_key())
+                .expect_err("a tampered document must not verify");
+            let got = if err.is_unverifiable() {
+                "unverifiable"
+            } else {
+                "invalid"
+            };
+            assert_eq!(got, expected, "negative {name}");
+        }
+    }
+}

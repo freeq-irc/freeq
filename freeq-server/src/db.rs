@@ -89,12 +89,13 @@ fn sanitize_fts_query(query: &str) -> String {
 /// Compute a canonical DM channel key from two DIDs.
 /// The key is `dm:<did_a>,<did_b>` where the DIDs are alphabetically sorted.
 /// This ensures both participants produce the same key regardless of who sends.
+///
+/// The same string is a DM's **signing venue** (`freeq_sdk::chatsig::dm_venue`),
+/// which is why this delegates rather than reimplementing: a persistence key
+/// and a signed venue that disagreed by one byte would make every DM signature
+/// unverifiable on one side of the conversation.
 pub fn canonical_dm_key(did_a: &str, did_b: &str) -> String {
-    if did_a <= did_b {
-        format!("dm:{did_a},{did_b}")
-    } else {
-        format!("dm:{did_b},{did_a}")
-    }
+    freeq_sdk::chatsig::dm_venue(did_a, did_b)
 }
 
 /// Database handle wrapping a SQLite connection.
