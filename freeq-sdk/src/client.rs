@@ -121,9 +121,14 @@ impl ConnectConfig {
 #[derive(Debug)]
 pub enum Command {
     Join(String),
+    /// A PRIVMSG, with any client tags the caller wants on it. The tags are
+    /// part of what gets signed (the ones the chat document covers), so they
+    /// travel with the command rather than being pre-formatted into a `Raw`
+    /// line — a signature cannot cover bytes the signer never sees.
     Privmsg {
         target: String,
         text: String,
+        tags: std::collections::HashMap<String, String>,
     },
     /// Send a `draft/multiline` BATCH. Used when the assembled body
     /// either contains `\n` (one chunk per logical line, concat=false)
@@ -404,6 +409,7 @@ impl ClientHandle {
                 .send(Command::Privmsg {
                     target: target.to_string(),
                     text: text.to_string(),
+                    tags: std::collections::HashMap::new(),
                 })
                 .await?;
         }
@@ -542,13 +548,16 @@ impl ClientHandle {
         if multiline_ready {
             self.send_chunked_multiline(target, text, tags).await?;
         } else {
-            let msg = crate::irc::Message {
-                tags,
-                prefix: None,
-                command: "PRIVMSG".to_string(),
-                params: vec![target.to_string(), text.to_string()],
-            };
-            self.cmd_tx.send(Command::Raw(msg.to_string())).await?;
+            // Structured, not `Raw`: a tagged message is signed like any other
+            // (its reply and coordination tags are inside the document), and
+            // the signer has to see the tags to cover them.
+            self.cmd_tx
+                .send(Command::Privmsg {
+                    target: target.to_string(),
+                    text: text.to_string(),
+                    tags,
+                })
+                .await?;
         }
         Ok(())
     }
@@ -1832,6 +1841,9 @@ where
     // Session message-signing keypair (generated after SASL success)
     let mut msg_signing_key: Option<ed25519_dalek::SigningKey> = None;
     let mut msg_signing_did: Option<String> = None;
+    // The session signing key's public half, waiting for registration to
+    // finish so `MSGSIG` isn't sent into a connection that will discard it.
+    let mut pending_msgsig: Option<String> = None;
     // Open `draft/multiline` batches keyed by batch id. Chunks
     // accumulate here while the batch is open; the BATCH closer drains
     // and emits a single Event::Message with the assembled body.
@@ -1947,7 +1959,13 @@ where
                                 let pubkey_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&pubkey_bytes);
                                 msg_signing_key = Some(key);
                                 msg_signing_did = Some(did);
-                                writer.write_all(format!("MSGSIG {pubkey_b64}\r\n").as_bytes()).await?;
+                                // Registered on 001, not here: MSGSIG before
+                                // registration completes is dropped by the
+                                // server (`if !conn.registered { continue }`),
+                                // which left the key unregistered and every
+                                // "client-signed" message silently
+                                // server-signed instead.
+                                pending_msgsig = Some(pubkey_b64);
                             }
                             web_token = None;
                             writer.write_all(b"CAP END\r\n").await?;
@@ -2020,6 +2038,15 @@ where
                             own_nick = nick.clone();
                             let _ = event_tx.send(Event::Registered { nick }).await;
                             registered = true;
+                            // Register the session's message-signing key now
+                            // that the server will accept it — before any
+                            // queued message goes out, so nothing is sent
+                            // with a signature the server can't yet check.
+                            if let Some(pubkey_b64) = pending_msgsig.take() {
+                                writer
+                                    .write_all(format!("MSGSIG {pubkey_b64}\r\n").as_bytes())
+                                    .await?;
+                            }
                             // Flush any commands that were queued before registration
                             for cmd in pending_commands.drain(..) {
                                 execute_command(&mut writer, cmd, &msg_signing_key, &msg_signing_did).await?;
@@ -2485,6 +2512,60 @@ async fn dispatch_assembled_multiline(
     // attach the assembled message to the outer batch.
 }
 
+/// Put a chat signature (and the event id it covers) on an outgoing message's
+/// tags, when this session has a signing key and the venue is knowable.
+///
+/// The document is `freeq_sdk::chatsig`'s: the sender's DID, a **signer-minted**
+/// event id, the normalized venue, a hash of the wire body, plus the reply,
+/// edit and coordination tags that are present. Signing over an id we mint —
+/// instead of the wall clock the retired canonical used — is what lets any
+/// receiver rebuild the exact signed bytes: the id travels as `msgid`, the
+/// clock never travelled at all.
+///
+/// Nothing is added when the venue can't be determined (a bare-nick DM whose
+/// peer DID we haven't learned): sending unsigned is honest, while signing a
+/// venue no verifier would rebuild produces a signature that reads as
+/// tampering.
+fn sign_outgoing(
+    tags: &mut std::collections::HashMap<String, String>,
+    signing_key: &Option<ed25519_dalek::SigningKey>,
+    signing_did: &Option<String>,
+    target: &str,
+    body: &str,
+) {
+    let (Some(key), Some(did)) = (signing_key, signing_did) else {
+        return;
+    };
+    let Some(venue) = crate::chatsig::venue_for_target(target, did) else {
+        tracing::debug!(
+            target,
+            "no signable venue for this target — sending unsigned"
+        );
+        return;
+    };
+
+    let event_id = crate::chatsig::new_event_id();
+    let mut doc = crate::chatsig::ChatDoc::message(did, &event_id, &venue, body);
+    // References name root msgids, which are the only ids a client is ever
+    // given: a message keeps its id through every revision.
+    let reply = tags
+        .get("+reply")
+        .or_else(|| tags.get("+draft/reply"))
+        .cloned();
+    if let Some(ref reply) = reply {
+        doc = doc.with_reply(reply);
+    }
+    let edit = tags.get("+draft/edit").cloned();
+    if let Some(ref edit) = edit {
+        doc = doc.with_edit(edit);
+    }
+    let coord: Vec<(String, String)> = tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let doc = doc.with_coord(coord.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+
+    tags.insert(crate::chatsig::EVENT_ID_TAG.to_string(), event_id.clone());
+    tags.insert(crate::sigtag::SIG_TAG.to_string(), doc.sign(key));
+}
+
 /// Execute a single IRC command on the wire.
 /// If `signing_key` and `signing_did` are set, PRIVMSG gets a `+freeq.at/sig` tag.
 async fn execute_command<W: AsyncWrite + Unpin>(
@@ -2499,28 +2580,24 @@ async fn execute_command<W: AsyncWrite + Unpin>(
                 .write_all(format!("JOIN {channel}\r\n").as_bytes())
                 .await?;
         }
-        Command::Privmsg { target, text } => {
-            if let (Some(key), Some(did)) = (signing_key, signing_did) {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let canonical = format!("{did}\0{target}\0{text}\0{timestamp}");
-                use ed25519_dalek::Signer;
-                let sig = key.sign(canonical.as_bytes());
-                use base64::Engine;
-                let sig_b64 =
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes());
-                // Send with IRCv3 message tag
-                writer
-                    .write_all(
-                        format!("@+freeq.at/sig={sig_b64} PRIVMSG {target} :{text}\r\n").as_bytes(),
-                    )
-                    .await?;
-            } else {
+        Command::Privmsg {
+            target,
+            text,
+            mut tags,
+        } => {
+            sign_outgoing(&mut tags, signing_key, signing_did, &target, &text);
+            if tags.is_empty() {
                 writer
                     .write_all(format!("PRIVMSG {target} :{text}\r\n").as_bytes())
                     .await?;
+            } else {
+                let msg = crate::irc::Message {
+                    tags,
+                    prefix: None,
+                    command: "PRIVMSG".to_string(),
+                    params: vec![target, text],
+                };
+                writer.write_all(format!("{msg}\r\n").as_bytes()).await?;
             }
         }
         Command::SendMultiline {
@@ -2544,26 +2621,17 @@ async fn execute_command<W: AsyncWrite + Unpin>(
             // assembled message's tags (which are the opener tags
             // after multiline dispatch), so per-chunk sigs would not
             // verify against the canonical `{did}\0{target}\0{body}\0{ts}`.
-            if let (Some(key), Some(did)) = (signing_key, signing_did) {
-                let mut body = String::new();
-                for (i, chunk) in chunks.iter().enumerate() {
-                    if i > 0 && !chunk.concat {
-                        body.push('\n');
-                    }
-                    body.push_str(&chunk.body);
+            // The body the *server* will assemble — the bytes the document's
+            // hash covers. Per-chunk signatures would cover something no
+            // receiver ever holds.
+            let mut body = String::new();
+            for (i, chunk) in chunks.iter().enumerate() {
+                if i > 0 && !chunk.concat {
+                    body.push('\n');
                 }
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let canonical = format!("{did}\0{target}\0{body}\0{timestamp}");
-                use ed25519_dalek::Signer;
-                let sig = key.sign(canonical.as_bytes());
-                use base64::Engine;
-                let sig_b64 =
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes());
-                opener_tags.insert("+freeq.at/sig".to_string(), sig_b64);
+                body.push_str(&chunk.body);
             }
+            sign_outgoing(&mut opener_tags, signing_key, signing_did, &target, &body);
             let opener_tags_str = if opener_tags.is_empty() {
                 String::new()
             } else {
@@ -3296,43 +3364,23 @@ mod multiline_tests {
                 "chunk should not carry sig: {chunk_line}"
             );
         }
-        // The sig MUST verify over the assembled body — extract and check.
-        let sig_b64 = opener
-            .split_whitespace()
-            .find(|tok| tok.contains("+freeq.at/sig="))
-            .unwrap()
-            .split("+freeq.at/sig=")
-            .nth(1)
-            .unwrap()
-            .trim_end_matches(';');
-        // The opener tag block may pack multiple tags; pull the sig
-        // value out cleanly by splitting on ; first.
-        let sig_b64 = sig_b64.split(';').next().unwrap();
-        use base64::Engine;
-        let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(sig_b64)
-            .unwrap();
-        let sig_array: [u8; 64] = sig_bytes.try_into().unwrap();
-        let sig = ed25519_dalek::Signature::from_bytes(&sig_array);
-        // Try every plausible timestamp around now — the test runs in
-        // <1s so the timestamp written by execute_command is within a
-        // narrow window. We accept any second in the last 5.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        use ed25519_dalek::Verifier;
-        let vk = key.verifying_key();
-        let mut verified = false;
-        for delta in 0..=5 {
-            let ts = now - delta;
-            let canonical = format!("{did}\0#room\0hello\nworld\nfoo\0{ts}");
-            if vk.verify(canonical.as_bytes(), &sig).is_ok() {
-                verified = true;
-                break;
-            }
-        }
-        assert!(verified, "sig did not verify over assembled body");
+        // The sig MUST verify over the assembled body — and now it does so
+        // deterministically. The old canonical folded a wall clock the signer
+        // minted and never transmitted, so this test used to try every second
+        // in the last five and accept any hit. A receiver had no such luxury.
+        let opener_tags = crate::irc::Message::parse(opener)
+            .expect("opener parses")
+            .tags;
+        let sig_tag = opener_tags
+            .get("+freeq.at/sig")
+            .expect("opener carries the signature");
+        let event_id = opener_tags
+            .get(crate::chatsig::EVENT_ID_TAG)
+            .expect("a signature covers an id the signer minted");
+        let venue = crate::chatsig::channel_venue("#room");
+        let doc = crate::chatsig::ChatDoc::message(&did, event_id, &venue, "hello\nworld\nfoo");
+        doc.verify(sig_tag, &key.verifying_key())
+            .expect("sig verifies over the assembled body, first try");
     }
 
     #[tokio::test]
@@ -3409,7 +3457,7 @@ mod multiline_tests {
         };
         handle.privmsg("#test", "a\nb").await.unwrap();
         match cmd_rx.recv().await.unwrap() {
-            Command::Privmsg { target, text } => {
+            Command::Privmsg { target, text, .. } => {
                 assert_eq!(target, "#test");
                 assert_eq!(text, "a\nb");
             }
@@ -3482,7 +3530,7 @@ mod multiline_tests {
         };
         handle.privmsg("#test", "hello world").await.unwrap();
         match cmd_rx.recv().await.unwrap() {
-            Command::Privmsg { target, text } => {
+            Command::Privmsg { target, text, .. } => {
                 assert_eq!(target, "#test");
                 assert_eq!(text, "hello world");
             }
@@ -4111,6 +4159,7 @@ mod irc_loop_tests {
         let cmd = Command::Privmsg {
             target: "#general".to_string(),
             text: "hello world".to_string(),
+            tags: HashMap::new(),
         };
         execute_command(&mut buf, cmd, &None, &None)
             .await
@@ -4130,12 +4179,14 @@ mod irc_loop_tests {
         use ed25519_dalek::ed25519::signature::rand_core::OsRng;
 
         let key = SigningKey::generate(&mut OsRng);
+        let key_pub = key.verifying_key();
         let did = Some("did:plc:testuser".to_string());
 
         let mut buf: Vec<u8> = Vec::new();
         let cmd = Command::Privmsg {
             target: "#secret".to_string(),
             text: "signed message".to_string(),
+            tags: HashMap::new(),
         };
         execute_command(&mut buf, cmd, &Some(key), &did)
             .await
@@ -4143,13 +4194,129 @@ mod irc_loop_tests {
 
         let wire = String::from_utf8(buf).expect("utf8");
         assert!(
-            wire.starts_with("@+freeq.at/sig="),
-            "signed PRIVMSG must start with sig tag, got:\n{wire:?}"
-        );
-        assert!(
             wire.contains("PRIVMSG #secret :signed message"),
             "target and body must be present, got:\n{wire:?}"
         );
+
+        // And the signature verifies against the document a receiver would
+        // rebuild from this very line — no clock, no guessing.
+        let sent = crate::irc::Message::parse(wire.trim_end()).expect("parses");
+        let sig_tag = sent.tags.get("+freeq.at/sig").expect("sig tag");
+        let event_id = sent
+            .tags
+            .get(crate::chatsig::EVENT_ID_TAG)
+            .expect("the id the signature covers travels with it");
+        let venue = crate::chatsig::channel_venue("#secret");
+        crate::chatsig::ChatDoc::message(
+            did.as_deref().unwrap(),
+            event_id,
+            &venue,
+            "signed message",
+        )
+        .verify(sig_tag, &key_pub)
+        .expect("signature verifies over the document");
+    }
+
+    /// A DM to a resolved DID is signed under the sorted-pair venue, which
+    /// both ends and any peer can rebuild. A DM to a bare nick is sent
+    /// unsigned: a nick is not a venue, and signing a guess would look like
+    /// tampering to whoever checked it.
+    #[tokio::test]
+    async fn a_dm_is_signed_only_when_the_venue_is_knowable() {
+        use ed25519_dalek::SigningKey;
+
+        let key = SigningKey::from_bytes(&[5u8; 32]);
+        let did = Some("did:plc:sender".to_string());
+
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(
+            &mut buf,
+            Command::Privmsg {
+                target: "did:plc:peer".to_string(),
+                text: "for your eyes only".to_string(),
+                tags: HashMap::new(),
+            },
+            &Some(key.clone()),
+            &did,
+        )
+        .await
+        .unwrap();
+        let wire = String::from_utf8(buf).unwrap();
+        let sent = crate::irc::Message::parse(wire.trim_end()).expect("parses");
+        let sig_tag = sent.tags.get("+freeq.at/sig").expect("DM is signed");
+        let event_id = sent.tags.get(crate::chatsig::EVENT_ID_TAG).unwrap();
+        let venue = crate::chatsig::dm_venue("did:plc:sender", "did:plc:peer");
+        crate::chatsig::ChatDoc::message("did:plc:sender", event_id, &venue, "for your eyes only")
+            .verify(sig_tag, &key.verifying_key())
+            .expect("a DM binds the sorted DID pair");
+
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(
+            &mut buf,
+            Command::Privmsg {
+                target: "bob".to_string(),
+                text: "who are you, really".to_string(),
+                tags: HashMap::new(),
+            },
+            &Some(key),
+            &did,
+        )
+        .await
+        .unwrap();
+        let wire = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            wire, "PRIVMSG bob :who are you, really\r\n",
+            "an unresolvable peer means unsigned, not signed-with-a-guess"
+        );
+    }
+
+    /// A tagged send (a reply, a coordination event) is signed too, and the
+    /// signature covers the tags — sanitizing one in flight has to break it.
+    #[tokio::test]
+    async fn a_tagged_message_is_signed_over_its_tags() {
+        use ed25519_dalek::SigningKey;
+
+        let key = SigningKey::from_bytes(&[6u8; 32]);
+        let did = "did:plc:tagger";
+        let mut tags = HashMap::new();
+        tags.insert(
+            "+reply".to_string(),
+            "01ROOTMSGID0000000000000AA".to_string(),
+        );
+        tags.insert("+freeq.at/event".to_string(), "task_result".to_string());
+
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(
+            &mut buf,
+            Command::Privmsg {
+                target: "#swarm".to_string(),
+                text: "done".to_string(),
+                tags,
+            },
+            &Some(key.clone()),
+            &Some(did.to_string()),
+        )
+        .await
+        .unwrap();
+
+        let wire = String::from_utf8(buf).unwrap();
+        let sent = crate::irc::Message::parse(wire.trim_end()).expect("parses");
+        let sig_tag = sent.tags.get("+freeq.at/sig").unwrap();
+        let event_id = sent.tags.get(crate::chatsig::EVENT_ID_TAG).unwrap();
+        let venue = crate::chatsig::channel_venue("#swarm");
+
+        let covered = crate::chatsig::ChatDoc::message(did, event_id, &venue, "done")
+            .with_reply("01ROOTMSGID0000000000000AA")
+            .with_coord([("+freeq.at/event", "task_result")]);
+        covered
+            .verify(sig_tag, &key.verifying_key())
+            .expect("reply and coordination tags are covered");
+
+        // Drop the coordination tag on the way through: the signature fails,
+        // which is the whole point of covering it.
+        let sanitized = crate::chatsig::ChatDoc::message(did, event_id, &venue, "done")
+            .with_reply("01ROOTMSGID0000000000000AA");
+        assert!(sanitized.verify(sig_tag, &key.verifying_key()).is_err());
     }
 
     // ── JOIN and PART events ──────────────────────────────────────────────────

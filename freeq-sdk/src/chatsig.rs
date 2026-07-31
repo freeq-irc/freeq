@@ -326,6 +326,51 @@ pub fn dm_venue(did_a: &str, did_b: &str) -> String {
     }
 }
 
+/// Mint an event id: a ULID, 26 characters of uppercase Crockford base32,
+/// 48-bit millisecond timestamp then 80 random bits.
+///
+/// Signers mint their own ids ([`EVENT_ID_TAG`]) because the signature covers
+/// the id. A server checks the shape and that the embedded time is near its
+/// own before adopting one, so the timestamp must be real.
+pub fn new_event_id() -> String {
+    const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let random: u128 = ((rand::random::<u64>() as u128) << 16 | rand::random::<u16>() as u128)
+        & ((1u128 << 80) - 1);
+
+    let mut out = [0u8; 26];
+    let mut t = ms;
+    for slot in out[..10].iter_mut().rev() {
+        *slot = CROCKFORD[(t & 0x1F) as usize];
+        t >>= 5;
+    }
+    let mut r = random;
+    for slot in out[10..].iter_mut().rev() {
+        *slot = CROCKFORD[(r & 0x1F) as usize];
+        r >>= 5;
+    }
+    String::from_utf8(out.to_vec()).expect("Crockford alphabet is ASCII")
+}
+
+/// The venue to sign for a wire target, from the sender's point of view.
+///
+/// `None` when the target is a bare nick: a nick is not a venue (it is unique
+/// only per server, and mutable), and the DM venue needs the recipient's DID.
+/// A client that cannot resolve the peer's DID should send unsigned rather
+/// than sign a venue no verifier would rebuild.
+pub fn venue_for_target(target: &str, sender_did: &str) -> Option<String> {
+    if target.starts_with('#') || target.starts_with('&') {
+        return Some(channel_venue(target));
+    }
+    if target.starts_with("did:") {
+        return Some(dm_venue(sender_did, target));
+    }
+    None
+}
+
 /// Strip the client-tag vendor prefix from a tag name, if present.
 fn stripped_name(tag_name: &str) -> &str {
     tag_name
@@ -540,6 +585,49 @@ mod tests {
         let sig = typed.sign(&key);
         let seen = ChatDoc::message(ALICE, MSGID, &as_folded, "hi");
         seen.verify(&sig, &key.verifying_key()).unwrap();
+    }
+
+    #[test]
+    fn a_minted_event_id_is_a_ulid_at_the_current_time() {
+        let id = new_event_id();
+        assert_eq!(id.len(), 26);
+        assert!(
+            id.bytes()
+                .all(|b| b.is_ascii_digit() || (b.is_ascii_uppercase() && !b"ILOU".contains(&b))),
+            "Crockford base32 only: {id}"
+        );
+        // Two ids differ, and the timestamp half really is the time (so a
+        // server's skew check passes).
+        assert_ne!(new_event_id(), new_event_id());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let mut decoded: u64 = 0;
+        const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+        for b in id.bytes().take(10) {
+            decoded = (decoded << 5) | CROCKFORD.iter().position(|c| *c == b).unwrap() as u64;
+        }
+        assert!(decoded.abs_diff(now_ms) < 5_000, "{decoded} vs {now_ms}");
+    }
+
+    #[test]
+    fn a_venue_comes_from_the_target_except_for_a_bare_nick() {
+        assert_eq!(
+            venue_for_target("#Ops", ALICE).as_deref(),
+            Some("#ops"),
+            "a channel is folded"
+        );
+        assert_eq!(
+            venue_for_target("did:plc:aaa", ALICE).as_deref(),
+            Some("dm:did:plc:aaa,did:plc:k2n3e2vsihf3farequ44t5j7"),
+            "a DID target gives the sorted pair"
+        );
+        assert_eq!(
+            venue_for_target("bob", ALICE),
+            None,
+            "a nick is not a venue — send unsigned rather than sign a guess"
+        );
     }
 
     #[test]

@@ -38,6 +38,8 @@ export class FreeqClient extends EventEmitter {
   private sasl: SaslCredentials | null = null;
   private skipBrokerRefresh: boolean;
   private guestFallbackCount = 0;
+  /** Session signing key waiting on registration before MSGSIG is sent. */
+  private pendingMsgSig: Promise<string | null> | null = null;
   /** Set when SASL was attempted and 904 was received. Suppresses any
    *  subsequent registration completion as a guest, and blocks outgoing
    *  PRIVMSGs that would silently leak under the guest identity. */
@@ -409,9 +411,12 @@ export class FreeqClient extends EventEmitter {
         // text) and reads `+freeq.at/sig` from the opener tags. Per-batch
         // signing keeps each emitted message independently verifiable.
         const body = this.assembleMultiline(group);
-        signing.signMessage(wireTarget, body).then((sig) => {
+        signing.signMessage(wireTarget, body, { tags: extraOpenerTags }).then((signed) => {
           const openerTagsWithSig: Record<string, string> = { ...extraOpenerTags };
-          if (sig) openerTagsWithSig['+freeq.at/sig'] = sig;
+          if (signed) {
+            openerTagsWithSig[signing.EVENT_ID_TAG] = signed.eventId;
+            openerTagsWithSig[signing.SIG_TAG] = signed.sigTag;
+          }
           this.emitMultilineBatch(wireTarget, group, openerTagsWithSig);
         });
         this.maybeLocalEcho(bufKey, body, willEncrypt);
@@ -1038,9 +1043,20 @@ export class FreeqClient extends EventEmitter {
   }
 
   private async signedPrivmsg(target: string, text: string, extraTags?: Record<string, string>): Promise<void> {
-    const sig = await signing.signMessage(target, text);
     const tags: Record<string, string> = { ...extraTags };
-    if (sig) tags['+freeq.at/sig'] = sig;
+    // The signature covers the tags it rides with — the reply reference and
+    // the coordination tags — so they're passed in, not added afterwards.
+    const signed = await signing.signMessage(target, text, {
+      reply: tags['+reply'] ?? tags['+draft/reply'],
+      edit: tags['+draft/edit'],
+      tags,
+    });
+    if (signed) {
+      // Both tags, always together: the id is what the signature covers, and
+      // the server adopts it as the message's msgid.
+      tags[signing.EVENT_ID_TAG] = signed.eventId;
+      tags[signing.SIG_TAG] = signed.sigTag;
+    }
     if (Object.keys(tags).length > 0) {
       this.raw(format('PRIVMSG', [target, text], tags));
     } else {
@@ -1374,9 +1390,11 @@ export class FreeqClient extends EventEmitter {
         // FreeqClientOptions.autoMsgSig=false.
         if (this.sasl?.did && this.opts.autoMsgSig !== false) {
           signing.setSigningDid(this.sasl.did);
-          signing.generateSigningKey().then((pubkey) => {
-            if (pubkey) this.raw(`MSGSIG ${pubkey}`);
-          });
+          // Minted here, REGISTERED on 001. MSGSIG sent before registration
+          // completes is discarded by the server (`if !conn.registered`),
+          // which left the key unregistered and every "client-signed"
+          // message silently server-signed instead.
+          this.pendingMsgSig = signing.generateSigningKey();
         }
         this.raw('CAP END');
         break;
@@ -1443,6 +1461,15 @@ export class FreeqClient extends EventEmitter {
         this._registered = true;
         this.emit('registered', this._nick);
         this.emit('nickChanged', this._nick);
+
+        // Register the session signing key now that the server will accept it.
+        if (this.pendingMsgSig) {
+          const pending = this.pendingMsgSig;
+          this.pendingMsgSig = null;
+          pending.then((pubkey) => {
+            if (pubkey) this.raw(`MSGSIG ${pubkey}`);
+          });
+        }
 
         const toJoin = this.autoJoinChannels.length > 0
           ? this.autoJoinChannels

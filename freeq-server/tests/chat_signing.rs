@@ -587,3 +587,128 @@ async fn a_guests_message_is_not_signed_by_anyone() {
     })
     .await;
 }
+
+/// The full loop, with no test-only shortcuts in the middle: the SDK client
+/// signs a message, the server verifies it and relays the sender's own
+/// signature, and a third party rebuilds the document and checks it against
+/// the public key the server publishes for that (DID, kid).
+///
+/// This is the property the whole canonical exists for — verification by
+/// someone who was not there when the message was sent.
+#[tokio::test]
+async fn a_third_party_can_verify_an_sdk_clients_signature_from_the_wire_alone() {
+    use freeq_sdk::client::{self, ConnectConfig};
+    use freeq_sdk::event::Event;
+    use std::sync::Arc;
+
+    let k = key();
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let db_path = tmp.path().to_str().unwrap().to_string();
+    std::mem::forget(tmp);
+    let config = freeq_server::config::ServerConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        web_addr: Some("127.0.0.1:0".to_string()),
+        server_name: "test-sig-web".to_string(),
+        challenge_timeout_secs: 60,
+        db_path: Some(db_path),
+        ..Default::default()
+    };
+    let (irc_addr, web_addr, _h) =
+        freeq_server::server::Server::with_resolver(config, resolver_with(vec![(DID_ALICE, &k)]))
+            .start_with_web()
+            .await
+            .unwrap();
+
+    // A watcher on raw IRC sees exactly what crosses the wire. A guest will
+    // do — the point is what a bystander receives, not who they are.
+    let watcher_addr = irc_addr;
+    let watcher = tokio::task::spawn_blocking(move || {
+        let mut c = C::guest(watcher_addr, "watcher");
+        c.join("#sig");
+        c
+    })
+    .await
+    .unwrap();
+
+    // Alice sends through the SDK, which signs on her device.
+    let signer: Arc<dyn ChallengeSigner> = Arc::new(KeySigner::new(DID_ALICE.to_string(), k));
+    let (handle, mut events) = client::connect(
+        ConnectConfig {
+            server_addr: irc_addr.to_string(),
+            nick: "alice".to_string(),
+            user: "alice".to_string(),
+            realname: "Alice".to_string(),
+            ..Default::default()
+        },
+        Some(signer),
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(e) = events.recv().await {
+            if matches!(e, Event::Registered { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    handle.join("#sig").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    handle
+        .privmsg("#sig", "verifiable by anyone")
+        .await
+        .unwrap();
+
+    let mut watcher = watcher;
+    let seen = tokio::task::spawn_blocking(move || {
+        let line = watcher.rx(|l| l.contains("verifiable by anyone"), "delivery");
+        (line, watcher)
+    })
+    .await
+    .unwrap()
+    .0;
+
+    let sig_tag = C::sig_of(&seen).expect("the message is signed");
+    let msgid = C::msgid_of(&seen).expect("the message has an id");
+    let (kid, _) = freeq_sdk::sigtag::parse(&sig_tag).expect("sig tag is alg:kid:sig");
+
+    // The key the signature names, fetched from the durable store the same way
+    // any third party would.
+    let resp = reqwest::get(format!("http://{web_addr}/api/v1/signing-keys/{DID_ALICE}"))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    let key_json: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|_| panic!("key lookup for kid {kid} was {status}: {body}"));
+    let pubkey = {
+        use base64::Engine;
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(key_json["public_key"].as_str().unwrap())
+            .unwrap();
+        ed25519_dalek::VerifyingKey::from_bytes(&raw.try_into().unwrap()).unwrap()
+    };
+
+    // Rebuilt from the wire alone: sender, venue, body, id.
+    ChatDoc::message(
+        DID_ALICE,
+        &msgid,
+        &channel_venue("#sig"),
+        "verifiable by anyone",
+    )
+    .verify(&sig_tag, &pubkey)
+    .expect("a stranger can verify this message");
+
+    // And the server's own verify endpoint agrees it was the device, not itself.
+    let verdict: serde_json::Value =
+        reqwest::get(format!("http://{web_addr}/api/v1/verify/{msgid}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(verdict["verification"]["verdict"], "valid");
+    assert_eq!(
+        verdict["verification"]["verified_by"], "client-session-key",
+        "signed on the sender's device, not by the server: {verdict}"
+    );
+}

@@ -176,29 +176,38 @@ describe('comprehensive: sig on BATCH opener', () => {
     await flushAsync();
     const opener = findOpener(ws.sent);
     expect(opener).toBeDefined();
-    // Extract the sig from the opener's tag block
+    // The opener carries the signature AND the event id it covers.
     const sigMatch = opener!.match(/\+freeq\.at\/sig=([^;\s]+)/);
-    expect(sigMatch).not.toBeNull();
-    const sigB64 = sigMatch![1];
-    // Decode + verify against the assembled body's canonical form.
-    // signMessage uses Math.floor(Date.now()/1000) at sign time; accept
-    // any timestamp in the last 5 seconds.
-    const padded = sigB64 + '='.repeat((4 - (sigB64.length % 4)) % 4);
-    const b64 = padded.replace(/-/g, '+').replace(/_/g, '/');
-    const sig = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-    const now = Math.floor(Date.now() / 1000);
-    let verified = false;
-    for (let delta = 0; delta <= 5; delta++) {
-      const canonical = `${did}\0#room\0${text}\0${now - delta}`;
-      const ok = await crypto.subtle.verify(
-        'Ed25519',
-        verifyKey,
-        sig,
-        new TextEncoder().encode(canonical),
-      );
-      if (ok) { verified = true; break; }
-    }
-    expect(verified).toBe(true);
+    expect(sigMatch, `opener: ${opener}`).not.toBeNull();
+    const sigTag = sigMatch![1]!;
+    const idMatch = opener!.match(/\+freeq\.at\/eventid=([^;\s]+)/);
+    expect(idMatch, 'a signature covers an id the signer minted').not.toBeNull();
+    const eventId = idMatch![1]!;
+
+    // Verification is now deterministic. This test used to try every second in
+    // the last five and accept any hit, because the retired canonical folded a
+    // wall clock the signer minted and never sent — a receiver had no such
+    // luxury, which is precisely why the canonical changed.
+    const [alg, kid, sigB64] = sigTag.split(':');
+    expect(alg).toBe('ed25519');
+    expect(kid).toBe(signing.getKid());
+    const padded = sigB64! + '='.repeat((4 - (sigB64!.length % 4)) % 4);
+    const sig = Uint8Array.from(atob(padded.replace(/-/g, '+').replace(/_/g, '/')), (c) =>
+      c.charCodeAt(0),
+    );
+    const canonical = await signing.messageCanonical({
+      from: did,
+      msgid: eventId,
+      target: signing.channelVenue('#room'),
+      body: text,
+    });
+    const verified = await crypto.subtle.verify(
+      'Ed25519',
+      verifyKey,
+      sig,
+      new TextEncoder().encode(canonical),
+    );
+    expect(verified, 'signature verifies over the assembled body, first try').toBe(true);
   });
 
   it('chunks do NOT carry +freeq.at/sig', async () => {
