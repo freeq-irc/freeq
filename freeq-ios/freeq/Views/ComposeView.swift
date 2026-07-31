@@ -719,7 +719,13 @@ struct ComposeView: View {
         case "mode", "m":
             if parts.count > 1 { appState.sendRaw("MODE \(parts[1])") }
         case "names":
-            if let chan = appState.activeChannel { appState.sendRaw("NAMES \(chan)") }
+            // NAMES is channel-only; activeChannel also holds DM keys (nicks
+            // and DIDs), and asking about a person makes the server answer as
+            // though they were a room. No-op outside channels.
+            if let chan = appState.activeChannel,
+               chan.hasPrefix("#") || chan.hasPrefix("&") {
+                appState.sendRaw("NAMES \(chan)")
+            }
         case "who":
             let target = parts.dropFirst().first.map(String.init) ?? appState.activeChannel ?? ""
             if !target.isEmpty { appState.sendRaw("WHO \(target)") }
