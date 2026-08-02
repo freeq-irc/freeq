@@ -587,6 +587,82 @@ async fn tagmsg_to_remote_did_relays_as_structured_tagmsg() {
     drop((srv_a, srv_b));
 }
 
+// ── a mutation TAGMSG's signature tag crosses the hop byte-identical ─────
+//
+// Message signatures cross S2S in a dedicated field of `S2sMessage::Privmsg`
+// (and the PRIVMSG tag-relay helper deliberately strips `+freeq.at/sig`,
+// since the field carries it). A TAGMSG mutation has no such field — its
+// signature rides the raw `Tagmsg` tag map, and nothing else asserts that
+// path. One route-through-the-filter refactor would silently drop mutation
+// signatures in flight, and once receivers verify, a signed delete arriving
+// without its signature is indistinguishable from tampering. This pins the
+// transport contract before anything signs a mutation for real: the tag
+// arrives exactly as sent, or this fails.
+
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn mutation_sig_tag_crosses_the_hop_byte_identical() {
+    let alice = TestId::new("did:plc:alicesigtag");
+    let bob = TestId::new("did:plc:bobsigtag");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#fsig").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#fsig").await.unwrap();
+
+    // Land a message so the reaction points at something both servers hold.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut msgid = None;
+    while tokio::time::Instant::now() < deadline {
+        ha.privmsg("#fsig", "react to me").await.ok();
+        if let Some(id) = recv_channel_msgid(&mut rxb, "react to me", Duration::from_secs(2)).await
+        {
+            msgid = Some(id);
+            break;
+        }
+    }
+    let msgid = msgid.expect("bob's server received the channel message");
+
+    // A reaction carrying a signature tag. The value is opaque to today's
+    // servers (nothing verifies mutation sigs yet); the contract under test
+    // is transport fidelity, not validity.
+    const SIG: &str = "ed25519:testkid0000000000000000:c2lnbmF0dXJlLWJ5dGVzLWhlcmU";
+    ha.raw(&format!(
+        "@+react=\u{1F44D};+reply={msgid};+freeq.at/sig={SIG} TAGMSG #fsig"
+    ))
+    .await
+    .unwrap();
+
+    let relayed_sig = timeout(EVENT_TIMEOUT, async {
+        loop {
+            match rxb.recv().await {
+                Some(Event::TagMsg { tags, .. }) if tags.contains_key("+react") => {
+                    return tags.get("+freeq.at/sig").cloned();
+                }
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    })
+    .await
+    .expect("the reaction TAGMSG never crossed the hop");
+
+    assert_eq!(
+        relayed_sig.as_deref(),
+        Some(SIG),
+        "a mutation's +freeq.at/sig must cross S2S byte-identical"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
 // ── a single send is delivered exactly once (event_id dedup) ─────
 
 #[tokio::test]
