@@ -663,6 +663,99 @@ async fn mutation_sig_tag_crosses_the_hop_byte_identical() {
     drop((srv_a, srv_b));
 }
 
+// ── a PRIVMSG's stamped signature crosses the hop byte-identical ─────
+//
+// The companion path to the mutation test above. PRIVMSG signatures cross
+// S2S through machinery of their own: the origin server verifies-or-stamps
+// `+freeq.at/sig` at ingress, the tag-relay helper strips the tag, and a
+// dedicated field on `S2sMessage::Privmsg` carries it across; the receive
+// side reattaches it. Nothing asserted that round trip end to end. The
+// contract: whatever signature the origin broadcast to its own members,
+// the peer's members receive byte-identical — or downstream verification
+// fails in a way that looks exactly like tampering.
+
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn privmsg_sig_crosses_the_hop_byte_identical() {
+    let alice = TestId::new("did:plc:alicepmsig");
+    let bob = TestId::new("did:plc:bobpmsig");
+    let carol = TestId::new("did:plc:carolpmsig");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob, &carol]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#psig").await.unwrap();
+
+    // Carol is the origin-side observer: what she receives is what server A
+    // broadcast, stamped signature included.
+    let (hc, mut rxc) = connect(&srv_a, &carol, "carol");
+    wait_auth_and_register(&mut rxc).await;
+    hc.join("#psig").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#psig").await.unwrap();
+
+    // Unique text per attempt so both observations are matched to the same
+    // send — every attempt gets a fresh signature, so comparing sigs from
+    // two different attempts would be meaningless.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut crossed = None;
+    let mut attempt = 0u32;
+    while tokio::time::Instant::now() < deadline {
+        attempt += 1;
+        let text = format!("sig probe {attempt}");
+        ha.privmsg("#psig", &text).await.ok();
+        let got = timeout(Duration::from_secs(2), async {
+            loop {
+                match rxb.recv().await {
+                    Some(Event::Message { text: t, tags, .. }) if t == text => {
+                        return Some(tags.get("+freeq.at/sig").cloned());
+                    }
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+        })
+        .await;
+        if let Ok(Some(sig)) = got {
+            crossed = Some((text, sig));
+            break;
+        }
+    }
+    let (text, b_sig) = crossed.expect("no channel message crossed the hop");
+
+    // Find the origin broadcast of that same send.
+    let a_sig = timeout(EVENT_TIMEOUT, async {
+        loop {
+            match rxc.recv().await {
+                Some(Event::Message { text: t, tags, .. }) if t == text => {
+                    return tags.get("+freeq.at/sig").cloned();
+                }
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    })
+    .await
+    .expect("carol never saw the origin broadcast");
+
+    assert!(
+        a_sig.is_some(),
+        "the origin server must stamp +freeq.at/sig on an authenticated sender's channel message"
+    );
+    assert_eq!(
+        b_sig, a_sig,
+        "a PRIVMSG's +freeq.at/sig must arrive at the peer byte-identical to the origin broadcast"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    hc.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
 // ── a single send is delivered exactly once (event_id dedup) ─────
 
 #[tokio::test]
