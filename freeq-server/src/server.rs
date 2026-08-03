@@ -3407,6 +3407,47 @@ pub(crate) async fn process_s2s_message(
                     if let Some(ref acct) = account {
                         tags.insert("account".to_string(), acct.clone());
                     }
+                    // Prefer the DID carried from the origin; fall back to a
+                    // local nick_owners lookup for peers that didn't send one.
+                    let sender_nick = from.split('!').next().unwrap_or(&from);
+                    let s2s_sender_did = account
+                        .clone()
+                        .or_else(|| state.nick_owners.lock().get(sender_nick).cloned());
+                    // File it before showing it. Persists the coordination
+                    // tags (incl. +freeq.at/origin) so CHATHISTORY replay
+                    // carries them, like the DM persist path — and if the
+                    // store refuses the msgid (a re-delivery, or a
+                    // conflicting claim on an id already on file), the event
+                    // must not reach history or local clients either.
+                    let stored = state
+                        .with_db(|db| match edit_of {
+                            // Same shape as a local edit: a new row that
+                            // carries the root, so the pair reads as one
+                            // message here too.
+                            Some(ref root) => db.insert_edit(
+                                &target,
+                                &from,
+                                &text,
+                                timestamp,
+                                &relay_tags,
+                                &msgid,
+                                root,
+                                s2s_sender_did.as_deref(),
+                            ),
+                            None => db.insert_message(
+                                &target,
+                                &from,
+                                &text,
+                                timestamp,
+                                &relay_tags,
+                                Some(&msgid),
+                                s2s_sender_did.as_deref(),
+                            ),
+                        })
+                        .unwrap_or(true);
+                    if !stored {
+                        return;
+                    }
                     let mut channels = state.channels.lock();
                     if let Some(ch) = channels.get_mut(&channel_key) {
                         // An edit revises the entry we already hold; only a
@@ -3453,37 +3494,6 @@ pub(crate) async fn process_s2s_message(
                         }
                     }
                     drop(channels);
-                    // Prefer the DID carried from the origin; fall back to a
-                    // local nick_owners lookup for peers that didn't send one.
-                    let sender_nick = from.split('!').next().unwrap_or(&from);
-                    let s2s_sender_did = account
-                        .clone()
-                        .or_else(|| state.nick_owners.lock().get(sender_nick).cloned());
-                    // Persist the coordination tags (incl. +freeq.at/origin) so
-                    // CHATHISTORY replay carries them, like the DM persist path.
-                    state.with_db(|db| match edit_of {
-                        // Same shape as a local edit: a new row that carries
-                        // the root, so the pair reads as one message here too.
-                        Some(ref root) => db.insert_edit(
-                            &target,
-                            &from,
-                            &text,
-                            timestamp,
-                            &relay_tags,
-                            &msgid,
-                            root,
-                            s2s_sender_did.as_deref(),
-                        ),
-                        None => db.insert_message(
-                            &target,
-                            &from,
-                            &text,
-                            timestamp,
-                            &relay_tags,
-                            Some(&msgid),
-                            s2s_sender_did.as_deref(),
-                        ),
-                    });
                 }
 
                 // Deliver to local members with tag-awareness
@@ -3577,6 +3587,74 @@ pub(crate) async fn process_s2s_message(
                     }
                 }
             } else {
+                // Persist first — a DM the store refuses (spent msgid) must
+                // not be delivered either. A durable row needs both DIDs:
+                // prefer the sender DID carried from the origin (a remote
+                // sender is not in our nick_owners); fall back to the local
+                // lookup.
+                let sender_nick = from.split('!').next().unwrap_or(&from);
+                let sender_did = account
+                    .clone()
+                    .or_else(|| state.nick_owners.lock().get(sender_nick).cloned());
+                // Recipient: honor the origin's stamp, cross-checked against our
+                // own resolution. On a mismatch we fall back (no durable row)
+                // rather than persist under a possibly-wrong identity.
+                let stamped_recipient_did =
+                    stamped_recipient_did.map(|d| sanitize_s2s_str(&d, 512));
+                let local_recipient =
+                    crate::connection::routing::recipient_did_for_target(state, &target);
+                let recipient_did = crate::connection::routing::reconcile_recipient_did(
+                    stamped_recipient_did.as_deref(),
+                    local_recipient.as_deref(),
+                );
+                let mut stored = true;
+                if let (Some(s_did), Some(r_did)) =
+                    (sender_did.as_deref(), recipient_did.as_deref())
+                {
+                    let dm_key = crate::db::canonical_dm_key(s_did, r_did);
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let mut tags = HashMap::new();
+                    tags.extend(relay_tags.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    tags.insert("msgid".to_string(), msgid.clone());
+                    if let Some(ref sig) = sig {
+                        tags.insert("+freeq.at/sig".to_string(), sig.clone());
+                    }
+                    if let Some(ref acct) = account {
+                        tags.insert("account".to_string(), acct.clone());
+                    }
+                    // A DM edit is a revision of a row we already hold, keyed
+                    // by the root — same as the channel path. Storing it as a
+                    // new message would leave the thread showing both versions.
+                    stored = state
+                        .with_db(|db| match edit_of {
+                            Some(ref root) => db.insert_edit(
+                                &dm_key,
+                                &from,
+                                &text,
+                                timestamp,
+                                &tags,
+                                &msgid,
+                                root,
+                                sender_did.as_deref(),
+                            ),
+                            None => db.insert_message(
+                                &dm_key,
+                                &from,
+                                &text,
+                                timestamp,
+                                &tags,
+                                Some(&msgid),
+                                sender_did.as_deref(),
+                            ),
+                        })
+                        .unwrap_or(true);
+                }
+                if !stored {
+                    return;
+                }
                 // DM target: a nick or a `did:`. Resolve to every local session
                 // bound to the recipient (DID fan-out) — a federated DID-addressed
                 // DM must reach the same person here, with no per-server nick
@@ -3613,66 +3691,6 @@ pub(crate) async fn process_s2s_message(
                 drop(acct_caps);
                 drop(tag_caps);
 
-                // Persist DM if both sender and recipient have DIDs. Prefer the
-                // sender DID carried from the origin (a remote sender is not in
-                // our nick_owners); fall back to the local lookup.
-                let sender_nick = from.split('!').next().unwrap_or(&from);
-                let sender_did = account
-                    .clone()
-                    .or_else(|| state.nick_owners.lock().get(sender_nick).cloned());
-                // Recipient: honor the origin's stamp, cross-checked against our
-                // own resolution. On a mismatch we fall back (no durable row)
-                // rather than persist under a possibly-wrong identity.
-                let stamped_recipient_did =
-                    stamped_recipient_did.map(|d| sanitize_s2s_str(&d, 512));
-                let local_recipient =
-                    crate::connection::routing::recipient_did_for_target(state, &target);
-                let recipient_did = crate::connection::routing::reconcile_recipient_did(
-                    stamped_recipient_did.as_deref(),
-                    local_recipient.as_deref(),
-                );
-                if let (Some(s_did), Some(r_did)) =
-                    (sender_did.as_deref(), recipient_did.as_deref())
-                {
-                    let dm_key = crate::db::canonical_dm_key(s_did, r_did);
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let mut tags = HashMap::new();
-                    tags.extend(relay_tags.iter().map(|(k, v)| (k.clone(), v.clone())));
-                    tags.insert("msgid".to_string(), msgid.clone());
-                    if let Some(ref sig) = sig {
-                        tags.insert("+freeq.at/sig".to_string(), sig.clone());
-                    }
-                    if let Some(ref acct) = account {
-                        tags.insert("account".to_string(), acct.clone());
-                    }
-                    // A DM edit is a revision of a row we already hold, keyed
-                    // by the root — same as the channel path. Storing it as a
-                    // new message would leave the thread showing both versions.
-                    state.with_db(|db| match edit_of {
-                        Some(ref root) => db.insert_edit(
-                            &dm_key,
-                            &from,
-                            &text,
-                            timestamp,
-                            &tags,
-                            &msgid,
-                            root,
-                            sender_did.as_deref(),
-                        ),
-                        None => db.insert_message(
-                            &dm_key,
-                            &from,
-                            &text,
-                            timestamp,
-                            &tags,
-                            Some(&msgid),
-                            sender_did.as_deref(),
-                        ),
-                    });
-                }
             }
         }
 
@@ -5714,6 +5732,67 @@ mod s2s_adversarial_tests {
         // The key question: can the local user distinguish the real alice
         // from the S2S-spoofed alice? Currently they can't — both appear
         // as "alice" in the channel. This is a known limitation.
+    }
+
+    /// The same event delivered twice over S2S — a peer re-sending its tail
+    /// after a reconnect, or the same event arriving via two relay paths —
+    /// files exactly one row and reaches local clients exactly once.
+    /// Distinct envelope ids, same msgid: envelope dedup can't catch this;
+    /// only msgid uniqueness can. And what the store refuses must not be
+    /// relayed: clients key messages by msgid, so forwarding a conflicting
+    /// copy would let a peer rewrite a displayed message in place.
+    #[tokio::test]
+    async fn s2s_duplicate_privmsg_delivery_files_one_row() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#chat");
+
+        // A local member watching the channel.
+        let (tx, mut rx) = mpsc::channel(16);
+        state
+            .connections
+            .lock()
+            .insert("watcher-sess".to_string(), tx);
+        state
+            .channels
+            .lock()
+            .get_mut("#chat")
+            .unwrap()
+            .members
+            .insert("watcher-sess".to_string());
+
+        let msg = |envelope: &str, text: &str| S2sMessage::Privmsg {
+            event_id: format!("{PEER}:{envelope}"),
+            from: "remote!u@s2s".to_string(),
+            target: "#chat".to_string(),
+            text: text.to_string(),
+            origin: PEER.to_string(),
+            msgid: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()),
+            sig: None,
+            account: None,
+            recipient_did: None,
+            replaces_msgid: None,
+            tags: HashMap::new(),
+            multiline_lines: None,
+        };
+        process_s2s_message(&state, &mgr, PEER, msg("dup1", "hello twice")).await;
+        // Benign re-delivery, then a conflicting claim on the same id.
+        process_s2s_message(&state, &mgr, PEER, msg("dup2", "hello twice")).await;
+        process_s2s_message(&state, &mgr, PEER, msg("dup3", "impostor content")).await;
+
+        let rows = state
+            .with_db(|db| db.get_messages("#chat", 10, None))
+            .unwrap();
+        assert_eq!(rows.len(), 1, "re-delivery must not file a second row");
+        assert_eq!(rows[0].text, "hello twice", "first write wins");
+
+        let first = rx.try_recv().expect("the first delivery reaches members");
+        assert!(first.contains("hello twice"));
+        assert!(
+            rx.try_recv().is_err(),
+            "refused inserts must not be relayed to members"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════

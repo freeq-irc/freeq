@@ -33,6 +33,8 @@ use rusqlite_migration::Migrations;
 mod m001_schema_baseline;
 #[path = "002_root_msgid_backfill.rs"]
 mod m002_root_msgid_backfill;
+#[path = "003_msgid_unique.rs"]
+mod m003_msgid_unique;
 
 // db.rs unit tests exercise the backfill directly against hand-built rows.
 // Production reaches it only as a rung of the ladder below.
@@ -43,6 +45,7 @@ pub(crate) fn migration_ladder() -> Migrations<'static> {
     Migrations::new(vec![
         m001_schema_baseline::migration(),
         m002_root_msgid_backfill::migration(),
+        m003_msgid_unique::migration(),
     ])
 }
 
@@ -111,7 +114,16 @@ mod tests {
             after_baseline,
             "migration 2 moves data; it must not change the schema"
         );
+
+        migration_ladder().to_version(&mut conn, 3).unwrap();
+        assert_eq!(version(&conn), 3);
+        assert_eq!(
+            tables(&conn),
+            after_baseline,
+            "migration 3 adds an index; it must not change the tables"
+        );
     }
+
 
     /// Climbing straight to the top lands in the same place as stepping.
     #[test]
@@ -119,6 +131,7 @@ mod tests {
         let mut stepped = Connection::open_in_memory().unwrap();
         migration_ladder().to_version(&mut stepped, 1).unwrap();
         migration_ladder().to_version(&mut stepped, 2).unwrap();
+        migration_ladder().to_version(&mut stepped, 3).unwrap();
 
         let mut direct = Connection::open_in_memory().unwrap();
         migration_ladder().to_latest(&mut direct).unwrap();
@@ -135,7 +148,7 @@ mod tests {
         migration_ladder().to_latest(&mut conn).unwrap();
         let before = tables(&conn);
         migration_ladder().to_latest(&mut conn).unwrap();
-        assert_eq!(version(&conn), 2);
+        assert_eq!(version(&conn), 3);
         assert_eq!(tables(&conn), before);
     }
 }

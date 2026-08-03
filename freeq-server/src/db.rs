@@ -734,6 +734,9 @@ impl Db {
     // ── Messages ───────────────────────────────────────────────────────
 
     /// Store a message.
+    /// Returns whether a row was written — `false` when the msgid was
+    /// already on file (first write wins; callers must not present a
+    /// message the store refused).
     pub fn insert_message(
         &self,
         channel: &str,
@@ -743,7 +746,7 @@ impl Db {
         tags: &HashMap<String, String>,
         msgid: Option<&str>,
         sender_did: Option<&str>,
-    ) -> SqlResult<()> {
+    ) -> SqlResult<bool> {
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "{}".to_string());
         let stored_text = if let Some(ref key) = self.encryption_key {
             encrypt_at_rest(key, text)
@@ -752,7 +755,7 @@ impl Db {
         };
         // An original message is its own root — its identity for life.
         self.conn.execute(
-            "INSERT INTO messages (channel, sender, text, timestamp, tags_json, msgid, root_msgid, sender_did)
+            "INSERT OR IGNORE INTO messages (channel, sender, text, timestamp, tags_json, msgid, root_msgid, sender_did)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
             params![
                 channel,
@@ -764,6 +767,26 @@ impl Db {
                 sender_did
             ],
         )?;
+        if self.conn.changes() == 0 {
+            // The msgid is already on file. First write wins either way, and
+            // `last_insert_rowid()` still names an earlier row, so neither
+            // the recorder nor the search index may run — but same-content
+            // (a peer re-delivering) and different-content (a conflicting
+            // claim on an identity) deserve very different log lines.
+            let conflicting = msgid
+                .and_then(|id| self.find_message_by_msgid(id).ok().flatten())
+                .is_some_and(|row| row.text != text);
+            if conflicting {
+                tracing::warn!(
+                    ?msgid,
+                    channel,
+                    "msgid already on file with DIFFERENT content; conflicting insert dropped"
+                );
+            } else {
+                tracing::debug!(?msgid, channel, "duplicate delivery; insert ignored");
+            }
+            return Ok(false);
+        }
         // Record into the agent-assist diagnostic ring buffer. We
         // capture only the fact that a message was accepted — never
         // the body or tags. The auto-increment row id is the canonical
@@ -777,7 +800,7 @@ impl Db {
         ev.server_sequence = Some(self.conn.last_insert_rowid());
         crate::agent_assist::recorder::record(ev);
         self.fts_index(self.conn.last_insert_rowid(), text)?;
-        Ok(())
+        Ok(true)
     }
 
     /// Fetch recent messages for a channel, ordered oldest-first.
@@ -1212,6 +1235,7 @@ impl Db {
     /// one logical message shares an identity no matter which revision the
     /// editor named. Only the newest revision stays in the search index —
     /// otherwise a search for pre-edit text surfaces superseded revisions.
+    /// Returns whether a row was written, as [`Self::insert_message`] does.
     pub fn insert_edit(
         &self,
         channel: &str,
@@ -1222,7 +1246,7 @@ impl Db {
         msgid: &str,
         replaces_msgid: &str,
         sender_did: Option<&str>,
-    ) -> SqlResult<()> {
+    ) -> SqlResult<bool> {
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "{}".to_string());
         let stored_text = if let Some(ref key) = self.encryption_key {
             encrypt_at_rest(key, text)
@@ -1231,10 +1255,30 @@ impl Db {
         };
         let root = self.root_of(replaces_msgid);
         self.conn.execute(
-            "INSERT INTO messages (channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, root_msgid, sender_did)
+            "INSERT OR IGNORE INTO messages (channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, root_msgid, sender_did)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![channel, sender, stored_text, timestamp as i64, tags_json, msgid, replaces_msgid, root, sender_did],
         )?;
+        if self.conn.changes() == 0 {
+            // A revision may not take over an id already on file (see
+            // `insert_message` — same first-write-wins rule, same
+            // duplicate-vs-conflict distinction).
+            let conflicting = self
+                .find_message_by_msgid(msgid)
+                .ok()
+                .flatten()
+                .is_some_and(|row| row.text != text);
+            if conflicting {
+                tracing::warn!(
+                    msgid,
+                    channel,
+                    "msgid already on file with DIFFERENT content; conflicting edit dropped"
+                );
+            } else {
+                tracing::debug!(msgid, channel, "duplicate edit delivery; insert ignored");
+            }
+            return Ok(false);
+        }
         let rowid = self.conn.last_insert_rowid();
         if self.fts_enabled() {
             self.conn.execute(
@@ -1245,7 +1289,7 @@ impl Db {
             )?;
         }
         self.fts_index(rowid, text)?;
-        Ok(())
+        Ok(true)
     }
 
     // ── Reactions ──────────────────────────────────────────────────────
@@ -2662,6 +2706,57 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_msgid_insert_is_ignored() {
+        let db = Db::open_memory().unwrap();
+        db.insert_message("#c", "a!a@h", "original", 100, &HashMap::new(), Some("DUPID"), None)
+            .unwrap();
+        // Same msgid arriving again (an S2S re-delivery, or a raced client
+        // mint slipping past the pre-insert lookup): first write wins, the
+        // second is a no-op, not an error and not a second row.
+        db.insert_message("#c", "a!a@h", "impostor", 200, &HashMap::new(), Some("DUPID"), None)
+            .unwrap();
+        let msgs = db.get_messages("#c", 10, None).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].text, "original");
+    }
+
+    #[test]
+    fn duplicate_msgid_insert_does_not_corrupt_search_index() {
+        // On an ignored INSERT, `last_insert_rowid()` still names some earlier
+        // row — indexing the discarded text under it would bind that text to
+        // the wrong message in search.
+        let db = Db::open_memory().unwrap();
+        db.insert_message("#c", "a!a@h", "kept words", 100, &HashMap::new(), Some("DUPFTS"), None)
+            .unwrap();
+        db.insert_message("#c", "a!a@h", "phantom words", 200, &HashMap::new(), Some("DUPFTS"), None)
+            .unwrap();
+        assert!(db.search_messages("#c", "phantom", 10, None).unwrap().is_empty());
+        assert_eq!(db.search_messages("#c", "kept", 10, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn edit_claiming_spent_msgid_is_ignored() {
+        let db = Db::open_memory().unwrap();
+        db.insert_message("#c", "a!a@h", "one", 100, &HashMap::new(), Some("SPENT"), None)
+            .unwrap();
+        db.insert_message("#c", "a!a@h", "two", 150, &HashMap::new(), Some("ORIG"), None)
+            .unwrap();
+        // A revision row may not take over an id already on file.
+        db.insert_edit("#c", "a!a@h", "two edited", 200, &HashMap::new(), "SPENT", "ORIG", None)
+            .unwrap();
+        let n: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM messages WHERE msgid = 'SPENT'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        let text: String = db
+            .conn
+            .query_row("SELECT text FROM messages WHERE msgid = 'SPENT'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(text, "one");
+    }
+
+    #[test]
     fn recent_nick_for_did_skips_rows_without_sender_did() {
         let db = Db::open_memory().unwrap();
         // Pre-migration rows carry NULL sender_did (no backfill) and must be
@@ -2917,7 +3012,7 @@ mod tests {
                 db.conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                     .unwrap(),
-                2,
+                3,
                 "first open stamps the schema"
             );
         }
@@ -2929,7 +3024,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
         assert_eq!(db.root_of("id-2"), "id-1");
         assert_eq!(db.current_revision("id-1").unwrap().unwrap().text, "v2");
@@ -2959,7 +3054,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
     }
 
@@ -3002,7 +3097,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
     }
 
