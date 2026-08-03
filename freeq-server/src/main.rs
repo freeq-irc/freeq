@@ -21,6 +21,19 @@ async fn main() -> Result<()> {
 
     let mut config = freeq_server::config::ServerConfig::parse();
 
+    // A maintenance verb, not a server mode: run the ladder to the requested
+    // version and exit. Startup only ever migrates up; this is how the tested
+    // down migrations get run without hand-written SQL.
+    if let Some(target) = config.migrate_to {
+        let Some(ref db_path) = config.db_path else {
+            anyhow::bail!("--migrate-to requires --db-path (in-memory storage has nothing to migrate)");
+        };
+        let (before, after) = freeq_server::migrations::migrate_to(db_path, target)
+            .map_err(|e| anyhow::anyhow!("migration failed: {e}"))?;
+        tracing::info!(before, after, target, "migration ladder finished");
+        return Ok(());
+    }
+
     // Fold --model-price flags into the price table the metered proxy charges from.
     if !config.model_price_args.is_empty() {
         config.model_prices = freeq_server::model_proxy::parse_price_args(&config.model_price_args);

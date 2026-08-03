@@ -516,6 +516,7 @@ Options:
   --server-name <NAME>            Server name [default: freeq]
   --challenge-timeout-secs <N>    SASL challenge validity [default: 60]
   --db-path <PATH>                SQLite database path (omit for in-memory)
+  --migrate-to <VERSION>          Run the schema ladder to VERSION and exit
   --web-addr <ADDR>               HTTP/WebSocket listener address
   --iroh                          Enable iroh QUIC transport
   --iroh-port <PORT>              UDP port for iroh (default: random)
@@ -531,9 +532,9 @@ When `--db-path` is set, the server persists:
 - **Bans** — hostmask and DID bans survive restarts
 - **DID-nick bindings** — nick ownership persists across server restarts
 
-Without `--db-path`, the server runs entirely in-memory.
-The database uses SQLite with WAL mode for good concurrent read performance.
-Persistence failures are logged but do not crash the server.
+Without `--db-path`, the server runs entirely in-memory. The database uses SQLite with WAL mode for good concurrent read performance. Persistence failures are logged but do not crash the server.
+
+Schema migrations run automatically (and upward only) at startup. A server binary refuses to open a database stamped with a newer schema than it knows, so before rolling back to an older binary, downgrade the schema first: `freeq-server --db-path <PATH> --migrate-to <VERSION>` runs the ladder to the named version and exits. Downgrades stop with an error at any migration that is irreversible by design.
 
 ## Deployment
 

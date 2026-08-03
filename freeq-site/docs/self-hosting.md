@@ -130,6 +130,7 @@ freeq-server --db-path /data/irc.db --data-dir /data
 | Flag | Default | Description |
 |---|---|---|
 | `--db-path` | *(none — in-memory)* | SQLite database file |
+| `--migrate-to` | *(none)* | Run the schema ladder to this version and exit (see [Schema migrations](#schema-migrations)) |
 | `--data-dir` | parent of `--db-path` | Directory for keys and iroh state |
 | `--max-messages-per-channel` | `10000` | Prune oldest messages beyond this count |
 
@@ -281,6 +282,18 @@ chmod 600 /backup/keys/*
 2. Copy backup `.db` files to `--db-path` location
 3. Copy backup `.secret` files to `--data-dir` location
 4. Start the server
+
+### Schema migrations
+
+The database schema is versioned, and startup migrates it forward automatically — upgrading the server never needs a manual step. A binary refuses to open a database stamped with a *newer* schema than it knows, so **rolling back to an older binary requires downgrading the schema first**:
+
+```bash
+# Stop the server, then run the ladder down to the version the old binary expects:
+freeq-server --db-path /data/irc.db --migrate-to 2
+# Then start the older binary as usual.
+```
+
+The command prints the version it moved from and to, then exits without starting the server. Downgrades stop with an error at any migration that is irreversible by design (the database is left at the last version reached) — in that case, restore from backup instead. Take a backup before any downgrade regardless.
 
 ## Connection Limits
 

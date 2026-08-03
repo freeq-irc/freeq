@@ -33,6 +33,14 @@ pub struct ServerConfig {
     #[arg(long)]
     pub db_path: Option<String>,
 
+    /// Run the migration ladder to this schema version and exit instead of
+    /// starting the server. Requires --db-path. Downgrades run each rung's
+    /// down migration; a rung with no down (irreversible) stops with an
+    /// error. Normal startup always migrates to latest — this exists for
+    /// the other direction, e.g. before rolling back to an older binary.
+    #[arg(long, value_name = "VERSION")]
+    pub migrate_to: Option<usize>,
+
     /// HTTP/WebSocket listener address. Enables WebSocket IRC transport and REST API.
     /// If not set, no HTTP listener starts.
     #[arg(long)]
@@ -237,6 +245,7 @@ impl Default for ServerConfig {
             server_name: "freeq".to_string(),
             challenge_timeout_secs: 60,
             db_path: None,
+            migrate_to: None,
             web_addr: None,
             iroh: false,
             iroh_port: None,

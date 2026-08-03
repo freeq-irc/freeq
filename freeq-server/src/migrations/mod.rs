@@ -49,6 +49,35 @@ pub(crate) fn migration_ladder() -> Migrations<'static> {
     ])
 }
 
+/// The schema version stamped on `conn` (0 = unstamped).
+fn stamped_version(conn: &rusqlite::Connection) -> Result<usize, String> {
+    use rusqlite_migration::SchemaVersion;
+    match migration_ladder().current_version(conn) {
+        Ok(SchemaVersion::NoneSet) => Ok(0),
+        Ok(SchemaVersion::Inside(v) | SchemaVersion::Outside(v)) => Ok(v.get()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Run the ladder to `target` against the database file at `path` — the
+/// operational entry point behind `--migrate-to`. Opens the file directly
+/// rather than through `Db::open`, which always migrates to latest and so
+/// can never go down. Returns (version before, version after).
+///
+/// A downgrade stops with an error at any rung that defines no down
+/// (migration 2 is irreversible by design); the database is left at the
+/// last rung reached.
+pub fn migrate_to(path: &str, target: usize) -> Result<(usize, usize), String> {
+    let mut conn = rusqlite::Connection::open(path)
+        .map_err(|e| format!("open {path}: {e}"))?;
+    let before = stamped_version(&conn)?;
+    migration_ladder()
+        .to_version(&mut conn, target)
+        .map_err(|e| e.to_string())?;
+    let after = stamped_version(&conn)?;
+    Ok((before, after))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +167,29 @@ mod tests {
 
         assert_eq!(version(&stepped), version(&direct));
         assert_eq!(tables(&stepped), tables(&direct));
+    }
+
+    /// The `--migrate-to` entry point: a real file, up to latest, down one
+    /// rung, and a loud stop at the rung that defines no down.
+    #[test]
+    fn migrate_to_runs_the_ladder_on_a_file_and_stops_at_irreversible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ladder.db");
+        let path = path.to_str().unwrap();
+
+        let (before, after) = super::migrate_to(path, 3).unwrap();
+        assert_eq!((before, after), (0, 3), "fresh file climbs to the target");
+
+        let (before, after) = super::migrate_to(path, 2).unwrap();
+        assert_eq!((before, after), (3, 2), "the down migration runs");
+
+        let err = super::migrate_to(path, 0).unwrap_err();
+        assert!(
+            !err.is_empty(),
+            "descending past an irreversible rung must error, got success"
+        );
+        let conn = Connection::open(path).unwrap();
+        assert_eq!(version(&conn), 2, "the database stays at the last rung reached");
     }
 
     /// Re-running the ladder against an already-current database is a no-op,
