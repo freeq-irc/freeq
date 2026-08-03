@@ -2,34 +2,38 @@
 
 Run your own freeq server with TLS, the web client, and optional federation.
 
+> Just want it running? The [Self-Hosting Quickstart](self-hosting-quickstart.md)
+> covers the three simplest paths (Miren, Docker, single binary) with
+> copy-paste commands. This guide is the full reference.
+
 ## Recommended: Miren
 
-The default self-hosting path. [Miren](https://miren.dev/) is a self-hosted,
-Heroku-style PaaS — one command builds and deploys the IRC server **and** the
-web client, with `$PORT` injection, a `Procfile` process model, and HTTPS
-routing for your domain:
+The default self-hosting path. [Miren](https://miren.md/) is a container
+platform you run on your own server. The repo ships a ready Miren config at
+[`.miren/app.toml`](../.miren/app.toml) — three commands build and deploy
+the IRC server **and** the web client, with HTTPS routing, automatic Let's
+Encrypt certs, a persistent managed disk for the database and keys, and a
+hard pin to one instance (IRC state is in-process — no autoscaling):
 
 ```bash
-# Prerequisites: a Miren instance + the miren CLI installed and logged in
+# Prerequisites: a Miren server + the miren CLI installed and logged in
+# (host firewall: TCP 80/443 + UDP 8443 open)
 git clone https://github.com/freeq-irc/freeq
 cd freeq
-DOMAIN=irc.example.com ./deploy/miren/deploy.sh
+
+miren deploy -e FREEQ_SERVER_NAME=irc.example.com
+miren route set irc.example.com freeq
+miren env set -s OPER_PASSWORD   # optional, masked prompt
 ```
 
-Then point DNS (A/AAAA) for `irc.example.com` at your Miren host. Miren's
-router terminates TLS; the web client is served at the root, WebSocket IRC at
-`/irc`, REST API at `/api/v1/*`.
+Then point DNS at your cluster — a CNAME to its `*.miren.systems` hostname
+for subdomains, or ALIAS/ANAME/A at the apex. The web client is served at
+the root, WebSocket IRC at `/irc`, REST API at `/api/v1/*`; native TCP IRC
+(6667) is a documented opt-in.
 
-Secrets can be exported before deploying:
-
-```bash
-OPER_PASSWORD=... BROKER_SHARED_SECRET=... \
-DOMAIN=irc.example.com ./deploy/miren/deploy.sh
-```
-
-The full 10-minute walkthrough — secrets, domain/TLS, where the SQLite data
-lives and how to back it up, upgrades, the auth broker, and federation flags
-— is in [deploy/miren/README.md](../deploy/miren/README.md).
+The full 10-minute walkthrough — DNS options, secrets, where the SQLite
+data lives and how to back it up, upgrades, the auth broker, and federation
+flags — is in [deploy/miren/README.md](../deploy/miren/README.md).
 
 ## Fallback: Docker Compose
 
@@ -48,18 +52,22 @@ For TLS termination with nginx:
 docker compose --profile with-tls up -d
 ```
 
-For the OAuth broker (needed for web client AT Protocol login):
+The OAuth broker (AT Protocol web login) is embedded in the server by
+default — no extra service needed. To run it as a separate service instead
+(separate auth domain, sessions that survive restarts):
 ```bash
 docker compose --profile with-broker up -d
 ```
 
-Plain Docker, without compose:
+Plain Docker, without compose (builds from source — prebuilt
+`ghcr.io/freeq-irc/freeq` images arrive with the first tagged release):
 
 ```bash
+docker build -t freeq .
 docker run -d \
   -p 6667:6667 -p 8080:8080 \
   -v freeq-data:/data \
-  ghcr.io/freeq-irc/freeq:latest
+  freeq
 ```
 
 ## From source

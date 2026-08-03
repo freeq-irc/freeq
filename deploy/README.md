@@ -1,7 +1,7 @@
 # Deployment
 
 **Map of this directory:** [`miren/`](miren/README.md) is the **recommended
-self-hosting path** — a generalized, parameterized [Miren](https://miren.dev/)
+self-hosting path** — a generalized, parameterized [Miren](https://miren.md/)
 deploy (server + web client) any user can run from a fresh clone; start with
 [deploy/miren/README.md](miren/README.md). `irc/` is the **maintainer's
 bespoke production deploy** of irc.freeq.at on Miren (hardcoded app name,
@@ -81,25 +81,28 @@ sudo journalctl -u freeq-server -f   # Tail logs
 
 ## Recommended: Miren Deployment
 
-[Miren](https://miren.dev/) is a self-hosted, Heroku-style PaaS. The `miren/`
-subdirectory contains a parameterized deployment any user can run from a
-fresh clone:
+[Miren](https://miren.md/) is a container platform you run on your own
+server. The repo ships a ready-to-use config at `.miren/app.toml`, so a
+fresh clone deploys directly — no staging script:
 
 ```sh
-DOMAIN=irc.example.com ./deploy/miren/deploy.sh
+miren deploy -e FREEQ_SERVER_NAME=irc.example.com
+miren route set irc.example.com freeq
 ```
 
-This script:
-1. Copies the workspace + web client to a temp directory
-2. Generates a Miren app config, Procfile, and Dockerfile
-3. Runs `miren deploy -f`
-4. Sets the route for your domain
+The committed config builds the root `Dockerfile` (server + web client),
+runs `freeq-server` with `$PORT` injected, pins the app to **one fixed
+instance** (in-process IRC state + SQLite must never autoscale), and
+attaches a **managed disk at `/data`** so the database and server keys
+survive redeploys. Secrets go in via `miren env set -s` — never into
+`app.toml`.
 
-The Procfile runs freeq-server with data stored at `/app/data/`. Miren sets `$PORT` for the web interface.
+**Requirements:** Miren CLI installed and logged in (`miren login`), TCP
+80/443 + UDP 8443 open on the host, and DNS pointing your domain at the
+cluster.
 
-**Requirements:** Miren CLI installed and logged in, DNS pointing your domain at your Miren instance.
-
-Full quickstart (secrets, TLS, backups, upgrades, federation): [deploy/miren/README.md](miren/README.md).
+Full quickstart (DNS/TLS, secrets, backups, upgrades, federation, native
+IRC): [deploy/miren/README.md](miren/README.md).
 
 `irc/` and `staging/` are the maintainer's hardcoded production/staging
 variants of the same approach — useful as reference, not meant to be run by

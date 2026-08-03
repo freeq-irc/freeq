@@ -1,6 +1,7 @@
 """freeq.at — static site with markdown docs rendering."""
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -106,6 +107,7 @@ SLUG_MAP = {
     "moderation": ("site", "moderation.md"),
     "federation": ("site", "federation.md"),
     "self-hosting": ("site", "self-hosting.md"),
+    "self-hosting-quickstart": ("site", "self-hosting-quickstart.md"),
     "api-reference": ("site", "api-reference.md"),
     # Repo docs (existing technical docs)
     "protocol": ("site", "PROTOCOL.md"),
@@ -137,6 +139,54 @@ SLUG_MAP = {
     "vc-e2e-channels": ("site", "VC-BOOTSTRAPPED-CHANNEL-E2EE.md"),
     "self-hosting-e2e": ("site", "SELF-HOSTING-END-TO-END.md"),
 }
+
+
+# ── Relative .md link rewriting ──────────────────────────────────────
+#
+# Docs are written for the repo (GitHub), where relative links like
+# `[guide](self-hosting.md)` or `[deploy](../deploy/miren/README.md)` work.
+# Served on the site those hrefs are dead, so rewrite them at render time:
+# links to files that have a docs page become `/docs/<slug>/`, anything else
+# that exists in the repo becomes a github.com blob URL.
+
+GITHUB_BLOB_BASE = "https://github.com/freeq-irc/freeq/blob/main/"
+
+_MD_BASENAME_TO_SLUG = {}
+for _slug, (_source, _fn) in SLUG_MAP.items():
+    _MD_BASENAME_TO_SLUG.setdefault(Path(_fn).name.lower(), _slug)
+
+_HREF_RE = re.compile(r'href="([^"]+)"')
+
+
+def rewrite_links(html: str, doc_filename: str) -> str:
+    """Rewrite relative .md hrefs in rendered HTML for site serving."""
+    # Doc's directory, relative to the repo root (docs/<parent>).
+    source_dir = Path("docs") / Path(doc_filename).parent
+
+    def repl(m):
+        href = m.group(1)
+        if "://" in href or href.startswith(("/", "#", "mailto:")):
+            return m.group(0)
+        path_part, _, anchor = href.partition("#")
+        is_md = path_part.lower().endswith(".md")
+        # Process .md links anywhere, plus any explicit relative link
+        # (../deploy/..., ../.miren/app.toml) — those are repo references.
+        if not is_md and not path_part.startswith(("./", "../")):
+            return m.group(0)
+        slug = _MD_BASENAME_TO_SLUG.get(Path(path_part).name.lower()) if is_md else None
+        if slug:
+            new = f"/docs/{slug}/" + (f"#{anchor}" if anchor else "")
+            return f'href="{new}"'
+        resolved = os.path.normpath(str(source_dir / path_part))
+        # Anything that resolves inside the repo → GitHub blob URL. (Can't
+        # check existence here: the deployed site only ships docs/, not the
+        # full repo. test_docs_links verifies targets locally.)
+        if not resolved.startswith(".."):
+            new = GITHUB_BLOB_BASE + resolved + (f"#{anchor}" if anchor else "")
+            return f'href="{new}"'
+        return m.group(0)
+
+    return re.sub(_HREF_RE, repl, html)
 
 
 # ── Routes ────────────────────────────────────────────────────────
@@ -319,6 +369,7 @@ def docs_page(slug):
         }
         return f"<pre>Doc not found:\n{json.dumps(info, indent=2)}</pre>", 404
     doc = render_md(filepath)
+    doc["html"] = rewrite_links(doc["html"], filename)
     return render_template("doc_page.html", doc=doc)
 
 

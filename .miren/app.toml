@@ -1,0 +1,90 @@
+# freeq — self-hosted Miren deployment
+#
+# This file is everything Miren needs to deploy freeq from a fresh clone:
+#
+#   miren deploy --analyze                 # inspect what will be built/run
+#   miren deploy -e FREEQ_SERVER_NAME=irc.example.com
+#   miren route set irc.example.com freeq  # + point DNS at your cluster
+#
+# Full walkthrough (secrets, backups, upgrades, federation, native IRC):
+# deploy/miren/README.md  ·  https://freeq.at/docs/self-hosting-quickstart/
+#
+# Miren respects .gitignore when uploading, so target/ and node_modules/
+# are not part of the deploy bundle.
+
+name = "freeq"
+
+# Build from the repository root Dockerfile (server + web client).
+[build]
+dockerfile = "Dockerfile"
+
+# Miren requires an explicit service command for custom Dockerfiles (the
+# image's CMD/ENTRYPOINT is not used). User-controlled values come from env
+# vars, referenced with quoted shell expansion so values can't break or
+# inject into the command line.
+[services.web]
+command = """
+exec freeq-server \
+  --listen-addr 127.0.0.1:6667 \
+  --web-addr 0.0.0.0:${PORT:-8080} \
+  --web-static-dir /app/web \
+  --server-name "$FREEQ_SERVER_NAME" \
+  --db-path /data/irc.db \
+  --data-dir /data \
+  --motd "$FREEQ_MOTD"
+"""
+port_timeout = "60s"
+
+[[services.web.ports]]
+port = 8080
+name = "http"
+type = "http"
+
+# ── Native IRC over raw TCP (opt-in) ──────────────────────────────────────
+# By default clients reach IRC through the WebSocket gateway at /irc on your
+# HTTPS domain — no extra ports. To let any IRC client connect directly,
+# uncomment below AND allow inbound TCP 6667 in your host firewall / security
+# group (node ports are exposed on the host directly, bypassing Miren's HTTP
+# router and its TLS — clients will be on a plaintext connection).
+#
+# [[services.web.ports]]
+# port = 6667
+# name = "irc"
+# type = "tcp"
+# node_port = 6667
+#
+# …and change --listen-addr above to 0.0.0.0:6667.
+
+# ── Concurrency: exactly one instance, always ─────────────────────────────
+# freeq holds IRC state in-process and uses a local SQLite database — it is
+# not an interchangeable web worker. Never autoscale it (a managed Miren disk
+# also requires fixed/1 because the disk lease is exclusive).
+[services.web.concurrency]
+mode = "fixed"
+num_instances = 1
+shutdown_timeout = "30s"
+
+# ── Persistent state ──────────────────────────────────────────────────────
+# SQLite database + server keys (signing identity, db-encryption-key.secret,
+# iroh identity). A managed Miren disk is created on first deploy, survives
+# redeploys, is chowned to the container's run user automatically, and can be
+# snapshotted with `miren disk backup` (see deploy/miren/README.md).
+[[services.web.disks]]
+name = "freeq-data"
+mount_path = "/data"
+size_gb = 10
+filesystem = "ext4"
+
+# ── Configuration (non-secret; secrets go in via `miren env set -s`) ──────
+[[env]]
+key = "FREEQ_SERVER_NAME"
+value = "freeq"
+required = true
+
+[[env]]
+key = "FREEQ_MOTD"
+value = "Welcome to freeq — IRC with AT Protocol identity."
+
+[[env]]
+key = "RUST_LOG"
+value = "info"
