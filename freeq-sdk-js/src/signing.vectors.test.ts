@@ -40,7 +40,10 @@ interface Vector {
 interface Negative {
   name: string;
   vector: string;
-  tamperedCanonical: string;
+  /** A document-level attack: this canonical against the vector's sigTag. */
+  tamperedCanonical?: string;
+  /** A tag-level attack: this sigTag against the vector's canonical. */
+  sigTag?: string;
   expected: 'invalid' | 'unverifiable';
 }
 
@@ -124,15 +127,36 @@ describe('chat signing vectors', () => {
     });
   }
 
+  /**
+   * The three-state verdict, as every verifier must reach it: only a
+   * well-formed ed25519 tag whose kid matches the key on hand can be judged
+   * `invalid`; a tag we cannot even check — legacy shape, foreign algorithm,
+   * a kid naming a key we do not hold — is `unverifiable`, never forgery.
+   */
+  async function verdict(
+    canonical: string,
+    sigTag: string,
+    publicKey: string,
+  ): Promise<'valid' | 'invalid' | 'unverifiable'> {
+    const parts = sigTag.split(':');
+    if (parts.length !== 3) return 'unverifiable';
+    const [alg, kid] = parts;
+    if (alg !== 'ed25519') return 'unverifiable';
+    if (kid !== (await signing.deriveKid(fromB64url(publicKey)))) return 'unverifiable';
+    return (await verify(canonical, sigTag, publicKey)) ? 'valid' : 'invalid';
+  }
+
   for (const n of spec.negatives) {
     it(`reaches "${n.expected}" for ${n.name}`, async () => {
       const v = spec.vectors.find((x) => x.name === n.vector)!;
       expect(v, `negative names unknown vector ${n.vector}`).toBeTruthy();
-      // Every negative here is tampering with covered content, so the
-      // signature must fail against the very key it names — the one outcome
-      // that is a verdict about the bytes rather than a missing capability.
-      expect(n.expected).toBe('invalid');
-      expect(await verify(n.tamperedCanonical, v.sigTag, v.publicKey)).toBe(false);
+      // A negative attacks either the document (tamperedCanonical against
+      // the vector's real signature) or the tag itself (sigTag against the
+      // vector's real canonical) — exactly one of the two is present.
+      expect(Boolean(n.tamperedCanonical) !== Boolean(n.sigTag)).toBe(true);
+      const canonical = n.tamperedCanonical ?? v.canonical;
+      const sigTag = n.sigTag ?? v.sigTag;
+      expect(await verdict(canonical, sigTag, v.publicKey)).toBe(n.expected);
     });
   }
 

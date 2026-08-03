@@ -783,18 +783,69 @@ mod tests {
         ]
     }
 
-    /// Negative vectors: each takes a positive vector's signature and a
-    /// tampered document, and states the verdict every implementation must
-    /// reach. `invalid` is evidence about the bytes; `unverifiable` never is.
-    fn negatives() -> Vec<(&'static str, &'static str, ChatDoc<'static>, &'static str)> {
+    /// A negative vector attacks one of the two things a verifier holds: the
+    /// document (a tampered canonical, checked against the vector's real
+    /// signature) or the sig tag itself (a rewritten tag, checked against the
+    /// vector's real canonical). Exactly one of `tampered`/`sig` is set.
+    /// `invalid` is evidence about the bytes; `unverifiable` never is.
+    struct Negative {
+        name: &'static str,
+        of: &'static str,
+        tampered: Option<ChatDoc<'static>>,
+        sig: Option<SigAttack>,
+        expected: &'static str,
+    }
+
+    /// The tag-level attacks. Each needs the positive vector's signature
+    /// bytes, so the concrete tag is built at fixture time.
+    enum SigAttack {
+        /// Valid signature bytes, but the kid names a key nobody holds.
+        WrongKid,
+        /// An algorithm label this implementation has never heard of.
+        UnknownAlgorithm,
+        /// The pre-cutover format: a bare base64 blob, no algorithm, no kid.
+        LegacyBareBase64,
+    }
+
+    impl SigAttack {
+        fn build(&self, real_sig_tag: &str) -> String {
+            use base64::Engine;
+            let sig_b64 = real_sig_tag.rsplit(':').next().unwrap();
+            match self {
+                SigAttack::WrongKid => {
+                    let foreign_kid = crate::sigtag::derive_kid(&test_key(9).verifying_key());
+                    format!("ed25519:{foreign_kid}:{sig_b64}")
+                }
+                SigAttack::UnknownAlgorithm => {
+                    let kid = real_sig_tag.split(':').nth(1).unwrap();
+                    format!("ml-dsa-87:{kid}:{sig_b64}")
+                }
+                SigAttack::LegacyBareBase64 => {
+                    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(sig_b64)
+                        .unwrap();
+                    base64::engine::general_purpose::STANDARD.encode(raw)
+                }
+            }
+        }
+    }
+
+    fn doc_negative(name: &'static str, of: &'static str, tampered: ChatDoc<'static>) -> Negative {
+        Negative { name, of, tampered: Some(tampered), sig: None, expected: "invalid" }
+    }
+
+    fn sig_negative(name: &'static str, of: &'static str, sig: SigAttack) -> Negative {
+        Negative { name, of, tampered: None, sig: Some(sig), expected: "unverifiable" }
+    }
+
+    fn negatives() -> Vec<Negative> {
         vec![
-            (
+            doc_negative(
                 "altered-body",
                 "message-plain",
                 ChatDoc::message(ALICE, MSGID, "#freeq", "ship it tomorrow"),
-                "invalid",
             ),
-            (
+            doc_negative(
                 "stripped-edit",
                 "message-reply-edit-and-coord",
                 ChatDoc::message(ALICE, MSGID, "#swarm", "revised: use the cached index")
@@ -805,9 +856,16 @@ mod tests {
                         ("+freeq.at/task-id", "01KYVT2AAA0000000000000000"),
                         ("+freeq.at/ref", "01KYVT2BBB0000000000000000"),
                     ]),
-                "invalid",
             ),
-            (
+            // The inverse: an edit reference attached to a message that was
+            // signed without one — an intermediary rewriting history *into*
+            // a signed event rather than out of it.
+            doc_negative(
+                "injected-edit",
+                "message-plain",
+                ChatDoc::message(ALICE, MSGID, "#freeq", "ship it").with_edit(ROOT),
+            ),
+            doc_negative(
                 "sanitized-coord-tag",
                 "message-reply-edit-and-coord",
                 ChatDoc::message(ALICE, MSGID, "#swarm", "revised: use the cached index")
@@ -819,15 +877,13 @@ mod tests {
                         ("+freeq.at/task-id", "01KYVT2AAA0000000000000000"),
                         ("+freeq.at/ref", "01KYVT2BBB0000000000000000"),
                     ]),
-                "invalid",
             ),
-            (
+            doc_negative(
                 "re-venued-target",
                 "message-plain",
                 ChatDoc::message(ALICE, MSGID, "#public", "ship it"),
-                "invalid",
             ),
-            (
+            doc_negative(
                 "swapped-subject",
                 "delete",
                 ChatDoc::mutation(
@@ -837,14 +893,15 @@ mod tests {
                     "#freeq",
                     "01KYVT9ZZZ0000000000000000",
                 ),
-                "invalid",
             ),
-            (
+            doc_negative(
                 "verb-swap-react-to-unreact",
                 "react",
                 ChatDoc::mutation(Mutation::Unreact, ALICE, MSGID, "#freeq", ROOT).with_emoji("👍"),
-                "invalid",
             ),
+            sig_negative("wrong-kid", "message-plain", SigAttack::WrongKid),
+            sig_negative("unknown-algorithm", "message-plain", SigAttack::UnknownAlgorithm),
+            sig_negative("legacy-bare-base64", "message-plain", SigAttack::LegacyBareBase64),
         ]
     }
 
@@ -879,18 +936,26 @@ mod tests {
 
         let negatives: Vec<serde_json::Value> = negatives()
             .into_iter()
-            .map(|(name, of, tampered, expected)| {
-                serde_json::json!({
-                    "name": name,
-                    "vector": of,
-                    "tamperedCanonical": tampered.canonical(),
-                    "expected": expected,
-                })
+            .map(|n| {
+                let mut entry = serde_json::json!({
+                    "name": n.name,
+                    "vector": n.of,
+                    "expected": n.expected,
+                });
+                if let Some(tampered) = &n.tampered {
+                    entry["tamperedCanonical"] = tampered.canonical().into();
+                }
+                if let Some(attack) = &n.sig {
+                    let case = cases().into_iter().find(|c| c.name == n.of).unwrap();
+                    let real = case.doc.sign(&test_key(case.seed));
+                    entry["sigTag"] = attack.build(&real).into();
+                }
+                entry
             })
             .collect();
 
         serde_json::json!({
-            "description": "Worked signing examples for freeq chat events (messages, deletes, reactions). Every implementation must reproduce `canonical` and `sigTag` byte-for-byte from `input` + `seed`, and must reach `expected` for each negative when checking that vector's sigTag against `tamperedCanonical`.",
+            "description": "Worked signing examples for freeq chat events (messages, deletes, reactions). Every implementation must reproduce `canonical` and `sigTag` byte-for-byte from `input` + `seed`, and must reach `expected` for each negative: check the negative's `sigTag` when present (a tag-level attack, against the named vector's canonical), otherwise the vector's own sigTag against `tamperedCanonical` (a document-level attack).",
             "documentRule": "JCS (RFC 8785) over an enumerated per-kind document. Mandatory: from, msgid, target. A message carries no `kind` (its absence is the kind) and covers body/reply?/edit?/coord?; a mutation carries kind and subject, plus emoji for react|unreact. Optional fields are omitted entirely when absent.",
             "bodyRule": "body = \"sha256:\" + lowercase hex of SHA-256 over the UTF-8 wire body — ciphertext under E2EE, and the assembled body (real newlines) for a draft/multiline batch.",
             "venueRule": "target is the normalized venue, never the wire target: a channel lowercased, or `dm:<did_a>,<did_b>` with the two DIDs sorted ascending.",
@@ -935,22 +1000,30 @@ mod tests {
                 .verify(&sig, &key.verifying_key())
                 .unwrap_or_else(|e| panic!("vector {} failed to verify: {e}", case.name));
         }
-        for (name, of, tampered, expected) in negatives() {
+        for n in negatives() {
             let case = cases()
                 .into_iter()
-                .find(|c| c.name == of)
-                .unwrap_or_else(|| panic!("negative {name} names unknown vector {of}"));
+                .find(|c| c.name == n.of)
+                .unwrap_or_else(|| panic!("negative {} names unknown vector {}", n.name, n.of));
             let key = test_key(case.seed);
-            let sig = case.doc.sign(&key);
-            let err = tampered
+            let real_sig = case.doc.sign(&key);
+            // A doc attack checks the real signature against the tampered
+            // document; a tag attack checks the rewritten tag against the
+            // real document.
+            let (doc, sig) = match (&n.tampered, &n.sig) {
+                (Some(tampered), None) => (tampered, real_sig),
+                (None, Some(attack)) => (&case.doc, attack.build(&real_sig)),
+                _ => panic!("negative {} must set exactly one of tampered/sig", n.name),
+            };
+            let err = doc
                 .verify(&sig, &key.verifying_key())
-                .expect_err("a tampered document must not verify");
+                .expect_err("a negative must not verify");
             let got = if err.is_unverifiable() {
                 "unverifiable"
             } else {
                 "invalid"
             };
-            assert_eq!(got, expected, "negative {name}");
+            assert_eq!(got, n.expected, "negative {}", n.name);
         }
     }
 }
