@@ -261,6 +261,11 @@ pub(crate) enum ClientSigOutcome {
     Unverifiable(&'static str),
 }
 
+/// The one reason a signature is uncheckable that a key lookup can fix — the
+/// signer is real and named a key, we just do not hold it. See
+/// [`crate::peer_keys`].
+pub(crate) const NO_KEY_ON_FILE: &str = "no key on file for that kid";
+
 /// Verify `sig_tag` over `doc`, using the key its `kid` names.
 ///
 /// `session` is the local session that registered the key, when there is one.
@@ -295,7 +300,7 @@ fn verify_client_signature(
             .and_then(|bytes| ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok())
         {
             Some(vk) => vk,
-            None => return ClientSigOutcome::Unverifiable("no key on file for that kid"),
+            None => return ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE),
         },
     };
 

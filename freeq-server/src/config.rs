@@ -68,6 +68,16 @@ pub struct ServerConfig {
     #[arg(long, value_delimiter = ',')]
     pub s2s_allowed_peers: Vec<String>,
 
+    /// Where each S2S peer serves its own users' message-signing keys.
+    /// Comma-separated `<endpoint-id>=<http(s)://base>` entries — the base URL
+    /// of the peer's REST API, e.g. `44f1415c...=https://irc.example.com`.
+    /// Without an entry a peer's signatures stay uncheckable here (never
+    /// "invalid"), because there is nowhere to fetch the signer's key from.
+    /// Deliberately configuration rather than something a peer announces: no
+    /// peer gets to choose where this server sends requests.
+    #[arg(long, value_delimiter = ',')]
+    pub s2s_peer_api: Vec<String>,
+
     /// S2S peer trust levels. Format: "endpoint_id:level" where level is
     /// "full" (default), "relay" (messages only), or "readonly" (observe only).
     /// Peers not listed here default to "full" if in --s2s-allowed-peers.
@@ -251,6 +261,7 @@ impl Default for ServerConfig {
             iroh_port: None,
             s2s_peers: vec![],
             s2s_allowed_peers: vec![],
+            s2s_peer_api: vec![],
             s2s_peer_trust: vec![],
             server_did: None,
             data_dir: None,

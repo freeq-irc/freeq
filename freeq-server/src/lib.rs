@@ -18,6 +18,7 @@ pub mod migrations;
 pub mod media_store;
 pub mod model_proxy;
 pub mod msgid;
+pub mod peer_keys;
 pub mod plugin;
 pub mod policy;
 pub mod s2s;

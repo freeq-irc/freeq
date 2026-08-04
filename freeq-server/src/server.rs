@@ -3451,7 +3451,15 @@ pub(crate) async fn process_s2s_message(
                 other => other,
             };
             if let Some(verdict) = sig_verdict {
-                use crate::connection::messaging::ClientSigOutcome;
+                use crate::connection::messaging::{ClientSigOutcome, NO_KEY_ON_FILE};
+                // A signer we hold no key for. Ask its home server — off this
+                // path, so nothing waits: the message is already on its way,
+                // labeled honestly, and the answer serves the next one.
+                if let (ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE), Some(did), Some(sig)) =
+                    (verdict, account.as_deref(), sig.as_deref())
+                {
+                    crate::peer_keys::fetch_on_miss(state, &origin, did, sig);
+                }
                 match verdict {
                     ClientSigOutcome::Verified => tracing::debug!(
                         peer = %authenticated_peer_id, target = %target,
@@ -3997,7 +4005,14 @@ pub(crate) async fn process_s2s_message(
             // the check reads the tags as they arrived.
             let sig_verdict = verify_relayed_mutation_tags(state, peer_account.as_deref(), &target, &tags);
             if let Some(verdict) = sig_verdict {
-                use crate::connection::messaging::ClientSigOutcome;
+                use crate::connection::messaging::{ClientSigOutcome, NO_KEY_ON_FILE};
+                if let (ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE), Some(did), Some(sig)) = (
+                    verdict,
+                    peer_account.as_deref(),
+                    tags.get("+freeq.at/sig").map(String::as_str),
+                ) {
+                    crate::peer_keys::fetch_on_miss(state, &origin, did, sig);
+                }
                 match verdict {
                     ClientSigOutcome::Verified => tracing::debug!(
                         peer = %authenticated_peer_id, target = %target,
@@ -5613,7 +5628,7 @@ mod nickmap_tests {
 }
 
 #[cfg(test)]
-pub(crate) use s2s_adversarial_tests::{test_state, test_state_with_db};
+pub(crate) use s2s_adversarial_tests::{test_state, test_state_with_config, test_state_with_db};
 
 #[cfg(test)]
 mod s2s_adversarial_tests {
@@ -5625,23 +5640,32 @@ mod s2s_adversarial_tests {
 
     /// Build a minimal SharedState for testing (no DB, no iroh).
     pub(crate) fn test_state() -> Arc<SharedState> {
-        test_state_inner(None)
+        test_state_inner(None, None)
     }
 
     /// Like `test_state` but with an in-memory SQLite DB attached, so
     /// persistence paths (`identities`, `messages`, …) are exercised. Shared
     /// with other modules' tests (e.g. web endpoints) via the re-export below.
     pub(crate) fn test_state_with_db() -> Arc<SharedState> {
-        test_state_inner(Some(crate::db::Db::open_memory().unwrap()))
+        test_state_inner(Some(crate::db::Db::open_memory().unwrap()), None)
     }
 
-    fn test_state_inner(db: Option<crate::db::Db>) -> Arc<SharedState> {
-        let config = crate::config::ServerConfig {
+    /// Like `test_state_with_db`, for the flags a test needs to set — the
+    /// config is read at runtime, so it cannot be adjusted after construction.
+    pub(crate) fn test_state_with_config(config: crate::config::ServerConfig) -> Arc<SharedState> {
+        test_state_inner(Some(crate::db::Db::open_memory().unwrap()), Some(config))
+    }
+
+    fn test_state_inner(
+        db: Option<crate::db::Db>,
+        config: Option<crate::config::ServerConfig>,
+    ) -> Arc<SharedState> {
+        let config = config.unwrap_or_else(|| crate::config::ServerConfig {
             listen_addr: "127.0.0.1:0".to_string(),
             server_name: "test-s2s".to_string(),
             challenge_timeout_secs: 60,
             ..Default::default()
-        };
+        });
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         Arc::new(SharedState {
             server_name: config.server_name.clone(),
@@ -6114,6 +6138,69 @@ mod s2s_adversarial_tests {
         assert!(
             frame.contains("+reply=01ROOTMSGID"),
             "a federated reply must arrive as a reply: {frame}"
+        );
+    }
+
+    /// A relayed message from a signer we hold no key for asks that signer's
+    /// home server for it — and is delivered anyway, in the same pass. A
+    /// lookup that held chat back would be the wrong trade every time.
+    #[tokio::test]
+    async fn a_relayed_message_from_an_unknown_signer_asks_its_home_server() {
+        let did = "did:plc:unknownatreceive";
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let sig = sign_channel_message(&key, did, "01UNKNOWNSIGNER", "#chat", "who am i");
+
+        // A peer whose key server is named, but which we have asked nothing of
+        // yet. The address need not answer: what is under test is that the
+        // lookup is started and the message does not wait for it.
+        let state = test_state_with_config(crate::config::ServerConfig {
+            s2s_peer_api: vec![format!("{PEER}=http://127.0.0.1:1")],
+            ..Default::default()
+        });
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#chat");
+
+        let (tx, mut rx) = mpsc::channel(16);
+        state.connections.lock().insert("w".to_string(), tx);
+        state.cap_message_tags.lock().insert("w".to_string());
+        state
+            .channels
+            .lock()
+            .get_mut("#chat")
+            .unwrap()
+            .members
+            .insert("w".to_string());
+
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Privmsg {
+                event_id: format!("{PEER}:unknown1"),
+                from: "stranger!u@s2s".to_string(),
+                target: "#chat".to_string(),
+                text: "who am i".to_string(),
+                origin: PEER.to_string(),
+                msgid: Some("01UNKNOWNSIGNER".to_string()),
+                sig: Some(sig),
+                account: Some(did.to_string()),
+                recipient_did: None,
+                replaces_msgid: None,
+                tags: HashMap::new(),
+                multiline_lines: None,
+            },
+        )
+        .await;
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "the message must reach local members without waiting on a key lookup"
+        );
+        assert!(
+            crate::peer_keys::lookup_pending(did, &kid),
+            "an unknown signer must start a lookup with its home server"
         );
     }
 
