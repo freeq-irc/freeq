@@ -347,6 +347,7 @@ pub(crate) fn verify_relayed_message(
 /// `event_msgid` is the mutation's own signer-minted id and `subject` the
 /// message it acts on, both as transmitted — the subject before it was
 /// resolved to a local root, since the signer signed the id it was given.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_relayed_mutation(
     state: &Arc<SharedState>,
     sender_did: &str,
@@ -357,18 +358,83 @@ pub(crate) fn verify_relayed_mutation(
     emoji: Option<&str>,
     sig_tag: &str,
 ) -> ClientSigOutcome {
+    verify_mutation(
+        state,
+        sender_did,
+        target,
+        kind,
+        event_msgid,
+        subject,
+        emoji,
+        sig_tag,
+        None,
+    )
+}
+
+/// Check the signature on a mutation a client is sending *here*.
+///
+/// The same document and the same rules as a relayed one, with one
+/// difference: this signer authenticated to this server, so its session's
+/// registered key is consulted first. The common order is register-then-send,
+/// and the durable store is not the fast path for a key minted seconds ago.
+///
+/// The document binds the sender's DID, so a signature made under someone
+/// else's identity rebuilds a different document and fails — which is the
+/// point, and why the caller passes the connection's own DID rather than
+/// anything the client asserted.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_local_mutation(
+    state: &Arc<SharedState>,
+    conn: &Connection,
+    target: &str,
+    kind: freeq_sdk::chatsig::Mutation,
+    event_msgid: &str,
+    subject: &str,
+    emoji: Option<&str>,
+    sig_tag: &str,
+) -> ClientSigOutcome {
+    let Some(did) = conn.authenticated_did.as_deref() else {
+        // A guest has no identity to bind, so there is no document — and
+        // nothing for a signature to be evidence of.
+        return ClientSigOutcome::Unverifiable("a guest cannot sign");
+    };
+    verify_mutation(
+        state,
+        did,
+        target,
+        kind,
+        event_msgid,
+        subject,
+        emoji,
+        sig_tag,
+        Some(&conn.id),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_mutation(
+    state: &Arc<SharedState>,
+    sender_did: &str,
+    target: &str,
+    kind: freeq_sdk::chatsig::Mutation,
+    event_msgid: &str,
+    subject: &str,
+    emoji: Option<&str>,
+    sig_tag: &str,
+    session: Option<&str>,
+) -> ClientSigOutcome {
     if event_msgid.is_empty() {
-        return ClientSigOutcome::Unverifiable("relayed mutation carries no event id");
+        return ClientSigOutcome::Unverifiable("mutation carries no event id");
     }
     let Some(venue) = signing_venue(state, sender_did, target) else {
-        return ClientSigOutcome::Unverifiable("venue for the relayed target does not resolve");
+        return ClientSigOutcome::Unverifiable("venue for the target does not resolve");
     };
     let mut doc =
         freeq_sdk::chatsig::ChatDoc::mutation(kind, sender_did, event_msgid, &venue, subject);
     if let Some(emoji) = emoji {
         doc = doc.with_emoji(emoji);
     }
-    verify_client_signature(&doc, sig_tag, sender_did, None, state)
+    verify_client_signature(&doc, sig_tag, sender_did, session, state)
 }
 
 /// Verify a commit-reveal binding declared on a PRIVMSG carrying
@@ -551,6 +617,97 @@ impl TagmsgLines {
     }
 }
 
+/// A mutation's signature, checked against the event exactly as it arrived.
+pub(super) struct CheckedMutation {
+    kind: freeq_sdk::chatsig::Mutation,
+    /// The subject as the signer named it, before any re-rooting.
+    subject: String,
+    outcome: ClientSigOutcome,
+}
+
+/// The mutation a TAGMSG's tags describe, if any: the kind, the msgid it acts
+/// on, and — for reactions — the emoji.
+///
+/// Both spellings of every tag, because this reads the wire before the draft
+/// names are canonicalized. Kept in step with the sender side
+/// (`freeq_sdk::client`) and the receive side (`verify_relayed_mutation_tags`)
+/// so what one signs is what the others rebuild.
+fn mutation_in(
+    tags: &HashMap<String, String>,
+) -> Option<(freeq_sdk::chatsig::Mutation, String, Option<String>)> {
+    use freeq_sdk::chatsig::Mutation;
+    let get = |a: &str, b: &str| tags.get(a).or_else(|| tags.get(b)).cloned();
+    let subject = || get("+reply", "+draft/reply");
+    if let Some(subject) = get("+draft/delete", "+delete") {
+        return Some((Mutation::Delete, subject, None));
+    }
+    if let Some(emoji) = get("+react", "+draft/react") {
+        return Some((Mutation::React, subject()?, Some(emoji)));
+    }
+    if let Some(emoji) = tags.get("+freeq.at/unreact").cloned() {
+        return Some((Mutation::Unreact, subject()?, Some(emoji)));
+    }
+    None
+}
+
+/// Check the signature on an incoming mutation, if it carries one.
+///
+/// `None` when the event is not a mutation (typing, AV signalling — ephemera
+/// nobody signs) or carries no signature at all, which is today's traffic and
+/// stays exactly as permissive as today.
+fn mutation_signature(
+    conn: &Connection,
+    target: &str,
+    tags: &HashMap<String, String>,
+    state: &Arc<SharedState>,
+) -> Option<CheckedMutation> {
+    let sig_tag = tags
+        .get("+freeq.at/sig")
+        .or_else(|| tags.get("freeq.at/sig"))?;
+    let (kind, subject, emoji) = mutation_in(tags)?;
+    let event_msgid = tags
+        .get(freeq_sdk::chatsig::EVENT_ID_TAG)
+        .or_else(|| tags.get(freeq_sdk::chatsig::EVENT_ID_TAG_BARE))
+        .map(String::as_str)
+        .unwrap_or_default();
+    let outcome = verify_local_mutation(
+        state,
+        conn,
+        target,
+        kind,
+        event_msgid,
+        &subject,
+        emoji.as_deref(),
+        sig_tag,
+    );
+    Some(CheckedMutation {
+        kind,
+        subject,
+        outcome,
+    })
+}
+
+/// Whether a *mutation's* signature may ride onward — to local members and
+/// over S2S — attached to this event.
+///
+/// Only a signature that verified, and only while the values it covers are
+/// still the values on the wire. Re-rooting a subject is this server's doing,
+/// so a peer that then read the event as forged would be reading our edit, not
+/// the sender's intent.
+fn keep_signature(checked: Option<&CheckedMutation>, tidied: &HashMap<String, String>) -> bool {
+    let Some(checked) = checked else {
+        // An unsigned mutation, or one from a guest with nothing to vouch for.
+        return false;
+    };
+    if checked.outcome != ClientSigOutcome::Verified {
+        return false;
+    }
+    match mutation_in(tidied) {
+        Some((kind, subject, _)) => kind == checked.kind && subject == checked.subject,
+        None => false,
+    }
+}
+
 pub(super) fn handle_tagmsg(
     conn: &Connection,
     target: &str,
@@ -575,6 +732,41 @@ pub(super) fn handle_tagmsg(
     } else {
         target
     };
+
+    // ── Check the signature before rewriting anything it covers ──
+    //
+    // Everything below renames draft tags and re-roots the subject. Both
+    // change bytes the document binds, so the check runs against the event as
+    // it arrived; the tidied copy is what gets filed and relayed.
+    //
+    // Scoped to mutations on purpose. An act event or a coordination event
+    // also carries `+freeq.at/sig`, over a different document and verified by
+    // a different profile — judging those by the mutation canonical would
+    // condemn every one of them.
+    let is_mutation = mutation_in(tags).is_some();
+    let arrived = mutation_signature(conn, target, tags, state);
+    if let Some(ref checked) = arrived
+        && checked.outcome == ClientSigOutcome::Failed
+    {
+        tracing::warn!(
+            session = %conn.id, did = ?conn.authenticated_did, target = %target,
+            kind = %checked.kind.as_str(), subject = %checked.subject,
+            "Mutation signature did not verify against the key it names — refusing the event"
+        );
+        let reply = Message::from_server(
+            &state.server_name,
+            "FAIL",
+            vec![
+                "TAGMSG",
+                "SIGNATURE_INVALID",
+                "That signature does not verify against the key it names",
+            ],
+        );
+        if let Some(tx) = state.connections.lock().get(&conn.id) {
+            let _ = tx.try_send(format!("{reply}\r\n"));
+        }
+        return;
+    }
 
     // Normalize IRCv3 draft tags to their canonical forms so all downstream
     // code (persistence, relay, fallback) only needs to check one name.
@@ -602,11 +794,22 @@ pub(super) fn handle_tagmsg(
             tags.insert("+draft/delete".to_string(), root);
         }
     }
+    // A signature the server did not stand behind must not leave the server —
+    // the same never-launder rule local message ingress follows, and what
+    // stops a guest from inventing a lock badge for free. `keep_signature`
+    // also drops it when *our* re-rooting moved the subject out from under
+    // the signature, so a peer reads "unsigned" rather than "forged".
+    if is_mutation && !keep_signature(arrived.as_ref(), &tags) {
+        tags.remove("+freeq.at/sig");
+        tags.remove("freeq.at/sig");
+        tags.remove(freeq_sdk::chatsig::EVENT_ID_TAG);
+        tags.remove(freeq_sdk::chatsig::EVENT_ID_TAG_BARE);
+    }
     let tags = &tags;
 
     // ── Message deletion (+draft/delete=<msgid>) ──
     if let Some(original_msgid) = tags.get("+draft/delete") {
-        handle_delete(conn, target, original_msgid, state);
+        handle_delete(conn, target, original_msgid, tags, state);
         return;
     }
 
@@ -2959,7 +3162,19 @@ fn handle_edit(
 
 /// Handle a TAGMSG with +draft/delete=<msgid> tag.
 /// Verifies authorship, soft-deletes the message, broadcasts to channel or DM recipient.
-fn handle_delete(conn: &Connection, target: &str, original_msgid: &str, state: &Arc<SharedState>) {
+///
+/// `event_tags` carries the signer's `+freeq.at/sig` and the event id it
+/// covers when the signature checked out — already stripped by the caller
+/// when it did not, so this path never has to decide again. They ride on
+/// every copy of the delete, local and federated, because a delete nobody
+/// downstream can attribute is exactly the forgery this closes.
+fn handle_delete(
+    conn: &Connection,
+    target: &str,
+    original_msgid: &str,
+    event_tags: &std::collections::HashMap<String, String>,
+    state: &Arc<SharedState>,
+) {
     let hostmask = conn.hostmask();
     let nick = conn.nick_or_star();
     let is_channel = target.starts_with('#') || target.starts_with('&');
@@ -3058,6 +3273,14 @@ fn handle_delete(conn: &Connection, target: &str, original_msgid: &str, state: &
     // cannot do from a nick.
     let mut del_tags = std::collections::HashMap::new();
     del_tags.insert("+draft/delete".to_string(), original_msgid.to_string());
+    for name in [
+        "+freeq.at/sig",
+        freeq_sdk::chatsig::EVENT_ID_TAG,
+    ] {
+        if let Some(v) = event_tags.get(name) {
+            del_tags.insert(name.to_string(), v.clone());
+        }
+    }
     let build_delete_line = |with_account: bool| -> String {
         let mut t = del_tags.clone();
         if with_account && let Some(ref did) = conn.authenticated_did {
@@ -3121,10 +3344,11 @@ fn handle_delete(conn: &Connection, target: &str, original_msgid: &str, state: &
                 event_id: s2s_next_event_id(state),
                 from: nick.to_string(),
                 target: target.to_string(),
-                tags: std::collections::HashMap::from([(
-                    "+draft/delete".to_string(),
-                    original_msgid.to_string(),
-                )]),
+                // `del_tags`, not a fresh map: a peer verifies the delete
+                // against the signature and the event id it covers, and a
+                // relay that dropped them left every receiver unable to
+                // attribute the delete to anyone.
+                tags: del_tags.clone(),
                 origin: state.server_iroh_id.lock().clone().unwrap_or_default(),
                 // The peer authorizes the delete against the message's author;
                 // a nick alone would let any peer assert its way to one.
@@ -3172,10 +3396,11 @@ fn handle_delete(conn: &Connection, target: &str, original_msgid: &str, state: &
                 event_id: s2s_next_event_id(state),
                 from: nick.to_string(),
                 target: target.to_string(),
-                tags: std::collections::HashMap::from([(
-                    "+draft/delete".to_string(),
-                    original_msgid.to_string(),
-                )]),
+                // `del_tags`, not a fresh map: a peer verifies the delete
+                // against the signature and the event id it covers, and a
+                // relay that dropped them left every receiver unable to
+                // attribute the delete to anyone.
+                tags: del_tags.clone(),
                 origin: state.server_iroh_id.lock().clone().unwrap_or_default(),
                 account: conn.authenticated_did.clone(),
             },

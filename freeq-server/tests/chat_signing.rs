@@ -712,3 +712,250 @@ async fn a_third_party_can_verify_an_sdk_clients_signature_from_the_wire_alone()
         "signed on the sender's device, not by the server: {verdict}"
     );
 }
+
+// ── Signed mutations at client ingress ──────────────────────────────
+//
+// A delete or a reaction is durable state asserted under a user's name. The
+// server checks the sender's signature against the event as it arrived,
+// refuses one that fails, and relays a verified one verbatim so every
+// receiver — local or federated — can attribute the act for itself.
+
+/// The tag block a signed mutation puts on the wire.
+fn signed_mutation_tags(
+    kind: freeq_sdk::chatsig::Mutation,
+    subject_tag: &str,
+    subject: &str,
+    emoji: Option<&str>,
+    channel: &str,
+    event_id: &str,
+    signing: &SigningKey,
+) -> String {
+    let venue = channel_venue(channel);
+    let mut doc = ChatDoc::mutation(kind, DID_ALICE, event_id, &venue, subject);
+    if let Some(emoji) = emoji {
+        doc = doc.with_emoji(emoji);
+    }
+    let sig = doc.sign(signing);
+    let mut tags = match emoji {
+        Some(e) => format!("{subject_tag}={e};+reply={subject}"),
+        None => format!("{subject_tag}={subject}"),
+    };
+    tags.push_str(&format!(";{EVENT_ID_TAG}={event_id};+freeq.at/sig={sig}"));
+    tags
+}
+
+/// Alice, Bob, a channel they share, and a message of Alice's to act on.
+/// Returns (bob, alice, alice's session signing key, the message's msgid).
+fn two_in_a_channel(
+    addr: SocketAddr,
+    ka: PrivateKey,
+    kb: PrivateKey,
+    did_bob: &str,
+    channel: &str,
+) -> (C, C, SigningKey, String) {
+    let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+    bob.join(channel);
+    let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+    alice.join(channel);
+    let signing = SigningKey::from_bytes(&[42u8; 32]);
+    alice.msgsig(&signing);
+
+    let msgid = freeq_server::msgid::generate();
+    alice.send_with_id(&msgid, channel, "act on me");
+    bob.rx(|l| l.contains("act on me"), "the message to act on");
+    (bob, alice, signing, msgid)
+}
+
+#[tokio::test]
+async fn a_signed_delete_relays_the_senders_own_signature() {
+    use freeq_sdk::chatsig::Mutation;
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let (mut bob, mut alice, signing, msgid) =
+            two_in_a_channel(addr, ka, kb, did_bob, "#del");
+
+        let event_id = freeq_server::msgid::generate();
+        let tags = signed_mutation_tags(
+            Mutation::Delete,
+            "+draft/delete",
+            &msgid,
+            None,
+            "#del",
+            &event_id,
+            &signing,
+        );
+        alice.tx(&format!("@{tags} TAGMSG #del"));
+
+        let seen = bob.rx(|l| l.contains("+draft/delete"), "the delete");
+        let sig = tags
+            .split(';')
+            .find_map(|t| t.strip_prefix("+freeq.at/sig="))
+            .unwrap();
+        assert_eq!(
+            C::sig_of(&seen).as_deref(),
+            Some(sig),
+            "the sender's signature must be relayed byte-for-byte: {seen}"
+        );
+        assert!(
+            seen.contains(&format!("{EVENT_ID_TAG}={event_id}")),
+            "and the id it covers must travel with it, or nobody can rebuild \
+             the document: {seen}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_signed_reaction_and_its_removal_relay_their_signatures() {
+    use freeq_sdk::chatsig::Mutation;
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let (mut bob, mut alice, signing, msgid) =
+            two_in_a_channel(addr, ka, kb, did_bob, "#react");
+
+        for (kind, tag) in [
+            (Mutation::React, "+react"),
+            (Mutation::Unreact, "+freeq.at/unreact"),
+        ] {
+            let event_id = freeq_server::msgid::generate();
+            let tags = signed_mutation_tags(
+                kind,
+                tag,
+                &msgid,
+                Some("👍"),
+                "#react",
+                &event_id,
+                &signing,
+            );
+            alice.tx(&format!("@{tags} TAGMSG #react"));
+
+            let seen = bob.rx(|l| l.contains(tag), "the reaction");
+            let sig = tags
+                .split(';')
+                .find_map(|t| t.strip_prefix("+freeq.at/sig="))
+                .unwrap();
+            assert_eq!(
+                C::sig_of(&seen).as_deref(),
+                Some(sig),
+                "{kind:?} must relay the sender's own signature: {seen}"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_mutation_signature_that_fails_is_refused_and_never_relayed() {
+    use freeq_sdk::chatsig::Mutation;
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let (mut bob, mut alice, signing, msgid) =
+            two_in_a_channel(addr, ka, kb, did_bob, "#forged");
+
+        // Signed over a different subject than the one sent — what a relay
+        // swapping the victim's message produces.
+        let event_id = freeq_server::msgid::generate();
+        let sig = ChatDoc::mutation(
+            Mutation::Delete,
+            DID_ALICE,
+            &event_id,
+            &channel_venue("#forged"),
+            "01SOMEONEELSESMESSAGE00000",
+        )
+        .sign(&signing);
+        alice.tx(&format!(
+            "@+draft/delete={msgid};{EVENT_ID_TAG}={event_id};+freeq.at/sig={sig} TAGMSG #forged"
+        ));
+
+        alice.rx(|l| l.contains("SIGNATURE_INVALID"), "FAIL to the sender");
+        assert!(
+            bob.maybe(|l| l.contains("+draft/delete"), 500).is_none(),
+            "an event whose signature failed must not reach anyone"
+        );
+        // And the message it named is still there.
+        alice.tx("CHATHISTORY LATEST #forged * 10");
+        assert!(
+            alice.maybe(|l| l.contains("act on me"), 1000).is_some(),
+            "a refused delete must not have deleted anything"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_guest_cannot_attach_a_mutation_signature() {
+    let (addr, _h) = start(DidResolver::static_map(HashMap::new())).await;
+    run(addr, move |addr| {
+        let mut watcher = C::guest(addr, "watcher");
+        watcher.join("#guestreact");
+        let mut guest = C::guest(addr, "nobody");
+        guest.join("#guestreact");
+
+        guest.tx(
+            "@+react=👍;+reply=01SOMEMESSAGE000000000000;\
+             +freeq.at/sig=ed25519:AAAAAAAAAAAAAAAAAAAAAA:AAAA TAGMSG #guestreact",
+        );
+        let seen = watcher.rx(|l| l.contains("+react"), "the reaction");
+        assert_eq!(
+            C::sig_of(&seen),
+            None,
+            "there is no identity here to vouch for: {seen}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_unsigned_delete_behaves_exactly_as_before() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let (mut bob, mut alice, _signing, msgid) =
+            two_in_a_channel(addr, ka, kb, did_bob, "#plain");
+
+        alice.tx(&format!("@+draft/delete={msgid} TAGMSG #plain"));
+        let seen = bob.rx(|l| l.contains("+draft/delete"), "the delete");
+        assert_eq!(C::sig_of(&seen), None, "nothing was signed: {seen}");
+        assert!(
+            !seen.contains(EVENT_ID_TAG),
+            "and no id was minted: {seen}"
+        );
+        assert!(seen.contains(&msgid), "the delete still names its subject: {seen}");
+    })
+    .await;
+}
+
+/// A coordination event's signature covers a different document, verified by
+/// a different profile. The mutation path must leave it alone rather than
+/// judge it by a canonical it was never signed under.
+#[tokio::test]
+async fn a_coordination_events_signature_is_left_alone() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#coord");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#coord");
+
+        alice.tx(
+            "@+freeq.at/event=task_request;+freeq.at/task-id=01TASK00000000000000000000;\
+             +freeq.at/sig=ed25519:someotherprofile00000A:c2ln TAGMSG #coord",
+        );
+        let seen = bob.rx(|l| l.contains("+freeq.at/event"), "the coordination event");
+        assert_eq!(
+            C::sig_of(&seen).as_deref(),
+            Some("ed25519:someotherprofile00000A:c2ln"),
+            "another profile's signature is not the mutation path's to strip: {seen}"
+        );
+    })
+    .await;
+}
