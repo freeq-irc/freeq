@@ -142,6 +142,14 @@ pub enum Command {
         chunks: Vec<MultilineChunk>,
         opener_tags: std::collections::HashMap<String, String>,
     },
+    /// A TAGMSG — tags, no body. Structured for the same reason `Privmsg` is:
+    /// a delete or a reaction *is* its tags, so the signer has to see them
+    /// before they reach the wire. Ephemera (typing, AV signalling) travel as
+    /// TAGMSGs too and are deliberately left unsigned.
+    Tagmsg {
+        target: String,
+        tags: std::collections::HashMap<String, String>,
+    },
     Raw(String),
     Quit(Option<String>),
 }
@@ -573,18 +581,20 @@ impl ClientHandle {
     }
 
     /// Send a TAGMSG (tags-only, no body) to a target.
+    ///
+    /// Structured, not `Raw`: a delete or a reaction is signed over the tags
+    /// that carry it, and one place has to see them to sign them.
     pub async fn send_tagmsg(
         &self,
         target: &str,
         tags: std::collections::HashMap<String, String>,
     ) -> Result<()> {
-        let msg = crate::irc::Message {
-            tags,
-            prefix: None,
-            command: "TAGMSG".to_string(),
-            params: vec![target.to_string()],
-        };
-        self.cmd_tx.send(Command::Raw(msg.to_string())).await?;
+        self.cmd_tx
+            .send(Command::Tagmsg {
+                target: target.to_string(),
+                tags,
+            })
+            .await?;
         Ok(())
     }
 
@@ -2048,8 +2058,9 @@ where
                                     .await?;
                             }
                             // Flush any commands that were queued before registration
+                            let verifies = caps_acked.lock().acked.contains(MSGSIG_CAP);
                             for cmd in pending_commands.drain(..) {
-                                execute_command(&mut writer, cmd, &msg_signing_key, &msg_signing_did).await?;
+                                execute_command(&mut writer, cmd, &msg_signing_key, &msg_signing_did, verifies).await?;
                             }
                         }
                         "353" => {
@@ -2453,7 +2464,8 @@ where
             }
             Some(cmd) = cmd_rx.recv() => {
                 if registered || matches!(cmd, Command::Quit(_)) {
-                    execute_command(&mut writer, cmd, &msg_signing_key, &msg_signing_did).await?;
+                    let verifies = caps_acked.lock().acked.contains(MSGSIG_CAP);
+                    execute_command(&mut writer, cmd, &msg_signing_key, &msg_signing_did, verifies).await?;
                     if !registered {
                         break; // Quit before registration
                     }
@@ -2512,6 +2524,18 @@ async fn dispatch_assembled_multiline(
     // attach the assembled message to the outer batch.
 }
 
+/// The capability a server advertises to say it verifies the chat signing
+/// document — see [`crate::chatsig`] for what that document is.
+///
+/// A signature is only worth sending to a server that checks it. Against one
+/// that doesn't, the signature is stripped and replaced by the server's own
+/// (the pre-document behaviour), and the event id we minted is ignored while
+/// its tag leaks onward — so signing there costs bytes and buys nothing, and
+/// worse, produces a lock badge no client should trust. Gating on the cap makes
+/// the client rollout self-coordinating per server: no deploy lockstep, no
+/// flag day.
+pub const MSGSIG_CAP: &str = "freeq.at/msgsig";
+
 /// Put a chat signature (and the event id it covers) on an outgoing message's
 /// tags, when this session has a signing key and the venue is knowable.
 ///
@@ -2526,13 +2550,19 @@ async fn dispatch_assembled_multiline(
 /// peer DID we haven't learned): sending unsigned is honest, while signing a
 /// venue no verifier would rebuild produces a signature that reads as
 /// tampering.
+/// Nothing is signed and no id is minted against a server that never
+/// negotiated [`MSGSIG_CAP`] — see that constant for why.
 fn sign_outgoing(
     tags: &mut std::collections::HashMap<String, String>,
     signing_key: &Option<ed25519_dalek::SigningKey>,
     signing_did: &Option<String>,
     target: &str,
     body: &str,
+    server_verifies_documents: bool,
 ) {
+    if !server_verifies_documents {
+        return;
+    }
     let (Some(key), Some(did)) = (signing_key, signing_did) else {
         return;
     };
@@ -2566,13 +2596,92 @@ fn sign_outgoing(
     tags.insert(crate::sigtag::SIG_TAG.to_string(), doc.sign(key));
 }
 
+/// The mutation a TAGMSG's tags describe: the kind, the **root** msgid it acts
+/// on, and — for reactions — the emoji.
+///
+/// The same three tag shapes the server reads on the receive side, so what a
+/// sender signs and what a verifier rebuilds cannot drift: a delete carries
+/// its subject as the value of `+draft/delete`, a reaction carries the emoji
+/// in `+react` (or `+freeq.at/unreact`) and the subject in `+reply`.
+///
+/// `None` for every other TAGMSG — typing, AV signalling, presence. Those are
+/// ephemera: nothing durable is asserted under a user's name, so there is
+/// nothing for a signature to be evidence of.
+fn mutation_in(
+    tags: &std::collections::HashMap<String, String>,
+) -> Option<(crate::chatsig::Mutation, String, Option<String>)> {
+    use crate::chatsig::Mutation;
+    let get = |a: &str, b: &str| tags.get(a).or_else(|| tags.get(b)).cloned();
+    let subject = || get("+reply", "+draft/reply");
+    if let Some(subject) = get("+draft/delete", "+delete") {
+        return Some((Mutation::Delete, subject, None));
+    }
+    if let Some(emoji) = get("+react", "+draft/react") {
+        return Some((Mutation::React, subject()?, Some(emoji)));
+    }
+    if let Some(emoji) = tags.get("+freeq.at/unreact").cloned() {
+        return Some((Mutation::Unreact, subject()?, Some(emoji)));
+    }
+    None
+}
+
+/// Sign an outgoing mutation — a delete, a reaction added or removed — and put
+/// the event id the signature covers on its tags.
+///
+/// A mutation is durable state asserted under a user's name: it retracts a
+/// message or attaches a reaction that others will see and that history will
+/// keep. Signing it is what lets the server act on a *proven* actor rather
+/// than on a nick, and what lets a receiving server check the claim for
+/// itself instead of taking the relaying peer's word.
+///
+/// Same three refusals as a message: no key, no venue (a bare-nick DM has no
+/// reproducible venue — send unsigned rather than sign a guess), and nothing
+/// at all against a server that never negotiated [`MSGSIG_CAP`].
+fn sign_mutation_outgoing(
+    tags: &mut std::collections::HashMap<String, String>,
+    signing_key: &Option<ed25519_dalek::SigningKey>,
+    signing_did: &Option<String>,
+    target: &str,
+    server_verifies_documents: bool,
+) {
+    if !server_verifies_documents {
+        return;
+    }
+    let (Some(key), Some(did)) = (signing_key, signing_did) else {
+        return;
+    };
+    let Some((kind, subject, emoji)) = mutation_in(tags) else {
+        return;
+    };
+    let Some(venue) = crate::chatsig::venue_for_target(target, did) else {
+        tracing::debug!(
+            target,
+            "no signable venue for this target — sending the mutation unsigned"
+        );
+        return;
+    };
+
+    let event_id = crate::chatsig::new_event_id();
+    let mut doc = crate::chatsig::ChatDoc::mutation(kind, did, &event_id, &venue, &subject);
+    if let Some(ref emoji) = emoji {
+        doc = doc.with_emoji(emoji);
+    }
+    let sig = doc.sign(key);
+    tags.insert(crate::chatsig::EVENT_ID_TAG.to_string(), event_id);
+    tags.insert(crate::sigtag::SIG_TAG.to_string(), sig);
+}
+
 /// Execute a single IRC command on the wire.
-/// If `signing_key` and `signing_did` are set, PRIVMSG gets a `+freeq.at/sig` tag.
+///
+/// If `signing_key` and `signing_did` are set **and** the server negotiated
+/// [`MSGSIG_CAP`], a PRIVMSG gets a `+freeq.at/sig` tag and the event id it
+/// covers.
 async fn execute_command<W: AsyncWrite + Unpin>(
     writer: &mut W,
     cmd: Command,
     signing_key: &Option<ed25519_dalek::SigningKey>,
     signing_did: &Option<String>,
+    server_verifies_documents: bool,
 ) -> Result<()> {
     match cmd {
         Command::Join(channel) => {
@@ -2585,7 +2694,14 @@ async fn execute_command<W: AsyncWrite + Unpin>(
             text,
             mut tags,
         } => {
-            sign_outgoing(&mut tags, signing_key, signing_did, &target, &text);
+            sign_outgoing(
+                &mut tags,
+                signing_key,
+                signing_did,
+                &target,
+                &text,
+                server_verifies_documents,
+            );
             if tags.is_empty() {
                 writer
                     .write_all(format!("PRIVMSG {target} :{text}\r\n").as_bytes())
@@ -2631,7 +2747,14 @@ async fn execute_command<W: AsyncWrite + Unpin>(
                 }
                 body.push_str(&chunk.body);
             }
-            sign_outgoing(&mut opener_tags, signing_key, signing_did, &target, &body);
+            sign_outgoing(
+                &mut opener_tags,
+                signing_key,
+                signing_did,
+                &target,
+                &body,
+                server_verifies_documents,
+            );
             let opener_tags_str = if opener_tags.is_empty() {
                 String::new()
             } else {
@@ -2670,6 +2793,22 @@ async fn execute_command<W: AsyncWrite + Unpin>(
             writer
                 .write_all(format!("BATCH -{batch_id}\r\n").as_bytes())
                 .await?;
+        }
+        Command::Tagmsg { target, mut tags } => {
+            sign_mutation_outgoing(
+                &mut tags,
+                signing_key,
+                signing_did,
+                &target,
+                server_verifies_documents,
+            );
+            let msg = crate::irc::Message {
+                tags,
+                prefix: None,
+                command: "TAGMSG".to_string(),
+                params: vec![target],
+            };
+            writer.write_all(format!("{msg}\r\n").as_bytes()).await?;
         }
         Command::Raw(line) => {
             // Strip CRLF/NUL to prevent protocol injection via raw commands
@@ -2724,6 +2863,10 @@ async fn handle_cap_response<W: AsyncWrite + Unpin>(
                 "draft/chathistory",
                 "draft/multiline",
                 "draft/read-marker",
+                // Requested rather than merely read off the LS line: the ACK
+                // is the server's own confirmation that it verifies chat
+                // documents, and signing is gated on it (see `MSGSIG_CAP`).
+                MSGSIG_CAP,
             ] {
                 if caps_str.contains(cap) {
                     req_caps.push(cap);
@@ -3227,7 +3370,7 @@ mod multiline_tests {
             ],
             opener_tags: std::collections::HashMap::new(),
         };
-        execute_command(&mut buf, cmd, &None, &None).await.unwrap();
+        execute_command(&mut buf, cmd, &None, &None, true).await.unwrap();
         let wire = String::from_utf8(buf).unwrap();
         // Find the batch id from the opener
         let opener_line = wire.lines().next().unwrap();
@@ -3272,7 +3415,7 @@ mod multiline_tests {
             ],
             opener_tags: std::collections::HashMap::new(),
         };
-        execute_command(&mut buf, cmd, &None, &None).await.unwrap();
+        execute_command(&mut buf, cmd, &None, &None, true).await.unwrap();
         let wire = String::from_utf8(buf).unwrap();
         // First chunk: no concat tag
         assert!(wire.contains(":ENC1:abc"));
@@ -3304,7 +3447,7 @@ mod multiline_tests {
             ],
             opener_tags,
         };
-        execute_command(&mut buf, cmd, &None, &None).await.unwrap();
+        execute_command(&mut buf, cmd, &None, &None, true).await.unwrap();
         let wire = String::from_utf8(buf).unwrap();
         let opener = wire.lines().find(|l| l.contains("BATCH +")).unwrap();
         let chunk_a = wire.lines().find(|l| l.ends_with(":a")).unwrap();
@@ -3346,7 +3489,7 @@ mod multiline_tests {
             ],
             opener_tags: std::collections::HashMap::new(),
         };
-        execute_command(&mut buf, cmd, &Some(key.clone()), &Some(did.clone()))
+        execute_command(&mut buf, cmd, &Some(key.clone()), &Some(did.clone()), true)
             .await
             .unwrap();
         let wire = String::from_utf8(buf).unwrap();
@@ -3394,7 +3537,7 @@ mod multiline_tests {
             }],
             opener_tags: std::collections::HashMap::new(),
         };
-        execute_command(&mut buf, cmd, &None, &None).await.unwrap();
+        execute_command(&mut buf, cmd, &None, &None, true).await.unwrap();
         let wire = String::from_utf8(buf).unwrap();
         let opener = wire.lines().next().unwrap();
         // No leading "@..." tag block when there are no opener tags
@@ -4126,7 +4269,7 @@ mod irc_loop_tests {
     async fn raw_command_strips_injection_chars() {
         let mut buf: Vec<u8> = Vec::new();
         let cmd = Command::Raw("PRIVMSG #ch :hello\r\nEVIL LINE\0".to_string());
-        execute_command(&mut buf, cmd, &None, &None)
+        execute_command(&mut buf, cmd, &None, &None, true)
             .await
             .expect("execute_command");
 
@@ -4161,7 +4304,7 @@ mod irc_loop_tests {
             text: "hello world".to_string(),
             tags: HashMap::new(),
         };
-        execute_command(&mut buf, cmd, &None, &None)
+        execute_command(&mut buf, cmd, &None, &None, true)
             .await
             .expect("execute_command");
 
@@ -4188,7 +4331,7 @@ mod irc_loop_tests {
             text: "signed message".to_string(),
             tags: HashMap::new(),
         };
-        execute_command(&mut buf, cmd, &Some(key), &did)
+        execute_command(&mut buf, cmd, &Some(key), &did, true)
             .await
             .expect("execute_command");
 
@@ -4238,6 +4381,7 @@ mod irc_loop_tests {
             },
             &Some(key.clone()),
             &did,
+            true,
         )
         .await
         .unwrap();
@@ -4260,6 +4404,7 @@ mod irc_loop_tests {
             },
             &Some(key),
             &did,
+            true,
         )
         .await
         .unwrap();
@@ -4268,6 +4413,253 @@ mod irc_loop_tests {
             wire, "PRIVMSG bob :who are you, really\r\n",
             "an unresolvable peer means unsigned, not signed-with-a-guess"
         );
+    }
+
+    /// A delete and both halves of a reaction are signed over the mutation
+    /// document, with the event id the signature covers riding alongside.
+    #[tokio::test]
+    async fn a_delete_and_a_reaction_are_signed_over_the_mutation_document() {
+        use crate::chatsig::Mutation;
+        use ed25519_dalek::SigningKey;
+
+        let key = SigningKey::from_bytes(&[8u8; 32]);
+        let did = "did:plc:mutator";
+        let root = "01ROOTMSGID0000000000000BB";
+
+        // (tags as a client sends them, expected kind, expected emoji)
+        let cases: Vec<(HashMap<String, String>, Mutation, Option<&str>)> = vec![
+            (
+                HashMap::from([("+draft/delete".to_string(), root.to_string())]),
+                Mutation::Delete,
+                None,
+            ),
+            (
+                HashMap::from([
+                    ("+react".to_string(), "👍".to_string()),
+                    ("+reply".to_string(), root.to_string()),
+                ]),
+                Mutation::React,
+                Some("👍"),
+            ),
+            (
+                HashMap::from([
+                    ("+freeq.at/unreact".to_string(), "👍".to_string()),
+                    ("+reply".to_string(), root.to_string()),
+                ]),
+                Mutation::Unreact,
+                Some("👍"),
+            ),
+        ];
+
+        for (tags, kind, emoji) in cases {
+            let mut buf: Vec<u8> = Vec::new();
+            execute_command(
+                &mut buf,
+                Command::Tagmsg {
+                    target: "#room".to_string(),
+                    tags,
+                },
+                &Some(key.clone()),
+                &Some(did.to_string()),
+                true,
+            )
+            .await
+            .unwrap();
+
+            let wire = String::from_utf8(buf).unwrap();
+            let sent = crate::irc::Message::parse(wire.trim_end()).expect("parses");
+            assert_eq!(sent.command, "TAGMSG");
+            let sig_tag = sent
+                .tags
+                .get(crate::sigtag::SIG_TAG)
+                .unwrap_or_else(|| panic!("{kind:?} must be signed: {wire}"));
+            let event_id = sent
+                .tags
+                .get(crate::chatsig::EVENT_ID_TAG)
+                .expect("the id the signature covers travels with it");
+
+            let venue = crate::chatsig::channel_venue("#room");
+            let mut doc = crate::chatsig::ChatDoc::mutation(kind, did, event_id, &venue, root);
+            if let Some(emoji) = emoji {
+                doc = doc.with_emoji(emoji);
+            }
+            doc.verify(sig_tag, &key.verifying_key())
+                .unwrap_or_else(|e| panic!("{kind:?} signature does not verify: {e}"));
+        }
+    }
+
+    /// Ephemera stay unsigned: a typing notice asserts nothing durable under
+    /// anyone's name, and a signature over a keystroke is noise a verifier
+    /// would have to keep forever.
+    #[tokio::test]
+    async fn ephemeral_tagmsgs_are_not_signed() {
+        use ed25519_dalek::SigningKey;
+
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(
+            &mut buf,
+            Command::Tagmsg {
+                target: "#room".to_string(),
+                tags: HashMap::from([("+typing".to_string(), "active".to_string())]),
+            },
+            &Some(SigningKey::from_bytes(&[8u8; 32])),
+            &Some("did:plc:mutator".to_string()),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let wire = String::from_utf8(buf).unwrap();
+        let sent = crate::irc::Message::parse(wire.trim_end()).expect("parses");
+        assert!(!sent.tags.contains_key(crate::sigtag::SIG_TAG), "{wire}");
+        assert!(
+            !sent.tags.contains_key(crate::chatsig::EVENT_ID_TAG),
+            "{wire}"
+        );
+    }
+
+    /// The gate covers mutations exactly as it covers messages: against a
+    /// server that doesn't verify documents, a delete is the line a legacy
+    /// client sends.
+    #[tokio::test]
+    async fn a_mutation_is_unsigned_against_a_server_that_does_not_verify() {
+        use ed25519_dalek::SigningKey;
+
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(
+            &mut buf,
+            Command::Tagmsg {
+                target: "#room".to_string(),
+                tags: HashMap::from([(
+                    "+draft/delete".to_string(),
+                    "01ROOTMSGID0000000000000CC".to_string(),
+                )]),
+            },
+            &Some(SigningKey::from_bytes(&[8u8; 32])),
+            &Some("did:plc:mutator".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "@+draft/delete=01ROOTMSGID0000000000000CC TAGMSG #room\r\n"
+        );
+    }
+
+    /// A mutation in a DM to a bare nick has no venue any verifier could
+    /// rebuild — so it goes out unsigned rather than signed over a guess,
+    /// the same rule messages follow.
+    #[tokio::test]
+    async fn a_mutation_to_a_bare_nick_is_unsigned() {
+        use ed25519_dalek::SigningKey;
+
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(
+            &mut buf,
+            Command::Tagmsg {
+                target: "bob".to_string(),
+                tags: HashMap::from([(
+                    "+draft/delete".to_string(),
+                    "01ROOTMSGID0000000000000DD".to_string(),
+                )]),
+            },
+            &Some(SigningKey::from_bytes(&[8u8; 32])),
+            &Some("did:plc:mutator".to_string()),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let wire = String::from_utf8(buf).unwrap();
+        let sent = crate::irc::Message::parse(wire.trim_end()).expect("parses");
+        assert!(!sent.tags.contains_key(crate::sigtag::SIG_TAG), "{wire}");
+    }
+
+    /// The cap is asked for when the server offers it, and not otherwise —
+    /// requesting a cap a server never advertised makes it NAK the whole REQ,
+    /// which would cost every other capability too.
+    #[tokio::test]
+    async fn the_signing_cap_is_requested_only_when_the_server_offers_it() {
+        async fn requested(advertised: &str) -> String {
+            let caps_acked: CapsAcked =
+                Arc::new(parking_lot::Mutex::new(CapsState::default()));
+            let msg = Message::parse(&format!(":srv CAP * LS :{advertised}")).unwrap();
+            let mut buf: Vec<u8> = Vec::new();
+            let mut sasl = false;
+            handle_cap_response(&msg, &None, &None, &mut buf, &mut sasl, &caps_acked)
+                .await
+                .unwrap();
+            String::from_utf8(buf).unwrap()
+        }
+
+        assert!(
+            requested("message-tags server-time freeq.at/msgsig")
+                .await
+                .contains(MSGSIG_CAP),
+            "a server that verifies documents is asked for the cap"
+        );
+        let legacy = requested("message-tags server-time").await;
+        assert!(
+            !legacy.contains(MSGSIG_CAP),
+            "and one that doesn't advertise it is never asked: {legacy}"
+        );
+        assert!(legacy.contains("message-tags"), "the rest still goes: {legacy}");
+    }
+
+    /// Against a server that never negotiated `freeq.at/msgsig`, an updated
+    /// client is byte-identical to an old one: no signature, no minted id.
+    /// That server would strip the signature and re-sign the message itself,
+    /// turning our non-repudiable claim into its own attestation — and it
+    /// ignores the id while the tag rides on over federation.
+    #[tokio::test]
+    async fn a_server_that_does_not_verify_documents_gets_no_signature_and_no_id() {
+        use ed25519_dalek::SigningKey;
+
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let did = Some("did:plc:gated".to_string());
+
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(
+            &mut buf,
+            Command::Privmsg {
+                target: "#legacy".to_string(),
+                text: "same as it ever was".to_string(),
+                tags: HashMap::new(),
+            },
+            &Some(key.clone()),
+            &did,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "PRIVMSG #legacy :same as it ever was\r\n",
+            "a legacy server must see exactly what a legacy client sends"
+        );
+
+        // The same send against a server that does verify: signed, with the
+        // id the signature covers. Only the cap differs.
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(
+            &mut buf,
+            Command::Privmsg {
+                target: "#legacy".to_string(),
+                text: "same as it ever was".to_string(),
+                tags: HashMap::new(),
+            },
+            &Some(key),
+            &did,
+            true,
+        )
+        .await
+        .unwrap();
+        let wire = String::from_utf8(buf).unwrap();
+        let sent = crate::irc::Message::parse(wire.trim_end()).expect("parses");
+        assert!(sent.tags.contains_key(crate::sigtag::SIG_TAG));
+        assert!(sent.tags.contains_key(crate::chatsig::EVENT_ID_TAG));
     }
 
     /// A tagged send (a reply, a coordination event) is signed too, and the
@@ -4295,6 +4687,7 @@ mod irc_loop_tests {
             },
             &Some(key.clone()),
             &Some(did.to_string()),
+            true,
         )
         .await
         .unwrap();
