@@ -523,7 +523,9 @@ async fn api_signing_key(State(state): State<Arc<SharedState>>) -> Json<serde_js
         "public_key": pubkey_b64,
         "encoding": "base64url",
         "usage": "message-signing",
-        "canonical_form": "{sender_did}\\0{target}\\0{text}\\0{timestamp}",
+        "canonical_form": "jcs-per-event-kind",
+        "spec": "https://github.com/freeq-irc/freeq/blob/main/spec/chat-signing-vectors.json",
+        "sig_tag_format": "ed25519:<kid>:<base64url-nopad signature>",
         "tag": "+freeq.at/sig"
     }))
 }
