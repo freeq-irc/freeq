@@ -515,6 +515,7 @@ Options:
   --tls-key <PATH>                TLS private key PEM file
   --server-name <NAME>            Server name [default: freeq]
   --challenge-timeout-secs <N>    SASL challenge validity [default: 60]
+  --config <PATH>                 Read options from a TOML file (flags override)
   --db-path <PATH>                SQLite database path (omit for in-memory)
   --migrate-to <VERSION>          Run the schema ladder to VERSION and exit
   --web-addr <ADDR>               HTTP/WebSocket listener address
@@ -533,6 +534,8 @@ When `--db-path` is set, the server persists:
 - **DID-nick bindings** — nick ownership persists across server restarts
 
 Without `--db-path`, the server runs entirely in-memory. The database uses SQLite with WAL mode for good concurrent read performance. Persistence failures are logged but do not crash the server.
+
+Every flag can also live in a TOML file passed via `--config server.toml` (or `FREEQ_CONFIG`): keys are the flag names with underscores (`listen_addr = "0.0.0.0:6667"`), lists are arrays, and precedence is CLI flag > environment variable > file > default, so existing flag-based deployments work unchanged. A typo'd key is a startup error that names the key. `--migrate-to` is deliberately CLI-only. A full worked example ships as [`server.toml.example`](server.toml.example), and a test keeps it in sync with the real schema.
 
 Schema migrations run automatically (and upward only) at startup. A server binary refuses to open a database stamped with a newer schema than it knows, so before rolling back to an older binary, downgrade the schema first: `freeq-server --db-path <PATH> --migrate-to <VERSION>` runs the ladder to the named version and exits. Downgrades stop with an error at any migration that is irreversible by design.
 

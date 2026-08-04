@@ -1,5 +1,4 @@
 use anyhow::Result;
-use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -19,7 +18,8 @@ async fn main() -> Result<()> {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 
-    let mut config = freeq_server::config::ServerConfig::parse();
+    let mut config = freeq_server::config::ServerConfig::load()
+        .map_err(|e| anyhow::anyhow!("configuration: {e}"))?;
 
     // A maintenance verb, not a server mode: run the ladder to the requested
     // version and exit. Startup only ever migrates up; this is how the tested

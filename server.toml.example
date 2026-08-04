@@ -1,0 +1,73 @@
+## freeq-server example configuration.
+## Copy next to your deployment (e.g. /etc/freeq/server.toml) and start with:
+##   freeq-server --config /etc/freeq/server.toml
+##
+## Every key mirrors a CLI flag (underscore name). Precedence:
+## CLI flag > environment variable > this file > built-in default.
+## An unknown key is a startup error — typos fail loudly.
+##
+## Convention in this file: `##` lines are prose; `# key = value` lines are
+## real settings, commented out, showing the default or a realistic example.
+## (`--migrate-to` and `--config` itself are CLI-only, so they do not appear.)
+
+## ── Listeners ──────────────────────────────────────────────────────
+# listen_addr = "127.0.0.1:6667"
+# tls_listen_addr = "127.0.0.1:6697"
+# tls_cert = "/etc/freeq/cert.pem"
+# tls_key = "/etc/freeq/key.pem"
+# web_addr = "0.0.0.0:8080"
+# web_static_dir = "/opt/freeq/freeq-web"
+
+## ── Identity ───────────────────────────────────────────────────────
+# server_name = "irc.example.com"
+# server_did = "did:web:irc.example.com"
+# challenge_timeout_secs = 60
+
+## ── Storage ────────────────────────────────────────────────────────
+# db_path = "/data/irc.db"
+# data_dir = "/data"
+# max_messages_per_channel = 10000
+# message_retention_days = 0
+
+## ── Federation (iroh + S2S) ────────────────────────────────────────
+# iroh = true
+# iroh_port = 4433
+# s2s_peers = ["44f1415c..."]
+# s2s_allowed_peers = ["44f1415c..."]
+## Where each peer serves its users' message-signing keys; without an entry a
+## peer's signatures stay uncheckable here (never reported as forged).
+# s2s_peer_api = ["44f1415c...=https://irc.example.com"]
+# s2s_peer_trust = ["44f1415c...:full"]
+# require_did_for_ops = false
+
+## ── Access control ─────────────────────────────────────────────────
+# no_guest = false
+# allowed_dids = ["did:plc:abc..."]
+# allowed_did_domains = ["example.com"]
+# oper_password = "change-me"
+# oper_dids = ["did:plc:abc..."]
+# reverify_identity_mins = 0
+
+## ── Auth broker / OAuth ────────────────────────────────────────────
+# github_client_id = "Iv1.abc..."
+# github_client_secret = "..."
+# broker_shared_secret = "..."
+
+## ── MOTD ───────────────────────────────────────────────────────────
+# motd = "welcome"
+# motd_file = "/etc/freeq/motd.txt"
+
+## ── Plugins ────────────────────────────────────────────────────────
+# plugins = ["name:key=val"]
+# plugin_dir = "/etc/freeq/plugins"
+
+## ── Agent assistance (LLM) ─────────────────────────────────────────
+# llm_provider = "openai"
+# llm_base_url = "https://api.openai.com/v1"
+# llm_api_key = "..."
+# llm_model = "gpt-4o-mini"
+# llm_timeout_secs = 8
+# model_price_args = ["gpt-4o-mini=0.15,0.60"]
+
+## ── Test/dev only ──────────────────────────────────────────────────
+# did_resolver_static = ["did:plc:test=zQ3sh..."]

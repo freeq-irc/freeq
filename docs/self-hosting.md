@@ -127,8 +127,29 @@ REST API endpoints are at `/api/v1/*`.
 freeq-server --db-path /data/irc.db --data-dir /data
 ```
 
+Or keep everything in a file instead of a flag list. Every flag is also a TOML key under its underscore name; precedence is CLI flag > environment variable > file > default, and an unknown key is a startup error naming the key (typos fail loudly rather than being silently ignored):
+
+```toml
+# /etc/freeq/server.toml
+listen_addr = "0.0.0.0:6667"
+web_addr = "0.0.0.0:8080"
+db_path = "/data/irc.db"
+data_dir = "/data"
+server_name = "irc.example.com"
+iroh = true
+s2s_allowed_peers = ["44f1415c..."]
+s2s_peer_api = ["44f1415c...=https://irc.example.com"]
+```
+
+```bash
+freeq-server --config /etc/freeq/server.toml
+```
+
+`--migrate-to` stays CLI-only on purpose — a config file that migrates-and-exits on every boot would be a footgun. The repo ships a complete commented example as `server.toml.example`, kept in sync with the schema by a test.
+
 | Flag | Default | Description |
 |---|---|---|
+| `--config` | *(none)* | TOML file of options; flags and env vars override it |
 | `--db-path` | *(none — in-memory)* | SQLite database file |
 | `--migrate-to` | *(none)* | Run the schema ladder to this version and exit (see [Schema migrations](#schema-migrations)) |
 | `--data-dir` | parent of `--db-path` | Directory for keys and iroh state |

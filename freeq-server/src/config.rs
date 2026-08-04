@@ -4,6 +4,15 @@ use clap::Parser;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "freeq-server", version, about)]
 pub struct ServerConfig {
+    /// Read options from a TOML file. Every flag below is also a file key
+    /// under its underscore name (`--listen-addr` → `listen_addr`), except
+    /// `--config` itself and `--migrate-to` (a maintenance verb — a file
+    /// that migrates-and-exits on every boot would be a footgun).
+    /// Precedence: CLI flag > environment variable > file > built-in default.
+    /// An unknown key in the file is a startup error, so typos fail loudly.
+    #[arg(long, env = "FREEQ_CONFIG", value_name = "PATH")]
+    pub config: Option<String>,
+
     /// Plain TCP listener address. (`--bind` kept as an alias — older docs
     /// and docker-compose files used it.)
     #[arg(long, alias = "bind", default_value = "127.0.0.1:6667")]
@@ -248,6 +257,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            config: None,
             listen_addr: "127.0.0.1:6667".to_string(),
             tls_listen_addr: "127.0.0.1:6697".to_string(),
             tls_cert: None,
@@ -352,5 +362,276 @@ impl ServerConfig {
             }
         }
         None
+    }
+}
+
+/// Every settable flag as an optional TOML key, named after its struct field.
+/// Excluded on purpose: `config` (a file naming a file) and `migrate_to` (a
+/// maintenance verb that must not run on every boot). `deny_unknown_fields`
+/// turns a typo'd key into a startup error instead of a silently-ignored line.
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    listen_addr: Option<String>,
+    tls_listen_addr: Option<String>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    server_name: Option<String>,
+    challenge_timeout_secs: Option<u64>,
+    db_path: Option<String>,
+    web_addr: Option<String>,
+    iroh: Option<bool>,
+    iroh_port: Option<u16>,
+    s2s_peers: Option<Vec<String>>,
+    s2s_allowed_peers: Option<Vec<String>>,
+    s2s_peer_api: Option<Vec<String>>,
+    s2s_peer_trust: Option<Vec<String>>,
+    server_did: Option<String>,
+    data_dir: Option<String>,
+    did_resolver_static: Option<Vec<String>>,
+    max_messages_per_channel: Option<usize>,
+    motd: Option<String>,
+    motd_file: Option<String>,
+    web_static_dir: Option<String>,
+    plugins: Option<Vec<String>>,
+    plugin_dir: Option<String>,
+    require_did_for_ops: Option<bool>,
+    github_client_id: Option<String>,
+    github_client_secret: Option<String>,
+    broker_shared_secret: Option<String>,
+    oper_password: Option<String>,
+    oper_dids: Option<Vec<String>>,
+    allowed_dids: Option<Vec<String>>,
+    allowed_did_domains: Option<Vec<String>>,
+    no_guest: Option<bool>,
+    reverify_identity_mins: Option<u64>,
+    message_retention_days: Option<u64>,
+    llm_provider: Option<String>,
+    llm_base_url: Option<String>,
+    llm_api_key: Option<String>,
+    llm_model: Option<String>,
+    llm_timeout_secs: Option<u64>,
+    model_price_args: Option<Vec<String>>,
+}
+
+/// Whether the operator said this on the command line or in the environment —
+/// the two sources that beat the file.
+fn explicitly_set(matches: &clap::ArgMatches, id: &str) -> bool {
+    matches!(
+        matches.value_source(id),
+        Some(clap::parser::ValueSource::CommandLine | clap::parser::ValueSource::EnvVariable)
+    )
+}
+
+impl ServerConfig {
+    /// Production entry point: parse the CLI, and if `--config` (or
+    /// `FREEQ_CONFIG`) names a file, layer it underneath.
+    pub fn load() -> Result<Self, String> {
+        let matches = <Self as clap::CommandFactory>::command().get_matches();
+        let mut cfg = <Self as clap::FromArgMatches>::from_arg_matches(&matches)
+            .map_err(|e| e.to_string())?;
+        if let Some(path) = cfg.config.clone() {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("--config {path}: {e}"))?;
+            let file: FileConfig =
+                toml::from_str(&text).map_err(|e| format!("--config {path}: {e}"))?;
+            apply_file(&mut cfg, &matches, file);
+        }
+        Ok(cfg)
+    }
+
+    /// The same layering with the file's text passed in — the testable seam.
+    pub fn from_args_and_file_str<I, T>(args: I, file_toml: Option<&str>) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let matches = <Self as clap::CommandFactory>::command()
+            .try_get_matches_from(args)
+            .map_err(|e| e.to_string())?;
+        let mut cfg = <Self as clap::FromArgMatches>::from_arg_matches(&matches)
+            .map_err(|e| e.to_string())?;
+        if let Some(text) = file_toml {
+            let file: FileConfig = toml::from_str(text).map_err(|e| e.to_string())?;
+            apply_file(&mut cfg, &matches, file);
+        }
+        Ok(cfg)
+    }
+}
+
+/// File values fill in wherever the CLI and environment were silent.
+fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConfig) {
+    macro_rules! plain {
+        ($($field:ident),* $(,)?) => {$(
+            if let Some(v) = file.$field {
+                if !explicitly_set(matches, stringify!($field)) {
+                    cfg.$field = v;
+                }
+            }
+        )*};
+    }
+    macro_rules! optional {
+        ($($field:ident),* $(,)?) => {$(
+            if let Some(v) = file.$field {
+                if !explicitly_set(matches, stringify!($field)) {
+                    cfg.$field = Some(v);
+                }
+            }
+        )*};
+    }
+    plain!(
+        listen_addr,
+        tls_listen_addr,
+        server_name,
+        challenge_timeout_secs,
+        iroh,
+        s2s_peers,
+        s2s_allowed_peers,
+        s2s_peer_api,
+        s2s_peer_trust,
+        did_resolver_static,
+        max_messages_per_channel,
+        plugins,
+        require_did_for_ops,
+        oper_dids,
+        allowed_dids,
+        allowed_did_domains,
+        no_guest,
+        reverify_identity_mins,
+        message_retention_days,
+        llm_timeout_secs,
+        model_price_args,
+    );
+    optional!(
+        tls_cert,
+        tls_key,
+        db_path,
+        web_addr,
+        iroh_port,
+        server_did,
+        data_dir,
+        motd,
+        motd_file,
+        web_static_dir,
+        plugin_dir,
+        github_client_id,
+        github_client_secret,
+        broker_shared_secret,
+        oper_password,
+        llm_provider,
+        llm_base_url,
+        llm_api_key,
+        llm_model,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(args: &[&str], file: Option<&str>) -> Result<ServerConfig, String> {
+        let argv = std::iter::once("freeq-server").chain(args.iter().copied());
+        ServerConfig::from_args_and_file_str(argv, file)
+    }
+
+    #[test]
+    fn file_values_apply_when_the_cli_is_silent() {
+        let c = cfg(
+            &[],
+            Some(
+                r#"
+                listen_addr = "0.0.0.0:6667"
+                server_name = "toml-test"
+                max_messages_per_channel = 42
+                iroh = true
+                s2s_peer_api = ["abcd=https://irc.example.com"]
+                "#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(c.listen_addr, "0.0.0.0:6667");
+        assert_eq!(c.server_name, "toml-test");
+        assert_eq!(c.max_messages_per_channel, 42);
+        assert!(c.iroh);
+        assert_eq!(c.s2s_peer_api, vec!["abcd=https://irc.example.com"]);
+    }
+
+    #[test]
+    fn a_cli_flag_beats_the_file() {
+        let c = cfg(
+            &["--server-name", "from-cli"],
+            Some(r#"server_name = "from-file""#),
+        )
+        .unwrap();
+        assert_eq!(c.server_name, "from-cli");
+    }
+
+    #[test]
+    fn defaults_hold_when_neither_speaks() {
+        let c = cfg(&[], Some(r#"motd = "hi""#)).unwrap();
+        assert_eq!(c.listen_addr, "127.0.0.1:6667");
+        assert_eq!(c.server_name, "freeq");
+        assert_eq!(c.motd.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn a_cli_list_replaces_the_file_list() {
+        let c = cfg(
+            &["--oper-dids", "did:plc:cli1,did:plc:cli2"],
+            Some(r#"oper_dids = ["did:plc:file"]"#),
+        )
+        .unwrap();
+        assert_eq!(c.oper_dids, vec!["did:plc:cli1", "did:plc:cli2"]);
+    }
+
+    #[test]
+    fn an_unknown_key_is_a_loud_error_naming_the_key() {
+        let err = cfg(&[], Some(r#"lisen_addr = "typo""#)).unwrap_err();
+        assert!(err.contains("lisen_addr"), "error must name the bad key: {err}");
+    }
+
+    #[test]
+    fn migrate_to_is_not_a_file_key() {
+        // A file that migrates-and-exits on every boot would be a footgun;
+        // the maintenance verb stays CLI-only.
+        let err = cfg(&[], Some("migrate_to = 2")).unwrap_err();
+        assert!(err.contains("migrate_to"), "{err}");
+    }
+
+    #[test]
+    fn malformed_toml_is_a_clear_error() {
+        let err = cfg(&[], Some("this is not toml ===")).unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn no_file_means_plain_cli_parsing() {
+        let c = cfg(&["--server-name", "bare"], None).unwrap();
+        assert_eq!(c.server_name, "bare");
+    }
+
+    /// The shipped example must never drift from the real schema: uncomment
+    /// every `# key = value` line (`##` lines are prose, per the file's own
+    /// convention) and the result must parse under `deny_unknown_fields`.
+    /// A renamed or removed flag whose example line goes stale fails here.
+    #[test]
+    fn the_shipped_example_file_matches_the_schema() {
+        let example = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../server.toml.example"),
+        )
+        .expect("server.toml.example missing from the repo root");
+        let uncommented: String = example
+            .lines()
+            .filter(|l| l.starts_with("# ") && l.contains('='))
+            .map(|l| &l[2..])
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            uncommented.lines().count() >= 30,
+            "the example should cover the flag surface; got {} settings",
+            uncommented.lines().count()
+        );
+        let parsed: Result<super::FileConfig, _> = toml::from_str(&uncommented);
+        parsed.expect("every setting in server.toml.example must be a valid config key");
     }
 }
