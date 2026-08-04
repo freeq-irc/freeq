@@ -1477,13 +1477,21 @@ pub(super) fn handle_privmsg_with_multiline(
             }
             drop(channels);
             let sender_did = conn.authenticated_did.as_deref();
+            // `full_tags`, not the tags as the client sent them — the same set
+            // the DM path has always filed. The raw set carries whatever
+            // signature the client attached, so history replayed a failed
+            // signature that live delivery had stripped, and carried no
+            // signature at all for a message the server signed on the
+            // sender's behalf. It also still held the minted event id
+            // alongside the msgid it became: two tags that must agree forever,
+            // which is the ambiguity signing exists to remove.
             state.with_db(|db| {
                 db.insert_message(
                     target,
                     &hostmask,
                     text,
                     timestamp,
-                    tags,
+                    &full_tags,
                     Some(&msgid),
                     sender_did,
                 )
@@ -2870,7 +2878,10 @@ fn handle_edit(
     };
 
     // Store in DB
-    let mut store_tags: std::collections::HashMap<String, String> = tags
+    // From `full_tags`, so the row keeps the signature the server actually
+    // stood behind rather than whatever the client attached — the same rule
+    // the plain-message path follows.
+    let mut store_tags: std::collections::HashMap<String, String> = full_tags
         .iter()
         .filter(|(k, _)| *k != "msgid")
         .map(|(k, v)| (k.clone(), v.clone()))

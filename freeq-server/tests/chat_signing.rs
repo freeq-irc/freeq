@@ -959,3 +959,201 @@ async fn a_coordination_events_signature_is_left_alone() {
     })
     .await;
 }
+
+// ── Replayed history keeps its signatures ───────────────────────────
+//
+// A signature is only useful for as long as someone can still check it. Live
+// delivery is the easy half; the half that matters is a client that wasn't
+// there — joining later, or reloading — asking for history and being able to
+// reach the same verdict from the replayed lines alone.
+
+/// A reader who was not present when the message was sent: connects after the
+/// fact, joins, and asks for history. Its only copy of the message is the
+/// replay, so nothing here can be satisfied by a live frame.
+fn history_of(addr: SocketAddr, channel: &str, needle: &str) -> Option<String> {
+    let mut reader = C::guest(addr, "reader");
+    reader.join(channel);
+    reader.tx(&format!("CHATHISTORY LATEST {channel} * 20"));
+    reader.maybe(|l| l.contains(needle), 2000)
+}
+
+#[tokio::test]
+async fn replayed_history_carries_a_signature_a_reader_can_check() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#replay");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#replay");
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
+
+        let id = freeq_server::msgid::generate();
+        let body = "still checkable tomorrow";
+        let sig = ChatDoc::message(DID_ALICE, &id, &channel_venue("#replay"), body).sign(&signing);
+        alice.send_signed(&id, "#replay", body, &sig);
+        bob.rx(|l| l.contains(body), "live delivery");
+
+        let replayed = history_of(addr, "#replay", body).expect("history replays the message");
+        let replayed_sig = C::sig_of(&replayed).unwrap_or_else(|| {
+            panic!("a replayed signed message must still carry its signature: {replayed}")
+        });
+        let replayed_id = C::msgid_of(&replayed).expect("and the id it covers");
+
+        // Rebuilt from the replayed line alone.
+        ChatDoc::message(DID_ALICE, &replayed_id, &channel_venue("#replay"), body)
+            .verify(&replayed_sig, &signing.verifying_key())
+            .expect("the reader reaches the same verdict from history alone");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn replayed_history_carries_the_servers_signature_too() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#serversigned");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#serversigned");
+
+        // No client signature: the server signs on her behalf, and that
+        // attestation is what history has to keep.
+        alice.tx("PRIVMSG #serversigned :the server vouched for this");
+        let live = bob.rx(|l| l.contains("the server vouched"), "live delivery");
+        let live_sig = C::sig_of(&live).expect("the server signs for an identity");
+
+        let replayed = history_of(addr, "#serversigned", "the server vouched")
+            .expect("history replays the message");
+        assert_eq!(
+            C::sig_of(&replayed).as_deref(),
+            Some(live_sig.as_str()),
+            "history must carry the same attestation the live frame did: {replayed}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_signature_that_failed_is_not_replayed_by_history() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#notlaundered");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#notlaundered");
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
+
+        let id = freeq_server::msgid::generate();
+        let sig = ChatDoc::message(DID_ALICE, &id, &channel_venue("#notlaundered"), "what I signed")
+            .sign(&signing);
+        alice.send_signed(&id, "#notlaundered", "what I sent", &sig);
+        let live = bob.rx(|l| l.contains("what I sent"), "live delivery");
+        assert_eq!(C::sig_of(&live), None, "live delivery strips it: {live}");
+
+        let replayed =
+            history_of(addr, "#notlaundered", "what I sent").expect("history replays the message");
+        assert_eq!(
+            C::sig_of(&replayed),
+            None,
+            "and history must not resurrect a signature the server refused to \
+             stand behind: {replayed}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn replayed_history_names_one_id_not_two() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#oneid");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#oneid");
+
+        let id = freeq_server::msgid::generate();
+        alice.send_with_id(&id, "#oneid", "one identity");
+        bob.rx(|l| l.contains("one identity"), "live delivery");
+
+        let replayed = history_of(addr, "#oneid", "one identity").expect("history replays it");
+        assert_eq!(C::msgid_of(&replayed).as_deref(), Some(id.as_str()));
+        assert!(
+            !replayed.contains(EVENT_ID_TAG),
+            "the adopted id *is* the msgid; two tags that must agree forever is \
+             the ambiguity signing exists to remove: {replayed}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_replayed_edit_carries_the_signature_over_its_own_revision() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#editreplay");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#editreplay");
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
+
+        let root = freeq_server::msgid::generate();
+        alice.send_with_id(&root, "#editreplay", "first draft");
+        bob.rx(|l| l.contains("first draft"), "the original");
+
+        // An edit is its own event: its own id, and a document that names the
+        // message it revises.
+        let edit_id = freeq_server::msgid::generate();
+        let revised = "second draft";
+        let sig = ChatDoc::message(
+            DID_ALICE,
+            &edit_id,
+            &channel_venue("#editreplay"),
+            revised,
+        )
+        .with_edit(&root)
+        .sign(&signing);
+        alice.tx(&format!(
+            "@{EVENT_ID_TAG}={edit_id};+draft/edit={root};+freeq.at/sig={sig} \
+             PRIVMSG #editreplay :{revised}"
+        ));
+        let live = bob.rx(|l| l.contains(revised), "the edit");
+        assert_eq!(
+            C::sig_of(&live).as_deref(),
+            Some(sig.as_str()),
+            "the sender's signature relays as made: {live}"
+        );
+
+        let replayed =
+            history_of(addr, "#editreplay", revised).expect("history replays the revision");
+        let replayed_sig = C::sig_of(&replayed)
+            .unwrap_or_else(|| panic!("a replayed edit must keep its signature: {replayed}"));
+        let replayed_id = C::msgid_of(&replayed).expect("and its own id");
+        assert!(
+            !replayed.contains(EVENT_ID_TAG),
+            "one id, not two — the minted id *is* the msgid: {replayed}"
+        );
+        ChatDoc::message(
+            DID_ALICE,
+            &replayed_id,
+            &channel_venue("#editreplay"),
+            revised,
+        )
+        .with_edit(&root)
+        .verify(&replayed_sig, &signing.verifying_key())
+        .expect("a reader rebuilds and checks the revision from history alone");
+    })
+    .await;
+}
