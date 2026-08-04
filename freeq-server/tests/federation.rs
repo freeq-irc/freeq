@@ -610,10 +610,13 @@ async fn tagmsg_to_remote_did_relays_as_structured_tagmsg() {
 // since the field carries it). A TAGMSG mutation has no such field — its
 // signature rides the raw `Tagmsg` tag map, and nothing else asserts that
 // path. One route-through-the-filter refactor would silently drop mutation
-// signatures in flight, and once receivers verify, a signed delete arriving
-// without its signature is indistinguishable from tampering. This pins the
-// transport contract before anything signs a mutation for real: the tag
-// arrives exactly as sent, or this fails.
+// signatures in flight, and a signed delete arriving without its signature is
+// indistinguishable from tampering.
+//
+// The signature is the sender's real one: the origin now checks a mutation's
+// signature at ingress and refuses to relay one it cannot stand behind, so an
+// invented tag no longer travels at all — it is stripped at the source, which
+// is a different property, pinned separately in the ingress tests.
 
 #[tokio::test]
 #[ignore = "e2e federation harness; run with --ignored"]
@@ -644,33 +647,35 @@ async fn mutation_sig_tag_crosses_the_hop_byte_identical() {
     }
     let msgid = msgid.expect("bob's server received the channel message");
 
-    // A reaction carrying a signature tag. The value is opaque to today's
-    // servers (nothing verifies mutation sigs yet); the contract under test
-    // is transport fidelity, not validity.
-    const SIG: &str = "ed25519:testkid0000000000000000:c2lnbmF0dXJlLWJ5dGVzLWhlcmU";
-    ha.raw(&format!(
-        "@+react=\u{1F44D};+reply={msgid};+freeq.at/sig={SIG} TAGMSG #fsig"
-    ))
-    .await
-    .unwrap();
+    // A reaction, signed by alice's own device through the SDK.
+    ha.react("#fsig", "\u{1F44D}", &msgid).await.unwrap();
 
-    let relayed_sig = timeout(EVENT_TIMEOUT, async {
-        loop {
-            match rxb.recv().await {
-                Some(Event::TagMsg { tags, .. }) if tags.contains_key("+react") => {
-                    return tags.get("+freeq.at/sig").cloned();
+    async fn reaction_sig(rx: &mut mpsc::Receiver<Event>) -> Option<String> {
+        timeout(EVENT_TIMEOUT, async {
+            loop {
+                match rx.recv().await {
+                    Some(Event::TagMsg { tags, .. }) if tags.contains_key("+react") => {
+                        return tags.get("+freeq.at/sig").cloned();
+                    }
+                    Some(_) => continue,
+                    None => return None,
                 }
-                Some(_) => continue,
-                None => return None,
             }
-        }
-    })
-    .await
-    .expect("the reaction TAGMSG never crossed the hop");
+        })
+        .await
+        .expect("the reaction TAGMSG never arrived")
+    }
 
+    // The origin's own copy (echo-message), then the peer's.
+    let origin_sig = reaction_sig(&mut rxa).await;
+    let relayed_sig = reaction_sig(&mut rxb).await;
+
+    assert!(
+        origin_sig.is_some(),
+        "the origin must relay a verified mutation's own signature"
+    );
     assert_eq!(
-        relayed_sig.as_deref(),
-        Some(SIG),
+        relayed_sig, origin_sig,
         "a mutation's +freeq.at/sig must cross S2S byte-identical"
     );
 
