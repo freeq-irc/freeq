@@ -1342,12 +1342,20 @@ async fn api_verify_message(
     let mut venue = String::new();
     let mut sender_did: Option<String> = None;
     let mut found: Option<crate::server::HistoryMessage> = None;
+    // The message this row revises, as a column rather than a tag. A local edit
+    // files `+draft/edit` among its tags; one that arrived over S2S carries the
+    // linkage only in `replaces_msgid`, because the relayed tag map is filtered
+    // to `+freeq.at/*`. `edit` is a covered field either way, so reading only
+    // the tag rebuilt a document without it and reported an honest federated
+    // edit as *invalid* — the accusation the three-state design exists to avoid.
+    let mut revises: Option<String> = None;
     if let Some(row) = state
         .with_db(|db| db.find_message_by_msgid(&msgid))
         .flatten()
     {
         venue = row.channel.clone();
         sender_did = row.sender_did.clone();
+        revises = row.replaces_msgid.clone();
         found = Some(crate::server::HistoryMessage {
             from: row.sender,
             text: row.text,
@@ -1413,7 +1421,7 @@ async fn api_verify_message(
         {
             doc = doc.with_reply(reply);
         }
-        if let Some(edit) = msg.tags.get("+draft/edit") {
+        if let Some(edit) = msg.tags.get("+draft/edit").or(revises.as_ref()) {
             doc = doc.with_edit(edit);
         }
         doc.with_coord(msg.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
@@ -5099,6 +5107,64 @@ mod signature_verdict_tests {
         assert_eq!(out.0["verification"]["verdict"], "valid");
         assert_eq!(out.0["verification"]["verified_by"], "client-session-key");
         assert_eq!(out.0["sender_did"], did);
+    }
+
+    /// A federated *edit*: the linkage it signs lives in the row's
+    /// `replaces_msgid` column, because the relayed tag map is filtered to
+    /// `+freeq.at/*` and `+draft/edit` never crosses. Reading only the tag
+    /// rebuilt a four-key document and called an honest edit forged.
+    #[tokio::test]
+    async fn a_federated_edit_verifies_from_the_row_it_revises() {
+        let state = test_state_with_db();
+        let key = SigningKey::from_bytes(&[11u8; 32]);
+        let did = "did:plc:federatededitor";
+        let root = "01KYVT5Z8Q0000000000ROOT01";
+        let edit_msgid = "01KYVT5Z8Q0000000000EDIT01";
+        state
+            .with_db(|db| db.save_signing_key(did, key.verifying_key().as_bytes()))
+            .expect("test state has a database");
+
+        let sig = ChatDoc::message(
+            did,
+            edit_msgid,
+            &freeq_sdk::chatsig::channel_venue("#edits"),
+            "revised across the hop",
+        )
+        .with_edit(root)
+        .sign(&key);
+        // Exactly the tag set the S2S receive path files: no `+draft/edit`.
+        let tags = std::collections::HashMap::from([
+            (freeq_sdk::sigtag::SIG_TAG.to_string(), sig),
+            ("+freeq.at/origin".to_string(), "other-server".to_string()),
+        ]);
+        state
+            .with_db(|db| {
+                db.insert_edit(
+                    "#edits",
+                    "remote!u@s2s",
+                    "revised across the hop",
+                    0,
+                    &tags,
+                    edit_msgid,
+                    root,
+                    Some(did),
+                )
+            })
+            .expect("test state has a database");
+
+        let out = api_verify_message(
+            axum::extract::State(state),
+            axum::extract::Path(edit_msgid.to_string()),
+        )
+        .await
+        .expect("the edit is on file");
+        assert_eq!(
+            out.0["verification"]["verdict"], "valid",
+            "an edit's covered reference must come from the row when the tag is \
+             absent: {}",
+            out.0
+        );
+        assert_eq!(out.0["verification"]["verified_by"], "client-session-key");
     }
 
     /// Reading a message signed by someone we hold no key for asks a peer for

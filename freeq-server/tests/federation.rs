@@ -844,6 +844,113 @@ async fn the_receiving_server_verifies_a_signature_for_itself() {
     drop((srv_a, srv_b));
 }
 
+/// The receiving server's own answer for `msgid`, polled until it reaches a
+/// verdict. The key lookup runs off the delivery path, so the first read can
+/// still honestly say "cannot check"; this waits for the server to have what
+/// it needs and returns the last body read either way.
+async fn poll_verify(web_addr: &str, msgid: &str) -> serde_json::Value {
+    let url = format!("http://{web_addr}/api/v1/verify/{msgid}");
+    let client = reqwest::Client::new();
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut last = serde_json::Value::Null;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(resp) = client.get(&url).send().await
+            && let Ok(body) = resp.json::<serde_json::Value>().await
+        {
+            last = body;
+            if last["verification"]["verdict"] == "valid" {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    last
+}
+
+// ── a signed reply and a signed edit survive the hop ─────────────
+//
+// A plain message's document has four keys; a reply and an edit each add a
+// covered field that has to cross the link intact and be *stored* intact, or
+// the receiving server rebuilds a different document and reports an honest
+// message as tampering. The transport half is unit-pinned
+// (`privmsg_sig_crosses_the_hop_byte_identical`); this is the end-to-end half,
+// from a real client's signature to the receiving server's own verdict.
+
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_signed_reply_and_a_signed_edit_reach_valid_at_the_receiver() {
+    let alice = TestId::new("did:plc:alicethreads");
+    let bob = TestId::new("did:plc:bobthreads");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#threaded").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#threaded").await.unwrap();
+
+    // The message the reply and the edit both refer to. Retried until it
+    // lands, which is also what proves the channel is joined on both sides.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut landed = None;
+    let mut attempt = 0u32;
+    while tokio::time::Instant::now() < deadline {
+        attempt += 1;
+        let text = format!("root {attempt}");
+        ha.privmsg("#threaded", &text).await.ok();
+        if let Some(msgid) = recv_channel_msgid(&mut rxb, &text, Duration::from_secs(2)).await {
+            landed = Some(msgid);
+            break;
+        }
+    }
+    let root = landed.expect("alice's message never reached bob's server");
+
+    // A reply: the document covers `reply`, so the reference has to arrive
+    // and be filed under the same spelling the signer used.
+    ha.reply("#threaded", &root, "replying to that")
+        .await
+        .unwrap();
+    let reply_msgid = recv_channel_msgid(&mut rxb, "replying to that", EVENT_TIMEOUT)
+        .await
+        .expect("alice's reply never reached bob's server");
+    let verified = poll_verify(&srv_b.web_addr, &reply_msgid).await;
+    assert_eq!(
+        verified["verification"]["verdict"], "valid",
+        "a signed reply must verify at the receiving server: {verified}"
+    );
+    assert_eq!(
+        verified["verification"]["verified_by"], "client-session-key",
+        "and it must be alice's device that signed it: {verified}"
+    );
+    assert_eq!(verified["sender_did"], alice.did);
+
+    // An edit: same shape, but the covered field is `edit`, and the event is
+    // filed as a revision of the message it names.
+    ha.edit_message("#threaded", &root, "revised text")
+        .await
+        .unwrap();
+    let edit_msgid = recv_channel_msgid(&mut rxb, "revised text", EVENT_TIMEOUT)
+        .await
+        .expect("alice's edit never reached bob's server");
+    assert_ne!(edit_msgid, root, "an edit is its own event, with its own id");
+    let verified = poll_verify(&srv_b.web_addr, &edit_msgid).await;
+    assert_eq!(
+        verified["verification"]["verdict"], "valid",
+        "a signed edit must verify at the receiving server: {verified}"
+    );
+    assert_eq!(
+        verified["verification"]["verified_by"], "client-session-key",
+        "and it must be alice's device that signed it: {verified}"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
 // ── a single send is delivered exactly once (event_id dedup) ─────
 
 #[tokio::test]
