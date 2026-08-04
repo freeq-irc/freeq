@@ -6306,15 +6306,35 @@ mod s2s_adversarial_tests {
             !frame.contains("+freeq.at/sig"),
             "a signature that failed must not reach local clients: {frame}"
         );
-        // And it is not filed either — a reader of history must not find it.
-        let rows = state
-            .with_db(|db| db.get_messages("#chat", 10, None))
-            .unwrap();
-        assert_eq!(rows.len(), 1);
+
+        // The same rule for a signed event replayed somewhere it was never
+        // sent: the venue is inside the document, so the signature does not
+        // survive the move and must not travel with it.
+        let elsewhere = sign_channel_message(&key, SIGNER, "01REPLAYED", "#private", "for us only");
+        let frame = relay_to_member(
+            &state,
+            &mgr,
+            "replayed",
+            Some(SIGNER),
+            "01REPLAYED",
+            "for us only",
+            Some(elsewhere),
+        )
+        .await;
         assert!(
-            !rows[0].tags.contains_key("+freeq.at/sig"),
+            !frame.contains("+freeq.at/sig"),
+            "a signed event replayed into another channel must lose its signature: {frame}"
+        );
+        // Nor is it filed — a reader of history must not find it either.
+        let row = state
+            .with_db(|db| db.find_message_by_msgid("01TAMPERED"))
+            .flatten()
+            .expect("the message itself is still stored");
+        assert!(
+            !row.tags.contains_key("+freeq.at/sig"),
             "a signature that failed must not be stored"
         );
+        assert_eq!(row.text, "what a liar substituted");
     }
 
     /// The other side of the same rule: a signature that checks out is
