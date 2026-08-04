@@ -138,7 +138,10 @@ data_dir = "/data"
 server_name = "irc.example.com"
 iroh = true
 s2s_allowed_peers = ["44f1415c..."]
-s2s_peer_api = ["44f1415c...=https://irc.example.com"]
+
+# Where each federation peer serves its users' signing keys:
+[s2s_peer_api]
+"44f1415c..." = "https://irc.example.com"
 ```
 
 ```bash

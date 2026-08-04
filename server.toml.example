@@ -38,6 +38,12 @@
 ## peer's signatures stay uncheckable here (never reported as forged).
 # s2s_peer_api = ["44f1415c...=https://irc.example.com"]
 # s2s_peer_trust = ["44f1415c...:full"]
+## Map-shaped keys like the two above may also be written as TOML tables
+## (tables go at the END of the file — TOML files them after top-level keys):
+##   [s2s_peer_api]
+##   "44f1415c..." = "https://irc.example.com"
+##   [s2s_peer_trust]
+##   "44f1415c..." = "full"
 # require_did_for_ops = false
 
 ## ── Access control ─────────────────────────────────────────────────

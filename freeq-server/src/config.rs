@@ -372,6 +372,25 @@ impl ServerConfig {
     }
 }
 
+/// A map-shaped setting: natively a TOML table, but the CLI flag spells it
+/// as `key<sep>value` strings, and the file accepts that spelling too.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum MapOrPairs {
+    Map(std::collections::BTreeMap<String, String>),
+    Pairs(Vec<String>),
+}
+
+impl MapOrPairs {
+    /// The CLI spelling, which is what the rest of the server parses.
+    fn into_pairs(self, sep: char) -> Vec<String> {
+        match self {
+            MapOrPairs::Map(m) => m.into_iter().map(|(k, v)| format!("{k}{sep}{v}")).collect(),
+            MapOrPairs::Pairs(v) => v,
+        }
+    }
+}
+
 /// Every settable flag as an optional TOML key, named after its struct field.
 /// Excluded on purpose: `config` (a file naming a file) and `migrate_to` (a
 /// maintenance verb that must not run on every boot). `deny_unknown_fields`
@@ -391,11 +410,11 @@ struct FileConfig {
     iroh_port: Option<u16>,
     s2s_peers: Option<Vec<String>>,
     s2s_allowed_peers: Option<Vec<String>>,
-    s2s_peer_api: Option<Vec<String>>,
-    s2s_peer_trust: Option<Vec<String>>,
+    s2s_peer_api: Option<MapOrPairs>,
+    s2s_peer_trust: Option<MapOrPairs>,
     server_did: Option<String>,
     data_dir: Option<String>,
-    did_resolver_static: Option<Vec<String>>,
+    did_resolver_static: Option<MapOrPairs>,
     max_messages_per_channel: Option<usize>,
     motd: Option<String>,
     motd_file: Option<String>,
@@ -486,6 +505,23 @@ fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConf
             }
         )*};
     }
+    // Map-shaped settings: a TOML table (or the CLI's pair spelling),
+    // normalized to the pair form the server parses.
+    if let Some(v) = file.s2s_peer_api {
+        if !explicitly_set(matches, "s2s_peer_api") {
+            cfg.s2s_peer_api = v.into_pairs('=');
+        }
+    }
+    if let Some(v) = file.s2s_peer_trust {
+        if !explicitly_set(matches, "s2s_peer_trust") {
+            cfg.s2s_peer_trust = v.into_pairs(':');
+        }
+    }
+    if let Some(v) = file.did_resolver_static {
+        if !explicitly_set(matches, "did_resolver_static") {
+            cfg.did_resolver_static = v.into_pairs('=');
+        }
+    }
     plain!(
         listen_addr,
         tls_listen_addr,
@@ -494,9 +530,6 @@ fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConf
         iroh,
         s2s_peers,
         s2s_allowed_peers,
-        s2s_peer_api,
-        s2s_peer_trust,
-        did_resolver_static,
         max_messages_per_channel,
         plugins,
         require_did_for_ops,
@@ -615,6 +648,37 @@ mod tests {
     fn no_file_means_plain_cli_parsing() {
         let c = cfg(&["--server-name", "bare"], None).unwrap();
         assert_eq!(c.server_name, "bare");
+    }
+
+    /// A map-shaped setting reads naturally as a TOML table, and the CLI's
+    /// pair spelling stays valid — both normalize to the same thing.
+    #[test]
+    fn peer_maps_accept_tables_and_pair_strings() {
+        let c = cfg(
+            &[],
+            Some(
+                r#"
+                [s2s_peer_api]
+                "abcd" = "https://irc.example.com"
+
+                [s2s_peer_trust]
+                "abcd" = "relay"
+                "#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(c.s2s_peer_api, vec!["abcd=https://irc.example.com"]);
+        assert_eq!(c.s2s_peer_trust, vec!["abcd:relay"]);
+
+        let c = cfg(&[], Some(r#"s2s_peer_api = ["abcd=https://irc.example.com"]"#)).unwrap();
+        assert_eq!(c.s2s_peer_api, vec!["abcd=https://irc.example.com"]);
+
+        let c = cfg(
+            &["--s2s-peer-api", "cli=https://cli.example.com"],
+            Some(r#"s2s_peer_api = ["file=https://file.example.com"]"#),
+        )
+        .unwrap();
+        assert_eq!(c.s2s_peer_api, vec!["cli=https://cli.example.com"]);
     }
 
     /// The shipped example must never drift from the real schema: uncomment
