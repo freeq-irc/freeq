@@ -150,6 +150,7 @@ freeq-server --config /etc/freeq/server.toml
 | Flag | Default | Description |
 |---|---|---|
 | `--config` | *(none)* | TOML file of options; flags and env vars override it |
+| `--check-config` | | Validate configuration and exit — run before a restart to catch bad edits |
 | `--db-path` | *(none — in-memory)* | SQLite database file |
 | `--migrate-to` | *(none)* | Run the schema ladder to this version and exit (see [Schema migrations](#schema-migrations)) |
 | `--data-dir` | parent of `--db-path` | Directory for keys and iroh state |

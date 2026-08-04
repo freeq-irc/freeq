@@ -8,6 +8,10 @@ Type=simple
 User=chad
 Group=chad
 WorkingDirectory=/home/chad/src/freeq
+# Alternative: keep options in a config file instead of flags —
+#   ExecStart=/home/chad/src/freeq/target/release/freeq-server --config /etc/freeq/server.toml
+# Every flag below is also a TOML key (see server.toml.example in the repo
+# root); flags override the file. setup.sh-managed installs use this style.
 ExecStart=/home/chad/src/freeq/target/release/freeq-server \
     --listen-addr 0.0.0.0:6667 \
     --tls-listen-addr 0.0.0.0:6697 \

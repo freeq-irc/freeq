@@ -21,6 +21,13 @@ async fn main() -> Result<()> {
     let mut config = freeq_server::config::ServerConfig::load()
         .map_err(|e| anyhow::anyhow!("configuration: {e}"))?;
 
+    // `load()` already failed loudly on a bad file, so reaching here IS the
+    // validation — report and stop before any listener or database opens.
+    if config.check_config {
+        println!("configuration OK");
+        return Ok(());
+    }
+
     // A maintenance verb, not a server mode: run the ladder to the requested
     // version and exit. Startup only ever migrates up; this is how the tested
     // down migrations get run without hand-written SQL.

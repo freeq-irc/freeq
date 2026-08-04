@@ -516,6 +516,7 @@ Options:
   --server-name <NAME>            Server name [default: freeq]
   --challenge-timeout-secs <N>    SASL challenge validity [default: 60]
   --config <PATH>                 Read options from a TOML file (flags override)
+  --check-config                  Validate configuration and exit
   --db-path <PATH>                SQLite database path (omit for in-memory)
   --migrate-to <VERSION>          Run the schema ladder to VERSION and exit
   --web-addr <ADDR>               HTTP/WebSocket listener address

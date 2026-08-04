@@ -17,6 +17,16 @@ npm ci --silent
 npm run build
 cd "$REPO_DIR"
 
+# Catch a bad config edit while the old server is still running, instead of
+# discovering it as a crash loop after the restart. Run the check as the
+# service user: the file is root:freeq 640, and this also proves the real
+# service will be able to read it.
+if [[ -f /etc/freeq/server.toml ]]; then
+    echo "==> Validating /etc/freeq/server.toml..."
+    SVC_USER=$(systemctl show -p User --value freeq-server 2>/dev/null || true)
+    sudo -u "${SVC_USER:-freeq}" ./target/release/freeq-server --config /etc/freeq/server.toml --check-config
+fi
+
 echo "==> Restarting service..."
 sudo systemctl restart freeq-server
 

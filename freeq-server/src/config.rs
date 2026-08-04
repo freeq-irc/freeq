@@ -13,6 +13,12 @@ pub struct ServerConfig {
     #[arg(long, env = "FREEQ_CONFIG", value_name = "PATH")]
     pub config: Option<String>,
 
+    /// Validate the configuration (including --config, if given) and exit —
+    /// nothing starts. Deploy scripts run this before restarting the service
+    /// so a bad edit is caught while the old server is still up.
+    #[arg(long)]
+    pub check_config: bool,
+
     /// Plain TCP listener address. (`--bind` kept as an alias — older docs
     /// and docker-compose files used it.)
     #[arg(long, alias = "bind", default_value = "127.0.0.1:6667")]
@@ -258,6 +264,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             config: None,
+            check_config: false,
             listen_addr: "127.0.0.1:6667".to_string(),
             tls_listen_addr: "127.0.0.1:6697".to_string(),
             tls_cert: None,

@@ -113,24 +113,28 @@ self-hosters.
 | Path | Purpose |
 |------|---------|
 | `/var/lib/freeq/freeq.db` | SQLite database |
-| `/etc/freeq/secrets` | Environment variables (secrets) |
-| `/etc/systemd/system/freeq-server.service` | Systemd unit |
+| `/etc/freeq/server.toml` | Server configuration (every CLI flag as a TOML key) |
+| `/etc/freeq/secrets` | Environment variables (secrets) — env beats the config file |
+| `/etc/systemd/system/freeq-server.service` | Systemd unit (just `--config /etc/freeq/server.toml`) |
 
 ## Manual Setup
 
-If you prefer to set things up manually, the templates use these placeholders:
+The unit is a one-liner pointing at the config file; server options live in `/etc/freeq/server.toml`, not in the unit. The template uses two placeholders — `{{USER}}` (service user, default `freeq`) and `{{REPO_DIR}}` (path to the repo):
 
-- `{{DOMAIN}}` — your domain (e.g. freeq.example.com)
-- `{{USER}}` — system user running the service (default: `freeq`)
-- `{{REPO_DIR}}` — path to the freeq repo
-
-Example:
 ```sh
-sed -e 's|{{DOMAIN}}|freeq.example.com|g' \
-    -e 's|{{USER}}|freeq|g' \
+sed -e 's|{{USER}}|freeq|g' \
     -e 's|{{REPO_DIR}}|/home/ubuntu/freeq|g' \
-    deploy/freeq-server.service.template > /tmp/freeq-server.service
+    deploy/freeq-server.service.template | sudo tee /etc/systemd/system/freeq-server.service
 
-# Optional: add --iroh flag
-sed -i 's|--server-name freeq.example.com \\|--server-name freeq.example.com \\\n    --iroh \\|' /tmp/freeq-server.service
+sudo mkdir -p /etc/freeq
+# Start from the annotated example (every key documented, commented out):
+cp server.toml.example /etc/freeq/server.toml
+$EDITOR /etc/freeq/server.toml   # uncomment and set listen/db/domain/etc.
+
+# Validate before starting — a typo'd key is an error naming the key:
+target/release/freeq-server --config /etc/freeq/server.toml --check-config
 ```
+
+`setup.sh` writes `/etc/freeq/server.toml` on first run and never overwrites an existing one — the file belongs to the operator after that. `deploy.sh` validates it before every restart.
+
+**Converting an existing flag-style install:** write the complete `/etc/freeq/server.toml` *first* — every flag from your current unit's `ExecStart` mapped to its key, because setup.sh's own generated file covers only the options it manages (a fresh one would silently drop e.g. S2S peer settings). With your file pre-written, re-running setup.sh is safe: it leaves the file alone, swaps the unit to `--config`, validates, and restarts.
