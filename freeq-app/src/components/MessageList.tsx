@@ -918,7 +918,7 @@ async function verifySignature(msgid: string): Promise<VerifyOutcome> {
   if (cached) return cached;
   try {
     const r = await fetch(`/api/v1/verify/${encodeURIComponent(msgid)}`);
-    if (!r.ok) return 'failed';
+    if (!r.ok) return 'unverifiable';
     const j = await r.json();
     const v = j?.verification;
     // `verdict` is the server's three-way answer; fall back to the older
