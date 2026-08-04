@@ -118,10 +118,19 @@ pub fn parse_trust_config(entries: &[String]) -> HashMap<String, TrustLevel> {
 /// re-attested on receipt), and `account`/`time`/`msgid` (regenerated
 /// locally; not `+freeq.at/`-prefixed so excluded anyway).
 pub fn relay_coordination_tags(full: &HashMap<String, String>) -> HashMap<String, String> {
-    full.iter()
+    let mut relayed: HashMap<String, String> = full
+        .iter()
         .filter(|(k, _)| k.starts_with("+freeq.at/") && k.as_str() != "+freeq.at/sig")
         .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
+        .collect();
+    // The reply reference is part of what a signature covers, so it has to
+    // reach the peer intact — a receiver rebuilding the document without it
+    // gets a different canonical and reads an honest reply as tampering.
+    // Normalized to the canonical spelling, the one local delivery emits.
+    if let Some(root) = full.get("+reply").or_else(|| full.get("+draft/reply")) {
+        relayed.insert("+reply".to_string(), root.clone());
+    }
+    relayed
 }
 
 /// Encode a PRIVMSG body for the S2S `text` field so that ANY peer
@@ -2062,6 +2071,31 @@ mod tests {
         // And the tag is there so the old peer's freeq-aware clients
         // know to decode on render.
         assert!(tags.contains_key("+freeq.at/multiline"));
+    }
+
+    /// A signed message covers what it replies to, so the reply reference has
+    /// to survive the hop or the receiving server rebuilds a different
+    /// document and reads an honest reply as tampering. Both client spellings
+    /// cross under the canonical one.
+    #[test]
+    fn relay_coordination_tags_carry_the_reply_reference() {
+        for spelling in ["+reply", "+draft/reply"] {
+            let mut full = HashMap::new();
+            full.insert(spelling.to_string(), "01ROOTMSGID".to_string());
+            let relayed = relay_coordination_tags(&full);
+            assert_eq!(
+                relayed.get("+reply").map(String::as_str),
+                Some("01ROOTMSGID"),
+                "{spelling} must cross S2S as +reply"
+            );
+        }
+
+        // A message that replies to nothing gains no reply tag.
+        let relayed = relay_coordination_tags(&HashMap::from([(
+            "+freeq.at/event".to_string(),
+            "x".to_string(),
+        )]));
+        assert!(!relayed.contains_key("+reply"));
     }
 
     #[test]

@@ -2845,6 +2845,138 @@ fn s2s_channel_entry<'a>(
     ch
 }
 
+/// The body a relayed message's signature covers, rebuilt from the wire.
+///
+/// The S2S `text` field is not always the body the sender signed: a multiline
+/// message is escaped for transport (`encode_privmsg_text_for_s2s`) so that a
+/// peer relaying it to its own clients cannot break the IRC line. When the
+/// per-line breakdown rode along, reassemble from that — the exact bytes the
+/// origin assembled — and fall back to undoing the escape for peers that send
+/// only the escaped text.
+fn relayed_signed_body(
+    text: &str,
+    tags: &HashMap<String, String>,
+    lines: Option<&Vec<crate::s2s::MultilineLine>>,
+) -> String {
+    if let Some(lines) = lines {
+        let mut out = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 && !line.concat {
+                out.push('\n');
+            }
+            out.push_str(&line.body);
+        }
+        return out;
+    }
+    if tags.contains_key("+freeq.at/multiline") {
+        return text.replace("\\n", "\n");
+    }
+    text.to_string()
+}
+
+/// Check a relayed PRIVMSG's signature against the message as transmitted.
+///
+/// `None` when the message carries no signature — there is nothing to check,
+/// which is not the same as failing to check.
+///
+/// Every argument is the value that *arrived*, before the receive path tidies
+/// it, and the sender DID is the one the origin stamped — never the nick-map
+/// fallback, which would have us rebuild a document around an identity the
+/// origin never asserted.
+#[allow(clippy::too_many_arguments)]
+fn verify_relayed_privmsg(
+    state: &Arc<SharedState>,
+    account: Option<&str>,
+    target: &str,
+    msgid: Option<&str>,
+    text: &str,
+    tags: &HashMap<String, String>,
+    replaces_msgid: Option<&str>,
+    multiline_lines: Option<&Vec<crate::s2s::MultilineLine>>,
+    sig: Option<&str>,
+) -> Option<crate::connection::messaging::ClientSigOutcome> {
+    use crate::connection::messaging::{ClientSigOutcome, SignedFields, verify_relayed_message};
+    let sig = sig?;
+    let Some(did) = account else {
+        return Some(ClientSigOutcome::Unverifiable(
+            "relayed message names no sender DID",
+        ));
+    };
+    let body = relayed_signed_body(text, tags, multiline_lines);
+    let fields = SignedFields {
+        body: &body,
+        msgid: msgid.unwrap_or_default(),
+        reply: tags
+            .get("+reply")
+            .or_else(|| tags.get("+draft/reply"))
+            .map(String::as_str),
+        edit: replaces_msgid.filter(|r| !r.is_empty()),
+        body_rewritten: false,
+    };
+    Some(verify_relayed_message(
+        state, did, target, &fields, tags, sig,
+    ))
+}
+
+/// Check a relayed mutation's signature against the event as transmitted.
+///
+/// `None` when the event carries no signature, or carries no mutation at all
+/// (a typing notification is not a signed event).
+///
+/// Read before the receive path renames draft tags and resolves the subject to
+/// a local root: both rewrite values the signature covers. A sender that mints
+/// no event id leaves nothing to rebuild, which reads unverifiable — the state
+/// of every mutation on the wire until senders sign them.
+fn verify_relayed_mutation_tags(
+    state: &Arc<SharedState>,
+    account: Option<&str>,
+    target: &str,
+    tags: &HashMap<String, String>,
+) -> Option<crate::connection::messaging::ClientSigOutcome> {
+    use crate::connection::messaging::{ClientSigOutcome, verify_relayed_mutation};
+    use freeq_sdk::chatsig::Mutation;
+
+    let get = |a: &str, b: &str| tags.get(a).or_else(|| tags.get(b)).map(String::as_str);
+    let subject = || get("+reply", "+draft/reply");
+    let (kind, subject, emoji) = if let Some(subject) = get("+draft/delete", "+delete") {
+        (Mutation::Delete, Some(subject), None)
+    } else if let Some(emoji) = get("+react", "+draft/react") {
+        (Mutation::React, subject(), Some(emoji))
+    } else if let Some(emoji) = tags.get("+freeq.at/unreact").map(String::as_str) {
+        (Mutation::Unreact, subject(), Some(emoji))
+    } else {
+        return None;
+    };
+
+    let sig = tags.get("+freeq.at/sig").map(String::as_str)?;
+    let Some(did) = account else {
+        return Some(ClientSigOutcome::Unverifiable(
+            "relayed mutation names no actor DID",
+        ));
+    };
+    let Some(subject) = subject else {
+        return Some(ClientSigOutcome::Unverifiable(
+            "relayed mutation names no subject",
+        ));
+    };
+    let event_msgid = get(
+        freeq_sdk::chatsig::EVENT_ID_TAG,
+        freeq_sdk::chatsig::EVENT_ID_TAG_BARE,
+    )
+    .unwrap_or_default();
+
+    Some(verify_relayed_mutation(
+        state,
+        did,
+        target,
+        kind,
+        event_msgid,
+        subject,
+        emoji,
+        sig,
+    ))
+}
+
 /// Process an incoming S2S message. Exposed as pub(crate) for adversarial testing.
 pub(crate) async fn process_s2s_message(
     state: &Arc<SharedState>,
@@ -3263,19 +3395,78 @@ pub(crate) async fn process_s2s_message(
             multiline_lines,
             ..
         } => {
+            // ── verify before tidying ────────────────────────────────
+            // Everything below this block rewrites the envelope: it
+            // sanitizes, stamps in a msgid of our own, re-roots the edit
+            // reference, filters and caps the tags. All of that changes bytes
+            // the signature covers, so the check runs against the message as
+            // transmitted, and only the tidied copy is filed and delivered.
+            let sig_verdict = verify_relayed_privmsg(
+                state,
+                account.as_deref(),
+                &target,
+                msgid.as_deref(),
+                &text,
+                &relayed_tags,
+                replaces_msgid.as_deref(),
+                multiline_lines.as_ref(),
+                sig.as_deref(),
+            );
+
             // Sanitize all peer-provided strings to prevent IRC protocol injection.
             let from = sanitize_s2s_str(&from, 512);
-            let target = sanitize_s2s_str(&target, 200);
+            let raw_target = target;
+            let target = sanitize_s2s_str(&raw_target, 200);
             // Match the local multiline ceiling (MAX_BYTES) so a federated
             // message isn't truncated in history/CHATHISTORY when it crosses a
             // server boundary. `\r`/`\n`/`\0` stripping is the injection
             // defense; the length cap is only a size bound. Tied to the same
             // constant so the two paths can't drift apart again.
-            let text = sanitize_s2s_str(&text, crate::connection::draft_multiline::MAX_BYTES);
+            let raw_text = text;
+            let text = sanitize_s2s_str(&raw_text, crate::connection::draft_multiline::MAX_BYTES);
             // Sender DID carried from the origin (the `account` tag value).
             // Stamped by the origin from its authenticated session, never
             // client-set; relayed on the same peer trust as the message body.
-            let account = account.map(|a| sanitize_s2s_str(&a, 512));
+            let raw_account = account;
+            let account = raw_account.as_deref().map(|a| sanitize_s2s_str(a, 512));
+
+            // Sanitizing just changed bytes the signature covers. When it did,
+            // this server is why the document no longer matches — which reads
+            // *unverifiable*, never invalid, exactly as a plugin rewrite does
+            // at local ingress.
+            let sig_verdict = match sig_verdict {
+                Some(v)
+                    if text != raw_text
+                        || target != raw_target
+                        || account.as_deref() != raw_account.as_deref() =>
+                {
+                    tracing::debug!(
+                        peer = %authenticated_peer_id,
+                        "Relayed message was altered by our own sanitizer ({v:?} discarded)"
+                    );
+                    Some(crate::connection::messaging::ClientSigOutcome::Unverifiable(
+                        "sanitized on receipt",
+                    ))
+                }
+                other => other,
+            };
+            if let Some(verdict) = sig_verdict {
+                use crate::connection::messaging::ClientSigOutcome;
+                match verdict {
+                    ClientSigOutcome::Verified => tracing::debug!(
+                        peer = %authenticated_peer_id, target = %target,
+                        "Relayed message signature verified against the sender's own key"
+                    ),
+                    ClientSigOutcome::Failed => tracing::warn!(
+                        peer = %authenticated_peer_id, target = %target, from = %from,
+                        "Relayed message signature did not verify against the key it names"
+                    ),
+                    ClientSigOutcome::Unverifiable(why) => tracing::debug!(
+                        peer = %authenticated_peer_id, target = %target, why = %why,
+                        "Relayed message signature cannot be checked here"
+                    ),
+                }
+            }
 
             // Generate a local msgid if the remote didn't send one
             let msgid = msgid.unwrap_or_else(crate::msgid::generate);
@@ -3319,11 +3510,25 @@ pub(crate) async fn process_s2s_message(
             // sanitize key+value against IRC injection, and cap the count to
             // bound relay amplification.
             let mut relay_tags: HashMap<String, String> = relayed_tags
-                .into_iter()
-                .filter(|(k, _)| k.starts_with("+freeq.at/") && k != "+freeq.at/sig")
+                .iter()
+                .filter(|(k, _)| k.starts_with("+freeq.at/") && k.as_str() != "+freeq.at/sig")
                 .take(16)
-                .map(|(k, v)| (sanitize_s2s_str(&k, 64), sanitize_s2s_str(&v, 4096)))
+                .map(|(k, v)| (sanitize_s2s_str(k, 64), sanitize_s2s_str(v, 4096)))
                 .collect();
+            // The reply reference rides outside that cap: it is a covered
+            // field, so dropping it because a peer sent many coordination tags
+            // would silently detach a reply from its thread. Resolved to our
+            // own root, like every other reference a peer names.
+            if let Some(root) = relayed_tags
+                .get("+reply")
+                .or_else(|| relayed_tags.get("+draft/reply"))
+            {
+                let root = crate::connection::helpers::root_msgid(
+                    state,
+                    &sanitize_s2s_str(root, 100),
+                );
+                relay_tags.insert("+reply".to_string(), root);
+            }
             // Provenance: every message reaching here is from a remote origin
             // (self-origin is skipped above), so tag it with the origin
             // server's name. Lets clients distinguish a peer-vouched federated
@@ -3785,6 +3990,29 @@ pub(crate) async fn process_s2s_message(
                     .get(&actor_nick.to_lowercase())
                     .cloned()
             });
+
+            // ── verify before tidying ────────────────────────────────
+            // Same rule the relayed-PRIVMSG path follows: the renames and the
+            // subject re-rooting below rewrite values the signature covers, so
+            // the check reads the tags as they arrived.
+            let sig_verdict = verify_relayed_mutation_tags(state, peer_account.as_deref(), &target, &tags);
+            if let Some(verdict) = sig_verdict {
+                use crate::connection::messaging::ClientSigOutcome;
+                match verdict {
+                    ClientSigOutcome::Verified => tracing::debug!(
+                        peer = %authenticated_peer_id, target = %target,
+                        "Relayed mutation signature verified against the actor's own key"
+                    ),
+                    ClientSigOutcome::Failed => tracing::warn!(
+                        peer = %authenticated_peer_id, target = %target, from = %from,
+                        "Relayed mutation signature did not verify against the key it names"
+                    ),
+                    ClientSigOutcome::Unverifiable(why) => tracing::debug!(
+                        peer = %authenticated_peer_id, target = %target, why = %why,
+                        "Relayed mutation signature cannot be checked here"
+                    ),
+                }
+            }
 
             // Normalize draft tags
             let mut tags = tags.clone();
@@ -5538,6 +5766,424 @@ mod s2s_adversarial_tests {
 
     fn setup_channel(state: &SharedState, name: &str) {
         state.channels.lock().entry(name.to_string()).or_default();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // What a peer relays gets checked before anything tidies it
+    // ═══════════════════════════════════════════════════════════
+    //
+    // A receiving server holds no session for a remote sender, so every one of
+    // these goes through the durable per-(DID, kid) key store — the one a
+    // cross-server lookup fills. The contract under test is always the same:
+    // the document is rebuilt from the bytes that arrived, and the three
+    // answers stay distinct (checks out / does not check out / cannot tell).
+
+    use crate::connection::messaging::ClientSigOutcome;
+
+    const SIGNER: &str = "did:plc:relayedsigner";
+
+    /// A signer whose key is on file here, as a key lookup would leave it.
+    fn signer_on_file(state: &Arc<SharedState>, did: &str) -> ed25519_dalek::SigningKey {
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        state
+            .with_db(|db| db.save_signing_key(did, key.verifying_key().as_bytes()))
+            .expect("db present");
+        key
+    }
+
+    /// The signature a client would put on a channel message.
+    fn sign_channel_message(
+        key: &ed25519_dalek::SigningKey,
+        did: &str,
+        msgid: &str,
+        channel: &str,
+        body: &str,
+    ) -> String {
+        freeq_sdk::chatsig::ChatDoc::message(
+            did,
+            msgid,
+            &freeq_sdk::chatsig::channel_venue(channel),
+            body,
+        )
+        .sign(key)
+    }
+
+    /// A relayed PRIVMSG, exactly as `verify_relayed_privmsg` receives one.
+    #[allow(clippy::too_many_arguments)]
+    fn check_relayed(
+        state: &Arc<SharedState>,
+        account: Option<&str>,
+        target: &str,
+        msgid: Option<&str>,
+        text: &str,
+        tags: &HashMap<String, String>,
+        sig: Option<&str>,
+    ) -> Option<crate::connection::messaging::ClientSigOutcome> {
+        verify_relayed_privmsg(
+            state, account, target, msgid, text, tags, None, None, sig,
+        )
+    }
+
+    #[tokio::test]
+    async fn relayed_signature_verifies_against_the_message_as_transmitted() {
+        let state = test_state_with_db();
+        let key = signer_on_file(&state, SIGNER);
+        let sig = sign_channel_message(&key, SIGNER, "01EVENTID", "#chat", "hello there");
+
+        assert_eq!(
+            check_relayed(
+                &state,
+                Some(SIGNER),
+                "#chat",
+                Some("01EVENTID"),
+                "hello there",
+                &HashMap::new(),
+                Some(&sig),
+            ),
+            Some(ClientSigOutcome::Verified)
+        );
+    }
+
+    /// A peer that changes the words in flight. This is the branch that must
+    /// read as tampering rather than as "cannot tell" — the whole point of
+    /// checking at all.
+    #[tokio::test]
+    async fn relayed_message_altered_in_flight_does_not_verify() {
+        let state = test_state_with_db();
+        let key = signer_on_file(&state, SIGNER);
+        let sig = sign_channel_message(&key, SIGNER, "01EVENTID", "#chat", "hello there");
+
+        assert_eq!(
+            check_relayed(
+                &state,
+                Some(SIGNER),
+                "#chat",
+                Some("01EVENTID"),
+                "hello, enemy",
+                &HashMap::new(),
+                Some(&sig),
+            ),
+            Some(ClientSigOutcome::Failed),
+            "a body changed in flight must not verify"
+        );
+    }
+
+    /// The same signed event, relayed into a channel it was never sent to.
+    /// The venue is part of the document precisely so this cannot work.
+    #[tokio::test]
+    async fn relayed_message_replayed_into_another_channel_does_not_verify() {
+        let state = test_state_with_db();
+        let key = signer_on_file(&state, SIGNER);
+        let sig = sign_channel_message(&key, SIGNER, "01EVENTID", "#chat", "hello there");
+
+        assert_eq!(
+            check_relayed(
+                &state,
+                Some(SIGNER),
+                "#elsewhere",
+                Some("01EVENTID"),
+                "hello there",
+                &HashMap::new(),
+                Some(&sig),
+            ),
+            Some(ClientSigOutcome::Failed),
+            "a signed event replayed into another channel must not verify"
+        );
+    }
+
+    /// A peer that strips the event id. Checking after the receive path minted
+    /// a replacement would compare the signature against an id this server
+    /// invented and call an honest message forged; checked as it arrived,
+    /// there is simply no document to rebuild.
+    #[tokio::test]
+    async fn relayed_message_without_an_event_id_cannot_be_checked() {
+        let state = test_state_with_db();
+        let key = signer_on_file(&state, SIGNER);
+        let sig = sign_channel_message(&key, SIGNER, "01EVENTID", "#chat", "hello there");
+
+        assert!(
+            matches!(
+                check_relayed(
+                    &state,
+                    Some(SIGNER),
+                    "#chat",
+                    None,
+                    "hello there",
+                    &HashMap::new(),
+                    Some(&sig),
+                ),
+                Some(ClientSigOutcome::Unverifiable(_))
+            ),
+            "a relayed message with no event id is uncheckable, not forged"
+        );
+    }
+
+    /// No `account` on the wire means no signer to build a document around.
+    /// The nick map must not stand in: it would have us verify a signature
+    /// against an identity the origin never asserted.
+    #[tokio::test]
+    async fn relayed_message_with_no_sender_did_cannot_be_checked() {
+        let state = test_state_with_db();
+        let key = signer_on_file(&state, SIGNER);
+        let sig = sign_channel_message(&key, SIGNER, "01EVENTID", "#chat", "hello there");
+
+        assert!(matches!(
+            check_relayed(
+                &state,
+                None,
+                "#chat",
+                Some("01EVENTID"),
+                "hello there",
+                &HashMap::new(),
+                Some(&sig),
+            ),
+            Some(ClientSigOutcome::Unverifiable(_))
+        ));
+    }
+
+    /// A signer this server has never seen. Until a key lookup fills the
+    /// store this is "cannot tell" — never "forged".
+    #[tokio::test]
+    async fn relayed_message_from_an_unknown_signer_cannot_be_checked() {
+        let state = test_state_with_db();
+        // Signed by a key that was never registered anywhere.
+        let stranger = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let sig = sign_channel_message(&stranger, SIGNER, "01EVENTID", "#chat", "hello there");
+
+        assert!(matches!(
+            check_relayed(
+                &state,
+                Some(SIGNER),
+                "#chat",
+                Some("01EVENTID"),
+                "hello there",
+                &HashMap::new(),
+                Some(&sig),
+            ),
+            Some(ClientSigOutcome::Unverifiable(_))
+        ));
+    }
+
+    /// A message with no signature at all is not a verdict of any kind.
+    #[tokio::test]
+    async fn relayed_message_with_no_signature_yields_no_verdict() {
+        let state = test_state_with_db();
+        assert_eq!(
+            check_relayed(
+                &state,
+                Some(SIGNER),
+                "#chat",
+                Some("01EVENTID"),
+                "hello there",
+                &HashMap::new(),
+                None,
+            ),
+            None
+        );
+    }
+
+    /// A multiline message is escaped for transport, so the wire `text` is not
+    /// the body its sender signed. Rebuilt from the per-line breakdown, it is.
+    #[tokio::test]
+    async fn relayed_multiline_verifies_against_the_assembled_body() {
+        let state = test_state_with_db();
+        let key = signer_on_file(&state, SIGNER);
+        let assembled = "first line\nsecond line";
+        let sig = sign_channel_message(&key, SIGNER, "01EVENTID", "#chat", assembled);
+
+        let (wire_text, wire_tags) =
+            crate::s2s::encode_privmsg_text_for_s2s(assembled, HashMap::new());
+        assert!(
+            !wire_text.contains('\n'),
+            "the transport escape is what makes this test worth having"
+        );
+        let lines = vec![
+            crate::s2s::MultilineLine {
+                body: "first line".to_string(),
+                concat: false,
+            },
+            crate::s2s::MultilineLine {
+                body: "second line".to_string(),
+                concat: false,
+            },
+        ];
+
+        assert_eq!(
+            verify_relayed_privmsg(
+                &state,
+                Some(SIGNER),
+                "#chat",
+                Some("01EVENTID"),
+                &wire_text,
+                &wire_tags,
+                None,
+                Some(&lines),
+                Some(&sig),
+            ),
+            Some(ClientSigOutcome::Verified),
+            "a multiline body must be reassembled before it is hashed"
+        );
+
+        // And with no per-line breakdown (an older peer), undoing the escape
+        // reaches the same body.
+        assert_eq!(
+            verify_relayed_privmsg(
+                &state,
+                Some(SIGNER),
+                "#chat",
+                Some("01EVENTID"),
+                &wire_text,
+                &wire_tags,
+                None,
+                None,
+                Some(&sig),
+            ),
+            Some(ClientSigOutcome::Verified)
+        );
+    }
+
+    /// A reply covers what it replies to. The reference now crosses the hop,
+    /// so the document rebuilds — and local clients see the thread instead of
+    /// a loose message.
+    #[tokio::test]
+    async fn relayed_reply_verifies_and_reaches_clients_with_its_thread() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#chat");
+        let key = signer_on_file(&state, SIGNER);
+
+        let sig = freeq_sdk::chatsig::ChatDoc::message(
+            SIGNER,
+            "01REPLYEVENT",
+            &freeq_sdk::chatsig::channel_venue("#chat"),
+            "answering you",
+        )
+        .with_reply("01ROOTMSGID")
+        .sign(&key);
+
+        let tags = HashMap::from([("+reply".to_string(), "01ROOTMSGID".to_string())]);
+        assert_eq!(
+            check_relayed(
+                &state,
+                Some(SIGNER),
+                "#chat",
+                Some("01REPLYEVENT"),
+                "answering you",
+                &tags,
+                Some(&sig),
+            ),
+            Some(ClientSigOutcome::Verified),
+            "the reply reference must be part of the rebuilt document"
+        );
+
+        // The delivery half: a tag-capable local member sees the thread.
+        let (tx, mut rx) = mpsc::channel(16);
+        state.connections.lock().insert("w".to_string(), tx);
+        state.cap_message_tags.lock().insert("w".to_string());
+        state
+            .channels
+            .lock()
+            .get_mut("#chat")
+            .unwrap()
+            .members
+            .insert("w".to_string());
+
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Privmsg {
+                event_id: format!("{PEER}:reply1"),
+                from: "remote!u@s2s".to_string(),
+                target: "#chat".to_string(),
+                text: "answering you".to_string(),
+                origin: PEER.to_string(),
+                msgid: Some("01REPLYEVENT".to_string()),
+                sig: Some(sig.clone()),
+                account: Some(SIGNER.to_string()),
+                recipient_did: None,
+                replaces_msgid: None,
+                tags,
+                multiline_lines: None,
+            },
+        )
+        .await;
+
+        let frame = rx.try_recv().expect("the message reached the member");
+        assert!(
+            frame.contains("+reply=01ROOTMSGID"),
+            "a federated reply must arrive as a reply: {frame}"
+        );
+    }
+
+    // ── mutations ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn relayed_mutation_verifies_against_the_subject_as_named() {
+        let state = test_state_with_db();
+        let key = signer_on_file(&state, SIGNER);
+        let sig = freeq_sdk::chatsig::ChatDoc::mutation(
+            freeq_sdk::chatsig::Mutation::React,
+            SIGNER,
+            "01MUTATIONID",
+            &freeq_sdk::chatsig::channel_venue("#chat"),
+            "01SUBJECTMSGID",
+        )
+        .with_emoji("👍")
+        .sign(&key);
+
+        let tags = |subject: &str| {
+            HashMap::from([
+                ("+react".to_string(), "👍".to_string()),
+                ("+reply".to_string(), subject.to_string()),
+                (
+                    freeq_sdk::chatsig::EVENT_ID_TAG.to_string(),
+                    "01MUTATIONID".to_string(),
+                ),
+                ("+freeq.at/sig".to_string(), sig.clone()),
+            ])
+        };
+
+        assert_eq!(
+            verify_relayed_mutation_tags(&state, Some(SIGNER), "#chat", &tags("01SUBJECTMSGID")),
+            Some(ClientSigOutcome::Verified)
+        );
+
+        // The subject swapped in flight — the reaction moved onto a different
+        // message than the one its author reacted to.
+        assert_eq!(
+            verify_relayed_mutation_tags(&state, Some(SIGNER), "#chat", &tags("01OTHERMESSAGE")),
+            Some(ClientSigOutcome::Failed),
+            "a mutation whose subject was swapped must not verify"
+        );
+    }
+
+    /// No sender mints mutation event ids yet, so this is what live relayed
+    /// mutations classify as today: uncheckable, never forged.
+    #[tokio::test]
+    async fn relayed_mutation_without_an_event_id_cannot_be_checked() {
+        let state = test_state_with_db();
+        let tags = HashMap::from([
+            ("+draft/delete".to_string(), "01SUBJECTMSGID".to_string()),
+            ("+freeq.at/sig".to_string(), "ed25519:kid:sig".to_string()),
+        ]);
+        assert!(matches!(
+            verify_relayed_mutation_tags(&state, Some(SIGNER), "#chat", &tags),
+            Some(ClientSigOutcome::Unverifiable(_))
+        ));
+    }
+
+    /// A TAGMSG that is not a mutation (a typing notification) is not a signed
+    /// event and gets no verdict.
+    #[tokio::test]
+    async fn relayed_tagmsg_that_is_not_a_mutation_yields_no_verdict() {
+        let state = test_state_with_db();
+        let tags = HashMap::from([("+typing".to_string(), "active".to_string())]);
+        assert_eq!(
+            verify_relayed_mutation_tags(&state, Some(SIGNER), "#chat", &tags),
+            None
+        );
     }
 
     fn add_remote_member(state: &SharedState, channel: &str, nick: &str, is_op: bool) {

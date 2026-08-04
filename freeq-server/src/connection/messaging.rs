@@ -152,7 +152,11 @@ pub(crate) struct SignedFields<'a> {
 /// client signing `#Ops` as typed would fail at its own origin), and a DM
 /// binds the sorted DID pair, because a DM's wire target is a nick or a `did:`
 /// and history is replayed under whichever the *reader* asked for.
-fn signing_venue(state: &Arc<SharedState>, sender_did: &str, target: &str) -> Option<String> {
+pub(crate) fn signing_venue(
+    state: &Arc<SharedState>,
+    sender_did: &str,
+    target: &str,
+) -> Option<String> {
     if target.starts_with('#') || target.starts_with('&') {
         return Some(freeq_sdk::chatsig::channel_venue(target));
     }
@@ -210,7 +214,7 @@ fn resolve_signature(
         && !fields.body_rewritten
     {
         let doc = message_document(did, venue, fields, tags);
-        match verify_client_signature(&doc, sig_tag, did, &conn.id, state) {
+        match verify_client_signature(&doc, sig_tag, did, Some(&conn.id), state) {
             ClientSigOutcome::Verified => return Some(sig_tag.to_string()),
             ClientSigOutcome::Failed => {
                 tracing::warn!(
@@ -246,7 +250,8 @@ fn resolve_signature(
 
 /// What happened when we checked a client's signature — three outcomes, not
 /// two, because "cannot check" and "does not check out" are different facts.
-enum ClientSigOutcome {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientSigOutcome {
     Verified,
     /// The named key was found and the signature is wrong: tampering, forgery,
     /// or a client whose canonical disagrees with ours.
@@ -256,11 +261,17 @@ enum ClientSigOutcome {
     Unverifiable(&'static str),
 }
 
+/// Verify `sig_tag` over `doc`, using the key its `kid` names.
+///
+/// `session` is the local session that registered the key, when there is one.
+/// A relayed event has no session here — its signer authenticated to another
+/// server — so it passes `None` and the key can only come from the durable
+/// per-(DID, kid) store.
 fn verify_client_signature(
     doc: &freeq_sdk::chatsig::ChatDoc<'_>,
     sig_tag: &str,
     did: &str,
-    session: &str,
+    session: Option<&str>,
     state: &Arc<SharedState>,
 ) -> ClientSigOutcome {
     // A legacy signature is a bare base64 blob over the retired canonical,
@@ -273,11 +284,8 @@ fn verify_client_signature(
     // The session's registered key first (the common case: sign, then send),
     // then the durable per-(DID, kid) history, which is what keeps a signature
     // checkable after the session that made it has ended.
-    let session_key = state
-        .session_msg_keys
-        .lock()
-        .get(session)
-        .copied()
+    let session_key = session
+        .and_then(|s| state.session_msg_keys.lock().get(s).copied())
         .filter(|vk| freeq_sdk::sigtag::derive_kid(vk) == kid);
     let key = match session_key {
         Some(vk) => vk,
@@ -296,6 +304,66 @@ fn verify_client_signature(
         Err(e) if e.is_unverifiable() => ClientSigOutcome::Unverifiable("unusable signature tag"),
         Err(_) => ClientSigOutcome::Failed,
     }
+}
+
+/// Check a message signature that arrived from a peer, against the message
+/// exactly as it arrived.
+///
+/// The same document and the same key rules as local ingress — the only
+/// differences are that there is no session to consult (the signer
+/// authenticated to another server, so the key comes from the durable store
+/// that [`crate::peer_keys`] fills on miss) and that the caller must hand over
+/// untidied values: an adopted msgid, a body as transmitted, an edit reference
+/// before it was re-rooted, coordination tags before they were filtered.
+///
+/// A signer signs its own event id, so a relayed message carrying no msgid has
+/// no document to rebuild — unverifiable, never wrong.
+pub(crate) fn verify_relayed_message(
+    state: &Arc<SharedState>,
+    sender_did: &str,
+    target: &str,
+    fields: &SignedFields<'_>,
+    coord_tags: &HashMap<String, String>,
+    sig_tag: &str,
+) -> ClientSigOutcome {
+    if fields.msgid.is_empty() {
+        return ClientSigOutcome::Unverifiable("relayed message carries no event id");
+    }
+    let Some(venue) = signing_venue(state, sender_did, target) else {
+        return ClientSigOutcome::Unverifiable("venue for the relayed target does not resolve");
+    };
+    let doc = message_document(sender_did, &venue, fields, coord_tags);
+    verify_client_signature(&doc, sig_tag, sender_did, None, state)
+}
+
+/// Check a mutation signature (delete / react / unreact) that arrived from a
+/// peer, against the event exactly as it arrived.
+///
+/// `event_msgid` is the mutation's own signer-minted id and `subject` the
+/// message it acts on, both as transmitted — the subject before it was
+/// resolved to a local root, since the signer signed the id it was given.
+pub(crate) fn verify_relayed_mutation(
+    state: &Arc<SharedState>,
+    sender_did: &str,
+    target: &str,
+    kind: freeq_sdk::chatsig::Mutation,
+    event_msgid: &str,
+    subject: &str,
+    emoji: Option<&str>,
+    sig_tag: &str,
+) -> ClientSigOutcome {
+    if event_msgid.is_empty() {
+        return ClientSigOutcome::Unverifiable("relayed mutation carries no event id");
+    }
+    let Some(venue) = signing_venue(state, sender_did, target) else {
+        return ClientSigOutcome::Unverifiable("venue for the relayed target does not resolve");
+    };
+    let mut doc =
+        freeq_sdk::chatsig::ChatDoc::mutation(kind, sender_did, event_msgid, &venue, subject);
+    if let Some(emoji) = emoji {
+        doc = doc.with_emoji(emoji);
+    }
+    verify_client_signature(&doc, sig_tag, sender_did, None, state)
 }
 
 /// Verify a commit-reveal binding declared on a PRIVMSG carrying
