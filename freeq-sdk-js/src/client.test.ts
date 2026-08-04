@@ -1444,3 +1444,173 @@ describe('onNickCollision policy', () => {
     const nicks = msgs[0].reactions?.get('🔥');
     expect(nicks && [...nicks].sort()).toEqual(['alice', 'bob']);
   });
+
+// ────────────────────────────────────────────────────────────────────
+// Signed mutations, and the cap that gates them
+// ────────────────────────────────────────────────────────────────────
+
+describe('signed mutations', () => {
+  /** A registered client whose server advertises and ACKs the signing cap,
+   *  with a real Ed25519 session key provisioned. */
+  async function makeSigningClient(did = 'did:plc:mutator'): Promise<{
+    client: import('./client.js').FreeqClient;
+    ws: MockWebSocket;
+    verifyKey: CryptoKey;
+  }> {
+    const signing = await import('./signing.js');
+    signing.setSigningDid(did);
+    await signing.generateSigningKey();
+    const pubB64 = signing.getPublicKey();
+    if (!pubB64) throw new Error('signing key not provisioned');
+    const padded = pubB64 + '='.repeat((4 - (pubB64.length % 4)) % 4);
+    const bytes = Uint8Array.from(
+      atob(padded.replace(/-/g, '+').replace(/_/g, '/')),
+      (c) => c.charCodeAt(0),
+    );
+    const verifyKey = await crypto.subtle.importKey('raw', bytes, 'Ed25519', false, [
+      'verify',
+    ]);
+
+    const { FreeqClient } = await import('./client.js');
+    const client = new FreeqClient({
+      url: 'wss://test/irc',
+      nick: 'alice',
+      skipInitialBrokerRefresh: true,
+    });
+    client.connect();
+    await flushAsync();
+    const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    ws.recv(':srv CAP * LS :message-tags freeq.at/msgsig');
+    await flushAsync();
+    ws.recv(':srv CAP * ACK :message-tags freeq.at/msgsig');
+    await flushAsync();
+    ws.recv(':srv 001 alice :Welcome');
+    await flushAsync();
+    ws.sent.length = 0;
+    return { client, ws, verifyKey };
+  }
+
+  /** Wait for the client's async signing to land a line on the wire.
+   *  `crypto.subtle.sign` resolves off the microtask queue, so draining
+   *  microtasks alone is not enough. */
+  async function waitForSent(ws: MockWebSocket, match: string): Promise<string> {
+    for (let i = 0; i < 100; i++) {
+      const line = ws.sent.find((l) => l.includes(match));
+      if (line) return line;
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    throw new Error(`no ${match} on the wire; sent: ${ws.sent.join(' | ')}`);
+  }
+
+  function tagOf(line: string, name: string): string | null {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+    const m = line.match(new RegExp(`${escaped}=([^;\\s]+)`));
+    return m ? m[1]! : null;
+  }
+
+  async function verifySig(
+    canonical: string,
+    sigTag: string,
+    key: CryptoKey,
+  ): Promise<boolean> {
+    const sigB64 = sigTag.split(':')[2]!;
+    const padded = sigB64 + '='.repeat((4 - (sigB64.length % 4)) % 4);
+    const sig = Uint8Array.from(
+      atob(padded.replace(/-/g, '+').replace(/_/g, '/')),
+      (c) => c.charCodeAt(0),
+    );
+    return crypto.subtle.verify(
+      'Ed25519',
+      key,
+      sig as unknown as ArrayBuffer,
+      new TextEncoder().encode(canonical) as unknown as ArrayBuffer,
+    );
+  }
+
+  it('a delete carries its own event id and a signature over the delete document', async () => {
+    const signing = await import('./signing.js');
+    const { client, ws, verifyKey } = await makeSigningClient();
+    client.sendDelete('#room', 'M0');
+    const line = await waitForSent(ws, 'TAGMSG');
+    const eventId = tagOf(line, '+freeq.at/eventid');
+    const sigTag = tagOf(line, '+freeq.at/sig');
+    expect(eventId, `line: ${line}`).not.toBeNull();
+    expect(sigTag).not.toBeNull();
+
+    const canonical = signing.mutationCanonical({
+      kind: 'delete',
+      from: 'did:plc:mutator',
+      msgid: eventId!,
+      target: '#room',
+      subject: 'M0',
+    });
+    expect(await verifySig(canonical, sigTag!, verifyKey)).toBe(true);
+  });
+
+  it('a reaction and its removal sign different documents', async () => {
+    const signing = await import('./signing.js');
+    const { client, ws, verifyKey } = await makeSigningClient();
+
+    for (const [kind, send] of [
+      ['react', () => client.sendReaction('#room', '👍', 'M0')],
+      ['unreact', () => client.sendUnreact('#room', '👍', 'M0')],
+    ] as const) {
+      ws.sent.length = 0;
+      send();
+      const line = await waitForSent(ws, 'TAGMSG');
+      const eventId = tagOf(line, '+freeq.at/eventid')!;
+      const sigTag = tagOf(line, '+freeq.at/sig')!;
+      expect(sigTag, `line: ${line}`).not.toBeNull();
+
+      const canonical = signing.mutationCanonical({
+        kind,
+        from: 'did:plc:mutator',
+        msgid: eventId,
+        target: '#room',
+        subject: 'M0',
+        emoji: '👍',
+      });
+      expect(await verifySig(canonical, sigTag, verifyKey)).toBe(true);
+
+      // The verb is inside the document: the other kind's canonical must not
+      // verify against the same signature.
+      const other = signing.mutationCanonical({
+        kind: kind === 'react' ? 'unreact' : 'react',
+        from: 'did:plc:mutator',
+        msgid: eventId,
+        target: '#room',
+        subject: 'M0',
+        emoji: '👍',
+      });
+      expect(await verifySig(other, sigTag, verifyKey)).toBe(false);
+    }
+  });
+
+  it('sends nothing new against a server that does not verify documents', async () => {
+    const signing = await import('./signing.js');
+    signing.setSigningDid('did:plc:mutator');
+    await signing.generateSigningKey();
+    // makeRegistered's server advertises no caps at all — a legacy server.
+    const { client, ws } = await makeRegistered();
+    client.sendDelete('#room', 'M0');
+    client.sendReaction('#room', '👍', 'M0');
+    await flushAsync();
+
+    for (const line of ws.sent) {
+      expect(line, 'a legacy server must see a legacy client').not.toContain(
+        '+freeq.at/sig',
+      );
+      expect(line).not.toContain('+freeq.at/eventid');
+    }
+    expect(ws.sent).toContain('@+draft/delete=M0 TAGMSG #room');
+  });
+
+  it('leaves ephemera unsigned', async () => {
+    const { client, ws } = await makeSigningClient();
+    client.startTyping('#room');
+    await flushAsync();
+    for (const line of ws.sent) {
+      expect(line).not.toContain('+freeq.at/sig');
+    }
+  });
+});

@@ -21,6 +21,19 @@ import type {
   HeartbeatHandle, GovernanceSignal, CoordinationEventPayload,
 } from './types.js';
 
+/**
+ * The capability a server advertises to say it verifies the chat signing
+ * document (see `signing.ts` for what that document is).
+ *
+ * A signature is only worth sending to a server that checks it. Against one
+ * that doesn't, the signature is stripped and replaced by the server's own
+ * — turning a non-repudiable claim into that server's attestation — and the
+ * event id we minted is ignored while its tag leaks onward over federation.
+ * Gating on the cap makes the client rollout self-coordinating per server: no
+ * deploy lockstep, no flag day.
+ */
+export const SIGNING_CAP = 'freeq.at/msgsig';
+
 export class FreeqClient extends EventEmitter {
   private transport: Transport | null = null;
   private _nick = '';
@@ -411,7 +424,10 @@ export class FreeqClient extends EventEmitter {
         // text) and reads `+freeq.at/sig` from the opener tags. Per-batch
         // signing keeps each emitted message independently verifiable.
         const body = this.assembleMultiline(group);
-        signing.signMessage(wireTarget, body, { tags: extraOpenerTags }).then((signed) => {
+        const signing_ = this.ackedCaps.has(SIGNING_CAP)
+          ? signing.signMessage(wireTarget, body, { tags: extraOpenerTags })
+          : Promise.resolve(null);
+        signing_.then((signed) => {
           const openerTagsWithSig: Record<string, string> = { ...extraOpenerTags };
           if (signed) {
             openerTagsWithSig[signing.EVENT_ID_TAG] = signed.eventId;
@@ -522,14 +538,14 @@ export class FreeqClient extends EventEmitter {
   /** Delete a message. */
   sendDelete(target: string, msgId: string): void {
     this.emit('messageDeleted', target, msgId);
-    this.raw(format('TAGMSG', [target], { '+draft/delete': msgId }));
+    this.signedMutation('delete', target, { '+draft/delete': msgId }, msgId);
   }
 
   /** React to a message with an emoji. */
   sendReaction(target: string, emoji: string, msgId?: string): void {
     const tags: Record<string, string> = { '+react': emoji };
     if (msgId) tags['+reply'] = msgId;
-    this.raw(format('TAGMSG', [target], tags));
+    this.signedMutation('react', target, tags, msgId, emoji);
 
     if (msgId) {
       this.emit('reactionAdded', target, msgId, emoji, this._nick);
@@ -542,7 +558,7 @@ export class FreeqClient extends EventEmitter {
       '+freeq.at/unreact': emoji,
       '+reply': msgId,
     };
-    this.raw(format('TAGMSG', [target], tags));
+    this.signedMutation('unreact', target, tags, msgId, emoji);
     this.emit('reactionRemoved', target, msgId, emoji, this._nick);
   }
 
@@ -1042,15 +1058,51 @@ export class FreeqClient extends EventEmitter {
     this.emit('coordinationEvent', eventPayload);
   }
 
+  /**
+   * Sign an outgoing mutation — a delete, a reaction added or removed — and
+   * put it on the wire with the event id the signature covers.
+   *
+   * A mutation is durable state asserted under a user's name, so the server
+   * can act on a *proven* actor instead of a nick, and a receiving server can
+   * check the claim itself rather than trusting the peer that relayed it.
+   * Unsigned when there is no subject to name, no reproducible venue (a
+   * bare-nick DM), or no key — and never signed at all against a server that
+   * doesn't verify documents (see `SIGNING_CAP`).
+   */
+  private async signedMutation(
+    kind: 'delete' | 'react' | 'unreact',
+    target: string,
+    tags: Record<string, string>,
+    subject?: string,
+    emoji?: string,
+  ): Promise<void> {
+    const signed =
+      subject && this.ackedCaps.has(SIGNING_CAP)
+        ? await signing.signMutation(kind, target, subject, emoji)
+        : null;
+    const wireTags = { ...tags };
+    if (signed) {
+      wireTags[signing.EVENT_ID_TAG] = signed.eventId;
+      wireTags[signing.SIG_TAG] = signed.sigTag;
+    }
+    this.raw(format('TAGMSG', [target], wireTags));
+  }
+
   private async signedPrivmsg(target: string, text: string, extraTags?: Record<string, string>): Promise<void> {
     const tags: Record<string, string> = { ...extraTags };
     // The signature covers the tags it rides with — the reply reference and
     // the coordination tags — so they're passed in, not added afterwards.
-    const signed = await signing.signMessage(target, text, {
-      reply: tags['+reply'] ?? tags['+draft/reply'],
-      edit: tags['+draft/edit'],
-      tags,
-    });
+    // Nothing is signed against a server that never negotiated `SIGNING_CAP`:
+    // it would strip our signature and re-sign the message itself, turning a
+    // non-repudiable claim into its own attestation, and ignore the id we
+    // minted while its tag rides on over federation.
+    const signed = this.ackedCaps.has(SIGNING_CAP)
+      ? await signing.signMessage(target, text, {
+          reply: tags['+reply'] ?? tags['+draft/reply'],
+          edit: tags['+draft/edit'],
+          tags,
+        })
+      : null;
     if (signed) {
       // Both tags, always together: the id is what the signature covers, and
       // the server adopts it as the message's msgid.
@@ -2424,6 +2476,10 @@ export class FreeqClient extends EventEmitter {
         'message-tags', 'server-time', 'batch', 'multi-prefix',
         'echo-message', 'account-notify', 'account-tag', 'extended-join', 'away-notify',
         'draft/chathistory', 'draft/multiline', 'draft/read-marker',
+        // Requested rather than merely read off the LS line: the ACK is the
+        // server's own confirmation that it verifies chat documents, and
+        // signing is gated on it (see `SIGNING_CAP`).
+        SIGNING_CAP,
       ];
       for (const c of caps) {
         // `draft/multiline` advertises with params (`=max-bytes=…,max-lines=…`)

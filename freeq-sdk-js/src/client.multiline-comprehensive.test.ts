@@ -118,11 +118,13 @@ async function makeMultilineClient(nick: string): Promise<{
   await flushAsync();
   const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
   ws.recv(
-    ':srv CAP * LS :message-tags server-time batch echo-message ' +
+    ':srv CAP * LS :message-tags server-time batch echo-message freeq.at/msgsig ' +
       'draft/multiline=max-bytes=40000,max-lines=100',
   );
   await flushAsync();
-  ws.recv(':srv CAP * ACK :message-tags server-time batch draft/multiline');
+  ws.recv(
+    ':srv CAP * ACK :message-tags server-time batch draft/multiline freeq.at/msgsig',
+  );
   await flushAsync();
   ws.recv(`:srv 001 ${nick} :Welcome`);
   await flushAsync();
