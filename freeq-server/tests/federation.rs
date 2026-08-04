@@ -75,6 +75,7 @@ struct TestServer {
     _dir: tempfile::TempDir,
     child: Child,
     irc_addr: String,
+    web_addr: String,
     db_path: String,
     /// Held by server A for the test's lifetime; see `ONE_TEST_AT_A_TIME`.
     serial: Option<MutexGuard<'static, ()>>,
@@ -109,6 +110,9 @@ fn seed_iroh_identity(dir: &std::path::Path, seed: u8) -> (String, u16) {
 struct ServerPlan {
     dir: tempfile::TempDir,
     irc_port: u16,
+    /// REST/WebSocket listener. Real deployments run one, and cross-server
+    /// key lookup reaches a peer through it.
+    web_port: u16,
     iroh_id: String,
     iroh_port: u16,
     seed: u8,
@@ -120,6 +124,7 @@ fn plan_server(seed: u8) -> ServerPlan {
     ServerPlan {
         dir,
         irc_port: alloc_port(),
+        web_port: alloc_port(),
         iroh_id,
         iroh_port,
         seed,
@@ -131,6 +136,7 @@ fn plan_server(seed: u8) -> ServerPlan {
 struct PeerRef {
     iroh_id: String,
     iroh_port: u16,
+    web_port: u16,
 }
 
 impl PeerRef {
@@ -138,6 +144,7 @@ impl PeerRef {
         PeerRef {
             iroh_id: plan.iroh_id.clone(),
             iroh_port: plan.iroh_port,
+            web_port: plan.web_port,
         }
     }
 }
@@ -152,7 +159,11 @@ fn spawn_server(plan: ServerPlan, peer: &PeerRef, resolver_entries: &str) -> Tes
         .unwrap()
         .to_string();
     let irc_addr = format!("127.0.0.1:{}", plan.irc_port);
+    let web_addr = format!("127.0.0.1:{}", plan.web_port);
     let peer_spec = format!("{}@127.0.0.1:{}", peer.iroh_id, peer.iroh_port);
+    // Where this server looks for the peer's users' signing keys. Operator
+    // configuration in production; here, the peer's own REST listener.
+    let peer_api = format!("{}=http://127.0.0.1:{}", peer.iroh_id, peer.web_port);
 
     let child = Command::new(env!("CARGO_BIN_EXE_freeq-server"))
         .args([
@@ -169,6 +180,10 @@ fn spawn_server(plan: ServerPlan, peer: &PeerRef, resolver_entries: &str) -> Tes
             &peer_spec,
             "--s2s-allowed-peers",
             &peer.iroh_id,
+            "--web-addr",
+            &web_addr,
+            "--s2s-peer-api",
+            &peer_api,
             "--did-resolver-static",
             resolver_entries,
             "--server-name",
@@ -182,6 +197,7 @@ fn spawn_server(plan: ServerPlan, peer: &PeerRef, resolver_entries: &str) -> Tes
         _dir: plan.dir,
         child,
         irc_addr,
+        web_addr,
         db_path,
         serial: None,
     }
@@ -753,6 +769,78 @@ async fn privmsg_sig_crosses_the_hop_byte_identical() {
     ha.quit(None).await.ok();
     hb.quit(None).await.ok();
     hc.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── the receiving server reaches its own verdict ─────────────────
+//
+// The one that matters: a message signed by a client on server A, checked by
+// server B, using a key B fetched from A's key endpoint. Server A's assurance
+// plays no part — B rebuilds the document from what arrived, looks up the key
+// the signature names, and answers for itself. Nothing here asserts on A.
+
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn the_receiving_server_verifies_a_signature_for_itself() {
+    let alice = TestId::new("did:plc:aliceverifies");
+    let bob = TestId::new("did:plc:bobverifies");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#verified").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#verified").await.unwrap();
+
+    // Land a signed message on B and learn the id B filed it under.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut landed = None;
+    let mut attempt = 0u32;
+    while tokio::time::Instant::now() < deadline {
+        attempt += 1;
+        let text = format!("verify me {attempt}");
+        ha.privmsg("#verified", &text).await.ok();
+        if let Some(msgid) = recv_channel_msgid(&mut rxb, &text, Duration::from_secs(2)).await {
+            landed = Some(msgid);
+            break;
+        }
+    }
+    let msgid = landed.expect("alice's signed message never reached bob's server");
+
+    // B's own answer, from B's own endpoint. The key lookup runs off the
+    // delivery path, so the first read may still say "cannot check" — poll
+    // until B has what it needs, then insist on a real verdict.
+    let url = format!("http://{}/api/v1/verify/{msgid}", srv_b.web_addr);
+    let client = reqwest::Client::new();
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut last = serde_json::Value::Null;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(resp) = client.get(&url).send().await
+            && let Ok(body) = resp.json::<serde_json::Value>().await
+        {
+            last = body;
+            if last["verification"]["verdict"] == "valid" {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    assert_eq!(
+        last["verification"]["verdict"], "valid",
+        "the receiving server must reach a valid verdict on its own: {last}"
+    );
+    assert_eq!(
+        last["verification"]["verified_by"], "client-session-key",
+        "and it must be the sender's device that signed, not a server: {last}"
+    );
+    assert_eq!(last["sender_did"], alice.did);
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
     drop((srv_a, srv_b));
 }
 

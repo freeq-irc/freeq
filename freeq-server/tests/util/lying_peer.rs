@@ -403,6 +403,35 @@ impl LyingPeer {
         }
     }
 
+    /// A message carrying a signature — the shape a peer uses to attribute
+    /// signed words to someone. `msgid` is the event id the signature would
+    /// have covered.
+    #[allow(clippy::too_many_arguments)]
+    pub fn signed_privmsg(
+        &mut self,
+        from: &str,
+        target: &str,
+        text: &str,
+        account: Option<&str>,
+        msgid: &str,
+        sig: &str,
+    ) -> S2sMessage {
+        S2sMessage::Privmsg {
+            event_id: self.next_event_id(),
+            from: from.to_string(),
+            target: target.to_string(),
+            text: text.to_string(),
+            origin: self.id.clone(),
+            msgid: Some(msgid.to_string()),
+            sig: Some(sig.to_string()),
+            account: account.map(str::to_string),
+            recipient_did: None,
+            replaces_msgid: None,
+            tags: HashMap::new(),
+            multiline_lines: None,
+        }
+    }
+
     pub fn kick(&mut self, by: &str, nick: &str, channel: &str) -> S2sMessage {
         S2sMessage::Kick {
             event_id: self.next_event_id(),
@@ -552,6 +581,22 @@ pub fn is_deleted(db_path: &str, msgid: &str) -> bool {
         |r| r.get(0),
     )
     .expect("message row exists")
+}
+
+/// The key id of a signing key `did` has registered with this server.
+///
+/// A forged signature has to name a key the receiver actually holds, or the
+/// verdict is "cannot check" and nothing is proven about the strip. Reading it
+/// out of the server's own store is how a test gets one without ever holding
+/// the private half.
+pub fn registered_kid(db_path: &str, did: &str) -> Option<String> {
+    let conn = rusqlite::Connection::open(db_path).expect("open server db");
+    conn.query_row(
+        "SELECT kid FROM signing_keys WHERE did = ?1 ORDER BY registered_at DESC LIMIT 1",
+        rusqlite::params![did],
+        |r| r.get(0),
+    )
+    .ok()
 }
 
 /// How many rows make up the logical message `root` — the original plus one

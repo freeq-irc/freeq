@@ -19,6 +19,7 @@ use freeq_sdk::event::Event;
 mod util;
 
 use util::lying_peer::{
+    registered_kid,
     LyingPeer, NO_EFFECT_WINDOW, TestId, TestServer, connect, is_deleted, msgid_of, revision_count,
     spawn_server_with_peer, try_event, wait_auth_and_register, wait_event, warm_link,
 };
@@ -169,6 +170,97 @@ async fn a_peer_impersonating_a_local_nick_can_currently_delete_that_users_messa
         is_deleted(&srv.db_path, &msgid),
         "the nick fallback no longer authorizes a peer-asserted delete — \
          if that was intentional, delete this test"
+    );
+}
+
+// ── signatures ───────────────────────────────────────────────────
+
+/// A peer that attaches a signature which does not check out. The words still
+/// arrive — a bad signature is not grounds to drop someone's message — but the
+/// signature does not, because a client that saw it would draw a lock beside
+/// text nobody proved.
+///
+/// The forged signature names a key this server really holds (the author's own
+/// registered key id), so the verdict is a genuine failure rather than "cannot
+/// check". Only the private half is missing, which is exactly the attacker's
+/// position.
+#[tokio::test]
+async fn a_peer_cannot_attach_a_signature_that_does_not_check_out() {
+    let author = TestId::new("did:plc:lpsigauthor");
+    let watcher = TestId::new("did:plc:lpsigwatcher");
+    let (srv, mut peer, ha, mut rxw) = open_room(&author, &watcher).await;
+
+    // Posting registers the author's session signing key with this server.
+    post(&ha, &mut rxw, "something the author really said").await;
+    let kid = registered_kid(&srv.db_path, &author.did)
+        .expect("the author's client registered a signing key");
+
+    // Right kid, wrong bytes: 64 bytes of base64url that are not a signature
+    // over anything.
+    let forged = format!("ed25519:{kid}:{}", "A".repeat(86));
+    let msg = peer.signed_privmsg(
+        "mallory",
+        "#room",
+        "words with a forged seal",
+        Some(&author.did),
+        "01LYINGPEERFORGEDSIG000000",
+        &forged,
+    );
+    peer.forge(msg).await;
+
+    let seen = wait_event(
+        &mut rxw,
+        |e| matches!(e, Event::Message { text: t, .. } if t == "words with a forged seal"),
+        "the peer's signed message",
+    )
+    .await;
+    let Event::Message { tags, .. } = &seen else {
+        unreachable!("matched above")
+    };
+    assert!(
+        !tags.contains_key("+freeq.at/sig"),
+        "a signature that failed verification reached a local client: {tags:?}"
+    );
+
+    assert_link_alive(&mut peer, &mut rxw, "probe-after-forged-signature").await;
+}
+
+/// The other half of the rule, on the same wire: a signature this server
+/// cannot judge is left exactly as it arrived. Stripping it would destroy
+/// something a holder of the key could still check, and would report "cannot
+/// tell" as if it were "forged".
+#[tokio::test]
+async fn a_peer_relaying_an_uncheckable_signature_keeps_it_intact() {
+    let author = TestId::new("did:plc:lpsigauthor2");
+    let watcher = TestId::new("did:plc:lpsigwatcher2");
+    let (_srv, mut peer, _ha, mut rxw) = open_room(&author, &watcher).await;
+
+    // A key id this server has never seen, so there is nothing to check
+    // against — and no key server is configured for this peer either.
+    let uncheckable = format!("ed25519:{}:{}", "unknownkid0000000000AA", "B".repeat(86));
+    let msg = peer.signed_privmsg(
+        "mallory",
+        "#room",
+        "signed by a stranger",
+        Some(FORGED_DID),
+        "01LYINGPEERUNKNOWNKEY00000",
+        &uncheckable,
+    );
+    peer.forge(msg).await;
+
+    let seen = wait_event(
+        &mut rxw,
+        |e| matches!(e, Event::Message { text: t, .. } if t == "signed by a stranger"),
+        "the peer's uncheckable message",
+    )
+    .await;
+    let Event::Message { tags, .. } = &seen else {
+        unreachable!("matched above")
+    };
+    assert_eq!(
+        tags.get("+freeq.at/sig").map(String::as_str),
+        Some(uncheckable.as_str()),
+        "an uncheckable signature must be relayed exactly as it arrived"
     );
 }
 

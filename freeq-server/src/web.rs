@@ -1393,6 +1393,15 @@ async fn api_verify_message(
     // Rebuild the exact document the signer signed (see `chatsig`): the venue
     // is the stored channel key — a folded channel name, or the sorted DID
     // pair a DM is filed under — never a reader-perspective target.
+    //
+    // Folded here rather than trusted to be folded already: a local row is
+    // filed under a normalized channel, but a row that arrived over S2S keeps
+    // the spelling the origin's user typed, so a mixed-case federated channel
+    // would otherwise rebuild a venue no signer ever signed and report honest
+    // messages as invalid.
+    if venue.starts_with('#') || venue.starts_with('&') {
+        venue = chatsig::channel_venue(&venue);
+    }
     let canonical = sender_did.as_ref().map(|did| {
         let mut doc = chatsig::ChatDoc::message(did, &msgid, &venue, &msg.text);
         if let Some(reply) = msg
@@ -1415,6 +1424,16 @@ async fn api_verify_message(
         canonical.as_deref(),
         sig_tag.as_deref(),
     );
+
+    // A signer whose key we do not hold — typically someone on another
+    // server, reached through history rather than through the link their
+    // message arrived on. Ask for the key so the next read of this message
+    // gets a real verdict; this read reports what is true right now.
+    if verified_by == "unverifiable-unknown-key"
+        && let (Some(did), Some(sig)) = (sender_did.as_deref(), sig_tag.as_deref())
+    {
+        crate::peer_keys::fetch_from_any_peer(&state, did, sig);
+    }
     let server_vk = state.msg_signing_key.verifying_key();
 
     let server_pubkey = {
@@ -4953,6 +4972,7 @@ mod signing_key_endpoint_tests {
 mod signature_verdict_tests {
     use super::classify_message_signature;
     use crate::server::test_state_with_db;
+    use crate::web::api_verify_message;
     use ed25519_dalek::SigningKey;
     use freeq_sdk::chatsig::ChatDoc;
 
@@ -5025,6 +5045,108 @@ mod signature_verdict_tests {
         let (verdict, _, _) =
             classify_message_signature(&state, Some(DID), Some(&elsewhere), Some(&sig));
         assert_eq!(verdict, "invalid");
+    }
+
+    /// A message that arrived from another server, read back through the real
+    /// endpoint. The verdict is this server's own — its key store, its
+    /// document rebuild — and says the sender's device signed it.
+    #[tokio::test]
+    async fn a_federated_message_verifies_from_our_own_key_store() {
+        let state = test_state_with_db();
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let did = "did:plc:federatedsender";
+        let msgid = "01KYVT5Z8Q0000000000FEDER8";
+        state
+            .with_db(|db| db.save_signing_key(did, key.verifying_key().as_bytes()))
+            .expect("test state has a database");
+
+        // Stored the way the S2S receive path stores one: the origin's
+        // channel spelling, the sender DID the origin stamped, and the
+        // client's own signature relayed unchanged.
+        let sig = ChatDoc::message(
+            did,
+            msgid,
+            &freeq_sdk::chatsig::channel_venue("#Federated"),
+            "across the hop",
+        )
+        .sign(&key);
+        let tags = std::collections::HashMap::from([
+            (freeq_sdk::sigtag::SIG_TAG.to_string(), sig),
+            ("+freeq.at/origin".to_string(), "other-server".to_string()),
+        ]);
+        state
+            .with_db(|db| {
+                db.insert_message(
+                    "#Federated",
+                    "remote!u@s2s",
+                    "across the hop",
+                    0,
+                    &tags,
+                    Some(msgid),
+                    Some(did),
+                )
+            })
+            .expect("test state has a database");
+
+        let out = api_verify_message(
+            axum::extract::State(state),
+            axum::extract::Path(msgid.to_string()),
+        )
+        .await
+        .expect("the message is on file");
+        assert_eq!(out.0["verification"]["verdict"], "valid");
+        assert_eq!(out.0["verification"]["verified_by"], "client-session-key");
+        assert_eq!(out.0["sender_did"], did);
+    }
+
+    /// Reading a message signed by someone we hold no key for asks a peer for
+    /// it. The read itself still answers honestly — uncheckable, not forged —
+    /// because a lookup is never waited on.
+    #[tokio::test]
+    async fn reading_an_unknown_signers_message_asks_a_peer_for_the_key() {
+        let did = "did:plc:readerlookup";
+        let msgid = "01KYVT5Z8Q00000000000READ1";
+        let key = SigningKey::from_bytes(&[5u8; 32]);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+
+        let state = crate::server::test_state_with_config(crate::config::ServerConfig {
+            s2s_peer_api: vec!["peer=http://127.0.0.1:1".to_string()],
+            ..Default::default()
+        });
+        let sig = ChatDoc::message(did, msgid, "#unknownkey", "who signed this").sign(&key);
+        state
+            .with_db(|db| {
+                db.insert_message(
+                    "#unknownkey",
+                    "remote!u@s2s",
+                    "who signed this",
+                    0,
+                    &std::collections::HashMap::from([(
+                        freeq_sdk::sigtag::SIG_TAG.to_string(),
+                        sig,
+                    )]),
+                    Some(msgid),
+                    Some(did),
+                )
+            })
+            .expect("test state has a database");
+
+        let out = api_verify_message(
+            axum::extract::State(state),
+            axum::extract::Path(msgid.to_string()),
+        )
+        .await
+        .expect("the message is on file");
+
+        assert_eq!(
+            out.0["verification"]["verified_by"],
+            "unverifiable-unknown-key",
+            "the read reports what is true now, not what a lookup might find"
+        );
+        assert!(
+            crate::peer_keys::lookup_pending(did, &kid),
+            "reading it must have asked a peer for the key"
+        );
     }
 
     /// Everything we cannot check reads as unverifiable, each with its own
