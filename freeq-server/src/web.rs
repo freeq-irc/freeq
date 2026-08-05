@@ -1378,10 +1378,61 @@ async fn api_verify_message(
         }
     }
 
-    let msg = found.ok_or((
-        axum::http::StatusCode::NOT_FOUND,
-        format!("Message {msgid} not found"),
-    ))?;
+    // Not a message this server can serve — but perhaps an event on file: a
+    // delete, a reaction or its removal, or a deleted message's own log row.
+    // The log stores the exact bytes that were signed, so the answer is read
+    // back, not rebuilt — and it is hash-only: facts about the act, never a
+    // body.
+    let msg = match found {
+        Some(msg) => msg,
+        None => {
+            if let Some(ev) = state.with_db(|db| db.get_event(&msgid)).flatten() {
+                let canonical = (!ev.canonical.is_empty()).then_some(ev.canonical.as_str());
+                let (verdict, verified_by, client_public_key) = classify_message_signature(
+                    &state,
+                    ev.actor_did.as_deref(),
+                    canonical,
+                    ev.signature.as_deref(),
+                );
+                let server_pubkey = {
+                    use base64::Engine;
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .encode(state.msg_signing_key.verifying_key().as_bytes())
+                };
+                let canonical_hex = canonical.map(|c| {
+                    c.as_bytes()
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                });
+                return Ok(Json(serde_json::json!({
+                    "event_id": ev.event_id,
+                    "kind": ev.kind,
+                    "channel": ev.venue,
+                    "actor_did": ev.actor_did,
+                    "subject": ev.subject,
+                    "emoji": ev.emoji,
+                    "body_hash": ev.body_hash,
+                    "timestamp": ev.timestamp,
+                    "signature": ev.signature,
+                    "canonical_form": canonical,
+                    "canonical_hex": canonical_hex,
+                    "verification": {
+                        "valid": verdict == "valid",
+                        "verdict": verdict,
+                        "verified_by": verified_by,
+                        "server_public_key": server_pubkey,
+                        "client_public_key": client_public_key,
+                    },
+                    "how_to_verify": "The canonical_form is JCS over the signed document; the signature tag is ed25519:<kid>:<base64url sig> over its UTF-8 bytes"
+                })));
+            }
+            return Err((
+                axum::http::StatusCode::NOT_FOUND,
+                format!("Message {msgid} not found"),
+            ));
+        }
+    };
     let sig_tag = msg.tags.get(freeq_sdk::sigtag::SIG_TAG).cloned();
 
     // The `account` tag is the origin's own statement of who sent this, which

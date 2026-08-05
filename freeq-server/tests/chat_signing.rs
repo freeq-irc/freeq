@@ -1414,3 +1414,84 @@ fn full_events_in(db_path: &str, venue: &str) -> Vec<EventRow> {
     .collect::<Result<Vec<_>, _>>()
     .unwrap()
 }
+
+/// The verify endpoint answers for a mutation's own event id.
+///
+/// A reaction files a signed event; a bystander with only the event id can
+/// ask the server what act it was, who performed it, against what subject,
+/// and whether the signature verifies as the actor's own device — without
+/// database access. The log stores the exact signed bytes, so the answer is
+/// read, not rebuilt, and stays hash-only (facts, never a body).
+#[tokio::test]
+async fn the_verify_endpoint_answers_for_a_mutation_event() {
+    use freeq_sdk::chatsig::Mutation;
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let db_path = tmp.path().to_str().unwrap().to_string();
+    std::mem::forget(tmp);
+    let config = freeq_server::config::ServerConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        web_addr: Some("127.0.0.1:0".to_string()),
+        server_name: "test-sig-ev".to_string(),
+        challenge_timeout_secs: 60,
+        db_path: Some(db_path),
+        ..Default::default()
+    };
+    let (irc_addr, web_addr, _h) = freeq_server::server::Server::with_resolver(
+        config,
+        resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)]),
+    )
+    .start_with_web()
+    .await
+    .unwrap();
+
+    let (event_id, msgid) = tokio::task::spawn_blocking(move || {
+        let (mut bob, mut alice, signing, msgid) =
+            two_in_a_channel(irc_addr, ka, kb, did_bob, "#evverify");
+        let event_id = freeq_server::msgid::generate();
+        let tags = signed_mutation_tags(
+            Mutation::React,
+            "+react",
+            &msgid,
+            Some("👍"),
+            "#evverify",
+            &event_id,
+            &signing,
+        );
+        alice.tx(&format!("@{tags} TAGMSG #evverify"));
+        bob.rx(|l| l.contains("+react"), "the reaction");
+        (event_id, msgid)
+    })
+    .await
+    .unwrap();
+
+    // The broadcast races the row by a hair; give the write a beat.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let v: serde_json::Value =
+        reqwest::get(format!("http://{web_addr}/api/v1/verify/{event_id}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(v["kind"], "react", "the filed act, by name: {v}");
+    assert_eq!(v["actor_did"], DID_ALICE);
+    assert_eq!(v["subject"], msgid.as_str());
+    assert_eq!(v["emoji"], "👍");
+    assert_eq!(v["verification"]["verdict"], "valid");
+    assert_eq!(
+        v["verification"]["verified_by"], "client-session-key",
+        "signed on the actor's device, not vouched by the server: {v}"
+    );
+
+    // An id nobody minted still answers 404 — the fallthrough reads the
+    // log, it doesn't invent.
+    let missing = reqwest::get(format!(
+        "http://{web_addr}/api/v1/verify/01H000000000000000NOPE0000"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(missing.status(), 404);
+}
