@@ -809,12 +809,45 @@ impl Db {
         msgid: Option<&str>,
         sender_did: Option<&str>,
     ) -> SqlResult<bool> {
+        self.insert_message_with(
+            channel,
+            sender,
+            text,
+            timestamp,
+            tags,
+            msgid,
+            sender_did,
+            &crate::events::EventContext::default(),
+        )
+    }
+
+    /// [`Db::insert_message`], plus what this server concluded about the
+    /// message's signature and where it came from — the facts the event log
+    /// cannot derive from the document. Ingress paths use this; anything with
+    /// no verdict to state uses the shorter form and gets the state that
+    /// claims least.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_message_with(
+        &self,
+        channel: &str,
+        sender: &str,
+        text: &str,
+        timestamp: u64,
+        tags: &HashMap<String, String>,
+        msgid: Option<&str>,
+        sender_did: Option<&str>,
+        ctx: &crate::events::EventContext,
+    ) -> SqlResult<bool> {
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "{}".to_string());
         let stored_text = if let Some(ref key) = self.encryption_key {
             encrypt_at_rest(key, text)
         } else {
             text.to_string()
         };
+        // The message row and its event are one write or neither: a message
+        // present in history with no event would be a hole in the log that
+        // nothing later could tell from a message that never happened.
+        let tx = self.conn.unchecked_transaction()?;
         // An original message is its own root — its identity for life.
         self.conn.execute(
             "INSERT OR IGNORE INTO messages (channel, sender, text, timestamp, tags_json, msgid, root_msgid, sender_did)
@@ -844,11 +877,21 @@ impl Db {
                     channel,
                     "msgid already on file with DIFFERENT content; conflicting insert dropped"
                 );
+                // The receipt: what was dropped, so that two claims on one id
+                // leaves a trace instead of vanishing.
+                if let Some(id) = msgid {
+                    self.record_event_conflict(
+                        id,
+                        &self.claim_fingerprint(channel, text, tags, sender_did, id, None),
+                    )?;
+                }
             } else {
                 tracing::debug!(?msgid, channel, "duplicate delivery; insert ignored");
             }
+            tx.commit()?;
             return Ok(false);
         }
+        self.file_message_event(channel, text, tags, msgid, sender_did, None, timestamp, ctx)?;
         // Record into the agent-assist diagnostic ring buffer. We
         // capture only the fact that a message was accepted — never
         // the body or tags. The auto-increment row id is the canonical
@@ -862,6 +905,7 @@ impl Db {
         ev.server_sequence = Some(self.conn.last_insert_rowid());
         crate::agent_assist::recorder::record(ev);
         self.fts_index(self.conn.last_insert_rowid(), text)?;
+        tx.commit()?;
         Ok(true)
     }
 
@@ -1309,6 +1353,34 @@ impl Db {
         replaces_msgid: &str,
         sender_did: Option<&str>,
     ) -> SqlResult<bool> {
+        self.insert_edit_with(
+            channel,
+            sender,
+            text,
+            timestamp,
+            tags,
+            msgid,
+            replaces_msgid,
+            sender_did,
+            &crate::events::EventContext::default(),
+        )
+    }
+
+    /// [`Db::insert_edit`], plus the verdict and provenance the event log
+    /// cannot derive. See [`Db::insert_message_with`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_edit_with(
+        &self,
+        channel: &str,
+        sender: &str,
+        text: &str,
+        timestamp: u64,
+        tags: &HashMap<String, String>,
+        msgid: &str,
+        replaces_msgid: &str,
+        sender_did: Option<&str>,
+        ctx: &crate::events::EventContext,
+    ) -> SqlResult<bool> {
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "{}".to_string());
         let stored_text = if let Some(ref key) = self.encryption_key {
             encrypt_at_rest(key, text)
@@ -1316,6 +1388,8 @@ impl Db {
             text.to_string()
         };
         let root = self.root_of(replaces_msgid);
+        // Row and event together or not at all — see `insert_message_with`.
+        let tx = self.conn.unchecked_transaction()?;
         self.conn.execute(
             "INSERT OR IGNORE INTO messages (channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, root_msgid, sender_did)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -1336,11 +1410,33 @@ impl Db {
                     channel,
                     "msgid already on file with DIFFERENT content; conflicting edit dropped"
                 );
+                self.record_event_conflict(
+                    msgid,
+                    &self.claim_fingerprint(
+                        channel,
+                        text,
+                        tags,
+                        sender_did,
+                        msgid,
+                        Some(replaces_msgid),
+                    ),
+                )?;
             } else {
                 tracing::debug!(msgid, channel, "duplicate edit delivery; insert ignored");
             }
+            tx.commit()?;
             return Ok(false);
         }
+        self.file_message_event(
+            channel,
+            text,
+            tags,
+            Some(msgid),
+            sender_did,
+            Some(replaces_msgid),
+            timestamp,
+            ctx,
+        )?;
         let rowid = self.conn.last_insert_rowid();
         if self.fts_enabled() {
             self.conn.execute(
@@ -1351,10 +1447,99 @@ impl Db {
             )?;
         }
         self.fts_index(rowid, text)?;
+        tx.commit()?;
         Ok(true)
     }
 
     // ── The event log ──────────────────────────────────────────────────
+
+    /// File the event that accompanies a message row, from the same values
+    /// the row was written with.
+    ///
+    /// The document is rebuilt here rather than threaded down from ingress:
+    /// every input it needs is already an argument to the write, and asking
+    /// 145 call sites to carry bytes they don't otherwise touch would be a
+    /// worse trade than one rebuild in the one place that files the row.
+    ///
+    /// A sender with no DID has no identity to bind, so there is no document —
+    /// the row records what it knows and says so.
+    #[allow(clippy::too_many_arguments)]
+    fn file_message_event(
+        &self,
+        channel: &str,
+        text: &str,
+        tags: &HashMap<String, String>,
+        msgid: Option<&str>,
+        sender_did: Option<&str>,
+        replaces_msgid: Option<&str>,
+        timestamp: u64,
+        ctx: &crate::events::EventContext,
+    ) -> SqlResult<()> {
+        // No id, no identity to file the event under. Rows this old predate
+        // message ids entirely; the parity check excludes them for the same
+        // reason.
+        let Some(msgid) = msgid else {
+            return Ok(());
+        };
+        let signature = tags
+            .get(freeq_sdk::sigtag::SIG_TAG)
+            .or_else(|| tags.get("freeq.at/sig"))
+            .map(String::as_str);
+        let canonical = sender_did.map(|did| {
+            crate::events::message_canonical(did, msgid, channel, text, tags, replaces_msgid)
+        });
+        let record = match canonical.as_deref() {
+            Some(canonical) => EventRecord {
+                shape: EventShape::Document(canonical),
+                signature,
+                ctx: ctx.clone(),
+                timestamp,
+            },
+            None => EventRecord {
+                shape: EventShape::Bare(crate::events::EventFacts {
+                    event_id: msgid.to_string(),
+                    kind: if replaces_msgid.is_some() { "edit" } else { "message" }.to_string(),
+                    venue: crate::events::venue_of(channel),
+                    actor_did: None,
+                    subject: replaces_msgid.map(str::to_string),
+                    body_hash: None,
+                }),
+                signature: None,
+                ctx: ctx.clone(),
+                timestamp,
+            },
+        };
+        self.insert_event(&record)?;
+        Ok(())
+    }
+
+    /// The fingerprint of a *rejected* claim on an id — the bytes it would
+    /// have been filed under, had it arrived first.
+    ///
+    /// A document where the claimant has an identity, so the receipt names
+    /// exactly what was refused; the body otherwise, which is the only thing
+    /// there is to name.
+    fn claim_fingerprint(
+        &self,
+        channel: &str,
+        text: &str,
+        tags: &HashMap<String, String>,
+        sender_did: Option<&str>,
+        msgid: &str,
+        replaces_msgid: Option<&str>,
+    ) -> String {
+        match sender_did {
+            Some(did) => crate::events::fingerprint(&crate::events::message_canonical(
+                did,
+                msgid,
+                channel,
+                text,
+                tags,
+                replaces_msgid,
+            )),
+            None => crate::events::fingerprint(text),
+        }
+    }
 
     /// File an event. **The only path that writes `events`.**
     ///
@@ -5482,5 +5667,210 @@ mod event_log_tests {
         assert_eq!(db.all_events().unwrap().len(), 2);
         assert_eq!(db.prune_events_older_than(500).unwrap(), 1);
         assert_eq!(db.all_events().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod dual_write_tests {
+    use super::*;
+    use crate::events::{EventContext, SigState};
+
+    const ALICE: &str = "did:plc:dualalice";
+
+    fn tags(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Every message written from here on has an event. That is the whole
+    /// point of the log being born complete: there is no window in which the
+    /// two can disagree.
+    #[test]
+    fn every_message_written_lands_in_the_log_too() {
+        let db = Db::open_memory().unwrap();
+        db.insert_message("#Room", "a!u@h", "hello", 10, &HashMap::new(), Some("M1"), Some(ALICE))
+            .unwrap();
+        db.insert_message("#Room", "g!u@h", "guest here", 11, &HashMap::new(), Some("M2"), None)
+            .unwrap();
+        db.insert_edit("#Room", "a!u@h", "revised", 12, &HashMap::new(), "M3", "M1", Some(ALICE))
+            .unwrap();
+
+        assert_eq!(
+            db.messages_without_events().unwrap(),
+            Vec::<String>::new(),
+            "message → event parity, which is the direction that holds"
+        );
+        assert_eq!(
+            db.events_disagreeing_with_their_bytes().unwrap(),
+            Vec::<String>::new()
+        );
+
+        let msg = db.get_event("M1").unwrap().unwrap();
+        assert_eq!(msg.kind, "message");
+        assert_eq!(msg.venue, "#room", "the venue a signer would have signed");
+        assert_eq!(msg.actor_did.as_deref(), Some(ALICE));
+        assert_eq!(
+            msg.body_hash.as_deref(),
+            Some(freeq_sdk::chatsig::body_hash("hello").as_str())
+        );
+
+        let guest = db.get_event("M2").unwrap().unwrap();
+        assert_eq!(guest.canonical, "", "a guest has no identity to bind");
+        assert_eq!(guest.sig_state, SigState::Unsigned);
+        assert_eq!(guest.actor_did, None);
+
+        let edit = db.get_event("M3").unwrap().unwrap();
+        assert_eq!((edit.kind.as_str(), edit.subject.as_deref()), ("edit", Some("M1")));
+    }
+
+    /// The log holds hashes, never bodies. A table that quietly accumulated a
+    /// second copy of every private message would be a liability.
+    #[test]
+    fn no_body_ever_reaches_the_log() {
+        let db = Db::open_memory().unwrap();
+        let secret = "the passphrase is hunter2";
+        db.insert_message("#Room", "a!u@h", secret, 10, &HashMap::new(), Some("M1"), Some(ALICE))
+            .unwrap();
+
+        let hits: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE
+                   canonical LIKE '%hunter2%' OR subject LIKE '%hunter2%'
+                   OR venue LIKE '%hunter2%' OR COALESCE(signature,'') LIKE '%hunter2%'
+                   OR COALESCE(body_hash,'') LIKE '%hunter2%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 0, "the body is in `messages`, and only there");
+        assert!(
+            db.get_event("M1").unwrap().unwrap().canonical.contains("sha256:"),
+            "what the log holds is the hash the document carries"
+        );
+    }
+
+    /// The signature the row was filed with is the signature the log records,
+    /// and the caller's verdict rides with it.
+    #[test]
+    fn the_log_records_the_signature_and_the_verdict_it_was_filed_with() {
+        let db = Db::open_memory().unwrap();
+        db.insert_message_with(
+            "#Room",
+            "a!u@h",
+            "signed",
+            10,
+            &tags(&[("+freeq.at/sig", "ed25519:kid:sig")]),
+            Some("M1"),
+            Some(ALICE),
+            &EventContext::verified(),
+        )
+        .unwrap();
+        db.insert_message_with(
+            "#Room",
+            "a!u@h",
+            "relayed",
+            11,
+            &tags(&[("+freeq.at/sig", "ed25519:other:sig")]),
+            Some("M2"),
+            Some(ALICE),
+            &EventContext {
+                sig_state: SigState::Unverifiable,
+                origin: Some("peer.example".to_string()),
+            },
+        )
+        .unwrap();
+
+        let ours = db.get_event("M1").unwrap().unwrap();
+        assert_eq!(ours.signature.as_deref(), Some("ed25519:kid:sig"));
+        assert_eq!(ours.sig_state, SigState::Valid);
+        assert_eq!(ours.origin, None, "local ingress has no relaying peer");
+
+        let theirs = db.get_event("M2").unwrap().unwrap();
+        assert_eq!(theirs.sig_state, SigState::Unverifiable);
+        assert_eq!(theirs.origin.as_deref(), Some("peer.example"));
+    }
+
+    /// A second claim on an id keeps the first row and leaves a receipt —
+    /// through the real write path, not a hand-built one.
+    #[test]
+    fn a_conflicting_message_leaves_a_receipt_on_the_event_it_lost_to() {
+        let db = Db::open_memory().unwrap();
+        assert!(db
+            .insert_message("#Room", "a!u@h", "what I said", 10, &HashMap::new(), Some("M1"), Some(ALICE))
+            .unwrap());
+        assert!(!db
+            .insert_message("#Room", "a!u@h", "what they claim", 11, &HashMap::new(), Some("M1"), Some(ALICE))
+            .unwrap());
+
+        let row = db.get_event("M1").unwrap().unwrap();
+        assert_eq!(
+            row.body_hash.as_deref(),
+            Some(freeq_sdk::chatsig::body_hash("what I said").as_str()),
+            "the log still holds what arrived first"
+        );
+        assert!(
+            row.conflict.is_some(),
+            "and records that a differing claim on this id was refused"
+        );
+
+        // A re-delivery of the *same* content is not a conflict and leaves no
+        // receipt — peers re-deliver all the time.
+        let db2 = Db::open_memory().unwrap();
+        db2.insert_message("#Room", "a!u@h", "same", 10, &HashMap::new(), Some("M9"), Some(ALICE))
+            .unwrap();
+        db2.insert_message("#Room", "a!u@h", "same", 10, &HashMap::new(), Some("M9"), Some(ALICE))
+            .unwrap();
+        assert_eq!(db2.get_event("M9").unwrap().unwrap().conflict, None);
+    }
+
+    /// The message row and its event are one write. A message that reached
+    /// history with no event would be a hole nothing later could distinguish
+    /// from a message that never happened.
+    #[test]
+    fn the_pair_is_written_together_or_not_at_all() {
+        let db = Db::open_memory().unwrap();
+        db.insert_message("#Room", "a!u@h", "hi", 10, &HashMap::new(), Some("M1"), Some(ALICE))
+            .unwrap();
+        let (msgs, events): (i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM messages), (SELECT COUNT(*) FROM events)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((msgs, events), (1, 1));
+
+        // A refused message writes neither.
+        db.insert_message("#Room", "a!u@h", "different", 11, &HashMap::new(), Some("M1"), Some(ALICE))
+            .unwrap();
+        let (msgs, events): (i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM messages), (SELECT COUNT(*) FROM events)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((msgs, events), (1, 1), "still one of each");
+    }
+
+    /// Encryption at rest changes what `messages` holds and nothing about the
+    /// log: the document hashes the wire body, which is the same either way.
+    #[test]
+    fn an_encrypted_database_logs_the_same_document() {
+        let plain = Db::open_memory().unwrap();
+        let sealed = Db::open_encrypted_memory([7u8; 32]).unwrap();
+        for db in [&plain, &sealed] {
+            db.insert_message("#Room", "a!u@h", "same body", 10, &HashMap::new(), Some("M1"), Some(ALICE))
+                .unwrap();
+        }
+        assert_eq!(
+            plain.get_event("M1").unwrap().unwrap().canonical,
+            sealed.get_event("M1").unwrap().unwrap().canonical
+        );
     }
 }

@@ -178,6 +178,71 @@ pub fn derive_facts(canonical: &str) -> Option<EventFacts> {
     })
 }
 
+/// The venue a stored row belongs to: a channel key folded, anything else
+/// (a `dm:<a>,<b>` conversation key) already being a venue.
+///
+/// Folded here rather than trusted to be folded already — a local row is filed
+/// under a normalized channel, but a row that arrived over S2S keeps the
+/// spelling the origin's user typed, and a signer signed the folded form.
+pub fn venue_of(channel: &str) -> String {
+    if channel.starts_with('#') || channel.starts_with('&') {
+        freeq_sdk::chatsig::channel_venue(channel)
+    } else {
+        channel.to_string()
+    }
+}
+
+/// Rebuild the document a stored message's signature covers, from the columns
+/// the row already holds.
+///
+/// The one place this rebuild lives. It ran in three before — the log, the
+/// verify endpoint, and ingress — and three copies of a byte-exact
+/// reconstruction is three chances for one of them to drift and start calling
+/// honest messages forged.
+///
+/// `replaces_msgid` is the column; `+draft/edit` is the tag. A local edit
+/// files the tag, one that arrived over S2S carries the linkage only in the
+/// column (the relayed tag map is filtered to `+freeq.at/*`), so both are
+/// consulted and either answer serves.
+pub fn message_canonical(
+    sender_did: &str,
+    msgid: &str,
+    channel: &str,
+    body: &str,
+    tags: &std::collections::HashMap<String, String>,
+    replaces_msgid: Option<&str>,
+) -> String {
+    let venue = venue_of(channel);
+    let mut doc = freeq_sdk::chatsig::ChatDoc::message(sender_did, msgid, &venue, body);
+    if let Some(reply) = tags.get("+reply").or_else(|| tags.get("+draft/reply")) {
+        doc = doc.with_reply(reply);
+    }
+    let edit = tags.get("+draft/edit").map(String::as_str).or(replaces_msgid);
+    if let Some(edit) = edit {
+        doc = doc.with_edit(edit);
+    }
+    doc.with_coord(tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .canonical()
+}
+
+/// Rebuild the document a mutation's signature covers.
+pub fn mutation_canonical(
+    kind: freeq_sdk::chatsig::Mutation,
+    actor_did: &str,
+    event_id: &str,
+    channel: &str,
+    subject: &str,
+    emoji: Option<&str>,
+) -> String {
+    let venue = venue_of(channel);
+    let mut doc =
+        freeq_sdk::chatsig::ChatDoc::mutation(kind, actor_did, event_id, &venue, subject);
+    if let Some(emoji) = emoji {
+        doc = doc.with_emoji(emoji);
+    }
+    doc.canonical()
+}
+
 /// A fingerprint of bytes, for the `conflict` column: `sha256:<lowercase hex>`.
 ///
 /// Recorded when a second, differing claim on an id is dropped, so the fact

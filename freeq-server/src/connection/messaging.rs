@@ -1485,8 +1485,12 @@ pub(super) fn handle_privmsg_with_multiline(
             // sender's behalf. It also still held the minted event id
             // alongside the msgid it became: two tags that must agree forever,
             // which is the ambiguity signing exists to remove.
+            // Whatever signature is on `full_tags` is one this server stands
+            // behind: it either verified the sender's, or made its own. A
+            // failing one was stripped before it got here.
+            let event_ctx = crate::events::EventContext::verified();
             state.with_db(|db| {
-                db.insert_message(
+                db.insert_message_with(
                     target,
                     &hostmask,
                     text,
@@ -1494,6 +1498,7 @@ pub(super) fn handle_privmsg_with_multiline(
                     &full_tags,
                     Some(&msgid),
                     sender_did,
+                    &event_ctx,
                 )
             });
 
@@ -1940,8 +1945,9 @@ pub(super) fn handle_privmsg_with_multiline(
         if let (Some(s_did), Some(r_did)) = (sender_did, recipient_did.as_deref()) {
             let dm_key = crate::db::canonical_dm_key(s_did, r_did);
             let did_for_db = Some(s_did);
+            let event_ctx = crate::events::EventContext::verified();
             state.with_db(|db| {
-                db.insert_message(
+                db.insert_message_with(
                     &dm_key,
                     &hostmask,
                     text,
@@ -1949,6 +1955,7 @@ pub(super) fn handle_privmsg_with_multiline(
                     &pm_tags,
                     Some(&pm_msgid),
                     did_for_db,
+                    &event_ctx,
                 )
             });
         }
@@ -2894,8 +2901,9 @@ fn handle_edit(
     // the edit is as ephemeral as the message it replaces.
     let editor_did = conn.authenticated_did.as_deref();
     if persisted {
+        let event_ctx = crate::events::EventContext::verified();
         state.with_db(|db| {
-            db.insert_edit(
+            db.insert_edit_with(
                 &store_channel,
                 &hostmask,
                 new_text,
@@ -2904,6 +2912,7 @@ fn handle_edit(
                 &edit_msgid,
                 original_msgid,
                 editor_did,
+                &event_ctx,
             )
         });
     }

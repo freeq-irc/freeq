@@ -1334,8 +1334,6 @@ async fn api_verify_message(
     State(state): State<Arc<SharedState>>,
     axum::extract::Path(msgid): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    use freeq_sdk::chatsig;
-
     // The database first: its row is authoritative about the venue and the
     // sender's DID, both of which the signed document covers. In-memory
     // history is the fallback for a server running without a database.
@@ -1400,32 +1398,25 @@ async fn api_verify_message(
         });
     }
 
-    // Rebuild the exact document the signer signed (see `chatsig`): the venue
-    // is the stored channel key — a folded channel name, or the sorted DID
-    // pair a DM is filed under — never a reader-perspective target.
+    // Rebuild the exact document the signer signed, through the one builder
+    // that does it — the same call the event log files with, so a reader's
+    // answer and the log's row can never disagree about what was signed.
     //
-    // Folded here rather than trusted to be folded already: a local row is
-    // filed under a normalized channel, but a row that arrived over S2S keeps
-    // the spelling the origin's user typed, so a mixed-case federated channel
-    // would otherwise rebuild a venue no signer ever signed and report honest
+    // The venue is the stored channel key folded: a local row is filed under a
+    // normalized channel, but a row that arrived over S2S keeps the spelling
+    // the origin's user typed, and a mixed-case federated channel would
+    // otherwise rebuild a venue no signer ever signed and report honest
     // messages as invalid.
-    if venue.starts_with('#') || venue.starts_with('&') {
-        venue = chatsig::channel_venue(&venue);
-    }
+    venue = crate::events::venue_of(&venue);
     let canonical = sender_did.as_ref().map(|did| {
-        let mut doc = chatsig::ChatDoc::message(did, &msgid, &venue, &msg.text);
-        if let Some(reply) = msg
-            .tags
-            .get("+reply")
-            .or_else(|| msg.tags.get("+draft/reply"))
-        {
-            doc = doc.with_reply(reply);
-        }
-        if let Some(edit) = msg.tags.get("+draft/edit").or(revises.as_ref()) {
-            doc = doc.with_edit(edit);
-        }
-        doc.with_coord(msg.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .canonical()
+        crate::events::message_canonical(
+            did,
+            &msgid,
+            &venue,
+            &msg.text,
+            &msg.tags,
+            revises.as_deref(),
+        )
     });
 
     let (verdict, verified_by, client_public_key) = classify_message_signature(

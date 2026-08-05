@@ -3554,6 +3554,21 @@ pub(crate) async fn process_s2s_message(
             // message from a locally-verified one, rather than rendering the
             // (only peer-trusted) `account` as if this server had verified it.
             let origin_name = sanitize_s2s_str(&manager.peer_display_name(&origin).await, 64);
+            // What the log records about this relay: the verdict this server
+            // actually reached, and the peer it came through. A signature we
+            // stripped leaves nothing to have concluded, and a peer's word is
+            // not a verdict — only our own check may say `valid`.
+            let event_ctx = crate::events::EventContext {
+                sig_state: match (&sig, sig_verdict) {
+                    (None, _) => crate::events::SigState::Unsigned,
+                    (
+                        Some(_),
+                        Some(crate::connection::messaging::ClientSigOutcome::Verified),
+                    ) => crate::events::SigState::Valid,
+                    _ => crate::events::SigState::Unverifiable,
+                },
+                origin: Some(origin_name.clone()),
+            };
             relay_tags.insert("+freeq.at/origin".to_string(), origin_name);
 
             // Plain line for non-tag clients, tagged line with msgid + sig for
@@ -3653,7 +3668,7 @@ pub(crate) async fn process_s2s_message(
                             // reading history later — CHATHISTORY, the verify
                             // endpoint — can check the message at all. The DM
                             // path below has always filed the full set.
-                            Some(ref root) => db.insert_edit(
+                            Some(ref root) => db.insert_edit_with(
                                 &target,
                                 &from,
                                 &text,
@@ -3662,8 +3677,9 @@ pub(crate) async fn process_s2s_message(
                                 &msgid,
                                 root,
                                 s2s_sender_did.as_deref(),
+                                &event_ctx,
                             ),
-                            None => db.insert_message(
+                            None => db.insert_message_with(
                                 &target,
                                 &from,
                                 &text,
@@ -3671,6 +3687,7 @@ pub(crate) async fn process_s2s_message(
                                 &tags,
                                 Some(&msgid),
                                 s2s_sender_did.as_deref(),
+                                &event_ctx,
                             ),
                         })
                         .unwrap_or(true);
@@ -3859,7 +3876,7 @@ pub(crate) async fn process_s2s_message(
                     // new message would leave the thread showing both versions.
                     stored = state
                         .with_db(|db| match edit_of {
-                            Some(ref root) => db.insert_edit(
+                            Some(ref root) => db.insert_edit_with(
                                 &dm_key,
                                 &from,
                                 &text,
@@ -3868,8 +3885,9 @@ pub(crate) async fn process_s2s_message(
                                 &msgid,
                                 root,
                                 sender_did.as_deref(),
+                                &event_ctx,
                             ),
-                            None => db.insert_message(
+                            None => db.insert_message_with(
                                 &dm_key,
                                 &from,
                                 &text,
@@ -3877,6 +3895,7 @@ pub(crate) async fn process_s2s_message(
                                 &tags,
                                 Some(&msgid),
                                 sender_did.as_deref(),
+                                &event_ctx,
                             ),
                         })
                         .unwrap_or(true);
