@@ -4720,9 +4720,23 @@ pub(crate) async fn process_s2s_message(
             limit,
         } => {
             const MAX_REPLAY: usize = 500;
+            // The same predicate the live relay path uses, so a replay is
+            // never broader or narrower than what this peer already receives
+            // as things happen. See `S2sManager::may_relay_to`.
+            let in_scope = {
+                let peers = manager.peers.lock().await;
+                manager.may_relay_to(authenticated_peer_id, &peers)
+            };
+            if !in_scope {
+                tracing::warn!(
+                    peer = %authenticated_peer_id,
+                    "S2S catch-up refused: this peer receives no events from us"
+                );
+                return;
+            }
             let limit = if limit == 0 { MAX_REPLAY } else { limit.min(MAX_REPLAY) };
             let rows = state
-                .with_db(|db| db.events_since_for_replay(since_ts, limit + 1))
+                .with_db(|db| db.events_since(since_ts, limit + 1))
                 .unwrap_or_default();
             let more = rows.len() > limit;
             let events: Vec<crate::s2s::ReplayedEvent> = rows
@@ -6034,7 +6048,7 @@ mod s2s_adversarial_tests {
     }
 
     /// Build a minimal S2sManager for testing.
-    fn test_manager() -> Arc<S2sManager> {
+    pub(super) fn test_manager() -> Arc<S2sManager> {
         test_manager_with_trust(HashMap::new())
     }
 
@@ -6059,12 +6073,13 @@ mod s2s_adversarial_tests {
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            allowed_peers: Vec::new(),
         })
     }
 
-    const PEER: &str = "fake-peer-id-for-testing";
+    pub(super) const PEER: &str = "fake-peer-id-for-testing";
 
-    async fn setup_authenticated_peer(state: &SharedState, manager: &Arc<S2sManager>) {
+    pub(super) async fn setup_authenticated_peer(state: &SharedState, manager: &Arc<S2sManager>) {
         manager
             .authenticated_peers
             .lock()
@@ -7630,6 +7645,7 @@ mod s2s_adversarial_tests {
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            allowed_peers: Vec::new(),
         });
         (manager, broadcast_rx)
     }
@@ -10546,10 +10562,15 @@ mod catchup_tests {
     use freeq_sdk::chatsig::ChatDoc;
     use crate::events::SigState;
     use crate::s2s::{CATCHUP, ReplayedEvent, S2sMessage, our_capabilities, peer_supports};
-    use super::{ReplayOutcome, SharedState, apply_replayed_event, test_state_with_db};
+    use super::s2s_adversarial_tests::{setup_authenticated_peer, test_manager};
+    use super::{
+        ReplayOutcome, SharedState, apply_replayed_event, process_s2s_message, test_state_with_db,
+    };
+    use tokio::sync::mpsc;
 
     const ALICE: &str = "did:plc:catchupalice";
-    const PEER: &str = "peer-endpoint-id";
+    /// The peer id the shared S2S test helpers authenticate.
+    use super::s2s_adversarial_tests::PEER;
 
     fn state_with_key(key: &SigningKey) -> Arc<SharedState> {
         let state = test_state_with_db();
@@ -10789,6 +10810,120 @@ mod catchup_tests {
 
         // And our own Hello does declare it, so a peer running this build is asked.
         assert!(peer_supports(&our_capabilities(), CATCHUP));
+    }
+
+    /// The answer a peer actually receives contains the whole window — direct
+    /// messages included. Live relay is peer-blind broadcast to allowlisted
+    /// peers, so a replay that held DMs back would protect nothing (the peer
+    /// received them live) while denying its own users what they missed.
+    /// Driven through the real handler, so it pins what crosses the wire and
+    /// not just what a query returns.
+    #[tokio::test]
+    async fn the_answer_a_peer_receives_includes_direct_messages() {
+        let state = test_state_with_db();
+        let manager = test_manager();
+        setup_authenticated_peer(&state, &manager).await;
+
+        // A channel message and a direct message, both in the window.
+        for (venue, id) in [
+            ("#open", "01SCOPE00000000000000001"),
+            ("dm:did:plc:a,did:plc:b", "01SCOPE00000000000000002"),
+        ] {
+            state
+                .with_db(|db| {
+                    db.insert_message(
+                        venue,
+                        "a!u@h",
+                        "x",
+                        100,
+                        &HashMap::new(),
+                        Some(id),
+                        Some("did:plc:a"),
+                    )
+                })
+                .unwrap();
+        }
+
+        // A live link to answer down.
+        let (tx, mut rx) = mpsc::channel(16);
+        manager.peers.lock().await.insert(
+            PEER.to_string(),
+            crate::s2s::PeerEntry { tx, conn_gen: 1 },
+        );
+
+        process_s2s_message(
+            &state,
+            &manager,
+            PEER,
+            S2sMessage::CatchupRequest {
+                peer_id: PEER.to_string(),
+                since_ts: 0,
+                limit: 0,
+            },
+        )
+        .await;
+
+        let reply = rx.try_recv().expect("the peer receives an answer");
+        let events = match reply {
+            S2sMessage::CatchupEvents { events, .. } => events,
+            other => panic!("expected CatchupEvents, got {other:?}"),
+        };
+        let venues: Vec<&str> = events.iter().map(|e| e.venue.as_str()).collect();
+        assert!(
+            venues.contains(&"dm:did:plc:a,did:plc:b"),
+            "the window is the window: {venues:?}"
+        );
+        assert!(venues.contains(&"#open"), "{venues:?}");
+    }
+
+    /// …and a peer the live relay path would skip gets no answer either,
+    /// because both paths ask the same question. The peer here is *connected*
+    /// — the only thing keeping it out is the allowlist, which is the half of
+    /// the predicate a replay could otherwise have forgotten.
+    #[tokio::test]
+    async fn a_peer_we_would_not_relay_to_gets_no_answer() {
+        let state = test_state_with_db();
+        let mut manager = test_manager();
+        Arc::get_mut(&mut manager)
+            .expect("sole owner before the peer is registered")
+            .allowed_peers = vec!["some-other-server".to_string()];
+        setup_authenticated_peer(&state, &manager).await;
+        state
+            .with_db(|db| {
+                db.insert_message(
+                    "#open",
+                    "a!u@h",
+                    "x",
+                    100,
+                    &HashMap::new(),
+                    Some("01SCOPE00000000000000003"),
+                    Some("did:plc:a"),
+                )
+            })
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        manager.peers.lock().await.insert(
+            PEER.to_string(),
+            crate::s2s::PeerEntry { tx, conn_gen: 1 },
+        );
+
+        process_s2s_message(
+            &state,
+            &manager,
+            PEER,
+            S2sMessage::CatchupRequest {
+                peer_id: PEER.to_string(),
+                since_ts: 0,
+                limit: 0,
+            },
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a connected but disallowed peer receives no events live, so it \
+             receives none in a replay"
+        );
     }
 
     /// A catch-up answer is drawn from the log, oldest first, and stops at the

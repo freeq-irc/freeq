@@ -945,6 +945,10 @@ pub struct S2sManager {
     /// from this map, or present with an empty list, is sent nothing new —
     /// see [`CAPABILITIES`].
     pub peer_capabilities: Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
+    /// `--s2s-allowed-peers`, empty meaning no restriction. Held here rather
+    /// than read from config at each call site so [`S2sManager::may_relay_to`]
+    /// can state the whole rule in one place.
+    pub allowed_peers: Vec<String>,
 }
 
 impl S2sManager {
@@ -962,6 +966,35 @@ impl S2sManager {
         }
     }
 
+    /// **The** scope predicate: may events this server holds go to `peer_id`?
+    ///
+    /// One function, two readers. The live relay path calls it per peer, and
+    /// the catch-up replay path calls it before answering — so a replay can
+    /// never be broader or narrower than what that same peer receives as
+    /// things happen. That symmetry is the rule, not an implementation
+    /// detail: scoping replay on its own made it *stricter* than live, which
+    /// protected nothing (the peer gets everything live regardless) while
+    /// withholding its own users' missed messages. See the near-term
+    /// decisions in `docs/FEDERATION-TOPOLOGY.md`.
+    ///
+    /// Today the answer is "the peer is connected and allowlisted", and live
+    /// relay is peer-blind: every allowlisted peer receives every event,
+    /// channels and direct messages alike. When relay becomes targeted —
+    /// membership-scoped channels, residency-routed direct messages — the
+    /// narrowing goes **here**, and replay inherits it with no second edit.
+    ///
+    /// Connectedness is passed in as the peer map the caller already holds,
+    /// rather than locked here: the live path calls this while iterating it.
+    pub fn may_relay_to(&self, peer_id: &str, peers: &HashMap<String, PeerEntry>) -> bool {
+        peers.contains_key(peer_id) && self.is_allowlisted(peer_id)
+    }
+
+    /// Whether the operator permits this peer at all. An empty allowlist means
+    /// no restriction, matching `--s2s-allowed-peers`.
+    fn is_allowlisted(&self, peer_id: &str) -> bool {
+        self.allowed_peers.is_empty() || self.allowed_peers.iter().any(|p| p == peer_id)
+    }
+
     /// Internal: send a message directly to all connected peers (called by broadcast worker).
     async fn broadcast_to_peers(&self, msg: S2sMessage) {
         let peers = self.peers.lock().await;
@@ -969,6 +1002,9 @@ impl S2sManager {
             return;
         }
         for (peer_id, entry) in peers.iter() {
+            if !self.may_relay_to(peer_id, &peers) {
+                continue;
+            }
             if entry.tx.send(msg.clone()).await.is_err() {
                 tracing::warn!(peer = %peer_id, "S2S broadcast: failed to send to peer");
             }
@@ -1213,7 +1249,8 @@ pub async fn start(
         trust_config,
         pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
-            peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        allowed_peers: state.config.s2s_allowed_peers.clone(),
     });
 
     // Spawn the ordered broadcast worker.  All outbound S2S messages flow
@@ -1860,6 +1897,7 @@ mod tests {
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            allowed_peers: Vec::new(),
         };
 
         // Sign a message
@@ -1923,6 +1961,7 @@ mod tests {
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            allowed_peers: Vec::new(),
         };
 
         let msg = S2sMessage::SyncRequest;
@@ -1965,6 +2004,7 @@ mod tests {
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            allowed_peers: Vec::new(),
         };
 
         let msg = S2sMessage::Privmsg {
@@ -2040,6 +2080,7 @@ mod tests {
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            allowed_peers: Vec::new(),
         };
 
         let rotation = manager.announce_rotation(&new_id);
@@ -2083,6 +2124,7 @@ mod tests {
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            allowed_peers: Vec::new(),
         };
 
         let rotation = manager.announce_rotation(&new_id);
@@ -2125,6 +2167,7 @@ mod tests {
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            allowed_peers: Vec::new(),
         };
 
         // Manually create a rotation with an old timestamp
