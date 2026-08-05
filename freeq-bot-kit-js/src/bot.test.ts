@@ -988,3 +988,109 @@ describe("FreeqBot announce-on-reconnect", () => {
     await bot.stop({ drainMs: 0 });
   });
 });
+
+describe("session signing", () => {
+  let root: string;
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "freeq-bot-kit-bot-"));
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  /** Drive registration against a server that offers SASL and the signing
+   *  cap, completing the crypto-SASL exchange with the bot's real did:key. */
+  async function driveSigningReady(ws: MockWebSocket, nick: string): Promise<void> {
+    await flushAsync();
+    ws.recv(":srv CAP * LS :sasl message-tags freeq.at/msgsig");
+    await flushAsync();
+    ws.recv(":srv CAP * ACK :sasl message-tags freeq.at/msgsig");
+    await flushAsync();
+    const challenge = Buffer.from(JSON.stringify({ nonce: "n1" })).toString("base64url");
+    ws.recv(`AUTHENTICATE ${challenge}`);
+    await flushAsync();
+    ws.recv(`:srv 903 ${nick} :SASL authentication successful`);
+    await flushAsync();
+    ws.recv(`:srv 001 ${nick} :Welcome`);
+    await flushAsync();
+    ws.recv(`:srv 376 ${nick} :End of MOTD`);
+    await flushAsync();
+  }
+
+  it("a bot registers a session signing key like every other client", async () => {
+    const { FreeqBot } = await import("./bot.js");
+    const bot = await FreeqBot.create({
+      name: "test-bot",
+      ownerDid: "did:plc:owner",
+      nick: "test-bot",
+      url: "wss://test/irc",
+      root,
+    });
+
+    const startPromise = bot.start();
+    await flushAsync();
+    const ws = MockWebSocket.instances[0]!;
+    await driveSigningReady(ws, "test-bot");
+    await startPromise;
+
+    // The MSGSIG mint is async off the 001 handler; give it a beat.
+    for (let i = 0; i < 100 && !ws.sent.some((l) => l.startsWith("MSGSIG ")); i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(
+      ws.sent.some((l) => l.startsWith("MSGSIG ")),
+      `no MSGSIG on the wire; sent: ${ws.sent.join(" | ")}`,
+    ).toBe(true);
+    await bot.stop({ drainMs: 0 });
+  });
+});
+
+describe("session signing opt-out", () => {
+  let root: string;
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "freeq-bot-kit-bot-"));
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("autoMsgSig: false passes through — no session key is registered", async () => {
+    const { FreeqBot } = await import("./bot.js");
+    const bot = await FreeqBot.create({
+      name: "test-bot",
+      ownerDid: "did:plc:owner",
+      nick: "test-bot",
+      url: "wss://test/irc",
+      root,
+      autoMsgSig: false,
+    });
+
+    const startPromise = bot.start();
+    await flushAsync();
+    const ws = MockWebSocket.instances[0]!;
+    await flushAsync();
+    ws.recv(":srv CAP * LS :sasl message-tags freeq.at/msgsig");
+    await flushAsync();
+    ws.recv(":srv CAP * ACK :sasl message-tags freeq.at/msgsig");
+    await flushAsync();
+    const challenge = Buffer.from(JSON.stringify({ nonce: "n1" })).toString("base64url");
+    ws.recv(`AUTHENTICATE ${challenge}`);
+    await flushAsync();
+    ws.recv(":srv 903 test-bot :SASL authentication successful");
+    await flushAsync();
+    ws.recv(":srv 001 test-bot :Welcome");
+    await flushAsync();
+    ws.recv(":srv 376 test-bot :End of MOTD");
+    await flushAsync();
+    await startPromise;
+
+    // Symmetric wait to the opt-in test: give an (incorrect) async mint
+    // every chance to appear before asserting it didn't.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(
+      ws.sent.some((l) => l.startsWith("MSGSIG ")),
+      `unexpected MSGSIG; sent: ${ws.sent.join(" | ")}`,
+    ).toBe(false);
+    await bot.stop({ drainMs: 0 });
+  });
+});

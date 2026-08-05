@@ -86,6 +86,10 @@ export interface FreeqBotCreateOptions {
   serverOrigin?: string;
   /** Policy on 433 ERR_NICKNAMEINUSE. Default `"refuse"`. */
   onNickCollision?: NickCollisionPolicy;
+  /** Register a per-session message-signing key after SASL (SDK default:
+   *  true). Set false to skip the mint — outbound messages then get the
+   *  server's fallback signature instead of the bot's own. */
+  autoMsgSig?: boolean;
   /** Sender-DID resolver tuning. Sets defaults on the per-bot resolver
    *  used by `bot.resolveSenderDid()`. Override per-call via the
    *  method's `opts` argument. */
@@ -217,11 +221,11 @@ export class FreeqBot {
         token: "",
         pdsUrl: "",
       },
-      // The bot has its own long-lived ed25519 identity (its did:key); skip
-      // the SDK's auto-mint of a per-session MSGSIG key. The server will
-      // server-sign outbound messages on our behalf when the client doesn't
-      // attach a signature.
-      autoMsgSig: false,
+      // The SDK's default per-session MSGSIG key stays on: a bot signs its
+      // messages and mutations like every other client. (The did:key the bot
+      // authenticates with is a separate concern — signing with it directly
+      // is the DID-document-anchored model, not built yet.)
+      autoMsgSig: opts.autoMsgSig,
     });
 
     const defaultMentionMatcher: MentionMatcher = (text, nick) => {
