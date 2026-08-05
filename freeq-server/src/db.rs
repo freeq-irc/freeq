@@ -6097,3 +6097,92 @@ fn pin_event_id(channel: &str, msgid: &str, at: u64, pinning: bool) -> String {
     // downstream that assumed an id's shape has to widen for these.
     format!("pin-{}", &digest["sha256:".len().."sha256:".len() + 22])
 }
+
+impl Db {
+    /// Events accepted at or after `since_ts`, oldest first — the whole log,
+    /// for local readers and tests.
+    pub fn events_since(&self, since_ts: u64, limit: usize) -> SqlResult<Vec<StoredEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, canonical, signature, sig_state, kind, venue,
+                    actor_did, subject, body_hash, origin, conflict, timestamp
+             FROM events WHERE timestamp >= ?1
+             ORDER BY timestamp ASC, event_id ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![since_ts as i64, limit as i64], map_stored_event)?;
+        rows.collect()
+    }
+
+    /// The window a returning peer may be told about: **channel events only.**
+    ///
+    /// A direct message's venue is `dm:<did_a>,<did_b>`, and its event row
+    /// carries that venue, the actor, the time and a body hash. Replaying
+    /// those to any peer that asked would hand over the shape of every private
+    /// conversation on this server — who spoke to whom, how often, when —
+    /// which is metadata nobody consented to federate.
+    ///
+    /// Channels only is the conservative floor, not the finished policy: it
+    /// still tells a peer about channels it has no members in. Narrowing that
+    /// further is a policy question rather than a mechanical one, and is
+    /// written up rather than guessed at (see `docs/ITEM2-REVIEW-NOTES.md`).
+    pub fn events_since_for_replay(
+        &self,
+        since_ts: u64,
+        limit: usize,
+    ) -> SqlResult<Vec<StoredEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, canonical, signature, sig_state, kind, venue,
+                    actor_did, subject, body_hash, origin, conflict, timestamp
+             FROM events
+             WHERE timestamp >= ?1 AND substr(venue, 1, 1) IN ('#', '&')
+             ORDER BY timestamp ASC, event_id ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![since_ts as i64, limit as i64], map_stored_event)?;
+        rows.collect()
+    }
+}
+
+#[cfg(test)]
+mod replay_window_tests {
+    use super::*;
+
+    /// A catch-up answer never carries a direct message's event. The row holds
+    /// the conversation key, the participants and the timing, and that is the
+    /// shape of a private conversation — not something a peer gets for asking.
+    #[test]
+    fn a_replay_window_never_includes_a_direct_message() {
+        let db = Db::open_memory().unwrap();
+        db.insert_message(
+            "#public",
+            "a!u@h",
+            "in the open",
+            10,
+            &HashMap::new(),
+            Some("M1"),
+            Some("did:plc:a"),
+        )
+        .unwrap();
+        db.insert_message(
+            "dm:did:plc:a,did:plc:b",
+            "a!u@h",
+            "between us",
+            20,
+            &HashMap::new(),
+            Some("M2"),
+            Some("did:plc:a"),
+        )
+        .unwrap();
+
+        let local = db.events_since(0, 10).unwrap();
+        assert_eq!(local.len(), 2, "the log itself holds both");
+
+        let replayable = db.events_since_for_replay(0, 10).unwrap();
+        assert_eq!(replayable.len(), 1, "but only one may cross the wire");
+        assert_eq!(replayable[0].event_id, "M1");
+        assert!(
+            !replayable.iter().any(|e| e.venue.starts_with("dm:")),
+            "no conversation key leaves this server in a replay"
+        );
+    }
+}

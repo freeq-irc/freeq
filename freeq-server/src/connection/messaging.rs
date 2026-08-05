@@ -311,6 +311,36 @@ fn verify_client_signature(
     }
 }
 
+/// Check a signature against canonical bytes we were handed verbatim.
+///
+/// The replay case: a catch-up carries the exact document its signature
+/// covers, so there is nothing to rebuild and nothing to guess — check the
+/// bytes as given, against the key the signature names. Nothing here consults
+/// a session, because the signer authenticated to another server.
+pub(crate) fn verify_canonical_bytes(
+    state: &Arc<SharedState>,
+    signer_did: &str,
+    canonical: &str,
+    sig_tag: &str,
+) -> ClientSigOutcome {
+    let Ok((kid, _)) = freeq_sdk::sigtag::parse(sig_tag) else {
+        return ClientSigOutcome::Unverifiable("unparseable or legacy signature format");
+    };
+    let key = match state
+        .with_db(|db| db.get_signing_key_by_kid(signer_did, kid))
+        .flatten()
+        .and_then(|bytes| ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok())
+    {
+        Some(vk) => vk,
+        None => return ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE),
+    };
+    match freeq_sdk::sigtag::verify_canonical(canonical, sig_tag, &key) {
+        Ok(()) => ClientSigOutcome::Verified,
+        Err(e) if e.is_unverifiable() => ClientSigOutcome::Unverifiable("unusable signature tag"),
+        Err(_) => ClientSigOutcome::Failed,
+    }
+}
+
 /// Check a message signature that arrived from a peer, against the message
 /// exactly as it arrived.
 ///

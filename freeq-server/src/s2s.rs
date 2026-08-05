@@ -183,6 +183,93 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// The capabilities a server may declare in its Hello.
+///
+/// **This list is the only source of truth.** Both the advertisement and every
+/// check read from here — no string literals at call sites — because a
+/// capability name typed twice is a capability that silently stops gating
+/// anything the day one of the two is misspelled. `capabilities_are_all_used`
+/// enforces the other half: a name here that no send site consults is a test
+/// failure, not a zombie.
+///
+/// **What belongs here:** new wire message types, and nothing else. Not
+/// preferences, not tuning knobs, not "this peer prefers X" — those are
+/// configuration, and putting them here turns a compatibility list into a
+/// settings bag nobody can reason about.
+///
+/// **Retirement.** A capability lives until the feature it gates is baseline
+/// for every peer, which is what a `protocol_version` bump means. At that bump
+/// the entry is *deleted*, not kept for sentiment — the version bump is the
+/// purge moment, and an entry that outlives its purpose is exactly the rot
+/// this list is designed to avoid.
+///
+/// **Names are append-only.** A breaking revision of a capability ships as a
+/// new name rather than a changed meaning, because a peer that declares the
+/// old name is telling you what it can actually do. If a capability ever needs
+/// parameters, they attach as `name=value` — the name itself never changes
+/// shape.
+pub struct Capability {
+    /// The wire name. Append-only.
+    pub name: &'static str,
+    /// What it gates, and when it arrived — so a reader years later can tell
+    /// whether it is still doing anything.
+    pub gates: &'static str,
+}
+
+/// Every capability this build declares. See [`Capability`] for the rules.
+pub const CAPABILITIES: &[Capability] = &[Capability {
+    name: CATCHUP,
+    // Added 2026-08-05. Retire at the next protocol_version bump, once no
+    // peer predates event replay.
+    gates: "CatchupRequest / CatchupEvents — replay of events missed while a link was down",
+}];
+
+/// Catch-up replay. A peer that does not declare this is never sent
+/// [`S2sMessage::CatchupRequest`] or [`S2sMessage::CatchupEvents`]; it would
+/// warn-and-skip them, which is data loss dressed as compatibility.
+pub const CATCHUP: &str = "catchup";
+
+/// The capability list this server advertises.
+pub fn our_capabilities() -> Vec<String> {
+    CAPABILITIES.iter().map(|c| c.name.to_string()).collect()
+}
+
+/// Whether `peer_caps` — as declared in that peer's Hello — includes `name`.
+///
+/// The only way to ask. A peer that declared nothing (an older build, whose
+/// Hello has no capability field at all) gets an empty list and therefore a
+/// `false` for everything, which is precisely the intended answer: send it
+/// nothing it cannot parse.
+pub fn peer_supports(peer_caps: &[String], name: &str) -> bool {
+    peer_caps.iter().any(|c| c == name || c.starts_with(&format!("{name}=")))
+}
+
+/// One event, as it travels in a catch-up reply.
+///
+/// The canonical bytes and the signature ride together and unaltered: a
+/// receiver rebuilds nothing and trusts nothing, it checks the signature
+/// against the bytes it was handed and reaches its own verdict. `sig_state` is
+/// deliberately **not** on the wire — a peer's conclusion about a signature is
+/// that peer's, and repeating it would invite a receiver to adopt it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplayedEvent {
+    pub event_id: String,
+    /// The exact JCS bytes the signature covers. Empty when nothing signed
+    /// this event, in which case there is nothing to check and it is filed as
+    /// unsigned.
+    #[serde(default)]
+    pub canonical: String,
+    #[serde(default)]
+    pub signature: Option<String>,
+    pub kind: String,
+    pub venue: String,
+    #[serde(default)]
+    pub actor_did: Option<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    pub timestamp: u64,
+}
+
 /// Messages exchanged between servers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -197,12 +284,22 @@ pub enum S2sMessage {
         peer_id: String,
         /// Human-readable server name (untrusted display metadata).
         server_name: String,
-        /// Protocol version for capability negotiation.
+        /// Protocol version. Reserved for genuinely breaking envelope
+        /// changes; feature negotiation goes through `capabilities` instead,
+        /// so two independent features can ship in either order.
         #[serde(default)]
         protocol_version: u32,
         /// Trust level this server offers to the peer (informational).
         #[serde(default)]
         trust_level: Option<String>,
+        /// What this server can receive — see [`CAPABILITIES`].
+        ///
+        /// `serde(default)` is the whole compatibility story: a peer that
+        /// predates this field deserializes to an empty list, so it declares
+        /// nothing, so it is sent nothing new. The rollout constraint is
+        /// satisfied by construction rather than by remembering to check.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
     },
 
     /// Phase 1: Mutual auth acknowledgment — sent after receiving Hello.
@@ -473,6 +570,43 @@ pub enum S2sMessage {
     /// Request full state sync (sent on initial link).
     #[serde(rename = "sync_request")]
     SyncRequest,
+
+    /// Ask a peer for the events it accepted in a venue since `since_ts`.
+    ///
+    /// Sent on link establishment to a peer that declared [`CATCHUP`], and
+    /// never to one that didn't — a frozen peer warn-and-skips a message type
+    /// it cannot parse, which is data loss wearing compatibility's clothes.
+    ///
+    /// A window rather than a cursor: the asking server states how far back it
+    /// wants, so a peer holding more history than we ever had does not have to
+    /// reason about what we might be missing.
+    #[serde(rename = "catchup_request")]
+    CatchupRequest {
+        /// Our endpoint ID, so the answer comes back to us.
+        peer_id: String,
+        /// Earliest event timestamp wanted (unix seconds).
+        since_ts: u64,
+        /// Most events to send back. The answering peer caps this itself.
+        #[serde(default)]
+        limit: usize,
+    },
+
+    /// Events a peer missed, in reply to a [`S2sMessage::CatchupRequest`].
+    ///
+    /// Each event carries its own signature and the bytes that signature
+    /// covers, so the receiver reaches its own verdict rather than trusting
+    /// the peer that replayed them — which is why cross-server verification
+    /// had to land before replay could.
+    #[serde(rename = "catchup_events")]
+    CatchupEvents {
+        /// The server that accepted these events.
+        origin: String,
+        events: Vec<ReplayedEvent>,
+        /// True when the answer was cut short by the cap, so the asker can
+        /// come back for more rather than assume it has everything.
+        #[serde(default)]
+        more: bool,
+    },
 
     /// Response with current server state.
     #[serde(rename = "sync_response")]
@@ -804,6 +938,10 @@ pub struct S2sManager {
     pub pending_rotations: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     /// Phase 1: Peers that have completed mutual HelloAck handshake.
     pub authenticated_peers: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    /// What each peer declared it can receive, from its Hello. A peer absent
+    /// from this map, or present with an empty list, is sent nothing new —
+    /// see [`CAPABILITIES`].
+    pub peer_capabilities: Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
 }
 
 impl S2sManager {
@@ -832,6 +970,51 @@ impl S2sManager {
                 tracing::warn!(peer = %peer_id, "S2S broadcast: failed to send to peer");
             }
         }
+    }
+
+    /// How far back a reconnecting link asks for. Generous on purpose: the
+    /// cost of asking for more than we missed is a few duplicate events, each
+    /// of which is a no-op, while the cost of asking for less is a hole.
+    pub const CATCHUP_WINDOW_SECS: u64 = 24 * 60 * 60;
+
+    /// Ask a peer to replay what we missed, once it has said it can.
+    ///
+    /// The Hello that carries a peer's capabilities and the link coming up are
+    /// two different moments, so this waits a short while for the declaration
+    /// rather than deciding from a map that has not been filled in yet. A peer
+    /// that never declares [`CATCHUP`] is never asked — the whole point.
+    pub async fn request_catchup_when_supported(&self, peer_id: &str, our_id: &str) {
+        for _ in 0..20 {
+            let declared = self
+                .peer_capabilities
+                .lock()
+                .await
+                .get(peer_id)
+                .cloned()
+                .unwrap_or_default();
+            if peer_supports(&declared, CATCHUP) {
+                let since_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .saturating_sub(Self::CATCHUP_WINDOW_SECS);
+                let req = S2sMessage::CatchupRequest {
+                    peer_id: our_id.to_string(),
+                    since_ts,
+                    limit: 0,
+                };
+                if let Some(entry) = self.peers.lock().await.get(peer_id) {
+                    let _ = entry.tx.send(req).await;
+                    tracing::info!(peer = %peer_id, since_ts, "S2S catch-up requested");
+                }
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        tracing::debug!(
+            peer = %peer_id,
+            "S2S peer declared no catch-up support — nothing new will be sent to it"
+        );
     }
 
     /// Look up the human-readable name for a peer (from Hello handshake).
@@ -1027,6 +1210,7 @@ pub async fn start(
         trust_config,
         pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     });
 
     // Spawn the ordered broadcast worker.  All outbound S2S messages flow
@@ -1474,6 +1658,7 @@ async fn handle_s2s_connection(
             server_name: server_name.clone(),
             protocol_version: 2, // v2 = signed envelopes + HelloAck
             trust_level: Some(trust.to_string()),
+            capabilities: our_capabilities(),
         };
         if let Some(entry) = peers.lock().await.get(&peer_id) {
             let _ = entry.tx.send(hello).await;
@@ -1486,6 +1671,20 @@ async fn handle_s2s_connection(
         if let Some(entry) = peers.lock().await.get(&peer_id) {
             let _ = entry.tx.send(sync_req).await;
         }
+    }
+
+    // Ask for what we missed while the link was down — but only of a peer that
+    // said it can answer. A peer that declared nothing warn-and-skips a type
+    // it cannot parse, so asking it would be silence dressed as an empty
+    // answer. The peer's Hello may not have arrived yet, so this waits briefly
+    // for it rather than racing the handshake.
+    {
+        let manager = Arc::clone(&manager);
+        let peer_id = peer_id.clone();
+        let server_id = server_id.clone();
+        tokio::spawn(async move {
+            manager.request_catchup_when_supported(&peer_id, &server_id).await;
+        });
     }
 
     // Wait for either direction to end
@@ -1657,6 +1856,7 @@ mod tests {
             trust_config,
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
 
         // Sign a message
@@ -1719,6 +1919,7 @@ mod tests {
             trust_config: HashMap::new(),
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
 
         let msg = S2sMessage::SyncRequest;
@@ -1760,6 +1961,7 @@ mod tests {
             trust_config: HashMap::new(),
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
 
         let msg = S2sMessage::Privmsg {
@@ -1834,6 +2036,7 @@ mod tests {
             trust_config: HashMap::new(),
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
 
         let rotation = manager.announce_rotation(&new_id);
@@ -1876,6 +2079,7 @@ mod tests {
             trust_config: HashMap::new(),
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
 
         let rotation = manager.announce_rotation(&new_id);
@@ -1917,6 +2121,7 @@ mod tests {
             trust_config: HashMap::new(),
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
 
         // Manually create a rotation with an old timestamp
@@ -1935,6 +2140,7 @@ mod tests {
             server_name: "test-server".to_string(),
             protocol_version: 2,
             trust_level: Some("full".to_string()),
+            capabilities: our_capabilities(),
         };
         let json = serde_json::to_string(&hello).unwrap();
         assert!(json.contains("protocol_version"));
@@ -2192,6 +2398,142 @@ mod tests {
                 );
             }
             _ => panic!("expected Privmsg"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    /// Every registered capability is actually consulted somewhere. A name
+    /// nobody checks gates nothing, and a list full of those is exactly the
+    /// rot this registry is meant to prevent — so it fails the build rather
+    /// than sitting there looking authoritative.
+    ///
+    /// Checked by source inspection because that is where the marriage lives:
+    /// the constant has to be *named* at a send site, not merely exist.
+    #[test]
+    fn every_registered_capability_gates_a_real_send_site() {
+        let sources = [
+            include_str!("s2s.rs"),
+            include_str!("server.rs"),
+        ];
+        for cap in CAPABILITIES {
+            // The const identifier, not the wire string: call sites use the
+            // constant, which is what makes a typo a compile error.
+            let ident = cap.name.to_uppercase();
+            let uses: usize = sources
+                .iter()
+                .map(|src| src.matches(&format!("peer_supports(&declared, {ident})")).count()
+                    + src.matches(&format!("peer_supports(caps, {ident})")).count())
+                .sum();
+            assert!(
+                uses > 0,
+                "capability `{}` is registered but no send site is gated on it — \
+                 either gate something or delete the entry ({})",
+                cap.name,
+                cap.gates
+            );
+        }
+    }
+
+    /// …and nothing gates on a string literal, which would drift silently.
+    #[test]
+    fn no_send_site_gates_on_a_bare_string() {
+        for src in [include_str!("s2s.rs"), include_str!("server.rs")] {
+            for cap in CAPABILITIES {
+                let literal = format!("peer_supports(&declared, \"{}\"", cap.name);
+                assert!(
+                    !src.contains(&literal),
+                    "gate on the registry constant, not the literal `{}`",
+                    cap.name
+                );
+            }
+        }
+    }
+
+    /// A peer that declared nothing supports nothing. This is the rollout
+    /// constraint in one line: a frozen peer's Hello has no capability field,
+    /// deserializes to empty, and is therefore never sent a new message type.
+    #[test]
+    fn a_peer_that_declared_nothing_supports_nothing() {
+        assert!(!peer_supports(&[], CATCHUP));
+        assert!(peer_supports(&[CATCHUP.to_string()], CATCHUP));
+        assert!(
+            !peer_supports(&["something-else".to_string()], CATCHUP),
+            "and declaring one thing is not declaring another"
+        );
+    }
+
+    /// Parameters attach as `name=value` without changing the name, so a
+    /// capability can gain them later without a peer's declaration becoming
+    /// unreadable.
+    #[test]
+    fn a_parameterised_declaration_still_names_its_capability() {
+        assert!(peer_supports(&[format!("{CATCHUP}=window:3600")], CATCHUP));
+        assert!(
+            !peer_supports(&[format!("{CATCHUP}x")], CATCHUP),
+            "and a longer name is a different capability, not this one"
+        );
+    }
+
+    /// A Hello from a peer that predates the field parses, and declares
+    /// nothing — the wire back-compat this whole design rests on.
+    #[test]
+    fn a_legacy_hello_parses_and_declares_nothing() {
+        let legacy = r#"{"type":"hello","peer_id":"abc","server_name":"old",
+                         "protocol_version":2,"trust_level":"full"}"#;
+        match serde_json::from_str::<S2sMessage>(legacy).expect("a legacy Hello still parses") {
+            S2sMessage::Hello { capabilities, .. } => {
+                assert!(capabilities.is_empty(), "no field means no declaration");
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    /// Our own Hello carries the list, and omits it entirely when empty so a
+    /// peer's parser never sees a field it has no need for.
+    #[test]
+    fn our_hello_declares_what_we_can_receive() {
+        let hello = S2sMessage::Hello {
+            peer_id: "us".to_string(),
+            server_name: "ours".to_string(),
+            protocol_version: 2,
+            trust_level: None,
+            capabilities: our_capabilities(),
+        };
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(json.contains(CATCHUP), "{json}");
+    }
+
+    /// A catch-up reply round-trips, and does not carry the answering peer's
+    /// verdict — only the evidence, so the receiver reaches its own.
+    #[test]
+    fn a_replayed_event_carries_evidence_and_not_a_verdict() {
+        let ev = ReplayedEvent {
+            event_id: "01REPLAY000000000000000000".to_string(),
+            canonical: r##"{"body":"sha256:aa","from":"did:plc:x","msgid":"01REPLAY000000000000000000","target":"#room"}"##.to_string(),
+            signature: Some("ed25519:kid:sig".to_string()),
+            kind: "message".to_string(),
+            venue: "#room".to_string(),
+            actor_did: Some("did:plc:x".to_string()),
+            subject: None,
+            timestamp: 42,
+        };
+        let json = serde_json::to_string(&S2sMessage::CatchupEvents {
+            origin: "peer".to_string(),
+            events: vec![ev.clone()],
+            more: false,
+        })
+        .unwrap();
+        assert!(
+            !json.contains("sig_state"),
+            "a peer's conclusion is not evidence: {json}"
+        );
+        match serde_json::from_str::<S2sMessage>(&json).unwrap() {
+            S2sMessage::CatchupEvents { events, .. } => assert_eq!(events, vec![ev]),
+            other => panic!("expected CatchupEvents, got {other:?}"),
         }
     }
 }

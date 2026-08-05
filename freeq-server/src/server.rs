@@ -2977,6 +2977,156 @@ fn verify_relayed_mutation_tags(
     ))
 }
 
+/// What happened to one replayed event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayOutcome {
+    /// New to us, and now on file.
+    Filed,
+    /// Already on file with the same content — a no-op, which is what makes
+    /// replay safe to run as often as a link flaps.
+    AlreadyHeld,
+    /// Already on file with *different* content: a second claim on one
+    /// identity. Dropped, logged loudly, and a receipt recorded against the
+    /// row we keep.
+    Conflicted,
+    /// Nothing we can file: no id, or bytes that are not a document.
+    Unusable,
+}
+
+/// Apply one replayed event.
+///
+/// The conflict rules, in the terms the plan states them:
+///
+/// - **Same id, same content → no-op.** A peer re-sending what we already
+///   hold is the normal case, not an error; replay would be unusable if it
+///   weren't.
+/// - **Same id, different content → drop and log loudly**, and record the
+///   dropped copy's fingerprint against the row we keep. First write wins,
+///   always — the copy we already showed our users is the copy we keep
+///   showing, because silently swapping it for another is the failure this
+///   whole design exists to prevent. The receipt is what stops the second
+///   claim from vanishing without trace: equivocation stays *visible* here
+///   even though it does not change what anyone sees.
+/// - **No deterministic winner, ever.** Picking one signed claim over another
+///   by hash or clock converges two servers at the cost of silently replacing
+///   a displayed message, and the rule is grindable by whoever mints the ids.
+///
+/// The receipt is local. It is written here, read here, and never crosses the
+/// wire — a peer's opinion about our conflicts is not evidence.
+///
+/// The ±120s id clock check deliberately does not run: it is a live-client
+/// ingress check, and a replay is *made* of old events. Signature verification
+/// is what stands in for freshness here, which is why item 1 came first.
+pub(crate) fn apply_replayed_event(
+    state: &Arc<SharedState>,
+    origin: &str,
+    ev: crate::s2s::ReplayedEvent,
+) -> ReplayOutcome {
+    use crate::events::{EventContext, EventFacts, SigState};
+
+    let event_id = sanitize_s2s_str(&ev.event_id, 100);
+    if event_id.is_empty() {
+        return ReplayOutcome::Unusable;
+    }
+
+    // What we already hold under this id, if anything.
+    let existing = state.with_db(|db| db.get_event(&event_id)).flatten();
+    if let Some(existing) = existing {
+        if existing.canonical == ev.canonical {
+            return ReplayOutcome::AlreadyHeld;
+        }
+        let fingerprint = crate::events::fingerprint(&ev.canonical);
+        tracing::warn!(
+            %origin, event_id = %event_id,
+            "S2S replay: a second claim on this id with different content — dropped,              and a receipt recorded against the copy we keep"
+        );
+        state.with_db(|db| db.record_event_conflict(&event_id, &fingerprint));
+        return ReplayOutcome::Conflicted;
+    }
+
+    // New to us. Check the signature ourselves against the bytes we were
+    // handed — never adopt the replaying peer's conclusion, which is why it
+    // does not travel.
+    let sig_state = match (ev.signature.as_deref(), ev.canonical.is_empty()) {
+        (None, _) => SigState::Unsigned,
+        (Some(sig), false) => match replayed_signature_verdict(state, &ev, sig) {
+            crate::connection::messaging::ClientSigOutcome::Verified => SigState::Valid,
+            crate::connection::messaging::ClientSigOutcome::Failed => {
+                // Evidence of tampering. Refused outright, the same as at
+                // live ingress: a failing signature is never filed.
+                tracing::warn!(
+                    %origin, event_id = %event_id,
+                    "S2S replay: signature did not verify against the key it names — refused"
+                );
+                return ReplayOutcome::Unusable;
+            }
+            crate::connection::messaging::ClientSigOutcome::Unverifiable(_) => {
+                SigState::Unverifiable
+            }
+        },
+        // A signature with no bytes to check it against is uncheckable, not
+        // wrong.
+        (Some(_), true) => SigState::Unverifiable,
+    };
+
+    let ctx = EventContext {
+        sig_state,
+        origin: Some(sanitize_s2s_str(origin, 64)),
+    };
+    let signature = ev.signature.as_deref();
+    let filed = if ev.canonical.is_empty() {
+        state.with_db(|db| {
+            db.insert_event(&crate::db::EventRecord {
+                shape: crate::db::EventShape::Bare(EventFacts {
+                    event_id: event_id.clone(),
+                    kind: sanitize_s2s_str(&ev.kind, 32),
+                    venue: crate::events::venue_of(&sanitize_s2s_str(&ev.venue, 200)),
+                    actor_did: ev.actor_did.as_deref().map(|d| sanitize_s2s_str(d, 512)),
+                    subject: ev.subject.as_deref().map(|s| sanitize_s2s_str(s, 100)),
+                    body_hash: None,
+                }),
+                signature,
+                ctx: ctx.clone(),
+                timestamp: ev.timestamp,
+            })
+        })
+    } else {
+        state.with_db(|db| {
+            db.insert_event(&crate::db::EventRecord {
+                shape: crate::db::EventShape::Document(&ev.canonical),
+                signature,
+                ctx: ctx.clone(),
+                timestamp: ev.timestamp,
+            })
+        })
+    };
+    match filed {
+        Some(true) => ReplayOutcome::Filed,
+        Some(false) => ReplayOutcome::Unusable,
+        // No database attached: nothing to file into, and nothing to claim.
+        None => ReplayOutcome::Filed,
+    }
+}
+
+/// Check a replayed event's signature against the bytes it travelled with.
+fn replayed_signature_verdict(
+    state: &Arc<SharedState>,
+    ev: &crate::s2s::ReplayedEvent,
+    sig: &str,
+) -> crate::connection::messaging::ClientSigOutcome {
+    use crate::connection::messaging::{ClientSigOutcome, NO_KEY_ON_FILE};
+    let Some(did) = ev.actor_did.as_deref() else {
+        return ClientSigOutcome::Unverifiable("replayed event names no actor");
+    };
+    let outcome = crate::connection::messaging::verify_canonical_bytes(state, did, &ev.canonical, sig);
+    // A signer we hold no key for: ask its home server, off this path, so the
+    // next replay of theirs gets a real verdict.
+    if let ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE) = outcome {
+        crate::peer_keys::fetch_from_any_peer(state, did, sig);
+    }
+    outcome
+}
+
 /// Process an incoming S2S message. Exposed as pub(crate) for adversarial testing.
 pub(crate) async fn process_s2s_message(
     state: &Arc<SharedState>,
@@ -3188,6 +3338,12 @@ pub(crate) async fn process_s2s_message(
         } => (event_id.clone(), origin.clone()),
         S2sMessage::CrdtSync { origin, .. } => (String::new(), origin.clone()),
         S2sMessage::PeerDisconnected { .. } => (String::new(), String::new()),
+        // Catch-up carries no event id of its own: the *replayed* events
+        // inside it dedup individually, by the id each already has, which is
+        // the whole reason a re-delivery is a no-op.
+        S2sMessage::CatchupRequest { .. } | S2sMessage::CatchupEvents { .. } => {
+            (String::new(), String::new())
+        }
         S2sMessage::Hello { .. }
         | S2sMessage::HelloAck { .. }
         | S2sMessage::Signed { .. }
@@ -3264,6 +3420,7 @@ pub(crate) async fn process_s2s_message(
             server_name,
             protocol_version,
             trust_level,
+            capabilities,
         } => {
             // Verify the claimed peer_id matches the transport-authenticated identity.
             if peer_id != authenticated_peer_id {
@@ -3289,6 +3446,20 @@ pub(crate) async fn process_s2s_message(
                 .lock()
                 .await
                 .insert(authenticated_peer_id.to_string(), server_name);
+
+            // What this peer says it can receive. A peer that declared nothing
+            // — an older build with no such field — is recorded as declaring
+            // nothing, and is therefore sent nothing new.
+            tracing::debug!(
+                peer = %authenticated_peer_id,
+                ?capabilities,
+                "S2S peer capabilities recorded"
+            );
+            manager
+                .peer_capabilities
+                .lock()
+                .await
+                .insert(authenticated_peer_id.to_string(), capabilities);
 
             // Phase 1: Send HelloAck — mutual auth confirmation.
             let our_trust = manager.get_trust(authenticated_peer_id).await;
@@ -4532,6 +4703,76 @@ pub(crate) async fn process_s2s_message(
             if has_local_members {
                 send_names_update(state, &channel);
             }
+        }
+
+        // ── Catch-up: what a peer missed while the link was down ──
+        //
+        // The window a returning peer asks for, answered from the log. The
+        // canonical bytes and the signature travel unaltered, so the asker
+        // reaches its own verdict on every one — which is why cross-server
+        // verification had to land before replay could exist at all.
+        S2sMessage::CatchupRequest {
+            peer_id,
+            since_ts,
+            limit,
+        } => {
+            const MAX_REPLAY: usize = 500;
+            let limit = if limit == 0 { MAX_REPLAY } else { limit.min(MAX_REPLAY) };
+            let rows = state
+                .with_db(|db| db.events_since_for_replay(since_ts, limit + 1))
+                .unwrap_or_default();
+            let more = rows.len() > limit;
+            let events: Vec<crate::s2s::ReplayedEvent> = rows
+                .into_iter()
+                .take(limit)
+                .map(|e| crate::s2s::ReplayedEvent {
+                    event_id: e.event_id,
+                    canonical: e.canonical,
+                    // A peer's conclusion about a signature is that peer's.
+                    // Only the evidence crosses.
+                    signature: e.signature,
+                    kind: e.kind,
+                    venue: e.venue,
+                    actor_did: e.actor_did,
+                    subject: e.subject,
+                    timestamp: e.timestamp,
+                })
+                .collect();
+            tracing::info!(
+                peer = %authenticated_peer_id,
+                asked_by = %peer_id,
+                since_ts,
+                count = events.len(),
+                more,
+                "S2S catch-up: answering with events from the log"
+            );
+            let reply = S2sMessage::CatchupEvents {
+                origin: manager.server_id.clone(),
+                events,
+                more,
+            };
+            if let Some(entry) = manager.peers.lock().await.get(authenticated_peer_id) {
+                let _ = entry.tx.send(reply).await;
+            }
+        }
+
+        S2sMessage::CatchupEvents { origin, events, more } => {
+            let count = events.len();
+            let mut filed = 0usize;
+            let mut conflicts = 0usize;
+            for ev in events {
+                match apply_replayed_event(state, &origin, ev) {
+                    ReplayOutcome::Filed => filed += 1,
+                    ReplayOutcome::AlreadyHeld => {}
+                    ReplayOutcome::Conflicted => conflicts += 1,
+                    ReplayOutcome::Unusable => {}
+                }
+            }
+            tracing::info!(
+                peer = %authenticated_peer_id,
+                count, filed, conflicts, more,
+                "S2S catch-up: applied replayed events"
+            );
         }
 
         S2sMessage::SyncRequest => {
@@ -5813,6 +6054,7 @@ mod s2s_adversarial_tests {
             trust_config,
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -6641,6 +6883,7 @@ mod s2s_adversarial_tests {
             server_name: "liar".to_string(),
             protocol_version: 2,
             trust_level: Some("full".to_string()),
+            capabilities: vec![],
         };
         process_s2s_message(&state, &manager, PEER, hello).await;
 
@@ -7382,6 +7625,7 @@ mod s2s_adversarial_tests {
             trust_config: HashMap::new(),
             pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         });
         (manager, broadcast_rx)
     }
@@ -10272,4 +10516,315 @@ mod allowlist_tests {
         let doms = v(&["acme.com"]);
         assert!(!did_allowed(&[], &doms, "did:plc:x", None));
     }
+}
+
+#[cfg(test)]
+mod catchup_tests {
+    //! Catch-up replay: what a peer missed while the link was down.
+    //!
+    //! Two properties, both load-bearing. **Every replayed event is verified
+    //! by the receiver**, against the bytes it travelled with, using a key the
+    //! receiver looks up — the replaying peer's opinion never crosses, so it
+    //! can never be adopted. And **a peer that did not declare catch-up
+    //! support is never sent these message types**, because a peer that cannot
+    //! parse a message warn-and-skips it, which is data loss wearing
+    //! compatibility's clothes.
+    //!
+    //! The conflict rules live here too: same id twice is a no-op, same id
+    //! with different content is dropped and logged with a receipt against the
+    //! copy we keep, and there is no deterministic winner — first write wins,
+    //! always.
+
+    use std::collections::HashMap;
+
+    use ed25519_dalek::SigningKey;
+        use std::sync::Arc;
+    use freeq_sdk::chatsig::ChatDoc;
+    use crate::events::SigState;
+    use crate::s2s::{CATCHUP, ReplayedEvent, S2sMessage, our_capabilities, peer_supports};
+    use super::{ReplayOutcome, SharedState, apply_replayed_event, test_state_with_db};
+
+    const ALICE: &str = "did:plc:catchupalice";
+    const PEER: &str = "peer-endpoint-id";
+
+    fn state_with_key(key: &SigningKey) -> Arc<SharedState> {
+        let state = test_state_with_db();
+        state
+            .with_db(|db| db.save_signing_key(ALICE, key.verifying_key().as_bytes()))
+            .expect("test state has a database");
+        state
+    }
+
+    fn signed_event(key: &SigningKey, event_id: &str, body: &str) -> ReplayedEvent {
+        let doc = ChatDoc::message(ALICE, event_id, "#caught", body);
+        ReplayedEvent {
+            event_id: event_id.to_string(),
+            canonical: doc.canonical(),
+            signature: Some(doc.sign(key)),
+            kind: "message".to_string(),
+            venue: "#caught".to_string(),
+            actor_did: Some(ALICE.to_string()),
+            subject: None,
+            timestamp: 1000,
+        }
+    }
+
+    /// The receiver checks each replayed event itself and files its own verdict.
+    #[test]
+    fn a_replayed_event_is_verified_by_the_receiver_and_filed() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+
+        let ev = signed_event(&key, "01CATCH000000000000000001", "missed while you were out");
+        assert_eq!(
+            apply_replayed_event(&state, PEER, ev),
+            ReplayOutcome::Filed
+        );
+
+        let row = state
+            .with_db(|db| db.get_event("01CATCH000000000000000001"))
+            .flatten()
+            .expect("the event is on file");
+        assert_eq!(
+            row.sig_state,
+            SigState::Valid,
+            "the receiver reached its own verdict against the bytes it was handed"
+        );
+        assert_eq!(row.origin.as_deref(), Some(PEER), "and recorded who replayed it");
+        assert_eq!(row.venue, "#caught");
+    }
+
+    /// A replay of what we already hold changes nothing. Links flap; replay has to
+    /// be safe to run every time one comes back.
+    #[test]
+    fn replaying_an_event_we_already_hold_is_a_no_op() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        let ev = signed_event(&key, "01CATCH000000000000000002", "once");
+
+        assert_eq!(
+            apply_replayed_event(&state, PEER, ev.clone()),
+            ReplayOutcome::Filed
+        );
+        assert_eq!(
+            apply_replayed_event(&state, PEER, ev.clone()),
+            ReplayOutcome::AlreadyHeld
+        );
+        assert_eq!(
+            apply_replayed_event(&state, PEER, ev),
+            ReplayOutcome::AlreadyHeld,
+            "and again, as many times as the link flaps"
+        );
+
+        let row = state
+            .with_db(|db| db.get_event("01CATCH000000000000000002"))
+            .flatten()
+            .unwrap();
+        assert_eq!(row.conflict, None, "a re-delivery is not a conflict");
+    }
+
+    /// Same id, different content: dropped, and the copy we keep carries a receipt
+    /// naming what was refused. First write wins — there is no rule by which a
+    /// second signed claim replaces what our users have already seen.
+    #[test]
+    fn a_second_claim_on_an_id_is_dropped_and_leaves_a_receipt() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        let id = "01CATCH000000000000000003";
+
+        let first = signed_event(&key, id, "what I said");
+        let second = signed_event(&key, id, "what they claim I said");
+        assert_ne!(first.canonical, second.canonical);
+
+        assert_eq!(
+            apply_replayed_event(&state, PEER, first.clone()),
+            ReplayOutcome::Filed
+        );
+        assert_eq!(
+            apply_replayed_event(&state, PEER, second.clone()),
+            ReplayOutcome::Conflicted
+        );
+
+        let row = state.with_db(|db| db.get_event(id)).flatten().unwrap();
+        assert_eq!(
+            row.canonical, first.canonical,
+            "first write wins; the copy already shown stays the copy shown"
+        );
+        assert_eq!(
+            row.conflict.as_deref(),
+            Some(crate::events::fingerprint(&second.canonical).as_str()),
+            "and the refused claim leaves a trace, so equivocation is visible here"
+        );
+
+        // Replaying the loser again does not overwrite the receipt, and does not
+        // start winning by persistence.
+        assert_eq!(
+            apply_replayed_event(&state, PEER, second),
+            ReplayOutcome::Conflicted
+        );
+        let row2 = state.with_db(|db| db.get_event(id)).flatten().unwrap();
+        assert_eq!(row2.canonical, first.canonical);
+        assert_eq!(row2.conflict, row.conflict);
+    }
+
+    /// A replayed event whose signature fails against the key it names is refused
+    /// outright — the same rule as live ingress. A peer that tampers in flight
+    /// gains nothing by using the replay path.
+    #[test]
+    fn a_replayed_event_whose_signature_fails_is_refused() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+
+        let mut ev = signed_event(&key, "01CATCH000000000000000004", "what was signed");
+        // The bytes the peer hands over no longer match the signature it hands
+        // over with them.
+        ev.canonical = ChatDoc::message(ALICE, "01CATCH000000000000000004", "#caught", "what was sent")
+            .canonical();
+
+        assert_eq!(
+            apply_replayed_event(&state, PEER, ev),
+            ReplayOutcome::Unusable
+        );
+        assert!(
+            state
+                .with_db(|db| db.get_event("01CATCH000000000000000004"))
+                .flatten()
+                .is_none(),
+            "nothing is filed for an event whose signature did not check out"
+        );
+    }
+
+    /// A signer we hold no key for is uncheckable, not forged: the event still
+    /// files, labelled honestly.
+    #[test]
+    fn a_replayed_event_from_an_unknown_signer_files_as_unverifiable() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        // A state that has never seen this signer's key.
+        let state = test_state_with_db();
+
+        let ev = signed_event(&key, "01CATCH000000000000000005", "who signed this");
+        assert_eq!(
+            apply_replayed_event(&state, PEER, ev),
+            ReplayOutcome::Filed
+        );
+        assert_eq!(
+            state
+                .with_db(|db| db.get_event("01CATCH000000000000000005"))
+                .flatten()
+                .unwrap()
+                .sig_state,
+            SigState::Unverifiable,
+            "cannot check is not the same as does not check out"
+        );
+    }
+
+    /// An event nothing signed replays as unsigned rather than being rejected —
+    /// a guest's event is still a fact.
+    #[test]
+    fn an_unsigned_replayed_event_files_as_unsigned() {
+        let state = test_state_with_db();
+        let ev = ReplayedEvent {
+            event_id: "01CATCH000000000000000006".to_string(),
+            canonical: String::new(),
+            signature: None,
+            kind: "message".to_string(),
+            venue: "#caught".to_string(),
+            actor_did: None,
+            subject: None,
+            timestamp: 1000,
+        };
+        assert_eq!(
+            apply_replayed_event(&state, PEER, ev),
+            ReplayOutcome::Filed
+        );
+        assert_eq!(
+            state
+                .with_db(|db| db.get_event("01CATCH000000000000000006"))
+                .flatten()
+                .unwrap()
+                .sig_state,
+            SigState::Unsigned
+        );
+    }
+
+    /// The replay path never applies the ±120s id clock check. It is a
+    /// live-client-ingress rule, and a catch-up is *made* of old events — running
+    /// it here would reject everything a returning peer has to offer.
+    #[test]
+    fn replayed_events_are_not_judged_by_their_age() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+
+        let mut ancient = signed_event(&key, "01CATCH000000000000000007", "from last year");
+        ancient.timestamp = 1;
+        assert_eq!(
+            apply_replayed_event(&state, PEER, ancient),
+            ReplayOutcome::Filed,
+            "an old event is exactly what a catch-up is for"
+        );
+    }
+
+    /// The rollout constraint, against the literal legacy handshake: a peer whose
+    /// Hello carries no capability field declares nothing, and is therefore asked
+    /// for nothing and sent nothing new.
+    #[test]
+    fn a_peer_with_a_legacy_handshake_is_never_asked_for_catch_up() {
+        let legacy = r#"{"type":"hello","peer_id":"frozen","server_name":"pre-batch",
+                         "protocol_version":2,"trust_level":"full"}"#;
+        let declared = match serde_json::from_str::<S2sMessage>(legacy).unwrap() {
+            S2sMessage::Hello { capabilities, .. } => capabilities,
+            other => panic!("expected Hello, got {other:?}"),
+        };
+        assert!(declared.is_empty());
+        assert!(
+            !peer_supports(&declared, CATCHUP),
+            "nothing declared means nothing supported, which means nothing sent"
+        );
+
+        // And our own Hello does declare it, so a peer running this build is asked.
+        assert!(peer_supports(&our_capabilities(), CATCHUP));
+    }
+
+    /// A catch-up answer is drawn from the log, oldest first, and stops at the
+    /// window it was asked for.
+    #[test]
+    fn the_answer_is_the_window_that_was_asked_for() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+
+        for (i, id) in [
+            "01WINDOW00000000000000001",
+            "01WINDOW00000000000000002",
+            "01WINDOW00000000000000003",
+        ]
+        .iter()
+        .enumerate()
+        {
+            state
+                .with_db(|db| {
+                    db.insert_message(
+                        "#caught",
+                        "a!u@h",
+                        "x",
+                        100 + i as u64 * 100,
+                        &HashMap::new(),
+                        Some(id),
+                        Some(ALICE),
+                    )
+                })
+                .unwrap();
+        }
+
+        let all = state.with_db(|db| db.events_since(0, 10)).unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(
+            all.windows(2).all(|w| w[0].timestamp <= w[1].timestamp),
+            "oldest first, so a replay applies them in the order they happened"
+        );
+
+        let recent = state.with_db(|db| db.events_since(250, 10)).unwrap();
+        assert_eq!(recent.len(), 1, "the window is respected");
+        assert_eq!(recent[0].event_id, "01WINDOW00000000000000003");
+    }
+
 }

@@ -278,6 +278,7 @@ impl LyingPeer {
             server_name: "lying-peer".to_string(),
             protocol_version: 2,
             trust_level: Some("full".to_string()),
+            capabilities: freeq_server::s2s::our_capabilities(),
         })
         .await;
 

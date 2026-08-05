@@ -77,8 +77,30 @@ struct TestServer {
     irc_addr: String,
     web_addr: String,
     db_path: String,
+    /// The argv this server was spawned with, so it can be stopped and
+    /// started again on the same data — which is what "a peer went away and
+    /// came back" means.
+    args: Vec<String>,
     /// Held by server A for the test's lifetime; see `ONE_TEST_AT_A_TIME`.
     serial: Option<MutexGuard<'static, ()>>,
+}
+
+impl TestServer {
+    /// Stop the process, leaving its database and identity on disk.
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    /// Start it again on the same data, same identity, same ports.
+    async fn start_again(&mut self) {
+        self.child = Command::new(env!("CARGO_BIN_EXE_freeq-server"))
+            .args(&self.args)
+            .env("RUST_LOG", "freeq_server=warn")
+            .spawn()
+            .expect("respawn freeq-server");
+        wait_port(&self.irc_addr).await;
+    }
 }
 
 impl Drop for TestServer {
@@ -165,30 +187,35 @@ fn spawn_server(plan: ServerPlan, peer: &PeerRef, resolver_entries: &str) -> Tes
     // configuration in production; here, the peer's own REST listener.
     let peer_api = format!("{}=http://127.0.0.1:{}", peer.iroh_id, peer.web_port);
 
+    let args: Vec<String> = [
+        "--listen-addr",
+        &irc_addr,
+        "--iroh",
+        "--iroh-port",
+        &plan.iroh_port.to_string(),
+        "--data-dir",
+        plan.dir.path().to_str().unwrap(),
+        "--db-path",
+        &db_path,
+        "--s2s-peers",
+        &peer_spec,
+        "--s2s-allowed-peers",
+        &peer.iroh_id,
+        "--web-addr",
+        &web_addr,
+        "--s2s-peer-api",
+        &peer_api,
+        "--did-resolver-static",
+        resolver_entries,
+        "--server-name",
+        &format!("test-fed-{}", plan.seed),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
     let child = Command::new(env!("CARGO_BIN_EXE_freeq-server"))
-        .args([
-            "--listen-addr",
-            &irc_addr,
-            "--iroh",
-            "--iroh-port",
-            &plan.iroh_port.to_string(),
-            "--data-dir",
-            plan.dir.path().to_str().unwrap(),
-            "--db-path",
-            &db_path,
-            "--s2s-peers",
-            &peer_spec,
-            "--s2s-allowed-peers",
-            &peer.iroh_id,
-            "--web-addr",
-            &web_addr,
-            "--s2s-peer-api",
-            &peer_api,
-            "--did-resolver-static",
-            resolver_entries,
-            "--server-name",
-            &format!("test-fed-{}", plan.seed),
-        ])
+        .args(&args)
         .env("RUST_LOG", "freeq_server=warn")
         .spawn()
         .expect("spawn freeq-server");
@@ -199,6 +226,7 @@ fn spawn_server(plan: ServerPlan, peer: &PeerRef, resolver_entries: &str) -> Tes
         irc_addr,
         web_addr,
         db_path,
+        args,
         serial: None,
     }
 }
@@ -1460,4 +1488,108 @@ async fn saw_reaction(rx: &mut mpsc::Receiver<Event>) -> bool {
     })
     .await
     .unwrap_or(false)
+}
+
+// ── a peer that was away comes back and is told what it missed ────
+//
+// The end-to-end half of catch-up: a real link, a real outage, a real replay.
+// What returns is the *log* — the events, each verified by the receiver
+// against the bytes it travelled with. Derived state is deliberately not
+// backfilled from a replay: showing a user messages that arrive hours late,
+// interleaved into a channel they have been reading, is a product decision
+// nobody has made.
+
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_returning_peer_is_told_what_it_missed() {
+    let alice = TestId::new("did:plc:alicecatchup");
+    let bob = TestId::new("did:plc:bobcatchup");
+    let (srv_a, mut srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#missed").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#missed").await.unwrap();
+
+    // Prove the link works before breaking it, so a failure below is about
+    // catch-up and not about the channel never having been joined.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut live = false;
+    while tokio::time::Instant::now() < deadline {
+        ha.privmsg("#missed", "you are here").await.ok();
+        if recv_channel_msgid(&mut rxb, "you are here", Duration::from_secs(2))
+            .await
+            .is_some()
+        {
+            live = true;
+            break;
+        }
+    }
+    assert!(live, "the link must be live before the outage");
+
+    // B goes away.
+    hb.quit(None).await.ok();
+    srv_b.stop();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // A keeps going. B is down, so none of this reaches it live.
+    const MISSED: &str = "sent while you were gone";
+    ha.privmsg("#missed", MISSED).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // B comes back on the same data and the same identity.
+    srv_b.start_again().await;
+
+    // What B now holds under that body hash can only have come from a replay.
+    let want = freeq_sdk::chatsig::body_hash(MISSED);
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut caught_up = None;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(row) = event_by_body_hash(&srv_b.db_path, &want) {
+            caught_up = Some(row);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let (venue, sig_state, origin) =
+        caught_up.expect("the returning peer must be told what it missed");
+    assert_eq!(venue, "#missed");
+    assert_eq!(
+        sig_state, "valid",
+        "and must have checked it for itself, not taken the replaying peer's word"
+    );
+    assert!(origin.is_some(), "recording which peer replayed it");
+
+    // Replaying is idempotent: the second link-up files nothing new.
+    let before = event_count(&srv_b.db_path);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        event_count(&srv_b.db_path),
+        before,
+        "a duplicate replay is a no-op"
+    );
+
+    ha.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+/// One event on a server, looked up by the body hash its document carries.
+fn event_by_body_hash(db_path: &str, body_hash: &str) -> Option<(String, String, Option<String>)> {
+    let conn = rusqlite::Connection::open(db_path).ok()?;
+    conn.query_row(
+        "SELECT venue, sig_state, origin FROM events WHERE body_hash = ?1",
+        rusqlite::params![body_hash],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .ok()
+}
+
+fn event_count(db_path: &str) -> i64 {
+    let conn = rusqlite::Connection::open(db_path).expect("open server db");
+    conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+        .unwrap_or(0)
 }
