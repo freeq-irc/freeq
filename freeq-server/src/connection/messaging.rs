@@ -708,6 +708,111 @@ fn keep_signature(checked: Option<&CheckedMutation>, tidied: &HashMap<String, St
     }
 }
 
+/// What this server will stand behind for an outgoing mutation: the id the
+/// event is filed under, and the signature that goes with it.
+pub(crate) struct VouchedMutation {
+    pub event_id: String,
+    /// The sender's own signature, or this server's over the same document.
+    /// `None` only for a guest — no identity, nothing to vouch for.
+    pub signature: Option<String>,
+}
+
+/// Settle a mutation's signature the way a message's is settled.
+///
+/// A note under a user's name means the same thing whether it is a sentence or
+/// a delete: *this server saw this authenticated account do this*. So the
+/// rules are the message rules, with no special case:
+///
+/// - the sender's signature, when it verifies and still covers what is on the
+///   wire — the only outcome with real non-repudiation;
+/// - **this server's signature** over the same document otherwise, which says
+///   only what it means. A reader tells the two apart by the key each names,
+///   which is what `verified_by` reports;
+/// - nothing at all for a guest, who has no identity to bind.
+///
+/// A signature that *failed* never reaches here: the caller refuses the event.
+fn vouch_mutation(
+    conn: &Connection,
+    target: &str,
+    tidied: &HashMap<String, String>,
+    checked: Option<&CheckedMutation>,
+    state: &Arc<SharedState>,
+) -> Option<VouchedMutation> {
+    let (kind, subject, emoji) = mutation_in(tidied)?;
+    let event_id = tidied
+        .get(freeq_sdk::chatsig::EVENT_ID_TAG)
+        .or_else(|| tidied.get(freeq_sdk::chatsig::EVENT_ID_TAG_BARE))
+        .cloned();
+
+    // The sender's own, when it verified and nothing since has moved out from
+    // under it.
+    if keep_signature(checked, tidied)
+        && let (Some(event_id), Some(sig)) = (
+            event_id.clone(),
+            tidied
+                .get("+freeq.at/sig")
+                .or_else(|| tidied.get("freeq.at/sig"))
+                .cloned(),
+        )
+    {
+        return Some(VouchedMutation {
+            event_id,
+            signature: Some(sig),
+        });
+    }
+
+    let did = conn.authenticated_did.as_deref()?;
+    // Without a venue there is no document, and inventing one would produce a
+    // signature nobody could rebuild — the exact failure the canonical exists
+    // to end. The act still happens; it just isn't vouched for.
+    let venue = signing_venue(state, did, target)?;
+    // The sender's id is kept when it holds up, so the event this server
+    // vouches for and the one the sender named are the same event. Otherwise
+    // the act still needs an identity, and this server mints it.
+    let event_id = event_id
+        .filter(|id| crate::msgid::check_client_minted(id, now_ms()).is_ok())
+        .unwrap_or_else(crate::msgid::generate);
+
+    let mut doc =
+        freeq_sdk::chatsig::ChatDoc::mutation(kind, did, &event_id, &venue, &subject);
+    if let Some(ref emoji) = emoji {
+        doc = doc.with_emoji(emoji);
+    }
+    let signature = doc.sign(&state.msg_signing_key);
+    Some(VouchedMutation {
+        event_id,
+        signature: Some(signature),
+    })
+}
+
+/// The log entry a settled mutation makes, if there is anything to log.
+///
+/// `None` when the mutation was never vouched for — a guest, or a target whose
+/// venue does not resolve. The derived-table change still happens; the log
+/// records only acts it can name an id for.
+fn mutation_event<'a>(
+    vouched: Option<&'a VouchedMutation>,
+    actor_did: Option<&'a str>,
+    ctx: &crate::events::EventContext,
+    timestamp: u64,
+) -> Option<crate::db::MutationEvent<'a>> {
+    let vouched = vouched?;
+    Some(crate::db::MutationEvent {
+        event_id: &vouched.event_id,
+        actor_did,
+        signature: vouched.signature.as_deref(),
+        ctx: ctx.clone(),
+        timestamp,
+    })
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 pub(super) fn handle_tagmsg(
     conn: &Connection,
     target: &str,
@@ -794,22 +899,48 @@ pub(super) fn handle_tagmsg(
             tags.insert("+draft/delete".to_string(), root);
         }
     }
-    // A signature the server did not stand behind must not leave the server —
-    // the same never-launder rule local message ingress follows, and what
-    // stops a guest from inventing a lock badge for free. `keep_signature`
-    // also drops it when *our* re-rooting moved the subject out from under
-    // the signature, so a peer reads "unsigned" rather than "forged".
-    if is_mutation && !keep_signature(arrived.as_ref(), &tags) {
+    // Settle what this server stands behind. The sender's signature when it
+    // verified and still covers what is on the wire; this server's over the
+    // same document otherwise; nothing at all for a guest. A signature the
+    // server did not make and cannot vouch for never leaves the server — the
+    // never-launder rule, which is also what stops a guest inventing a lock
+    // badge for free.
+    let vouched = if is_mutation {
+        vouch_mutation(conn, target, &tags, arrived.as_ref(), state)
+    } else {
+        None
+    };
+    if is_mutation {
         tags.remove("+freeq.at/sig");
         tags.remove("freeq.at/sig");
-        tags.remove(freeq_sdk::chatsig::EVENT_ID_TAG);
         tags.remove(freeq_sdk::chatsig::EVENT_ID_TAG_BARE);
+        tags.remove(freeq_sdk::chatsig::EVENT_ID_TAG);
+        if let Some(ref v) = vouched {
+            tags.insert(
+                freeq_sdk::chatsig::EVENT_ID_TAG.to_string(),
+                v.event_id.clone(),
+            );
+            if let Some(ref sig) = v.signature {
+                tags.insert("+freeq.at/sig".to_string(), sig.clone());
+            }
+        }
     }
     let tags = &tags;
+    // What the log records: a signature this server checked or made either
+    // way, so the verdict is `valid` whenever there is one at all.
+    let event_ctx = crate::events::EventContext::verified();
 
     // ── Message deletion (+draft/delete=<msgid>) ──
     if let Some(original_msgid) = tags.get("+draft/delete") {
-        handle_delete(conn, target, original_msgid, tags, state);
+        handle_delete(
+            conn,
+            target,
+            original_msgid,
+            tags,
+            vouched.as_ref(),
+            &event_ctx,
+            state,
+        );
         return;
     }
 
@@ -979,8 +1110,17 @@ pub(super) fn handle_tagmsg(
             .as_secs();
         let emoji = emoji.clone();
         let target_msgid = target_msgid.clone();
+        let ev = mutation_event(vouched.as_ref(), did.as_deref(), &event_ctx, ts);
         state.with_db(|db| {
-            db.store_reaction(&target_msgid, &channel, &nick, did.as_deref(), &emoji, ts)
+            db.store_reaction_by(
+                &target_msgid,
+                &channel,
+                &nick,
+                did.as_deref(),
+                &emoji,
+                ts,
+                ev.as_ref(),
+            )
         });
     }
 
@@ -994,7 +1134,15 @@ pub(super) fn handle_tagmsg(
         let did = conn.authenticated_did.clone();
         let target_msgid = target_msgid.clone();
         let emoji = emoji.clone();
-        state.with_db(|db| db.remove_reaction(&target_msgid, &nick, did.as_deref(), &emoji));
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // The reaction row goes; the signed event that removed it stays.
+        let ev = mutation_event(vouched.as_ref(), did.as_deref(), &event_ctx, ts);
+        state.with_db(|db| {
+            db.remove_reaction_by(&target_msgid, &nick, did.as_deref(), &emoji, ev.as_ref())
+        });
     }
 
     let hostmask = conn.hostmask();
@@ -3188,11 +3336,14 @@ fn handle_edit(
 /// when it did not, so this path never has to decide again. They ride on
 /// every copy of the delete, local and federated, because a delete nobody
 /// downstream can attribute is exactly the forgery this closes.
+#[allow(clippy::too_many_arguments)]
 fn handle_delete(
     conn: &Connection,
     target: &str,
     original_msgid: &str,
     event_tags: &std::collections::HashMap<String, String>,
+    vouched: Option<&VouchedMutation>,
+    event_ctx: &crate::events::EventContext,
     state: &Arc<SharedState>,
 ) {
     let hostmask = conn.hostmask();
@@ -3272,9 +3423,17 @@ fn handle_delete(
     }
     let persisted = matches!(original, Some(Some(_)));
 
-    // Soft-delete in DB (no-op for unpersisted threads — nothing to mark)
+    // Soft-delete in DB (no-op for unpersisted threads — nothing to mark).
+    // The event is what records *who* asked: the row itself keeps no actor,
+    // and before the log there was nothing anywhere that did.
     if persisted {
-        state.with_db(|db| db.soft_delete_message(&storage_key, original_msgid));
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let did = conn.authenticated_did.clone();
+        let ev = mutation_event(vouched, did.as_deref(), event_ctx, ts);
+        state.with_db(|db| db.soft_delete_message_by(&storage_key, original_msgid, ev.as_ref()));
     }
 
     // Remove from in-memory history and pins (channels only)

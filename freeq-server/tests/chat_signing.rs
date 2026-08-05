@@ -911,23 +911,59 @@ async fn a_guest_cannot_attach_a_mutation_signature() {
     .await;
 }
 
+/// An unsigned mutation from an identity is vouched for by the server, the
+/// same way an unsigned message is. The note means the same thing in both
+/// cases — *this server saw this authenticated account do this* — and a
+/// reader tells a vouch from a device's proof by the key each names.
 #[tokio::test]
-async fn an_unsigned_delete_behaves_exactly_as_before() {
+async fn an_unsigned_delete_is_vouched_for_by_the_server() {
     let (ka, kb) = (key(), key());
     let did_bob = "did:plc:sig_bob";
     let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
     run(addr, move |addr| {
-        let (mut bob, mut alice, _signing, msgid) =
+        let (mut bob, mut alice, signing, msgid) =
             two_in_a_channel(addr, ka, kb, did_bob, "#plain");
 
         alice.tx(&format!("@+draft/delete={msgid} TAGMSG #plain"));
         let seen = bob.rx(|l| l.contains("+draft/delete"), "the delete");
-        assert_eq!(C::sig_of(&seen), None, "nothing was signed: {seen}");
+        let sig = C::sig_of(&seen).expect("the server vouches for it");
+        let (kid, _) = freeq_sdk::sigtag::parse(&sig).expect("sig tag is alg:kid:sig");
+        assert_ne!(
+            kid,
+            freeq_sdk::sigtag::derive_kid(&signing.verifying_key()),
+            "a server vouch must not claim to be the sender's key: {seen}"
+        );
         assert!(
-            !seen.contains(EVENT_ID_TAG),
-            "and no id was minted: {seen}"
+            seen.contains(EVENT_ID_TAG),
+            "a signature covers an id, so the act gets one: {seen}"
         );
         assert!(seen.contains(&msgid), "the delete still names its subject: {seen}");
+    })
+    .await;
+}
+
+/// A guest has no identity to bind, so there is nothing to vouch for and
+/// nothing is attached.
+#[tokio::test]
+async fn a_guests_delete_is_vouched_for_by_nobody() {
+    let (addr, _h) = start(DidResolver::static_map(HashMap::new())).await;
+    run(addr, move |addr| {
+        let mut watcher = C::guest(addr, "watcher");
+        watcher.join("#guestdel");
+        let mut guest = C::guest(addr, "nobody");
+        guest.join("#guestdel");
+
+        guest.tx("PRIVMSG #guestdel :delete me");
+        let posted = watcher.rx(|l| l.contains("delete me"), "the message");
+        let msgid = C::msgid_of(&posted).expect("the server minted an id for it");
+
+        guest.tx(&format!("@+draft/delete={msgid} TAGMSG #guestdel"));
+        let seen = watcher.rx(|l| l.contains("+draft/delete"), "the delete");
+        assert_eq!(
+            C::sig_of(&seen),
+            None,
+            "there is no identity here to vouch for: {seen}"
+        );
     })
     .await;
 }
@@ -1156,4 +1192,148 @@ async fn a_replayed_edit_carries_the_signature_over_its_own_revision() {
         .expect("a reader rebuilds and checks the revision from history alone");
     })
     .await;
+}
+
+// ── The record a mutation leaves ────────────────────────────────────
+//
+// A delete used to record no actor and an unreaction used to delete the
+// reaction row outright, so the fact that anyone had ever reacted — let alone
+// that they took it back — survived nowhere. The log is where it survives now.
+
+/// Read the event log of a running test server, the way an auditor would.
+fn events_in(db_path: &str, venue: &str) -> Vec<(String, String, Option<String>, Option<String>)> {
+    let conn = rusqlite::Connection::open(db_path).expect("open server db");
+    let mut stmt = conn
+        .prepare(
+            "SELECT kind, event_id, actor_did, signature FROM events
+             WHERE venue = ?1 ORDER BY timestamp ASC, event_id ASC",
+        )
+        .unwrap();
+    stmt.query_map(rusqlite::params![venue], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    })
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+/// A server whose database file the test can read back.
+async fn start_with_db(
+    resolver: DidResolver,
+) -> (SocketAddr, String, tokio::task::JoinHandle<anyhow::Result<()>>) {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let db_path = tmp.path().to_str().unwrap().to_string();
+    std::mem::forget(tmp);
+    let config = freeq_server::config::ServerConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        server_name: "test-sig-log".to_string(),
+        challenge_timeout_secs: 60,
+        db_path: Some(db_path.clone()),
+        ..Default::default()
+    };
+    let (addr, h) = freeq_server::server::Server::with_resolver(config, resolver)
+        .start()
+        .await
+        .unwrap();
+    (addr, db_path, h)
+}
+
+#[tokio::test]
+async fn a_delete_records_the_actor_who_asked_for_it() {
+    use freeq_sdk::chatsig::Mutation;
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, db_path, _h) =
+        start_with_db(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    let db_for_test = db_path.clone();
+    run(addr, move |addr| {
+        let (mut bob, mut alice, signing, msgid) =
+            two_in_a_channel(addr, ka, kb, did_bob, "#actor");
+
+        let event_id = freeq_server::msgid::generate();
+        let tags = signed_mutation_tags(
+            Mutation::Delete,
+            "+draft/delete",
+            &msgid,
+            None,
+            "#actor",
+            &event_id,
+            &signing,
+        );
+        alice.tx(&format!("@{tags} TAGMSG #actor"));
+        bob.rx(|l| l.contains("+draft/delete"), "the delete");
+    })
+    .await;
+
+    // Give the write a moment to land, then read the log as an auditor would.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let events = events_in(&db_for_test, "#actor");
+    let delete = events
+        .iter()
+        .find(|(kind, ..)| kind == "delete")
+        .unwrap_or_else(|| panic!("the delete is on file: {events:?}"));
+    assert_eq!(
+        delete.2.as_deref(),
+        Some(DID_ALICE),
+        "the row records who asked, which no message row ever did: {delete:?}"
+    );
+    assert!(
+        delete.3.is_some(),
+        "with the signature that proves the request came from them: {delete:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unreaction_leaves_the_event_that_removed_the_reaction() {
+    use freeq_sdk::chatsig::Mutation;
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, db_path, _h) =
+        start_with_db(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    let db_for_test = db_path.clone();
+    run(addr, move |addr| {
+        let (mut bob, mut alice, signing, msgid) =
+            two_in_a_channel(addr, ka, kb, did_bob, "#undone");
+
+        for (kind, tag) in [
+            (Mutation::React, "+react"),
+            (Mutation::Unreact, "+freeq.at/unreact"),
+        ] {
+            let event_id = freeq_server::msgid::generate();
+            let tags = signed_mutation_tags(
+                kind,
+                tag,
+                &msgid,
+                Some("👍"),
+                "#undone",
+                &event_id,
+                &signing,
+            );
+            alice.tx(&format!("@{tags} TAGMSG #undone"));
+            bob.rx(|l| l.contains(tag), "the reaction");
+        }
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let events = events_in(&db_for_test, "#undone");
+    let kinds: Vec<&str> = events.iter().map(|(k, ..)| k.as_str()).collect();
+    assert!(
+        kinds.contains(&"react") && kinds.contains(&"unreact"),
+        "both halves are on file — the reaction row is gone, the record is not: {events:?}"
+    );
+    for (kind, _, actor, signature) in &events {
+        if kind == "react" || kind == "unreact" {
+            assert_eq!(actor.as_deref(), Some(DID_ALICE), "{kind} names its actor");
+            assert!(signature.is_some(), "{kind} keeps the signature that made it");
+        }
+    }
+
+    // And the derived tally really is empty — the log is not a duplicate of
+    // live state, it is the record of how live state got here.
+    let conn = rusqlite::Connection::open(&db_for_test).unwrap();
+    let live: i64 = conn
+        .query_row("SELECT COUNT(*) FROM reactions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(live, 0, "the reaction was taken back");
 }

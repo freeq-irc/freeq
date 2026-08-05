@@ -203,6 +203,26 @@ pub struct EventRecord<'a> {
     pub timestamp: u64,
 }
 
+/// A mutation on its way into the log, alongside the derived-table change it
+/// makes.
+///
+/// A delete, a reaction, an unreaction and a pin all change a derived table
+/// *and* are events in their own right. The pair is written together, so the
+/// record of who did it survives even when what they did was to remove
+/// something — which is the whole point: an unreaction used to delete the
+/// reaction row and leave nothing at all.
+pub struct MutationEvent<'a> {
+    /// This event's own id: the signer's where there was one, otherwise one
+    /// this server minted so the act still has an identity.
+    pub event_id: &'a str,
+    /// The proven actor. `None` for a guest, who has no identity to bind.
+    pub actor_did: Option<&'a str>,
+    /// The signature, verbatim — the sender's own, or this server vouching.
+    pub signature: Option<&'a str>,
+    pub ctx: crate::events::EventContext,
+    pub timestamp: u64,
+}
+
 /// An event read back out of the log.
 #[derive(Debug, Clone)]
 pub struct StoredEvent {
@@ -1180,6 +1200,37 @@ impl Db {
     /// in CHATHISTORY and in FTS search. Either end of the family may be named:
     /// every row of one logical message carries the same `root_msgid`.
     pub fn soft_delete_message(&self, channel: &str, msgid: &str) -> SqlResult<usize> {
+        self.soft_delete_message_by(channel, msgid, None)
+    }
+
+    /// [`Db::soft_delete_message`], recording *who* asked.
+    ///
+    /// A soft delete used to leave no actor at all: the message vanished and
+    /// the record of who removed it went with it. The event is the record —
+    /// its own id, the acting identity, and the signature that proves the
+    /// request came from them.
+    pub fn soft_delete_message_by(
+        &self,
+        channel: &str,
+        msgid: &str,
+        ev: Option<&MutationEvent<'_>>,
+    ) -> SqlResult<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some(ev) = ev {
+            self.file_mutation_event(
+                freeq_sdk::chatsig::Mutation::Delete,
+                channel,
+                msgid,
+                None,
+                ev,
+            )?;
+        }
+        let changed = self.soft_delete_rows(channel, msgid)?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    fn soft_delete_rows(&self, channel: &str, msgid: &str) -> SqlResult<usize> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1541,6 +1592,64 @@ impl Db {
         }
     }
 
+    /// File the event a mutation is.
+    ///
+    /// The venue comes from the channel the derived change lands in, and the
+    /// subject is resolved to the root — the identity the message keeps for
+    /// life — so a mutation naming any revision files against the same one
+    /// the message is known by everywhere else.
+    fn file_mutation_event(
+        &self,
+        kind: freeq_sdk::chatsig::Mutation,
+        channel: &str,
+        subject: &str,
+        emoji: Option<&str>,
+        ev: &MutationEvent<'_>,
+    ) -> SqlResult<()> {
+        let subject = self.root_of(subject);
+        let canonical = ev.actor_did.map(|did| {
+            crate::events::mutation_canonical(kind, did, ev.event_id, channel, &subject, emoji)
+        });
+        let record = match canonical.as_deref() {
+            Some(canonical) => EventRecord {
+                shape: EventShape::Document(canonical),
+                signature: ev.signature,
+                ctx: ev.ctx.clone(),
+                timestamp: ev.timestamp,
+            },
+            // A guest acted, and the act is still a fact worth keeping — it
+            // just isn't a signed one.
+            None => EventRecord {
+                shape: EventShape::Bare(crate::events::EventFacts {
+                    event_id: ev.event_id.to_string(),
+                    kind: kind.as_str().to_string(),
+                    venue: crate::events::venue_of(channel),
+                    actor_did: None,
+                    subject: Some(subject.clone()),
+                    body_hash: None,
+                }),
+                signature: None,
+                ctx: ev.ctx.clone(),
+                timestamp: ev.timestamp,
+            },
+        };
+        self.insert_event(&record)?;
+        Ok(())
+    }
+
+    /// The channel a message is filed under, by any of its msgids.
+    ///
+    /// A mutation that only names its subject — an unreaction does — still
+    /// needs the venue, because the venue is inside the document it signs.
+    pub fn channel_of_message(&self, msgid: &str) -> SqlResult<Option<String>> {
+        let root = self.root_of(msgid);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT channel FROM messages WHERE root_msgid = ?1 OR msgid = ?1 LIMIT 1")?;
+        let mut rows = stmt.query_map(params![root], |r| r.get(0))?;
+        rows.next().transpose()
+    }
+
     /// File an event. **The only path that writes `events`.**
     ///
     /// One path, so one rule holds everywhere: when there is a document, every
@@ -1754,12 +1863,38 @@ impl Db {
         emoji: &str,
         timestamp: u64,
     ) -> SqlResult<()> {
+        self.store_reaction_by(target_msgid, channel, reactor_nick, reactor_did, emoji, timestamp, None)
+    }
+
+    /// [`Db::store_reaction`], logging the act as its own event.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_reaction_by(
+        &self,
+        target_msgid: &str,
+        channel: &str,
+        reactor_nick: &str,
+        reactor_did: Option<&str>,
+        emoji: &str,
+        timestamp: u64,
+        ev: Option<&MutationEvent<'_>>,
+    ) -> SqlResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some(ev) = ev {
+            self.file_mutation_event(
+                freeq_sdk::chatsig::Mutation::React,
+                channel,
+                target_msgid,
+                Some(emoji),
+                ev,
+            )?;
+        }
         let target_msgid = &self.root_of(target_msgid);
         self.conn.execute(
             "INSERT OR IGNORE INTO reactions (target_msgid, channel, reactor_nick, reactor_did, emoji, timestamp)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![target_msgid, channel, reactor_nick, reactor_did, emoji, timestamp as i64],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1779,6 +1914,38 @@ impl Db {
         reactor_did: Option<&str>,
         emoji: &str,
     ) -> SqlResult<usize> {
+        self.remove_reaction_by(target_msgid, reactor_nick, reactor_did, emoji, None)
+    }
+
+    /// [`Db::remove_reaction`], keeping the record of the removal.
+    ///
+    /// This is the case the log exists for. Removing a reaction deletes its
+    /// row — that table is the current tally, and a removed reaction is not
+    /// part of it — so before the log there was no trace that anyone had ever
+    /// reacted, let alone that they later took it back. The signed event that
+    /// removed it is now on file, and the react it undoes still is too.
+    pub fn remove_reaction_by(
+        &self,
+        target_msgid: &str,
+        reactor_nick: &str,
+        reactor_did: Option<&str>,
+        emoji: &str,
+        ev: Option<&MutationEvent<'_>>,
+    ) -> SqlResult<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some(ev) = ev {
+            // The venue is inside the document, and an unreaction names only
+            // its subject — so the channel comes from the message it acts on.
+            if let Some(channel) = self.channel_of_message(target_msgid)? {
+                self.file_mutation_event(
+                    freeq_sdk::chatsig::Mutation::Unreact,
+                    &channel,
+                    target_msgid,
+                    Some(emoji),
+                    ev,
+                )?;
+            }
+        }
         let target_msgid = &self.root_of(target_msgid);
         let changed = match reactor_did {
             Some(did) => self.conn.execute(
@@ -1792,6 +1959,7 @@ impl Db {
                 params![target_msgid, emoji, reactor_nick],
             )?,
         };
+        tx.commit()?;
         Ok(changed)
     }
 
@@ -1851,23 +2019,63 @@ impl Db {
         pinned_by: &str,
         pinned_at: u64,
     ) -> SqlResult<()> {
-        let msgid = &self.root_of(msgid);
+        let root = self.root_of(msgid);
+        let tx = self.conn.unchecked_transaction()?;
+        // Pins are outside the signing model — they are moderation, which
+        // this phase leaves unsigned on purpose — so the event records the
+        // act without a document to back it. `pinned_by` is a nick, which is
+        // exactly why the row cannot claim an actor identity.
+        self.file_bare_event("pin", channel, &root, pinned_at, &pin_event_id(channel, &root, pinned_at, true))?;
         self.conn.execute(
             "INSERT OR IGNORE INTO pins (channel, msgid, pinned_by, pinned_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![channel, msgid, pinned_by, pinned_at as i64],
+            params![channel, &root, pinned_by, pinned_at as i64],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
     /// Remove a pin.
     pub fn remove_pin(&self, channel: &str, msgid: &str) -> SqlResult<usize> {
-        let msgid = &self.root_of(msgid);
+        let root = self.root_of(msgid);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let tx = self.conn.unchecked_transaction()?;
+        self.file_bare_event("unpin", channel, &root, now, &pin_event_id(channel, &root, now, false))?;
         let changed = self.conn.execute(
             "DELETE FROM pins WHERE channel = ?1 AND msgid = ?2",
-            params![channel, msgid],
+            params![channel, &root],
         )?;
+        tx.commit()?;
         Ok(changed)
+    }
+
+    /// File an event nothing signed: the act is a fact, but no document
+    /// stands behind it.
+    fn file_bare_event(
+        &self,
+        kind: &str,
+        channel: &str,
+        subject: &str,
+        timestamp: u64,
+        event_id: &str,
+    ) -> SqlResult<()> {
+        self.insert_event(&EventRecord {
+            shape: EventShape::Bare(crate::events::EventFacts {
+                event_id: event_id.to_string(),
+                kind: kind.to_string(),
+                venue: crate::events::venue_of(channel),
+                actor_did: None,
+                subject: Some(subject.to_string()),
+                body_hash: None,
+            }),
+            signature: None,
+            ctx: crate::events::EventContext::default(),
+            timestamp,
+        })?;
+        Ok(())
     }
 
     /// Get all pins for a channel, most recent first.
@@ -5873,4 +6081,19 @@ mod dual_write_tests {
             sealed.get_event("M1").unwrap().unwrap().canonical
         );
     }
+}
+
+/// A stable id for a pin or unpin event.
+///
+/// Pins carry no signer-minted id — nothing signs them — so the log needs one
+/// of its own. Derived from what the act *is* (channel, message, direction,
+/// second), so re-pinning after an unpin is a new event while a duplicate
+/// delivery of the same act is not: the append-only insert then dedupes it for
+/// free, which a random id could never do.
+fn pin_event_id(channel: &str, msgid: &str, at: u64, pinning: bool) -> String {
+    let verb = if pinning { "pin" } else { "unpin" };
+    let digest = freeq_sdk::chatsig::body_hash(&format!("{verb}\u{0}{channel}\u{0}{msgid}\u{0}{at}"));
+    // `sha256:` + 26 hex characters: the same width as a ULID, so nothing
+    // downstream that assumed an id's shape has to widen for these.
+    format!("pin-{}", &digest["sha256:".len().."sha256:".len() + 22])
 }
