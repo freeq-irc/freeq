@@ -177,6 +177,68 @@ pub struct IdentityRow {
     pub nick: String,
 }
 
+/// What an event row is made of, at the moment of filing.
+///
+/// Two shapes, and no way to supply both: an event either has signed bytes —
+/// in which case they are the record and every column comes out of them — or
+/// it has none, in which case the facts the caller states are the record.
+pub enum EventShape<'a> {
+    /// The exact canonical bytes a signature covers. Queryable columns are
+    /// read back out of these, never taken on the caller's word.
+    Document(&'a str),
+    /// Nothing signed this: a guest's event, or an event outside the signing
+    /// model. There is no canonical to store and none to derive from.
+    Bare(crate::events::EventFacts),
+}
+
+/// An event on its way into the log.
+pub struct EventRecord<'a> {
+    pub shape: EventShape<'a>,
+    /// The signature, verbatim. `None` when nothing signed this.
+    pub signature: Option<&'a str>,
+    /// Facts about receipt: the verdict reached, and the peer that relayed it.
+    pub ctx: crate::events::EventContext,
+    /// When this server accepted the event. Not in any document — a chat
+    /// document deliberately carries no wall clock.
+    pub timestamp: u64,
+}
+
+/// An event read back out of the log.
+#[derive(Debug, Clone)]
+pub struct StoredEvent {
+    pub event_id: String,
+    /// Empty when nothing signed this event.
+    pub canonical: String,
+    pub signature: Option<String>,
+    pub sig_state: crate::events::SigState,
+    pub kind: String,
+    pub venue: String,
+    pub actor_did: Option<String>,
+    pub subject: Option<String>,
+    pub body_hash: Option<String>,
+    pub origin: Option<String>,
+    /// Fingerprint of a dropped second claim on this id, if there was one.
+    pub conflict: Option<String>,
+    pub timestamp: u64,
+}
+
+fn map_stored_event(row: &rusqlite::Row<'_>) -> SqlResult<StoredEvent> {
+    Ok(StoredEvent {
+        event_id: row.get(0)?,
+        canonical: row.get(1)?,
+        signature: row.get(2)?,
+        sig_state: crate::events::SigState::from_str(&row.get::<_, String>(3)?),
+        kind: row.get(4)?,
+        venue: row.get(5)?,
+        actor_did: row.get(6)?,
+        subject: row.get(7)?,
+        body_hash: row.get(8)?,
+        origin: row.get(9)?,
+        conflict: row.get(10)?,
+        timestamp: row.get::<_, i64>(11)? as u64,
+    })
+}
+
 impl Db {
     /// Open (or create) the database at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> SqlResult<Self> {
@@ -1290,6 +1352,206 @@ impl Db {
         }
         self.fts_index(rowid, text)?;
         Ok(true)
+    }
+
+    // ── The event log ──────────────────────────────────────────────────
+
+    /// File an event. **The only path that writes `events`.**
+    ///
+    /// One path, so one rule holds everywhere: when there is a document, every
+    /// queryable column is read back out of those exact bytes
+    /// ([`crate::events::derive_facts`]) rather than taken on the caller's
+    /// word, and the columns therefore cannot say something the canonical
+    /// doesn't. [`Db::events_disagreeing_with_their_bytes`] is the audit that
+    /// keeps this true over time.
+    ///
+    /// Append-only and first-write-wins: a second claim on an id is ignored
+    /// here, and its *content* is judged by the caller, which records a
+    /// [`Db::record_event_conflict`] receipt when the second claim differed.
+    ///
+    /// Returns whether a row was written.
+    pub fn insert_event(&self, rec: &EventRecord<'_>) -> SqlResult<bool> {
+        use crate::events::SigState;
+        let (canonical, facts) = match &rec.shape {
+            EventShape::Document(canonical) => match crate::events::derive_facts(canonical) {
+                Some(facts) => (*canonical, facts),
+                None => {
+                    // The caller handed over bytes it called a document and
+                    // they are not one. Filing the row anyway would put a
+                    // canonical in the log that nothing can read back — the
+                    // one thing this table must never contain.
+                    tracing::error!(
+                        canonical_len = canonical.len(),
+                        "refusing to file an event whose canonical is not a document"
+                    );
+                    return Ok(false);
+                }
+            },
+            EventShape::Bare(facts) => ("", facts.clone()),
+        };
+        // A signature is what a verdict is *about*. Without one there is
+        // nothing to have concluded, whatever the caller said.
+        let sig_state = if rec.signature.is_none() {
+            SigState::Unsigned
+        } else {
+            rec.ctx.sig_state
+        };
+        self.conn.execute(
+            "INSERT OR IGNORE INTO events
+                 (event_id, canonical, signature, sig_state, kind, venue,
+                  actor_did, subject, body_hash, origin, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                facts.event_id,
+                canonical,
+                rec.signature,
+                sig_state.as_str(),
+                facts.kind,
+                facts.venue,
+                facts.actor_did,
+                facts.subject,
+                facts.body_hash,
+                rec.ctx.origin,
+                rec.timestamp as i64,
+            ],
+        )?;
+        Ok(self.conn.changes() > 0)
+    }
+
+    /// Record that a second, differing claim on `event_id` was dropped.
+    ///
+    /// The receipt is the fingerprint of what was dropped, so the fact that
+    /// two signed claims existed survives the drop — without it, equivocation
+    /// is invisible to everyone including us. Local only: it is written here,
+    /// read here, and never crosses the wire.
+    ///
+    /// The first receipt wins. A third claim adds nothing: the question the
+    /// column answers is "was there ever a conflicting claim on this id", and
+    /// one is enough to answer it.
+    pub fn record_event_conflict(&self, event_id: &str, fingerprint: &str) -> SqlResult<usize> {
+        self.conn.execute(
+            "UPDATE events SET conflict = ?2 WHERE event_id = ?1 AND conflict IS NULL",
+            params![event_id, fingerprint],
+        )
+    }
+
+    /// Every row whose columns disagree with its own canonical.
+    ///
+    /// The invariant this table rests on, made checkable: a row that carries
+    /// bytes must be describable by them. Returns one line per disagreement,
+    /// `<event_id> <column>: <stored> != <derived>`; empty is the healthy
+    /// answer. Rows with no canonical are skipped — there is nothing to
+    /// derive from, and their columns are the whole record by design.
+    pub fn events_disagreeing_with_their_bytes(&self) -> SqlResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, canonical, kind, venue, actor_did, subject, body_hash
+             FROM events WHERE canonical <> ''",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+
+        let mut bad = Vec::new();
+        for row in rows {
+            let (id, canonical, kind, venue, actor_did, subject, body_hash) = row?;
+            let Some(derived) = crate::events::derive_facts(&canonical) else {
+                bad.push(format!("{id} canonical: not a document"));
+                continue;
+            };
+            let mut note = |column: &str, stored: String, want: String| {
+                if stored != want {
+                    bad.push(format!("{id} {column}: {stored} != {want}"));
+                }
+            };
+            note("event_id", id.clone(), derived.event_id.clone());
+            note("kind", kind, derived.kind);
+            note("venue", venue, derived.venue);
+            note(
+                "actor_did",
+                format!("{actor_did:?}"),
+                format!("{:?}", derived.actor_did),
+            );
+            note(
+                "subject",
+                format!("{subject:?}"),
+                format!("{:?}", derived.subject),
+            );
+            note(
+                "body_hash",
+                format!("{body_hash:?}"),
+                format!("{:?}", derived.body_hash),
+            );
+        }
+        Ok(bad)
+    }
+
+    /// The msgids of messages with no event row — the count-parity check, in
+    /// the one direction that holds.
+    ///
+    /// Parity runs message → event and never the reverse: the log is
+    /// append-only and outlives what it points at, so a pruned message leaves
+    /// its event behind on purpose. Rows predating message ids are excluded;
+    /// they have no identity to file an event under.
+    pub fn messages_without_events(&self) -> SqlResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.msgid FROM messages m
+             LEFT JOIN events e ON e.event_id = m.msgid
+             WHERE m.msgid IS NOT NULL AND e.event_id IS NULL",
+        )?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect()
+    }
+
+    /// Read one event back, whole.
+    pub fn get_event(&self, event_id: &str) -> SqlResult<Option<StoredEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, canonical, signature, sig_state, kind, venue,
+                    actor_did, subject, body_hash, origin, conflict, timestamp
+             FROM events WHERE event_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![event_id], map_stored_event)?;
+        rows.next().transpose()
+    }
+
+    /// Every event in a venue, oldest first — the order a replay applies them
+    /// in, and the order a rebuild reads them in.
+    pub fn events_in_venue(&self, venue: &str) -> SqlResult<Vec<StoredEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, canonical, signature, sig_state, kind, venue,
+                    actor_did, subject, body_hash, origin, conflict, timestamp
+             FROM events WHERE venue = ?1 ORDER BY timestamp ASC, event_id ASC",
+        )?;
+        let rows = stmt.query_map(params![venue], map_stored_event)?;
+        rows.collect()
+    }
+
+    /// Every event this server holds, oldest first.
+    pub fn all_events(&self) -> SqlResult<Vec<StoredEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, canonical, signature, sig_state, kind, venue,
+                    actor_did, subject, body_hash, origin, conflict, timestamp
+             FROM events ORDER BY timestamp ASC, event_id ASC",
+        )?;
+        let rows = stmt.query_map([], map_stored_event)?;
+        rows.collect()
+    }
+
+    /// Drop event rows older than `cutoff_ts`. Only ever called when an
+    /// operator has set a retention window — the log keeps everything by
+    /// default, because discarding evidence should be a decision someone made.
+    pub fn prune_events_older_than(&self, cutoff_ts: u64) -> SqlResult<usize> {
+        self.conn.execute(
+            "DELETE FROM events WHERE timestamp < ?1",
+            params![cutoff_ts as i64],
+        )
     }
 
     // ── Reactions ──────────────────────────────────────────────────────
@@ -3012,7 +3274,7 @@ mod tests {
                 db.conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                     .unwrap(),
-                3,
+                4,
                 "first open stamps the schema"
             );
         }
@@ -3024,7 +3286,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
         assert_eq!(db.root_of("id-2"), "id-1");
         assert_eq!(db.current_revision("id-1").unwrap().unwrap().text, "v2");
@@ -3054,7 +3316,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
     }
 
@@ -3097,7 +3359,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
     }
 
@@ -5037,5 +5299,188 @@ impl Db {
             })
         })?;
         rows.collect()
+    }
+}
+
+#[cfg(test)]
+mod event_log_tests {
+    use super::*;
+    use crate::events::{EventContext, EventFacts, SigState};
+    use freeq_sdk::chatsig::{ChatDoc, Mutation};
+
+    const ALICE: &str = "did:plc:logalice";
+
+    fn file(db: &Db, canonical: &str, signature: Option<&str>, ctx: EventContext, ts: u64) -> bool {
+        db.insert_event(&EventRecord {
+            shape: EventShape::Document(canonical),
+            signature,
+            ctx,
+            timestamp: ts,
+        })
+        .unwrap()
+    }
+
+    /// Every column of every filed row is re-derivable from the row's own
+    /// bytes. This is the invariant the whole table rests on: a column that
+    /// could drift from the canonical would make the log a second, quieter
+    /// source of truth, which is the thing it exists to replace.
+    #[test]
+    fn every_column_of_every_row_is_re_derivable_from_its_own_bytes() {
+        let db = Db::open_memory().unwrap();
+        let root = "01KYVT1W2P0000000000000000";
+        let dm = freeq_sdk::chatsig::dm_venue(ALICE, "did:plc:bob");
+
+        let docs = vec![
+            ChatDoc::message(ALICE, "01AAAA0000000000000000000A", "#room", "plain").canonical(),
+            ChatDoc::message(ALICE, "01AAAA0000000000000000000B", "#room", "a reply")
+                .with_reply(root)
+                .canonical(),
+            ChatDoc::message(ALICE, "01AAAA0000000000000000000C", "#room", "revised")
+                .with_edit(root)
+                .canonical(),
+            ChatDoc::message(ALICE, "01AAAA0000000000000000000D", &dm, "quietly").canonical(),
+            ChatDoc::message(ALICE, "01AAAA0000000000000000000E", "#room", "coordinated")
+                .with_coord([("+freeq.at/event", "task_request")])
+                .canonical(),
+            ChatDoc::mutation(Mutation::Delete, ALICE, "01AAAA0000000000000000000F", "#room", root)
+                .canonical(),
+            ChatDoc::mutation(Mutation::React, ALICE, "01AAAA0000000000000000000G", "#room", root)
+                .with_emoji("👍")
+                .canonical(),
+            ChatDoc::mutation(
+                Mutation::Unreact,
+                ALICE,
+                "01AAAA0000000000000000000H",
+                "#room",
+                root,
+            )
+            .with_emoji("👍")
+            .canonical(),
+        ];
+        for (i, canonical) in docs.iter().enumerate() {
+            assert!(
+                file(&db, canonical, Some("ed25519:kid:sig"), EventContext::verified(), i as u64),
+                "each document files a row"
+            );
+        }
+        // And one with nothing to derive from, which the audit must skip
+        // rather than trip over.
+        db.insert_event(&EventRecord {
+            shape: EventShape::Bare(EventFacts {
+                event_id: "01BARE0000000000000000000A".to_string(),
+                kind: "pin".to_string(),
+                venue: "#room".to_string(),
+                actor_did: None,
+                subject: Some(root.to_string()),
+                body_hash: None,
+            }),
+            signature: None,
+            ctx: EventContext::default(),
+            timestamp: 99,
+        })
+        .unwrap();
+
+        assert_eq!(
+            db.events_disagreeing_with_their_bytes().unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    /// …and the audit really would catch a drift, rather than passing because
+    /// it checks nothing.
+    #[test]
+    fn the_audit_catches_a_column_that_drifted_from_its_bytes() {
+        let db = Db::open_memory().unwrap();
+        let canonical = ChatDoc::message(ALICE, "01DRIFT000000000000000000A", "#room", "hi").canonical();
+        file(&db, &canonical, None, EventContext::default(), 1);
+
+        db.conn
+            .execute("UPDATE events SET venue = '#elsewhere'", [])
+            .unwrap();
+        let bad = db.events_disagreeing_with_their_bytes().unwrap();
+        assert_eq!(bad.len(), 1, "{bad:?}");
+        assert!(bad[0].contains("venue: #elsewhere != #room"), "{bad:?}");
+    }
+
+    /// Bytes the caller calls a document, that are not one, are refused —
+    /// filing them would put a canonical in the log nothing can read back.
+    #[test]
+    fn bytes_that_are_not_a_document_are_refused() {
+        let db = Db::open_memory().unwrap();
+        assert!(!file(&db, "{\"nope\":true}", None, EventContext::default(), 1));
+        assert!(db.all_events().unwrap().is_empty());
+    }
+
+    /// A verdict is about a signature. With none on file, nothing has been
+    /// concluded — whatever the caller passed.
+    #[test]
+    fn a_row_with_no_signature_is_unsigned_whatever_the_caller_claimed() {
+        let db = Db::open_memory().unwrap();
+        let canonical = ChatDoc::message(ALICE, "01NOSIG000000000000000000A", "#room", "hi").canonical();
+        file(&db, &canonical, None, EventContext::verified(), 1);
+        assert_eq!(
+            db.get_event("01NOSIG000000000000000000A").unwrap().unwrap().sig_state,
+            SigState::Unsigned
+        );
+    }
+
+    /// A caller that did not check gets the state that claims least — never
+    /// `valid` by omission.
+    #[test]
+    fn a_signature_nobody_checked_files_as_unverifiable() {
+        let db = Db::open_memory().unwrap();
+        let canonical = ChatDoc::message(ALICE, "01UNCHK000000000000000000A", "#room", "hi").canonical();
+        file(&db, &canonical, Some("ed25519:kid:sig"), EventContext::default(), 1);
+        assert_eq!(
+            db.get_event("01UNCHK000000000000000000A").unwrap().unwrap().sig_state,
+            SigState::Unverifiable
+        );
+    }
+
+    /// Append-only: an id already in the log keeps the row it has, and the
+    /// second claim leaves a receipt instead of a rewrite.
+    #[test]
+    fn a_second_claim_on_an_id_leaves_a_receipt_not_a_rewrite() {
+        let db = Db::open_memory().unwrap();
+        let id = "01CONFL00000000000000000AA";
+        let first = ChatDoc::message(ALICE, id, "#room", "what I said").canonical();
+        let second = ChatDoc::message(ALICE, id, "#room", "what they claim I said").canonical();
+        assert!(file(&db, &first, None, EventContext::default(), 1));
+        assert!(!file(&db, &second, None, EventContext::default(), 2), "first write wins");
+
+        db.record_event_conflict(id, &crate::events::fingerprint(&second))
+            .unwrap();
+        let row = db.get_event(id).unwrap().unwrap();
+        assert_eq!(row.canonical, first, "the row still holds what arrived first");
+        assert_eq!(
+            row.conflict.as_deref(),
+            Some(crate::events::fingerprint(&second).as_str()),
+            "and the dropped claim leaves a trace, so equivocation is not invisible"
+        );
+
+        // A third claim adds nothing: the question is whether there was ever
+        // a conflict, and one receipt answers it.
+        db.record_event_conflict(id, "sha256:another").unwrap();
+        assert_eq!(
+            db.get_event(id).unwrap().unwrap().conflict,
+            row.conflict,
+            "the first receipt stands"
+        );
+    }
+
+    /// The log keeps everything unless an operator says otherwise.
+    #[test]
+    fn pruning_the_log_happens_only_when_asked() {
+        let db = Db::open_memory().unwrap();
+        for (i, id) in ["01OLD00000000000000000000A", "01NEW00000000000000000000A"]
+            .iter()
+            .enumerate()
+        {
+            let canonical = ChatDoc::message(ALICE, id, "#room", "x").canonical();
+            file(&db, &canonical, None, EventContext::default(), i as u64 * 1000);
+        }
+        assert_eq!(db.all_events().unwrap().len(), 2);
+        assert_eq!(db.prune_events_older_than(500).unwrap(), 1);
+        assert_eq!(db.all_events().unwrap().len(), 1);
     }
 }

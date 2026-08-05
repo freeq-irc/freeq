@@ -35,6 +35,8 @@ mod m001_schema_baseline;
 mod m002_root_msgid_backfill;
 #[path = "003_msgid_unique.rs"]
 mod m003_msgid_unique;
+#[path = "004_events_log.rs"]
+mod m004_events_log;
 
 // db.rs unit tests exercise the backfill directly against hand-built rows.
 // Production reaches it only as a rung of the ladder below.
@@ -46,6 +48,7 @@ pub(crate) fn migration_ladder() -> Migrations<'static> {
         m001_schema_baseline::migration(),
         m002_root_msgid_backfill::migration(),
         m003_msgid_unique::migration(),
+        m004_events_log::migration(),
     ])
 }
 
@@ -151,6 +154,13 @@ mod tests {
             after_baseline,
             "migration 3 adds an index; it must not change the tables"
         );
+
+        migration_ladder().to_version(&mut conn, 4).unwrap();
+        assert_eq!(version(&conn), 4);
+        assert!(
+            tables(&conn).iter().any(|t| t == "events"),
+            "migration 4 adds the event log"
+        );
     }
 
 
@@ -161,6 +171,7 @@ mod tests {
         migration_ladder().to_version(&mut stepped, 1).unwrap();
         migration_ladder().to_version(&mut stepped, 2).unwrap();
         migration_ladder().to_version(&mut stepped, 3).unwrap();
+        migration_ladder().to_version(&mut stepped, 4).unwrap();
 
         let mut direct = Connection::open_in_memory().unwrap();
         migration_ladder().to_latest(&mut direct).unwrap();
@@ -177,11 +188,11 @@ mod tests {
         let path = dir.path().join("ladder.db");
         let path = path.to_str().unwrap();
 
-        let (before, after) = super::migrate_to(path, 3).unwrap();
-        assert_eq!((before, after), (0, 3), "fresh file climbs to the target");
+        let (before, after) = super::migrate_to(path, 4).unwrap();
+        assert_eq!((before, after), (0, 4), "fresh file climbs to the target");
 
         let (before, after) = super::migrate_to(path, 2).unwrap();
-        assert_eq!((before, after), (3, 2), "the down migration runs");
+        assert_eq!((before, after), (4, 2), "the down migrations run");
 
         let err = super::migrate_to(path, 0).unwrap_err();
         assert!(
@@ -200,7 +211,7 @@ mod tests {
         migration_ladder().to_latest(&mut conn).unwrap();
         let before = tables(&conn);
         migration_ladder().to_latest(&mut conn).unwrap();
-        assert_eq!(version(&conn), 3);
+        assert_eq!(version(&conn), 4);
         assert_eq!(tables(&conn), before);
     }
 }

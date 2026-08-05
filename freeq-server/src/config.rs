@@ -211,6 +211,19 @@ pub struct ServerConfig {
     #[arg(long, env = "FREEQ_MESSAGE_RETENTION_DAYS", default_value_t = 0)]
     pub message_retention_days: u64,
 
+    /// Delete event-log rows older than this many days. 0 = disabled
+    /// (default) — keep everything.
+    ///
+    /// Separate from message retention on purpose. The log is append-only and
+    /// outlives the bodies it points at: a message pruned for space or for
+    /// compliance leaves its event behind, which is what keeps "this id was
+    /// used, by this actor, at this time" answerable afterwards. That also
+    /// means the log grows without bound unless an operator says otherwise,
+    /// so this is the knob that says otherwise — a deliberate, local decision
+    /// about disk, not a default that quietly discards evidence.
+    #[arg(long, env = "FREEQ_EVENT_RETENTION_DAYS", default_value_t = 0)]
+    pub event_retention_days: u64,
+
     // ── Agent Assistance Interface: LLM provider ───────────────────
     /// LLM provider for the `POST /agent/session` free-form router.
     /// `openai` = any OpenAI-compatible /chat/completions endpoint
@@ -300,6 +313,7 @@ impl Default for ServerConfig {
             no_guest: false,
             reverify_identity_mins: 0,
             message_retention_days: 0,
+            event_retention_days: 0,
             llm_provider: None,
             llm_base_url: None,
             llm_api_key: None,
@@ -432,6 +446,7 @@ struct FileConfig {
     no_guest: Option<bool>,
     reverify_identity_mins: Option<u64>,
     message_retention_days: Option<u64>,
+    event_retention_days: Option<u64>,
     llm_provider: Option<String>,
     llm_base_url: Option<String>,
     llm_api_key: Option<String>,
@@ -539,6 +554,7 @@ fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConf
         no_guest,
         reverify_identity_mins,
         message_retention_days,
+        event_retention_days,
         llm_timeout_secs,
         model_price_args,
     );
