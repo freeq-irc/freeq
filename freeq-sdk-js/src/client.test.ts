@@ -1613,4 +1613,34 @@ describe('signed mutations', () => {
       expect(line).not.toContain('+freeq.at/sig');
     }
   });
+
+  it('sendAndAwaitEcho signs the message like sendMessage does', async () => {
+    const signing = await import('./signing.js');
+    const { client, ws, verifyKey } = await makeSigningClient();
+    const promise = client.sendAndAwaitEcho('#room', 'echoed and signed');
+    const line = await waitForSent(ws, 'PRIVMSG');
+    const eventId = tagOf(line, '+freeq.at/eventid');
+    const sigTag = tagOf(line, '+freeq.at/sig');
+    const nonce = tagOf(line, '+freeq.at/echo-nonce');
+    expect(eventId, `line: ${line}`).not.toBeNull();
+    expect(sigTag).not.toBeNull();
+    expect(nonce).not.toBeNull();
+
+    // The echo nonce is not a covered tag: the signature is over the plain
+    // message document, and the signed id is the one the server adopts.
+    const canonical = await signing.messageCanonical({
+      from: 'did:plc:mutator',
+      msgid: eventId!,
+      target: '#room',
+      body: 'echoed and signed',
+    });
+    expect(await verifySig(canonical, sigTag!, verifyKey)).toBe(true);
+
+    // The round-trip contract is unchanged: the promise resolves with the
+    // msgid the server stamps on the echo.
+    ws.recv(
+      `@+freeq.at/echo-nonce=${nonce};msgid=${eventId} :alice PRIVMSG #room :echoed and signed`,
+    );
+    expect(await promise).toBe(eventId);
+  });
 });

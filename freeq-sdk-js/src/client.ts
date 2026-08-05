@@ -2743,7 +2743,11 @@ export class FreeqClient extends EventEmitter {
         resolve(msgid);
       };
       this.on('raw', onRaw);
-      this.raw(format('PRIVMSG', [target, text], fullTags));
+      // Through the signing path, not a hand-built line: a helper that
+      // bypasses signedPrivmsg sends unsigned even when signing is armed.
+      // The nonce tag is not a covered field, so it rides outside the
+      // signed document.
+      void this.signedPrivmsg(target, text, fullTags);
     });
   }
 
