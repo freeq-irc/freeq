@@ -3084,6 +3084,9 @@ pub(crate) fn apply_replayed_event(
                     actor_did: ev.actor_did.as_deref().map(|d| sanitize_s2s_str(d, 512)),
                     subject: ev.subject.as_deref().map(|s| sanitize_s2s_str(s, 100)),
                     body_hash: None,
+                    // A bare replayed event states its own facts; a reaction's
+                    // emoji is one of them.
+                    emoji: ev.emoji.as_deref().map(|e| sanitize_s2s_str(e, 64)),
                 }),
                 signature,
                 ctx: ctx.clone(),
@@ -4735,6 +4738,7 @@ pub(crate) async fn process_s2s_message(
                     venue: e.venue,
                     actor_did: e.actor_did,
                     subject: e.subject,
+                    emoji: e.emoji,
                     timestamp: e.timestamp,
                 })
                 .collect();
@@ -10565,6 +10569,7 @@ mod catchup_tests {
             venue: "#caught".to_string(),
             actor_did: Some(ALICE.to_string()),
             subject: None,
+            emoji: None,
             timestamp: 1000,
         }
     }
@@ -10731,6 +10736,7 @@ mod catchup_tests {
             venue: "#caught".to_string(),
             actor_did: None,
             subject: None,
+            emoji: None,
             timestamp: 1000,
         };
         assert_eq!(

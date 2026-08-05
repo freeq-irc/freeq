@@ -164,13 +164,10 @@ fn replay(events: &[freeq_server::db::StoredEvent]) -> DerivedState {
     }
 }
 
-/// A reaction's emoji lives in the document, which is where a replay reads it
-/// from — the column set deliberately holds nothing a document doesn't.
+/// A reaction's emoji, from the column that holds it whether or not anything
+/// signed the event — which is what makes a guest's reaction rebuildable.
 fn emoji_of(ev: &freeq_server::db::StoredEvent) -> String {
-    serde_json::from_str::<serde_json::Value>(&ev.canonical)
-        .ok()
-        .and_then(|d| d.get("emoji").and_then(|e| e.as_str()).map(str::to_string))
-        .unwrap_or_default()
+    ev.emoji.clone().unwrap_or_default()
 }
 
 fn mutation(event_id: &str, did: Option<&str>, ts: u64) -> freeq_server::db::MutationEvent<'static> {
@@ -178,7 +175,9 @@ fn mutation(event_id: &str, did: Option<&str>, ts: u64) -> freeq_server::db::Mut
     freeq_server::db::MutationEvent {
         event_id: Box::leak(event_id.to_string().into_boxed_str()),
         actor_did: did.map(|d| &*Box::leak(d.to_string().into_boxed_str())),
-        signature: Some("ed25519:testkid:testsig"),
+        // A guest has nothing to sign with, which is exactly the case the
+        // rebuild has to survive.
+        signature: did.map(|_| "ed25519:testkid:testsig"),
         ctx: freeq_server::events::EventContext::verified(),
         timestamp: ts,
     }
@@ -221,6 +220,15 @@ fn replaying_the_log_reproduces_the_derived_state() {
     db.store_pin("#Rebuild", "M1", "a", 60).unwrap();
     db.store_pin("#Rebuild", "M2", "a", 61).unwrap();
     db.remove_pin("#Rebuild", "M2").unwrap();
+
+    // A guest reacts and a guest deletes: no identity, no signature, and both
+    // acts still have to come back out of the log. The reaction is on a
+    // message that survives, so it has to survive the rebuild too — a guest
+    // reaction has no canonical for its emoji to hide in.
+    db.store_reaction_by("M2", "#Rebuild", "g", None, "😀", 54, Some(&mutation("R5", None, 54)))
+        .unwrap();
+    db.soft_delete_message_by("#Rebuild", "M4", Some(&mutation("D0", None, 55)))
+        .unwrap();
 
     // A delete, which has to strike the whole revision family.
     db.soft_delete_message_by("#Rebuild", "M1", Some(&mutation("D1", Some(ALICE), 70)))

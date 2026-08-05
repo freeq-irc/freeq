@@ -815,25 +815,30 @@ fn vouch_mutation(
     })
 }
 
-/// The log entry a settled mutation makes, if there is anything to log.
+/// The log entry a settled mutation makes.
 ///
-/// `None` when the mutation was never vouched for — a guest, or a target whose
-/// venue does not resolve. The derived-table change still happens; the log
-/// records only acts it can name an id for.
+/// Always something. The log records *events*, not signatures — a guest's
+/// delete happened, and so did a reaction sent somewhere with no venue a
+/// verifier could rebuild. Those acts get a server-minted id and no signature
+/// rather than no row: a log that quietly skipped whatever it could not sign
+/// would be a record of some of what happened.
+///
+/// The id is the vouched one where there is a vouch, so the event the server
+/// stands behind and the event on file are the same event.
 fn mutation_event<'a>(
     vouched: Option<&'a VouchedMutation>,
+    minted: &'a str,
     actor_did: Option<&'a str>,
     ctx: &crate::events::EventContext,
     timestamp: u64,
-) -> Option<crate::db::MutationEvent<'a>> {
-    let vouched = vouched?;
-    Some(crate::db::MutationEvent {
-        event_id: &vouched.event_id,
+) -> crate::db::MutationEvent<'a> {
+    crate::db::MutationEvent {
+        event_id: vouched.map_or(minted, |v| v.event_id.as_str()),
         actor_did,
-        signature: vouched.signature.as_deref(),
+        signature: vouched.and_then(|v| v.signature.as_deref()),
         ctx: ctx.clone(),
         timestamp,
-    })
+    }
 }
 
 fn now_ms() -> u64 {
@@ -1140,7 +1145,8 @@ pub(super) fn handle_tagmsg(
             .as_secs();
         let emoji = emoji.clone();
         let target_msgid = target_msgid.clone();
-        let ev = mutation_event(vouched.as_ref(), did.as_deref(), &event_ctx, ts);
+        let minted = crate::msgid::generate();
+        let ev = mutation_event(vouched.as_ref(), &minted, did.as_deref(), &event_ctx, ts);
         state.with_db(|db| {
             db.store_reaction_by(
                 &target_msgid,
@@ -1149,7 +1155,7 @@ pub(super) fn handle_tagmsg(
                 did.as_deref(),
                 &emoji,
                 ts,
-                ev.as_ref(),
+                Some(&ev),
             )
         });
     }
@@ -1169,9 +1175,10 @@ pub(super) fn handle_tagmsg(
             .unwrap_or_default()
             .as_secs();
         // The reaction row goes; the signed event that removed it stays.
-        let ev = mutation_event(vouched.as_ref(), did.as_deref(), &event_ctx, ts);
+        let minted = crate::msgid::generate();
+        let ev = mutation_event(vouched.as_ref(), &minted, did.as_deref(), &event_ctx, ts);
         state.with_db(|db| {
-            db.remove_reaction_by(&target_msgid, &nick, did.as_deref(), &emoji, ev.as_ref())
+            db.remove_reaction_by(&target_msgid, &nick, did.as_deref(), &emoji, Some(&ev))
         });
     }
 
@@ -3462,8 +3469,9 @@ fn handle_delete(
             .unwrap_or_default()
             .as_secs();
         let did = conn.authenticated_did.clone();
-        let ev = mutation_event(vouched, did.as_deref(), event_ctx, ts);
-        state.with_db(|db| db.soft_delete_message_by(&storage_key, original_msgid, ev.as_ref()));
+        let minted = crate::msgid::generate();
+        let ev = mutation_event(vouched, &minted, did.as_deref(), event_ctx, ts);
+        state.with_db(|db| db.soft_delete_message_by(&storage_key, original_msgid, Some(&ev)));
     }
 
     // Remove from in-memory history and pins (channels only)

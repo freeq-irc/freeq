@@ -1337,3 +1337,80 @@ async fn an_unreaction_leaves_the_event_that_removed_the_reaction() {
         .unwrap();
     assert_eq!(live, 0, "the reaction was taken back");
 }
+
+/// The log records events, not signatures. A guest has no identity to bind and
+/// nothing to sign with — and their acts still happened, so they are still on
+/// file: a server-minted id, no signature, no canonical, and honest about all
+/// three.
+#[tokio::test]
+async fn a_guests_mutations_are_on_file_unsigned() {
+    let (addr, db_path, _h) = start_with_db(DidResolver::static_map(HashMap::new())).await;
+    let db_for_test = db_path.clone();
+    run(addr, move |addr| {
+        let mut watcher = C::guest(addr, "watcher");
+        watcher.join("#guestlog");
+        let mut guest = C::guest(addr, "nobody");
+        guest.join("#guestlog");
+
+        guest.tx("PRIVMSG #guestlog :something to act on");
+        let posted = watcher.rx(|l| l.contains("something to act on"), "the message");
+        let msgid = C::msgid_of(&posted).expect("the server minted an id");
+
+        guest.tx(&format!("@+react=👍;+reply={msgid} TAGMSG #guestlog"));
+        watcher.rx(|l| l.contains("+react"), "the reaction");
+
+        guest.tx(&format!("@+draft/delete={msgid} TAGMSG #guestlog"));
+        watcher.rx(|l| l.contains("+draft/delete"), "the delete");
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let rows = full_events_in(&db_for_test, "#guestlog");
+    for kind in ["react", "delete"] {
+        let row = rows
+            .iter()
+            .find(|r| r.kind == kind)
+            .unwrap_or_else(|| panic!("a guest's {kind} is on file too: {rows:?}"));
+        assert_eq!(row.actor_did, None, "a guest has no identity to bind");
+        assert_eq!(row.signature, None, "and nothing to sign with");
+        assert_eq!(row.canonical, "", "so there are no signed bytes to store");
+        assert_eq!(row.sig_state, "unsigned", "stated, not implied");
+        assert!(
+            !row.event_id.is_empty(),
+            "the act still needs an identity, and the server mints one"
+        );
+    }
+}
+
+#[derive(Debug)]
+struct EventRow {
+    kind: String,
+    event_id: String,
+    actor_did: Option<String>,
+    signature: Option<String>,
+    canonical: String,
+    sig_state: String,
+}
+
+fn full_events_in(db_path: &str, venue: &str) -> Vec<EventRow> {
+    let conn = rusqlite::Connection::open(db_path).expect("open server db");
+    let mut stmt = conn
+        .prepare(
+            "SELECT kind, event_id, actor_did, signature, canonical, sig_state
+             FROM events WHERE venue = ?1 ORDER BY timestamp ASC, event_id ASC",
+        )
+        .unwrap();
+    stmt.query_map(rusqlite::params![venue], |r| {
+        Ok(EventRow {
+            kind: r.get(0)?,
+            event_id: r.get(1)?,
+            actor_did: r.get(2)?,
+            signature: r.get(3)?,
+            canonical: r.get(4)?,
+            sig_state: r.get(5)?,
+        })
+    })
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}

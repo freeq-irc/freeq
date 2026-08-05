@@ -37,6 +37,8 @@ mod m002_root_msgid_backfill;
 mod m003_msgid_unique;
 #[path = "004_events_log.rs"]
 mod m004_events_log;
+#[path = "005_event_emoji.rs"]
+mod m005_event_emoji;
 
 // db.rs unit tests exercise the backfill directly against hand-built rows.
 // Production reaches it only as a rung of the ladder below.
@@ -49,6 +51,7 @@ pub(crate) fn migration_ladder() -> Migrations<'static> {
         m002_root_msgid_backfill::migration(),
         m003_msgid_unique::migration(),
         m004_events_log::migration(),
+        m005_event_emoji::migration(),
     ])
 }
 
@@ -172,6 +175,7 @@ mod tests {
         migration_ladder().to_version(&mut stepped, 2).unwrap();
         migration_ladder().to_version(&mut stepped, 3).unwrap();
         migration_ladder().to_version(&mut stepped, 4).unwrap();
+        migration_ladder().to_version(&mut stepped, 5).unwrap();
 
         let mut direct = Connection::open_in_memory().unwrap();
         migration_ladder().to_latest(&mut direct).unwrap();
@@ -188,11 +192,11 @@ mod tests {
         let path = dir.path().join("ladder.db");
         let path = path.to_str().unwrap();
 
-        let (before, after) = super::migrate_to(path, 4).unwrap();
-        assert_eq!((before, after), (0, 4), "fresh file climbs to the target");
+        let (before, after) = super::migrate_to(path, 5).unwrap();
+        assert_eq!((before, after), (0, 5), "fresh file climbs to the target");
 
         let (before, after) = super::migrate_to(path, 2).unwrap();
-        assert_eq!((before, after), (4, 2), "the down migrations run");
+        assert_eq!((before, after), (5, 2), "the down migrations run");
 
         let err = super::migrate_to(path, 0).unwrap_err();
         assert!(
@@ -211,7 +215,7 @@ mod tests {
         migration_ladder().to_latest(&mut conn).unwrap();
         let before = tables(&conn);
         migration_ladder().to_latest(&mut conn).unwrap();
-        assert_eq!(version(&conn), 4);
+        assert_eq!(version(&conn), 5);
         assert_eq!(tables(&conn), before);
     }
 }

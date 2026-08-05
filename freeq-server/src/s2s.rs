@@ -267,6 +267,9 @@ pub struct ReplayedEvent {
     pub actor_did: Option<String>,
     #[serde(default)]
     pub subject: Option<String>,
+    /// A reaction's emoji, for an event with no canonical to carry it.
+    #[serde(default)]
+    pub emoji: Option<String>,
     pub timestamp: u64,
 }
 
@@ -2519,6 +2522,7 @@ mod capability_tests {
             venue: "#room".to_string(),
             actor_did: Some("did:plc:x".to_string()),
             subject: None,
+            emoji: None,
             timestamp: 42,
         };
         let json = serde_json::to_string(&S2sMessage::CatchupEvents {

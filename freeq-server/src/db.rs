@@ -236,6 +236,8 @@ pub struct StoredEvent {
     pub actor_did: Option<String>,
     pub subject: Option<String>,
     pub body_hash: Option<String>,
+    /// A reaction's emoji.
+    pub emoji: Option<String>,
     pub origin: Option<String>,
     /// Fingerprint of a dropped second claim on this id, if there was one.
     pub conflict: Option<String>,
@@ -253,9 +255,10 @@ fn map_stored_event(row: &rusqlite::Row<'_>) -> SqlResult<StoredEvent> {
         actor_did: row.get(6)?,
         subject: row.get(7)?,
         body_hash: row.get(8)?,
-        origin: row.get(9)?,
-        conflict: row.get(10)?,
-        timestamp: row.get::<_, i64>(11)? as u64,
+        emoji: row.get(9)?,
+        origin: row.get(10)?,
+        conflict: row.get(11)?,
+        timestamp: row.get::<_, i64>(12)? as u64,
     })
 }
 
@@ -1554,6 +1557,7 @@ impl Db {
                     actor_did: None,
                     subject: replaces_msgid.map(str::to_string),
                     body_hash: None,
+                    emoji: None,
                 }),
                 signature: None,
                 ctx: ctx.clone(),
@@ -1607,9 +1611,15 @@ impl Db {
         ev: &MutationEvent<'_>,
     ) -> SqlResult<()> {
         let subject = self.root_of(subject);
-        let canonical = ev.actor_did.map(|did| {
-            crate::events::mutation_canonical(kind, did, ev.event_id, channel, &subject, emoji)
-        });
+        // A document only where one exists. The canonical column holds bytes
+        // a signature covers, so an act nothing signed gets none — and its
+        // facts, which happened either way, are stated instead.
+        let canonical = match (ev.actor_did, ev.signature) {
+            (Some(did), Some(_)) => Some(crate::events::mutation_canonical(
+                kind, did, ev.event_id, channel, &subject, emoji,
+            )),
+            _ => None,
+        };
         let record = match canonical.as_deref() {
             Some(canonical) => EventRecord {
                 shape: EventShape::Document(canonical),
@@ -1617,16 +1627,18 @@ impl Db {
                 ctx: ev.ctx.clone(),
                 timestamp: ev.timestamp,
             },
-            // A guest acted, and the act is still a fact worth keeping — it
-            // just isn't a signed one.
+            // A guest acted — or an identity acted somewhere with no venue a
+            // verifier could rebuild. Either way the act is a fact worth
+            // keeping; it just isn't a signed one, and the row says so.
             None => EventRecord {
                 shape: EventShape::Bare(crate::events::EventFacts {
                     event_id: ev.event_id.to_string(),
                     kind: kind.as_str().to_string(),
                     venue: crate::events::venue_of(channel),
-                    actor_did: None,
+                    actor_did: ev.actor_did.map(str::to_string),
                     subject: Some(subject.clone()),
                     body_hash: None,
+                    emoji: emoji.map(str::to_string),
                 }),
                 signature: None,
                 ctx: ev.ctx.clone(),
@@ -1693,8 +1705,8 @@ impl Db {
         self.conn.execute(
             "INSERT OR IGNORE INTO events
                  (event_id, canonical, signature, sig_state, kind, venue,
-                  actor_did, subject, body_hash, origin, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  actor_did, subject, body_hash, emoji, origin, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 facts.event_id,
                 canonical,
@@ -1705,6 +1717,7 @@ impl Db {
                 facts.actor_did,
                 facts.subject,
                 facts.body_hash,
+                facts.emoji,
                 rec.ctx.origin,
                 rec.timestamp as i64,
             ],
@@ -1738,7 +1751,7 @@ impl Db {
     /// derive from, and their columns are the whole record by design.
     pub fn events_disagreeing_with_their_bytes(&self) -> SqlResult<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT event_id, canonical, kind, venue, actor_did, subject, body_hash
+            "SELECT event_id, canonical, kind, venue, actor_did, subject, body_hash, emoji
              FROM events WHERE canonical <> ''",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1750,12 +1763,13 @@ impl Db {
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, Option<String>>(5)?,
                 r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
             ))
         })?;
 
         let mut bad = Vec::new();
         for row in rows {
-            let (id, canonical, kind, venue, actor_did, subject, body_hash) = row?;
+            let (id, canonical, kind, venue, actor_did, subject, body_hash, emoji) = row?;
             let Some(derived) = crate::events::derive_facts(&canonical) else {
                 bad.push(format!("{id} canonical: not a document"));
                 continue;
@@ -1783,6 +1797,7 @@ impl Db {
                 format!("{body_hash:?}"),
                 format!("{:?}", derived.body_hash),
             );
+            note("emoji", format!("{emoji:?}"), format!("{:?}", derived.emoji));
         }
         Ok(bad)
     }
@@ -1808,7 +1823,7 @@ impl Db {
     pub fn get_event(&self, event_id: &str) -> SqlResult<Option<StoredEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT event_id, canonical, signature, sig_state, kind, venue,
-                    actor_did, subject, body_hash, origin, conflict, timestamp
+                    actor_did, subject, body_hash, emoji, origin, conflict, timestamp
              FROM events WHERE event_id = ?1",
         )?;
         let mut rows = stmt.query_map(params![event_id], map_stored_event)?;
@@ -1820,7 +1835,7 @@ impl Db {
     pub fn events_in_venue(&self, venue: &str) -> SqlResult<Vec<StoredEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT event_id, canonical, signature, sig_state, kind, venue,
-                    actor_did, subject, body_hash, origin, conflict, timestamp
+                    actor_did, subject, body_hash, emoji, origin, conflict, timestamp
              FROM events WHERE venue = ?1 ORDER BY timestamp ASC, event_id ASC",
         )?;
         let rows = stmt.query_map(params![venue], map_stored_event)?;
@@ -1831,7 +1846,7 @@ impl Db {
     pub fn all_events(&self) -> SqlResult<Vec<StoredEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT event_id, canonical, signature, sig_state, kind, venue,
-                    actor_did, subject, body_hash, origin, conflict, timestamp
+                    actor_did, subject, body_hash, emoji, origin, conflict, timestamp
              FROM events ORDER BY timestamp ASC, event_id ASC",
         )?;
         let rows = stmt.query_map([], map_stored_event)?;
@@ -2070,6 +2085,7 @@ impl Db {
                 actor_did: None,
                 subject: Some(subject.to_string()),
                 body_hash: None,
+                emoji: None,
             }),
             signature: None,
             ctx: crate::events::EventContext::default(),
@@ -3667,7 +3683,7 @@ mod tests {
                 db.conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                     .unwrap(),
-                4,
+                5,
                 "first open stamps the schema"
             );
         }
@@ -3679,7 +3695,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
         assert_eq!(db.root_of("id-2"), "id-1");
         assert_eq!(db.current_revision("id-1").unwrap().unwrap().text, "v2");
@@ -3709,7 +3725,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
     }
 
@@ -3752,7 +3768,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
     }
 
@@ -5766,6 +5782,7 @@ mod event_log_tests {
                 actor_did: None,
                 subject: Some(root.to_string()),
                 body_hash: None,
+                emoji: None,
             }),
             signature: None,
             ctx: EventContext::default(),
@@ -6104,7 +6121,7 @@ impl Db {
     pub fn events_since(&self, since_ts: u64, limit: usize) -> SqlResult<Vec<StoredEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT event_id, canonical, signature, sig_state, kind, venue,
-                    actor_did, subject, body_hash, origin, conflict, timestamp
+                    actor_did, subject, body_hash, emoji, origin, conflict, timestamp
              FROM events WHERE timestamp >= ?1
              ORDER BY timestamp ASC, event_id ASC
              LIMIT ?2",
@@ -6132,7 +6149,7 @@ impl Db {
     ) -> SqlResult<Vec<StoredEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT event_id, canonical, signature, sig_state, kind, venue,
-                    actor_did, subject, body_hash, origin, conflict, timestamp
+                    actor_did, subject, body_hash, emoji, origin, conflict, timestamp
              FROM events
              WHERE timestamp >= ?1 AND substr(venue, 1, 1) IN ('#', '&')
              ORDER BY timestamp ASC, event_id ASC

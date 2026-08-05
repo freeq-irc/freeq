@@ -112,6 +112,11 @@ pub struct EventFacts {
     pub subject: Option<String>,
     /// `sha256:<hex>` over the wire body, for the kinds that have one.
     pub body_hash: Option<String>,
+    /// A reaction's emoji. A column of its own because it is a closed part of
+    /// the document schema — and because an unsigned reaction has no canonical
+    /// to hold it, which would otherwise make `reactions` unrebuildable for
+    /// anyone who reacted without an account.
+    pub emoji: Option<String>,
 }
 
 /// Facts about *receipt*, which no document contains.
@@ -175,6 +180,7 @@ pub fn derive_facts(canonical: &str) -> Option<EventFacts> {
         actor_did: Some(actor_did),
         subject,
         body_hash,
+        emoji: get("emoji"),
     })
 }
 
