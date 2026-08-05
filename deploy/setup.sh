@@ -192,7 +192,10 @@ else
     WEB_ADDR="0.0.0.0:8080"
 fi
 
-if [[ -f /etc/freeq/server.toml ]]; then
+# `sudo test`, not `[[ -f ]]`: /etc/freeq is root:freeq 750, so the invoking
+# user cannot see into it — a bare test reads "missing" for a file that
+# exists, and the never-overwrite guarantee silently inverts.
+if sudo test -f /etc/freeq/server.toml; then
     echo "==> /etc/freeq/server.toml exists — leaving it untouched."
     echo "    (This run wanted: web_addr=$WEB_ADDR, iroh=$ENABLE_IROH, tls=$HAS_CERT — verify if you changed options.)"
 else

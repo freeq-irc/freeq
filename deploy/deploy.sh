@@ -21,7 +21,9 @@ cd "$REPO_DIR"
 # discovering it as a crash loop after the restart. Run the check as the
 # service user: the file is root:freeq 640, and this also proves the real
 # service will be able to read it.
-if [[ -f /etc/freeq/server.toml ]]; then
+# `sudo test`: the config dir is unreadable to the invoking user, so a bare
+# [[ -f ]] silently skipped this validation on every correctly-permissioned box.
+if sudo test -f /etc/freeq/server.toml; then
     echo "==> Validating /etc/freeq/server.toml..."
     SVC_USER=$(systemctl show -p User --value freeq-server 2>/dev/null || true)
     sudo -u "${SVC_USER:-freeq}" ./target/release/freeq-server --config /etc/freeq/server.toml --check-config

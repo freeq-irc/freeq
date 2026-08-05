@@ -45,14 +45,26 @@ mod m005_event_emoji;
 #[cfg(test)]
 pub(crate) use m002_root_msgid_backfill::backfill_root_msgids;
 
-pub(crate) fn migration_ladder() -> Migrations<'static> {
-    Migrations::new(vec![
+/// The rungs, in order. List position is the schema version, so this vec is
+/// the single source for both the ladder and its height.
+fn rungs() -> Vec<rusqlite_migration::M<'static>> {
+    vec![
         m001_schema_baseline::migration(),
         m002_root_msgid_backfill::migration(),
         m003_msgid_unique::migration(),
         m004_events_log::migration(),
         m005_event_emoji::migration(),
-    ])
+    ]
+}
+
+/// The ladder's height, derived — so startup can announce a pending climb
+/// before it begins without a hand-maintained number.
+pub(crate) fn ladder_top() -> usize {
+    rungs().len()
+}
+
+pub(crate) fn migration_ladder() -> Migrations<'static> {
+    Migrations::new(rungs())
 }
 
 /// The schema version stamped on `conn` (0 = unstamped).
@@ -182,6 +194,7 @@ mod tests {
 
         assert_eq!(version(&stepped), version(&direct));
         assert_eq!(tables(&stepped), tables(&direct));
+        assert_eq!(version(&direct), ladder_top(), "the stamp must equal the rung count");
     }
 
     /// The `--migrate-to` entry point: a real file, up to latest, down one

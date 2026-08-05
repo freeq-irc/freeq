@@ -423,6 +423,22 @@ impl Db {
         // (migration 1) and one-time data migrations (2+). It runs right
         // after the per-connection pragmas; everything below may assume
         // fully-shaped tables.
+        //
+        // Announced in the log, because a data migration over a large table
+        // can hold startup for a while and a silent boot invites an abort —
+        // and because "did it migrate?" should be answerable from the
+        // journal, not by opening the database.
+        let schema_before: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if schema_before < crate::migrations::ladder_top() as i64 {
+            tracing::info!(
+                from = schema_before,
+                to = crate::migrations::ladder_top(),
+                "migrating schema — may take a while on a large database; interrupting is safe (each rung is one transaction and rolls back whole)"
+            );
+        }
         crate::migrations::migration_ladder()
             .to_latest(&mut self.conn)
             .map_err(|e| match e {
@@ -432,6 +448,17 @@ impl Db {
                     Some(other.to_string()),
                 ),
             })?;
+        let schema_after: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if schema_before != schema_after {
+            tracing::info!(
+                from = schema_before,
+                to = schema_after,
+                "schema migrated at startup (each rung is one transaction; an interrupt rolls back to the previous rung)"
+            );
+        }
 
         // Outside the ladder on purpose: it manages its own transaction,
         // which the ladder's per-migration transaction cannot nest.
