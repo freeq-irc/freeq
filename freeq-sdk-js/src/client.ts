@@ -1504,7 +1504,14 @@ export class FreeqClient extends EventEmitter {
         // MSGSIG. Some consumers (Node-side bots, agents that already hold
         // their own signing key) want to skip this; opt out via
         // FreeqClientOptions.autoMsgSig=false.
-        if (this.sasl?.did && this.opts.autoMsgSig !== false) {
+        //
+        // Only where the key can be used: a server that never negotiated the
+        // signing cap cannot verify a client document, so registering with it
+        // files a public key it will never read — and the command itself is
+        // one an older server has no reason to know, which is exactly what
+        // capability gating exists to avoid saying. Cap negotiation is settled
+        // by the time authentication succeeds, so the answer is known here.
+        if (this.sasl?.did && this.opts.autoMsgSig !== false && this.ackedCaps.has(SIGNING_CAP)) {
           signing.setSigningDid(this.sasl.did);
           // Minted here, REGISTERED on 001. MSGSIG sent before registration
           // completes is discarded by the server (`if !conn.registered`),

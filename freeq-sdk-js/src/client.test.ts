@@ -1715,6 +1715,51 @@ describe('signed mutations', () => {
     }
   });
 
+  // A session key is registered only with a server that asked for the signing
+  // capability. A server that never advertised it cannot verify a client
+  // document, so it would file a public key it will never read — and the
+  // registration is a command an older server has no reason to know at all.
+  it('registers the session key only with a server that can use it', async () => {
+    async function wireAfterLogin(caps: string): Promise<string[]> {
+      const { FreeqClient } = await import('./client.js');
+      const client = new FreeqClient({
+        url: 'wss://test/irc',
+        nick: 'alice',
+        skipInitialBrokerRefresh: true,
+      });
+      client.setSaslCredentials({
+        token: 't',
+        did: 'did:plc:alice',
+        pdsUrl: 'https://pds.example',
+        method: 'oauth',
+      });
+      client.connect();
+      await flushAsync();
+      const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+      ws.recv(`:srv CAP * LS :${caps}`);
+      await flushAsync();
+      ws.recv(`:srv CAP * ACK :${caps}`);
+      await flushAsync();
+      ws.recv(':srv 903 alice :SASL authentication successful');
+      await flushAsync();
+      ws.recv(':srv 001 alice :Welcome');
+      for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 5));
+      return ws.sent;
+    }
+
+    const legacy = await wireAfterLogin('message-tags server-time');
+    expect(
+      legacy.filter((l) => l.startsWith('MSGSIG')),
+      'a server that never advertised the capability stays unaware of the key',
+    ).toEqual([]);
+
+    const current = await wireAfterLogin('message-tags server-time freeq.at/msgsig');
+    expect(
+      current.filter((l) => l.startsWith('MSGSIG')).length,
+      'where the capability was negotiated, nothing changes',
+    ).toBe(1);
+  });
+
   it('a mutation to a peer we cannot name still sends, unsigned', async () => {
     const { client, ws } = await makeSigningClient();
     client.sendReaction('carol', '👍', 'M0');
