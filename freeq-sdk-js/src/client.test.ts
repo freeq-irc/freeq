@@ -1683,6 +1683,48 @@ describe('signed mutations', () => {
     expect(await verifySig(canonical, tagOf(line, '+freeq.at/sig')!, verifyKey)).toBe(true);
   });
 
+  it('a mutation in a DM addresses the peer it knows, and signs that venue', async () => {
+    const signing = await import('./signing.js');
+    const { client, ws, verifyKey } = await makeSigningClient();
+    ws.recv(':srv 330 alice bob did:plc:bob :is authenticated as');
+    await flushAsync();
+
+    for (const [kind, send] of [
+      ['delete', () => client.sendDelete('bob', 'M0')],
+      ['react', () => client.sendReaction('bob', '👍', 'M0')],
+      ['unreact', () => client.sendUnreact('bob', '👍', 'M0')],
+    ] as const) {
+      ws.sent.length = 0;
+      send();
+      const line = await waitForSent(ws, 'TAGMSG');
+      expect(line, `a ${kind} in a known DM is addressed by DID`).toContain(
+        'TAGMSG did:plc:bob',
+      );
+      const canonical = signing.mutationCanonical({
+        kind,
+        from: 'did:plc:mutator',
+        msgid: tagOf(line, '+freeq.at/eventid')!,
+        target: signing.dmVenue('did:plc:mutator', 'did:plc:bob'),
+        subject: 'M0',
+        emoji: kind === 'delete' ? undefined : '👍',
+      });
+      expect(
+        await verifySig(canonical, tagOf(line, '+freeq.at/sig')!, verifyKey),
+        `a ${kind} must sign the DM venue it was addressed to`,
+      ).toBe(true);
+    }
+  });
+
+  it('a mutation to a peer we cannot name still sends, unsigned', async () => {
+    const { client, ws } = await makeSigningClient();
+    client.sendReaction('carol', '👍', 'M0');
+    const line = await waitForSent(ws, 'TAGMSG');
+    expect(line, 'a nick we have no DID for stays a nick').toContain('TAGMSG carol');
+    expect(line, 'a bare nick is no venue a verifier could rebuild').not.toContain(
+      '+freeq.at/sig',
+    );
+  });
+
   it('an action against a legacy server is an ordinary unsigned PRIVMSG', async () => {
     const signing = await import('./signing.js');
     signing.setSigningDid('did:plc:mutator');

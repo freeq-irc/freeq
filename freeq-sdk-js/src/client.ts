@@ -333,7 +333,7 @@ export class FreeqClient extends EventEmitter {
     // `target` stays the caller's input for E2EE peer resolution; `bufKey`
     // is where the local echo files — resolved loosely (dmKey) so a send to
     // an offline peer's nick still lands in the DID-keyed thread.
-    const wireTarget = isChannel ? target : this.wireDmTarget(target);
+    const wireTarget = this.wireTargetFor(target);
     const bufKey = isChannel ? target : this.dmKey(target);
 
     // +E channels require the `+encrypted` tag on every PRIVMSG —
@@ -529,9 +529,8 @@ export class FreeqClient extends EventEmitter {
     // Same target discipline as sendMessageInternal: strict DID resolution
     // for the wire, canonical (loose) key for the local echo.
     const isChannel = target.startsWith('#') || target.startsWith('&');
-    const wireTarget = isChannel ? target : this.wireDmTarget(target);
     const bufKey = isChannel ? target : this.dmKey(target);
-    this.signedPrivmsg(wireTarget, wireText, tags);
+    this.signedPrivmsg(this.wireTargetFor(target), wireText, tags);
 
     if (!this.ackedCaps.has('echo-message')) {
       this.emit('message', bufKey, {
@@ -554,10 +553,7 @@ export class FreeqClient extends EventEmitter {
    */
   sendAction(target: string, text: string): void {
     const isChannel = target.startsWith('#') || target.startsWith('&');
-    // Same target discipline as every other send: strict DID resolution for
-    // the wire, canonical (loose) key for the local echo.
-    const wireTarget = isChannel ? target : this.wireDmTarget(target);
-    this.signedPrivmsg(wireTarget, `\x01ACTION ${text}\x01`);
+    this.signedPrivmsg(this.wireTargetFor(target), `\x01ACTION ${text}\x01`);
 
     if (!this.ackedCaps.has('echo-message')) {
       this.emit('message', isChannel ? target : this.dmKey(target), {
@@ -572,17 +568,24 @@ export class FreeqClient extends EventEmitter {
     }
   }
 
-  /** Delete a message. */
+  /**
+   * Delete a message.
+   *
+   * The mutation is addressed like a message is: in a DM, the peer's DID when
+   * we know it. The signer derives the venue from the target it is handed, so
+   * a mutation left on a bare nick could not be signed at all — while the DID
+   * needed to sign it sat in the map the whole time.
+   */
   sendDelete(target: string, msgId: string): void {
     this.emit('messageDeleted', target, msgId);
-    this.signedMutation('delete', target, { '+draft/delete': msgId }, msgId);
+    this.signedMutation('delete', this.wireTargetFor(target), { '+draft/delete': msgId }, msgId);
   }
 
   /** React to a message with an emoji. */
   sendReaction(target: string, emoji: string, msgId?: string): void {
     const tags: Record<string, string> = { '+react': emoji };
     if (msgId) tags['+reply'] = msgId;
-    this.signedMutation('react', target, tags, msgId, emoji);
+    this.signedMutation('react', this.wireTargetFor(target), tags, msgId, emoji);
 
     if (msgId) {
       this.emit('reactionAdded', target, msgId, emoji, this._nick);
@@ -595,7 +598,7 @@ export class FreeqClient extends EventEmitter {
       '+freeq.at/unreact': emoji,
       '+reply': msgId,
     };
-    this.signedMutation('unreact', target, tags, msgId, emoji);
+    this.signedMutation('unreact', this.wireTargetFor(target), tags, msgId, emoji);
     this.emit('reactionRemoved', target, msgId, emoji, this._nick);
   }
 
@@ -1011,6 +1014,16 @@ export class FreeqClient extends EventEmitter {
   /** Strict resolver for wire targets: DID only when addressing-grade known. */
   private wireDmTarget(peer: string): string {
     return dmPeerKey(peer, (n) => this.didForNick(n));
+  }
+
+  /**
+   * What a send addresses on the wire: a channel unchanged, a DM peer by DID
+   * when we know it. Every send path resolves through here, so a target's
+   * wire form cannot depend on which kind of event is being sent.
+   */
+  private wireTargetFor(target: string): string {
+    const isChannel = target.startsWith('#') || target.startsWith('&');
+    return isChannel ? target : this.wireDmTarget(target);
   }
 
   /** The DID whose known display nick is `nick`, if exactly that binding exists. */
