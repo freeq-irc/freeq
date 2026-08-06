@@ -1594,17 +1594,25 @@ fn server_kid_from_public_key(public_key_b64url: &str) -> Option<String> {
 /// binds it to.
 ///
 /// The signature tag alone does not answer the first question: a server signs
-/// on behalf of clients that can't, under its own key and in the same tag. So
-/// the tag counts as the sender's only when it names a key id that is not the
-/// server's. Anything we cannot attribute — an older server's bare signature,
-/// or any signature at all before we know the server's key — is left unmarked,
-/// because a lock that might mean "the server said so" is worse than none.
+/// on behalf of clients that can't, under its own key and in the same tag. All
+/// three conditions have to hold before the marker is earned:
+///
+/// - the signature names a key id (an older server's is bare base64),
+/// - that key id is not our server's, and
+/// - the message did not come from another server.
+///
+/// The last one is why the first two are not enough. A relayed message was
+/// signed under a key that is not ours either way — by its sender, or by its
+/// origin server on their behalf — and nothing on the wire separates those, so
+/// a relayed message is never marked. Everything unmarked here is still
+/// answerable by `/verify`, which asks a server that holds the keys.
 fn signature_of(
     tags: &std::collections::HashMap<String, String>,
     server_kid: Option<&str>,
 ) -> (bool, Option<String>) {
+    let relayed = tags.contains_key("+freeq.at/origin");
     let by_sender = match (tags.get(freeq_sdk::sigtag::SIG_TAG), server_kid) {
-        (Some(sig), Some(server_kid)) => {
+        (Some(sig), Some(server_kid)) if !relayed => {
             let mut parts = sig.splitn(3, ':');
             matches!(
                 (parts.next(), parts.next(), parts.next()),
@@ -3320,6 +3328,35 @@ mod tests {
             Some(SERVER_KID),
         );
         assert!(!signed, "a signature we cannot attribute is not the sender's");
+    }
+
+    /// A message relayed from another server was signed under a key that is
+    /// not ours whether its sender signed it or its origin server signed for
+    /// them — and only one of those is the sender's claim. The kid comparison
+    /// cannot separate them, so a relayed message never gets the marker.
+    /// `/verify` still answers for it; the server holds the keys we don't.
+    #[test]
+    fn a_relayed_message_never_wears_the_senders_lock() {
+        let foreign = tags(&[
+            ("+freeq.at/sig", "ed25519:someforeignkid:c2ln"),
+            ("+freeq.at/origin", "other.server"),
+            ("account", "did:plc:alice"),
+        ]);
+        let (signed, account) = signature_of(&foreign, Some(SERVER_KID));
+        assert!(
+            !signed,
+            "a foreign server's key is not ours either — that is the whole problem"
+        );
+        assert_eq!(
+            account.as_deref(),
+            Some("did:plc:alice"),
+            "the account still travels; only the marker is withheld"
+        );
+
+        // And it holds regardless of what we know about our own server: the
+        // rule is about provenance, not about the comparison succeeding.
+        let (signed, _) = signature_of(&foreign, None);
+        assert!(!signed);
     }
 
     /// Not knowing the server's key means not being able to tell the two
