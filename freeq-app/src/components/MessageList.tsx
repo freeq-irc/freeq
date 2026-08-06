@@ -940,6 +940,8 @@ function SignedBadge({ msgid }: { msgid: string }) {
   return (
     <span className="relative inline-block">
       <button
+        data-testid="signed-badge"
+        data-verdict={outcome ?? 'unchecked'}
         className={`text-xs opacity-60 hover:opacity-100 transition-opacity ${badgeTone(outcome)}`}
         onClick={(e) => { e.stopPropagation(); toggle(); }}
         title={badgeTitle(outcome)}
