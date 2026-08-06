@@ -303,7 +303,8 @@ impl DidMapsState {
     /// Learn the display direction only (CHATHISTORY TARGETS): the display
     /// nick may be historical, so it must not become an addressing binding.
     fn learn_display(&mut self, did: &str, nick: &str) {
-        self.did_to_nick.insert(did.to_string(), nick.to_lowercase());
+        self.did_to_nick
+            .insert(did.to_string(), nick.to_lowercase());
     }
 
     /// The peer's DID whose retained display nick is `nick`, if any.
@@ -352,16 +353,15 @@ pub(crate) type DidMaps = Arc<parking_lot::Mutex<DidMapsState>>;
 /// Compute the DM key for an inbound/echoed message, or `None` for channels.
 /// The peer is the non-self end: our echo's peer is the target, an incoming
 /// message's peer is the sender.
-fn dm_key_for(
-    maps: &DidMaps,
-    own_nick: &str,
-    from: &str,
-    target: &str,
-) -> Option<String> {
+fn dm_key_for(maps: &DidMaps, own_nick: &str, from: &str, target: &str) -> Option<String> {
     if target.starts_with('#') || target.starts_with('&') {
         return None;
     }
-    let peer = if from.eq_ignore_ascii_case(own_nick) { target } else { from };
+    let peer = if from.eq_ignore_ascii_case(own_nick) {
+        target
+    } else {
+        from
+    };
     Some(maps.lock().dm_key(peer))
 }
 
@@ -584,17 +584,18 @@ impl ClientHandle {
     ///
     /// Structured, not `Raw`: a delete or a reaction is signed over the tags
     /// that carry it, and one place has to see them to sign them.
+    ///
+    /// A DM peer resolves to their DID exactly as it does for a message send —
+    /// the signer derives the venue from the target it is handed, so routing
+    /// a mutation to a bare nick when the DID is known would send it unsigned
+    /// for no reason.
     pub async fn send_tagmsg(
         &self,
         target: &str,
         tags: std::collections::HashMap<String, String>,
     ) -> Result<()> {
-        self.cmd_tx
-            .send(Command::Tagmsg {
-                target: target.to_string(),
-                tags,
-            })
-            .await?;
+        let target = self.resolve_wire_target(target);
+        self.cmd_tx.send(Command::Tagmsg { target, tags }).await?;
         Ok(())
     }
 
@@ -3383,7 +3384,9 @@ mod multiline_tests {
             ],
             opener_tags: std::collections::HashMap::new(),
         };
-        execute_command(&mut buf, cmd, &None, &None, true).await.unwrap();
+        execute_command(&mut buf, cmd, &None, &None, true)
+            .await
+            .unwrap();
         let wire = String::from_utf8(buf).unwrap();
         // Find the batch id from the opener
         let opener_line = wire.lines().next().unwrap();
@@ -3428,7 +3431,9 @@ mod multiline_tests {
             ],
             opener_tags: std::collections::HashMap::new(),
         };
-        execute_command(&mut buf, cmd, &None, &None, true).await.unwrap();
+        execute_command(&mut buf, cmd, &None, &None, true)
+            .await
+            .unwrap();
         let wire = String::from_utf8(buf).unwrap();
         // First chunk: no concat tag
         assert!(wire.contains(":ENC1:abc"));
@@ -3460,7 +3465,9 @@ mod multiline_tests {
             ],
             opener_tags,
         };
-        execute_command(&mut buf, cmd, &None, &None, true).await.unwrap();
+        execute_command(&mut buf, cmd, &None, &None, true)
+            .await
+            .unwrap();
         let wire = String::from_utf8(buf).unwrap();
         let opener = wire.lines().find(|l| l.contains("BATCH +")).unwrap();
         let chunk_a = wire.lines().find(|l| l.ends_with(":a")).unwrap();
@@ -3550,7 +3557,9 @@ mod multiline_tests {
             }],
             opener_tags: std::collections::HashMap::new(),
         };
-        execute_command(&mut buf, cmd, &None, &None, true).await.unwrap();
+        execute_command(&mut buf, cmd, &None, &None, true)
+            .await
+            .unwrap();
         let wire = String::from_utf8(buf).unwrap();
         let opener = wire.lines().next().unwrap();
         // No leading "@..." tag block when there are no opener tags
@@ -3691,6 +3700,128 @@ mod multiline_tests {
                 assert_eq!(text, "hello world");
             }
             other => panic!("expected Privmsg, got {other:?}"),
+        }
+    }
+
+    /// A mutation in a DM addresses the peer's DID whenever we know it, the
+    /// same resolution a message send does. Routing them differently is what
+    /// left reactions and deletes in a DM unsigned: the signer derives the
+    /// venue from the target it is handed, and a bare nick has no venue any
+    /// verifier could rebuild.
+    #[tokio::test]
+    async fn a_dm_mutation_addresses_the_peer_did_when_it_is_known() {
+        use ed25519_dalek::SigningKey;
+
+        let root = "01ROOTMSGID0000000000000FF";
+        let peer = "did:plc:peer";
+        let did = "did:plc:mutator";
+        let key = SigningKey::from_bytes(&[11u8; 32]);
+
+        let did_maps: DidMaps = Arc::new(parking_lot::Mutex::new(DidMapsState::default()));
+        did_maps.lock().learn("bob", peer);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let handle = ClientHandle {
+            cmd_tx,
+            echo_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            caps_acked: Arc::new(parking_lot::Mutex::new(CapsState::default())),
+            did_maps,
+        };
+
+        handle.delete_message("bob", root).await.unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(
+            &mut buf,
+            cmd_rx.recv().await.unwrap(),
+            &Some(key.clone()),
+            &Some(did.to_string()),
+            true,
+        )
+        .await
+        .unwrap();
+        let wire = String::from_utf8(buf).unwrap();
+        let sent = crate::irc::Message::parse(wire.trim_end()).expect("parses");
+        assert_eq!(
+            sent.params,
+            vec![peer.to_string()],
+            "a known peer is addressed by DID: {wire}"
+        );
+        let sig = sent
+            .tags
+            .get(crate::sigtag::SIG_TAG)
+            .unwrap_or_else(|| panic!("a DM mutation with a knowable venue is signed: {wire}"));
+        let event_id = sent.tags.get(crate::chatsig::EVENT_ID_TAG).unwrap();
+        crate::chatsig::ChatDoc::mutation(
+            crate::chatsig::Mutation::Delete,
+            did,
+            event_id,
+            &crate::chatsig::dm_venue(did, peer),
+            root,
+        )
+        .verify(sig, &key.verifying_key())
+        .expect("the mutation binds the sorted DID pair");
+    }
+
+    /// An unknown peer still gets the mutation — unsigned, addressed by nick,
+    /// and without an error. A guest has no DID to resolve to, and refusing
+    /// to delete your own message because the other end is a guest would be
+    /// a worse failure than sending it unsigned.
+    #[tokio::test]
+    async fn a_dm_mutation_to_an_unknown_peer_still_sends_unsigned() {
+        use ed25519_dalek::SigningKey;
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let handle = ClientHandle {
+            cmd_tx,
+            echo_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            caps_acked: Arc::new(parking_lot::Mutex::new(CapsState::default())),
+            did_maps: Arc::new(parking_lot::Mutex::new(DidMapsState::default())),
+        };
+
+        handle
+            .react("stranger", "👍", "01ROOTMSGID000000000000GG")
+            .await
+            .unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(
+            &mut buf,
+            cmd_rx.recv().await.unwrap(),
+            &Some(SigningKey::from_bytes(&[12u8; 32])),
+            &Some("did:plc:mutator".to_string()),
+            true,
+        )
+        .await
+        .unwrap();
+        let wire = String::from_utf8(buf).unwrap();
+        let sent = crate::irc::Message::parse(wire.trim_end()).expect("parses");
+        assert_eq!(sent.params, vec!["stranger".to_string()], "{wire}");
+        assert!(!sent.tags.contains_key(crate::sigtag::SIG_TAG), "{wire}");
+        assert_eq!(
+            sent.tags.get("+react").map(String::as_str),
+            Some("👍"),
+            "the reaction itself still goes out: {wire}"
+        );
+    }
+
+    /// Channel targets are not DM peers and must pass through resolution
+    /// untouched, including the rarer `&` prefix.
+    #[tokio::test]
+    async fn a_channel_mutation_target_is_never_rewritten() {
+        let did_maps: DidMaps = Arc::new(parking_lot::Mutex::new(DidMapsState::default()));
+        did_maps.lock().learn("bob", "did:plc:peer");
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let handle = ClientHandle {
+            cmd_tx,
+            echo_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            caps_acked: Arc::new(parking_lot::Mutex::new(CapsState::default())),
+            did_maps,
+        };
+
+        for target in ["#room", "&local"] {
+            handle.typing_start(target).await.unwrap();
+            match cmd_rx.recv().await.unwrap() {
+                Command::Tagmsg { target: t, .. } => assert_eq!(t, target),
+                other => panic!("expected Tagmsg, got {other:?}"),
+            }
         }
     }
 
@@ -4685,8 +4816,7 @@ mod irc_loop_tests {
     #[tokio::test]
     async fn the_signing_cap_is_requested_only_when_the_server_offers_it() {
         async fn requested(advertised: &str) -> String {
-            let caps_acked: CapsAcked =
-                Arc::new(parking_lot::Mutex::new(CapsState::default()));
+            let caps_acked: CapsAcked = Arc::new(parking_lot::Mutex::new(CapsState::default()));
             let msg = Message::parse(&format!(":srv CAP * LS :{advertised}")).unwrap();
             let mut buf: Vec<u8> = Vec::new();
             let mut sasl = false;
@@ -4707,7 +4837,10 @@ mod irc_loop_tests {
             !legacy.contains(MSGSIG_CAP),
             "and one that doesn't advertise it is never asked: {legacy}"
         );
-        assert!(legacy.contains("message-tags"), "the rest still goes: {legacy}");
+        assert!(
+            legacy.contains("message-tags"),
+            "the rest still goes: {legacy}"
+        );
     }
 
     /// Against a server that never negotiated `freeq.at/msgsig`, an updated
@@ -5368,7 +5501,10 @@ mod irc_loop_tests {
 
         let got = tokio::time::timeout(tokio::time::Duration::from_millis(400), async {
             while let Some(ev) = events.recv().await {
-                if let Event::TagMsg { from, target, tags, .. } = ev {
+                if let Event::TagMsg {
+                    from, target, tags, ..
+                } = ev
+                {
                     return Some((from, target, tags));
                 }
             }
@@ -5582,6 +5718,9 @@ mod did_maps_tests {
         // Echo of our own send: peer is the target.
         assert_eq!(dm_key_for(&maps, "me", "me", "bob").as_deref(), Some(BOB));
         // Guest peer stays nick-keyed.
-        assert_eq!(dm_key_for(&maps, "me", "guest9", "me").as_deref(), Some("guest9"));
+        assert_eq!(
+            dm_key_for(&maps, "me", "guest9", "me").as_deref(),
+            Some("guest9")
+        );
     }
 }
