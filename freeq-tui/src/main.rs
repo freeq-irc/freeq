@@ -1732,6 +1732,11 @@ async fn fetch_verdict(url: &str) -> Result<serde_json::Value> {
 /// the ceiling for the case where no answer is coming at all.
 const DM_IDENTIFY_WAIT: Duration = Duration::from_secs(2);
 
+/// Wrap text as a CTCP ACTION — what `/me` puts on the wire.
+fn ctcp_action(text: &str) -> String {
+    format!("\x01ACTION {text}\x01")
+}
+
 /// Send a DM, holding the first one to a peer we cannot yet name.
 ///
 /// A signature over a DM binds the pair of DIDs, so a peer known only by nick
@@ -2136,8 +2141,11 @@ async fn process_input(app: &mut App, handle: &client::ClientHandle, input: &str
                 if !arg.is_empty() {
                     let target = app.active_buffer.clone();
                     if target != "status" {
-                        let action = format!("\x01ACTION {arg}\x01");
-                        handle.privmsg(&target, &action).await?;
+                        // Through the same path as a plain send: an action in
+                        // a DM is a message like any other, and signing it
+                        // needs the peer named just the same.
+                        let action = ctcp_action(arg);
+                        send_dm(app, handle, &target, &action).await?;
                         // echo-message is negotiated; the server echoes our
                         // ACTION back as Event::Message which renders it via
                         // the CTCP branch. No optimistic local push, or we'd
@@ -3271,7 +3279,10 @@ fn try_nick_complete(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::parse_join_prefix;
-    use super::{format_verify_verdict, server_kid_from_public_key, signature_of, verify_api_base};
+    use super::{
+        ctcp_action, format_verify_verdict, server_kid_from_public_key, signature_of,
+        verify_api_base,
+    };
     use std::collections::HashMap;
 
     fn tags(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -3335,6 +3346,24 @@ mod tests {
     /// them — and only one of those is the sender's claim. The kid comparison
     /// cannot separate them, so a relayed message never gets the marker.
     /// `/verify` still answers for it; the server holds the keys we don't.
+    /// An action to an unnamed peer waits for the WHOIS like any other DM,
+    /// and comes out of the wait as the exact bytes it went in as — a CTCP
+    /// action that lost its framing on the way through would render as
+    /// literal text on every client that received it.
+    #[test]
+    fn an_action_held_for_an_unidentified_peer_keeps_its_ctcp_framing() {
+        let body = ctcp_action("waves");
+        assert_eq!(body, "\u{1}ACTION waves\u{1}");
+
+        let mut app = crate::app::App::new("me", false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        app.hold_dm("bob", &body, deadline);
+        assert!(app.ready_dms(std::time::Instant::now(), |_| false).is_empty());
+
+        let ready = app.ready_dms(std::time::Instant::now(), |t| t == "bob");
+        assert_eq!(ready, vec![("bob".to_string(), body)]);
+    }
+
     #[test]
     fn a_relayed_message_never_wears_the_senders_lock() {
         let foreign = tags(&[
