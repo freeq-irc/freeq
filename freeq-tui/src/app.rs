@@ -33,6 +33,12 @@ pub const BATCH_LINE_CAP: usize = 2000;
 /// limit so we tolerate legitimate growth without unbounded memory.
 pub const PINNED_CAP: usize = 64;
 
+/// Cap on the number of messages the reaction ledger tracks per buffer.
+/// Same defence as `PINNED_CAP`: the ledger is filled from wire tags, so a
+/// hostile peer could otherwise react to endless invented msgids. Well above
+/// the buffer's own message cap for any realistic conversation.
+pub const REACTION_CAP: usize = 256;
+
 /// Upper bound on accepted `msgid` length. Server-assigned msgids are
 /// ULIDs (26 chars). The cap leaves headroom for benign experimentation
 /// without letting a hostile peer feed the buffer index a megabyte string.
@@ -190,6 +196,11 @@ pub struct Buffer {
     /// True once we've seen an empty CHATHISTORY batch — no older messages
     /// exist on the server, so we should stop firing requests.
     pub history_exhausted: bool,
+    /// Reactions seen in this buffer: msgid → the (nick, emoji) pairs sitting
+    /// on it. Fed by `+react` TAGMSGs — our own included, since the server
+    /// echoes them back — and cleared by `+freeq.at/unreact`. `/unreact` reads
+    /// it to find the message a reaction of ours is actually on.
+    pub reactions: HashMap<String, Vec<(String, String)>>,
 }
 
 /// In-progress BATCH buffer (e.g., CHATHISTORY).
@@ -263,6 +274,7 @@ impl Buffer {
             pinned: HashSet::new(),
             history_in_flight: false,
             history_exhausted: false,
+            reactions: HashMap::new(),
         }
     }
 
@@ -324,6 +336,54 @@ impl Buffer {
             reply_to: None,
             edit_of: None,
         });
+    }
+
+    /// Record that `nick` reacted to `msgid` with `emoji`. Idempotent: the
+    /// same reaction arriving twice (live, then replayed) adds one entry.
+    pub fn add_reaction(&mut self, msgid: &str, nick: &str, emoji: &str) {
+        if self.reactions.len() >= REACTION_CAP
+            && !self.reactions.contains_key(msgid)
+            && let Some(victim) = self.reactions.keys().next().cloned()
+        {
+            self.reactions.remove(&victim);
+        }
+        let on_message = self.reactions.entry(msgid.to_string()).or_default();
+        if !on_message
+            .iter()
+            .any(|(n, e)| n.eq_ignore_ascii_case(nick) && e == emoji)
+        {
+            on_message.push((nick.to_string(), emoji.to_string()));
+        }
+    }
+
+    /// Drop `nick`'s `emoji` reaction on `msgid`. Returns whether it was
+    /// there — removing one we already removed is a no-op, since our own
+    /// removal comes back to us as an echo after we applied it locally.
+    pub fn remove_reaction(&mut self, msgid: &str, nick: &str, emoji: &str) -> bool {
+        let Some(on_message) = self.reactions.get_mut(msgid) else {
+            return false;
+        };
+        let before = on_message.len();
+        on_message.retain(|(n, e)| !(n.eq_ignore_ascii_case(nick) && e == emoji));
+        let removed = on_message.len() != before;
+        if on_message.is_empty() {
+            self.reactions.remove(msgid);
+        }
+        removed
+    }
+
+    /// The newest message in this buffer carrying `nick`'s `emoji` reaction.
+    /// Recency follows message order, not the order reactions arrived, so
+    /// `/unreact` acts on the last thing you reacted to as you see it.
+    pub fn recent_reacted_msgid(&self, nick: &str, emoji: &str) -> Option<&str> {
+        self.messages.iter().rev().find_map(|line| {
+            let id = line.msgid.as_deref()?;
+            self.reactions
+                .get(id)?
+                .iter()
+                .any(|(n, e)| n.eq_ignore_ascii_case(nick) && e == emoji)
+                .then_some(id)
+        })
     }
 
     /// Find a message by its server-assigned msgid.
@@ -1214,6 +1274,73 @@ mod tests {
     fn recent_msgid_none_on_empty_buffer() {
         let buf = Buffer::new("#test");
         assert!(buf.recent_msgid().is_none());
+    }
+
+    #[test]
+    fn a_reaction_is_remembered_against_the_message_it_sits_on() {
+        let mut buf = Buffer::new("#test");
+        buf.push(line("first", "alice", Some("id1")));
+        buf.push(line("second", "bob", Some("id2")));
+        buf.add_reaction("id1", "me", "👍");
+        buf.add_reaction("id2", "bob", "👍");
+
+        // The newest message I reacted to with this emoji — not the newest
+        // message, and not someone else's reaction.
+        assert_eq!(buf.recent_reacted_msgid("me", "👍"), Some("id1"));
+        assert_eq!(buf.recent_reacted_msgid("me", "🎉"), None);
+        assert_eq!(buf.recent_reacted_msgid("carol", "👍"), None);
+    }
+
+    #[test]
+    fn the_newest_of_several_of_my_reactions_wins() {
+        let mut buf = Buffer::new("#test");
+        buf.push(line("first", "alice", Some("id1")));
+        buf.push(line("second", "bob", Some("id2")));
+        buf.push(line("third", "carol", Some("id3")));
+        buf.add_reaction("id3", "me", "👍");
+        buf.add_reaction("id1", "me", "👍");
+        // Recency is message order, not the order the reactions arrived.
+        assert_eq!(buf.recent_reacted_msgid("me", "👍"), Some("id3"));
+    }
+
+    #[test]
+    fn removing_a_reaction_takes_it_out_of_the_ledger() {
+        let mut buf = Buffer::new("#test");
+        buf.push(line("first", "alice", Some("id1")));
+        buf.add_reaction("id1", "Me", "👍");
+
+        // Nick comparison is case-insensitive, as everywhere else on IRC.
+        assert!(buf.remove_reaction("id1", "me", "👍"));
+        assert_eq!(buf.recent_reacted_msgid("me", "👍"), None);
+        // Removing again is a no-op, not a panic — the echo of our own
+        // removal arrives after we already applied it.
+        assert!(!buf.remove_reaction("id1", "me", "👍"));
+    }
+
+    #[test]
+    fn one_nick_can_hold_several_distinct_reactions() {
+        let mut buf = Buffer::new("#test");
+        buf.push(line("first", "alice", Some("id1")));
+        buf.add_reaction("id1", "me", "👍");
+        buf.add_reaction("id1", "me", "🎉");
+        buf.add_reaction("id1", "me", "👍"); // duplicate: no second copy
+
+        buf.remove_reaction("id1", "me", "👍");
+        assert_eq!(buf.recent_reacted_msgid("me", "👍"), None);
+        assert_eq!(buf.recent_reacted_msgid("me", "🎉"), Some("id1"));
+    }
+
+    #[test]
+    fn the_reaction_ledger_does_not_grow_without_bound() {
+        let mut buf = Buffer::new("#test");
+        for i in 0..REACTION_CAP * 3 {
+            buf.add_reaction(&format!("id{i:05}"), "spammer", "👍");
+        }
+        assert!(
+            buf.reactions.len() <= REACTION_CAP,
+            "a peer flooding reactions must not grow the ledger forever, got {}",
+            buf.reactions.len()
+        );
     }
 
     #[test]

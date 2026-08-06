@@ -1221,9 +1221,18 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                 app.apply_delete(&from, batch_id, &buf_name, deleted_msgid);
                 return;
             }
-            // Handle reactions
-            if let Some(reaction) = freeq_sdk::media::Reaction::from_tags(&tags) {
-                let target_msgid = tags.get("+reply").cloned();
+            // Handle reactions, added and withdrawn. Both keep the buffer's
+            // reaction ledger current — that's what `/unreact` reads to find
+            // which message a reaction of ours is on.
+            let reacted = freeq_sdk::media::Reaction::from_tags(&tags).map(|r| (r.emoji, true));
+            let unreacted = tags
+                .get("+freeq.at/unreact")
+                .map(|emoji| (emoji.clone(), false));
+            if let Some((emoji, added)) = reacted.or(unreacted) {
+                let target_msgid = tags
+                    .get("+reply")
+                    .filter(|v| crate::app::is_valid_msgid(v))
+                    .cloned();
                 let target_preview = target_msgid
                     .as_deref()
                     .and_then(|id| {
@@ -1240,10 +1249,19 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                         }
                     })
                     .unwrap_or_default();
+                if let Some(ref id) = target_msgid {
+                    let buf = app.buffer_mut(&buf_name);
+                    if added {
+                        buf.add_reaction(id, &from, &emoji);
+                    } else {
+                        buf.remove_reaction(id, &from, &emoji);
+                    }
+                }
+                let verb = if added { "reacted" } else { "removed" };
                 app.buffer_mut(&buf_name).push(crate::app::BufferLine {
                     timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
                     from: String::new(),
-                    text: format!("  {} reacted {}{}", from, reaction.emoji, target_preview),
+                    text: format!("  {from} {verb} {emoji}{target_preview}"),
                     is_system: true,
                     image_url: None,
                     msgid: None,
@@ -1771,12 +1789,48 @@ async fn process_input(app: &mut App, handle: &client::ClientHandle, input: &str
                         if target_msgid.is_none() {
                             app.status_msg("No message to react to in this buffer");
                         } else {
+                            let emoji = arg.trim().to_string();
+                            // Record it locally as well as sending it: the
+                            // echo re-adds the same entry idempotently, and
+                            // without this `/unreact` couldn't find its own
+                            // reaction on a server that never echoed.
+                            if let Some(ref id) = target_msgid {
+                                let nick = app.nick.clone();
+                                app.buffer_mut(&target).add_reaction(id, &nick, &emoji);
+                            }
                             let reaction = freeq_sdk::media::Reaction {
-                                emoji: arg.trim().to_string(),
+                                emoji,
                                 msgid: target_msgid,
                             };
                             handle.send_reaction(&target, &reaction).await?;
                             // echo-message will deliver the reaction back to us
+                        }
+                    }
+                }
+            }
+            "/unreact" | "/unr" => {
+                if arg.is_empty() {
+                    app.status_msg("Usage: /unreact <emoji>");
+                } else {
+                    let target = app.active_buffer.clone();
+                    if target != "status" {
+                        let emoji = arg.trim().to_string();
+                        let nick = app.nick.clone();
+                        let target_msgid = app
+                            .buffers
+                            .get(&crate::app::buffer_key(&target))
+                            .and_then(|b| b.recent_reacted_msgid(&nick, &emoji))
+                            .map(|s| s.to_string());
+                        match target_msgid {
+                            None => app.status_msg(&format!(
+                                "No {emoji} reaction of yours in this buffer"
+                            )),
+                            Some(id) => {
+                                // Optimistic — the echoed removal re-applies
+                                // it, which the ledger treats as a no-op.
+                                app.buffer_mut(&target).remove_reaction(&id, &nick, &emoji);
+                                handle.unreact(&target, &emoji, &id).await?;
+                            }
                         }
                     }
                 }
@@ -2189,6 +2243,7 @@ async fn process_input(app: &mut App, handle: &client::ClientHandle, input: &str
                 app.status_msg("  /msgs [N]           List DM conversations (default 50)");
                 app.status_msg("  /me action          Action message (* nick does something)");
                 app.status_msg("  /react emoji        React to most recent message (/r)");
+                app.status_msg("  /unreact emoji      Take back that reaction (/unr)");
                 app.status_msg(
                     "  /reply [id] text    Reply to most recent (or specific) message (/re)",
                 );
