@@ -13,6 +13,14 @@ import { MarkdownMessage } from './MarkdownRenderer';
 import { CoordinationEventCard, isCoordinationEvent } from './CoordinationCards';
 import { jumbomojiSize } from '../lib/jumbomoji';
 import { buildTranscript } from '../lib/transcript';
+import {
+  verifySignature,
+  cachedVerdict,
+  badgeTone,
+  badgeTitle,
+  VERIFY_LABELS,
+  type VerifyOutcome,
+} from '../lib/verify-signature';
 
 // ── Colors ──
 
@@ -823,7 +831,20 @@ function GroupedMessageImpl({ msg, channel, onNickClick }: MessageProps) {
         <Reactions msg={msg} channel={channel} />
       </div>
 
-      <div className="opacity-0 group-hover:opacity-100 absolute right-3 -top-3 flex items-center bg-bg-secondary border border-border rounded-lg shadow-lg overflow-hidden">
+      {/* A follow-up row carries the same evidence as the row that opened the
+          group — being the second thing someone said is not a reason to stop
+          saying whether it was signed. The markers get a fixed column so a
+          line that has them doesn't sit differently from one that doesn't. */}
+      <span className="w-10 shrink-0 flex items-start justify-end gap-1 leading-[24px]">
+        {msg.encrypted && <EncryptedBadge />}
+        {msg.tags?.['+freeq.at/sig'] && !msg.tags?.['+freeq.at/origin'] && (
+          <SignedBadge msgid={msg.id} />
+        )}
+      </span>
+
+      {/* Clear of the marker column, so hovering a row never hides what it
+          says about itself. */}
+      <div className="opacity-0 group-hover:opacity-100 absolute right-14 -top-3 flex items-center bg-bg-secondary border border-border rounded-lg shadow-lg overflow-hidden">
         <HoverBtn emoji="↩️" title="Reply" onClick={() => {
           useStore.getState().setReplyTo({ msgId: msg.id, from: msg.from, text: msg.text, channel });
         }} />
@@ -899,60 +920,12 @@ function ViaBadge({ origin }: { origin: string }) {
   );
 }
 
-/** Result of checking a signature against GET /api/v1/verify/{msgid}.
- *
- *  Four outcomes, because "we couldn't check this" and "this doesn't check
- *  out" are different facts and only one of them is an accusation:
- *  `unverifiable` covers a signature from before the current canonical, or one
- *  made with a key the server no longer holds; `invalid` means the key the
- *  signature names was found and the signature does not match. */
-type VerifyOutcome = 'device' | 'server' | 'unverifiable' | 'invalid';
-
-// Cache checked results per msgid so re-opening the popover (or the same
-// badge in another render) doesn't re-fetch. Definitive server answers are
-// cached; network errors are not, so a transient failure can be retried.
-const verifyCache = new Map<string, VerifyOutcome>();
-
-async function verifySignature(msgid: string): Promise<VerifyOutcome> {
-  const cached = verifyCache.get(msgid);
-  if (cached) return cached;
-  try {
-    const r = await fetch(`/api/v1/verify/${encodeURIComponent(msgid)}`);
-    if (!r.ok) return 'unverifiable';
-    const j = await r.json();
-    const v = j?.verification;
-    // `verdict` is the server's three-way answer; fall back to the older
-    // boolean for a server that predates it.
-    const verdict: string = v?.verdict ?? (v?.valid ? 'valid' : 'unverifiable');
-    let outcome: VerifyOutcome;
-    if (verdict === 'valid') {
-      outcome = v.verified_by === 'client-session-key' ? 'device' : 'server';
-    } else if (verdict === 'invalid') {
-      outcome = 'invalid';
-    } else {
-      outcome = 'unverifiable';
-    }
-    verifyCache.set(msgid, outcome);
-    return outcome;
-  } catch {
-    // A network failure says nothing about the signature.
-    return 'unverifiable';
-  }
-}
-
-const VERIFY_LABELS: Record<VerifyOutcome, { text: string; tone: string }> = {
-  device: { text: 'Verified — signed on the sender’s device', tone: 'text-success' },
-  server: { text: 'Verified — signed by the server on the sender’s behalf', tone: 'text-success' },
-  unverifiable: { text: 'Could not be checked here — not a claim either way', tone: 'text-warning' },
-  invalid: { text: 'Does not match its signing key — treat with suspicion', tone: 'text-danger' },
-};
-
 /** Signed message badge — message carries a cryptographic signature.
  *  Clicking it checks the signature against the server's verify endpoint
  *  and shows the actual result, instead of asserting validity unchecked. */
 function SignedBadge({ msgid }: { msgid: string }) {
   const [showInfo, setShowInfo] = useState(false);
-  const [outcome, setOutcome] = useState<VerifyOutcome | null>(() => verifyCache.get(msgid) ?? null);
+  const [outcome, setOutcome] = useState<VerifyOutcome | null>(() => cachedVerdict(msgid) ?? null);
   const [checking, setChecking] = useState(false);
 
   const toggle = () => {
@@ -967,9 +940,9 @@ function SignedBadge({ msgid }: { msgid: string }) {
   return (
     <span className="relative inline-block">
       <button
-        className="text-success text-xs opacity-60 hover:opacity-100 transition-opacity"
+        className={`text-xs opacity-60 hover:opacity-100 transition-opacity ${badgeTone(outcome)}`}
         onClick={(e) => { e.stopPropagation(); toggle(); }}
-        title="Signed message — click to verify"
+        title={badgeTitle(outcome)}
       >
         <svg className="w-3 h-3 inline -mt-0.5" viewBox="0 0 16 16" fill="currentColor">
           <path d="M8 1a2 2 0 00-2 2v3H5a2 2 0 00-2 2v5a2 2 0 002 2h6a2 2 0 002-2V8a2 2 0 00-2-2H10V3a2 2 0 00-2-2zm0 1.5a.5.5 0 01.5.5v3h-1V3a.5.5 0 01.5-.5z"/>
@@ -978,7 +951,7 @@ function SignedBadge({ msgid }: { msgid: string }) {
       {showInfo && (
         <div className="absolute bottom-full left-0 mb-1 w-64 bg-bg-secondary border border-border rounded-lg shadow-xl p-3 z-50 animate-fadeIn"
              onClick={(e) => e.stopPropagation()}>
-          <div className="text-xs font-semibold text-success mb-1 flex items-center gap-1">
+          <div className={`text-xs font-semibold mb-1 flex items-center gap-1 ${badgeTone(outcome)}`}>
             <svg className="w-3 h-3" viewBox="0 0 16 16" fill="currentColor">
               <path d="M8 1a2 2 0 00-2 2v3H5a2 2 0 00-2 2v5a2 2 0 002 2h6a2 2 0 002-2V8a2 2 0 00-2-2H10V3a2 2 0 00-2-2zm0 1.5a.5.5 0 01.5.5v3h-1V3a.5.5 0 01.5-.5z"/>
             </svg>
