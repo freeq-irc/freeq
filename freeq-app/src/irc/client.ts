@@ -11,6 +11,7 @@ import { notify } from '../lib/notifications';
 import { prefetchProfiles } from '@freeq/sdk';
 import { shouldRejoinCall, AV_REJOIN_WINDOW_MS, type PendingCallRejoin } from '../lib/av-mesh';
 import { fetchFavorites, pushFavorites, mergeFavorites, favoritesEqual } from '../lib/favorites-sync';
+import { createDmSendGate, dmThreadKey } from './dm-resolve';
 
 // Roaming-favorites state (module scope so it survives reconnects).
 let favoritesSynced = false;
@@ -55,6 +56,41 @@ async function syncFavorites(c: FreeqClient): Promise<void> {
 // ── Singleton SDK client ──
 
 let client: FreeqClient | null = null;
+
+/**
+ * How long a first DM waits to learn its peer. Long enough for a WHOIS
+ * round-trip, short enough that a typed message never feels stuck.
+ */
+const DM_PEER_WHOIS_TIMEOUT_MS = 2000;
+
+/** Rebuilt per connection: what a peer resolved to dies with the session. */
+let dmSendGate: ((target: string, send: () => void) => void) | null = null;
+
+/** Send to a DM peer, waiting once for a stranger's identity. */
+function sendToPeer(target: string, send: () => void): void {
+  if (dmSendGate) dmSendGate(target, send);
+  else send();
+}
+
+/**
+ * Make sure the conversation is filed where the SDK will address and echo it.
+ * Learning a peer's DID moves the thread, so a buffer opened under the bare
+ * nick has to follow, or the message the user just sent lands in a thread
+ * they aren't looking at.
+ */
+function ensureDmThread(target: string): void {
+  if (target.startsWith('#') || target.startsWith('&')) return;
+  const store = useStore.getState();
+  const key = dmThreadKey(target, (nick) => client?.getDidForNick(nick));
+  if (!store.channels.has(key.toLowerCase())) store.addChannel(key);
+  if (key === target) return;
+  if (store.activeChannel.toLowerCase() !== target.toLowerCase()) return;
+  store.setActiveChannel(key);
+  // Don't leave an empty twin of the same conversation behind.
+  if (!store.channels.get(target.toLowerCase())?.messages.length) {
+    store.removeChannel(target);
+  }
+}
 
 const SAVED_CHANNELS_KEY = 'freeq-joined-channels';
 
@@ -145,6 +181,15 @@ export function connect(url: string, desiredNick: string, channels?: string[]) {
     return undefined;
   };
 
+  // A DM to someone we share no channel with reaches the SDK as a bare nick,
+  // which it will not sign — no venue a verifier could rebuild. One WHOIS
+  // before the first message turns that into an addressed, signed DM.
+  const sdk = client;
+  dmSendGate = createDmSendGate({
+    didForNick: (nick) => sdk.getDidForNick(nick),
+    requestWhois: (nick) => sdk.requestWhois(nick, { timeoutMs: DM_PEER_WHOIS_TIMEOUT_MS }),
+  });
+
   wireEvents(client);
   client.connect();
 
@@ -159,6 +204,7 @@ export function connect(url: string, desiredNick: string, channels?: string[]) {
 export function disconnect() {
   client?.disconnect();
   client = null;
+  dmSendGate = null;
   saslState = { token: '', did: '', pdsUrl: '', method: '', skipBrokerRefresh: false };
   // Clear persistent-login material so ConnectScreen doesn't immediately
   // re-auth the user via broker session refresh after a deliberate logout.
@@ -203,50 +249,41 @@ export function setSaslCredentials(token: string, did: string, pdsUrl: string, m
 }
 
 export function sendMessage(target: string, text: string, multiline = false) {
-  client?.sendMessage(target, text, multiline);
-  // Ensure DM buffer exists
-  const isChannel = target.startsWith('#') || target.startsWith('&');
-  if (!isChannel) {
-    const store = useStore.getState();
-    if (!store.channels.has(target.toLowerCase())) {
-      store.addChannel(target);
-    }
-  }
+  sendToPeer(target, () => {
+    client?.sendMessage(target, text, multiline);
+    ensureDmThread(target);
+  });
 }
 
 export function sendReply(target: string, replyToMsgId: string, text: string, multiline = false) {
-  client?.sendReply(target, replyToMsgId, text, multiline);
-  const isChannel = target.startsWith('#') || target.startsWith('&');
-  if (!isChannel) {
-    const store = useStore.getState();
-    if (!store.channels.has(target.toLowerCase())) {
-      store.addChannel(target);
-    }
-  }
+  sendToPeer(target, () => {
+    client?.sendReply(target, replyToMsgId, text, multiline);
+    ensureDmThread(target);
+  });
 }
 
 export function sendEdit(target: string, originalMsgId: string, newText: string, multiline = false) {
-  client?.sendEdit(target, originalMsgId, newText, multiline);
+  sendToPeer(target, () => client?.sendEdit(target, originalMsgId, newText, multiline));
 }
 
 export function sendMarkdown(target: string, text: string) {
-  client?.sendMarkdown(target, text);
+  sendToPeer(target, () => client?.sendMarkdown(target, text));
 }
 
 export function sendAction(target: string, text: string) {
-  client?.sendAction(target, text);
+  sendToPeer(target, () => client?.sendAction(target, text));
 }
 
 export function sendDelete(target: string, msgId: string) {
-  client?.sendDelete(target, msgId);
+  sendToPeer(target, () => client?.sendDelete(target, msgId));
 }
 
 export function sendReaction(target: string, emoji: string, msgId?: string) {
-  client?.sendReaction(target, emoji, msgId);
+  sendToPeer(target, () => client?.sendReaction(target, emoji, msgId));
 }
 
 export function sendUnreact(target: string, emoji: string, msgId: string) {
-  client?.sendUnreact(target, emoji, msgId);
+  sendToPeer(target, () => client?.sendUnreact(target, emoji, msgId));
 }
 
 export function joinChannel(channel: string) {
