@@ -13,7 +13,11 @@ use crate::app::{IMAGE_ROWS, ImageState};
 /// Message markers. Each occupies a fixed column in the prefix gutter whether
 /// or not the message has it, so nicks stay aligned down the buffer.
 pub(crate) const PIN_MARKER: &str = "📌 ";
-pub(crate) const SIGNED_MARKER: &str = "🔒 ";
+/// Deliberately not an emoji padlock: terminals draw emoji in the font's own
+/// colours and ignore the style we set, so an emoji marker cannot be made
+/// quiet. This one takes the dim grey it is given, which is the whole point —
+/// it marks a property of the line, it is not an announcement about it.
+pub(crate) const SIGNED_MARKER: &str = "• ";
 
 /// The empty form of a marker: the same number of terminal columns, drawn as
 /// spaces. Emoji are two columns wide, so this is not the marker's char count.
@@ -449,7 +453,7 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
                 // traffic gets no marker — the badge claims only what the wire
                 // proved — but it still gets the column.
                 first_prefix_spans.push(match msg.is_signed {
-                    true => Span::styled(SIGNED_MARKER, Style::default().fg(Color::Green)),
+                    true => Span::styled(SIGNED_MARKER, Style::default().fg(Color::DarkGray)),
                     false => Span::raw(blank_marker(SIGNED_MARKER)),
                 });
                 first_prefix_spans.push(Span::styled(
@@ -819,22 +823,33 @@ mod tests {
 
     /// A marker and its absence occupy the same terminal columns, so a column
     /// of alternating signed and unsigned messages reads down a straight edge
-    /// instead of shifting sideways line to line. Emoji are two columns wide,
-    /// which is why this is measured and not assumed.
+    /// instead of shifting sideways line to line. An emoji is two columns wide
+    /// and one character, which is why this is measured and not assumed.
     #[test]
     fn a_marker_and_its_blank_are_the_same_width() {
         for marker in [SIGNED_MARKER, PIN_MARKER] {
-            let marked = Span::raw(marker).width();
-            let blank = Span::raw(blank_marker(marker)).width();
+            let blank = blank_marker(marker);
             assert_eq!(
-                marked, blank,
-                "{marker:?} is {marked} columns but its blank is {blank}"
+                Span::raw(marker).width(),
+                Span::raw(&blank).width(),
+                "{marker:?} and its blank must occupy the same columns"
             );
             assert!(
-                marked > marker.chars().count() - 1,
-                "sanity: {marker:?} is wider than one column"
+                blank.chars().all(|c| c == ' '),
+                "a blank marker is spaces, got {blank:?}"
             );
         }
+    }
+
+    /// The signature marker has to be styleable, which rules out an emoji:
+    /// terminals draw those in the font's own colours and ignore the style,
+    /// so an emoji marker is stuck at whatever loudness the font chose.
+    #[test]
+    fn the_signature_marker_is_not_an_emoji() {
+        assert!(
+            SIGNED_MARKER.chars().all(|c| (c as u32) < 0x1F000),
+            "{SIGNED_MARKER:?} is in an emoji block — its colour would be ignored"
+        );
     }
 
     /// Two messages from the same nick, one signed and one not, put their
