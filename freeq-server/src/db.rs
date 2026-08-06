@@ -219,6 +219,12 @@ pub struct MutationEvent<'a> {
     pub actor_did: Option<&'a str>,
     /// The signature, verbatim — the sender's own, or this server vouching.
     pub signature: Option<&'a str>,
+    /// The venue the signature covers, as ingress worked it out. A DM's is the
+    /// sorted DID pair, which the wire target never spells: the target is a
+    /// nick or a `did:` depending on who addressed whom. `None` when the caller
+    /// has no venue to offer (a guest, an unresolvable recipient), and the
+    /// channel the change lands in is then the best the row can say.
+    pub venue: Option<&'a str>,
     pub ctx: crate::events::EventContext,
     pub timestamp: u64,
 }
@@ -1625,8 +1631,14 @@ impl Db {
 
     /// File the event a mutation is.
     ///
-    /// The venue comes from the channel the derived change lands in, and the
-    /// subject is resolved to the root — the identity the message keeps for
+    /// The venue is the one the signature covers, which the caller carries down
+    /// from ingress; the channel the derived change lands in stands in when
+    /// there is none. Those two agree for a channel and differ for a DM, whose
+    /// venue is the sorted DID pair while the change lands under a wire target
+    /// that may be a nick — and a canonical built from the target is not the
+    /// bytes the stored signature covers, so the act reads as forged.
+    ///
+    /// The subject is resolved to the root — the identity the message keeps for
     /// life — so a mutation naming any revision files against the same one
     /// the message is known by everywhere else.
     fn file_mutation_event(
@@ -1638,12 +1650,16 @@ impl Db {
         ev: &MutationEvent<'_>,
     ) -> SqlResult<()> {
         let subject = self.root_of(subject);
+        let venue = match ev.venue {
+            Some(venue) => venue.to_string(),
+            None => crate::events::venue_of(channel),
+        };
         // A document only where one exists. The canonical column holds bytes
         // a signature covers, so an act nothing signed gets none — and its
         // facts, which happened either way, are stated instead.
         let canonical = match (ev.actor_did, ev.signature) {
             (Some(did), Some(_)) => Some(crate::events::mutation_canonical(
-                kind, did, ev.event_id, channel, &subject, emoji,
+                kind, did, ev.event_id, &venue, &subject, emoji,
             )),
             _ => None,
         };
@@ -1661,7 +1677,7 @@ impl Db {
                 shape: EventShape::Bare(crate::events::EventFacts {
                     event_id: ev.event_id.to_string(),
                     kind: kind.as_str().to_string(),
-                    venue: crate::events::venue_of(channel),
+                    venue,
                     actor_did: ev.actor_did.map(str::to_string),
                     subject: Some(subject.clone()),
                     body_hash: None,

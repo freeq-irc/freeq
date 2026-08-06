@@ -178,6 +178,9 @@ fn mutation(event_id: &str, did: Option<&str>, ts: u64) -> freeq_server::db::Mut
         // A guest has nothing to sign with, which is exactly the case the
         // rebuild has to survive.
         signature: did.map(|_| "ed25519:testkid:testsig"),
+        // The channel these acts land in is their venue, so the write path's
+        // own fallback is the right answer here.
+        venue: None,
         ctx: freeq_server::events::EventContext::verified(),
         timestamp: ts,
     }

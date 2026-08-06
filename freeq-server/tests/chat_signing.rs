@@ -730,8 +730,29 @@ fn signed_mutation_tags(
     event_id: &str,
     signing: &SigningKey,
 ) -> String {
-    let venue = channel_venue(channel);
-    let mut doc = ChatDoc::mutation(kind, DID_ALICE, event_id, &venue, subject);
+    signed_mutation_tags_in(
+        kind,
+        subject_tag,
+        subject,
+        emoji,
+        &channel_venue(channel),
+        event_id,
+        signing,
+    )
+}
+
+/// [`signed_mutation_tags`] for a venue the caller names, because a DM's venue
+/// is the sorted DID pair — a string no wire target spells.
+fn signed_mutation_tags_in(
+    kind: freeq_sdk::chatsig::Mutation,
+    subject_tag: &str,
+    subject: &str,
+    emoji: Option<&str>,
+    venue: &str,
+    event_id: &str,
+    signing: &SigningKey,
+) -> String {
+    let mut doc = ChatDoc::mutation(kind, DID_ALICE, event_id, venue, subject);
     if let Some(emoji) = emoji {
         doc = doc.with_emoji(emoji);
     }
@@ -1480,6 +1501,10 @@ async fn the_verify_endpoint_answers_for_a_mutation_event() {
     assert_eq!(v["actor_did"], DID_ALICE);
     assert_eq!(v["subject"], msgid.as_str());
     assert_eq!(v["emoji"], "👍");
+    assert_eq!(
+        v["channel"], "#evverify",
+        "a channel mutation files under the folded channel, unchanged: {v}"
+    );
     assert_eq!(v["verification"]["verdict"], "valid");
     assert_eq!(
         v["verification"]["verified_by"], "client-session-key",
@@ -1494,4 +1519,105 @@ async fn the_verify_endpoint_answers_for_a_mutation_event() {
     .await
     .unwrap();
     assert_eq!(missing.status(), 404);
+}
+
+// ── The venue a DM mutation is filed under ──────────────────────────
+//
+// A DM's venue is the sorted DID pair, never the wire target: that target is a
+// nick or a `did:` depending on who addressed whom, so it is not a string a
+// verifier can reproduce. Filing the event under the wire target stores a
+// canonical that is not the bytes the stored signature covers — and the verify
+// endpoint then calls an honest act forged, which is the one answer the
+// three-state verdict exists to prevent.
+
+#[tokio::test]
+async fn a_signed_dm_mutation_is_filed_under_the_venue_its_signature_covers() {
+    use freeq_sdk::chatsig::{Mutation, dm_venue};
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let db_path = tmp.path().to_str().unwrap().to_string();
+    std::mem::forget(tmp);
+    let config = freeq_server::config::ServerConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        web_addr: Some("127.0.0.1:0".to_string()),
+        server_name: "test-sig-dm".to_string(),
+        challenge_timeout_secs: 60,
+        db_path: Some(db_path),
+        ..Default::default()
+    };
+    let (irc_addr, web_addr, _h) = freeq_server::server::Server::with_resolver(
+        config,
+        resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)]),
+    )
+    .start_with_web()
+    .await
+    .unwrap();
+
+    let venue = dm_venue(DID_ALICE, did_bob);
+    let signed_venue = venue.clone();
+    let filed = tokio::task::spawn_blocking(move || {
+        let mut bob = C::authenticated(irc_addr, "bob", did_bob, kb);
+        let mut alice = C::authenticated(irc_addr, "alice", DID_ALICE, ka);
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
+
+        let msgid = freeq_server::msgid::generate();
+        alice.send_with_id(&msgid, "bob", "act on me");
+        bob.rx(|l| l.contains("act on me"), "the DM to act on");
+
+        // Addressed to the nick, signed over the pair. The delete goes last so
+        // the react and its removal act on a message that is still there.
+        let mut filed = Vec::new();
+        for (kind, name, tag, emoji) in [
+            (Mutation::React, "react", "+react", Some("👍")),
+            (Mutation::Unreact, "unreact", "+freeq.at/unreact", Some("👍")),
+            (Mutation::Delete, "delete", "+draft/delete", None),
+        ] {
+            let event_id = freeq_server::msgid::generate();
+            let tags = signed_mutation_tags_in(
+                kind,
+                tag,
+                &msgid,
+                emoji,
+                &signed_venue,
+                &event_id,
+                &signing,
+            );
+            alice.tx(&format!("@{tags} TAGMSG bob"));
+            bob.rx(|l| l.contains(tag), name);
+            filed.push((name, event_id));
+        }
+        filed
+    })
+    .await
+    .unwrap();
+
+    // The broadcast races the row by a hair; give the writes a beat.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    for (name, event_id) in filed {
+        let v: serde_json::Value =
+            reqwest::get(format!("http://{web_addr}/api/v1/verify/{event_id}"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(v["kind"], name, "the filed act, by name: {v}");
+        assert_eq!(v["actor_did"], DID_ALICE);
+        assert_eq!(
+            v["channel"], venue,
+            "a {name} files under the venue its signature covers, not the nick \
+             it was addressed to: {v}"
+        );
+        assert_eq!(
+            v["verification"]["verdict"], "valid",
+            "an honest {name} must not read as forged: {v}"
+        );
+        assert_eq!(
+            v["verification"]["verified_by"], "client-session-key",
+            "signed on the actor's device, not vouched by the server: {v}"
+        );
+    }
 }

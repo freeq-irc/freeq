@@ -234,17 +234,20 @@ pub fn message_canonical(
 }
 
 /// Rebuild the document a mutation's signature covers.
+///
+/// The venue arrives resolved: a mutation's is not derivable from the row it
+/// lands on, because a DM's venue is the sorted DID pair while the change is
+/// filed under a wire target that may be a nick.
 pub fn mutation_canonical(
     kind: freeq_sdk::chatsig::Mutation,
     actor_did: &str,
     event_id: &str,
-    channel: &str,
+    venue: &str,
     subject: &str,
     emoji: Option<&str>,
 ) -> String {
-    let venue = venue_of(channel);
     let mut doc =
-        freeq_sdk::chatsig::ChatDoc::mutation(kind, actor_did, event_id, &venue, subject);
+        freeq_sdk::chatsig::ChatDoc::mutation(kind, actor_did, event_id, venue, subject);
     if let Some(emoji) = emoji {
         doc = doc.with_emoji(emoji);
     }

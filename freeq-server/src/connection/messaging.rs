@@ -824,11 +824,14 @@ fn vouch_mutation(
 /// would be a record of some of what happened.
 ///
 /// The id is the vouched one where there is a vouch, so the event the server
-/// stands behind and the event on file are the same event.
+/// stands behind and the event on file are the same event. The venue travels
+/// with it for the same reason: the row must be filed under the bytes the
+/// signature covers, and for a DM the wire target is not those bytes.
 fn mutation_event<'a>(
     vouched: Option<&'a VouchedMutation>,
     minted: &'a str,
     actor_did: Option<&'a str>,
+    venue: Option<&'a str>,
     ctx: &crate::events::EventContext,
     timestamp: u64,
 ) -> crate::db::MutationEvent<'a> {
@@ -836,6 +839,7 @@ fn mutation_event<'a>(
         event_id: vouched.map_or(minted, |v| v.event_id.as_str()),
         actor_did,
         signature: vouched.and_then(|v| v.signature.as_deref()),
+        venue,
         ctx: ctx.clone(),
         timestamp,
     }
@@ -1134,6 +1138,16 @@ pub(super) fn handle_tagmsg(
         return; // AV control tags are consumed server-side; don't relay
     }
 
+    // The venue the mutation's signature covers, worked out exactly as ingress
+    // worked it out when it checked that signature — so the bytes on file and
+    // the bytes verified are the same bytes. A DM's is the sorted DID pair; the
+    // wire target it was addressed to is a nick or a `did:` and reproduces for
+    // nobody.
+    let signed_venue = conn
+        .authenticated_did
+        .as_deref()
+        .and_then(|did| signing_venue(state, did, target));
+
     // ── Persist reactions (+react with +reply) ──
     if let (Some(emoji), Some(target_msgid)) = (tags.get("+react"), tags.get("+reply")) {
         let nick = conn.nick_or_star().to_string();
@@ -1146,7 +1160,14 @@ pub(super) fn handle_tagmsg(
         let emoji = emoji.clone();
         let target_msgid = target_msgid.clone();
         let minted = crate::msgid::generate();
-        let ev = mutation_event(vouched.as_ref(), &minted, did.as_deref(), &event_ctx, ts);
+        let ev = mutation_event(
+            vouched.as_ref(),
+            &minted,
+            did.as_deref(),
+            signed_venue.as_deref(),
+            &event_ctx,
+            ts,
+        );
         state.with_db(|db| {
             db.store_reaction_by(
                 &target_msgid,
@@ -1176,7 +1197,14 @@ pub(super) fn handle_tagmsg(
             .as_secs();
         // The reaction row goes; the signed event that removed it stays.
         let minted = crate::msgid::generate();
-        let ev = mutation_event(vouched.as_ref(), &minted, did.as_deref(), &event_ctx, ts);
+        let ev = mutation_event(
+            vouched.as_ref(),
+            &minted,
+            did.as_deref(),
+            signed_venue.as_deref(),
+            &event_ctx,
+            ts,
+        );
         state.with_db(|db| {
             db.remove_reaction_by(&target_msgid, &nick, did.as_deref(), &emoji, Some(&ev))
         });
@@ -3470,7 +3498,19 @@ fn handle_delete(
             .as_secs();
         let did = conn.authenticated_did.clone();
         let minted = crate::msgid::generate();
-        let ev = mutation_event(vouched, &minted, did.as_deref(), event_ctx, ts);
+        // The venue the signature covers, not the key the row lives under —
+        // they agree for a channel and differ for a DM addressed to a nick.
+        let signed_venue = did
+            .as_deref()
+            .and_then(|did| signing_venue(state, did, target));
+        let ev = mutation_event(
+            vouched,
+            &minted,
+            did.as_deref(),
+            signed_venue.as_deref(),
+            event_ctx,
+            ts,
+        );
         state.with_db(|db| db.soft_delete_message_by(&storage_key, original_msgid, Some(&ev)));
     }
 
