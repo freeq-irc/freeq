@@ -6843,6 +6843,69 @@ mod s2s_adversarial_tests {
         );
     }
 
+    /// A DM mutation that crossed the hop verifies here against the venue its
+    /// signature covers.
+    ///
+    /// The venue is the sorted DID pair, and the receiving server rebuilds it
+    /// from the wire target — which is a nick or a `did:` depending on how the
+    /// sender addressed it, and neither of which is itself a venue. So the
+    /// document is only reproducible here when the recipient resolves; the
+    /// three cases below are the three answers that can come back, and the
+    /// third is the one that matters: an unresolvable recipient makes the act
+    /// *uncheckable*, never forged.
+    #[tokio::test]
+    async fn a_relayed_dm_mutation_verifies_against_the_pair_not_the_wire_target() {
+        let state = test_state_with_db();
+        let key = signer_on_file(&state, SIGNER);
+        let recipient = "did:plc:relayedrecipient";
+        let sig = freeq_sdk::chatsig::ChatDoc::mutation(
+            freeq_sdk::chatsig::Mutation::React,
+            SIGNER,
+            "01DMMUTATION",
+            &freeq_sdk::chatsig::dm_venue(SIGNER, recipient),
+            "01SUBJECTMSGID",
+        )
+        .with_emoji("👍")
+        .sign(&key);
+        let tags = HashMap::from([
+            ("+react".to_string(), "👍".to_string()),
+            ("+reply".to_string(), "01SUBJECTMSGID".to_string()),
+            (
+                freeq_sdk::chatsig::EVENT_ID_TAG.to_string(),
+                "01DMMUTATION".to_string(),
+            ),
+            ("+freeq.at/sig".to_string(), sig),
+        ]);
+
+        // Addressed to the recipient's DID: the pair is on the wire already.
+        assert_eq!(
+            verify_relayed_mutation_tags(&state, Some(SIGNER), recipient, &tags),
+            Some(ClientSigOutcome::Verified),
+        );
+
+        // Addressed to a nick this server can resolve to that same DID — the
+        // signer signed the pair either way, and so must the rebuild.
+        state
+            .nick_owners
+            .lock()
+            .insert("recipient".to_string(), recipient.to_string());
+        assert_eq!(
+            verify_relayed_mutation_tags(&state, Some(SIGNER), "recipient", &tags),
+            Some(ClientSigOutcome::Verified),
+            "a nick and a DID name one conversation, and one venue",
+        );
+
+        // A nick nobody here knows: no venue can be rebuilt, so there is
+        // nothing to have checked. Honest, and never an accusation.
+        assert!(
+            matches!(
+                verify_relayed_mutation_tags(&state, Some(SIGNER), "astranger", &tags),
+                Some(ClientSigOutcome::Unverifiable(_))
+            ),
+            "an unresolvable recipient is uncheckable, not forged",
+        );
+    }
+
     /// A TAGMSG that is not a mutation (a typing notification) is not a signed
     /// event and gets no verdict.
     #[tokio::test]
