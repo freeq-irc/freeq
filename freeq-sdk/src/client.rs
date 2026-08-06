@@ -729,6 +729,19 @@ impl ClientHandle {
         self.send_tagmsg(target, tags).await
     }
 
+    /// Remove a reaction emoji you previously added to a message.
+    ///
+    /// The mirror of [`react`](Self::react): same target, same emoji, same
+    /// message. The removal is a mutation like any other — it is signed and
+    /// filed under an event id of its own, so history records who withdrew
+    /// the reaction rather than silently losing that it was ever there.
+    pub async fn unreact(&self, target: &str, emoji: &str, msgid: &str) -> Result<()> {
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("+freeq.at/unreact".to_string(), emoji.to_string());
+        tags.insert("+reply".to_string(), msgid.to_string());
+        self.send_tagmsg(target, tags).await
+    }
+
     /// Edit a previously sent message.
     pub async fn edit_message(
         &self,
@@ -3679,6 +3692,95 @@ mod multiline_tests {
             }
             other => panic!("expected Privmsg, got {other:?}"),
         }
+    }
+
+    /// Removing a reaction travels the same signed path as adding one: the
+    /// handle emits the tag shape the mutation signer already recognizes, so
+    /// against a server that negotiated the cap the TAGMSG carries the event
+    /// id and the signature over the removal — and against one that didn't,
+    /// exactly the tags a legacy client would send.
+    #[tokio::test]
+    async fn unreact_is_signed_when_the_server_verifies_documents() {
+        use ed25519_dalek::SigningKey;
+
+        let root = "01ROOTMSGID0000000000000EE";
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let did = "did:plc:unreactor";
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let handle = ClientHandle {
+            cmd_tx,
+            echo_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            caps_acked: Arc::new(parking_lot::Mutex::new(CapsState::default())),
+            did_maps: Arc::new(parking_lot::Mutex::new(DidMapsState::default())),
+        };
+
+        // Signed against a verifying server, and the signature is over the
+        // Unreact document a receiver rebuilds from this very line.
+        handle.unreact("#room", "👍", root).await.unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(
+            &mut buf,
+            cmd_rx.recv().await.unwrap(),
+            &Some(key.clone()),
+            &Some(did.to_string()),
+            true,
+        )
+        .await
+        .unwrap();
+        let wire = String::from_utf8(buf).unwrap();
+        let sent = crate::irc::Message::parse(wire.trim_end()).expect("parses");
+        assert_eq!(sent.command, "TAGMSG");
+        assert_eq!(sent.params, vec!["#room".to_string()]);
+        assert_eq!(
+            sent.tags.get("+freeq.at/unreact").map(String::as_str),
+            Some("👍"),
+            "the removal names its emoji: {wire}"
+        );
+        assert_eq!(
+            sent.tags.get("+reply").map(String::as_str),
+            Some(root),
+            "and the message it acts on: {wire}"
+        );
+        let event_id = sent
+            .tags
+            .get(crate::chatsig::EVENT_ID_TAG)
+            .unwrap_or_else(|| panic!("event id must travel with the signature: {wire}"));
+        let sig = sent
+            .tags
+            .get(crate::sigtag::SIG_TAG)
+            .unwrap_or_else(|| panic!("a removal is durable state — sign it: {wire}"));
+        crate::chatsig::ChatDoc::mutation(
+            crate::chatsig::Mutation::Unreact,
+            did,
+            event_id,
+            &crate::chatsig::channel_venue("#room"),
+            root,
+        )
+        .with_emoji("👍")
+        .verify(sig, &key.verifying_key())
+        .expect("the unreact signature verifies over the mutation document");
+
+        // And byte-identical to legacy against a server that never offered
+        // the cap: no id, no signature.
+        handle.unreact("#room", "👍", root).await.unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(
+            &mut buf,
+            cmd_rx.recv().await.unwrap(),
+            &Some(key),
+            &Some(did.to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+        let wire = String::from_utf8(buf).unwrap();
+        let sent = crate::irc::Message::parse(wire.trim_end()).expect("parses");
+        assert!(!sent.tags.contains_key(crate::sigtag::SIG_TAG), "{wire}");
+        assert!(
+            !sent.tags.contains_key(crate::chatsig::EVENT_ID_TAG),
+            "{wire}"
+        );
     }
 
     /// CHATHISTORY replays multi-line messages as a `draft/multiline`
