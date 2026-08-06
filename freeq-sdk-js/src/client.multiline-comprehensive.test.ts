@@ -149,6 +149,20 @@ async function provisionSigningKey(did: string): Promise<CryptoKey> {
   return crypto.subtle.importKey('raw', bytes, 'Ed25519', false, ['verify']);
 }
 
+/** Verify a `+freeq.at/sig` tag value against the canonical it should cover. */
+async function verifyOpenerSig(
+  canonical: string,
+  sigTag: string,
+  key: CryptoKey,
+): Promise<boolean> {
+  const sigB64 = sigTag.split(':')[2]!;
+  const padded = sigB64 + '='.repeat((4 - (sigB64.length % 4)) % 4);
+  const sig = Uint8Array.from(atob(padded.replace(/-/g, '+').replace(/_/g, '/')), (c) =>
+    c.charCodeAt(0),
+  );
+  return crypto.subtle.verify('Ed25519', key, sig, new TextEncoder().encode(canonical));
+}
+
 /** Pick the BATCH opener line out of an array of sent wire frames. */
 function findOpener(sent: string[]): string | undefined {
   return sent.find((l) => l.includes('BATCH +') && l.includes('draft/multiline'));
@@ -219,6 +233,43 @@ describe('comprehensive: sig on BATCH opener', () => {
     await flushAsync();
     for (const chunk of findChunks(ws.sent)) {
       expect(chunk).not.toContain('+freeq.at/sig');
+    }
+  });
+
+  // A reply and an edit are on the wire as opener tags, and a receiver
+  // rebuilding the document reads them from there. The signature has to cover
+  // them, or a multiline reply reads as tampered against the very document any
+  // verifier builds from the frames it received.
+  it('the opener signs the reference it carries', async () => {
+    for (const [tagged, field] of [
+      ['reply', 'reply'],
+      ['edit', 'edit'],
+    ] as const) {
+      const did = 'did:plc:test-signer';
+      const verifyKey = await provisionSigningKey(did);
+      const { client, ws } = await makeMultilineClient('alice');
+      const text = 'first\nsecond\nthird';
+      if (tagged === 'reply') client.sendReply('#room', '01ROOTMSGID', text);
+      else client.sendEdit('#room', '01ROOTMSGID', text);
+      await flushAsync();
+
+      const opener = findOpener(ws.sent);
+      expect(opener, `no opener for a multiline ${tagged}`).toBeDefined();
+      const sigTag = opener!.match(/\+freeq\.at\/sig=([^;\s]+)/)?.[1];
+      const eventId = opener!.match(/\+freeq\.at\/eventid=([^;\s]+)/)?.[1];
+      expect(sigTag, `opener: ${opener}`).toBeDefined();
+
+      const canonical = await signing.messageCanonical({
+        from: did,
+        msgid: eventId!,
+        target: signing.channelVenue('#room'),
+        body: text,
+        [field]: '01ROOTMSGID',
+      });
+      expect(
+        await verifyOpenerSig(canonical, sigTag!, verifyKey),
+        `a multiline ${tagged} must sign the document a receiver rebuilds`,
+      ).toBe(true);
     }
   });
 });

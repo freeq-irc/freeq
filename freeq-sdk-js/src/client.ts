@@ -424,16 +424,8 @@ export class FreeqClient extends EventEmitter {
         // text) and reads `+freeq.at/sig` from the opener tags. Per-batch
         // signing keeps each emitted message independently verifiable.
         const body = this.assembleMultiline(group);
-        const signing_ = this.ackedCaps.has(SIGNING_CAP)
-          ? signing.signMessage(wireTarget, body, { tags: extraOpenerTags })
-          : Promise.resolve(null);
-        signing_.then((signed) => {
-          const openerTagsWithSig: Record<string, string> = { ...extraOpenerTags };
-          if (signed) {
-            openerTagsWithSig[signing.EVENT_ID_TAG] = signed.eventId;
-            openerTagsWithSig[signing.SIG_TAG] = signed.sigTag;
-          }
-          this.emitMultilineBatch(wireTarget, group, openerTagsWithSig);
+        this.signatureTags(wireTarget, body, extraOpenerTags).then((sigTags) => {
+          this.emitMultilineBatch(wireTarget, group, { ...extraOpenerTags, ...sigTags });
         });
         this.maybeLocalEcho(bufKey, body, willEncrypt);
       }
@@ -1088,27 +1080,41 @@ export class FreeqClient extends EventEmitter {
     this.raw(format('TAGMSG', [target], wireTags));
   }
 
+  /**
+   * The signature tags for a message document, or an empty set when this send
+   * goes unsigned.
+   *
+   * The signature covers the tags it rides with — the reply or edit reference
+   * and the coordination tags — so they're read from the wire tags here, in
+   * one place: a receiver rebuilds the document from those same tags, and a
+   * reference the sender left out of the document reads as tampering.
+   *
+   * Nothing is signed against a server that never negotiated `SIGNING_CAP`:
+   * it would strip our signature and re-sign the message itself, turning a
+   * non-repudiable claim into its own attestation, and ignore the id we
+   * minted while its tag rides on over federation.
+   */
+  private async signatureTags(
+    target: string,
+    body: string,
+    tags: Record<string, string>,
+  ): Promise<Record<string, string>> {
+    if (!this.ackedCaps.has(SIGNING_CAP)) return {};
+    const signed = await signing.signMessage(target, body, {
+      reply: tags['+reply'] ?? tags['+draft/reply'],
+      edit: tags['+draft/edit'],
+      tags,
+    });
+    // Both tags, always together: the id is what the signature covers, and
+    // the server adopts it as the message's msgid.
+    return signed
+      ? { [signing.EVENT_ID_TAG]: signed.eventId, [signing.SIG_TAG]: signed.sigTag }
+      : {};
+  }
+
   private async signedPrivmsg(target: string, text: string, extraTags?: Record<string, string>): Promise<void> {
     const tags: Record<string, string> = { ...extraTags };
-    // The signature covers the tags it rides with — the reply reference and
-    // the coordination tags — so they're passed in, not added afterwards.
-    // Nothing is signed against a server that never negotiated `SIGNING_CAP`:
-    // it would strip our signature and re-sign the message itself, turning a
-    // non-repudiable claim into its own attestation, and ignore the id we
-    // minted while its tag rides on over federation.
-    const signed = this.ackedCaps.has(SIGNING_CAP)
-      ? await signing.signMessage(target, text, {
-          reply: tags['+reply'] ?? tags['+draft/reply'],
-          edit: tags['+draft/edit'],
-          tags,
-        })
-      : null;
-    if (signed) {
-      // Both tags, always together: the id is what the signature covers, and
-      // the server adopts it as the message's msgid.
-      tags[signing.EVENT_ID_TAG] = signed.eventId;
-      tags[signing.SIG_TAG] = signed.sigTag;
-    }
+    Object.assign(tags, await this.signatureTags(target, text, tags));
     if (Object.keys(tags).length > 0) {
       this.raw(format('PRIVMSG', [target, text], tags));
     } else {
