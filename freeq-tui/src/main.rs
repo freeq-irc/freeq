@@ -4,7 +4,7 @@ mod editor;
 mod ui;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
@@ -749,6 +749,11 @@ async fn run_app(
         if let Some(mut bg_rx) = app.bg_result_rx.take() {
             while let Ok(result) = bg_rx.try_recv() {
                 match result {
+                    crate::app::BgResult::VerifyLines(buf, lines) => {
+                        for line in &lines {
+                            app.buffer_mut(&buf).push_system(line);
+                        }
+                    }
                     crate::app::BgResult::ProfileLines(buf, lines, avatar_url) => {
                         for line in &lines {
                             // Skip the 🖼 avatar-URL line — we render it as inline image below
@@ -1018,6 +1023,7 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                 .get("+reply")
                 .filter(|v| crate::app::is_valid_msgid(v))
                 .cloned();
+            let (is_signed, account) = signature_of(&tags);
             // Join replay collapses an edited message into one row with no
             // `+draft/edit`; the server's `+freeq.at/edited` tag is the only
             // thing that says the text isn't the original.
@@ -1075,6 +1081,8 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                             is_deleted: false,
                             reply_to: reply_to.clone(),
                             edit_of: Some(original_msgid.clone()),
+                            is_signed,
+                            account: account.clone(),
                         },
                     );
                 }
@@ -1104,6 +1112,8 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                             is_deleted: false,
                             reply_to: reply_to.clone(),
                             edit_of: None,
+                            is_signed,
+                            account: account.clone(),
                         },
                     );
                 }
@@ -1135,6 +1145,8 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                         is_deleted: false,
                         reply_to: reply_to.clone(),
                         edit_of: None,
+                        is_signed,
+                        account: account.clone(),
                     },
                 );
             } else {
@@ -1158,6 +1170,8 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                             is_deleted: false,
                             reply_to: reply_to.clone(),
                             edit_of: None,
+                            is_signed,
+                            account: account.clone(),
                         },
                     );
                 } else {
@@ -1177,6 +1191,8 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                             is_deleted: false,
                             reply_to: reply_to.clone(),
                             edit_of: None,
+                            is_signed,
+                            account: account.clone(),
                         },
                     );
 
@@ -1273,6 +1289,8 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                     is_deleted: false,
                     reply_to: None,
                     edit_of: None,
+                    is_signed: false,
+                    account: None,
                 });
             }
         }
@@ -1557,11 +1575,98 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
     }
 }
 
+/// Whether a message carried a client signature, and the account the document
+/// binds it to. An account tag alone proves nothing — the server states it —
+/// so the two travel together; the marker needs both to mean anything.
+fn signature_of(tags: &std::collections::HashMap<String, String>) -> (bool, Option<String>) {
+    (
+        tags.contains_key(freeq_sdk::sigtag::SIG_TAG),
+        tags.get("account").cloned(),
+    )
+}
+
+/// Where the connected server answers HTTP. Anything public is https on the
+/// default port; a loopback server is a local build serving its web API in the
+/// clear on the port it defaults to.
+fn verify_api_base(server_addr: &str) -> String {
+    let host = server_addr.rsplit_once(':').map_or(server_addr, |(h, _)| h);
+    if matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        format!("http://{host}:8080")
+    } else {
+        format!("https://{host}")
+    }
+}
+
+/// Render the server's answer about one event as a line a person can read.
+///
+/// The verdict is three-way, and `verified_by` is the part that matters: a
+/// message the sender's own device signed is a claim they cannot later
+/// disown, while one the server signed is only the server vouching for what
+/// it received. Collapsing those into "valid" would throw away the point of
+/// client signing, so the line always says who vouches.
+fn format_verify_verdict(body: &serde_json::Value) -> String {
+    let Some(verification) = body.get("verification") else {
+        return "Verify: the server returned no verdict for that id".to_string();
+    };
+    let verdict = verification
+        .get("verdict")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let by = verification
+        .get("verified_by")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let vouches = match by {
+        "client-session-key" => "the sender's device signed it",
+        "server-key" => "the server signed it, not the sender",
+        "unsigned" => "nothing was signed",
+        other => other,
+    };
+
+    // A mutation's id resolves to the act. There is no body to show, by
+    // design: the log keeps facts about what was done, never content.
+    if let Some(kind) = body.get("kind").and_then(|v| v.as_str()) {
+        let subject = body
+            .get("subject")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(none)");
+        let emoji = body
+            .get("emoji")
+            .and_then(|v| v.as_str())
+            .map(|e| format!(" {e}"))
+            .unwrap_or_default();
+        let actor = body
+            .get("actor_did")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(unknown)");
+        return format!("Verify: {kind}{emoji} on {subject} by {actor} — {verdict} ({vouches})");
+    }
+
+    let signer = body
+        .get("sender_did")
+        .and_then(|v| v.as_str())
+        .map(|d| format!(" by {d}"))
+        .unwrap_or_default();
+    format!("Verify: {verdict} ({vouches}){signer}")
+}
+
+/// Ask the connected server for its verdict on one event id.
+async fn fetch_verdict(url: &str) -> Result<serde_json::Value> {
+    let resp = reqwest::Client::new()
+        .get(url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        anyhow::bail!("server answered {status}");
+    }
+    Ok(resp.json().await?)
+}
+
 /// How long a first DM waits for the server to name its peer before going out
 /// unsigned. A WHOIS round trip is milliseconds on a live connection; this is
 /// the ceiling for the case where no answer is coming at all.
-use std::time::Instant;
-
 const DM_IDENTIFY_WAIT: Duration = Duration::from_secs(2);
 
 /// Send a DM, holding the first one to a peer we cannot yet name.
@@ -1763,6 +1868,51 @@ async fn process_input(app: &mut App, handle: &client::ClientHandle, input: &str
                             // echo-message returns the new line; the +reply tag
                             // populates reply_to so the indicator renders.
                         }
+                    }
+                }
+            }
+            "/verify" => {
+                // Ask the server what it can prove about one event: a message
+                // id, or the id of a delete or a reaction. The client checks
+                // nothing itself — the point is the server's answer, which
+                // anyone else can fetch and compare.
+                let target = app.active_buffer.clone();
+                let id = if arg.trim().is_empty() {
+                    app.buffers
+                        .get(&crate::app::buffer_key(&target))
+                        .and_then(|b| b.recent_msgid())
+                        .map(|s| s.to_string())
+                } else {
+                    Some(arg.trim().to_string())
+                };
+                match id.filter(|id| crate::app::is_valid_msgid(id)) {
+                    None if !arg.trim().is_empty() => app.status_msg("Not a usable message id"),
+                    None => app.status_msg("No message to verify in this buffer"),
+                    Some(id) => {
+                        let url =
+                            format!("{}/api/v1/verify/{id}", verify_api_base(&app.server_addr));
+                        let claimed = app
+                            .buffers
+                            .get(&crate::app::buffer_key(&target))
+                            .and_then(|b| b.find_by_msgid(&id))
+                            .and_then(|l| l.account.clone());
+                        app.buffer_mut(&target)
+                            .push_system(&format!("Verifying {id}..."));
+                        let buf = target.clone();
+                        let tx = app.bg_result_tx.clone();
+                        tokio::spawn(async move {
+                            let mut lines = match fetch_verdict(&url).await {
+                                Ok(body) => vec![format_verify_verdict(&body)],
+                                Err(e) => vec![format!("Verify failed: {e}")],
+                            };
+                            // The account the line claimed locally against the
+                            // signer the server checked: they should agree, and
+                            // a disagreement is exactly what verifying is for.
+                            if let Some(claimed) = claimed {
+                                lines.push(format!("  this client saw it as {claimed}"));
+                            }
+                            let _ = tx.send(crate::app::BgResult::VerifyLines(buf, lines)).await;
+                        });
                     }
                 }
             }
@@ -2316,6 +2466,9 @@ async fn process_input(app: &mut App, handle: &client::ClientHandle, input: &str
                 app.status_msg("  /pin [id]           Pin most recent (or specific) message");
                 app.status_msg("  /unpin <id>         Unpin a message by msgid");
                 app.status_msg("  /pins               List pinned messages in this channel");
+                app.status_msg(
+                    "  /verify [id]        Ask the server what it can prove about a message",
+                );
                 app.status_msg("  /search text        Search messages in current buffer (/find)");
                 app.status_msg("  /preview url        Fetch and share a link preview");
                 app.status_msg("── Channel moderation ───────────────────");
@@ -3055,6 +3208,104 @@ fn try_nick_complete(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::parse_join_prefix;
+    use super::{format_verify_verdict, signature_of, verify_api_base};
+    use std::collections::HashMap;
+
+    fn tags(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_signed_message_carries_its_signature_and_the_account_it_binds() {
+        let (signed, account) = signature_of(&tags(&[
+            ("+freeq.at/sig", "ed25519:kid:c2ln"),
+            ("account", "did:plc:alice"),
+            ("msgid", "01ABC"),
+        ]));
+        assert!(signed);
+        assert_eq!(account.as_deref(), Some("did:plc:alice"));
+    }
+
+    #[test]
+    fn an_unsigned_message_claims_nothing() {
+        let (signed, account) = signature_of(&tags(&[("account", "did:plc:alice")]));
+        assert!(!signed, "an account tag is not a signature");
+        assert_eq!(account.as_deref(), Some("did:plc:alice"));
+
+        let (signed, account) = signature_of(&tags(&[]));
+        assert!(!signed);
+        assert_eq!(account, None);
+    }
+
+    #[test]
+    fn the_verify_endpoint_lives_on_the_server_we_are_connected_to() {
+        assert_eq!(
+            verify_api_base("irc.zerosum.org:6697"),
+            "https://irc.zerosum.org"
+        );
+        assert_eq!(verify_api_base("irc.freeq.at"), "https://irc.freeq.at");
+        // A local server serves its web API on the port it defaults to,
+        // in the clear — a self-signed https guess would just fail.
+        assert_eq!(verify_api_base("127.0.0.1:6667"), "http://127.0.0.1:8080");
+        assert_eq!(verify_api_base("localhost:6667"), "http://localhost:8080");
+    }
+
+    #[test]
+    fn a_verdict_reads_as_who_vouches_for_the_message() {
+        // The pass condition: the sender's own device signed it.
+        let v = format_verify_verdict(&serde_json::json!({
+            "verification": { "verdict": "valid", "verified_by": "client-session-key" },
+            "sender_did": "did:plc:alice",
+        }));
+        assert!(v.contains("valid"), "{v}");
+        assert!(v.contains("the sender's device"), "{v}");
+
+        // A server-signed message is honest but weaker — the server vouches,
+        // not the sender, and the reader has to be able to tell.
+        let v = format_verify_verdict(&serde_json::json!({
+            "verification": { "verdict": "valid", "verified_by": "server-key" },
+        }));
+        assert!(v.contains("valid"), "{v}");
+        assert!(v.contains("the server"), "{v}");
+
+        // Nothing to check, and a signature that fails: distinct states.
+        let v = format_verify_verdict(&serde_json::json!({
+            "verification": { "verdict": "unverifiable", "verified_by": "unsigned" },
+        }));
+        assert!(v.contains("unverifiable"), "{v}");
+        let v = format_verify_verdict(&serde_json::json!({
+            "verification": { "verdict": "invalid", "verified_by": "client-session-key" },
+        }));
+        assert!(v.contains("invalid"), "{v}");
+    }
+
+    #[test]
+    fn a_mutations_verdict_names_the_act_it_covers() {
+        // A reaction's event id resolves to the act, not to a message body.
+        let v = format_verify_verdict(&serde_json::json!({
+            "kind": "unreact",
+            "actor_did": "did:plc:alice",
+            "subject": "01ROOT",
+            "emoji": "👍",
+            "verification": { "verdict": "valid", "verified_by": "client-session-key" },
+        }));
+        assert!(v.contains("unreact"), "{v}");
+        assert!(v.contains("01ROOT"), "{v}");
+        assert!(v.contains("👍"), "{v}");
+        assert!(v.contains("valid"), "{v}");
+    }
+
+    #[test]
+    fn a_verdict_the_server_did_not_send_is_not_invented() {
+        let v = format_verify_verdict(&serde_json::json!({ "msgid": "01ABC" }));
+        assert!(
+            v.contains("no verdict"),
+            "a missing verification block must read as missing, got: {v}"
+        );
+    }
 
     #[test]
     fn parse_join_prefix_basic() {

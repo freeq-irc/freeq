@@ -426,6 +426,12 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
                     first_prefix_spans
                         .push(Span::styled("📌 ", Style::default().fg(Color::Yellow)));
                 }
+                // The sender's own device signed this one, and the server
+                // relayed it untouched. Server-signed and unsigned traffic
+                // gets no marker — the badge claims only what the wire proved.
+                if msg.is_signed {
+                    first_prefix_spans.push(Span::styled("🔒 ", Style::default().fg(Color::Green)));
+                }
                 first_prefix_spans.push(Span::styled(
                     format!("<{}> ", msg.from),
                     if is_mention {
@@ -861,6 +867,8 @@ mod tests {
             is_deleted: false,
             reply_to: None,
             edit_of: None,
+            is_signed: false,
+            account: None,
         });
         buf.apply_delete("alice", "01PARENT");
 
@@ -904,6 +912,8 @@ mod tests {
             is_deleted: false,
             reply_to: None,
             edit_of: None,
+            is_signed: false,
+            account: None,
         });
         let label = super::reply_indicator_label(&buf, "01P");
         assert!(
@@ -931,6 +941,8 @@ mod tests {
             is_deleted: false,
             reply_to: None,
             edit_of: None,
+            is_signed: false,
+            account: None,
         });
         let label = super::reply_indicator_label(&buf, "01P");
         assert!(label.contains("alice"), "got {label:?}");
@@ -1023,6 +1035,8 @@ mod tests {
             is_deleted: false,
             reply_to: None,
             edit_of: None,
+            is_signed: false,
+            account: None,
         }
     }
 

@@ -2722,6 +2722,7 @@ dependencies = [
  "ratatui-image",
  "reqwest 0.12.28",
  "serde",
+ "serde_json",
  "tokio",
  "toml 0.8.23",
  "tracing",

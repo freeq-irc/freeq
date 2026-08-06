@@ -143,6 +143,15 @@ pub struct BufferLine {
     /// set purely as a marker that an edit was applied (and it equals
     /// `msgid` for lines edited in place).
     pub edit_of: Option<String>,
+    /// The message arrived carrying a client signature (`+freeq.at/sig`): its
+    /// sender signed it on their own device, and the server relayed it
+    /// unchanged. False for server-signed and unsigned traffic alike — the
+    /// marker claims only what the wire actually proved.
+    pub is_signed: bool,
+    /// The DID the sending server attributes this message to (`account`).
+    /// A statement about the sender, not proof of one — `/verify` is what
+    /// checks whether the signature agrees with it.
+    pub account: Option<String>,
 }
 
 /// State of a cached image.
@@ -335,6 +344,8 @@ impl Buffer {
             is_deleted: false,
             reply_to: None,
             edit_of: None,
+            is_signed: false,
+            account: None,
         });
     }
 
@@ -710,6 +721,8 @@ pub fn shorten_did(s: &str) -> String {
 pub enum BgResult {
     /// Profile lines to display in a buffer, with optional avatar URL for the last line.
     ProfileLines(String, Vec<String>, Option<String>),
+    /// The server's verdict on one event, for the buffer that asked.
+    VerifyLines(String, Vec<String>),
 }
 
 impl App {
@@ -968,6 +981,8 @@ impl App {
             is_deleted: false,
             reply_to: None,
             edit_of: None,
+            is_signed: false,
+            account: None,
         });
 
         // Track unread + mentions for inactive buffers. IRC nicks are
@@ -1281,6 +1296,8 @@ mod tests {
             is_deleted: false,
             reply_to: None,
             edit_of: None,
+            is_signed: false,
+            account: None,
         }
     }
 
@@ -1795,6 +1812,8 @@ mod tests {
                     is_deleted: false,
                     reply_to: None,
                     edit_of: None,
+                    is_signed: false,
+                    account: None,
                 },
             );
         }
@@ -1956,6 +1975,8 @@ mod tests {
             is_deleted: false,
             reply_to: None,
             edit_of: None,
+            is_signed: false,
+            account: None,
         });
         let line = buf.messages.back().unwrap();
         for c in line.from.chars() {
@@ -2473,6 +2494,8 @@ mod delete_after_edit_tests {
             is_deleted: false,
             reply_to: None,
             edit_of: None,
+            is_signed: false,
+            account: None,
         }
     }
 
