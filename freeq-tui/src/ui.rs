@@ -17,7 +17,10 @@ pub(crate) const PIN_MARKER: &str = "📌 ";
 /// colours and ignore the style we set, so an emoji marker cannot be made
 /// quiet. This one takes the dim grey it is given, which is the whole point —
 /// it marks a property of the line, it is not an announcement about it.
-pub(crate) const SIGNED_MARKER: &str = "• ";
+///
+/// U+2713, not the heavy U+2714: the heavy form has an emoji presentation in
+/// many fonts and would land back where the padlock was.
+pub(crate) const SIGNED_MARKER: &str = "✓ ";
 
 /// The empty form of a marker: the same number of terminal columns, drawn as
 /// spaces. Emoji are two columns wide, so this is not the marker's char count.
