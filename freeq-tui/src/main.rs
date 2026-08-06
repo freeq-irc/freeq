@@ -722,6 +722,10 @@ async fn run_app(
             process_irc_event(app, evt, handle);
         }
 
+        // A WHOIS answer drained above may have named a peer we're holding a
+        // first DM for — send it now, signed, rather than a tick later.
+        flush_pending_dms(app, handle).await;
+
         // Drain P2P events
         {
             let mut p2p_evts = Vec::new();
@@ -1553,6 +1557,64 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
     }
 }
 
+/// How long a first DM waits for the server to name its peer before going out
+/// unsigned. A WHOIS round trip is milliseconds on a live connection; this is
+/// the ceiling for the case where no answer is coming at all.
+use std::time::Instant;
+
+const DM_IDENTIFY_WAIT: Duration = Duration::from_secs(2);
+
+/// Send a DM, holding the first one to a peer we cannot yet name.
+///
+/// A signature over a DM binds the pair of DIDs, so a peer known only by nick
+/// has no venue any verifier could rebuild and the message goes out unsigned.
+/// The server can answer who they are in one round trip, so a first DM waits
+/// that long rather than losing its signature for the life of the session.
+///
+/// A peer with no DID — a guest — is the normal unsigned case: the wait
+/// expires, the message goes to the bare nick, and we don't ask again.
+/// Channels never wait; they are their own venue.
+async fn send_dm(
+    app: &mut App,
+    handle: &client::ClientHandle,
+    target: &str,
+    text: &str,
+) -> Result<()> {
+    let is_channel = target.starts_with('#') || target.starts_with('&');
+    if is_channel || handle.identified_dm_peer(target).is_some() {
+        handle.privmsg(target, text).await?;
+        return Ok(());
+    }
+    // Already waiting on this peer: queue behind it, or a later message
+    // would overtake an earlier one on the wire.
+    if app.dm_is_held(target) {
+        app.hold_dm(target, text, Instant::now() + DM_IDENTIFY_WAIT);
+        return Ok(());
+    }
+    if !app.first_dm_probe(target) {
+        // We asked once and they have no DID to give. Don't ask again.
+        handle.privmsg(target, text).await?;
+        return Ok(());
+    }
+    handle.raw(&format!("WHOIS {target}")).await?;
+    app.hold_dm(target, text, Instant::now() + DM_IDENTIFY_WAIT);
+    Ok(())
+}
+
+/// Release DMs whose peer the server has now named, and those whose wait ran
+/// out. Called every loop pass, so an answer landing this tick sends this tick.
+async fn flush_pending_dms(app: &mut App, handle: &client::ClientHandle) {
+    if app.pending_dms.is_empty() {
+        return;
+    }
+    let ready = app.ready_dms(Instant::now(), |t| handle.identified_dm_peer(t).is_some());
+    for (target, text) in ready {
+        if let Err(e) = handle.privmsg(&target, &text).await {
+            app.status_msg(&format!("Failed to send to {target}: {e}"));
+        }
+    }
+}
+
 async fn process_input(app: &mut App, handle: &client::ClientHandle, input: &str) -> Result<()> {
     if input.starts_with('/') {
         let parts: Vec<&str> = input.splitn(2, ' ').collect();
@@ -1873,7 +1935,7 @@ async fn process_input(app: &mut App, handle: &client::ClientHandle, input: &str
             "/msg" => {
                 let msg_parts: Vec<&str> = arg.splitn(2, ' ').collect();
                 if msg_parts.len() == 2 {
-                    handle.privmsg(msg_parts[0], msg_parts[1]).await?;
+                    send_dm(app, handle, msg_parts[0], msg_parts[1]).await?;
                 } else {
                     app.status_msg("Usage: /msg <target> <message>");
                 }
@@ -2526,7 +2588,7 @@ async fn process_input(app: &mut App, handle: &client::ClientHandle, input: &str
             } else {
                 input.to_string()
             };
-            handle.privmsg(&target, &wire_text).await?;
+            send_dm(app, handle, &target, &wire_text).await?;
             // echo-message cap is negotiated, so server will echo it back.
             // Don't add locally — that would duplicate the message.
         }

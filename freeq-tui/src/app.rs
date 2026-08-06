@@ -652,6 +652,24 @@ pub struct App {
     /// Buffer keys (channels and DMs) we've already requested history for
     /// this session, so activating one fetches its backlog exactly once.
     pub history_requested: HashSet<String>,
+    /// DMs held back while we ask the server who the peer is. In send order.
+    pub pending_dms: Vec<PendingDm>,
+    /// Lowercase nicks we've already asked about this session. A guest has no
+    /// DID to find, and asking again before every message to them would buy a
+    /// round trip and a delay for an answer that will not change.
+    dm_peers_asked: HashSet<String>,
+}
+
+/// A DM waiting on the peer's identity before it goes out.
+#[derive(Debug, Clone)]
+pub struct PendingDm {
+    /// The target as typed — the SDK resolves it to a DID when it can.
+    pub target: String,
+    /// The body exactly as it will go on the wire (already encrypted, if the
+    /// buffer is encrypted).
+    pub text: String,
+    /// When to stop waiting and send unsigned to the bare nick.
+    pub deadline: std::time::Instant,
 }
 
 /// Canonical buffer-map key for a name. Nicks and channels are
@@ -743,7 +761,53 @@ impl App {
             nick_hosts: HashMap::new(),
             did_names: HashMap::new(),
             history_requested: HashSet::new(),
+            pending_dms: Vec::new(),
+            dm_peers_asked: HashSet::new(),
         }
+    }
+
+    /// Claim the one WHOIS this session owes `nick`. True the first time,
+    /// false ever after — including when the answer came back empty, which
+    /// is what a guest's answer looks like.
+    pub fn first_dm_probe(&mut self, nick: &str) -> bool {
+        self.dm_peers_asked.insert(nick.to_lowercase())
+    }
+
+    /// Hold a DM until the peer is identified or `deadline` passes.
+    pub fn hold_dm(&mut self, target: &str, text: &str, deadline: std::time::Instant) {
+        self.pending_dms.push(PendingDm {
+            target: target.to_string(),
+            text: text.to_string(),
+            deadline,
+        });
+    }
+
+    /// Whether anything is already held for `target`. A later message must
+    /// queue behind an earlier one rather than overtake it on the wire.
+    pub fn dm_is_held(&self, target: &str) -> bool {
+        self.pending_dms
+            .iter()
+            .any(|p| p.target.eq_ignore_ascii_case(target))
+    }
+
+    /// Take the held DMs whose peer is now identified, plus any whose wait
+    /// has run out — in the order they were typed. `identified` answers for a
+    /// target the way the SDK's addressing map does.
+    pub fn ready_dms(
+        &mut self,
+        now: std::time::Instant,
+        identified: impl Fn(&str) -> bool,
+    ) -> Vec<(String, String)> {
+        let mut ready = Vec::new();
+        self.pending_dms.retain(|p| {
+            if identified(&p.target) || now >= p.deadline {
+                ready.push((p.target.clone(), p.text.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        ready
     }
 
     /// Get or create a buffer.
@@ -1277,6 +1341,77 @@ mod tests {
     }
 
     #[test]
+    fn a_first_dm_to_an_unidentified_peer_waits_for_the_answer() {
+        let mut app = App::new("me", false);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        app.hold_dm("bob", "hello", deadline);
+
+        // Nothing goes out while the peer is still unidentified and the
+        // wait has not run out.
+        let now = std::time::Instant::now();
+        assert!(app.ready_dms(now, |_| false).is_empty());
+
+        // The answer lands: the held message goes, addressed to a peer the
+        // SDK can now resolve — and the queue is empty afterwards.
+        let ready = app.ready_dms(now, |t| t == "bob");
+        assert_eq!(ready, vec![("bob".to_string(), "hello".to_string())]);
+        assert!(app.ready_dms(now, |_| true).is_empty());
+    }
+
+    #[test]
+    fn a_peer_who_never_answers_gets_the_message_anyway() {
+        let mut app = App::new("me", false);
+        let deadline = std::time::Instant::now() - Duration::from_millis(1);
+        app.hold_dm("guest", "hello", deadline);
+
+        // A guest has no DID to find. The wait is a courtesy, not a
+        // condition: past the deadline the message goes out unsigned.
+        let ready = app.ready_dms(std::time::Instant::now(), |_| false);
+        assert_eq!(ready, vec![("guest".to_string(), "hello".to_string())]);
+    }
+
+    #[test]
+    fn messages_held_for_one_peer_keep_their_order() {
+        let mut app = App::new("me", false);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        app.hold_dm("bob", "first", deadline);
+        app.hold_dm("bob", "second", deadline);
+        app.hold_dm("carol", "hi carol", deadline);
+
+        // Resolving bob releases both of his, in the order they were typed,
+        // and leaves carol's held.
+        let ready = app.ready_dms(std::time::Instant::now(), |t| t == "bob");
+        assert_eq!(
+            ready,
+            vec![
+                ("bob".to_string(), "first".to_string()),
+                ("bob".to_string(), "second".to_string()),
+            ]
+        );
+        assert_eq!(app.pending_dms.len(), 1);
+    }
+
+    #[test]
+    fn a_peer_is_only_asked_about_once_a_session() {
+        let mut app = App::new("me", false);
+        assert!(app.first_dm_probe("Bob"), "the first DM asks");
+        assert!(!app.first_dm_probe("bob"), "a second one does not, ever");
+        assert!(app.first_dm_probe("carol"), "per peer, not globally");
+    }
+
+    #[test]
+    fn a_held_message_still_waiting_takes_the_next_one_with_it() {
+        let mut app = App::new("me", false);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        app.first_dm_probe("bob");
+        app.hold_dm("bob", "first", deadline);
+        // The probe already went out, so the second message must not jump
+        // the queue and arrive before the first.
+        assert!(app.dm_is_held("bob"));
+        assert!(!app.dm_is_held("carol"));
+    }
+
+    #[test]
     fn a_reaction_is_remembered_against_the_message_it_sits_on() {
         let mut buf = Buffer::new("#test");
         buf.push(line("first", "alice", Some("id1")));
@@ -1525,6 +1660,8 @@ mod tests {
             nick_hosts: HashMap::new(),
             did_names: HashMap::new(),
             history_requested: HashSet::new(),
+            pending_dms: Vec::new(),
+            dm_peers_asked: HashSet::new(),
         };
         app.start_batch("b1", "#test");
         app.end_batch("b1");

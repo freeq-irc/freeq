@@ -386,6 +386,22 @@ impl ClientHandle {
         self.did_maps.lock().wire_target(target)
     }
 
+    /// The DID a DM to `target` will actually be addressed to, if the peer is
+    /// addressing-grade known. `None` for a channel, and for a nick we hold no
+    /// authoritative binding for.
+    ///
+    /// That `None` is the difference between a signed DM and an unsigned one:
+    /// a bare nick has no venue any verifier could rebuild, so the signer
+    /// declines it. A client that wants a first DM signed can ask the server
+    /// who the peer is (WHOIS) and send once the answer lands.
+    pub fn identified_dm_peer(&self, target: &str) -> Option<String> {
+        if target.starts_with('#') || target.starts_with('&') {
+            return None;
+        }
+        let resolved = self.resolve_wire_target(target);
+        crate::address::is_did(&resolved).then_some(resolved)
+    }
+
     pub async fn join(&self, channel: &str) -> Result<()> {
         self.cmd_tx.send(Command::Join(channel.to_string())).await?;
         Ok(())
@@ -3701,6 +3717,44 @@ mod multiline_tests {
             }
             other => panic!("expected Privmsg, got {other:?}"),
         }
+    }
+
+    /// Whether a DM peer is addressing-grade known is something a client has
+    /// to be able to ask: it is the difference between a signed first DM and
+    /// an unsigned one, and the fix (ask the server who they are) is only
+    /// worth doing when the answer is missing.
+    #[tokio::test]
+    async fn a_client_can_ask_whether_a_dm_peer_is_identified() {
+        let did_maps: DidMaps = Arc::new(parking_lot::Mutex::new(DidMapsState::default()));
+        did_maps.lock().learn("bob", "did:plc:bob");
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+        let handle = ClientHandle {
+            cmd_tx,
+            echo_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            caps_acked: Arc::new(parking_lot::Mutex::new(CapsState::default())),
+            did_maps,
+        };
+
+        assert_eq!(
+            handle.identified_dm_peer("Bob").as_deref(),
+            Some("did:plc:bob"),
+            "a learned binding resolves, case-insensitively"
+        );
+        assert_eq!(
+            handle.identified_dm_peer("did:plc:carol").as_deref(),
+            Some("did:plc:carol"),
+            "a peer addressed by DID is already identified"
+        );
+        assert_eq!(
+            handle.identified_dm_peer("stranger"),
+            None,
+            "an unknown nick is exactly the case worth asking about"
+        );
+        assert_eq!(
+            handle.identified_dm_peer("#room"),
+            None,
+            "a channel is not a DM peer"
+        );
     }
 
     /// A mutation in a DM addresses the peer's DID whenever we know it, the
