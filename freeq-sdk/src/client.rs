@@ -1990,8 +1990,18 @@ where
                             let did = authenticated_did.take()
                                 .or_else(|| signer.as_ref().map(|s| s.did().to_string()))
                                 .unwrap_or_default();
+                            // Only where the key can be used: a server that
+                            // never negotiated the cap cannot verify a client
+                            // document, so registering a key with it files a
+                            // public key it will never read — and the command
+                            // itself is one an older server has no reason to
+                            // know. Cap negotiation is settled by now.
+                            let server_verifies_documents =
+                                caps_acked.lock().acked.contains(MSGSIG_CAP);
                             if !did.is_empty() {
                                 let _ = event_tx.send(Event::Authenticated { did: did.clone() }).await;
+                            }
+                            if !did.is_empty() && server_verifies_documents {
                                 // Generate session message-signing keypair
                                 let key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
                                 let pubkey_bytes = key.verifying_key().as_bytes().to_vec();
@@ -3965,6 +3975,94 @@ mod multiline_tests {
         assert!(
             !sent.tags.contains_key(crate::chatsig::EVENT_ID_TAG),
             "{wire}"
+        );
+    }
+
+    /// A session key is registered only with a server that asked for the
+    /// signing cap. A server that never advertised it cannot verify a client
+    /// document, so it would file a public key it will never use — and the
+    /// registration is a command an older server has no reason to know at all.
+    /// Against such a server an updated client stays silent on the subject.
+    #[tokio::test]
+    async fn the_session_key_is_registered_only_where_it_can_be_used() {
+        /// Drive a whole registration against a server advertising `caps`,
+        /// and return everything the client wrote.
+        async fn client_wire(caps: &str) -> String {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+
+            let (client_side, mut server_side) = tokio::io::duplex(8192);
+            let (event_tx, _event_rx) = mpsc::channel::<Event>(64);
+            let (_cmd_tx, cmd_rx) = mpsc::channel::<Command>(16);
+            let config = ConnectConfig {
+                server_addr: "test".to_string(),
+                nick: "tester".to_string(),
+                user: "tester".to_string(),
+                realname: "tester".to_string(),
+                tls: false,
+                tls_insecure: false,
+                web_token: None,
+                websocket_url: None,
+            };
+            let (reader, writer) = tokio::io::split(client_side);
+            tokio::spawn(async move {
+                let _ = run_irc(
+                    BufReader::new(reader),
+                    writer,
+                    &config,
+                    None,
+                    event_tx,
+                    cmd_rx,
+                    Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                    Arc::new(parking_lot::Mutex::new(CapsState::default())),
+                    Arc::new(parking_lot::Mutex::new(DidMapsState::default())),
+                )
+                .await;
+            });
+
+            for line in [
+                format!(":srv CAP * LS :{caps}"),
+                format!(":srv CAP * ACK :{caps}"),
+                ":srv 900 tester :You are now logged in as did:plc:tester".to_string(),
+                ":srv 903 tester :SASL authentication successful".to_string(),
+                ":srv 001 tester :Welcome".to_string(),
+            ] {
+                server_side
+                    .write_all(format!("{line}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+
+            let mut wire = Vec::new();
+            let mut chunk = vec![0u8; 4096];
+            while let Ok(Ok(n)) = tokio::time::timeout(
+                std::time::Duration::from_millis(120),
+                server_side.read(&mut chunk),
+            )
+            .await
+            {
+                if n == 0 {
+                    break;
+                }
+                wire.extend_from_slice(&chunk[..n]);
+            }
+            String::from_utf8_lossy(&wire).into_owned()
+        }
+
+        let signing = client_wire(&format!("sasl message-tags server-time {MSGSIG_CAP}")).await;
+        assert!(
+            signing.contains("MSGSIG "),
+            "a server that verifies documents gets the key: {signing:?}"
+        );
+
+        let legacy = client_wire("sasl message-tags server-time").await;
+        assert!(
+            !legacy.contains("MSGSIG"),
+            "a server that never offered the cap must not be sent a key: {legacy:?}"
+        );
+        assert!(
+            legacy.contains("CAP REQ"),
+            "the rest of registration is unchanged: {legacy:?}"
         );
     }
 
