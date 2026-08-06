@@ -900,6 +900,92 @@ async fn poll_verify(web_addr: &str, msgid: &str) -> serde_json::Value {
     last
 }
 
+// ── a mutation that crossed the hop is on file at the receiver ───
+//
+// A reaction is durable state asserted under a user's name, and the receiving
+// server applies it. Applying an act without recording it left that server's
+// log unable to rebuild its own derived state, and its verify endpoint
+// answering 404 for something it had itself accepted — so a bystander could
+// check a federated *message* and not a federated *reaction*.
+
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_reaction_that_crossed_the_hop_verifies_at_the_receiver() {
+    let alice = TestId::new("did:plc:alicereacts");
+    let bob = TestId::new("did:plc:bobreacts");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#reactverify").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#reactverify").await.unwrap();
+
+    // A message for the reaction to act on, and the id B filed it under.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut landed = None;
+    let mut attempt = 0u32;
+    while tokio::time::Instant::now() < deadline {
+        attempt += 1;
+        let text = format!("react to me {attempt}");
+        ha.privmsg("#reactverify", &text).await.ok();
+        if let Some(msgid) = recv_channel_msgid(&mut rxb, &text, Duration::from_secs(2)).await {
+            landed = Some(msgid);
+            break;
+        }
+    }
+    let msgid = landed.expect("alice's message never reached bob's server");
+
+    // The reaction's own event id, learned the way any receiver learns it:
+    // off the wire, from the tag the signature covers.
+    let event_id = timeout(S2S_SETTLE, async {
+        loop {
+            ha.react("#reactverify", "\u{1F44D}", &msgid).await.ok();
+            if let Ok(Some(id)) = timeout(Duration::from_secs(2), async {
+                loop {
+                    match rxb.recv().await {
+                        Some(Event::TagMsg { tags, .. }) if tags.contains_key("+react") => {
+                            return tags.get(freeq_sdk::chatsig::EVENT_ID_TAG).cloned();
+                        }
+                        Some(_) => continue,
+                        None => return None,
+                    }
+                }
+            })
+            .await
+            {
+                return id;
+            }
+        }
+    })
+    .await
+    .expect("the reaction never reached bob's server with an id");
+
+    let v = poll_verify(&srv_b.web_addr, &event_id).await;
+    assert_eq!(
+        v["kind"], "react",
+        "the receiving server must hold the act it applied, not 404 on it: {v}"
+    );
+    assert_eq!(v["actor_did"], alice.did);
+    assert_eq!(v["subject"], msgid.as_str());
+    assert_eq!(v["channel"], "#reactverify");
+    assert_eq!(
+        v["verification"]["verdict"], "valid",
+        "and reach its own verdict on the signature: {v}"
+    );
+    assert_eq!(
+        v["verification"]["verified_by"], "client-session-key",
+        "signed on alice's device, not vouched by either server: {v}"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
 // ── a signed reply and a signed edit survive the hop ─────────────
 //
 // A plain message's document has four keys; a reply and an edit each add a

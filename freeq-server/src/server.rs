@@ -4240,6 +4240,16 @@ pub(crate) async fn process_s2s_message(
                 }
             }
 
+            // The subject as it arrived, before the re-rooting below rewrites
+            // it. The signature covers this value, so a filed document may only
+            // claim the signature when the two still agree.
+            let wire_subject = tags
+                .get("+reply")
+                .or_else(|| tags.get("+draft/reply"))
+                .or_else(|| tags.get("+draft/delete"))
+                .or_else(|| tags.get("+delete"))
+                .cloned();
+
             // Normalize draft tags
             let mut tags = tags.clone();
             // A mutation signature that did not check out does not travel
@@ -4264,6 +4274,70 @@ pub(crate) async fn process_s2s_message(
                 tags.insert("+reply".to_string(), root);
             }
 
+            // ── the record this server keeps of what it accepted ──────
+            //
+            // The log holds every chat event this server accepted, and a
+            // mutation it verified and applied is one. Relayed messages already
+            // file; mutations did not, so a federated server's own log could
+            // not rebuild its own derived state and the verify endpoint
+            // answered 404 for an act this server had itself applied.
+            //
+            // The verdict is this server's own. A peer's assurance about a
+            // signature is not evidence, so `Valid` is recorded only where the
+            // check above returned Verified — and a signature that failed was
+            // stripped from `tags` already, so it cannot reach a row at all.
+            //
+            // The signature rides only when the DID the check ran against is
+            // the one the document will bind, and only while the subject is
+            // still the value it covers: re-rooting is this server's doing, and
+            // a document rebuilt around our edit is not what the sender signed.
+            let relayed_actor = peer_account.clone().or_else(|| actor_did.clone());
+            let subject_intact = match (&wire_subject, tags.get("+reply")) {
+                (Some(wire), Some(now)) => wire == now,
+                // A delete names its subject in a tag nothing re-roots.
+                _ => true,
+            };
+            let relayed_sig = peer_account
+                .as_ref()
+                .filter(|_| subject_intact)
+                .and_then(|_| {
+                    tags.get("+freeq.at/sig")
+                        .or_else(|| tags.get("freeq.at/sig"))
+                        .cloned()
+                });
+            // The sender's id where there is one, so the event this server
+            // files and the event the origin holds are the same event — which
+            // is what lets a later replay recognise it rather than read it as a
+            // second claim on the id.
+            let relayed_event_id = tags
+                .get(freeq_sdk::chatsig::EVENT_ID_TAG)
+                .or_else(|| tags.get(freeq_sdk::chatsig::EVENT_ID_TAG_BARE))
+                .cloned()
+                .unwrap_or_else(crate::msgid::generate);
+            let relayed_venue = relayed_actor
+                .as_deref()
+                .and_then(|did| crate::connection::messaging::signing_venue(state, did, &target));
+            let relayed_event = crate::db::MutationEvent {
+                event_id: &relayed_event_id,
+                actor_did: relayed_actor.as_deref(),
+                signature: relayed_sig.as_deref(),
+                venue: relayed_venue.as_deref(),
+                ctx: crate::events::EventContext {
+                    sig_state: if sig_verdict
+                        == Some(crate::connection::messaging::ClientSigOutcome::Verified)
+                    {
+                        crate::events::SigState::Valid
+                    } else {
+                        crate::events::SigState::Unverifiable
+                    },
+                    origin: Some(sanitize_s2s_str(&origin, 64)),
+                },
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            };
+
             // Persist reactions
             if let (Some(emoji), Some(target_msgid)) = (tags.get("+react"), tags.get("+reply")) {
                 let nick = actor_nick.clone();
@@ -4276,7 +4350,15 @@ pub(crate) async fn process_s2s_message(
                 let target_msgid = target_msgid.clone();
                 let channel = target.clone();
                 state.with_db(|db| {
-                    db.store_reaction(&target_msgid, &channel, &nick, did.as_deref(), &emoji, ts)
+                    db.store_reaction_by(
+                        &target_msgid,
+                        &channel,
+                        &nick,
+                        did.as_deref(),
+                        &emoji,
+                        ts,
+                        Some(&relayed_event),
+                    )
                 });
             }
 
@@ -4291,8 +4373,15 @@ pub(crate) async fn process_s2s_message(
                 let did = actor_did.clone();
                 let emoji = emoji.clone();
                 let target_msgid = target_msgid.clone();
-                state
-                    .with_db(|db| db.remove_reaction(&target_msgid, &nick, did.as_deref(), &emoji));
+                state.with_db(|db| {
+                    db.remove_reaction_by(
+                        &target_msgid,
+                        &nick,
+                        did.as_deref(),
+                        &emoji,
+                        Some(&relayed_event),
+                    )
+                });
             }
 
             // Apply a federated delete to our own state. Relaying it to live
@@ -4329,7 +4418,21 @@ pub(crate) async fn process_s2s_message(
                         .flatten()
                         .map(|a| a.channel)
                         .unwrap_or_else(|| storage_key.clone());
-                    state.with_db(|db| db.soft_delete_message(&db_key, &root));
+                    // A delete's subject is resolved to our root only here, so
+                    // the intactness rule the reactions got is applied to it
+                    // now: if re-rooting moved the value the signature covers,
+                    // the act is filed as a fact without one.
+                    let delete_event = crate::db::MutationEvent {
+                        event_id: relayed_event.event_id,
+                        actor_did: relayed_event.actor_did,
+                        signature: relayed_event.signature.filter(|_| root == deleted_msgid),
+                        venue: relayed_event.venue,
+                        ctx: relayed_event.ctx.clone(),
+                        timestamp: relayed_event.timestamp,
+                    };
+                    state.with_db(|db| {
+                        db.soft_delete_message_by(&db_key, &root, Some(&delete_event))
+                    });
                     if is_channel {
                         let mut channels = state.channels.lock();
                         if let Some(ch) = channels.get_mut(&storage_key) {
@@ -6903,6 +7006,223 @@ mod s2s_adversarial_tests {
                 Some(ClientSigOutcome::Unverifiable(_))
             ),
             "an unresolvable recipient is uncheckable, not forged",
+        );
+    }
+
+    // ── what a relayed mutation leaves on file ───────────────────
+    //
+    // The events table's contract is every chat event this server accepted,
+    // and a mutation this server verified and applied is one. Relayed messages
+    // already file; mutations were the asymmetry, so a federated server's log
+    // could not rebuild its own derived state and `/api/v1/verify` answered 404
+    // for an act it had itself applied.
+
+    /// Drive a signed mutation in over S2S and hand back the event it filed.
+    async fn relay_mutation(
+        state: &Arc<SharedState>,
+        mgr: &Arc<S2sManager>,
+        target: &str,
+        venue: &str,
+        event_id: &str,
+        key: &ed25519_dalek::SigningKey,
+        account: Option<&str>,
+    ) -> Option<crate::db::StoredEvent> {
+        let sig = freeq_sdk::chatsig::ChatDoc::mutation(
+            freeq_sdk::chatsig::Mutation::React,
+            SIGNER,
+            event_id,
+            venue,
+            "01SUBJECTMSGID",
+        )
+        .with_emoji("👍")
+        .sign(key);
+        process_s2s_message(
+            state,
+            mgr,
+            PEER,
+            S2sMessage::Tagmsg {
+                event_id: format!("{PEER}:{event_id}"),
+                from: "remote!u@s2s".to_string(),
+                target: target.to_string(),
+                tags: HashMap::from([
+                    ("+react".to_string(), "👍".to_string()),
+                    ("+reply".to_string(), "01SUBJECTMSGID".to_string()),
+                    (
+                        freeq_sdk::chatsig::EVENT_ID_TAG.to_string(),
+                        event_id.to_string(),
+                    ),
+                    ("+freeq.at/sig".to_string(), sig),
+                ]),
+                origin: PEER.to_string(),
+                account: account.map(str::to_string),
+            },
+        )
+        .await;
+        state.with_db(|db| db.get_event(event_id)).flatten()
+    }
+
+    /// A channel mutation that crossed the hop is on file here, with this
+    /// server's own verdict on it.
+    #[tokio::test]
+    async fn a_relayed_mutation_is_filed_at_the_receiver() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#chat");
+        let key = signer_on_file(&state, SIGNER);
+
+        let ev = relay_mutation(
+            &state,
+            &mgr,
+            "#chat",
+            &freeq_sdk::chatsig::channel_venue("#chat"),
+            "01RELAYEDREACT",
+            &key,
+            Some(SIGNER),
+        )
+        .await
+        .expect("a mutation this server applied is a mutation it accepted");
+
+        assert_eq!(ev.kind, "react");
+        assert_eq!(ev.venue, "#chat");
+        assert_eq!(ev.actor_did.as_deref(), Some(SIGNER));
+        assert_eq!(ev.subject.as_deref(), Some("01SUBJECTMSGID"));
+        assert_eq!(ev.emoji.as_deref(), Some("👍"));
+        assert!(ev.signature.is_some(), "relayed verbatim");
+        assert_eq!(
+            ev.sig_state,
+            crate::events::SigState::Valid,
+            "this server checked it against the key it names — its own verdict, \
+             not the peer's claim",
+        );
+        assert_eq!(
+            ev.origin.as_deref(),
+            Some(PEER),
+            "the row records which peer relayed it",
+        );
+    }
+
+    /// A relayed DM mutation files under the pair its signature covers — the
+    /// same venue the receive-side check verified against, not the wire target.
+    #[tokio::test]
+    async fn a_relayed_dm_mutation_is_filed_under_the_pair() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let key = signer_on_file(&state, SIGNER);
+        let recipient = "did:plc:relayedrecipient";
+
+        let ev = relay_mutation(
+            &state,
+            &mgr,
+            recipient,
+            &freeq_sdk::chatsig::dm_venue(SIGNER, recipient),
+            "01RELAYEDDM",
+            &key,
+            Some(SIGNER),
+        )
+        .await
+        .expect("a relayed DM mutation is filed too");
+
+        assert_eq!(
+            ev.venue,
+            freeq_sdk::chatsig::dm_venue(SIGNER, recipient),
+            "the venue the signature covers, not the `did:` on the wire",
+        );
+        assert_eq!(ev.sig_state, crate::events::SigState::Valid);
+    }
+
+    /// A guest's relayed mutation is a fact without a signature, filed the way
+    /// local ingress files one: bare, and honest about it.
+    #[tokio::test]
+    async fn an_unsigned_relayed_mutation_is_filed_as_bare_facts() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#chat");
+
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Tagmsg {
+                event_id: format!("{PEER}:bare"),
+                from: "guest!u@s2s".to_string(),
+                target: "#chat".to_string(),
+                tags: HashMap::from([
+                    ("+react".to_string(), "👍".to_string()),
+                    ("+reply".to_string(), "01SUBJECTMSGID".to_string()),
+                    (
+                        freeq_sdk::chatsig::EVENT_ID_TAG.to_string(),
+                        "01BARERELAYED".to_string(),
+                    ),
+                ]),
+                origin: PEER.to_string(),
+                account: None,
+            },
+        )
+        .await;
+
+        let ev = state
+            .with_db(|db| db.get_event("01BARERELAYED"))
+            .flatten()
+            .expect("the act happened, so it is on file");
+        assert!(ev.canonical.is_empty(), "nothing signed it, so no document");
+        assert_eq!(ev.sig_state, crate::events::SigState::Unsigned);
+        assert_eq!(ev.emoji.as_deref(), Some("👍"), "its facts are stated");
+    }
+
+    /// A mutation received live and then replayed after a link flap is the
+    /// same event, not a second claim on its id.
+    ///
+    /// The receiver rebuilds the canonical from what arrived; the replay
+    /// carries the origin's stored bytes. If those disagreed by a byte, replay
+    /// would read an honest re-send as equivocation and log it as such — so
+    /// this pins that they are the same bytes.
+    #[tokio::test]
+    async fn a_mutation_received_live_is_not_refiled_by_a_later_replay() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#chat");
+        let key = signer_on_file(&state, SIGNER);
+        let venue = freeq_sdk::chatsig::channel_venue("#chat");
+
+        let filed = relay_mutation(
+            &state,
+            &mgr,
+            "#chat",
+            &venue,
+            "01LIVETHENREPLAY",
+            &key,
+            Some(SIGNER),
+        )
+        .await
+        .expect("filed on live receipt");
+
+        // What the origin holds for the same act, and would replay.
+        let replayed = crate::s2s::ReplayedEvent {
+            event_id: "01LIVETHENREPLAY".to_string(),
+            canonical: crate::events::mutation_canonical(
+                freeq_sdk::chatsig::Mutation::React,
+                SIGNER,
+                "01LIVETHENREPLAY",
+                &venue,
+                "01SUBJECTMSGID",
+                Some("👍"),
+            ),
+            signature: filed.signature.clone(),
+            kind: "react".to_string(),
+            venue: venue.clone(),
+            actor_did: Some(SIGNER.to_string()),
+            subject: Some("01SUBJECTMSGID".to_string()),
+            emoji: Some("👍".to_string()),
+            timestamp: filed.timestamp,
+        };
+        assert_eq!(
+            apply_replayed_event(&state, PEER, replayed),
+            ReplayOutcome::AlreadyHeld,
+            "the same act twice is one event — spent stays spent",
         );
     }
 
