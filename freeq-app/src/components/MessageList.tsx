@@ -920,6 +920,9 @@ function ViaBadge({ origin }: { origin: string }) {
   );
 }
 
+/** Roughly how tall the verify panel is; below this it opens downward. */
+const VERIFY_PANEL_HEIGHT_PX = 200;
+
 /** Signed message badge — message carries a cryptographic signature.
  *  Clicking it checks the signature against the server's verify endpoint
  *  and shows the actual result, instead of asserting validity unchecked. */
@@ -927,9 +930,19 @@ function SignedBadge({ msgid }: { msgid: string }) {
   const [showInfo, setShowInfo] = useState(false);
   const [outcome, setOutcome] = useState<VerifyOutcome | null>(() => cachedVerdict(msgid) ?? null);
   const [checking, setChecking] = useState(false);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const [openDownward, setOpenDownward] = useState(false);
 
   const toggle = () => {
     const opening = !showInfo;
+    // The panel opens upward by default, which puts the verdict off the top of
+    // the screen for the first message in a conversation — the answer the
+    // whole check exists to deliver, clipped. Open downward when the room
+    // above isn't there.
+    if (opening) {
+      const top = btnRef.current?.getBoundingClientRect().top ?? Infinity;
+      setOpenDownward(top < VERIFY_PANEL_HEIGHT_PX);
+    }
     setShowInfo(opening);
     if (opening && outcome === null && !checking) {
       setChecking(true);
@@ -940,6 +953,7 @@ function SignedBadge({ msgid }: { msgid: string }) {
   return (
     <span className="relative inline-block">
       <button
+        ref={btnRef}
         data-testid="signed-badge"
         data-verdict={outcome ?? 'unchecked'}
         className={`text-xs opacity-60 hover:opacity-100 transition-opacity ${badgeTone(outcome)}`}
@@ -951,7 +965,7 @@ function SignedBadge({ msgid }: { msgid: string }) {
         </svg>
       </button>
       {showInfo && (
-        <div className="absolute bottom-full left-0 mb-1 w-64 bg-bg-secondary border border-border rounded-lg shadow-xl p-3 z-50 animate-fadeIn"
+        <div className={`absolute ${openDownward ? 'top-full mt-1' : 'bottom-full mb-1'} left-0 w-64 bg-bg-secondary border border-border rounded-lg shadow-xl p-3 z-50 animate-fadeIn`}
              onClick={(e) => e.stopPropagation()}>
           <div className={`text-xs font-semibold mb-1 flex items-center gap-1 ${badgeTone(outcome)}`}>
             <svg className="w-3 h-3" viewBox="0 0 16 16" fill="currentColor">
