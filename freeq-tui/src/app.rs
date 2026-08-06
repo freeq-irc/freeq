@@ -665,6 +665,10 @@ pub struct App {
     pub history_requested: HashSet<String>,
     /// DMs held back while we ask the server who the peer is. In send order.
     pub pending_dms: Vec<PendingDm>,
+    /// Key id of the connected server's own signing key, once fetched. Without
+    /// it a signature cannot be attributed to the sender rather than to the
+    /// server, so nothing is marked as signed.
+    pub server_signing_kid: Option<String>,
     /// Lowercase nicks we've already asked about this session. A guest has no
     /// DID to find, and asking again before every message to them would buy a
     /// round trip and a delay for an answer that will not change.
@@ -723,6 +727,8 @@ pub enum BgResult {
     ProfileLines(String, Vec<String>, Option<String>),
     /// The server's verdict on one event, for the buffer that asked.
     VerifyLines(String, Vec<String>),
+    /// The key id of the connected server's own signing key.
+    ServerSigningKid(String),
 }
 
 impl App {
@@ -776,6 +782,7 @@ impl App {
             history_requested: HashSet::new(),
             pending_dms: Vec::new(),
             dm_peers_asked: HashSet::new(),
+            server_signing_kid: None,
         }
     }
 
@@ -1679,6 +1686,7 @@ mod tests {
             history_requested: HashSet::new(),
             pending_dms: Vec::new(),
             dm_peers_asked: HashSet::new(),
+            server_signing_kid: None,
         };
         app.start_batch("b1", "#test");
         app.end_batch("b1");

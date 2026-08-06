@@ -394,6 +394,7 @@ async fn main() -> Result<()> {
     app.server_addr = resolved.server.clone();
     app.connected_at = Some(std::time::Instant::now());
     app.media_uploader = media_uploader;
+    fetch_server_signing_kid(&app);
     #[cfg(feature = "inline-images")]
     {
         app.picker = picker;
@@ -749,6 +750,9 @@ async fn run_app(
         if let Some(mut bg_rx) = app.bg_result_rx.take() {
             while let Ok(result) = bg_rx.try_recv() {
                 match result {
+                    crate::app::BgResult::ServerSigningKid(kid) => {
+                        app.server_signing_kid = Some(kid);
+                    }
                     crate::app::BgResult::VerifyLines(buf, lines) => {
                         for line in &lines {
                             app.buffer_mut(&buf).push_system(line);
@@ -1023,7 +1027,7 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                 .get("+reply")
                 .filter(|v| crate::app::is_valid_msgid(v))
                 .cloned();
-            let (is_signed, account) = signature_of(&tags);
+            let (is_signed, account) = signature_of(&tags, app.server_signing_kid.as_deref());
             // Join replay collapses an edited message into one row with no
             // `+draft/edit`; the server's `+freeq.at/edited` tag is the only
             // thing that says the text isn't the original.
@@ -1575,14 +1579,41 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
     }
 }
 
-/// Whether a message carried a client signature, and the account the document
-/// binds it to. An account tag alone proves nothing — the server states it —
-/// so the two travel together; the marker needs both to mean anything.
-fn signature_of(tags: &std::collections::HashMap<String, String>) -> (bool, Option<String>) {
-    (
-        tags.contains_key(freeq_sdk::sigtag::SIG_TAG),
-        tags.get("account").cloned(),
-    )
+/// The key id of the server's own signing key, from the public key it
+/// publishes. Every signer derives this id the same way, so a signature's kid
+/// can be compared against it without holding any key material.
+fn server_kid_from_public_key(public_key_b64url: &str) -> Option<String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(public_key_b64url)
+        .ok()?;
+    Some(freeq_sdk::sigtag::derive_kid_bytes(&bytes))
+}
+
+/// Whether the *sender* signed this message, and the account the document
+/// binds it to.
+///
+/// The signature tag alone does not answer the first question: a server signs
+/// on behalf of clients that can't, under its own key and in the same tag. So
+/// the tag counts as the sender's only when it names a key id that is not the
+/// server's. Anything we cannot attribute — an older server's bare signature,
+/// or any signature at all before we know the server's key — is left unmarked,
+/// because a lock that might mean "the server said so" is worse than none.
+fn signature_of(
+    tags: &std::collections::HashMap<String, String>,
+    server_kid: Option<&str>,
+) -> (bool, Option<String>) {
+    let by_sender = match (tags.get(freeq_sdk::sigtag::SIG_TAG), server_kid) {
+        (Some(sig), Some(server_kid)) => {
+            let mut parts = sig.splitn(3, ':');
+            matches!(
+                (parts.next(), parts.next(), parts.next()),
+                (Some("ed25519"), Some(kid), Some(_)) if kid != server_kid
+            )
+        }
+        _ => false,
+    };
+    (by_sender, tags.get("account").cloned())
 }
 
 /// Where the connected server answers HTTP. Anything public is https on the
@@ -1648,6 +1679,30 @@ fn format_verify_verdict(body: &serde_json::Value) -> String {
         .map(|d| format!(" by {d}"))
         .unwrap_or_default();
     format!("Verify: {verdict} ({vouches}){signer}")
+}
+
+/// Learn the connected server's own signing key id, in the background.
+///
+/// Until it lands, no message is marked as signed: telling the sender's
+/// signature from the server's requires knowing which key is the server's, and
+/// a marker that might mean either says nothing worth saying.
+fn fetch_server_signing_kid(app: &App) {
+    let url = format!("{}/api/v1/signing-key", verify_api_base(&app.server_addr));
+    let tx = app.bg_result_tx.clone();
+    tokio::spawn(async move {
+        let Ok(body) = fetch_verdict(&url).await else {
+            tracing::debug!(url, "no server signing key published — nothing gets marked");
+            return;
+        };
+        let Some(kid) = body
+            .get("public_key")
+            .and_then(|v| v.as_str())
+            .and_then(server_kid_from_public_key)
+        else {
+            return;
+        };
+        let _ = tx.send(crate::app::BgResult::ServerSigningKid(kid)).await;
+    });
 }
 
 /// Ask the connected server for its verdict on one event id.
@@ -3208,7 +3263,7 @@ fn try_nick_complete(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::parse_join_prefix;
-    use super::{format_verify_verdict, signature_of, verify_api_base};
+    use super::{format_verify_verdict, server_kid_from_public_key, signature_of, verify_api_base};
     use std::collections::HashMap;
 
     fn tags(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -3218,26 +3273,74 @@ mod tests {
             .collect()
     }
 
+    const SERVER_KID: &str = "c2VydmVya2lkMDAwMDAw";
+
     #[test]
     fn a_signed_message_carries_its_signature_and_the_account_it_binds() {
-        let (signed, account) = signature_of(&tags(&[
-            ("+freeq.at/sig", "ed25519:kid:c2ln"),
-            ("account", "did:plc:alice"),
-            ("msgid", "01ABC"),
-        ]));
+        let (signed, account) = signature_of(
+            &tags(&[
+                ("+freeq.at/sig", "ed25519:senderkid:c2ln"),
+                ("account", "did:plc:alice"),
+                ("msgid", "01ABC"),
+            ]),
+            Some(SERVER_KID),
+        );
         assert!(signed);
         assert_eq!(account.as_deref(), Some("did:plc:alice"));
     }
 
     #[test]
     fn an_unsigned_message_claims_nothing() {
-        let (signed, account) = signature_of(&tags(&[("account", "did:plc:alice")]));
+        let (signed, account) = signature_of(
+            &tags(&[("account", "did:plc:alice")]),
+            Some(SERVER_KID),
+        );
         assert!(!signed, "an account tag is not a signature");
         assert_eq!(account.as_deref(), Some("did:plc:alice"));
 
-        let (signed, account) = signature_of(&tags(&[]));
+        let (signed, account) = signature_of(&tags(&[]), Some(SERVER_KID));
         assert!(!signed);
         assert_eq!(account, None);
+    }
+
+    /// The marker says the *sender* signed. A server signing on a client's
+    /// behalf produces the same tag under its own key, and marking that would
+    /// credit the sender with a claim they never made.
+    #[test]
+    fn a_server_signature_is_not_the_senders_signature() {
+        let (signed, _) = signature_of(
+            &tags(&[("+freeq.at/sig", &format!("ed25519:{SERVER_KID}:c2ln"))]),
+            Some(SERVER_KID),
+        );
+        assert!(!signed, "the server's own key must not earn the marker");
+
+        // An older server signs in a bare-base64 form with no key id at all.
+        let (signed, _) = signature_of(
+            &tags(&[("+freeq.at/sig", "HNKqMdYu9tHikBPgAqjrI3OM3s1wyERKFjGNjKjw")]),
+            Some(SERVER_KID),
+        );
+        assert!(!signed, "a signature we cannot attribute is not the sender's");
+    }
+
+    /// Not knowing the server's key means not being able to tell the two
+    /// apart. Silence is the honest answer; a lock would be a guess.
+    #[test]
+    fn without_the_servers_key_nothing_is_marked() {
+        let (signed, _) = signature_of(
+            &tags(&[("+freeq.at/sig", "ed25519:senderkid:c2ln")]),
+            None,
+        );
+        assert!(!signed);
+    }
+
+    #[test]
+    fn the_servers_key_id_comes_from_its_published_key() {
+        // The published key is base64url; the id is the same digest every
+        // signer derives, so a tag's kid can be compared against it directly.
+        let pubkey = "9uyAsw2ckm4rhDIMctwH9Ev0gwQ1S1a9nRfsH0AwlD0";
+        let kid = server_kid_from_public_key(pubkey).expect("derives");
+        assert_eq!(kid.len(), 22, "a key id is 22 base64url chars, got {kid}");
+        assert_eq!(server_kid_from_public_key("not base64!!"), None);
     }
 
     #[test]
