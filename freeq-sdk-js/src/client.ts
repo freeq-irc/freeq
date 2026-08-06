@@ -368,7 +368,7 @@ export class FreeqClient extends EventEmitter {
         ? () => e2ee.encryptChannel(target, text)
         : () => e2ee.encryptMessage(remoteDid!, text, this.serverOrigin);
 
-      encryptFn().then((encrypted) => {
+      encryptFn().then(async (encrypted) => {
         if (!encrypted) {
           // Encryption failed — fall back to signed plaintext
           this.sendLegacyPlaintext(wireTarget, text, extraOpenerTags);
@@ -376,12 +376,17 @@ export class FreeqClient extends EventEmitter {
         }
         this.cacheEchoPlaintext(encrypted, text);
         if (encrypted.length + 200 <= perChunkBudget || !multilineCap) {
-          // Fits in one line, or we can't multiline anyway → one PRIVMSG
+          // Fits in one line, or we can't multiline anyway → one PRIVMSG.
+          // Signed like any other message: the document hashes the WIRE body,
+          // so under encryption it covers the ciphertext — the same bytes the
+          // server stores and every federated receiver holds. Nothing about
+          // the canonical changes, and nobody has to see the plaintext to
+          // check who sent it.
           const tags: Record<string, string> = {
             '+encrypted': '',
             ...extraOpenerTags,
           };
-          this.raw(format('PRIVMSG', [wireTarget, encrypted], tags));
+          await this.signedPrivmsg(wireTarget, encrypted, tags);
         } else {
           // Ciphertext too big → chunk across a multiline BATCH with
           // concat=true. Receiver concatenates fragments and decrypts once.
@@ -394,7 +399,20 @@ export class FreeqClient extends EventEmitter {
             );
             return;
           }
-          this.emitMultilineBatch(wireTarget, chunks, extraOpenerTags, { '+encrypted': '' });
+          // The signature rides the opener and covers the ASSEMBLED
+          // ciphertext, which is what the server reassembles and verifies —
+          // per-chunk signatures would cover bytes no receiver ever holds.
+          const sigTags = await this.signatureTags(
+            wireTarget,
+            this.assembleMultiline(chunks),
+            extraOpenerTags,
+          );
+          this.emitMultilineBatch(
+            wireTarget,
+            chunks,
+            { ...extraOpenerTags, ...sigTags },
+            { '+encrypted': '' },
+          );
         }
       });
       this.maybeLocalEcho(bufKey, text, willEncrypt);
