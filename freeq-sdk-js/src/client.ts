@@ -1057,10 +1057,6 @@ export class FreeqClient extends EventEmitter {
   /** Resolve nick to DID — set by the app layer for E2EE support. */
   nickToDid: ((nick: string) => string | undefined) | null = null;
 
-  private resolveNickToDid(targetNick: string): string | undefined {
-    return this.nickToDid?.(targetNick);
-  }
-
   /** Parse a `+freeq.at/event=*` TAGMSG/PRIVMSG and emit `coordinationEvent`.
    *  De-dupes by eventId so the paired TAGMSG + companion PRIVMSG fire
    *  the event only once. */
@@ -1289,7 +1285,7 @@ export class FreeqClient extends EventEmitter {
       if (plain !== null) { displayText = plain; isEncryptedMsg = true; }
       else { displayText = '[encrypted message]'; isEncryptedMsg = true; }
     } else if (e2ee.isEncrypted(wireText) && !isChannel && !isSelf) {
-      const remoteDid = this.resolveNickToDid(from);
+      const remoteDid = this.didForNick(from);
       if (remoteDid) {
         const plain = await e2ee.decryptMessage(remoteDid, wireText, this.serverOrigin);
         if (plain !== null) { displayText = plain; isEncryptedMsg = true; }
@@ -1795,7 +1791,7 @@ export class FreeqClient extends EventEmitter {
           if (plain !== null) { displayText = plain; isEncryptedMsg = true; }
           else { displayText = '[encrypted message]'; isEncryptedMsg = true; }
         } else if (e2ee.isEncrypted(text) && !isChannel && !isSelf) {
-          const remoteDid = this.resolveNickToDid(from);
+          const remoteDid = this.didForNick(from);
           if (remoteDid) {
             const plain = await e2ee.decryptMessage(remoteDid, text, this.serverOrigin);
             if (plain !== null) { displayText = plain; isEncryptedMsg = true; }
@@ -1919,7 +1915,7 @@ export class FreeqClient extends EventEmitter {
         }
 
         // Background WHOIS for DM partners
-        if (!isChannel && !isSelf && !this.resolveNickToDid(from) && !this.backgroundWhois.has(from.toLowerCase()) && this.backgroundWhois.size < 500) {
+        if (!isChannel && !isSelf && !this.didForNick(from) && !this.backgroundWhois.has(from.toLowerCase()) && this.backgroundWhois.size < 500) {
           this.backgroundWhois.add(from.toLowerCase());
           this.raw(`WHOIS ${from}`);
         }
@@ -1970,6 +1966,11 @@ export class FreeqClient extends EventEmitter {
         const bearerMatch = text.match(/^API-BEARER (\S+)$/);
         if (bearerMatch) {
           this._apiBearer = bearerMatch[1];
+          // Publishing a pre-key bundle means proving we own the DID we
+          // publish under, and this bearer is that proof. It lands either
+          // side of e2ee.initialize (started on 900) finishing, so hand it
+          // over and let e2ee publish whenever it can.
+          e2ee.setAuthToken(this._apiBearer);
           break; // suppress; do not surface to systemMessage
         }
 

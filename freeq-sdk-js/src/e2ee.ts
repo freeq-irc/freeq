@@ -59,6 +59,10 @@ interface RatchetSession {
 
 let db: IDBPDatabase | null = null;
 let identityKeys: IdentityKeys | null = null;
+let ownDid: string | null = null;
+let authToken: string | null = null;
+let publishOrigin: string | null = null;
+let bundlePublished = false;
 const sessions = new Map<string, RatchetSession>();
 let initialized = false;
 
@@ -197,8 +201,10 @@ export async function initialize(did: string, serverOrigin: string): Promise<voi
   const allSessions: RatchetSession[] = await db.getAll('sessions');
   for (const s of allSessions) sessions.set(s.remoteDid, s);
 
+  ownDid = did;
+  publishOrigin = serverOrigin;
   try {
-    await uploadPreKeyBundle(serverOrigin, did, identityKeys);
+    bundlePublished = await uploadPreKeyBundle(serverOrigin, did, identityKeys);
   } catch (e) {
     console.warn('[e2ee] Failed to upload pre-key bundle:', e);
   }
@@ -210,6 +216,10 @@ export async function initialize(did: string, serverOrigin: string): Promise<voi
 export function shutdown(): void {
   initialized = false;
   identityKeys = null;
+  ownDid = null;
+  authToken = null;
+  publishOrigin = null;
+  bundlePublished = false;
   sessions.clear();
   if (db) { db.close(); db = null; }
 }
@@ -251,13 +261,12 @@ export async function encryptMessage(
 
   try {
     const st: SessionState = JSON.parse(session.state);
-    const msgKey = await deriveMessageKey(st.sendChainKey, st.sendMsgNum);
     const iv = crypto.getRandomValues(new Uint8Array(12));
 
     if (st.dhRatchetInitialized && st.dhRecvPublic && st.sendMsgNum > 0 && st.sendMsgNum % 10 === 0) {
       try {
         const dhPair = await (crypto.subtle.generateKey as any)({ name: 'X25519' }, true, ['deriveBits']);
-        const newSecret = new Uint8Array(await crypto.subtle.exportKey('raw', dhPair.privateKey));
+        const newSecret = await exportPrivateBytes(dhPair.privateKey);
         const newPublic = new Uint8Array(await crypto.subtle.exportKey('raw', dhPair.publicKey));
         const dhOutput = await x25519DH(newSecret, new Uint8Array(st.dhRecvPublic));
         const newRoot = await hkdfDerive(dhOutput, 'freeq-ratchet-root');
@@ -272,6 +281,10 @@ export async function encryptMessage(
         console.warn('[e2ee] DH ratchet step failed, continuing with chain key:', e);
       }
     }
+
+    // Derived after any ratchet step, so it matches the chain the header
+    // announces — the receiver re-keys off that header before decrypting.
+    const msgKey = await deriveMessageKey(st.sendChainKey, st.sendMsgNum);
 
     const dhPub = st.dhSendPublic ? new Uint8Array(st.dhSendPublic) : identityKeys.publicKey;
     const header = new Uint8Array(40);
@@ -445,9 +458,9 @@ async function generateIdentityKeys(): Promise<IdentityKeys> {
   const spkPair = await (crypto.subtle.generateKey as any)(
     { name: 'X25519' }, true, ['deriveBits']
   );
-  const ikSecret = new Uint8Array(await crypto.subtle.exportKey('raw', ikPair.privateKey));
+  const ikSecret = await exportPrivateBytes(ikPair.privateKey);
   const ikPublic = new Uint8Array(await crypto.subtle.exportKey('raw', ikPair.publicKey));
-  const spkSecret = new Uint8Array(await crypto.subtle.exportKey('raw', spkPair.privateKey));
+  const spkSecret = await exportPrivateBytes(spkPair.privateKey);
   const spkPublic = new Uint8Array(await crypto.subtle.exportKey('raw', spkPair.publicKey));
 
   let signingKey: CryptoKeyPair | undefined;
@@ -471,7 +484,7 @@ async function generateIdentityKeys(): Promise<IdentityKeys> {
 
 // ── Pre-Key Bundle API ──
 
-async function uploadPreKeyBundle(origin: string, did: string, keys: IdentityKeys): Promise<void> {
+async function uploadPreKeyBundle(origin: string, did: string, keys: IdentityKeys): Promise<boolean> {
   const bundle: Record<string, unknown> = {
     did,
     identity_key: toB64(keys.publicKey),
@@ -482,11 +495,45 @@ async function uploadPreKeyBundle(origin: string, did: string, keys: IdentityKey
   if (keys.signingPublic) {
     bundle.signing_key = toB64(keys.signingPublic);
   }
-  await fetch(`${origin}/api/v1/keys`, {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (authToken) headers.Authorization = `Bearer ${authToken}`;
+  const resp = await fetch(`${origin}/api/v1/keys`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({ did, bundle }),
   });
+  if (!resp.ok) {
+    console.warn('[e2ee] Pre-key bundle upload rejected:', resp.status);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Supply the credential that proves we own the DID we publish keys under.
+ * The server only accepts a pre-key bundle from the session that authenticated
+ * as that DID, and that token arrives after login — either while `initialize`
+ * is still generating keys (the upload then picks it up) or after it already
+ * tried and was refused, which is why setting it retries the publish. Without
+ * a published bundle nobody can open a session with us.
+ */
+export function setAuthToken(token: string | null): void {
+  authToken = token;
+  if (token && !bundlePublished && identityKeys && publishOrigin) {
+    void publishPreKeyBundle(publishOrigin);
+  }
+}
+
+/** Publish our pre-key bundle. Safe to call again once the token is known. */
+export async function publishPreKeyBundle(serverOrigin: string): Promise<boolean> {
+  if (!identityKeys || !ownDid) return false;
+  try {
+    bundlePublished = await uploadPreKeyBundle(serverOrigin, ownDid, identityKeys);
+    return bundlePublished;
+  } catch (e) {
+    console.warn('[e2ee] Failed to upload pre-key bundle:', e);
+    return false;
+  }
 }
 
 // ── Session Establishment ──
@@ -531,9 +578,11 @@ async function establishSession(remoteDid: string, serverOrigin: string): Promis
     const chain_a = await hkdfDerive(sharedSecret, 'freeq-chain-a');
     const chain_b = await hkdfDerive(sharedSecret, 'freeq-chain-b');
 
-    const dhPair = await (crypto.subtle.generateKey as any)({ name: 'X25519' }, true, ['deriveBits']);
-    const dhSecret = new Uint8Array(await crypto.subtle.exportKey('raw', dhPair.privateKey));
-    const dhPublic = new Uint8Array(await crypto.subtle.exportKey('raw', dhPair.publicKey));
+    // The signed pre-key is the initial ratchet key on both sides: the peer
+    // knows it from our bundle, so the first message needs no ratchet step and
+    // later steps line up (a per-side ephemeral here can never agree).
+    const dhSecret = identityKeys.spkSecret;
+    const dhPublic = identityKeys.spkPublic;
 
     const st: SessionState = {
       sharedSecret: Array.from(sharedSecret),
@@ -568,8 +617,35 @@ function arraysEqual(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
+/**
+ * The 32 raw secret bytes of an X25519 private key. WebCrypto permits `raw`
+ * export for public keys only; the JWK `d` field is those same bytes.
+ */
+async function exportPrivateBytes(key: CryptoKey): Promise<Uint8Array> {
+  const jwk = await crypto.subtle.exportKey('jwk', key);
+  if (!jwk.d) throw new Error('exported JWK is missing the private component');
+  return fromB64(jwk.d);
+}
+
+/**
+ * RFC 8410 PKCS#8 wrapper for a bare 32-byte X25519 scalar. WebCrypto's `raw`
+ * format carries public keys only, so a stored secret has to be wrapped to be
+ * imported back.
+ */
+const X25519_PKCS8_PREFIX = new Uint8Array([
+  0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
+  0x03, 0x2b, 0x65, 0x6e, 0x04, 0x22, 0x04, 0x20,
+]);
+
+async function importPrivateKey(secret: Uint8Array): Promise<CryptoKey> {
+  const pkcs8 = new Uint8Array(X25519_PKCS8_PREFIX.length + secret.length);
+  pkcs8.set(X25519_PKCS8_PREFIX, 0);
+  pkcs8.set(secret, X25519_PKCS8_PREFIX.length);
+  return (crypto.subtle as any).importKey('pkcs8', pkcs8, { name: 'X25519' }, false, ['deriveBits']);
+}
+
 async function x25519DH(mySecret: Uint8Array, theirPublic: Uint8Array): Promise<Uint8Array> {
-  const myKey = await (crypto.subtle as any).importKey('raw', mySecret, { name: 'X25519' }, false, ['deriveBits']);
+  const myKey = await importPrivateKey(mySecret);
   const theirKey = await (crypto.subtle as any).importKey('raw', theirPublic, { name: 'X25519' }, false, []);
   const bits = await (crypto.subtle as any).deriveBits({ name: 'X25519', public: theirKey }, myKey, 256);
   return new Uint8Array(bits);
