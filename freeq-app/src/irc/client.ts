@@ -233,6 +233,10 @@ export function sendMarkdown(target: string, text: string) {
   client?.sendMarkdown(target, text);
 }
 
+export function sendAction(target: string, text: string) {
+  client?.sendAction(target, text);
+}
+
 export function sendDelete(target: string, msgId: string) {
   client?.sendDelete(target, msgId);
 }

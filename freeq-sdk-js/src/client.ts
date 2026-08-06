@@ -545,6 +545,33 @@ export class FreeqClient extends EventEmitter {
     }
   }
 
+  /**
+   * Send an action — what `/me` writes. The body carries the CTCP ACTION
+   * framing every receiver reads it by, and the framing is inside what the
+   * signature covers: an action asserts something under a user's name just as
+   * a sentence does, and stripping the framing in flight would change what
+   * was said.
+   */
+  sendAction(target: string, text: string): void {
+    const isChannel = target.startsWith('#') || target.startsWith('&');
+    // Same target discipline as every other send: strict DID resolution for
+    // the wire, canonical (loose) key for the local echo.
+    const wireTarget = isChannel ? target : this.wireDmTarget(target);
+    this.signedPrivmsg(wireTarget, `\x01ACTION ${text}\x01`);
+
+    if (!this.ackedCaps.has('echo-message')) {
+      this.emit('message', isChannel ? target : this.dmKey(target), {
+        id: crypto.randomUUID(),
+        from: this._nick,
+        text,
+        timestamp: new Date(),
+        tags: {},
+        isSelf: true,
+        isAction: true,
+      });
+    }
+  }
+
   /** Delete a message. */
   sendDelete(target: string, msgId: string): void {
     this.emit('messageDeleted', target, msgId);

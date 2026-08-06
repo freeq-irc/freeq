@@ -1643,4 +1643,54 @@ describe('signed mutations', () => {
     );
     expect(await promise).toBe(eventId);
   });
+
+  it('an action is signed, and its body keeps the framing a receiver reads', async () => {
+    const signing = await import('./signing.js');
+    const { client, ws, verifyKey } = await makeSigningClient();
+    client.sendAction('#room', 'waves at the room');
+    const line = await waitForSent(ws, 'PRIVMSG');
+    expect(line).toContain('\x01ACTION waves at the room\x01');
+
+    const canonical = await signing.messageCanonical({
+      from: 'did:plc:mutator',
+      msgid: tagOf(line, '+freeq.at/eventid')!,
+      target: '#room',
+      // The framing is part of the body: strip it and the document no longer
+      // describes what was sent.
+      body: '\x01ACTION waves at the room\x01',
+    });
+    expect(await verifySig(canonical, tagOf(line, '+freeq.at/sig')!, verifyKey)).toBe(true);
+  });
+
+  it('an action in a DM addresses the peer it knows, and signs that venue', async () => {
+    const signing = await import('./signing.js');
+    const { client, ws, verifyKey } = await makeSigningClient();
+    ws.recv(':srv 330 alice bob did:plc:bob :is authenticated as');
+    await flushAsync();
+
+    client.sendAction('bob', 'nods');
+    const line = await waitForSent(ws, 'PRIVMSG');
+    expect(line, 'a DM whose peer is known is addressed by DID').toContain(
+      'PRIVMSG did:plc:bob',
+    );
+
+    const canonical = await signing.messageCanonical({
+      from: 'did:plc:mutator',
+      msgid: tagOf(line, '+freeq.at/eventid')!,
+      target: signing.dmVenue('did:plc:mutator', 'did:plc:bob'),
+      body: '\x01ACTION nods\x01',
+    });
+    expect(await verifySig(canonical, tagOf(line, '+freeq.at/sig')!, verifyKey)).toBe(true);
+  });
+
+  it('an action against a legacy server is an ordinary unsigned PRIVMSG', async () => {
+    const signing = await import('./signing.js');
+    signing.setSigningDid('did:plc:mutator');
+    await signing.generateSigningKey();
+    const { client, ws } = await makeRegistered();
+    client.sendAction('#room', 'waves');
+    await flushAsync();
+    const line = ws.sent.find((l) => l.includes('PRIVMSG'));
+    expect(line).toBe('PRIVMSG #room :\x01ACTION waves\x01');
+  });
 });

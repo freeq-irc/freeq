@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect, useMemo, type KeyboardEvent, type DragEvent } from 'react';
 import { useStore } from '../store';
-import { sendMessage, sendReply, sendEdit, sendMarkdown, joinChannel, partChannel, setTopic, setMode, kickUser, inviteUser, setAway, rawCommand, sendWhois } from '../irc/client';
+import { sendMessage, sendReply, sendEdit, sendMarkdown, sendAction, joinChannel, partChannel, setTopic, setMode, kickUser, inviteUser, setAway, rawCommand, sendWhois } from '../irc/client';
 import { detectStepUpRequired, requestStepUp } from '../lib/oauth-step-up';
 import { displayNameForKey } from '../lib/display-name';
 import { EmojiPicker, EMOJI_DATA } from './EmojiPicker';
@@ -885,7 +885,7 @@ function handleCommand(text: string, activeChannel: string) {
       break;
     }
     case 'me': case 'action':
-      if (target) rawCommand(`PRIVMSG ${target} :\x01ACTION ${args}\x01`);
+      if (target) sendAction(target, args);
       break;
     case 'raw': case 'quote':
       rawCommand(args);
