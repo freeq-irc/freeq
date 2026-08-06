@@ -249,7 +249,7 @@ fn map_stored_event(row: &rusqlite::Row<'_>) -> SqlResult<StoredEvent> {
         event_id: row.get(0)?,
         canonical: row.get(1)?,
         signature: row.get(2)?,
-        sig_state: crate::events::SigState::from_str(&row.get::<_, String>(3)?),
+        sig_state: crate::events::SigState::parse(&row.get::<_, String>(3)?),
         kind: row.get(4)?,
         venue: row.get(5)?,
         actor_did: row.get(6)?,

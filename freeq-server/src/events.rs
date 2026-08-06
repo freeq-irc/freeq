@@ -81,7 +81,9 @@ impl SigState {
         }
     }
 
-    pub fn from_str(s: &str) -> SigState {
+    /// Read a stored state back. Not `FromStr`: this never fails — an
+    /// unrecognized value reads as unverifiable, which is the honest floor.
+    pub fn parse(s: &str) -> SigState {
         match s {
             "valid" => SigState::Valid,
             "unsigned" => SigState::Unsigned,
@@ -348,8 +350,8 @@ mod tests {
         // Round-trips through the column, and an unknown value reads as the
         // claim-least state rather than panicking on data from a newer build.
         for state in [SigState::Valid, SigState::Unverifiable, SigState::Unsigned] {
-            assert_eq!(SigState::from_str(state.as_str()), state);
+            assert_eq!(SigState::parse(state.as_str()), state);
         }
-        assert_eq!(SigState::from_str("invalid"), SigState::Unverifiable);
+        assert_eq!(SigState::parse("invalid"), SigState::Unverifiable);
     }
 }

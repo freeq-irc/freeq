@@ -522,20 +522,20 @@ fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConf
     }
     // Map-shaped settings: a TOML table (or the CLI's pair spelling),
     // normalized to the pair form the server parses.
-    if let Some(v) = file.s2s_peer_api {
-        if !explicitly_set(matches, "s2s_peer_api") {
-            cfg.s2s_peer_api = v.into_pairs('=');
-        }
+    if let Some(v) = file.s2s_peer_api
+        && !explicitly_set(matches, "s2s_peer_api")
+    {
+        cfg.s2s_peer_api = v.into_pairs('=');
     }
-    if let Some(v) = file.s2s_peer_trust {
-        if !explicitly_set(matches, "s2s_peer_trust") {
-            cfg.s2s_peer_trust = v.into_pairs(':');
-        }
+    if let Some(v) = file.s2s_peer_trust
+        && !explicitly_set(matches, "s2s_peer_trust")
+    {
+        cfg.s2s_peer_trust = v.into_pairs(':');
     }
-    if let Some(v) = file.did_resolver_static {
-        if !explicitly_set(matches, "did_resolver_static") {
-            cfg.did_resolver_static = v.into_pairs('=');
-        }
+    if let Some(v) = file.did_resolver_static
+        && !explicitly_set(matches, "did_resolver_static")
+    {
+        cfg.did_resolver_static = v.into_pairs('=');
     }
     plain!(
         listen_addr,
