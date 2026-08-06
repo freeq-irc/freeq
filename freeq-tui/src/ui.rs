@@ -10,6 +10,17 @@ use crate::app::App;
 #[cfg(feature = "inline-images")]
 use crate::app::{IMAGE_ROWS, ImageState};
 
+/// Message markers. Each occupies a fixed column in the prefix gutter whether
+/// or not the message has it, so nicks stay aligned down the buffer.
+pub(crate) const PIN_MARKER: &str = "📌 ";
+pub(crate) const SIGNED_MARKER: &str = "🔒 ";
+
+/// The empty form of a marker: the same number of terminal columns, drawn as
+/// spaces. Emoji are two columns wide, so this is not the marker's char count.
+pub(crate) fn blank_marker(marker: &str) -> String {
+    " ".repeat(Span::raw(marker).width())
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -415,23 +426,32 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
                     .as_deref()
                     .is_some_and(|id| buffer.pinned.contains(id));
 
-                // First-line prefix spans: timestamp + (pin) + <from> ".
-                // Continuation lines use an equal-width indent so the
-                // body of every source line is column-aligned.
+                // First-line prefix spans: timestamp + marker gutter + <from> ".
+                // The gutter holds a fixed column for each marker the buffer
+                // can show, blank when a message doesn't have it, so every
+                // nick in a buffer starts in the same column. A marker that
+                // pushed the rest of the line sideways made an alternating
+                // column of them exhausting to read down.
                 let mut first_prefix_spans: Vec<Span> = vec![Span::styled(
                     format!("{} ", msg.timestamp),
                     Style::default().fg(Color::DarkGray),
                 )];
-                if is_pinned {
-                    first_prefix_spans
-                        .push(Span::styled("📌 ", Style::default().fg(Color::Yellow)));
+                // The pin column only exists in a buffer that has pins — it is
+                // constant for the whole buffer, so it costs no alignment.
+                if !buffer.pinned.is_empty() {
+                    first_prefix_spans.push(match is_pinned {
+                        true => Span::styled(PIN_MARKER, Style::default().fg(Color::Yellow)),
+                        false => Span::raw(blank_marker(PIN_MARKER)),
+                    });
                 }
                 // The sender's own device signed this one, and the server
-                // relayed it untouched. Server-signed and unsigned traffic
-                // gets no marker — the badge claims only what the wire proved.
-                if msg.is_signed {
-                    first_prefix_spans.push(Span::styled("🔒 ", Style::default().fg(Color::Green)));
-                }
+                // relayed it untouched. Server-signed, relayed and unsigned
+                // traffic gets no marker — the badge claims only what the wire
+                // proved — but it still gets the column.
+                first_prefix_spans.push(match msg.is_signed {
+                    true => Span::styled(SIGNED_MARKER, Style::default().fg(Color::Green)),
+                    false => Span::raw(blank_marker(SIGNED_MARKER)),
+                });
                 first_prefix_spans.push(Span::styled(
                     format!("<{}> ", msg.from),
                     if is_mention {
@@ -442,10 +462,10 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
                         Style::default().fg(Color::Green)
                     },
                 ));
-                let prefix_width: usize = first_prefix_spans
-                    .iter()
-                    .map(|s| s.content.chars().count())
-                    .sum();
+                // Display width, not char count: an emoji marker occupies two
+                // terminal columns, so counting chars indented every wrapped
+                // continuation line one column short of its own first line.
+                let prefix_width: usize = first_prefix_spans.iter().map(|s| s.width()).sum();
                 let continuation_indent = " ".repeat(prefix_width);
 
                 let mut lines: Vec<Line> = Vec::new();
@@ -627,8 +647,16 @@ pub(crate) fn wrapped_height(msg: &crate::app::BufferLine, width: usize) -> usiz
         // "HH:MM:SS *** "
         msg.timestamp.len() + 1 + 4
     } else {
-        // "HH:MM:SS <nick> "
-        msg.timestamp.len() + 1 + msg.from.len() + 2 + 1
+        // "HH:MM:SS <signature gutter><nick> ". The gutter is on every message
+        // line, marked or not. A buffer with pins carries one more column that
+        // isn't counted here — this has no buffer to ask, and the cost of the
+        // omission is the same one-column-optimistic wrap it has always had.
+        msg.timestamp.len()
+            + 1
+            + Span::raw(SIGNED_MARKER).width()
+            + msg.from.len()
+            + 2
+            + 1
     };
     let base = if msg.is_deleted {
         (prefix_len + "[deleted]".len()).div_ceil(width).max(1)
@@ -785,7 +813,75 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::markdown_spans;
+    use super::{PIN_MARKER, SIGNED_MARKER, blank_marker};
     use ratatui::style::{Modifier, Style};
+    use ratatui::text::Span;
+
+    /// A marker and its absence occupy the same terminal columns, so a column
+    /// of alternating signed and unsigned messages reads down a straight edge
+    /// instead of shifting sideways line to line. Emoji are two columns wide,
+    /// which is why this is measured and not assumed.
+    #[test]
+    fn a_marker_and_its_blank_are_the_same_width() {
+        for marker in [SIGNED_MARKER, PIN_MARKER] {
+            let marked = Span::raw(marker).width();
+            let blank = Span::raw(blank_marker(marker)).width();
+            assert_eq!(
+                marked, blank,
+                "{marker:?} is {marked} columns but its blank is {blank}"
+            );
+            assert!(
+                marked > marker.chars().count() - 1,
+                "sanity: {marker:?} is wider than one column"
+            );
+        }
+    }
+
+    /// Two messages from the same nick, one signed and one not, put their
+    /// bodies in the same column — the property the gutter exists for.
+    #[test]
+    fn signed_and_unsigned_lines_start_their_text_in_the_same_column() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = crate::app::App::new("me", false);
+        let mut signed = line("signed body");
+        signed.is_signed = true;
+        let unsigned = line("plain body");
+        app.buffer_mut("#room").push(signed);
+        app.buffer_mut("#room").push(unsigned);
+        app.active_buffer = "#room".to_string();
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|f| super::draw(f, &mut app)).unwrap();
+        let rows: Vec<Vec<String>> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(60)
+            .map(|row| row.iter().map(|c| c.symbol().to_string()).collect())
+            .collect();
+
+        // The column a body starts in, counted in terminal cells. Not a string
+        // index: an emoji is one char, four bytes and two cells, and only the
+        // cell count is what the eye reads down the screen.
+        let col_of = |needle: &str| {
+            rows.iter()
+                .find_map(|row| {
+                    (0..row.len()).find(|&i| row[i..].concat().starts_with(needle))
+                })
+                .unwrap_or_else(|| {
+                    let shown: Vec<String> = rows.iter().map(|r| r.concat()).collect();
+                    panic!("{needle:?} not rendered in:\n{}", shown.join("\n"))
+                })
+        };
+        assert_eq!(
+            col_of("signed body"),
+            col_of("plain body"),
+            "bodies must line up:\n{}",
+            rows.iter().map(|r| r.concat()).collect::<Vec<_>>().join("\n")
+        );
+    }
 
     /// Stringify a list of spans by joining their text content. Used to
     /// verify segmentation independently of style assertions.
