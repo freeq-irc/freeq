@@ -1698,7 +1698,7 @@ fn fetch_server_signing_kid(app: &App) {
     let url = format!("{}/api/v1/signing-key", verify_api_base(&app.server_addr));
     let tx = app.bg_result_tx.clone();
     tokio::spawn(async move {
-        let Ok(body) = fetch_verdict(&url).await else {
+        let Ok(body) = fetch_json(&url).await else {
             tracing::debug!(url, "no server signing key published — nothing gets marked");
             return;
         };
@@ -1713,18 +1713,59 @@ fn fetch_server_signing_kid(app: &App) {
     });
 }
 
+/// What the verify endpoint said about one event id.
+enum VerifyAnswer {
+    /// The event is on file; this is the verdict document for it.
+    OnFile(serde_json::Value),
+    /// The server has nothing filed under that id. An answer, not a failure:
+    /// it can only speak for what it stored, and it stores nothing for a
+    /// conversation it cannot key by DID — a DM with a guest, say.
+    NotOnFile,
+}
+
+/// Read a non-success status from the verify endpoint. Only "not found" is an
+/// answer; everything else is a lookup that broke, and the reader needs to
+/// tell those apart — one is worth trying again and the other never will be.
+fn answer_for_error_status(status: u16) -> Result<VerifyAnswer> {
+    match status {
+        404 => Ok(VerifyAnswer::NotOnFile),
+        other => anyhow::bail!("server answered {other}"),
+    }
+}
+
+/// The line an answer prints.
+fn verify_answer_line(answer: &VerifyAnswer) -> String {
+    match answer {
+        VerifyAnswer::OnFile(body) => format_verify_verdict(body),
+        VerifyAnswer::NotOnFile => "Verify: the server has no record of this message".to_string(),
+    }
+}
+
+/// GET a JSON document from the connected server.
+async fn fetch_json(url: &str) -> Result<serde_json::Value> {
+    let resp = reqwest::Client::new()
+        .get(url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("server answered {}", status.as_u16());
+    }
+    Ok(resp.json().await?)
+}
+
 /// Ask the connected server for its verdict on one event id.
-async fn fetch_verdict(url: &str) -> Result<serde_json::Value> {
+async fn fetch_verdict(url: &str) -> Result<VerifyAnswer> {
     let resp = reqwest::Client::new()
         .get(url)
         .timeout(Duration::from_secs(10))
         .send()
         .await?;
     if !resp.status().is_success() {
-        let status = resp.status();
-        anyhow::bail!("server answered {status}");
+        return answer_for_error_status(resp.status().as_u16());
     }
-    Ok(resp.json().await?)
+    Ok(VerifyAnswer::OnFile(resp.json().await?))
 }
 
 /// How long a first DM waits for the server to name its peer before going out
@@ -1970,7 +2011,7 @@ async fn process_input(app: &mut App, handle: &client::ClientHandle, input: &str
                         let tx = app.bg_result_tx.clone();
                         tokio::spawn(async move {
                             let mut lines = match fetch_verdict(&url).await {
-                                Ok(body) => vec![format_verify_verdict(&body)],
+                                Ok(answer) => vec![verify_answer_line(&answer)],
                                 Err(e) => vec![format!("Verify failed: {e}")],
                             };
                             // The account the line claimed locally against the
@@ -3280,8 +3321,8 @@ fn try_nick_complete(app: &mut App) {
 mod tests {
     use super::parse_join_prefix;
     use super::{
-        ctcp_action, format_verify_verdict, server_kid_from_public_key, signature_of,
-        verify_api_base,
+        answer_for_error_status, ctcp_action, format_verify_verdict, server_kid_from_public_key,
+        signature_of, verify_answer_line, verify_api_base,
     };
     use std::collections::HashMap;
 
@@ -3465,6 +3506,33 @@ mod tests {
         assert!(v.contains("01ROOT"), "{v}");
         assert!(v.contains("👍"), "{v}");
         assert!(v.contains("valid"), "{v}");
+    }
+
+    /// A server with nothing on file for an id has given an answer, not
+    /// failed. It is the ordinary outcome for anything it never stored — a DM
+    /// between people it cannot key by DID is never persisted — so it reads
+    /// as what it is, without the HTTP status the reader can do nothing with.
+    #[test]
+    fn an_event_the_server_never_stored_reads_as_no_record() {
+        let line = verify_answer_line(&answer_for_error_status(404).expect("404 is an answer"));
+        assert!(line.contains("no record"), "{line}");
+        assert!(!line.contains("404"), "the status is not the point: {line}");
+        assert!(!line.contains("failed"), "nothing failed here: {line}");
+    }
+
+    /// Anything else that comes back is a lookup that broke, and the reader
+    /// has to be able to tell "there is no such event" from "I could not find
+    /// out" — the second one is worth retrying and the first one is not.
+    #[test]
+    fn a_broken_lookup_still_says_what_broke() {
+        for status in [500u16, 503, 403] {
+            let e = answer_for_error_status(status)
+                .err()
+                .unwrap_or_else(|| panic!("{status} must not read as an answer"))
+                .to_string();
+            assert!(e.contains(&status.to_string()), "{e}");
+            assert!(!e.contains("no record"), "{e}");
+        }
     }
 
     #[test]
