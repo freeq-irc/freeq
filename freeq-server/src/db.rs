@@ -1972,7 +1972,7 @@ impl Db {
         reactor_did: Option<&str>,
         emoji: &str,
     ) -> SqlResult<usize> {
-        self.remove_reaction_by(target_msgid, reactor_nick, reactor_did, emoji, None)
+        self.remove_reaction_by(target_msgid, reactor_nick, reactor_did, emoji, "", None)
     }
 
     /// [`Db::remove_reaction`], keeping the record of the removal.
@@ -1988,21 +1988,22 @@ impl Db {
         reactor_nick: &str,
         reactor_did: Option<&str>,
         emoji: &str,
+        channel: &str,
         ev: Option<&MutationEvent<'_>>,
     ) -> SqlResult<usize> {
         let tx = self.conn.unchecked_transaction()?;
         if let Some(ev) = ev {
-            // The venue is inside the document, and an unreaction names only
-            // its subject — so the channel comes from the message it acts on.
-            if let Some(channel) = self.channel_of_message(target_msgid)? {
-                self.file_mutation_event(
-                    freeq_sdk::chatsig::Mutation::Unreact,
-                    &channel,
-                    target_msgid,
-                    Some(emoji),
-                    ev,
-                )?;
-            }
+            // The channel comes from the caller, exactly as it does for the
+            // react being undone — deriving it from the subject instead
+            // silently dropped the event whenever the subject message wasn't
+            // on file, which every legacy-id row is.
+            self.file_mutation_event(
+                freeq_sdk::chatsig::Mutation::Unreact,
+                channel,
+                target_msgid,
+                Some(emoji),
+                ev,
+            )?;
         }
         let target_msgid = &self.root_of(target_msgid);
         let changed = match reactor_did {
@@ -4307,6 +4308,70 @@ mod tests {
         let msg_reactions = reactions.get("msg001").unwrap();
         assert_eq!(msg_reactions.len(), 1);
         assert_eq!(msg_reactions[0].emoji, "❤️");
+    }
+
+    #[test]
+    fn an_unreact_event_files_even_when_the_subject_message_is_not_on_file() {
+        // A reaction can land on a message this server never stored — the
+        // UUID-era history rows are exactly that, and reacting to them works.
+        // The react files its event under the channel the caller names; the
+        // unreact must leave the same record instead of losing it because the
+        // subject can't answer for its channel.
+        let db = Db::open_memory().unwrap();
+        let subject = "2b92520e-7d46-463a-a1ae-05d8e93ea966";
+        let react_ev = MutationEvent {
+            event_id: "01EVREACT00000000000000001",
+            actor_did: Some("did:plc:aaa"),
+            signature: None,
+            venue: Some("#t"),
+            ctx: crate::events::EventContext::default(),
+            timestamp: 1000,
+        };
+        db.store_reaction_by(subject, "#t", "alice", Some("did:plc:aaa"), "👍", 1000, Some(&react_ev))
+            .unwrap();
+        assert!(
+            db.get_event("01EVREACT00000000000000001").unwrap().is_some(),
+            "the react on an unknown subject files its event"
+        );
+
+        let unreact_ev = MutationEvent {
+            event_id: "01EVUNREACT000000000000001",
+            actor_did: Some("did:plc:aaa"),
+            signature: None,
+            venue: Some("#t"),
+            ctx: crate::events::EventContext::default(),
+            timestamp: 1001,
+        };
+        let removed = db
+            .remove_reaction_by(subject, "alice", Some("did:plc:aaa"), "👍", "#t", Some(&unreact_ev))
+            .unwrap();
+        assert_eq!(removed, 1, "the reaction row itself must go");
+        assert!(
+            db.get_event("01EVUNREACT000000000000001").unwrap().is_some(),
+            "the unreact must leave the same record the react did"
+        );
+    }
+
+    #[test]
+    fn a_delete_event_files_even_when_the_subject_message_is_not_on_file() {
+        // Same property as the unreact twin above, pinned so the guarantee is
+        // a test and not an argument: delete takes its channel from the
+        // caller, so an unknown subject cannot cost it its event.
+        let db = Db::open_memory().unwrap();
+        let ev = MutationEvent {
+            event_id: "01EVDELETE0000000000000001",
+            actor_did: Some("did:plc:aaa"),
+            signature: None,
+            venue: Some("#t"),
+            ctx: crate::events::EventContext::default(),
+            timestamp: 1000,
+        };
+        db.soft_delete_message_by("#t", "2b92520e-7d46-463a-a1ae-05d8e93ea966", Some(&ev))
+            .unwrap();
+        assert!(
+            db.get_event("01EVDELETE0000000000000001").unwrap().is_some(),
+            "the delete leaves its record regardless of the subject's presence"
+        );
     }
 
     #[test]

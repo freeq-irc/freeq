@@ -216,7 +216,7 @@ fn replaying_the_log_reproduces_the_derived_state() {
         .unwrap();
     db.store_reaction_by("M2", "#Rebuild", "b", Some(BOB), "🔥", 52, Some(&mutation("R3", Some(BOB), 52)))
         .unwrap();
-    db.remove_reaction_by("M2", "b", Some(BOB), "🔥", Some(&mutation("R4", Some(BOB), 53)))
+    db.remove_reaction_by("M2", "b", Some(BOB), "🔥", "#Rebuild", Some(&mutation("R4", Some(BOB), 53)))
         .unwrap();
 
     // Pins: one that stays, one lifted.

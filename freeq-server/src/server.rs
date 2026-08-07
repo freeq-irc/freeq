@@ -4373,12 +4373,14 @@ pub(crate) async fn process_s2s_message(
                 let did = actor_did.clone();
                 let emoji = emoji.clone();
                 let target_msgid = target_msgid.clone();
+                let channel = target.clone();
                 state.with_db(|db| {
                     db.remove_reaction_by(
                         &target_msgid,
                         &nick,
                         did.as_deref(),
                         &emoji,
+                        &channel,
                         Some(&relayed_event),
                     )
                 });

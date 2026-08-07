@@ -1205,8 +1205,9 @@ pub(super) fn handle_tagmsg(
             &event_ctx,
             ts,
         );
+        let channel = target.to_string();
         state.with_db(|db| {
-            db.remove_reaction_by(&target_msgid, &nick, did.as_deref(), &emoji, Some(&ev))
+            db.remove_reaction_by(&target_msgid, &nick, did.as_deref(), &emoji, &channel, Some(&ev))
         });
     }
 
