@@ -415,7 +415,7 @@ private fun MessageBubble(
     var showMenu by remember { mutableStateOf(false) }
     var showEmojiPicker by remember { mutableStateOf(false) }
     var showReportDialog by remember { mutableStateOf(false) }
-    var showProof by remember { mutableStateOf(false) }
+    var showMessageProof by remember { mutableStateOf(false) }
     val haptic = LocalHapticFeedback.current
     val isOwn = msg.from.equals(appState.nick.value, ignoreCase = true)
     // Sender identity: the server-bound DID from the channel member entry
@@ -424,10 +424,6 @@ private fun MessageBubble(
     val senderMember = channelState.members
         .firstOrNull { it.nick.equals(msg.from, ignoreCase = true) }
     val senderDid = senderMember?.did ?: appState.didForNick(msg.from)
-    // Who to show proof for. The live binding first; failing that, the DID the
-    // message itself carries — a sender who has since left the channel is gone
-    // from the member list but not from their own message.
-    val proofDid = senderDid?.takeIf { it.isNotEmpty() } ?: msg.account
     val isMention = !isOwn && appState.nick.value.isNotEmpty() &&
             msg.text.contains(appState.nick.value, ignoreCase = true)
     // Read directly from pins map so Compose tracks the state change
@@ -598,11 +594,15 @@ private fun MessageBubble(
                             && !senderDid.startsWith("did:key:")) {
                             Icon(
                                 Icons.Default.CheckCircle,
-                                contentDescription = "Verified — tap for proof",
+                                contentDescription = "Verified — tap for this person's profile",
                                 tint = FreeqColors.accent,
                                 modifier = Modifier
                                     .size(14.dp)
-                                    .clickable { showProof = true }
+                                    // Who this person is is a question about
+                                    // them, so it goes where their identity
+                                    // already lives: the profile card, which
+                                    // holds the proof view behind its own mark.
+                                    .clickable { onNickClick?.invoke(msg.from, msg.origin) }
                             )
                         }
                         // Federated: relayed from another server — peer-vouched,
@@ -633,7 +633,7 @@ private fun MessageBubble(
                                 tint = FreeqColors.danger,
                                 modifier = Modifier
                                     .size(12.dp)
-                                    .clickable { showProof = true }
+                                    .clickable { showMessageProof = true }
                             )
                         }
                         if (msg.isEdited) {
@@ -770,7 +770,7 @@ private fun MessageBubble(
                 text = { Text("Verify Signature") },
                 onClick = {
                     showMenu = false
-                    showProof = true
+                    showMessageProof = true
                 },
                 leadingIcon = { Icon(Icons.Default.VerifiedUser, contentDescription = null) }
             )
@@ -856,16 +856,13 @@ private fun MessageBubble(
             }
         }
 
-        // Report reason picker — on choice: report (log) + block + snackbar
-        // The check the user asked for, and the proof behind it. Opens even
-        // for a sender with no DID on file — the message's signature is still
-        // a fair question, and the sheet declines to claim an identity.
-        if (showProof) {
+        // The check the user asked for, about this message and nothing else.
+        // Who sent it is a separate question with its own surface, so this one
+        // neither claims nor disowns an identity.
+        if (showMessageProof) {
             VerifiedProofSheet(
-                did = proofDid,
-                handle = msg.from,
-                msgId = msg.id,
-                onDismiss = { showProof = false }
+                request = ProofRequest.Message(msg.id),
+                onDismiss = { showMessageProof = false }
             )
         }
 

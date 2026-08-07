@@ -9,6 +9,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Flag
+import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.automirrored.filled.Chat
@@ -40,6 +41,7 @@ fun UserProfileSheet(
     var profile by remember { mutableStateOf<BlueskyProfile?>(null) }
     var loading by remember { mutableStateOf(true) }
     var showReportDialog by remember { mutableStateOf(false) }
+    var showIdentityProof by remember { mutableStateOf(false) }
     val uriHandler = LocalUriHandler.current
     val isOwnProfile = nick.equals(appState.nick.value, ignoreCase = true)
     // Identity is the server-bound DID, never the nick. Resolve the DID
@@ -122,9 +124,11 @@ fun UserProfileSheet(
                 if (profile != null && origin == null) {
                     Icon(
                         Icons.Default.CheckCircle,
-                        contentDescription = "Verified",
+                        contentDescription = "Verified — tap for the proof",
                         tint = FreeqColors.accent,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier
+                            .size(18.dp)
+                            .clickable { showIdentityProof = true }
                     )
                 }
             }
@@ -264,6 +268,42 @@ fun UserProfileSheet(
                     }
                 }
 
+                // The identity claim's evidence: this person's DID and the key
+                // they sign with. Reachable for everyone we hold a DID for,
+                // including the senders who carry no ✓ — a did:key bot and a
+                // relayed stranger have a proof view too, and it says what it
+                // can support rather than nothing at all.
+                if (!resolvedDid.isNullOrEmpty()) {
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showIdentityProof = true },
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 12.dp),
+                            horizontalArrangement = Arrangement.Center,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                Icons.Default.VerifiedUser,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                                tint = MaterialTheme.colorScheme.onBackground
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                "Identity proof",
+                                fontWeight = FontWeight.Medium,
+                                color = MaterialTheme.colorScheme.onBackground
+                            )
+                        }
+                    }
+                }
+
                 // Safety actions (hidden for own profile)
                 if (!isOwnProfile) {
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -323,6 +363,20 @@ fun UserProfileSheet(
                 )
             }
         }
+    }
+
+    // The proof behind the identity claim this card makes — opened from the
+    // card's own mark, over the card, so the person stays the subject.
+    if (showIdentityProof) {
+        VerifiedProofSheet(
+            request = ProofRequest.Identity(
+                did = resolvedDid,
+                handle = profile?.handle,
+                displayName = profile?.displayName?.takeIf { it.isNotEmpty() },
+                origin = origin
+            ),
+            onDismiss = { showIdentityProof = false }
+        )
     }
 
     // Report reason picker — on choice: report (log) + block + snackbar

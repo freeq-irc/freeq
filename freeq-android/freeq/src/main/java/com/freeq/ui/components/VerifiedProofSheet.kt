@@ -30,10 +30,32 @@ import com.freeq.ui.theme.FreeqColors
 import kotlinx.coroutines.delay
 
 /**
- * The differentiator, made tangible. Ask for a signature to be checked and see
- * the actual proof: the DID that IS this person, the key they sign every
- * message with, and the server's real ed25519 check of the message's
- * signature. Mirrors iOS VerifiedProofSheet against the same REST endpoints.
+ * What the sheet was opened to answer. Who a person is and whether one message
+ * was signed are claims about different subjects, so they never share a
+ * surface: each gesture says which of the two it is asking about, and the sheet
+ * shows that one and nothing else.
+ */
+sealed interface ProofRequest {
+    /** Who this person is: the DID that identifies them and the key they sign
+     *  with. Says nothing about any particular message. */
+    data class Identity(
+        val did: String?,
+        val handle: String? = null,
+        val displayName: String? = null,
+        /** Set when we only know this person through a relaying peer. */
+        val origin: String? = null,
+    ) : ProofRequest
+
+    /** Whether this one message's signature holds up. Says nothing about who
+     *  the sender is — that question has its own surface. */
+    data class Message(val msgId: String) : ProofRequest
+}
+
+/**
+ * The differentiator, made tangible: the DID that IS this person and the key
+ * they sign with, or the server's real ed25519 check of one message's
+ * signature — whichever was asked for. Mirrors iOS VerifiedProofSheet against
+ * the same REST endpoints.
  *
  * The verdict says only what the server supported. A check that could not be
  * made is a fact, never a warning, and only a signature the server found and
@@ -42,42 +64,9 @@ import kotlinx.coroutines.delay
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun VerifiedProofSheet(
-    /** The sender's DID, when they have one. Guests don't, and the sheet
-     *  claims no identity for them. */
-    did: String?,
-    handle: String? = null,
-    displayName: String? = null,
-    /** When set, check this specific message's signature. */
-    msgId: String? = null,
+    request: ProofRequest,
     onDismiss: () -> Unit,
 ) {
-    var key by remember { mutableStateOf<SigningKeyInfo?>(null) }
-    var keyLoading by remember { mutableStateOf(did != null) }
-    var verify by remember { mutableStateOf<VerifyAnswer?>(null) }
-    var verifying by remember { mutableStateOf(msgId != null) }
-
-    LaunchedEffect(did) {
-        val d = did ?: return@LaunchedEffect
-        keyLoading = true
-        key = VerificationService.fetchSigningKey(d)
-        keyLoading = false
-    }
-    LaunchedEffect(msgId) {
-        val id = msgId ?: return@LaunchedEffect
-        verifying = true
-        var answer = VerificationService.verifyMessage(id)
-        // The server starts fetching the signer's key by answering, so this
-        // one flavour of can't-check is worth waiting out — briefly.
-        var attempts = 0
-        while (answer.transient && attempts < 2) {
-            attempts++
-            delay(1200)
-            answer = VerificationService.verifyMessage(id)
-        }
-        verify = answer
-        verifying = false
-    }
-
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
             modifier = Modifier
@@ -87,84 +76,140 @@ fun VerifiedProofSheet(
                 .padding(bottom = 32.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            if (did != null) {
-                Icon(
-                    Icons.Default.CheckCircle,
-                    contentDescription = null,
-                    tint = FreeqColors.success,
-                    modifier = Modifier.size(64.dp),
-                )
-                Spacer(Modifier.height(12.dp))
-                Text(
-                    text = displayName ?: handle?.let { "@$it" } ?: "Verified identity",
-                    fontSize = 20.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface,
-                )
-                Text(
-                    text = "Verified via the AT Protocol",
-                    fontSize = 13.sp,
-                    color = FreeqColors.success,
-                )
-                Spacer(Modifier.height(16.dp))
-                Text(
-                    text = "This is a real, self-owned identity. Its owner holds the key " +
-                        "below and signs everything they send — so no one can impersonate " +
-                        "them, on freeq or anywhere else on the network.",
-                    fontSize = 14.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(Modifier.height(20.dp))
-
-                ProofCard(
-                    label = "DECENTRALIZED IDENTIFIER",
-                    value = did,
-                    detail = handle?.let { "resolves to @$it" },
-                    copyable = true,
-                )
-
-                Spacer(Modifier.height(12.dp))
-
-                if (key != null) {
-                    ProofCard(
-                        label = "MESSAGE SIGNING KEY",
-                        value = key!!.publicKey,
-                        detail = "${key!!.algorithm.uppercase()} · ${key!!.sourceLabel}",
-                        copyable = false,
-                    )
-                } else if (keyLoading) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(20.dp),
-                        strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            } else {
-                // No DID to speak of — a guest, or someone whose binding this
-                // client never learned. The message's signature is still worth
-                // asking about; this person's identity is not ours to assert.
-                Spacer(Modifier.height(12.dp))
-                Text(
-                    text = handle?.let { "@$it" } ?: "Unidentified sender",
-                    fontSize = 20.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface,
-                )
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    text = "No decentralized identity is on file for this sender here.",
-                    fontSize = 14.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(Modifier.height(8.dp))
-            }
-
-            if (msgId != null) {
-                Spacer(Modifier.height(12.dp))
-                MessageVerdict(verifying = verifying, verify = verify)
+            when (request) {
+                is ProofRequest.Identity -> IdentityProof(request)
+                is ProofRequest.Message -> MessageProof(request.msgId)
             }
         }
     }
+}
+
+/** Who this person is — never a word about any single message. */
+@Composable
+private fun IdentityProof(request: ProofRequest.Identity) {
+    val did = request.did
+    var key by remember { mutableStateOf<SigningKeyInfo?>(null) }
+    var keyLoading by remember { mutableStateOf(did != null) }
+
+    LaunchedEffect(did) {
+        val d = did ?: return@LaunchedEffect
+        keyLoading = true
+        key = VerificationService.fetchSigningKey(d)
+        keyLoading = false
+    }
+
+    if (did != null) {
+        Icon(
+            Icons.Default.CheckCircle,
+            contentDescription = null,
+            tint = FreeqColors.success,
+            modifier = Modifier.size(64.dp),
+        )
+        Spacer(Modifier.height(12.dp))
+        Text(
+            text = request.displayName ?: request.handle?.let { "@$it" } ?: "Verified identity",
+            fontSize = 20.sp,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Text(
+            text = "Verified via the AT Protocol",
+            fontSize = 13.sp,
+            color = FreeqColors.success,
+        )
+        Spacer(Modifier.height(16.dp))
+        Text(
+            text = "This is a real, self-owned identity. Its owner holds the key " +
+                "below and signs everything they send — so no one can impersonate " +
+                "them, on freeq or anywhere else on the network.",
+            fontSize = 14.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(20.dp))
+
+        ProofCard(
+            label = "DECENTRALIZED IDENTIFIER",
+            value = did,
+            detail = request.handle?.let { "resolves to @$it" },
+            copyable = true,
+        )
+
+        Spacer(Modifier.height(12.dp))
+
+        if (key != null) {
+            ProofCard(
+                label = "MESSAGE SIGNING KEY",
+                value = key!!.publicKey,
+                detail = "${key!!.algorithm.uppercase()} · ${key!!.sourceLabel}",
+                copyable = false,
+            )
+        } else if (keyLoading) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(20.dp),
+                strokeWidth = 2.dp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    } else {
+        // No DID to speak of — a guest, or someone whose binding this client
+        // never learned. This person's identity is not ours to assert.
+        Spacer(Modifier.height(12.dp))
+        Text(
+            text = request.handle?.let { "@$it" } ?: "Unidentified sender",
+            fontSize = 20.sp,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = "No decentralized identity is on file for this sender here.",
+            fontSize = 14.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(8.dp))
+    }
+}
+
+/**
+ * One message's signature, and nothing else. Whoever sent it is a separate
+ * question with a separate surface, so nothing here identifies them — a sender
+ * this client knows perfectly well is neither claimed nor disowned.
+ */
+@Composable
+private fun MessageProof(msgId: String) {
+    var verify by remember { mutableStateOf<VerifyAnswer?>(null) }
+    var verifying by remember { mutableStateOf(true) }
+
+    LaunchedEffect(msgId) {
+        verifying = true
+        var answer = VerificationService.verifyMessage(msgId)
+        // The server starts fetching the signer's key by answering, so this
+        // one flavour of can't-check is worth waiting out — briefly.
+        var attempts = 0
+        while (answer.transient && attempts < 2) {
+            attempts++
+            delay(1200)
+            answer = VerificationService.verifyMessage(msgId)
+        }
+        verify = answer
+        verifying = false
+    }
+
+    Spacer(Modifier.height(12.dp))
+    Text(
+        text = "This message",
+        fontSize = 20.sp,
+        fontWeight = FontWeight.Bold,
+        color = MaterialTheme.colorScheme.onSurface,
+    )
+    Spacer(Modifier.height(8.dp))
+    Text(
+        text = "Whether this one message carries a signature that checks out.",
+        fontSize = 14.sp,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(Modifier.height(16.dp))
+    MessageVerdict(verifying = verifying, verify = verify)
 }
 
 @Composable
@@ -271,7 +316,7 @@ private fun MessageVerdict(verifying: Boolean, verify: VerifyAnswer?) {
                 }
                 Icon(
                     when (verify.outcome) {
-                        VerifyOutcome.DEVICE, VerifyOutcome.SERVER -> Icons.Default.CheckCircle
+                        VerifyOutcome.DEVICE -> Icons.Default.CheckCircle
                         VerifyOutcome.INVALID -> Icons.Default.Warning
                         else -> Icons.Default.Info
                     },
