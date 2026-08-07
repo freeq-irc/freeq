@@ -711,41 +711,48 @@ class AppState(application: Application) : AndroidViewModel(application) {
 
     // ── Messaging ──
 
+    /**
+     * Send what the compose bar holds — a new message, an edit, or a reply.
+     *
+     * Every branch goes through a typed SDK sender, which signs the message
+     * and files an event id for it. Hand-built lines reach the wire as raw
+     * commands, which the SDK deliberately never signs; an edit sent that way
+     * carried no proof of who made it.
+     *
+     * `\n` is passed through untouched. The SDK auto-routes newline-bearing
+     * text to a `draft/multiline` BATCH when the server acked the cap, and
+     * signs the body a receiver reassembles — so the escaping this used to do
+     * would have signed bytes nobody ever holds.
+     */
     fun sendMessage(target: String, text: String) {
         if (text.isEmpty()) return
-        sendRaw("@+typing=done TAGMSG $target")
-        lastTypingSent = 0
-
-        // Edit + reply paths go through sendRaw because the FFI doesn't
-        // expose typed send_reply/send_edit yet. For those, encode `\n`
-        // as the legacy `+freeq.at/multiline` inline form so multi-line
-        // content survives a single PRIVMSG — receivers (web app, TUI,
-        // freeq-aware mobile) decode the tag on render.
-        val cleaned = text.replace("\r", "")
-        val hasNewline = cleaned.contains("\n")
-        val escaped = if (hasNewline) cleaned.replace("\n", "\\n") else cleaned
-        val multilineTag = if (hasNewline) ";+freeq.at/multiline" else ""
-
-        val editing = editingMessage.value
-        if (editing != null) {
-            sendRaw("@+draft/edit=${editing.id}$multilineTag PRIVMSG $target :$escaped")
-            editingMessage.value = null
-            return
-        }
-
-        val reply = replyingTo.value
-        if (reply != null) {
-            sendRaw("@+reply=${reply.id}$multilineTag PRIVMSG $target :$escaped")
-            replyingTo.value = null
-            return
-        }
-
-        // Plain send: pass text as-is. The FFI calls Rust SDK's privmsg,
-        // which auto-routes `\n`-bearing text to a draft/multiline BATCH
-        // when the server acked the cap — one logical message, msgid
-        // coherence for edits / reactions / replies.
+        stopTyping(target)
+        val plan = ComposeSend.plan(
+            target,
+            text,
+            editingId = editingMessage.value?.id,
+            replyToId = replyingTo.value?.id,
+        ) ?: return
         try {
-            client?.sendMessage(target, cleaned)
+            when (plan) {
+                is OutboundSend.Edit -> client?.editMessage(plan.target, plan.msgId, plan.text)
+                is OutboundSend.Reply -> client?.reply(plan.target, plan.msgId, plan.text)
+                is OutboundSend.Plain -> client?.sendMessage(plan.target, plan.text)
+            }
+        } catch (_: Exception) {
+            errorMessage.value = "Send failed"
+        }
+        editingMessage.value = null
+        replyingTo.value = null
+    }
+
+    /** Send a `/me` as a CTCP ACTION. The framing lives in the body, so the
+     *  SDK signs it as the ordinary message it is. */
+    fun sendAction(target: String, text: String) {
+        if (text.isEmpty()) return
+        stopTyping(target)
+        try {
+            client?.sendMessage(target, "\u0001ACTION $text\u0001")
         } catch (_: Exception) {
             errorMessage.value = "Send failed"
         }
@@ -773,7 +780,12 @@ class AppState(application: Application) : AndroidViewModel(application) {
         } else {
             ch?.addReaction(msgId, emoji, nick.value)
         }
-        sendRaw(ReactionOp.line(target, msgId, emoji, alreadyReacted))
+        try {
+            when (val op = ReactionOp.plan(target, msgId, emoji, alreadyReacted)) {
+                is ReactionSend.Add -> client?.react(op.target, op.emoji, op.msgId)
+                is ReactionSend.Remove -> client?.unreact(op.target, op.emoji, op.msgId)
+            }
+        } catch (_: Exception) {}
     }
 
     fun deleteMessage(target: String, msgId: String) {
@@ -781,14 +793,28 @@ class AppState(application: Application) : AndroidViewModel(application) {
         val ch = channels.firstOrNull { it.name.equals(target, ignoreCase = true) }
             ?: dmBuffers.firstOrNull { it.name.equals(target, ignoreCase = true) }
         ch?.applyDelete(msgId)
-        sendRaw("@+draft/delete=$msgId TAGMSG $target")
+        try {
+            client?.deleteMessage(target, msgId)
+        } catch (_: Exception) {}
     }
 
     fun sendTyping(target: String) {
         val now = System.currentTimeMillis()
         if (now - lastTypingSent < 3000) return
         lastTypingSent = now
-        sendRaw("@+typing=active TAGMSG $target")
+        try {
+            client?.typingStart(target)
+        } catch (_: Exception) {}
+    }
+
+    /** Withdraw the typing indicator. Ephemeral either way — it carries no
+     *  event id and nothing signs it, because nothing about it is worth
+     *  attesting to later. */
+    private fun stopTyping(target: String) {
+        lastTypingSent = 0
+        try {
+            client?.typingStop(target)
+        } catch (_: Exception) {}
     }
 
     fun requestHistory(channel: String) {

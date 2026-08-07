@@ -869,6 +869,24 @@ internal open class UniffiVTableCallbackInterfaceP2pEventHandler(
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -908,7 +926,11 @@ fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_connect(
 ): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_current_nick(
 ): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_delete_message(
+): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_disconnect(
+): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_edit_message(
 ): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_is_connected(
 ): Short
@@ -918,9 +940,17 @@ fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_nick(
 ): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_part(
 ): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_react(
+): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_reply(
+): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_request_whois(
+): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_send_message(
 ): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_send_raw(
+): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_send_tagged(
 ): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_platform(
 ): Short
@@ -929,6 +959,12 @@ fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_topic(
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_web_token(
 ): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_websocket_url(
+): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_typing_start(
+): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_typing_stop(
+): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_unreact(
 ): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqe2ee_decrypt_message(
 ): Short
@@ -1064,7 +1100,11 @@ fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_connect(`ptr`: Pointer,uniffi_out
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_current_nick(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_delete_message(`ptr`: Pointer,`target`: RustBuffer.ByValue,`msgid`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_disconnect(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_edit_message(`ptr`: Pointer,`target`: RustBuffer.ByValue,`msgid`: RustBuffer.ByValue,`newText`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_is_connected(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
@@ -1074,9 +1114,17 @@ fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_nick(`ptr`: Pointer,`newNick`: Ru
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_part(`ptr`: Pointer,`channel`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_react(`ptr`: Pointer,`target`: RustBuffer.ByValue,`emoji`: RustBuffer.ByValue,`msgid`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_reply(`ptr`: Pointer,`target`: RustBuffer.ByValue,`msgid`: RustBuffer.ByValue,`text`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_request_whois(`ptr`: Pointer,`nick`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_send_message(`ptr`: Pointer,`target`: RustBuffer.ByValue,`text`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_send_raw(`ptr`: Pointer,`line`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_send_tagged(`ptr`: Pointer,`target`: RustBuffer.ByValue,`text`: RustBuffer.ByValue,`tags`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_platform(`ptr`: Pointer,`platform`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1085,6 +1133,12 @@ fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_topic(`ptr`: Pointer,`channel
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_web_token(`ptr`: Pointer,`token`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_websocket_url(`ptr`: Pointer,`url`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_typing_start(`ptr`: Pointer,`target`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_typing_stop(`ptr`: Pointer,`target`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_unreact(`ptr`: Pointer,`target`: RustBuffer.ByValue,`emoji`: RustBuffer.ByValue,`msgid`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_clone_freeqe2ee(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Pointer
@@ -1298,7 +1352,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_current_nick() != 2287.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_delete_message() != 56869.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_disconnect() != 50640.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_edit_message() != 7999.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_is_connected() != 11223.toShort()) {
@@ -1313,10 +1373,22 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_part() != 40069.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_react() != 14725.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_reply() != 46428.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_request_whois() != 29431.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_send_message() != 60197.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_send_raw() != 34247.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_send_tagged() != 64231.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_platform() != 50791.toShort()) {
@@ -1329,6 +1401,15 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_websocket_url() != 40379.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_typing_start() != 12743.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_typing_stop() != 39542.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_unreact() != 55886.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqe2ee_decrypt_message() != 42382.toShort()) {
@@ -2238,7 +2319,11 @@ public interface FreeqClientInterface {
     
     fun `currentNick`(): kotlin.String?
     
+    fun `deleteMessage`(`target`: kotlin.String, `msgid`: kotlin.String)
+    
     fun `disconnect`()
+    
+    fun `editMessage`(`target`: kotlin.String, `msgid`: kotlin.String, `newText`: kotlin.String)
     
     fun `isConnected`(): kotlin.Boolean
     
@@ -2248,9 +2333,17 @@ public interface FreeqClientInterface {
     
     fun `part`(`channel`: kotlin.String)
     
+    fun `react`(`target`: kotlin.String, `emoji`: kotlin.String, `msgid`: kotlin.String)
+    
+    fun `reply`(`target`: kotlin.String, `msgid`: kotlin.String, `text`: kotlin.String)
+    
+    fun `requestWhois`(`nick`: kotlin.String)
+    
     fun `sendMessage`(`target`: kotlin.String, `text`: kotlin.String)
     
     fun `sendRaw`(`line`: kotlin.String)
+    
+    fun `sendTagged`(`target`: kotlin.String, `text`: kotlin.String, `tags`: List<TagEntry>)
     
     fun `setPlatform`(`platform`: kotlin.String)
     
@@ -2259,6 +2352,12 @@ public interface FreeqClientInterface {
     fun `setWebToken`(`token`: kotlin.String)
     
     fun `setWebsocketUrl`(`url`: kotlin.String)
+    
+    fun `typingStart`(`target`: kotlin.String)
+    
+    fun `typingStop`(`target`: kotlin.String)
+    
+    fun `unreact`(`target`: kotlin.String, `emoji`: kotlin.String, `msgid`: kotlin.String)
     
     companion object
 }
@@ -2376,12 +2475,36 @@ open class FreeqClient: Disposable, AutoCloseable, FreeqClientInterface
     }
     
 
+    
+    @Throws(FreeqException::class)override fun `deleteMessage`(`target`: kotlin.String, `msgid`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(FreeqException) { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_delete_message(
+        it, FfiConverterString.lower(`target`),FfiConverterString.lower(`msgid`),_status)
+}
+    }
+    
+    
+
     override fun `disconnect`()
         = 
     callWithPointer {
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_disconnect(
         it, _status)
+}
+    }
+    
+    
+
+    
+    @Throws(FreeqException::class)override fun `editMessage`(`target`: kotlin.String, `msgid`: kotlin.String, `newText`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(FreeqException) { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_edit_message(
+        it, FfiConverterString.lower(`target`),FfiConverterString.lower(`msgid`),FfiConverterString.lower(`newText`),_status)
 }
     }
     
@@ -2436,6 +2559,42 @@ open class FreeqClient: Disposable, AutoCloseable, FreeqClientInterface
     
 
     
+    @Throws(FreeqException::class)override fun `react`(`target`: kotlin.String, `emoji`: kotlin.String, `msgid`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(FreeqException) { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_react(
+        it, FfiConverterString.lower(`target`),FfiConverterString.lower(`emoji`),FfiConverterString.lower(`msgid`),_status)
+}
+    }
+    
+    
+
+    
+    @Throws(FreeqException::class)override fun `reply`(`target`: kotlin.String, `msgid`: kotlin.String, `text`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(FreeqException) { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_reply(
+        it, FfiConverterString.lower(`target`),FfiConverterString.lower(`msgid`),FfiConverterString.lower(`text`),_status)
+}
+    }
+    
+    
+
+    
+    @Throws(FreeqException::class)override fun `requestWhois`(`nick`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(FreeqException) { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_request_whois(
+        it, FfiConverterString.lower(`nick`),_status)
+}
+    }
+    
+    
+
+    
     @Throws(FreeqException::class)override fun `sendMessage`(`target`: kotlin.String, `text`: kotlin.String)
         = 
     callWithPointer {
@@ -2454,6 +2613,18 @@ open class FreeqClient: Disposable, AutoCloseable, FreeqClientInterface
     uniffiRustCallWithError(FreeqException) { _status ->
     UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_send_raw(
         it, FfiConverterString.lower(`line`),_status)
+}
+    }
+    
+    
+
+    
+    @Throws(FreeqException::class)override fun `sendTagged`(`target`: kotlin.String, `text`: kotlin.String, `tags`: List<TagEntry>)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(FreeqException) { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_send_tagged(
+        it, FfiConverterString.lower(`target`),FfiConverterString.lower(`text`),FfiConverterSequenceTypeTagEntry.lower(`tags`),_status)
 }
     }
     
@@ -2502,6 +2673,42 @@ open class FreeqClient: Disposable, AutoCloseable, FreeqClientInterface
     uniffiRustCallWithError(FreeqException) { _status ->
     UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_websocket_url(
         it, FfiConverterString.lower(`url`),_status)
+}
+    }
+    
+    
+
+    
+    @Throws(FreeqException::class)override fun `typingStart`(`target`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(FreeqException) { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_typing_start(
+        it, FfiConverterString.lower(`target`),_status)
+}
+    }
+    
+    
+
+    
+    @Throws(FreeqException::class)override fun `typingStop`(`target`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(FreeqException) { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_typing_stop(
+        it, FfiConverterString.lower(`target`),_status)
+}
+    }
+    
+    
+
+    
+    @Throws(FreeqException::class)override fun `unreact`(`target`: kotlin.String, `emoji`: kotlin.String, `msgid`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(FreeqException) { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_unreact(
+        it, FfiConverterString.lower(`target`),FfiConverterString.lower(`emoji`),FfiConverterString.lower(`msgid`),_status)
 }
     }
     

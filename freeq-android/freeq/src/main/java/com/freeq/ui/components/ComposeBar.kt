@@ -361,7 +361,7 @@ private fun handleCommand(input: String, appState: AppState) {
         SlashCommand.PartActive -> appState.activeChannel.value?.let { appState.partChannel(it) }
         is SlashCommand.Nick -> appState.sendRaw("NICK ${parsed.newNick}")
         is SlashCommand.Me -> appState.activeChannel.value?.let { target ->
-            appState.sendRaw("PRIVMSG $target :\u0001ACTION ${parsed.text}\u0001")
+            appState.sendAction(target, parsed.text)
         }
         is SlashCommand.Msg -> appState.sendMessage(parsed.target, parsed.text)
         is SlashCommand.Topic -> appState.activeChannel.value?.let { target ->
