@@ -826,25 +826,24 @@ function GroupedMessageImpl({ msg, channel, onNickClick }: MessageProps) {
       <span className="w-10 shrink-0 text-right text-[11px] text-fg-dim opacity-0 group-hover:opacity-100 leading-[24px] cursor-default" title={msg.timestamp.toLocaleString([], { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })}>
         {formatTime(msg.timestamp)}
       </span>
-      <div className="min-w-0 flex-1">
-        <MessageContent msg={msg} channel={channel} onNickClick={onNickClick} />
-        <Reactions msg={msg} channel={channel} />
-      </div>
-
       {/* A follow-up row carries the same evidence as the row that opened the
           group — being the second thing someone said is not a reason to stop
-          saying whether it was signed. The markers get a fixed column so a
-          line that has them doesn't sit differently from one that doesn't. */}
-      <span className="w-10 shrink-0 flex items-start justify-end gap-1 leading-[24px]">
+          saying whether it was signed. The markers sit where a full row
+          carries them: before the content, in a reserved slot so a line that
+          has them doesn't sit differently from one that doesn't. */}
+      <span className="min-w-5 shrink-0 flex items-start gap-1 leading-[24px]">
         {msg.encrypted && <EncryptedBadge />}
         {msg.tags?.['+freeq.at/sig'] && !msg.tags?.['+freeq.at/origin'] && (
           <SignedBadge msgid={msg.id} />
         )}
       </span>
 
-      {/* Clear of the marker column, so hovering a row never hides what it
-          says about itself. */}
-      <div className="opacity-0 group-hover:opacity-100 absolute right-14 -top-3 flex items-center bg-bg-secondary border border-border rounded-lg shadow-lg overflow-hidden">
+      <div className="min-w-0 flex-1">
+        <MessageContent msg={msg} channel={channel} onNickClick={onNickClick} />
+        <Reactions msg={msg} channel={channel} />
+      </div>
+
+      <div className="opacity-0 group-hover:opacity-100 absolute right-3 -top-3 flex items-center bg-bg-secondary border border-border rounded-lg shadow-lg overflow-hidden">
         <HoverBtn emoji="↩️" title="Reply" onClick={() => {
           useStore.getState().setReplyTo({ msgId: msg.id, from: msg.from, text: msg.text, channel });
         }} />
