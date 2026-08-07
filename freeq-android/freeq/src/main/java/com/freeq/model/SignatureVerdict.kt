@@ -28,8 +28,10 @@ enum class VerdictTone { GOOD, BAD, QUIET }
  * final.
  */
 data class VerifyAnswer(val outcome: VerifyOutcome, val transient: Boolean = false) {
+    /** Sender proof only. A server signature is the server vouching for what
+     *  it received — a valid fact, not a verification of the sender. */
     val isVerified: Boolean
-        get() = outcome == VerifyOutcome.DEVICE || outcome == VerifyOutcome.SERVER
+        get() = outcome == VerifyOutcome.DEVICE
 
     val isInvalid: Boolean
         get() = outcome == VerifyOutcome.INVALID
@@ -89,15 +91,16 @@ object SignatureVerdict {
     }
 
     fun tone(outcome: VerifyOutcome): VerdictTone = when (outcome) {
-        VerifyOutcome.DEVICE, VerifyOutcome.SERVER -> VerdictTone.GOOD
+        VerifyOutcome.DEVICE -> VerdictTone.GOOD
         VerifyOutcome.INVALID -> VerdictTone.BAD
-        VerifyOutcome.UNVERIFIABLE, VerifyOutcome.UNREACHABLE -> VerdictTone.QUIET
+        // A server vouch is quiet like every other not-proven state.
+        VerifyOutcome.SERVER, VerifyOutcome.UNVERIFIABLE, VerifyOutcome.UNREACHABLE -> VerdictTone.QUIET
     }
 
     /** What the verdict says, in the sheet. */
     fun label(answer: VerifyAnswer): String = when (answer.outcome) {
         VerifyOutcome.DEVICE -> "Verified — signed on the sender's device."
-        VerifyOutcome.SERVER -> "Verified — signed by the server on the sender's behalf."
+        VerifyOutcome.SERVER -> "Valid server signature — the server vouches for what it received; the sender's own key did not sign it."
         VerifyOutcome.INVALID -> "Does not match its signing key — treat with suspicion."
         VerifyOutcome.UNVERIFIABLE ->
             if (answer.transient) "Fetching the signer's key — checking again shortly."

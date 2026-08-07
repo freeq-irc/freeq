@@ -25,10 +25,12 @@ class SignatureVerdictTest {
         assertFalse(a.transient)
     }
 
-    @Test fun a_server_signature_is_verified_but_says_so_differently() {
+    @Test fun a_server_signature_is_a_vouch_not_a_verification() {
+        // Valid is not verified: the server vouching for what it received is a
+        // fact about the server, not proof from the sender.
         val a = answer(200, """{"verification":{"verdict":"valid","verified_by":"server-key"}}""")
         assertEquals(VerifyOutcome.SERVER, a.outcome)
-        assertTrue(a.isVerified)
+        assertFalse(a.isVerified)
     }
 
     @Test fun a_mismatch_is_the_one_accusation() {
@@ -86,12 +88,20 @@ class SignatureVerdictTest {
         assertEquals(VerifyOutcome.UNVERIFIABLE, answer(200, "not json at all").outcome)
     }
 
-    @Test fun only_a_verified_answer_gets_a_success_tone() {
+    @Test fun only_sender_proof_gets_the_success_tone() {
         assertEquals(VerdictTone.GOOD, SignatureVerdict.tone(VerifyOutcome.DEVICE))
-        assertEquals(VerdictTone.GOOD, SignatureVerdict.tone(VerifyOutcome.SERVER))
+        assertEquals(VerdictTone.QUIET, SignatureVerdict.tone(VerifyOutcome.SERVER))
         assertEquals(VerdictTone.BAD, SignatureVerdict.tone(VerifyOutcome.INVALID))
         assertEquals(VerdictTone.QUIET, SignatureVerdict.tone(VerifyOutcome.UNVERIFIABLE))
         assertEquals(VerdictTone.QUIET, SignatureVerdict.tone(VerifyOutcome.UNREACHABLE))
+    }
+
+    @Test fun a_server_vouch_never_wears_the_verified_headline() {
+        val device = SignatureVerdict.label(VerifyAnswer(VerifyOutcome.DEVICE))
+        val server = SignatureVerdict.label(VerifyAnswer(VerifyOutcome.SERVER))
+        assertTrue(device.startsWith("Verified"))
+        assertFalse(server.startsWith("Verified"))
+        assertTrue(server.contains("vouches"))
     }
 
     @Test fun only_a_mismatch_marks_the_message_row() {
