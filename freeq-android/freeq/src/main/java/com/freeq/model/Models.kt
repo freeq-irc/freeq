@@ -270,6 +270,17 @@ class AppState(application: Application) : AndroidViewModel(application) {
     private var lastTypingSent: Long = 0
     var reconnectAttempts = 0
     internal val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
+    /** Learns who a bare nick is before the first DM to them, so that message
+     *  can be signed like every other one. */
+    internal val dmResolver = DmResolver(
+        nickToDid = ::didForNick,
+        askWhois = { nick ->
+            try {
+                client?.requestWhois(nick)
+            } catch (_: Exception) {}
+        },
+    )
     val notificationManager = FreeqNotificationManager(application)
     val networkMonitor = NetworkMonitor(application).also { it.bind(this) }
 
@@ -733,17 +744,23 @@ class AppState(application: Application) : AndroidViewModel(application) {
             editingId = editingMessage.value?.id,
             replyToId = replyingTo.value?.id,
         ) ?: return
-        try {
-            when (plan) {
-                is OutboundSend.Edit -> client?.editMessage(plan.target, plan.msgId, plan.text)
-                is OutboundSend.Reply -> client?.reply(plan.target, plan.msgId, plan.text)
-                is OutboundSend.Plain -> client?.sendMessage(plan.target, plan.text)
-            }
-        } catch (_: Exception) {
-            errorMessage.value = "Send failed"
-        }
         editingMessage.value = null
         replyingTo.value = null
+        scope.launch {
+            // A first DM to a bare nick waits, briefly, to learn who they are
+            // — a nick is not a venue a signature can name. Already-known
+            // peers and channels don't suspend at all.
+            val venue = dmResolver.resolve(plan.target)
+            try {
+                when (plan) {
+                    is OutboundSend.Edit -> client?.editMessage(venue, plan.msgId, plan.text)
+                    is OutboundSend.Reply -> client?.reply(venue, plan.msgId, plan.text)
+                    is OutboundSend.Plain -> client?.sendMessage(venue, plan.text)
+                }
+            } catch (_: Exception) {
+                errorMessage.value = "Send failed"
+            }
+        }
     }
 
     /** Send a `/me` as a CTCP ACTION. The framing lives in the body, so the
@@ -942,6 +959,7 @@ class AppState(application: Application) : AndroidViewModel(application) {
 
     fun recordUserDid(nick: String, did: String) {
         knownDids[nick.lowercase()] = did
+        dmResolver.learned(nick, did)
         didDisplayNames[did] = nick
         for (ch in channels) {
             val idx = ch.members.indexOfFirst { it.nick.equals(nick, ignoreCase = true) }
@@ -1001,6 +1019,9 @@ class AppState(application: Application) : AndroidViewModel(application) {
                 // must land in the existing DID-keyed thread, not fork a
                 // second one that only merges on the next inbound event.
                 val key = DidDisplay.canonicalDmKey(trimmed, ::didForNick)
+                // Ask who they are the moment the thread opens, so the first
+                // message doesn't have to wait on the answer to be signed.
+                dmResolver.probe(key)
                 dmBuffers.firstOrNull { it.name.equals(key, ignoreCase = true) }
                     ?.let { return it }
                 val dm = ChannelState(key)
