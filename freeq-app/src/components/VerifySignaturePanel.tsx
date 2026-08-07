@@ -6,6 +6,9 @@ interface Props {
   signed: boolean;
   position: { x: number; y: number };
   onClose: () => void;
+  /** What the id names — adjusts the panel wording. Coordination events
+   *  verify through the same endpoint as messages. */
+  noun?: 'message' | 'event';
 }
 
 const PANEL_W = 288;
@@ -20,7 +23,7 @@ const PANEL_H_ESTIMATE = 210;
  * context menu that opened it, which is also what keeps two panels from ever
  * being open at once.
  */
-export function VerifySignaturePanel({ msgid, signed, position, onClose }: Props) {
+export function VerifySignaturePanel({ msgid, signed, position, onClose, noun = 'message' }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [answer, setAnswer] = useState<VerifyAnswer | null>(null);
   const [checking, setChecking] = useState(signed);
@@ -86,7 +89,9 @@ export function VerifySignaturePanel({ msgid, signed, position, onClose }: Props
       onClick={(e) => e.stopPropagation()}
     >
       <div className={`text-xs font-semibold mb-1 ${headerTone}`}>
-        {signed ? 'Message Signature' : 'Unsigned Message'}
+        {signed
+          ? (noun === 'event' ? 'Event Signature' : 'Message Signature')
+          : (noun === 'event' ? 'Unsigned Event' : 'Unsigned Message')}
       </div>
 
       {signed && (checking || stillFetchingKey) && (
@@ -103,22 +108,19 @@ export function VerifySignaturePanel({ msgid, signed, position, onClose }: Props
 
       {signed && !checking && !stillFetchingKey && outcome && (
         <div className={`text-[11px] font-medium mb-1 ${VERIFY_LABELS[outcome].tone}`}>
-          {(outcome === 'device' || outcome === 'server') && '✓ '}
+          {outcome === 'device' && '✓ '}
           {outcome === 'invalid' && '⚠ '}
           {VERIFY_LABELS[outcome].text}
         </div>
       )}
 
-      <p className="text-[11px] text-fg-muted leading-relaxed">
-        {signed ? (
-          <>This message carries a cryptographic signature tied to the sender&apos;s
-          AT Protocol DID. The check above is the server&apos;s answer from its
-          signing keys.</>
-        ) : (
-          <>Nothing was signed — there is no signature to check. Typical for
-          guest accounts and messages from legacy servers.</>
-        )}
-      </p>
+      {!signed && (
+        <p className="text-[11px] text-fg-muted leading-relaxed">
+          {noun === 'event'
+            ? 'Nothing was signed — there is no signature to check. Typical for events emitted before event signing.'
+            : 'Nothing was signed — there is no signature to check. Typical for guest accounts and messages from legacy servers.'}
+        </p>
+      )}
 
       <button
         className="text-[10px] text-fg-dim hover:text-fg-muted mt-1.5"

@@ -3,6 +3,7 @@
  * Fetches from GET /api/v1/tasks/{taskId}
  */
 import { useEffect, useState } from 'react';
+import { VerifySignaturePanel } from './VerifySignaturePanel';
 
 interface TaskEvent {
   event_id: string;
@@ -25,6 +26,7 @@ const phaseOrder = ['specifying', 'designing', 'building', 'reviewing', 'testing
 export function TaskTimeline({ taskId, onClose }: { taskId: string; onClose: () => void }) {
   const [data, setData] = useState<TaskData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [verify, setVerify] = useState<{ id: string; signed: boolean; pos: { x: number; y: number } } | null>(null);
 
   useEffect(() => {
     fetch(`/api/v1/tasks/${encodeURIComponent(taskId)}`)
@@ -79,6 +81,13 @@ export function TaskTimeline({ taskId, onClose }: { taskId: string; onClose: () 
           <span>📋</span>
           <span className="font-semibold text-sm text-fg">Task</span>
           <span className="text-[10px] font-mono text-fg-dim/60">{taskId.slice(0, 12)}</span>
+          <button
+            className="text-[10px] text-fg-dim/60 hover:text-fg-muted underline decoration-dotted"
+            title="Check this event's signature"
+            onClick={e => setVerify({ id: task.event_id, signed: !!task.signature, pos: { x: e.clientX, y: e.clientY } })}
+          >
+            verify
+          </button>
         </div>
         <button onClick={onClose} className="text-fg-dim hover:text-fg text-sm">✕</button>
       </div>
@@ -136,11 +145,27 @@ export function TaskTimeline({ taskId, onClose }: { taskId: string; onClose: () 
                 <span>📎</span>
                 <span className="font-semibold capitalize">{type.replace(/_/g, ' ')}</span>
                 <span className="text-fg-dim truncate">{summary}</span>
-                {e.signature && <span className="text-[10px] text-success/60">🔒</span>}
+                <button
+                  className="text-[10px] text-fg-dim/60 hover:text-fg-muted underline decoration-dotted"
+                  title="Check this event's signature"
+                  onClick={ev => setVerify({ id: e.event_id, signed: !!e.signature, pos: { x: ev.clientX, y: ev.clientY } })}
+                >
+                  verify
+                </button>
               </div>
             );
           })}
         </div>
+      )}
+
+      {verify && (
+        <VerifySignaturePanel
+          msgid={verify.id}
+          signed={verify.signed}
+          position={verify.pos}
+          noun="event"
+          onClose={() => setVerify(null)}
+        />
       )}
     </div>
   );

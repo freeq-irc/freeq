@@ -30,14 +30,6 @@ function EvidenceIcon({ type }: { type?: string }) {
   return <span>{icons[type || ''] || '📎'}</span>;
 }
 
-function SignedBadge() {
-  return (
-    <span className="inline-flex items-center gap-0.5 text-[10px] text-success/80 ml-1" title="Cryptographically signed">
-      🔒
-    </span>
-  );
-}
-
 function TaskIdBadge({ taskId }: { taskId?: string }) {
   if (!taskId) return null;
   const short = taskId.length > 10 ? taskId.slice(0, 10) + '…' : taskId;
@@ -58,7 +50,6 @@ function CardFrame({ icon, label, children, msg, className }: {
   className?: string;
 }) {
   const taskId = tag(msg, 'ref') || tag(msg, 'task-id');
-  const signed = !!tag(msg, 'sig');
 
   return (
     <div className={`mt-1 rounded-lg border border-border/50 overflow-hidden ${className || ''}`}>
@@ -66,7 +57,6 @@ function CardFrame({ icon, label, children, msg, className }: {
         <span>{icon}</span>
         <span className="font-semibold text-fg-muted">{label}</span>
         <TaskIdBadge taskId={taskId} />
-        {signed && <SignedBadge />}
         <span className="ml-auto text-[10px] text-fg-dim/50">
           {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
         </span>

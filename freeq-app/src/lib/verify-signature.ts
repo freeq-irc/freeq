@@ -113,12 +113,15 @@ export async function verifySignature(msgid: string): Promise<VerifyAnswer> {
 }
 
 /** How a checked message describes itself, and the colour it wears.
- *  Green only after a verified answer; red only after a mismatch; every
- *  can't-know is quiet — a fact, never a warning. */
+ *  Green means the SENDER proved it — a server signature is the server
+ *  vouching for what it received, which is a fact worth stating and not a
+ *  verification of the sender, so it stays quiet (ruled 2026-08-07: valid
+ *  is not verified). Red only after a mismatch; every can't-know is quiet —
+ *  a fact, never a warning. */
 export const VERIFY_LABELS: Record<VerifyOutcome, { text: string; tone: string }> = {
   device: { text: 'Verified — signed on the sender’s device', tone: 'text-success' },
-  server: { text: 'Verified — signed by the server on the sender’s behalf', tone: 'text-success' },
-  unverifiable: { text: 'Could not be checked — the server doesn’t have what it needs to verify this one', tone: 'text-fg-dim' },
+  server: { text: 'Valid server signature — the server vouches for what it received; the sender’s own key did not sign it', tone: 'text-fg-muted' },
+  unverifiable: { text: 'Could not be checked — the server doesn’t have what it needs to verify this one', tone: 'text-fg-muted' },
   invalid: { text: 'Does not match its signing key — treat with suspicion', tone: 'text-danger' },
-  unreachable: { text: 'The check didn’t go through — nothing was determined. Close and try again.', tone: 'text-fg-dim' },
+  unreachable: { text: 'The check didn’t go through — nothing was determined. Close and try again.', tone: 'text-fg-muted' },
 };

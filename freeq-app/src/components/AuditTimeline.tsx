@@ -5,6 +5,7 @@
 import { useEffect, useState } from 'react';
 import { displayNameForKey } from '../lib/display-name';
 import { apiFetch } from '../lib/api';
+import { VerifySignaturePanel } from './VerifySignaturePanel';
 
 interface AuditEvent {
   timestamp: string;
@@ -14,6 +15,8 @@ interface AuditEvent {
   actor_name?: string;
   details: Record<string, any>;
   signature?: string;
+  /** Present on coordination rows — the id the verify endpoint answers for. */
+  event_id?: string;
 }
 
 interface AuditTimelineProps {
@@ -48,6 +51,7 @@ export function AuditTimeline({ channel, onClose }: AuditTimelineProps) {
   const [loading, setLoading] = useState(true);
   const [actorFilter, setActorFilter] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('');
+  const [verify, setVerify] = useState<{ id: string; signed: boolean; pos: { x: number; y: number } } | null>(null);
 
   useEffect(() => {
     setLoading(true);
@@ -114,16 +118,33 @@ export function AuditTimeline({ channel, onClose }: AuditTimelineProps) {
         ) : (
           <div className="space-y-1">
             {filtered.map((evt, i) => (
-              <AuditEventRow key={i} event={evt} />
+              <AuditEventRow
+                key={i}
+                event={evt}
+                onVerify={(id, signed, pos) => setVerify({ id, signed, pos })}
+              />
             ))}
           </div>
         )}
       </div>
+
+      {verify && (
+        <VerifySignaturePanel
+          msgid={verify.id}
+          signed={verify.signed}
+          position={verify.pos}
+          noun="event"
+          onClose={() => setVerify(null)}
+        />
+      )}
     </div>
   );
 }
 
-function AuditEventRow({ event }: { event: AuditEvent }) {
+function AuditEventRow({ event, onVerify }: {
+  event: AuditEvent;
+  onVerify: (id: string, signed: boolean, pos: { x: number; y: number }) => void;
+}) {
   const [expanded, setExpanded] = useState(false);
   const ts = new Date(event.timestamp);
   const time = ts.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -161,7 +182,15 @@ function AuditEventRow({ event }: { event: AuditEvent }) {
             {event.actor_name || event.actor_did?.slice(0, 20)}
           </span>
           <span className="text-xs text-fg-muted truncate">{summary}</span>
-          {event.signature && <span className="text-[10px] text-success/60" title="Signed">🔒</span>}
+          {event.event_id && (
+            <button
+              className="text-[10px] text-fg-dim/60 hover:text-fg-muted underline decoration-dotted"
+              title="Check this event's signature"
+              onClick={e => { e.stopPropagation(); onVerify(event.event_id!, !!event.signature, { x: e.clientX, y: e.clientY }); }}
+            >
+              verify
+            </button>
+          )}
         </div>
         {expanded && (
           <pre className="mt-1 p-2 bg-surface rounded text-[11px] font-mono text-fg-dim overflow-x-auto whitespace-pre-wrap">

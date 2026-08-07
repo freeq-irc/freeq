@@ -7,6 +7,7 @@ import {
   cachedVerdict,
   subscribeVerdicts,
   __resetVerifyCacheForTests,
+  VERIFY_LABELS,
   type VerifyOutcome,
 } from './verify-signature';
 
@@ -142,5 +143,15 @@ describe('the one retryable flavour of can’t-check', () => {
     const a = await verifySignature('01OLD');
     expect(a.transient).toBe(false);
     expect(cachedVerdict('01OLD')?.outcome).toBe('unverifiable');
+  });
+});
+
+describe('valid is not verified (ruled 2026-08-07)', () => {
+  it('sender proof wears green; a server vouch stays quiet and never claims "Verified"', () => {
+    expect(VERIFY_LABELS.device.tone).toBe('text-success');
+    expect(VERIFY_LABELS.device.text).toMatch(/^Verified/);
+    expect(VERIFY_LABELS.server.tone).toBe('text-fg-muted');
+    expect(VERIFY_LABELS.server.text).not.toMatch(/^Verified/);
+    expect(VERIFY_LABELS.server.text).toMatch(/vouches/);
   });
 });
