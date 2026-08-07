@@ -272,6 +272,13 @@ pub struct FreeqClient {
     websocket_url: Arc<Mutex<Option<String>>>,
 }
 
+/// Flatten the FFI's tag list into the map the SDK sends with. UniFFI has no
+/// map type in this binding, so tags cross the boundary as a sequence; a key
+/// repeated by the caller keeps its last value, as it would on the wire.
+fn tag_entries_to_map(tags: Vec<TagEntry>) -> std::collections::HashMap<String, String> {
+    tags.into_iter().map(|t| (t.key, t.value)).collect()
+}
+
 impl FreeqClient {
     pub fn new(
         server: String,
@@ -467,6 +474,98 @@ impl FreeqClient {
                 Err(FreeqError::SendFailed)
             }
         }
+    }
+
+    // ── Typed senders ──
+    //
+    // Everything a client sends that carries a message or mutates one goes
+    // through these rather than `send_raw`. A raw line reaches the wire as
+    // `Command::Raw`, which the SDK deliberately never signs; only the
+    // structured commands behind these methods get a signature and an event
+    // id. A hand-built `@+draft/delete=... TAGMSG` therefore travels
+    // unsigned no matter what the server negotiated.
+
+    /// Send a PRIVMSG with IRCv3 tags — reply, edit, and any tag combination
+    /// a client needs on a message body. Signed like any other message.
+    pub fn send_tagged(
+        &self,
+        target: String,
+        text: String,
+        tags: Vec<TagEntry>,
+    ) -> Result<(), FreeqError> {
+        let tags = tag_entries_to_map(tags);
+        self.on_handle(move |h| async move { h.send_tagged(&target, &text, tags).await })
+    }
+
+    /// Add a reaction emoji to a message.
+    pub fn react(&self, target: String, emoji: String, msgid: String) -> Result<(), FreeqError> {
+        self.on_handle(move |h| async move { h.react(&target, &emoji, &msgid).await })
+    }
+
+    /// Withdraw a reaction emoji previously added to a message.
+    pub fn unreact(&self, target: String, emoji: String, msgid: String) -> Result<(), FreeqError> {
+        self.on_handle(move |h| async move { h.unreact(&target, &emoji, &msgid).await })
+    }
+
+    /// Delete one of your own messages.
+    pub fn delete_message(&self, target: String, msgid: String) -> Result<(), FreeqError> {
+        self.on_handle(move |h| async move { h.delete_message(&target, &msgid).await })
+    }
+
+    /// Replace the text of one of your own messages.
+    pub fn edit_message(
+        &self,
+        target: String,
+        msgid: String,
+        new_text: String,
+    ) -> Result<(), FreeqError> {
+        self.on_handle(move |h| async move { h.edit_message(&target, &msgid, &new_text).await })
+    }
+
+    /// Send a message that answers another one.
+    pub fn reply(&self, target: String, msgid: String, text: String) -> Result<(), FreeqError> {
+        self.on_handle(move |h| async move { h.reply(&target, &msgid, &text).await })
+    }
+
+    /// Announce that we are typing. Ephemeral — carries no event id and is
+    /// not signed, because nothing about it is worth attesting to later.
+    pub fn typing_start(&self, target: String) -> Result<(), FreeqError> {
+        self.on_handle(move |h| async move { h.typing_start(&target).await })
+    }
+
+    /// Announce that we stopped typing.
+    pub fn typing_stop(&self, target: String) -> Result<(), FreeqError> {
+        self.on_handle(move |h| async move { h.typing_stop(&target).await })
+    }
+
+    /// Ask who `nick` is. The DID, if the server knows one, arrives later as
+    /// a `MemberDid` event — this call only poses the question.
+    pub fn request_whois(&self, nick: String) -> Result<(), FreeqError> {
+        self.on_handle(move |h| async move { h.whois(&nick).await })
+    }
+
+    /// Run `f` against the live client handle on the SDK runtime and wait for
+    /// its result. Spawn-plus-channel rather than `block_on`, because these
+    /// are called from the platform's UI thread, which the runtime may
+    /// already be borrowing.
+    fn on_handle<F, Fut, E>(&self, f: F) -> Result<(), FreeqError>
+    where
+        F: FnOnce(freeq_sdk::client::ClientHandle) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(), E>> + Send + 'static,
+        E: Send + 'static,
+    {
+        let handle = self
+            .handle
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(FreeqError::NotConnected)?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        RUNTIME.spawn(async move {
+            let result = f(handle).await.map_err(|_| FreeqError::SendFailed);
+            let _ = tx.send(result);
+        });
+        rx.recv().map_err(|_| FreeqError::SendFailed)?
     }
 
     pub fn set_topic(&self, channel: String, topic: String) -> Result<(), FreeqError> {
@@ -2605,5 +2704,94 @@ mod tests {
             panic!("expected Message variant");
         };
         assert!(msg.reactions.is_empty());
+    }
+
+    // ── typed senders ──
+
+    #[test]
+    fn tag_entries_become_a_tag_map() {
+        let map = tag_entries_to_map(vec![
+            TagEntry {
+                key: "+reply".to_string(),
+                value: "01ABC".to_string(),
+            },
+            TagEntry {
+                key: "+draft/edit".to_string(),
+                value: "01DEF".to_string(),
+            },
+        ]);
+        assert_eq!(map.get("+reply").map(String::as_str), Some("01ABC"));
+        assert_eq!(map.get("+draft/edit").map(String::as_str), Some("01DEF"));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn valueless_tags_survive_the_conversion() {
+        // A bare tag is `key` with no `=value` on the wire — the empty string
+        // has to reach the SDK as a present key, not get dropped.
+        let map = tag_entries_to_map(vec![TagEntry {
+            key: "+freeq.at/multiline".to_string(),
+            value: String::new(),
+        }]);
+        assert_eq!(map.get("+freeq.at/multiline").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn a_repeated_tag_key_keeps_the_last_value() {
+        let map = tag_entries_to_map(vec![
+            TagEntry {
+                key: "+reply".to_string(),
+                value: "first".to_string(),
+            },
+            TagEntry {
+                key: "+reply".to_string(),
+                value: "second".to_string(),
+            },
+        ]);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("+reply").map(String::as_str), Some("second"));
+    }
+
+    struct SilentHandler;
+    impl EventHandler for SilentHandler {
+        fn on_event(&self, _event: FreeqEvent) {}
+    }
+
+    fn unconnected_client() -> FreeqClient {
+        FreeqClient::new(
+            "localhost:6667".to_string(),
+            "tester".to_string(),
+            Box::new(SilentHandler),
+        )
+        .expect("client")
+    }
+
+    /// Every typed sender refuses before there is a connection to send on,
+    /// and says so as `NotConnected` rather than a generic send failure —
+    /// the caller distinguishes "not yet" from "it went wrong".
+    #[test]
+    fn typed_senders_report_not_connected() {
+        macro_rules! assert_not_connected {
+            ($call:expr) => {
+                match $call {
+                    Err(FreeqError::NotConnected) => {}
+                    other => panic!(
+                        "{}: expected NotConnected, got {other:?}",
+                        stringify!($call)
+                    ),
+                }
+            };
+        }
+        let c = unconnected_client();
+        assert!(!c.is_connected());
+        assert_not_connected!(c.send_tagged("#c".into(), "hi".into(), Vec::new()));
+        assert_not_connected!(c.react("#c".into(), "👍".into(), "01A".into()));
+        assert_not_connected!(c.unreact("#c".into(), "👍".into(), "01A".into()));
+        assert_not_connected!(c.delete_message("#c".into(), "01A".into()));
+        assert_not_connected!(c.edit_message("#c".into(), "01A".into(), "new".into()));
+        assert_not_connected!(c.reply("#c".into(), "01A".into(), "text".into()));
+        assert_not_connected!(c.typing_start("#c".into()));
+        assert_not_connected!(c.typing_stop("#c".into()));
+        assert_not_connected!(c.request_whois("bob".into()));
     }
 }

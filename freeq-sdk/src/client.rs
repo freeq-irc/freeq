@@ -793,6 +793,17 @@ impl ClientHandle {
         self.raw(&format!("TOPIC {channel} :{topic}")).await
     }
 
+    /// Ask the server who `nick` is.
+    ///
+    /// The answer arrives asynchronously: the account binding in RPL_WHOISACCOUNT
+    /// (330) surfaces as [`Event::MemberDid`](crate::event::Event::MemberDid), the
+    /// rest as [`Event::WhoisReply`](crate::event::Event::WhoisReply). Callers that
+    /// need the DID before sending — a first DM to a bare nick — watch for the
+    /// former.
+    pub async fn whois(&self, nick: &str) -> Result<()> {
+        self.raw(&format!("WHOIS {nick}")).await
+    }
+
     // ── Read markers (draft/read-marker) ──────────────────────────────
 
     /// Set the cross-device read marker for `target` to `timestamp`.

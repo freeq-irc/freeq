@@ -124,6 +124,36 @@ interface FreeqClient {
     [Throws=FreeqError]
     void send_raw(string line);
 
+    // Typed senders. Anything that carries a message or mutates one belongs
+    // here — send_raw is never signed.
+
+    [Throws=FreeqError]
+    void send_tagged(string target, string text, sequence<TagEntry> tags);
+
+    [Throws=FreeqError]
+    void react(string target, string emoji, string msgid);
+
+    [Throws=FreeqError]
+    void unreact(string target, string emoji, string msgid);
+
+    [Throws=FreeqError]
+    void delete_message(string target, string msgid);
+
+    [Throws=FreeqError]
+    void edit_message(string target, string msgid, string new_text);
+
+    [Throws=FreeqError]
+    void reply(string target, string msgid, string text);
+
+    [Throws=FreeqError]
+    void typing_start(string target);
+
+    [Throws=FreeqError]
+    void typing_stop(string target);
+
+    [Throws=FreeqError]
+    void request_whois(string nick);
+
     [Throws=FreeqError]
     void set_topic(string channel, string topic);
 
