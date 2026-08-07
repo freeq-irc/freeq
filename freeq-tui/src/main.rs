@@ -1027,7 +1027,7 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                 .get("+reply")
                 .filter(|v| crate::app::is_valid_msgid(v))
                 .cloned();
-            let (is_signed, account) = signature_of(&tags, app.server_signing_kid.as_deref());
+            let (_, account) = signature_of(&tags, app.server_signing_kid.as_deref());
             // Join replay collapses an edited message into one row with no
             // `+draft/edit`; the server's `+freeq.at/edited` tag is the only
             // thing that says the text isn't the original.
@@ -1085,7 +1085,6 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                             is_deleted: false,
                             reply_to: reply_to.clone(),
                             edit_of: Some(original_msgid.clone()),
-                            is_signed,
                             account: account.clone(),
                         },
                     );
@@ -1116,7 +1115,6 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                             is_deleted: false,
                             reply_to: reply_to.clone(),
                             edit_of: None,
-                            is_signed,
                             account: account.clone(),
                         },
                     );
@@ -1149,7 +1147,6 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                         is_deleted: false,
                         reply_to: reply_to.clone(),
                         edit_of: None,
-                        is_signed,
                         account: account.clone(),
                     },
                 );
@@ -1174,7 +1171,6 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                             is_deleted: false,
                             reply_to: reply_to.clone(),
                             edit_of: None,
-                            is_signed,
                             account: account.clone(),
                         },
                     );
@@ -1195,7 +1191,6 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                             is_deleted: false,
                             reply_to: reply_to.clone(),
                             edit_of: None,
-                            is_signed,
                             account: account.clone(),
                         },
                     );
@@ -1293,7 +1288,6 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                     is_deleted: false,
                     reply_to: None,
                     edit_of: None,
-                    is_signed: false,
                     account: None,
                 });
             }

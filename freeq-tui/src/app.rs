@@ -147,7 +147,6 @@ pub struct BufferLine {
     /// sender signed it on their own device, and the server relayed it
     /// unchanged. False for server-signed and unsigned traffic alike — the
     /// marker claims only what the wire actually proved.
-    pub is_signed: bool,
     /// The DID the sending server attributes this message to (`account`).
     /// A statement about the sender, not proof of one — `/verify` is what
     /// checks whether the signature agrees with it.
@@ -344,7 +343,6 @@ impl Buffer {
             is_deleted: false,
             reply_to: None,
             edit_of: None,
-            is_signed: false,
             account: None,
         });
     }
@@ -988,7 +986,6 @@ impl App {
             is_deleted: false,
             reply_to: None,
             edit_of: None,
-            is_signed: false,
             account: None,
         });
 
@@ -1303,7 +1300,6 @@ mod tests {
             is_deleted: false,
             reply_to: None,
             edit_of: None,
-            is_signed: false,
             account: None,
         }
     }
@@ -1820,7 +1816,6 @@ mod tests {
                     is_deleted: false,
                     reply_to: None,
                     edit_of: None,
-                    is_signed: false,
                     account: None,
                 },
             );
@@ -1983,7 +1978,6 @@ mod tests {
             is_deleted: false,
             reply_to: None,
             edit_of: None,
-            is_signed: false,
             account: None,
         });
         let line = buf.messages.back().unwrap();
@@ -2502,7 +2496,6 @@ mod delete_after_edit_tests {
             is_deleted: false,
             reply_to: None,
             edit_of: None,
-            is_signed: false,
             account: None,
         }
     }

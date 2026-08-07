@@ -13,14 +13,6 @@ use crate::app::{IMAGE_ROWS, ImageState};
 /// Message markers. Each occupies a fixed column in the prefix gutter whether
 /// or not the message has it, so nicks stay aligned down the buffer.
 pub(crate) const PIN_MARKER: &str = "📌 ";
-/// Deliberately not an emoji padlock: terminals draw emoji in the font's own
-/// colours and ignore the style we set, so an emoji marker cannot be made
-/// quiet. This one takes the dim grey it is given, which is the whole point —
-/// it marks a property of the line, it is not an announcement about it.
-///
-/// U+2713, not the heavy U+2714: the heavy form has an emoji presentation in
-/// many fonts and would land back where the padlock was.
-pub(crate) const SIGNED_MARKER: &str = "✓ ";
 
 /// The empty form of a marker: the same number of terminal columns, drawn as
 /// spaces. Emoji are two columns wide, so this is not the marker's char count.
@@ -451,14 +443,8 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
                         false => Span::raw(blank_marker(PIN_MARKER)),
                     });
                 }
-                // The sender's own device signed this one, and the server
-                // relayed it untouched. Server-signed, relayed and unsigned
-                // traffic gets no marker — the badge claims only what the wire
-                // proved — but it still gets the column.
-                first_prefix_spans.push(match msg.is_signed {
-                    true => Span::styled(SIGNED_MARKER, Style::default().fg(Color::DarkGray)),
-                    false => Span::raw(blank_marker(SIGNED_MARKER)),
-                });
+                // Signing is the default state of a message and earns no
+                // resting ink — verification is the explicit /verify action.
                 first_prefix_spans.push(Span::styled(
                     format!("<{}> ", msg.from),
                     if is_mention {
@@ -654,16 +640,10 @@ pub(crate) fn wrapped_height(msg: &crate::app::BufferLine, width: usize) -> usiz
         // "HH:MM:SS *** "
         msg.timestamp.len() + 1 + 4
     } else {
-        // "HH:MM:SS <signature gutter><nick> ". The gutter is on every message
-        // line, marked or not. A buffer with pins carries one more column that
+        // "HH:MM:SS <nick> ". A buffer with pins carries one more column that
         // isn't counted here — this has no buffer to ask, and the cost of the
         // omission is the same one-column-optimistic wrap it has always had.
-        msg.timestamp.len()
-            + 1
-            + Span::raw(SIGNED_MARKER).width()
-            + msg.from.len()
-            + 2
-            + 1
+        msg.timestamp.len() + 1 + msg.from.len() + 2 + 1
     };
     let base = if msg.is_deleted {
         (prefix_len + "[deleted]".len()).div_ceil(width).max(1)
@@ -820,7 +800,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::markdown_spans;
-    use super::{PIN_MARKER, SIGNED_MARKER, blank_marker};
+    use super::{PIN_MARKER, blank_marker};
     use ratatui::style::{Modifier, Style};
     use ratatui::text::Span;
 
@@ -830,7 +810,7 @@ mod tests {
     /// and one character, which is why this is measured and not assumed.
     #[test]
     fn a_marker_and_its_blank_are_the_same_width() {
-        for marker in [SIGNED_MARKER, PIN_MARKER] {
+        for marker in [PIN_MARKER] {
             let blank = blank_marker(marker);
             assert_eq!(
                 Span::raw(marker).width(),
@@ -844,27 +824,17 @@ mod tests {
         }
     }
 
-    /// The signature marker has to be styleable, which rules out an emoji:
-    /// terminals draw those in the font's own colours and ignore the style,
-    /// so an emoji marker is stuck at whatever loudness the font chose.
+    /// A signed message wears no resting marker — signing is the default and
+    /// earns no ink; /verify is the explicit check. Bodies of signed and
+    /// unsigned lines sit in the same column because their prefixes are
+    /// identical, not because a gutter pads them.
     #[test]
-    fn the_signature_marker_is_not_an_emoji() {
-        assert!(
-            SIGNED_MARKER.chars().all(|c| (c as u32) < 0x1F000),
-            "{SIGNED_MARKER:?} is in an emoji block — its colour would be ignored"
-        );
-    }
-
-    /// Two messages from the same nick, one signed and one not, put their
-    /// bodies in the same column — the property the gutter exists for.
-    #[test]
-    fn signed_and_unsigned_lines_start_their_text_in_the_same_column() {
+    fn message_bodies_align_and_wear_no_signature_marker() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
         let mut app = crate::app::App::new("me", false);
-        let mut signed = line("signed body");
-        signed.is_signed = true;
+        let signed = line("signed body");
         let unsigned = line("plain body");
         app.buffer_mut("#room").push(signed);
         app.buffer_mut("#room").push(unsigned);
@@ -897,6 +867,11 @@ mod tests {
             col_of("signed body"),
             col_of("plain body"),
             "bodies must line up:\n{}",
+            rows.iter().map(|r| r.concat()).collect::<Vec<_>>().join("\n")
+        );
+        assert!(
+            !rows.iter().any(|r| r.concat().contains('✓')),
+            "a signed message must wear no resting marker:\n{}",
             rows.iter().map(|r| r.concat()).collect::<Vec<_>>().join("\n")
         );
     }
@@ -981,7 +956,6 @@ mod tests {
             is_deleted: false,
             reply_to: None,
             edit_of: None,
-            is_signed: false,
             account: None,
         });
         buf.apply_delete("alice", "01PARENT");
@@ -1026,7 +1000,6 @@ mod tests {
             is_deleted: false,
             reply_to: None,
             edit_of: None,
-            is_signed: false,
             account: None,
         });
         let label = super::reply_indicator_label(&buf, "01P");
@@ -1055,7 +1028,6 @@ mod tests {
             is_deleted: false,
             reply_to: None,
             edit_of: None,
-            is_signed: false,
             account: None,
         });
         let label = super::reply_indicator_label(&buf, "01P");
@@ -1149,7 +1121,6 @@ mod tests {
             is_deleted: false,
             reply_to: None,
             edit_of: None,
-            is_signed: false,
             account: None,
         }
     }
