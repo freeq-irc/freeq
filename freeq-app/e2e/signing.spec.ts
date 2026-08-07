@@ -97,7 +97,7 @@ test.describe('signature verification', () => {
     // Nothing on this server ever signed that id, so the honest answer is
     // that it cannot be checked — and it must not read as verified.
     await expect(panel).toHaveAttribute('data-verdict', 'unverifiable');
-    await expect(page.getByText('Could not be checked here')).toBeVisible();
+    await expect(page.getByText('Could not be checked')).toBeVisible();
     await panel.getByRole('button', { name: 'Dismiss' }).click();
     await expect(page.getByTestId('verify-panel')).toHaveCount(0);
   });

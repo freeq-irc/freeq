@@ -118,7 +118,7 @@ export async function verifySignature(msgid: string): Promise<VerifyAnswer> {
 export const VERIFY_LABELS: Record<VerifyOutcome, { text: string; tone: string }> = {
   device: { text: 'Verified — signed on the sender’s device', tone: 'text-success' },
   server: { text: 'Verified — signed by the server on the sender’s behalf', tone: 'text-success' },
-  unverifiable: { text: 'Could not be checked here — not a claim either way', tone: 'text-fg-dim' },
+  unverifiable: { text: 'Could not be checked — the server doesn’t have what it needs to verify this one', tone: 'text-fg-dim' },
   invalid: { text: 'Does not match its signing key — treat with suspicion', tone: 'text-danger' },
   unreachable: { text: 'The check didn’t go through — nothing was determined. Close and try again.', tone: 'text-fg-dim' },
 };

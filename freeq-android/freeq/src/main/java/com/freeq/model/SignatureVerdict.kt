@@ -101,7 +101,7 @@ object SignatureVerdict {
         VerifyOutcome.INVALID -> "Does not match its signing key — treat with suspicion."
         VerifyOutcome.UNVERIFIABLE ->
             if (answer.transient) "Fetching the signer's key — checking again shortly."
-            else "Could not be checked here — not a claim either way."
+            else "Could not be checked — the server doesn't have what it needs to verify this one."
         VerifyOutcome.UNREACHABLE ->
             "The check didn't go through — nothing was determined. Close and try again."
     }
