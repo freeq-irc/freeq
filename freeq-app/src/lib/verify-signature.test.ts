@@ -1,18 +1,20 @@
 /**
- * What the badge is allowed to claim, given what the server answered.
+ * What a verification answer is allowed to claim, given what actually happened.
  */
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import {
   verifySignature,
   cachedVerdict,
+  subscribeVerdicts,
   __resetVerifyCacheForTests,
   type VerifyOutcome,
 } from './verify-signature';
 
 /** Answer the verify endpoint with `body`, or fail the request. */
-function serverSays(body: unknown, ok = true) {
+function serverSays(body: unknown, ok = true, status = 200) {
   return vi.fn().mockResolvedValue({
     ok,
+    status,
     json: () => Promise.resolve(body),
   });
 }
@@ -54,45 +56,56 @@ describe('reading the server verdict', () => {
   for (const [name, body, expected] of cases) {
     it(`${name} reads as ${expected}`, async () => {
       vi.stubGlobal('fetch', serverSays(body));
-      expect(await verifySignature('01MSG')).toBe(expected);
+      expect((await verifySignature('01MSG')).outcome).toBe(expected);
     });
   }
 
   it('reads the older boolean from a server that predates the three-way verdict', async () => {
     vi.stubGlobal('fetch', serverSays({ verification: { valid: true, verified_by: 'client-session-key' } }));
-    expect(await verifySignature('01MSG')).toBe('device');
+    expect((await verifySignature('01MSG')).outcome).toBe('device');
 
     __resetVerifyCacheForTests();
     vi.stubGlobal('fetch', serverSays({ verification: { valid: false } }));
     expect(
-      await verifySignature('01MSG'),
+      (await verifySignature('01MSG')).outcome,
       'an old server saying "not valid" is not the same as saying "forged"',
     ).toBe('unverifiable');
   });
 
   it('treats no record on file as unverifiable, not as an accusation', async () => {
-    vi.stubGlobal('fetch', serverSays({ error: 'not found' }, false));
-    expect(await verifySignature('01MSG')).toBe('unverifiable');
-  });
-
-  it('says nothing about the signature when the network fails', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')));
-    expect(await verifySignature('01MSG')).toBe('unverifiable');
-    expect(
-      cachedVerdict('01MSG'),
-      'a transient failure must be retryable, so it is not remembered',
-    ).toBeUndefined();
+    vi.stubGlobal('fetch', serverSays({ error: 'not found' }, false, 404));
+    expect((await verifySignature('01MSG')).outcome).toBe('unverifiable');
   });
 });
 
-describe('what a badge already knows', () => {
+describe('a check that never happened is not a verdict', () => {
+  it('a network failure reads as unreachable, and is not remembered', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')));
+    expect((await verifySignature('01MSG')).outcome).toBe('unreachable');
+    expect(
+      cachedVerdict('01MSG'),
+      'a failed check must be retryable, so it is not remembered',
+    ).toBeUndefined();
+  });
+
+  it('a server (or proxy) error reads as unreachable, not as "could not be checked"', async () => {
+    // The observed failure this pins: a broken dev proxy answered every
+    // verify with an empty 500, and provably-valid messages were shown as
+    // "could not be checked here" — a transport fault dressed as a verdict.
+    vi.stubGlobal('fetch', serverSays(undefined, false, 500));
+    expect((await verifySignature('01MSG')).outcome).toBe('unreachable');
+    expect(cachedVerdict('01MSG')).toBeUndefined();
+  });
+});
+
+describe('what is already on file', () => {
   it('remembers a definitive answer instead of asking again', async () => {
     const fetchMock = serverSays({ verification: { verdict: 'valid', verified_by: 'client-session-key' } });
     vi.stubGlobal('fetch', fetchMock);
-    expect(await verifySignature('01MSG')).toBe('device');
-    expect(await verifySignature('01MSG')).toBe('device');
+    expect((await verifySignature('01MSG')).outcome).toBe('device');
+    expect((await verifySignature('01MSG')).outcome).toBe('device');
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(cachedVerdict('01MSG')).toBe('device');
+    expect(cachedVerdict('01MSG')?.outcome).toBe('device');
   });
 
   it('knows nothing about a message it has not checked', () => {
@@ -101,7 +114,33 @@ describe('what a badge already knows', () => {
 
   it('remembers a bad verdict too, so no other row can show it as good', async () => {
     vi.stubGlobal('fetch', serverSays({ verification: { verdict: 'invalid' } }));
-    expect(await verifySignature('01BAD')).toBe('invalid');
-    expect(cachedVerdict('01BAD')).toBe('invalid');
+    expect((await verifySignature('01BAD')).outcome).toBe('invalid');
+    expect(cachedVerdict('01BAD')?.outcome).toBe('invalid');
+  });
+
+  it('tells subscribers when a verdict lands, so a row can wear the ⚠', async () => {
+    const seen = vi.fn();
+    const unsubscribe = subscribeVerdicts(seen);
+    vi.stubGlobal('fetch', serverSays({ verification: { verdict: 'invalid' } }));
+    await verifySignature('01BAD');
+    expect(seen).toHaveBeenCalled();
+    unsubscribe();
+  });
+});
+
+describe('the one retryable flavour of can’t-check', () => {
+  it('a key the server hasn’t fetched yet is transient and not cached', async () => {
+    vi.stubGlobal('fetch', serverSays({ verification: { verdict: 'unverifiable', verified_by: 'unverifiable-unknown-key' } }));
+    const a = await verifySignature('01FED');
+    expect(a.outcome).toBe('unverifiable');
+    expect(a.transient, 'answering is what starts the key fetch — worth re-asking').toBe(true);
+    expect(cachedVerdict('01FED'), 'a transient answer must stay retryable').toBeUndefined();
+  });
+
+  it('every other flavour of can’t-check is final and cached', async () => {
+    vi.stubGlobal('fetch', serverSays({ verification: { verdict: 'unverifiable', verified_by: 'unverifiable-legacy-format' } }));
+    const a = await verifySignature('01OLD');
+    expect(a.transient).toBe(false);
+    expect(cachedVerdict('01OLD')?.outcome).toBe('unverifiable');
   });
 });

@@ -13,9 +13,10 @@ interface Props {
   onEdit: () => void;
   onThread: () => void;
   onReact: (e: React.MouseEvent) => void;
+  onVerify: () => void;
 }
 
-export function MessageContextMenu({ msg, channel, position, onClose, onReply, onEdit, onThread, onReact }: Props) {
+export function MessageContextMenu({ msg, channel, position, onClose, onReply, onEdit, onThread, onReact, onVerify }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [showReportReasons, setShowReportReasons] = useState(false);
 
@@ -88,6 +89,9 @@ export function MessageContextMenu({ msg, channel, position, onClose, onReply, o
         showToast('Message ID copied', 'success', 2000);
         onClose();
       }} />}
+      {msg.id && !msg.isSystem && (
+        <MenuItem icon="🔏" label="Verify Signature…" onClick={() => { onVerify(); onClose(); }} />
+      )}
       <MenuItem icon="🔖" label="Bookmark" onClick={() => {
         useStore.getState().addBookmark(channel, msg.id, msg.from, msg.text, msg.timestamp);
         onClose();

@@ -4,24 +4,22 @@
  * Runs against a local freeq-server (see playwright.config.ts). Point
  * FREEQ_WEB at a real deployment to run the same flows there.
  *
- * A guest has no identity, so nothing a guest sends is signed — which is the
- * first property worth pinning: no signature, no marker, no claim. The marker
- * states themselves are exercised on messages that do carry a signature, with
- * the verdict coming from the server's real verify endpoint.
+ * Signing is the default state of a message, so it earns no resting ink —
+ * there is no marker to click. Verification is an explicit request: the
+ * message context menu offers "Verify Signature…", and the panel it opens
+ * says only what the check actually established. The one mark a row can ever
+ * wear is the ⚠ after a check answered "invalid".
  */
 import { test, expect, type Page } from '@playwright/test';
 import { uniqueNick, uniqueChannel, connectGuest, sendMessage, expectMessage } from './helpers';
-
-/** The verdicts a checked marker is allowed to show. */
-const VERDICTS = ['device', 'server', 'unverifiable', 'invalid'];
 
 /**
  * Put a signed message into the open conversation, as if it had arrived.
  *
  * A signature needs an identity, and a browser in CI has none — so the
  * message is injected while everything downstream of it stays real: the row
- * renders through the app, and clicking its marker asks the running server
- * about that id.
+ * renders through the app, and verifying it asks the running server about
+ * that id.
  */
 async function receiveSignedMessage(
   page: Page,
@@ -41,21 +39,49 @@ async function receiveSignedMessage(
   );
 }
 
-test.describe('signature markers', () => {
-  test('a guest message claims nothing, because nothing signed it', async ({ page }) => {
+/** Right-click a message and choose "Verify Signature…". */
+async function requestVerify(page: Page, text: string) {
+  await page.getByTestId('message-list').getByText(text).click({ button: 'right' });
+  await page.getByRole('button', { name: /Verify Signature/ }).click();
+}
+
+test.describe('signature verification', () => {
+  test('nothing signature-related rests on a message', async ({ page }) => {
+    const channel = uniqueChannel();
+    await connectGuest(page, uniqueNick(), channel);
+    await receiveSignedMessage(page, channel, {
+      id: '01JBADGERESTINGSILENT000001',
+      from: 'someone',
+      text: 'a signed message wearing nothing',
+    });
+    await expectMessage(page, 'a signed message wearing nothing');
+
+    await expect(page.getByTestId('verify-panel')).toHaveCount(0);
+    await expect(
+      page.getByTestId('sig-invalid-mark'),
+      'the ⚠ exists only after a check answered invalid',
+    ).toHaveCount(0);
+  });
+
+  test('an unsigned message answers with a fact, not a warning', async ({ page }) => {
     const channel = uniqueChannel();
     await connectGuest(page, uniqueNick(), channel);
 
     await sendMessage(page, 'sent without an identity');
     await expectMessage(page, 'sent without an identity');
 
-    await expect(
-      page.getByTestId('signed-badge'),
-      'a guest has no key, so there is nothing to claim',
-    ).toHaveCount(0);
+    await requestVerify(page, 'sent without an identity');
+    const panel = page.getByTestId('verify-panel');
+    await expect(panel).toHaveAttribute('data-verdict', 'unsigned');
+    await expect(page.getByText('there is no signature to check')).toBeVisible();
+    // Clicking inside the panel is the guard visibility checks can't give:
+    // an element clipped away by an overflow ancestor still reads as
+    // "visible", but its hit-target is gone and this click fails.
+    await panel.getByRole('button', { name: 'Dismiss' }).click();
+    await expect(page.getByTestId('verify-panel')).toHaveCount(0);
   });
 
-  test('a signed message rests unchecked, then shows what the server answered', async ({ page }) => {
+  test('a signed message shows what the server actually answered', async ({ page }) => {
     const channel = uniqueChannel();
     await connectGuest(page, uniqueNick(), channel);
     await receiveSignedMessage(page, channel, {
@@ -65,24 +91,112 @@ test.describe('signature markers', () => {
     });
     await expectMessage(page, 'a message with a signature on it');
 
-    const badge = page.getByTestId('signed-badge').first();
-    await expect(badge).toBeVisible({ timeout: 10_000 });
-    await expect(
-      badge,
-      'the resting marker knows only that a signature is present',
-    ).toHaveAttribute('data-verdict', 'unchecked');
-
-    await badge.click();
-    await expect(badge).not.toHaveAttribute('data-verdict', 'unchecked', { timeout: 10_000 });
-    const verdict = await badge.getAttribute('data-verdict');
-    expect(VERDICTS).toContain(verdict);
+    await requestVerify(page, 'a message with a signature on it');
+    const panel = page.getByTestId('verify-panel');
+    await expect(panel).not.toHaveAttribute('data-verdict', 'checking', { timeout: 10_000 });
     // Nothing on this server ever signed that id, so the honest answer is
-    // that it cannot be checked — and the marker must not read as verified.
-    expect(verdict, 'an unknown id is not evidence of anything').toBe('unverifiable');
+    // that it cannot be checked — and it must not read as verified.
+    await expect(panel).toHaveAttribute('data-verdict', 'unverifiable');
     await expect(page.getByText('Could not be checked here')).toBeVisible();
+    await panel.getByRole('button', { name: 'Dismiss' }).click();
+    await expect(page.getByTestId('verify-panel')).toHaveCount(0);
   });
 
-  test('a follow-up row carries its own marker', async ({ page }) => {
+  test('the panel stays inside the viewport wherever the request came from', async ({ page }) => {
+    const channel = uniqueChannel();
+    await connectGuest(page, uniqueNick(), channel);
+    await receiveSignedMessage(page, channel, {
+      id: '01JBADGEVIEWPORTEDGE0000001',
+      from: 'someone',
+      text: 'verify me from the far edge',
+    });
+    await expectMessage(page, 'verify me from the far edge');
+
+    // Ask from the bottom-right corner of the row — the spot that pushed the
+    // old panel off the right edge of the screen.
+    const row = page.locator('.msg-full', { hasText: 'verify me from the far edge' }).first();
+    const box = await row.boundingBox();
+    if (!box) throw new Error('row has no box');
+    await row.click({ button: 'right', position: { x: box.width - 4, y: box.height - 4 } });
+    await page.getByRole('button', { name: /Verify Signature/ }).click();
+
+    const panel = page.getByTestId('verify-panel');
+    await expect(panel).toBeVisible();
+    const pbox = await panel.boundingBox();
+    const viewport = page.viewportSize();
+    if (!pbox || !viewport) throw new Error('panel or viewport has no box');
+    expect(pbox.x, 'panel must not start left of the viewport').toBeGreaterThanOrEqual(0);
+    expect(pbox.y, 'panel must not start above the viewport').toBeGreaterThanOrEqual(0);
+    expect(pbox.x + pbox.width, 'panel must not run off the right edge').toBeLessThanOrEqual(viewport.width);
+    expect(pbox.y + pbox.height, 'panel must not run off the bottom edge').toBeLessThanOrEqual(viewport.height);
+    await panel.getByRole('button', { name: 'Dismiss' }).click();
+  });
+
+  test('only one panel is ever open, and clicking away dismisses it', async ({ page }) => {
+    const channel = uniqueChannel();
+    await connectGuest(page, uniqueNick(), channel);
+    await receiveSignedMessage(page, channel, {
+      id: '01JBADGEONLYONEA0000000001',
+      from: 'someone',
+      text: 'first candidate for a verdict',
+    });
+    await receiveSignedMessage(page, channel, {
+      id: '01JBADGEONLYONEB0000000002',
+      from: 'someoneelse',
+      text: 'second candidate for a verdict',
+    });
+    await expectMessage(page, 'second candidate for a verdict');
+
+    await requestVerify(page, 'first candidate for a verdict');
+    await expect(page.getByTestId('verify-panel')).toHaveCount(1);
+
+    // The open panel covers the neighbouring row's text, so the second
+    // request comes from the row's right edge — as a real hand would. The
+    // mousedown of that right-click is itself the click-away that closes the
+    // first panel.
+    const second = page.locator('.msg-full', { hasText: 'second candidate for a verdict' }).first();
+    const box = await second.boundingBox();
+    if (!box) throw new Error('row has no box');
+    await second.click({ button: 'right', position: { x: box.width - 8, y: box.height / 2 } });
+    await page.getByRole('button', { name: /Verify Signature/ }).click();
+    await expect(
+      page.getByTestId('verify-panel'),
+      'a second request replaces the first panel instead of stacking on it',
+    ).toHaveCount(1);
+
+    await page.getByTestId('message-list').click({ position: { x: 10, y: 10 } });
+    await expect(page.getByTestId('verify-panel')).toHaveCount(0);
+  });
+
+  test('a check that answers invalid marks the row — and only that answer does', async ({ page }) => {
+    const channel = uniqueChannel();
+    await connectGuest(page, uniqueNick(), channel);
+    await receiveSignedMessage(page, channel, {
+      id: '01JBADGEINVALIDMARK0000001',
+      from: 'someone',
+      text: 'a signature that will not hold up',
+    });
+    await expectMessage(page, 'a signature that will not hold up');
+
+    // The server-side "invalid" answer essentially never occurs in the wild,
+    // so it is staged: the endpoint is mocked, everything downstream is real.
+    await page.route('**/api/v1/verify/**', (route) =>
+      route.fulfill({ json: { verification: { verdict: 'invalid', verified_by: 'client-session-key' } } }),
+    );
+
+    await requestVerify(page, 'a signature that will not hold up');
+    const panel = page.getByTestId('verify-panel');
+    await expect(panel).toHaveAttribute('data-verdict', 'invalid', { timeout: 10_000 });
+    await expect(page.getByText('Does not match its signing key')).toBeVisible();
+    await panel.getByRole('button', { name: 'Dismiss' }).click();
+
+    await expect(
+      page.getByTestId('sig-invalid-mark'),
+      'the row wears the verdict after the panel is gone',
+    ).toHaveCount(1);
+  });
+
+  test('a follow-up row offers the same request', async ({ page }) => {
     const channel = uniqueChannel();
     await connectGuest(page, uniqueNick(), channel);
     await receiveSignedMessage(page, channel, {
@@ -97,13 +211,12 @@ test.describe('signature markers', () => {
     });
     await expectMessage(page, 'second thing said');
 
-    await expect(
-      page.getByTestId('signed-badge'),
-      'being the second thing someone said is not a reason to drop the evidence',
-    ).toHaveCount(2, { timeout: 10_000 });
+    await requestVerify(page, 'second thing said');
+    await expect(page.getByTestId('verify-panel')).toHaveCount(1);
+    await page.getByTestId('verify-panel').getByRole('button', { name: 'Dismiss' }).click();
   });
 
-  test('an encrypted message shows both what it is and who wrote it', async ({ page }) => {
+  test('an encrypted message still shows what it is', async ({ page }) => {
     const channel = uniqueChannel();
     await connectGuest(page, uniqueNick(), channel);
     await receiveSignedMessage(page, channel, {
@@ -114,7 +227,6 @@ test.describe('signature markers', () => {
     });
     await expectMessage(page, 'unreadable to the server');
 
-    await expect(page.getByTestId('signed-badge')).toHaveCount(1, { timeout: 10_000 });
     await expect(page.getByTitle('End-to-end encrypted')).toBeVisible();
   });
 

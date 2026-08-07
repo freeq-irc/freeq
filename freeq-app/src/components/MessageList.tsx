@@ -13,14 +13,8 @@ import { MarkdownMessage } from './MarkdownRenderer';
 import { CoordinationEventCard, isCoordinationEvent } from './CoordinationCards';
 import { jumbomojiSize } from '../lib/jumbomoji';
 import { buildTranscript } from '../lib/transcript';
-import {
-  verifySignature,
-  cachedVerdict,
-  badgeTone,
-  badgeTitle,
-  VERIFY_LABELS,
-  type VerifyOutcome,
-} from '../lib/verify-signature';
+import { useCachedVerdict, VERIFY_LABELS } from '../lib/verify-signature';
+import { VerifySignaturePanel } from './VerifySignaturePanel';
 
 // ── Colors ──
 
@@ -692,6 +686,10 @@ function FullMessageImpl({ msg, channel, onNickClick }: MessageProps) {
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [pickerPos, setPickerPos] = useState<{ x: number; y: number } | undefined>();
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
+  const [verifyPanel, setVerifyPanel] = useState<{ x: number; y: number } | null>(null);
+  // The only signature state a resting row ever shows: a check that already
+  // answered "invalid". Everything short of that answer is silent.
+  const sigInvalid = useCachedVerdict(msg.id)?.outcome === 'invalid';
   const color = msg.isSelf ? '#b18cff' : nickColor(msg.from);
   const currentNick = getNick();
   const isMention = !msg.isSelf && msg.text.toLowerCase().includes(currentNick.toLowerCase());
@@ -704,7 +702,7 @@ function FullMessageImpl({ msg, channel, onNickClick }: MessageProps) {
   // Federated provenance: when present, this message was relayed from another
   // server (+freeq.at/origin = its name). Its identity is peer-vouched by that
   // server, not verified here — so we show "via {origin}" and suppress the
-  // local "verified" (✓) and "signed" (🔒) badges, which would overstate trust.
+  // local "verified" (✓) badge, which would overstate trust.
   const origin = msg.tags?.['+freeq.at/origin'];
   const isFederated = !!origin;
 
@@ -740,7 +738,7 @@ function FullMessageImpl({ msg, channel, onNickClick }: MessageProps) {
           </button>
           {member?.did && !isFederated && <VerifiedBadge />}
           {isFederated && <ViaBadge origin={origin!} />}
-          {msg.tags['+freeq.at/sig'] && !isFederated && <SignedBadge msgid={msg.id} />}
+          {sigInvalid && <InvalidSigMark />}
           {member?.away != null && (
             <span className="text-xs text-fg-dim bg-warning/10 text-warning px-1.5 py-0.5 rounded">away</span>
           )}
@@ -796,6 +794,16 @@ function FullMessageImpl({ msg, channel, onNickClick }: MessageProps) {
           onEdit={() => useStore.getState().setEditingMsg({ msgId: msg.id, text: msg.text, channel })}
           onThread={() => useStore.getState().openThread(msg.id, channel)}
           onReact={openEmojiPicker}
+          onVerify={() => setVerifyPanel(ctxMenu)}
+        />
+      )}
+
+      {verifyPanel && (
+        <VerifySignaturePanel
+          msgid={msg.id}
+          signed={!!msg.tags['+freeq.at/sig']}
+          position={verifyPanel}
+          onClose={() => setVerifyPanel(null)}
         />
       )}
     </div>
@@ -806,6 +814,8 @@ function GroupedMessageImpl({ msg, channel, onNickClick }: MessageProps) {
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [pickerPos, setPickerPos] = useState<{ x: number; y: number } | undefined>();
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
+  const [verifyPanel, setVerifyPanel] = useState<{ x: number; y: number } | null>(null);
+  const sigInvalid = useCachedVerdict(msg.id)?.outcome === 'invalid';
   const currentNick = getNick();
   const isMention = !msg.isSelf && msg.text.toLowerCase().includes(currentNick.toLowerCase());
   const isPinned = useStore((s) => s.channels.get(channel.toLowerCase())?.pins?.some(p => p.msgid === msg.id) ?? false);
@@ -826,16 +836,13 @@ function GroupedMessageImpl({ msg, channel, onNickClick }: MessageProps) {
       <span className="w-10 shrink-0 text-right text-[11px] text-fg-dim opacity-0 group-hover:opacity-100 leading-[24px] cursor-default" title={msg.timestamp.toLocaleString([], { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })}>
         {formatTime(msg.timestamp)}
       </span>
-      {/* A follow-up row carries the same evidence as the row that opened the
-          group — being the second thing someone said is not a reason to stop
-          saying whether it was signed. The markers sit where a full row
-          carries them: before the content, in a reserved slot so a line that
-          has them doesn't sit differently from one that doesn't. */}
+      {/* Reserved marker slot so a line that carries a badge doesn't sit
+          differently from one that doesn't. Signatures earn no resting ink —
+          the only signature mark a row can wear is the ⚠ after a check
+          answered "invalid". */}
       <span className="min-w-5 shrink-0 flex items-start gap-1 leading-[24px]">
         {msg.encrypted && <EncryptedBadge />}
-        {msg.tags?.['+freeq.at/sig'] && !msg.tags?.['+freeq.at/origin'] && (
-          <SignedBadge msgid={msg.id} />
-        )}
+        {sigInvalid && <InvalidSigMark />}
       </span>
 
       <div className="min-w-0 flex-1">
@@ -877,6 +884,16 @@ function GroupedMessageImpl({ msg, channel, onNickClick }: MessageProps) {
           onEdit={() => useStore.getState().setEditingMsg({ msgId: msg.id, text: msg.text, channel })}
           onThread={() => useStore.getState().openThread(msg.id, channel)}
           onReact={(e: React.MouseEvent) => { setPickerPos({ x: e.clientX, y: e.clientY }); setShowEmojiPicker(true); }}
+          onVerify={() => setVerifyPanel(ctxMenu)}
+        />
+      )}
+
+      {verifyPanel && (
+        <VerifySignaturePanel
+          msgid={msg.id}
+          signed={!!msg.tags?.['+freeq.at/sig']}
+          position={verifyPanel}
+          onClose={() => setVerifyPanel(null)}
         />
       )}
     </div>
@@ -919,87 +936,16 @@ function ViaBadge({ origin }: { origin: string }) {
   );
 }
 
-/** Roughly how tall the verify panel is; below this it opens downward. */
-const VERIFY_PANEL_HEIGHT_PX = 200;
-
-/** Signed message badge — message carries a cryptographic signature.
- *  Clicking it checks the signature against the server's verify endpoint
- *  and shows the actual result, instead of asserting validity unchecked. */
-function SignedBadge({ msgid }: { msgid: string }) {
-  const [showInfo, setShowInfo] = useState(false);
-  const [outcome, setOutcome] = useState<VerifyOutcome | null>(() => cachedVerdict(msgid) ?? null);
-  const [checking, setChecking] = useState(false);
-  const btnRef = useRef<HTMLButtonElement>(null);
-  const [openDownward, setOpenDownward] = useState(false);
-
-  const toggle = () => {
-    const opening = !showInfo;
-    // The panel opens upward by default, which puts the verdict off the top of
-    // the screen for the first message in a conversation — the answer the
-    // whole check exists to deliver, clipped. Open downward when the room
-    // above isn't there.
-    if (opening) {
-      const top = btnRef.current?.getBoundingClientRect().top ?? Infinity;
-      setOpenDownward(top < VERIFY_PANEL_HEIGHT_PX);
-    }
-    setShowInfo(opening);
-    if (opening && outcome === null && !checking) {
-      setChecking(true);
-      verifySignature(msgid).then((o) => { setOutcome(o); setChecking(false); });
-    }
-  };
-
+/** The one signature mark a resting row can wear: a check that actually
+ *  answered "invalid". Never speculative — it exists only after evidence. */
+function InvalidSigMark() {
   return (
-    <span className="relative inline-block">
-      <button
-        ref={btnRef}
-        data-testid="signed-badge"
-        data-verdict={outcome ?? 'unchecked'}
-        className={`text-xs opacity-60 hover:opacity-100 transition-opacity ${badgeTone(outcome)}`}
-        onClick={(e) => { e.stopPropagation(); toggle(); }}
-        title={badgeTitle(outcome)}
-      >
-        <svg className="w-3 h-3 inline -mt-0.5" viewBox="0 0 16 16" fill="currentColor">
-          <path d="M8 1a2 2 0 00-2 2v3H5a2 2 0 00-2 2v5a2 2 0 002 2h6a2 2 0 002-2V8a2 2 0 00-2-2H10V3a2 2 0 00-2-2zm0 1.5a.5.5 0 01.5.5v3h-1V3a.5.5 0 01.5-.5z"/>
-        </svg>
-      </button>
-      {showInfo && (
-        <div className={`absolute ${openDownward ? 'top-full mt-1' : 'bottom-full mb-1'} left-0 w-64 bg-bg-secondary border border-border rounded-lg shadow-xl p-3 z-50 animate-fadeIn`}
-             onClick={(e) => e.stopPropagation()}>
-          <div className={`text-xs font-semibold mb-1 flex items-center gap-1 ${badgeTone(outcome)}`}>
-            <svg className="w-3 h-3" viewBox="0 0 16 16" fill="currentColor">
-              <path d="M8 1a2 2 0 00-2 2v3H5a2 2 0 00-2 2v5a2 2 0 002 2h6a2 2 0 002-2V8a2 2 0 00-2-2H10V3a2 2 0 00-2-2zm0 1.5a.5.5 0 01.5.5v3h-1V3a.5.5 0 01.5-.5z"/>
-            </svg>
-            Signed Message
-          </div>
-          {checking ? (
-            <div className="text-[11px] text-fg-dim flex items-center gap-1.5 mb-1">
-              <svg className="animate-spin w-3 h-3" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-              </svg>
-              Checking signature…
-            </div>
-          ) : outcome && (
-            <div className={`text-[11px] font-medium mb-1 ${VERIFY_LABELS[outcome].tone}`}>
-              {(outcome === 'device' || outcome === 'server') && '✓ '}
-              {outcome === 'invalid' && '⚠ '}
-              {VERIFY_LABELS[outcome].text}
-            </div>
-          )}
-          <p className="text-[11px] text-fg-muted leading-relaxed">
-            This message carries a cryptographic signature tied to the sender&apos;s
-            AT Protocol DID. The check above verifies it against the server&apos;s
-            signing keys.
-          </p>
-          <button
-            className="text-[10px] text-fg-dim hover:text-fg-muted mt-1.5"
-            onClick={() => setShowInfo(false)}
-          >
-            Dismiss
-          </button>
-        </div>
-      )}
+    <span
+      data-testid="sig-invalid-mark"
+      className="text-danger text-xs cursor-default"
+      title={VERIFY_LABELS.invalid.text}
+    >
+      ⚠
     </span>
   );
 }
