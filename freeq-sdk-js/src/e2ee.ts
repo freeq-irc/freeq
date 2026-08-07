@@ -13,13 +13,17 @@
  */
 
 import { openDB, type IDBPDatabase } from 'idb';
+import * as ratchet from './ratchet.js';
+import * as x3dh from './x3dh.js';
 
 // ── Constants ──
 
-const ENC3_PREFIX = 'ENC3:';
 const ENC1_PREFIX = 'ENC1:';
 const DB_NAME = 'freeq-e2ee';
-const DB_VERSION = 1;
+// v2 dropped the sessions store: what it held was the old construction's
+// state, which no longer decrypts anything and never reached a real user —
+// browser DM encryption did not work at all before this.
+const DB_VERSION = 2;
 
 // ── Types ──
 
@@ -34,23 +38,15 @@ interface IdentityKeys {
   signingPublic?: Uint8Array;
 }
 
-interface SessionState {
-  sharedSecret: number[];
-  sendChainKey: number[];
-  recvChainKey: number[];
-  sendMsgNum: number;
-  recvMsgNum: number;
-  prevChainLen: number;
-  dhSendSecret?: number[];
-  dhSendPublic?: number[];
-  dhRecvPublic?: number[];
-  rootKey?: number[];
-  dhRatchetInitialized?: boolean;
-}
-
 interface RatchetSession {
   remoteDid: string;
-  state: string;
+  /** The ratchet's own state — plain data, stored as-is. */
+  state: ratchet.SessionState;
+  /**
+   * The agreement we opened with, until it has been sent. The first message
+   * of a session has to carry it or the peer can derive nothing.
+   */
+  pendingIntro: ratchet.Intro | null;
   createdAt: number;
   lastUsed: number;
 }
@@ -71,9 +67,9 @@ const channelKeys = new Map<string, Uint8Array>();
 
 // ── Public API ──
 
-/** Check if text is an ENC3 (DM Double Ratchet) encrypted message. */
+/** Check if text is a Double Ratchet encrypted DM (ENC3, or ENC4 opening). */
 export function isEncrypted(text: string): boolean {
-  return text.startsWith(ENC3_PREFIX);
+  return ratchet.isEncrypted(text);
 }
 
 /** Check if text is an ENC1 (channel passphrase) encrypted message. */
@@ -244,7 +240,12 @@ export function removeChannelKey(channel: string): void {
 
 // ── Encrypt / Decrypt ──
 
-/** Encrypt a DM using the Double Ratchet. */
+/**
+ * Encrypt a DM.
+ *
+ * The first message of a session goes out as ENC4, carrying the agreement
+ * that opened it; everything after is ENC3.
+ */
 export async function encryptMessage(
   remoteDid: string,
   plaintext: string,
@@ -254,135 +255,94 @@ export async function encryptMessage(
 
   let session = sessions.get(remoteDid);
   if (!session) {
-    const newSession = await establishSession(remoteDid, serverOrigin);
-    if (!newSession) return null;
-    session = newSession;
+    const opened = await establishSession(remoteDid, serverOrigin);
+    if (!opened) return null;
+    session = opened;
   }
 
   try {
-    const st: SessionState = JSON.parse(session.state);
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-
-    if (st.dhRatchetInitialized && st.dhRecvPublic && st.sendMsgNum > 0 && st.sendMsgNum % 10 === 0) {
-      try {
-        const dhPair = await (crypto.subtle.generateKey as any)({ name: 'X25519' }, true, ['deriveBits']);
-        const newSecret = await exportPrivateBytes(dhPair.privateKey);
-        const newPublic = new Uint8Array(await crypto.subtle.exportKey('raw', dhPair.publicKey));
-        const dhOutput = await x25519DH(newSecret, new Uint8Array(st.dhRecvPublic));
-        const newRoot = await hkdfDerive(dhOutput, 'freeq-ratchet-root');
-        const newChain = await hkdfDerive(newRoot, 'freeq-ratchet-chain');
-        st.prevChainLen = st.sendMsgNum;
-        st.sendMsgNum = 0;
-        st.dhSendSecret = Array.from(newSecret);
-        st.dhSendPublic = Array.from(newPublic);
-        st.rootKey = Array.from(newRoot);
-        st.sendChainKey = Array.from(newChain);
-      } catch (e) {
-        console.warn('[e2ee] DH ratchet step failed, continuing with chain key:', e);
-      }
-    }
-
-    // Derived after any ratchet step, so it matches the chain the header
-    // announces — the receiver re-keys off that header before decrypting.
-    const msgKey = await deriveMessageKey(st.sendChainKey, st.sendMsgNum);
-
-    const dhPub = st.dhSendPublic ? new Uint8Array(st.dhSendPublic) : identityKeys.publicKey;
-    const header = new Uint8Array(40);
-    header.set(dhPub, 0);
-    new DataView(header.buffer).setUint32(32, st.prevChainLen, false);
-    new DataView(header.buffer).setUint32(36, st.sendMsgNum, false);
-
-    const key = await ((crypto.subtle as any).importKey)('raw', msgKey, { name: 'AES-GCM' }, false, ['encrypt']);
-    const ct = new Uint8Array(await ((crypto.subtle as any).encrypt)(
-      { name: 'AES-GCM', iv, additionalData: header } as any, key,
-      new TextEncoder().encode(plaintext),
-    ));
-
-    st.sendChainKey = Array.from(await advanceChainKey(st.sendChainKey));
-    st.sendMsgNum++;
-    session.state = JSON.stringify(st);
-    session.lastUsed = Date.now();
-    sessions.set(remoteDid, session);
-    if (db) await db.put('sessions', session);
-
-    return `${ENC3_PREFIX}${toB64(header)}:${toB64(iv)}:${toB64(ct)}`;
+    const wire = session.pendingIntro
+      ? await ratchet.encryptFirst(session.state, session.pendingIntro, plaintext)
+      : await ratchet.encrypt(session.state, plaintext);
+    session.pendingIntro = null;
+    await rememberSession(session);
+    return wire;
   } catch (e) {
     console.error('[e2ee] Encrypt failed:', e);
     return null;
   }
 }
 
-/** Decrypt a DM using the Double Ratchet. */
+/**
+ * Decrypt a DM.
+ *
+ * An opening message carries the agreement it was built from, so a responder
+ * can answer someone it has never heard from. An opening for a conversation
+ * we already have is tried against the existing session first: a replayed one
+ * must not be able to reset a live conversation's chains.
+ */
 export async function decryptMessage(
   remoteDid: string,
   wire: string,
   serverOrigin?: string,
 ): Promise<string | null> {
-  if (!initialized) return null;
-  if (!wire.startsWith(ENC3_PREFIX)) return null;
+  if (!initialized || !identityKeys) return null;
+  if (!ratchet.isEncrypted(wire)) return null;
 
-  let session = sessions.get(remoteDid);
-  if (!session && serverOrigin) {
-    const newSession = await establishSession(remoteDid, serverOrigin);
-    if (!newSession) return null;
-    session = newSession;
+  const existing = sessions.get(remoteDid);
+  if (existing) {
+    try {
+      const plaintext = await ratchet.decrypt(existing.state, wire);
+      await rememberSession(existing);
+      return plaintext;
+    } catch {
+      // Falls through: an opening may be starting a genuinely new session.
+    }
   }
-  if (!session) return null;
+
+  const intro = ratchet.introOf(wire);
+  if (!intro) {
+    // An ordinary message with no session to read it under. Nothing to do —
+    // the sender has to open a conversation before continuing one.
+    if (!existing) console.warn('[e2ee] No session for a DM from', remoteDid);
+    return null;
+  }
 
   try {
-    const body = wire.slice(ENC3_PREFIX.length);
-    const parts = body.split(':');
-    if (parts.length !== 3) return null;
-
-    const header = fromB64(parts[0]);
-    const iv = fromB64(parts[1]);
-    const ct = fromB64(parts[2]);
-    if (header.length !== 40 || iv.length !== 12) return null;
-
-    const senderDHPub = header.slice(0, 32);
-    const msgNum = new DataView(header.buffer, header.byteOffset + 36, 4).getUint32(0, false);
-    const st: SessionState = JSON.parse(session.state);
-
-    if (st.dhRatchetInitialized && st.dhRecvPublic && st.dhSendSecret) {
-      const currentRecvPub = new Uint8Array(st.dhRecvPublic);
-      if (!arraysEqual(senderDHPub, currentRecvPub)) {
-        try {
-          const dhOutput = await x25519DH(new Uint8Array(st.dhSendSecret), senderDHPub);
-          const newRoot = await hkdfDerive(dhOutput, 'freeq-ratchet-root');
-          const newChain = await hkdfDerive(newRoot, 'freeq-ratchet-chain');
-          st.dhRecvPublic = Array.from(senderDHPub);
-          st.rootKey = Array.from(newRoot);
-          st.recvChainKey = Array.from(newChain);
-          st.recvMsgNum = 0;
-        } catch (e) {
-          console.warn('[e2ee] Receiving DH ratchet failed:', e);
-        }
-      }
-    }
-
-    let chainKey = st.recvChainKey;
-    for (let i = st.recvMsgNum; i < msgNum; i++) {
-      chainKey = Array.from(await advanceChainKey(chainKey));
-    }
-
-    const msgKey = await deriveMessageKey(chainKey, msgNum);
-    const key = await ((crypto.subtle as any).importKey)('raw', msgKey, { name: 'AES-GCM' }, false, ['decrypt']);
-    const plain = await ((crypto.subtle as any).decrypt)(
-      { name: 'AES-GCM', iv, additionalData: header } as any, key, ct,
+    const sharedSecret = await x3dh.respond(
+      {
+        identitySecret: identityKeys.secretKey,
+        signedPreKeySecret: identityKeys.spkSecret,
+        spkId: identityKeys.spkId,
+      },
+      {
+        identityKey: ratchet.toB64Url(intro.identityKey),
+        ephemeralKey: ratchet.toB64Url(intro.ephemeralKey),
+        spkId: intro.spkId,
+        did: remoteDid,
+      },
     );
-
-    st.recvChainKey = Array.from(await advanceChainKey(chainKey));
-    st.recvMsgNum = msgNum + 1;
-    session.state = JSON.stringify(st);
-    session.lastUsed = Date.now();
-    sessions.set(remoteDid, session);
-    if (db) await db.put('sessions', session);
-
-    return new TextDecoder().decode(plain);
+    const state = await ratchet.initBob(sharedSecret, identityKeys.spkSecret);
+    const plaintext = await ratchet.decrypt(state, wire);
+    await rememberSession({
+      remoteDid,
+      state,
+      pendingIntro: null,
+      createdAt: Date.now(),
+      lastUsed: Date.now(),
+    });
+    return plaintext;
   } catch (e) {
     console.error('[e2ee] Decrypt failed:', e);
     return null;
   }
+}
+
+/** Keep a session in memory and on disk, both keyed by the peer. */
+async function rememberSession(session: RatchetSession): Promise<void> {
+  session.lastUsed = Date.now();
+  sessions.set(session.remoteDid, session);
+  if (db) await db.put('sessions', session);
 }
 
 /** Encrypt a message for a channel (ENC1 format). */
@@ -538,21 +498,29 @@ export async function publishPreKeyBundle(serverOrigin: string): Promise<boolean
 
 // ── Session Establishment ──
 
-async function establishSession(remoteDid: string, serverOrigin: string): Promise<RatchetSession | null> {
+async function establishSession(
+  remoteDid: string,
+  serverOrigin: string,
+): Promise<RatchetSession | null> {
   if (!identityKeys) return null;
   const bundle = await fetchPreKeyBundle(serverOrigin, remoteDid);
   if (!bundle) return null;
 
   try {
-    const theirIK = fromB64(bundle.identity_key);
-    const theirSPK = fromB64(bundle.signed_pre_key);
+    const theirIdentity = fromB64(bundle.identity_key);
+    const theirSignedPreKey = fromB64(bundle.signed_pre_key);
 
     if (bundle.signing_key && bundle.spk_signature) {
       try {
-        const signingPub = fromB64(bundle.signing_key);
-        const spkSig = fromB64(bundle.spk_signature);
-        const verifyKey = await (crypto.subtle as any).importKey('raw', signingPub, 'Ed25519', false, ['verify']);
-        const valid = await (crypto.subtle as any).verify('Ed25519', verifyKey, spkSig, theirSPK);
+        const verifyKey = await crypto.subtle.importKey(
+          'raw', fromB64(bundle.signing_key) as BufferSource, 'Ed25519', false, ['verify'],
+        );
+        const valid = await crypto.subtle.verify(
+          'Ed25519',
+          verifyKey,
+          fromB64(bundle.spk_signature) as BufferSource,
+          theirSignedPreKey as BufferSource,
+        );
         if (!valid) {
           console.error('[e2ee] SPK signature verification failed for', remoteDid);
           return null;
@@ -562,60 +530,37 @@ async function establishSession(remoteDid: string, serverOrigin: string): Promis
       }
     }
 
-    const dh_ik_spk = await x25519DH(identityKeys.secretKey, theirSPK);
-    const dh_spk_ik = await x25519DH(identityKeys.spkSecret, theirIK);
-    const dh_spk_spk = await x25519DH(identityKeys.spkSecret, theirSPK);
-
-    const myIK = identityKeys.publicKey;
-    const weAreFirst = compareBytes(myIK, theirIK) < 0;
-    const dh1 = weAreFirst ? dh_ik_spk : dh_spk_ik;
-    const dh2 = weAreFirst ? dh_spk_ik : dh_ik_spk;
-
-    const ikm = new Uint8Array(96);
-    ikm.set(dh1, 0); ikm.set(dh2, 32); ikm.set(dh_spk_spk, 64);
-
-    const sharedSecret = await hkdfDerive(ikm, 'freeq-x3dh-v1');
-    const chain_a = await hkdfDerive(sharedSecret, 'freeq-chain-a');
-    const chain_b = await hkdfDerive(sharedSecret, 'freeq-chain-b');
-
-    // The signed pre-key is the initial ratchet key on both sides: the peer
-    // knows it from our bundle, so the first message needs no ratchet step and
-    // later steps line up (a per-side ephemeral here can never agree).
-    const dhSecret = identityKeys.spkSecret;
-    const dhPublic = identityKeys.spkPublic;
-
-    const st: SessionState = {
-      sharedSecret: Array.from(sharedSecret),
-      sendChainKey: Array.from(weAreFirst ? chain_a : chain_b),
-      recvChainKey: Array.from(weAreFirst ? chain_b : chain_a),
-      sendMsgNum: 0, recvMsgNum: 0, prevChainLen: 0,
-      dhSendSecret: Array.from(dhSecret),
-      dhSendPublic: Array.from(dhPublic),
-      dhRecvPublic: Array.from(theirSPK),
-      rootKey: Array.from(sharedSecret),
-      dhRatchetInitialized: true,
-    };
+    // The agreement mints a per-session ephemeral, which is what the opening
+    // message carries: without it the peer cannot derive the same secret.
+    const agreed = await x3dh.initiate(
+      { identitySecret: identityKeys.secretKey, did: ownDid ?? '' },
+      {
+        identityKey: theirIdentity,
+        signedPreKey: theirSignedPreKey,
+        spkId: typeof bundle.spk_id === 'number' ? bundle.spk_id : 1,
+      },
+    );
 
     const session: RatchetSession = {
-      remoteDid, state: JSON.stringify(st),
-      createdAt: Date.now(), lastUsed: Date.now(),
+      remoteDid,
+      state: await ratchet.initAlice(agreed.sharedSecret, agreed.theirRatchetKey),
+      pendingIntro: {
+        identityKey: ratchet.fromB64Url(agreed.initialMessage.identityKey),
+        ephemeralKey: ratchet.fromB64Url(agreed.initialMessage.ephemeralKey),
+        spkId: agreed.initialMessage.spkId,
+      },
+      createdAt: Date.now(),
+      lastUsed: Date.now(),
     };
-    sessions.set(remoteDid, session);
-    if (db) await db.put('sessions', session);
+    await rememberSession(session);
     return session;
   } catch (e) {
-    console.error('[e2ee] X3DH failed:', e);
+    console.error('[e2ee] Key agreement failed:', e);
     return null;
   }
 }
 
 // ── Crypto Helpers ──
-
-function arraysEqual(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) { if (a[i] !== b[i]) return false; }
-  return true;
-}
 
 /**
  * The 32 raw secret bytes of an X25519 private key. WebCrypto permits `raw`
@@ -625,61 +570,6 @@ async function exportPrivateBytes(key: CryptoKey): Promise<Uint8Array> {
   const jwk = await crypto.subtle.exportKey('jwk', key);
   if (!jwk.d) throw new Error('exported JWK is missing the private component');
   return fromB64(jwk.d);
-}
-
-/**
- * RFC 8410 PKCS#8 wrapper for a bare 32-byte X25519 scalar. WebCrypto's `raw`
- * format carries public keys only, so a stored secret has to be wrapped to be
- * imported back.
- */
-const X25519_PKCS8_PREFIX = new Uint8Array([
-  0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
-  0x03, 0x2b, 0x65, 0x6e, 0x04, 0x22, 0x04, 0x20,
-]);
-
-async function importPrivateKey(secret: Uint8Array): Promise<CryptoKey> {
-  const pkcs8 = new Uint8Array(X25519_PKCS8_PREFIX.length + secret.length);
-  pkcs8.set(X25519_PKCS8_PREFIX, 0);
-  pkcs8.set(secret, X25519_PKCS8_PREFIX.length);
-  return (crypto.subtle as any).importKey('pkcs8', pkcs8, { name: 'X25519' }, false, ['deriveBits']);
-}
-
-async function x25519DH(mySecret: Uint8Array, theirPublic: Uint8Array): Promise<Uint8Array> {
-  const myKey = await importPrivateKey(mySecret);
-  const theirKey = await (crypto.subtle as any).importKey('raw', theirPublic, { name: 'X25519' }, false, []);
-  const bits = await (crypto.subtle as any).deriveBits({ name: 'X25519', public: theirKey }, myKey, 256);
-  return new Uint8Array(bits);
-}
-
-async function hkdfDerive(ikm: Uint8Array, info: string): Promise<Uint8Array> {
-  const key = await ((crypto.subtle as any).importKey)('raw', ikm, 'HKDF', false, ['deriveBits']);
-  const bits = await ((crypto.subtle as any).deriveBits)(
-    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32).fill(0xFF), info: new TextEncoder().encode(info) } as any,
-    key, 256,
-  );
-  return new Uint8Array(bits);
-}
-
-async function deriveMessageKey(chainKey: number[], _msgNum: number): Promise<Uint8Array> {
-  const ck = new Uint8Array(chainKey);
-  const key = await ((crypto.subtle as any).importKey)('raw', ck, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const sig = await ((crypto.subtle as any).sign)('HMAC', key, new Uint8Array([0x01]));
-  return new Uint8Array(sig);
-}
-
-async function advanceChainKey(chainKey: number[]): Promise<Uint8Array> {
-  const ck = new Uint8Array(chainKey);
-  const key = await ((crypto.subtle as any).importKey)('raw', ck, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const sig = await ((crypto.subtle as any).sign)('HMAC', key, new Uint8Array([0x02]));
-  return new Uint8Array(sig);
-}
-
-function compareBytes(a: Uint8Array, b: Uint8Array): number {
-  const len = Math.min(a.length, b.length);
-  for (let i = 0; i < len; i++) {
-    if (a[i] !== b[i]) return a[i] - b[i];
-  }
-  return a.length - b.length;
 }
 
 function toB64(data: Uint8Array): string {

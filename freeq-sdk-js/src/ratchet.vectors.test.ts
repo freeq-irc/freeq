@@ -35,6 +35,12 @@ interface Vectors {
     aliceRatchetSecret: string;
     aliceInitialState: Record<string, unknown>;
     aliceToBob: Array<{ name: string; nonce: string; plaintext: string; wire: string }>;
+    opening: {
+      intro: { identityKey: string; ephemeralKey: string; spkId: number; bytes: string };
+      nonce: string;
+      plaintext: string;
+      wire: string;
+    };
   };
 }
 
@@ -144,6 +150,40 @@ describe('a session', () => {
 
     const second = await ratchet.encrypt(alice, 'from alice again');
     expect(await ratchet.decrypt(bob, second)).toBe('from alice again');
+  });
+
+  it('opens a conversation with the agreement the responder needs', async () => {
+    const opening = spec.session.opening;
+    const intro = {
+      identityKey: unhex(opening.intro.identityKey),
+      ephemeralKey: unhex(opening.intro.ephemeralKey),
+      spkId: opening.intro.spkId,
+    };
+    expect(hex(ratchet.encodeIntro(intro))).toBe(opening.intro.bytes);
+
+    const alice = await ratchet.initAlice(
+      unhex(spec.session.sharedSecret),
+      unhex(spec.session.bobSignedPreKeyPublic),
+      unhex(spec.session.aliceRatchetSecret),
+    );
+    expect(
+      await ratchet.encryptFirst(alice, intro, opening.plaintext, unhex(opening.nonce)),
+      'the opening message must be byte-identical',
+    ).toBe(opening.wire);
+
+    // A responder reads the agreement before it has any session at all.
+    const read = ratchet.introOf(opening.wire);
+    expect(read).not.toBeNull();
+    expect(hex(read!.ephemeralKey)).toBe(opening.intro.ephemeralKey);
+    expect(read!.spkId).toBe(opening.intro.spkId);
+    expect(ratchet.introOf(spec.session.aliceToBob[0].wire), 'a later message carries none').toBeNull();
+
+    const bob = await ratchet.initBob(
+      unhex(spec.session.sharedSecret),
+      unhex(spec.session.bobSignedPreKeySecret),
+    );
+    expect(await ratchet.decrypt(bob, opening.wire)).toBe(opening.plaintext);
+    expect(ratchet.isEncrypted(opening.wire), 'and it reads as encrypted').toBe(true);
   });
 
   it('keeps messages that arrive out of order', async () => {

@@ -16,6 +16,20 @@
 /** Wire prefix for Double Ratchet encrypted messages. */
 export const ENC3_PREFIX = 'ENC3:';
 
+/**
+ * Wire prefix for the first message of a session, which carries the key
+ * agreement's opening alongside the ciphertext.
+ *
+ * The responder cannot derive anything without it, and it has to survive
+ * everywhere the ciphertext survives — stored, replayed to someone who was
+ * offline, relayed between servers — so it travels in the body rather than
+ * beside it.
+ */
+export const ENC4_PREFIX = 'ENC4:';
+
+/** Length of an encoded {@link Intro}. */
+const INTRO_LEN = 68;
+
 /** Most skipped message keys kept per session, as the Rust side caps it. */
 const MAX_SKIP = 1000;
 
@@ -42,6 +56,19 @@ export interface SessionState {
   prevSendChainLen: number;
   skipped: SkippedKey[];
   isInitiator: boolean;
+}
+
+/**
+ * The opening of a key agreement, carried on the first message.
+ *
+ * Wire layout, 68 bytes: identity key (32) ‖ ephemeral key (32) ‖ pre-key id
+ * (u32 big-endian). The sender's DID is not in it — the responder has that
+ * from the message it arrived on, and the agreement never reads it.
+ */
+export interface Intro {
+  identityKey: Uint8Array;
+  ephemeralKey: Uint8Array;
+  spkId: number;
 }
 
 export interface MessageHeader {
@@ -161,6 +188,39 @@ export function encodeHeader(header: MessageHeader): Uint8Array {
   return out;
 }
 
+export function encodeIntro(intro: Intro): Uint8Array {
+  const out = new Uint8Array(INTRO_LEN);
+  out.set(intro.identityKey, 0);
+  out.set(intro.ephemeralKey, 32);
+  new DataView(out.buffer).setUint32(64, intro.spkId, false);
+  return out;
+}
+
+export function decodeIntro(bytes: Uint8Array): Intro | null {
+  if (bytes.length !== INTRO_LEN) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return {
+    identityKey: bytes.slice(0, 32),
+    ephemeralKey: bytes.slice(32, 64),
+    spkId: view.getUint32(64, false),
+  };
+}
+
+/**
+ * Read the opening off a first message, or `null` for an ordinary one. A
+ * responder calls this before it has a session — the intro is what lets it
+ * build one.
+ */
+export function introOf(wire: string): Intro | null {
+  if (!wire.startsWith(ENC4_PREFIX)) return null;
+  const field = wire.slice(ENC4_PREFIX.length).split(':')[0];
+  try {
+    return decodeIntro(fromB64Url(field));
+  } catch {
+    return null;
+  }
+}
+
 export function decodeHeader(bytes: Uint8Array): MessageHeader | null {
   if (bytes.length !== HEADER_LEN) return null;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -233,10 +293,28 @@ export async function initBob(
  * `nonce` is for reproducing published vectors only — a repeated nonce under
  * one key breaks AES-GCM outright, so real sends leave it out.
  */
+export async function encryptFirst(
+  state: SessionState,
+  intro: Intro,
+  plaintext: string,
+  nonce?: Uint8Array,
+): Promise<string> {
+  return encryptInner(state, plaintext, nonce, intro);
+}
+
 export async function encrypt(
   state: SessionState,
   plaintext: string,
   nonce?: Uint8Array,
+): Promise<string> {
+  return encryptInner(state, plaintext, nonce, null);
+}
+
+async function encryptInner(
+  state: SessionState,
+  plaintext: string,
+  nonce: Uint8Array | undefined,
+  intro: Intro | null,
 ): Promise<string> {
   if (!state.sendChainKey) throw new Error('no sending chain (session not fully initialized)');
 
@@ -263,13 +341,27 @@ export async function encrypt(
     ),
   );
 
-  return `${ENC3_PREFIX}${toB64Url(headerBytes)}:${toB64Url(iv)}:${toB64Url(ciphertext)}`;
+  const tail = `${toB64Url(headerBytes)}:${toB64Url(iv)}:${toB64Url(ciphertext)}`;
+  // The intro is not in the AAD: tampering with it lands the responder on a
+  // different secret, so the message does not open either way.
+  return intro ? `${ENC4_PREFIX}${toB64Url(encodeIntro(intro))}:${tail}` : `${ENC3_PREFIX}${tail}`;
 }
 
 /** Decrypt one message, stepping the ratchet when the peer's key has moved. */
 export async function decrypt(state: SessionState, wire: string): Promise<string> {
-  if (!wire.startsWith(ENC3_PREFIX)) throw new Error('not an ENC3 encrypted message');
-  const parts = splitWire(wire.slice(ENC3_PREFIX.length));
+  // A first message carries the agreement's opening ahead of the header. By
+  // the time there is a session to decrypt with, that opening has done its
+  // work, so the rest is read exactly alike.
+  let parts: [string, string, string] | null;
+  if (wire.startsWith(ENC4_PREFIX)) {
+    const body = wire.slice(ENC4_PREFIX.length);
+    const cut = body.indexOf(':');
+    parts = cut < 0 ? null : splitWire(body.slice(cut + 1));
+  } else if (wire.startsWith(ENC3_PREFIX)) {
+    parts = splitWire(wire.slice(ENC3_PREFIX.length));
+  } else {
+    throw new Error('not an encrypted message');
+  }
   if (!parts) throw new Error('malformed encrypted message');
   const [headerB64, nonceB64, ctB64] = parts;
 
@@ -371,7 +463,7 @@ async function openMessage(
 
 /** Is this an ENC3 message? */
 export function isEncrypted(text: string): boolean {
-  return text.startsWith(ENC3_PREFIX);
+  return text.startsWith(ENC3_PREFIX) || text.startsWith(ENC4_PREFIX);
 }
 
 // ── Wire helpers ──
