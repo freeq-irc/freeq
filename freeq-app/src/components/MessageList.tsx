@@ -836,14 +836,15 @@ function GroupedMessageImpl({ msg, channel, onNickClick }: MessageProps) {
       <span className="w-10 shrink-0 text-right text-[11px] text-fg-dim opacity-0 group-hover:opacity-100 leading-[24px] cursor-default" title={msg.timestamp.toLocaleString([], { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })}>
         {formatTime(msg.timestamp)}
       </span>
-      {/* Reserved marker slot so a line that carries a badge doesn't sit
-          differently from one that doesn't. Signatures earn no resting ink —
-          the only signature mark a row can wear is the ⚠ after a check
-          answered "invalid". */}
-      <span className="min-w-5 shrink-0 flex items-start gap-1 leading-[24px]">
-        {msg.encrypted && <EncryptedBadge />}
-        {sigInvalid && <InvalidSigMark />}
-      </span>
+      {/* A follow-up line aligns with the full rows above it — no reserved
+          slot. The rare badges (E2EE, or the ⚠ after a check answered
+          "invalid") take their space only on the lines that carry them. */}
+      {(msg.encrypted || sigInvalid) && (
+        <span className="shrink-0 flex items-start gap-1 leading-[24px]">
+          {msg.encrypted && <EncryptedBadge />}
+          {sigInvalid && <InvalidSigMark />}
+        </span>
+      )}
 
       <div className="min-w-0 flex-1">
         <MessageContent msg={msg} channel={channel} onNickClick={onNickClick} />
