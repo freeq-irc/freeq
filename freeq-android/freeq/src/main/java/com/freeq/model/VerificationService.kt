@@ -22,56 +22,43 @@ data class SigningKeyInfo(
 }
 
 /**
- * The checked outcome of verifying a specific message's signature, from
- * `GET /api/v1/verify/{msgid}`. This is an actual ed25519 check the server
- * performed over the canonical bytes — not an assertion from a tag's presence.
- */
-data class VerifyResult(
-    val valid: Boolean,
-    val verifiedBy: String, // "client-session-key" | "server-key" | "none"
-) {
-    val summary: String
-        get() = when {
-            valid && verifiedBy == "client-session-key" ->
-                "Verified — this message was signed on the sender's own device."
-            valid && verifiedBy == "server-key" ->
-                "Verified — signed by the server on the sender's behalf."
-            valid -> "Verified — the signature checks out."
-            else -> "This message's signature could not be verified."
-        }
-}
-
-/**
  * Honest signature verification: asks the server to actually verify a message's
  * signature and to surface the sender's real signing key. Mirrors the iOS
  * VerifiedProofSheet / web MessageList flow against the same REST endpoints.
- * A null result means "unavailable" — we never claim a verdict we didn't get.
+ * The answer is only ever what the server said — `SignatureVerdict` keeps the
+ * distinction between a bad signature and one nobody could check.
  */
 object VerificationService {
 
-    /** Verify one message's ed25519 signature. null on any error → "unavailable". */
-    suspend fun verifyMessage(msgId: String): VerifyResult? = withContext(Dispatchers.IO) {
-        try {
-            val enc = URLEncoder.encode(msgId, "UTF-8")
-            val url = URL("${ServerConfig.apiBaseUrl}/api/v1/verify/$enc")
-            val conn = url.openConnection().apply {
-                connectTimeout = 5000
-                readTimeout = 5000
+    /**
+     * Ask whether one message's signature holds up. Settled answers are
+     * remembered, so re-opening the sheet is instant and a mismatch stays
+     * marked; a transient or failed check is asked again next time.
+     */
+    suspend fun verifyMessage(msgId: String): VerifyAnswer {
+        SignatureVerdict.checked[msgId]?.let { return it }
+        val answer = withContext(Dispatchers.IO) {
+            try {
+                val enc = URLEncoder.encode(msgId, "UTF-8")
+                val url = URL("${ServerConfig.apiBaseUrl}/api/v1/verify/$enc")
+                val conn = (url.openConnection() as java.net.HttpURLConnection).apply {
+                    connectTimeout = 5000
+                    readTimeout = 5000
+                }
+                val status = conn.responseCode
+                val text = if (status in 200..299) {
+                    conn.inputStream.bufferedReader().readText()
+                } else {
+                    null
+                }
+                SignatureVerdict.parse(status, text)
+            } catch (_: Exception) {
+                // A network failure says nothing about the signature.
+                VerifyAnswer(VerifyOutcome.UNREACHABLE)
             }
-            val text = conn.getInputStream().bufferedReader().readText()
-            val json = JSONObject(text)
-            // `verification` is null for an unsigned message; a present object
-            // carries the real check. Mirror iOS: a successful fetch always
-            // yields a verdict (valid=false/none when there's nothing to check),
-            // and only a transport/HTTP failure leaves it "unavailable" (null).
-            val v = json.optJSONObject("verification")
-            VerifyResult(
-                valid = v?.optBoolean("valid") ?: false,
-                verifiedBy = v?.optString("verified_by")?.takeIf { it.isNotEmpty() } ?: "none",
-            )
-        } catch (_: Exception) {
-            null
         }
+        SignatureVerdict.remember(msgId, answer)
+        return answer
     }
 
     /** Fetch the signing key a DID publishes. null on any error. */

@@ -89,6 +89,7 @@ internal object BufferCache {
                         .put("isEdited", m.isEdited)
                         .put("isDeleted", m.isDeleted)
                         .put("isSigned", m.isSigned)
+                        .put("account", m.account)
                         .put("origin", m.origin)
                         .put("reactions", reactions)
                 )
@@ -149,6 +150,7 @@ internal object BufferCache {
             isEdited = obj.optBoolean("isEdited"),
             isDeleted = obj.optBoolean("isDeleted"),
             isSigned = obj.optBoolean("isSigned"),
+            account = obj.optString("account").takeIf { it.isNotEmpty() },
             origin = obj.optString("origin").takeIf { it.isNotEmpty() },
             reactions = reactions,
         )

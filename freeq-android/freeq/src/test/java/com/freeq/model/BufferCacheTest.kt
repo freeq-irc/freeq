@@ -101,6 +101,7 @@ class BufferCacheTest {
             isEdited = true,
             isDeleted = false,
             isSigned = true,
+            account = "did:plc:alice",
             origin = "peer.example",
             reactions = mutableMapOf("🎉" to mutableSetOf("bob", "carol")),
         )
@@ -121,6 +122,7 @@ class BufferCacheTest {
         assertEquals(original.replyTo, m.replyTo)
         assertEquals(original.isEdited, m.isEdited)
         assertEquals(original.isSigned, m.isSigned)
+        assertEquals(original.account, m.account)
         assertEquals(original.origin, m.origin)
         assertEquals(mapOf("🎉" to setOf("bob", "carol")), m.reactions)
     }

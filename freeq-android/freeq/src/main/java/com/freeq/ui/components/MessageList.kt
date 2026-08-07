@@ -53,6 +53,7 @@ import com.freeq.model.AppState
 import com.freeq.model.ChannelState
 import com.freeq.model.UnreadBoundary
 import com.freeq.model.PinCache
+import com.freeq.model.SignatureVerdict
 import com.freeq.model.ChatMessage
 import com.freeq.model.MemberInfo
 import com.freeq.ui.theme.FreeqColors
@@ -423,6 +424,10 @@ private fun MessageBubble(
     val senderMember = channelState.members
         .firstOrNull { it.nick.equals(msg.from, ignoreCase = true) }
     val senderDid = senderMember?.did ?: appState.didForNick(msg.from)
+    // Who to show proof for. The live binding first; failing that, the DID the
+    // message itself carries — a sender who has since left the channel is gone
+    // from the member list but not from their own message.
+    val proofDid = senderDid?.takeIf { it.isNotEmpty() } ?: msg.account
     val isMention = !isOwn && appState.nick.value.isNotEmpty() &&
             msg.text.contains(appState.nick.value, ignoreCase = true)
     // Read directly from pins map so Compose tracks the state change
@@ -615,12 +620,20 @@ private fun MessageBubble(
                             fontSize = 11.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
                         )
-                        if (msg.origin == null && msg.isSigned) {
+                        // Signing is the default state of a message, so a
+                        // signed row wears nothing. The one mark a signature
+                        // ever leaves here is this: a check the user asked for
+                        // came back saying the signature does not match the
+                        // key it names. Never speculative — only after
+                        // evidence.
+                        if (SignatureVerdict.checked[msg.id]?.marksTheRow == true) {
                             Icon(
-                                Icons.Default.Lock,
-                                contentDescription = "Signed by sender",
-                                tint = FreeqColors.success,
-                                modifier = Modifier.size(10.dp)
+                                Icons.Default.Warning,
+                                contentDescription = "Signature does not match its key",
+                                tint = FreeqColors.danger,
+                                modifier = Modifier
+                                    .size(12.dp)
+                                    .clickable { showProof = true }
                             )
                         }
                         if (msg.isEdited) {
@@ -751,6 +764,16 @@ private fun MessageBubble(
                 },
                 leadingIcon = { Icon(Icons.Default.AddReaction, contentDescription = null) }
             )
+            // Checking a signature is something the user asks for, not
+            // something a row claims on its own.
+            DropdownMenuItem(
+                text = { Text("Verify Signature") },
+                onClick = {
+                    showMenu = false
+                    showProof = true
+                },
+                leadingIcon = { Icon(Icons.Default.VerifiedUser, contentDescription = null) }
+            )
             // Pin/Unpin - only for ops in channels
             if (channelState.name.startsWith("#")) {
                 val myNick = appState.nick.value
@@ -834,10 +857,12 @@ private fun MessageBubble(
         }
 
         // Report reason picker — on choice: report (log) + block + snackbar
-        // Honest signature verification — the real proof behind the seal.
-        if (showProof && !senderDid.isNullOrEmpty()) {
+        // The check the user asked for, and the proof behind it. Opens even
+        // for a sender with no DID on file — the message's signature is still
+        // a fair question, and the sheet declines to claim an identity.
+        if (showProof) {
             VerifiedProofSheet(
-                did = senderDid,
+                did = proofDid,
                 handle = msg.from,
                 msgId = msg.id,
                 onDismiss = { showProof = false }

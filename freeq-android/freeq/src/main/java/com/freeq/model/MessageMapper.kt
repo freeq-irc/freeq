@@ -34,6 +34,7 @@ internal object MessageMapper {
             // `+draft/edit` and would otherwise read as the original.
             isEdited = ircMsg.edited,
             isSigned = ircMsg.isSigned,
+            account = ircMsg.account,
             origin = ircMsg.origin,
             reactions = reactions,
         )

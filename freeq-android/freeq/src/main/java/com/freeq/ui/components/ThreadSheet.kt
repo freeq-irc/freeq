@@ -119,14 +119,6 @@ fun ThreadSheet(
                                         fontSize = 11.sp,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
                                     )
-                                    if (msg.isSigned) {
-                                        Icon(
-                                            Icons.Default.Lock,
-                                            contentDescription = "Signed by sender",
-                                            tint = FreeqColors.success,
-                                            modifier = Modifier.size(10.dp)
-                                        )
-                                    }
                                 }
 
                                 // Text

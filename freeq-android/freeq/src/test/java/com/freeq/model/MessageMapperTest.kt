@@ -84,6 +84,14 @@ class MessageMapperTest {
         )
     }
 
+    @Test fun account_propagates() {
+        // The sender's server-bound DID rides on the message itself. Without
+        // it, a signature check on a row from someone who has since left the
+        // channel has no identity to name — the member list is gone.
+        assertEquals("did:plc:abc", MessageMapper.fromIrc(ircMsg(account = "did:plc:abc")).account)
+        assertNull(MessageMapper.fromIrc(ircMsg(account = null)).account)
+    }
+
     @Test fun isSigned_propagates() {
         // The signing-badge regression hid here: FFI had isSigned, our
         // ChatMessage ignored it. This test pins the bit end-to-end.

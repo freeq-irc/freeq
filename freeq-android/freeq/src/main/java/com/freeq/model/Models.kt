@@ -26,7 +26,15 @@ data class ChatMessage(
     val replyTo: String? = null,
     var isEdited: Boolean = false,
     var isDeleted: Boolean = false,
+    // A signature tag was present on the wire. Not a verification result, and
+    // deliberately not rendered: whether a signature holds up is a question
+    // only a check can answer, and only when the user asks it.
     val isSigned: Boolean = false,
+    // The DID the sending server attributes this message to (`account`). A
+    // statement about the sender that travels on the message itself, so a
+    // signature check still has an identity to name when the sender has left
+    // and the member list no longer holds them.
+    val account: String? = null,
     // Origin server name when relayed from a federated peer (+freeq.at/origin).
     // null = locally-originated. Drives "via {origin}" + suppresses the local
     // verified/signed badges, which would overstate trust for a peer-vouched msg.
