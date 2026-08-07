@@ -20,6 +20,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.freeq.model.IdentityClaim
+import com.freeq.model.SenderIdentity
 import com.freeq.model.SignatureVerdict
 import com.freeq.model.SigningKeyInfo
 import com.freeq.model.VerdictTone
@@ -84,10 +86,19 @@ fun VerifiedProofSheet(
     }
 }
 
-/** Who this person is — never a word about any single message. */
+/**
+ * Who this person is — never a word about any single message.
+ *
+ * The claim it draws is the one the message row already draws, from the same
+ * rule: a mark only for an identity the AT Protocol resolves, nothing claimed
+ * for a sender we know only through a relaying peer, and no AT-Protocol claim
+ * over a self-issued key. Accent, never success — green belongs to proof that
+ * a sender's own device signed something.
+ */
 @Composable
 private fun IdentityProof(request: ProofRequest.Identity) {
     val did = request.did
+    val claim = SenderIdentity.claim(did, request.origin)
     var key by remember { mutableStateOf<SigningKeyInfo?>(null) }
     var keyLoading by remember { mutableStateOf(did != null) }
 
@@ -98,44 +109,75 @@ private fun IdentityProof(request: ProofRequest.Identity) {
         keyLoading = false
     }
 
-    if (did != null) {
+    val name = request.displayName ?: request.handle?.let { "@$it" }
+
+    if (claim == IdentityClaim.AT_PROTOCOL) {
         Icon(
             Icons.Default.CheckCircle,
             contentDescription = null,
-            tint = FreeqColors.success,
+            tint = FreeqColors.accent,
             modifier = Modifier.size(64.dp),
         )
         Spacer(Modifier.height(12.dp))
-        Text(
-            text = request.displayName ?: request.handle?.let { "@$it" } ?: "Verified identity",
-            fontSize = 20.sp,
-            fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.onSurface,
-        )
-        Text(
-            text = "Verified via the AT Protocol",
-            fontSize = 13.sp,
-            color = FreeqColors.success,
-        )
-        Spacer(Modifier.height(16.dp))
-        Text(
-            text = "This is a real, self-owned identity. Its owner holds the key " +
-                "below and signs everything they send — so no one can impersonate " +
-                "them, on freeq or anywhere else on the network.",
-            fontSize = 14.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Spacer(Modifier.height(20.dp))
+    } else {
+        Spacer(Modifier.height(12.dp))
+    }
 
+    Text(
+        text = name ?: "Unidentified sender",
+        fontSize = 20.sp,
+        fontWeight = FontWeight.Bold,
+        color = MaterialTheme.colorScheme.onSurface,
+    )
+
+    when (claim) {
+        IdentityClaim.AT_PROTOCOL -> {
+            Text(
+                text = "AT Protocol identity",
+                fontSize = 13.sp,
+                color = FreeqColors.accent,
+            )
+            Spacer(Modifier.height(16.dp))
+            Text(
+                text = "This identifier is theirs, not this server's to grant or " +
+                    "revoke, and it resolves to the same person anywhere on the " +
+                    "network.",
+                fontSize = 14.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        IdentityClaim.SELF_ISSUED_KEY -> {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "A key its holder issued to itself. Nothing on the AT " +
+                    "Protocol stands behind it, so this is an identifier and not " +
+                    "an identity.",
+                fontSize = 14.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        IdentityClaim.NONE -> {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = request.origin?.let {
+                    "Relayed via $it — this server did not verify this identity."
+                } ?: "No decentralized identifier is on file for this sender here.",
+                fontSize = 14.sp,
+                color = if (request.origin != null) FreeqColors.warning
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+
+    if (did != null) {
+        Spacer(Modifier.height(20.dp))
         ProofCard(
             label = "DECENTRALIZED IDENTIFIER",
             value = did,
             detail = request.handle?.let { "resolves to @$it" },
             copyable = true,
         )
-
         Spacer(Modifier.height(12.dp))
-
         if (key != null) {
             ProofCard(
                 label = "MESSAGE SIGNING KEY",
@@ -151,21 +193,6 @@ private fun IdentityProof(request: ProofRequest.Identity) {
             )
         }
     } else {
-        // No DID to speak of — a guest, or someone whose binding this client
-        // never learned. This person's identity is not ours to assert.
-        Spacer(Modifier.height(12.dp))
-        Text(
-            text = request.handle?.let { "@$it" } ?: "Unidentified sender",
-            fontSize = 20.sp,
-            fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.onSurface,
-        )
-        Spacer(Modifier.height(8.dp))
-        Text(
-            text = "No decentralized identity is on file for this sender here.",
-            fontSize = 14.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
         Spacer(Modifier.height(8.dp))
     }
 }

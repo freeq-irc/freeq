@@ -53,6 +53,7 @@ import com.freeq.model.AppState
 import com.freeq.model.ChannelState
 import com.freeq.model.UnreadBoundary
 import com.freeq.model.PinCache
+import com.freeq.model.SenderIdentity
 import com.freeq.model.SignatureVerdict
 import com.freeq.model.ChatMessage
 import com.freeq.model.MemberInfo
@@ -586,12 +587,9 @@ private fun MessageBubble(
                         )
                         // Verified = the sender's server-bound DID (never the
                         // "has a cached avatar" proxy, which false-negatives
-                        // before the avatar fetch lands). did:key = guest /
-                        // session key, not a verified AT identity. Federated
-                        // messages (origin set) stay suppressed — peer-vouched,
-                        // not verified here.
-                        if (msg.origin == null && !senderDid.isNullOrEmpty()
-                            && !senderDid.startsWith("did:key:")) {
+                        // before the avatar fetch lands). The same rule decides
+                        // what the profile card and the proof view claim.
+                        if (SenderIdentity.claim(senderDid, msg.origin).showsMark) {
                             Icon(
                                 Icons.Default.CheckCircle,
                                 contentDescription = "Verified — tap for this person's profile",

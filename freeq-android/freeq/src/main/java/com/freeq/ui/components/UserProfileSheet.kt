@@ -25,6 +25,7 @@ import androidx.compose.ui.unit.sp
 import com.freeq.model.AppState
 import com.freeq.model.AvatarCache
 import com.freeq.model.BlueskyProfile
+import com.freeq.model.SenderIdentity
 import com.freeq.ui.theme.FreeqColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -121,7 +122,9 @@ fun UserProfileSheet(
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onBackground
                 )
-                if (profile != null && origin == null) {
+                // The mark follows the identifier, not the avatar fetch, and
+                // it is the same rule the message row applies.
+                if (SenderIdentity.claim(resolvedDid, origin).showsMark) {
                     Icon(
                         Icons.Default.CheckCircle,
                         contentDescription = "Verified — tap for the proof",
