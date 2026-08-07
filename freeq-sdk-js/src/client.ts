@@ -357,9 +357,12 @@ export class FreeqClient extends EventEmitter {
       this.ackedCaps.has('draft/multiline') && this.ackedCaps.has('batch');
     const perChunkBudget = this.perChunkByteBudget();
 
-    const willEncrypt =
-      e2ee.hasChannelKey(target) ||
-      (!isChannel && e2ee.isE2eeReady() && !!this.remoteDidFor(target));
+    // DMs are deliberately NOT auto-encrypted. The per-message-key scheme
+    // makes history readable only on the one device that held the session,
+    // and no multi-device or durable-history model exists around it yet —
+    // so DMs go signed-plaintext until one does. Inbound decryption stays
+    // wired so anything already encrypted still reads where it can.
+    const willEncrypt = e2ee.hasChannelKey(target);
 
     // ── E2EE path ──
     if (willEncrypt) {
