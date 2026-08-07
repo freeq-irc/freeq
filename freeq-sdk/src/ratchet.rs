@@ -163,7 +163,24 @@ impl Session {
     /// `shared_secret` comes from X3DH.
     /// `their_ratchet_key` is Bob's signed pre-key (used as initial ratchet key).
     pub fn init_alice(shared_secret: [u8; 32], their_ratchet_key: [u8; 32]) -> Self {
-        let our_secret = StaticSecret::random_from_rng(OsRng);
+        Self::init_alice_with_ratchet_key(
+            shared_secret,
+            their_ratchet_key,
+            StaticSecret::random_from_rng(OsRng),
+        )
+    }
+
+    /// [`init_alice`](Self::init_alice), with the first ratchet keypair
+    /// supplied rather than generated.
+    ///
+    /// Session setup is otherwise unreproducible, and a construction no one
+    /// can write down is a construction no second implementation can be held
+    /// to. Real sessions want [`init_alice`](Self::init_alice).
+    pub fn init_alice_with_ratchet_key(
+        shared_secret: [u8; 32],
+        their_ratchet_key: [u8; 32],
+        our_secret: StaticSecret,
+    ) -> Self {
         let our_public = PublicKey::from(&our_secret);
 
         // Perform initial DH ratchet step
@@ -212,6 +229,19 @@ impl Session {
     ///
     /// Returns the wire-format string: `ENC3:<header>:<nonce>:<ciphertext>`
     pub fn encrypt(&mut self, plaintext: &str) -> Result<String, RatchetError> {
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        self.encrypt_with_nonce(plaintext, nonce.into())
+    }
+
+    /// [`encrypt`](Self::encrypt), with the AEAD nonce supplied rather than
+    /// generated, so a message can be written down byte-for-byte for another
+    /// implementation to reproduce. Real sends want [`encrypt`](Self::encrypt):
+    /// a repeated nonce under one key breaks AES-GCM outright.
+    pub fn encrypt_with_nonce(
+        &mut self,
+        plaintext: &str,
+        nonce: [u8; 12],
+    ) -> Result<String, RatchetError> {
         // Ensure we have a sending chain
         if self.send_chain_key.is_none() {
             return Err(RatchetError::NoSendChain);
@@ -231,14 +261,14 @@ impl Session {
 
         // Encrypt with AES-256-GCM, using header as AAD
         let cipher = Aes256Gcm::new_from_slice(&msg_key).map_err(|_| RatchetError::CryptoError)?;
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let nonce = Nonce::from_slice(&nonce);
         let header_bytes = header.to_bytes();
         let payload = aes_gcm::aead::Payload {
             msg: plaintext.as_bytes(),
             aad: &header_bytes,
         };
         let ciphertext = cipher
-            .encrypt(&nonce, payload)
+            .encrypt(nonce, payload)
             .map_err(|_| RatchetError::CryptoError)?;
 
         // Wire format
@@ -477,6 +507,263 @@ pub enum RatchetError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Cross-implementation vectors ──────────────────────────────
+    //
+    // `spec/e2ee-dm-vectors.json` is to encrypted DMs what
+    // `spec/chat-signing-vectors.json` is to signatures: this implementation
+    // writes it, and every other one replays it byte-for-byte. A DM that one
+    // side can write and the other cannot read is not a feature, and the only
+    // way two implementations stay convergent is if the bytes are written
+    // down somewhere neither of them owns.
+
+    fn fixtures_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../spec/e2ee-dm-vectors.json")
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn seed(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    /// A session's full state, as a vector writes it down.
+    fn state_json(s: &Session) -> serde_json::Value {
+        serde_json::json!({
+            "dhSelfSecret": hex(&s.dh_self_secret),
+            "dhSelfPublic": hex(&s.dh_self_public),
+            "dhRemote": s.dh_remote.map(|k| hex(&k)),
+            "rootKey": hex(&s.root_key),
+            "sendChainKey": s.send_chain_key.map(|k| hex(&k)),
+            "sendMsgNum": s.send_msg_num,
+            "recvChainKey": s.recv_chain_key.map(|k| hex(&k)),
+            "recvMsgNum": s.recv_msg_num,
+            "prevSendChainLen": s.prev_send_chain_len,
+            "isInitiator": s.is_initiator,
+        })
+    }
+
+    /// The X3DH agreement, pinned from fixed keys and a fixed ephemeral.
+    fn x3dh_vector() -> serde_json::Value {
+        use crate::x3dh::{IdentityKeyPair, PreKeyBundle, SignedPreKey, initiate_with_ephemeral};
+        use ed25519_dalek::Signer;
+
+        let bob_identity = IdentityKeyPair::from_secret(seed(0x0b));
+        let bob_did_key = ed25519_dalek::SigningKey::from_bytes(&seed(0x0d));
+        let bob_spk_secret = seed(0x0c);
+        let bob_spk_public = PublicKey::from(&StaticSecret::from(bob_spk_secret));
+        let bob_spk = SignedPreKey::from_parts(
+            1,
+            bob_spk_secret,
+            bob_did_key.sign(bob_spk_public.as_bytes()).to_bytes().to_vec(),
+        );
+        let bundle = PreKeyBundle::new("did:plc:bob", &bob_identity, &bob_spk);
+        let alice_identity = IdentityKeyPair::from_secret(seed(0x0a));
+
+        let result = initiate_with_ephemeral(
+            &alice_identity,
+            "did:plc:alice",
+            &bundle,
+            &bob_did_key.verifying_key(),
+            StaticSecret::from(seed(0x0e)),
+        )
+        .expect("x3dh initiate");
+
+        serde_json::json!({
+            "name": "x3dh-fixed-keys",
+            "aliceIdentitySecret": hex(&seed(0x0a)),
+            "aliceEphemeralSecret": hex(&seed(0x0e)),
+            "bobIdentitySecret": hex(&seed(0x0b)),
+            "bobSignedPreKeySecret": hex(&bob_spk_secret),
+            "bobSpkId": 1,
+            "aliceDid": "did:plc:alice",
+            "sharedSecret": hex(&result.shared_secret),
+            "theirRatchetKey": hex(&result.their_ratchet_key),
+            "initialMessage": {
+                "identityKey": result.initial_message.identity_key,
+                "ephemeralKey": result.initial_message.ephemeral_key,
+                "spkId": result.initial_message.spk_id,
+                "did": result.initial_message.did,
+            },
+        })
+    }
+
+    fn build_fixtures_json() -> serde_json::Value {
+        let shared_secret = seed(0x2a);
+        let bob_spk_secret = seed(0x0c);
+        let bob_spk_public = PublicKey::from(&StaticSecret::from(bob_spk_secret)).to_bytes();
+        let alice_ratchet_secret = seed(0x0f);
+
+        // Alice opens the conversation: her session is reproducible from the
+        // shared secret, Bob's pre-key and her own first ratchet key.
+        let mut alice = Session::init_alice_with_ratchet_key(
+            shared_secret,
+            bob_spk_public,
+            StaticSecret::from(alice_ratchet_secret),
+        );
+        let alice_initial_state = state_json(&alice);
+
+        let mut messages = Vec::new();
+        for (i, (text, nonce_byte)) in [("first message", 0x11u8), ("second message", 0x12)]
+            .into_iter()
+            .enumerate()
+        {
+            let nonce = [nonce_byte; 12];
+            let wire = alice.encrypt_with_nonce(text, nonce).expect("encrypt");
+            messages.push(serde_json::json!({
+                "name": format!("alice-to-bob-{i}"),
+                "nonce": hex(&nonce),
+                "plaintext": text,
+                "wire": wire,
+            }));
+        }
+
+        // Bob reads both, from nothing but the shared secret and his own
+        // pre-key: the ratchet key he needs is in the header.
+        let mut bob = Session::init_bob(shared_secret, bob_spk_secret);
+        for message in &messages {
+            let wire = message["wire"].as_str().unwrap();
+            let plaintext = bob.decrypt(wire).expect("bob decrypts");
+            assert_eq!(plaintext, message["plaintext"].as_str().unwrap());
+        }
+
+        // The responder's own direction is deliberately not frozen here: the
+        // ratchet step he takes on first receive mints a fresh keypair, which
+        // is the point of it. That direction is covered by the round-trip
+        // tests, where both sides are live.
+        let bob_reply = bob.encrypt("a reply from bob").expect("bob encrypts");
+        assert_eq!(alice.decrypt(&bob_reply).expect("alice decrypts"), "a reply from bob");
+
+        // The two KDFs, pinned on their own so a mismatch says which one.
+        let (root_out, chain_out) = kdf_root(&seed(0x01), &seed(0x02));
+        let (next_chain, msg_key) = kdf_chain(&seed(0x03));
+
+        let header = Header {
+            ratchet_key: seed(0x04),
+            prev_chain_len: 7,
+            msg_num: 9,
+        };
+
+        serde_json::json!({
+            "description": "Worked examples for freeq encrypted DMs (ENC3). Every implementation must reproduce each value byte-for-byte from the inputs, and must decrypt every `wire` to its `plaintext`. Generated by freeq-sdk (Rust): run `cargo test -p freeq-sdk generate_e2ee_dm_vectors -- --ignored`.",
+            "x3dhRule": "SK = HKDF-SHA256(salt=0xFF*32, ikm=DH(IK_A,SPK_B)||DH(EK_A,IK_B)||DH(EK_A,SPK_B), info=\"freeq-x3dh-v1\", 32 bytes). EK_A is a per-session ephemeral; the responder needs IK_A, EK_A and the pre-key id to reach the same secret.",
+            "rootKdfRule": "HKDF-SHA256(salt=root_key, ikm=dh_output, info=\"freeq-ratchet-v1\", 64 bytes) -> (new_root_key, chain_key).",
+            "chainKdfRule": "message_key = HMAC-SHA256(chain_key, 0x01); next_chain_key = HMAC-SHA256(chain_key, 0x02).",
+            "headerRule": "32-byte ratchet public key || u32 big-endian previous chain length || u32 big-endian message number = 40 bytes, carried as AES-GCM additional authenticated data.",
+            "wireRule": "ENC3:<base64url-nopad header>:<base64url-nopad 12-byte nonce>:<base64url-nopad AES-256-GCM ciphertext+tag>.",
+            "initRule": "The initiator mints a ratchet keypair and steps the root KDF once with DH(own ratchet secret, their signed pre-key) before the first message. The responder starts with root = shared secret and no chains, and derives its receiving chain from the ratchet key in the first header it sees, then mints its own keypair for the reply — so the responder's direction is not byte-reproducible by design and is pinned by round-trip tests instead.",
+            "x3dh": x3dh_vector(),
+            "kdfRoot": {
+                "rootKey": hex(&seed(0x01)),
+                "dhOutput": hex(&seed(0x02)),
+                "newRootKey": hex(&root_out),
+                "chainKey": hex(&chain_out),
+            },
+            "kdfChain": {
+                "chainKey": hex(&seed(0x03)),
+                "messageKey": hex(&msg_key),
+                "nextChainKey": hex(&next_chain),
+            },
+            "header": {
+                "ratchetKey": hex(&header.ratchet_key),
+                "prevChainLen": header.prev_chain_len,
+                "msgNum": header.msg_num,
+                "bytes": hex(&header.to_bytes()),
+            },
+            "session": {
+                "sharedSecret": hex(&shared_secret),
+                "bobSignedPreKeySecret": hex(&bob_spk_secret),
+                "bobSignedPreKeyPublic": hex(&bob_spk_public),
+                "aliceRatchetSecret": hex(&alice_ratchet_secret),
+                "aliceInitialState": alice_initial_state,
+                "aliceToBob": messages,
+            },
+        })
+    }
+
+    /// Regenerate spec/e2ee-dm-vectors.json. Run manually:
+    /// `cargo test -p freeq-sdk generate_e2ee_dm_vectors -- --ignored`
+    #[test]
+    #[ignore]
+    fn generate_e2ee_dm_vectors() {
+        let json = serde_json::to_string_pretty(&build_fixtures_json()).unwrap();
+        std::fs::create_dir_all(fixtures_path().parent().unwrap()).unwrap();
+        std::fs::write(fixtures_path(), json + "\n").unwrap();
+    }
+
+    /// The committed file must be exactly what this implementation produces —
+    /// it is the side of the contract this crate is bound by.
+    #[test]
+    fn committed_e2ee_dm_vectors_are_reproducible() {
+        let on_disk = std::fs::read_to_string(fixtures_path())
+            .expect("spec/e2ee-dm-vectors.json missing — run generate_e2ee_dm_vectors");
+        let on_disk: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(on_disk, build_fixtures_json());
+    }
+
+    /// And this implementation must replay the committed file through its own
+    /// public API — the same thing every other implementation is asked to do.
+    #[test]
+    fn rust_replays_the_committed_vectors() {
+        let raw = std::fs::read_to_string(fixtures_path()).expect("vectors");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        let un_hex = |s: &str| -> [u8; 32] {
+            let bytes: Vec<u8> = (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect();
+            bytes.try_into().unwrap()
+        };
+
+        // The responder reads both messages with nothing but the shared
+        // secret and its own pre-key.
+        let session = &v["session"];
+        let mut bob = Session::init_bob(
+            un_hex(session["sharedSecret"].as_str().unwrap()),
+            un_hex(session["bobSignedPreKeySecret"].as_str().unwrap()),
+        );
+        for message in session["aliceToBob"].as_array().unwrap() {
+            assert_eq!(
+                bob.decrypt(message["wire"].as_str().unwrap()).unwrap(),
+                message["plaintext"].as_str().unwrap(),
+                "vector {} must decrypt",
+                message["name"]
+            );
+        }
+
+        // And the initiator reproduces those same bytes from the written-down
+        // inputs, which is what stops the two sides drifting.
+        let mut alice = Session::init_alice_with_ratchet_key(
+            un_hex(session["sharedSecret"].as_str().unwrap()),
+            un_hex(session["bobSignedPreKeyPublic"].as_str().unwrap()),
+            StaticSecret::from(un_hex(session["aliceRatchetSecret"].as_str().unwrap())),
+        );
+        for message in session["aliceToBob"].as_array().unwrap() {
+            let nonce_hex = message["nonce"].as_str().unwrap();
+            let nonce: [u8; 12] = (0..nonce_hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&nonce_hex[i..i + 2], 16).unwrap())
+                .collect::<Vec<u8>>()
+                .try_into()
+                .unwrap();
+            assert_eq!(
+                alice
+                    .encrypt_with_nonce(message["plaintext"].as_str().unwrap(), nonce)
+                    .unwrap(),
+                message["wire"].as_str().unwrap(),
+                "vector {} must re-encrypt to the same bytes",
+                message["name"]
+            );
+        }
+
+        // And the other direction still works between the two live sessions,
+        // which is where the responder's fresh ratchet key belongs.
+        let reply = bob.encrypt("a reply from bob").unwrap();
+        assert_eq!(alice.decrypt(&reply).unwrap(), "a reply from bob");
+    }
 
     fn make_sessions() -> (Session, Session) {
         // Simulate X3DH: both sides agree on a shared secret

@@ -233,14 +233,34 @@ pub fn initiate(
     their_bundle: &PreKeyBundle,
     their_did_verify_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<InitiatorResult, X3dhError> {
+    initiate_with_ephemeral(
+        our_identity,
+        our_did,
+        their_bundle,
+        their_did_verify_key,
+        StaticSecret::random_from_rng(OsRng),
+    )
+}
+
+/// [`initiate`], with the ephemeral supplied rather than generated.
+///
+/// The agreement is otherwise unreproducible: a fresh ephemeral means a fresh
+/// secret every run, so nothing can be written down for another implementation
+/// to be held to. Callers doing real key agreement want [`initiate`] — an
+/// ephemeral reused across sessions is no longer ephemeral.
+pub fn initiate_with_ephemeral(
+    our_identity: &IdentityKeyPair,
+    our_did: &str,
+    their_bundle: &PreKeyBundle,
+    their_did_verify_key: &ed25519_dalek::VerifyingKey,
+    ek_secret: StaticSecret,
+) -> Result<InitiatorResult, X3dhError> {
     // Verify the signed pre-key signature before using the bundle
     their_bundle.verify_spk_signature(their_did_verify_key)?;
 
     let ik_b = their_bundle.identity_public()?;
     let spk_b = their_bundle.signed_pre_key_public()?;
 
-    // Generate ephemeral keypair
-    let ek_secret = StaticSecret::random_from_rng(OsRng);
     let ek_public = PublicKey::from(&ek_secret);
 
     // X3DH: three DH computations
@@ -362,6 +382,53 @@ pub enum X3dhError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The agreement has to be reproducible from written-down inputs, or no
+    /// other implementation can be held to it: same keys, same ephemeral,
+    /// same secret, every time — and the same secret the responder reaches.
+    #[test]
+    fn a_chosen_ephemeral_makes_the_agreement_reproducible() {
+        let bob_identity = IdentityKeyPair::from_secret([0x0b; 32]);
+        let bob_did_key = ed25519_dalek::SigningKey::from_bytes(&[0x0d; 32]);
+        let bob_spk = SignedPreKey::from_parts(
+            1,
+            [0x0c; 32],
+            bob_did_key
+                .sign(PublicKey::from(&StaticSecret::from([0x0c; 32])).as_bytes())
+                .to_bytes()
+                .to_vec(),
+        );
+        let bob_bundle = PreKeyBundle::new("did:plc:bob", &bob_identity, &bob_spk);
+        let alice_identity = IdentityKeyPair::from_secret([0x0a; 32]);
+
+        let first = initiate_with_ephemeral(
+            &alice_identity,
+            "did:plc:alice",
+            &bob_bundle,
+            &bob_did_key.verifying_key(),
+            StaticSecret::from([0x0e; 32]),
+        )
+        .unwrap();
+        let again = initiate_with_ephemeral(
+            &alice_identity,
+            "did:plc:alice",
+            &bob_bundle,
+            &bob_did_key.verifying_key(),
+            StaticSecret::from([0x0e; 32]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            first.shared_secret, again.shared_secret,
+            "a chosen ephemeral must remove every source of variation"
+        );
+
+        let (bob_shared, _) = respond(&bob_identity, &bob_spk, &first.initial_message).unwrap();
+        assert_eq!(
+            first.shared_secret, bob_shared,
+            "the responder must still reach the same secret"
+        );
+    }
 
     #[test]
     fn full_x3dh_handshake() {
