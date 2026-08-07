@@ -29,11 +29,6 @@ export const SIG_TAG = '+freeq.at/sig';
  */
 export const COVERED_COORD_TAGS = ['event', 'payload', 'ref', 'task-id'] as const;
 
-let signingKey: CryptoKeyPair | null = null;
-let publicKeyB64: string | null = null;
-let publicKeyKid: string | null = null;
-let authenticatedDid: string | null = null;
-
 /** Base64url encode (no padding). */
 function b64url(buf: ArrayBuffer | Uint8Array): string {
   const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
@@ -201,120 +196,136 @@ export async function deriveKid(rawPublicKey: Uint8Array): Promise<string> {
   return b64url(new Uint8Array(digest).slice(0, 16));
 }
 
-/** Generate an Ed25519 keypair and return its base64url public key. */
-export async function generateSigningKey(): Promise<string | null> {
-  try {
-    const kp = (await crypto.subtle.generateKey('Ed25519', true, [
-      'sign',
-      'verify',
-    ])) as CryptoKeyPair;
-    signingKey = kp;
-    const rawPub = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey));
-    publicKeyB64 = b64url(rawPub);
-    publicKeyKid = await deriveKid(rawPub);
-    return publicKeyB64;
-  } catch (e) {
-    console.warn('Ed25519 not available in Web Crypto, falling back to server signing:', e);
-    return null;
-  }
-}
-
-/** Set the authenticated DID (called after SASL success). */
-export function setSigningDid(did: string) {
-  authenticatedDid = did;
-}
-
 /** A signed event: the id the signature covers, and the signature tag value. */
 export interface SignedEvent {
   eventId: string;
   sigTag: string;
 }
 
-async function signCanonical(canonical: string): Promise<string | null> {
-  if (!signingKey?.privateKey || !publicKeyKid) return null;
-  try {
-    const sig = await crypto.subtle.sign(
-      'Ed25519',
-      signingKey.privateKey,
-      new TextEncoder().encode(canonical),
-    );
-    return `ed25519:${publicKeyKid}:${b64url(sig)}`;
-  } catch {
-    return null;
+/**
+ * One connection's signing state: the session keypair, its kid, and the DID
+ * it signs for. Owned by the client instance — this used to be four module
+ * globals, which meant every `FreeqClient` in a process shared one key, and
+ * each connect overwrote the last. The browser's one-client-per-page never
+ * noticed; a multi-bot Node process lost attribution on every client but the
+ * last to connect (their signatures named a kid the server had no key for
+ * under their DID, so it server-signed on their behalf).
+ */
+export class SessionSigning {
+  private signingKey: CryptoKeyPair | null = null;
+  private publicKeyB64: string | null = null;
+  private publicKeyKid: string | null = null;
+  private authenticatedDid: string | null = null;
+
+  /** Generate an Ed25519 keypair and return its base64url public key. */
+  async generateSigningKey(): Promise<string | null> {
+    try {
+      const kp = (await crypto.subtle.generateKey('Ed25519', true, [
+        'sign',
+        'verify',
+      ])) as CryptoKeyPair;
+      this.signingKey = kp;
+      const rawPub = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey));
+      this.publicKeyB64 = b64url(rawPub);
+      this.publicKeyKid = await deriveKid(rawPub);
+      return this.publicKeyB64;
+    } catch (e) {
+      console.warn('Ed25519 not available in Web Crypto, falling back to server signing:', e);
+      return null;
+    }
   }
-}
 
-/**
- * Sign an outgoing message. Returns the event id to send as
- * `+freeq.at/eventid` **and** the `+freeq.at/sig` value — both are needed,
- * because the signature covers the id.
- *
- * `null` when this session has no signing key, or when the venue can't be
- * determined (a bare-nick DM whose peer DID we haven't learned): unsigned is
- * honest, a signature over a guessed venue reads as tampering.
- */
-export async function signMessage(
-  target: string,
-  body: string,
-  opts: { reply?: string; edit?: string; tags?: Record<string, string> } = {},
-): Promise<SignedEvent | null> {
-  if (!signingKey?.privateKey || !authenticatedDid) return null;
-  const venue = venueForTarget(target, authenticatedDid);
-  if (!venue) return null;
-  const eventId = newEventId();
-  const canonical = await messageCanonical({
-    from: authenticatedDid,
-    msgid: eventId,
-    target: venue,
-    body,
-    reply: opts.reply,
-    edit: opts.edit,
-    tags: opts.tags,
-  });
-  const sigTag = await signCanonical(canonical);
-  return sigTag ? { eventId, sigTag } : null;
-}
+  /** Set the authenticated DID (called after SASL success). */
+  setSigningDid(did: string) {
+    this.authenticatedDid = did;
+  }
 
-/**
- * Sign a mutation (delete / react / unreact). Durable state under a user's
- * name gets signed; ephemera (typing, AV signalling) don't.
- */
-export async function signMutation(
-  kind: 'delete' | 'react' | 'unreact',
-  target: string,
-  subject: string,
-  emoji?: string,
-): Promise<SignedEvent | null> {
-  if (!signingKey?.privateKey || !authenticatedDid) return null;
-  const venue = venueForTarget(target, authenticatedDid);
-  if (!venue) return null;
-  const eventId = newEventId();
-  const canonical = mutationCanonical({
-    kind,
-    from: authenticatedDid,
-    msgid: eventId,
-    target: venue,
-    subject,
-    emoji,
-  });
-  const sigTag = await signCanonical(canonical);
-  return sigTag ? { eventId, sigTag } : null;
-}
+  private async signCanonical(canonical: string): Promise<string | null> {
+    if (!this.signingKey?.privateKey || !this.publicKeyKid) return null;
+    try {
+      const sig = await crypto.subtle.sign(
+        'Ed25519',
+        this.signingKey.privateKey,
+        new TextEncoder().encode(canonical),
+      );
+      return `ed25519:${this.publicKeyKid}:${b64url(sig)}`;
+    } catch {
+      return null;
+    }
+  }
 
-/** Get the public key (for MSGSIG registration). */
-export function getPublicKey(): string | null {
-  return publicKeyB64;
-}
+  /**
+   * Sign an outgoing message. Returns the event id to send as
+   * `+freeq.at/eventid` **and** the `+freeq.at/sig` value — both are needed,
+   * because the signature covers the id.
+   *
+   * `null` when this session has no signing key, or when the venue can't be
+   * determined (a bare-nick DM whose peer DID we haven't learned): unsigned is
+   * honest, a signature over a guessed venue reads as tampering.
+   */
+  async signMessage(
+    target: string,
+    body: string,
+    opts: { reply?: string; edit?: string; tags?: Record<string, string> } = {},
+  ): Promise<SignedEvent | null> {
+    if (!this.signingKey?.privateKey || !this.authenticatedDid) return null;
+    const venue = venueForTarget(target, this.authenticatedDid);
+    if (!venue) return null;
+    const eventId = newEventId();
+    const canonical = await messageCanonical({
+      from: this.authenticatedDid,
+      msgid: eventId,
+      target: venue,
+      body,
+      reply: opts.reply,
+      edit: opts.edit,
+      tags: opts.tags,
+    });
+    const sigTag = await this.signCanonical(canonical);
+    return sigTag ? { eventId, sigTag } : null;
+  }
 
-/** The key id of this session's signing key, as signatures name it. */
-export function getKid(): string | null {
-  return publicKeyKid;
-}
+  /**
+   * Sign a mutation (delete / react / unreact). Durable state under a user's
+   * name gets signed; ephemera (typing, AV signalling) don't.
+   */
+  async signMutation(
+    kind: 'delete' | 'react' | 'unreact',
+    target: string,
+    subject: string,
+    emoji?: string,
+  ): Promise<SignedEvent | null> {
+    if (!this.signingKey?.privateKey || !this.authenticatedDid) return null;
+    const venue = venueForTarget(target, this.authenticatedDid);
+    if (!venue) return null;
+    const eventId = newEventId();
+    const canonical = mutationCanonical({
+      kind,
+      from: this.authenticatedDid,
+      msgid: eventId,
+      target: venue,
+      subject,
+      emoji,
+    });
+    const sigTag = await this.signCanonical(canonical);
+    return sigTag ? { eventId, sigTag } : null;
+  }
 
-/** Reset signing state (on disconnect). */
-export function resetSigning() {
-  signingKey = null;
-  publicKeyB64 = null;
-  publicKeyKid = null;
-  authenticatedDid = null;
+  /** Get the public key (for MSGSIG registration). */
+  getPublicKey(): string | null {
+    return this.publicKeyB64;
+  }
+
+  /** The key id of this session's signing key, as signatures name it. */
+  getKid(): string | null {
+    return this.publicKeyKid;
+  }
+
+  /** Reset signing state (on disconnect). */
+  resetSigning() {
+    this.signingKey = null;
+    this.publicKeyB64 = null;
+    this.publicKeyKid = null;
+    this.authenticatedDid = null;
+  }
 }

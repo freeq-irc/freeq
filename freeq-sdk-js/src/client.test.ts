@@ -494,6 +494,7 @@ describe('messaging methods', () => {
   it('sendTagged() emits PRIVMSG with custom tags', async () => {
     const { client, ws } = await makeRegistered();
     client.sendTagged('#foo', 'hello world', { '+freeq.at/streaming': '1' });
+    await flushAsync();
     expect(ws.sent[0]).toMatch(/^@\+freeq.at\/streaming=1 PRIVMSG #foo :hello world/);
   });
 
@@ -1457,10 +1458,16 @@ describe('signed mutations', () => {
     ws: MockWebSocket;
     verifyKey: CryptoKey;
   }> {
-    const signing = await import('./signing.js');
-    signing.setSigningDid(did);
-    await signing.generateSigningKey();
-    const pubB64 = signing.getPublicKey();
+    const { FreeqClient } = await import('./client.js');
+    const client = new FreeqClient({
+      url: 'wss://test/irc',
+      nick: 'alice',
+      skipInitialBrokerRefresh: true,
+    });
+    // Signing state lives on the instance, so provision this client's own.
+    client.signing.setSigningDid(did);
+    await client.signing.generateSigningKey();
+    const pubB64 = client.signing.getPublicKey();
     if (!pubB64) throw new Error('signing key not provisioned');
     const padded = pubB64 + '='.repeat((4 - (pubB64.length % 4)) % 4);
     const bytes = Uint8Array.from(
@@ -1470,13 +1477,6 @@ describe('signed mutations', () => {
     const verifyKey = await crypto.subtle.importKey('raw', bytes, 'Ed25519', false, [
       'verify',
     ]);
-
-    const { FreeqClient } = await import('./client.js');
-    const client = new FreeqClient({
-      url: 'wss://test/irc',
-      nick: 'alice',
-      skipInitialBrokerRefresh: true,
-    });
     client.connect();
     await flushAsync();
     const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
@@ -1587,11 +1587,10 @@ describe('signed mutations', () => {
   });
 
   it('sends nothing new against a server that does not verify documents', async () => {
-    const signing = await import('./signing.js');
-    signing.setSigningDid('did:plc:mutator');
-    await signing.generateSigningKey();
     // makeRegistered's server advertises no caps at all — a legacy server.
     const { client, ws } = await makeRegistered();
+    client.signing.setSigningDid('did:plc:mutator');
+    await client.signing.generateSigningKey();
     client.sendDelete('#room', 'M0');
     client.sendReaction('#room', '👍', 'M0');
     await flushAsync();
@@ -1771,13 +1770,62 @@ describe('signed mutations', () => {
   });
 
   it('an action against a legacy server is an ordinary unsigned PRIVMSG', async () => {
-    const signing = await import('./signing.js');
-    signing.setSigningDid('did:plc:mutator');
-    await signing.generateSigningKey();
     const { client, ws } = await makeRegistered();
+    client.signing.setSigningDid('did:plc:mutator');
+    await client.signing.generateSigningKey();
     client.sendAction('#room', 'waves');
     await flushAsync();
     const line = ws.sent.find((l) => l.includes('PRIVMSG'));
     expect(line).toBe('PRIVMSG #room :\x01ACTION waves\x01');
+  });
+
+  // A tagged send is a durable statement whose coordination tags are exactly
+  // what the document's covered-coord set exists to protect. It signs like
+  // any other message, with those tags inside the document.
+  it('sendTagged signs the document, coordination tags included', async () => {
+    const { client, ws, verifyKey } = await makeSigningClient();
+    const coord = {
+      '+freeq.at/event': 'society-question',
+      '+freeq.at/ref': 'r1',
+      '+freeq.at/payload': '{"q":1}',
+    };
+    client.sendTagged('#room', 'question', coord);
+    const line = await waitForSent(ws, '+freeq.at/sig');
+    for (const name of Object.keys(coord)) {
+      expect(tagOf(line, name), `line: ${line}`).not.toBeNull();
+    }
+    const eventId = tagOf(line, '+freeq.at/eventid')!;
+    const sigTag = tagOf(line, '+freeq.at/sig')!;
+
+    const signing = await import('./signing.js');
+    const canonical = await signing.messageCanonical({
+      from: 'did:plc:mutator',
+      msgid: eventId,
+      target: '#room',
+      body: 'question',
+      tags: coord,
+    });
+    expect(await verifySig(canonical, sigTag, verifyKey)).toBe(true);
+
+    // The tags are in the document: the same signature must not verify a
+    // document whose payload was swapped.
+    const tampered = await signing.messageCanonical({
+      from: 'did:plc:mutator',
+      msgid: eventId,
+      target: '#room',
+      body: 'question',
+      tags: { ...coord, '+freeq.at/payload': '{"q":2}' },
+    });
+    expect(await verifySig(tampered, sigTag, verifyKey)).toBe(false);
+  });
+
+  it('sendTagged against a legacy server stays a bare tagged PRIVMSG', async () => {
+    const { client, ws } = await makeRegistered();
+    client.signing.setSigningDid('did:plc:mutator');
+    await client.signing.generateSigningKey();
+    client.sendTagged('#room', 'question', { '+freeq.at/event': 'e' });
+    await flushAsync();
+    const line = ws.sent.find((l) => l.includes('PRIVMSG'));
+    expect(line).toBe('@+freeq.at/event=e PRIVMSG #room question');
   });
 });

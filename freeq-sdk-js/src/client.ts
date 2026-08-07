@@ -51,6 +51,11 @@ export class FreeqClient extends EventEmitter {
   private sasl: SaslCredentials | null = null;
   private skipBrokerRefresh: boolean;
   private guestFallbackCount = 0;
+  /** This connection's signing state (session key, kid, DID). Per-instance
+   *  on purpose: as a module global, every client in a Node process shared
+   *  one key and each connect overwrote the last — all but the last client's
+   *  messages then verified as server-signed instead of their own. */
+  readonly signing = new signing.SessionSigning();
   /** Session signing key waiting on registration before MSGSIG is sent. */
   private pendingMsgSig: Promise<string | null> | null = null;
   /** Set when SASL was attempted and 904 was received. Suppresses any
@@ -244,7 +249,7 @@ export class FreeqClient extends EventEmitter {
       clearInterval(this._agentHeartbeatTimer);
       this._agentHeartbeatTimer = null;
     }
-    signing.resetSigning();
+    this.signing.resetSigning();
     this._connectionState = 'disconnected';
   }
 
@@ -1127,7 +1132,7 @@ export class FreeqClient extends EventEmitter {
   ): Promise<void> {
     const signed =
       subject && this.ackedCaps.has(SIGNING_CAP)
-        ? await signing.signMutation(kind, target, subject, emoji)
+        ? await this.signing.signMutation(kind, target, subject, emoji)
         : null;
     const wireTags = { ...tags };
     if (signed) {
@@ -1157,7 +1162,7 @@ export class FreeqClient extends EventEmitter {
     tags: Record<string, string>,
   ): Promise<Record<string, string>> {
     if (!this.ackedCaps.has(SIGNING_CAP)) return {};
-    const signed = await signing.signMessage(target, body, {
+    const signed = await this.signing.signMessage(target, body, {
       reply: tags['+reply'] ?? tags['+draft/reply'],
       edit: tags['+draft/edit'],
       tags,
@@ -1511,12 +1516,12 @@ export class FreeqClient extends EventEmitter {
         // capability gating exists to avoid saying. Cap negotiation is settled
         // by the time authentication succeeds, so the answer is known here.
         if (this.sasl?.did && this.opts.autoMsgSig !== false && this.ackedCaps.has(SIGNING_CAP)) {
-          signing.setSigningDid(this.sasl.did);
+          this.signing.setSigningDid(this.sasl.did);
           // Minted here, REGISTERED on 001. MSGSIG sent before registration
           // completes is discarded by the server (`if !conn.registered`),
           // which left the key unregistered and every "client-signed"
           // message silently server-signed instead.
-          this.pendingMsgSig = signing.generateSigningKey();
+          this.pendingMsgSig = this.signing.generateSigningKey();
         }
         this.raw('CAP END');
         break;
@@ -2753,9 +2758,10 @@ export class FreeqClient extends EventEmitter {
   // ── Messaging extensions ──
 
   /** PRIVMSG with arbitrary IRCv3 tags. Caller-managed escaping is handled
-   *  by the SDK's format() helper. */
+   *  by the SDK's format() helper. Signs like any other message — the
+   *  covered coordination tags ride inside the document. */
   sendTagged(target: string, text: string, tags: Record<string, string>): void {
-    this.raw(format('PRIVMSG', [target, text], tags));
+    void this.signedPrivmsg(target, text, tags);
   }
 
   /** TAGMSG (tags-only, no body) to a target. */

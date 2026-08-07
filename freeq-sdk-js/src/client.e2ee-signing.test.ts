@@ -73,7 +73,6 @@ beforeEach(() => {
     configurable: true,
     writable: true,
   });
-  signing.resetSigning();
 });
 
 afterEach(() => {
@@ -112,11 +111,14 @@ async function makeClient(
   return { client, ws };
 }
 
-/** Provision a real Ed25519 session key and return the public half. */
-async function provisionSigningKey(did: string): Promise<CryptoKey> {
-  signing.setSigningDid(did);
-  await signing.generateSigningKey();
-  const pubB64 = signing.getPublicKey();
+/** Provision a real Ed25519 session key on a client and return the public half. */
+async function provisionSigningKey(
+  owner: { signing: signing.SessionSigning },
+  did: string,
+): Promise<CryptoKey> {
+  owner.signing.setSigningDid(did);
+  await owner.signing.generateSigningKey();
+  const pubB64 = owner.signing.getPublicKey();
   if (!pubB64) throw new Error('signing key not provisioned');
   const padded = pubB64 + '='.repeat((4 - (pubB64.length % 4)) % 4);
   const bytes = Uint8Array.from(atob(padded.replace(/-/g, '+').replace(/_/g, '/')), (c) =>
@@ -153,9 +155,9 @@ const DID = 'did:plc:encrypted-signer';
 describe('an encrypted message is signed over its ciphertext', () => {
   it('one PRIVMSG carries the encryption tag, the event id and a signature over the wire body', async () => {
     const channel = '#enc-signed-single';
-    const verifyKey = await provisionSigningKey(DID);
     await e2ee.setChannelKey(channel, 'a passphrase the room shares');
     const { client, ws } = await makeClient('alice');
+    const verifyKey = await provisionSigningKey(client, DID);
 
     client.sendMessage(channel, 'the quiet part');
     await flushAsync();
@@ -186,9 +188,9 @@ describe('an encrypted message is signed over its ciphertext', () => {
 
   it('a ciphertext-chunked batch signs the assembled ciphertext on its opener', async () => {
     const channel = '#enc-signed-multi';
-    const verifyKey = await provisionSigningKey(DID);
     await e2ee.setChannelKey(channel, 'a passphrase the room shares');
     const { client, ws } = await makeClient('alice');
+    const verifyKey = await provisionSigningKey(client, DID);
 
     const paragraph = 'Long enough that the ciphertext will not fit one line. '.repeat(30);
     const text = Array.from({ length: 5 }, (_, i) => `line${i}: ${paragraph}`).join('\n');
@@ -227,9 +229,9 @@ describe('an encrypted message is signed over its ciphertext', () => {
 
   it('an encrypted reply signs the message it answers', async () => {
     const channel = '#enc-signed-reply';
-    const verifyKey = await provisionSigningKey(DID);
     await e2ee.setChannelKey(channel, 'a passphrase the room shares');
     const { client, ws } = await makeClient('alice');
+    const verifyKey = await provisionSigningKey(client, DID);
 
     client.sendReply(channel, '01ROOTMSGID', 'answering in the dark');
     await flushAsync();
@@ -247,9 +249,9 @@ describe('an encrypted message is signed over its ciphertext', () => {
 
   it('a server that does not verify documents sees an unsigned encrypted message', async () => {
     const channel = '#enc-legacy';
-    await provisionSigningKey(DID);
     await e2ee.setChannelKey(channel, 'a passphrase the room shares');
     const { client, ws } = await makeClient('alice', 'message-tags server-time batch echo-message');
+    await provisionSigningKey(client, DID);
 
     client.sendMessage(channel, 'as far as this server can tell, nothing is new');
     await flushAsync();
@@ -267,10 +269,10 @@ describe('an encrypted message is signed over its ciphertext', () => {
     // The fallback re-enters the plaintext path; it must not lose the
     // signature on the way.
     const channel = '#enc-fallback';
-    const verifyKey = await provisionSigningKey(DID);
     await e2ee.setChannelKey(channel, 'a passphrase the room shares');
     vi.spyOn(e2ee, 'encryptChannel').mockResolvedValue(null);
     const { client, ws } = await makeClient('alice');
+    const verifyKey = await provisionSigningKey(client, DID);
 
     client.sendMessage(channel, 'plaintext, because encryption failed');
     await flushAsync();

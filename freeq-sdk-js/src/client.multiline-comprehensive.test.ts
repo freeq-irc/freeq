@@ -85,8 +85,6 @@ beforeEach(() => {
     configurable: true,
     writable: true,
   });
-  // Reset signing module state between tests so each test starts clean.
-  signing.resetSigning();
 });
 
 afterEach(() => {
@@ -132,15 +130,18 @@ async function makeMultilineClient(nick: string): Promise<{
   return { client, ws };
 }
 
-/** Provision a real Ed25519 signing key on the signing module. */
-async function provisionSigningKey(did: string): Promise<CryptoKey> {
-  signing.setSigningDid(did);
-  await signing.generateSigningKey();
+/** Provision a real Ed25519 signing key on a client's own signing state. */
+async function provisionSigningKey(
+  owner: { signing: signing.SessionSigning },
+  did: string,
+): Promise<CryptoKey> {
+  owner.signing.setSigningDid(did);
+  await owner.signing.generateSigningKey();
   // Re-grab the key from a sign() call's effect; we need the pubkey to
-  // verify in tests. The module exports getPublicKey() (b64url string),
+  // verify in tests. The instance exposes getPublicKey() (b64url string),
   // but for verify we need the CryptoKey form — generate it fresh from
   // the b64url and re-import.
-  const pubB64 = signing.getPublicKey();
+  const pubB64 = owner.signing.getPublicKey();
   if (!pubB64) throw new Error('signing key not provisioned');
   // base64url → bytes → import as Ed25519 raw
   const padded = pubB64 + '='.repeat((4 - (pubB64.length % 4)) % 4);
@@ -185,8 +186,8 @@ function findChunks(sent: string[]): string[] {
 describe('comprehensive: sig on BATCH opener', () => {
   it('signs assembled body and the sig verifies', async () => {
     const did = 'did:plc:test-signer';
-    const verifyKey = await provisionSigningKey(did);
     const { client, ws } = await makeMultilineClient('alice');
+    const verifyKey = await provisionSigningKey(client, did);
     const text = 'first\nsecond\nthird';
     client.sendMessage('#room', text);
     await flushAsync();
@@ -206,7 +207,7 @@ describe('comprehensive: sig on BATCH opener', () => {
     // luxury, which is precisely why the canonical changed.
     const [alg, kid, sigB64] = sigTag.split(':');
     expect(alg).toBe('ed25519');
-    expect(kid).toBe(signing.getKid());
+    expect(kid).toBe(client.signing.getKid());
     const padded = sigB64! + '='.repeat((4 - (sigB64!.length % 4)) % 4);
     const sig = Uint8Array.from(atob(padded.replace(/-/g, '+').replace(/_/g, '/')), (c) =>
       c.charCodeAt(0),
@@ -227,8 +228,8 @@ describe('comprehensive: sig on BATCH opener', () => {
   });
 
   it('chunks do NOT carry +freeq.at/sig', async () => {
-    await provisionSigningKey('did:plc:test-signer');
     const { client, ws } = await makeMultilineClient('alice');
+    await provisionSigningKey(client, 'did:plc:test-signer');
     client.sendMessage('#room', 'a\nb\nc');
     await flushAsync();
     for (const chunk of findChunks(ws.sent)) {
@@ -246,8 +247,8 @@ describe('comprehensive: sig on BATCH opener', () => {
       ['edit', 'edit'],
     ] as const) {
       const did = 'did:plc:test-signer';
-      const verifyKey = await provisionSigningKey(did);
       const { client, ws } = await makeMultilineClient('alice');
+      const verifyKey = await provisionSigningKey(client, did);
       const text = 'first\nsecond\nthird';
       if (tagged === 'reply') client.sendReply('#room', '01ROOTMSGID', text);
       else client.sendEdit('#room', '01ROOTMSGID', text);
