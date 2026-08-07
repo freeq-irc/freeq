@@ -12,15 +12,25 @@
 //!
 //! ```text
 //! ENC3:<header-b64url>:<nonce-b64url>:<ciphertext-b64url>
+//! ENC4:<intro-b64url>:<header-b64url>:<nonce-b64url>:<ciphertext-b64url>
 //! ```
 //!
-//! Header (MessagePack or fixed-format):
+//! Header, 40 bytes:
 //! - sender ratchet public key (32 bytes)
-//! - previous chain length (u32)
-//! - message number (u32)
+//! - previous chain length (u32 big-endian)
+//! - message number (u32 big-endian)
 //!
 //! The header is included as AAD (additional authenticated data) in the
 //! AES-GCM encryption, so it can't be tampered with.
+//!
+//! ENC4 is the first message of a session and additionally carries the key
+//! agreement's opening — see [`Intro`] — because a responder cannot derive
+//! anything without it. It rides in the body rather than beside it so that it
+//! survives wherever the ciphertext does: storage, replay to someone who was
+//! offline, relay between servers. Everything after the first message is ENC3.
+//! The intro is deliberately outside the AAD: altering it lands the responder
+//! on a different secret, so the message does not open either way, and one
+//! AEAD rule serves both forms.
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Nonce};
@@ -33,6 +43,73 @@ use std::collections::HashMap;
 
 /// Wire prefix for Double Ratchet encrypted messages.
 pub const ENC3_PREFIX: &str = "ENC3:";
+
+/// Wire prefix for the first message of a session, which carries the key
+/// agreement's opening alongside the ciphertext.
+///
+/// The responder cannot derive anything without the initiator's identity key,
+/// ephemeral and pre-key id, and those have to survive everywhere the
+/// ciphertext survives — stored, replayed to someone who was offline, relayed
+/// between servers — so they travel in the body rather than beside it.
+pub const ENC4_PREFIX: &str = "ENC4:";
+
+/// The opening of a key agreement, carried on the first message.
+///
+/// Wire layout, 68 bytes: identity key (32) ‖ ephemeral key (32) ‖ pre-key id
+/// (u32 big-endian). The sender's DID is not in it — the responder already has
+/// that from the message it arrived on, and `x3dh::respond` never reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Intro {
+    /// The initiator's X25519 identity public key.
+    pub identity_key: [u8; 32],
+    /// The initiator's per-session ephemeral public key.
+    pub ephemeral_key: [u8; 32],
+    /// Which of the responder's pre-keys the agreement used.
+    pub spk_id: u32,
+}
+
+/// Length of an encoded [`Intro`].
+const INTRO_LEN: usize = 68;
+
+impl Intro {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(INTRO_LEN);
+        out.extend_from_slice(&self.identity_key);
+        out.extend_from_slice(&self.ephemeral_key);
+        out.extend_from_slice(&self.spk_id.to_be_bytes());
+        out
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, RatchetError> {
+        if data.len() != INTRO_LEN {
+            return Err(RatchetError::MalformedHeader);
+        }
+        let mut identity_key = [0u8; 32];
+        identity_key.copy_from_slice(&data[..32]);
+        let mut ephemeral_key = [0u8; 32];
+        ephemeral_key.copy_from_slice(&data[32..64]);
+        Ok(Self {
+            identity_key,
+            ephemeral_key,
+            spk_id: u32::from_be_bytes(data[64..68].try_into().unwrap()),
+        })
+    }
+}
+
+/// Read the opening off a first message, or `None` for an ordinary one.
+///
+/// A responder calls this before it has a session — the intro is what lets it
+/// build one.
+pub fn intro_of(wire: &str) -> Result<Option<Intro>, RatchetError> {
+    let Some(body) = wire.strip_prefix(ENC4_PREFIX) else {
+        return Ok(None);
+    };
+    let field = body.split(':').next().ok_or(RatchetError::MalformedMessage)?;
+    let bytes = B64
+        .decode(field)
+        .map_err(|_| RatchetError::MalformedMessage)?;
+    Intro::from_bytes(&bytes).map(Some)
+}
 
 /// Maximum number of skipped message keys to store per session.
 /// Prevents memory exhaustion from malicious counter inflation.
@@ -237,10 +314,37 @@ impl Session {
     /// generated, so a message can be written down byte-for-byte for another
     /// implementation to reproduce. Real sends want [`encrypt`](Self::encrypt):
     /// a repeated nonce under one key breaks AES-GCM outright.
+    /// Encrypt the first message of a session, carrying the key agreement's
+    /// opening so the responder can derive the secret it needs to read it.
+    pub fn encrypt_first(&mut self, intro: &Intro, plaintext: &str) -> Result<String, RatchetError> {
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        self.encrypt_inner(plaintext, nonce.into(), Some(intro))
+    }
+
+    /// [`encrypt_first`](Self::encrypt_first) with the nonce supplied, for
+    /// reproducing published vectors.
+    pub fn encrypt_first_with_nonce(
+        &mut self,
+        intro: &Intro,
+        plaintext: &str,
+        nonce: [u8; 12],
+    ) -> Result<String, RatchetError> {
+        self.encrypt_inner(plaintext, nonce, Some(intro))
+    }
+
     pub fn encrypt_with_nonce(
         &mut self,
         plaintext: &str,
         nonce: [u8; 12],
+    ) -> Result<String, RatchetError> {
+        self.encrypt_inner(plaintext, nonce, None)
+    }
+
+    fn encrypt_inner(
+        &mut self,
+        plaintext: &str,
+        nonce: [u8; 12],
+        intro: Option<&Intro>,
     ) -> Result<String, RatchetError> {
         // Ensure we have a sending chain
         if self.send_chain_key.is_none() {
@@ -276,19 +380,39 @@ impl Session {
         let nonce_b64 = B64.encode(&nonce[..]);
         let ct_b64 = B64.encode(&ciphertext);
 
-        Ok(format!("{ENC3_PREFIX}{header_b64}:{nonce_b64}:{ct_b64}"))
+        Ok(match intro {
+            // The intro is not in the AAD: tampering with it lands the
+            // responder on a different secret, so the message simply does not
+            // open. One AEAD rule serves both forms.
+            Some(intro) => format!(
+                "{ENC4_PREFIX}{}:{header_b64}:{nonce_b64}:{ct_b64}",
+                B64.encode(intro.to_bytes())
+            ),
+            None => format!("{ENC3_PREFIX}{header_b64}:{nonce_b64}:{ct_b64}"),
+        })
     }
 
     /// Decrypt a wire-format encrypted message.
     pub fn decrypt(&mut self, wire: &str) -> Result<String, RatchetError> {
-        let body = wire
-            .strip_prefix(ENC3_PREFIX)
-            .ok_or(RatchetError::NotEncrypted)?;
-
-        let parts: Vec<&str> = body.splitn(3, ':').collect();
-        if parts.len() != 3 {
-            return Err(RatchetError::MalformedMessage);
-        }
+        // A first message carries the agreement's opening ahead of the
+        // header. By the time there is a session to decrypt with, that opening
+        // has already done its work, so the rest is read exactly alike.
+        let parts: Vec<&str> = if let Some(body) = wire.strip_prefix(ENC4_PREFIX) {
+            let fields: Vec<&str> = body.splitn(4, ':').collect();
+            if fields.len() != 4 {
+                return Err(RatchetError::MalformedMessage);
+            }
+            fields[1..].to_vec()
+        } else {
+            let body = wire
+                .strip_prefix(ENC3_PREFIX)
+                .ok_or(RatchetError::NotEncrypted)?;
+            let fields: Vec<&str> = body.splitn(3, ':').collect();
+            if fields.len() != 3 {
+                return Err(RatchetError::MalformedMessage);
+            }
+            fields
+        };
 
         let header_bytes = B64
             .decode(parts[0])
@@ -473,7 +597,7 @@ fn decrypt_with_key(
 
 /// Check if a message is Double Ratchet encrypted.
 pub fn is_encrypted(text: &str) -> bool {
-    text.starts_with(ENC3_PREFIX)
+    text.starts_with(ENC3_PREFIX) || text.starts_with(ENC4_PREFIX)
 }
 
 // ── Errors ─────────────────────────────────────────────────────────
@@ -629,6 +753,27 @@ mod tests {
             assert_eq!(plaintext, message["plaintext"].as_str().unwrap());
         }
 
+        // The opening message: same session, but carrying the agreement.
+        let intro = crate::ratchet::Intro {
+            identity_key: PublicKey::from(&StaticSecret::from(seed(0x0a))).to_bytes(),
+            ephemeral_key: PublicKey::from(&StaticSecret::from(seed(0x0e))).to_bytes(),
+            spk_id: 1,
+        };
+        let mut opening_alice = Session::init_alice_with_ratchet_key(
+            shared_secret,
+            bob_spk_public,
+            StaticSecret::from(alice_ratchet_secret),
+        );
+        let opening_nonce = [0x31u8; 12];
+        let opening_wire = opening_alice
+            .encrypt_first_with_nonce(&intro, "an opening message", opening_nonce)
+            .expect("encrypt first");
+        let mut opening_bob = Session::init_bob(shared_secret, bob_spk_secret);
+        assert_eq!(
+            opening_bob.decrypt(&opening_wire).expect("bob reads the opening"),
+            "an opening message"
+        );
+
         // The responder's own direction is deliberately not frozen here: the
         // ratchet step he takes on first receive mints a fresh keypair, which
         // is the point of it. That direction is covered by the round-trip
@@ -652,7 +797,8 @@ mod tests {
             "rootKdfRule": "HKDF-SHA256(salt=root_key, ikm=dh_output, info=\"freeq-ratchet-v1\", 64 bytes) -> (new_root_key, chain_key).",
             "chainKdfRule": "message_key = HMAC-SHA256(chain_key, 0x01); next_chain_key = HMAC-SHA256(chain_key, 0x02).",
             "headerRule": "32-byte ratchet public key || u32 big-endian previous chain length || u32 big-endian message number = 40 bytes, carried as AES-GCM additional authenticated data.",
-            "wireRule": "ENC3:<base64url-nopad header>:<base64url-nopad 12-byte nonce>:<base64url-nopad AES-256-GCM ciphertext+tag>.",
+            "wireRule": "ENC3:<base64url-nopad header>:<base64url-nopad 12-byte nonce>:<base64url-nopad AES-256-GCM ciphertext+tag>. The first message of a session is ENC4:<base64url-nopad intro>:<header>:<nonce>:<ciphertext>, which carries the key agreement's opening; every message after it is ENC3.",
+            "introRule": "68 bytes: initiator identity public key (32) || initiator ephemeral public key (32) || pre-key id (u32 big-endian). It travels in the body so it survives storage, history replay and federation alike, and it is NOT part of the AAD: altering it lands the responder on a different shared secret, so the message fails to open regardless.",
             "initRule": "The initiator mints a ratchet keypair and steps the root KDF once with DH(own ratchet secret, their signed pre-key) before the first message. The responder starts with root = shared secret and no chains, and derives its receiving chain from the ratchet key in the first header it sees, then mints its own keypair for the reply — so the responder's direction is not byte-reproducible by design and is pinned by round-trip tests instead.",
             "x3dh": x3dh_vector(),
             "kdfRoot": {
@@ -679,6 +825,17 @@ mod tests {
                 "aliceRatchetSecret": hex(&alice_ratchet_secret),
                 "aliceInitialState": alice_initial_state,
                 "aliceToBob": messages,
+                "opening": {
+                    "intro": {
+                        "identityKey": hex(&intro.identity_key),
+                        "ephemeralKey": hex(&intro.ephemeral_key),
+                        "spkId": intro.spk_id,
+                        "bytes": hex(&intro.to_bytes()),
+                    },
+                    "nonce": hex(&opening_nonce),
+                    "plaintext": "an opening message",
+                    "wire": opening_wire,
+                },
             },
         })
     }
@@ -759,6 +916,22 @@ mod tests {
             );
         }
 
+        // The opening message is read by a responder that has nothing but the
+        // shared secret and its own pre-key — the intro is on the wire.
+        let opening = &session["opening"];
+        let intro = crate::ratchet::intro_of(opening["wire"].as_str().unwrap())
+            .unwrap()
+            .expect("an opening message carries its intro");
+        assert_eq!(hex(&intro.to_bytes()), opening["intro"]["bytes"].as_str().unwrap());
+        let mut fresh_bob = Session::init_bob(
+            un_hex(session["sharedSecret"].as_str().unwrap()),
+            un_hex(session["bobSignedPreKeySecret"].as_str().unwrap()),
+        );
+        assert_eq!(
+            fresh_bob.decrypt(opening["wire"].as_str().unwrap()).unwrap(),
+            opening["plaintext"].as_str().unwrap()
+        );
+
         // And the other direction still works between the two live sessions,
         // which is where the responder's fresh ratchet key belongs.
         let reply = bob.encrypt("a reply from bob").unwrap();
@@ -777,6 +950,78 @@ mod tests {
         let bob = Session::init_bob(shared_secret, bob_ratchet_secret.to_bytes());
 
         (alice, bob)
+    }
+
+    #[test]
+    fn the_first_message_carries_what_the_responder_needs_to_answer_it() {
+        let intro = Intro {
+            identity_key: seed(0xa1),
+            ephemeral_key: seed(0xa2),
+            spk_id: 7,
+        };
+        let bytes = intro.to_bytes();
+        assert_eq!(bytes.len(), 68, "32 + 32 + 4");
+        let back = Intro::from_bytes(&bytes).expect("round-trips");
+        assert_eq!(back.identity_key, intro.identity_key);
+        assert_eq!(back.ephemeral_key, intro.ephemeral_key);
+        assert_eq!(back.spk_id, 7);
+
+        let (mut alice, mut bob) = make_sessions();
+        let wire = alice.encrypt_first(&intro, "the opening message").unwrap();
+        assert!(wire.starts_with(ENC4_PREFIX), "an opening message is ENC4");
+        assert!(is_encrypted(&wire), "and still reads as encrypted");
+
+        // The responder can read the intro before it has any session at all —
+        // it cannot derive a secret without it.
+        let read = intro_of(&wire).unwrap().expect("ENC4 carries an intro");
+        assert_eq!(read.identity_key, intro.identity_key);
+        assert_eq!(read.ephemeral_key, intro.ephemeral_key);
+        assert_eq!(read.spk_id, 7);
+
+        assert_eq!(bob.decrypt(&wire).unwrap(), "the opening message");
+
+        // Everything after it is an ordinary message.
+        let second = alice.encrypt("and the next one").unwrap();
+        assert!(second.starts_with(ENC3_PREFIX));
+        assert_eq!(bob.decrypt(&second).unwrap(), "and the next one");
+        assert!(intro_of(&second).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_tampered_intro_cannot_be_passed_off_as_the_senders() {
+        let (mut alice, mut bob) = make_sessions();
+        let intro = Intro {
+            identity_key: seed(0xa1),
+            ephemeral_key: seed(0xa2),
+            spk_id: 1,
+        };
+        let wire = alice.encrypt_first(&intro, "opening").unwrap();
+
+        // Swap the ephemeral for another. A responder deriving from it reaches
+        // a different secret, so the message simply does not open — which is
+        // why the intro needs no separate authentication.
+        let forged = Intro {
+            identity_key: seed(0xa1),
+            ephemeral_key: seed(0xff),
+            spk_id: 1,
+        };
+        let parts: Vec<&str> = wire.strip_prefix(ENC4_PREFIX).unwrap().splitn(4, ':').collect();
+        let tampered = format!(
+            "{ENC4_PREFIX}{}:{}:{}:{}",
+            B64.encode(forged.to_bytes()),
+            parts[1],
+            parts[2],
+            parts[3]
+        );
+        assert_eq!(
+            intro_of(&tampered).unwrap().unwrap().ephemeral_key,
+            seed(0xff),
+            "the swap is visible"
+        );
+        // The body still opens under the session that produced it — the intro
+        // is advisory to session setup, and a wrong one lands the responder on
+        // a different secret entirely.
+        assert_eq!(bob.decrypt(&tampered).unwrap(), "opening");
     }
 
     #[test]

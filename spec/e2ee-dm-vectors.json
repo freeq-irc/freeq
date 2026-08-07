@@ -9,6 +9,7 @@
   },
   "headerRule": "32-byte ratchet public key || u32 big-endian previous chain length || u32 big-endian message number = 40 bytes, carried as AES-GCM additional authenticated data.",
   "initRule": "The initiator mints a ratchet keypair and steps the root KDF once with DH(own ratchet secret, their signed pre-key) before the first message. The responder starts with root = shared secret and no chains, and derives its receiving chain from the ratchet key in the first header it sees, then mints its own keypair for the reply — so the responder's direction is not byte-reproducible by design and is pinned by round-trip tests instead.",
+  "introRule": "68 bytes: initiator identity public key (32) || initiator ephemeral public key (32) || pre-key id (u32 big-endian). It travels in the body so it survives storage, history replay and federation alike, and it is NOT part of the AAD: altering it lands the responder on a different shared secret, so the message fails to open regardless.",
   "kdfChain": {
     "chainKey": "0303030303030303030303030303030303030303030303030303030303030303",
     "messageKey": "aa6fa3f949be2b2cc7de5a18e7f65fee5fb78488f588d53196a63e66ad67ad12",
@@ -51,9 +52,20 @@
     ],
     "bobSignedPreKeyPublic": "97c3b10b4d6c133a78ea5dcc1cf6421d3f81ae37b1f628ce14ca6fce7730f333",
     "bobSignedPreKeySecret": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+    "opening": {
+      "intro": {
+        "bytes": "f77ff4b10788bfdca62ca0bb160d427cf5762d85f2b5cad6807ec9c3febbde095855784cb3c8c796d84ac93e8f4a53dab0bb31e80960042cfa87f03a4293b30800000001",
+        "ephemeralKey": "5855784cb3c8c796d84ac93e8f4a53dab0bb31e80960042cfa87f03a4293b308",
+        "identityKey": "f77ff4b10788bfdca62ca0bb160d427cf5762d85f2b5cad6807ec9c3febbde09",
+        "spkId": 1
+      },
+      "nonce": "313131313131313131313131",
+      "plaintext": "an opening message",
+      "wire": "ENC4:93_0sQeIv9ymLKC7Fg1CfPV2LYXytcrWgH7Jw_673glYVXhMs8jHlthKyT6PSlPasLsx6AlgBCz6h_A6QpOzCAAAAAE:foHpFuOvzbMe902NuSPyuhW4KhqmWU6iKNzfJ9e1T2wAAAAAAAAAAA:MTExMTExMTExMTEx:ygc8H8XiQDhMwfreVE8JxDVQ4dzT-m3nD8KeDJG-2oruvQ"
+    },
     "sharedSecret": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
   },
-  "wireRule": "ENC3:<base64url-nopad header>:<base64url-nopad 12-byte nonce>:<base64url-nopad AES-256-GCM ciphertext+tag>.",
+  "wireRule": "ENC3:<base64url-nopad header>:<base64url-nopad 12-byte nonce>:<base64url-nopad AES-256-GCM ciphertext+tag>. The first message of a session is ENC4:<base64url-nopad intro>:<header>:<nonce>:<ciphertext>, which carries the key agreement's opening; every message after it is ENC3.",
   "x3dh": {
     "aliceDid": "did:plc:alice",
     "aliceEphemeralSecret": "0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e",
