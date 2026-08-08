@@ -250,6 +250,9 @@ export class FreeqClient extends EventEmitter {
       this._agentHeartbeatTimer = null;
     }
     this.signing.resetSigning();
+    // Whatever was waiting for a registration on this connection is not
+    // getting one. The next session arms the gate again.
+    this.msgSigRegistered();
     this._connectionState = 'disconnected';
   }
 
@@ -1216,8 +1219,47 @@ export class FreeqClient extends EventEmitter {
    */
   private sendChain: Promise<unknown> = Promise.resolve();
 
+  /**
+   * Resolves once this session's key registration has reached the wire.
+   *
+   * `null` whenever no registration is coming — a guest, a server that never
+   * acked the capability, `autoMsgSig: false`. A send must never wait on a
+   * registration that will never happen, so the absence is the release.
+   *
+   * The window this closes: the session key is generated asynchronously and
+   * `MSGSIG` goes out when that resolves, which is after `001`. A client that
+   * emitted the moment it was registered therefore raced its own key — going
+   * out unsigned, or signed with a key the server had not been told about and
+   * so could not resolve. The Rust SDK writes `MSGSIG` before draining the
+   * commands it queued; this is the same ordering, expressed through the
+   * chain every signed send already takes its turn on.
+   */
+  private msgSigReady: Promise<void> | null = null;
+  private releaseMsgSigReady: (() => void) | null = null;
+
+  /** Arm the gate: sends now wait for the key registration. */
+  private awaitMsgSigRegistration(): void {
+    this.releaseMsgSigReady?.();
+    this.msgSigReady = new Promise<void>((resolve) => {
+      this.releaseMsgSigReady = resolve;
+    });
+  }
+
+  /** Open the gate, whether or not a key actually materialized. */
+  private msgSigRegistered(): void {
+    this.releaseMsgSigReady?.();
+    this.releaseMsgSigReady = null;
+    this.msgSigReady = null;
+  }
+
   private enqueueSend(run: () => Promise<void>): Promise<void> {
-    const next = this.sendChain.then(run, run);
+    // Read the gate when the turn comes up, not when it is taken: a send
+    // queued before registration must honour the gate armed after it.
+    const gated = async (): Promise<void> => {
+      if (this.msgSigReady) await this.msgSigReady;
+      return run();
+    };
+    const next = this.sendChain.then(gated, gated);
     // A failed send must not wedge every send after it.
     this.sendChain = next.catch(() => undefined);
     return next;
@@ -1587,6 +1629,8 @@ export class FreeqClient extends EventEmitter {
           // which left the key unregistered and every "client-signed"
           // message silently server-signed instead.
           this.pendingMsgSig = this.signing.generateSigningKey();
+          // From here until MSGSIG is on the wire, a signing send waits.
+          this.awaitMsgSigRegistration();
         }
         this.raw('CAP END');
         break;
@@ -1658,9 +1702,15 @@ export class FreeqClient extends EventEmitter {
         if (this.pendingMsgSig) {
           const pending = this.pendingMsgSig;
           this.pendingMsgSig = null;
-          pending.then((pubkey) => {
-            if (pubkey) this.raw(`MSGSIG ${pubkey}`);
-          });
+          pending.then(
+            (pubkey) => {
+              if (pubkey) this.raw(`MSGSIG ${pubkey}`);
+              // Released either way: a key this platform could not generate
+              // is a reason to send unsigned, never a reason to stop sending.
+              this.msgSigRegistered();
+            },
+            () => this.msgSigRegistered(),
+          );
         }
 
         const toJoin = this.autoJoinChannels.length > 0
@@ -3072,7 +3122,11 @@ export class FreeqClient extends EventEmitter {
     // holding the id it chose, would be pointing at nothing.
     const signable =
       this.ackedCaps.has(SIGNING_CAP) &&
-      this.signing.canSign(channel) &&
+      // A key still being generated counts: the send waits for the
+      // registration, so by the time this event reaches the wire it can be
+      // signed — and deciding otherwise would emit unsigned events for the
+      // first moments of every session.
+      this.signing.canSign(channel, { keyPending: this.msgSigReady !== null }) &&
       (opts.eventId === undefined || isUlid(opts.eventId));
     const eventId = opts.eventId ?? (signable ? signing.newEventId() : mintEventId());
     const tags: Record<string, string> = {

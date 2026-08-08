@@ -1777,6 +1777,121 @@ describe('signed mutations', () => {
     ).toBe(1);
   });
 
+  // Nothing that signs may reach the wire before the key registration does.
+  // The session key is generated asynchronously and MSGSIG goes out when that
+  // resolves, after 001 — so a client that emits the moment it is registered
+  // used to race its own registration and send either unsigned or with a
+  // signature naming a key the server had not been told about. The Rust SDK
+  // has always ordered these; this is the same ordering.
+  //
+  // Registration here is driven through the real sequence rather than the
+  // helper, because the helper provisions the key before connecting and so
+  // cannot reproduce the race.
+  async function loggedIn(caps: string): Promise<{
+    client: import('./client.js').FreeqClient;
+    ws: MockWebSocket;
+  }> {
+    const { FreeqClient } = await import('./client.js');
+    const client = new FreeqClient({
+      url: 'wss://test/irc',
+      nick: 'alice',
+      skipInitialBrokerRefresh: true,
+    });
+    client.setSaslCredentials({
+      token: 't',
+      did: 'did:plc:alice',
+      pdsUrl: 'https://pds.example',
+      method: 'oauth',
+    });
+    client.connect();
+    await flushAsync();
+    const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    ws.recv(`:srv CAP * LS :${caps}`);
+    await flushAsync();
+    ws.recv(`:srv CAP * ACK :${caps}`);
+    await flushAsync();
+    ws.recv(':srv 903 alice :SASL authentication successful');
+    await flushAsync();
+    ws.recv(':srv 001 alice :Welcome');
+    await flushAsync();
+    return { client, ws };
+  }
+
+  /** Wait for the wire to hold every line named, or give up and let the
+   *  assertions report what actually arrived. */
+  async function settle(ws: MockWebSocket, ...needles: string[]): Promise<void> {
+    for (let i = 0; i < 200; i++) {
+      if (needles.every((n) => ws.sent.some((l) => l.includes(n)))) return;
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  }
+
+  it('registers the key before the first event a client emits on connect', async () => {
+    const { client, ws } = await loggedIn('message-tags server-time freeq.at/msgsig');
+    // The moment registration lands — exactly what the reference example does.
+    const eventId = client.createTask('#room', 'ship it');
+    await settle(ws, 'MSGSIG ', 'TAGMSG');
+
+    const msgsig = ws.sent.findIndex((l) => l.startsWith('MSGSIG '));
+    const tagmsg = ws.sent.findIndex((l) => l.includes('TAGMSG'));
+    expect(msgsig, `no key registration on the wire: ${ws.sent.join(' | ')}`).toBeGreaterThan(-1);
+    expect(tagmsg).toBeGreaterThan(-1);
+    expect(
+      msgsig,
+      `the key must reach the server before the event it signs: ${ws.sent.join(' | ')}`,
+    ).toBeLessThan(tagmsg);
+
+    expect(eventId, 'a signed event is filed under a ULID').toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+    const line = ws.sent[tagmsg]!;
+    expect(tagOf(line, '+freeq.at/eventid')).toBe(eventId);
+    expect(line).toContain('+freeq.at/sig=');
+  });
+
+  it('does not hold sends for a registration that will never come', async () => {
+    // A server without the capability, and a guest with no identity at all:
+    // neither will ever register a key, so neither may wait for one.
+    const { client, ws } = await loggedIn('message-tags server-time');
+    client.sendMessage('#room', 'hello');
+    await settle(ws, 'PRIVMSG');
+    expect(ws.sent.filter((l) => l.includes('PRIVMSG'))).toEqual(['PRIVMSG #room :hello']);
+
+    const guest = await makeRegistered();
+    guest.client.sendMessage('#room', 'hello');
+    await settle(guest.ws, 'PRIVMSG');
+    expect(guest.ws.sent.filter((l) => l.includes('PRIVMSG'))).toEqual([
+      'PRIVMSG #room :hello',
+    ]);
+  });
+
+  it('closes the same window again on a reconnect', async () => {
+    const { client, ws } = await loggedIn('message-tags server-time freeq.at/msgsig');
+    await settle(ws, 'MSGSIG ');
+    ws.close();
+    await flushAsync();
+
+    // Same sequence on the new connection; the guarantee has to be re-armed,
+    // not spent.
+    client.connect();
+    await flushAsync();
+    const ws2 = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    ws2.recv(':srv CAP * LS :message-tags server-time freeq.at/msgsig');
+    await flushAsync();
+    ws2.recv(':srv CAP * ACK :message-tags server-time freeq.at/msgsig');
+    await flushAsync();
+    ws2.recv(':srv 903 alice :SASL authentication successful');
+    await flushAsync();
+    ws2.recv(':srv 001 alice :Welcome');
+    await flushAsync();
+
+    client.createTask('#room', 'again');
+    await settle(ws2, 'MSGSIG ', 'TAGMSG');
+    const msgsig = ws2.sent.findIndex((l) => l.startsWith('MSGSIG '));
+    const tagmsg = ws2.sent.findIndex((l) => l.includes('TAGMSG'));
+    expect(msgsig, `wire: ${ws2.sent.join(' | ')}`).toBeGreaterThan(-1);
+    expect(msgsig, `wire: ${ws2.sent.join(' | ')}`).toBeLessThan(tagmsg);
+    expect(ws2.sent[tagmsg]!).toContain('+freeq.at/sig=');
+  });
+
   it('a mutation to a peer we cannot name still sends, unsigned', async () => {
     const { client, ws } = await makeSigningClient();
     client.sendReaction('carol', '👍', 'M0');
@@ -2160,7 +2275,10 @@ describe('signed mutations', () => {
     await client.signing.generateSigningKey();
     client.sendMedia('#room', { url: 'https://cdn.example/cat.png', mime: 'image/png' });
     client.sendLinkPreview('#room', { url: 'https://example.com/post' });
-    await flushAsync();
+    // Two separate sends, each taking its turn on the queue.
+    for (let i = 0; i < 50 && ws.sent.length < 2; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
     expect(ws.sent).toEqual([
       '@+freeq.at/media-url=https://cdn.example/cat.png;+freeq.at/media-mime=image/png ' +
         'PRIVMSG #room :📎 https://cdn.example/cat.png',

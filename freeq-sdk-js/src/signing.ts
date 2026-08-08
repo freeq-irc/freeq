@@ -367,9 +367,19 @@ export class SessionSigning {
    * the signing to resolve, and the id it returns has to be the id the server
    * will file — a signer-minted ULID when this signs, the legacy id when it
    * doesn't.
+   *
+   * Pass `keyPending` when the session key is still being generated and the
+   * send will wait for it; without that, an emit issued the moment a client
+   * registers reads its own half-armed state as "cannot sign" and takes the
+   * unsigned path for no reason.
    */
-  canSign(target: string): boolean {
-    if (!this.signingKey?.privateKey || !this.authenticatedDid) return false;
+  canSign(target: string, opts: { keyPending?: boolean } = {}): boolean {
+    if (!this.authenticatedDid) return false;
+    // `keyPending` is the caller saying a key is on the way and the send will
+    // wait for it. An emitter has to answer "will this be signed" before the
+    // signature exists, and during the window between authenticating and the
+    // key finishing generation the honest answer is yes.
+    if (!this.signingKey?.privateKey && !opts.keyPending) return false;
     return venueForTarget(target, this.authenticatedDid) !== null;
   }
 
