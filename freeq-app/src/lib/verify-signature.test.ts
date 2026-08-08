@@ -10,6 +10,7 @@ import {
   VERIFY_LABELS,
   CHECKING_COPY,
   unsignedCopy,
+  verdictCopy,
   type VerifyOutcome,
 } from './verify-signature';
 
@@ -182,5 +183,24 @@ describe('valid is not verified (ruled 2026-08-07)', () => {
       // The heading is the answer, not a restatement of the line.
       expect(c.line).not.toBe(c.heading);
     }
+  });
+});
+
+describe('an answer names what the id actually points at', () => {
+  it('the two lines that say "message" say "event" over a coordination event', () => {
+    expect(verdictCopy('unverifiable', 'event').line).toContain('older event');
+    expect(verdictCopy('invalid', 'event').line).toMatch(/^This event is signed/);
+    expect(unsignedCopy('event').line).toContain('before event signing');
+  });
+
+  it('the noun-neutral answers are the same object either way', () => {
+    for (const o of ['device', 'server', 'unreachable'] as VerifyOutcome[]) {
+      expect(verdictCopy(o, 'event')).toBe(verdictCopy(o, 'message'));
+    }
+  });
+
+  it('a message reads as a message', () => {
+    expect(verdictCopy('unverifiable').line).toContain('older message');
+    expect(verdictCopy('invalid').line).toMatch(/^This message is signed/);
   });
 });

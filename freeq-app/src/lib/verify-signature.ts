@@ -156,6 +156,25 @@ export const VERIFY_LABELS: Record<VerifyOutcome, VerdictCopy> = {
   },
 };
 
+/** Five of the seven answers never name what was signed, so they read the
+ *  same over a message and over a coordination event. These two do. Kept as
+ *  whole sentences rather than an interpolated noun: copy that is assembled
+ *  is copy nobody reads before it ships. */
+const EVENT_LINES: Partial<Record<VerifyOutcome, string>> = {
+  unverifiable: 'The server can’t check this signature — usually an older event, sometimes a newer app.',
+  invalid: 'This event is signed, but the signature doesn’t check out. Treat it with suspicion.',
+};
+
+/** The answer for one outcome, worded for what the id actually names. */
+export function verdictCopy(
+  outcome: VerifyOutcome,
+  noun: 'message' | 'event' = 'message',
+): VerdictCopy {
+  const base = VERIFY_LABELS[outcome];
+  const line = noun === 'event' ? EVENT_LINES[outcome] : undefined;
+  return line ? { ...base, line } : base;
+}
+
 /** Nothing was signed, so there is nothing to ask the server about. Not a
  *  failed check — asking anyway would return a can't-check that reads like a
  *  fault where there is none. */

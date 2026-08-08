@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   verifySignature,
-  VERIFY_LABELS,
+  verdictCopy,
   CHECKING_COPY,
   unsignedCopy,
   type VerdictCopy,
@@ -87,7 +87,7 @@ export function VerifySignaturePanel({ msgid, signed, position, onClose, noun = 
     : stillFetchingKey
       ? CHECKING_COPY
       : outcome
-        ? VERIFY_LABELS[outcome]
+        ? verdictCopy(outcome, noun)
         : null;
 
   const style: React.CSSProperties = {
