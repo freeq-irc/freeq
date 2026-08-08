@@ -513,6 +513,9 @@ describe('messaging methods', () => {
       mime: 'image/png',
       alt: 'a cat',
     });
+    // The send goes through the signing path, which resolves off the
+    // microtask queue even when nothing is signed.
+    await flushAsync();
     const line = ws.sent[0];
     expect(line).toContain('PRIVMSG #foo');
     expect(line).toContain('+freeq.at/media-url=https://x.com/img.png');
@@ -526,6 +529,7 @@ describe('messaging methods', () => {
       title: 'Title',
       description: 'Desc',
     });
+    await flushAsync();
     const line = ws.sent[0];
     expect(line).toContain('+freeq.at/link-url=https://x.com');
     expect(line).toContain('+freeq.at/link-title=Title');
@@ -1827,5 +1831,66 @@ describe('signed mutations', () => {
     await flushAsync();
     const line = ws.sent.find((l) => l.includes('PRIVMSG'));
     expect(line).toBe('@+freeq.at/event=e PRIVMSG #room question');
+  });
+
+  // Media and link previews are messages with metadata attached, and the
+  // metadata is the part a reader acts on — so they sign like every other
+  // message. The media tags themselves are not covered fields; they ride
+  // outside the document, as the echo nonce does.
+  it('a media send is signed, and its media tags survive intact', async () => {
+    const signing = await import('./signing.js');
+    const { client, ws, verifyKey } = await makeSigningClient();
+    client.sendMedia('#room', {
+      url: 'https://cdn.example/cat.png',
+      mime: 'image/png',
+      alt: 'a cat',
+      width: 640,
+    });
+    const line = await waitForSent(ws, '+freeq.at/sig');
+    expect(tagOf(line, '+freeq.at/media-url')).toBe('https://cdn.example/cat.png');
+    expect(tagOf(line, '+freeq.at/media-mime')).toBe('image/png');
+    expect(tagOf(line, '+freeq.at/media-alt')).toBe('a\\scat');
+    expect(tagOf(line, '+freeq.at/media-w')).toBe('640');
+
+    const canonical = await signing.messageCanonical({
+      from: 'did:plc:mutator',
+      msgid: tagOf(line, '+freeq.at/eventid')!,
+      target: '#room',
+      body: '📎 https://cdn.example/cat.png',
+    });
+    expect(await verifySig(canonical, tagOf(line, '+freeq.at/sig')!, verifyKey)).toBe(true);
+  });
+
+  it('a link preview is signed over the fallback body a reader sees', async () => {
+    const signing = await import('./signing.js');
+    const { client, ws, verifyKey } = await makeSigningClient();
+    client.sendLinkPreview('#room', {
+      url: 'https://example.com/post',
+      title: 'A post',
+    });
+    const line = await waitForSent(ws, '+freeq.at/sig');
+    expect(tagOf(line, '+freeq.at/link-url')).toBe('https://example.com/post');
+
+    const canonical = await signing.messageCanonical({
+      from: 'did:plc:mutator',
+      msgid: tagOf(line, '+freeq.at/eventid')!,
+      target: '#room',
+      body: '🔗 A post (https://example.com/post)',
+    });
+    expect(await verifySig(canonical, tagOf(line, '+freeq.at/sig')!, verifyKey)).toBe(true);
+  });
+
+  it('media and link previews against a legacy server are byte-identical to before', async () => {
+    const { client, ws } = await makeRegistered();
+    client.signing.setSigningDid('did:plc:mutator');
+    await client.signing.generateSigningKey();
+    client.sendMedia('#room', { url: 'https://cdn.example/cat.png', mime: 'image/png' });
+    client.sendLinkPreview('#room', { url: 'https://example.com/post' });
+    await flushAsync();
+    expect(ws.sent).toEqual([
+      '@+freeq.at/media-url=https://cdn.example/cat.png;+freeq.at/media-mime=image/png ' +
+        'PRIVMSG #room :📎 https://cdn.example/cat.png',
+      '@+freeq.at/link-url=https://example.com/post PRIVMSG #room :🔗 https://example.com/post',
+    ]);
   });
 });

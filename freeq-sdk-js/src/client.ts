@@ -2770,7 +2770,9 @@ export class FreeqClient extends EventEmitter {
   }
 
   /** Send a media attachment (image/audio/video URL with metadata).
-   *  Server side stores the media tags; rich clients render the embed. */
+   *  Server side stores the media tags; rich clients render the embed.
+   *  Signs like any other message — the media tags are not covered fields,
+   *  so they ride outside the signed document. */
   sendMedia(
     target: string,
     media: { url: string; mime?: string; alt?: string; width?: number; height?: number; durationMs?: number; sizeBytes?: number; fallback?: string },
@@ -2783,10 +2785,10 @@ export class FreeqClient extends EventEmitter {
     if (media.durationMs !== undefined) tags['+freeq.at/media-duration'] = String(media.durationMs);
     if (media.sizeBytes !== undefined) tags['+freeq.at/media-size'] = String(media.sizeBytes);
     const body = media.fallback ?? `📎 ${media.url}`;
-    this.raw(format('PRIVMSG', [target, body], tags));
+    void this.signedPrivmsg(target, body, tags);
   }
 
-  /** Attach link-preview metadata to a message. */
+  /** Attach link-preview metadata to a message. Signed, same as media. */
   sendLinkPreview(
     target: string,
     preview: { url: string; title?: string; description?: string; imageUrl?: string },
@@ -2800,7 +2802,7 @@ export class FreeqClient extends EventEmitter {
       : preview.title
         ? `🔗 ${preview.title} (${preview.url})`
         : `🔗 ${preview.url}`;
-    this.raw(format('PRIVMSG', [target, fallback], tags));
+    void this.signedPrivmsg(target, fallback, tags);
   }
 
   /** Send a message and await the server-assigned msgid via echo-message.
