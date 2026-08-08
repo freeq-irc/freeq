@@ -130,10 +130,37 @@ pub const COORD_ID_TAG: &str = "+freeq.at/coordid";
 /// belongs to. Without a name of its own the pair travels joined by nothing,
 /// and a reader holding both halves cannot tell they are one event.
 ///
+/// The attachment fields are here for the same reason: a reader renders them
+/// — an image inline, a link's title and description on screen — so a value
+/// none of them covers is one a relay can change with the signature still
+/// checking out. [`stripped_name`] folds both spellings onto one key, so
+/// covering a field covers it however it was written; a client still writing
+/// the bare spelling signs a field its peers never receive, which is what the
+/// writers moving off it prevents.
+///
 /// Adding a name here costs nothing already signed: a document that does not
 /// carry the tag canonicalizes to exactly the bytes it did before.
-pub const COVERED_COORD_TAGS: [&str; 6] =
-    ["coordid", "event", "evidence-type", "payload", "ref", "task-id"];
+pub const COVERED_COORD_TAGS: [&str; 19] = [
+    "coordid",
+    "event",
+    "evidence-type",
+    "link-desc",
+    "link-image",
+    "link-title",
+    "link-url",
+    "media-alt",
+    "media-blurhash",
+    "media-duration",
+    "media-filename",
+    "media-h",
+    "media-mime",
+    "media-size",
+    "media-url",
+    "media-w",
+    "payload",
+    "ref",
+    "task-id",
+];
 
 const CLIENT_TAG_PREFIX: &str = "+freeq.at/";
 const TAG_PREFIX: &str = "freeq.at/";
@@ -637,6 +664,74 @@ mod tests {
             .with_coord([("+freeq.at/event", "task_request")])
             .canonical();
         assert!(!with_others.contains("coordid"), "{with_others}");
+    }
+
+    /// An attachment is rendered, so a signature has to cover what it says
+    /// about itself — and cover it under either spelling, since the two fold
+    /// onto one key.
+    #[test]
+    fn an_attachment_is_covered_however_it_was_spelled() {
+        let prefixed = ChatDoc::message(ALICE, MSGID, "#freeq", "📎 cat.png").with_coord([
+            ("+freeq.at/media-url", "https://cdn/cat.png"),
+            ("+freeq.at/media-mime", "image/png"),
+            ("+freeq.at/media-alt", "a cat"),
+        ]);
+        let bare = ChatDoc::message(ALICE, MSGID, "#freeq", "📎 cat.png").with_coord([
+            ("media-url", "https://cdn/cat.png"),
+            ("media-mime", "image/png"),
+            ("media-alt", "a cat"),
+        ]);
+        assert_eq!(
+            prefixed.canonical(),
+            bare.canonical(),
+            "a covered set a relay could dodge by rewriting the spelling covers nothing"
+        );
+        assert!(prefixed.canonical().contains(r#""media-url":"https://cdn/cat.png""#));
+
+        let key = test_key(1);
+        let sig = prefixed.sign(&key);
+        let repointed = ChatDoc::message(ALICE, MSGID, "#freeq", "📎 cat.png").with_coord([
+            ("+freeq.at/media-url", "https://cdn/dog.png"),
+            ("+freeq.at/media-mime", "image/png"),
+            ("+freeq.at/media-alt", "a cat"),
+        ]);
+        assert_eq!(
+            repointed.verify(&sig, &key.verifying_key()),
+            Err(SigError::Invalid)
+        );
+
+        let retitled = ChatDoc::message(ALICE, MSGID, "#freeq", "🔗 A post")
+            .with_coord([("+freeq.at/link-url", "https://example.com/post")]);
+        let sig = retitled.sign(&key);
+        let other = ChatDoc::message(ALICE, MSGID, "#freeq", "🔗 A post").with_coord([
+            ("+freeq.at/link-url", "https://example.com/post"),
+            ("+freeq.at/link-title", "Something else entirely"),
+        ]);
+        assert_eq!(
+            other.verify(&sig, &key.verifying_key()),
+            Err(SigError::Invalid),
+            "a title added in flight is a title the sender never wrote"
+        );
+    }
+
+    /// A field the sender left out is absent from the document, full stop.
+    /// A reader's default for a missing type is a rendering decision; putting
+    /// it in the signed bytes would have every other implementation rebuild
+    /// from the wire, find no such field, and call an honest message invalid.
+    #[test]
+    fn a_field_the_sender_omitted_is_not_in_the_document() {
+        let doc = ChatDoc::message(ALICE, MSGID, "#freeq", "📎 thing.bin")
+            .with_coord([("+freeq.at/media-url", "https://cdn/thing.bin")]);
+        let canonical = doc.canonical();
+        assert!(canonical.contains(r#""media-url""#), "{canonical}");
+        assert!(
+            !canonical.contains("media-mime"),
+            "no default may reach the signed bytes: {canonical}"
+        );
+        assert!(
+            !canonical.contains("octet-stream"),
+            "least of all a type nobody declared: {canonical}"
+        );
     }
 
     #[test]
@@ -1153,6 +1248,27 @@ mod tests {
                 }),
             },
             Case {
+                name: "message-with-an-attachment",
+                seed: 6,
+                doc: ChatDoc::message(ALICE, MSGID, "#freeq", "📎 https://cdn.example/cat.png")
+                    .with_coord([
+                        ("+freeq.at/media-url", "https://cdn.example/cat.png"),
+                        ("+freeq.at/media-mime", "image/png"),
+                        ("+freeq.at/media-alt", "a cat"),
+                        ("+freeq.at/media-w", "640"),
+                    ]),
+                input: json!({
+                    "kind": "message", "from": ALICE, "msgid": MSGID,
+                    "target": "#freeq", "bodyText": "📎 https://cdn.example/cat.png",
+                    "tags": {
+                        "+freeq.at/media-url": "https://cdn.example/cat.png",
+                        "+freeq.at/media-mime": "image/png",
+                        "+freeq.at/media-alt": "a cat",
+                        "+freeq.at/media-w": "640",
+                    },
+                }),
+            },
+            Case {
                 name: "coordination-evidence-attach",
                 seed: 5,
                 doc: ChatDoc::coordination(ALICE, MSGID, "#swarm", "evidence_attach")
@@ -1336,6 +1452,19 @@ mod tests {
                     .with_ref(ROOT)
                     .with_evidence("test_run"),
             ),
+            // Repointing an attachment changes what a reader is shown while
+            // every other byte of the message stays as written.
+            doc_negative(
+                "repointed-attachment-url",
+                "message-with-an-attachment",
+                ChatDoc::message(ALICE, MSGID, "#freeq", "📎 https://cdn.example/cat.png")
+                    .with_coord([
+                        ("+freeq.at/media-url", "https://cdn.example/dog.png"),
+                        ("+freeq.at/media-mime", "image/png"),
+                        ("+freeq.at/media-alt", "a cat"),
+                        ("+freeq.at/media-w", "640"),
+                    ]),
+            ),
             doc_negative(
                 "altered-coordination-payload",
                 "coordination-task-complete-with-ref",
@@ -1413,7 +1542,7 @@ mod tests {
             "bodyRule": "body = \"sha256:\" + lowercase hex of SHA-256 over the UTF-8 wire body — ciphertext under E2EE, and the assembled body (real newlines) for a draft/multiline batch.",
             "payloadRule": "payload = \"sha256:\" + lowercase hex of SHA-256 over the UTF-8 wire value of +freeq.at/payload, IRC-unescaped and otherwise verbatim — any app-level encoding inside it is opaque bytes to the signature.",
             "venueRule": "target is the normalized venue, never the wire target: a channel lowercased, or `dm:<did_a>,<did_b>` with the two DIDs sorted ascending.",
-            "coordRule": "coord covers exactly the client-authored coordination tags coordid, event, evidence-type, payload, ref, task-id (canonical keys; wire names carry a +freeq.at/ prefix), IRC-unescaped, verbatim. coordid is how the companion message of a coordination event names that event; the event's own TAGMSG carries its id in +freeq.at/eventid instead. Every other tag — server stamps, tallies, verdicts, provenance, ephemera, framing — is excluded.",
+            "coordRule": "coord covers exactly the client-authored coordination and attachment tags coordid, event, evidence-type, link-desc, link-image, link-title, link-url, media-alt, media-blurhash, media-duration, media-filename, media-h, media-mime, media-size, media-url, media-w, payload, ref, task-id (canonical keys; wire names carry a +freeq.at/ prefix), IRC-unescaped, verbatim. coordid is how the companion message of a coordination event names that event; the event's own TAGMSG carries its id in +freeq.at/eventid instead. Every other tag — server stamps, tallies, verdicts, provenance, ephemera, framing — is excluded.",
             "referenceRule": "edit, reply and subject always name root msgids. A signed event naming a revision is refused, never rewritten.",
             "kidRule": "base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16])",
             "sigTagFormat": "ed25519:<kid>:<base64url-nopad signature over the UTF-8 canonical bytes>",

@@ -1981,11 +1981,20 @@ describe('signed mutations', () => {
     expect(tagOf(line, '+freeq.at/media-alt')).toBe('a\\scat');
     expect(tagOf(line, '+freeq.at/media-w')).toBe('640');
 
+    // The media tags are inside the document now: they are rendered, so a
+    // signature that skipped them left a relay free to change what the
+    // reader sees.
     const canonical = await signing.messageCanonical({
       from: 'did:plc:mutator',
       msgid: tagOf(line, '+freeq.at/eventid')!,
       target: '#room',
       body: '📎 https://cdn.example/cat.png',
+      tags: {
+        '+freeq.at/media-url': 'https://cdn.example/cat.png',
+        '+freeq.at/media-mime': 'image/png',
+        '+freeq.at/media-alt': 'a cat',
+        '+freeq.at/media-w': '640',
+      },
     });
     expect(await verifySig(canonical, tagOf(line, '+freeq.at/sig')!, verifyKey)).toBe(true);
   });
@@ -2005,6 +2014,10 @@ describe('signed mutations', () => {
       msgid: tagOf(line, '+freeq.at/eventid')!,
       target: '#room',
       body: '🔗 A post (https://example.com/post)',
+      tags: {
+        '+freeq.at/link-url': 'https://example.com/post',
+        '+freeq.at/link-title': 'A post',
+      },
     });
     expect(await verifySig(canonical, tagOf(line, '+freeq.at/sig')!, verifyKey)).toBe(true);
   });
@@ -2248,6 +2261,95 @@ describe('signed mutations', () => {
       },
     });
     expect(await verifySig(companionDoc, tagOf(privmsg, '+freeq.at/sig')!, verifyKey)).toBe(true);
+  });
+
+  // An attachment is rendered — an image inline, a link's title and
+  // description on screen — so a value no signature covers is one a relay can
+  // change with the message still verifying.
+  it('covers what an attachment says about itself', async () => {
+    const signing = await import('./signing.js');
+    const { client, ws, verifyKey } = await makeSigningClient();
+    client.sendMedia('#room', {
+      url: 'https://cdn.example/cat.png',
+      mime: 'image/png',
+      alt: 'a cat',
+    });
+    const line = await waitForSent(ws, '+freeq.at/sig');
+    const tags = {
+      '+freeq.at/media-url': 'https://cdn.example/cat.png',
+      '+freeq.at/media-mime': 'image/png',
+      '+freeq.at/media-alt': 'a cat',
+    };
+    const canonical = await signing.messageCanonical({
+      from: 'did:plc:mutator',
+      msgid: tagOf(line, '+freeq.at/eventid')!,
+      target: '#room',
+      body: '📎 https://cdn.example/cat.png',
+      tags,
+    });
+    const sig = tagOf(line, '+freeq.at/sig')!;
+    expect(await verifySig(canonical, sig, verifyKey)).toBe(true);
+
+    // Repointed at another file, relabelled, or retyped: each is a different
+    // claim about what was attached.
+    for (const swap of [
+      { '+freeq.at/media-url': 'https://cdn.example/dog.png' },
+      { '+freeq.at/media-alt': 'a dog' },
+      { '+freeq.at/media-mime': 'text/plain' },
+    ]) {
+      const tampered = await signing.messageCanonical({
+        from: 'did:plc:mutator',
+        msgid: tagOf(line, '+freeq.at/eventid')!,
+        target: '#room',
+        body: '📎 https://cdn.example/cat.png',
+        tags: { ...tags, ...swap },
+      });
+      expect(await verifySig(tampered, sig, verifyKey), JSON.stringify(swap)).toBe(false);
+    }
+  });
+
+  it('covers a link preview title, and signs no field the sender left out', async () => {
+    const signing = await import('./signing.js');
+    const { client, ws, verifyKey } = await makeSigningClient();
+    client.sendLinkPreview('#room', { url: 'https://example.com/post', title: 'A post' });
+    const line = await waitForSent(ws, '+freeq.at/sig');
+    const body = '🔗 A post (https://example.com/post)';
+    const tags = {
+      '+freeq.at/link-url': 'https://example.com/post',
+      '+freeq.at/link-title': 'A post',
+    };
+    const canonical = await signing.messageCanonical({
+      from: 'did:plc:mutator',
+      msgid: tagOf(line, '+freeq.at/eventid')!,
+      target: '#room',
+      body,
+      tags,
+    });
+    const sig = tagOf(line, '+freeq.at/sig')!;
+    expect(await verifySig(canonical, sig, verifyKey)).toBe(true);
+
+    const retitled = await signing.messageCanonical({
+      from: 'did:plc:mutator',
+      msgid: tagOf(line, '+freeq.at/eventid')!,
+      target: '#room',
+      body,
+      tags: { ...tags, '+freeq.at/link-title': 'Something else entirely' },
+    });
+    expect(await verifySig(retitled, sig, verifyKey)).toBe(false);
+
+    // A field the sender never sent is not in the document. A reader's
+    // default for an absent type is a rendering decision; putting it in the
+    // signed bytes would have every other implementation rebuild a document
+    // the sender never signed.
+    const noMime = await signing.messageCanonical({
+      from: 'did:plc:mutator',
+      msgid: 'M0',
+      target: '#room',
+      body: 'x',
+      tags: { '+freeq.at/media-url': 'https://cdn.example/thing.bin' },
+    });
+    expect(noMime).not.toContain('media-mime');
+    expect(noMime).toContain('"media-url"');
   });
 
   it('an emitted event against a legacy server is byte-identical to before', async () => {

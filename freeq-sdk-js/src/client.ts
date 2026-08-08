@@ -2908,8 +2908,9 @@ export class FreeqClient extends EventEmitter {
 
   /** Send a media attachment (image/audio/video URL with metadata).
    *  Server side stores the media tags; rich clients render the embed.
-   *  Signs like any other message — the media tags are not covered fields,
-   *  so they ride outside the signed document. */
+   *  Signs like any other message, and the media tags are inside the
+   *  document: a reader renders them, so a signature that skipped them would
+   *  leave a relay free to change what the reader sees. */
   sendMedia(
     target: string,
     media: { url: string; mime?: string; alt?: string; width?: number; height?: number; durationMs?: number; sizeBytes?: number; fallback?: string },
@@ -2925,7 +2926,8 @@ export class FreeqClient extends EventEmitter {
     void this.signedPrivmsg(target, body, tags);
   }
 
-  /** Attach link-preview metadata to a message. Signed, same as media. */
+  /** Attach link-preview metadata to a message. Signed, same as media, with
+   *  the preview's fields covered for the same reason. */
   sendLinkPreview(
     target: string,
     preview: { url: string; title?: string; description?: string; imageUrl?: string },

@@ -41,6 +41,12 @@ export const COORD_ID_TAG = '+freeq.at/coordid';
  * a name of its own the pair travels joined by nothing, and a reader holding
  * both halves cannot tell they are one event.
  *
+ * The attachment fields are here for the same reason `coordid` is: a reader
+ * renders them — an image, a link's title and description — so a value none
+ * of them covers is one a relay can change while the signature still checks
+ * out. Both spellings fold onto one key (see the stripped-name rule), so
+ * covering a field covers it however it was written.
+ *
  * Adding a name here costs nothing already signed: a document that does not
  * carry the tag canonicalizes to exactly the bytes it did before.
  */
@@ -48,6 +54,19 @@ export const COVERED_COORD_TAGS = [
   'coordid',
   'event',
   'evidence-type',
+  'link-desc',
+  'link-image',
+  'link-title',
+  'link-url',
+  'media-alt',
+  'media-blurhash',
+  'media-duration',
+  'media-filename',
+  'media-h',
+  'media-mime',
+  'media-size',
+  'media-url',
+  'media-w',
   'payload',
   'ref',
   'task-id',
