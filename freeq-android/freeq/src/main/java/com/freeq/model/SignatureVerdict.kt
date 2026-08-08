@@ -13,12 +13,17 @@ import org.json.JSONObject
  * down, proxy fault, server error — which is a fact about the network and not
  * a verdict about the message.
  */
-enum class VerifyOutcome { DEVICE, SERVER, UNVERIFIABLE, INVALID, UNREACHABLE }
+enum class VerifyOutcome { DEVICE, SERVER, UNSIGNED, UNVERIFIABLE, INVALID, UNREACHABLE }
 
 /** How loudly a verdict is allowed to speak. Green only after the server
  *  answered valid; red only after it answered invalid; everything else is a
  *  quiet statement of fact. */
 enum class VerdictTone { GOOD, BAD, QUIET }
+
+/** One answer in two parts: what it is, and what it means for the reader.
+ *  Every client carries the same pair for the same state; how they are laid
+ *  out on a given surface is that surface's business. */
+data class VerdictCopy(val heading: String, val line: String)
 
 /**
  * A checked answer, with the one distinction inside `UNVERIFIABLE` that
@@ -83,10 +88,16 @@ object SignatureVerdict {
                 else VerifyOutcome.SERVER
             )
             "invalid" -> VerifyAnswer(VerifyOutcome.INVALID)
-            else -> VerifyAnswer(
-                VerifyOutcome.UNVERIFIABLE,
-                transient = verifiedBy == "unverifiable-unknown-key",
-            )
+            // The server names its reason, and "nobody signed it" is a
+            // different fact from "I couldn't check it" — a guest's message is
+            // not a failed check.
+            else -> when (verifiedBy) {
+                "unsigned" -> VerifyAnswer(VerifyOutcome.UNSIGNED)
+                else -> VerifyAnswer(
+                    VerifyOutcome.UNVERIFIABLE,
+                    transient = verifiedBy == "unverifiable-unknown-key",
+                )
+            }
         }
     }
 
@@ -94,20 +105,71 @@ object SignatureVerdict {
         VerifyOutcome.DEVICE -> VerdictTone.GOOD
         VerifyOutcome.INVALID -> VerdictTone.BAD
         // A server vouch is quiet like every other not-proven state.
-        VerifyOutcome.SERVER, VerifyOutcome.UNVERIFIABLE, VerifyOutcome.UNREACHABLE -> VerdictTone.QUIET
+        VerifyOutcome.SERVER, VerifyOutcome.UNSIGNED,
+        VerifyOutcome.UNVERIFIABLE, VerifyOutcome.UNREACHABLE -> VerdictTone.QUIET
     }
 
-    /** What the verdict says, in the sheet. */
-    fun label(answer: VerifyAnswer): String = when (answer.outcome) {
-        VerifyOutcome.DEVICE -> "Verified — signed on the sender's device."
-        VerifyOutcome.SERVER -> "Valid server signature — the server vouches for what it received; the sender's own key did not sign it."
-        VerifyOutcome.INVALID -> "Does not match its signing key — treat with suspicion."
+    /**
+     * What the answer is, and what it means for the person reading it.
+     *
+     * The reader is asking one question — who vouches for this message — so
+     * the heading answers it and the line says what that means for them.
+     * Every client says these same words for these same states; they were
+     * agreed line by line and are not to be paraphrased per platform.
+     *
+     * @param retrying whether the caller is still going to ask again. The
+     *   fetching-a-key answer holds only while that is true: a panel that
+     *   promises it is still checking after it has stopped is lying, so once
+     *   the retries are gone this decays into the plain can't-check.
+     */
+    fun copy(answer: VerifyAnswer, retrying: Boolean = false): VerdictCopy = when (answer.outcome) {
+        VerifyOutcome.DEVICE -> VerdictCopy(
+            "Verified",
+            "Signed on the sender's device.",
+        )
+        VerifyOutcome.SERVER -> VerdictCopy(
+            "Server Signed",
+            "The server confirms it arrived from the sender's account, but they didn't " +
+                "sign it themselves — so you're taking the server's word for it.",
+        )
+        VerifyOutcome.UNSIGNED -> UNSIGNED
+        VerifyOutcome.INVALID -> VerdictCopy(
+            "Signature Invalid",
+            "This message is signed, but the signature doesn't check out. Treat it with suspicion.",
+        )
         VerifyOutcome.UNVERIFIABLE ->
-            if (answer.transient) "Fetching the signer's key — checking again shortly."
-            else "Could not be checked — the server doesn't have what it needs to verify this one."
-        VerifyOutcome.UNREACHABLE ->
-            "The check didn't go through — nothing was determined. Close and try again."
+            if (answer.transient && retrying) CHECKING
+            else VerdictCopy(
+                "Signature Not Supported",
+                "The server can't check this signature — usually an older message, " +
+                    "sometimes a newer app.",
+            )
+        VerifyOutcome.UNREACHABLE -> VerdictCopy(
+            "Unable to Verify",
+            "The app couldn't reach the server, so this signature hasn't been checked yet.",
+        )
     }
+
+    /**
+     * A message nobody signed. Not a failed check and not a doubt about the
+     * sender — there is simply nothing to check, and asking the server would
+     * only produce a can't-check that reads like a fault.
+     */
+    val UNSIGNED = VerdictCopy(
+        "Unsigned",
+        "Nothing was signed — there is no signature to check. Typical for guest accounts " +
+            "and messages from legacy servers.",
+    )
+
+    /**
+     * The one can't-check a retry can outrun: the key belongs to someone on
+     * another server, and answering the request is what starts the fetch.
+     */
+    val CHECKING = VerdictCopy(
+        "Verification in Progress",
+        "The sender's key is on another server. We're fetching it now — this will " +
+            "answer in a moment.",
+    )
 
     /** A settled answer is the same every time it is asked; a transient or
      *  failed one deserves a fresh try. */

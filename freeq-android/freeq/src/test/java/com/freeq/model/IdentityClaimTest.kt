@@ -46,6 +46,17 @@ class IdentityClaimTest {
         assertEquals(IdentityClaim.NONE, SenderIdentity.claim("   ", null))
     }
 
+    @Test fun anyone_we_can_name_is_not_unidentified() {
+        // A bot signing with a self-issued key has no handle and no display
+        // name, and calling it "Unidentified sender" over its own nick is a
+        // claim about it that isn't true.
+        assertEquals("unreactproof", SenderIdentity.title(null, null, "unreactproof"))
+        assertEquals("@alice.bsky.social", SenderIdentity.title(null, "alice.bsky.social", "alice"))
+        assertEquals("Alice", SenderIdentity.title("Alice", "alice.bsky.social", "alice"))
+        assertEquals("Unidentified sender", SenderIdentity.title(null, null, null))
+        assertEquals("Unidentified sender", SenderIdentity.title("", "", ""))
+    }
+
     @Test fun only_an_at_protocol_identity_earns_the_mark() {
         // The mark is the claim, so it appears exactly where the claim holds.
         assertEquals(true, SenderIdentity.claim("did:plc:abc", null).showsMark)

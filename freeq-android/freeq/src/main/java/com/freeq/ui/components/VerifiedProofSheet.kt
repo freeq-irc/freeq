@@ -42,6 +42,7 @@ sealed interface ProofRequest {
      *  with. Says nothing about any particular message. */
     data class Identity(
         val did: String?,
+        val nick: String? = null,
         val handle: String? = null,
         val displayName: String? = null,
         /** Set when we only know this person through a relaying peer. */
@@ -50,7 +51,13 @@ sealed interface ProofRequest {
 
     /** Whether this one message's signature holds up. Says nothing about who
      *  the sender is — that question has its own surface. */
-    data class Message(val msgId: String) : ProofRequest
+    data class Message(
+        val msgId: String,
+        /** A signature was on the wire. Without one there is nothing to ask
+         *  the server, and asking anyway returns a can't-check that reads
+         *  like a fault where there is none. */
+        val signed: Boolean,
+    ) : ProofRequest
 }
 
 /**
@@ -80,7 +87,7 @@ fun VerifiedProofSheet(
         ) {
             when (request) {
                 is ProofRequest.Identity -> IdentityProof(request)
-                is ProofRequest.Message -> MessageProof(request.msgId)
+                is ProofRequest.Message -> MessageProof(request.msgId, request.signed)
             }
         }
     }
@@ -109,7 +116,7 @@ private fun IdentityProof(request: ProofRequest.Identity) {
         keyLoading = false
     }
 
-    val name = request.displayName ?: request.handle?.let { "@$it" }
+    val name = SenderIdentity.title(request.displayName, request.handle, request.nick)
 
     if (claim == IdentityClaim.AT_PROTOCOL) {
         Icon(
@@ -124,7 +131,7 @@ private fun IdentityProof(request: ProofRequest.Identity) {
     }
 
     Text(
-        text = name ?: "Unidentified sender",
+        text = name,
         fontSize = 20.sp,
         fontWeight = FontWeight.Bold,
         color = MaterialTheme.colorScheme.onSurface,
@@ -203,40 +210,83 @@ private fun IdentityProof(request: ProofRequest.Identity) {
  * this client knows perfectly well is neither claimed nor disowned.
  */
 @Composable
-private fun MessageProof(msgId: String) {
+private fun MessageProof(msgId: String, signed: Boolean) {
     var verify by remember { mutableStateOf<VerifyAnswer?>(null) }
-    var verifying by remember { mutableStateOf(true) }
+    var retrying by remember { mutableStateOf(false) }
 
     LaunchedEffect(msgId) {
-        verifying = true
+        if (!signed) return@LaunchedEffect
         var answer = VerificationService.verifyMessage(msgId)
         // The server starts fetching the signer's key by answering, so this
-        // one flavour of can't-check is worth waiting out — briefly.
+        // one flavour of can't-check is worth waiting out — briefly. It reads
+        // as in-progress only while we are actually going to ask again; after
+        // that it is an ordinary can't-check.
         var attempts = 0
         while (answer.transient && attempts < 2) {
             attempts++
+            retrying = true
+            verify = answer
             delay(1200)
             answer = VerificationService.verifyMessage(msgId)
         }
+        retrying = false
         verify = answer
-        verifying = false
     }
 
+    val answer = verify
+    val quiet = MaterialTheme.colorScheme.onSurfaceVariant
+    val copy = when {
+        !signed -> SignatureVerdict.UNSIGNED
+        answer == null -> null
+        else -> SignatureVerdict.copy(answer, retrying)
+    }
+    val tint = when {
+        answer == null || retrying -> quiet
+        else -> when (SignatureVerdict.tone(answer.outcome)) {
+            VerdictTone.GOOD -> FreeqColors.success
+            VerdictTone.BAD -> FreeqColors.danger
+            VerdictTone.QUIET -> quiet
+        }
+    }
+
+    // The same shape the identity side uses, so the two read as one family:
+    // the glyph carries the answer, the heading names it, one line says what
+    // it means.
+    if (signed && (answer == null || retrying)) {
+        CircularProgressIndicator(
+            modifier = Modifier.size(48.dp),
+            strokeWidth = 4.dp,
+            color = quiet,
+        )
+    } else {
+        Icon(
+            when {
+                !signed -> Icons.Default.Info
+                answer?.outcome == VerifyOutcome.DEVICE -> Icons.Default.CheckCircle
+                answer?.outcome == VerifyOutcome.INVALID -> Icons.Default.Warning
+                else -> Icons.Default.Info
+            },
+            contentDescription = null,
+            tint = tint,
+            modifier = Modifier.size(64.dp),
+        )
+    }
     Spacer(Modifier.height(12.dp))
     Text(
-        text = "This message",
+        text = copy?.heading ?: "Checking signature…",
         fontSize = 20.sp,
         fontWeight = FontWeight.Bold,
         color = MaterialTheme.colorScheme.onSurface,
     )
+    if (copy != null) {
+        Spacer(Modifier.height(16.dp))
+        Text(
+            text = copy.line,
+            fontSize = 14.sp,
+            color = tint,
+        )
+    }
     Spacer(Modifier.height(8.dp))
-    Text(
-        text = "Whether this one message carries a signature that checks out.",
-        fontSize = 14.sp,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-    )
-    Spacer(Modifier.height(16.dp))
-    MessageVerdict(verifying = verifying, verify = verify)
 }
 
 @Composable
@@ -297,65 +347,6 @@ private fun ProofCard(
                     text = detail,
                     fontSize = 11.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
-    }
-}
-
-/**
- * The checked result for a specific message.
- *
- * Each verdict wears its own weight: green once the server confirmed the
- * signature, red once it found the key and the signature didn't match it, and
- * a plain grey statement for everything it could not determine — including a
- * message nobody signed, which is a fact about a guest and not a complaint.
- */
-@Composable
-private fun MessageVerdict(verifying: Boolean, verify: VerifyAnswer?) {
-    Surface(
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-        shape = RoundedCornerShape(14.dp),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Row(
-            modifier = Modifier.padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            if (verifying || verify == null) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(16.dp),
-                    strokeWidth = 2.dp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    text = "Checking this message's signature…",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            } else {
-                val quiet = MaterialTheme.colorScheme.onSurfaceVariant
-                val tint = when (SignatureVerdict.tone(verify.outcome)) {
-                    VerdictTone.GOOD -> FreeqColors.success
-                    VerdictTone.BAD -> FreeqColors.danger
-                    VerdictTone.QUIET -> quiet
-                }
-                Icon(
-                    when (verify.outcome) {
-                        VerifyOutcome.DEVICE -> Icons.Default.CheckCircle
-                        VerifyOutcome.INVALID -> Icons.Default.Warning
-                        else -> Icons.Default.Info
-                    },
-                    contentDescription = null,
-                    tint = tint,
-                    modifier = Modifier.size(18.dp),
-                )
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    text = SignatureVerdict.label(verify),
-                    fontSize = 12.sp,
-                    color = if (verify.isVerified) MaterialTheme.colorScheme.onSurface else tint,
                 )
             }
         }

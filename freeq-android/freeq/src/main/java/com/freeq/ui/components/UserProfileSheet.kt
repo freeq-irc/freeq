@@ -374,6 +374,7 @@ fun UserProfileSheet(
         VerifiedProofSheet(
             request = ProofRequest.Identity(
                 did = resolvedDid,
+                nick = nick,
                 handle = profile?.handle,
                 displayName = profile?.displayName?.takeIf { it.isNotEmpty() },
                 origin = origin

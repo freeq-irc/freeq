@@ -96,12 +96,51 @@ class SignatureVerdictTest {
         assertEquals(VerdictTone.QUIET, SignatureVerdict.tone(VerifyOutcome.UNREACHABLE))
     }
 
-    @Test fun a_server_vouch_never_wears_the_verified_headline() {
-        val device = SignatureVerdict.label(VerifyAnswer(VerifyOutcome.DEVICE))
-        val server = SignatureVerdict.label(VerifyAnswer(VerifyOutcome.SERVER))
-        assertTrue(device.startsWith("Verified"))
-        assertFalse(server.startsWith("Verified"))
-        assertTrue(server.contains("vouches"))
+    @Test fun a_server_vouch_says_the_sender_did_not_sign_it() {
+        val device = SignatureVerdict.copy(VerifyAnswer(VerifyOutcome.DEVICE))
+        val server = SignatureVerdict.copy(VerifyAnswer(VerifyOutcome.SERVER))
+        // Each says what it means for the reader, and the server's answer
+        // never lets itself be read as proof from the sender.
+        assertEquals("Verified", device.heading)
+        assertFalse(server.heading.contains("Verified"))
+        assertTrue(server.line.contains("didn't sign it themselves"))
+    }
+
+    @Test fun every_answer_says_what_it_is_and_what_it_means() {
+        val all = VerifyOutcome.values().map { SignatureVerdict.copy(VerifyAnswer(it)) } +
+            SignatureVerdict.CHECKING
+        for (c in all) {
+            assertTrue(c.heading.isNotBlank())
+            assertTrue(c.line.isNotBlank())
+            // The heading is the answer, not a restatement of the line.
+            assertFalse(c.heading == c.line)
+        }
+    }
+
+    @Test fun an_unsigned_message_is_not_a_failed_check() {
+        // The server distinguishes these; so must we. A guest's message is not
+        // a check that failed, and saying "could not be checked" over it reads
+        // as a fault where there is none.
+        val a = answer(200, """{"verification":{"verdict":"unverifiable","verified_by":"unsigned"}}""")
+        assertEquals(VerifyOutcome.UNSIGNED, a.outcome)
+        assertEquals(VerdictTone.QUIET, SignatureVerdict.tone(a.outcome))
+        assertEquals("Unsigned", SignatureVerdict.copy(a).heading)
+        assertFalse(SignatureVerdict.copy(a).line.contains("can't check"))
+    }
+
+    @Test fun the_fetching_answer_decays_once_we_stop_asking() {
+        // A panel that promises it is still checking after it has given up is
+        // lying. While we will ask again it reads as in progress; after that
+        // it is an ordinary can't-check.
+        val a = VerifyAnswer(VerifyOutcome.UNVERIFIABLE, transient = true)
+        assertEquals("Verification in Progress", SignatureVerdict.copy(a, retrying = true).heading)
+        assertEquals("Signature Not Supported", SignatureVerdict.copy(a, retrying = false).heading)
+    }
+
+    @Test fun a_missing_key_is_still_a_cant_check_not_an_unsigned_message() {
+        val a = answer(200, """{"verification":{"verdict":"unverifiable","verified_by":"unverifiable-unknown-key"}}""")
+        assertEquals(VerifyOutcome.UNVERIFIABLE, a.outcome)
+        assertTrue(a.transient)
     }
 
     @Test fun only_a_mismatch_marks_the_message_row() {

@@ -38,6 +38,17 @@ object SenderIdentity {
      * @param origin the peer that relayed this, when we did not see it first
      *   hand. Anything relayed is peer-vouched and claims nothing here.
      */
+    /**
+     * What to call this person on a surface about them. Anyone we can name is
+     * named: "Unidentified sender" is for having nothing at all, not for a bot
+     * whose self-issued key comes with no handle to resolve.
+     */
+    fun title(displayName: String?, handle: String?, nick: String?): String =
+        displayName?.takeIf { it.isNotBlank() }
+            ?: handle?.takeIf { it.isNotBlank() }?.let { "@$it" }
+            ?: nick?.takeIf { it.isNotBlank() }
+            ?: "Unidentified sender"
+
     fun claim(did: String?, origin: String?): IdentityClaim = when {
         origin != null -> IdentityClaim.NONE
         did.isNullOrBlank() -> IdentityClaim.NONE

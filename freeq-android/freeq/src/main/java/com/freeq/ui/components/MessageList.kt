@@ -859,7 +859,7 @@ private fun MessageBubble(
         // neither claims nor disowns an identity.
         if (showMessageProof) {
             VerifiedProofSheet(
-                request = ProofRequest.Message(msg.id),
+                request = ProofRequest.Message(msg.id, signed = msg.isSigned),
                 onDismiss = { showMessageProof = false }
             )
         }
