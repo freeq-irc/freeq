@@ -112,16 +112,71 @@ export async function verifySignature(msgid: string): Promise<VerifyAnswer> {
   }
 }
 
-/** How a checked message describes itself, and the colour it wears.
- *  Green means the SENDER proved it — a server signature is the server
- *  vouching for what it received, which is a fact worth stating and not a
- *  verification of the sender, so it stays quiet (ruled 2026-08-07: valid
- *  is not verified). Red only after a mismatch; every can't-know is quiet —
- *  a fact, never a warning. */
-export const VERIFY_LABELS: Record<VerifyOutcome, { text: string; tone: string }> = {
-  device: { text: 'Verified — signed on the sender’s device', tone: 'text-success' },
-  server: { text: 'Valid server signature — the server vouches for what it received; the sender’s own key did not sign it', tone: 'text-fg-muted' },
-  unverifiable: { text: 'Could not be checked — the server doesn’t have what it needs to verify this one', tone: 'text-fg-muted' },
-  invalid: { text: 'Does not match its signing key — treat with suspicion', tone: 'text-danger' },
-  unreachable: { text: 'The check didn’t go through — nothing was determined. Close and try again.', tone: 'text-fg-muted' },
+/** One answer: what it is, what it means for the reader, and the colour it
+ *  wears. The reader is asking a single question — who vouches for this
+ *  message — so the heading answers it and the line says what that means for
+ *  them. Every client says these same words for these same states; they were
+ *  agreed line by line and are not to be paraphrased or "improved" per
+ *  platform. Green means the SENDER proved it: a server signature is the
+ *  server vouching for what it received, a fact worth stating and not a
+ *  verification of the sender, so it stays quiet (ruled 2026-08-07: valid is
+ *  not verified). Red only after a mismatch; every can't-know is quiet — a
+ *  fact, never a warning. */
+export interface VerdictCopy {
+  heading: string;
+  line: string;
+  tone: string;
+}
+
+export const VERIFY_LABELS: Record<VerifyOutcome, VerdictCopy> = {
+  device: {
+    heading: 'Verified',
+    line: 'Signed on the sender’s device.',
+    tone: 'text-success',
+  },
+  server: {
+    heading: 'Server Signed',
+    line: 'The server confirms it arrived from the sender’s account, but they didn’t sign it themselves — so you’re taking the server’s word for it.',
+    tone: 'text-fg-muted',
+  },
+  unverifiable: {
+    heading: 'Signature Not Supported',
+    line: 'The server can’t check this signature — usually an older message, sometimes a newer app.',
+    tone: 'text-fg-muted',
+  },
+  invalid: {
+    heading: 'Signature Invalid',
+    line: 'This message is signed, but the signature doesn’t check out. Treat it with suspicion.',
+    tone: 'text-danger',
+  },
+  unreachable: {
+    heading: 'Unable to Verify',
+    line: 'The app couldn’t reach the server, so this signature hasn’t been checked yet.',
+    tone: 'text-fg-muted',
+  },
+};
+
+/** Nothing was signed, so there is nothing to ask the server about. Not a
+ *  failed check — asking anyway would return a can't-check that reads like a
+ *  fault where there is none. */
+export function unsignedCopy(noun: 'message' | 'event' = 'message'): VerdictCopy {
+  return {
+    heading: 'Unsigned',
+    line:
+      noun === 'event'
+        ? 'Nothing was signed — there is no signature to check. Typical for events emitted before event signing.'
+        : 'Nothing was signed — there is no signature to check. Typical for guest accounts and messages from legacy servers.',
+    tone: 'text-fg-muted',
+  };
+}
+
+/** The one can't-check a retry can outrun: the key belongs to someone on
+ *  another server and answering the request is what starts the fetch. Shown
+ *  only while retries remain — once they run out this state decays into
+ *  `unverifiable`, because a panel that promises it is still checking after
+ *  it has stopped is lying. */
+export const CHECKING_COPY: VerdictCopy = {
+  heading: 'Verification in Progress',
+  line: 'The sender’s key is on another server. We’re fetching it now — this will answer in a moment.',
+  tone: 'text-fg-muted',
 };

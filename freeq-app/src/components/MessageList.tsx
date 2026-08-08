@@ -944,7 +944,7 @@ function InvalidSigMark() {
     <span
       data-testid="sig-invalid-mark"
       className="text-danger text-xs cursor-default"
-      title={VERIFY_LABELS.invalid.text}
+      title={VERIFY_LABELS.invalid.line}
     >
       ⚠
     </span>

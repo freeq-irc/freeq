@@ -1,5 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
-import { verifySignature, VERIFY_LABELS, type VerifyAnswer } from '../lib/verify-signature';
+import {
+  verifySignature,
+  VERIFY_LABELS,
+  CHECKING_COPY,
+  unsignedCopy,
+  type VerdictCopy,
+  type VerifyAnswer,
+} from '../lib/verify-signature';
 
 interface Props {
   msgid: string;
@@ -68,8 +75,20 @@ export function VerifySignaturePanel({ msgid, signed, position, onClose, noun = 
   }, [msgid, signed]);
 
   const outcome = answer?.outcome ?? null;
-  const headerTone = signed && outcome ? VERIFY_LABELS[outcome].tone : 'text-fg-muted';
   const stillFetchingKey = !checking && answer?.transient && retriesLeft.current > 0;
+
+  // Which of the seven answers this panel is showing. Nothing signed is its
+  // own answer, not a failed check; the fetching-a-key answer holds only
+  // while we will actually re-ask, and decays into the plain can't-check once
+  // the retries are gone — a panel still promising to check after it stopped
+  // would be lying.
+  const copy: VerdictCopy | null = !signed
+    ? unsignedCopy(noun)
+    : stillFetchingKey
+      ? CHECKING_COPY
+      : outcome
+        ? VERIFY_LABELS[outcome]
+        : null;
 
   const style: React.CSSProperties = {
     position: 'fixed',
@@ -88,37 +107,22 @@ export function VerifySignaturePanel({ msgid, signed, position, onClose, noun = 
       className="bg-bg-secondary border border-border rounded-xl shadow-2xl p-3 animate-fadeIn"
       onClick={(e) => e.stopPropagation()}
     >
-      <div className={`text-xs font-semibold mb-1 ${headerTone}`}>
-        {signed
-          ? (noun === 'event' ? 'Event Signature' : 'Message Signature')
-          : (noun === 'event' ? 'Unsigned Event' : 'Unsigned Message')}
+      <div className={`text-xs font-semibold mb-1 ${copy?.tone ?? 'text-fg-muted'}`}>
+        {copy ? copy.heading : 'Checking signature…'}
       </div>
 
       {signed && (checking || stillFetchingKey) && (
-        <div className="text-[11px] text-fg-dim flex items-center gap-1.5 mb-1">
-          <svg className="animate-spin w-3 h-3 shrink-0" viewBox="0 0 24 24">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-          </svg>
-          {answer?.transient
-            ? 'This server doesn’t hold the signer’s key yet — it’s fetching it from the origin server now, and this panel re-checks by itself…'
-            : 'Checking signature…'}
-        </div>
+        <svg className="animate-spin w-3 h-3 shrink-0 text-fg-dim mb-1" viewBox="0 0 24 24">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+        </svg>
       )}
 
-      {signed && !checking && !stillFetchingKey && outcome && (
-        <div className={`text-[11px] font-medium mb-1 ${VERIFY_LABELS[outcome].tone}`}>
-          {outcome === 'device' && '✓ '}
-          {outcome === 'invalid' && '⚠ '}
-          {VERIFY_LABELS[outcome].text}
-        </div>
-      )}
-
-      {!signed && (
-        <p className="text-[11px] text-fg-muted leading-relaxed">
-          {noun === 'event'
-            ? 'Nothing was signed — there is no signature to check. Typical for events emitted before event signing.'
-            : 'Nothing was signed — there is no signature to check. Typical for guest accounts and messages from legacy servers.'}
+      {copy && (
+        <p className={`text-[11px] leading-relaxed mb-1 ${copy.tone}`}>
+          {outcome === 'device' && signed && !stillFetchingKey && '✓ '}
+          {outcome === 'invalid' && signed && !stillFetchingKey && '⚠ '}
+          {copy.line}
         </p>
       )}
 

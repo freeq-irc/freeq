@@ -8,6 +8,8 @@ import {
   subscribeVerdicts,
   __resetVerifyCacheForTests,
   VERIFY_LABELS,
+  CHECKING_COPY,
+  unsignedCopy,
   type VerifyOutcome,
 } from './verify-signature';
 
@@ -149,9 +151,36 @@ describe('the one retryable flavour of can’t-check', () => {
 describe('valid is not verified (ruled 2026-08-07)', () => {
   it('sender proof wears green; a server vouch stays quiet and never claims "Verified"', () => {
     expect(VERIFY_LABELS.device.tone).toBe('text-success');
-    expect(VERIFY_LABELS.device.text).toMatch(/^Verified/);
+    expect(VERIFY_LABELS.device.heading).toBe('Verified');
     expect(VERIFY_LABELS.server.tone).toBe('text-fg-muted');
-    expect(VERIFY_LABELS.server.text).not.toMatch(/^Verified/);
-    expect(VERIFY_LABELS.server.text).toMatch(/vouches/);
+    expect(VERIFY_LABELS.server.heading).not.toMatch(/Verified/);
+    // The distinction the reader has to come away with: the server stands
+    // behind it, the sender did not sign it.
+    expect(VERIFY_LABELS.server.line).toMatch(/didn’t sign it themselves/);
+  });
+
+  it('only the sender-proof answer wears green, and only a mismatch wears red', () => {
+    const tones = Object.fromEntries(
+      Object.entries(VERIFY_LABELS).map(([k, v]) => [k, v.tone]),
+    );
+    expect(tones).toEqual({
+      device: 'text-success',
+      server: 'text-fg-muted',
+      unverifiable: 'text-fg-muted',
+      invalid: 'text-danger',
+      unreachable: 'text-fg-muted',
+    });
+    expect(unsignedCopy().tone).toBe('text-fg-muted');
+    expect(CHECKING_COPY.tone).toBe('text-fg-muted');
+  });
+
+  it('every answer says what it is and what it means, in two parts', () => {
+    const all = [...Object.values(VERIFY_LABELS), unsignedCopy(), unsignedCopy('event'), CHECKING_COPY];
+    for (const c of all) {
+      expect(c.heading.length).toBeGreaterThan(0);
+      expect(c.line.length).toBeGreaterThan(0);
+      // The heading is the answer, not a restatement of the line.
+      expect(c.line).not.toBe(c.heading);
+    }
   });
 });
