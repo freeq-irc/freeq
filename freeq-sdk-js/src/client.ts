@@ -2958,29 +2958,75 @@ export class FreeqClient extends EventEmitter {
 
   /** Emit a coordination event as paired TAGMSG (for storage) +
    *  companion PRIVMSG (for rich-client rendering). Returns the
-   *  server-stored event ID. */
+   *  server-stored event ID.
+   *
+   *  Against a server that verifies documents the TAGMSG is signed over its
+   *  own document and carries a signer-minted ULID; against one that doesn't,
+   *  the pair is exactly what a pre-signing client sent, legacy id and all.
+   *  Either way the returned id is the id the server files, because callers
+   *  reference it. */
   emitEvent(
     channel: string,
     eventType: string,
     payload: unknown,
     opts: EmitEventOptions = {},
   ): string {
-    const eventId = opts.eventId ?? mintEventId();
     const payloadJson = JSON.stringify(payload);
     // Percent-encode `;` and ` ` so the value survives both IRCv3 tag
     // escape and the server's url-decode pass (see proposal §5.0).
     const encoded = payloadJson.replace(/;/g, '%3B').replace(/ /g, '%20');
+    // Decided before the signature exists, because the id is returned now:
+    // a signed event is filed under the ULID its signature covers, an
+    // unsigned one under the legacy id the server reads from `msgid`.
+    const signable = this.ackedCaps.has(SIGNING_CAP) && this.signing.canSign(channel);
+    const eventId = opts.eventId ?? (signable ? signing.newEventId() : mintEventId());
     const tags: Record<string, string> = {
-      msgid: eventId,
       '+freeq.at/event': eventType,
       '+freeq.at/payload': encoded,
     };
     if (opts.refId) tags['+freeq.at/task-id'] = opts.refId;
     if (opts.extraTags) Object.assign(tags, opts.extraTags);
     const humanText = opts.humanText ?? `${eventType}`;
-    this.raw(format('TAGMSG', [channel], tags));
-    this.raw(format('PRIVMSG', [channel, humanText], tags));
+    if (!signable) {
+      // Byte-for-byte what a pre-signing client sends, `msgid` first.
+      const legacy = { msgid: eventId, ...tags };
+      this.raw(format('TAGMSG', [channel], legacy));
+      this.raw(format('PRIVMSG', [channel, humanText], legacy));
+      return eventId;
+    }
+    void this.signedCoordinationEvent(channel, eventType, eventId, encoded, tags, humanText, opts.refId);
     return eventId;
+  }
+
+  /**
+   * Put a signed coordination event on the wire: the TAGMSG that is the
+   * stored artifact, then the companion message that renders it.
+   *
+   * Two documents, each signing its own id. The message is an ordinary
+   * message whose covered coordination tags name the event — which is what
+   * joins the pair without either one signing the other's bytes.
+   */
+  private async signedCoordinationEvent(
+    channel: string,
+    eventType: string,
+    eventId: string,
+    encodedPayload: string,
+    tags: Record<string, string>,
+    humanText: string,
+    refId?: string,
+  ): Promise<void> {
+    const signed = await this.signing.signCoordination(channel, eventType, {
+      eventId,
+      payload: encodedPayload,
+      ref: refId,
+    });
+    const wireTags = { ...tags };
+    if (signed) {
+      wireTags[signing.EVENT_ID_TAG] = signed.eventId;
+      wireTags[signing.SIG_TAG] = signed.sigTag;
+    }
+    this.raw(format('TAGMSG', [channel], wireTags));
+    await this.signedPrivmsg(channel, humanText, tags);
   }
 
   /** Sugar over `emitEvent` for `task_request`. Returns the task ID. */

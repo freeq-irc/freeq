@@ -1880,6 +1880,104 @@ describe('signed mutations', () => {
     expect(await verifySig(canonical, tagOf(line, '+freeq.at/sig')!, verifyKey)).toBe(true);
   });
 
+  // A coordination event is the artifact the server stores and serves back as
+  // a task card and an audit row, so it signs standalone rather than leaning
+  // on the message that renders it.
+  it('a coordination event is a TAGMSG signed over its own event id', async () => {
+    const signing = await import('./signing.js');
+    const { client, ws, verifyKey } = await makeSigningClient();
+    const eventId = client.createTask('#room', 'ship it');
+    const line = await waitForSent(ws, 'TAGMSG');
+
+    expect(eventId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+    expect(tagOf(line, '+freeq.at/eventid')).toBe(eventId);
+    expect(line, 'the legacy self-minted id is gone under the cap').not.toContain('msgid=');
+
+    const canonical = await signing.coordinationCanonical({
+      from: 'did:plc:mutator',
+      msgid: eventId,
+      target: '#room',
+      eventType: 'task_request',
+      payload: '{"description":"ship%20it"}',
+    });
+    expect(await verifySig(canonical, tagOf(line, '+freeq.at/sig')!, verifyKey)).toBe(true);
+  });
+
+  it('an event that references a task covers the reference it names', async () => {
+    const signing = await import('./signing.js');
+    const { client, ws, verifyKey } = await makeSigningClient();
+    client.completeTask('#room', '01KYVT1W2P0000000000000000', 'done');
+    const line = await waitForSent(ws, 'TAGMSG');
+    const sigTag = tagOf(line, '+freeq.at/sig')!;
+
+    const canonical = await signing.coordinationCanonical({
+      from: 'did:plc:mutator',
+      msgid: tagOf(line, '+freeq.at/eventid')!,
+      target: '#room',
+      eventType: 'task_complete',
+      payload: '{"summary":"done"}',
+      ref: '01KYVT1W2P0000000000000000',
+    });
+    expect(await verifySig(canonical, sigTag, verifyKey)).toBe(true);
+
+    // Re-pointing the completion at another task is tampering, and reads as it.
+    const repointed = await signing.coordinationCanonical({
+      from: 'did:plc:mutator',
+      msgid: tagOf(line, '+freeq.at/eventid')!,
+      target: '#room',
+      eventType: 'task_complete',
+      payload: '{"summary":"done"}',
+      ref: '01KYVT9ZZZ0000000000000000',
+    });
+    expect(await verifySig(repointed, sigTag, verifyKey)).toBe(false);
+  });
+
+  it('the companion message is signed on its own, and carries the event tags', async () => {
+    const signing = await import('./signing.js');
+    const { client, ws, verifyKey } = await makeSigningClient();
+    client.emitEvent('#room', 'task_request', { description: 'ship it' }, {
+      humanText: 'New task: ship it',
+    });
+    const privmsg = await waitForSent(ws, 'PRIVMSG');
+    const tagmsg = ws.sent.find((l) => l.includes('TAGMSG'))!;
+
+    const messageId = tagOf(privmsg, '+freeq.at/eventid')!;
+    expect(messageId, 'each document signs its own id').not.toBe(
+      tagOf(tagmsg, '+freeq.at/eventid'),
+    );
+    const coord = {
+      '+freeq.at/event': 'task_request',
+      '+freeq.at/payload': '{"description":"ship%20it"}',
+    };
+    const canonical = await signing.messageCanonical({
+      from: 'did:plc:mutator',
+      msgid: messageId,
+      target: '#room',
+      body: 'New task: ship it',
+      tags: coord,
+    });
+    expect(await verifySig(canonical, tagOf(privmsg, '+freeq.at/sig')!, verifyKey)).toBe(true);
+  });
+
+  it('an emitted event against a legacy server is byte-identical to before', async () => {
+    const { client, ws } = await makeRegistered();
+    client.signing.setSigningDid('did:plc:mutator');
+    await client.signing.generateSigningKey();
+    const eventId = client.emitEvent('#room', 'task_request', { description: 'ship it' }, {
+      refId: 'task-abc',
+      humanText: '📋 New task: ship it',
+    });
+    await flushAsync();
+    expect(eventId, 'the legacy id format is what a legacy server files').toMatch(/^[0-9a-f]+$/);
+    const tags =
+      `msgid=${eventId};+freeq.at/event=task_request;` +
+      '+freeq.at/payload={"description":"ship%20it"};+freeq.at/task-id=task-abc';
+    expect(ws.sent).toEqual([
+      `@${tags} TAGMSG #room`,
+      `@${tags} PRIVMSG #room :📋 New task: ship it`,
+    ]);
+  });
+
   it('media and link previews against a legacy server are byte-identical to before', async () => {
     const { client, ws } = await makeRegistered();
     client.signing.setSigningDid('did:plc:mutator');
