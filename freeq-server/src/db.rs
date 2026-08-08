@@ -4995,7 +4995,29 @@ pub struct CoordinationEventRow {
 }
 
 impl Db {
-    pub fn store_coordination_event(&self, event: &CoordinationEventRow) -> SqlResult<()> {
+    /// Store a coordination event.
+    ///
+    /// Returns `false` when the write was refused. The id is the *client's*,
+    /// so two actors can name the same one; the first to file it keeps it.
+    /// `INSERT OR REPLACE` alone let any authenticated user overwrite any
+    /// stored event — its actor, its payload, all of it — by reusing the id.
+    /// Re-filing your own event still replaces it, which is what makes an
+    /// idempotent re-emit harmless.
+    pub fn store_coordination_event(&self, event: &CoordinationEventRow) -> SqlResult<bool> {
+        let filed_by: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT actor_did FROM coordination_events WHERE event_id = ?1",
+                params![event.event_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(filed_by) = filed_by
+            && filed_by != event.actor_did
+        {
+            return Ok(false);
+        }
+
         self.conn.execute(
             "INSERT OR REPLACE INTO coordination_events
              (event_id, event_type, actor_did, channel, ref_id, payload_json, signature, timestamp)
@@ -5011,7 +5033,7 @@ impl Db {
                 event.timestamp,
             ],
         )?;
-        Ok(())
+        Ok(true)
     }
 
     /// Query coordination events with optional filters.

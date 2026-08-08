@@ -1094,7 +1094,14 @@ pub(super) fn handle_tagmsg(
             signature,
             timestamp: now,
         };
-        state.with_db(|db| db.store_coordination_event(&event));
+        let stored = state.with_db(|db| db.store_coordination_event(&event));
+        if stored == Some(false) {
+            tracing::warn!(
+                actor = %did, event_id = %event_id, channel = %target,
+                "Refused a coordination event reusing an id another actor filed"
+            );
+            return;
+        }
         tracing::debug!(
             event_type = %event_type,
             event_id = %event_id,

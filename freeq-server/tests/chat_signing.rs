@@ -1621,3 +1621,92 @@ async fn a_signed_dm_mutation_is_filed_under_the_venue_its_signature_covers() {
         );
     }
 }
+
+// ── Coordination events ─────────────────────────────────────────────
+
+/// A server with a database and a web API, for the tests that read a stored
+/// row back through the verify endpoint.
+async fn start_web(
+    resolver: DidResolver,
+    name: &str,
+) -> (SocketAddr, SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>) {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let db_path = tmp.path().to_str().unwrap().to_string();
+    std::mem::forget(tmp); // outlives the server
+    let config = freeq_server::config::ServerConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        web_addr: Some("127.0.0.1:0".to_string()),
+        server_name: name.to_string(),
+        challenge_timeout_secs: 60,
+        db_path: Some(db_path),
+        ..Default::default()
+    };
+    freeq_server::server::Server::with_resolver(config, resolver)
+        .start_with_web()
+        .await
+        .unwrap()
+}
+
+
+/// The event id is the *client's*, so two actors can name the same one. The
+/// first to file it keeps it: reusing someone else's id changed their stored
+/// event — its actor, its payload, all of it — into yours.
+#[tokio::test]
+async fn an_event_id_another_actor_filed_cannot_be_overwritten() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (irc_addr, web_addr, _h) = start_web(
+        resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)]),
+        "test-coord-steal",
+    )
+    .await;
+
+    let event_id = tokio::task::spawn_blocking(move || {
+        let mut bob = C::authenticated(irc_addr, "bob", did_bob, kb);
+        bob.join("#coordsteal");
+        let mut alice = C::authenticated(irc_addr, "alice", DID_ALICE, ka);
+        alice.join("#coordsteal");
+
+        let event_id = freeq_server::msgid::generate();
+        alice.tx(&format!(
+            "@+freeq.at/event=task_request;msgid={event_id};\
+             +freeq.at/payload=%7B%22budget%22%3A1%7D TAGMSG #coordsteal"
+        ));
+        bob.rx(|l| l.contains("task_request"), "alice's task");
+
+        bob.tx(&format!(
+            "@+freeq.at/event=task_request;msgid={event_id};\
+             +freeq.at/payload=%7B%22budget%22%3A9999%7D TAGMSG #coordsteal"
+        ));
+        alice.rx(|l| l.contains("budget"), "bob's attempt reaches the room");
+        event_id
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let events: serde_json::Value = reqwest::get(format!(
+        "http://{web_addr}/api/v1/channels/coordsteal/events"
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let filed: Vec<&serde_json::Value> = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event_id"] == event_id.as_str())
+        .collect();
+    assert_eq!(filed.len(), 1, "one id, one row: {events}");
+    assert_eq!(
+        filed[0]["actor_did"], DID_ALICE,
+        "the actor who filed it keeps it: {events}"
+    );
+    assert_eq!(
+        filed[0]["payload"]["budget"], 1,
+        "and the payload they filed: {events}"
+    );
+}
+
