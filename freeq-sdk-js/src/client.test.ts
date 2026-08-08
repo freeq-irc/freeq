@@ -2197,6 +2197,59 @@ describe('signed mutations', () => {
     expect(line).not.toContain('+freeq.at/eventid');
   });
 
+  // What kind of evidence an event carries is rendered — the card's icon and
+  // label — and handed to bots. It rode on a signed event covered by nothing,
+  // so a relay could relabel it with both signatures still verifying.
+  it('covers the kind of evidence an event carries, on both halves', async () => {
+    const signing = await import('./signing.js');
+    const { client, ws, verifyKey } = await makeSigningClient();
+    client.attachEvidence('#room', '01KYVT1W2P0000000000000000', 'code_review', 'looks ok');
+    const tagmsg = await waitForSent(ws, 'TAGMSG');
+    const privmsg = await waitForSent(ws, 'PRIVMSG');
+    expect(tagOf(tagmsg, '+freeq.at/evidence-type')).toBe('code_review');
+
+    const eventId = tagOf(tagmsg, '+freeq.at/eventid')!;
+    const payload = tagOf(tagmsg, '+freeq.at/payload')!;
+    const canonical = await signing.coordinationCanonical({
+      from: 'did:plc:mutator',
+      msgid: eventId,
+      target: '#room',
+      eventType: 'evidence_attach',
+      payload,
+      ref: '01KYVT1W2P0000000000000000',
+      evidence: 'code_review',
+    });
+    expect(await verifySig(canonical, tagOf(tagmsg, '+freeq.at/sig')!, verifyKey)).toBe(true);
+
+    // Relabelled is a different claim, and reads as one.
+    const relabelled = await signing.coordinationCanonical({
+      from: 'did:plc:mutator',
+      msgid: eventId,
+      target: '#room',
+      eventType: 'evidence_attach',
+      payload,
+      ref: '01KYVT1W2P0000000000000000',
+      evidence: 'test_run',
+    });
+    expect(await verifySig(relabelled, tagOf(tagmsg, '+freeq.at/sig')!, verifyKey)).toBe(false);
+
+    // And the companion covers it through its coordination tags.
+    const companionDoc = await signing.messageCanonical({
+      from: 'did:plc:mutator',
+      msgid: tagOf(privmsg, '+freeq.at/eventid')!,
+      target: '#room',
+      body: '📎 Evidence (code_review): looks ok',
+      tags: {
+        '+freeq.at/event': 'evidence_attach',
+        '+freeq.at/payload': payload,
+        '+freeq.at/task-id': '01KYVT1W2P0000000000000000',
+        '+freeq.at/evidence-type': 'code_review',
+        '+freeq.at/coordid': eventId,
+      },
+    });
+    expect(await verifySig(companionDoc, tagOf(privmsg, '+freeq.at/sig')!, verifyKey)).toBe(true);
+  });
+
   it('an emitted event against a legacy server is byte-identical to before', async () => {
     const { client, ws } = await makeRegistered();
     client.signing.setSigningDid('did:plc:mutator');

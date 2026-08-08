@@ -30,9 +30,10 @@
 //!            "target":"<venue>"}
 //!
 //! coordination:
-//!           {"event":"<event type>", "from":"<DID>", "kind":"coordination",
-//!            "msgid":"<event ULID>", "payload":"sha256:<hex>",
-//!            "ref":"<referenced event id>"?, "target":"<venue>"}
+//!           {"event":"<event type>", "evidence":"<evidence type>"?,
+//!            "from":"<DID>", "kind":"coordination", "msgid":"<event ULID>",
+//!            "payload":"sha256:<hex>", "ref":"<referenced event id>"?,
+//!            "target":"<venue>"}
 //! ```
 //!
 //! Optional fields appear only when present, so a plain message reduces to
@@ -46,7 +47,10 @@
 //! `+freeq.at/payload` — verbatim, app-level percent-encoding included, so a
 //! verifier checks bytes it holds rather than a decoding it has to agree
 //! about. Its `ref` is the event it refers to, usually a task's id; both wire
-//! spellings (`+freeq.at/ref`, `+freeq.at/task-id`) mean that one field.
+//! spellings (`+freeq.at/ref`, `+freeq.at/task-id`) mean that one field. Its
+//! `evidence` is the kind of evidence an `evidence_attach` carries — covered
+//! because it is what a reader renders and a bot reads, and a value on screen
+//! that no signature covers is one a relay can change.
 //!
 //! Field rules, each with a reason:
 //!
@@ -128,7 +132,8 @@ pub const COORD_ID_TAG: &str = "+freeq.at/coordid";
 ///
 /// Adding a name here costs nothing already signed: a document that does not
 /// carry the tag canonicalizes to exactly the bytes it did before.
-pub const COVERED_COORD_TAGS: [&str; 5] = ["coordid", "event", "payload", "ref", "task-id"];
+pub const COVERED_COORD_TAGS: [&str; 6] =
+    ["coordid", "event", "evidence-type", "payload", "ref", "task-id"];
 
 const CLIENT_TAG_PREFIX: &str = "+freeq.at/";
 const TAG_PREFIX: &str = "freeq.at/";
@@ -204,6 +209,8 @@ pub struct ChatDoc<'a> {
     payload: Option<&'a str>,
     /// Coordination only: the event this one refers to, usually a task's id.
     reference: Option<&'a str>,
+    /// Coordination only: what kind of evidence an `evidence_attach` carries.
+    evidence: Option<&'a str>,
 }
 
 impl<'a> ChatDoc<'a> {
@@ -226,6 +233,7 @@ impl<'a> ChatDoc<'a> {
             event: None,
             payload: None,
             reference: None,
+            evidence: None,
         }
     }
 
@@ -253,6 +261,7 @@ impl<'a> ChatDoc<'a> {
             event: None,
             payload: None,
             reference: None,
+            evidence: None,
         }
     }
 
@@ -287,6 +296,7 @@ impl<'a> ChatDoc<'a> {
             event: Some(event_type),
             payload: None,
             reference: None,
+            evidence: None,
         }
     }
 
@@ -312,6 +322,18 @@ impl<'a> ChatDoc<'a> {
     /// `+freeq.at/task-id`) mean this one field.
     pub fn with_ref(mut self, reference: &'a str) -> Self {
         self.reference = Some(reference);
+        self
+    }
+
+    /// The kind of evidence an `evidence_attach` event carries, as it rides in
+    /// `+freeq.at/evidence-type`.
+    ///
+    /// Covered because it is *rendered*: a reader shows it as the evidence's
+    /// icon and label, and a bot reads it off the event. A value on screen
+    /// that no signature covers is a value a relay can change. Ignored on
+    /// other kinds.
+    pub fn with_evidence(mut self, evidence_type: &'a str) -> Self {
+        self.evidence = Some(evidence_type);
         self
     }
 
@@ -395,6 +417,10 @@ impl<'a> ChatDoc<'a> {
             if let Some(reference) = self.reference {
                 put("ref", reference);
             }
+            if let Some(evidence) = self.evidence {
+                put("evidence", evidence);
+            }
+
         }
         if !self.coord.is_empty() {
             let coord: serde_json::Map<String, serde_json::Value> = self
@@ -729,6 +755,63 @@ mod tests {
     /// Coordination fields belong to the coordination kind alone. A builder
     /// call on another kind must not move a byte, or a client that makes the
     /// call and one that doesn't sign different documents for the same event.
+    /// What kind of evidence an event carries is rendered — a reader shows it
+    /// as the evidence's icon and label, and a bot reads it off the event. It
+    /// rode on a signed event covered by nothing, so a relay could change it
+    /// and no verifier would notice. Both halves cover it now: the event's own
+    /// document, and the companion's coordination tags.
+    #[test]
+    fn the_kind_of_evidence_an_event_carries_is_covered() {
+        let key = test_key(1);
+        let sent = ChatDoc::coordination(ALICE, MSGID, "#swarm", "evidence_attach")
+            .with_payload("%7B%22type%22%3A%22code_review%22%7D")
+            .with_ref(ROOT)
+            .with_evidence("code_review");
+        assert!(
+            sent.canonical().contains(r#""evidence":"code_review""#),
+            "{}",
+            sent.canonical()
+        );
+        let sig = sent.sign(&key);
+        sent.verify(&sig, &key.verifying_key()).unwrap();
+
+        // A relabelled evidence card is a different claim about the same work.
+        let relabelled = ChatDoc::coordination(ALICE, MSGID, "#swarm", "evidence_attach")
+            .with_payload("%7B%22type%22%3A%22code_review%22%7D")
+            .with_ref(ROOT)
+            .with_evidence("test_run");
+        assert_eq!(
+            relabelled.verify(&sig, &key.verifying_key()),
+            Err(SigError::Invalid)
+        );
+
+        // And on the companion, through the covered coordination tags.
+        let companion = ChatDoc::message(ALICE, MSGID, "#swarm", "📎 Evidence")
+            .with_coord([("+freeq.at/evidence-type", "code_review")]);
+        assert!(
+            companion
+                .canonical()
+                .contains(r#""coord":{"evidence-type":"code_review"}"#),
+            "{}",
+            companion.canonical()
+        );
+    }
+
+    /// An event that carries no evidence type signs exactly the bytes it did
+    /// before the field existed.
+    #[test]
+    fn a_coordination_event_without_evidence_signs_as_before() {
+        let doc = ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_request")
+            .with_payload("%7B%7D");
+        assert_eq!(
+            doc.canonical(),
+            format!(
+                r##"{{"event":"task_request","from":"{ALICE}","kind":"coordination","msgid":"{MSGID}","payload":"{}","target":"#swarm"}}"##,
+                body_hash("%7B%7D")
+            )
+        );
+    }
+
     #[test]
     fn coordination_fields_are_ignored_on_other_kinds() {
         let message = ChatDoc::message(ALICE, MSGID, "#freeq", "hi");
@@ -742,7 +825,11 @@ mod tests {
         );
         let delete = ChatDoc::mutation(Mutation::Delete, ALICE, MSGID, "#freeq", ROOT);
         assert_eq!(
-            delete.clone().with_payload("%7B%7D").canonical(),
+            delete
+                .clone()
+                .with_payload("%7B%7D")
+                .with_evidence("code_review")
+                .canonical(),
             delete.canonical()
         );
     }
@@ -1066,6 +1153,23 @@ mod tests {
                 }),
             },
             Case {
+                name: "coordination-evidence-attach",
+                seed: 5,
+                doc: ChatDoc::coordination(ALICE, MSGID, "#swarm", "evidence_attach")
+                    .with_payload("%7B%22type%22%3A%22code_review%22%7D")
+                    .with_ref(ROOT)
+                    .with_evidence("code_review"),
+                input: json!({
+                    "kind": "coordination", "from": ALICE, "msgid": MSGID,
+                    "target": "#swarm", "eventType": "evidence_attach",
+                    "payload": "%7B%22type%22%3A%22code_review%22%7D",
+                    "ref": ROOT,
+                    // The wire value of +freeq.at/evidence-type: what a reader
+                    // renders, so what a signature has to cover.
+                    "evidence": "code_review",
+                }),
+            },
+            Case {
                 name: "coordination-task-request",
                 seed: 5,
                 doc: ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_request")
@@ -1222,6 +1326,16 @@ mod tests {
                     ("+freeq.at/coordid", "01KYVT9ZZZ0000000000000000"),
                 ]),
             ),
+            // Relabelling evidence changes what a reader is shown about work
+            // that was signed for.
+            doc_negative(
+                "relabelled-evidence-type",
+                "coordination-evidence-attach",
+                ChatDoc::coordination(ALICE, MSGID, "#swarm", "evidence_attach")
+                    .with_payload("%7B%22type%22%3A%22code_review%22%7D")
+                    .with_ref(ROOT)
+                    .with_evidence("test_run"),
+            ),
             doc_negative(
                 "altered-coordination-payload",
                 "coordination-task-complete-with-ref",
@@ -1295,11 +1409,11 @@ mod tests {
 
         serde_json::json!({
             "description": "Worked signing examples for freeq chat events (messages, deletes, reactions). Every implementation must reproduce `canonical` and `sigTag` byte-for-byte from `input` + `seed`, and must reach `expected` for each negative: check the negative's `sigTag` when present (a tag-level attack, against the named vector's canonical), otherwise the vector's own sigTag against `tamperedCanonical` (a document-level attack).",
-            "documentRule": "JCS (RFC 8785) over an enumerated per-kind document. Mandatory: from, msgid, target. A message carries no `kind` (its absence is the kind) and covers body/reply?/edit?/coord?; a mutation carries kind and subject, plus emoji for react|unreact; a coordination event carries kind \"coordination\", event, payload and ref?. Optional fields are omitted entirely when absent.",
+            "documentRule": "JCS (RFC 8785) over an enumerated per-kind document. Mandatory: from, msgid, target. A message carries no `kind` (its absence is the kind) and covers body/reply?/edit?/coord?; a mutation carries kind and subject, plus emoji for react|unreact; a coordination event carries kind \"coordination\", event, payload, ref? and evidence?. Optional fields are omitted entirely when absent.",
             "bodyRule": "body = \"sha256:\" + lowercase hex of SHA-256 over the UTF-8 wire body — ciphertext under E2EE, and the assembled body (real newlines) for a draft/multiline batch.",
             "payloadRule": "payload = \"sha256:\" + lowercase hex of SHA-256 over the UTF-8 wire value of +freeq.at/payload, IRC-unescaped and otherwise verbatim — any app-level encoding inside it is opaque bytes to the signature.",
             "venueRule": "target is the normalized venue, never the wire target: a channel lowercased, or `dm:<did_a>,<did_b>` with the two DIDs sorted ascending.",
-            "coordRule": "coord covers exactly the client-authored coordination tags coordid, event, payload, ref, task-id (canonical keys; wire names carry a +freeq.at/ prefix), IRC-unescaped, verbatim. coordid is how the companion message of a coordination event names that event; the event's own TAGMSG carries its id in +freeq.at/eventid instead. Every other tag — server stamps, tallies, verdicts, provenance, ephemera, framing — is excluded.",
+            "coordRule": "coord covers exactly the client-authored coordination tags coordid, event, evidence-type, payload, ref, task-id (canonical keys; wire names carry a +freeq.at/ prefix), IRC-unescaped, verbatim. coordid is how the companion message of a coordination event names that event; the event's own TAGMSG carries its id in +freeq.at/eventid instead. Every other tag — server stamps, tallies, verdicts, provenance, ephemera, framing — is excluded.",
             "referenceRule": "edit, reply and subject always name root msgids. A signed event naming a revision is refused, never rewritten.",
             "kidRule": "base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16])",
             "sigTagFormat": "ed25519:<kid>:<base64url-nopad signature over the UTF-8 canonical bytes>",

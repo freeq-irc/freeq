@@ -687,6 +687,7 @@ fn mutation_in(
 /// would hash bytes the signer never held. Both spellings of the reference
 /// mean the document's one `ref` field, resolved in the same order the stored
 /// row resolves it.
+#[allow(clippy::too_many_arguments)]
 fn coordination_document<'a>(
     did: &'a str,
     event_id: &'a str,
@@ -694,6 +695,7 @@ fn coordination_document<'a>(
     event_type: &'a str,
     payload: Option<&'a str>,
     ref_id: Option<&'a str>,
+    evidence_type: Option<&'a str>,
 ) -> freeq_sdk::chatsig::ChatDoc<'a> {
     let mut doc = freeq_sdk::chatsig::ChatDoc::coordination(did, event_id, venue, event_type);
     if let Some(payload) = payload {
@@ -701,6 +703,9 @@ fn coordination_document<'a>(
     }
     if let Some(ref_id) = ref_id {
         doc = doc.with_ref(ref_id);
+    }
+    if let Some(evidence_type) = evidence_type {
+        doc = doc.with_evidence(evidence_type);
     }
     doc
 }
@@ -754,6 +759,7 @@ fn coordination_signature(
         tags.get("+freeq.at/ref")
             .or_else(|| tags.get("+freeq.at/task-id"))
             .map(String::as_str),
+        tags.get("+freeq.at/evidence-type").map(String::as_str),
     );
     let canonical = doc.canonical();
     let outcome = verify_client_signature(&doc, sig_tag, did, Some(&conn.id), state);

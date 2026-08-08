@@ -3174,6 +3174,9 @@ export class FreeqClient extends EventEmitter {
       eventId,
       payload: encodedPayload,
       ref: refId,
+      // Rendered, so covered: a reader shows it as the evidence's icon and
+      // label, and a bot reads it off the event.
+      evidence: tags['+freeq.at/evidence-type'],
     });
     const wireTags = { ...tags };
     if (signed) {

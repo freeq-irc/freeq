@@ -166,6 +166,9 @@ pub enum Command {
         /// The wire value of `+freeq.at/payload`, already percent-encoded.
         payload: String,
         ref_id: Option<String>,
+        /// The kind of evidence an `evidence_attach` carries. Rides as
+        /// `+freeq.at/evidence-type` and is covered by both signatures.
+        evidence_type: Option<String>,
         human_text: String,
     },
     Raw(String),
@@ -958,6 +961,22 @@ impl ClientHandle {
         ref_id: Option<&str>,
         human_text: &str,
     ) -> Result<String> {
+        self.emit_event_with_evidence(channel, event_type, payload_json, ref_id, None, human_text)
+            .await
+    }
+
+    /// [`Self::emit_event`], plus the evidence type an `evidence_attach`
+    /// carries. Private: the public shape stays as it was, and the only
+    /// caller is [`Self::attach_evidence`].
+    async fn emit_event_with_evidence(
+        &self,
+        channel: &str,
+        event_type: &str,
+        payload_json: &str,
+        ref_id: Option<&str>,
+        evidence_type: Option<&str>,
+        human_text: &str,
+    ) -> Result<String> {
         // Decided here, not at the wire, because the id is returned now: a
         // signed event is filed under the ULID its signature covers, an
         // unsigned one under the legacy id the server reads from `msgid`.
@@ -974,6 +993,7 @@ impl ClientHandle {
                 event_type: event_type.to_string(),
                 payload: payload_json.replace(';', "%3B").replace(' ', "%20"),
                 ref_id: ref_id.map(str::to_string),
+                evidence_type: evidence_type.map(str::to_string),
                 human_text: human_text.to_string(),
             })
             .await?;
@@ -1068,11 +1088,15 @@ impl ClientHandle {
             payload["url"] = serde_json::json!(u);
         }
         let url_str = url.map(|u| format!(" — {u}")).unwrap_or_default();
-        self.emit_event(
+        // The type rides as a tag as well as inside the payload: the tag is
+        // what a reader renders and a bot reads, and both SDKs send it so the
+        // same event is covered the same way whichever emitted it.
+        self.emit_event_with_evidence(
             channel,
             "evidence_attach",
             &payload.to_string(),
             Some(task_id),
+            Some(evidence_type),
             &format!("📎 Evidence ({evidence_type}): {summary}{url_str}"),
         )
         .await?;
@@ -2765,6 +2789,7 @@ fn legacy_event_id() -> String {
 /// `None` — and the caller falls back to the legacy `msgid` tag — under the
 /// same three refusals as everything else: a server that doesn't verify
 /// documents, no key, and no venue a verifier could rebuild.
+#[allow(clippy::too_many_arguments)]
 fn sign_coordination_outgoing(
     signing_key: &Option<ed25519_dalek::SigningKey>,
     signing_did: &Option<String>,
@@ -2773,6 +2798,7 @@ fn sign_coordination_outgoing(
     event_type: &str,
     payload: &str,
     ref_id: Option<&str>,
+    evidence_type: Option<&str>,
     server_verifies_documents: bool,
 ) -> Option<String> {
     if !server_verifies_documents {
@@ -2790,6 +2816,9 @@ fn sign_coordination_outgoing(
         .with_payload(payload);
     if let Some(ref_id) = ref_id {
         doc = doc.with_ref(ref_id);
+    }
+    if let Some(evidence_type) = evidence_type {
+        doc = doc.with_evidence(evidence_type);
     }
     Some(doc.sign(key))
 }
@@ -2939,6 +2968,7 @@ async fn execute_command<W: AsyncWrite + Unpin>(
             event_type,
             payload,
             ref_id,
+            evidence_type,
             human_text,
         } => {
             let signature = sign_coordination_outgoing(
@@ -2949,6 +2979,7 @@ async fn execute_command<W: AsyncWrite + Unpin>(
                 &event_type,
                 &payload,
                 ref_id.as_deref(),
+                evidence_type.as_deref(),
                 server_verifies_documents,
             );
             let Some(signature) = signature else {
@@ -2960,6 +2991,9 @@ async fn execute_command<W: AsyncWrite + Unpin>(
                 );
                 if let Some(ref rid) = ref_id {
                     tags.push_str(&format!(";+freeq.at/ref={rid}"));
+                }
+                if let Some(ref evidence) = evidence_type {
+                    tags.push_str(&format!(";+freeq.at/evidence-type={evidence}"));
                 }
                 writer
                     .write_all(format!("@{tags} TAGMSG {channel}\r\n").as_bytes())
@@ -2976,6 +3010,9 @@ async fn execute_command<W: AsyncWrite + Unpin>(
             ]);
             if let Some(rid) = ref_id {
                 tags.insert("+freeq.at/ref".to_string(), rid);
+            }
+            if let Some(evidence) = evidence_type {
+                tags.insert("+freeq.at/evidence-type".to_string(), evidence);
             }
             let mut event_tags = tags.clone();
             event_tags.insert(crate::chatsig::EVENT_ID_TAG.to_string(), event_id.clone());

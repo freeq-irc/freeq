@@ -36,6 +36,7 @@ interface Vector {
     eventType?: string;
     payload?: string;
     ref?: string;
+    evidence?: string;
     tags?: Record<string, string>;
   };
 }
@@ -83,6 +84,7 @@ async function canonicalOf(v: Vector): Promise<string> {
       eventType: v.input.eventType!,
       payload: v.input.payload,
       ref: v.input.ref,
+      evidence: v.input.evidence,
     });
   }
   return signing.mutationCanonical({

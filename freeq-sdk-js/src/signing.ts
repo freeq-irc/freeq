@@ -44,7 +44,14 @@ export const COORD_ID_TAG = '+freeq.at/coordid';
  * Adding a name here costs nothing already signed: a document that does not
  * carry the tag canonicalizes to exactly the bytes it did before.
  */
-export const COVERED_COORD_TAGS = ['coordid', 'event', 'payload', 'ref', 'task-id'] as const;
+export const COVERED_COORD_TAGS = [
+  'coordid',
+  'event',
+  'evidence-type',
+  'payload',
+  'ref',
+  'task-id',
+] as const;
 
 /** Base64url encode (no padding). */
 function b64url(buf: ArrayBuffer | Uint8Array): string {
@@ -224,6 +231,9 @@ export async function coordinationCanonical(fields: {
   eventType: string;
   payload?: string;
   ref?: string;
+  /** The kind of evidence an `evidence_attach` carries. Covered because it is
+   *  what a reader renders and a bot reads. */
+  evidence?: string;
 }): Promise<string> {
   const doc: Record<string, unknown> = {
     event: fields.eventType,
@@ -234,6 +244,7 @@ export async function coordinationCanonical(fields: {
   };
   if (fields.payload !== undefined) doc.payload = await bodyHash(fields.payload);
   if (fields.ref) doc.ref = fields.ref;
+  if (fields.evidence) doc.evidence = fields.evidence;
   return canonicalize(doc);
 }
 
@@ -394,7 +405,7 @@ export class SessionSigning {
   async signCoordination(
     target: string,
     eventType: string,
-    opts: { eventId: string; payload?: string; ref?: string },
+    opts: { eventId: string; payload?: string; ref?: string; evidence?: string },
   ): Promise<SignedEvent | null> {
     if (!this.signingKey?.privateKey || !this.authenticatedDid) return null;
     const venue = venueForTarget(target, this.authenticatedDid);
@@ -409,6 +420,7 @@ export class SessionSigning {
       eventType,
       payload: opts.payload,
       ref: opts.ref,
+      evidence: opts.evidence,
     });
     const sigTag = await this.signCanonical(canonical);
     return sigTag ? { eventId, sigTag } : null;

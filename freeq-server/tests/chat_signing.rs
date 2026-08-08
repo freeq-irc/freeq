@@ -2129,3 +2129,77 @@ async fn both_halves_of_a_signed_pair_relay_the_id_that_joins_them() {
     })
     .await;
 }
+
+/// What kind of evidence an event carries is rendered, so it is covered — by
+/// the event's own document and by the companion's coordination tags. A
+/// server that rebuilt either without it would reach a different document and
+/// refuse an honest event, so this passing is what says both ends agree.
+#[tokio::test]
+async fn an_evidence_event_is_verified_with_the_type_it_names() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (irc_addr, web_addr, _h) = start_web(
+        resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)]),
+        "test-evidence",
+    )
+    .await;
+
+    let event_id = tokio::task::spawn_blocking(move || {
+        let mut bob = C::authenticated(irc_addr, "bob", did_bob, kb);
+        bob.join("#evidence");
+        let mut alice = C::authenticated(irc_addr, "alice", DID_ALICE, ka);
+        alice.join("#evidence");
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
+
+        let event_id = freeq_server::msgid::generate();
+        let payload = "%7B%22type%22%3A%22code_review%22%7D";
+        let venue = channel_venue("#evidence");
+        let doc = ChatDoc::coordination(DID_ALICE, &event_id, &venue, "evidence_attach")
+            .with_payload(payload)
+            .with_ref("01TASK00000000000000000000")
+            .with_evidence("code_review");
+        // Both sides build through the same covered set, so pin the bytes:
+        // a set that dropped the field would have them agree without it.
+        assert!(
+            doc.canonical().contains(r#""evidence":"code_review""#),
+            "the document must cover the evidence type: {}",
+            doc.canonical()
+        );
+        let sig = doc.sign(&signing);
+        alice.tx(&format!(
+            "@+freeq.at/event=evidence_attach;+freeq.at/payload={payload};\
+             +freeq.at/ref=01TASK00000000000000000000;\
+             +freeq.at/evidence-type=code_review;\
+             {EVENT_ID_TAG}={event_id};+freeq.at/sig={sig} TAGMSG #evidence"
+        ));
+        let seen = bob.rx(|l| l.contains("evidence_attach"), "the evidence event");
+        assert!(
+            seen.contains("+freeq.at/evidence-type=code_review"),
+            "the type reaches other members: {seen}"
+        );
+        event_id
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let v: serde_json::Value = reqwest::get(format!("http://{web_addr}/api/v1/verify/{event_id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        v["verification"]["verdict"], "valid",
+        "the server rebuilt the same document the sender signed: {v}"
+    );
+    assert_eq!(v["verification"]["verified_by"], "client-session-key", "{v}");
+    assert!(
+        v["canonical_form"]
+            .as_str()
+            .unwrap()
+            .contains(r#""evidence":"code_review""#),
+        "the stored bytes name the evidence type: {v}"
+    );
+}
