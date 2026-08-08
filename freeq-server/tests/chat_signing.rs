@@ -1623,6 +1623,12 @@ async fn a_signed_dm_mutation_is_filed_under_the_venue_its_signature_covers() {
 }
 
 // ── Coordination events ─────────────────────────────────────────────
+//
+// A coordination event is the artifact the server *stores* and serves back:
+// task cards, the audit timeline. An audit row nobody can check is the defect
+// this signing model exists to close, so the event signs standalone — over its
+// own document, under its own id — and the server files it under the id the
+// signature covers.
 
 /// A server with a database and a web API, for the tests that read a stored
 /// row back through the verify endpoint.
@@ -1647,6 +1653,184 @@ async fn start_web(
         .unwrap()
 }
 
+/// The tags of a signed coordination event, as an emitter puts them on the
+/// wire: the event type, the payload as transmitted, an optional reference,
+/// and the id the signature covers.
+fn signed_coordination_tags(
+    channel: &str,
+    event_id: &str,
+    event_type: &str,
+    payload: &str,
+    ref_id: Option<&str>,
+    signing: &SigningKey,
+) -> String {
+    let venue = channel_venue(channel);
+    let mut doc =
+        ChatDoc::coordination(DID_ALICE, event_id, &venue, event_type).with_payload(payload);
+    if let Some(ref_id) = ref_id {
+        doc = doc.with_ref(ref_id);
+    }
+    let sig = doc.sign(signing);
+    let mut tags =
+        format!("+freeq.at/event={event_type};+freeq.at/payload={payload};{EVENT_ID_TAG}={event_id}");
+    if let Some(ref_id) = ref_id {
+        tags.push_str(&format!(";+freeq.at/ref={ref_id}"));
+    }
+    tags.push_str(&format!(";+freeq.at/sig={sig}"));
+    tags
+}
+
+#[tokio::test]
+async fn a_signed_coordination_event_is_filed_under_the_id_it_signed() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (irc_addr, web_addr, _h) = start_web(
+        resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)]),
+        "test-coord",
+    )
+    .await;
+
+    let (task_id, done_id) = tokio::task::spawn_blocking(move || {
+        let mut bob = C::authenticated(irc_addr, "bob", did_bob, kb);
+        bob.join("#coordsig");
+        let mut alice = C::authenticated(irc_addr, "alice", DID_ALICE, ka);
+        alice.join("#coordsig");
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
+
+        let task_id = freeq_server::msgid::generate();
+        alice.tx(&format!(
+            "@{} TAGMSG #coordsig",
+            signed_coordination_tags(
+                "#coordsig",
+                &task_id,
+                "task_request",
+                "%7B%22description%22%3A%22ship%20it%22%7D",
+                None,
+                &signing,
+            )
+        ));
+        bob.rx(|l| l.contains("task_request"), "the task request");
+
+        // And the event that refers to it, so the linkage is a signed claim
+        // too rather than a tag anyone could re-point.
+        let done_id = freeq_server::msgid::generate();
+        alice.tx(&format!(
+            "@{} TAGMSG #coordsig",
+            signed_coordination_tags(
+                "#coordsig",
+                &done_id,
+                "task_complete",
+                "%7B%22summary%22%3A%22done%22%7D",
+                Some(&task_id),
+                &signing,
+            )
+        ));
+        bob.rx(|l| l.contains("task_complete"), "the completion");
+        (task_id, done_id)
+    })
+    .await
+    .unwrap();
+
+    // The broadcast races the row by a hair; give the writes a beat.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let v: serde_json::Value = reqwest::get(format!("http://{web_addr}/api/v1/verify/{task_id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        v["event_id"], task_id,
+        "the id the sender signed is the id on file: {v}"
+    );
+    assert_eq!(v["kind"], "coordination", "{v}");
+    assert_eq!(v["actor_did"], DID_ALICE, "{v}");
+    assert_eq!(v["channel"], "#coordsig", "{v}");
+    assert_eq!(v["verification"]["verdict"], "valid", "{v}");
+    assert_eq!(
+        v["verification"]["verified_by"], "client-session-key",
+        "signed on the sender's device, not vouched by the server: {v}"
+    );
+
+    // The reference survives as the event's subject, so a reader can walk
+    // from a completion to the work it completed.
+    let done: serde_json::Value = reqwest::get(format!("http://{web_addr}/api/v1/verify/{done_id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(done["subject"], task_id, "{done}");
+    assert_eq!(done["verification"]["verdict"], "valid", "{done}");
+
+    // …and the task API reaches the same linkage from the other end.
+    let task: serde_json::Value = reqwest::get(format!("http://{web_addr}/api/v1/tasks/{task_id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(task["task_id"], task_id, "{task}");
+    assert_eq!(task["status"], "task_complete", "{task}");
+}
+
+/// A signature that fails against the key it names is not a coordination
+/// event this server will keep, relay, or answer for.
+#[tokio::test]
+async fn a_coordination_event_whose_signature_fails_is_refused() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (irc_addr, web_addr, _h) = start_web(
+        resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)]),
+        "test-coord-bad",
+    )
+    .await;
+
+    let event_id = tokio::task::spawn_blocking(move || {
+        let mut bob = C::authenticated(irc_addr, "bob", did_bob, kb);
+        bob.join("#coordbad");
+        let mut alice = C::authenticated(irc_addr, "alice", DID_ALICE, ka);
+        alice.join("#coordbad");
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
+
+        // Signed over one payload, sent with another — the rewrite in flight
+        // this signature exists to expose.
+        let event_id = freeq_server::msgid::generate();
+        let honest = signed_coordination_tags(
+            "#coordbad",
+            &event_id,
+            "task_complete",
+            "%7B%22paid%22%3A1%7D",
+            None,
+            &signing,
+        );
+        alice.tx(&format!(
+            "@{} TAGMSG #coordbad",
+            honest.replace("%7B%22paid%22%3A1%7D", "%7B%22paid%22%3A9%7D")
+        ));
+        alice.rx(|l| l.contains("SIGNATURE_INVALID"), "the refusal");
+        assert!(
+            bob.maybe(|l| l.contains("task_complete"), 500).is_none(),
+            "a refused event must not reach the room either"
+        );
+        event_id
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let missing = reqwest::get(format!("http://{web_addr}/api/v1/verify/{event_id}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        missing.status(),
+        404,
+        "nothing was filed under the refused event's id"
+    );
+}
 
 /// The event id is the *client's*, so two actors can name the same one. The
 /// first to file it keeps it: reusing someone else's id changed their stored
@@ -1710,3 +1894,64 @@ async fn an_event_id_another_actor_filed_cannot_be_overwritten() {
     );
 }
 
+/// An unsigned coordination event is still stored and still answers — it just
+/// answers honestly. What it must not do is carry a signature nobody checked:
+/// storing the tag as it arrived put whatever the client typed in the column a
+/// reader takes for evidence.
+#[tokio::test]
+async fn an_unsigned_coordination_event_is_filed_without_a_signature() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (irc_addr, web_addr, _h) = start_web(
+        resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)]),
+        "test-coord-plain",
+    )
+    .await;
+
+    let event_id = tokio::task::spawn_blocking(move || {
+        let mut bob = C::authenticated(irc_addr, "bob", did_bob, kb);
+        bob.join("#coordplain");
+        let mut alice = C::authenticated(irc_addr, "alice", DID_ALICE, ka);
+        alice.join("#coordplain");
+
+        let event_id = freeq_server::msgid::generate();
+        alice.tx(&format!(
+            "@+freeq.at/event=task_request;msgid={event_id};\
+             +freeq.at/payload=%7B%7D;+freeq.at/sig=ed25519:nobodyskid00000000000A:c2ln \
+             TAGMSG #coordplain"
+        ));
+        bob.rx(|l| l.contains("task_request"), "the event still relays");
+        event_id
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let events: serde_json::Value = reqwest::get(format!(
+        "http://{web_addr}/api/v1/channels/coordplain/events"
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let row = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["event_id"] == event_id.as_str())
+        .unwrap_or_else(|| panic!("the event is still filed: {events}"));
+    assert!(
+        row["signature"].is_null(),
+        "a signature this server never checked is not evidence: {events}"
+    );
+
+    let v: serde_json::Value = reqwest::get(format!("http://{web_addr}/api/v1/verify/{event_id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["verification"]["verdict"], "unverifiable", "{v}");
+    assert_eq!(v["verification"]["verified_by"], "unsigned", "{v}");
+}

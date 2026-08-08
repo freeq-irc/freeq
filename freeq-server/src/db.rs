@@ -4995,7 +4995,13 @@ pub struct CoordinationEventRow {
 }
 
 impl Db {
-    /// Store a coordination event.
+    /// Store a coordination event, and file it in the append-only log.
+    ///
+    /// `canonical` is the exact bytes the event's signature covers, and is
+    /// supplied only when this server checked that signature: the row then
+    /// carries a document a reader can re-verify years later. Without one the
+    /// event is filed as facts and nothing else — it happened, and nobody
+    /// signed for it.
     ///
     /// Returns `false` when the write was refused. The id is the *client's*,
     /// so two actors can name the same one; the first to file it keeps it.
@@ -5003,7 +5009,11 @@ impl Db {
     /// stored event — its actor, its payload, all of it — by reusing the id.
     /// Re-filing your own event still replaces it, which is what makes an
     /// idempotent re-emit harmless.
-    pub fn store_coordination_event(&self, event: &CoordinationEventRow) -> SqlResult<bool> {
+    pub fn store_coordination_event(
+        &self,
+        event: &CoordinationEventRow,
+        canonical: Option<&str>,
+    ) -> SqlResult<bool> {
         let filed_by: Option<String> = self
             .conn
             .query_row(
@@ -5018,6 +5028,7 @@ impl Db {
             return Ok(false);
         }
 
+        let tx = self.conn.unchecked_transaction()?;
         self.conn.execute(
             "INSERT OR REPLACE INTO coordination_events
              (event_id, event_type, actor_did, channel, ref_id, payload_json, signature, timestamp)
@@ -5033,6 +5044,30 @@ impl Db {
                 event.timestamp,
             ],
         )?;
+        let record = match canonical {
+            Some(canonical) => EventRecord {
+                shape: EventShape::Document(canonical),
+                signature: event.signature.as_deref(),
+                ctx: crate::events::EventContext::verified(),
+                timestamp: event.timestamp as u64,
+            },
+            None => EventRecord {
+                shape: EventShape::Bare(crate::events::EventFacts {
+                    event_id: event.event_id.clone(),
+                    kind: "coordination".to_string(),
+                    venue: crate::events::venue_of(&event.channel),
+                    actor_did: Some(event.actor_did.clone()),
+                    subject: event.ref_id.clone(),
+                    body_hash: None,
+                    emoji: None,
+                }),
+                signature: None,
+                ctx: crate::events::EventContext::default(),
+                timestamp: event.timestamp as u64,
+            },
+        };
+        self.insert_event(&record)?;
+        tx.commit()?;
         Ok(true)
     }
 

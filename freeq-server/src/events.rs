@@ -103,7 +103,7 @@ pub struct EventFacts {
     /// The event's own id — the signer's, where there was a signer.
     pub event_id: String,
     /// `message` | `edit` | `delete` | `react` | `unreact` | `pin` | `unpin`
-    /// | `coord`.
+    /// | `coordination`.
     pub kind: String,
     /// The normalized venue: a folded channel name, or `dm:<a>,<b>`.
     pub venue: String,
@@ -163,7 +163,9 @@ pub fn derive_facts(canonical: &str) -> Option<EventFacts> {
     let event_id = get("msgid")?;
     let venue = get("target")?;
     let actor_did = get("from")?;
-    let body_hash = get("body");
+    // A coordination event's `payload` is a hash of what it carries, exactly
+    // as a message's `body` is — same column, same meaning.
+    let body_hash = get("body").or_else(|| get("payload"));
     let edit = get("edit");
     let kind = match get("kind") {
         Some(k) => k,
@@ -171,9 +173,9 @@ pub fn derive_facts(canonical: &str) -> Option<EventFacts> {
         None => "message".to_string(),
     };
     // A mutation acts on its `subject`; an edit acts on the message it
-    // revises. Both name a root msgid, which is the identity a message keeps
-    // for life — so one column serves both.
-    let subject = get("subject").or(edit);
+    // revises; a coordination event acts on the task it references. All three
+    // name an event by the id it keeps for life — so one column serves them.
+    let subject = get("subject").or(edit).or_else(|| get("ref"));
 
     Some(EventFacts {
         event_id,

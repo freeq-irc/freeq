@@ -1710,6 +1710,22 @@ async fn coordination_events_rest_api() {
     assert_eq!(body["task_id"], task_id);
     assert_eq!(body["status"], "in_progress");
 
+    // The id the SDK handed back is the id the event is filed under, and the
+    // event answers for itself: signed on the sender's device, not vouched
+    // for by the server. A task card nobody can check is the defect the
+    // signing model exists to close.
+    let v: serde_json::Value = client
+        .get(format!("http://{web_addr}/api/v1/verify/{task_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["kind"], "coordination", "{v}");
+    assert_eq!(v["verification"]["verdict"], "valid", "{v}");
+    assert_eq!(v["verification"]["verified_by"], "client-session-key", "{v}");
+
     bot_handle.quit(None).await.unwrap();
     server_handle.abort();
 }

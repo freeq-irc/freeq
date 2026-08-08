@@ -680,6 +680,86 @@ fn mutation_in(
     None
 }
 
+/// Build the document a coordination event's signature covers.
+///
+/// The payload is the **wire** value of `+freeq.at/payload`, hashed verbatim:
+/// the sender percent-encoded what it sent, and a verifier that decoded first
+/// would hash bytes the signer never held. Both spellings of the reference
+/// mean the document's one `ref` field, resolved in the same order the stored
+/// row resolves it.
+fn coordination_document<'a>(
+    did: &'a str,
+    event_id: &'a str,
+    venue: &'a str,
+    event_type: &'a str,
+    payload: Option<&'a str>,
+    ref_id: Option<&'a str>,
+) -> freeq_sdk::chatsig::ChatDoc<'a> {
+    let mut doc = freeq_sdk::chatsig::ChatDoc::coordination(did, event_id, venue, event_type);
+    if let Some(payload) = payload {
+        doc = doc.with_payload(payload);
+    }
+    if let Some(ref_id) = ref_id {
+        doc = doc.with_ref(ref_id);
+    }
+    doc
+}
+
+/// What this server concluded about an incoming coordination event, and the
+/// bytes it concluded it about.
+struct CheckedCoordination {
+    outcome: ClientSigOutcome,
+    /// The signed canonical, kept so a verified event is filed as the exact
+    /// document a reader will re-check rather than one rebuilt later.
+    canonical: String,
+}
+
+/// Check the signature on a coordination event, if it carries one over an id
+/// this server can adopt.
+///
+/// `None` — today's behaviour, unchanged — when the event is unsigned, names
+/// no id of its own, or names one this server will not file it under: the
+/// signature covers the id, so an id we cannot adopt is a document we cannot
+/// honour, and pretending otherwise would file a row whose bytes name an id
+/// that isn't the row's.
+fn coordination_signature(
+    conn: &Connection,
+    target: &str,
+    event_type: &str,
+    tags: &HashMap<String, String>,
+    state: &Arc<SharedState>,
+) -> Option<CheckedCoordination> {
+    let sig_tag = tags
+        .get("+freeq.at/sig")
+        .or_else(|| tags.get("freeq.at/sig"))?;
+    let event_id = tags
+        .get(freeq_sdk::chatsig::EVENT_ID_TAG)
+        .or_else(|| tags.get(freeq_sdk::chatsig::EVENT_ID_TAG_BARE))?;
+    let did = conn.authenticated_did.as_deref()?;
+    if let Err(rejection) = crate::msgid::check_client_minted(event_id, now_ms()) {
+        tracing::warn!(
+            session = %conn.id, did = %did, event_id = %event_id,
+            reason = %rejection.description(),
+            "Refusing to adopt a coordination event id — filing the event under one of ours"
+        );
+        return None;
+    }
+    let venue = signing_venue(state, did, target)?;
+    let doc = coordination_document(
+        did,
+        event_id,
+        &venue,
+        event_type,
+        tags.get("+freeq.at/payload").map(String::as_str),
+        tags.get("+freeq.at/ref")
+            .or_else(|| tags.get("+freeq.at/task-id"))
+            .map(String::as_str),
+    );
+    let canonical = doc.canonical();
+    let outcome = verify_client_signature(&doc, sig_tag, did, Some(&conn.id), state);
+    Some(CheckedCoordination { outcome, canonical })
+}
+
 /// Check the signature on an incoming mutation, if it carries one.
 ///
 /// `None` when the event is not a mutation (typing, AV signalling — ephemera
@@ -1059,10 +1139,54 @@ pub(super) fn handle_tagmsg(
             );
             return;
         }
-        let event_id = tags
-            .get("msgid")
-            .cloned()
-            .unwrap_or_else(crate::msgid::generate);
+        // ── The sender's own signature over the event ──
+        //
+        // A coordination event is what this server stores and serves back as
+        // a task card and an audit row, so the question "who asked for this"
+        // has to be answerable from the row alone. When the sender signed it,
+        // the id it signed becomes the id we file it under — that is what
+        // makes the signed value and the stored value the same value.
+        let checked = coordination_signature(conn, target, event_type, tags, state);
+        if let Some(ref checked) = checked
+            && checked.outcome == ClientSigOutcome::Failed
+        {
+            tracing::warn!(
+                session = %conn.id, did = %did, target = %target,
+                event_type = %event_type,
+                "Coordination event signature did not verify against the key it names — \
+                 refusing the event"
+            );
+            let reply = Message::from_server(
+                &state.server_name,
+                "FAIL",
+                vec![
+                    "TAGMSG",
+                    "SIGNATURE_INVALID",
+                    "That signature does not verify against the key it names",
+                ],
+            );
+            if let Some(tx) = state.connections.lock().get(&conn.id) {
+                let _ = tx.try_send(format!("{reply}\r\n"));
+            }
+            return;
+        }
+        let verified = checked
+            .filter(|c| c.outcome == ClientSigOutcome::Verified)
+            .map(|c| c.canonical);
+        // The signer's id when it verified; the legacy self-minted `msgid`
+        // otherwise, which is what a pre-signing client sends and what an
+        // unsigned event is still filed under.
+        let event_id = match verified.is_some() {
+            true => tags
+                .get(freeq_sdk::chatsig::EVENT_ID_TAG)
+                .or_else(|| tags.get(freeq_sdk::chatsig::EVENT_ID_TAG_BARE))
+                .cloned()
+                .unwrap_or_else(crate::msgid::generate),
+            false => tags
+                .get("msgid")
+                .cloned()
+                .unwrap_or_else(crate::msgid::generate),
+        };
         let ref_id = tags
             .get("+freeq.at/ref")
             .or_else(|| tags.get("+freeq.at/task-id"))
@@ -1082,7 +1206,14 @@ pub(super) fn handle_tagmsg(
             tracing::warn!(actor = %did, "Decoded payload exceeded cap; dropping");
             return;
         }
-        let signature = tags.get("+freeq.at/sig").cloned();
+        // Only a signature this server checked. Storing the tag as it arrived
+        // put whatever the client typed in the column a reader takes for
+        // evidence — the never-launder rule, applied where the event is kept
+        // rather than only where it is relayed.
+        let signature = verified
+            .is_some()
+            .then(|| tags.get("+freeq.at/sig").cloned())
+            .flatten();
         let now = chrono::Utc::now().timestamp();
         let event = crate::db::CoordinationEventRow {
             event_id: event_id.clone(),
@@ -1094,7 +1225,7 @@ pub(super) fn handle_tagmsg(
             signature,
             timestamp: now,
         };
-        let stored = state.with_db(|db| db.store_coordination_event(&event));
+        let stored = state.with_db(|db| db.store_coordination_event(&event, verified.as_deref()));
         if stored == Some(false) {
             tracing::warn!(
                 actor = %did, event_id = %event_id, channel = %target,
@@ -1107,6 +1238,7 @@ pub(super) fn handle_tagmsg(
             event_id = %event_id,
             actor = %did,
             channel = %target,
+            signed = verified.is_some(),
             "Stored coordination event"
         );
     }

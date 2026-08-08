@@ -150,6 +150,24 @@ pub enum Command {
         target: String,
         tags: std::collections::HashMap<String, String>,
     },
+    /// A coordination event: the TAGMSG a task event is stored as, and the
+    /// companion message that renders it.
+    ///
+    /// Structured, and one command for the pair, because the two halves are
+    /// two documents that have to agree: the TAGMSG signs the coordination
+    /// document over `event_id`, and the message signs itself with the same
+    /// coordination tags inside it. `event_id` arrives already minted — the
+    /// caller was handed it before this reached the wire, and the signature
+    /// covers exactly that id.
+    CoordinationEvent {
+        channel: String,
+        event_id: String,
+        event_type: String,
+        /// The wire value of `+freeq.at/payload`, already percent-encoded.
+        payload: String,
+        ref_id: Option<String>,
+        human_text: String,
+    },
     Raw(String),
     Quit(Option<String>),
 }
@@ -926,6 +944,12 @@ impl ClientHandle {
 
     /// Emit a typed coordination event to a channel.
     /// Sends both a TAGMSG (structured, for rich clients) and PRIVMSG (human-readable).
+    ///
+    /// Against a server that verifies documents the TAGMSG is signed over its
+    /// own coordination document and filed under a signer-minted ULID; against
+    /// one that doesn't, the pair is byte-for-byte what a pre-signing client
+    /// sent, legacy id and all. Either way the returned id is the id the
+    /// server files, because callers reference it.
     pub async fn emit_event(
         &self,
         channel: &str,
@@ -934,25 +958,24 @@ impl ClientHandle {
         ref_id: Option<&str>,
         human_text: &str,
     ) -> Result<String> {
-        let event_id = format!(
-            "{:016x}{:016x}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            rand::random::<u64>(),
-        );
-        let mut tags = format!(
-            "+freeq.at/event={event_type};msgid={event_id};+freeq.at/payload={}",
-            payload_json.replace(';', "%3B").replace(' ', "%20")
-        );
-        if let Some(rid) = ref_id {
-            tags.push_str(&format!(";+freeq.at/ref={rid}"));
-        }
-        // Send structured TAGMSG
-        self.raw(&format!("@{tags} TAGMSG {channel}")).await?;
-        // Send human-readable PRIVMSG with the same event tags (for rich client rendering)
-        self.raw(&format!("@{tags} PRIVMSG {channel} :{human_text}"))
+        // Decided here, not at the wire, because the id is returned now: a
+        // signed event is filed under the ULID its signature covers, an
+        // unsigned one under the legacy id the server reads from `msgid`.
+        let signs = self.caps_acked.lock().acked.contains(MSGSIG_CAP);
+        let event_id = if signs {
+            crate::chatsig::new_event_id()
+        } else {
+            legacy_event_id()
+        };
+        self.cmd_tx
+            .send(Command::CoordinationEvent {
+                channel: channel.to_string(),
+                event_id: event_id.clone(),
+                event_type: event_type.to_string(),
+                payload: payload_json.replace(';', "%3B").replace(' ', "%20"),
+                ref_id: ref_id.map(str::to_string),
+                human_text: human_text.to_string(),
+            })
             .await?;
         Ok(event_id)
     }
@@ -2722,6 +2745,55 @@ fn sign_mutation_outgoing(
     tags.insert(crate::sigtag::SIG_TAG.to_string(), sig);
 }
 
+/// The id an unsigned coordination event is filed under: the format the
+/// emitter has always minted, kept so a server that never offered the cap
+/// receives exactly what it always did.
+fn legacy_event_id() -> String {
+    format!(
+        "{:016x}{:016x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        rand::random::<u64>(),
+    )
+}
+
+/// Sign a coordination event's own document, returning the `+freeq.at/sig`
+/// value.
+///
+/// `None` — and the caller falls back to the legacy `msgid` tag — under the
+/// same three refusals as everything else: a server that doesn't verify
+/// documents, no key, and no venue a verifier could rebuild.
+fn sign_coordination_outgoing(
+    signing_key: &Option<ed25519_dalek::SigningKey>,
+    signing_did: &Option<String>,
+    channel: &str,
+    event_id: &str,
+    event_type: &str,
+    payload: &str,
+    ref_id: Option<&str>,
+    server_verifies_documents: bool,
+) -> Option<String> {
+    if !server_verifies_documents {
+        return None;
+    }
+    let (key, did) = (signing_key.as_ref()?, signing_did.as_ref()?);
+    let venue = crate::chatsig::venue_for_target(channel, did).or_else(|| {
+        tracing::debug!(
+            channel,
+            "no signable venue for this target — sending the event unsigned"
+        );
+        None
+    })?;
+    let mut doc = crate::chatsig::ChatDoc::coordination(did, event_id, &venue, event_type)
+        .with_payload(payload);
+    if let Some(ref_id) = ref_id {
+        doc = doc.with_ref(ref_id);
+    }
+    Some(doc.sign(key))
+}
+
 /// Execute a single IRC command on the wire.
 ///
 /// If `signing_key` and `signing_did` are set **and** the server negotiated
@@ -2860,6 +2932,80 @@ async fn execute_command<W: AsyncWrite + Unpin>(
                 params: vec![target],
             };
             writer.write_all(format!("{msg}\r\n").as_bytes()).await?;
+        }
+        Command::CoordinationEvent {
+            channel,
+            event_id,
+            event_type,
+            payload,
+            ref_id,
+            human_text,
+        } => {
+            let signature = sign_coordination_outgoing(
+                signing_key,
+                signing_did,
+                &channel,
+                &event_id,
+                &event_type,
+                &payload,
+                ref_id.as_deref(),
+                server_verifies_documents,
+            );
+            let Some(signature) = signature else {
+                // Nothing here can be vouched for, so send what a pre-signing
+                // client sent, verbatim: the server reads the id off `msgid`,
+                // and the id the caller holds stays the id on file.
+                let mut tags = format!(
+                    "+freeq.at/event={event_type};msgid={event_id};+freeq.at/payload={payload}"
+                );
+                if let Some(ref rid) = ref_id {
+                    tags.push_str(&format!(";+freeq.at/ref={rid}"));
+                }
+                writer
+                    .write_all(format!("@{tags} TAGMSG {channel}\r\n").as_bytes())
+                    .await?;
+                writer
+                    .write_all(format!("@{tags} PRIVMSG {channel} :{human_text}\r\n").as_bytes())
+                    .await?;
+                return Ok(());
+            };
+
+            let mut tags = std::collections::HashMap::from([
+                ("+freeq.at/event".to_string(), event_type),
+                ("+freeq.at/payload".to_string(), payload),
+            ]);
+            if let Some(rid) = ref_id {
+                tags.insert("+freeq.at/ref".to_string(), rid);
+            }
+            let mut event_tags = tags.clone();
+            event_tags.insert(crate::chatsig::EVENT_ID_TAG.to_string(), event_id);
+            event_tags.insert(crate::sigtag::SIG_TAG.to_string(), signature);
+            let tagmsg = crate::irc::Message {
+                tags: event_tags,
+                prefix: None,
+                command: "TAGMSG".to_string(),
+                params: vec![channel.clone()],
+            };
+            writer.write_all(format!("{tagmsg}\r\n").as_bytes()).await?;
+
+            // The companion is an ordinary message, signing its own id. The
+            // coordination tags are covered fields, so the document it signs
+            // names the event — which is what joins the pair.
+            sign_outgoing(
+                &mut tags,
+                signing_key,
+                signing_did,
+                &channel,
+                &human_text,
+                server_verifies_documents,
+            );
+            let privmsg = crate::irc::Message {
+                tags,
+                prefix: None,
+                command: "PRIVMSG".to_string(),
+                params: vec![channel, human_text],
+            };
+            writer.write_all(format!("{privmsg}\r\n").as_bytes()).await?;
         }
         Command::Raw(line) => {
             // Strip CRLF/NUL to prevent protocol injection via raw commands
@@ -3986,6 +4132,198 @@ mod multiline_tests {
         assert!(
             !sent.tags.contains_key(crate::chatsig::EVENT_ID_TAG),
             "{wire}"
+        );
+    }
+
+    /// A coordination event is the artifact the server stores and serves back
+    /// as a task card and an audit row, so it signs standalone — over its own
+    /// document, under the id the caller was handed.
+    #[tokio::test]
+    async fn a_coordination_event_is_signed_over_its_own_document() {
+        use ed25519_dalek::SigningKey;
+
+        let key = SigningKey::from_bytes(&[11u8; 32]);
+        let did = "did:plc:emitter";
+        let caps: CapsAcked = Arc::new(parking_lot::Mutex::new(CapsState::default()));
+        caps.lock().acked.insert(MSGSIG_CAP.to_string());
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let handle = ClientHandle {
+            cmd_tx,
+            echo_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            caps_acked: caps,
+            did_maps: Arc::new(parking_lot::Mutex::new(DidMapsState::default())),
+        };
+
+        let task_id = handle.create_task("#room", "ship it").await.unwrap();
+        assert_eq!(task_id.len(), 26, "a signed event is filed under a ULID");
+
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(
+            &mut buf,
+            cmd_rx.recv().await.unwrap(),
+            &Some(key.clone()),
+            &Some(did.to_string()),
+            true,
+        )
+        .await
+        .unwrap();
+        let wire = String::from_utf8(buf).unwrap();
+        let mut lines = wire.lines();
+        let tagmsg = crate::irc::Message::parse(lines.next().unwrap()).expect("parses");
+        let privmsg = crate::irc::Message::parse(lines.next().unwrap()).expect("parses");
+
+        assert_eq!(tagmsg.command, "TAGMSG");
+        assert!(
+            !tagmsg.tags.contains_key("msgid"),
+            "the self-minted legacy id is gone: {wire}"
+        );
+        assert_eq!(
+            tagmsg.tags.get(crate::chatsig::EVENT_ID_TAG),
+            Some(&task_id),
+            "the id the caller holds is the id the signature covers: {wire}"
+        );
+        let payload = tagmsg.tags.get("+freeq.at/payload").expect("payload rides");
+        crate::chatsig::ChatDoc::coordination(
+            did,
+            &task_id,
+            &crate::chatsig::channel_venue("#room"),
+            "task_request",
+        )
+        .with_payload(payload)
+        .verify(
+            tagmsg.tags.get(crate::sigtag::SIG_TAG).expect("signed"),
+            &key.verifying_key(),
+        )
+        .expect("the signature verifies over the coordination document");
+
+        // The companion message is a message: its own id, its own signature,
+        // and the coordination tags inside the document that joins the pair.
+        assert_eq!(privmsg.command, "PRIVMSG");
+        let message_id = privmsg
+            .tags
+            .get(crate::chatsig::EVENT_ID_TAG)
+            .expect("the companion signs too");
+        assert_ne!(message_id, &task_id, "each document signs its own id");
+        let venue = crate::chatsig::channel_venue("#room");
+        let mut doc =
+            crate::chatsig::ChatDoc::message(did, message_id, &venue, &privmsg.params[1]);
+        let coord: Vec<(String, String)> = privmsg
+            .tags
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        doc = doc.with_coord(coord.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        doc.verify(
+            privmsg.tags.get(crate::sigtag::SIG_TAG).expect("signed"),
+            &key.verifying_key(),
+        )
+        .expect("the companion verifies over the message document");
+    }
+
+    /// An event that refers to a task covers the reference it names:
+    /// re-pointing a completion at other work would otherwise still read as
+    /// signed.
+    #[tokio::test]
+    async fn a_coordination_event_covers_the_task_it_refers_to() {
+        use ed25519_dalek::SigningKey;
+
+        let key = SigningKey::from_bytes(&[12u8; 32]);
+        let did = "did:plc:emitter";
+        let root = "01KYVT1W2P0000000000000000";
+        let caps: CapsAcked = Arc::new(parking_lot::Mutex::new(CapsState::default()));
+        caps.lock().acked.insert(MSGSIG_CAP.to_string());
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let handle = ClientHandle {
+            cmd_tx,
+            echo_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            caps_acked: caps,
+            did_maps: Arc::new(parking_lot::Mutex::new(DidMapsState::default())),
+        };
+
+        handle
+            .complete_task("#room", root, "done", None)
+            .await
+            .unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(
+            &mut buf,
+            cmd_rx.recv().await.unwrap(),
+            &Some(key.clone()),
+            &Some(did.to_string()),
+            true,
+        )
+        .await
+        .unwrap();
+        let wire = String::from_utf8(buf).unwrap();
+        let tagmsg = crate::irc::Message::parse(wire.lines().next().unwrap()).expect("parses");
+        let event_id = tagmsg.tags.get(crate::chatsig::EVENT_ID_TAG).unwrap();
+        let payload = tagmsg.tags.get("+freeq.at/payload").unwrap();
+        let sig = tagmsg.tags.get(crate::sigtag::SIG_TAG).unwrap();
+        assert_eq!(tagmsg.tags.get("+freeq.at/ref"), Some(&root.to_string()));
+
+        let venue = crate::chatsig::channel_venue("#room");
+        crate::chatsig::ChatDoc::coordination(did, event_id, &venue, "task_complete")
+            .with_payload(payload)
+            .with_ref(root)
+            .verify(sig, &key.verifying_key())
+            .expect("verifies over the document it named");
+        assert!(
+            crate::chatsig::ChatDoc::coordination(did, event_id, &venue, "task_complete")
+                .with_payload(payload)
+                .with_ref("01KYVT9ZZZ0000000000000000")
+                .verify(sig, &key.verifying_key())
+                .is_err(),
+            "a re-pointed reference is tampering"
+        );
+    }
+
+    /// Against a server that never offered the cap, the pair is the pair a
+    /// pre-signing client sent — same tags, same order, same legacy id — so
+    /// ref-linkage keeps working where nothing has been deployed yet.
+    #[tokio::test]
+    async fn a_coordination_event_against_a_legacy_server_is_the_line_it_always_was() {
+        use ed25519_dalek::SigningKey;
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let handle = ClientHandle {
+            cmd_tx,
+            echo_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            caps_acked: Arc::new(parking_lot::Mutex::new(CapsState::default())),
+            did_maps: Arc::new(parking_lot::Mutex::new(DidMapsState::default())),
+        };
+
+        let task_id = handle
+            .emit_event(
+                "#room",
+                "task_update",
+                r#"{"phase":"reviewing","summary":"looking at it"}"#,
+                Some("task-abc"),
+                "🔄 [reviewing] looking at it",
+            )
+            .await
+            .unwrap();
+        assert_eq!(task_id.len(), 32, "the legacy id format is 32 hex digits");
+
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(
+            &mut buf,
+            cmd_rx.recv().await.unwrap(),
+            &Some(SigningKey::from_bytes(&[13u8; 32])),
+            &Some("did:plc:emitter".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+        let tags = format!(
+            "+freeq.at/event=task_update;msgid={task_id};\
+             +freeq.at/payload={{\"phase\":\"reviewing\",\"summary\":\"looking%20at%20it\"}};\
+             +freeq.at/ref=task-abc"
+        );
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            format!(
+                "@{tags} TAGMSG #room\r\n@{tags} PRIVMSG #room :🔄 [reviewing] looking at it\r\n"
+            )
         );
     }
 
