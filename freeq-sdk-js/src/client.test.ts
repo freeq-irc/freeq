@@ -1978,6 +1978,32 @@ describe('signed mutations', () => {
     ]);
   });
 
+  // The generic TAGMSG door and the named helpers lead to the same place:
+  // which method a caller reached for is not a reason for one delete to be
+  // provable and another not.
+  it('a mutation handed to the generic TAGMSG helper is signed like any other', async () => {
+    const signing = await import('./signing.js');
+    const { client, ws, verifyKey } = await makeSigningClient();
+    client.sendTagmsg('#room', { '+draft/delete': 'M0' });
+    const line = await waitForSent(ws, 'TAGMSG');
+
+    const canonical = signing.mutationCanonical({
+      kind: 'delete',
+      from: 'did:plc:mutator',
+      msgid: tagOf(line, '+freeq.at/eventid')!,
+      target: '#room',
+      subject: 'M0',
+    });
+    expect(await verifySig(canonical, tagOf(line, '+freeq.at/sig')!, verifyKey)).toBe(true);
+  });
+
+  it('an ephemeral TAGMSG handed to the same helper stays unsigned', async () => {
+    const { client, ws } = await makeSigningClient();
+    client.sendTagmsg('#room', { '+typing': 'active' });
+    await flushAsync();
+    expect(ws.sent).toEqual(['@+typing=active TAGMSG #room']);
+  });
+
   // A notice is a statement under the sender's name like any other, and the
   // server checks it against the same document — so an agent that answers by
   // NOTICE carries the same proof as one that answers by PRIVMSG.

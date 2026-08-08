@@ -2786,9 +2786,21 @@ export class FreeqClient extends EventEmitter {
     void this.signedMessage('NOTICE', this.wireTargetFor(target), text, tags);
   }
 
-  /** TAGMSG (tags-only, no body) to a target. */
+  /** TAGMSG (tags-only, no body) to a target.
+   *
+   *  A TAGMSG carrying a mutation — a delete, a reaction, its removal — is
+   *  signed like one sent through the named helpers. The generic door and the
+   *  named ones lead to the same place: which method a caller reached for is
+   *  not a reason for one event to be provable and another not. Ephemera
+   *  (typing, AV signalling) go out as they always have. */
   sendTagmsg(target: string, tags: Record<string, string>): void {
-    this.raw(format('TAGMSG', [target], tags));
+    const mutation = mutationIn(tags);
+    if (!mutation) {
+      this.raw(format('TAGMSG', [target], tags));
+      return;
+    }
+    const { kind, subject, emoji } = mutation;
+    this.signedMutation(kind, target, tags, subject, emoji);
   }
 
   /** Send a media attachment (image/audio/video URL with metadata).
@@ -3169,6 +3181,28 @@ export class FreeqClient extends EventEmitter {
   requestBudget(channel: string): void {
     this.raw(`BUDGET ${channel}`);
   }
+}
+
+/**
+ * The mutation a TAGMSG's tags describe: the kind, the root msgid it acts on,
+ * and — for reactions — the emoji.
+ *
+ * Both spellings of every tag, and the same three shapes the Rust SDK and the
+ * server read, so what one signs is what the others rebuild. `null` for every
+ * other TAGMSG: typing, AV signalling and presence assert nothing durable
+ * under a user's name, so there is nothing for a signature to be evidence of.
+ */
+function mutationIn(
+  tags: Record<string, string>,
+): { kind: 'delete' | 'react' | 'unreact'; subject?: string; emoji?: string } | null {
+  const subject = tags['+reply'] ?? tags['+draft/reply'];
+  const deleted = tags['+draft/delete'] ?? tags['+delete'];
+  if (deleted) return { kind: 'delete', subject: deleted };
+  const react = tags['+react'] ?? tags['+draft/react'];
+  if (react) return { kind: 'react', subject, emoji: react };
+  const unreact = tags['+freeq.at/unreact'];
+  if (unreact) return { kind: 'unreact', subject, emoji: unreact };
+  return null;
 }
 
 /** Generate a coordination event ID. Format mirrors Rust SDK
