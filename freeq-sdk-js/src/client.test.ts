@@ -1979,6 +1979,42 @@ describe('signed mutations', () => {
     expect(await verifySig(untied, tagOf(privmsg, '+freeq.at/sig')!, verifyKey)).toBe(false);
   });
 
+  // The reader's de-dupe used to work because both halves carried the same
+  // `msgid`. A signed event does not: the TAGMSG names the event in
+  // `+freeq.at/eventid`, the companion in `+freeq.at/coordid`, and the
+  // companion's `msgid` is its own. Replaying the lines the emitter actually
+  // produced is the only way to catch that — the legacy-shaped fixture the
+  // older de-dupe test uses cannot.
+  it('a signed pair read back is one event, carrying the event id', async () => {
+    const { client: sender, ws: senderWs } = await makeSigningClient();
+    const eventId = sender.createTask('#room', 'ship it');
+    const tagmsgOut = await waitForSent(senderWs, 'TAGMSG');
+    const privmsgOut = await waitForSent(senderWs, 'PRIVMSG');
+
+    const { client, ws } = await makeRegistered();
+    const seen: Array<{ eventId: string; eventType: string }> = [];
+    client.on('coordinationEvent', (e) =>
+      seen.push({ eventId: e.eventId, eventType: e.eventType }),
+    );
+    // What the server puts on a receiver's socket, built from those exact
+    // lines: the sender's prefix after the tags, a TAGMSG relayed verbatim,
+    // and a companion whose signer-minted event id has been adopted as the
+    // message's own `msgid` (`strip_event_id_tag` then `msgid`, server-side).
+    const relayed = (sent: string): string => {
+      const [tags, ...rest] = sent.split(' ');
+      return `${tags} :bot!u@h ${rest.join(' ')}`;
+    };
+    ws.recv(relayed(tagmsgOut));
+    ws.recv(
+      relayed(privmsgOut.replace(/\+freeq\.at\/eventid=([0-9A-HJKMNP-TV-Z]{26})/, 'msgid=$1')),
+    );
+    await flushAsync();
+
+    expect(seen, 'one event, not one per half').toHaveLength(1);
+    expect(seen[0]!.eventId, "the event's own id, not the companion's").toBe(eventId);
+    expect(seen[0]!.eventType).toBe('task_request');
+  });
+
   it('an emitted event against a legacy server is byte-identical to before', async () => {
     const { client, ws } = await makeRegistered();
     client.signing.setSigningDid('did:plc:mutator');

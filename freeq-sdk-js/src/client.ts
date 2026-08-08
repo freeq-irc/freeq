@@ -1071,7 +1071,17 @@ export class FreeqClient extends EventEmitter {
   private emitCoordinationEvent(channel: string, from: string, tags: Record<string, string>): void {
     const eventType = tags['+freeq.at/event'];
     if (!eventType) return;
-    const eventId = tags['msgid'] || '';
+    // Where each half of a signed pair names the event: the companion message
+    // in `coordid`, the TAGMSG in the id its own signature covers. Both are
+    // signed fields on the half that carries them. `msgid` is the legacy
+    // shape, where the server stamped one id on both halves — still the
+    // answer against a server that does not verify documents, and still what
+    // joins the pair there.
+    const eventId =
+      tags[signing.COORD_ID_TAG] ||
+      tags[signing.EVENT_ID_TAG] ||
+      tags['msgid'] ||
+      '';
     if (eventId) {
       const now = Date.now();
       const seen = this._seenCoordinationEvents.get(eventId);
