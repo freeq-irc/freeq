@@ -450,6 +450,8 @@ describe('messaging methods', () => {
   it('sendDelete() sends TAGMSG with +draft/delete', async () => {
     const { client, ws } = await makeRegistered();
     client.sendDelete('#foo', 'msg123');
+    // Signed sends are serialized, so every send leaves on the queue.
+    await flushAsync();
     const line = ws.sent.find((l) => l.includes('TAGMSG'));
     expect(line).toContain('+draft/delete=msg123');
   });
@@ -465,6 +467,8 @@ describe('messaging methods', () => {
   it('sendReaction() sends TAGMSG with +react + +reply', async () => {
     const { client, ws } = await makeRegistered();
     client.sendReaction('#foo', '🎉', 'msg123');
+    // Signed sends are serialized, so every send leaves on the queue.
+    await flushAsync();
     const line = ws.sent[0];
     expect(line).toContain('+react=🎉');
     expect(line).toContain('+reply=msg123');
@@ -481,6 +485,8 @@ describe('messaging methods', () => {
   it('sendUnreact() sends TAGMSG with +freeq.at/unreact', async () => {
     const { client, ws } = await makeRegistered();
     client.sendUnreact('#foo', '🎉', 'msg123');
+    // Signed sends are serialized, so every send leaves on the queue.
+    await flushAsync();
     expect(ws.sent[0]).toContain('+freeq.at/unreact=🎉');
   });
 
@@ -501,6 +507,8 @@ describe('messaging methods', () => {
   it('sendTagmsg() emits tags-only TAGMSG (no body)', async () => {
     const { client, ws } = await makeRegistered();
     client.sendTagmsg('#foo', { '+react': '🎉', '+reply': 'abc' });
+    // Signed sends are serialized, so every send leaves on the queue.
+    await flushAsync();
     expect(ws.sent[0]).toContain('TAGMSG #foo');
     expect(ws.sent[0]).toContain('+react=🎉');
     expect(ws.sent[0]).toContain('+reply=abc');
@@ -755,6 +763,7 @@ describe('coordination event methods', () => {
     const eventId = client.emitEvent('#foo', 'task_request', { description: 'review PR' }, {
       humanText: 'New task',
     });
+    await flushAsync();
     expect(eventId).toBeDefined();
     const tagmsg = ws.sent.find((l) => l.includes(`TAGMSG #foo`));
     const privmsg = ws.sent.find((l) => l.includes('PRIVMSG #foo'));
@@ -769,6 +778,7 @@ describe('coordination event methods', () => {
   it('emitEvent() percent-encodes payload', async () => {
     const { client, ws } = await makeRegistered();
     client.emitEvent('#foo', 'test', { msg: 'has spaces; and semicolons' });
+    await flushAsync();
     const line = ws.sent.find((l) => l.includes('TAGMSG'));
     expect(line).toContain('%20');
     expect(line).toContain('%3B');
@@ -783,6 +793,7 @@ describe('coordination event methods', () => {
   it('updateTask() includes ref tag', async () => {
     const { client, ws } = await makeRegistered();
     client.updateTask('#foo', 'task-abc', 'reviewing', 'looking');
+    await flushAsync();
     const line = ws.sent.find((l) => l.includes('TAGMSG'));
     expect(line).toContain('+freeq.at/task-id=task-abc');
   });
@@ -790,6 +801,7 @@ describe('coordination event methods', () => {
   it('completeTask() emits task_complete', async () => {
     const { client, ws } = await makeRegistered();
     client.completeTask('#foo', 'task-abc', 'done', 'https://result');
+    await flushAsync();
     const line = ws.sent.find((l) => l.includes('TAGMSG'));
     expect(line).toContain('+freeq.at/event=task_complete');
   });
@@ -797,6 +809,7 @@ describe('coordination event methods', () => {
   it('failTask() emits task_failed', async () => {
     const { client, ws } = await makeRegistered();
     client.failTask('#foo', 'task-abc', 'something broke');
+    await flushAsync();
     const line = ws.sent.find((l) => l.includes('TAGMSG'));
     expect(line).toContain('+freeq.at/event=task_failed');
   });
@@ -804,6 +817,7 @@ describe('coordination event methods', () => {
   it('attachEvidence() emits evidence_attach with evidence-type tag', async () => {
     const { client, ws } = await makeRegistered();
     client.attachEvidence('#foo', 'task-abc', 'code_review', 'looks ok');
+    await flushAsync();
     const line = ws.sent.find((l) => l.includes('TAGMSG'));
     expect(line).toContain('+freeq.at/event=evidence_attach');
     expect(line).toContain('+freeq.at/evidence-type=code_review');
@@ -1977,6 +1991,27 @@ describe('signed mutations', () => {
       tags: { '+freeq.at/event': 'task_request', '+freeq.at/payload': '{"description":"ship%20it"}' },
     });
     expect(await verifySig(untied, tagOf(privmsg, '+freeq.at/sig')!, verifyKey)).toBe(false);
+  });
+
+  // Signing moved these sends off the synchronous socket write, and each one
+  // awaits its own signature. If completion order could differ from call
+  // order, a streaming reply would edit itself out of sequence and land on
+  // the wrong text — freeqcc sends a chunk and then edits it, twice.
+  it('keeps call order on the wire when every send is signed', async () => {
+    const { client, ws } = await makeSigningClient();
+    client.sendTagged('#room', 'chunk one', { '+freeq.at/streaming': '1' });
+    client.sendTagged('#room', 'chunk one and two', { '+draft/edit': 'M0', '+freeq.at/streaming': '1' });
+    client.sendTagged('#room', 'chunk one and two and three', { '+draft/edit': 'M0' });
+    for (let i = 0; i < 100 && ws.sent.length < 3; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(ws.sent).toHaveLength(3);
+    const bodies = ws.sent.map((l) => l.slice(l.lastIndexOf(' :') + 2));
+    expect(bodies, `wire: ${ws.sent.join(' | ')}`).toEqual([
+      'chunk one',
+      'chunk one and two',
+      'chunk one and two and three',
+    ]);
   });
 
   // The reader's de-dupe used to work because both halves carried the same

@@ -410,17 +410,19 @@ export class FreeqClient extends EventEmitter {
           // The signature rides the opener and covers the ASSEMBLED
           // ciphertext, which is what the server reassembles and verifies —
           // per-chunk signatures would cover bytes no receiver ever holds.
-          const sigTags = await this.signatureTags(
-            wireTarget,
-            this.assembleMultiline(chunks),
-            extraOpenerTags,
-          );
-          this.emitMultilineBatch(
-            wireTarget,
-            chunks,
-            { ...extraOpenerTags, ...sigTags },
-            { '+encrypted': '' },
-          );
+          await this.enqueueSend(async () => {
+            const sigTags = await this.signatureTags(
+              wireTarget,
+              this.assembleMultiline(chunks),
+              extraOpenerTags,
+            );
+            this.emitMultilineBatch(
+              wireTarget,
+              chunks,
+              { ...extraOpenerTags, ...sigTags },
+              { '+encrypted': '' },
+            );
+          });
         }
       });
       this.maybeLocalEcho(bufKey, text, willEncrypt);
@@ -450,7 +452,8 @@ export class FreeqClient extends EventEmitter {
         // text) and reads `+freeq.at/sig` from the opener tags. Per-batch
         // signing keeps each emitted message independently verifiable.
         const body = this.assembleMultiline(group);
-        this.signatureTags(wireTarget, body, extraOpenerTags).then((sigTags) => {
+        void this.enqueueSend(async () => {
+          const sigTags = await this.signatureTags(wireTarget, body, extraOpenerTags);
           this.emitMultilineBatch(wireTarget, group, { ...extraOpenerTags, ...sigTags });
         });
         this.maybeLocalEcho(bufKey, body, willEncrypt);
@@ -1133,7 +1136,19 @@ export class FreeqClient extends EventEmitter {
    * bare-nick DM), or no key — and never signed at all against a server that
    * doesn't verify documents (see `SIGNING_CAP`).
    */
-  private async signedMutation(
+  private signedMutation(
+    kind: 'delete' | 'react' | 'unreact',
+    target: string,
+    tags: Record<string, string>,
+    subject?: string,
+    emoji?: string,
+  ): Promise<void> {
+    return this.enqueueSend(() =>
+      this.writeSignedMutation(kind, target, tags, subject, emoji),
+    );
+  }
+
+  private async writeSignedMutation(
     kind: 'delete' | 'react' | 'unreact',
     target: string,
     tags: Record<string, string>,
@@ -1184,16 +1199,42 @@ export class FreeqClient extends EventEmitter {
       : {};
   }
 
-  private async signedPrivmsg(target: string, text: string, extraTags?: Record<string, string>): Promise<void> {
-    return this.signedMessage('PRIVMSG', target, text, extraTags);
+  /**
+   * Outbound sends that sign go out in the order they were called.
+   *
+   * Each send awaits its own signature, and signatures do not complete in the
+   * order they were started — three sends fired back to back reach the wire
+   * shuffled. That is invisible for independent messages and wrong for
+   * dependent ones: a streaming reply edits the message it just sent, so an
+   * edit overtaking a later edit leaves the reader looking at stale text for
+   * good. Serializing the whole signed path costs a message's own signing
+   * latency and nothing else — sends were already asynchronous.
+   *
+   * A task on this chain must never wait on another: `enqueue` is called by
+   * the outermost signed operation only, and the helpers it calls write
+   * directly.
+   */
+  private sendChain: Promise<unknown> = Promise.resolve();
+
+  private enqueueSend(run: () => Promise<void>): Promise<void> {
+    const next = this.sendChain.then(run, run);
+    // A failed send must not wedge every send after it.
+    this.sendChain = next.catch(() => undefined);
+    return next;
+  }
+
+  private signedPrivmsg(target: string, text: string, extraTags?: Record<string, string>): Promise<void> {
+    return this.enqueueSend(() => this.writeSignedMessage('PRIVMSG', target, text, extraTags));
   }
 
   /**
    * A message on the wire, signed. `NOTICE` and `PRIVMSG` sign the same
    * document — the canonical binds who said what, where, and under which id,
    * and says nothing about which verb carried it.
+   *
+   * Writes immediately; ordering is the caller's, through `enqueueSend`.
    */
-  private async signedMessage(
+  private async writeSignedMessage(
     command: 'PRIVMSG' | 'NOTICE',
     target: string,
     text: string,
@@ -2793,7 +2834,9 @@ export class FreeqClient extends EventEmitter {
    *  do. A DM peer resolves to their DID where it's known, which is what
    *  gives the signature a venue a verifier can rebuild. */
   sendNotice(target: string, text: string, tags: Record<string, string> = {}): void {
-    void this.signedMessage('NOTICE', this.wireTargetFor(target), text, tags);
+    void this.enqueueSend(() =>
+      this.writeSignedMessage('NOTICE', this.wireTargetFor(target), text, tags),
+    );
   }
 
   /** TAGMSG (tags-only, no body) to a target.
@@ -3040,13 +3083,19 @@ export class FreeqClient extends EventEmitter {
     if (opts.extraTags) Object.assign(tags, opts.extraTags);
     const humanText = opts.humanText ?? `${eventType}`;
     if (!signable) {
-      // Byte-for-byte what a pre-signing client sends, `msgid` first.
+      // Byte-for-byte what a pre-signing client sends, `msgid` first — but
+      // still through the queue, so an unsigned event cannot overtake a
+      // signed send that is still waiting on its signature.
       const legacy = { msgid: eventId, ...tags };
-      this.raw(format('TAGMSG', [channel], legacy));
-      this.raw(format('PRIVMSG', [channel, humanText], legacy));
+      void this.enqueueSend(async () => {
+        this.raw(format('TAGMSG', [channel], legacy));
+        this.raw(format('PRIVMSG', [channel, humanText], legacy));
+      });
       return eventId;
     }
-    void this.signedCoordinationEvent(channel, eventType, eventId, encoded, tags, humanText, opts.refId);
+    void this.enqueueSend(() =>
+      this.signedCoordinationEvent(channel, eventType, eventId, encoded, tags, humanText, opts.refId),
+    );
     return eventId;
   }
 
@@ -3087,7 +3136,7 @@ export class FreeqClient extends EventEmitter {
     // coordination tag — so the tie between the two halves is inside the
     // signature rather than a tag an intermediary could cut. The TAGMSG
     // needs nothing added: it already carries the id in a covered field.
-    await this.signedPrivmsg(channel, humanText, {
+    await this.writeSignedMessage('PRIVMSG', channel, humanText, {
       ...tags,
       [signing.COORD_ID_TAG]: eventId,
     });
