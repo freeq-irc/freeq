@@ -1679,3 +1679,116 @@ fn event_count(db_path: &str) -> i64 {
     conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
         .unwrap_or(0)
 }
+
+// ── attachments across a federation link ─────────────────────────
+//
+// The relay carries vendor-prefixed client tags and drops everything else, so
+// what an SDK names its attachment fields with decides whether a peer sees an
+// attachment at all. This SDK wrote bare names, which meant its media and its
+// link previews rendered for a reader on the same server and reached nobody
+// on another one.
+
+/// Wait for a message whose body matches, and hand back its tags.
+async fn recv_tags(
+    rx: &mut mpsc::Receiver<Event>,
+    text: &str,
+    dur: Duration,
+) -> Option<std::collections::HashMap<String, String>> {
+    timeout(dur, async {
+        loop {
+            match rx.recv().await {
+                Some(Event::Message { text: t, tags, .. }) if t == text => return Some(tags),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn an_attachment_reaches_a_reader_on_a_peer_server() {
+    let alice = TestId::new("did:plc:aliceatt");
+    let bob = TestId::new("did:plc:bobatt");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+
+    hb.join("#attach").await.ok();
+    ha.join("#attach").await.ok();
+
+    let media = freeq_sdk::media::MediaAttachment {
+        content_type: "image/png".to_string(),
+        url: "https://cdn.example/cat.png".to_string(),
+        alt: Some("a cat".to_string()),
+        width: Some(640),
+        height: Some(480),
+        blurhash: None,
+        size: Some(1024),
+        filename: None,
+    };
+    let preview = freeq_sdk::media::LinkPreview {
+        url: "https://example.com/post".to_string(),
+        title: Some("A post".to_string()),
+        description: Some("about things".to_string()),
+        thumb_url: Some("https://cdn.example/og.png".to_string()),
+    };
+
+    // Resend until the link settles, as the other tests here do.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut seen_media = None;
+    while tokio::time::Instant::now() < deadline {
+        ha.send_media("#attach", &media).await.ok();
+        if let Some(tags) =
+            recv_tags(&mut rxb, &media.fallback_text(), Duration::from_secs(2)).await
+        {
+            seen_media = Some(tags);
+            break;
+        }
+    }
+    let tags = seen_media.expect("bob received the media message across servers");
+    let parsed = freeq_sdk::media::MediaAttachment::from_tags(&tags).unwrap_or_else(|| {
+        panic!("a reader on the peer server sees no attachment at all: {tags:?}")
+    });
+    assert_eq!(parsed.url, media.url, "{tags:?}");
+    assert_eq!(parsed.content_type, "image/png", "{tags:?}");
+    assert_eq!(parsed.alt.as_deref(), Some("a cat"), "{tags:?}");
+    assert!(parsed.is_image(), "{tags:?}");
+
+    let fallback = "🔗 A post — about things (https://example.com/post)";
+    let mut seen_preview = None;
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        ha.send_link_preview("#attach", &preview).await.ok();
+        if let Some(tags) = recv_tags(&mut rxb, fallback, Duration::from_secs(2)).await {
+            seen_preview = Some(tags);
+            break;
+        }
+    }
+    let tags = seen_preview.expect("bob received the link preview across servers");
+    let parsed = freeq_sdk::media::LinkPreview::from_tags(&tags)
+        .unwrap_or_else(|| panic!("a reader on the peer server sees no preview: {tags:?}"));
+    assert_eq!(parsed.url, preview.url, "{tags:?}");
+    assert_eq!(parsed.title.as_deref(), Some("A post"), "{tags:?}");
+    assert_eq!(parsed.description.as_deref(), Some("about things"), "{tags:?}");
+    assert_eq!(
+        parsed.thumb_url.as_deref(),
+        Some("https://cdn.example/og.png"),
+        "{tags:?}"
+    );
+    // And it is a preview, not an attachment wearing one's tags.
+    assert!(
+        freeq_sdk::media::MediaAttachment::from_tags(&tags).is_none(),
+        "{tags:?}"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}

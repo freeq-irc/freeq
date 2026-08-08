@@ -48,27 +48,36 @@ fn tag<'a>(tags: &'a HashMap<String, String>, name: &str) -> Option<&'a String> 
 
 impl MediaAttachment {
     /// Encode as IRCv3 message tags.
+    ///
+    /// Vendor-prefixed throughout: the S2S relay carries client tags and
+    /// drops everything else, so a bare name is a field that reaches nobody
+    /// on a peer server. `media-mime` rather than `content-type` because the
+    /// latter is an HTTP header name and arrives carrying the header's
+    /// semantics, parameters included.
     pub fn to_tags(&self) -> HashMap<String, String> {
         let mut tags = HashMap::new();
-        tags.insert("content-type".to_string(), self.content_type.clone());
-        tags.insert("media-url".to_string(), self.url.clone());
+        tags.insert(
+            "+freeq.at/media-mime".to_string(),
+            self.content_type.clone(),
+        );
+        tags.insert("+freeq.at/media-url".to_string(), self.url.clone());
         if let Some(ref alt) = self.alt {
-            tags.insert("media-alt".to_string(), alt.clone());
+            tags.insert("+freeq.at/media-alt".to_string(), alt.clone());
         }
         if let Some(w) = self.width {
-            tags.insert("media-w".to_string(), w.to_string());
+            tags.insert("+freeq.at/media-w".to_string(), w.to_string());
         }
         if let Some(h) = self.height {
-            tags.insert("media-h".to_string(), h.to_string());
+            tags.insert("+freeq.at/media-h".to_string(), h.to_string());
         }
         if let Some(ref bh) = self.blurhash {
-            tags.insert("media-blurhash".to_string(), bh.clone());
+            tags.insert("+freeq.at/media-blurhash".to_string(), bh.clone());
         }
         if let Some(sz) = self.size {
-            tags.insert("media-size".to_string(), sz.to_string());
+            tags.insert("+freeq.at/media-size".to_string(), sz.to_string());
         }
         if let Some(ref name) = self.filename {
-            tags.insert("media-filename".to_string(), name.clone());
+            tags.insert("+freeq.at/media-filename".to_string(), name.clone());
         }
         tags
     }
@@ -178,21 +187,24 @@ fn is_link_preview(tags: &HashMap<String, String>) -> bool {
 }
 
 impl LinkPreview {
+    /// Encode as IRCv3 message tags.
+    ///
+    /// The URL is the preview's own field rather than the media one behind a
+    /// `content-type` discriminator: the discriminator was a bare tag, so it
+    /// never crossed a federation link, and a preview that arrives without it
+    /// is indistinguishable from an attachment. The image field is named for
+    /// what it holds — the page's `og:image`, nothing derived or resized.
     pub fn to_tags(&self) -> HashMap<String, String> {
         let mut tags = HashMap::new();
-        tags.insert(
-            "content-type".to_string(),
-            "text/x-link-preview".to_string(),
-        );
-        tags.insert("media-url".to_string(), self.url.clone());
+        tags.insert("+freeq.at/link-url".to_string(), self.url.clone());
         if let Some(ref t) = self.title {
-            tags.insert("link-title".to_string(), t.clone());
+            tags.insert("+freeq.at/link-title".to_string(), t.clone());
         }
         if let Some(ref d) = self.description {
-            tags.insert("link-desc".to_string(), d.clone());
+            tags.insert("+freeq.at/link-desc".to_string(), d.clone());
         }
-        if let Some(ref thumb) = self.thumb_url {
-            tags.insert("link-thumb".to_string(), thumb.clone());
+        if let Some(ref image) = self.thumb_url {
+            tags.insert("+freeq.at/link-image".to_string(), image.clone());
         }
         tags
     }
@@ -791,6 +803,62 @@ mod tests {
             ("media-h".to_string(), "480".to_string()),
             ("media-size".to_string(), "1024".to_string()),
         ])
+    }
+
+    /// Every tag this SDK writes has to survive a federation hop, and the
+    /// relay carries only vendor-prefixed client tags — so a bare name is a
+    /// field that reaches nobody on a peer server. What this SDK sent has
+    /// therefore rendered on its own server and vanished everywhere else.
+    #[test]
+    fn what_this_sdk_writes_is_what_a_relay_carries() {
+        let media = MediaAttachment {
+            content_type: "image/jpeg".to_string(),
+            url: "https://cdn/sunset.jpg".to_string(),
+            alt: Some("A sunset".to_string()),
+            width: Some(1200),
+            height: Some(800),
+            blurhash: Some("LEHV6nWB2yk8".to_string()),
+            size: Some(45000),
+            filename: Some("sunset.jpg".to_string()),
+        };
+        for (name, _) in media.to_tags() {
+            assert!(
+                name.starts_with("+freeq.at/"),
+                "a bare tag is dropped at the boundary: {name}"
+            );
+        }
+        let tags = media.to_tags();
+        assert_eq!(
+            tags.get("+freeq.at/media-mime").map(String::as_str),
+            Some("image/jpeg"),
+            "the type is a media field, not an HTTP header: {tags:?}"
+        );
+        assert!(!tags.contains_key("content-type"), "{tags:?}");
+
+        let preview = LinkPreview {
+            url: "https://example.com/article".to_string(),
+            title: Some("Great Article".to_string()),
+            description: Some("An interesting read".to_string()),
+            thumb_url: Some("https://example.com/og.jpg".to_string()),
+        };
+        for (name, _) in preview.to_tags() {
+            assert!(name.starts_with("+freeq.at/"), "{name}");
+        }
+        let tags = preview.to_tags();
+        assert_eq!(
+            tags.get("+freeq.at/link-url").map(String::as_str),
+            Some("https://example.com/article"),
+            "a preview names its own URL rather than borrowing the media one: {tags:?}"
+        );
+        assert_eq!(
+            tags.get("+freeq.at/link-image").map(String::as_str),
+            Some("https://example.com/og.jpg"),
+            "the value is the page's own image, not a thumbnail: {tags:?}"
+        );
+        assert!(
+            !tags.contains_key("content-type") && !tags.contains_key("media-url"),
+            "the discriminator that could not federate is gone: {tags:?}"
+        );
     }
 
     #[test]

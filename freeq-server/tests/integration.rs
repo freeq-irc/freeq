@@ -3009,17 +3009,27 @@ async fn media_tags_passthrough() {
     ).await;
 
     if let Event::Message { tags, text, .. } = msg {
-        // Tags should be present (both clients negotiated message-tags)
+        // Vendor-prefixed, which is what a client tag has to be to reach a
+        // reader on another server: the relay carries these and drops bare
+        // names, so the spelling here is the difference between an
+        // attachment that federates and one that does not.
         assert_eq!(
-            tags.get("content-type").map(|s| s.as_str()),
+            tags.get("+freeq.at/media-mime").map(|s| s.as_str()),
             Some("image/jpeg")
         );
         assert_eq!(
-            tags.get("media-url").map(|s| s.as_str()),
+            tags.get("+freeq.at/media-url").map(|s| s.as_str()),
             Some("https://cdn.example.com/photo.jpg")
         );
-        assert_eq!(tags.get("media-alt").map(|s| s.as_str()), Some("A sunset"));
-        assert_eq!(tags.get("media-w").map(|s| s.as_str()), Some("1200"));
+        assert_eq!(
+            tags.get("+freeq.at/media-alt").map(|s| s.as_str()),
+            Some("A sunset")
+        );
+        assert_eq!(tags.get("+freeq.at/media-w").map(|s| s.as_str()), Some("1200"));
+        assert!(
+            !tags.contains_key("content-type"),
+            "an HTTP header name is not this field: {tags:?}"
+        );
         // Fallback text should contain the URL
         assert!(text.contains("https://cdn.example.com/photo.jpg"));
     } else {
