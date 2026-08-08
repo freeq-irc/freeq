@@ -3022,7 +3022,15 @@ export class FreeqClient extends EventEmitter {
     // Decided before the signature exists, because the id is returned now:
     // a signed event is filed under the ULID its signature covers, an
     // unsigned one under the legacy id the server reads from `msgid`.
-    const signable = this.ackedCaps.has(SIGNING_CAP) && this.signing.canSign(channel);
+    //
+    // A caller-supplied id that is not ULID-shaped takes the unsigned path
+    // whole: a server will not adopt it, so signing over it would file the
+    // event under an id its own document does not name — and the caller,
+    // holding the id it chose, would be pointing at nothing.
+    const signable =
+      this.ackedCaps.has(SIGNING_CAP) &&
+      this.signing.canSign(channel) &&
+      (opts.eventId === undefined || isUlid(opts.eventId));
     const eventId = opts.eventId ?? (signable ? signing.newEventId() : mintEventId());
     const tags: Record<string, string> = {
       '+freeq.at/event': eventType,
@@ -3068,6 +3076,11 @@ export class FreeqClient extends EventEmitter {
     if (signed) {
       wireTags[signing.EVENT_ID_TAG] = signed.eventId;
       wireTags[signing.SIG_TAG] = signed.sigTag;
+    } else {
+      // Signing was expected and did not happen. The caller already holds
+      // this id, so it still has to be the id the server files: the legacy
+      // tag is the only one an unsigned event is filed under.
+      wireTags['msgid'] = eventId;
     }
     this.raw(format('TAGMSG', [channel], wireTags));
     // The message names the event it renders, and the name is a covered
@@ -3220,6 +3233,12 @@ function mutationIn(
   const unreact = tags['+freeq.at/unreact'];
   if (unreact) return { kind: 'unreact', subject, emoji: unreact };
   return null;
+}
+
+/** ULID shape: 26 characters of uppercase Crockford base32. What a server
+ *  checks before it will adopt a client-minted id as an event's own. */
+function isUlid(id: string): boolean {
+  return /^[0-9A-HJKMNP-TV-Z]{26}$/.test(id);
 }
 
 /** Generate a coordination event ID. Format mirrors Rust SDK

@@ -2015,6 +2015,38 @@ describe('signed mutations', () => {
     expect(seen[0]!.eventType).toBe('task_request');
   });
 
+  // The id is handed to the caller before the signature exists, so the send
+  // has to file under it whatever happens next. Two ways it could not:
+  // signing failing after the emitter committed to signing, and a caller
+  // naming an id the server will refuse to adopt.
+  it('files under the id it returned even when signing fails after the fact', async () => {
+    const { client, ws } = await makeSigningClient();
+    vi.spyOn(client.signing, 'signCoordination').mockResolvedValue(null);
+    const eventId = client.createTask('#room', 'ship it');
+    const line = await waitForSent(ws, 'TAGMSG');
+    expect(line).not.toContain('+freeq.at/sig');
+    expect(
+      tagOf(line, 'msgid'),
+      'unsigned, but still filed under the id the caller holds',
+    ).toBe(eventId);
+  });
+
+  it('lets a caller-named id the server would refuse take the unsigned path', async () => {
+    const { client, ws } = await makeSigningClient();
+    // Not ULID-shaped: the server will not adopt it, and signing over it
+    // would produce a document filed under a different id than it names.
+    const eventId = client.emitEvent('#room', 'task_request', { description: 'x' }, {
+      eventId: 'task-abc',
+      humanText: 'New task: x',
+    });
+    await flushAsync();
+    expect(eventId).toBe('task-abc');
+    const line = ws.sent.find((l) => l.includes('TAGMSG'))!;
+    expect(tagOf(line, 'msgid')).toBe('task-abc');
+    expect(line).not.toContain('+freeq.at/sig');
+    expect(line).not.toContain('+freeq.at/eventid');
+  });
+
   it('an emitted event against a legacy server is byte-identical to before', async () => {
     const { client, ws } = await makeRegistered();
     client.signing.setSigningDid('did:plc:mutator');
