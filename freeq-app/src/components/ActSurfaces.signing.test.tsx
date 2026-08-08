@@ -3,7 +3,9 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render, cleanup, waitFor } from '@testing-library/react';
 import { CoordinationEventCard } from './CoordinationCards';
 import { TaskTimeline } from './TaskTimeline';
+import { AuditTimeline } from './AuditTimeline';
 import type { Message } from '../store';
+import * as api from '../lib/api';
 
 afterEach(() => {
   cleanup();
@@ -63,5 +65,34 @@ describe('act surfaces carry no resting signature ink', () => {
     expect(container.textContent).not.toContain('🔒');
     // Header + evidence row each offer an explicit check.
     expect(getAllByText('verify').length).toBe(2);
+  });
+});
+
+// A DID is the identity the app operates on, never the name it shows a
+// person. The audit timeline was chopping one to 20 characters, which put a
+// mid-string `did:key:z6MkiM7w5ZcW` in front of the reader.
+describe('the audit timeline never renders a raw DID', () => {
+  it('resolves the actor, and compacts it when nothing resolves', async () => {
+    const event = {
+      id: 1,
+      event_id: '01KZAUDIT0000000000000AUD',
+      category: 'coordination',
+      event_type: 'task_request',
+      actor_did: 'did:key:z6MkiM7w5ZcWlongtailthatgetschopped',
+      channel: '#naptest',
+      payload_json: '{"capability":"url_fetch"}',
+      signature: 'ed25519:kid:sigsigsig',
+      timestamp: 0,
+    };
+    vi.spyOn(api, 'apiFetch').mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ events: [event] }),
+    } as unknown as Response);
+
+    const { container } = render(<AuditTimeline channel="#naptest" onClose={() => {}} />);
+    // Nothing resolves this bot, so it wears the compact form — not a DID
+    // truncated mid-identifier, and not the full string either.
+    await waitFor(() => expect(container.textContent).toContain('key:z6Mk…'));
+    expect(container.textContent).not.toContain('did:key:z6MkiM7w5ZcW');
   });
 });

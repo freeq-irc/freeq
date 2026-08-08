@@ -93,7 +93,9 @@ export function AuditTimeline({ channel, onClose }: AuditTimelineProps) {
           className="bg-surface text-fg-muted rounded px-2 py-1 border border-border/50"
         >
           <option value="">All actors</option>
-          {actors.map(a => <option key={a} value={a}>{a}</option>)}
+          {/* The value stays the identifier the API filters on; only the label
+              is resolved, so a DID never faces the reader. */}
+          {actors.map(a => <option key={a} value={a}>{displayNameForKey(a)}</option>)}
         </select>
         <select
           value={categoryFilter}
@@ -179,7 +181,7 @@ function AuditEventRow({ event, onVerify }: {
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-1.5">
           <span className={`text-xs font-semibold ${color}`}>
-            {event.actor_name || event.actor_did?.slice(0, 20)}
+            {event.actor_name || (event.actor_did ? displayNameForKey(event.actor_did) : '')}
           </span>
           <span className="text-xs text-fg-muted truncate">{summary}</span>
           {event.event_id && (
