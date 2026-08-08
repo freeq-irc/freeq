@@ -2203,3 +2203,95 @@ async fn an_evidence_event_is_verified_with_the_type_it_names() {
         "the stored bytes name the evidence type: {v}"
     );
 }
+
+/// A signature this server cannot check yet is not a signature to throw away.
+///
+/// The sender's key can be absent for ordinary reasons — it registers moments
+/// after the event on a fresh session, or it belongs to someone on another
+/// server. Discarding the signature filed the event under a server-minted id
+/// instead of the one the signature covered, which made it unverifiable
+/// forever: the bytes named an id the row did not have, and the signature was
+/// gone. Keep both, say `unverifiable`, and let the answer improve when the
+/// key arrives.
+#[tokio::test]
+async fn a_signature_this_server_cannot_check_yet_is_kept_and_answered_honestly() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (irc_addr, web_addr, _h) = start_web(
+        resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)]),
+        "test-unverifiable",
+    )
+    .await;
+
+    let signing = SigningKey::from_bytes(&[77u8; 32]);
+    let event_id = freeq_server::msgid::generate();
+    let sent_id = event_id.clone();
+    let sending_key = signing.clone();
+    let mut alice_holder = tokio::task::spawn_blocking(move || {
+        let mut bob = C::authenticated(irc_addr, "bob", did_bob, kb);
+        bob.join("#unver");
+        let mut alice = C::authenticated(irc_addr, "alice", DID_ALICE, ka);
+        alice.join("#unver");
+
+        // Signed, but the key is not registered — the server has no way to
+        // resolve the kid this names.
+        alice.tx(&format!(
+            "@{} TAGMSG #unver",
+            signed_coordination_tags("#unver", &sent_id, "task_request", "%7B%7D", None, &sending_key)
+        ));
+        bob.rx(|l| l.contains("task_request"), "the event still relays");
+        alice
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let resp = reqwest::get(format!("http://{web_addr}/api/v1/verify/{event_id}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "nothing is filed under the id the signature covers — the event went \
+         in under an id of ours instead, and can never be checked"
+    );
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        v["event_id"], event_id,
+        "filed under the id its signature covers, not one of ours: {v}"
+    );
+    assert!(
+        v["signature"].is_string(),
+        "the signature is kept, not destroyed: {v}"
+    );
+    assert_eq!(v["verification"]["verdict"], "unverifiable", "{v}");
+    assert_eq!(
+        v["verification"]["verified_by"], "unverifiable-unknown-key",
+        "honest about why, rather than calling it unsigned: {v}"
+    );
+
+    // The key arrives. Nothing about the stored row changes, and the same row
+    // now answers for itself.
+    tokio::task::spawn_blocking(move || {
+        alice_holder.msgsig(&signing);
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let after: serde_json::Value =
+        reqwest::get(format!("http://{web_addr}/api/v1/verify/{event_id}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(
+        after["verification"]["verdict"], "valid",
+        "once the key is on file the event verifies: {after}"
+    );
+    assert_eq!(
+        after["verification"]["verified_by"], "client-session-key",
+        "{after}"
+    );
+}

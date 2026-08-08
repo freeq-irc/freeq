@@ -1176,13 +1176,31 @@ pub(super) fn handle_tagmsg(
             }
             return;
         }
-        let verified = checked
-            .filter(|c| c.outcome == ClientSigOutcome::Verified)
-            .map(|c| c.canonical);
-        // The signer's id when it verified; the legacy self-minted `msgid`
-        // otherwise, which is what a pre-signing client sends and what an
-        // unsigned event is still filed under.
-        let event_id = match verified.is_some() {
+        // A signature this server cannot check *yet* is still the sender's
+        // signature. The key registers moments later on a fresh session, or
+        // belongs to someone on another server; discarding it filed the event
+        // under an id of ours while the bytes named the signer's, which made
+        // it unverifiable forever. Keep both and record the verdict honestly —
+        // the log has a state for exactly this, and the answer improves by
+        // itself once the key is on file. A signature that *failed* never
+        // reaches here; the caller refused the event.
+        let signed = checked.map(|c| {
+            let state = match c.outcome {
+                ClientSigOutcome::Verified => crate::events::SigState::Valid,
+                _ => crate::events::SigState::Unverifiable,
+            };
+            if let ClientSigOutcome::Unverifiable(why) = c.outcome {
+                tracing::debug!(
+                    session = %conn.id, did = %did, why = %why,
+                    "Coordination signature not checkable here — filed as unverifiable"
+                );
+            }
+            (c.canonical, state)
+        });
+        // The signer's id whenever it signed at all, so the id on file is the
+        // id the signature covers; the legacy self-minted `msgid` otherwise,
+        // which is what a pre-signing client sends.
+        let event_id = match signed.is_some() {
             true => tags
                 .get(freeq_sdk::chatsig::EVENT_ID_TAG)
                 .or_else(|| tags.get(freeq_sdk::chatsig::EVENT_ID_TAG_BARE))
@@ -1212,11 +1230,11 @@ pub(super) fn handle_tagmsg(
             tracing::warn!(actor = %did, "Decoded payload exceeded cap; dropping");
             return;
         }
-        // Only a signature this server checked. Storing the tag as it arrived
-        // put whatever the client typed in the column a reader takes for
-        // evidence — the never-launder rule, applied where the event is kept
-        // rather than only where it is relayed.
-        let signature = verified
+        // The sender's signature, kept whenever there was one to keep. What
+        // the row must never do is *claim* more than this server established,
+        // and it doesn't: the verdict travels with the bytes, and a reader
+        // asking about this event is told whether it was checked.
+        let signature = signed
             .is_some()
             .then(|| tags.get("+freeq.at/sig").cloned())
             .flatten();
@@ -1231,7 +1249,15 @@ pub(super) fn handle_tagmsg(
             signature,
             timestamp: now,
         };
-        let stored = state.with_db(|db| db.store_coordination_event(&event, verified.as_deref()));
+        let stored = state.with_db(|db| {
+            db.store_coordination_event(
+                &event,
+                signed.as_ref().map(|(canonical, state)| crate::db::SignedCoordination {
+                    canonical,
+                    state: *state,
+                }),
+            )
+        });
         if stored == Some(crate::db::CoordinationWrite::Refused) {
             tracing::warn!(
                 actor = %did, event_id = %event_id, channel = %target,
@@ -1245,7 +1271,7 @@ pub(super) fn handle_tagmsg(
             event_id = %event_id,
             actor = %did,
             channel = %target,
-            signed = verified.is_some(),
+            signed = signed.is_some(),
             outcome = ?stored,
             "Stored coordination event"
         );

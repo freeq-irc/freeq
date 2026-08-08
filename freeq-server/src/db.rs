@@ -4994,6 +4994,18 @@ pub struct CoordinationEventRow {
     pub timestamp: i64,
 }
 
+/// The bytes behind a coordination event's signature, and what this server
+/// concluded about them.
+///
+/// A signature it could not check is still recorded — the state says so. The
+/// alternative was throwing it away, which filed the event under an id the
+/// signature did not cover and made it permanently uncheckable.
+pub struct SignedCoordination<'a> {
+    /// The exact canonical the sender signed.
+    pub canonical: &'a str,
+    pub state: crate::events::SigState,
+}
+
 /// What happened to a coordination event offered for filing.
 ///
 /// Three answers, because a second claim on one id is three different
@@ -5014,11 +5026,12 @@ pub enum CoordinationWrite {
 impl Db {
     /// Store a coordination event, and file it in the append-only log.
     ///
-    /// `canonical` is the exact bytes the event's signature covers, and is
-    /// supplied only when this server checked that signature: the row then
-    /// carries a document a reader can re-verify years later. Without one the
-    /// event is filed as facts and nothing else — it happened, and nobody
-    /// signed for it.
+    /// `signed` carries the exact bytes the event's signature covers and the
+    /// verdict this server reached about them — including `Unverifiable`, for
+    /// a signature it could not check yet. The row then holds a document a
+    /// reader can re-verify later, when the key it names is on file. Without
+    /// a signature at all the event is filed as facts and nothing else: it
+    /// happened, and nobody signed for it.
     ///
     /// The id is the *client's*, so two claims can name the same one. The
     /// first write wins — the rule the message path already follows
@@ -5034,7 +5047,7 @@ impl Db {
     pub fn store_coordination_event(
         &self,
         event: &CoordinationEventRow,
-        canonical: Option<&str>,
+        signed: Option<SignedCoordination<'_>>,
     ) -> SqlResult<CoordinationWrite> {
         if let Some(filed) = self.coordination_event(&event.event_id)? {
             if filed.actor_did != event.actor_did {
@@ -5085,11 +5098,14 @@ impl Db {
                 event.timestamp,
             ],
         )?;
-        let record = match canonical {
-            Some(canonical) => EventRecord {
+        let record = match signed {
+            Some(SignedCoordination { canonical, state }) => EventRecord {
                 shape: EventShape::Document(canonical),
                 signature: event.signature.as_deref(),
-                ctx: crate::events::EventContext::verified(),
+                ctx: crate::events::EventContext {
+                    sig_state: state,
+                    ..Default::default()
+                },
                 timestamp: event.timestamp as u64,
             },
             None => EventRecord {
