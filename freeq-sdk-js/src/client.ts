@@ -3060,7 +3060,14 @@ export class FreeqClient extends EventEmitter {
       wireTags[signing.SIG_TAG] = signed.sigTag;
     }
     this.raw(format('TAGMSG', [channel], wireTags));
-    await this.signedPrivmsg(channel, humanText, tags);
+    // The message names the event it renders, and the name is a covered
+    // coordination tag — so the tie between the two halves is inside the
+    // signature rather than a tag an intermediary could cut. The TAGMSG
+    // needs nothing added: it already carries the id in a covered field.
+    await this.signedPrivmsg(channel, humanText, {
+      ...tags,
+      [signing.COORD_ID_TAG]: eventId,
+    });
   }
 
   /** Sugar over `emitEvent` for `task_request`. Returns the task ID. */

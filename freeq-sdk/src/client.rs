@@ -2978,7 +2978,7 @@ async fn execute_command<W: AsyncWrite + Unpin>(
                 tags.insert("+freeq.at/ref".to_string(), rid);
             }
             let mut event_tags = tags.clone();
-            event_tags.insert(crate::chatsig::EVENT_ID_TAG.to_string(), event_id);
+            event_tags.insert(crate::chatsig::EVENT_ID_TAG.to_string(), event_id.clone());
             event_tags.insert(crate::sigtag::SIG_TAG.to_string(), signature);
             let tagmsg = crate::irc::Message {
                 tags: event_tags,
@@ -2988,9 +2988,12 @@ async fn execute_command<W: AsyncWrite + Unpin>(
             };
             writer.write_all(format!("{tagmsg}\r\n").as_bytes()).await?;
 
-            // The companion is an ordinary message, signing its own id. The
-            // coordination tags are covered fields, so the document it signs
-            // names the event — which is what joins the pair.
+            // The companion is an ordinary message, signing its own id, and it
+            // names the event it renders in a covered coordination tag — so
+            // the tie between the two halves is inside the signature rather
+            // than a tag an intermediary could cut. The TAGMSG needs nothing
+            // added: it already carries the id in a covered field.
+            tags.insert(crate::chatsig::COORD_ID_TAG.to_string(), event_id);
             sign_outgoing(
                 &mut tags,
                 signing_key,
@@ -4197,13 +4200,23 @@ mod multiline_tests {
         .expect("the signature verifies over the coordination document");
 
         // The companion message is a message: its own id, its own signature,
-        // and the coordination tags inside the document that joins the pair.
+        // and — inside that signature — the name of the event it renders, so
+        // a reader holding both halves can tell they are one event.
         assert_eq!(privmsg.command, "PRIVMSG");
         let message_id = privmsg
             .tags
             .get(crate::chatsig::EVENT_ID_TAG)
             .expect("the companion signs too");
         assert_ne!(message_id, &task_id, "each document signs its own id");
+        assert_eq!(
+            privmsg.tags.get(crate::chatsig::COORD_ID_TAG),
+            Some(&task_id),
+            "the companion names its event: {wire}"
+        );
+        assert!(
+            !tagmsg.tags.contains_key(crate::chatsig::COORD_ID_TAG),
+            "the TAGMSG already names the event in a covered field: {wire}"
+        );
         let venue = crate::chatsig::channel_venue("#room");
         let mut doc =
             crate::chatsig::ChatDoc::message(did, message_id, &venue, &privmsg.params[1]);

@@ -1932,22 +1932,32 @@ describe('signed mutations', () => {
     expect(await verifySig(repointed, sigTag, verifyKey)).toBe(false);
   });
 
-  it('the companion message is signed on its own, and carries the event tags', async () => {
+  // The two halves of one event have to be recognizable as one event, and the
+  // tie has to be inside the signature or an intermediary can cut it. The
+  // TAGMSG names the event in its own covered id; the message names it in a
+  // covered coordination tag.
+  it('the companion message names the event it renders, inside its signature', async () => {
     const signing = await import('./signing.js');
     const { client, ws, verifyKey } = await makeSigningClient();
-    client.emitEvent('#room', 'task_request', { description: 'ship it' }, {
+    const eventId = client.emitEvent('#room', 'task_request', { description: 'ship it' }, {
       humanText: 'New task: ship it',
     });
     const privmsg = await waitForSent(ws, 'PRIVMSG');
     const tagmsg = ws.sent.find((l) => l.includes('TAGMSG'))!;
 
+    expect(tagOf(tagmsg, '+freeq.at/eventid')).toBe(eventId);
+    expect(
+      tagOf(tagmsg, '+freeq.at/coordid'),
+      'the TAGMSG already names the event in a covered field',
+    ).toBeNull();
+    expect(tagOf(privmsg, '+freeq.at/coordid')).toBe(eventId);
     const messageId = tagOf(privmsg, '+freeq.at/eventid')!;
-    expect(messageId, 'each document signs its own id').not.toBe(
-      tagOf(tagmsg, '+freeq.at/eventid'),
-    );
+    expect(messageId, 'each document still signs its own id').not.toBe(eventId);
+
     const coord = {
       '+freeq.at/event': 'task_request',
       '+freeq.at/payload': '{"description":"ship%20it"}',
+      '+freeq.at/coordid': eventId,
     };
     const canonical = await signing.messageCanonical({
       from: 'did:plc:mutator',
@@ -1957,6 +1967,16 @@ describe('signed mutations', () => {
       tags: coord,
     });
     expect(await verifySig(canonical, tagOf(privmsg, '+freeq.at/sig')!, verifyKey)).toBe(true);
+
+    // Cutting the tie is tampering, and reads as it.
+    const untied = await signing.messageCanonical({
+      from: 'did:plc:mutator',
+      msgid: messageId,
+      target: '#room',
+      body: 'New task: ship it',
+      tags: { '+freeq.at/event': 'task_request', '+freeq.at/payload': '{"description":"ship%20it"}' },
+    });
+    expect(await verifySig(untied, tagOf(privmsg, '+freeq.at/sig')!, verifyKey)).toBe(false);
   });
 
   it('an emitted event against a legacy server is byte-identical to before', async () => {
