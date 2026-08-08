@@ -1978,6 +1978,33 @@ describe('signed mutations', () => {
     ]);
   });
 
+  // A notice is a statement under the sender's name like any other, and the
+  // server checks it against the same document — so an agent that answers by
+  // NOTICE carries the same proof as one that answers by PRIVMSG.
+  it('a notice is signed over the same document a message would be', async () => {
+    const signing = await import('./signing.js');
+    const { client, ws, verifyKey } = await makeSigningClient();
+    client.sendNotice('#room', 'back in five');
+    const line = await waitForSent(ws, 'NOTICE');
+
+    const canonical = await signing.messageCanonical({
+      from: 'did:plc:mutator',
+      msgid: tagOf(line, '+freeq.at/eventid')!,
+      target: '#room',
+      body: 'back in five',
+    });
+    expect(await verifySig(canonical, tagOf(line, '+freeq.at/sig')!, verifyKey)).toBe(true);
+  });
+
+  it('a notice against a legacy server is a plain NOTICE line', async () => {
+    const { client, ws } = await makeRegistered();
+    client.signing.setSigningDid('did:plc:mutator');
+    await client.signing.generateSigningKey();
+    client.sendNotice('#room', 'back in five');
+    await flushAsync();
+    expect(ws.sent).toEqual(['NOTICE #room :back in five']);
+  });
+
   it('media and link previews against a legacy server are byte-identical to before', async () => {
     const { client, ws } = await makeRegistered();
     client.signing.setSigningDid('did:plc:mutator');

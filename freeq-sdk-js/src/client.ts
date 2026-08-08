@@ -1175,12 +1175,26 @@ export class FreeqClient extends EventEmitter {
   }
 
   private async signedPrivmsg(target: string, text: string, extraTags?: Record<string, string>): Promise<void> {
+    return this.signedMessage('PRIVMSG', target, text, extraTags);
+  }
+
+  /**
+   * A message on the wire, signed. `NOTICE` and `PRIVMSG` sign the same
+   * document — the canonical binds who said what, where, and under which id,
+   * and says nothing about which verb carried it.
+   */
+  private async signedMessage(
+    command: 'PRIVMSG' | 'NOTICE',
+    target: string,
+    text: string,
+    extraTags?: Record<string, string>,
+  ): Promise<void> {
     const tags: Record<string, string> = { ...extraTags };
     Object.assign(tags, await this.signatureTags(target, text, tags));
     if (Object.keys(tags).length > 0) {
-      this.raw(format('PRIVMSG', [target, text], tags));
+      this.raw(format(command, [target, text], tags));
     } else {
-      this.raw(`PRIVMSG ${target} :${text}`);
+      this.raw(`${command} ${target} :${text}`);
     }
   }
 
@@ -2762,6 +2776,14 @@ export class FreeqClient extends EventEmitter {
    *  covered coordination tags ride inside the document. */
   sendTagged(target: string, text: string, tags: Record<string, string>): void {
     void this.signedPrivmsg(target, text, tags);
+  }
+
+  /** Send a NOTICE. Signed like a PRIVMSG — the server verifies both against
+   *  the same document, so a bot's notices carry the same proof its messages
+   *  do. A DM peer resolves to their DID where it's known, which is what
+   *  gives the signature a venue a verifier can rebuild. */
+  sendNotice(target: string, text: string, tags: Record<string, string> = {}): void {
+    void this.signedMessage('NOTICE', this.wireTargetFor(target), text, tags);
   }
 
   /** TAGMSG (tags-only, no body) to a target. */

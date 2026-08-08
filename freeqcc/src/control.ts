@@ -4,8 +4,9 @@
 // any stale entry. Each accepted connection reads one JSON line of the form
 //   {token, action, args}
 // validates the token against the in-memory store, dispatches to an action
-// handler that issues client.raw(...) on the freeq SDK, and writes back one
-// JSON line {ok, ...}.
+// handler that drives the freeq SDK client, and writes back one JSON line
+// {ok, ...}. Messages go through the client's signed send path; only the
+// control verbs (JOIN/PART/NICK) are written as raw lines.
 //
 // Tokens are minted in handleDm (daemon.ts), expire on dispatch completion
 // (dispatch.ts onComplete/onError), and have a 10-min hard TTL safety net.
@@ -96,9 +97,16 @@ interface Response {
 
 /** A minimal interface over the FreeqClient that we actually need. The SDK
  *  type is intentionally NOT imported here so this module can be tested in
- *  isolation. The daemon passes an object with .raw and .nick. */
+ *  isolation. The daemon passes an object backed by the client. */
 export interface IrcSink {
+  /** Control verbs — JOIN, PART, NICK. Nothing a signature is about. */
   raw(line: string): void;
+  /** A message under this agent's name. Goes through the client's signed
+   *  send path: a hand-built line bypasses the armed session key, and the
+   *  message arrives with the server vouching instead of the sender. */
+  say(target: string, text: string): void;
+  /** A notice under this agent's name. Signed for the same reason. */
+  notice(target: string, text: string): void;
   readonly nick: string;
 }
 
@@ -162,25 +170,25 @@ function runAction(action: string, args: unknown[], sink: IrcSink): Record<strin
     case "privmsg-user": {
       const target = asNick(args[0], "nick");
       const text = asText(args[1], "text");
-      sink.raw(`PRIVMSG ${target} :${text}`);
+      sink.say(target, text);
       return {};
     }
     case "privmsg-channel": {
       const target = asChannel(args[0], "channel");
       const text = asText(args[1], "text");
-      sink.raw(`PRIVMSG ${target} :${text}`);
+      sink.say(target, text);
       return {};
     }
     case "notice-user": {
       const target = asNick(args[0], "nick");
       const text = asText(args[1], "text");
-      sink.raw(`NOTICE ${target} :${text}`);
+      sink.notice(target, text);
       return {};
     }
     case "notice-channel": {
       const target = asChannel(args[0], "channel");
       const text = asText(args[1], "text");
-      sink.raw(`NOTICE ${target} :${text}`);
+      sink.notice(target, text);
       return {};
     }
     case "nick": {

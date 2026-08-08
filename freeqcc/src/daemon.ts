@@ -88,7 +88,12 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
   const tokenStore = new TokenStore();
   const controlServer: ControlServerHandle = await startControlServer({
     store: tokenStore,
-    sink: { raw: (line) => conn.client.raw(line), get nick() { return conn.client.nick; } },
+    sink: {
+      raw: (line) => conn.client.raw(line),
+      say: (target, text) => conn.client.sendMessage(target, text),
+      notice: (target, text) => conn.client.sendNotice(target, text),
+      get nick() { return conn.client.nick; },
+    },
   });
 
   // ── Bot's own channel ──
@@ -269,9 +274,7 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
     const sendStreamingPrivmsg = (chunkText: string): void => {
       // Initial: tag streaming=1, no edit ref. SDK assigns msgid via echo.
       const safe = chunkText.replace(/[\r\n]/g, " ").slice(0, 1500) || "…";
-      conn.client.raw(
-        `@+freeq.at/streaming=1 PRIVMSG ${replyTarget} :${safe}`,
-      );
+      conn.client.sendTagged(replyTarget, safe, { "+freeq.at/streaming": "1" });
       streamSent = true;
       lastFlushedText = chunkText;
     };
@@ -279,10 +282,9 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
     const sendStreamingEdit = (chunkText: string, isFinal: boolean): void => {
       if (!streamMsgId) return; // can't edit without msgid yet
       const safe = chunkText.replace(/[\r\n]/g, " ").slice(0, 1500) || "…";
-      const tag = isFinal
-        ? `+draft/edit=${streamMsgId}`
-        : `+draft/edit=${streamMsgId};+freeq.at/streaming=1`;
-      conn.client.raw(`@${tag} PRIVMSG ${replyTarget} :${safe}`);
+      const tags: Record<string, string> = { "+draft/edit": streamMsgId };
+      if (!isFinal) tags["+freeq.at/streaming"] = "1";
+      conn.client.sendTagged(replyTarget, safe, tags);
       lastFlushedText = chunkText;
     };
 
@@ -336,7 +338,7 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
             // Never streamed (model returned only the result event).
             // Fire one PRIVMSG with the final text, no streaming tag.
             const safe = latestText.replace(/[\r\n]/g, " ").slice(0, 1500);
-            conn.client.raw(`PRIVMSG ${replyTarget} :${safe}`);
+            conn.client.sendMessage(replyTarget, safe);
           } else {
             // We sent a streaming PRIVMSG but the echo with the server-
             // assigned msgid may not have arrived yet. Wait up to 2s; if
@@ -351,7 +353,7 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
               flush(true); // final edit clears the streaming tag
             } else {
               const safe = latestText.replace(/[\r\n]/g, " ").slice(0, 1500);
-              conn.client.raw(`PRIVMSG ${replyTarget} :${safe}`);
+              conn.client.sendMessage(replyTarget, safe);
               console.warn(
                 `[stream] msgid never arrived via echo — sent fallback PRIVMSG`,
               );
@@ -369,8 +371,10 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
           }
           const message = (err as Error).message;
           if (streamSent && streamMsgId) {
-            conn.client.raw(
-              `@+draft/edit=${streamMsgId} PRIVMSG ${replyTarget} :(claude error: ${message.slice(0, 200)})`,
+            conn.client.sendTagged(
+              replyTarget,
+              `(claude error: ${message.slice(0, 200)})`,
+              { "+draft/edit": streamMsgId },
             );
           } else {
             conn.client.sendMessage(
