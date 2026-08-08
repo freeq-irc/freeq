@@ -190,6 +190,36 @@ export function mutationCanonical(fields: {
   return canonicalize(doc);
 }
 
+/**
+ * The exact UTF-8 string a coordination event's signature covers — the TAGMSG
+ * half of a task request, an update, a completion, attached evidence.
+ *
+ * `msgid` is this event's own id. `payload` is the wire value of
+ * `+freeq.at/payload` (IRC-unescaped, otherwise verbatim), hashed like a body:
+ * a payload runs to kilobytes, and any app-level encoding inside it is opaque
+ * bytes to the signature. `ref` is the event this one refers to — usually the
+ * task's id — and both wire spellings (`ref`, `task-id`) mean this one field.
+ */
+export async function coordinationCanonical(fields: {
+  from: string;
+  msgid: string;
+  target: string;
+  eventType: string;
+  payload?: string;
+  ref?: string;
+}): Promise<string> {
+  const doc: Record<string, unknown> = {
+    event: fields.eventType,
+    from: fields.from,
+    kind: 'coordination',
+    msgid: fields.msgid,
+    target: fields.target,
+  };
+  if (fields.payload !== undefined) doc.payload = await bodyHash(fields.payload);
+  if (fields.ref) doc.ref = fields.ref;
+  return canonicalize(doc);
+}
+
 /** Derive a key id: base64url of the first 16 bytes of SHA-256 over the key. */
 export async function deriveKid(rawPublicKey: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', rawPublicKey as unknown as ArrayBuffer);
@@ -306,6 +336,52 @@ export class SessionSigning {
       target: venue,
       subject,
       emoji,
+    });
+    const sigTag = await this.signCanonical(canonical);
+    return sigTag ? { eventId, sigTag } : null;
+  }
+
+  /**
+   * Whether a send to `target` would be signed — a key, an identity, and a
+   * venue a verifier could rebuild.
+   *
+   * Synchronous because a caller sometimes has to decide *before* the
+   * signature exists: an emitter that returns its event's id cannot wait for
+   * the signing to resolve, and the id it returns has to be the id the server
+   * will file — a signer-minted ULID when this signs, the legacy id when it
+   * doesn't.
+   */
+  canSign(target: string): boolean {
+    if (!this.signingKey?.privateKey || !this.authenticatedDid) return false;
+    return venueForTarget(target, this.authenticatedDid) !== null;
+  }
+
+  /**
+   * Sign a coordination event (the TAGMSG a task event is stored as).
+   *
+   * The server files this event and serves it back as a task card and an
+   * audit row, so it signs standalone rather than leaning on the companion
+   * message that renders it. Same refusals as everything else: no key, no
+   * venue, no signature.
+   */
+  async signCoordination(
+    target: string,
+    eventType: string,
+    opts: { eventId: string; payload?: string; ref?: string },
+  ): Promise<SignedEvent | null> {
+    if (!this.signingKey?.privateKey || !this.authenticatedDid) return null;
+    const venue = venueForTarget(target, this.authenticatedDid);
+    if (!venue) return null;
+    // The id comes from the caller, not from here: an emitter hands its id
+    // back to application code before this signature exists.
+    const eventId = opts.eventId;
+    const canonical = await coordinationCanonical({
+      from: this.authenticatedDid,
+      msgid: eventId,
+      target: venue,
+      eventType,
+      payload: opts.payload,
+      ref: opts.ref,
     });
     const sigTag = await this.signCanonical(canonical);
     return sigTag ? { eventId, sigTag } : null;

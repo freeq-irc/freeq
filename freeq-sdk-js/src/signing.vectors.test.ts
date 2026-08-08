@@ -22,7 +22,7 @@ interface Vector {
   canonical: string;
   sigTag: string;
   input: {
-    kind: 'message' | 'delete' | 'react' | 'unreact';
+    kind: 'message' | 'delete' | 'react' | 'unreact' | 'coordination';
     from: string;
     msgid: string;
     target: string;
@@ -33,6 +33,9 @@ interface Vector {
     edit?: string;
     subject?: string;
     emoji?: string;
+    eventType?: string;
+    payload?: string;
+    ref?: string;
     tags?: Record<string, string>;
   };
 }
@@ -70,6 +73,16 @@ async function canonicalOf(v: Vector): Promise<string> {
       reply: v.input.reply,
       edit: v.input.edit,
       tags: v.input.tags,
+    });
+  }
+  if (v.input.kind === 'coordination') {
+    return signing.coordinationCanonical({
+      from: v.input.from,
+      msgid: v.input.msgid,
+      target: v.input.target,
+      eventType: v.input.eventType!,
+      payload: v.input.payload,
+      ref: v.input.ref,
     });
   }
   return signing.mutationCanonical({

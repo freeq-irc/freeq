@@ -2,7 +2,7 @@
   "bodyRule": "body = \"sha256:\" + lowercase hex of SHA-256 over the UTF-8 wire body — ciphertext under E2EE, and the assembled body (real newlines) for a draft/multiline batch.",
   "coordRule": "coord covers exactly the client-authored coordination tags event, payload, ref, task-id (canonical keys; wire names carry a +freeq.at/ prefix), IRC-unescaped, verbatim. Every other tag — server stamps, tallies, verdicts, provenance, ephemera, framing — is excluded.",
   "description": "Worked signing examples for freeq chat events (messages, deletes, reactions). Every implementation must reproduce `canonical` and `sigTag` byte-for-byte from `input` + `seed`, and must reach `expected` for each negative: check the negative's `sigTag` when present (a tag-level attack, against the named vector's canonical), otherwise the vector's own sigTag against `tamperedCanonical` (a document-level attack).",
-  "documentRule": "JCS (RFC 8785) over an enumerated per-kind document. Mandatory: from, msgid, target. A message carries no `kind` (its absence is the kind) and covers body/reply?/edit?/coord?; a mutation carries kind and subject, plus emoji for react|unreact. Optional fields are omitted entirely when absent.",
+  "documentRule": "JCS (RFC 8785) over an enumerated per-kind document. Mandatory: from, msgid, target. A message carries no `kind` (its absence is the kind) and covers body/reply?/edit?/coord?; a mutation carries kind and subject, plus emoji for react|unreact; a coordination event carries kind \"coordination\", event, payload and ref?. Optional fields are omitted entirely when absent.",
   "kidRule": "base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16])",
   "negatives": [
     {
@@ -48,6 +48,18 @@
       "vector": "react"
     },
     {
+      "expected": "invalid",
+      "name": "altered-coordination-payload",
+      "tamperedCanonical": "{\"event\":\"task_complete\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kind\":\"coordination\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"payload\":\"sha256:c32b4467d1b6bc39a870b00b42a7bbf709804061298c442393be5310f1dc5474\",\"ref\":\"01KYVT1W2P0000000000000000\",\"target\":\"#swarm\"}",
+      "vector": "coordination-task-complete-with-ref"
+    },
+    {
+      "expected": "invalid",
+      "name": "repointed-coordination-ref",
+      "tamperedCanonical": "{\"event\":\"task_complete\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kind\":\"coordination\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"payload\":\"sha256:f14c5b18363d833304b6cf6811fa77cf10240656bcfaacfac4560e4d3b17f616\",\"ref\":\"01KYVT9ZZZ0000000000000000\",\"target\":\"#swarm\"}",
+      "vector": "coordination-task-complete-with-ref"
+    },
+    {
       "expected": "unverifiable",
       "name": "wrong-kid",
       "sigTag": "ed25519:28KYJRxRMhtyZueNHBUcKw:_82Len7Z3lcnJsRKEZ9fYPfR4UqC0KhkxW01m9LTeqXN36TPPNdN-jROTIWYFvjiPyEXZUH7ZCyEJC4f0JH_BQ",
@@ -66,6 +78,7 @@
       "vector": "message-plain"
     }
   ],
+  "payloadRule": "payload = \"sha256:\" + lowercase hex of SHA-256 over the UTF-8 wire value of +freeq.at/payload, IRC-unescaped and otherwise verbatim — any app-level encoding inside it is opaque bytes to the signature.",
   "referenceRule": "edit, reply and subject always name root msgids. A signed event naming a revision is refused, never rewritten.",
   "sigTagFormat": "ed25519:<kid>:<base64url-nopad signature over the UTF-8 canonical bytes>",
   "vectors": [
@@ -204,6 +217,39 @@
       "publicKey": "ypOsFwUYcHHWe4PH_w7-gQjo7EUwV113JoeTM9vavnw",
       "seed": "0404040404040404040404040404040404040404040404040404040404040404",
       "sigTag": "ed25519:xblA7T9lw5GWXegpX8XSXw:jUj6OnweFd-BMliw3PrGrDRfs7Y8b_xB07csz36ZWcag4vkhPufw7SiotS-Rx3joEGZIKbFHo7R49V8kCsDTBg"
+    },
+    {
+      "canonical": "{\"event\":\"task_request\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kind\":\"coordination\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"payload\":\"sha256:5547e8a017ab59335f6b664d6faab8e7515f49db770baafb7ff65cbae9fef71e\",\"target\":\"#swarm\"}",
+      "input": {
+        "eventType": "task_request",
+        "from": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "kind": "coordination",
+        "msgid": "01KYVT5Z8Q0000000000000000",
+        "payload": "%7B%22description%22%3A%22ship%20it%22%7D",
+        "target": "#swarm"
+      },
+      "kid": "dZl3bDCF4_naDRMHHrC0qw",
+      "name": "coordination-task-request",
+      "publicKey": "bnoc3Smwt4_ROvTFWY_v9O8qlxZuPKby5Pv8zYBQW_E",
+      "seed": "0505050505050505050505050505050505050505050505050505050505050505",
+      "sigTag": "ed25519:dZl3bDCF4_naDRMHHrC0qw:tjr4FOCQcR-f-EUejK1J18qSsR5TcRsBY8pq8jepjT1MWNscojcH_kWtwmp_wP1JTDjuOFAb5bxazJN22y3uAA"
+    },
+    {
+      "canonical": "{\"event\":\"task_complete\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kind\":\"coordination\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"payload\":\"sha256:f14c5b18363d833304b6cf6811fa77cf10240656bcfaacfac4560e4d3b17f616\",\"ref\":\"01KYVT1W2P0000000000000000\",\"target\":\"#swarm\"}",
+      "input": {
+        "eventType": "task_complete",
+        "from": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "kind": "coordination",
+        "msgid": "01KYVT5Z8Q0000000000000000",
+        "payload": "%7B%22summary%22%3A%22done%22%7D",
+        "ref": "01KYVT1W2P0000000000000000",
+        "target": "#swarm"
+      },
+      "kid": "dZl3bDCF4_naDRMHHrC0qw",
+      "name": "coordination-task-complete-with-ref",
+      "publicKey": "bnoc3Smwt4_ROvTFWY_v9O8qlxZuPKby5Pv8zYBQW_E",
+      "seed": "0505050505050505050505050505050505050505050505050505050505050505",
+      "sigTag": "ed25519:dZl3bDCF4_naDRMHHrC0qw:HlTllkvUcGetHogC5TZAnYqrm08YgeG_PsIUWUcVp7QolIQwFat1A22DTXEPS0BYMiMPdCNTuHmj4JzuGYGEAw"
     }
   ],
   "venueRule": "target is the normalized venue, never the wire target: a channel lowercased, or `dm:<did_a>,<did_b>` with the two DIDs sorted ascending.",

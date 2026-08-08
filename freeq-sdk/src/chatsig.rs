@@ -28,12 +28,25 @@
 //! react:    {"emoji":"<emoji>", "from":"<DID>", "kind":"react"|"unreact",
 //!            "msgid":"<event ULID>", "subject":"<root msgid>",
 //!            "target":"<venue>"}
+//!
+//! coordination:
+//!           {"event":"<event type>", "from":"<DID>", "kind":"coordination",
+//!            "msgid":"<event ULID>", "payload":"sha256:<hex>",
+//!            "ref":"<referenced event id>"?, "target":"<venue>"}
 //! ```
 //!
 //! Optional fields appear only when present, so a plain message reduces to
 //! four keys. A message carries no `kind`: every other kind has one, so its
 //! **absence is the message kind** — and because the field sets are disjoint
 //! (`body` vs `kind`), no document of one kind can be reread as another.
+//!
+//! The coordination kind covers the task-event family (`+freeq.at/event`),
+//! whose TAGMSG is what a server stores and later serves as a task card or an
+//! audit row. Its `payload` is hashed like a body, over the **wire** value of
+//! `+freeq.at/payload` — verbatim, app-level percent-encoding included, so a
+//! verifier checks bytes it holds rather than a decoding it has to agree
+//! about. Its `ref` is the event it refers to, usually a task's id; both wire
+//! spellings (`+freeq.at/ref`, `+freeq.at/task-id`) mean that one field.
 //!
 //! Field rules, each with a reason:
 //!
@@ -128,6 +141,25 @@ impl Mutation {
     }
 }
 
+/// What a document that names a `kind` is a claim about.
+///
+/// A message names none — its absence is the message kind — so this covers
+/// everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocKind {
+    Mutation(Mutation),
+    Coordination,
+}
+
+impl DocKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            DocKind::Mutation(m) => m.as_str(),
+            DocKind::Coordination => "coordination",
+        }
+    }
+}
+
 /// A chat event's signed document, before canonicalization.
 ///
 /// Built through [`ChatDoc::message`] / [`ChatDoc::mutation`] so a document is
@@ -138,7 +170,7 @@ pub struct ChatDoc<'a> {
     from: &'a str,
     msgid: &'a str,
     target: &'a str,
-    kind: Option<Mutation>,
+    kind: Option<DocKind>,
     /// Message only: the raw wire body. Hashed on canonicalization.
     body: Option<&'a str>,
     /// Message only.
@@ -151,6 +183,12 @@ pub struct ChatDoc<'a> {
     subject: Option<&'a str>,
     /// Reactions only.
     emoji: Option<&'a str>,
+    /// Coordination only: the event type (`task_request`, `task_complete`, …).
+    event: Option<&'a str>,
+    /// Coordination only: the raw wire payload. Hashed on canonicalization.
+    payload: Option<&'a str>,
+    /// Coordination only: the event this one refers to, usually a task's id.
+    reference: Option<&'a str>,
 }
 
 impl<'a> ChatDoc<'a> {
@@ -170,6 +208,9 @@ impl<'a> ChatDoc<'a> {
             coord: BTreeMap::new(),
             subject: None,
             emoji: None,
+            event: None,
+            payload: None,
+            reference: None,
         }
     }
 
@@ -187,14 +228,76 @@ impl<'a> ChatDoc<'a> {
             from,
             msgid,
             target,
-            kind: Some(kind),
+            kind: Some(DocKind::Mutation(kind)),
             body: None,
             reply: None,
             edit: None,
             coord: BTreeMap::new(),
             subject: Some(subject),
             emoji: None,
+            event: None,
+            payload: None,
+            reference: None,
         }
+    }
+
+    /// A coordination-event document — the TAGMSG half of a task request, an
+    /// update, a completion, attached evidence.
+    ///
+    /// The server *stores and serves* this event: task cards and the audit
+    /// timeline are built from it. So it signs standalone, over its own
+    /// signer-minted id, rather than leaning on the companion PRIVMSG that
+    /// renders it — a stored row nobody can check is the thing this signing
+    /// model exists to end.
+    ///
+    /// `event_type` is the verb (`task_request`, `task_complete`, …).
+    /// `target` must already be a normalized venue.
+    pub fn coordination(
+        from: &'a str,
+        msgid: &'a str,
+        target: &'a str,
+        event_type: &'a str,
+    ) -> Self {
+        ChatDoc {
+            from,
+            msgid,
+            target,
+            kind: Some(DocKind::Coordination),
+            body: None,
+            reply: None,
+            edit: None,
+            coord: BTreeMap::new(),
+            subject: None,
+            emoji: None,
+            event: Some(event_type),
+            payload: None,
+            reference: None,
+        }
+    }
+
+    /// The coordination payload, exactly as it rides in `+freeq.at/payload`:
+    /// IRC-unescaped, and otherwise verbatim.
+    ///
+    /// Hashed, not inlined — a payload runs to kilobytes, and the log stores
+    /// the canonical. Verbatim because any app-level encoding inside the value
+    /// (the emitters percent-encode `;` and space) is opaque bytes to the
+    /// signature: a verifier hashes what it received without needing to know
+    /// how to decode it. Ignored on other kinds.
+    pub fn with_payload(mut self, payload: &'a str) -> Self {
+        self.payload = Some(payload);
+        self
+    }
+
+    /// The event this coordination event refers to — a task's id, for every
+    /// event in a task's life after the request that opened it.
+    ///
+    /// Covered because the reference *is* the linkage: an update re-pointed at
+    /// a different task in flight would otherwise still read as signed.
+    /// Ignored on other kinds. Both wire spellings (`+freeq.at/ref` and
+    /// `+freeq.at/task-id`) mean this one field.
+    pub fn with_ref(mut self, reference: &'a str) -> Self {
+        self.reference = Some(reference);
+        self
     }
 
     /// Mark this message as a reply to `root_msgid`. Covered so that adding or
@@ -260,9 +363,23 @@ impl<'a> ChatDoc<'a> {
             put("subject", subject);
         }
         if let Some(emoji) = self.emoji
-            && matches!(self.kind, Some(Mutation::React) | Some(Mutation::Unreact))
+            && matches!(
+                self.kind,
+                Some(DocKind::Mutation(Mutation::React | Mutation::Unreact))
+            )
         {
             put("emoji", emoji);
+        }
+        if matches!(self.kind, Some(DocKind::Coordination)) {
+            if let Some(event) = self.event {
+                put("event", event);
+            }
+            if let Some(payload) = self.payload {
+                put("payload", &body_hash(payload));
+            }
+            if let Some(reference) = self.reference {
+                put("ref", reference);
+            }
         }
         if !self.coord.is_empty() {
             let coord: serde_json::Map<String, serde_json::Value> = self
@@ -490,12 +607,94 @@ mod tests {
     }
 
     #[test]
+    fn a_coordination_event_signs_its_type_payload_and_reference() {
+        let doc = ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_complete")
+            .with_payload("%7B%22ok%22%3Atrue%7D")
+            .with_ref(ROOT);
+        assert_eq!(
+            doc.canonical(),
+            format!(
+                r##"{{"event":"task_complete","from":"{ALICE}","kind":"coordination","msgid":"{MSGID}","payload":"{}","ref":"{ROOT}","target":"#swarm"}}"##,
+                body_hash("%7B%22ok%22%3Atrue%7D")
+            )
+        );
+    }
+
+    /// A task request references nothing, so the key is absent rather than
+    /// empty — the same rule every optional field follows.
+    #[test]
+    fn a_coordination_event_without_a_reference_omits_the_key() {
+        let doc = ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_request")
+            .with_payload("%7B%7D");
+        assert!(!doc.canonical().contains(r#""ref""#), "{}", doc.canonical());
+    }
+
+    /// The payload is what a bot acts on. Rewriting it in flight — a relay
+    /// "sanitizing" the JSON, an intermediary changing an amount — is the
+    /// attack the signature exists to make visible.
+    #[test]
+    fn altering_a_coordination_payload_or_reference_breaks_the_signature() {
+        let key = test_key(1);
+        let sent = ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_complete")
+            .with_payload("%7B%22paid%22%3A1%7D")
+            .with_ref(ROOT);
+        let sig = sent.sign(&key);
+        for tampered in [
+            ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_complete")
+                .with_payload("%7B%22paid%22%3A9%7D")
+                .with_ref(ROOT),
+            ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_complete")
+                .with_payload("%7B%22paid%22%3A1%7D")
+                .with_ref("01KYVT9ZZZ0000000000000000"),
+            // The event type is the verb: a completion re-presented as a
+            // failure is a different claim about the same work.
+            ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_failed")
+                .with_payload("%7B%22paid%22%3A1%7D")
+                .with_ref(ROOT),
+        ] {
+            assert_eq!(
+                tampered.verify(&sig, &key.verifying_key()),
+                Err(SigError::Invalid)
+            );
+        }
+        sent.verify(&sig, &key.verifying_key()).unwrap();
+    }
+
+    /// Coordination fields belong to the coordination kind alone. A builder
+    /// call on another kind must not move a byte, or a client that makes the
+    /// call and one that doesn't sign different documents for the same event.
+    #[test]
+    fn coordination_fields_are_ignored_on_other_kinds() {
+        let message = ChatDoc::message(ALICE, MSGID, "#freeq", "hi");
+        assert_eq!(
+            message
+                .clone()
+                .with_payload("%7B%7D")
+                .with_ref(ROOT)
+                .canonical(),
+            message.canonical()
+        );
+        let delete = ChatDoc::mutation(Mutation::Delete, ALICE, MSGID, "#freeq", ROOT);
+        assert_eq!(
+            delete.clone().with_payload("%7B%7D").canonical(),
+            delete.canonical()
+        );
+    }
+
+    #[test]
     fn message_and_mutation_documents_cannot_be_confused() {
         // Disjoint field sets: a message has `body` and no `kind`.
         let msg = ChatDoc::message(ALICE, MSGID, "#freeq", "hi").canonical();
         let del = ChatDoc::mutation(Mutation::Delete, ALICE, MSGID, "#freeq", ROOT).canonical();
         assert!(msg.contains(r#""body""#) && !msg.contains(r#""kind""#));
         assert!(del.contains(r#""kind""#) && !del.contains(r#""body""#));
+        // A coordination event names its own kind and carries neither a body
+        // nor a subject, so no document of one kind reads as another.
+        let coord = ChatDoc::coordination(ALICE, MSGID, "#freeq", "task_request")
+            .with_payload("%7B%7D")
+            .canonical();
+        assert!(coord.contains(r#""kind":"coordination""#));
+        assert!(!coord.contains(r#""body""#) && !coord.contains(r#""subject""#));
     }
 
     #[test]
@@ -780,6 +979,33 @@ mod tests {
                     "target": "#freeq", "subject": ROOT, "emoji": "👍",
                 }),
             },
+            Case {
+                name: "coordination-task-request",
+                seed: 5,
+                doc: ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_request")
+                    .with_payload("%7B%22description%22%3A%22ship%20it%22%7D"),
+                input: json!({
+                    "kind": "coordination", "from": ALICE, "msgid": MSGID,
+                    "target": "#swarm", "eventType": "task_request",
+                    // The wire value of +freeq.at/payload, verbatim: the
+                    // emitters percent-encode `;` and space, and the signature
+                    // covers those bytes without decoding them.
+                    "payload": "%7B%22description%22%3A%22ship%20it%22%7D",
+                }),
+            },
+            Case {
+                name: "coordination-task-complete-with-ref",
+                seed: 5,
+                doc: ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_complete")
+                    .with_payload("%7B%22summary%22%3A%22done%22%7D")
+                    .with_ref(ROOT),
+                input: json!({
+                    "kind": "coordination", "from": ALICE, "msgid": MSGID,
+                    "target": "#swarm", "eventType": "task_complete",
+                    "payload": "%7B%22summary%22%3A%22done%22%7D",
+                    "ref": ROOT,
+                }),
+            },
         ]
     }
 
@@ -899,6 +1125,22 @@ mod tests {
                 "react",
                 ChatDoc::mutation(Mutation::Unreact, ALICE, MSGID, "#freeq", ROOT).with_emoji("👍"),
             ),
+            doc_negative(
+                "altered-coordination-payload",
+                "coordination-task-complete-with-ref",
+                ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_complete")
+                    .with_payload("%7B%22summary%22%3A%22not%20done%22%7D")
+                    .with_ref(ROOT),
+            ),
+            // Re-pointing an update at another task keeps every other field
+            // intact, and would rewrite one task's history into another's.
+            doc_negative(
+                "repointed-coordination-ref",
+                "coordination-task-complete-with-ref",
+                ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_complete")
+                    .with_payload("%7B%22summary%22%3A%22done%22%7D")
+                    .with_ref("01KYVT9ZZZ0000000000000000"),
+            ),
             sig_negative("wrong-kid", "message-plain", SigAttack::WrongKid),
             sig_negative("unknown-algorithm", "message-plain", SigAttack::UnknownAlgorithm),
             sig_negative("legacy-bare-base64", "message-plain", SigAttack::LegacyBareBase64),
@@ -956,8 +1198,9 @@ mod tests {
 
         serde_json::json!({
             "description": "Worked signing examples for freeq chat events (messages, deletes, reactions). Every implementation must reproduce `canonical` and `sigTag` byte-for-byte from `input` + `seed`, and must reach `expected` for each negative: check the negative's `sigTag` when present (a tag-level attack, against the named vector's canonical), otherwise the vector's own sigTag against `tamperedCanonical` (a document-level attack).",
-            "documentRule": "JCS (RFC 8785) over an enumerated per-kind document. Mandatory: from, msgid, target. A message carries no `kind` (its absence is the kind) and covers body/reply?/edit?/coord?; a mutation carries kind and subject, plus emoji for react|unreact. Optional fields are omitted entirely when absent.",
+            "documentRule": "JCS (RFC 8785) over an enumerated per-kind document. Mandatory: from, msgid, target. A message carries no `kind` (its absence is the kind) and covers body/reply?/edit?/coord?; a mutation carries kind and subject, plus emoji for react|unreact; a coordination event carries kind \"coordination\", event, payload and ref?. Optional fields are omitted entirely when absent.",
             "bodyRule": "body = \"sha256:\" + lowercase hex of SHA-256 over the UTF-8 wire body — ciphertext under E2EE, and the assembled body (real newlines) for a draft/multiline batch.",
+            "payloadRule": "payload = \"sha256:\" + lowercase hex of SHA-256 over the UTF-8 wire value of +freeq.at/payload, IRC-unescaped and otherwise verbatim — any app-level encoding inside it is opaque bytes to the signature.",
             "venueRule": "target is the normalized venue, never the wire target: a channel lowercased, or `dm:<did_a>,<did_b>` with the two DIDs sorted ascending.",
             "coordRule": "coord covers exactly the client-authored coordination tags event, payload, ref, task-id (canonical keys; wire names carry a +freeq.at/ prefix), IRC-unescaped, verbatim. Every other tag — server stamps, tallies, verdicts, provenance, ephemera, framing — is excluded.",
             "referenceRule": "edit, reply and subject always name root msgids. A signed event naming a revision is refused, never rewritten.",
