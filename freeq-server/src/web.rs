@@ -830,6 +830,27 @@ async fn api_channel_audit(
         timeline.extend(entries);
     }
 
+    // A row says who acted, not what their identifier is. Resolve every actor
+    // the same way the rest of the server does — a client can only name a DID
+    // it has seen, and an audit row's actor is usually an agent that is long
+    // gone. `display_nick_for_did` returns the DID itself when it resolves
+    // nothing, and sending that as a name would put a raw identifier on
+    // screen; an unresolved actor carries no name instead, leaving the client
+    // free to compact it.
+    for row in &mut timeline {
+        let Some(did) = row
+            .get("actor_did")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let name = state.display_nick_for_did(&did);
+        if name != did {
+            row["actor_name"] = serde_json::json!(name);
+        }
+    }
+
     // Sort by timestamp
     timeline.sort_by(|a, b| {
         let ta = a.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -5318,5 +5339,37 @@ mod signature_verdict_tests {
         );
         assert_eq!(verdict, "unverifiable");
         assert_eq!(by, "unverifiable-unknown-algorithm");
+    }
+}
+
+#[cfg(test)]
+mod audit_actor_name_tests {
+    use crate::server::test_state_with_db;
+
+    /// The audit timeline is read by people, so a row says who acted. A DID
+    /// this server can resolve gets a name; one it cannot gets none at all.
+    ///
+    /// The second half is the trap worth pinning: `display_nick_for_did`
+    /// answers with the DID itself when every source misses, so passing its
+    /// result straight through would send a raw identifier as though it were
+    /// a name — and a client showing `actor_name` verbatim would print it,
+    /// which is worse than the compact form it would otherwise render.
+    #[test]
+    fn an_actor_is_named_only_when_the_name_is_really_a_name() {
+        let state = test_state_with_db();
+        state.bind_identity("did:key:zBOT", "taskbot");
+
+        let known = state.display_nick_for_did("did:key:zBOT");
+        assert_eq!(known, "taskbot");
+        assert_ne!(known, "did:key:zBOT", "a resolved actor carries a name");
+
+        // Never seen here: the resolver hands back what it was given, and the
+        // audit row must send no name rather than that.
+        let stranger = "did:key:zNEVERSEEN";
+        assert_eq!(
+            state.display_nick_for_did(stranger),
+            stranger,
+            "an unknown DID resolves to itself — the audit row must treat this as no name",
+        );
     }
 }
