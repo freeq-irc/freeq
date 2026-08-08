@@ -1892,6 +1892,17 @@ async fn an_event_id_another_actor_filed_cannot_be_overwritten() {
         filed[0]["payload"]["budget"], 1,
         "and the payload they filed: {events}"
     );
+
+    // And the log agrees with the card — the second actor's claim did not
+    // reach either one.
+    let v: serde_json::Value = reqwest::get(format!("http://{web_addr}/api/v1/verify/{event_id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["actor_did"], DID_ALICE, "{v}");
+    assert_eq!(v["kind"], "coordination", "{v}");
 }
 
 /// An unsigned coordination event is still stored and still answers — it just
