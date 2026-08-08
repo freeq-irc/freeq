@@ -107,13 +107,28 @@ pub const EVENT_ID_TAG: &str = "+freeq.at/eventid";
 /// rest of the tag handling.
 pub const EVENT_ID_TAG_BARE: &str = "freeq.at/eventid";
 
+/// The tag by which a coordination event's **companion message** names the
+/// event it renders. Covered by the message document — see
+/// [`COVERED_COORD_TAGS`].
+pub const COORD_ID_TAG: &str = "+freeq.at/coordid";
+
 /// The client-authored coordination tags covered by a message document, as
 /// canonical keys (the wire names are these with a `+freeq.at/` prefix).
 ///
 /// Closed on purpose: a rule like "every `+freeq.at/*` tag" would cover tags
 /// the *server* writes, and every new server-side tag would then invalidate
 /// signatures that were fine.
-pub const COVERED_COORD_TAGS: [&str; 4] = ["event", "payload", "ref", "task-id"];
+///
+/// `coordid` is how the **companion message** of a coordination event names
+/// the event it renders. The event's own id rides on its TAGMSG in
+/// [`EVENT_ID_TAG`], which no message can reuse — on a message that tag means
+/// *that message's* id — and `ref`/`task-id` already mean the task an event
+/// belongs to. Without a name of its own the pair travels joined by nothing,
+/// and a reader holding both halves cannot tell they are one event.
+///
+/// Adding a name here costs nothing already signed: a document that does not
+/// carry the tag canonicalizes to exactly the bytes it did before.
+pub const COVERED_COORD_TAGS: [&str; 5] = ["coordid", "event", "payload", "ref", "task-id"];
 
 const CLIENT_TAG_PREFIX: &str = "+freeq.at/";
 const TAG_PREFIX: &str = "freeq.at/";
@@ -545,6 +560,57 @@ mod tests {
         assert!(full.contains(r#""reply":"#));
         assert!(full.contains(r#""edit":"#));
         assert!(full.contains(r#""coord":{"event":"task_request"}"#));
+    }
+
+    /// The companion message of a coordination event names that event, and the
+    /// name is inside the signature. Without it the pair is joined by nothing:
+    /// the TAGMSG carries the event's id in a covered field, the message
+    /// carries its own, and a reader holding both cannot tell they are one
+    /// event.
+    #[test]
+    fn a_companion_message_covers_the_event_it_renders() {
+        let doc = ChatDoc::message(ALICE, MSGID, "#swarm", "📋 New task: ship it").with_coord([
+            ("+freeq.at/event", "task_request"),
+            ("+freeq.at/coordid", ROOT),
+        ]);
+        assert!(
+            doc.canonical()
+                .contains(r#""coord":{"coordid":"01KYVT1W2P0000000000000000","event":"task_request"}"#),
+            "{}",
+            doc.canonical()
+        );
+
+        // Re-pointing the companion at another event is tampering: it would
+        // file a rendering under work it does not describe.
+        let key = test_key(1);
+        let sig = doc.sign(&key);
+        let repointed = ChatDoc::message(ALICE, MSGID, "#swarm", "📋 New task: ship it")
+            .with_coord([
+                ("+freeq.at/event", "task_request"),
+                ("+freeq.at/coordid", "01KYVT9ZZZ0000000000000000"),
+            ]);
+        assert_eq!(
+            repointed.verify(&sig, &key.verifying_key()),
+            Err(SigError::Invalid)
+        );
+    }
+
+    /// Adding a name to the covered set must not move a byte for a message
+    /// that does not carry it — every signature already made stays good.
+    #[test]
+    fn a_message_without_the_new_tag_signs_exactly_as_before() {
+        let plain = ChatDoc::message(ALICE, MSGID, "#freeq", "hi").canonical();
+        assert_eq!(
+            plain,
+            format!(
+                r##"{{"body":"{}","from":"{ALICE}","msgid":"{MSGID}","target":"#freeq"}}"##,
+                body_hash("hi")
+            )
+        );
+        let with_others = ChatDoc::message(ALICE, MSGID, "#freeq", "hi")
+            .with_coord([("+freeq.at/event", "task_request")])
+            .canonical();
+        assert!(!with_others.contains("coordid"), "{with_others}");
     }
 
     #[test]
@@ -980,6 +1046,26 @@ mod tests {
                 }),
             },
             Case {
+                name: "message-companion-of-a-coordination-event",
+                seed: 5,
+                doc: ChatDoc::message(ALICE, MSGID, "#swarm", "📋 New task: ship it").with_coord([
+                    ("+freeq.at/event", "task_request"),
+                    ("+freeq.at/payload", "%7B%22description%22%3A%22ship%20it%22%7D"),
+                    // The event this message renders. Covered, so the tie
+                    // between the two halves of one event is signed.
+                    ("+freeq.at/coordid", ROOT),
+                ]),
+                input: json!({
+                    "kind": "message", "from": ALICE, "msgid": MSGID,
+                    "target": "#swarm", "bodyText": "📋 New task: ship it",
+                    "tags": {
+                        "+freeq.at/event": "task_request",
+                        "+freeq.at/payload": "%7B%22description%22%3A%22ship%20it%22%7D",
+                        "+freeq.at/coordid": ROOT,
+                    },
+                }),
+            },
+            Case {
                 name: "coordination-task-request",
                 seed: 5,
                 doc: ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_request")
@@ -1125,6 +1211,17 @@ mod tests {
                 "react",
                 ChatDoc::mutation(Mutation::Unreact, ALICE, MSGID, "#freeq", ROOT).with_emoji("👍"),
             ),
+            // Re-pointing a companion at another event would file a rendering
+            // under work it does not describe.
+            doc_negative(
+                "repointed-companion-coordid",
+                "message-companion-of-a-coordination-event",
+                ChatDoc::message(ALICE, MSGID, "#swarm", "📋 New task: ship it").with_coord([
+                    ("+freeq.at/event", "task_request"),
+                    ("+freeq.at/payload", "%7B%22description%22%3A%22ship%20it%22%7D"),
+                    ("+freeq.at/coordid", "01KYVT9ZZZ0000000000000000"),
+                ]),
+            ),
             doc_negative(
                 "altered-coordination-payload",
                 "coordination-task-complete-with-ref",
@@ -1202,7 +1299,7 @@ mod tests {
             "bodyRule": "body = \"sha256:\" + lowercase hex of SHA-256 over the UTF-8 wire body — ciphertext under E2EE, and the assembled body (real newlines) for a draft/multiline batch.",
             "payloadRule": "payload = \"sha256:\" + lowercase hex of SHA-256 over the UTF-8 wire value of +freeq.at/payload, IRC-unescaped and otherwise verbatim — any app-level encoding inside it is opaque bytes to the signature.",
             "venueRule": "target is the normalized venue, never the wire target: a channel lowercased, or `dm:<did_a>,<did_b>` with the two DIDs sorted ascending.",
-            "coordRule": "coord covers exactly the client-authored coordination tags event, payload, ref, task-id (canonical keys; wire names carry a +freeq.at/ prefix), IRC-unescaped, verbatim. Every other tag — server stamps, tallies, verdicts, provenance, ephemera, framing — is excluded.",
+            "coordRule": "coord covers exactly the client-authored coordination tags coordid, event, payload, ref, task-id (canonical keys; wire names carry a +freeq.at/ prefix), IRC-unescaped, verbatim. coordid is how the companion message of a coordination event names that event; the event's own TAGMSG carries its id in +freeq.at/eventid instead. Every other tag — server stamps, tallies, verdicts, provenance, ephemera, framing — is excluded.",
             "referenceRule": "edit, reply and subject always name root msgids. A signed event naming a revision is refused, never rewritten.",
             "kidRule": "base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16])",
             "sigTagFormat": "ed25519:<kid>:<base64url-nopad signature over the UTF-8 canonical bytes>",

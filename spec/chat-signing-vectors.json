@@ -1,6 +1,6 @@
 {
   "bodyRule": "body = \"sha256:\" + lowercase hex of SHA-256 over the UTF-8 wire body — ciphertext under E2EE, and the assembled body (real newlines) for a draft/multiline batch.",
-  "coordRule": "coord covers exactly the client-authored coordination tags event, payload, ref, task-id (canonical keys; wire names carry a +freeq.at/ prefix), IRC-unescaped, verbatim. Every other tag — server stamps, tallies, verdicts, provenance, ephemera, framing — is excluded.",
+  "coordRule": "coord covers exactly the client-authored coordination tags coordid, event, payload, ref, task-id (canonical keys; wire names carry a +freeq.at/ prefix), IRC-unescaped, verbatim. coordid is how the companion message of a coordination event names that event; the event's own TAGMSG carries its id in +freeq.at/eventid instead. Every other tag — server stamps, tallies, verdicts, provenance, ephemera, framing — is excluded.",
   "description": "Worked signing examples for freeq chat events (messages, deletes, reactions). Every implementation must reproduce `canonical` and `sigTag` byte-for-byte from `input` + `seed`, and must reach `expected` for each negative: check the negative's `sigTag` when present (a tag-level attack, against the named vector's canonical), otherwise the vector's own sigTag against `tamperedCanonical` (a document-level attack).",
   "documentRule": "JCS (RFC 8785) over an enumerated per-kind document. Mandatory: from, msgid, target. A message carries no `kind` (its absence is the kind) and covers body/reply?/edit?/coord?; a mutation carries kind and subject, plus emoji for react|unreact; a coordination event carries kind \"coordination\", event, payload and ref?. Optional fields are omitted entirely when absent.",
   "kidRule": "base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16])",
@@ -46,6 +46,12 @@
       "name": "verb-swap-react-to-unreact",
       "tamperedCanonical": "{\"emoji\":\"👍\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kind\":\"unreact\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"subject\":\"01KYVT1W2P0000000000000000\",\"target\":\"#freeq\"}",
       "vector": "react"
+    },
+    {
+      "expected": "invalid",
+      "name": "repointed-companion-coordid",
+      "tamperedCanonical": "{\"body\":\"sha256:be46c60e549841a0e5da4831188f5698a14efe6bb41b5426bd453e563815c8c0\",\"coord\":{\"coordid\":\"01KYVT9ZZZ0000000000000000\",\"event\":\"task_request\",\"payload\":\"%7B%22description%22%3A%22ship%20it%22%7D\"},\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"target\":\"#swarm\"}",
+      "vector": "message-companion-of-a-coordination-event"
     },
     {
       "expected": "invalid",
@@ -217,6 +223,26 @@
       "publicKey": "ypOsFwUYcHHWe4PH_w7-gQjo7EUwV113JoeTM9vavnw",
       "seed": "0404040404040404040404040404040404040404040404040404040404040404",
       "sigTag": "ed25519:xblA7T9lw5GWXegpX8XSXw:jUj6OnweFd-BMliw3PrGrDRfs7Y8b_xB07csz36ZWcag4vkhPufw7SiotS-Rx3joEGZIKbFHo7R49V8kCsDTBg"
+    },
+    {
+      "canonical": "{\"body\":\"sha256:be46c60e549841a0e5da4831188f5698a14efe6bb41b5426bd453e563815c8c0\",\"coord\":{\"coordid\":\"01KYVT1W2P0000000000000000\",\"event\":\"task_request\",\"payload\":\"%7B%22description%22%3A%22ship%20it%22%7D\"},\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"target\":\"#swarm\"}",
+      "input": {
+        "bodyText": "📋 New task: ship it",
+        "from": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "kind": "message",
+        "msgid": "01KYVT5Z8Q0000000000000000",
+        "tags": {
+          "+freeq.at/coordid": "01KYVT1W2P0000000000000000",
+          "+freeq.at/event": "task_request",
+          "+freeq.at/payload": "%7B%22description%22%3A%22ship%20it%22%7D"
+        },
+        "target": "#swarm"
+      },
+      "kid": "dZl3bDCF4_naDRMHHrC0qw",
+      "name": "message-companion-of-a-coordination-event",
+      "publicKey": "bnoc3Smwt4_ROvTFWY_v9O8qlxZuPKby5Pv8zYBQW_E",
+      "seed": "0505050505050505050505050505050505050505050505050505050505050505",
+      "sigTag": "ed25519:dZl3bDCF4_naDRMHHrC0qw:itajqdjLs36P0_pQEBL_lqdEu4NBffT4bNz04fm9DG_B_V53VKBlhn4JhZZMS5lk_gGT3XqRYv62bmkDf5F0DA"
     },
     {
       "canonical": "{\"event\":\"task_request\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kind\":\"coordination\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"payload\":\"sha256:5547e8a017ab59335f6b664d6faab8e7515f49db770baafb7ff65cbae9fef71e\",\"target\":\"#swarm\"}",

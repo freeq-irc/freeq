@@ -22,12 +22,29 @@ export const EVENT_ID_TAG = '+freeq.at/eventid';
 export const SIG_TAG = '+freeq.at/sig';
 
 /**
+ * The tag by which a coordination event's **companion message** names the
+ * event it renders. Covered by the message document — see
+ * `COVERED_COORD_TAGS`.
+ */
+export const COORD_ID_TAG = '+freeq.at/coordid';
+
+/**
  * The client-authored coordination tags a message document covers — a closed
  * set on purpose. "Every `+freeq.at/*` tag" would swallow tags the *server*
  * writes (reaction tallies, provenance, commit verdicts), and each new one
  * would invalidate signatures that were fine.
+ *
+ * `coordid` is how the **companion message** of a coordination event names the
+ * event it renders. The event's own id rides on its TAGMSG in `EVENT_ID_TAG`,
+ * which no message can reuse — on a message that tag means *that message's*
+ * id — and `ref`/`task-id` already mean the task an event belongs to. Without
+ * a name of its own the pair travels joined by nothing, and a reader holding
+ * both halves cannot tell they are one event.
+ *
+ * Adding a name here costs nothing already signed: a document that does not
+ * carry the tag canonicalizes to exactly the bytes it did before.
  */
-export const COVERED_COORD_TAGS = ['event', 'payload', 'ref', 'task-id'] as const;
+export const COVERED_COORD_TAGS = ['coordid', 'event', 'payload', 'ref', 'task-id'] as const;
 
 /** Base64url encode (no padding). */
 function b64url(buf: ArrayBuffer | Uint8Array): string {
