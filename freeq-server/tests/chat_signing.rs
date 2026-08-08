@@ -1955,3 +1955,166 @@ async fn an_unsigned_coordination_event_is_filed_without_a_signature() {
     assert_eq!(v["verification"]["verdict"], "unverifiable", "{v}");
     assert_eq!(v["verification"]["verified_by"], "unsigned", "{v}");
 }
+
+/// A second claim on one event id is three situations, and the card and the
+/// log have to reach the same answer in all of them — the card replacing
+/// itself while the log ignored the second write left the two describing
+/// different events, and the verify endpoint attesting bytes the card no
+/// longer showed.
+#[tokio::test]
+async fn a_re_filed_event_leaves_the_card_and_the_log_agreeing() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (irc_addr, web_addr, _h) = start_web(
+        resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)]),
+        "test-coord-refile",
+    )
+    .await;
+
+    let (same, differing) = tokio::task::spawn_blocking(move || {
+        let mut bob = C::authenticated(irc_addr, "bob", did_bob, kb);
+        bob.join("#refile");
+        let mut alice = C::authenticated(irc_addr, "alice", DID_ALICE, ka);
+        alice.join("#refile");
+
+        // An event, then the same event again — a re-emit, which must be
+        // harmless.
+        let same = freeq_server::msgid::generate();
+        let line = format!(
+            "@+freeq.at/event=task_request;msgid={same};\
+             +freeq.at/payload=%7B%22budget%22%3A1%7D TAGMSG #refile"
+        );
+        alice.tx(&line);
+        bob.rx(|l| l.contains("task_request"), "the event");
+        alice.tx(&line);
+
+        // And an id already on file, re-filed by its own actor with different
+        // content — the case that used to rewrite the card underneath the log.
+        let differing = freeq_server::msgid::generate();
+        alice.tx(&format!(
+            "@+freeq.at/event=task_request;msgid={differing};\
+             +freeq.at/payload=%7B%22budget%22%3A1%7D TAGMSG #refile"
+        ));
+        bob.rx(|l| l.contains("budget"), "the second event");
+        alice.tx(&format!(
+            "@+freeq.at/event=task_request;msgid={differing};\
+             +freeq.at/payload=%7B%22budget%22%3A9999%7D TAGMSG #refile"
+        ));
+        // A refused event is not relayed, so bob seeing nothing proves
+        // nothing. Fence on an ordinary message instead: the server reads one
+        // connection in order, so once this comes back the events before it
+        // have been decided.
+        alice.tx("PRIVMSG #refile :fence");
+        bob.rx(|l| l.contains("fence"), "the fence");
+        (same, differing)
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let events: serde_json::Value =
+        reqwest::get(format!("http://{web_addr}/api/v1/channels/refile/events"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    let rows = events["events"].as_array().unwrap();
+
+    for id in [&same, &differing] {
+        let filed: Vec<&serde_json::Value> =
+            rows.iter().filter(|e| e["event_id"] == id.as_str()).collect();
+        assert_eq!(filed.len(), 1, "one id, one card: {events}");
+        assert_eq!(
+            filed[0]["payload"]["budget"], 1,
+            "the first claim is the one on file: {events}"
+        );
+
+        // And the log says the same. It answers for the id either way; what
+        // it must never do is describe a different event than the card.
+        let v: serde_json::Value = reqwest::get(format!("http://{web_addr}/api/v1/verify/{id}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["event_id"], id.as_str(), "{v}");
+        assert_eq!(v["kind"], "coordination", "{v}");
+        assert_eq!(v["actor_did"], DID_ALICE, "{v}");
+    }
+}
+
+/// Both halves of a signed pair reach other members carrying the field that
+/// names the event — the TAGMSG's tags are relayed verbatim, the message's
+/// are rebuilt, and only one of those two paths was ever exercised.
+#[tokio::test]
+async fn both_halves_of_a_signed_pair_relay_the_id_that_joins_them() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#pairrelay");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#pairrelay");
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
+
+        let event_id = freeq_server::msgid::generate();
+        alice.tx(&format!(
+            "@{} TAGMSG #pairrelay",
+            signed_coordination_tags(
+                "#pairrelay",
+                &event_id,
+                "task_request",
+                "%7B%7D",
+                None,
+                &signing,
+            )
+        ));
+        let tagmsg = bob.rx(|l| l.contains("TAGMSG"), "the event");
+        assert!(
+            tagmsg.contains(&format!("{EVENT_ID_TAG}={event_id}")),
+            "the TAGMSG carries the id its signature covers: {tagmsg}"
+        );
+
+        // The companion: an ordinary message naming the event in a covered
+        // tag, signed over a document that includes it. If the server's
+        // covered set did not include that tag it would rebuild a different
+        // document, reach `invalid`, and relay the message unsigned — so the
+        // surviving signature is what proves both ends agree.
+        let message_id = freeq_server::msgid::generate();
+        let body = "📋 New task";
+        let venue = channel_venue("#pairrelay");
+        let doc = ChatDoc::message(DID_ALICE, &message_id, &venue, body)
+            .with_coord([
+                ("+freeq.at/event", "task_request"),
+                ("+freeq.at/coordid", event_id.as_str()),
+            ]);
+        // Both this test and the server build the document through the same
+        // covered set, so a set that dropped the tag would have them agree on
+        // a document without it and prove nothing. Pin the bytes.
+        assert!(
+            doc.canonical().contains(r#""coordid""#),
+            "the message document must cover the tag: {}",
+            doc.canonical()
+        );
+        let sig = doc.sign(&signing);
+        alice.tx(&format!(
+            "@{EVENT_ID_TAG}={message_id};+freeq.at/event=task_request;\
+             +freeq.at/coordid={event_id};+freeq.at/sig={sig} PRIVMSG #pairrelay :{body}"
+        ));
+        let privmsg = bob.rx(|l| l.contains(body), "the companion");
+        assert!(
+            privmsg.contains(&format!("+freeq.at/coordid={event_id}")),
+            "the companion carries the id that joins it to the event: {privmsg}"
+        );
+        assert_eq!(
+            C::sig_of(&privmsg).as_deref(),
+            Some(sig.as_str()),
+            "the sender's own signature survives, so the server rebuilt the \
+             same document — the new tag included: {privmsg}"
+        );
+    })
+    .await;
+}

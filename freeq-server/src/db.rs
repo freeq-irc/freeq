@@ -4994,6 +4994,23 @@ pub struct CoordinationEventRow {
     pub timestamp: i64,
 }
 
+/// What happened to a coordination event offered for filing.
+///
+/// Three answers, because a second claim on one id is three different
+/// situations and only one of them is a problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinationWrite {
+    /// Filed: the card written, the event logged.
+    Filed,
+    /// Already on file, identical, by the same actor — a re-emit. Nothing
+    /// written, nothing wrong.
+    Duplicate,
+    /// Refused. Either a different actor named an id already on file, or the
+    /// same actor named it with different content; a conflict receipt records
+    /// the second claim in the latter case.
+    Refused,
+}
+
 impl Db {
     /// Store a coordination event, and file it in the append-only log.
     ///
@@ -5003,34 +5020,58 @@ impl Db {
     /// event is filed as facts and nothing else — it happened, and nobody
     /// signed for it.
     ///
-    /// Returns `false` when the write was refused. The id is the *client's*,
-    /// so two actors can name the same one; the first to file it keeps it.
-    /// `INSERT OR REPLACE` alone let any authenticated user overwrite any
-    /// stored event — its actor, its payload, all of it — by reusing the id.
-    /// Re-filing your own event still replaces it, which is what makes an
-    /// idempotent re-emit harmless.
+    /// The id is the *client's*, so two claims can name the same one. The
+    /// first write wins — the rule the message path already follows
+    /// ([`Db::insert_message`]) — because the card and the log resolve a
+    /// collision differently on their own: replacing the card while the log
+    /// ignores the second write leaves the two disagreeing, and the verify
+    /// endpoint then attests bytes the card no longer shows.
+    ///
+    /// So: an identical re-emit by the same actor is accepted and written
+    /// nowhere; a differing claim on an id already on file is refused, with a
+    /// [`Db::record_event_conflict`] receipt so the fact that two claims
+    /// existed survives; and an id another actor filed is refused outright.
     pub fn store_coordination_event(
         &self,
         event: &CoordinationEventRow,
         canonical: Option<&str>,
-    ) -> SqlResult<bool> {
-        let filed_by: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT actor_did FROM coordination_events WHERE event_id = ?1",
-                params![event.event_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(filed_by) = filed_by
-            && filed_by != event.actor_did
-        {
-            return Ok(false);
+    ) -> SqlResult<CoordinationWrite> {
+        if let Some(filed) = self.coordination_event(&event.event_id)? {
+            if filed.actor_did != event.actor_did {
+                return Ok(CoordinationWrite::Refused);
+            }
+            // Everything the event *is*. Not the timestamp: that is when this
+            // server took delivery, and a re-emit of the same event is the
+            // same event however long later it arrives.
+            let same = filed.event_type == event.event_type
+                && filed.channel == event.channel
+                && filed.ref_id == event.ref_id
+                && filed.payload_json == event.payload_json
+                && filed.signature == event.signature;
+            if same {
+                return Ok(CoordinationWrite::Duplicate);
+            }
+            self.record_event_conflict(
+                &event.event_id,
+                &crate::events::fingerprint(&format!(
+                    "{}\0{}\0{}\0{}",
+                    event.event_type,
+                    event.channel,
+                    event.ref_id.as_deref().unwrap_or(""),
+                    event.payload_json,
+                )),
+            )?;
+            tracing::warn!(
+                event_id = %event.event_id, actor = %event.actor_did,
+                "Coordination event id already on file with DIFFERENT content; \
+                 conflicting claim dropped"
+            );
+            return Ok(CoordinationWrite::Refused);
         }
 
         let tx = self.conn.unchecked_transaction()?;
         self.conn.execute(
-            "INSERT OR REPLACE INTO coordination_events
+            "INSERT INTO coordination_events
              (event_id, event_type, actor_did, channel, ref_id, payload_json, signature, timestamp)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
@@ -5066,9 +5107,44 @@ impl Db {
                 timestamp: event.timestamp as u64,
             },
         };
-        self.insert_event(&record)?;
+        // The log is append-only and first-write-wins. If it declines the id,
+        // something else already holds it and the card must not be written
+        // either — one of them showing an event the other does not is the
+        // disagreement this whole path exists to prevent. Dropping the
+        // transaction unwritten is the refusal.
+        if !self.insert_event(&record)? {
+            tracing::warn!(
+                event_id = %event.event_id, actor = %event.actor_did,
+                "Event id already in the log; coordination event not filed"
+            );
+            return Ok(CoordinationWrite::Refused);
+        }
         tx.commit()?;
-        Ok(true)
+        Ok(CoordinationWrite::Filed)
+    }
+
+    /// A coordination event by id, whatever kind it is.
+    fn coordination_event(&self, event_id: &str) -> SqlResult<Option<CoordinationEventRow>> {
+        self.conn
+            .query_row(
+                "SELECT event_id, event_type, actor_did, channel, ref_id, payload_json,
+                        signature, timestamp
+                 FROM coordination_events WHERE event_id = ?1",
+                params![event_id],
+                |row| {
+                    Ok(CoordinationEventRow {
+                        event_id: row.get(0)?,
+                        event_type: row.get(1)?,
+                        actor_did: row.get(2)?,
+                        channel: row.get(3)?,
+                        ref_id: row.get(4)?,
+                        payload_json: row.get(5)?,
+                        signature: row.get(6)?,
+                        timestamp: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
     }
 
     /// Query coordination events with optional filters.

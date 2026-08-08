@@ -1226,10 +1226,11 @@ pub(super) fn handle_tagmsg(
             timestamp: now,
         };
         let stored = state.with_db(|db| db.store_coordination_event(&event, verified.as_deref()));
-        if stored == Some(false) {
+        if stored == Some(crate::db::CoordinationWrite::Refused) {
             tracing::warn!(
                 actor = %did, event_id = %event_id, channel = %target,
-                "Refused a coordination event reusing an id another actor filed"
+                "Refused a coordination event: that id is already on file for \
+                 another actor, or for different content"
             );
             return;
         }
@@ -1239,6 +1240,7 @@ pub(super) fn handle_tagmsg(
             actor = %did,
             channel = %target,
             signed = verified.is_some(),
+            outcome = ?stored,
             "Stored coordination event"
         );
     }
