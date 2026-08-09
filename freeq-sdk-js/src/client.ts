@@ -1085,7 +1085,6 @@ export class FreeqClient extends EventEmitter {
     // through a server that predates adoption, in `+freeq.at/eventid`
     // verbatim; a legacy emitter's event, in its self-minted `msgid`.
     const eventId =
-      tags[signing.COORD_ID_TAG] ||
       tags[signing.EVENT_ID_TAG] ||
       tags['msgid'] ||
       '';
@@ -3203,14 +3202,11 @@ export class FreeqClient extends EventEmitter {
       wireTags['msgid'] = eventId;
     }
     this.raw(format('TAGMSG', [channel], wireTags));
-    // The message names the event it renders, and the name is a covered
-    // coordination tag — so the tie between the two halves is inside the
-    // signature rather than a tag an intermediary could cut. The TAGMSG
-    // needs nothing added: it already carries the id in a covered field.
-    await this.writeSignedMessage('PRIVMSG', channel, humanText, {
-      ...tags,
-      [signing.COORD_ID_TAG]: eventId,
-    });
+    // The companion is an ordinary message signing its own id. The TAGMSG
+    // is the event — it carries the event id under its own signature — and
+    // the companion is a rendering of it: it carries the event tags a
+    // reader draws a card from, and no claim to the event's id.
+    await this.writeSignedMessage('PRIVMSG', channel, humanText, { ...tags });
   }
 
   /** Sugar over `emitEvent` for `task_request`. Returns the task ID. */

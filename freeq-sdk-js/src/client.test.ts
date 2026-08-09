@@ -2074,11 +2074,11 @@ describe('signed mutations', () => {
     expect(await verifySig(repointed, sigTag, verifyKey)).toBe(false);
   });
 
-  // The two halves of one event have to be recognizable as one event, and the
-  // tie has to be inside the signature or an intermediary can cut it. The
-  // TAGMSG names the event in its own covered id; the message names it in a
-  // covered coordination tag.
-  it('the companion message names the event it renders, inside its signature', async () => {
+  // The TAGMSG is the event: it carries the event's id under its own
+  // signature. The companion is a rendering of it — an ordinary signed
+  // message whose covered event tags are what a reader draws a card from —
+  // and it makes no claim to the event's id.
+  it('the companion is a rendering: signed event tags, no claim to the event id', async () => {
     const signing = await import('./signing.js');
     const { client, ws, verifyKey } = await makeSigningClient();
     const eventId = client.emitEvent('#room', 'task_request', { description: 'ship it' }, {
@@ -2089,17 +2089,15 @@ describe('signed mutations', () => {
 
     expect(tagOf(tagmsg, '+freeq.at/eventid')).toBe(eventId);
     expect(
-      tagOf(tagmsg, '+freeq.at/coordid'),
-      'the TAGMSG already names the event in a covered field',
+      tagOf(privmsg, '+freeq.at/coordid'),
+      'a message never carries another event’s id',
     ).toBeNull();
-    expect(tagOf(privmsg, '+freeq.at/coordid')).toBe(eventId);
     const messageId = tagOf(privmsg, '+freeq.at/eventid')!;
-    expect(messageId, 'each document still signs its own id').not.toBe(eventId);
+    expect(messageId, 'each document signs its own id').not.toBe(eventId);
 
     const coord = {
       '+freeq.at/event': 'task_request',
       '+freeq.at/payload': '{"description":"ship%20it"}',
-      '+freeq.at/coordid': eventId,
     };
     const canonical = await signing.messageCanonical({
       from: 'did:plc:mutator',
@@ -2110,15 +2108,15 @@ describe('signed mutations', () => {
     });
     expect(await verifySig(canonical, tagOf(privmsg, '+freeq.at/sig')!, verifyKey)).toBe(true);
 
-    // Cutting the tie is tampering, and reads as it.
-    const untied = await signing.messageCanonical({
+    // Sanitizing a covered event tag off the rendering is tampering.
+    const sanitized = await signing.messageCanonical({
       from: 'did:plc:mutator',
       msgid: messageId,
       target: '#room',
       body: 'New task: ship it',
-      tags: { '+freeq.at/event': 'task_request', '+freeq.at/payload': '{"description":"ship%20it"}' },
+      tags: { '+freeq.at/event': 'task_request' },
     });
-    expect(await verifySig(untied, tagOf(privmsg, '+freeq.at/sig')!, verifyKey)).toBe(false);
+    expect(await verifySig(sanitized, tagOf(privmsg, '+freeq.at/sig')!, verifyKey)).toBe(false);
   });
 
   // Signing moved these sends off the synchronous socket write, and each one
@@ -2261,7 +2259,6 @@ describe('signed mutations', () => {
         '+freeq.at/payload': payload,
         '+freeq.at/task-id': '01KYVT1W2P0000000000000000',
         '+freeq.at/evidence-type': 'code_review',
-        '+freeq.at/coordid': eventId,
       },
     });
     expect(await verifySig(companionDoc, tagOf(privmsg, '+freeq.at/sig')!, verifyKey)).toBe(true);

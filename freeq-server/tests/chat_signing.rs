@@ -2055,11 +2055,13 @@ async fn a_re_filed_event_leaves_the_card_and_the_log_agreeing() {
     }
 }
 
-/// Both halves of a signed pair reach other members carrying the field that
-/// names the event — the TAGMSG's tags are relayed verbatim, the message's
-/// are rebuilt, and only one of those two paths was ever exercised.
+/// Both halves of a signed pair reach other members with their signatures
+/// intact — the TAGMSG's tags are relayed verbatim, the message's are
+/// rebuilt, and only one of those two paths was ever exercised. The TAGMSG
+/// is the event; the companion is an ordinary signed message whose covered
+/// event tags are what a reader renders.
 #[tokio::test]
-async fn both_halves_of_a_signed_pair_relay_the_id_that_joins_them() {
+async fn both_halves_of_a_signed_pair_relay_with_signatures_intact() {
     let (ka, kb) = (key(), key());
     let did_bob = "did:plc:sig_bob";
     let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
@@ -2089,42 +2091,33 @@ async fn both_halves_of_a_signed_pair_relay_the_id_that_joins_them() {
             "the TAGMSG carries the id its signature covers: {tagmsg}"
         );
 
-        // The companion: an ordinary message naming the event in a covered
-        // tag, signed over a document that includes it. If the server's
-        // covered set did not include that tag it would rebuild a different
-        // document, reach `invalid`, and relay the message unsigned — so the
-        // surviving signature is what proves both ends agree.
+        // The companion: an ordinary message whose covered event tags are
+        // what a reader renders, signed over a document that includes them.
+        // If the server's covered set disagreed with the sender's it would
+        // rebuild a different document, reach `invalid`, and relay the
+        // message unsigned — so the surviving signature is what proves both
+        // ends agree.
         let message_id = freeq_server::msgid::generate();
         let body = "📋 New task";
         let venue = channel_venue("#pairrelay");
         let doc = ChatDoc::message(DID_ALICE, &message_id, &venue, body)
-            .with_coord([
-                ("+freeq.at/event", "task_request"),
-                ("+freeq.at/coordid", event_id.as_str()),
-            ]);
-        // Both this test and the server build the document through the same
-        // covered set, so a set that dropped the tag would have them agree on
-        // a document without it and prove nothing. Pin the bytes.
+            .with_coord([("+freeq.at/event", "task_request")]);
         assert!(
-            doc.canonical().contains(r#""coordid""#),
-            "the message document must cover the tag: {}",
+            doc.canonical().contains(r#""coord":{"event":"task_request"}"#),
+            "the message document must cover the event tag: {}",
             doc.canonical()
         );
         let sig = doc.sign(&signing);
         alice.tx(&format!(
             "@{EVENT_ID_TAG}={message_id};+freeq.at/event=task_request;\
-             +freeq.at/coordid={event_id};+freeq.at/sig={sig} PRIVMSG #pairrelay :{body}"
+             +freeq.at/sig={sig} PRIVMSG #pairrelay :{body}"
         ));
         let privmsg = bob.rx(|l| l.contains(body), "the companion");
-        assert!(
-            privmsg.contains(&format!("+freeq.at/coordid={event_id}")),
-            "the companion carries the id that joins it to the event: {privmsg}"
-        );
         assert_eq!(
             C::sig_of(&privmsg).as_deref(),
             Some(sig.as_str()),
             "the sender's own signature survives, so the server rebuilt the \
-             same document — the new tag included: {privmsg}"
+             same document: {privmsg}"
         );
     })
     .await;
