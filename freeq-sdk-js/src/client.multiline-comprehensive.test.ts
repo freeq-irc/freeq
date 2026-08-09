@@ -410,10 +410,12 @@ describe('comprehensive: opener tag passthrough', () => {
     expect(seen[0].isStreaming).toBe(true);
   });
 
-  it('+freeq.at/event=reveal on opener fires coordinationEvent', async () => {
+  it('+freeq.at/event on opener rides the message; only a TAGMSG is an event', async () => {
     const { client, ws } = await makeMultilineClient('alice');
     const events: unknown[] = [];
+    const seen: Array<{ tags?: Record<string, string> }> = [];
     client.on('coordinationEvent', (...args) => events.push(args));
+    client.on('message', (_ch, m) => seen.push(m));
     ws.recv(
       '@msgid=01EV;+freeq.at/event=reveal;+freeq.at/payload=%7B%7D ' +
         ':bob!u@h BATCH +tg4 draft/multiline #room',
@@ -422,7 +424,13 @@ describe('comprehensive: opener tag passthrough', () => {
     ws.recv('@batch=tg4 :bob!u@h PRIVMSG #room :revealed line 2');
     ws.recv(':srv BATCH -tg4');
     await flushAsync();
-    expect(events.length).toBeGreaterThan(0);
+    // A message carrying event tags is a rendering of its event, not the
+    // event — the TAGMSG fires `coordinationEvent`, a batch never does.
+    expect(events).toHaveLength(0);
+    // What a tag-reading message handler depends on: the opener's event
+    // tags arrive on the assembled message.
+    expect(seen).toHaveLength(1);
+    expect(seen[0].tags?.['+freeq.at/event']).toBe('reveal');
   });
 });
 

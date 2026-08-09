@@ -2142,12 +2142,11 @@ describe('signed mutations', () => {
     ]);
   });
 
-  // The reader's de-dupe used to work because both halves carried the same
-  // `msgid`. A signed event does not: the TAGMSG names the event in
-  // `+freeq.at/eventid`, the companion in `+freeq.at/coordid`, and the
-  // companion's `msgid` is its own. Replaying the lines the emitter actually
-  // produced is the only way to catch that — the legacy-shaped fixture the
-  // older de-dupe test uses cannot.
+  // The TAGMSG is the event; the companion is a message. A receiver holding
+  // both halves reports exactly one event, under the event's own id — not by
+  // de-duping the pair, but because the companion never fires
+  // `coordinationEvent` at all. Replaying the lines the emitter actually
+  // produced is what pins this — a hand-written legacy fixture cannot.
   it('a signed pair read back is one event, carrying the event id', async () => {
     const { client: sender, ws: senderWs } = await makeSigningClient();
     const eventId = sender.createTask('#room', 'ship it');
@@ -2156,9 +2155,11 @@ describe('signed mutations', () => {
 
     const { client, ws } = await makeRegistered();
     const seen: Array<{ eventId: string; eventType: string }> = [];
+    const messages: string[] = [];
     client.on('coordinationEvent', (e) =>
       seen.push({ eventId: e.eventId, eventType: e.eventType }),
     );
+    client.on('message', (_ch, m) => messages.push(m.text));
     // What the server puts on a receiver's socket, built from those exact
     // lines: the sender's prefix after the tags, a TAGMSG relayed verbatim,
     // and a companion whose signer-minted event id has been adopted as the
@@ -2176,6 +2177,9 @@ describe('signed mutations', () => {
     expect(seen, 'one event, not one per half').toHaveLength(1);
     expect(seen[0]!.eventId, "the event's own id, not the companion's").toBe(eventId);
     expect(seen[0]!.eventType).toBe('task_request');
+    expect(messages, 'the companion still renders as a message').toContain(
+      '📋 New task: ship it',
+    );
   });
 
   // The id is handed to the caller before the signature exists, so the send

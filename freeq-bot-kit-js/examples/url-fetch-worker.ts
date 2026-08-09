@@ -8,10 +8,12 @@
  * transitions between `idle` and `executing` are visible to observers
  * via PRESENCE broadcasts and WHOIS.
  *
- * Fire a task from any IRC client (or another bot):
- *   /msg #tasks @+freeq.at/event=task_request;\
- *               +freeq.at/payload={"capability":"url_fetch","url":"https://httpbin.org/delay/3"} \
- *               PRIVMSG #tasks :requesting url_fetch
+ * Fire a task from a raw IRC connection (or another bot). The event is a
+ * TAGMSG — the server stores the event from that line, and workers listen
+ * for it; a PRIVMSG carrying event tags is only a human-readable rendering:
+ *   @+freeq.at/event=task_request;\
+ *    +freeq.at/payload={"capability":"url_fetch","url":"https://httpbin.org/delay/3"} \
+ *    TAGMSG #tasks
  *
  * Or in TypeScript:
  *   bot.client.emitEvent('#tasks', 'task_request', {

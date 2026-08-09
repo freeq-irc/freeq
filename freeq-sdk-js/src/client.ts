@@ -1071,18 +1071,19 @@ export class FreeqClient extends EventEmitter {
   /** Resolve nick to DID — set by the app layer for E2EE support. */
   nickToDid: ((nick: string) => string | undefined) | null = null;
 
-  /** Parse a `+freeq.at/event=*` TAGMSG/PRIVMSG and emit `coordinationEvent`.
-   *  De-dupes by eventId so the paired TAGMSG + companion PRIVMSG fire
-   *  the event only once. */
+  /** Parse a `+freeq.at/event=*` TAGMSG and emit `coordinationEvent`.
+   *  The TAGMSG is the event — the server stores the event from it, and it
+   *  carries the event's id under its own signature. A PRIVMSG carrying
+   *  event tags is a rendering of the event (the human-readable companion),
+   *  so it fires `message`, never `coordinationEvent`. De-dupes by eventId
+   *  against echo and multi-path delivery. */
   private emitCoordinationEvent(channel: string, from: string, tags: Record<string, string>): void {
     const eventType = tags['+freeq.at/event'];
     if (!eventType) return;
-    // Where each half of a signed pair names the event: the companion message
-    // in `coordid`, the TAGMSG in the id its own signature covers. Both are
-    // signed fields on the half that carries them. `msgid` is the legacy
-    // shape, where the server stamped one id on both halves — still the
-    // answer against a server that does not verify documents, and still what
-    // joins the pair there.
+    // A signed event through an adopting server arrives with the id in
+    // `msgid` (the server adopts the signed id and strips the eventid tag);
+    // through a server that predates adoption, in `+freeq.at/eventid`
+    // verbatim; a legacy emitter's event, in its self-minted `msgid`.
     const eventId =
       tags[signing.COORD_ID_TAG] ||
       tags[signing.EVENT_ID_TAG] ||
@@ -1463,10 +1464,8 @@ export class FreeqClient extends EventEmitter {
       return;
     }
 
-    // Coordination companion: same handling as the single-PRIVMSG case.
-    if (openerTags['+freeq.at/event']) {
-      this.emitCoordinationEvent(target, from, openerTags);
-    }
+    // A multiline companion carrying event tags is a rendering of its event,
+    // not the event: the TAGMSG already fired `coordinationEvent`.
 
     // If this batch was nested inside a parent (CHATHISTORY most likely),
     // push the assembled message into the parent's message list instead
@@ -1893,13 +1892,10 @@ export class FreeqClient extends EventEmitter {
           }
         }
 
-        // Coordination event companion PRIVMSG. The paired TAGMSG fires
-        // `coordinationEvent` first; the de-dupe in emitCoordinationEvent
-        // suppresses the second fire. We still emit the regular `message`
-        // event below so human-readable text renders normally.
-        if (msg.tags['+freeq.at/event']) {
-          this.emitCoordinationEvent(target, from, msg.tags);
-        }
+        // A PRIVMSG carrying event tags is the event's human-readable
+        // companion — a rendering, not the event. The TAGMSG is the event
+        // and the only thing that fires `coordinationEvent`; this fires the
+        // regular `message` event below so the text renders normally.
 
         let displayText = isAction ? text.slice(8, -1) : text;
         let isEncryptedMsg = false;
@@ -2173,9 +2169,9 @@ export class FreeqClient extends EventEmitter {
           }
         }
 
-        // Coordination event (+freeq.at/event=*). Server stores these
-        // from TAGMSG; PRIVMSG companion fires the same event below.
-        // De-dupe by eventId so handlers fire at most once per pair.
+        // Coordination event (+freeq.at/event=*). The TAGMSG is the event:
+        // the server stores it from this line, and this is the one place
+        // `coordinationEvent` fires. De-dupe by eventId against echo.
         const eventType = msg.tags['+freeq.at/event'];
         if (eventType) {
           this.emitCoordinationEvent(target, from, msg.tags);
