@@ -647,8 +647,6 @@ pub struct App {
     pub p2p_handle: Option<freeq_sdk::p2p::P2pHandle>,
     /// P2P event receiver (moved to main loop on first use).
     pub p2p_event_rx: Option<tokio::sync::mpsc::Receiver<freeq_sdk::p2p::P2pEvent>>,
-    /// Pending URL from a server notice (waiting for user to press Enter to open).
-    pub pending_url: Option<String>,
     /// Most recently observed host for each nick (lowercase keys).
     /// Populated by parsing the IRC prefix on JOIN lines. Used to surface
     /// hostname cloaks like `freeq/plc/xxx` in join system messages and
@@ -774,7 +772,6 @@ impl App {
             bg_result_rx: Some(rx),
             p2p_handle: None,
             p2p_event_rx: None,
-            pending_url: None,
             nick_hosts: HashMap::new(),
             did_names: HashMap::new(),
             history_requested: HashSet::new(),
@@ -1676,7 +1673,6 @@ mod tests {
             bg_result_rx: None,
             p2p_handle: None,
             p2p_event_rx: None,
-            pending_url: None,
             nick_hosts: HashMap::new(),
             did_names: HashMap::new(),
             history_requested: HashSet::new(),

@@ -634,22 +634,6 @@ async fn run_app(
                         continue;
                     }
                 }
-                // Handle pending URL prompt (Enter to open, anything else to dismiss)
-                if app.pending_url.is_some() {
-                    use crossterm::event::KeyCode;
-                    if matches!(key.code, KeyCode::Enter) {
-                        if let Some(url) = app.pending_url.take() {
-                            match open::that(&url) {
-                                Ok(_) => app.status_msg("Opened URL in browser."),
-                                Err(e) => app.status_msg(&format!("Failed to open URL: {e}")),
-                            }
-                        }
-                    } else {
-                        app.pending_url = None;
-                        app.status_msg("URL dismissed.");
-                    }
-                    continue;
-                }
                 let action = app.editor.handle_key(key);
                 match action {
                     EditAction::Submit => {
@@ -1442,11 +1426,6 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
             // was invisible when it only ever landed in the status buffer.
             let active = app.active_buffer.clone();
             app.buffer_mut(&active).push_system(&text);
-            // Detect URLs in server notices and offer to open them
-            if let Some(url) = extract_url(&text) {
-                app.pending_url = Some(url.to_string());
-                app.status_msg("Press Enter to open URL in browser, or any other key to dismiss.");
-            }
         }
         Event::Disconnected { reason } => {
             app.connection_state = "disconnected".to_string();
@@ -3213,23 +3192,6 @@ fn format_link_preview(preview: &freeq_sdk::media::LinkPreview) -> String {
     }
     parts.push(format!("({})", preview.url));
     parts.join(" ")
-}
-
-/// Extract the first http/https URL from a message.
-fn extract_url(text: &str) -> Option<String> {
-    for word in text.split_whitespace() {
-        if (word.starts_with("https://") || word.starts_with("http://"))
-            && word.len() > 10
-            // Don't preview our own CDN/PDS URLs
-            && !word.contains("cdn.bsky.app")
-            && !word.contains("/xrpc/")
-        {
-            // Strip trailing punctuation
-            let url = word.trim_end_matches(['.', ',', ')', ']', ';']);
-            return Some(url.to_string());
-        }
-    }
-    None
 }
 
 fn format_media_display(media: &freeq_sdk::media::MediaAttachment) -> String {
