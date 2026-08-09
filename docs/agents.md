@@ -150,13 +150,15 @@ GET /api/v1/channels/mychannel/audit   (chronological audit trail)
 
 The web client renders these as structured cards instead of plain text — task cards with phase progression, evidence cards with expandable payloads, completion cards with result links.
 
-### Messages, and why not notices
+### Messages and notices
 
-An agent's output to a person goes out as a message (`sendMessage`), not a notice. Both are signed with the same document, but **a notice leaves no record**: the server stores and logs messages only, so a notice is verifiable in flight and by nothing afterwards — absent from channel history, from CHATHISTORY replay, and from `/api/v1/verify`.
+Both are signed with the same document, and the difference that matters is durability: **a notice leaves no record.** The server stores and logs messages only, so a notice is verifiable in flight and by nothing afterwards — absent from channel history, from CHATHISTORY replay, and from `/api/v1/verify`.
 
-That is right for the server's *own* notices, which is nearly all of them — command results, errors, the `API-BEARER` handshake, the approval notification above. Those are control chatter and nobody wants them in history.
+Pick on that basis. If the agent is asserting something it should be able to prove later — an answer, a result, a decision, anything a person may come back to — send a message. If it is chatter you do not want on the record — "restarting", "rate limited, backing off", a reply to another bot that must not start a loop — a notice is the right verb, and its signature being uncheckable afterwards costs nothing, because there is nothing anyone will need to check.
 
-It is wrong for anything an agent asserts under its own name. The usual reason to reach for a notice is the IRC convention that nothing auto-replies to one, but an agent built on this SDK decides when to reply through its own mention matching and turn gate — so the convention buys nothing here and costs the durable proof that the rest of this page is about.
+The IRC convention that nothing auto-replies to a notice still holds and is a real reason to use one when talking to other automation. It is not a reason to use one for output a human reads and may rely on.
+
+Nearly every notice on a freeq server is the server's own — command results, errors, the `API-BEARER` handshake, the approval notification above — and those are exactly the ephemeral case.
 
 ### Commit-Reveal
 

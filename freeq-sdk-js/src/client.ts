@@ -2891,11 +2891,14 @@ export class FreeqClient extends EventEmitter {
    *  command results, errors, the API bearer — which are control chatter
    *  nobody wants in history.
    *
-   *  **For anything an agent says to a person, prefer `sendMessage`.** The
-   *  usual reason to reach for a notice is the convention that nothing
-   *  auto-replies to one, but a bot built on this SDK decides when to reply
-   *  through its own mention matching and turn gate, so the convention buys
-   *  nothing here and costs the durable proof. */
+   *  Choose on that basis. Something the sender should be able to *prove*
+   *  later — an answer, a result, a decision — wants `sendMessage`. Chatter
+   *  that should not be on the record — "restarting", "backing off", a reply
+   *  to another bot that must not start a loop — is what a notice is for, and
+   *  there the missing record costs nothing. The convention that nothing
+   *  auto-replies to a notice is a real reason to use one when talking to
+   *  other automation; it is not a reason to use one for output a person
+   *  reads and may rely on. */
   sendNotice(target: string, text: string, tags: Record<string, string> = {}): void {
     void this.enqueueSend(() =>
       this.writeSignedMessage('NOTICE', this.wireTargetFor(target), text, tags),
