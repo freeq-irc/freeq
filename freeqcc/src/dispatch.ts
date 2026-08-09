@@ -82,6 +82,11 @@ Action vocabulary:
 User-vs-channel scopes are SEPARATE — defaults grant -user only. Broadcasting \
 to channels and changing nick require explicit owner grants.
 
+Use privmsg-* for anything a person reads and may rely on: it is stored, so it \
+can be looked up and its signature checked later. Use notice-* only for output \
+nobody needs to prove afterwards — talking to another bot without starting a \
+reply loop, or throwaway status. A notice is not stored anywhere.
+
 The set of actions YOU specifically are allowed to invoke for THIS turn is in \
 \`$FREEQCC_DISPATCH_GRANTED_ACTIONS\` (comma-separated). If the action the user \
 asks for isn't in that list, do NOT call \`freeqcc send\` for it — the daemon \
