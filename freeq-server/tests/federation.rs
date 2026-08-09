@@ -1792,3 +1792,86 @@ async fn an_attachment_reaches_a_reader_on_a_peer_server() {
     hb.quit(None).await.ok();
     drop((srv_a, srv_b));
 }
+
+// ── a federated multiline edit is stored as the bytes its signature covers ──
+//
+// The S2S hop escapes a multiline body to literal `\n` for the wire, and the
+// receiver verifies the signature over the UN-escaped body — then must file
+// that same body. Filing the escaped wire form instead leaves the two servers
+// holding different bytes for one message, with every signature still
+// passing: verifiers un-escape before checking, so nothing fails loudly.
+// REST, search, and the FTS index read the stored form raw.
+
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn federated_multiline_edit_stores_the_verified_body() {
+    let alice = TestId::new("did:plc:alicemledit");
+    let bob = TestId::new("did:plc:bobmledit");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#mledit").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#mledit").await.unwrap();
+
+    let original = "first line\nsecond line\nthird line";
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut msgid = None;
+    while tokio::time::Instant::now() < deadline {
+        ha.privmsg("#mledit", original).await.ok();
+        if let Some(id) = recv_channel_msgid(&mut rxb, original, Duration::from_secs(2)).await {
+            msgid = Some(id);
+            break;
+        }
+    }
+    let msgid = msgid.expect("bob's server received the multiline message");
+
+    let edited = "first line\nsecond line\nthird line, revised";
+    ha.edit_message("#mledit", &msgid, edited).await.unwrap();
+    recv_channel_msgid(&mut rxb, edited, EVENT_TIMEOUT)
+        .await
+        .expect("bob's client received the edit assembled");
+
+    // The receiver's stored bodies, read back through its own REST search —
+    // the surface REST consumers actually see (the store is encrypted at
+    // rest, so the server's own read path is the honest witness).
+    let rows: Vec<serde_json::Value> = reqwest::get(format!(
+        "http://{}/api/v1/search?channel=%23mledit&q=line",
+        srv_b.web_addr
+    ))
+    .await
+    .expect("search reachable")
+    .json::<serde_json::Value>()
+    .await
+    .map(|v| match v {
+        serde_json::Value::Array(a) => a,
+        other => other["results"].as_array().cloned().unwrap_or_default(),
+    })
+    .expect("search answered");
+    let text_of = |pred: &dyn Fn(&serde_json::Value) -> bool| -> Option<String> {
+        rows.iter()
+            .find(|r| pred(r))
+            .and_then(|r| r["text"].as_str().map(String::from))
+    };
+    // Root-identity semantics: the row under the original msgid serves the
+    // CURRENT text — the edit — so one assertion covers filing and unescaping.
+    let stored = text_of(&|r| r["msgid"].as_str() == Some(msgid.as_str()));
+    assert_eq!(
+        stored.as_deref(),
+        Some(edited),
+        "the receiver must file the body its verifier checked, not the escaped wire form"
+    );
+    assert!(
+        rows.iter()
+            .all(|r| !r["text"].as_str().unwrap_or_default().contains("\\n")),
+        "no stored body may hold the escaped wire form: {rows:?}"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}

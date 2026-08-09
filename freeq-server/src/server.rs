@@ -3664,6 +3664,41 @@ pub(crate) async fn process_s2s_message(
             // Generate a local msgid if the remote didn't send one
             let msgid = msgid.unwrap_or_else(crate::msgid::generate);
 
+            // The body to FILE: the assembled form — the same bytes the
+            // verifier checked and the origin stored. The wire keeps the
+            // escaped form (a raw newline cannot ride an IRC line); the store
+            // must not, or REST, search, FTS and replay read escape sequences
+            // as text and the two servers hold different bytes for one
+            // message. Line bodies are peer-provided, so each is sanitized
+            // before reassembly; the joins are ours.
+            let stored_body = match multiline_lines.as_ref() {
+                Some(lines) => {
+                    let mut out = String::new();
+                    for (i, line) in lines.iter().enumerate() {
+                        if i > 0 && !line.concat {
+                            out.push('\n');
+                        }
+                        out.push_str(&sanitize_s2s_str(
+                            &line.body,
+                            crate::connection::draft_multiline::MAX_BYTES,
+                        ));
+                    }
+                    let max = crate::connection::draft_multiline::MAX_BYTES;
+                    if out.len() > max {
+                        let mut cut = max;
+                        while !out.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
+                        out.truncate(cut);
+                    }
+                    out
+                }
+                None if relayed_tags.contains_key("+freeq.at/multiline") => {
+                    text.replace("\\n", "\n")
+                }
+                None => text.clone(),
+            };
+
             // An edit names the message it revises. Resolve to our own root:
             // the peer names the root too, but an id we've never seen is its
             // own root, so this is also what makes an edit of a message that
@@ -3845,7 +3880,7 @@ pub(crate) async fn process_s2s_message(
                             Some(ref root) => db.insert_edit_with(
                                 &target,
                                 &from,
-                                &text,
+                                &stored_body,
                                 timestamp,
                                 &tags,
                                 &msgid,
@@ -3856,7 +3891,7 @@ pub(crate) async fn process_s2s_message(
                             None => db.insert_message_with(
                                 &target,
                                 &from,
-                                &text,
+                                &stored_body,
                                 timestamp,
                                 &tags,
                                 Some(&msgid),
@@ -3889,7 +3924,7 @@ pub(crate) async fn process_s2s_message(
                             ch.history[i].from.split('!').next() == from.split('!').next()
                         });
                         if let (Some(i), true) = (revised, author_matches) {
-                            ch.history[i].text = text.clone();
+                            ch.history[i].text = stored_body.clone();
                             ch.history[i].edited = true;
                         } else if revised.is_some() {
                             tracing::warn!(
@@ -3899,7 +3934,7 @@ pub(crate) async fn process_s2s_message(
                         } else {
                             ch.history.push_back(HistoryMessage {
                                 from: from.clone(),
-                                text: text.clone(),
+                                text: stored_body.clone(),
                                 timestamp,
                                 tags: tags.clone(),
                                 // An edit of a message we never saw still keys
@@ -4053,7 +4088,7 @@ pub(crate) async fn process_s2s_message(
                             Some(ref root) => db.insert_edit_with(
                                 &dm_key,
                                 &from,
-                                &text,
+                                &stored_body,
                                 timestamp,
                                 &tags,
                                 &msgid,
@@ -4064,7 +4099,7 @@ pub(crate) async fn process_s2s_message(
                             None => db.insert_message_with(
                                 &dm_key,
                                 &from,
-                                &text,
+                                &stored_body,
                                 timestamp,
                                 &tags,
                                 Some(&msgid),
