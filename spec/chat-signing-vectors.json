@@ -49,6 +49,12 @@
     },
     {
       "expected": "invalid",
+      "name": "cross-kind-swap",
+      "tamperedCanonical": "{\"emoji\":\"👍\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kind\":\"react\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"subject\":\"01KYVT1W2P0000000000000000\",\"target\":\"#freeq\"}",
+      "vector": "delete"
+    },
+    {
+      "expected": "invalid",
       "name": "relabelled-evidence-type",
       "tamperedCanonical": "{\"event\":\"evidence_attach\",\"evidence\":\"test_run\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kind\":\"coordination\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"payload\":\"sha256:16f42045ce0a6db023ee9dc036f41a8fba6da87e8329fa53fd54c32c1fdc1ce3\",\"ref\":\"01KYVT1W2P0000000000000000\",\"target\":\"#swarm\"}",
       "vector": "coordination-evidence-attach"

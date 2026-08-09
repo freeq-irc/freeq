@@ -1371,6 +1371,14 @@ mod tests {
                 "react",
                 ChatDoc::mutation(Mutation::Unreact, ALICE, MSGID, "#freeq", ROOT).with_emoji("👍"),
             ),
+            // Re-typing an event changes what it *does* while every named
+            // field stays as signed: a delete re-presented as a react.
+            // `kind` is inside the document precisely so this cannot survive.
+            doc_negative(
+                "cross-kind-swap",
+                "delete",
+                ChatDoc::mutation(Mutation::React, ALICE, MSGID, "#freeq", ROOT).with_emoji("👍"),
+            ),
             // Relabelling evidence changes what a reader is shown about work
             // that was signed for.
             doc_negative(
