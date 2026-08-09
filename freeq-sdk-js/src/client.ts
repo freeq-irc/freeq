@@ -2880,9 +2880,22 @@ export class FreeqClient extends EventEmitter {
   }
 
   /** Send a NOTICE. Signed like a PRIVMSG — the server verifies both against
-   *  the same document, so a bot's notices carry the same proof its messages
-   *  do. A DM peer resolves to their DID where it's known, which is what
-   *  gives the signature a venue a verifier can rebuild. */
+   *  the same document. A DM peer resolves to their DID where it's known,
+   *  which is what gives the signature a venue a verifier can rebuild.
+   *
+   *  **A notice leaves no record, so its signature cannot be checked later.**
+   *  The server stores and logs messages only (persistence is gated on
+   *  PRIVMSG), so a notice is verifiable in flight and by nothing afterwards:
+   *  it is absent from channel history, from CHATHISTORY replay, and from
+   *  `/api/v1/verify`. That is deliberate for the server's own notices —
+   *  command results, errors, the API bearer — which are control chatter
+   *  nobody wants in history.
+   *
+   *  **For anything an agent says to a person, prefer `sendMessage`.** The
+   *  usual reason to reach for a notice is the convention that nothing
+   *  auto-replies to one, but a bot built on this SDK decides when to reply
+   *  through its own mention matching and turn gate, so the convention buys
+   *  nothing here and costs the durable proof. */
   sendNotice(target: string, text: string, tags: Record<string, string> = {}): void {
     void this.enqueueSend(() =>
       this.writeSignedMessage('NOTICE', this.wireTargetFor(target), text, tags),

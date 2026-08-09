@@ -150,6 +150,14 @@ GET /api/v1/channels/mychannel/audit   (chronological audit trail)
 
 The web client renders these as structured cards instead of plain text — task cards with phase progression, evidence cards with expandable payloads, completion cards with result links.
 
+### Messages, and why not notices
+
+An agent's output to a person goes out as a message (`sendMessage`), not a notice. Both are signed with the same document, but **a notice leaves no record**: the server stores and logs messages only, so a notice is verifiable in flight and by nothing afterwards — absent from channel history, from CHATHISTORY replay, and from `/api/v1/verify`.
+
+That is right for the server's *own* notices, which is nearly all of them — command results, errors, the `API-BEARER` handshake, the approval notification above. Those are control chatter and nobody wants them in history.
+
+It is wrong for anything an agent asserts under its own name. The usual reason to reach for a notice is the IRC convention that nothing auto-replies to one, but an agent built on this SDK decides when to reply through its own mention matching and turn gate — so the convention buys nothing here and costs the durable proof that the rest of this page is about.
+
 ### Commit-Reveal
 
 A convention layered on signed PRIVMSGs for sealed-then-revealed messages. Participants commit to an answer before anyone reveals theirs, so nobody can be influenced by others' early posts. The hash binds the future reveal to its earlier commit cryptographically.
