@@ -1611,11 +1611,13 @@ fn verify_api_base(server_addr: &str) -> String {
 
 /// Render the server's answer about one event as a line a person can read.
 ///
-/// The verdict is three-way, and `verified_by` is the part that matters: a
-/// message the sender's own device signed is a claim they cannot later
-/// disown, while one the server signed is only the server vouching for what
-/// it received. Collapsing those into "valid" would throw away the point of
-/// client signing, so the line always says who vouches.
+/// The answer is a sentence, never the protocol tokens it was derived from:
+/// `verdict` and `verified_by` are wire vocabulary and mean nothing to a
+/// reader. What they have to come away with is who vouches — a message the
+/// sender's own device signed is a claim they cannot later disown, while one
+/// the server signed is only the server vouching for what it received. Any
+/// pair this build doesn't recognise reads as a check that didn't happen,
+/// because printing the token back would say less than nothing.
 fn format_verify_verdict(body: &serde_json::Value) -> String {
     let Some(verification) = body.get("verification") else {
         return "Verify: the server returned no verdict for that id".to_string();
@@ -1623,16 +1625,17 @@ fn format_verify_verdict(body: &serde_json::Value) -> String {
     let verdict = verification
         .get("verdict")
         .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+        .unwrap_or_default();
     let by = verification
         .get("verified_by")
         .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let vouches = match by {
-        "client-session-key" => "the sender's device signed it",
-        "server-key" => "the server signed it, not the sender",
-        "unsigned" => "nothing was signed",
-        other => other,
+        .unwrap_or_default();
+    let vouches = match (verdict, by) {
+        ("valid", "client-session-key") => "the sender's device signed it",
+        ("valid", _) => "the server signed it, not the sender",
+        ("invalid", _) => "the signature doesn't check out",
+        (_, "unsigned") => "nothing was signed",
+        _ => "couldn't be checked here",
     };
 
     // A mutation's id resolves to the act. There is no body to show, by
@@ -1651,15 +1654,15 @@ fn format_verify_verdict(body: &serde_json::Value) -> String {
             .get("actor_did")
             .and_then(|v| v.as_str())
             .unwrap_or("(unknown)");
-        return format!("Verify: {kind}{emoji} on {subject} by {actor} — {verdict} ({vouches})");
+        return format!("Verify: {kind}{emoji} on {subject} by {actor} — {vouches}");
     }
 
     let signer = body
         .get("sender_did")
         .and_then(|v| v.as_str())
-        .map(|d| format!(" by {d}"))
+        .map(|d| format!(" — {d}"))
         .unwrap_or_default();
-    format!("Verify: {verdict} ({vouches}){signer}")
+    format!("Verify: {vouches}{signer}")
 }
 
 /// Learn the connected server's own signing key id, in the background.
@@ -3419,6 +3422,8 @@ mod tests {
         assert_eq!(verify_api_base("localhost:6667"), "http://localhost:8080");
     }
 
+    /// Every word the reader is shown is a word they can act on. The wire
+    /// vocabulary — the verdict names, the key names — stays on the wire.
     #[test]
     fn a_verdict_reads_as_who_vouches_for_the_message() {
         // The pass condition: the sender's own device signed it.
@@ -3426,26 +3431,83 @@ mod tests {
             "verification": { "verdict": "valid", "verified_by": "client-session-key" },
             "sender_did": "did:plc:alice",
         }));
-        assert!(v.contains("valid"), "{v}");
-        assert!(v.contains("the sender's device"), "{v}");
+        assert_eq!(v, "Verify: the sender's device signed it — did:plc:alice");
 
         // A server-signed message is honest but weaker — the server vouches,
         // not the sender, and the reader has to be able to tell.
         let v = format_verify_verdict(&serde_json::json!({
             "verification": { "verdict": "valid", "verified_by": "server-key" },
+            "sender_did": "did:plc:alice",
         }));
-        assert!(v.contains("valid"), "{v}");
-        assert!(v.contains("the server"), "{v}");
+        assert_eq!(
+            v,
+            "Verify: the server signed it, not the sender — did:plc:alice"
+        );
 
-        // Nothing to check, and a signature that fails: distinct states.
+        // A signature that fails is the one accusation this line ever makes.
+        let v = format_verify_verdict(&serde_json::json!({
+            "verification": { "verdict": "invalid", "verified_by": "client-session-key" },
+            "sender_did": "did:plc:alice",
+        }));
+        assert_eq!(v, "Verify: the signature doesn't check out — did:plc:alice");
+
+        // Nothing to check is not a failed check. Without a sender on file
+        // there is nobody to name, so the line names nobody.
         let v = format_verify_verdict(&serde_json::json!({
             "verification": { "verdict": "unverifiable", "verified_by": "unsigned" },
         }));
-        assert!(v.contains("unverifiable"), "{v}");
+        assert_eq!(v, "Verify: nothing was signed");
+
+        // A key this server doesn't hold, a retired format, an algorithm it
+        // doesn't know: all of them are the same fact to a reader.
         let v = format_verify_verdict(&serde_json::json!({
-            "verification": { "verdict": "invalid", "verified_by": "client-session-key" },
+            "verification": { "verdict": "unverifiable", "verified_by": "unverifiable-unknown-key" },
         }));
-        assert!(v.contains("invalid"), "{v}");
+        assert_eq!(v, "Verify: couldn't be checked here");
+    }
+
+    /// A `verified_by` this build has never heard of is still an answer to a
+    /// person, and the token itself is not it. This pins the fallback that
+    /// used to print the raw token straight through.
+    #[test]
+    fn an_answer_this_build_does_not_know_never_shows_its_token() {
+        for body in [
+            serde_json::json!({
+                "verification": { "verdict": "unverifiable", "verified_by": "quantum-notary-2039" },
+            }),
+            serde_json::json!({ "verification": {} }),
+            serde_json::json!({ "verification": { "verdict": "shrug" } }),
+        ] {
+            let v = format_verify_verdict(&body);
+            assert_eq!(v, "Verify: couldn't be checked here", "{body}");
+        }
+
+        for token in [
+            "valid",
+            "invalid",
+            "unverifiable",
+            "unknown",
+            "client-session-key",
+            "server-key",
+        ] {
+            for body in [
+                serde_json::json!({
+                    "verification": { "verdict": "valid", "verified_by": "client-session-key" },
+                }),
+                serde_json::json!({
+                    "verification": { "verdict": "invalid", "verified_by": "server-key" },
+                }),
+                serde_json::json!({
+                    "verification": { "verdict": "unverifiable", "verified_by": "unsigned" },
+                }),
+                serde_json::json!({
+                    "verification": { "verdict": "unverifiable", "verified_by": "unverifiable-unknown-key" },
+                }),
+            ] {
+                let v = format_verify_verdict(&body);
+                assert!(!v.contains(token), "wire vocabulary leaked: {v}");
+            }
+        }
     }
 
     #[test]
@@ -3458,10 +3520,10 @@ mod tests {
             "emoji": "👍",
             "verification": { "verdict": "valid", "verified_by": "client-session-key" },
         }));
-        assert!(v.contains("unreact"), "{v}");
-        assert!(v.contains("01ROOT"), "{v}");
-        assert!(v.contains("👍"), "{v}");
-        assert!(v.contains("valid"), "{v}");
+        assert_eq!(
+            v,
+            "Verify: unreact 👍 on 01ROOT by did:plc:alice — the sender's device signed it"
+        );
     }
 
     /// A server with nothing on file for an id has given an answer, not
