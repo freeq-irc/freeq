@@ -106,6 +106,12 @@ export interface FreeqEvents {
   /** Fired when WHOIS info is updated. */
   whois: (nick: string, info: Partial<WhoisInfo>) => void;
 
+  /** Fired when the server has finished answering a WHOIS — 318
+   *  (RPL_ENDOFWHOIS), or 401 (ERR_NOSUCHNICK) for a name nobody holds.
+   *  Without it a caller cannot tell "the answer named no account" from
+   *  "no answer yet", and the only alternative is a timer that guesses. */
+  whoisEnd: (nick: string) => void;
+
   /** Fired when a MOTD line is received. */
   motd: (line: string) => void;
 

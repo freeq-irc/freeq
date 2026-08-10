@@ -668,6 +668,65 @@ describe('requestWhois', () => {
   });
 });
 
+// A caller that only sees `whois` cannot tell "the server finished and named
+// no account" from "no answer yet" — the two need different words on screen,
+// and a timer that guesses which is exactly the defect this replaces.
+describe('whoisEnd', () => {
+  it('318 ends the WHOIS, naming the nick', async () => {
+    const { client, ws } = await makeRegistered();
+    const ended: string[] = [];
+    client.on('whoisEnd', (nick) => ended.push(nick));
+    client.whois('bob');
+    ws.recv(':srv 311 alice bob ~user host.example * :Bob');
+    await flushAsync();
+    expect(ended).toEqual([]);
+    ws.recv(':srv 318 alice bob :End of WHOIS list');
+    await flushAsync();
+    expect(ended).toEqual(['bob']);
+  });
+
+  it('a guest answer ends with no account named', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: Array<{ did?: string }> = [];
+    let ended = false;
+    client.on('whois', (_nick, info) => seen.push(info));
+    client.on('whoisEnd', () => { ended = true; });
+    client.whois('guest1');
+    ws.recv(':srv 311 alice guest1 ~u freeq/guest * :IRC User');
+    await flushAsync();
+    ws.recv(':srv 312 alice guest1 srv :freeq');
+    await flushAsync();
+    ws.recv(':srv 318 alice guest1 :End of WHOIS list');
+    await flushAsync();
+    expect(ended).toBe(true);
+    expect(seen.some((i) => i.did)).toBe(false);
+    expect(client.getDidForNick('guest1')).toBeUndefined();
+  });
+
+  it('401 for a name nobody holds also ends the WHOIS', async () => {
+    const { client, ws } = await makeRegistered();
+    const ended: string[] = [];
+    client.on('whoisEnd', (nick) => ended.push(nick));
+    ws.recv(':srv 401 alice ghost :No such nick');
+    await flushAsync();
+    expect(ended).toEqual(['ghost']);
+  });
+
+  it('ends the WHOIS for a background lookup too', async () => {
+    // The SDK fires its own WHOIS for DM partners; those answers end the
+    // same way, so a surface watching the event is never left pending.
+    const { client, ws } = await makeRegistered();
+    const ended: string[] = [];
+    client.on('whoisEnd', (nick) => ended.push(nick));
+    ws.recv(':carol!u@h PRIVMSG alice :hi');
+    await flushAsync();
+    expect(ws.sent).toContain('WHOIS carol');
+    ws.recv(':srv 318 alice carol :End of WHOIS list');
+    await flushAsync();
+    expect(ended).toEqual(['carol']);
+  });
+});
+
 describe('agent lifecycle methods', () => {
   it('registerAgent() sends AGENT REGISTER', async () => {
     const { client, ws } = await makeRegistered();

@@ -2475,6 +2475,9 @@ export class FreeqClient extends EventEmitter {
       // Error numerics
       case '401': {
         const failTarget = msg.params[1];
+        // A name nobody holds ends any WHOIS out for it, so listeners waiting
+        // on an answer are released rather than left pending forever.
+        this.emit('whoisEnd', failTarget || '');
         // Show a name rather than a raw did:… string, and file the notice
         // under the CANONICAL conversation key (dmKey) — keying by the raw
         // fail target created a nick-keyed ghost thread holding nothing but
@@ -2547,6 +2550,7 @@ export class FreeqClient extends EventEmitter {
         // End of WHOIS. Resolve any pending requestWhois() Promise(s)
         // for this nick with the accumulated info.
         const lc = (msg.params[1] || '').toLowerCase();
+        this.emit('whoisEnd', msg.params[1] || '');
         this.backgroundWhois.delete(lc);
         const buf = this._whoisBuffer.get(lc);
         this._whoisBuffer.delete(lc);
