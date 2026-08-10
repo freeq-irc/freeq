@@ -529,6 +529,18 @@ struct MentionTarget: Identifiable {
     let nick: String
 }
 
+/// Why the proof sheet is open. Showing who someone is and checking whether a
+/// specific message's signature holds up are different questions, and the
+/// sheet leads with whichever was asked.
+struct ProofRequest: Identifiable {
+    let id = UUID()
+    /// nil = identity only; set = check this message and lead with the answer.
+    let msgId: String?
+
+    static let identity = ProofRequest(msgId: nil)
+    static func verify(_ messageId: String) -> ProofRequest { ProofRequest(msgId: messageId) }
+}
+
 struct MessageRow: View {
     @Environment(AppState.self) private var appState
     /// Present only in the AppKit list; nil in the legacy list (no clamp).
@@ -556,7 +568,9 @@ struct MessageRow: View {
 
     // Safety (report/block) + identity proof presentation
     @State private var reportTarget: ReportTarget?
-    @State private var showProof = false
+    /// Which proof the sheet is open for: the sender's identity, or the
+    /// checked answer for this specific message.
+    @State private var proofRequest: ProofRequest?
     /// A tapped @mention, presenting that person's profile.
     @State private var mentionTarget: MentionTarget?
 
@@ -570,6 +584,11 @@ struct MessageRow: View {
 
     private var profile: ProfileCache.Profile? {
         ProfileCache.shared.profile(for: message.from)
+    }
+
+    /// The answer, if the reader has already asked about this message.
+    private var checkedVerdict: VerifyAnswer? {
+        appState.checkedVerdicts[message.id]
     }
 
     private var hasDid: Bool {
@@ -623,7 +642,7 @@ struct MessageRow: View {
                             }
 
                             if hasDid {
-                                Button { showProof = true } label: {
+                                Button { proofRequest = .identity } label: {
                                     Image(systemName: "checkmark.seal.fill")
                                         .font(.caption2)
                                         .foregroundStyle(Theme.verified)
@@ -632,14 +651,19 @@ struct MessageRow: View {
                                 .help("AT Protocol verified identity — click for proof")
                             }
 
-                            if message.origin == nil && message.isSigned {
-                                Button { showProof = true } label: {
-                                    Image(systemName: "lock.fill")
+                            // No badge for a signed message: almost every
+                            // message is signed, so a badge on every row says
+                            // nothing. Verification is an explicit action in
+                            // the context menu, and only a checked mismatch
+                            // shows a marker here.
+                            if checkedVerdict?.marksTheRow == true {
+                                Button { proofRequest = .verify(message.id) } label: {
+                                    Image(systemName: "exclamationmark.shield.fill")
                                         .font(.system(size: 9))
-                                        .foregroundStyle(Theme.success)
+                                        .foregroundStyle(Theme.danger)
                                 }
                                 .buttonStyle(.plain)
-                                .help("Cryptographically signed message — click to verify")
+                                .help("This message's signature did not check out — click for detail")
                             }
 
                             if message.isEncrypted {
@@ -868,13 +892,13 @@ struct MessageRow: View {
         .reportDialog($reportTarget) { t, reason in
             appState.reportUser(nick: t.nick, did: t.did, reason: reason)
         }
-        .sheet(isPresented: $showProof) {
+        .sheet(item: $proofRequest) { request in
             VerifiedProofSheet(
                 did: ProfileCache.shared.did(for: message.from),
                 handle: profile?.handle,
                 displayName: profile?.displayName,
                 nick: message.from,
-                msgId: message.isSigned ? message.id : nil
+                msgId: request.msgId
             )
             .environment(appState)
         }
@@ -958,6 +982,12 @@ struct MessageRow: View {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(msgId, forType: .string)
             }
+        }
+
+        // Checking a signature is a question the reader asks, not a claim the
+        // row makes on its own. Same label as the web and Android clients.
+        if !isSystem {
+            Button("Verify Signature") { proofRequest = .verify(message.id) }
         }
 
         if !isSystem {
