@@ -777,7 +777,11 @@ public protocol FreeqClientProtocol: AnyObject, Sendable {
     
     func currentNick()  -> String?
     
+    func deleteMessage(target: String, msgid: String) throws 
+    
     func disconnect() 
+    
+    func editMessage(target: String, msgid: String, newText: String) throws 
     
     func isConnected()  -> Bool
     
@@ -787,9 +791,17 @@ public protocol FreeqClientProtocol: AnyObject, Sendable {
     
     func part(channel: String) throws 
     
+    func react(target: String, emoji: String, msgid: String) throws 
+    
+    func reply(target: String, msgid: String, text: String) throws 
+    
+    func requestWhois(nick: String) throws 
+    
     func sendMessage(target: String, text: String) throws 
     
     func sendRaw(line: String) throws 
+    
+    func sendTagged(target: String, text: String, tags: [TagEntry]) throws 
     
     func setPlatform(platform: String) throws 
     
@@ -798,6 +810,12 @@ public protocol FreeqClientProtocol: AnyObject, Sendable {
     func setWebToken(token: String) throws 
     
     func setWebsocketUrl(url: String) throws 
+    
+    func typingStart(target: String) throws 
+    
+    func typingStop(target: String) throws 
+    
+    func unreact(target: String, emoji: String, msgid: String) throws 
     
 }
 open class FreeqClient: FreeqClientProtocol, @unchecked Sendable {
@@ -875,8 +893,25 @@ open func currentNick() -> String?  {
 })
 }
     
+open func deleteMessage(target: String, msgid: String)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
+    uniffi_freeq_sdk_ffi_fn_method_freeqclient_delete_message(self.uniffiClonePointer(),
+        FfiConverterString.lower(target),
+        FfiConverterString.lower(msgid),$0
+    )
+}
+}
+    
 open func disconnect()  {try! rustCall() {
     uniffi_freeq_sdk_ffi_fn_method_freeqclient_disconnect(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func editMessage(target: String, msgid: String, newText: String)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
+    uniffi_freeq_sdk_ffi_fn_method_freeqclient_edit_message(self.uniffiClonePointer(),
+        FfiConverterString.lower(target),
+        FfiConverterString.lower(msgid),
+        FfiConverterString.lower(newText),$0
     )
 }
 }
@@ -909,6 +944,31 @@ open func part(channel: String)throws   {try rustCallWithError(FfiConverterTypeF
 }
 }
     
+open func react(target: String, emoji: String, msgid: String)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
+    uniffi_freeq_sdk_ffi_fn_method_freeqclient_react(self.uniffiClonePointer(),
+        FfiConverterString.lower(target),
+        FfiConverterString.lower(emoji),
+        FfiConverterString.lower(msgid),$0
+    )
+}
+}
+    
+open func reply(target: String, msgid: String, text: String)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
+    uniffi_freeq_sdk_ffi_fn_method_freeqclient_reply(self.uniffiClonePointer(),
+        FfiConverterString.lower(target),
+        FfiConverterString.lower(msgid),
+        FfiConverterString.lower(text),$0
+    )
+}
+}
+    
+open func requestWhois(nick: String)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
+    uniffi_freeq_sdk_ffi_fn_method_freeqclient_request_whois(self.uniffiClonePointer(),
+        FfiConverterString.lower(nick),$0
+    )
+}
+}
+    
 open func sendMessage(target: String, text: String)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
     uniffi_freeq_sdk_ffi_fn_method_freeqclient_send_message(self.uniffiClonePointer(),
         FfiConverterString.lower(target),
@@ -920,6 +980,15 @@ open func sendMessage(target: String, text: String)throws   {try rustCallWithErr
 open func sendRaw(line: String)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
     uniffi_freeq_sdk_ffi_fn_method_freeqclient_send_raw(self.uniffiClonePointer(),
         FfiConverterString.lower(line),$0
+    )
+}
+}
+    
+open func sendTagged(target: String, text: String, tags: [TagEntry])throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
+    uniffi_freeq_sdk_ffi_fn_method_freeqclient_send_tagged(self.uniffiClonePointer(),
+        FfiConverterString.lower(target),
+        FfiConverterString.lower(text),
+        FfiConverterSequenceTypeTagEntry.lower(tags),$0
     )
 }
 }
@@ -949,6 +1018,29 @@ open func setWebToken(token: String)throws   {try rustCallWithError(FfiConverter
 open func setWebsocketUrl(url: String)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
     uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_websocket_url(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
+    )
+}
+}
+    
+open func typingStart(target: String)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
+    uniffi_freeq_sdk_ffi_fn_method_freeqclient_typing_start(self.uniffiClonePointer(),
+        FfiConverterString.lower(target),$0
+    )
+}
+}
+    
+open func typingStop(target: String)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
+    uniffi_freeq_sdk_ffi_fn_method_freeqclient_typing_stop(self.uniffiClonePointer(),
+        FfiConverterString.lower(target),$0
+    )
+}
+}
+    
+open func unreact(target: String, emoji: String, msgid: String)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
+    uniffi_freeq_sdk_ffi_fn_method_freeqclient_unreact(self.uniffiClonePointer(),
+        FfiConverterString.lower(target),
+        FfiConverterString.lower(emoji),
+        FfiConverterString.lower(msgid),$0
     )
 }
 }
@@ -3681,7 +3773,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_current_nick() != 2287) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_delete_message() != 56869) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_disconnect() != 50640) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_edit_message() != 7999) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_is_connected() != 11223) {
@@ -3696,10 +3794,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_part() != 40069) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_react() != 14725) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_reply() != 46428) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_request_whois() != 29431) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_send_message() != 60197) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_send_raw() != 34247) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_send_tagged() != 64231) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_platform() != 50791) {
@@ -3712,6 +3822,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_websocket_url() != 40379) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_typing_start() != 12743) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_typing_stop() != 39542) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_unreact() != 55886) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqe2ee_decrypt_message() != 42382) {
