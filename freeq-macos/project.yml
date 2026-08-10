@@ -92,6 +92,27 @@ targets:
         # Uploads via open panel / drag-drop; image "Save" via save panel.
         com.apple.security.files.user-selected.read-write: true
 
+  # App-hosted unit tests. The SwiftPM package covers the pure models; this
+  # bundle is the only place AppState itself can be exercised, so the send
+  # paths (venue resolution, optimistic apply, error surfacing) live here.
+  freeq-macosTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: freeq-macosTests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: at.freeq.macos.tests
+        GENERATE_INFOPLIST_FILE: YES
+        MACOSX_DEPLOYMENT_TARGET: "14.4"
+        # The app target is `freeq-macos` but its product is `freeq.app`, and
+        # the generated TEST_HOST follows the target name, so it points at an
+        # app that was never built. Name the real one.
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/freeq.app/Contents/MacOS/freeq"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+    dependencies:
+      - target: freeq-macos
+
   freeq-share:
     type: app-extension
     platform: macOS
@@ -119,6 +140,10 @@ schemes:
         freeq-macos: all
     run:
       config: Debug
+    test:
+      config: Debug
+      targets:
+        - freeq-macosTests
   freeq-macos-zerosum:
     build:
       targets:
