@@ -328,6 +328,8 @@ class AppState {
     func recordUserDid(nick: String, did: String) {
         profileCache.setDid(did, for: nick)
         didDisplayNames[did] = nick
+        // Release any first DM waiting to learn who this nick is.
+        dmResolver.learned(nick: nick, did: did)
         for ch in channels {
             if let idx = ch.members.firstIndex(where: { $0.nick.lowercased() == nick.lowercased() }) {
                 let m = ch.members[idx]
@@ -339,6 +341,19 @@ class AppState {
             }
         }
     }
+
+    /// Learns who a bare nick is before the first DM to them, so that message
+    /// can be signed like every other one. Set in `init`; every call happens
+    /// on the main thread.
+    @ObservationIgnored private(set) var dmResolver: DmResolver!
+
+    // MARK: - Checked signature verdicts
+
+    /// Answers to signatures the reader explicitly asked about, by message id.
+    /// Nothing is checked unless someone asks, and only a mismatch shows a
+    /// marker on the row — almost every message is signed, so marking all of
+    /// them would say nothing.
+    var checkedVerdicts: [String: VerifyAnswer] = [:]
 
     // MARK: - Typing debounce
     private var lastTypingSent: [String: Date] = [:]
@@ -427,6 +442,10 @@ class AppState {
 
     init() {
         AppState.current = self
+        dmResolver = DmResolver(
+            nickToDid: { [weak self] nick in self?.didForNick(nick) },
+            askWhois: { [weak self] nick in self?.sendWhois(nick, display: false) }
+        )
         loadSavedState()
         requestNotificationPermission()
         // In test mode the SwiftUI view lifecycle may never run `.onAppear`
@@ -538,6 +557,8 @@ class AppState {
         connectionState = .connecting
         authenticatedDID = nil
         didRequestDmTargets = false
+        // A new connection may be a new server, whose answers are its own.
+        dmResolver.reset()
         UserDefaults.standard.set(nick, forKey: "freeq.nick")
 
         // Tear down any prior client FIRST so its socket closes cleanly
@@ -583,6 +604,9 @@ class AppState {
         client = nil
         connectGate.drop()
         connectionState = .disconnected
+        // Releases any send still waiting on a WHOIS answer that can no longer
+        // arrive; it goes out at the nick, as it would have before asking.
+        dmResolver.reset()
         authenticatedDID = nil
         didRequestDmTargets = false
         apiBearerSessionId = nil
@@ -722,32 +746,87 @@ class AppState {
             return
         }
 
-        // Channel E2EE: when this channel has a key, relay ciphertext with the
-        // `+encrypted` tag (matches the web client's wire behavior). The echo
-        // cache inside ChannelE2eeState restores our plaintext on server echo.
-        if target.hasPrefix("#"), let wire = channelE2ee.outgoing(text: text, channel: target) {
-            sendRaw("@+encrypted PRIVMSG \(target) :\(wire)")
+        dispatch(.plain(target: target, text: text))
+    }
+
+    /// One send, addressed to the venue a signature can name.
+    ///
+    /// Channels and peers we already know never suspend, so ordinary sends
+    /// keep their order exactly. Only a first DM to a nick nobody has asked
+    /// about waits — briefly — for the WHOIS answer, and goes out at the nick
+    /// anyway if it never comes.
+    func dispatch(_ send: OutboundSend, encrypt: Bool = true) {
+        if let venue = dmResolver.venueIfSettled(send.target) {
+            transmit(send.addressed(to: venue), encrypt: encrypt)
             return
         }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let venue = await self.dmResolver.resolve(send.target)
+            self.transmit(send.addressed(to: venue), encrypt: encrypt)
+        }
+    }
 
-        // Server-relayed
+    /// Every send that reaches the wire, after the venue is resolved. Nil in
+    /// normal use; the test bundle sets it because a suite has no live client
+    /// and could not otherwise see which venue a send was addressed to.
+    @ObservationIgnored var onOutboundSend: ((OutboundSend) -> Void)?
+
+    /// Put one send on the wire through the SDK's typed senders — the only
+    /// path that signs. A hand-built line reaches the wire as a raw command,
+    /// which the SDK deliberately never signs, so an edit built by hand
+    /// carried no proof of who made it.
+    private func transmit(_ send: OutboundSend, encrypt: Bool) {
+        onOutboundSend?(send)
+        guard let client else {
+            errorMessage = "Not connected — that didn't send."
+            return
+        }
         do {
-            try client?.sendMessage(target: target, text: text)
+            // Channel E2EE: relay ciphertext with the `+encrypted` tag (matches
+            // the web client's wire behavior). The tagged sender signs the
+            // ciphertext that actually travels; the echo cache inside
+            // ChannelE2eeState restores our plaintext on server echo.
+            if encrypt, send.target.hasPrefix("#"),
+               let wire = channelE2ee.outgoing(text: send.text, channel: send.target) {
+                try client.sendTagged(
+                    target: send.target,
+                    text: wire,
+                    tags: send.encryptedTags.map { TagEntry(key: $0.key, value: $0.value) }
+                )
+                return
+            }
+            switch send {
+            case .plain(let target, let text):
+                try client.sendMessage(target: target, text: text)
+            case .edit(let target, let msgId, let text):
+                try client.editMessage(target: target, msgid: msgId, newText: text)
+            case .reply(let target, let msgId, let text):
+                try client.reply(target: target, msgid: msgId, text: text)
+            }
         } catch {
             errorMessage = "Send failed: \(error.localizedDescription)"
         }
     }
 
+    /// `/me` as a CTCP ACTION. The framing lives in the body, so the SDK signs
+    /// it as the ordinary message it is.
+    ///
+    /// Never encrypted: the action framing is read off the wire text, so a
+    /// ciphertext body would reach readers as literal control characters
+    /// instead of an action line.
     func sendAction(to target: String, text: String) {
-        sendRaw("PRIVMSG \(target) :\u{01}ACTION \(text)\u{01}")
+        dispatch(.plain(target: target, text: "\u{01}ACTION \(text)\u{01}"), encrypt: false)
     }
 
     func editMessage(target: String, msgId: String, newText: String) {
-        if target.hasPrefix("#"), let wire = channelE2ee.outgoing(text: newText, channel: target) {
-            sendRaw("@+draft/edit=\(msgId);+encrypted PRIVMSG \(target) :\(wire)")
-        } else {
-            sendRaw("@+draft/edit=\(msgId) PRIVMSG \(target) :\(newText)")
-        }
+        dispatch(.edit(target: target, msgId: msgId, text: newText))
+    }
+
+    /// Answer a specific message. Same signed path as any other send; the
+    /// `+reply` tag is inside the document the signature covers.
+    func sendReply(target: String, msgId: String, text: String) {
+        dispatch(.reply(target: target, msgId: msgId, text: text))
     }
 
     func deleteMessage(target: String, msgId: String) {
@@ -761,7 +840,11 @@ class AppState {
             ch?.applyDelete(msgId: msgId)
             Task { await MessageStore.shared.markDeleted(msgId: msgId) }
         }
-        sendRaw("@+draft/delete=\(msgId) TAGMSG \(target)")
+        do {
+            try client?.deleteMessage(target: target, msgid: msgId)
+        } catch {
+            errorMessage = "Delete failed: \(error.localizedDescription)"
+        }
     }
 
     func sendReaction(target: String, msgId: String, emoji: String) {
@@ -773,19 +856,32 @@ class AppState {
         let already = ch?.hasReaction(msgId: msgId, emoji: emoji, from: nick) ?? false
         if already {
             ch?.removeReaction(msgId: msgId, emoji: emoji, from: nick)
-            sendRaw("@+freeq.at/unreact=\(emoji);+reply=\(msgId) TAGMSG \(target)")
         } else {
             ch?.addReaction(msgId: msgId, emoji: emoji, from: nick)
-            sendRaw("@+react=\(emoji);+reply=\(msgId) TAGMSG \(target)")
+        }
+        do {
+            // Adding and withdrawing are separate signed events, each with an
+            // id of its own, so history records who took a reaction back.
+            switch ReactionOp.plan(target: target, msgId: msgId, emoji: emoji,
+                                   alreadyReacted: already) {
+            case .add(let target, let msgId, let emoji):
+                try client?.react(target: target, emoji: emoji, msgid: msgId)
+            case .remove(let target, let msgId, let emoji):
+                try client?.unreact(target: target, emoji: emoji, msgid: msgId)
+            }
+        } catch {
+            errorMessage = "Reaction failed: \(error.localizedDescription)"
         }
     }
 
+    /// Announce that we are typing. Ephemeral — it carries no event id and
+    /// nothing signs it, because nothing about it is worth attesting to later.
     func sendTyping(target: String) {
         let now = Date()
         let key = target.lowercased()
         if let last = lastTypingSent[key], now.timeIntervalSince(last) < 3 { return }
         lastTypingSent[key] = now
-        sendRaw("@+typing=active TAGMSG \(target)")
+        try? client?.typingStart(target: target)
     }
 
     func joinChannel(_ channel: String) {
@@ -855,8 +951,20 @@ class AppState {
         }
     }
 
+    /// Control verbs only — TOPIC, MODE, CHATHISTORY, AWAY, PIN. Nothing that
+    /// carries or mutates a message goes through here: a raw line reaches the
+    /// wire as `Command::Raw`, which the SDK deliberately never signs.
     func sendRaw(_ line: String) {
-        try? client?.sendRaw(line: line)
+        do {
+            try client?.sendRaw(line: line)
+        } catch {
+            // Not a banner — a failed control verb shows up as the thing it
+            // asked for not happening. But swallowing it left no trace at all.
+            Log.irc.error("""
+                raw send failed: \(line, privacy: .public) — \
+                \(error.localizedDescription, privacy: .public)
+                """)
+        }
     }
 
     private func requestDmTargetsIfReady() {
@@ -1193,6 +1301,10 @@ class AppState {
     func getOrCreateDM(_ nick: String) -> ChannelState {
         let lower = nick.lowercased()
         resolveDmDidIfNeeded(nick)
+        // Ask who a bare nick is as soon as the thread opens, so the answer is
+        // usually in hand by the time anything is typed and the first message
+        // can be signed.
+        dmResolver.probe(nick)
         if let dm = dmBuffers.first(where: { $0.name.lowercased() == lower }) {
             return dm
         }

@@ -70,6 +70,8 @@ let package = Package(
                 "ApiAuth.swift",
                 "MenuBarModel.swift",
                 "MessageActions.swift",
+                "OutboundSend.swift",
+                "DmResolver.swift",
                 "Safety.swift",
                 "SelfStatus.swift",
                 "SignatureProof.swift",

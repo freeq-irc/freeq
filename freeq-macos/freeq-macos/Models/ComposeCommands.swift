@@ -8,40 +8,34 @@ extension AppState {
     /// Handle one line of compose input for `target` — slash command, edit, or
     /// plain message (honoring an active reply). UI-only concerns (pending
     /// uploads, input history, clearing the field) stay in ComposeBar.
+    /// Handle one submission for `target` — a slash command, or the message
+    /// the compose state describes (new, edit, or reply).
+    ///
+    /// A multi-line body stays one message. The SDK routes it into a
+    /// `draft/multiline` batch and signs what a receiver reassembles; sending
+    /// one message per line — which is what this used to do — turned one
+    /// thought into several, each with an id of its own.
     func submitInput(_ raw: String, target: String) {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        // Editing mode
-        if let editId = editingMessageId {
-            editMessage(target: target, msgId: editId, newText: trimmed)
-            editingMessageId = nil
-            editingText = nil
-            return
-        }
-
-        // Slash commands
-        if trimmed.hasPrefix("/") {
+        // Slash commands. Checked after the edit state, so a revision that
+        // starts with `/` is still text.
+        if editingMessageId == nil, trimmed.hasPrefix("/") {
             handleCommand(trimmed, target: target)
             return
         }
 
-        // Plain messages (split multi-line), honoring an active reply.
-        let replyId = replyingToMessage?.id
-        for line in trimmed.components(separatedBy: .newlines) {
-            let l = line.trimmingCharacters(in: .whitespaces)
-            guard !l.isEmpty else { continue }
-            if let replyId {
-                if target.hasPrefix("#"), let wire = channelE2ee.outgoing(text: l, channel: target) {
-                    sendRaw("@+reply=\(replyId);+encrypted PRIVMSG \(target) :\(wire)")
-                } else {
-                    sendRaw("@+reply=\(replyId) PRIVMSG \(target) :\(l)")
-                }
-                replyingToMessage = nil
-            } else {
-                sendMessage(to: target, text: l)
-            }
-        }
+        guard let send = ComposeSend.plan(
+            target: target,
+            text: raw,
+            editingId: editingMessageId,
+            replyToId: replyingToMessage?.id
+        ) else { return }
+        editingMessageId = nil
+        editingText = nil
+        replyingToMessage = nil
+        dispatch(send)
     }
 
     func handleCommand(_ input: String, target: String) {
@@ -119,9 +113,9 @@ extension AppState {
         case "reply", "re":
             let rp = arg.split(separator: " ", maxSplits: 1)
             if rp.count == 2, activeChannelState?.findMessage(byId: String(rp[0])) != nil {
-                sendRaw("@+reply=\(rp[0]) PRIVMSG \(target) :\(rp[1])")
+                sendReply(target: target, msgId: String(rp[0]), text: String(rp[1]))
             } else if !arg.isEmpty, let last = activeChannelState?.messages.last {
-                sendRaw("@+reply=\(last.id) PRIVMSG \(target) :\(arg)")
+                sendReply(target: target, msgId: last.id, text: arg)
             }
         case "pin":
             let mid = arg.isEmpty ? activeChannelState?.messages.last?.id : arg.trimmingCharacters(in: .whitespaces)

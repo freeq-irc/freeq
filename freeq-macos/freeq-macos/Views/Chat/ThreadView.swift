@@ -138,7 +138,7 @@ struct ThreadReplyBar: View {
     private func send() {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        appState.sendRaw("@+reply=\(rootId) PRIVMSG \(channel) :\(trimmed)")
+        appState.sendReply(target: channel, msgId: rootId, text: trimmed)
         text = ""
     }
 }
