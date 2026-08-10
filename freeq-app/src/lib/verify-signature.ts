@@ -15,10 +15,17 @@ import { useSyncExternalStore } from 'react';
  *  and only one of them is an accusation: `unverifiable` covers a signature
  *  from before the current canonical, or one made with a key the server does
  *  not hold; `invalid` means the key the signature names was found and the
- *  signature does not match. `unreachable` means the check itself failed —
- *  network down, proxy fault, server error. It is not a verdict about the
- *  message and must never be dressed up as one. */
-export type VerifyOutcome = 'device' | 'server' | 'unverifiable' | 'invalid' | 'unreachable';
+ *  signature does not match. `unsigned` is a third thing again — there was
+ *  never a signature, so nothing was checked and nothing failed. `unreachable`
+ *  means the check itself failed — network down, proxy fault, server error. It
+ *  is not a verdict about the message and must never be dressed up as one. */
+export type VerifyOutcome =
+  | 'device'
+  | 'server'
+  | 'unsigned'
+  | 'unverifiable'
+  | 'invalid'
+  | 'unreachable';
 
 /** A checked answer, with the one distinction inside `unverifiable` that
  *  changes what happens next: a signature naming a key this server simply
@@ -92,6 +99,11 @@ export async function verifySignature(msgid: string): Promise<VerifyAnswer> {
       };
     } else if (verdict === 'invalid') {
       answer = { outcome: 'invalid', transient: false };
+    } else if (v?.verified_by === 'unsigned') {
+      // Nothing was signed, so nothing was checked. Reading this as a
+      // can't-check would put a fault on a message that has none — and would
+      // answer differently from every other client for the same server reply.
+      answer = { outcome: 'unsigned', transient: false };
     } else {
       // The server names its reason; a key it hasn't fetched yet is the one
       // reason a retry can outrun, because answering the request is what
@@ -139,6 +151,11 @@ export const VERIFY_LABELS: Record<VerifyOutcome, VerdictCopy> = {
     line: 'The server confirms it arrived from the sender’s account, but they didn’t sign it themselves — so you’re taking the server’s word for it.',
     tone: 'text-fg-muted',
   },
+  unsigned: {
+    heading: 'Unsigned',
+    line: 'Nothing was signed — there is no signature to check. Typical for guest accounts and messages from legacy servers.',
+    tone: 'text-fg-muted',
+  },
   unverifiable: {
     heading: 'Signature Not Supported',
     line: 'The server can’t check this signature — usually an older message, sometimes a newer app.',
@@ -156,11 +173,12 @@ export const VERIFY_LABELS: Record<VerifyOutcome, VerdictCopy> = {
   },
 };
 
-/** Five of the seven answers never name what was signed, so they read the
- *  same over a message and over a coordination event. These two do. Kept as
+/** Four of the seven answers never name what was signed, so they read the
+ *  same over a message and over a coordination event. These three do. Kept as
  *  whole sentences rather than an interpolated noun: copy that is assembled
  *  is copy nobody reads before it ships. */
 const EVENT_LINES: Partial<Record<VerifyOutcome, string>> = {
+  unsigned: 'Nothing was signed — there is no signature to check. Typical for events emitted before event signing.',
   unverifiable: 'The server can’t check this signature — usually an older event, sometimes a newer app.',
   invalid: 'This event is signed, but the signature doesn’t check out. Treat it with suspicion.',
 };
@@ -177,16 +195,15 @@ export function verdictCopy(
 
 /** Nothing was signed, so there is nothing to ask the server about. Not a
  *  failed check — asking anyway would return a can't-check that reads like a
- *  fault where there is none. */
+ *  fault where there is none.
+ *
+ *  The server reaches the same conclusion from the stored message and says so,
+ *  so this is one answer with two ways in — the caller that already knows
+ *  there is no signature, and the verdict that came back. One set of words for
+ *  both, or the same fact reads two ways depending on which door it came
+ *  through. */
 export function unsignedCopy(noun: 'message' | 'event' = 'message'): VerdictCopy {
-  return {
-    heading: 'Unsigned',
-    line:
-      noun === 'event'
-        ? 'Nothing was signed — there is no signature to check. Typical for events emitted before event signing.'
-        : 'Nothing was signed — there is no signature to check. Typical for guest accounts and messages from legacy servers.',
-    tone: 'text-fg-muted',
-  };
+  return verdictCopy('unsigned', noun);
 }
 
 /** The one can't-check a retry can outrun: the key belongs to someone on

@@ -53,6 +53,13 @@ describe('reading the server verdict', () => {
       { verification: { verdict: 'unverifiable' } },
       'unverifiable',
     ],
+    [
+      // A message nobody signed is not a message that failed a check, and
+      // every other client already says so in those words.
+      'a message that was never signed at all',
+      { verification: { verdict: 'unverifiable', verified_by: 'unsigned' } },
+      'unsigned',
+    ],
     ['a verdict this client has never heard of', { verification: { verdict: 'shrug' } }, 'unverifiable'],
     ['an answer with no verification at all', {}, 'unverifiable'],
   ];
@@ -167,6 +174,7 @@ describe('valid is not verified (ruled 2026-08-07)', () => {
     expect(tones).toEqual({
       device: 'text-success',
       server: 'text-fg-muted',
+      unsigned: 'text-fg-muted',
       unverifiable: 'text-fg-muted',
       invalid: 'text-danger',
       unreachable: 'text-fg-muted',
@@ -191,6 +199,11 @@ describe('an answer names what the id actually points at', () => {
     expect(verdictCopy('unverifiable', 'event').line).toContain('older event');
     expect(verdictCopy('invalid', 'event').line).toMatch(/^This event is signed/);
     expect(unsignedCopy('event').line).toContain('before event signing');
+    // Reached through the server's answer instead of the caller's knowledge,
+    // it is still the same answer in the same words.
+    expect(verdictCopy('unsigned', 'event')).toEqual(unsignedCopy('event'));
+    expect(verdictCopy('unsigned')).toEqual(unsignedCopy());
+    expect(verdictCopy('unsigned').line).toContain('guest accounts');
   });
 
   it('the noun-neutral answers are the same object either way', () => {
