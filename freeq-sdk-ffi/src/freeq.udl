@@ -86,6 +86,9 @@ interface FreeqEvent {
     // devices advancing the marker. timestamp null = server reports none.
     ReadMarker(string target, string? timestamp);
     WhoisReply(string nick, string info);
+    // The server finished answering a WHOIS: the point at which "no account"
+    // becomes an answer rather than an absence.
+    WhoisEnd(string nick);
     Notice(string text);
     Disconnected(string reason);
 };

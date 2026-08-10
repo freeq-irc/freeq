@@ -264,6 +264,12 @@ pub fn convert_event(event: &freeq_sdk::event::Event) -> DomainEvent {
         Event::WhoisReply { nick, info } => DomainEvent::Notice {
             text: format!("WHOIS {nick}: {info}"),
         },
+        // Nothing here waits on a WHOIS being complete, and a notice saying
+        // the server stopped talking would be noise in the buffer. Empty
+        // notice, the same way MemberDid is passed over below.
+        Event::WhoisEnd { .. } => DomainEvent::Notice {
+            text: String::new(),
+        },
         Event::ChatHistoryTarget { nick, timestamp, .. } => DomainEvent::Notice {
             text: format!("DM: {nick} (last: {})", timestamp.as_deref().unwrap_or("?")),
         },

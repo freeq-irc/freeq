@@ -232,6 +232,11 @@ pub enum FreeqEvent {
         nick: String,
         info: String,
     },
+    /// The server has finished answering a WHOIS for this nick. A surface
+    /// waiting to learn whether someone has an account settles here.
+    WhoisEnd {
+        nick: String,
+    },
     Notice {
         text: String,
     },
@@ -808,6 +813,7 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
             nick: nick.clone(),
             info: info.clone(),
         },
+        Event::WhoisEnd { nick } => FreeqEvent::WhoisEnd { nick: nick.clone() },
         Event::ReadMarker { target, timestamp } => FreeqEvent::ReadMarker {
             target: target.clone(),
             timestamp: timestamp.clone(),

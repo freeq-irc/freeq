@@ -1433,6 +1433,10 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
             // Don't quit — reconnection is handled by the main loop
             app.reconnect_pending = true;
         }
+        // The TUI prints WHOIS lines as they arrive and has nothing waiting on
+        // the answer being complete, so the end of one is not news here.
+        Event::WhoisEnd { nick: _ } => {}
+
         Event::WhoisReply { nick: _, info } => {
             let buf = app.active_buffer.clone();
             app.buffer_mut(&buf).push_system(&format!("*** {info}"));

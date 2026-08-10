@@ -164,6 +164,17 @@ pub enum Event {
         info: String,
     },
 
+    /// The server has finished answering a WHOIS.
+    ///
+    /// The reason this exists: every other WHOIS event reports something the
+    /// server found. Only this one reports that it has nothing more to say,
+    /// which is the difference between "this person has no account" and "the
+    /// answer hasn't arrived yet". Without it a caller can only guess with a
+    /// timer, and a timer long enough to be safe is long enough to be seen.
+    WhoisEnd {
+        nick: String,
+    },
+
     /// Server sent an error or notice.
     ServerNotice {
         text: String,

@@ -2379,16 +2379,25 @@ where
                             }
                         }
                         "318" => {
-                            // RPL_ENDOFWHOIS — ignore silently
+                            // RPL_ENDOFWHOIS — the server is done. Nothing
+                            // more is coming, so a caller waiting to hear
+                            // whether this nick has an account has its answer.
+                            if msg.params.len() >= 2 {
+                                let nick = msg.params[1].clone();
+                                let _ = event_tx.send(Event::WhoisEnd { nick }).await;
+                            }
                         }
                         "401" => {
-                            // ERR_NOSUCHNICK
+                            // ERR_NOSUCHNICK — also the end of a WHOIS, and
+                            // the only end some servers send for a nick that
+                            // isn't there.
                             if msg.params.len() >= 3 {
                                 let nick = msg.params[1].clone();
                                 let _ = event_tx.send(Event::WhoisReply {
                                     nick: nick.clone(),
                                     info: format!("{nick}: No such nick"),
                                 }).await;
+                                let _ = event_tx.send(Event::WhoisEnd { nick }).await;
                             }
                         }
                         "QUIT" => {
