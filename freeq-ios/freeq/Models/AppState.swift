@@ -342,6 +342,81 @@ class AppState: ObservableObject {
         knownDids[nick.lowercased()]
     }
 
+    // ── The identity lookup machine (port of macOS, 401-first from day one) ──
+
+    /// What a card should assume about a nick it has asked about.
+    @Published var identityLookups: [String: IdentityLookup] = [:]
+
+    /// Nicks the server answered with "no such nick". They are not guests —
+    /// nobody is holding the name, so there is nobody to have an account.
+    private var whoisNoSuchNick: Set<String> = []
+
+    /// Only a backstop; the real answer is the server's end-of-WHOIS.
+    private static let identityLookupTimeout: TimeInterval = 5.0
+
+    /// Ask who this nick is, for a card the reader just opened. Asks once;
+    /// a live-known binding needs nothing; an ask already out is not
+    /// repeated.
+    func lookUpIdentity(nick: String) {
+        let key = nick.lowercased()
+        guard !key.isEmpty else { return }
+        guard liveDidForNick(nick) == nil, identityLookups[key] == nil else { return }
+        whoisNoSuchNick.remove(key)
+        identityLookups[key] = .inFlight
+        try? client?.requestWhois(nick: nick)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.identityLookupTimeout) { [weak self] in
+            guard let self, self.identityLookups[key] == .inFlight else { return }
+            self.identityLookups.removeValue(forKey: key)
+        }
+    }
+
+    /// The server says nobody holds this name.
+    func noteWhoisNoSuchNick(nick: String) {
+        whoisNoSuchNick.insert(nick.lowercased())
+    }
+
+    /// The server has finished answering. Nobody-holds-this-name always
+    /// wins: a 401 says nothing about anybody, and a DID the cache happens
+    /// to remember must never be laundered into "the answer named one" —
+    /// that is the stale-cache vote this design exists to end.
+    func settleIdentityLookup(_ nickOrKey: String) {
+        let key = nickOrKey.lowercased()
+        guard identityLookups[key] == .inFlight else { return }
+        if whoisNoSuchNick.contains(key) {
+            identityLookups.removeValue(forKey: key)
+        } else if didForNick(key) != nil {
+            identityLookups[key] = .answeredDid
+        } else {
+            identityLookups[key] = .noAccount
+        }
+    }
+
+    /// True when the nick is in some channel roster right now.
+    func isNickPresent(_ nick: String) -> Bool {
+        channels.contains { ch in
+            ch.members.contains { $0.nick.caseInsensitiveCompare(nick) == .orderedSame }
+        }
+    }
+
+    /// The nick's DID, only when it is live-known: in a roster right now, or
+    /// a WHOIS answered with it this session. A binding remembered from an
+    /// earlier session never votes on identity; the persisted map stays for
+    /// display and addressing, where staleness costs a name, not a claim.
+    func liveDidForNick(_ nick: String) -> String? {
+        let answered = identityLookups[nick.lowercased()] == .answeredDid
+        return (answered || isNickPresent(nick)) ? didForNick(nick) : nil
+    }
+
+    /// The lookup state in the SDK's vocabulary, for the claim functions.
+    func personLookup(for nick: String) -> PersonLookup {
+        let key = nick.lowercased()
+        switch identityLookups[key] {
+        case .inFlight: return .inFlight
+        case .noAccount: return .noAccount
+        default: return whoisNoSuchNick.contains(key) ? .noSuchNick : .notAsked
+        }
+    }
+
     /// Canonical buffer key for opening a conversation: channels and DIDs pass
     /// through; a nick follows its DID binding when known, so every open path
     /// (compose sheet, deep link, intent, profile tap) lands in the one thread.
@@ -2715,6 +2790,7 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                 isSigned: ircMsg.isSigned,
                 isEncrypted: wasEncrypted,
                 origin: ircMsg.origin,
+                account: ircMsg.account,
                 editOf: ircMsg.editOf,
                 coordination: ircMsg.coordination.map {
                     CoordinationInfo(
@@ -2900,11 +2976,10 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                 for msg in sorted { dm.appendIfNew(msg) }
             }
 
-        case .whoisEnd:
-            // The server finished a WHOIS. The identity surfaces consume
-            // this in the identity port; the resolver's timeout already
-            // bounds the DM wait.
-            break
+        case .whoisEnd(let whoisNick):
+            // The server has finished. A card that was waiting has its
+            // answer now, whatever the answer turned out to be.
+            state.settleIdentityLookup(whoisNick)
 
         case .memberDid(let bindNick, let bindDid):
             state.dmResolver.learned(nick: bindNick, did: bindDid)
@@ -3166,11 +3241,21 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                 print("Notice: \(text)")
             }
 
-        case .whoisReply(_, _):
+        case .whoisReply(let whoisNick, let whoisInfo):
+            // "No such nick" is an answer about the name, not about a
+            // person: an unheld name has nobody to have an account.
+            if whoisInfo.contains("No such nick") {
+                state.noteWhoisNoSuchNick(nick: whoisNick)
+            }
             // WHOIS replies — currently unused in UI
             break
 
         case .disconnected(let reason):
+            // A dropped connection ends every question that was out on it,
+            // and a WHOIS answer from the old session is not a live binding
+            // on the new one.
+            state.identityLookups.removeAll()
+
             print("[freeq.event] .disconnected reason=\(reason)")
             state.connectionState = .disconnected
             if !reason.isEmpty && !reason.contains("EOF") {
