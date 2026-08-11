@@ -93,7 +93,7 @@ fun SettingsTab(appState: AppState) {
                                 if (authenticatedDID != null) {
                                     Icon(
                                         Icons.Default.Verified,
-                                        contentDescription = "Verified",
+                                        contentDescription = "AT Protocol identity",
                                         tint = FreeqColors.accent,
                                         modifier = Modifier.size(18.dp)
                                     )

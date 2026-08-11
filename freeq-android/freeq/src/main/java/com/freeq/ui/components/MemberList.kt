@@ -120,7 +120,7 @@ private fun MemberRow(member: MemberInfo, onMemberClick: ((String) -> Unit)? = n
                 if (AvatarCache.avatarUrl(member.nick) != null) {
                     Icon(
                         Icons.Default.CheckCircle,
-                        contentDescription = "Verified",
+                        contentDescription = "AT Protocol identity",
                         tint = FreeqColors.accent,
                         modifier = Modifier.size(13.dp)
                     )

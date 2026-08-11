@@ -26,7 +26,7 @@ struct OnboardingView: View {
             VStack(alignment: .leading, spacing: 16) {
                 FeatureRow(icon: "person.badge.shield.checkmark", color: .blue,
                            title: "AT Protocol Identity",
-                           desc: "Sign in with your Bluesky account for verified identity")
+                           desc: "Sign in with your Bluesky account for an AT Protocol identity")
                 FeatureRow(icon: "lock.fill", color: .green,
                            title: "Cryptographic Signatures",
                            desc: "Messages are signed — non-repudiable and tamper-proof")

@@ -146,7 +146,7 @@ private fun SheetMemberRow(member: MemberInfo, onMemberClick: (String) -> Unit) 
                 if (AvatarCache.avatarUrl(member.nick) != null) {
                     Icon(
                         Icons.Default.CheckCircle,
-                        contentDescription = "Verified",
+                        contentDescription = "AT Protocol identity",
                         tint = FreeqColors.accent,
                         modifier = Modifier.size(14.dp)
                     )

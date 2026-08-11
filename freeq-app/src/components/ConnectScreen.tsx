@@ -413,7 +413,7 @@ export function ConnectScreen() {
               <span className="text-success">🔒</span> E2EE DMs
             </span>
             <span className="flex items-center gap-1">
-              <span className="text-accent">🦋</span> Bluesky identity
+              <span className="text-accent">🦋</span> AT Protocol identity
             </span>
           </div>
         </div>

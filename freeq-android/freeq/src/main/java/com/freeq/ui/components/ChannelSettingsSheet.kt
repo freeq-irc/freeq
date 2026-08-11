@@ -214,7 +214,7 @@ fun ChannelSettingsSheet(
                                 if (AvatarCache.avatarUrl(op.nick) != null) {
                                     Icon(
                                         Icons.Default.CheckCircle,
-                                        contentDescription = "Verified",
+                                        contentDescription = "AT Protocol identity",
                                         tint = FreeqColors.accent,
                                         modifier = Modifier.size(14.dp)
                                     )
