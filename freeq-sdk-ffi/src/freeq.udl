@@ -1,4 +1,66 @@
-namespace freeq {};
+namespace freeq {
+    // The identity-claim rule — what a client can honestly say about who
+    // someone is. Computed here, from spec/identity-claims.json, so every
+    // native client renders the same answer the web client does. Clients
+    // pass what they see (a row's tags, the roster, the lookup state) and
+    // render what comes back; no client computes a state or owns a string.
+    IdentityClaim claim_for_message(MessageClaimInput input);
+    IdentityClaim claim_for_person(PersonClaimInput input);
+    IdentityClaim claim_for_sender(MessageClaimInput input, PersonLookup lookup);
+    u64 identity_stamping_epoch_unix();
+};
+
+// The six honest answers about who someone is.
+enum IdentityClaimState {
+    "AtProtocol",
+    "SelfIssued",
+    "Relayed",
+    "Guest",
+    "LookingUp",
+    "Unknown",
+};
+
+// What has been done about finding out who someone is.
+enum PersonLookup {
+    "NotAsked",
+    "InFlight",
+    "NoAccount",
+    "NoSuchNick",
+    "TimedOut",
+};
+
+// Inputs for a message row: the row's own tags, and the live room — never a
+// stored cache.
+dictionary MessageClaimInput {
+    string? account;
+    string? origin;
+    boolean sender_present;
+    string? sender_live_did;
+    u64? row_time_unix;
+};
+
+// Inputs for a person surface. A first-hand binding and seen-only-via-peer
+// are mutually exclusive by construction.
+dictionary PersonClaimInput {
+    string? binding;
+    boolean seen_only_via_peer;
+    string? via_peer_origin;
+    boolean via_peer_had_account;
+    PersonLookup lookup;
+};
+
+// A finished claim: the state plus everything a surface needs to render it,
+// strings already rendered.
+dictionary IdentityClaim {
+    IdentityClaimState state;
+    string? did;
+    string? origin;
+    string? label;
+    string? line;
+    boolean shows_mark;
+    boolean is_pending;
+    boolean needs_key_card;
+};
 
 dictionary IrcMessage {
     string from_nick;

@@ -36,6 +36,131 @@ uniffi::include_scaffolding!("freeq");
 
 // ── Types (must match UDL exactly) ──
 
+/// The identity-claim rule, passed through unchanged from the SDK — see
+/// `freeq_sdk::identity_claim` and `spec/identity-claims.json`. The FFI layer
+/// converts owned strings to the SDK's borrowed inputs and copies the finished
+/// claim back out; it adds no logic, so the vectors that pin the SDK pin this
+/// surface too.
+pub enum IdentityClaimState {
+    AtProtocol,
+    SelfIssued,
+    Relayed,
+    Guest,
+    LookingUp,
+    Unknown,
+}
+
+pub enum PersonLookup {
+    NotAsked,
+    InFlight,
+    NoAccount,
+    NoSuchNick,
+    TimedOut,
+}
+
+pub struct MessageClaimInput {
+    pub account: Option<String>,
+    pub origin: Option<String>,
+    pub sender_present: bool,
+    pub sender_live_did: Option<String>,
+    pub row_time_unix: Option<u64>,
+}
+
+pub struct PersonClaimInput {
+    pub binding: Option<String>,
+    pub seen_only_via_peer: bool,
+    pub via_peer_origin: Option<String>,
+    pub via_peer_had_account: bool,
+    pub lookup: PersonLookup,
+}
+
+pub struct IdentityClaim {
+    pub state: IdentityClaimState,
+    pub did: Option<String>,
+    pub origin: Option<String>,
+    pub label: Option<String>,
+    pub line: Option<String>,
+    pub shows_mark: bool,
+    pub is_pending: bool,
+    pub needs_key_card: bool,
+}
+
+impl From<freeq_sdk::identity_claim::IdentityClaim> for IdentityClaim {
+    fn from(c: freeq_sdk::identity_claim::IdentityClaim) -> Self {
+        use freeq_sdk::identity_claim::IdentityClaimState as S;
+        Self {
+            state: match c.state {
+                S::AtProtocol => IdentityClaimState::AtProtocol,
+                S::SelfIssued => IdentityClaimState::SelfIssued,
+                S::Relayed => IdentityClaimState::Relayed,
+                S::Guest => IdentityClaimState::Guest,
+                S::LookingUp => IdentityClaimState::LookingUp,
+                S::Unknown => IdentityClaimState::Unknown,
+            },
+            did: c.did,
+            origin: c.origin,
+            label: c.label,
+            line: c.line,
+            shows_mark: c.shows_mark,
+            is_pending: c.is_pending,
+            needs_key_card: c.needs_key_card,
+        }
+    }
+}
+
+impl PersonLookup {
+    fn to_sdk(&self) -> freeq_sdk::identity_claim::PersonLookup {
+        use freeq_sdk::identity_claim::PersonLookup as L;
+        match self {
+            PersonLookup::NotAsked => L::NotAsked,
+            PersonLookup::InFlight => L::InFlight,
+            PersonLookup::NoAccount => L::NoAccount,
+            PersonLookup::NoSuchNick => L::NoSuchNick,
+            PersonLookup::TimedOut => L::TimedOut,
+        }
+    }
+}
+
+pub fn claim_for_message(input: MessageClaimInput) -> IdentityClaim {
+    freeq_sdk::identity_claim::claim_for_message(&freeq_sdk::identity_claim::MessageClaimInput {
+        account: input.account.as_deref(),
+        origin: input.origin.as_deref(),
+        sender_present: input.sender_present,
+        sender_live_did: input.sender_live_did.as_deref(),
+        row_time_unix: input.row_time_unix,
+    })
+    .into()
+}
+
+pub fn claim_for_person(input: PersonClaimInput) -> IdentityClaim {
+    freeq_sdk::identity_claim::claim_for_person(&freeq_sdk::identity_claim::PersonClaimInput {
+        binding: input.binding.as_deref(),
+        seen_only_via_peer: input.seen_only_via_peer,
+        via_peer_origin: input.via_peer_origin.as_deref(),
+        via_peer_had_account: input.via_peer_had_account,
+        lookup: input.lookup.to_sdk(),
+    })
+    .into()
+}
+
+pub fn claim_for_sender(input: MessageClaimInput, lookup: PersonLookup) -> IdentityClaim {
+    freeq_sdk::identity_claim::claim_for_sender(
+        &freeq_sdk::identity_claim::MessageClaimInput {
+            account: input.account.as_deref(),
+            origin: input.origin.as_deref(),
+            sender_present: input.sender_present,
+            sender_live_did: input.sender_live_did.as_deref(),
+            row_time_unix: input.row_time_unix,
+        },
+        lookup.to_sdk(),
+    )
+    .into()
+}
+
+pub fn identity_stamping_epoch_unix() -> u64 {
+    freeq_sdk::identity_claim::stamping_epoch_unix()
+}
+
 pub struct IrcMessage {
     pub from_nick: String,
     pub target: String,
@@ -2799,5 +2924,43 @@ mod tests {
         assert_not_connected!(c.typing_start("#c".into()));
         assert_not_connected!(c.typing_stop("#c".into()));
         assert_not_connected!(c.request_whois("bob".into()));
+    }
+
+    /// The FFI layer adds no logic, but a field mix-up in the conversion
+    /// would still compile — so one claim crosses the boundary end to end.
+    #[test]
+    fn a_claim_crosses_the_ffi_conversion_intact() {
+        let relayed = claim_for_message(MessageClaimInput {
+            account: Some("did:plc:abc".into()),
+            origin: Some("irc.freeq.at".into()),
+            sender_present: false,
+            sender_live_did: None,
+            row_time_unix: Some(1_786_320_000),
+        });
+        assert!(matches!(relayed.state, IdentityClaimState::Relayed));
+        assert_eq!(relayed.did.as_deref(), Some("did:plc:abc"));
+        assert_eq!(relayed.origin.as_deref(), Some("irc.freeq.at"));
+        assert_eq!(relayed.label.as_deref(), Some("Relayed identity"));
+        assert!(relayed.line.unwrap().contains("irc.freeq.at vouches for it"));
+        assert!(!relayed.shows_mark);
+        assert!(!relayed.is_pending);
+        assert!(!relayed.needs_key_card);
+
+        let pending = claim_for_sender(
+            MessageClaimInput {
+                account: None,
+                origin: None,
+                sender_present: false,
+                sender_live_did: None,
+                row_time_unix: Some(1_750_000_000),
+            },
+            PersonLookup::InFlight,
+        );
+        assert!(matches!(pending.state, IdentityClaimState::LookingUp));
+        assert!(pending.is_pending);
+        assert_eq!(pending.label, None);
+        assert_eq!(pending.line, None);
+
+        assert_eq!(identity_stamping_epoch_unix(), 1_785_542_400);
     }
 }
