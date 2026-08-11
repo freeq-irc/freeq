@@ -612,6 +612,27 @@ void uniffi_freeq_sdk_ffi_fn_init_callback_vtable_eventhandler(const UniffiVTabl
 void uniffi_freeq_sdk_ffi_fn_init_callback_vtable_p2peventhandler(const UniffiVTableCallbackInterfaceP2pEventHandler* _Nonnull vtable
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_FUNC_CLAIM_FOR_MESSAGE
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_FUNC_CLAIM_FOR_MESSAGE
+RustBuffer uniffi_freeq_sdk_ffi_fn_func_claim_for_message(RustBuffer input, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_FUNC_CLAIM_FOR_PERSON
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_FUNC_CLAIM_FOR_PERSON
+RustBuffer uniffi_freeq_sdk_ffi_fn_func_claim_for_person(RustBuffer input, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_FUNC_CLAIM_FOR_SENDER
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_FUNC_CLAIM_FOR_SENDER
+RustBuffer uniffi_freeq_sdk_ffi_fn_func_claim_for_sender(RustBuffer input, RustBuffer lookup, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_FUNC_IDENTITY_STAMPING_EPOCH_UNIX
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_FUNC_IDENTITY_STAMPING_EPOCH_UNIX
+uint64_t uniffi_freeq_sdk_ffi_fn_func_identity_stamping_epoch_unix(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_FFI_FREEQ_SDK_FFI_RUSTBUFFER_ALLOC
 #define UNIFFI_FFIDEF_FFI_FREEQ_SDK_FFI_RUSTBUFFER_ALLOC
 RustBuffer ffi_freeq_sdk_ffi_rustbuffer_alloc(uint64_t size, RustCallStatus *_Nonnull out_status
@@ -890,6 +911,30 @@ void ffi_freeq_sdk_ffi_rust_future_free_void(uint64_t handle
 #ifndef UNIFFI_FFIDEF_FFI_FREEQ_SDK_FFI_RUST_FUTURE_COMPLETE_VOID
 #define UNIFFI_FFIDEF_FFI_FREEQ_SDK_FFI_RUST_FUTURE_COMPLETE_VOID
 void ffi_freeq_sdk_ffi_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_FUNC_CLAIM_FOR_MESSAGE
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_FUNC_CLAIM_FOR_MESSAGE
+uint16_t uniffi_freeq_sdk_ffi_checksum_func_claim_for_message(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_FUNC_CLAIM_FOR_PERSON
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_FUNC_CLAIM_FOR_PERSON
+uint16_t uniffi_freeq_sdk_ffi_checksum_func_claim_for_person(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_FUNC_CLAIM_FOR_SENDER
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_FUNC_CLAIM_FOR_SENDER
+uint16_t uniffi_freeq_sdk_ffi_checksum_func_claim_for_sender(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_FUNC_IDENTITY_STAMPING_EPOCH_UNIX
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_FUNC_IDENTITY_STAMPING_EPOCH_UNIX
+uint16_t uniffi_freeq_sdk_ffi_checksum_func_identity_stamping_epoch_unix(void
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQAV_IS_CONNECTED

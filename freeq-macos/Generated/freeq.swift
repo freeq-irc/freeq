@@ -1749,6 +1749,124 @@ public func FfiConverterTypeCoordinationEvent_lower(_ value: CoordinationEvent) 
 }
 
 
+public struct IdentityClaim {
+    public var state: IdentityClaimState
+    public var did: String?
+    public var origin: String?
+    public var label: String?
+    public var line: String?
+    public var showsMark: Bool
+    public var isPending: Bool
+    public var needsKeyCard: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(state: IdentityClaimState, did: String?, origin: String?, label: String?, line: String?, showsMark: Bool, isPending: Bool, needsKeyCard: Bool) {
+        self.state = state
+        self.did = did
+        self.origin = origin
+        self.label = label
+        self.line = line
+        self.showsMark = showsMark
+        self.isPending = isPending
+        self.needsKeyCard = needsKeyCard
+    }
+}
+
+#if compiler(>=6)
+extension IdentityClaim: Sendable {}
+#endif
+
+
+extension IdentityClaim: Equatable, Hashable {
+    public static func ==(lhs: IdentityClaim, rhs: IdentityClaim) -> Bool {
+        if lhs.state != rhs.state {
+            return false
+        }
+        if lhs.did != rhs.did {
+            return false
+        }
+        if lhs.origin != rhs.origin {
+            return false
+        }
+        if lhs.label != rhs.label {
+            return false
+        }
+        if lhs.line != rhs.line {
+            return false
+        }
+        if lhs.showsMark != rhs.showsMark {
+            return false
+        }
+        if lhs.isPending != rhs.isPending {
+            return false
+        }
+        if lhs.needsKeyCard != rhs.needsKeyCard {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(state)
+        hasher.combine(did)
+        hasher.combine(origin)
+        hasher.combine(label)
+        hasher.combine(line)
+        hasher.combine(showsMark)
+        hasher.combine(isPending)
+        hasher.combine(needsKeyCard)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIdentityClaim: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IdentityClaim {
+        return
+            try IdentityClaim(
+                state: FfiConverterTypeIdentityClaimState.read(from: &buf), 
+                did: FfiConverterOptionString.read(from: &buf), 
+                origin: FfiConverterOptionString.read(from: &buf), 
+                label: FfiConverterOptionString.read(from: &buf), 
+                line: FfiConverterOptionString.read(from: &buf), 
+                showsMark: FfiConverterBool.read(from: &buf), 
+                isPending: FfiConverterBool.read(from: &buf), 
+                needsKeyCard: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: IdentityClaim, into buf: inout [UInt8]) {
+        FfiConverterTypeIdentityClaimState.write(value.state, into: &buf)
+        FfiConverterOptionString.write(value.did, into: &buf)
+        FfiConverterOptionString.write(value.origin, into: &buf)
+        FfiConverterOptionString.write(value.label, into: &buf)
+        FfiConverterOptionString.write(value.line, into: &buf)
+        FfiConverterBool.write(value.showsMark, into: &buf)
+        FfiConverterBool.write(value.isPending, into: &buf)
+        FfiConverterBool.write(value.needsKeyCard, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIdentityClaim_lift(_ buf: RustBuffer) throws -> IdentityClaim {
+    return try FfiConverterTypeIdentityClaim.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIdentityClaim_lower(_ value: IdentityClaim) -> RustBuffer {
+    return FfiConverterTypeIdentityClaim.lower(value)
+}
+
+
 public struct IrcMember {
     public var nick: String
     public var isOp: Bool
@@ -2046,6 +2164,194 @@ public func FfiConverterTypeIrcMessage_lift(_ buf: RustBuffer) throws -> IrcMess
 #endif
 public func FfiConverterTypeIrcMessage_lower(_ value: IrcMessage) -> RustBuffer {
     return FfiConverterTypeIrcMessage.lower(value)
+}
+
+
+public struct MessageClaimInput {
+    public var account: String?
+    public var origin: String?
+    public var senderPresent: Bool
+    public var senderLiveDid: String?
+    public var rowTimeUnix: UInt64?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(account: String?, origin: String?, senderPresent: Bool, senderLiveDid: String?, rowTimeUnix: UInt64?) {
+        self.account = account
+        self.origin = origin
+        self.senderPresent = senderPresent
+        self.senderLiveDid = senderLiveDid
+        self.rowTimeUnix = rowTimeUnix
+    }
+}
+
+#if compiler(>=6)
+extension MessageClaimInput: Sendable {}
+#endif
+
+
+extension MessageClaimInput: Equatable, Hashable {
+    public static func ==(lhs: MessageClaimInput, rhs: MessageClaimInput) -> Bool {
+        if lhs.account != rhs.account {
+            return false
+        }
+        if lhs.origin != rhs.origin {
+            return false
+        }
+        if lhs.senderPresent != rhs.senderPresent {
+            return false
+        }
+        if lhs.senderLiveDid != rhs.senderLiveDid {
+            return false
+        }
+        if lhs.rowTimeUnix != rhs.rowTimeUnix {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(account)
+        hasher.combine(origin)
+        hasher.combine(senderPresent)
+        hasher.combine(senderLiveDid)
+        hasher.combine(rowTimeUnix)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMessageClaimInput: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageClaimInput {
+        return
+            try MessageClaimInput(
+                account: FfiConverterOptionString.read(from: &buf), 
+                origin: FfiConverterOptionString.read(from: &buf), 
+                senderPresent: FfiConverterBool.read(from: &buf), 
+                senderLiveDid: FfiConverterOptionString.read(from: &buf), 
+                rowTimeUnix: FfiConverterOptionUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MessageClaimInput, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.account, into: &buf)
+        FfiConverterOptionString.write(value.origin, into: &buf)
+        FfiConverterBool.write(value.senderPresent, into: &buf)
+        FfiConverterOptionString.write(value.senderLiveDid, into: &buf)
+        FfiConverterOptionUInt64.write(value.rowTimeUnix, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageClaimInput_lift(_ buf: RustBuffer) throws -> MessageClaimInput {
+    return try FfiConverterTypeMessageClaimInput.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageClaimInput_lower(_ value: MessageClaimInput) -> RustBuffer {
+    return FfiConverterTypeMessageClaimInput.lower(value)
+}
+
+
+public struct PersonClaimInput {
+    public var binding: String?
+    public var seenOnlyViaPeer: Bool
+    public var viaPeerOrigin: String?
+    public var viaPeerHadAccount: Bool
+    public var lookup: PersonLookup
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(binding: String?, seenOnlyViaPeer: Bool, viaPeerOrigin: String?, viaPeerHadAccount: Bool, lookup: PersonLookup) {
+        self.binding = binding
+        self.seenOnlyViaPeer = seenOnlyViaPeer
+        self.viaPeerOrigin = viaPeerOrigin
+        self.viaPeerHadAccount = viaPeerHadAccount
+        self.lookup = lookup
+    }
+}
+
+#if compiler(>=6)
+extension PersonClaimInput: Sendable {}
+#endif
+
+
+extension PersonClaimInput: Equatable, Hashable {
+    public static func ==(lhs: PersonClaimInput, rhs: PersonClaimInput) -> Bool {
+        if lhs.binding != rhs.binding {
+            return false
+        }
+        if lhs.seenOnlyViaPeer != rhs.seenOnlyViaPeer {
+            return false
+        }
+        if lhs.viaPeerOrigin != rhs.viaPeerOrigin {
+            return false
+        }
+        if lhs.viaPeerHadAccount != rhs.viaPeerHadAccount {
+            return false
+        }
+        if lhs.lookup != rhs.lookup {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(binding)
+        hasher.combine(seenOnlyViaPeer)
+        hasher.combine(viaPeerOrigin)
+        hasher.combine(viaPeerHadAccount)
+        hasher.combine(lookup)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePersonClaimInput: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PersonClaimInput {
+        return
+            try PersonClaimInput(
+                binding: FfiConverterOptionString.read(from: &buf), 
+                seenOnlyViaPeer: FfiConverterBool.read(from: &buf), 
+                viaPeerOrigin: FfiConverterOptionString.read(from: &buf), 
+                viaPeerHadAccount: FfiConverterBool.read(from: &buf), 
+                lookup: FfiConverterTypePersonLookup.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PersonClaimInput, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.binding, into: &buf)
+        FfiConverterBool.write(value.seenOnlyViaPeer, into: &buf)
+        FfiConverterOptionString.write(value.viaPeerOrigin, into: &buf)
+        FfiConverterBool.write(value.viaPeerHadAccount, into: &buf)
+        FfiConverterTypePersonLookup.write(value.lookup, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePersonClaimInput_lift(_ buf: RustBuffer) throws -> PersonClaimInput {
+    return try FfiConverterTypePersonClaimInput.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePersonClaimInput_lower(_ value: PersonClaimInput) -> RustBuffer {
+    return FfiConverterTypePersonClaimInput.lower(value)
 }
 
 
@@ -3057,6 +3363,104 @@ extension FreeqEvent: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
+public enum IdentityClaimState {
+    
+    case atProtocol
+    case selfIssued
+    case relayed
+    case guest
+    case lookingUp
+    case unknown
+}
+
+
+#if compiler(>=6)
+extension IdentityClaimState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIdentityClaimState: FfiConverterRustBuffer {
+    typealias SwiftType = IdentityClaimState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IdentityClaimState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .atProtocol
+        
+        case 2: return .selfIssued
+        
+        case 3: return .relayed
+        
+        case 4: return .guest
+        
+        case 5: return .lookingUp
+        
+        case 6: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: IdentityClaimState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .atProtocol:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .selfIssued:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .relayed:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .guest:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .lookingUp:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(6))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIdentityClaimState_lift(_ buf: RustBuffer) throws -> IdentityClaimState {
+    return try FfiConverterTypeIdentityClaimState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIdentityClaimState_lower(_ value: IdentityClaimState) -> RustBuffer {
+    return FfiConverterTypeIdentityClaimState.lower(value)
+}
+
+
+extension IdentityClaimState: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 public enum P2pEvent {
     
     case endpointReady(endpointId: String
@@ -3155,6 +3559,97 @@ public func FfiConverterTypeP2pEvent_lower(_ value: P2pEvent) -> RustBuffer {
 
 
 extension P2pEvent: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum PersonLookup {
+    
+    case notAsked
+    case inFlight
+    case noAccount
+    case noSuchNick
+    case timedOut
+}
+
+
+#if compiler(>=6)
+extension PersonLookup: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePersonLookup: FfiConverterRustBuffer {
+    typealias SwiftType = PersonLookup
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PersonLookup {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .notAsked
+        
+        case 2: return .inFlight
+        
+        case 3: return .noAccount
+        
+        case 4: return .noSuchNick
+        
+        case 5: return .timedOut
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PersonLookup, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .notAsked:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .inFlight:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .noAccount:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .noSuchNick:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .timedOut:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePersonLookup_lift(_ buf: RustBuffer) throws -> PersonLookup {
+    return try FfiConverterTypePersonLookup.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePersonLookup_lower(_ value: PersonLookup) -> RustBuffer {
+    return FfiConverterTypePersonLookup.lower(value)
+}
+
+
+extension PersonLookup: Equatable, Hashable {}
 
 
 
@@ -3512,6 +4007,30 @@ public func FfiConverterCallbackInterfaceP2pEventHandler_lower(_ v: P2pEventHand
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
+    typealias SwiftType = UInt64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
     typealias SwiftType = String?
 
@@ -3731,6 +4250,34 @@ fileprivate struct FfiConverterSequenceTypeTagEntry: FfiConverterRustBuffer {
         return seq
     }
 }
+public func claimForMessage(input: MessageClaimInput) -> IdentityClaim  {
+    return try!  FfiConverterTypeIdentityClaim_lift(try! rustCall() {
+    uniffi_freeq_sdk_ffi_fn_func_claim_for_message(
+        FfiConverterTypeMessageClaimInput_lower(input),$0
+    )
+})
+}
+public func claimForPerson(input: PersonClaimInput) -> IdentityClaim  {
+    return try!  FfiConverterTypeIdentityClaim_lift(try! rustCall() {
+    uniffi_freeq_sdk_ffi_fn_func_claim_for_person(
+        FfiConverterTypePersonClaimInput_lower(input),$0
+    )
+})
+}
+public func claimForSender(input: MessageClaimInput, lookup: PersonLookup) -> IdentityClaim  {
+    return try!  FfiConverterTypeIdentityClaim_lift(try! rustCall() {
+    uniffi_freeq_sdk_ffi_fn_func_claim_for_sender(
+        FfiConverterTypeMessageClaimInput_lower(input),
+        FfiConverterTypePersonLookup_lower(lookup),$0
+    )
+})
+}
+public func identityStampingEpochUnix() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_freeq_sdk_ffi_fn_func_identity_stamping_epoch_unix($0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -3746,6 +4293,18 @@ private let initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_freeq_sdk_ffi_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_func_claim_for_message() != 43850) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_func_claim_for_person() != 32096) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_func_claim_for_sender() != 12857) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_func_identity_stamping_epoch_unix() != 18507) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqav_is_connected() != 41973) {
         return InitializationResult.apiChecksumMismatch
