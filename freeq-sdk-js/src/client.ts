@@ -1059,13 +1059,28 @@ export class FreeqClient extends EventEmitter {
    * tag. Without this, the first DM from a peer we share no channel with (so
    * no JOIN/WHOIS taught us their DID) would key under the bare nick while
    * our own sends key under the DID — splitting one conversation in two.
+   *
+   * The server stamps the tag for any sender holding an account, so it is the
+   * same authority as an extended JOIN and is worth learning from whatever
+   * venue it arrives through — a DM, a channel, or a history replay. A peer
+   * whose only appearance is one line in a channel is still a peer we can
+   * name, and for a did:key, which has no profile behind it, this tag is the
+   * only thing that ever will.
+   *
+   * `from` is always a sender, never a target; the channel guard below is
+   * belt and braces against a caller that confuses the two.
    */
   private rememberSenderDid(from: string, tags?: Record<string, string>): void {
     const did = tags?.['+freeq.at/account'] ?? tags?.['account'];
     if (!did || !isDid(did) || !from || from.startsWith('#') || from.startsWith('&')) return;
     const lc = from.toLowerCase();
+    const isNews = this._nickToDid.get(lc) !== did || this._didToNick.get(did) !== lc;
     this._nickToDid.set(lc, did);
     this._didToNick.set(did, lc);
+    // Whatever is already on screen resolved this peer's name before we knew
+    // it. Say so, or a thread keyed by the DID wears the raw DID until
+    // something unrelated happens to re-render it.
+    if (isNews) this.emit('memberDid', from, did);
   }
 
   /** Resolve nick to DID — set by the app layer for E2EE support. */
@@ -1376,7 +1391,7 @@ export class FreeqClient extends EventEmitter {
     const target = batch.target;
     const isChannel = target.startsWith('#') || target.startsWith('&');
     const isSelf = this.isSelfSender(from, openerTags);
-    if (!isChannel && !isSelf) this.rememberSenderDid(from, openerTags);
+    if (!isSelf) this.rememberSenderDid(from, openerTags);
     // DM thread key = the peer's canonical DID when known (else the nick):
     // our own echo is keyed by the wire target, an incoming DM by the sender,
     // and both collapse to the same DID so a conversation is never split.
@@ -1861,7 +1876,7 @@ export class FreeqClient extends EventEmitter {
         const isAction = text.startsWith('\x01ACTION ') && text.endsWith('\x01');
         const isChannel = target.startsWith('#') || target.startsWith('&');
         const isSelf = this.isSelfSender(from, msg.tags);
-        if (!isChannel && !isSelf) this.rememberSenderDid(from, msg.tags);
+        if (!isSelf) this.rememberSenderDid(from, msg.tags);
         // DM thread key = the peer's canonical DID when known (else the nick):
         // our own echo is keyed by the wire target, an incoming DM by the
         // sender, and both collapse to the same DID so a conversation is
@@ -2123,7 +2138,7 @@ export class FreeqClient extends EventEmitter {
         const target = msg.params[0];
         const isChannel = target.startsWith('#') || target.startsWith('&');
         const isSelf = this.isSelfSender(from, msg.tags);
-        if (!isChannel && !isSelf) this.rememberSenderDid(from, msg.tags);
+        if (!isSelf) this.rememberSenderDid(from, msg.tags);
         // DM thread key = the peer's canonical DID when known (else the nick):
         // our own echo is keyed by the wire target, an incoming DM by the
         // sender, and both collapse to the same DID so a conversation is
