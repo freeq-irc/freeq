@@ -234,20 +234,36 @@ fn spawn_server(plan: ServerPlan, peer: &PeerRef, resolver_entries: &str) -> Tes
 /// Boot two mutually-peered servers, both resolving every `ids` DID offline.
 /// Blocks until both IRC ports accept connections.
 async fn spawn_pair(ids: &[&TestId]) -> (TestServer, TestServer) {
+    // A fresh iroh identity per pair. Every pair used to boot as the same two
+    // node IDs, so two pairs alive at once — the previous test's servers still
+    // exiting, or anything that runs this file without the serial lock — were, to
+    // iroh, the same two nodes reachable at two addresses. The lock makes that
+    // rare rather than impossible; distinct identities make it harmless.
+    static NEXT_SEED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+    let n = NEXT_SEED.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+    spawn_pair_with_seeds(ids, n, n.wrapping_add(1)).await
+}
+
+/// The same, with both iroh identities chosen by the caller.
+///
+/// Which of two simultaneous links survives is decided by comparing the two
+/// endpoint IDs, and an endpoint ID is derived from the seed — so the seeds a
+/// pair boots with decide which server keeps its outgoing link and which keeps
+/// its incoming one. Seeds handed out in sequence make that orientation a
+/// function of how many pairs booted earlier in the run, which is no basis for
+/// a test that cares. A test that cares picks its own.
+async fn spawn_pair_with_seeds(
+    ids: &[&TestId],
+    seed_a: u8,
+    seed_b: u8,
+) -> (TestServer, TestServer) {
     // A failed test poisons the lock; the next test's servers are unaffected,
     // so take it anyway.
     let serial = ONE_TEST_AT_A_TIME
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    // A fresh iroh identity per pair. Every pair used to boot as the same two
-    // node IDs, so two pairs alive at once — the previous test's servers still
-    // exiting, or anything that runs this file without the lock above — were, to
-    // iroh, the same two nodes reachable at two addresses. The lock makes that
-    // rare rather than impossible; distinct identities make it harmless.
-    static NEXT_SEED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
-    let n = NEXT_SEED.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
-    let a_plan = plan_server(n);
-    let b_plan = plan_server(n.wrapping_add(1));
+    let a_plan = plan_server(seed_a);
+    let b_plan = plan_server(seed_b);
     let resolver: String = ids
         .iter()
         .map(|i| i.resolver_entry())
@@ -1588,9 +1604,22 @@ async fn saw_reaction(rx: &mut mpsc::Receiver<Event>) -> bool {
 #[tokio::test]
 #[ignore = "e2e federation harness; run with --ignored"]
 async fn a_returning_peer_is_told_what_it_missed() {
+    // Pinned identities, because the outage this test stages is only a real
+    // test of catch-up if the link comes back — and whether it does depends on
+    // which server keeps its outgoing link, which is decided by comparing
+    // endpoint IDs. Left to sequence-allocated seeds, that comparison changes
+    // with the test's position in the run, so the same code passed or failed
+    // depending on how many pairs booted before it. These two put the server
+    // that stays up on the harder side of it.
+    const SEED_A: u8 = 202;
+    const SEED_B: u8 = 203;
+    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32]).public().to_string();
+    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32]).public().to_string();
+    assert!(id_a < id_b, "the server that stays up keeps its outgoing link");
+
     let alice = TestId::new("did:plc:alicecatchup");
     let bob = TestId::new("did:plc:bobcatchup");
-    let (srv_a, mut srv_b) = spawn_pair(&[&alice, &bob]).await;
+    let (srv_a, mut srv_b) = spawn_pair_with_seeds(&[&alice, &bob], SEED_A, SEED_B).await;
 
     let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
     wait_auth_and_register(&mut rxb).await;
@@ -1678,6 +1707,88 @@ fn event_count(db_path: &str) -> i64 {
     let conn = rusqlite::Connection::open(db_path).expect("open server db");
     conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
         .unwrap_or(0)
+}
+
+// ── a peer that comes back is linked again ───────────────────────
+//
+// Two servers that list each other both dial, so they end up holding two
+// connections and a total order on their endpoint IDs decides which one they
+// keep: the lower ID keeps its outgoing, the higher keeps its incoming. That
+// rule is about two links that both ends can see. A server whose peer was
+// killed can see neither — what it holds is a connection to a process that no
+// longer exists, and nothing tells it so until the idle timeout does.
+//
+// Seeded so the server that stays up is the lower ID, which is the case that
+// has to dial to recover: its half of the surviving link is the outgoing one.
+
+/// How many federation peers a server has completed a handshake with, read off
+/// its Prometheus endpoint. A server counts none until a link comes up, so
+/// after a restart this is the plainest "am I linked?" there is — no client, no
+/// channel, no message.
+async fn s2s_peer_count(web_addr: &str) -> u32 {
+    let url = format!("http://{web_addr}/metrics");
+    let Ok(resp) = reqwest::get(&url).await else {
+        return 0;
+    };
+    let body = resp.text().await.unwrap_or_default();
+    body.lines()
+        .find_map(|l| l.strip_prefix("freeq_s2s_peers "))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_peer_that_comes_back_is_linked_again() {
+    // The seeds decide the endpoint IDs and the endpoint IDs decide who keeps
+    // what, so assert the orientation rather than trusting seeds to keep
+    // deriving it.
+    const SEED_A: u8 = 200;
+    const SEED_B: u8 = 201;
+    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32]).public().to_string();
+    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32]).public().to_string();
+    assert!(
+        id_a < id_b,
+        "this test is about the server that keeps its outgoing link being the one left holding a dead one"
+    );
+
+    let alice = TestId::new("did:plc:alicerelink");
+    let bob = TestId::new("did:plc:bobrelink");
+    let (srv_a, mut srv_b) = spawn_pair_with_seeds(&[&alice, &bob], SEED_A, SEED_B).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+
+    // B goes away without a closing handshake — what a crash, a kill and a
+    // machine going down all look like from the other end.
+    hb.quit(None).await.ok();
+    srv_b.stop();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    srv_b.start_again().await;
+
+    // A server counts a peer only once a link has come up and been handshaken,
+    // so on a server that just restarted this goes above zero exactly when it
+    // has been linked again.
+    let back = tokio::time::Instant::now();
+    let mut linked = None;
+    while back.elapsed() < S2S_SETTLE {
+        if s2s_peer_count(&srv_b.web_addr).await > 0 {
+            linked = Some(back.elapsed());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        linked.is_some(),
+        "the peer that came back was never linked again within {S2S_SETTLE:?} — \
+         the server that stayed up is holding a connection to the process that died"
+    );
+
+    ha.quit(None).await.ok();
+    drop((srv_a, srv_b));
 }
 
 // ── attachments across a federation link ─────────────────────────
