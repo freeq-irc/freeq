@@ -331,12 +331,15 @@ export function UserPopover({ nick, did, origin, evidence, position, onClose }: 
     <>
       <div className="fixed inset-0 z-40" onClick={onClose} />
       <div style={style} data-testid="user-popover" className="z-50 bg-bg-secondary border border-border rounded-xl shadow-2xl w-72 animate-fadeIn overflow-hidden">
-        {/* Opened from a relayed message. Relaying is an ordinary state, not a
-            warning — it reads as plain secondary text. */}
-        {origin && (
-          <div className="border-b border-border px-3 py-2 text-[11px] text-fg-dim">
-            <div className="font-semibold text-fg-muted">{claim.label}</div>
-            <div className="mt-0.5 leading-relaxed">{claim.line}</div>
+        {/* The Relayed identity state — the one whose meaning IS provenance —
+            rides a slim color bar above the card; its sentence sits in the
+            card body with the other identity copy. Every other state,
+            including a guest at another server, renders uniformly in the
+            body. Relaying is an ordinary state, not a warning — the bar tint
+            matches the header, never the warning palette. */}
+        {claim.state === 'relayed' && (
+          <div className="bg-purple/15 border-b border-border px-3 py-1.5 text-[11px] font-semibold text-fg-muted">
+            {claim.label}
           </div>
         )}
         {/* Header */}
@@ -520,8 +523,10 @@ export function UserPopover({ nick, did, origin, evidence, position, onClose }: 
           {/* What we can honestly say about who this is. The two lines that
               name "the key below" belong on a surface showing that key; this
               card has none, so those states show the label alone. While the
-              ask is out it's motion, not words. */}
-          {!origin && (claim.isPending ? (
+              ask is out it's motion, not words. An origin-bearing claim's
+              label already rides the bar above the card, so only its
+              sentence renders here. */}
+          {claim.isPending ? (
             <div className="mt-2 flex text-fg-dim">
               <svg className="animate-spin w-3 h-3" viewBox="0 0 24 24" aria-hidden="true">
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
@@ -530,12 +535,12 @@ export function UserPopover({ nick, did, origin, evidence, position, onClose }: 
             </div>
           ) : (
             <div className="text-[10px] text-fg-dim mt-2 bg-bg-tertiary rounded px-2 py-1">
-              <div className="font-semibold text-fg-muted">{claim.label}</div>
+              {claim.state !== 'relayed' && <div className="font-semibold text-fg-muted">{claim.label}</div>}
               {!claim.needsKeyCard && (
-                <div className="mt-0.5 leading-relaxed">{claim.line}</div>
+                <div className={`leading-relaxed${claim.state === 'relayed' ? '' : ' mt-0.5'}`}>{claim.line}</div>
               )}
             </div>
-          ))}
+          )}
 
           {/* Actions */}
           <div className="flex gap-2 mt-3">
