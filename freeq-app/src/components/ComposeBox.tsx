@@ -1,12 +1,16 @@
 import { useState, useRef, useCallback, useEffect, useMemo, type KeyboardEvent, type DragEvent } from 'react';
 import { useStore } from '../store';
-import { sendMessage, sendReply, sendEdit, sendMarkdown, sendAction, joinChannel, partChannel, setTopic, setMode, kickUser, inviteUser, setAway, rawCommand, sendWhois } from '../irc/client';
+import { sendMessage, sendReply, sendEdit, sendMarkdown, sendAction, joinChannel, partChannel, setTopic, setMode, kickUser, inviteUser, setAway, rawCommand, sendWhois, startTyping, stopTyping } from '../irc/client';
 import { detectStepUpRequired, requestStepUp } from '../lib/oauth-step-up';
 import { displayNameForKey } from '../lib/display-name';
 import { EmojiPicker, EMOJI_DATA } from './EmojiPicker';
 import { SlashCommands, getCommandCount } from './SlashCommands';
 import { FormatToolbar } from './FormatToolbar';
 import { apiFetch } from '../lib/api';
+
+/** One `+typing=active` covers this long; keep sending while the box has
+ *  text. Matches the cadence the other clients type at. */
+const TYPING_INTERVAL_MS = 3000;
 
 // Max file size: 10MB
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
@@ -55,6 +59,8 @@ export function ComposeBox() {
   const emojiRef = useRef<HTMLButtonElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
+  // When we last told the room we were composing; -Infinity is "never".
+  const lastTypingSent = useRef(-Infinity);
   const activeChannel = useStore((s) => s.activeChannel);
   const channels = useStore((s) => s.channels);
   const authDid = useStore((s) => s.authDid);
@@ -352,6 +358,10 @@ export function ComposeBox() {
       handleCommand(trimmed, activeChannel);
     } else if (activeChannel !== 'server') {
       const target = ch?.name || activeChannel;
+      // The message itself is the news now — retract the typing hint, and let
+      // the next keystroke re-announce without waiting out the interval.
+      stopTyping(target);
+      lastTypingSent.current = -Infinity;
       if (markdownMode) {
         sendMarkdown(target, trimmed);
       } else if (editingMsg && editingMsg.channel.toLowerCase() === activeChannel.toLowerCase()) {
@@ -521,6 +531,17 @@ export function ComposeBox() {
         }
       } else {
         setSlashCmd(null);
+      }
+
+      // Tell the room we are composing, at the cadence the rest of the
+      // clients use. A quiet box says nothing; the server buffer has nobody
+      // to say it to.
+      if (activeChannel !== 'server' && el.value.trim()) {
+        const now = Date.now();
+        if (now - lastTypingSent.current >= TYPING_INTERVAL_MS) {
+          lastTypingSent.current = now;
+          startTyping(ch?.name || activeChannel);
+        }
       }
     }
   };

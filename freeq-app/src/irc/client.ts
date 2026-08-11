@@ -286,6 +286,20 @@ export function sendUnreact(target: string, emoji: string, msgId: string) {
   sendToPeer(target, () => client?.sendUnreact(target, emoji, msgId));
 }
 
+/**
+ * Typing is a hint about a message that may never be sent, so it goes straight
+ * out rather than through the DM identity gate: an ephemeral tag is not worth
+ * holding a keystroke for a WHOIS round trip, and the server routes a TAGMSG
+ * to a bare nick as readily as to a DID.
+ */
+export function startTyping(target: string) {
+  client?.startTyping(target);
+}
+
+export function stopTyping(target: string) {
+  client?.stopTyping(target);
+}
+
 export function joinChannel(channel: string) {
   client?.join(channel);
   useStore.getState().addChannel(channel);
