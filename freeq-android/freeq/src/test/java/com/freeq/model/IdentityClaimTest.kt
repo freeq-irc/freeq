@@ -4,64 +4,28 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 /**
- * What this client is willing to say about who someone is. Every surface that
- * makes an identity claim — the message row's mark, the profile card's mark,
- * the proof view behind them — asks this one question, so none of them can
- * claim more than another.
+ * The identity-claim rule itself is not tested here: it lives in the SDK,
+ * pinned by the executable vectors in spec/identity-claims.json, and this
+ * client only renders what the FFI hands it. What remains app-owned in this
+ * file's old territory is the naming helper.
  */
 class IdentityClaimTest {
 
-    @Test fun a_server_bound_did_is_an_at_protocol_identity() {
-        assertEquals(
-            IdentityClaim.AT_PROTOCOL,
-            SenderIdentity.claim("did:plc:k2n3e2vsihf3farequ44t5j7", null)
-        )
+    @Test fun a_display_name_wins_over_everything() {
+        assertEquals("Nap", SenderIdentity.title("Nap", "zapnap.bsky.social", "zapnap"))
     }
 
-    @Test fun a_self_issued_key_carries_no_at_protocol_claim() {
-        // did:key is live here for bots and guests. The key is real; nothing on
-        // the AT Protocol stands behind it.
-        assertEquals(
-            IdentityClaim.SELF_ISSUED_KEY,
-            SenderIdentity.claim("did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK", null)
-        )
+    @Test fun a_handle_wears_its_at_sign() {
+        assertEquals("@zapnap.bsky.social", SenderIdentity.title(null, "zapnap.bsky.social", "zapnap"))
     }
 
-    @Test fun a_relayed_sender_gets_no_claim_at_all() {
-        // Peer-vouched, not verified here — the DID arrived with the message
-        // from another server, and this one checked nothing.
-        assertEquals(
-            IdentityClaim.NONE,
-            SenderIdentity.claim("did:plc:k2n3e2vsihf3farequ44t5j7", "irc.example.org")
-        )
-        assertEquals(
-            IdentityClaim.NONE,
-            SenderIdentity.claim("did:key:z6Mkabc", "irc.example.org")
-        )
+    @Test fun a_bare_nick_is_a_fine_name() {
+        assertEquals("zapnap", SenderIdentity.title("", "  ", "zapnap"))
     }
 
-    @Test fun no_identifier_is_no_claim() {
-        assertEquals(IdentityClaim.NONE, SenderIdentity.claim(null, null))
-        assertEquals(IdentityClaim.NONE, SenderIdentity.claim("", null))
-        assertEquals(IdentityClaim.NONE, SenderIdentity.claim("   ", null))
-    }
-
-    @Test fun anyone_we_can_name_is_not_unidentified() {
-        // A bot signing with a self-issued key has no handle and no display
-        // name, and calling it "Unidentified sender" over its own nick is a
-        // claim about it that isn't true.
-        assertEquals("unreactproof", SenderIdentity.title(null, null, "unreactproof"))
-        assertEquals("@alice.bsky.social", SenderIdentity.title(null, "alice.bsky.social", "alice"))
-        assertEquals("Alice", SenderIdentity.title("Alice", "alice.bsky.social", "alice"))
-        assertEquals("Unidentified sender", SenderIdentity.title(null, null, null))
-        assertEquals("Unidentified sender", SenderIdentity.title("", "", ""))
-    }
-
-    @Test fun only_an_at_protocol_identity_earns_the_mark() {
-        // The mark is the claim, so it appears exactly where the claim holds.
-        assertEquals(true, SenderIdentity.claim("did:plc:abc", null).showsMark)
-        assertEquals(false, SenderIdentity.claim("did:key:z6Mkabc", null).showsMark)
-        assertEquals(false, SenderIdentity.claim("did:plc:abc", "peer.example").showsMark)
-        assertEquals(false, SenderIdentity.claim(null, null).showsMark)
+    @Test fun nothing_at_all_names_nobody_rather_than_inventing_a_phrase() {
+        // "Unidentified sender" was deleted by ruling: a message row always
+        // has a nick, so the phrase was unreachable and said nothing.
+        assertEquals("", SenderIdentity.title(null, null, ""))
     }
 }

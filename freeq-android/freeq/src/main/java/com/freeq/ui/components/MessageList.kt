@@ -67,7 +67,7 @@ import java.util.*
 fun MessageList(
     appState: AppState,
     channelState: ChannelState,
-    onProfileClick: ((String, String?) -> Unit)? = null,
+    onProfileClick: ((String, String?, ChatMessage?) -> Unit)? = null,
     scrollToMessageId: String? = null,
     modifier: Modifier = Modifier
 ) {
@@ -409,7 +409,7 @@ private fun MessageBubble(
     appState: AppState,
     channelState: ChannelState,
     clipboardManager: androidx.compose.ui.platform.ClipboardManager,
-    onNickClick: ((String, String?) -> Unit)? = null,
+    onNickClick: ((String, String?, ChatMessage?) -> Unit)? = null,
     onImageClick: ((String) -> Unit)? = null,
     onThreadClick: ((ChatMessage) -> Unit)? = null
 ) {
@@ -417,6 +417,7 @@ private fun MessageBubble(
     var showEmojiPicker by remember { mutableStateOf(false) }
     var showReportDialog by remember { mutableStateOf(false) }
     var showMessageProof by remember { mutableStateOf(false) }
+    var showIdentityProof by remember { mutableStateOf(false) }
     val haptic = LocalHapticFeedback.current
     val isOwn = msg.from.equals(appState.nick.value, ignoreCase = true)
     // Sender identity: the server-bound DID from the channel member entry
@@ -425,6 +426,17 @@ private fun MessageBubble(
     val senderMember = channelState.members
         .firstOrNull { it.nick.equals(msg.from, ignoreCase = true) }
     val senderDid = senderMember?.did ?: appState.didForNick(msg.from)
+    // What this row can honestly claim about its sender — computed by the SDK
+    // from the row's own tags and the live room, never from a stored cache.
+    val rowClaim = com.freeq.ffi.claimForMessage(
+        com.freeq.ffi.MessageClaimInput(
+            account = msg.account,
+            origin = msg.origin,
+            senderPresent = senderMember != null,
+            senderLiveDid = senderMember?.did,
+            rowTimeUnix = (msg.timestamp.time / 1000).toULong(),
+        )
+    )
     val isMention = !isOwn && appState.nick.value.isNotEmpty() &&
             msg.text.contains(appState.nick.value, ignoreCase = true)
     // Read directly from pins map so Compose tracks the state change
@@ -552,7 +564,7 @@ private fun MessageBubble(
                 UserAvatar(
                     nick = msg.from,
                     size = 36.dp,
-                    modifier = Modifier.clickable { onNickClick?.invoke(msg.from, msg.origin) }
+                    modifier = Modifier.clickable { onNickClick?.invoke(msg.from, msg.origin, msg) }
                 )
             } else {
                 Spacer(modifier = Modifier.width(36.dp))
@@ -583,26 +595,24 @@ private fun MessageBubble(
                             fontSize = 14.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = Theme.nickColor(msg.from),
-                            modifier = Modifier.clickable { onNickClick?.invoke(msg.from, msg.origin) }
+                            modifier = Modifier.clickable { onNickClick?.invoke(msg.from, msg.origin, msg) }
                         )
-                        // Verified = the sender's server-bound DID (never the
-                        // "has a cached avatar" proxy, which false-negatives
-                        // before the avatar fetch lands). The same rule decides
-                        // what the profile card and the proof view claim.
-                        if (SenderIdentity.claim(senderDid, msg.origin).showsMark) {
+                        // Only an identity the AT Protocol resolves earns a
+                        // mark. The mark IS the claim, so tapping it opens the
+                        // proof behind the claim — the identity side of the
+                        // proof sheet, with this message's verdict when the
+                        // message is signed. The name opens the profile.
+                        if (rowClaim.showsMark) {
                             Icon(
                                 Icons.Default.CheckCircle,
-                                contentDescription = "Verified — tap for this person's profile",
+                                contentDescription = "AT Protocol identity — tap for proof",
                                 tint = FreeqColors.accent,
                                 modifier = Modifier
                                     .size(14.dp)
-                                    // Who this person is is a question about
-                                    // them, so it goes where their identity
-                                    // already lives: the profile card, which
-                                    // holds the proof view behind its own mark.
-                                    .clickable { onNickClick?.invoke(msg.from, msg.origin) }
+                                    .clickable { showIdentityProof = true }
                             )
                         }
+
                         // Federated: relayed from another server — peer-vouched,
                         // not verified here. Show provenance instead of the local
                         // verified/signed badges (which would overstate trust).
@@ -861,6 +871,27 @@ private fun MessageBubble(
             VerifiedProofSheet(
                 request = ProofRequest.Message(msg.id, signed = msg.isSigned),
                 onDismiss = { showMessageProof = false }
+            )
+        }
+
+        // The proof behind the row's identity mark: who the sender is, and —
+        // because the mark sits on a message — that message's own verdict
+        // when it carries a signature. One sheet, content follows the message.
+        if (showIdentityProof) {
+            VerifiedProofSheet(
+                request = ProofRequest.Identity(
+                    did = rowClaim.did,
+                    nick = msg.from,
+                    origin = msg.origin,
+                    account = msg.account,
+                    rowTimeUnix = (msg.timestamp.time / 1000).toULong(),
+                    senderPresent = senderMember != null,
+                    senderLiveDid = senderMember?.did,
+                    msgId = msg.id,
+                    signed = msg.isSigned,
+                ),
+                onDismiss = { showIdentityProof = false },
+                appState = appState
             )
         }
 

@@ -10,7 +10,6 @@ import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Flag
 import androidx.compose.material.icons.filled.VerifiedUser
-import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material3.*
@@ -22,6 +21,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.freeq.model.ChatMessage
 import com.freeq.model.AppState
 import com.freeq.model.AvatarCache
 import com.freeq.model.BlueskyProfile
@@ -36,6 +36,10 @@ fun UserProfileSheet(
     nick: String,
     appState: AppState,
     origin: String? = null,
+    /** The message this sheet was opened from, when there is one. Its own
+     *  tags are evidence: when live identity can't answer, the row does —
+     *  the SDK owns that precedence. */
+    anchor: ChatMessage? = null,
     onDismiss: () -> Unit,
     onNavigateToDM: (String) -> Unit
 ) {
@@ -55,8 +59,25 @@ fun UserProfileSheet(
         appState.didForNick(nick)
     }
     val isBlocked = appState.isBlocked(nick, resolvedDid)
+    // The SDK owns the precedence: live identity first, then the anchoring
+    // row's evidence, then the lookup machine. A binding remembered from an
+    // earlier session never votes — that hole is how the same absent sender
+    // used to read differently here than on web.
+    val claim = com.freeq.ffi.claimForSender(
+        com.freeq.ffi.MessageClaimInput(
+            account = anchor?.account,
+            origin = origin,
+            senderPresent = appState.isNickPresent(nick),
+            senderLiveDid = if (isOwnProfile) appState.authenticatedDID.value else appState.liveDidForNick(nick),
+            rowTimeUnix = anchor?.timestamp?.let { (it.time / 1000).toULong() },
+        ),
+        appState.personLookup(nick),
+    )
 
     LaunchedEffect(nick) {
+        // Ask who this is, and let the card say an ask is out — so "unknown"
+        // is only ever shown after an answer, never before one.
+        if (origin == null && !isOwnProfile) appState.lookUpIdentity(nick)
         profile = withContext(Dispatchers.IO) {
             AvatarCache.fetchProfileIfNeeded(nick, resolvedDid)
         }
@@ -75,37 +96,6 @@ fun UserProfileSheet(
                 .padding(bottom = 32.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Federated provenance warning — opened from a relayed message.
-            // The sender is peer-vouched by {origin}, not verified here, so we
-            // warn and suppress the local verified badge below.
-            origin?.let { o ->
-                Surface(
-                    modifier = Modifier.fillMaxWidth(),
-                    color = FreeqColors.warning.copy(alpha = 0.15f)
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 10.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.Top
-                    ) {
-                        Icon(
-                            Icons.Default.Warning,
-                            contentDescription = null,
-                            tint = FreeqColors.warning,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Text(
-                            text = "Relayed via $o — this server did not verify this identity.",
-                            fontSize = 12.sp,
-                            color = FreeqColors.warning
-                        )
-                    }
-                }
-                Spacer(modifier = Modifier.height(16.dp))
-            }
-
             // Avatar
             UserAvatar(nick = nick, size = 80.dp)
 
@@ -124,14 +114,49 @@ fun UserProfileSheet(
                 )
                 // The mark follows the identifier, not the avatar fetch, and
                 // it is the same rule the message row applies.
-                if (SenderIdentity.claim(resolvedDid, origin).showsMark) {
+                if (claim.showsMark) {
                     Icon(
                         Icons.Default.CheckCircle,
-                        contentDescription = "Verified — tap for the proof",
+                        contentDescription = "AT Protocol identity — tap for the proof",
                         tint = FreeqColors.accent,
                         modifier = Modifier
                             .size(18.dp)
                             .clickable { showIdentityProof = true }
+                    )
+                }
+            }
+
+            // What this client can honestly say about who this is — the same
+            // claim rule and language as every other surface. An ask that is
+            // out shows as motion, not as a sentence nobody can finish reading
+            // before it is replaced.
+            if (claim.isPending) {
+                Spacer(modifier = Modifier.height(4.dp))
+                CircularProgressIndicator(
+                    modifier = Modifier.size(16.dp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    strokeWidth = 2.dp
+                )
+            }
+            claim.label?.let { label ->
+                Text(
+                    text = label,
+                    fontSize = 12.sp,
+                    color = if (claim.showsMark) FreeqColors.accent
+                    else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            // The proof sheet is where the explanation lives; this card
+            // carries the sentence only for someone with no DID, where there
+            // is no sheet to open and the card is the whole answer.
+            if (claim.did.isNullOrEmpty()) {
+                claim.line?.let { line ->
+                    Text(
+                        text = line,
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 32.dp)
                     )
                 }
             }
@@ -373,13 +398,18 @@ fun UserProfileSheet(
     if (showIdentityProof) {
         VerifiedProofSheet(
             request = ProofRequest.Identity(
-                did = resolvedDid,
+                did = claim.did,
                 nick = nick,
                 handle = profile?.handle,
                 displayName = profile?.displayName?.takeIf { it.isNotEmpty() },
-                origin = origin
+                origin = origin,
+                account = anchor?.account,
+                rowTimeUnix = anchor?.timestamp?.let { (it.time / 1000).toULong() },
+                senderPresent = appState.isNickPresent(nick),
+                senderLiveDid = if (isOwnProfile) appState.authenticatedDID.value else appState.liveDidForNick(nick),
             ),
-            onDismiss = { showIdentityProof = false }
+            onDismiss = { showIdentityProof = false },
+            appState = appState
         )
     }
 

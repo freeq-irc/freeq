@@ -887,6 +887,14 @@ internal open class UniffiVTableCallbackInterfaceP2pEventHandler(
 
 
 
+
+
+
+
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -902,7 +910,15 @@ internal open class UniffiVTableCallbackInterfaceP2pEventHandler(
 // when the library is loaded.
 internal interface IntegrityCheckingUniffiLib : Library {
     // Integrity check functions only
-    fun uniffi_freeq_sdk_ffi_checksum_method_freeqav_is_connected(
+    fun uniffi_freeq_sdk_ffi_checksum_func_claim_for_message(
+): Short
+fun uniffi_freeq_sdk_ffi_checksum_func_claim_for_person(
+): Short
+fun uniffi_freeq_sdk_ffi_checksum_func_claim_for_sender(
+): Short
+fun uniffi_freeq_sdk_ffi_checksum_func_identity_stamping_epoch_unix(
+): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_freeqav_is_connected(
 ): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqav_leave(
 ): Short
@@ -1190,6 +1206,14 @@ fun uniffi_freeq_sdk_ffi_fn_init_callback_vtable_eventhandler(`vtable`: UniffiVT
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_init_callback_vtable_p2peventhandler(`vtable`: UniffiVTableCallbackInterfaceP2pEventHandler,
 ): Unit
+fun uniffi_freeq_sdk_ffi_fn_func_claim_for_message(`input`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_freeq_sdk_ffi_fn_func_claim_for_person(`input`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_freeq_sdk_ffi_fn_func_claim_for_sender(`input`: RustBuffer.ByValue,`lookup`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_freeq_sdk_ffi_fn_func_identity_stamping_epoch_unix(uniffi_out_err: UniffiRustCallStatus, 
+): Long
 fun ffi_freeq_sdk_ffi_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun ffi_freeq_sdk_ffi_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1316,6 +1340,18 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
+    if (lib.uniffi_freeq_sdk_ffi_checksum_func_claim_for_message() != 43850.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_func_claim_for_person() != 32096.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_func_claim_for_sender() != 12857.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_func_identity_stamping_epoch_unix() != 18507.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqav_is_connected() != 41973.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -3557,6 +3593,62 @@ public object FfiConverterTypeCoordinationEvent: FfiConverterRustBuffer<Coordina
 
 
 
+data class IdentityClaim (
+    var `state`: IdentityClaimState, 
+    var `did`: kotlin.String?, 
+    var `origin`: kotlin.String?, 
+    var `label`: kotlin.String?, 
+    var `line`: kotlin.String?, 
+    var `showsMark`: kotlin.Boolean, 
+    var `isPending`: kotlin.Boolean, 
+    var `needsKeyCard`: kotlin.Boolean
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeIdentityClaim: FfiConverterRustBuffer<IdentityClaim> {
+    override fun read(buf: ByteBuffer): IdentityClaim {
+        return IdentityClaim(
+            FfiConverterTypeIdentityClaimState.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: IdentityClaim) = (
+            FfiConverterTypeIdentityClaimState.allocationSize(value.`state`) +
+            FfiConverterOptionalString.allocationSize(value.`did`) +
+            FfiConverterOptionalString.allocationSize(value.`origin`) +
+            FfiConverterOptionalString.allocationSize(value.`label`) +
+            FfiConverterOptionalString.allocationSize(value.`line`) +
+            FfiConverterBoolean.allocationSize(value.`showsMark`) +
+            FfiConverterBoolean.allocationSize(value.`isPending`) +
+            FfiConverterBoolean.allocationSize(value.`needsKeyCard`)
+    )
+
+    override fun write(value: IdentityClaim, buf: ByteBuffer) {
+            FfiConverterTypeIdentityClaimState.write(value.`state`, buf)
+            FfiConverterOptionalString.write(value.`did`, buf)
+            FfiConverterOptionalString.write(value.`origin`, buf)
+            FfiConverterOptionalString.write(value.`label`, buf)
+            FfiConverterOptionalString.write(value.`line`, buf)
+            FfiConverterBoolean.write(value.`showsMark`, buf)
+            FfiConverterBoolean.write(value.`isPending`, buf)
+            FfiConverterBoolean.write(value.`needsKeyCard`, buf)
+    }
+}
+
+
+
 data class IrcMember (
     var `nick`: kotlin.String, 
     var `isOp`: kotlin.Boolean, 
@@ -3696,6 +3788,94 @@ public object FfiConverterTypeIrcMessage: FfiConverterRustBuffer<IrcMessage> {
             FfiConverterBoolean.write(value.`edited`, buf)
             FfiConverterOptionalString.write(value.`dmKey`, buf)
             FfiConverterOptionalTypeCoordinationEvent.write(value.`coordination`, buf)
+    }
+}
+
+
+
+data class MessageClaimInput (
+    var `account`: kotlin.String?, 
+    var `origin`: kotlin.String?, 
+    var `senderPresent`: kotlin.Boolean, 
+    var `senderLiveDid`: kotlin.String?, 
+    var `rowTimeUnix`: kotlin.ULong?
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMessageClaimInput: FfiConverterRustBuffer<MessageClaimInput> {
+    override fun read(buf: ByteBuffer): MessageClaimInput {
+        return MessageClaimInput(
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MessageClaimInput) = (
+            FfiConverterOptionalString.allocationSize(value.`account`) +
+            FfiConverterOptionalString.allocationSize(value.`origin`) +
+            FfiConverterBoolean.allocationSize(value.`senderPresent`) +
+            FfiConverterOptionalString.allocationSize(value.`senderLiveDid`) +
+            FfiConverterOptionalULong.allocationSize(value.`rowTimeUnix`)
+    )
+
+    override fun write(value: MessageClaimInput, buf: ByteBuffer) {
+            FfiConverterOptionalString.write(value.`account`, buf)
+            FfiConverterOptionalString.write(value.`origin`, buf)
+            FfiConverterBoolean.write(value.`senderPresent`, buf)
+            FfiConverterOptionalString.write(value.`senderLiveDid`, buf)
+            FfiConverterOptionalULong.write(value.`rowTimeUnix`, buf)
+    }
+}
+
+
+
+data class PersonClaimInput (
+    var `binding`: kotlin.String?, 
+    var `seenOnlyViaPeer`: kotlin.Boolean, 
+    var `viaPeerOrigin`: kotlin.String?, 
+    var `viaPeerHadAccount`: kotlin.Boolean, 
+    var `lookup`: PersonLookup
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePersonClaimInput: FfiConverterRustBuffer<PersonClaimInput> {
+    override fun read(buf: ByteBuffer): PersonClaimInput {
+        return PersonClaimInput(
+            FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterTypePersonLookup.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: PersonClaimInput) = (
+            FfiConverterOptionalString.allocationSize(value.`binding`) +
+            FfiConverterBoolean.allocationSize(value.`seenOnlyViaPeer`) +
+            FfiConverterOptionalString.allocationSize(value.`viaPeerOrigin`) +
+            FfiConverterBoolean.allocationSize(value.`viaPeerHadAccount`) +
+            FfiConverterTypePersonLookup.allocationSize(value.`lookup`)
+    )
+
+    override fun write(value: PersonClaimInput, buf: ByteBuffer) {
+            FfiConverterOptionalString.write(value.`binding`, buf)
+            FfiConverterBoolean.write(value.`seenOnlyViaPeer`, buf)
+            FfiConverterOptionalString.write(value.`viaPeerOrigin`, buf)
+            FfiConverterBoolean.write(value.`viaPeerHadAccount`, buf)
+            FfiConverterTypePersonLookup.write(value.`lookup`, buf)
     }
 }
 
@@ -4435,6 +4615,11 @@ sealed class FreeqEvent {
         companion object
     }
     
+    data class WhoisEnd(
+        val `nick`: kotlin.String) : FreeqEvent() {
+        companion object
+    }
+    
     data class Notice(
         val `text`: kotlin.String) : FreeqEvent() {
         companion object
@@ -4537,10 +4722,13 @@ public object FfiConverterTypeFreeqEvent : FfiConverterRustBuffer<FreeqEvent>{
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            22 -> FreeqEvent.Notice(
+            22 -> FreeqEvent.WhoisEnd(
                 FfiConverterString.read(buf),
                 )
-            23 -> FreeqEvent.Disconnected(
+            23 -> FreeqEvent.Notice(
+                FfiConverterString.read(buf),
+                )
+            24 -> FreeqEvent.Disconnected(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
@@ -4714,6 +4902,13 @@ public object FfiConverterTypeFreeqEvent : FfiConverterRustBuffer<FreeqEvent>{
                 + FfiConverterString.allocationSize(value.`info`)
             )
         }
+        is FreeqEvent.WhoisEnd -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`nick`)
+            )
+        }
         is FreeqEvent.Notice -> {
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
@@ -4856,17 +5051,56 @@ public object FfiConverterTypeFreeqEvent : FfiConverterRustBuffer<FreeqEvent>{
                 FfiConverterString.write(value.`info`, buf)
                 Unit
             }
-            is FreeqEvent.Notice -> {
+            is FreeqEvent.WhoisEnd -> {
                 buf.putInt(22)
+                FfiConverterString.write(value.`nick`, buf)
+                Unit
+            }
+            is FreeqEvent.Notice -> {
+                buf.putInt(23)
                 FfiConverterString.write(value.`text`, buf)
                 Unit
             }
             is FreeqEvent.Disconnected -> {
-                buf.putInt(23)
+                buf.putInt(24)
                 FfiConverterString.write(value.`reason`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+
+enum class IdentityClaimState {
+    
+    AT_PROTOCOL,
+    SELF_ISSUED,
+    RELAYED,
+    GUEST,
+    LOOKING_UP,
+    UNKNOWN;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeIdentityClaimState: FfiConverterRustBuffer<IdentityClaimState> {
+    override fun read(buf: ByteBuffer) = try {
+        IdentityClaimState.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: IdentityClaimState) = 4UL
+
+    override fun write(value: IdentityClaimState, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
     }
 }
 
@@ -5001,6 +5235,39 @@ public object FfiConverterTypeP2pEvent : FfiConverterRustBuffer<P2pEvent>{
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+
+enum class PersonLookup {
+    
+    NOT_ASKED,
+    IN_FLIGHT,
+    NO_ACCOUNT,
+    NO_SUCH_NICK,
+    TIMED_OUT;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePersonLookup: FfiConverterRustBuffer<PersonLookup> {
+    override fun read(buf: ByteBuffer) = try {
+        PersonLookup.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: PersonLookup) = 4UL
+
+    override fun write(value: PersonLookup, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
     }
 }
 
@@ -5164,6 +5431,38 @@ internal object uniffiCallbackInterfaceP2pEventHandler {
  * @suppress
  */
 public object FfiConverterTypeP2pEventHandler: FfiConverterCallbackInterface<P2pEventHandler>()
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalULong: FfiConverterRustBuffer<kotlin.ULong?> {
+    override fun read(buf: ByteBuffer): kotlin.ULong? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterULong.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.ULong?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterULong.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.ULong?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterULong.write(value, buf)
+        }
+    }
+}
 
 
 
@@ -5423,5 +5722,41 @@ public object FfiConverterSequenceTypeTagEntry: FfiConverterRustBuffer<List<TagE
             FfiConverterTypeTagEntry.write(it, buf)
         }
     }
+} fun `claimForMessage`(`input`: MessageClaimInput): IdentityClaim {
+            return FfiConverterTypeIdentityClaim.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_func_claim_for_message(
+        FfiConverterTypeMessageClaimInput.lower(`input`),_status)
 }
+    )
+    }
+    
+ fun `claimForPerson`(`input`: PersonClaimInput): IdentityClaim {
+            return FfiConverterTypeIdentityClaim.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_func_claim_for_person(
+        FfiConverterTypePersonClaimInput.lower(`input`),_status)
+}
+    )
+    }
+    
+ fun `claimForSender`(`input`: MessageClaimInput, `lookup`: PersonLookup): IdentityClaim {
+            return FfiConverterTypeIdentityClaim.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_func_claim_for_sender(
+        FfiConverterTypeMessageClaimInput.lower(`input`),FfiConverterTypePersonLookup.lower(`lookup`),_status)
+}
+    )
+    }
+    
+ fun `identityStampingEpochUnix`(): kotlin.ULong {
+            return FfiConverterULong.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_func_identity_stamping_epoch_unix(
+        _status)
+}
+    )
+    }
+    
+
 

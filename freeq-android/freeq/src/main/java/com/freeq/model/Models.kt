@@ -556,6 +556,11 @@ class AppState(application: Application) : AndroidViewModel(application) {
         client = null  // Clear reference so reconnect creates fresh client
         connectionState.value = ConnectionState.Disconnected
         channels.clear()
+        // A dropped connection ends every question that was out on it, and a
+        // WHOIS answer from the old session is not a live binding on the new
+        // one.
+        identityLookups.clear()
+        whoisNoSuchNick.clear()
         dmBuffers.clear()
         batches.clear()
         activeChannel.value = null
@@ -1090,6 +1095,125 @@ class AppState(application: Application) : AndroidViewModel(application) {
             knownDids[newNick.lowercase()] = did
             didDisplayNames[did] = newNick
         }
+        // An identity answer is about a nick, and a rename moves the nick.
+        // Drop both sides rather than let one person's answer describe
+        // whoever picks the name up next.
+        identityLookups.remove(oldNick.lowercase())
+        identityLookups.remove(newNick.lowercase())
+    }
+
+    // ── Identity lookup for a surface the reader opened ──
+
+    /** Where the ask stands for each nick a card has asked about, keyed
+     *  lowercased. Read by identity surfaces so they can say a lookup is under
+     *  way rather than declaring the sender unknown before anyone asked. */
+    val identityLookups = mutableStateMapOf<String, IdentityLookup>()
+
+    /** Nicks the server answered with "no such nick". They are not guests —
+     *  nobody is holding the name, so there is nobody to have an account. */
+    private val whoisNoSuchNick = mutableSetOf<String>()
+
+    /** Only a backstop; the real answer is the server's end-of-WHOIS. Matches
+     *  the macOS client's budget. */
+    private val identityLookupBackstopMs = 5_000L
+
+    /**
+     * Ask who this nick is, for a card the reader just opened.
+     *
+     * Asks once. A nick we can already name needs nothing; an ask already out
+     * is not repeated; and an answer we have — "no account", the guest case —
+     * stands until something could have changed it, so reopening the same card
+     * doesn't re-interrogate the server. An answer that names nobody at all
+     * leaves nothing behind, so that one can be asked again.
+     */
+    fun lookUpIdentity(nick: String) {
+        val key = nick.trim().lowercase()
+        if (key.isEmpty()) return
+        if (liveDidForNick(key) != null || identityLookups.containsKey(key)) return
+        whoisNoSuchNick.remove(key)
+        identityLookups[key] = IdentityLookup.IN_FLIGHT
+        try {
+            client?.requestWhois(nick)
+        } catch (_: Exception) {}
+        // The answer normally arrives as the server's own end-of-WHOIS. This
+        // only catches a server that goes quiet mid-answer, or a socket that
+        // drops with the ask still out: without it the card spins for the rest
+        // of the session, because an ask already in flight is never repeated.
+        scope.launch {
+            delay(identityLookupBackstopMs)
+            abandonIdentityLookup(key)
+        }
+    }
+
+    /** The ask never came back. That is a fact about the connection, not about
+     *  the person, so nothing is claimed and the next card may ask again. */
+    private fun abandonIdentityLookup(key: String) {
+        if (identityLookups[key] == IdentityLookup.IN_FLIGHT) {
+            identityLookups.remove(key)
+        }
+    }
+
+    /** The server says nobody holds this name. */
+    fun noteWhoisNoSuchNick(nick: String) {
+        whoisNoSuchNick.add(nick.trim().lowercase())
+    }
+
+    /**
+     * The server has finished answering. Whatever it did or didn't say is the
+     * answer now, so the card stops waiting.
+     *
+     * A DID that arrived speaks for itself. Otherwise the server answered about
+     * a real person and named no account — a guest — unless it told us nobody
+     * holds the name at all, which says nothing about anybody.
+     */
+    fun settleIdentityLookup(nick: String) {
+        val key = nick.trim().lowercase()
+        if (identityLookups[key] != IdentityLookup.IN_FLIGHT) return
+        if (didForNick(key) != null) {
+            // The answer named a DID: the binding is live-known this session.
+            identityLookups[key] = IdentityLookup.ANSWERED_DID
+        } else if (key in whoisNoSuchNick) {
+            identityLookups.remove(key)
+        } else {
+            identityLookups[key] = IdentityLookup.NO_ACCOUNT
+        }
+    }
+
+    /** What a card should assume about this nick right now. */
+    fun identityLookup(nick: String): IdentityLookup =
+        identityLookups[nick.trim().lowercase()] ?: IdentityLookup.NOT_ASKED
+
+    /** True when the nick is in some channel roster right now. */
+    fun isNickPresent(nick: String): Boolean {
+        for (ch in channels) {
+            if (ch.members.any { it.nick.equals(nick, ignoreCase = true) }) return true
+        }
+        return false
+    }
+
+    /**
+     * The nick's DID, only when it is live-known: the nick is in a roster
+     * right now, or a WHOIS answered with it this session. A binding
+     * remembered from an earlier session never votes on identity — that is
+     * how one absent sender used to read differently on different clients.
+     * The persisted map stays for display and addressing, where staleness
+     * costs a name, not a claim.
+     */
+    fun liveDidForNick(nick: String): String? {
+        val key = nick.trim().lowercase()
+        val answered = identityLookups[key] == IdentityLookup.ANSWERED_DID
+        return if (answered || isNickPresent(nick)) didForNick(key) else null
+    }
+
+    /** The lookup state in the SDK's vocabulary, for the claim functions. */
+    fun personLookup(nick: String): com.freeq.ffi.PersonLookup {
+        val key = nick.trim().lowercase()
+        return when {
+            identityLookups[key] == IdentityLookup.IN_FLIGHT -> com.freeq.ffi.PersonLookup.IN_FLIGHT
+            identityLookups[key] == IdentityLookup.NO_ACCOUNT -> com.freeq.ffi.PersonLookup.NO_ACCOUNT
+            key in whoisNoSuchNick -> com.freeq.ffi.PersonLookup.NO_SUCH_NICK
+            else -> com.freeq.ffi.PersonLookup.NOT_ASKED
+        }
     }
 
     fun awayMessage(nick: String): String? {
@@ -1612,7 +1736,17 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
             }
 
             is FreeqEvent.WhoisReply -> {
-                // No-op for now
+                // "No such nick" is an answer about the name, not about a
+                // person: an unheld name has nobody to have an account.
+                if (event.info.contains("No such nick")) {
+                    state.noteWhoisNoSuchNick(event.nick)
+                }
+            }
+
+            // The server has finished. A card that was waiting has its answer
+            // now, whatever the answer turned out to be.
+            is FreeqEvent.WhoisEnd -> {
+                state.settleIdentityLookup(event.nick)
             }
 
             is FreeqEvent.ReadMarker -> {

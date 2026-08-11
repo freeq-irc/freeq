@@ -20,7 +20,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.freeq.model.IdentityClaim
+import com.freeq.model.AppState
 import com.freeq.model.SenderIdentity
 import com.freeq.model.SignatureVerdict
 import com.freeq.model.SigningKeyInfo
@@ -47,6 +47,16 @@ sealed interface ProofRequest {
         val displayName: String? = null,
         /** Set when we only know this person through a relaying peer. */
         val origin: String? = null,
+        /** The anchoring message's evidence, when opened from a row. */
+        val account: String? = null,
+        val rowTimeUnix: ULong? = null,
+        val senderPresent: Boolean = false,
+        val senderLiveDid: String? = null,
+        /** When the sheet was opened from a message row, that message's own
+         *  verdict renders below the identity — one sheet, content follows
+         *  the message. */
+        val msgId: String? = null,
+        val signed: Boolean = false,
     ) : ProofRequest
 
     /** Whether this one message's signature holds up. Says nothing about who
@@ -75,6 +85,10 @@ sealed interface ProofRequest {
 fun VerifiedProofSheet(
     request: ProofRequest,
     onDismiss: () -> Unit,
+    /** Needed only by the identity question, and only so this sheet can ask
+     *  who someone is when nothing is on file yet — and say that an ask is out
+     *  rather than declaring them unknown before anyone asked. */
+    appState: AppState? = null,
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
@@ -86,7 +100,7 @@ fun VerifiedProofSheet(
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             when (request) {
-                is ProofRequest.Identity -> IdentityProof(request)
+                is ProofRequest.Identity -> IdentityProof(request, appState)
                 is ProofRequest.Message -> MessageProof(request.msgId, request.signed)
             }
         }
@@ -103,11 +117,30 @@ fun VerifiedProofSheet(
  * a sender's own device signed something.
  */
 @Composable
-private fun IdentityProof(request: ProofRequest.Identity) {
-    val did = request.did
-    val claim = SenderIdentity.claim(did, request.origin)
+private fun IdentityProof(request: ProofRequest.Identity, appState: AppState?) {
+    val lookup = request.nick?.let { appState?.personLookup(it) }
+        ?: com.freeq.ffi.PersonLookup.NOT_ASKED
+    val claim = com.freeq.ffi.claimForSender(
+        com.freeq.ffi.MessageClaimInput(
+            account = request.account,
+            origin = request.origin,
+            senderPresent = request.senderPresent,
+            senderLiveDid = request.senderLiveDid ?: request.did,
+            rowTimeUnix = request.rowTimeUnix,
+        ),
+        lookup,
+    )
+    val did = claim.did
     var key by remember { mutableStateOf<SigningKeyInfo?>(null) }
     var keyLoading by remember { mutableStateOf(did != null) }
+
+    // If we can't name them yet, ask — otherwise this sheet would answer
+    // "unknown" without anyone having asked anything.
+    LaunchedEffect(request.nick, did, request.origin) {
+        if (did == null && request.origin == null) {
+            request.nick?.let { appState?.lookUpIdentity(it) }
+        }
+    }
 
     LaunchedEffect(did) {
         val d = did ?: return@LaunchedEffect
@@ -118,17 +151,15 @@ private fun IdentityProof(request: ProofRequest.Identity) {
 
     val name = SenderIdentity.title(request.displayName, request.handle, request.nick)
 
-    if (claim == IdentityClaim.AT_PROTOCOL) {
+    if (claim.showsMark) {
         Icon(
             Icons.Default.CheckCircle,
             contentDescription = null,
             tint = FreeqColors.accent,
             modifier = Modifier.size(64.dp),
         )
-        Spacer(Modifier.height(12.dp))
-    } else {
-        Spacer(Modifier.height(12.dp))
     }
+    Spacer(Modifier.height(12.dp))
 
     Text(
         text = name,
@@ -137,41 +168,32 @@ private fun IdentityProof(request: ProofRequest.Identity) {
         color = MaterialTheme.colorScheme.onSurface,
     )
 
-    when (claim) {
-        IdentityClaim.AT_PROTOCOL -> {
-            Text(
-                text = "AT Protocol identity",
-                fontSize = 13.sp,
-                color = FreeqColors.accent,
-            )
+    // Every state that has words names itself. Only the resolvable claim wears
+    // the accent; the rest are ordinary facts and are coloured like ones. An
+    // ask still out shows as motion instead — no words at all.
+    if (claim.isPending) {
+        Spacer(Modifier.height(8.dp))
+        CircularProgressIndicator(
+            modifier = Modifier.size(20.dp),
+            strokeWidth = 2.dp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    claim.label?.let { label ->
+        Text(
+            text = label,
+            fontSize = 13.sp,
+            color = if (claim.showsMark) FreeqColors.accent
+            else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    if (!claim.needsKeyCard || key != null || keyLoading) {
+        claim.line?.let { line ->
             Spacer(Modifier.height(16.dp))
             Text(
-                text = "This identifier is theirs, not this server's to grant or " +
-                    "revoke, and it resolves to the same person anywhere on the " +
-                    "network.",
+                text = line,
                 fontSize = 14.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        IdentityClaim.SELF_ISSUED_KEY -> {
-            Spacer(Modifier.height(8.dp))
-            Text(
-                text = "A key its holder issued to itself. Nothing on the AT " +
-                    "Protocol stands behind it, so this is an identifier and not " +
-                    "an identity.",
-                fontSize = 14.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        IdentityClaim.NONE -> {
-            Spacer(Modifier.height(8.dp))
-            Text(
-                text = request.origin?.let {
-                    "Relayed via $it — this server did not verify this identity."
-                } ?: "No decentralized identifier is on file for this sender here.",
-                fontSize = 14.sp,
-                color = if (request.origin != null) FreeqColors.warning
-                else MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }
@@ -189,7 +211,11 @@ private fun IdentityProof(request: ProofRequest.Identity) {
             ProofCard(
                 label = "MESSAGE SIGNING KEY",
                 value = key!!.publicKey,
-                detail = "${key!!.algorithm.uppercase()} · ${key!!.sourceLabel}",
+                // Algorithm only. The old source suffix read "server-attested"
+                // for every key (the endpoint labels them all "key-store"),
+                // contradicting a device-signed verdict one card up. Trust
+                // language belongs to the verdict, which carries it already.
+                detail = key!!.algorithm.uppercase(),
                 copyable = false,
             )
         } else if (keyLoading) {
@@ -201,6 +227,13 @@ private fun IdentityProof(request: ProofRequest.Identity) {
         }
     } else {
         Spacer(Modifier.height(8.dp))
+    }
+
+    // Opened from a message row: that message's own verdict, below the
+    // identity it anchors.
+    if (request.msgId != null) {
+        Spacer(Modifier.height(20.dp))
+        MessageProof(request.msgId, request.signed)
     }
 }
 

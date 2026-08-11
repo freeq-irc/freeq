@@ -1,58 +1,36 @@
 package com.freeq.model
 
 /**
- * What this client can honestly say about who someone is.
- *
- * A claim about a person is not a claim about any message they sent — those
- * are different subjects and they never share a surface. This one answers only
- * the first.
+ * The identity-claim rule does not live here. Its states, precedence, and
+ * every user-facing string come from the SDK (spec/identity-claims.json),
+ * reached through the FFI's claimForMessage / claimForPerson /
+ * claimForSender — the same rule, byte for byte, that the web client
+ * renders. This file keeps only the app-side lookup plumbing that feeds it.
  */
-enum class IdentityClaim {
-    /** A decentralized identifier the server bound at SASL and the AT Protocol
-     *  resolves. This is the only claim that earns a mark. */
-    AT_PROTOCOL,
+enum class IdentityLookup {
+    /** No ask has gone out, or the surface never asks. */
+    NOT_ASKED,
 
-    /** A key its holder issued to itself — real, and nothing on the AT
-     *  Protocol stands behind it. Bots and guests sign this way. */
-    SELF_ISSUED_KEY,
+    /** An ask is out and unanswered. */
+    IN_FLIGHT,
 
-    /** Nothing assertable here: no identifier on file, or one this server
-     *  learned from a peer rather than checked itself. */
-    NONE;
+    /** The answer came back and named no account. */
+    NO_ACCOUNT,
 
-    /** The mark IS the claim, so it appears exactly where the claim holds. */
-    val showsMark: Boolean
-        get() = this == AT_PROTOCOL
+    /** The answer named a DID this session, so the binding is live-known
+     *  even when the person is in no roster right now. */
+    ANSWERED_DID,
 }
 
 /**
- * The single rule behind every identity mark in the client. Kept here so the
- * message row, the profile card and the proof view cannot drift apart — the
- * defect that let a sender wear no mark on their message and a full
- * AT-Protocol seal in the sheet.
+ * What to call this person on a surface about them. Anyone we can name is
+ * named; a message row always has a nick, so the empty fallback is
+ * unreachable in practice.
  */
 object SenderIdentity {
-
-    /**
-     * @param did the server-bound identifier, never the freely-settable nick.
-     * @param origin the peer that relayed this, when we did not see it first
-     *   hand. Anything relayed is peer-vouched and claims nothing here.
-     */
-    /**
-     * What to call this person on a surface about them. Anyone we can name is
-     * named: "Unidentified sender" is for having nothing at all, not for a bot
-     * whose self-issued key comes with no handle to resolve.
-     */
     fun title(displayName: String?, handle: String?, nick: String?): String =
         displayName?.takeIf { it.isNotBlank() }
             ?: handle?.takeIf { it.isNotBlank() }?.let { "@$it" }
             ?: nick?.takeIf { it.isNotBlank() }
-            ?: "Unidentified sender"
-
-    fun claim(did: String?, origin: String?): IdentityClaim = when {
-        origin != null -> IdentityClaim.NONE
-        did.isNullOrBlank() -> IdentityClaim.NONE
-        did.startsWith("did:key:") -> IdentityClaim.SELF_ISSUED_KEY
-        else -> IdentityClaim.AT_PROTOCOL
-    }
+            ?: ""
 }

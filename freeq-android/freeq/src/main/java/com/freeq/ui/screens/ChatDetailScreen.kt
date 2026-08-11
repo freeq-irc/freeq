@@ -13,6 +13,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.freeq.model.ChatMessage
 import com.freeq.model.AppState
 import com.freeq.ui.components.ChannelSettingsSheet
 import com.freeq.ui.components.ComposeBar
@@ -44,7 +45,7 @@ fun ChatDetailScreen(
     var showChannelSettings by remember { mutableStateOf(false) }
     var showPinnedMessages by remember { mutableStateOf(false) }
     // (nick, origin): origin is non-null only when opened from a federated message.
-    var profileTarget by remember { mutableStateOf<Pair<String, String?>?>(null) }
+    var profileTarget by remember { mutableStateOf<Triple<String, String?, ChatMessage?>?>(null) }
     var scrollToMessageId by remember { mutableStateOf<String?>(null) }
     val isChannel = channelName.startsWith("#")
 
@@ -177,7 +178,7 @@ fun ChatDetailScreen(
                 MessageList(
                     appState = appState,
                     channelState = channelState,
-                    onProfileClick = { nick, origin -> profileTarget = nick to origin },
+                    onProfileClick = { nick, origin, anchor -> profileTarget = Triple(nick, origin, anchor) },
                     scrollToMessageId = scrollToMessageId,
                     modifier = Modifier.weight(1f)
                 )
@@ -194,7 +195,7 @@ fun ChatDetailScreen(
                 onDismiss = { showMembers = false },
                 onMemberClick = { nick ->
                     showMembers = false
-                    profileTarget = nick to null
+                    profileTarget = Triple(nick, null, null)
                 }
             )
         }
@@ -244,11 +245,12 @@ fun ChatDetailScreen(
         }
 
         // Profile sheet
-        profileTarget?.let { (nick, origin) ->
+        profileTarget?.let { (nick, origin, anchor) ->
             UserProfileSheet(
                 nick = nick,
                 appState = appState,
                 origin = origin,
+                anchor = anchor,
                 onDismiss = { profileTarget = null },
                 onNavigateToDM = { dmNick ->
                     val key = appState.didForNick(dmNick) ?: dmNick
