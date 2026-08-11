@@ -50,6 +50,8 @@ pub enum IdentityClaimState {
 }
 
 impl IdentityClaimState {
+    /// The state's key in the spec file — used by the vector runner.
+    #[cfg(test)]
     fn spec_key(self) -> &'static str {
         match self {
             Self::AtProtocol => "atProtocol",
