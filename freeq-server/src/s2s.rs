@@ -1343,6 +1343,52 @@ pub(crate) fn parse_peer_spec(spec: &str) -> Result<(iroh::EndpointId, iroh::End
     Ok((endpoint_id, addr))
 }
 
+/// How long an S2S connection may go without a packet from its peer before
+/// QUIC gives up on it.
+///
+/// The peers map is what stops the retry loop dialling and what makes a
+/// returning peer's dial look like a duplicate, so an entry that outlives the
+/// process it points at strands the link for exactly as long as it survives.
+/// QUIC's 30s default meant a peer that went without a closing handshake — a
+/// crash, a kill, a machine going down — stayed in the map for half a minute.
+/// Six seconds reaps it well inside the federation harness's settle window.
+const S2S_MAX_IDLE: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// How long an otherwise silent S2S connection waits before pinging its peer.
+///
+/// Under a third of `S2S_MAX_IDLE`, so two pings can go missing without the
+/// idle timeout firing. A ping is ack-eliciting and the reply resets the idle
+/// timer, so the short timeout above costs a trickle of traffic rather than a
+/// link that drops whenever a channel goes quiet.
+const S2S_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Dial a peer with the S2S transport parameters.
+///
+/// Set per dial rather than on the endpoint, which also carries client
+/// connections — a phone in a pocket has every reason to survive a quiet
+/// stretch that a federation link does not. QUIC negotiates the idle timeout
+/// down to the lower of the two ends' advertised values, so a connection dialled
+/// with these governs both ends of it whatever the peer advertises, and whatever
+/// version the peer is running.
+async fn dial_peer(
+    endpoint: &iroh::Endpoint,
+    addr: iroh::EndpointAddr,
+) -> Result<iroh::endpoint::Connection> {
+    let transport = iroh::endpoint::QuicTransportConfig::builder()
+        .max_idle_timeout(Some(
+            S2S_MAX_IDLE
+                .try_into()
+                .expect("S2S_MAX_IDLE is within QUIC's idle-timeout range"),
+        ))
+        .keep_alive_interval(S2S_KEEP_ALIVE)
+        .build();
+    let opts = iroh::endpoint::ConnectOptions::new().with_transport_config(transport);
+    Ok(endpoint
+        .connect_with_opts(addr, S2S_ALPN, opts)
+        .await?
+        .await?)
+}
+
 /// Connect to a peer server by iroh endpoint ID (optionally `id@host:port`).
 pub async fn connect_peer(
     endpoint: &iroh::Endpoint,
@@ -1352,7 +1398,7 @@ pub async fn connect_peer(
     let (_id, addr) = parse_peer_spec(peer_id)?;
 
     tracing::info!(peer = %peer_id, "Connecting to S2S peer");
-    let conn = endpoint.connect(addr, S2S_ALPN).await?;
+    let conn = dial_peer(endpoint, addr).await?;
 
     let manager = Arc::clone(manager);
     tokio::spawn(async move {
@@ -1394,7 +1440,7 @@ pub fn connect_peer_with_retry(
             }
 
             tracing::info!(peer = %peer_id, "Connecting to S2S peer");
-            match endpoint.connect(addr.clone(), S2S_ALPN).await {
+            match dial_peer(&endpoint, addr.clone()).await {
                 Ok(conn) => {
                     backoff = std::time::Duration::from_secs(1);
                     tracing::info!(peer = %peer_id, "S2S peer connected, entering link handler");
@@ -1464,6 +1510,14 @@ async fn handle_s2s_connection_from_manager(
 /// Applied only when a duplicate actually exists. A server that is dialed but
 /// does not dial back has exactly one link, and must keep it whichever side of
 /// the ID comparison it falls on.
+///
+/// Yielding is safe only because a dead connection leaves the peers map within
+/// `S2S_MAX_IDLE`. The side that keeps its outgoing link is the side that has
+/// to dial to recover, and it will not dial while an entry sits in the map — so
+/// an entry pointing at a peer that has died is a link neither end holds, and
+/// every dial the peer makes to rebuild it gets yielded away as a duplicate
+/// until the entry is reaped. Lengthen that timeout and you lengthen the outage
+/// after any peer restart.
 fn duplicate_link_wins(my_id: &str, peer_id: &str, incoming: bool) -> bool {
     // Lower ID keeps outgoing → for that side, an incoming duplicate loses.
     // Higher ID keeps incoming → for that side, an outgoing duplicate loses.
