@@ -41,6 +41,10 @@ let package = Package(
                 "FreeqDirectory.swift",
                 "BufferNavigation.swift",
                 "AvRejoin.swift",
+                "OutboundSend.swift",
+                "DmResolver.swift",
+                "IdentityClaim.swift",
+                "SignatureProof.swift",
             ]
         ),
         .testTarget(
