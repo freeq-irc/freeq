@@ -150,15 +150,9 @@ final class SignatureProofTests: XCTestCase {
         let k = SigningKeyInfo.from(json: ["public_key": "z6Mk..."])
         XCTAssertEqual(k?.publicKey, "z6Mk...")
         XCTAssertEqual(k?.algorithm, "ed25519")
-        XCTAssertEqual(k?.sourceLabel, "server-attested")
     }
 
     func testMissingPublicKeyYieldsNil() {
         XCTAssertNil(SigningKeyInfo.from(json: ["algorithm": "ed25519"]))
-    }
-
-    func testClientSessionSourceLabel() {
-        let k = SigningKeyInfo(publicKey: "pk", algorithm: "ed25519", source: "client-session")
-        XCTAssertEqual(k.sourceLabel, "signed on their device")
     }
 }

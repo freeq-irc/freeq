@@ -525,8 +525,16 @@ struct CoalescedSystemRow: View {
 
 /// A tapped @mention, used to present that person's profile sheet.
 struct MentionTarget: Identifiable {
-    let id = UUID()
+    var id: String { nick }
     let nick: String
+    var origin: String? = nil
+    /// The anchoring row's evidence, when opened from a message: its account
+    /// tag, its timestamp, and whether the sender is in a roster right now.
+    /// When live identity can't answer, the row does — the SDK owns that
+    /// precedence. A mention link with no row in hand carries none of it.
+    var account: String? = nil
+    var rowTime: Date? = nil
+    var senderPresent: Bool = false
 }
 
 /// Why the proof sheet is open. Showing who someone is and checking whether a
@@ -591,11 +599,22 @@ struct MessageRow: View {
         appState.checkedVerdicts[message.id]
     }
 
-    private var hasDid: Bool {
-        // A federated message is peer-vouched, not verified here — withhold the
-        // local verified badge even if a same-nick local member has a DID.
-        message.origin == nil && ProfileCache.shared.did(for: message.from) != nil
+    /// What this row can honestly claim about its sender — computed by the
+    /// SDK from the row's own tags and the live room, never from a cache.
+    /// Presence is only consulted when the tags can't answer, so the roster
+    /// scan is skipped for the common tagged row.
+    private var rowClaim: IdentityClaim {
+        let needsRoom = message.account == nil && message.origin == nil
+        let present = needsRoom && appState.isNickPresent(message.from)
+        return claimForMessage(input: MessageClaimInput(
+            account: message.account,
+            origin: message.origin,
+            senderPresent: present,
+            senderLiveDid: present ? appState.didForNick(message.from) : nil,
+            rowTimeUnix: UInt64(message.timestamp.timeIntervalSince1970)
+        ))
     }
+    private var showsIdentityMark: Bool { rowClaim.showsMark }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -606,13 +625,22 @@ struct MessageRow: View {
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(Theme.textTertiary.opacity(0.75))
                         .frame(width: 36, alignment: .trailing)
-                    Text(message.from)
-                        .font(.system(.caption, weight: .bold))
-                        .foregroundStyle(isSystem ? Theme.textSecondary : Theme.nickColor(for: message.from))
-                    if hasDid {
-                        Image(systemName: "checkmark.seal.fill")
-                            .font(.system(size: 8))
-                            .foregroundStyle(Theme.verified)
+                    Button { mentionTarget = MentionTarget(nick: message.from, origin: message.origin, account: message.account, rowTime: message.timestamp, senderPresent: appState.isNickPresent(message.from)) } label: {
+                        Text(message.from)
+                            .font(.system(.caption, weight: .bold))
+                            .foregroundStyle(isSystem ? Theme.textSecondary : Theme.nickColor(for: message.from))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isSystem)
+                    .help("View profile")
+                    if showsIdentityMark {
+                        Button { proofRequest = .identity } label: {
+                            Image(systemName: "checkmark.seal.fill")
+                                .font(.system(size: 8))
+                                .foregroundStyle(Theme.verified)
+                        }
+                        .buttonStyle(.plain)
+                        .help("AT Protocol identity — click for proof")
                     }
                     if let origin = message.origin {
                         Text("via \(origin)")
@@ -623,32 +651,54 @@ struct MessageRow: View {
             } else if showHeader {
                 HStack(alignment: .top, spacing: 8) {
                     if !isSystem {
-                        AvatarView(nick: message.from, size: 24)
-                            .padding(.top, 2)
+                        Button { mentionTarget = MentionTarget(nick: message.from, origin: message.origin, account: message.account, rowTime: message.timestamp, senderPresent: appState.isNickPresent(message.from)) } label: {
+                            AvatarView(nick: message.from, size: 24)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.top, 2)
+                        .help("View profile")
                     }
                     VStack(alignment: .leading, spacing: 0) {
                         HStack(alignment: .firstTextBaseline, spacing: 4) {
                             if let displayName = profile?.displayName, !displayName.isEmpty {
-                                Text(displayName)
-                                    .font(.system(.body, weight: .semibold))
-                                    .foregroundStyle(Theme.nickColor(for: message.from))
-                                Text(message.from)
-                                    .font(.caption)
-                                    .foregroundStyle(Theme.textTertiary)
+                                // Name and nick are one target. Split into a
+                                // button and a bare label, the nick beside a
+                                // clickable name reads as dead text.
+                                Button { mentionTarget = MentionTarget(nick: message.from, origin: message.origin, account: message.account, rowTime: message.timestamp, senderPresent: appState.isNickPresent(message.from)) } label: {
+                                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                                        Text(displayName)
+                                            .font(.system(.body, weight: .semibold))
+                                            .foregroundStyle(Theme.nickColor(for: message.from))
+                                        Text(message.from)
+                                            .font(.caption)
+                                            .foregroundStyle(Theme.textTertiary)
+                                    }
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .help("View profile")
                             } else {
-                                Text(message.from)
-                                    .font(.system(.body, weight: .semibold))
-                                    .foregroundStyle(isSystem ? Theme.textSecondary : Theme.nickColor(for: message.from))
+                                Button { mentionTarget = MentionTarget(nick: message.from, origin: message.origin, account: message.account, rowTime: message.timestamp, senderPresent: appState.isNickPresent(message.from)) } label: {
+                                    Text(message.from)
+                                        .font(.system(.body, weight: .semibold))
+                                        .foregroundStyle(isSystem ? Theme.textSecondary : Theme.nickColor(for: message.from))
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(isSystem)
+                                .help("View profile")
                             }
 
-                            if hasDid {
+                            // The mark opens the proof behind the claim it
+                            // makes, wherever it appears. The name opens the
+                            // person's card.
+                            if showsIdentityMark {
                                 Button { proofRequest = .identity } label: {
                                     Image(systemName: "checkmark.seal.fill")
                                         .font(.caption2)
                                         .foregroundStyle(Theme.verified)
                                 }
                                 .buttonStyle(.plain)
-                                .help("AT Protocol verified identity — click for proof")
+                                .help("AT Protocol identity — click for proof")
                             }
 
                             // No badge for a signed message: almost every
@@ -894,18 +944,27 @@ struct MessageRow: View {
         }
         .sheet(item: $proofRequest) { request in
             VerifiedProofSheet(
-                did: ProfileCache.shared.did(for: message.from),
+                did: appState.liveDidForNick(message.from),
                 handle: profile?.handle,
                 displayName: profile?.displayName,
                 nick: message.from,
-                msgId: request.msgId
+                origin: message.origin,
+                msgId: request.msgId,
+                signed: message.isSigned,
+                account: message.account,
+                rowTimeUnix: UInt64(message.timestamp.timeIntervalSince1970),
+                senderPresent: appState.isNickPresent(message.from),
+                rowMsgId: message.id,
+                rowSigned: message.isSigned
             )
             .environment(appState)
         }
         // Route @mention taps to the profile; real URLs open normally.
         .environment(\.openURL, OpenURLAction(handler: handleMessageURL))
         .sheet(item: $mentionTarget) { target in
-            UserProfileSheet(nick: target.nick)
+            UserProfileSheet(nick: target.nick, origin: target.origin, account: target.account,
+                rowTime: target.rowTime,
+                senderPresent: target.senderPresent)
                 .environment(appState)
         }
     }
@@ -986,7 +1045,10 @@ struct MessageRow: View {
 
         // Checking a signature is a question the reader asks, not a claim the
         // row makes on its own. Same label as the web and Android clients.
+        // Profile sits beside it so the identity question has a path from the
+        // same menu — the two questions, both reachable, never blended.
         if !isSystem {
+            Button("View Profile") { mentionTarget = MentionTarget(nick: message.from, origin: message.origin, account: message.account, rowTime: message.timestamp, senderPresent: appState.isNickPresent(message.from)) }
             Button("Verify Signature") { proofRequest = .verify(message.id) }
         }
 

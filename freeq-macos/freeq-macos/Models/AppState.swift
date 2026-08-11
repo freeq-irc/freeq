@@ -330,6 +330,9 @@ class AppState {
         didDisplayNames[did] = nick
         // Release any first DM waiting to learn who this nick is.
         dmResolver.learned(nick: nick, did: did)
+        // An identifier answers the question outright, so any card still
+        // showing a lookup stops showing one.
+        identityLookups.removeValue(forKey: nick.lowercased())
         for ch in channels {
             if let idx = ch.members.firstIndex(where: { $0.nick.lowercased() == nick.lowercased() }) {
                 let m = ch.members[idx]
@@ -623,6 +626,8 @@ class AppState {
         KeychainHelper.delete(key: "brokerToken")
         KeychainHelper.delete(key: "did")
         channels.removeAll()
+        identityLookups.removeAll()
+        whoisNoSuchNick.removeAll()
         dmBuffers.removeAll()
         activeChannel = nil
         closedDMs.removeAll()
@@ -1592,6 +1597,96 @@ class AppState {
         }
     }
 
+    // MARK: - Identity lookup for a surface the reader opened
+
+    /// Where the ask stands for each nick a card has asked about, keyed
+    /// lowercased. Read by identity surfaces so they can say a lookup is under
+    /// way rather than declaring the sender unknown before anyone asked.
+    var identityLookups: [String: IdentityLookup] = [:]
+
+    /// Nicks the server answered with "no such nick". They are not guests —
+    /// nobody is holding the name, so there is nobody to have an account.
+    @ObservationIgnored private var whoisNoSuchNick: Set<String> = []
+
+    /// Only a backstop. The answer normally arrives as the server's own
+    /// end-of-WHOIS; this exists so a card can't spin forever against a server
+    /// that goes quiet mid-answer.
+    private static let identityLookupTimeout: TimeInterval = 5.0
+
+    /// Ask who this nick is, for a card the reader just opened.
+    ///
+    /// Asks once. A nick we can already name needs nothing; an ask already out
+    /// is not repeated; and an answer we have — "no account", the guest case —
+    /// stands until something could have changed it, so reopening the same
+    /// card doesn't re-interrogate the server. An ask that went unanswered
+    /// leaves nothing behind and is retried, the same policy the signature
+    /// verdicts use: settled answers are kept, silence is not.
+    func lookUpIdentity(nick: String) {
+        let key = nick.lowercased()
+        guard liveDidForNick(nick) == nil, identityLookups[key] == nil else { return }
+        whoisNoSuchNick.remove(key)
+        identityLookups[key] = .inFlight
+        sendWhois(nick, display: false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.identityLookupTimeout) { [weak self] in
+            self?.settleIdentityLookup(key)
+        }
+    }
+
+    /// The server says nobody holds this name.
+    func noteWhoisNoSuchNick(nick: String) {
+        whoisNoSuchNick.insert(nick.lowercased())
+    }
+
+    /// The server has finished answering. Whatever it did or didn't say is the
+    /// answer now, so the card stops waiting.
+    ///
+    /// A DID that arrived speaks for itself. Otherwise the server answered
+    /// about a real person and named no account — a guest — unless it told us
+    /// nobody holds the name at all, which says nothing about anybody.
+    func settleIdentityLookup(_ nickOrKey: String) {
+        let key = nickOrKey.lowercased()
+        guard identityLookups[key] == .inFlight else { return }
+        if didForNick(key) != nil {
+            // The answer named a DID: the binding is live-known this session.
+            identityLookups[key] = .answeredDid
+        } else if whoisNoSuchNick.contains(key) {
+            identityLookups.removeValue(forKey: key)
+        } else {
+            identityLookups[key] = .noAccount
+        }
+    }
+
+    /// What a card should assume about this nick right now.
+    func identityLookup(for nick: String) -> IdentityLookup {
+        identityLookups[nick.lowercased()] ?? .notAsked
+    }
+
+    /// True when the nick is in some channel roster right now.
+    func isNickPresent(_ nick: String) -> Bool {
+        channels.contains { ch in
+            ch.members.contains { $0.nick.caseInsensitiveCompare(nick) == .orderedSame }
+        }
+    }
+
+    /// The nick's DID, only when it is live-known: the nick is in a roster
+    /// right now, or a WHOIS answered with it this session. A binding
+    /// remembered earlier never votes on identity — the profile cache stays
+    /// for display, where staleness costs a name, not a claim.
+    func liveDidForNick(_ nick: String) -> String? {
+        let answered = identityLookups[nick.lowercased()] == .answeredDid
+        return (answered || isNickPresent(nick)) ? didForNick(nick) : nil
+    }
+
+    /// The lookup state in the SDK's vocabulary, for the claim functions.
+    func personLookup(for nick: String) -> PersonLookup {
+        let key = nick.lowercased()
+        switch identityLookups[key] {
+        case .inFlight: return .inFlight
+        case .noAccount: return .noAccount
+        default: return whoisNoSuchNick.contains(key) ? .noSuchNick : .notAsked
+        }
+    }
+
     // Message notifications now live in NotificationManager (permission,
     // active/focus gating, click-to-focus, inline reply). See
     // handleEvent(_:) message routing for the call sites.
@@ -1848,7 +1943,7 @@ extension AppState {
                 isEdited: msg.edited,
                 isSigned: msg.isSigned,
                 isEncrypted: wasEncrypted,
-                origin: msg.origin,
+                origin: msg.origin, account: msg.account,
                 editOf: msg.editOf,
                 coordination: msg.coordination.map {
                     CoordinationInfo(
@@ -2106,6 +2201,11 @@ extension AppState {
                 UserDefaults.standard.set(newNick, forKey: "freeq.nick")
             }
             profileCache.renameUser(from: oldNick, to: newNick)
+            // An identity answer is about a nick, and a rename moves the nick.
+            // Drop both sides rather than let one person's answer describe
+            // whoever picks the name up next.
+            identityLookups.removeValue(forKey: oldNick.lowercased())
+            identityLookups.removeValue(forKey: newNick.lowercased())
             // Keep DID-keyed thread labels current across the rename.
             if let did = profileCache.did(for: newNick) {
                 didDisplayNames[did] = newNick
@@ -2180,7 +2280,17 @@ extension AppState {
                 }
             }
 
+        // The server has finished. A card that was waiting has its answer now,
+        // whatever the answer turned out to be.
+        case .whoisEnd(let whoisNick):
+            settleIdentityLookup(whoisNick)
+
         case .whoisReply(let whoisNick, let info):
+            // "No such nick" is an answer about the name, not about a person:
+            // an unheld name has nobody to have an account.
+            if info.contains("No such nick") {
+                noteWhoisNoSuchNick(nick: whoisNick)
+            }
             // Parse WHOIS for DID: "nick is authenticated as did:plc:xxx"
             // Or "nick is logged in as did:plc:xxx"
             if info.contains("authenticated as ") || info.contains("logged in as ") {

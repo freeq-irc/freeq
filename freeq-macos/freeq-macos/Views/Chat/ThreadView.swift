@@ -86,10 +86,16 @@ struct ThreadMessageRow: View {
     @Environment(AppState.self) private var appState
     let message: ChatMessage
     let isRoot: Bool
+    @State private var proofRequest: ProofRequest?
+    @State private var profileNick: MentionTarget?
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
-            AvatarView(nick: message.from, size: isRoot ? 28 : 22)
+            Button { profileNick = MentionTarget(nick: message.from, origin: message.origin, account: message.account, rowTime: message.timestamp, senderPresent: appState.isNickPresent(message.from)) } label: {
+                AvatarView(nick: message.from, size: isRoot ? 28 : 22)
+            }
+            .buttonStyle(.plain)
+            .help("View profile")
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     Text(message.from)
@@ -106,6 +112,36 @@ struct ThreadMessageRow: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, isRoot ? 10 : 6)
+        // The same two questions the main list answers, reachable here too.
+        .contextMenu {
+            Button("View Profile") { profileNick = MentionTarget(nick: message.from, origin: message.origin, account: message.account, rowTime: message.timestamp, senderPresent: appState.isNickPresent(message.from)) }
+            Button("Verify Signature") { proofRequest = .verify(message.id) }
+        }
+        .sheet(item: $proofRequest) { request in
+            VerifiedProofSheet(
+                did: appState.liveDidForNick(message.from),
+                nick: message.from,
+                origin: message.origin,
+                msgId: request.msgId,
+                signed: message.isSigned,
+                account: message.account,
+                rowTimeUnix: UInt64(message.timestamp.timeIntervalSince1970),
+                senderPresent: appState.isNickPresent(message.from),
+                rowMsgId: message.id,
+                rowSigned: message.isSigned
+            )
+            .environment(appState)
+        }
+        .sheet(item: $profileNick) { target in
+            UserProfileSheet(
+                nick: target.nick,
+                origin: target.origin,
+                account: target.account,
+                rowTime: target.rowTime,
+                senderPresent: target.senderPresent
+            )
+            .environment(appState)
+        }
         if isRoot {
             Divider().padding(.leading, 16)
         }

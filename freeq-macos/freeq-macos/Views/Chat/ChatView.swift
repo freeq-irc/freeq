@@ -247,8 +247,15 @@ struct ChannelWelcomeView: View {
                     if let topic = channel?.topic, !topic.isEmpty {
                         contextPill(icon: "quote.bubble.fill", text: topic)
                     }
-                } else if let did = ProfileCache.shared.did(for: displayName) {
-                    contextPill(icon: "checkmark.seal.fill", text: did.hasPrefix("did:key:") ? "Verified identity" : "Bluesky identity")
+                } else if let did = appState.didForNick(displayName),
+                          claimForPerson(input: PersonClaimInput(
+                              binding: did,
+                              seenOnlyViaPeer: false,
+                              viaPeerOrigin: nil,
+                              viaPeerHadAccount: false,
+                              lookup: .notAsked
+                          )).state == .atProtocol {
+                    contextPill(icon: "checkmark.seal.fill", text: "AT Protocol identity")
                 }
             }
         }

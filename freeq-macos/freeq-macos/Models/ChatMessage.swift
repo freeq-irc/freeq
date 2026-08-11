@@ -18,6 +18,9 @@ struct ChatMessage: Identifiable, Equatable {
     // nil = locally-originated. Drives "via {origin}" + suppresses the local
     // verified/signed badges, which would overstate trust for a peer-vouched msg.
     var origin: String? = nil
+    // The sender's server-bound DID from the row's `account` tag, when one
+    // arrived. The row's own evidence for identity claims — never a cache.
+    var account: String? = nil
     // The original msgid this message replaces, when it arrived as an edit
     // (+draft/edit). A single logical message can surface under two msgids —
     // the original (used by the local cache, which edits in place) and the

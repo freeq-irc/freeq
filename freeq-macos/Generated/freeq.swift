@@ -2787,6 +2787,8 @@ public enum FreeqEvent {
     )
     case whoisReply(nick: String, info: String
     )
+    case whoisEnd(nick: String
+    )
     case notice(text: String
     )
     case disconnected(reason: String
@@ -2870,10 +2872,13 @@ public struct FfiConverterTypeFreeqEvent: FfiConverterRustBuffer {
         case 21: return .whoisReply(nick: try FfiConverterString.read(from: &buf), info: try FfiConverterString.read(from: &buf)
         )
         
-        case 22: return .notice(text: try FfiConverterString.read(from: &buf)
+        case 22: return .whoisEnd(nick: try FfiConverterString.read(from: &buf)
         )
         
-        case 23: return .disconnected(reason: try FfiConverterString.read(from: &buf)
+        case 23: return .notice(text: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 24: return .disconnected(reason: try FfiConverterString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -3008,13 +3013,18 @@ public struct FfiConverterTypeFreeqEvent: FfiConverterRustBuffer {
             FfiConverterString.write(info, into: &buf)
             
         
-        case let .notice(text):
+        case let .whoisEnd(nick):
             writeInt(&buf, Int32(22))
+            FfiConverterString.write(nick, into: &buf)
+            
+        
+        case let .notice(text):
+            writeInt(&buf, Int32(23))
             FfiConverterString.write(text, into: &buf)
             
         
         case let .disconnected(reason):
-            writeInt(&buf, Int32(23))
+            writeInt(&buf, Int32(24))
             FfiConverterString.write(reason, into: &buf)
             
         }

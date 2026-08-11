@@ -190,11 +190,12 @@ struct SigningKeyInfo: Equatable {
     let algorithm: String
     let source: String
 
-    /// Client-session keys mean the message was signed on the sender's own
-    /// device — true non-repudiation, not the server vouching.
-    var sourceLabel: String {
-        source == "client-session" ? "signed on their device" : "server-attested"
-    }
+    // No label is derived from `source`. It used to read "client-session" for
+    // a key a device had registered, and the sheet said so; since the durable
+    // key store landed it reads "key-store" for everything, and every key that
+    // endpoint can return was registered by a client anyway — so the
+    // distinction it once drew no longer exists. Who signed a message is the
+    // verdict's answer, and the verdict already gives it.
 
     /// Parse the `/api/v1/signing-keys/{did}` response body.
     static func from(json: [String: Any]) -> SigningKeyInfo? {

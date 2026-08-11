@@ -72,6 +72,7 @@ let package = Package(
                 "MessageActions.swift",
                 "OutboundSend.swift",
                 "DmResolver.swift",
+                "IdentityClaim.swift",
                 "Safety.swift",
                 "SelfStatus.swift",
                 "SignatureProof.swift",

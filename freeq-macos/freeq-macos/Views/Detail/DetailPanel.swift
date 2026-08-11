@@ -120,7 +120,17 @@ struct MemberRow: View {
     }
 
     private var hasDid: Bool {
-        member.did != nil || ProfileCache.shared.did(for: member.nick) != nil
+        // Only an AT Protocol identity earns the seal (IdentityClaim rule);
+        // a self-issued did:key does not.
+        // A roster row is a present person, so the cache lookup here is
+        // presence-gated by construction.
+        claimForPerson(input: PersonClaimInput(
+            binding: member.did ?? ProfileCache.shared.did(for: member.nick),
+            seenOnlyViaPeer: false,
+            viaPeerOrigin: nil,
+            viaPeerHadAccount: false,
+            lookup: .notAsked
+        )).showsMark
     }
 
     var body: some View {
@@ -170,7 +180,7 @@ struct MemberRow: View {
                         Image(systemName: "checkmark.seal.fill")
                             .font(.caption2)
                             .foregroundStyle(Theme.verified)
-                            .help("AT Protocol verified identity")
+                            .help("AT Protocol identity")
                     }
 
                     if member.isAway {

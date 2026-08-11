@@ -1,16 +1,10 @@
 import SwiftUI
 
-/// The differentiator, made tangible: the decentralized identifier that IS
-/// this person, the key their messages are signed with, and — when the reader
-/// asked about a specific message — what checking that message's signature
-/// actually came back as.
-///
-/// The answer leads when there is one. A checked verdict is what the reader
-/// asked for, so it is the first thing on screen and the identity cards sit
-/// underneath it; leading with a large green seal would let identity read as
-/// an answer about the signature, which it is not. Green is sender-device
-/// proof only: the server vouching for what it received is a fact worth
-/// stating, and it stays quiet (ruled 2026-08-07 — valid is not verified).
+/// Two different questions, one window, never blended: who this person is, or
+/// what checking one message's signature came back as. The request says which
+/// was asked, and the sheet answers only that — a claim about a person is not
+/// a claim about any message they sent. Mirrors Android's VerifiedProofSheet:
+/// same claims, same language.
 struct VerifiedProofSheet: View {
     /// The sender's DID, when we've resolved one. nil = a sender whose
     /// identity hasn't hydrated yet (key card is skipped).
@@ -18,8 +12,21 @@ struct VerifiedProofSheet: View {
     var handle: String? = nil
     var displayName: String? = nil
     var nick: String? = nil
+    /// The peer that relayed this sender's message, when it wasn't seen first
+    /// hand. Anything relayed is peer-vouched and claims nothing here.
+    var origin: String? = nil
     /// Set when the reader asked about one specific message.
     var msgId: String? = nil
+    /// Whether that message carries a signature at all.
+    var signed: Bool = true
+    /// The anchoring row's evidence, when opened from a row.
+    var account: String? = nil
+    var rowTimeUnix: UInt64? = nil
+    var senderPresent: Bool = false
+    /// The row the identity mark was clicked on, so its own verdict renders
+    /// beneath the identity — one sheet, content follows the message.
+    var rowMsgId: String? = nil
+    var rowSigned: Bool = false
 
     @Environment(\.dismiss) private var dismiss
     @Environment(AppState.self) private var appState
@@ -35,64 +42,35 @@ struct VerifiedProofSheet: View {
     private static let maxRetries = 2
     private static let retryDelay: Duration = .milliseconds(1200)
 
+    private var claim: IdentityClaim {
+        claimForSender(
+            input: MessageClaimInput(
+                account: account,
+                origin: origin,
+                senderPresent: senderPresent,
+                senderLiveDid: did,
+                rowTimeUnix: rowTimeUnix
+            ),
+            lookup: nick.map { appState.personLookup(for: $0) } ?? .notAsked
+        )
+    }
+
+    /// The message whose verdict this sheet renders: the explicit ask, or the
+    /// row the identity mark was clicked on when that row is signed.
+    private var verdictMsgId: String? { msgId ?? (rowSigned ? rowMsgId : nil) }
+
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(spacing: 16) {
                     if msgId != nil {
-                        messageVerdict
-                            .padding(.top, 20)
+                        messageProof
                     } else {
-                        seal
-                            .padding(.top, 20)
-                    }
-
-                    VStack(spacing: 4) {
-                        Text(displayName ?? handle.map { "@\($0)" } ?? nick ?? "Verified identity")
-                            .font(.title3.weight(.bold))
-                            .foregroundStyle(Theme.textPrimary)
-                            .multilineTextAlignment(.center)
-                        Text("Verified via the AT Protocol")
-                            .font(.caption)
-                            .foregroundStyle(Theme.verified)
-                    }
-
-                    Text("This is a real, self-owned identity: the identifier below is theirs, resolved through the AT Protocol, and nobody else can claim it.")
-                        .font(.subheadline)
-                        .foregroundStyle(Theme.textSecondary)
-                        .multilineTextAlignment(.center)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.horizontal, 8)
-
-                    if let did {
-                        proofCard(
-                            label: "Decentralized identifier",
-                            icon: "person.text.rectangle",
-                            value: did,
-                            detail: handle.map { "resolves to @\($0)" },
-                            copyable: true
-                        )
-                    } else {
-                        Text("This sender's identity hasn't resolved yet.")
-                            .font(.caption)
-                            .foregroundStyle(Theme.textTertiary)
-                    }
-
-                    if let key {
-                        proofCard(
-                            label: "Message signing key",
-                            icon: "signature",
-                            value: key.publicKey,
-                            detail: "\(key.algorithm.uppercased()) · \(key.sourceLabel)",
-                            copyable: false
-                        )
-                    } else if loadingKey && did != nil {
-                        ProgressView()
-                            .controlSize(.small)
-                            .padding(.vertical, 8)
+                        identityProof
                     }
                 }
                 .padding(.horizontal, 20)
+                .padding(.top, 20)
                 .padding(.bottom, 16)
             }
 
@@ -105,37 +83,136 @@ struct VerifiedProofSheet: View {
             }
             .padding(12)
         }
-        .frame(width: 380, height: 480)
+        // The window hugs its question: a one-glyph verdict doesn't get an
+        // identity-sized sheet of empty space under it.
+        .frame(width: 380, height: msgId != nil ? 320 : 480)
         .background(Theme.appBackground)
-        .task { await loadKey() }
-        .task { await loadVerification() }
-    }
-
-    /// The checked answer for one message — what the server said, in the words
-    /// every client uses for that state.
-    @ViewBuilder private var messageVerdict: some View {
-        let copy = answer.map { SignatureVerdict.copy($0, retrying: retriesLeft > 0) }
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: verdictIcon)
-                .font(.system(size: 20))
-                .foregroundStyle(verdictColor)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(copy?.heading ?? "Checking signature…")
-                    .font(.headline)
-                    .foregroundStyle(verdictColor)
-                Text(copy?.line ?? "Asking the server whether this message's signature holds up.")
-                    .font(.caption)
-                    .foregroundStyle(Theme.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer(minLength: 0)
-            if verifying {
-                ProgressView().controlSize(.small)
+        .task {
+            if msgId == nil {
+                // The identity question. If we can't name them yet, ask —
+                // otherwise this sheet would answer "unknown" without anyone
+                // having asked anything.
+                if claim.did == nil, origin == nil, let nick {
+                    appState.lookUpIdentity(nick: nick)
+                }
+                await loadKey()
+                if verdictMsgId != nil { await loadVerification() }
+            } else {
+                await loadVerification()
             }
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Theme.surfaceSoft))
+    }
+
+    // MARK: - Identity: who this person is, never a word about any message.
+
+    @ViewBuilder private var identityProof: some View {
+        if claim.showsMark {
+            seal
+        }
+
+        VStack(spacing: 4) {
+            Text(SenderIdentity.title(displayName: displayName, handle: handle, nick: nick))
+                .font(.title3.weight(.bold))
+                .foregroundStyle(Theme.textPrimary)
+                .multilineTextAlignment(.center)
+            // Every state that has words names itself. Only the resolvable
+            // claim wears the accent; the rest are ordinary facts and are
+            // coloured like ones. An ask still out shows as motion instead.
+            if claim.isPending {
+                ProgressView().controlSize(.small)
+            }
+            if let label = claim.label {
+                Text(label)
+                    .font(.caption)
+                    .foregroundStyle(claim.showsMark ? Theme.verified : Theme.textTertiary)
+            }
+        }
+
+        if !claim.needsKeyCard || key != nil || loadingKey, let claimLine {
+            Text(claimLine)
+                .font(.subheadline)
+                .foregroundStyle(Theme.textSecondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 8)
+        }
+
+        if let did = claim.did {
+            proofCard(
+                label: "Decentralized identifier",
+                icon: "person.text.rectangle",
+                value: did,
+                detail: handle.map { "resolves to @\($0)" },
+                copyable: true
+            )
+        }
+
+        if let key {
+            proofCard(
+                label: "Message signing key",
+                icon: "signature",
+                value: key.publicKey,
+                // Algorithm only. The old source suffix read "server-attested"
+                // for every key (the endpoint labels them all "key-store"),
+                // contradicting a device-signed verdict one card up. Trust
+                // language belongs to the verdict, which carries it already.
+                detail: key.algorithm.uppercased(),
+                copyable: false
+            )
+        } else if loadingKey && claim.did != nil {
+            ProgressView()
+                .controlSize(.small)
+                .padding(.vertical, 8)
+        }
+
+        if msgId == nil, verdictMsgId != nil {
+            Divider().padding(.vertical, 4)
+            messageProof
+        }
+    }
+
+    /// Same claims, same language as every client; the strings live in the
+    /// SDK's spec file and arrive rendered.
+    private var claimLine: String? { claim.line }
+
+    // MARK: - Message: one message's signature, and nothing else.
+
+    /// The checked answer for one message — what the server said, in the words
+    /// every client uses for that state. Whoever sent it is a separate
+    /// question with a separate surface, so nothing here identifies them.
+    ///
+    /// Same shape as the identity side, so the two read as one family: the
+    /// glyph carries the answer, the heading names it, one line says what it
+    /// means.
+    @ViewBuilder private var messageProof: some View {
+        let copy = answer.map { SignatureVerdict.copy($0, retrying: retriesLeft > 0) }
+        if verifying || answer == nil {
+            ProgressView()
+                .controlSize(.large)
+                .padding(.top, 16)
+        } else {
+            ZStack {
+                Circle()
+                    .fill(verdictColor.opacity(0.14))
+                    .frame(width: 88, height: 88)
+                    .blur(radius: 10)
+                Image(systemName: verdictIcon)
+                    .font(.system(size: 56, weight: .semibold))
+                    .foregroundStyle(verdictColor)
+            }
+        }
+
+        Text(copy?.heading ?? "Checking signature…")
+            .font(.title3.weight(.bold))
+            .foregroundStyle(Theme.textPrimary)
+            .multilineTextAlignment(.center)
+
+        Text(copy?.line ?? "Asking the server whether this message's signature holds up.")
+            .font(.subheadline)
+            .foregroundStyle(answer == nil ? Theme.textSecondary : verdictColor)
+            .multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 8)
     }
 
     private var verdictIcon: String {
@@ -217,7 +294,7 @@ struct VerifiedProofSheet: View {
     }
 
     private func loadKey() async {
-        guard let did else { loadingKey = false; return }
+        guard let did = claim.did else { loadingKey = false; return }
         defer { loadingKey = false }
         let base = ServerConfig.apiBaseUrl
         let enc = did.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? did
@@ -235,7 +312,12 @@ struct VerifiedProofSheet: View {
     /// — answering the request is what starts the fetch — so that answer is
     /// re-asked a couple of times before it settles into the plain can't-check.
     private func loadVerification() async {
-        guard let msgId else { return }
+        guard let msgId = verdictMsgId else { return }
+        guard self.msgId == nil ? rowSigned : signed else {
+            answer = VerifyAnswer(outcome: .unsigned)
+            retriesLeft = 0
+            return
+        }
         if let remembered = appState.checkedVerdicts[msgId] {
             answer = remembered
             retriesLeft = 0
@@ -269,4 +351,54 @@ struct VerifiedProofSheet: View {
         }
         return SignatureVerdict.parse(status: http.statusCode, body: data)
     }
+}
+
+// MARK: - Previews
+
+// Xcode's canvas renders these without building or running the app, which is
+// the only way to see a layout change in less than a build cycle. The key card
+// stays empty here — it comes from a live server — so what these show is the
+// claim, the label, and how the two lines wrap at this width.
+
+#Preview("Identity — AT Protocol") {
+    VerifiedProofSheet(
+        did: "did:plc:4qsyxmnsblo4luuycm3572bq",
+        handle: "chadfowler.com",
+        displayName: "Chad Fowler",
+        nick: "chad"
+    )
+    .environment(AppState())
+}
+
+#Preview("Identity — self-created") {
+    VerifiedProofSheet(
+        did: "did:key:z6MkpdyZFX7tagEUaCBp8bwVgqBqzvLEDdi8E",
+        nick: "lobot"
+    )
+    .environment(AppState())
+}
+
+#Preview("Identity — relayed") {
+    VerifiedProofSheet(
+        did: "did:plc:padwfc6z5dke5g7c3nzratdy",
+        displayName: "nandi-test",
+        nick: "nandi-test",
+        origin: "irc.freeq.at"
+    )
+    .environment(AppState())
+}
+
+#Preview("Identity — nobody on file") {
+    VerifiedProofSheet(did: nil, nick: "stranger")
+        .environment(AppState())
+}
+
+#Preview("Message — unsigned") {
+    VerifiedProofSheet(
+        did: "did:plc:4qsyxmnsblo4luuycm3572bq",
+        nick: "chad",
+        msgId: "01KZNZCW8V3AJX29S5M2256VJB",
+        signed: false
+    )
+    .environment(AppState())
 }
