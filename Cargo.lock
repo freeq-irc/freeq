@@ -2718,7 +2718,6 @@ dependencies = [
  "freeq-sdk",
  "hex",
  "image",
- "open",
  "ratatui",
  "ratatui-image",
  "reqwest 0.12.28",
