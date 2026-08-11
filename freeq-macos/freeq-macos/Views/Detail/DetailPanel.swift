@@ -347,13 +347,27 @@ struct DMProfilePanel: View {
 
                         HStack(spacing: 8) {
                             statusPill
-                            if knownDid != nil {
-                                Label("Verified", systemImage: "checkmark.seal.fill")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(Theme.verified)
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 4)
-                                    .background(Capsule().fill(Theme.verified.opacity(0.10)))
+                            // The chip is the claim, in the settled vocabulary —
+                            // the thread's own DID is a structural fact and counts
+                            // as a binding on DM surfaces (ruled 2026-08-11). Only
+                            // an AT Protocol identity wears the seal; a self-issued
+                            // key reads as itself, neutrally; no DID, no chip.
+                            if let did = knownDid {
+                                let claim = claimForPerson(input: PersonClaimInput(
+                                    binding: did,
+                                    seenOnlyViaPeer: false,
+                                    viaPeerOrigin: nil,
+                                    viaPeerHadAccount: false,
+                                    lookup: .notAsked
+                                ))
+                                if let label = claim.label {
+                                    Label(label, systemImage: claim.showsMark ? "checkmark.seal.fill" : "person.text.rectangle")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(claim.showsMark ? Theme.verified : Theme.textSecondary)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(Capsule().fill((claim.showsMark ? Theme.verified : Theme.textSecondary).opacity(0.10)))
+                                }
                             }
                         }
                     }

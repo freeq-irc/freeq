@@ -21,6 +21,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.freeq.model.DidDisplay
 import com.freeq.model.ChatMessage
 import com.freeq.model.AppState
 import com.freeq.model.AvatarCache
@@ -59,6 +60,14 @@ fun UserProfileSheet(
         appState.didForNick(nick)
     }
     val isBlocked = appState.isBlocked(nick, resolvedDid)
+    // A DM thread's key is the peer's DID — a structural fact of the thread,
+    // not a cache guess — so it counts as a binding here (ruled 2026-08-11,
+    // matching web's DM panel).
+    val liveBinding = when {
+        isOwnProfile -> appState.authenticatedDID.value
+        DidDisplay.isDid(nick) -> nick
+        else -> appState.liveDidForNick(nick)
+    }
     // The SDK owns the precedence: live identity first, then the anchoring
     // row's evidence, then the lookup machine. A binding remembered from an
     // earlier session never votes — that hole is how the same absent sender
@@ -68,7 +77,7 @@ fun UserProfileSheet(
             account = anchor?.account,
             origin = origin,
             senderPresent = appState.isNickPresent(nick),
-            senderLiveDid = if (isOwnProfile) appState.authenticatedDID.value else appState.liveDidForNick(nick),
+            senderLiveDid = liveBinding,
             rowTimeUnix = anchor?.timestamp?.let { (it.time / 1000).toULong() },
         ),
         appState.personLookup(nick),
@@ -406,7 +415,7 @@ fun UserProfileSheet(
                 account = anchor?.account,
                 rowTimeUnix = anchor?.timestamp?.let { (it.time / 1000).toULong() },
                 senderPresent = appState.isNickPresent(nick),
-                senderLiveDid = if (isOwnProfile) appState.authenticatedDID.value else appState.liveDidForNick(nick),
+                senderLiveDid = liveBinding,
             ),
             onDismiss = { showIdentityProof = false },
             appState = appState
