@@ -1749,58 +1749,88 @@ class AppState: ObservableObject {
         getOrCreateChannel(channel).isEncrypted = true
     }
 
+    /// Who a first DM is really for, learned before it goes out. Wired
+    /// lazily so init stays untouched; every use is main-thread.
+    lazy var dmResolver = DmResolver(
+        nickToDid: { [weak self] nick in self?.didForNick(nick) },
+        askWhois: { [weak self] nick in try? self?.client?.requestWhois(nick: nick) }
+    )
+
     func sendMessage(target: String, text: String) -> Bool {
         guard !text.isEmpty else { return false }
-        // Channel E2EE: relay ciphertext with the `+encrypted` tag (matches
-        // web + macOS). The echo cache restores our plaintext on echo.
-        if target.hasPrefix("#"), let wire = channelE2ee.outgoing(text: text, channel: target) {
-            if let editing = editingMessage {
-                sendRaw("@+draft/edit=\(editing.id);+encrypted PRIVMSG \(target) :\(wire)")
-                editingMessage = nil
-            } else if let reply = replyingTo {
-                sendRaw("@+reply=\(reply.id);+encrypted PRIVMSG \(target) :\(wire)")
-                replyingTo = nil
-            } else {
-                sendRaw("@+encrypted PRIVMSG \(target) :\(wire)")
-            }
-            return true
-        }
-        // Clear typing indicator for remote users
-        sendRaw("@+typing=done TAGMSG \(target)")
-        lastTypingSent = .distantPast
-
-        let wireText = text.replacingOccurrences(of: "\r", with: "")
-        let isMultiline = wireText.contains("\n")
-        let encoded = isMultiline ? wireText.replacingOccurrences(of: "\n", with: "\\n") : wireText
-        let multilineTag = isMultiline ? ";+freeq.at/multiline" : ""
-
-        // Edit + reply paths go through sendRaw because the FFI doesn't
-        // expose typed send_reply/send_edit yet. For those, encode `\n`
-        // as the legacy `+freeq.at/multiline` inline form so multi-line
-        // content survives a single PRIVMSG — receivers (web app, TUI,
-        // freeq-aware mobile) decode the tag on render.
+        // What this press of Send actually is; the typed senders sign it and
+        // file an event id. Nothing message-bearing goes out as a raw line.
+        let send: OutboundSend
         if let editing = editingMessage {
-            sendRaw("@+draft/edit=\(editing.id)\(multilineTag) PRIVMSG \(target) :\(encoded)")
+            send = .edit(target: target, msgId: editing.id, text: text)
             editingMessage = nil
-            return true
-        }
-
-        if let reply = replyingTo {
-            sendRaw("@+reply=\(reply.id)\(multilineTag) PRIVMSG \(target) :\(encoded)")
+        } else if let reply = replyingTo {
+            send = .reply(target: target, msgId: reply.id, text: text)
             replyingTo = nil
-            return true
+        } else {
+            send = .plain(target: target, text: text)
         }
+        try? client?.typingStop(target: target)
+        lastTypingSent = .distantPast
+        dispatch(send)
+        return true
+    }
 
-        // Plain send: pass text as-is. The FFI calls Rust SDK's privmsg,
-        // which auto-routes `\n`-bearing text to a draft/multiline BATCH
-        // when the server acked the cap — one logical message, msgid
-        // coherence for edits / reactions / replies.
+    /// `/me` as a CTCP ACTION. The framing lives in the body, so the SDK
+    /// signs it as the ordinary message it is. Never encrypted: a ciphertext
+    /// body would reach readers as literal control characters.
+    func sendAction(to target: String, text: String) {
+        dispatch(.plain(target: target, text: "\u{01}ACTION \(text)\u{01}"), encrypt: false)
+    }
+
+    /// One send, addressed to the venue a signature can name. Channels and
+    /// known peers never suspend; only a first DM to a nick nobody has asked
+    /// about waits briefly for the WHOIS answer, and goes out at the nick
+    /// unchanged if none comes.
+    func dispatch(_ send: OutboundSend, encrypt: Bool = true) {
+        if let venue = dmResolver.venueIfSettled(send.target) {
+            transmit(send.addressed(to: venue), encrypt: encrypt)
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let venue = await self.dmResolver.resolve(send.target)
+            self.transmit(send.addressed(to: venue), encrypt: encrypt)
+        }
+    }
+
+    /// The only path to the wire for message-bearing sends — the SDK's typed
+    /// senders, which sign. An E2EE body travels as ciphertext under the
+    /// `+encrypted` tag, so the signature covers the bytes that actually go
+    /// out; the echo cache restores our plaintext on server echo. Multiline
+    /// passes through untouched — the SDK routes it into a draft/multiline
+    /// BATCH itself, one logical message.
+    private func transmit(_ send: OutboundSend, encrypt: Bool) {
+        guard let client else {
+            DispatchQueue.main.async { self.errorMessage = "Send failed" }
+            return
+        }
         do {
-            try client?.sendMessage(target: target, text: wireText)
-            return true
+            let wireText = send.text.replacingOccurrences(of: "\r", with: "")
+            if encrypt, send.target.hasPrefix("#"),
+               let wire = channelE2ee.outgoing(text: wireText, channel: send.target) {
+                try client.sendTagged(
+                    target: send.target,
+                    text: wire,
+                    tags: send.encryptedTags.map { TagEntry(key: $0.key, value: $0.value) }
+                )
+                return
+            }
+            switch send {
+            case .plain(let target, _):
+                try client.sendMessage(target: target, text: wireText)
+            case .edit(let target, let msgId, _):
+                try client.editMessage(target: target, msgid: msgId, newText: wireText)
+            case .reply(let target, let msgId, _):
+                try client.reply(target: target, msgid: msgId, text: wireText)
+            }
         } catch {
             DispatchQueue.main.async { self.errorMessage = "Send failed" }
-            return false
         }
     }
 
@@ -1843,12 +1873,16 @@ class AppState: ObservableObject {
         // `applyReaction` is idempotent (Set keyed by nick), so the inbound
         // echo (if any) is a no-op.
         bufferForSend(target).applyReaction(msgId: msgId, emoji: emoji, from: nick)
-        sendRaw("@+react=\(emoji);+reply=\(msgId) TAGMSG \(target)")
+        do { try client?.react(target: target, emoji: emoji, msgid: msgId) } catch {
+            DispatchQueue.main.async { self.errorMessage = "Reaction failed" }
+        }
     }
 
     func sendUnreaction(target: String, msgId: String, emoji: String) {
         bufferForSend(target).removeReaction(msgId: msgId, emoji: emoji, from: nick)
-        sendRaw("@+freeq.at/unreact=\(emoji);+reply=\(msgId) TAGMSG \(target)")
+        do { try client?.unreact(target: target, emoji: emoji, msgid: msgId) } catch {
+            DispatchQueue.main.async { self.errorMessage = "Reaction failed" }
+        }
     }
 
     /// Toggle the current user's reaction on a message: react if absent, unreact if present.
@@ -1861,7 +1895,9 @@ class AppState: ObservableObject {
     }
 
     func deleteMessage(target: String, msgId: String) {
-        sendRaw("@+draft/delete=\(msgId) TAGMSG \(target)")
+        do { try client?.deleteMessage(target: target, msgid: msgId) } catch {
+            DispatchQueue.main.async { self.errorMessage = "Delete failed" }
+        }
         // Apply the local row removal only after the context menu's dismissal
         // fully settles. The visual change from an edit works because its
         // echo lands seconds after the menu is gone; a mutation during the
@@ -1878,7 +1914,7 @@ class AppState: ObservableObject {
         let now = Date()
         guard now.timeIntervalSince(lastTypingSent) > 3 else { return }
         lastTypingSent = now
-        sendRaw("@+typing=active TAGMSG \(target)")
+        try? client?.typingStart(target: target)
     }
 
     func requestHistory(channel: String, before: Date? = nil) {
@@ -2864,7 +2900,14 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                 for msg in sorted { dm.appendIfNew(msg) }
             }
 
+        case .whoisEnd:
+            // The server finished a WHOIS. The identity surfaces consume
+            // this in the identity port; the resolver's timeout already
+            // bounds the DM wait.
+            break
+
         case .memberDid(let bindNick, let bindDid):
+            state.dmResolver.learned(nick: bindNick, did: bindDid)
             // A nick↔DID binding was learned (join/whois/account tag): record
             // it and fold any nick-keyed DM thread into the DID-keyed one —
             // a cold first DM keys by nick until the peer's reply teaches

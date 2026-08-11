@@ -656,7 +656,7 @@ struct ComposeView: View {
             }
         case "me":
             if let action = parts.dropFirst().first, let target = appState.activeChannel {
-                appState.sendRaw("PRIVMSG \(target) :\u{01}ACTION \(action)\u{01}")
+                appState.sendAction(to: target, text: String(action))
             }
         case "msg":
             let msgParts = input.dropFirst(5).split(separator: " ", maxSplits: 1)
