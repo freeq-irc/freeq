@@ -1044,12 +1044,18 @@ function Reactions({ msg, channel }: { msg: Message; channel: string }) {
 
 // ── Typing indicator ──
 
-function TypingIndicatorBar({ channel }: { channel: string }) {
-  const channels = useStore((s) => s.channels);
-  const ch = channels.get(channel.toLowerCase());
-  if (!ch) return null;
+/**
+ * Who is composing in the buffer on screen. Mounted between the transcript
+ * and the composer — inside the scrolling transcript it would sit below the
+ * last message, off the bottom of a reader's view, which is exactly where it
+ * used to be.
+ */
+export function TypingIndicatorBar() {
+  const activeChannel = useStore((s) => s.activeChannel);
+  const ch = useStore((s) => s.channels.get(s.activeChannel.toLowerCase()));
+  if (!ch || activeChannel === 'server') return null;
 
-  const typers = [...ch.members.values()].filter((m) => m.typing).map((m) => m.nick);
+  const typers = [...ch.typingUsers.values()].map((t) => t.nick);
   if (typers.length === 0) return null;
 
   const text = typers.length === 1
@@ -1491,7 +1497,6 @@ export function MessageList() {
           </div>
           );
         })}
-        <TypingIndicatorBar channel={activeChannel} />
       </div>
 
       {/* Scroll to bottom button */}

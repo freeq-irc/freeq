@@ -5,7 +5,7 @@ import { setUnreadCount } from './lib/notifications';
 import { ConnectScreen } from './components/ConnectScreen';
 import { Sidebar } from './components/Sidebar';
 import { TopBar } from './components/TopBar';
-import { MessageList } from './components/MessageList';
+import { MessageList, TypingIndicatorBar } from './components/MessageList';
 import { ComposeBox } from './components/ComposeBox';
 import { MemberList } from './components/MemberList';
 import { QuickSwitcher } from './components/QuickSwitcher';
@@ -266,6 +266,7 @@ export default function App() {
           />
           <CallPanel />
           <MessageList />
+          <TypingIndicatorBar />
           <ComposeBox />
         </main>
         {/* Member/profile list — inline on desktop, overlay on mobile */}

@@ -4,6 +4,10 @@ import { setLastReadMsgId } from './lib/db';
 
 // ── Types ──
 
+/** How long a single `+typing=active` stands for. Senders refresh every 3
+ *  seconds, so this only expires someone who stopped without saying so. */
+export const TYPING_TIMEOUT_MS = 10_000;
+
 export interface Message {
   id: string;
   from: string;
@@ -71,6 +75,15 @@ export interface Channel {
   lastReadMsgId?: string; // last message seen when channel was active
   isJoined: boolean;
   pins: PinnedMessage[];
+  /** Who is composing here, keyed by lowercased nick. A DM peer is on no
+   *  member roster, so this cannot hang off {@link Member}. */
+  typingUsers: Map<string, TypingUser>;
+}
+
+/** One typer: the nick as it came off the wire, and when we last heard it. */
+export interface TypingUser {
+  nick: string;
+  at: number;
 }
 
 interface Batch {
@@ -331,6 +344,7 @@ function getOrCreateChannel(channels: Map<string, Channel>, name: string): Chann
       mentionCount: 0,
       isJoined: false,
       pins: [],
+      typingUsers: new Map(),
     };
     channels.set(key, ch);
   }
@@ -532,6 +546,7 @@ export const useStore = create<Store>((set, get) => ({
       isHalfop: member.isHalfop ?? existing?.isHalfop ?? false,
       isVoiced: member.isVoiced ?? existing?.isVoiced ?? false,
       away: existing?.away,
+      typing: existing?.typing,
       actorClass: member.actorClass ?? existing?.actorClass,
     });
     channels.set(channel.toLowerCase(), ch);
@@ -557,6 +572,7 @@ export const useStore = create<Store>((set, get) => ({
         isHalfop: member.isHalfop ?? false,
         isVoiced: member.isVoiced ?? false,
         away: existing?.away,
+        typing: existing?.typing,
         actorClass: member.actorClass ?? existing?.actorClass,
       });
     }
@@ -569,7 +585,9 @@ export const useStore = create<Store>((set, get) => ({
     const ch = channels.get(channel.toLowerCase());
     if (ch) {
       ch.members.delete(nick.toLowerCase());
-      channels.set(channel.toLowerCase(), ch);
+      const typingUsers = new Map(ch.typingUsers);
+      typingUsers.delete(nick.toLowerCase());
+      channels.set(channel.toLowerCase(), { ...ch, typingUsers });
     }
     return { channels };
   }),
@@ -577,7 +595,14 @@ export const useStore = create<Store>((set, get) => ({
   removeUserFromAll: (nick, reason) => set((s) => {
     const channels = new Map(s.channels);
     for (const [key, ch] of channels) {
-      if (ch.members.has(nick.toLowerCase())) {
+      const wasMember = ch.members.has(nick.toLowerCase());
+      // Someone who left mid-word is not still typing — including in a DM,
+      // where there is no roster entry to remove.
+      const wasTyping = ch.typingUsers.has(nick.toLowerCase());
+      if (!wasMember && !wasTyping) continue;
+      const typingUsers = new Map(ch.typingUsers);
+      typingUsers.delete(nick.toLowerCase());
+      if (wasMember) {
         ch.members.delete(nick.toLowerCase());
         ch.messages = [...ch.messages, {
           id: crypto.randomUUID(),
@@ -587,8 +612,8 @@ export const useStore = create<Store>((set, get) => ({
           tags: {},
           isSystem: true,
         }];
-        channels.set(key, { ...ch });
       }
+      channels.set(key, { ...ch, typingUsers });
     }
     // Drop the cached WHOIS identity for this nick. The nick is now
     // freed and could be claimed by an entirely different account; a
@@ -603,11 +628,18 @@ export const useStore = create<Store>((set, get) => ({
     const channels = new Map(s.channels);
     for (const [key, ch] of channels) {
       const member = ch.members.get(oldNick.toLowerCase());
+      const typer = ch.typingUsers.get(oldNick.toLowerCase());
+      if (!member && !typer) continue;
       if (member) {
         ch.members.delete(oldNick.toLowerCase());
         ch.members.set(newNick.toLowerCase(), { ...member, nick: newNick });
-        channels.set(key, ch);
       }
+      const typingUsers = new Map(ch.typingUsers);
+      if (typer) {
+        typingUsers.delete(oldNick.toLowerCase());
+        typingUsers.set(newNick.toLowerCase(), { ...typer, nick: newNick });
+      }
+      channels.set(key, { ...ch, typingUsers });
     }
     // Move the WHOIS cache entry to the new nick. The same human is
     // behind it; the old nick must not still resolve to their DID
@@ -636,27 +668,34 @@ export const useStore = create<Store>((set, get) => ({
   }),
 
   setTyping: (channel, nick, typing) => {
+    const key = channel.toLowerCase();
+    const who = nick.toLowerCase();
+    const at = Date.now();
     set((s) => {
+      // Our own typing comes back from the server on the echo. We are not
+      // news to ourselves, and the roster would label us "typing" too.
+      if (who === s.nick.toLowerCase()) return {};
       const channels = new Map(s.channels);
-      const ch = channels.get(channel.toLowerCase());
-      if (ch) {
-        const member = ch.members.get(nick.toLowerCase());
-        if (member) {
-          ch.members.set(nick.toLowerCase(), { ...member, typing });
-          channels.set(channel.toLowerCase(), { ...ch });
-        }
-      }
+      const ch = channels.get(key);
+      if (!ch) return { channels };
+      const typingUsers = new Map(ch.typingUsers);
+      if (typing) typingUsers.set(who, { nick, at });
+      else typingUsers.delete(who);
+      // The roster flag drives the member list; it exists only for people we
+      // have a roster entry for, which is why it cannot be the only record.
+      const member = ch.members.get(who);
+      if (member) ch.members.set(who, { ...member, typing });
+      channels.set(key, { ...ch, typingUsers });
       return { channels };
     });
-    // Auto-clear typing after 10 seconds if not refreshed
+    // A client that goes quiet mid-word never sends `done`. Each `active`
+    // carries its own expiry and only ever clears the state it wrote, so a
+    // refresh 3 seconds later leaves the indicator up rather than blinking.
     if (typing) {
       setTimeout(() => {
-        const s = useStore.getState();
-        const ch = s.channels.get(channel.toLowerCase());
-        if (ch?.members.get(nick.toLowerCase())?.typing) {
-          useStore.getState().setTyping(channel, nick, false);
-        }
-      }, 10_000);
+        const entry = useStore.getState().channels.get(key)?.typingUsers.get(who);
+        if (entry?.at === at) useStore.getState().setTyping(channel, nick, false);
+      }, TYPING_TIMEOUT_MS);
     }
   },
 
@@ -732,6 +771,7 @@ export const useStore = create<Store>((set, get) => ({
       mentionCount: 0,
       isJoined: false,
       pins: [],
+      typingUsers: new Map(),
     };
     // Always produce a fresh Channel object so subscribers comparing
     // channel identity (Sidebar, MessageList children, etc.) see a new
