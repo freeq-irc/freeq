@@ -2461,9 +2461,17 @@ where
                                     // tag (a cold first DM would otherwise key
                                     // by nick until too late) and announce a
                                     // new binding so consumers can merge.
-                                    if !target.starts_with('#')
-                                        && !target.starts_with('&')
-                                        && !from.eq_ignore_ascii_case(&own_nick)
+                                    //
+                                    // Learned from whatever venue the message
+                                    // arrived through. The server stamps the
+                                    // tag for any sender holding an account, so
+                                    // a channel message carries the same
+                                    // binding a DM does — and for a session
+                                    // that joined after the sender was already
+                                    // there, it is the only one it will ever
+                                    // get: it saw no extended JOIN, and NAMES
+                                    // carries no DIDs.
+                                    if !from.eq_ignore_ascii_case(&own_nick)
                                         && let Some(did) = tags.get("account")
                                         && crate::address::is_did(did)
                                         && did_maps.lock().learn(&from, did)
@@ -2488,6 +2496,24 @@ where
                                     .unwrap_or("")
                                     .to_string();
                                 let target = msg.params[0].clone();
+                                // A TAGMSG carries the same server-stamped
+                                // account tag a PRIVMSG does — a delete is
+                                // relayed with one — so it names its sender
+                                // just as well. The JS SDK learns here too;
+                                // leaving it out would mean a peer known to
+                                // one client and nameless to the other.
+                                if !from.eq_ignore_ascii_case(&own_nick)
+                                    && let Some(did) = msg.tags.get("account")
+                                    && crate::address::is_did(did)
+                                    && did_maps.lock().learn(&from, did)
+                                {
+                                    let _ = event_tx
+                                        .send(Event::MemberDid {
+                                            nick: from.clone(),
+                                            did: did.clone(),
+                                        })
+                                        .await;
+                                }
                                 let dm_key = dm_key_for(&did_maps, &own_nick, &from, &target);
                                 let _ = event_tx.send(Event::TagMsg { from, target, tags: msg.tags.clone(), dm_key }).await;
                             }
