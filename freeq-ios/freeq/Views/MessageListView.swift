@@ -673,8 +673,11 @@ struct MessageListView: View {
 
             if showHeader {
                 HStack(alignment: .top, spacing: 12) {
-                    // Avatar
-                    UserAvatar(nick: msg.from, size: 40)
+                    // Avatar — opens the person's card, same as the name.
+                    Button(action: { profileTarget = ProfileNickTarget(nick: msg.from, origin: msg.origin, account: msg.account, rowTime: msg.timestamp) }) {
+                        UserAvatar(nick: msg.from, size: 40)
+                    }
+                    .buttonStyle(.plain)
 
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(alignment: .firstTextBaseline, spacing: 8) {

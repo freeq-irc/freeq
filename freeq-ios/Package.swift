@@ -23,6 +23,27 @@ let package = Package(
         .target(
             name: "FreeqIosCore",
             path: "freeq/Models",
+            // App-only files in the same directory (UIKit/CallKit/Keychain
+            // dependencies) — named so SwiftPM doesn't warn about them.
+            // Mirrors the macOS package.
+            exclude: [
+                "AppState.swift",
+                "AppState+Navigation.swift",
+                "AuthSession.swift",
+                "AvatarCache.swift",
+                "AvStartRace.swift",
+                "BlueskyGraph.swift",
+                "CallCameraCapture.swift",
+                "CallKitManager.swift",
+                "CallMicCapture.swift",
+                "IntelligenceService.swift",
+                "KeychainHelper.swift",
+                "NetworkMonitor.swift",
+                "Notifications.swift",
+                "PhoneWatchBridge.swift",
+                "StepUpAuth.swift",
+                "VoiceTranscriber.swift",
+            ],
             sources: [
                 "ChatMessage.swift",
                 "CoordinationCard.swift",

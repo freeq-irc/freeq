@@ -14,7 +14,10 @@ import Foundation
 ///
 /// Not thread-safe by design: every caller — the event handler and the send
 /// path alike — runs on the main thread, and the timeout fires there too.
-final class DmResolver {
+/// `@unchecked Sendable` states that contract to the compiler: the only
+/// cross-boundary capture is the main-queue timeout closure, which runs on
+/// the same thread as every other caller.
+final class DmResolver: @unchecked Sendable {
     /// Long enough for a WHOIS round trip, short enough that a silent peer
     /// does not feel like a hung send.
     static let defaultTimeout: TimeInterval = 2
