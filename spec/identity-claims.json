@@ -151,6 +151,59 @@
       "expect": { "state": "guest", "did": null, "line": "No account — just a nickname on this server. Nothing they send is signed." }
     }
   ],
+  "sender_vectors": [
+    {
+      "_comment": "claim_for_sender: a person surface anchored to a message (profile sheet or popover opened from a row). Live identity first, then the message's own evidence, then the lookup machine. Differs from the row rule in exactly one place: a live-known DID outranks the row's tag, because this surface answers who the person is NOW.",
+      "name": "s_account_tag_answers_without_any_ask",
+      "input": { "account": "did:plc:k2n3e2vsihf3farequ44t5j7", "origin": null, "sender_present": false, "sender_live_did": null, "row_time_unix": 1786320000, "lookup": "notAsked" },
+      "expect": { "state": "atProtocol", "did": "did:plc:k2n3e2vsihf3farequ44t5j7", "line": "This is a real, self-owned identity. Its owner holds the key below and signs everything they send — so anyone can prove a message really came from them, on freeq or anywhere else on the network." }
+    },
+    {
+      "name": "s_relayed_senders_never_wait_on_a_local_ask",
+      "input": { "account": null, "origin": "irc.freeq.at", "sender_present": false, "sender_live_did": null, "row_time_unix": 1786320000, "lookup": "inFlight" },
+      "expect": { "state": "guest", "did": null, "line": "No account — just a nickname on irc.freeq.at. Nothing they send is signed." }
+    },
+    {
+      "name": "s_person_surface_live_identity_beats_the_row_tag",
+      "input": { "account": "did:plc:oldaccountaaaaaaaaaaaaa", "origin": null, "sender_present": true, "sender_live_did": "did:plc:newaccountbbbbbbbbbbbbb", "row_time_unix": 1786320000, "lookup": "notAsked" },
+      "expect": { "state": "atProtocol", "did": "did:plc:newaccountbbbbbbbbbbbbb", "line": "This is a real, self-owned identity. Its owner holds the key below and signs everything they send — so anyone can prove a message really came from them, on freeq or anywhere else on the network." }
+    },
+    {
+      "name": "s_whois_answered_did_counts_as_live_even_for_an_absent_sender",
+      "input": { "account": null, "origin": null, "sender_present": false, "sender_live_did": "did:plc:k2n3e2vsihf3farequ44t5j7", "row_time_unix": 1786320000, "lookup": "notAsked" },
+      "expect": { "state": "atProtocol", "did": "did:plc:k2n3e2vsihf3farequ44t5j7", "line": "This is a real, self-owned identity. Its owner holds the key below and signs everything they send — so anyone can prove a message really came from them, on freeq or anywhere else on the network." }
+    },
+    {
+      "name": "s_post_epoch_evidence_answers_while_the_ask_is_still_out",
+      "input": { "account": null, "origin": null, "sender_present": false, "sender_live_did": null, "row_time_unix": 1786320000, "lookup": "inFlight" },
+      "expect": { "state": "guest", "did": null, "line": "No account — just a nickname on this server. Nothing they send is signed." }
+    },
+    {
+      "name": "s_post_epoch_evidence_survives_the_sender_disconnecting",
+      "input": { "account": null, "origin": null, "sender_present": false, "sender_live_did": null, "row_time_unix": 1786320000, "lookup": "noSuchNick" },
+      "expect": { "state": "guest", "did": null, "line": "No account — just a nickname on this server. Nothing they send is signed." }
+    },
+    {
+      "name": "s_present_unbound_is_a_guest_without_waiting",
+      "input": { "account": null, "origin": null, "sender_present": true, "sender_live_did": null, "row_time_unix": 1786320000, "lookup": "inFlight" },
+      "expect": { "state": "guest", "did": null, "line": "No account — just a nickname on this server. Nothing they send is signed." }
+    },
+    {
+      "name": "s_pre_epoch_defers_to_the_ask_while_pending",
+      "input": { "account": null, "origin": null, "sender_present": false, "sender_live_did": null, "row_time_unix": 1750000000, "lookup": "inFlight" },
+      "expect": { "state": "lookingUp", "did": null, "line": null }
+    },
+    {
+      "name": "s_pre_epoch_ask_answered_no_account",
+      "input": { "account": null, "origin": null, "sender_present": false, "sender_live_did": null, "row_time_unix": 1750000000, "lookup": "noAccount" },
+      "expect": { "state": "guest", "did": null, "line": "No account — just a nickname on this server. Nothing they send is signed." }
+    },
+    {
+      "name": "s_pre_epoch_ask_unanswered_stays_unknown",
+      "input": { "account": null, "origin": null, "sender_present": false, "sender_live_did": null, "row_time_unix": 1750000000, "lookup": "timedOut" },
+      "expect": { "state": "unknown", "did": null, "line": "No identity information is attached to this name." }
+    }
+  ],
   "person_vectors": [
     {
       "name": "p1_live_binding_plc",

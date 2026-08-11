@@ -154,6 +154,35 @@ export function claimForPerson(input: PersonClaimInput): IdentityClaim {
   }
 }
 
+/** The claim for a person surface anchored to a message — a profile sheet or
+ *  popover opened from a row. Live identity first, then the message's own
+ *  evidence, then the lookup machine. Differs from `claimForMessage` in
+ *  exactly one place: a live-known DID (`senderLiveDid` here means any DID
+ *  known live — the roster, or a fresh WHOIS answer — not only a roster
+ *  member) outranks the row's tag, because this surface answers who the
+ *  person is NOW, where the row answers who sent it THEN. */
+export function claimForSender(
+  input: MessageClaimInput,
+  lookup: PersonLookup = 'notAsked',
+): IdentityClaim {
+  if (nonblank(input.origin)) {
+    // Relayed senders never go through the local lookup — a WHOIS to this
+    // server about a relayed nick answers about the wrong person.
+    return claimForMessage(input);
+  }
+  const live = nonblank(input.senderLiveDid);
+  if (live) {
+    return render(byDid(live), live, null);
+  }
+  const fromRow = claimForMessage({ ...input, senderLiveDid: null });
+  // The row's evidence answered (a tag, or post-epoch absence). Only when it
+  // could not — Unknown, the pre-epoch case — does the ask machinery decide.
+  if (fromRow.state !== 'unknown') {
+    return fromRow;
+  }
+  return claimForPerson({ lookup });
+}
+
 /** The epoch before which tag absence proves nothing, unix seconds. */
 export function stampingEpochUnix(): number {
   return spec.stamping_epoch_unix;

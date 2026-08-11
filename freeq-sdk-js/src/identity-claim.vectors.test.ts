@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import {
   claimForMessage,
   claimForPerson,
+  claimForSender,
   stampingEpochUnix,
   type PersonLookup,
 } from './identity-claim';
@@ -40,6 +41,27 @@ describe('identity-claim spec parity', () => {
           senderLiveDid: i.sender_live_did,
           rowTimeUnix: i.row_time_unix,
         });
+        expect(claim.state).toBe(v.expect.state);
+        expect(claim.did).toBe(v.expect.did);
+        expect(claim.line).toBe(v.expect.line);
+      });
+    }
+  });
+
+  describe('sender vectors', () => {
+    for (const v of canonical.sender_vectors) {
+      it(v.name, () => {
+        const i = v.input;
+        const claim = claimForSender(
+          {
+            account: i.account,
+            origin: i.origin,
+            senderPresent: i.sender_present,
+            senderLiveDid: i.sender_live_did,
+            rowTimeUnix: i.row_time_unix,
+          },
+          i.lookup as PersonLookup,
+        );
         expect(claim.state).toBe(v.expect.state);
         expect(claim.did).toBe(v.expect.did);
         expect(claim.line).toBe(v.expect.line);

@@ -190,6 +190,43 @@ pub fn claim_for_person(input: &PersonClaimInput) -> IdentityClaim {
     }
 }
 
+/// The claim for a person surface anchored to a message — a profile sheet or
+/// popover opened from a row. Live identity first, then the message's own
+/// evidence, then the lookup machine. Differs from [`claim_for_message`] in
+/// exactly one place: a live-known DID (`sender_live_did` here means any DID
+/// known live — the roster, or a fresh WHOIS answer — not only a roster
+/// member) outranks the row's tag, because this surface answers who the
+/// person is NOW, where the row answers who sent it THEN.
+pub fn claim_for_sender(input: &MessageClaimInput, lookup: PersonLookup) -> IdentityClaim {
+    if nonblank(input.origin).is_some() {
+        // Relayed senders never go through the local lookup — a WHOIS to this
+        // server about a relayed nick answers about the wrong person.
+        return claim_for_message(input);
+    }
+    if let Some(did) = nonblank(input.sender_live_did) {
+        return render(by_did(did), Some(did), None);
+    }
+    let from_row = claim_for_message(&MessageClaimInput {
+        account: input.account,
+        origin: input.origin,
+        sender_present: input.sender_present,
+        sender_live_did: None,
+        row_time_unix: input.row_time_unix,
+    });
+    // The row's evidence answered (a tag, or post-epoch absence). Only when it
+    // could not — Unknown, the pre-epoch case — does the ask machinery decide.
+    if from_row.state != IdentityClaimState::Unknown {
+        return from_row;
+    }
+    claim_for_person(&PersonClaimInput {
+        binding: None,
+        seen_only_via_peer: false,
+        via_peer_origin: None,
+        via_peer_had_account: false,
+        lookup,
+    })
+}
+
 /// The epoch before which tag absence proves nothing, unix seconds.
 pub fn stamping_epoch_unix() -> u64 {
     spec().stamping_epoch_unix
@@ -404,6 +441,38 @@ mod tests {
                 lookup,
             });
             check(&claim, &v["expect"], name);
+        }
+    }
+
+    #[test]
+    fn every_sender_vector_in_the_spec_reproduces() {
+        let spec = vectors();
+        for v in spec["sender_vectors"].as_array().unwrap() {
+            let name = v["name"].as_str().unwrap();
+            let i = &v["input"];
+            let lookup = parse_lookup(i["lookup"].as_str().unwrap(), name);
+            let claim = claim_for_sender(
+                &MessageClaimInput {
+                    account: opt_str(&i["account"]),
+                    origin: opt_str(&i["origin"]),
+                    sender_present: i["sender_present"].as_bool().unwrap(),
+                    sender_live_did: opt_str(&i["sender_live_did"]),
+                    row_time_unix: i["row_time_unix"].as_u64(),
+                },
+                lookup,
+            );
+            check(&claim, &v["expect"], name);
+        }
+    }
+
+    fn parse_lookup(s: &str, name: &str) -> PersonLookup {
+        match s {
+            "notAsked" => PersonLookup::NotAsked,
+            "inFlight" => PersonLookup::InFlight,
+            "noAccount" => PersonLookup::NoAccount,
+            "noSuchNick" => PersonLookup::NoSuchNick,
+            "timedOut" => PersonLookup::TimedOut,
+            other => panic!("unknown lookup {other} in {name}"),
         }
     }
 

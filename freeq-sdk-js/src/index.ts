@@ -92,6 +92,7 @@ export type { GroupState, SealedGroupKey, X25519Secret } from './e2ee_group.js';
 export {
   claimForMessage,
   claimForPerson,
+  claimForSender,
   stampingEpochUnix,
 } from './identity-claim.js';
 export type {
