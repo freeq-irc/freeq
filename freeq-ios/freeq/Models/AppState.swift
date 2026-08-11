@@ -347,6 +347,11 @@ class AppState: ObservableObject {
     /// What a card should assume about a nick it has asked about.
     @Published var identityLookups: [String: IdentityLookup] = [:]
 
+    /// Signature answers the reader has already asked for, by message id.
+    /// A settled answer is the same every time; only a checked mismatch
+    /// marks a row, so this is also what the row marker reads.
+    @Published var checkedVerdicts: [String: VerifyAnswer] = [:]
+
     /// Nicks the server answered with "no such nick". They are not guests —
     /// nobody is holding the name, so there is nobody to have an account.
     private var whoisNoSuchNick: Set<String> = []

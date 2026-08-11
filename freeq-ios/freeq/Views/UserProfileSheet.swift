@@ -5,10 +5,12 @@ struct UserProfileSheet: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.dismiss) var dismiss
     let nick: String
-    /// Set when opened from a federated message (+freeq.at/origin = peer name).
-    /// The sender is peer-vouched by that server, not verified here — so we warn
-    /// and suppress the local verified badge.
+    /// The peer that relayed the message this card was opened from. Anything
+    /// relayed is peer-vouched and claims nothing here.
     var origin: String? = nil
+    /// The anchoring row's evidence, when opened from a message.
+    var account: String? = nil
+    var rowTime: Date? = nil
     /// When opened from People search / graph browsing (not a freeq member), the
     /// AT identifier (DID or handle) to show directly — bypasses nick→DID
     /// resolution and the freeq-only actions.
@@ -29,6 +31,33 @@ struct UserProfileSheet: View {
 
     /// True when this is a stranger from the graph, not a freeq member.
     private var isDirect: Bool { directActor != nil }
+
+    private var isSelf: Bool { nick.lowercased() == appState.nick.lowercased() }
+
+    /// The identity the claim may treat as live: the session's own DID, the
+    /// live room binding, or — for a graph-browse profile — the AT identifier
+    /// the person was opened by. Never a remembered cache.
+    private var liveDid: String? {
+        if isDirect { return resolvedActor?.hasPrefix("did:") == true ? resolvedActor : nil }
+        if isSelf { return appState.authenticatedDID }
+        return appState.liveDidForNick(nick)
+    }
+
+    // The SDK owns the precedence: live identity first, then the anchoring
+    // row's evidence, then the lookup machine. A binding remembered from an
+    // earlier session never votes.
+    private var claim: IdentityClaim {
+        claimForSender(
+            input: MessageClaimInput(
+                account: account,
+                origin: origin,
+                senderPresent: !isDirect && appState.isNickPresent(nick),
+                senderLiveDid: liveDid,
+                rowTimeUnix: rowTime.map { UInt64($0.timeIntervalSince1970) }
+            ),
+            lookup: isDirect ? .notAsked : appState.personLookup(for: nick)
+        )
+    }
 
     /// The freeq nick we can actually Message, if this identity is on freeq and
     /// isn't us. Falls back to the nick this sheet was opened with when the
@@ -59,39 +88,41 @@ struct UserProfileSheet: View {
 
                 ScrollView {
                     VStack(spacing: 20) {
-                        // Federated provenance warning — opened from a relayed message.
-                        if let origin {
-                            HStack(spacing: 8) {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .font(.system(size: 13))
-                                Text("Relayed via \(origin) — this server did not verify this identity.")
-                                    .font(.fqCaption)
-                                Spacer()
-                            }
-                            .foregroundColor(Theme.warning)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 10)
-                            .frame(maxWidth: .infinity)
-                            .background(Theme.warning.opacity(0.15))
-                        }
-
                         // Avatar
                         UserAvatar(nick: nick, size: 80)
                             .padding(.top, 24)
 
-                        // Name + verified
+                        // Name + what this client can honestly say about who
+                        // this is — the same claim rule and language as every
+                        // other surface.
                         VStack(spacing: 4) {
                             HStack(spacing: 6) {
                                 Text(headerTitle)
                                     .font(.fqTitle3.weight(.bold))
                                     .foregroundColor(Theme.textPrimary)
 
-                                if profile != nil && origin == nil {
+                                // The mark opens the proof behind the claim.
+                                if claim.showsMark {
                                     Button { showProof = true } label: {
                                         VerifiedBadge(size: 16)
                                     }
                                     .buttonStyle(.plain)
                                 }
+                            }
+
+                            // An ask that is out shows as motion, not as a
+                            // sentence nobody can finish reading before it is
+                            // replaced. A graph-browse profile makes no claim
+                            // until its identifier resolves to a DID.
+                            if claim.isPending {
+                                ProgressView()
+                                    .tint(Theme.textMuted)
+                                    .scaleEffect(0.8)
+                            }
+                            if !isDirect || claim.did != nil, let label = claim.label {
+                                Text(label)
+                                    .font(.fqFootnote)
+                                    .foregroundColor(claim.showsMark ? Theme.verify : Theme.textMuted)
                             }
 
                             if let away = appState.awayMessage(for: nick) {
@@ -137,6 +168,47 @@ struct UserProfileSheet: View {
                                     }
                                 }
                             }
+                        }
+
+                        // The proof sheet is where the explanation lives; the
+                        // card carries the sentence only for someone with no
+                        // DID, where there is no sheet to open and the card is
+                        // the whole answer. Everyone else gets the label, and
+                        // the words are one tap away behind "Identity proof".
+                        if claim.did == nil, !isDirect, let line = claim.line {
+                            Text(line)
+                                .font(.fqFootnote)
+                                .foregroundColor(Theme.textSecondary)
+                                .multilineTextAlignment(.center)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .padding(.horizontal, 32)
+                        }
+
+                        // DID — tap for the identity/signing-key proof card. A
+                        // monospace string doesn't look like a way in, and for
+                        // a self-issued identity it is the only one — no mark
+                        // on a row leads here.
+                        if let did = claim.did {
+                            Button { showProof = true } label: {
+                                VStack(spacing: 3) {
+                                    Text(did)
+                                        .font(.fqMonoCaption)
+                                        .foregroundColor(Theme.textMuted)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    HStack(spacing: 2) {
+                                        Text("Identity proof")
+                                            .font(.fqFootnote)
+                                        Image(systemName: "chevron.right")
+                                            .font(.fqCaption2)
+                                    }
+                                    .foregroundColor(Theme.accent)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.horizontal, 24)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
                         }
 
                         // Bio
@@ -300,11 +372,26 @@ struct UserProfileSheet: View {
             }
         }
         .preferredColorScheme(.dark)
-        .task { await fetchProfile() }
-        .sheet(isPresented: $showProof) {
-            if let actor = resolvedActor, actor.hasPrefix("did:") {
-                VerifiedProofSheet(did: actor, handle: profile?.handle, displayName: profile?.displayName)
+        .task {
+            // Ask who this is, and let the card say an ask is out — tracked so
+            // "unknown" is only ever shown after an answer, never before one.
+            // Relayed senders are the peer's to answer, never WHOISed here.
+            if origin == nil, !isSelf, !isDirect {
+                appState.lookUpIdentity(nick: nick)
             }
+            await fetchProfile()
+        }
+        .sheet(isPresented: $showProof) {
+            VerifiedProofSheet(
+                did: claim.did,
+                handle: profile?.handle,
+                displayName: profile?.displayName,
+                nick: isDirect ? nil : nick,
+                origin: origin,
+                account: account,
+                rowTimeUnix: rowTime.map { UInt64($0.timeIntervalSince1970) },
+                senderPresent: !isDirect && appState.isNickPresent(nick)
+            )
         }
         .reportDialog($reportSource) { target, reason in
             appState.reportUser(nick: target.nick, did: target.did, reason: reason)

@@ -285,7 +285,8 @@ struct MessageListView: View {
                 .presentationDragIndicator(.visible)
         }
         .sheet(item: $profileTarget) { target in
-            UserProfileSheet(nick: target.nick, origin: target.origin)
+            UserProfileSheet(nick: target.nick, origin: target.origin,
+                             account: target.account, rowTime: target.rowTime)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
@@ -298,7 +299,18 @@ struct MessageListView: View {
                 .presentationDragIndicator(.visible)
         }
         .sheet(item: $proofTarget) { target in
-            VerifiedProofSheet(did: target.did, handle: target.handle, msgId: target.msgId)
+            VerifiedProofSheet(
+                did: appState.liveDidForNick(target.nick),
+                nick: target.nick,
+                origin: target.origin,
+                msgId: target.msgId,
+                signed: target.rowSigned,
+                account: target.account,
+                rowTimeUnix: UInt64(target.rowTime.timeIntervalSince1970),
+                senderPresent: appState.isNickPresent(target.nick),
+                rowMsgId: target.rowMsgId,
+                rowSigned: target.rowSigned
+            )
         }
         .reportDialog($reportSource) { target, reason in
             appState.reportUser(nick: target.nick, did: target.did, reason: reason)
@@ -408,6 +420,23 @@ struct MessageListView: View {
             ToastManager.shared.show("Copied!", icon: "doc.on.doc.fill")
         }) {
             Label("Copy Text", systemImage: "doc.on.doc")
+        }
+
+        // Checking a signature is a question the reader asks, not a claim the
+        // row makes on its own. Same label as the other clients. Profile sits
+        // beside it so the identity question has a path from the same menu —
+        // the two questions, both reachable, never blended.
+        Button(action: {
+            profileTarget = ProfileNickTarget(nick: msg.from, origin: msg.origin,
+                                              account: msg.account, rowTime: msg.timestamp)
+        }) {
+            Label("View Profile", systemImage: "person.crop.circle")
+        }
+
+        Button(action: {
+            proofTarget = .verify(msg)
+        }) {
+            Label("Verify Signature", systemImage: "checkmark.shield")
         }
 
         // PIN is op-only server-side (ERR_CHANOPRIVSNEEDED otherwise) — don't
@@ -615,9 +644,18 @@ struct MessageListView: View {
         // three times per header row (verified badge, name prefix, signed
         // proof), each an O(members) lowercased linear search.
         let member = channel.memberInfo(for: msg.from)
-        // Verification is DID-anchored (identity we resolved), not "has an
-        // avatar" — one consistent definition of verified across the app.
-        let verified = msg.origin == nil && member?.did != nil
+        // What this row can honestly claim about its sender — computed by the
+        // SDK from the row's own tags and the live room, never from a cache.
+        // Presence is only consulted when the tags can't answer.
+        let needsRoom = msg.account == nil && msg.origin == nil
+        let present = needsRoom && appState.isNickPresent(msg.from)
+        let rowClaim = claimForMessage(input: MessageClaimInput(
+            account: msg.account,
+            origin: msg.origin,
+            senderPresent: present,
+            senderLiveDid: present ? appState.liveDidForNick(msg.from) : nil,
+            rowTimeUnix: UInt64(msg.timestamp.timeIntervalSince1970)
+        ))
 
         VStack(alignment: .leading, spacing: 0) {
             // Reply context — tap to open thread
@@ -640,7 +678,7 @@ struct MessageListView: View {
 
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Button(action: { profileTarget = ProfileNickTarget(nick: msg.from, origin: msg.origin) }) {
+                            Button(action: { profileTarget = ProfileNickTarget(nick: msg.from, origin: msg.origin, account: msg.account, rowTime: msg.timestamp) }) {
                                 HStack(spacing: 4) {
                                     Text((member?.prefix ?? "") + msg.from)
                                         .font(.fqSubheadline.weight(.bold))
@@ -649,14 +687,22 @@ struct MessageListView: View {
                                         // name with the signal glow once, so freeq's
                                         // "provably a real person" is felt, not just read.
                                         // Only for live arrivals, never history scroll-in.
-                                        .signalShimmer(active: verified && msg.timestamp.timeIntervalSinceNow > -8)
-
-                                    if verified {
-                                        VerifiedBadge(size: 12)
-                                    }
+                                        .signalShimmer(active: rowClaim.showsMark && msg.timestamp.timeIntervalSinceNow > -8)
                                 }
                             }
                             .buttonStyle(.plain)
+
+                            // The mark opens the proof behind the claim it
+                            // makes; the name opens the person's card.
+                            if rowClaim.showsMark {
+                                Button {
+                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                    proofTarget = .identity(msg)
+                                } label: {
+                                    VerifiedBadge(size: 12)
+                                }
+                                .buttonStyle(.plain)
+                            }
 
                             // Federated: relayed from another server — peer-vouched,
                             // not verified here. Show provenance instead of the local
@@ -671,20 +717,21 @@ struct MessageListView: View {
                                 .font(.fqCaption2)
                                 .foregroundColor(Theme.textMuted)
 
-                            if msg.origin == nil && msg.isSigned {
-                                let senderDID = member?.did
+                            // No badge for a signed message: almost every
+                            // message is signed, so a badge on every row says
+                            // nothing. Verification is an explicit action in
+                            // the context menu; only a checked mismatch marks
+                            // the row.
+                            if appState.checkedVerdicts[msg.id]?.marksTheRow == true {
                                 Button {
-                                    if let did = senderDID {
-                                        UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
-                                        proofTarget = ProofTarget(did: did, handle: nil, msgId: msg.id)
-                                    }
+                                    UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+                                    proofTarget = .verify(msg)
                                 } label: {
-                                    Image(systemName: "lock.fill")
+                                    Image(systemName: "exclamationmark.shield.fill")
                                         .font(.system(size: 9, weight: .semibold))
-                                        .foregroundColor(Theme.verify)
+                                        .foregroundColor(Theme.danger)
                                 }
                                 .buttonStyle(.plain)
-                                .disabled(senderDID == nil)
                             }
 
                             if msg.isEdited {
@@ -1320,19 +1367,41 @@ struct TypingDots: View {
     }
 }
 
-// Helper for profile sheet binding
+// Helper for profile sheet binding. Carries the anchoring row's evidence when
+// opened from a message, so the card's claim is computed from the row and the
+// live room — never from a cache.
 private struct ProfileNickTarget: Identifiable {
     let nick: String
     let origin: String?
+    var account: String? = nil
+    var rowTime: Date? = nil
     var id: String { nick }
 }
 
-// Helper for the verified-identity proof sheet binding
-private struct ProofTarget: Identifiable {
-    let did: String
-    let handle: String?
+// Which proof the sheet is open for — the sender's identity, or the checked
+// answer for one message — plus the row evidence the claim is computed from.
+// Shared with ThreadView, which presents the same sheet.
+struct ProofTarget: Identifiable {
+    let id = UUID()
+    let nick: String
+    let origin: String?
+    let account: String?
+    let rowTime: Date
+    /// nil = identity only; set = check this message and lead with the answer.
     let msgId: String?
-    var id: String { (msgId ?? "") + did }
+    let rowMsgId: String
+    let rowSigned: Bool
+
+    static func identity(_ msg: ChatMessage) -> ProofTarget {
+        ProofTarget(nick: msg.from, origin: msg.origin, account: msg.account,
+                    rowTime: msg.timestamp, msgId: nil,
+                    rowMsgId: msg.id, rowSigned: msg.isSigned)
+    }
+    static func verify(_ msg: ChatMessage) -> ProofTarget {
+        ProofTarget(nick: msg.from, origin: msg.origin, account: msg.account,
+                    rowTime: msg.timestamp, msgId: msg.id,
+                    rowMsgId: msg.id, rowSigned: msg.isSigned)
+    }
 }
 
 // Preference key for scroll offset detection

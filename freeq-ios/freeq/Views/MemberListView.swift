@@ -125,8 +125,17 @@ struct MemberListView: View {
                             .foregroundColor(member.isAway ? Theme.textMuted : Theme.textPrimary)
                             .lineLimit(1)
 
-                        // Verified badge — Bluesky profile found
-                        if AvatarCache.shared.avatarURL(for: member.nick.lowercased()) != nil {
+                        // Only an AT Protocol identity earns the seal
+                        // (IdentityClaim rule); a self-issued did:key does
+                        // not. A roster row is a present person, so the cache
+                        // lookup here is presence-gated by construction.
+                        if claimForPerson(input: PersonClaimInput(
+                            binding: member.did ?? AvatarCache.shared.did(for: member.nick),
+                            seenOnlyViaPeer: false,
+                            viaPeerOrigin: nil,
+                            viaPeerHadAccount: false,
+                            lookup: .notAsked
+                        )).showsMark {
                             VerifiedBadge(size: 11)
                         }
 

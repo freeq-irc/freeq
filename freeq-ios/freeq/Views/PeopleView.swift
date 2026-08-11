@@ -74,7 +74,17 @@ struct PersonRow: View {
                         .font(.fqSubheadline.weight(.semibold))
                         .foregroundColor(Theme.textPrimary)
                         .lineLimit(1)
-                    VerifiedBadge(size: 12)
+                    // Only an AT Protocol identity earns the seal
+                    // (IdentityClaim rule); a self-issued did:key does not.
+                    if claimForPerson(input: PersonClaimInput(
+                        binding: person.actor.did,
+                        seenOnlyViaPeer: false,
+                        viaPeerOrigin: nil,
+                        viaPeerHadAccount: false,
+                        lookup: .notAsked
+                    )).showsMark {
+                        VerifiedBadge(size: 12)
+                    }
                     if person.identity?.isAgent == true {
                         Text("AGENT")
                             .font(.system(size: 8, weight: .bold, design: .monospaced))

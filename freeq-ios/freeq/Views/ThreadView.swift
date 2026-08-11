@@ -43,7 +43,9 @@ struct ThreadView: View {
         return chain
     }
 
-    @StateObject private var avatarCache = AvatarCache.shared
+    /// Which proof the sheet is open for: a sender's identity, or the checked
+    /// answer for one message.
+    @State private var proofTarget: ProofTarget? = nil
 
     var body: some View {
         NavigationStack {
@@ -54,6 +56,18 @@ struct ThreadView: View {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(Array(thread.enumerated()), id: \.element.id) { idx, msg in
                             let isRoot = msg.id == rootMessage.id
+                            // What this row can honestly claim about its
+                            // sender — computed by the SDK from the row's own
+                            // tags and the live room, never from a cache.
+                            let needsRoom = msg.account == nil && msg.origin == nil
+                            let present = needsRoom && appState.isNickPresent(msg.from)
+                            let rowClaim = claimForMessage(input: MessageClaimInput(
+                                account: msg.account,
+                                origin: msg.origin,
+                                senderPresent: present,
+                                senderLiveDid: present ? appState.liveDidForNick(msg.from) : nil,
+                                rowTimeUnix: UInt64(msg.timestamp.timeIntervalSince1970)
+                            ))
 
                             VStack(alignment: .leading, spacing: 0) {
                                 // Thread connector line
@@ -87,8 +101,15 @@ struct ThreadView: View {
                                                 .font(.fqFootnote.weight(.bold))
                                                 .foregroundColor(Theme.nickColor(for: msg.from))
 
-                                            if msg.origin == nil && avatarCache.avatarURL(for: msg.from.lowercased()) != nil {
-                                                VerifiedBadge(size: 11)
+                                            // The mark opens the proof behind
+                                            // the claim it makes.
+                                            if rowClaim.showsMark {
+                                                Button {
+                                                    proofTarget = .identity(msg)
+                                                } label: {
+                                                    VerifiedBadge(size: 11)
+                                                }
+                                                .buttonStyle(.plain)
                                             }
 
                                             if let origin = msg.origin {
@@ -101,10 +122,18 @@ struct ThreadView: View {
                                                 .font(.fqCaption2)
                                                 .foregroundColor(Theme.textMuted)
 
-                                            if msg.origin == nil && msg.isSigned {
-                                                Image(systemName: "lock.fill")
-                                                    .font(.system(size: 9, weight: .semibold))
-                                                    .foregroundColor(Theme.success)
+                                            // Only a checked mismatch marks a
+                                            // row; verification is asked for
+                                            // from the context menu.
+                                            if appState.checkedVerdicts[msg.id]?.marksTheRow == true {
+                                                Button {
+                                                    proofTarget = .verify(msg)
+                                                } label: {
+                                                    Image(systemName: "exclamationmark.shield.fill")
+                                                        .font(.system(size: 9, weight: .semibold))
+                                                        .foregroundColor(Theme.danger)
+                                                }
+                                                .buttonStyle(.plain)
                                             }
                                         }
 
@@ -150,6 +179,11 @@ struct ThreadView: View {
                                 .padding(.horizontal, 16)
                                 .padding(.vertical, 6)
                                 .background(isRoot ? Theme.accent.opacity(0.05) : Color.clear)
+                                .contextMenu {
+                                    Button(action: { proofTarget = .verify(msg) }) {
+                                        Label("Verify Signature", systemImage: "checkmark.shield")
+                                    }
+                                }
                             }
                         }
                     }
@@ -185,6 +219,20 @@ struct ThreadView: View {
                     Button("Close") { dismiss() }
                         .foregroundColor(Theme.accent)
                 }
+            }
+            .sheet(item: $proofTarget) { target in
+                VerifiedProofSheet(
+                    did: appState.liveDidForNick(target.nick),
+                    nick: target.nick,
+                    origin: target.origin,
+                    msgId: target.msgId,
+                    signed: target.rowSigned,
+                    account: target.account,
+                    rowTimeUnix: UInt64(target.rowTime.timeIntervalSince1970),
+                    senderPresent: appState.isNickPresent(target.nick),
+                    rowMsgId: target.rowMsgId,
+                    rowSigned: target.rowSigned
+                )
             }
         }
         .preferredColorScheme(appState.isDarkTheme ? .dark : .light)

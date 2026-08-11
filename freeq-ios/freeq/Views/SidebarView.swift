@@ -85,7 +85,15 @@ struct SidebarView: View {
                             .foregroundColor(Theme.textPrimary)
                             .lineLimit(1)
 
-                        if appState.authenticatedDID != nil {
+                        // Only an AT Protocol identity earns the seal
+                        // (IdentityClaim rule); a self-issued did:key does not.
+                        if claimForPerson(input: PersonClaimInput(
+                            binding: appState.authenticatedDID,
+                            seenOnlyViaPeer: false,
+                            viaPeerOrigin: nil,
+                            viaPeerHadAccount: false,
+                            lookup: .notAsked
+                        )).showsMark {
                             Image(systemName: "checkmark.seal.fill")
                                 .font(.system(size: 10))
                                 .foregroundColor(Theme.accent)

@@ -50,6 +50,6 @@ struct VerifiedBadge: View {
         Image(systemName: "checkmark.seal.fill")
             .font(.system(size: size, weight: .semibold))
             .foregroundStyle(Theme.verify)
-            .accessibilityLabel("Verified identity")
+            .accessibilityLabel("AT Protocol identity")
     }
 }
