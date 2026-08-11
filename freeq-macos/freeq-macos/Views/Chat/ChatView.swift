@@ -247,7 +247,10 @@ struct ChannelWelcomeView: View {
                     if let topic = channel?.topic, !topic.isEmpty {
                         contextPill(icon: "quote.bubble.fill", text: topic)
                     }
-                } else if let did = appState.didForNick(displayName),
+                // The thread's own key is the binding when it is a DID —
+                // a structural fact (ruled 2026-08-11). Otherwise only a
+                // live binding counts; the persisted cache never votes.
+                } else if let did = (channel?.name).flatMap({ DidDisplay.isDid($0) ? $0 : nil }) ?? appState.liveDidForNick(displayName),
                           claimForPerson(input: PersonClaimInput(
                               binding: did,
                               seenOnlyViaPeer: false,
