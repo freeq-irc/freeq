@@ -50,6 +50,11 @@ private struct CachedMessage: Codable {
     let isDeleted: Bool
     let isSigned: Bool
     let reactions: CachedReactions
+    // The row's identity evidence. A hydrated row that lost these read
+    // "Unknown" on surfaces the live ingest answered correctly — and the
+    // stripped copy then shadowed the tag-bearing CHATHISTORY replay.
+    let origin: String?
+    let account: String?
 
     init(_ m: ChatMessage) {
         self.id = m.id
@@ -62,6 +67,8 @@ private struct CachedMessage: Codable {
         self.isDeleted = m.isDeleted
         self.isSigned = m.isSigned
         self.reactions = CachedReactions(m.reactions)
+        self.origin = m.origin
+        self.account = m.account
     }
 
     func toChatMessage() -> ChatMessage {
@@ -71,6 +78,8 @@ private struct CachedMessage: Codable {
         m.isEdited = isEdited
         m.isDeleted = isDeleted
         m.reactions = reactions.toDict()
+        m.origin = origin
+        m.account = account
         return m
     }
 }
@@ -88,7 +97,9 @@ private struct BufferCacheRoot: Codable {
 }
 
 enum BufferCacheStore {
-    static let version = 1
+    // 2: messages carry origin + account. The bump discards caches written
+    // without them, so stale evidence-less rows rebuild from replay.
+    static let version = 2
     static let maxMessagesPerBuffer = 50
 
     static func cacheURL() -> URL? {

@@ -75,6 +75,14 @@ class ChannelState: ObservableObject, Identifiable {
                     messages[idx].reactions[emoji] = nicks
                 }
             }
+            // Same for the row's identity evidence: a copy that arrived
+            // without `account`/`origin` (an old cache) must not shadow the
+            // replay that carries them — the claim engine reads the row.
+            if msg.account != nil || msg.origin != nil,
+               let idx = findMessage(byId: msg.id) {
+                if messages[idx].account == nil { messages[idx].account = msg.account }
+                if messages[idx].origin == nil { messages[idx].origin = msg.origin }
+            }
             return
         }
         // An edit whose ORIGINAL we already hold must not append as a second

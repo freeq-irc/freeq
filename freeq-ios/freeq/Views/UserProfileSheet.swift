@@ -43,6 +43,16 @@ struct UserProfileSheet: View {
         return appState.liveDidForNick(nick)
     }
 
+    /// The DID this card can display and open the proof sheet for: the
+    /// claim's own answer first, then what the app knows for display —
+    /// mirrors macOS (ProfileCache there). The display layer never votes on
+    /// the claim; it only keeps the proof path reachable.
+    private var proofDid: String? {
+        if let d = claim.did { return d }
+        if isDirect { return resolvedActor?.hasPrefix("did:") == true ? resolvedActor : nil }
+        return appState.didForNick(nick) ?? AvatarCache.shared.did(for: nick)
+    }
+
     // The SDK owns the precedence: live identity first, then the anchoring
     // row's evidence, then the lookup machine. A binding remembered from an
     // earlier session never votes.
@@ -188,7 +198,7 @@ struct UserProfileSheet: View {
                         // monospace string doesn't look like a way in, and for
                         // a self-issued identity it is the only one — no mark
                         // on a row leads here.
-                        if let did = claim.did {
+                        if let did = proofDid {
                             Button { showProof = true } label: {
                                 VStack(spacing: 3) {
                                     Text(did)
