@@ -6,6 +6,7 @@ import { sendWhois, getClient } from '../irc/client';
 import { SpeakerIcon } from './SessionIndicator';
 import { parseAwayStatus } from '../lib/status';
 import { isDid, resolveIdentityName, findMemberByKey } from '../lib/identity';
+import { claimForPerson, claimForSender, type PersonLookup } from '@freeq/sdk';
 import { displayNameForKey } from '../lib/display-name';
 import * as e2ee from '../lib/e2ee';
 
@@ -140,6 +141,29 @@ function DMProfilePanel({ nick, channel }: { nick: string; channel: { members: M
   const [profile, setProfile] = useState<ATProfile | null>(null);
   const [safetyNumber, setSafetyNumber] = useState<string | null>(null);
   const presence = usePresence(nick);
+  // Same rule the popover uses: pending outranks the cache, because a WHOIS
+  // fills it incrementally and a half-filled entry would read as "guest" a
+  // beat before the account lands.
+  const whoisOut = useStore((s) => (peerNick ? s.whoisPending.has(peerNick.toLowerCase()) : false));
+  // The thread's own messages carry the identity context — same rule as the
+  // message rows. A message relayed from a peer names its origin, and a local
+  // message with no account tag is already the guest answer.
+  const thread = useStore((s) => s.channels.get(nick.toLowerCase()));
+  const peerMsgs = (thread?.messages ?? []).filter(
+    (m) => peerNick && m.from.toLowerCase() === peerNick.toLowerCase() && !m.isSystem,
+  );
+  const lastPeerMsg = peerMsgs[peerMsgs.length - 1];
+  const origin = lastPeerMsg?.tags?.['+freeq.at/origin'];
+  // The SDK owns the precedence: live identity first, then the thread's own
+  // message evidence, then the lookup state machine.
+  const lookup: PersonLookup = whoisOut ? 'inFlight' : whois ? 'noAccount' : 'notAsked';
+  const claim = claimForSender({
+    account: lastPeerMsg?.tags?.['account'],
+    origin,
+    senderPresent: presence.online,
+    senderLiveDid: did,
+    rowTimeUnix: lastPeerMsg ? Math.floor(lastPeerMsg.timestamp.getTime() / 1000) : undefined,
+  }, lookup);
 
   useEffect(() => {
     if (peerNick) sendWhois(peerNick);
@@ -335,10 +359,23 @@ function DMProfilePanel({ nick, channel }: { nick: string; channel: { members: M
           </div>
         )}
 
-        {/* No identity badge for guests */}
-        {!did && whois && !handle && (
-          <div className="mt-3 text-[10px] text-fg-dim bg-bg-tertiary rounded px-2 py-1">
-            Guest — no AT Protocol identity
+        {/* What we can honestly say about who this is. The two lines that name
+            "the key below" belong on a surface showing that key; this panel
+            has none, so those states show the label alone. While the ask is
+            out it's motion, not words. */}
+        {claim.isPending ? (
+          <div className="mt-3 flex justify-center text-fg-dim">
+            <svg className="animate-spin w-3 h-3" viewBox="0 0 24 24" aria-hidden="true">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+            </svg>
+          </div>
+        ) : (
+          <div className="mt-3 text-[10px] text-fg-dim bg-bg-tertiary rounded px-2 py-1 text-left">
+            <div className="font-semibold text-fg-muted">{claim.label}</div>
+            {!claim.needsKeyCard && (
+              <div className="mt-0.5 leading-relaxed">{claim.line}</div>
+            )}
           </div>
         )}
 
@@ -425,8 +462,8 @@ function MemberItem({ member, onClick, inCall }: MemberItemProps) {
           <span className="text-xs" title="External Agent">🌐</span>
         )}
 
-        {effectiveDid && !member.actorClass?.includes('agent') && (
-          <span className="text-accent text-xs" title={`Verified AT Protocol identity: ${effectiveDid}`}>✓</span>
+        {claimForPerson({ binding: effectiveDid }).showsMark && !member.actorClass?.includes('agent') && (
+          <span className="text-accent text-xs" title="AT Protocol identity">✓</span>
         )}
 
         {inCall && (

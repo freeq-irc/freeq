@@ -306,6 +306,40 @@ describe('whois cache', () => {
   });
 });
 
+// ── WHOIS in flight ──────────────────────────────────────────────────
+// Telling "the answer named no account" from "no answer yet" is what keeps a
+// guest label off someone the server hasn't described yet. Only the server's
+// end-of-WHOIS clears it — never a timer.
+
+describe('whois pending', () => {
+  it('marks and ends a lookup, case-insensitively', () => {
+    useStore.getState().markWhoisPending('Bob');
+    expect(useStore.getState().whoisPending.has('bob')).toBe(true);
+    useStore.getState().endWhoisPending('bOB');
+    expect(useStore.getState().whoisPending.has('bob')).toBe(false);
+  });
+
+  it('ending a lookup nobody asked for is a no-op', () => {
+    const before = useStore.getState().whoisPending;
+    useStore.getState().endWhoisPending('nobody');
+    expect(useStore.getState().whoisPending).toBe(before);
+  });
+
+  it('an answer for one nick leaves another still waiting', () => {
+    useStore.getState().markWhoisPending('bob');
+    useStore.getState().markWhoisPending('carol');
+    useStore.getState().endWhoisPending('bob');
+    expect(useStore.getState().whoisPending.has('bob')).toBe(false);
+    expect(useStore.getState().whoisPending.has('carol')).toBe(true);
+  });
+
+  it('losing the connection ends every outstanding lookup', () => {
+    useStore.getState().markWhoisPending('bob');
+    useStore.getState().setConnectionState('disconnected');
+    expect(useStore.getState().whoisPending.size).toBe(0);
+  });
+});
+
 // ── Favorites / muted ────────────────────────────────────────────────
 
 describe('favorites and muted', () => {

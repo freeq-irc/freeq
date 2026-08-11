@@ -7,6 +7,7 @@ import { MicIcon, MicOffIcon, CameraOnIcon, CameraOffIcon, PhoneOffIcon } from '
 import { fetchProfile, getCachedProfile } from '../lib/profiles';
 import { parseAwayStatus } from '../lib/status';
 import { isDid, shortenDid, findMemberByKey, isPeerBlocked } from '../lib/identity';
+import { claimForPerson } from '@freeq/sdk';
 import { displayNameForKey } from '../lib/display-name';
 import { unjoinedFavorites } from '../lib/favorites-sync';
 
@@ -260,7 +261,9 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
           <div className="min-w-0 flex-1">
             <div className="text-[15px] font-semibold truncate flex items-center gap-1">
               {nick}
-              {authDid && <span className="text-accent text-xs" title="Verified AT Protocol identity">✓</span>}
+              {claimForPerson({ binding: authDid }).showsMark && (
+                <span className="text-accent text-xs" title="AT Protocol identity">✓</span>
+              )}
             </div>
             {authDid && (() => {
               const handle = localStorage.getItem('freeq-handle');

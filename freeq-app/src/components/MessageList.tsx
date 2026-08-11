@@ -3,6 +3,8 @@ import { useStore, uniqueMemberCount, type Message, type PinnedMessage } from '.
 import { getNick, getClient, requestHistory, sendReaction, sendUnreact, joinChannel } from '../irc/client';
 import { fetchProfile, getCachedProfile, type ATProfile } from '../lib/profiles';
 import { isDid, isPeerBlocked } from '../lib/identity';
+import { claimForMessage } from '@freeq/sdk';
+import type { RowEvidence } from './UserPopover';
 import { displayNameForKey } from '../lib/display-name';
 import { EmojiPicker } from './EmojiPicker';
 import { UserPopover } from './UserPopover';
@@ -201,7 +203,7 @@ function renderWithBreaks(text: string): React.ReactNode {
 /** Context for making @nick / #channel spans interactive. */
 interface RenderCtx {
   channel?: string;
-  onNickClick?: (nick: string, did: string | undefined, origin: string | undefined, e: React.MouseEvent) => void;
+  onNickClick?: (nick: string, did: string | undefined, origin: string | undefined, e: React.MouseEvent, evidence?: RowEvidence) => void;
 }
 
 /** Render text segments as React elements (XSS-safe — no innerHTML). */
@@ -416,7 +418,7 @@ function InlineVideoPlayer({ url }: { url: string }) {
 function MessageContentImpl({ msg, channel, onNickClick }: {
   msg: Message;
   channel?: string;
-  onNickClick?: (nick: string, did: string | undefined, origin: string | undefined, e: React.MouseEvent) => void;
+  onNickClick?: (nick: string, did: string | undefined, origin: string | undefined, e: React.MouseEvent, evidence?: RowEvidence) => void;
 }) {
   const setLightbox = useStore((s) => s.setLightboxUrl);
   const linkCtx: RenderCtx = { channel, onNickClick };
@@ -679,7 +681,7 @@ function SystemMessageImpl({ msg }: { msg: Message }) {
 interface MessageProps {
   msg: Message;
   channel: string;
-  onNickClick: (nick: string, did: string | undefined, origin: string | undefined, e: React.MouseEvent) => void;
+  onNickClick: (nick: string, did: string | undefined, origin: string | undefined, e: React.MouseEvent, evidence?: RowEvidence) => void;
 }
 
 function FullMessageImpl({ msg, channel, onNickClick }: MessageProps) {
@@ -705,6 +707,22 @@ function FullMessageImpl({ msg, channel, onNickClick }: MessageProps) {
   // local "verified" (✓) badge, which would overstate trust.
   const origin = msg.tags?.['+freeq.at/origin'];
   const isFederated = !!origin;
+  // What this row can honestly claim about its sender — computed by the SDK
+  // from the row's own tags and the live room, never from a stored cache.
+  const rowClaim = claimForMessage({
+    account: msg.tags?.account,
+    origin,
+    senderPresent: !!member || !!msg.isSelf,
+    senderLiveDid: member?.did || selfDid || undefined,
+    rowTimeUnix: Math.floor(msg.timestamp.getTime() / 1000),
+  });
+  // The same evidence, handed to the popover so a person surface opened from
+  // this row can answer with the row when live identity can't.
+  const rowEvidence: RowEvidence = {
+    account: msg.tags?.account,
+    timeUnix: Math.floor(msg.timestamp.getTime() / 1000),
+    present: !!member || !!msg.isSelf,
+  };
 
   const openEmojiPicker = (e: React.MouseEvent) => {
     setPickerPos({ x: e.clientX, y: e.clientY });
@@ -721,7 +739,7 @@ function FullMessageImpl({ msg, channel, onNickClick }: MessageProps) {
     >
       <div
         className="cursor-pointer mt-0.5"
-        onClick={(e) => onNickClick(msg.from, did, origin, e)}
+        onClick={(e) => onNickClick(msg.from, did, origin, e, rowEvidence)}
       >
         <Avatar nick={msg.from} did={did} />
       </div>
@@ -732,12 +750,12 @@ function FullMessageImpl({ msg, channel, onNickClick }: MessageProps) {
             className="font-semibold text-[15px] hover:underline"
             style={{ color }}
             title={isDid(msg.from) ? msg.from : undefined}
-            onClick={(e) => onNickClick(msg.from, member?.did, origin, e)}
+            onClick={(e) => onNickClick(msg.from, member?.did, origin, e, rowEvidence)}
           >
             {displayNameForKey(msg.from)}
           </button>
-          {member?.did && !isFederated && <VerifiedBadge />}
-          {isFederated && <ViaBadge origin={origin!} />}
+          {rowClaim.showsMark && <VerifiedBadge />}
+          {isFederated && <ViaBadge origin={origin!} line={rowClaim.line} />}
           {sigInvalid && <InvalidSigMark />}
           {member?.away != null && (
             <span className="text-xs text-fg-dim bg-warning/10 text-warning px-1.5 py-0.5 rounded">away</span>
@@ -913,10 +931,10 @@ const SystemMessage = memo(SystemMessageImpl);
 const FullMessage = memo(FullMessageImpl);
 const GroupedMessage = memo(GroupedMessageImpl);
 
-/** Verification badge for AT Protocol-authenticated users */
+/** The mark for an AT Protocol identity — the one claim that earns one. */
 function VerifiedBadge() {
   return (
-    <span className="text-accent text-xs" title="AT Protocol verified identity">
+    <span className="text-accent text-xs" title="AT Protocol identity">
       <svg className="w-3.5 h-3.5 inline -mt-0.5" viewBox="0 0 16 16" fill="currentColor">
         <path d="M8 0a8 8 0 100 16A8 8 0 008 0zm3.78 5.97l-4.5 5a.75.75 0 01-1.06.02l-2-1.86a.75.75 0 011.02-1.1l1.45 1.35 3.98-4.43a.75.75 0 011.11 1.02z"/>
       </svg>
@@ -926,11 +944,11 @@ function VerifiedBadge() {
 
 /** Provenance badge for a federated message — relayed from another server.
     The sender's identity is vouched for by that server, not verified here. */
-function ViaBadge({ origin }: { origin: string }) {
+function ViaBadge({ origin, line }: { origin: string; line: string | null }) {
   return (
     <span
       className="text-xs text-fg-dim bg-white/5 px-1.5 py-0.5 rounded cursor-default"
-      title={`Relayed from ${origin}. This server didn't verify the sender's identity — ${origin} vouches for it.`}
+      title={line ?? undefined}
     >
       via {origin}
     </span>
@@ -1100,7 +1118,7 @@ function ChannelEmptyState({ channel }: { channel: string }) {
         <div className="bg-bg-tertiary/50 border border-border rounded-lg p-3 text-left">
           <div className="text-[11px] font-semibold text-fg-muted mb-0.5">🔐 Verified Identity</div>
           <div className="text-[11px] text-fg-dim leading-relaxed">
-            Users with a <span className="text-accent">✓</span> next to their name are signed in with their AT Protocol (Bluesky) identity. Their messages are cryptographically signed and can&apos;t be forged.
+            Users with a <span className="text-accent">✓</span> next to their name are signed in with their AT Protocol (Bluesky) identity. Their messages are cryptographically signed.
           </div>
         </div>
         <div className="bg-bg-tertiary/50 border border-border rounded-lg p-3 text-left">
@@ -1228,7 +1246,7 @@ export function MessageList() {
   const stickToBottomRef = useRef(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const [newMsgCount, setNewMsgCount] = useState(0);
-  const [popover, setPopover] = useState<{ nick: string; did?: string; origin?: string; pos: { x: number; y: number } } | null>(null);
+  const [popover, setPopover] = useState<{ nick: string; did?: string; origin?: string; evidence?: RowEvidence; pos: { x: number; y: number } } | null>(null);
 
   // Track whether user has scrolled up (unstick from bottom)
   const handleScroll = useCallback(() => {
@@ -1343,8 +1361,8 @@ export function MessageList() {
     return () => clearTimeout(t);
   }, [activeChannel]);
 
-  const onNickClick = useCallback((nick: string, did: string | undefined, origin: string | undefined, e: React.MouseEvent) => {
-    setPopover({ nick, did, origin, pos: { x: e.clientX, y: e.clientY } });
+  const onNickClick = useCallback((nick: string, did: string | undefined, origin: string | undefined, e: React.MouseEvent, evidence?: RowEvidence) => {
+    setPopover({ nick, did, origin, evidence, pos: { x: e.clientX, y: e.clientY } });
   }, []);
 
   return (
@@ -1500,6 +1518,7 @@ export function MessageList() {
           nick={popover.nick}
           did={popover.did}
           origin={popover.origin}
+          evidence={popover.evidence}
           position={popover.pos}
           onClose={() => setPopover(null)}
         />

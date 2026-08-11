@@ -319,7 +319,11 @@ export function setAway(reason?: string) {
 }
 
 export function sendWhois(userNick: string) {
-  client?.whois(userNick);
+  if (!client) return;
+  client.whois(userNick);
+  // Marked only once the ask is actually on the wire — a surface waiting on
+  // the answer must never wait on a question nobody asked.
+  useStore.getState().markWhoisPending(userNick);
 }
 
 export function requestHistory(channel: string, beforeTimestamp?: string) {
@@ -808,6 +812,10 @@ function wireEvents(c: FreeqClient) {
 
   c.on('whois', (nick, info) => {
     s().updateWhois(nick, info);
+  });
+
+  c.on('whoisEnd', (nick) => {
+    s().endWhoisPending(nick);
   });
 
   c.on('motdStart', () => {

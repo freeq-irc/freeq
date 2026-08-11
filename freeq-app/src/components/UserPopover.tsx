@@ -6,6 +6,7 @@ import { sendWhois, getNick } from '../irc/client';
 import { REPORT_REASONS, reportUser } from '../lib/safety';
 import { parseAwayStatus } from '../lib/status';
 import { isDid } from '../lib/identity';
+import { claimForSender, type PersonLookup } from '@freeq/sdk';
 import { displayNameForKey } from '../lib/display-name';
 import { showToast } from './Toast';
 import * as e2ee from '../lib/e2ee';
@@ -189,18 +190,32 @@ interface ActorInfo {
   };
 }
 
+/** What a message row hands to a person surface opened from it. */
+export interface RowEvidence {
+  /** The row's `account` tag, if any. */
+  account?: string;
+  /** The row's timestamp, unix seconds. */
+  timeUnix?: number;
+  /** Whether the sender is in the venue's roster right now. */
+  present?: boolean;
+}
+
 interface UserPopoverProps {
   nick: string;
   did?: string;
   /** Set when opened from a federated message (+freeq.at/origin = peer name).
-   *  The sender is vouched for by that server, not verified here — so we show
-   *  a warning bar and suppress the local "verified" / WHOIS context. */
+   *  The sender is vouched for by that server, not verified here — so the card
+   *  says so and suppresses the local mark / WHOIS context. */
   origin?: string;
+  /** The anchoring message's evidence, when opened from a row: its account
+   *  tag, its timestamp, and whether the sender is in the room. When live
+   *  identity can't answer, the row does — the SDK owns that precedence. */
+  evidence?: RowEvidence;
   position: { x: number; y: number };
   onClose: () => void;
 }
 
-export function UserPopover({ nick, did, origin, position, onClose }: UserPopoverProps) {
+export function UserPopover({ nick, did, origin, evidence, position, onClose }: UserPopoverProps) {
   const [profile, setProfile] = useState<ATProfile | null>(null);
   const [loading, setLoading] = useState(false);
   const setActive = useStore((s) => s.setActiveChannel);
@@ -217,6 +232,22 @@ export function UserPopover({ nick, did, origin, position, onClose }: UserPopove
 
   const effectiveDid = did || whois?.did;
   const isDidKey = effectiveDid?.startsWith('did:key:');
+  // What we've done about finding out. Pending outranks the cache: a WHOIS
+  // fills the cache incrementally (host first, account last), so trusting a
+  // half-filled entry would call someone a guest a beat before their DID
+  // lands.
+  const whoisOut = useStore((s) => s.whoisPending.has(nick.toLowerCase()));
+  // The SDK owns the precedence: live identity first, then the anchoring
+  // row's evidence, then this lookup state — which only decides when the
+  // message can't answer.
+  const lookup: PersonLookup = whoisOut ? 'inFlight' : whois ? 'noAccount' : 'notAsked';
+  const claim = claimForSender({
+    account: evidence?.account,
+    origin,
+    senderPresent: evidence?.present ?? false,
+    senderLiveDid: effectiveDid,
+    rowTimeUnix: evidence?.timeUnix,
+  }, lookup);
   const isSelf = nick.toLowerCase() === getNick().toLowerCase();
   const isBlocked = useStore((s) =>
     (!!effectiveDid && s.blockedDids.includes(effectiveDid)) || s.blockedNicks.includes(nick.toLowerCase()));
@@ -299,12 +330,13 @@ export function UserPopover({ nick, did, origin, position, onClose }: UserPopove
   return createPortal(
     <>
       <div className="fixed inset-0 z-40" onClick={onClose} />
-      <div style={style} className="z-50 bg-bg-secondary border border-border rounded-xl shadow-2xl w-72 animate-fadeIn overflow-hidden">
-        {/* Federated provenance warning — opened from a relayed message */}
+      <div style={style} data-testid="user-popover" className="z-50 bg-bg-secondary border border-border rounded-xl shadow-2xl w-72 animate-fadeIn overflow-hidden">
+        {/* Opened from a relayed message. Relaying is an ordinary state, not a
+            warning — it reads as plain secondary text. */}
         {origin && (
-          <div className="bg-warning/15 border-b border-warning/30 px-3 py-2 text-[11px] text-warning flex items-start gap-1.5">
-            <span aria-hidden="true">⚠️</span>
-            <span>Relayed via <span className="font-semibold">{origin}</span> — this server did not verify this identity.</span>
+          <div className="border-b border-border px-3 py-2 text-[11px] text-fg-dim">
+            <div className="font-semibold text-fg-muted">{claim.label}</div>
+            <div className="mt-0.5 leading-relaxed">{claim.line}</div>
           </div>
         )}
         {/* Header */}
@@ -333,7 +365,7 @@ export function UserPopover({ nick, did, origin, position, onClose }: UserPopove
           {handle && !isDidKey && (
             <div className="text-xs text-accent mt-1 flex items-center gap-1">
               <span>@{handle}</span>
-              {!origin && <span className="text-success text-[10px]" title="AT Protocol identity">✓</span>}
+              {claim.showsMark && <span className="text-success text-[10px]" title="AT Protocol identity">✓</span>}
             </div>
           )}
 
@@ -485,12 +517,25 @@ export function UserPopover({ nick, did, origin, position, onClose }: UserPopove
             </div>
           )}
 
-          {/* No identity badge for guests */}
-          {!effectiveDid && !loading && whois && (
-            <div className="text-[10px] text-fg-dim mt-2 bg-bg-tertiary rounded px-2 py-1">
-              Guest — no AT Protocol identity
+          {/* What we can honestly say about who this is. The two lines that
+              name "the key below" belong on a surface showing that key; this
+              card has none, so those states show the label alone. While the
+              ask is out it's motion, not words. */}
+          {!origin && (claim.isPending ? (
+            <div className="mt-2 flex text-fg-dim">
+              <svg className="animate-spin w-3 h-3" viewBox="0 0 24 24" aria-hidden="true">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+              </svg>
             </div>
-          )}
+          ) : (
+            <div className="text-[10px] text-fg-dim mt-2 bg-bg-tertiary rounded px-2 py-1">
+              <div className="font-semibold text-fg-muted">{claim.label}</div>
+              {!claim.needsKeyCard && (
+                <div className="mt-0.5 leading-relaxed">{claim.line}</div>
+              )}
+            </div>
+          ))}
 
           {/* Actions */}
           <div className="flex gap-2 mt-3">

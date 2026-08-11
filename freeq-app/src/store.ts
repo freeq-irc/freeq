@@ -157,6 +157,10 @@ export interface Store {
 
   // WHOIS cache
   whoisCache: Map<string, WhoisInfo>;
+  /** Lowercase nicks with a WHOIS out and unanswered. The identity rule needs
+   *  this to tell "the answer named no account" (a guest) from "no answer
+   *  yet" — the server's end-of-WHOIS clears it, never a timer. */
+  whoisPending: Set<string>;
 
   // UI state
   replyTo: ReplyContext | null;
@@ -245,6 +249,10 @@ export interface Store {
 
   // Actions — whois
   updateWhois: (nick: string, info: Partial<WhoisInfo>) => void;
+  /** A WHOIS has gone out for this nick and no answer has arrived. */
+  markWhoisPending: (nick: string) => void;
+  /** The server finished answering (318, or 401 for a name nobody holds). */
+  endWhoisPending: (nick: string) => void;
 
   // Actions — UI
   setReplyTo: (ctx: ReplyContext | null) => void;
@@ -346,6 +354,7 @@ export const useStore = create<Store>((set, get) => ({
   serverMessages: [],
   batches: new Map(),
   whoisCache: new Map(),
+  whoisPending: new Set(),
   replyTo: null,
   editingMsg: null,
   theme: (localStorage.getItem('freeq-theme') as 'dark' | 'light') || 'dark',
@@ -378,7 +387,12 @@ export const useStore = create<Store>((set, get) => ({
   channelSettingsOpen: null,
 
   // Connection
-  setConnectionState: (state) => set({ connectionState: state }),
+  // A dropped connection ends every question that was out on it, so nothing
+  // is left waiting on an answer that can no longer arrive.
+  setConnectionState: (state) => set((s) =>
+    state === 'connected' || s.whoisPending.size === 0
+      ? { connectionState: state }
+      : { connectionState: state, whoisPending: new Set<string>() }),
   setNick: (nick) => set({ nick }),
   setRegistered: (v) => set({ registered: v }),
   setWasRegistered: (v) => set({ wasRegistered: v }),
@@ -412,6 +426,7 @@ export const useStore = create<Store>((set, get) => ({
     serverMessages: [],
     batches: new Map(),
     whoisCache: new Map(),
+    whoisPending: new Set(),
     replyTo: null,
     editingMsg: null,
     searchOpen: false,
@@ -1009,6 +1024,22 @@ export const useStore = create<Store>((set, get) => ({
     const existing = whoisCache.get(key) || { nick, fetchedAt: Date.now() };
     whoisCache.set(key, { ...existing, ...info, nick, fetchedAt: Date.now() });
     return { whoisCache };
+  }),
+
+  markWhoisPending: (nick) => set((s) => {
+    const key = nick.toLowerCase();
+    if (s.whoisPending.has(key)) return {};
+    const whoisPending = new Set(s.whoisPending);
+    whoisPending.add(key);
+    return { whoisPending };
+  }),
+
+  endWhoisPending: (nick) => set((s) => {
+    const key = nick.toLowerCase();
+    if (!s.whoisPending.has(key)) return {};
+    const whoisPending = new Set(s.whoisPending);
+    whoisPending.delete(key);
+    return { whoisPending };
   }),
 
   // UI actions
