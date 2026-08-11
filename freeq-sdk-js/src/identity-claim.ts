@@ -33,7 +33,7 @@ import spec from './identity-claims.json';
 
 export type IdentityClaimState =
   | 'atProtocol'
-  | 'selfCreated'
+  | 'selfIssued'
   | 'relayed'
   | 'guest'
   | 'lookingUp'
@@ -189,7 +189,7 @@ export function stampingEpochUnix(): number {
 }
 
 function byDid(did: string): IdentityClaimState {
-  return did.startsWith('did:key:') ? 'selfCreated' : 'atProtocol';
+  return did.startsWith('did:key:') ? 'selfIssued' : 'atProtocol';
 }
 
 function nonblank(s: string | null | undefined): string | null {
@@ -211,10 +211,10 @@ function render(
       line = s.atProtocol.line;
       flags = s.atProtocol;
       break;
-    case 'selfCreated':
-      ({ label } = s.selfCreated);
-      line = s.selfCreated.line;
-      flags = s.selfCreated;
+    case 'selfIssued':
+      ({ label } = s.selfIssued);
+      line = s.selfIssued.line;
+      flags = s.selfIssued;
       break;
     case 'relayed': {
       const who = origin ?? s.relayed.origin_fallback;

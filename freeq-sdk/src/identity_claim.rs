@@ -38,7 +38,7 @@ pub enum IdentityClaimState {
     /// A DID the server bound at SASL and the AT Protocol resolves.
     AtProtocol,
     /// A `did:key:` — real, and nothing outside vouches for who holds it.
-    SelfCreated,
+    SelfIssued,
     /// Learned through a relaying peer rather than checked here.
     Relayed,
     /// No account behind the name — the tags or the lookup said so.
@@ -53,7 +53,7 @@ impl IdentityClaimState {
     fn spec_key(self) -> &'static str {
         match self {
             Self::AtProtocol => "atProtocol",
-            Self::SelfCreated => "selfCreated",
+            Self::SelfIssued => "selfIssued",
             Self::Relayed => "relayed",
             Self::Guest => "guest",
             Self::LookingUp => "lookingUp",
@@ -234,7 +234,7 @@ pub fn stamping_epoch_unix() -> u64 {
 
 fn by_did(did: &str) -> IdentityClaimState {
     if did.starts_with("did:key:") {
-        IdentityClaimState::SelfCreated
+        IdentityClaimState::SelfIssued
     } else {
         IdentityClaimState::AtProtocol
     }
@@ -261,8 +261,8 @@ fn render(
             let st = &s.states.at_protocol;
             (st.label.clone(), st.flags(), st.line.clone())
         }
-        IdentityClaimState::SelfCreated => {
-            let st = &s.states.self_created;
+        IdentityClaimState::SelfIssued => {
+            let st = &s.states.self_issued;
             (st.label.clone(), st.flags(), st.line.clone())
         }
         IdentityClaimState::Relayed => {
@@ -319,8 +319,8 @@ struct Spec {
 struct SpecStates {
     #[serde(rename = "atProtocol")]
     at_protocol: SimpleState,
-    #[serde(rename = "selfCreated")]
-    self_created: SimpleState,
+    #[serde(rename = "selfIssued")]
+    self_issued: SimpleState,
     relayed: RelayedState,
     guest: GuestState,
     #[serde(rename = "lookingUp")]

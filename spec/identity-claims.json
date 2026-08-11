@@ -26,12 +26,12 @@
       "needs_key_card": true,
       "line": "This is a real, self-owned identity. Its owner holds the key below and signs everything they send — so anyone can prove a message really came from them, on freeq or anywhere else on the network."
     },
-    "selfCreated": {
-      "label": "Self-created identity",
+    "selfIssued": {
+      "label": "Self-issued identity",
       "shows_mark": false,
       "is_pending": false,
       "needs_key_card": true,
-      "line": "This is a self-created identity, but is not tied to a Bluesky account. Its owner holds the key below and signs everything they send — so anyone can prove a message really came from them, on freeq or anywhere else on the network."
+      "line": "This is a self-issued identity, not tied to a Bluesky account. Its owner holds the key below and signs everything they send — so anyone can prove a message really came from them, on freeq or anywhere else on the network."
     },
     "relayed": {
       "label": "Relayed identity",
@@ -78,7 +78,7 @@
     {
       "name": "m2_account_didkey",
       "input": { "account": "did:key:z6MktqKFTsnyiJsduutxcKaErvVJy4cvqh9D7VPvwYu3Y7c7", "origin": null, "sender_present": false, "sender_live_did": null, "row_time_unix": 1786320000 },
-      "expect": { "state": "selfCreated", "did": "did:key:z6MktqKFTsnyiJsduutxcKaErvVJy4cvqh9D7VPvwYu3Y7c7", "line": "This is a self-created identity, but is not tied to a Bluesky account. Its owner holds the key below and signs everything they send — so anyone can prove a message really came from them, on freeq or anywhere else on the network." }
+      "expect": { "state": "selfIssued", "did": "did:key:z6MktqKFTsnyiJsduutxcKaErvVJy4cvqh9D7VPvwYu3Y7c7", "line": "This is a self-issued identity, not tied to a Bluesky account. Its owner holds the key below and signs everything they send — so anyone can prove a message really came from them, on freeq or anywhere else on the network." }
     },
     {
       "name": "m3_relayed_with_plc_account",
@@ -108,7 +108,7 @@
     {
       "name": "m5_untagged_pre_epoch_row_present_sender_answers_didkey",
       "input": { "account": null, "origin": null, "sender_present": true, "sender_live_did": "did:key:z6MktqKFTsnyiJsduutxcKaErvVJy4cvqh9D7VPvwYu3Y7c7", "row_time_unix": 1750000000 },
-      "expect": { "state": "selfCreated", "did": "did:key:z6MktqKFTsnyiJsduutxcKaErvVJy4cvqh9D7VPvwYu3Y7c7", "line": "This is a self-created identity, but is not tied to a Bluesky account. Its owner holds the key below and signs everything they send — so anyone can prove a message really came from them, on freeq or anywhere else on the network." }
+      "expect": { "state": "selfIssued", "did": "did:key:z6MktqKFTsnyiJsduutxcKaErvVJy4cvqh9D7VPvwYu3Y7c7", "line": "This is a self-issued identity, not tied to a Bluesky account. Its owner holds the key below and signs everything they send — so anyone can prove a message really came from them, on freeq or anywhere else on the network." }
     },
     {
       "name": "m6_untagged_present_unbound_is_a_guest_post_epoch",
@@ -213,7 +213,7 @@
     {
       "name": "p2_live_binding_didkey",
       "input": { "binding": "did:key:z6MktqKFTsnyiJsduutxcKaErvVJy4cvqh9D7VPvwYu3Y7c7", "seen_only_via_peer": false, "via_peer_origin": null, "via_peer_had_account": false, "lookup": "notAsked" },
-      "expect": { "state": "selfCreated", "did": "did:key:z6MktqKFTsnyiJsduutxcKaErvVJy4cvqh9D7VPvwYu3Y7c7", "line": "This is a self-created identity, but is not tied to a Bluesky account. Its owner holds the key below and signs everything they send — so anyone can prove a message really came from them, on freeq or anywhere else on the network." }
+      "expect": { "state": "selfIssued", "did": "did:key:z6MktqKFTsnyiJsduutxcKaErvVJy4cvqh9D7VPvwYu3Y7c7", "line": "This is a self-issued identity, not tied to a Bluesky account. Its owner holds the key below and signs everything they send — so anyone can prove a message really came from them, on freeq or anywhere else on the network." }
     },
     {
       "name": "p3_seen_only_via_peer_with_account",
