@@ -86,3 +86,18 @@ export {
   sealBatch, openBest, isGroupEncrypted, parseEpoch,
 } from './e2ee_group.js';
 export type { GroupState, SealedGroupKey, X25519Secret } from './e2ee_group.js';
+
+// What a client can honestly say about who someone is — one rule, shared
+// byte-for-byte with the Rust SDK via spec/identity-claims.json.
+export {
+  claimForMessage,
+  claimForPerson,
+  stampingEpochUnix,
+} from './identity-claim.js';
+export type {
+  IdentityClaim,
+  IdentityClaimState,
+  MessageClaimInput,
+  PersonClaimInput,
+  PersonLookup,
+} from './identity-claim.js';
