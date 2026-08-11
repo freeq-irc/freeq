@@ -1169,11 +1169,14 @@ class AppState(application: Application) : AndroidViewModel(application) {
     fun settleIdentityLookup(nick: String) {
         val key = nick.trim().lowercase()
         if (identityLookups[key] != IdentityLookup.IN_FLIGHT) return
-        if (didForNick(key) != null) {
-            // The answer named a DID: the binding is live-known this session.
-            identityLookups[key] = IdentityLookup.ANSWERED_DID
-        } else if (key in whoisNoSuchNick) {
+        // Nobody-holds-this-name always wins: a 401 says nothing about
+        // anybody, and a DID the cache happens to remember must never be
+        // laundered into "the answer named one" — that is the stale-cache
+        // vote this whole design exists to end.
+        if (key in whoisNoSuchNick) {
             identityLookups.remove(key)
+        } else if (didForNick(key) != null) {
+            identityLookups[key] = IdentityLookup.ANSWERED_DID
         } else {
             identityLookups[key] = IdentityLookup.NO_ACCOUNT
         }

@@ -1646,11 +1646,14 @@ class AppState {
     func settleIdentityLookup(_ nickOrKey: String) {
         let key = nickOrKey.lowercased()
         guard identityLookups[key] == .inFlight else { return }
-        if didForNick(key) != nil {
-            // The answer named a DID: the binding is live-known this session.
-            identityLookups[key] = .answeredDid
-        } else if whoisNoSuchNick.contains(key) {
+        // Nobody-holds-this-name always wins: a 401 says nothing about
+        // anybody, and a DID the cache happens to remember must never be
+        // laundered into "the answer named one" — that is the stale-cache
+        // vote this whole design exists to end.
+        if whoisNoSuchNick.contains(key) {
             identityLookups.removeValue(forKey: key)
+        } else if didForNick(key) != nil {
+            identityLookups[key] = .answeredDid
         } else {
             identityLookups[key] = .noAccount
         }
