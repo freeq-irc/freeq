@@ -175,6 +175,23 @@
       "sigTag": "ed25519:ajgD1fBZkCocba-8m6Rykg:HB0V8hB-5M0VyHTR_orTsI3YRkv3syCRcgK9mN5GD47nUZG3sBS7L2bLpo9NN4eCV53nwUzUDkAmHSFD-Xv9Cw"
     },
     {
+      "canonical": "{\"body\":\"sha256:d7c83fe297e09ad05ed0cac98b53feebdfd239a6595047fc7ae87d422eaab6eb\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"target\":\"#freeq\"}",
+      "input": {
+        "bodyText": "empty is not a value",
+        "edit": "",
+        "from": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "kind": "message",
+        "msgid": "01KYVT5Z8Q0000000000000000",
+        "reply": "",
+        "target": "#freeq"
+      },
+      "kid": "ajgD1fBZkCocba-8m6Rykg",
+      "name": "message-empty-optional-fields-are-skipped",
+      "publicKey": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+      "seed": "0202020202020202020202020202020202020202020202020202020202020202",
+      "sigTag": "ed25519:ajgD1fBZkCocba-8m6Rykg:oqNMGwAmkk9YiaUfa8opE-Mf3BfbMuWHflhx6dQ50-So6lATrE2JQ1cTwmZVuAckrGIfDel3lsALNeFP-DZyCA"
+    },
+    {
       "canonical": "{\"body\":\"sha256:bd99281b6236112d2c1ed3776230493ccc9a31b4a8c12393d5d946c91663bcad\",\"from\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"msgid\":\"01KYVT5Z8Q0000000000000000\",\"target\":\"#freeq\"}",
       "input": {
         "bodyText": "line one\nline two — \"quoted\" ✓\nline three",

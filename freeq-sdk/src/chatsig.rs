@@ -410,16 +410,22 @@ impl<'a> ChatDoc<'a> {
         if let Some(body) = self.body {
             put("body", &body_hash(body));
         }
-        if let Some(reply) = self.reply {
+        // Optional string fields are skipped when empty, not emitted as "".
+        // An empty tag value asserts nothing, and an IRC tag written `+reply=`
+        // (or bare `+reply`) parses to an empty string — so skipping is what
+        // keeps this canonical byte-identical to the TypeScript one, which
+        // drops falsy fields. Emitting Some("") here made an honest empty-value
+        // message verify as tampered across the two implementations.
+        if let Some(reply) = self.reply.filter(|s| !s.is_empty()) {
             put("reply", reply);
         }
-        if let Some(edit) = self.edit {
+        if let Some(edit) = self.edit.filter(|s| !s.is_empty()) {
             put("edit", edit);
         }
         if let Some(subject) = self.subject {
             put("subject", subject);
         }
-        if let Some(emoji) = self.emoji
+        if let Some(emoji) = self.emoji.filter(|s| !s.is_empty())
             && matches!(
                 self.kind,
                 Some(DocKind::Mutation(Mutation::React | Mutation::Unreact))
@@ -434,10 +440,10 @@ impl<'a> ChatDoc<'a> {
             if let Some(payload) = self.payload {
                 put("payload", &body_hash(payload));
             }
-            if let Some(reference) = self.reference {
+            if let Some(reference) = self.reference.filter(|s| !s.is_empty()) {
                 put("ref", reference);
             }
-            if let Some(evidence) = self.evidence {
+            if let Some(evidence) = self.evidence.filter(|s| !s.is_empty()) {
                 put("evidence", evidence);
             }
 
@@ -1144,6 +1150,23 @@ mod tests {
                 }),
             },
             Case {
+                // An empty optional covered field is skipped, never emitted as
+                // "". An IRC tag written `+reply=` parses to an empty string, so
+                // a client that sends one must canonicalize identically to one
+                // that sends no reply at all — otherwise the two implementations
+                // disagree and an honest message reads as tampered.
+                name: "message-empty-optional-fields-are-skipped",
+                seed: 2,
+                doc: ChatDoc::message(ALICE, MSGID, "#freeq", "empty is not a value")
+                    .with_reply("")
+                    .with_edit(""),
+                input: json!({
+                    "kind": "message", "from": ALICE, "msgid": MSGID,
+                    "target": "#freeq", "bodyText": "empty is not a value",
+                    "reply": "", "edit": "",
+                }),
+            },
+            Case {
                 name: "message-multiline-and-escaping",
                 seed: 3,
                 doc: ChatDoc::message(
@@ -1507,6 +1530,35 @@ mod tests {
             .expect("spec/chat-signing-vectors.json missing — run generate_chat_signing_vectors");
         let on_disk: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
         assert_eq!(on_disk, build_fixtures_json());
+    }
+
+    #[test]
+    fn empty_optional_fields_are_skipped_not_emitted() {
+        // Every optional covered string field: an empty value canonicalizes
+        // exactly as an absent one, so this canonical stays byte-identical to
+        // the TypeScript one (which drops falsy fields). Pins the fix for the
+        // wire-reachable `+reply=` divergence and its four siblings.
+        let msg_absent = ChatDoc::message(ALICE, MSGID, "#freeq", "hi").canonical();
+        let msg_empty = ChatDoc::message(ALICE, MSGID, "#freeq", "hi")
+            .with_reply("")
+            .with_edit("")
+            .canonical();
+        assert_eq!(msg_empty, msg_absent, "empty reply/edit must be skipped");
+
+        let react_absent =
+            ChatDoc::mutation(Mutation::React, ALICE, MSGID, "#freeq", ROOT).canonical();
+        let react_empty = ChatDoc::mutation(Mutation::React, ALICE, MSGID, "#freeq", ROOT)
+            .with_emoji("")
+            .canonical();
+        assert_eq!(react_empty, react_absent, "empty emoji must be skipped");
+
+        let coord_absent =
+            ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_complete").canonical();
+        let coord_empty = ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_complete")
+            .with_ref("")
+            .with_evidence("")
+            .canonical();
+        assert_eq!(coord_empty, coord_absent, "empty ref/evidence must be skipped");
     }
 
     /// Every positive vector verifies, and every negative reaches its stated
