@@ -910,6 +910,50 @@ async fn a_mutation_signature_that_fails_is_refused_and_never_relayed() {
 }
 
 #[tokio::test]
+async fn an_edit_signature_that_fails_is_refused_and_never_applied() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#editforge");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#editforge");
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
+
+        let root = freeq_server::msgid::generate();
+        alice.send_with_id(&root, "#editforge", "first draft");
+        bob.rx(|l| l.contains("first draft"), "the original");
+
+        // Sign over one body, send another — what a relay tampering with an
+        // edit in flight produces. The signature no longer matches the bytes,
+        // and an edit changes an existing record, so it must be refused (the
+        // same rule delete/react/unreact enforce).
+        let edit_id = freeq_server::msgid::generate();
+        let sig = ChatDoc::message(DID_ALICE, &edit_id, &channel_venue("#editforge"), "honest revision")
+            .with_edit(&root)
+            .sign(&signing);
+        alice.tx(&format!(
+            "@{EVENT_ID_TAG}={edit_id};+draft/edit={root};+freeq.at/sig={sig} \
+             PRIVMSG #editforge :tampered revision"
+        ));
+
+        alice.rx(|l| l.contains("SIGNATURE_INVALID"), "FAIL to the sender");
+        assert!(
+            bob.maybe(|l| l.contains("tampered revision"), 500).is_none(),
+            "an edit whose signature failed must not reach anyone"
+        );
+        // The original still stands, unedited.
+        assert!(
+            history_of(addr, "#editforge", "first draft").is_some(),
+            "a refused edit must not have changed the original"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_guest_cannot_attach_a_mutation_signature() {
     let (addr, _h) = start(DidResolver::static_map(HashMap::new())).await;
     run(addr, move |addr| {

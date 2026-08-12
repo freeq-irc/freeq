@@ -3168,8 +3168,40 @@ fn handle_edit(
         msgid: &edit_msgid,
         reply: reply_reference(tags),
         edit: Some(original_msgid),
-        body_rewritten: false,
     };
+
+    // Refuse an edit whose signature fails to verify — the same tamper rule
+    // delete/react/unreact already enforce. An edit changes an existing record,
+    // so a signature that fails against the key it names is evidence of
+    // tampering and must not apply. Absent and unverifiable signatures still
+    // fall through to the server vouch below; only a *failed* check is refused.
+    if let Some(did) = conn.authenticated_did.as_deref()
+        && let (Some(sig_tag), Some(venue)) = (client_sig, signing_venue(state, did, target))
+    {
+        let doc = message_document(did, &venue, &signed, tags);
+        if verify_client_signature(&doc, sig_tag, did, Some(&conn.id), state)
+            == ClientSigOutcome::Failed
+        {
+            tracing::warn!(
+                session = %conn.id, did = %did, target = %target,
+                "Edit signature did not verify against the key it names — refusing the edit"
+            );
+            let reply = Message::from_server(
+                &state.server_name,
+                "FAIL",
+                vec![
+                    "EDIT",
+                    "SIGNATURE_INVALID",
+                    "That signature does not verify against the key it names",
+                ],
+            );
+            if let Some(tx) = state.connections.lock().get(&conn.id) {
+                let _ = tx.try_send(format!("{reply}\r\n"));
+            }
+            return;
+        }
+    }
+
     set_signature(
         &mut full_tags,
         resolve_signature(conn, target, &signed, tags, client_sig, state),
