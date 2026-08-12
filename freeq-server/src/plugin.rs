@@ -58,17 +58,6 @@ pub struct JoinEvent {
     pub is_new_channel: bool,
 }
 
-/// Event emitted when a PRIVMSG or NOTICE is sent.
-#[derive(Debug, Clone)]
-pub struct MessageEvent {
-    pub nick: String,
-    pub command: String, // "PRIVMSG" or "NOTICE"
-    pub target: String,
-    pub text: String,
-    pub did: Option<String>,
-    pub session_id: String,
-}
-
 /// Event emitted when a user changes their nick.
 #[derive(Debug, Clone)]
 pub struct NickChangeEvent {
@@ -86,15 +75,6 @@ pub struct AuthResult {
     pub override_did: Option<String>,
     /// If set, this replaces the handle in session_handles.
     pub override_handle: Option<String>,
-}
-
-/// Result of a plugin processing a message event.
-#[derive(Debug, Clone, Default)]
-pub struct MessageResult {
-    /// If true, suppress the message (don't deliver it).
-    pub suppress: bool,
-    /// If set, replace the message text.
-    pub rewrite_text: Option<String>,
 }
 
 /// Trait that all plugins implement.
@@ -117,13 +97,6 @@ pub trait Plugin: Send + Sync {
     /// Called when a user joins a channel.
     fn on_join(&self, event: &JoinEvent) {
         let _ = event;
-    }
-
-    /// Called when a PRIVMSG or NOTICE is about to be delivered.
-    /// Return a `MessageResult` to suppress or rewrite the message.
-    fn on_message(&self, event: &MessageEvent) -> Option<MessageResult> {
-        let _ = event;
-        None
     }
 
     /// Called when a user changes their nick.
@@ -247,22 +220,6 @@ impl PluginManager {
         for plugin in &self.plugins {
             plugin.on_join(event);
         }
-    }
-
-    /// Dispatch a message event to all plugins. Returns the merged result.
-    pub fn on_message(&self, event: &MessageEvent) -> MessageResult {
-        let mut result = MessageResult::default();
-        for plugin in &self.plugins {
-            if let Some(r) = plugin.on_message(event) {
-                if r.suppress {
-                    result.suppress = true;
-                }
-                if r.rewrite_text.is_some() {
-                    result.rewrite_text = r.rewrite_text;
-                }
-            }
-        }
-        result
     }
 
     /// Dispatch a nick change event to all plugins.

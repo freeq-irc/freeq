@@ -2911,7 +2911,6 @@ fn verify_relayed_privmsg(
             .or_else(|| tags.get("+draft/reply"))
             .map(String::as_str),
         edit: replaces_msgid.filter(|r| !r.is_empty()),
-        body_rewritten: false,
     };
     Some(verify_relayed_message(
         state, did, target, &fields, tags, sig,

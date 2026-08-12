@@ -138,10 +138,6 @@ pub(crate) struct SignedFields<'a> {
     pub reply: Option<&'a str>,
     /// Root msgid this message revises, if any.
     pub edit: Option<&'a str>,
-    /// True when a plugin rewrote the body after the client signed it. The
-    /// signature then cannot match, and the cause is this server, not the
-    /// sender — so it must read *unverifiable*, never invalid.
-    pub body_rewritten: bool,
 }
 
 /// The venue a signed document binds, or `None` when this server cannot work
@@ -192,9 +188,9 @@ fn message_document<'a>(
 ///   server never held the private key.
 /// - **A server signature** over the same document, when the client didn't
 ///   sign or when its signature was *unverifiable* (no key on file for that
-///   kid, an algorithm we don't know, a legacy-format signature, or a body
-///   this server's plugins rewrote). Attaching ours says only what it means:
-///   this server vouches that this identity sent this.
+///   kid, an algorithm we don't know, or a legacy-format signature). Attaching
+///   ours says only what it means: this server vouches that this identity sent
+///   this.
 /// - **Nothing**, for a guest — and for a signature that *failed* against the
 ///   key it named. That is the one case we refuse to paper over: quietly
 ///   replacing a failed signature with the server's own would turn a signature
@@ -210,9 +206,7 @@ fn resolve_signature(
     let did = conn.authenticated_did.as_ref()?;
     let venue = signing_venue(state, did, target);
 
-    if let (Some(sig_tag), Some(venue)) = (client_sig, venue.as_deref())
-        && !fields.body_rewritten
-    {
+    if let (Some(sig_tag), Some(venue)) = (client_sig, venue.as_deref()) {
         let doc = message_document(did, venue, fields, tags);
         match verify_client_signature(&doc, sig_tag, did, Some(&conn.id), state) {
             ClientSigOutcome::Verified => return Some(sig_tag.to_string()),
@@ -234,9 +228,7 @@ fn resolve_signature(
     } else if client_sig.is_some() {
         tracing::debug!(
             session = %conn.id, did = %did, msgid = %fields.msgid,
-            rewritten = fields.body_rewritten,
-            "Client signature not verifiable here (no venue, or body rewritten \
-             after signing) — server-signing instead"
+            "Client signature not verifiable here (no venue) — server-signing instead"
         );
     }
 
@@ -1735,21 +1727,6 @@ pub(super) fn handle_privmsg_with_multiline(
             }
         }
 
-        // Run plugin on_message hook
-        let msg_event = crate::plugin::MessageEvent {
-            nick: conn.nick.clone().unwrap_or_default(),
-            command: command.to_string(),
-            target: target.to_string(),
-            text: text.to_string(),
-            did: conn.authenticated_did.clone(),
-            session_id: conn.id.clone(),
-        };
-        let msg_result = state.plugin_manager.on_message(&msg_event);
-        if msg_result.suppress {
-            return;
-        }
-        let text = msg_result.rewrite_text.as_deref().unwrap_or(text);
-
         // The id this message is filed under — the sender's own if it minted
         // one and it holds up (see `resolve_event_msgid`).
         let msgid = match resolve_event_msgid(conn, tags, state) {
@@ -1772,7 +1749,6 @@ pub(super) fn handle_privmsg_with_multiline(
             msgid: &msgid,
             reply: reply_reference(tags),
             edit: None,
-            body_rewritten: msg_result.rewrite_text.is_some(),
         };
         set_signature(
             &mut full_tags,
@@ -2058,7 +2034,6 @@ pub(super) fn handle_privmsg_with_multiline(
             msgid: &pm_msgid,
             reply: reply_reference(tags),
             edit: None,
-            body_rewritten: false,
         };
         set_signature(
             &mut pm_tags,
