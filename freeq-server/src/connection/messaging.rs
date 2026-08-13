@@ -3179,31 +3179,45 @@ fn handle_edit(
         edit: Some(original_msgid),
     };
 
-    // Refuse an edit whose signature fails to verify — the same tamper rule
-    // delete/react/unreact already enforce. An edit changes an existing record,
-    // so a signature that fails against the key it names is evidence of
-    // tampering and must not apply. Absent and unverifiable signatures still
-    // fall through to the server vouch below; only a *failed* check is refused.
+    // An edit takes the editor's own proof, the same as a delete or a
+    // reaction: it rewrites a record that already exists, and a note saying
+    // this server believed them is not evidence of what they wrote.
+    //
+    // Two refusals, one rule, kept apart because they are different problems
+    // for the sender to fix. A signature that fails against the key it names
+    // is evidence the bytes moved. One this server cannot check at all —
+    // absent, or naming a key nobody registered — is a request nobody proved.
+    //
+    // A venue that does not resolve exempts the edit, as it does every other
+    // mutation: a DM with a guest has no document for anyone to sign, so
+    // requiring one would end editing in those threads and end nothing else.
     if let Some(did) = conn.authenticated_did.as_deref()
-        && let (Some(sig_tag), Some(venue)) = (client_sig, signing_venue(state, did, target))
+        && let Some(venue) = signing_venue(state, did, target)
     {
-        let doc = message_document(did, &venue, &signed, tags);
-        if verify_client_signature(&doc, sig_tag, did, Some(&conn.id), state)
-            == ClientSigOutcome::Failed
-        {
-            tracing::warn!(
-                session = %conn.id, did = %did, target = %target,
-                "Edit signature did not verify against the key it names — refusing the edit"
-            );
-            let reply = Message::from_server(
-                &state.server_name,
-                "FAIL",
-                vec![
-                    "EDIT",
+        let outcome = match client_sig {
+            Some(sig_tag) => {
+                let doc = message_document(did, &venue, &signed, tags);
+                verify_client_signature(&doc, sig_tag, did, Some(&conn.id), state)
+            }
+            None => ClientSigOutcome::Unverifiable("edit carries no signature"),
+        };
+        if outcome != ClientSigOutcome::Verified {
+            let (code, description) = match outcome {
+                ClientSigOutcome::Failed => (
                     "SIGNATURE_INVALID",
                     "That signature does not verify against the key it names",
-                ],
+                ),
+                _ => (
+                    "SIGNATURE_REQUIRED",
+                    "A signed request is required to modify messages on this server",
+                ),
+            };
+            tracing::warn!(
+                session = %conn.id, did = %did, target = %target, outcome = ?outcome,
+                "Edit refused: {code}"
             );
+            let reply =
+                Message::from_server(&state.server_name, "FAIL", vec!["EDIT", code, description]);
             if let Some(tx) = state.connections.lock().get(&conn.id) {
                 let _ = tx.try_send(format!("{reply}\r\n"));
             }

@@ -975,6 +975,97 @@ async fn an_edit_signature_that_fails_is_refused_and_never_applied() {
     .await;
 }
 
+/// An edit is a mutation like any other: it rewrites a record that already
+/// exists, so it takes the editor's own proof. Refused rather than vouched
+/// for, and the original stands.
+#[tokio::test]
+async fn an_unsigned_edit_from_an_identity_is_refused() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#unsignededit");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#unsignededit");
+
+        let root = freeq_server::msgid::generate();
+        alice.send_with_id(&root, "#unsignededit", "first draft");
+        bob.rx(|l| l.contains("first draft"), "the original");
+
+        alice.tx(&format!(
+            "@+draft/edit={root} PRIVMSG #unsignededit :revised without proof"
+        ));
+        let fail = alice.rx(|l| l.contains("SIGNATURE_REQUIRED"), "FAIL to the sender");
+        assert!(
+            fail.contains("FAIL EDIT SIGNATURE_REQUIRED"),
+            "the refusal names the command and why: {fail}"
+        );
+        assert!(
+            bob.maybe(|l| l.contains("revised without proof"), 500).is_none(),
+            "a refused edit must not reach anyone"
+        );
+        assert!(
+            history_of(addr, "#unsignededit", "first draft").is_some(),
+            "a refused edit must not have changed the original"
+        );
+    })
+    .await;
+}
+
+/// The other half of the same rule. A signature this server cannot check —
+/// here, one naming a key nobody registered — is not proof, and an edit is
+/// refused for want of proof rather than filed on the server's word.
+#[tokio::test]
+async fn an_edit_signed_with_a_key_this_server_cannot_resolve_is_refused() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#unresolvable");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#unresolvable");
+
+        let root = freeq_server::msgid::generate();
+        alice.send_with_id(&root, "#unresolvable", "first draft");
+        bob.rx(|l| l.contains("first draft"), "the original");
+
+        // Signed honestly, with a key never registered by MSGSIG: the kid
+        // resolves to nothing here, so the verdict is can't-check.
+        let stranger = SigningKey::from_bytes(&[99u8; 32]);
+        let edit_id = freeq_server::msgid::generate();
+        let sig = ChatDoc::message(
+            DID_ALICE,
+            &edit_id,
+            &channel_venue("#unresolvable"),
+            "revised with an unknown key",
+        )
+        .with_edit(&root)
+        .sign(&stranger);
+        alice.tx(&format!(
+            "@{EVENT_ID_TAG}={edit_id};+draft/edit={root};+freeq.at/sig={sig} \
+             PRIVMSG #unresolvable :revised with an unknown key"
+        ));
+
+        let fail = alice.rx(|l| l.contains("SIGNATURE_REQUIRED"), "FAIL to the sender");
+        assert!(
+            fail.contains("FAIL EDIT SIGNATURE_REQUIRED"),
+            "an unresolvable key is a missing proof, not a bad one: {fail}"
+        );
+        assert!(
+            bob.maybe(|l| l.contains("revised with an unknown key"), 500)
+                .is_none(),
+            "a refused edit must not reach anyone"
+        );
+        assert!(
+            history_of(addr, "#unresolvable", "first draft").is_some(),
+            "a refused edit must not have changed the original"
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_signed_multiline_edit_verifies_and_a_tampered_one_is_refused() {
     let (ka, kb) = (key(), key());
