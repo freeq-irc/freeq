@@ -820,76 +820,42 @@ fn keep_signature(checked: Option<&CheckedMutation>, tidied: &HashMap<String, St
 /// event is filed under, and the signature that goes with it.
 pub(crate) struct VouchedMutation {
     pub event_id: String,
-    /// The sender's own signature, or this server's over the same document.
-    /// `None` only for a guest — no identity, nothing to vouch for.
+    /// The sender's own signature. Never this server's: a mutation nobody
+    /// proved is refused rather than vouched for.
     pub signature: Option<String>,
 }
 
-/// Settle a mutation's signature the way a message's is settled.
+/// Settle a mutation's signature: the sender's own, or nothing.
 ///
-/// A note under a user's name means the same thing whether it is a sentence or
-/// a delete: *this server saw this authenticated account do this*. So the
-/// rules are the message rules, with no special case:
+/// A mutation changes a record that already exists, so the only thing worth
+/// attaching is proof from the key the actor registered. This server used to
+/// sign an unsigned one on the sender's behalf, which made the actor of a
+/// delete this server's word — indistinguishable, from the act alone, from
+/// the sender's own. Those events are now refused at ingress instead
+/// (`handle_tagmsg`), leaving this with one job: carry the sender's signature
+/// onward while it still covers what is on the wire.
 ///
-/// - the sender's signature, when it verifies and still covers what is on the
-///   wire — the only outcome with real non-repudiation;
-/// - **this server's signature** over the same document otherwise, which says
-///   only what it means. A reader tells the two apart by the key each names,
-///   which is what `verified_by` reports;
-/// - nothing at all for a guest, who has no identity to bind.
-///
-/// A signature that *failed* never reaches here: the caller refuses the event.
+/// `None` for a guest, who has no identity to bind, and for a verified
+/// signature whose subject this server has since re-rooted — the document a
+/// reader would rebuild is no longer the one the sender signed.
 fn vouch_mutation(
-    conn: &Connection,
-    target: &str,
     tidied: &HashMap<String, String>,
     checked: Option<&CheckedMutation>,
-    state: &Arc<SharedState>,
 ) -> Option<VouchedMutation> {
-    let (kind, subject, emoji) = mutation_in(tidied)?;
+    if !keep_signature(checked, tidied) {
+        return None;
+    }
     let event_id = tidied
         .get(freeq_sdk::chatsig::EVENT_ID_TAG)
         .or_else(|| tidied.get(freeq_sdk::chatsig::EVENT_ID_TAG_BARE))
-        .cloned();
-
-    // The sender's own, when it verified and nothing since has moved out from
-    // under it.
-    if keep_signature(checked, tidied)
-        && let (Some(event_id), Some(sig)) = (
-            event_id.clone(),
-            tidied
-                .get("+freeq.at/sig")
-                .or_else(|| tidied.get("freeq.at/sig"))
-                .cloned(),
-        )
-    {
-        return Some(VouchedMutation {
-            event_id,
-            signature: Some(sig),
-        });
-    }
-
-    let did = conn.authenticated_did.as_deref()?;
-    // Without a venue there is no document, and inventing one would produce a
-    // signature nobody could rebuild — the exact failure the canonical exists
-    // to end. The act still happens; it just isn't vouched for.
-    let venue = signing_venue(state, did, target)?;
-    // The sender's id is kept when it holds up, so the event this server
-    // vouches for and the one the sender named are the same event. Otherwise
-    // the act still needs an identity, and this server mints it.
-    let event_id = event_id
-        .filter(|id| crate::msgid::check_client_minted(id, now_ms()).is_ok())
-        .unwrap_or_else(crate::msgid::generate);
-
-    let mut doc =
-        freeq_sdk::chatsig::ChatDoc::mutation(kind, did, &event_id, &venue, &subject);
-    if let Some(ref emoji) = emoji {
-        doc = doc.with_emoji(emoji);
-    }
-    let signature = doc.sign(&state.msg_signing_key);
+        .cloned()?;
+    let sig = tidied
+        .get("+freeq.at/sig")
+        .or_else(|| tidied.get("freeq.at/sig"))
+        .cloned()?;
     Some(VouchedMutation {
         event_id,
-        signature: Some(signature),
+        signature: Some(sig),
     })
 }
 
@@ -990,6 +956,50 @@ pub(super) fn handle_tagmsg(
         return;
     }
 
+    // ── An identity's mutation must carry that identity's own proof ──
+    //
+    // A signature this server made over someone else's delete says only that
+    // this server believed them, and nothing downstream can tell the two
+    // apart from the act alone. So an authenticated sender whose mutation
+    // arrives unsigned — or with a signature no key here can check — is
+    // refused, and nothing is filed. `SIGNATURE_REQUIRED` stays distinct from
+    // `SIGNATURE_INVALID` above: one is a client that did not sign, the other
+    // is bytes that do not match, and they are different problems to fix.
+    //
+    // Two exemptions, both cases where the proof could not have existed:
+    // a guest, who has no identity to bind, and a thread with no venue — a
+    // DM with a guest, whose document names a DID the recipient does not
+    // have. Demanding a signature there would end deletes in those threads
+    // forever, and would end nothing else: no signature was ever attached to
+    // them, by the sender or by this server. A peer DID the *client* has not
+    // learned yet is not this case — that venue resolves here, and the client
+    // closes the gap by asking who the peer is before it acts.
+    if is_mutation
+        && let Some(did) = conn.authenticated_did.as_deref()
+        && signing_venue(state, did, target).is_some()
+        && arrived.as_ref().map(|c| c.outcome) != Some(ClientSigOutcome::Verified)
+    {
+        tracing::info!(
+            session = %conn.id, did = ?conn.authenticated_did, target = %target,
+            outcome = ?arrived.as_ref().map(|c| c.outcome),
+            "Mutation from an authenticated sender carries no signature this server can \
+             check — refusing the event"
+        );
+        let reply = Message::from_server(
+            &state.server_name,
+            "FAIL",
+            vec![
+                "TAGMSG",
+                "SIGNATURE_REQUIRED",
+                "A signed request is required to modify messages on this server",
+            ],
+        );
+        if let Some(tx) = state.connections.lock().get(&conn.id) {
+            let _ = tx.try_send(format!("{reply}\r\n"));
+        }
+        return;
+    }
+
     // Normalize IRCv3 draft tags to their canonical forms so all downstream
     // code (persistence, relay, fallback) only needs to check one name.
     let mut tags = tags.clone();
@@ -1016,14 +1026,13 @@ pub(super) fn handle_tagmsg(
             tags.insert("+draft/delete".to_string(), root);
         }
     }
-    // Settle what this server stands behind. The sender's signature when it
-    // verified and still covers what is on the wire; this server's over the
-    // same document otherwise; nothing at all for a guest. A signature the
+    // Settle what this server stands behind: the sender's signature while it
+    // still covers what is on the wire, and nothing otherwise. A signature the
     // server did not make and cannot vouch for never leaves the server — the
     // never-launder rule, which is also what stops a guest inventing a lock
     // badge for free.
     let vouched = if is_mutation {
-        vouch_mutation(conn, target, &tags, arrived.as_ref(), state)
+        vouch_mutation(&tags, arrived.as_ref())
     } else {
         None
     };

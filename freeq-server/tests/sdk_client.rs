@@ -772,6 +772,17 @@ async fn dm_delete_persists_across_history_replay() {
     wait(&mut rxc, |e| matches!(e, Event::Registered { .. }), "reg C").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // Ask who the peer is before acting on the thread. A DM's signed venue is
+    // the two DIDs, so a client that only knows a nick has no document to
+    // sign — and a mutation nobody signed is refused.
+    ha.raw("WHOIS delc").await.unwrap();
+    wait(
+        &mut rxa,
+        |e| matches!(e, Event::MemberDid { did, .. } if did == DID_C),
+        "A learns C's DID",
+    )
+    .await;
+
     ha.privmsg("delc", "delete me").await.unwrap();
     // The sender's echo carries the server-assigned msgid.
     let echo = wait(
@@ -974,6 +985,13 @@ async fn guest_dm_edit_relays_without_persistence() {
 }
 
 /// Same for delete: relays as a +draft/delete TAGMSG to the guest.
+///
+/// A guest recipient has no DID, so this thread has no venue any signature
+/// could name — no document for the sender to sign, none for a reader to
+/// rebuild. The signature requirement does not reach here: it ends the
+/// server vouching for acts it could not check, and there was never anything
+/// to vouch for in a thread like this one. Requiring proof that cannot exist
+/// would end deletes in guest DMs and end nothing else.
 #[tokio::test]
 async fn guest_dm_delete_relays_without_persistence() {
     let key_a = PrivateKey::generate_ed25519();

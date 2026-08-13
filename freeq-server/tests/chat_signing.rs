@@ -1068,35 +1068,121 @@ async fn a_guest_cannot_attach_a_mutation_signature() {
     .await;
 }
 
-/// An unsigned mutation from an identity is vouched for by the server, the
-/// same way an unsigned message is. The note means the same thing in both
-/// cases — *this server saw this authenticated account do this* — and a
-/// reader tells a vouch from a device's proof by the key each names.
+/// Changing an existing message takes the sender's own proof. A server
+/// signature over someone else's delete says only that this server believes
+/// them, and a reader cannot tell that from the act itself — so the act is
+/// refused rather than vouched for.
 #[tokio::test]
-async fn an_unsigned_delete_is_vouched_for_by_the_server() {
+async fn an_unsigned_delete_from_an_identity_is_refused() {
     let (ka, kb) = (key(), key());
     let did_bob = "did:plc:sig_bob";
     let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
     run(addr, move |addr| {
-        let (mut bob, mut alice, signing, msgid) =
+        let (mut bob, mut alice, _signing, msgid) =
             two_in_a_channel(addr, ka, kb, did_bob, "#plain");
 
         alice.tx(&format!("@+draft/delete={msgid} TAGMSG #plain"));
-        let seen = bob.rx(|l| l.contains("+draft/delete"), "the delete");
-        let sig = C::sig_of(&seen).expect("the server vouches for it");
-        let (kid, _) = freeq_sdk::sigtag::parse(&sig).expect("sig tag is alg:kid:sig");
-        assert_ne!(
-            kid,
-            freeq_sdk::sigtag::derive_kid(&signing.verifying_key()),
-            "a server vouch must not claim to be the sender's key: {seen}"
+        let fail = alice.rx(|l| l.contains("SIGNATURE_REQUIRED"), "FAIL to the sender");
+        assert!(
+            fail.contains("FAIL TAGMSG SIGNATURE_REQUIRED"),
+            "the refusal names the command and why: {fail}"
         );
         assert!(
-            seen.contains(EVENT_ID_TAG),
-            "a signature covers an id, so the act gets one: {seen}"
+            bob.maybe(|l| l.contains("+draft/delete"), 500).is_none(),
+            "a refused delete must not reach anyone"
         );
-        assert!(seen.contains(&msgid), "the delete still names its subject: {seen}");
+        // And it deleted nothing.
+        alice.tx("CHATHISTORY LATEST #plain * 10");
+        assert!(
+            alice.maybe(|l| l.contains("act on me"), 1000).is_some(),
+            "a refused delete must not have deleted anything"
+        );
     })
     .await;
+}
+
+/// The same rule for a reaction, which had no refusal branch at all: an
+/// unsigned one from an identity is refused, and no row is written.
+#[tokio::test]
+async fn an_unsigned_reaction_from_an_identity_is_refused() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, db_path, _h) =
+        start_with_db(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    let db_for_test = db_path.clone();
+    run(addr, move |addr| {
+        let (mut bob, mut alice, _signing, msgid) =
+            two_in_a_channel(addr, ka, kb, did_bob, "#unsignedreact");
+
+        alice.tx(&format!("@+react=👍;+reply={msgid} TAGMSG #unsignedreact"));
+        let fail = alice.rx(|l| l.contains("SIGNATURE_REQUIRED"), "FAIL to the sender");
+        assert!(
+            fail.contains("FAIL TAGMSG SIGNATURE_REQUIRED"),
+            "the refusal names the command and why: {fail}"
+        );
+        assert!(
+            bob.maybe(|l| l.contains("+react"), 500).is_none(),
+            "a refused reaction must not reach anyone"
+        );
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let conn = rusqlite::Connection::open(&db_for_test).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM reactions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "a refused reaction must file nothing");
+}
+
+/// And for taking one back. The signed reaction lands first, so what this
+/// pins is that the refusal leaves it standing rather than removing it.
+#[tokio::test]
+async fn an_unsigned_unreaction_from_an_identity_is_refused() {
+    use freeq_sdk::chatsig::Mutation;
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, db_path, _h) =
+        start_with_db(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    let db_for_test = db_path.clone();
+    run(addr, move |addr| {
+        let (mut bob, mut alice, signing, msgid) =
+            two_in_a_channel(addr, ka, kb, did_bob, "#unsignedunreact");
+
+        let event_id = freeq_server::msgid::generate();
+        let tags = signed_mutation_tags(
+            Mutation::React,
+            "+react",
+            &msgid,
+            Some("👍"),
+            "#unsignedunreact",
+            &event_id,
+            &signing,
+        );
+        alice.tx(&format!("@{tags} TAGMSG #unsignedunreact"));
+        bob.rx(|l| l.contains("+react"), "the signed reaction");
+
+        alice.tx(&format!(
+            "@+freeq.at/unreact=👍;+reply={msgid} TAGMSG #unsignedunreact"
+        ));
+        let fail = alice.rx(|l| l.contains("SIGNATURE_REQUIRED"), "FAIL to the sender");
+        assert!(
+            fail.contains("FAIL TAGMSG SIGNATURE_REQUIRED"),
+            "the refusal names the command and why: {fail}"
+        );
+        assert!(
+            bob.maybe(|l| l.contains("unreact"), 500).is_none(),
+            "a refused unreaction must not reach anyone"
+        );
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let conn = rusqlite::Connection::open(&db_for_test).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM reactions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "a refused unreaction must not remove the reaction");
 }
 
 /// A guest has no identity to bind, so there is nothing to vouch for and
