@@ -511,12 +511,82 @@ async fn a_signature_that_fails_is_not_quietly_replaced_with_the_servers() {
             .sign(&signing);
         alice.send_signed(&id, "#sig", "what I sent", &sig);
 
-        let seen = bob.rx(|l| l.contains("what I sent"), "delivery");
-        assert_eq!(
-            C::sig_of(&seen),
-            None,
+        // Neither laundered into a server signature nor delivered without the
+        // half that disagreed: refused outright.
+        assert!(
+            bob.maybe(|l| l.contains("what I sent"), 500).is_none(),
             "a signature that didn't check out must not be laundered into a \
-             server signature: {seen}"
+             server signature, and its message must not be relayed either"
+        );
+    })
+    .await;
+}
+
+/// A message whose signature fails against the key it names is evidence the
+/// bytes moved between the signer and here. It is refused rather than
+/// relayed stripped of the signature: the words and the proof arrived
+/// together and disagreed, and passing on the half that still looks fine
+/// hides exactly the fact worth knowing.
+#[tokio::test]
+async fn a_message_whose_signature_fails_is_refused_at_the_origin() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#tampered");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#tampered");
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
+
+        // Signed over one body, sent with another — what a relay rewriting a
+        // message in flight produces.
+        let msgid = freeq_server::msgid::generate();
+        let sig = ChatDoc::message(DID_ALICE, &msgid, &channel_venue("#tampered"), "what she wrote")
+            .sign(&signing);
+        alice.tx(&format!(
+            "@{EVENT_ID_TAG}={msgid};+freeq.at/sig={sig} PRIVMSG #tampered :what arrived instead"
+        ));
+
+        let fail = alice.rx(|l| l.contains("SIGNATURE_INVALID"), "FAIL to the sender");
+        assert!(
+            fail.contains("FAIL PRIVMSG SIGNATURE_INVALID"),
+            "the refusal names the command and why: {fail}"
+        );
+        assert!(
+            bob.maybe(|l| l.contains("what arrived instead"), 500).is_none(),
+            "a message whose signature failed must not reach anyone"
+        );
+    })
+    .await;
+}
+
+/// The other two verdicts are untouched: a message nobody signed still goes,
+/// carrying this server's vouch, and so does one signed under the retired
+/// format — which no key can check and which is therefore never evidence of
+/// tampering.
+#[tokio::test]
+async fn an_uncheckable_signature_still_delivers() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#legacy");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#legacy");
+
+        // A legacy signature: a bare base64 blob over the retired canonical.
+        alice.tx("@+freeq.at/sig=bGVnYWN5c2lnbmF0dXJl PRIVMSG #legacy :from an old client");
+        let seen = bob.rx(|l| l.contains("from an old client"), "the message");
+        assert!(
+            C::sig_of(&seen).is_some(),
+            "an uncheckable signature keeps the server's vouch: {seen}"
+        );
+        assert!(
+            alice.maybe(|l| l.contains("SIGNATURE_INVALID"), 300).is_none(),
+            "a signature nobody can check is not a signature that failed"
         );
     })
     .await;
@@ -550,11 +620,11 @@ async fn the_signed_venue_is_the_folded_channel_not_the_case_the_sender_typed() 
         let unfolded =
             ChatDoc::message(DID_ALICE, &id2, "#SIG", "signed the wrong venue").sign(&signing);
         alice.send_signed(&id2, "#SIG", "signed the wrong venue", &unfolded);
-        let seen2 = bob.rx(|l| l.contains("signed the wrong venue"), "delivery");
-        assert_eq!(
-            C::sig_of(&seen2),
-            None,
-            "a venue that isn't the folded one is not the venue: {seen2}"
+        alice.rx(|l| l.contains("SIGNATURE_INVALID"), "FAIL to the sender");
+        assert!(
+            bob.maybe(|l| l.contains("signed the wrong venue"), 500).is_none(),
+            "a venue that isn't the folded one is not the venue, and a \
+             signature over it does not verify"
         );
     })
     .await;
@@ -1425,16 +1495,11 @@ async fn a_signature_that_failed_is_not_replayed_by_history() {
         let sig = ChatDoc::message(DID_ALICE, &id, &channel_venue("#notlaundered"), "what I signed")
             .sign(&signing);
         alice.send_signed(&id, "#notlaundered", "what I sent", &sig);
-        let live = bob.rx(|l| l.contains("what I sent"), "live delivery");
-        assert_eq!(C::sig_of(&live), None, "live delivery strips it: {live}");
+        alice.rx(|l| l.contains("SIGNATURE_INVALID"), "FAIL to the sender");
 
-        let replayed =
-            history_of(addr, "#notlaundered", "what I sent").expect("history replays the message");
-        assert_eq!(
-            C::sig_of(&replayed),
-            None,
-            "and history must not resurrect a signature the server refused to \
-             stand behind: {replayed}"
+        assert!(
+            history_of(addr, "#notlaundered", "what I sent").is_none(),
+            "a message the server refused must not be on file to replay"
         );
     })
     .await;

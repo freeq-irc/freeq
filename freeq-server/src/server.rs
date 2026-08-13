@@ -3654,7 +3654,7 @@ pub(crate) async fn process_s2s_message(
                         peer = %authenticated_peer_id, target = %target, from = %from,
                         account = ?account, msgid = ?msgid,
                         "Relayed message signature did not verify against the key it names — \
-                         stripping it before relay"
+                         dropping the message"
                     ),
                     ClientSigOutcome::Unverifiable(why) => tracing::debug!(
                         peer = %authenticated_peer_id, target = %target, why = %why,
@@ -3662,15 +3662,15 @@ pub(crate) async fn process_s2s_message(
                     ),
                 }
             }
-            // A signature that did not check out is evidence about the bytes,
-            // and it must not travel any further under it: no local client
-            // sees it, nothing files it. The same never-launder rule the
-            // origin follows — a signature this server cannot stand behind
-            // does not leave this server.
-            let sig = match sig_verdict {
-                Some(crate::connection::messaging::ClientSigOutcome::Failed) => None,
-                _ => sig,
-            };
+            // A signature that did not check out is evidence about the bytes:
+            // the words and the proof arrived together and disagree. The
+            // message is dropped rather than relayed without the half that
+            // disagreed — passing on the words alone would put text under the
+            // sender's name that the evidence on the wire says is not theirs,
+            // and would hide the one fact worth knowing about it.
+            if sig_verdict == Some(crate::connection::messaging::ClientSigOutcome::Failed) {
+                return;
+            }
 
             // Generate a local msgid if the remote didn't send one
             let msgid = msgid.unwrap_or_else(crate::msgid::generate);
@@ -6785,11 +6785,58 @@ mod s2s_adversarial_tests {
         rx.try_recv().expect("the message reached the member")
     }
 
-    /// A signature that does not check out is evidence of tampering, so it
-    /// must not travel any further: no local client sees it, and nothing
-    /// downstream can mistake it for a signature this server stood behind.
+    /// The same, for a relay that may legitimately deliver nothing.
+    #[allow(clippy::too_many_arguments)]
+    async fn relay_to_member_maybe(
+        state: &Arc<SharedState>,
+        mgr: &Arc<S2sManager>,
+        envelope: &str,
+        did: Option<&str>,
+        msgid: &str,
+        text: &str,
+        sig: Option<String>,
+    ) -> Option<String> {
+        let (tx, mut rx) = mpsc::channel(16);
+        let session = format!("w-{envelope}");
+        state.connections.lock().insert(session.clone(), tx);
+        state.cap_message_tags.lock().insert(session.clone());
+        state
+            .channels
+            .lock()
+            .get_mut("#chat")
+            .unwrap()
+            .members
+            .insert(session.clone());
+
+        process_s2s_message(
+            state,
+            mgr,
+            PEER,
+            S2sMessage::Privmsg {
+                event_id: format!("{PEER}:{envelope}"),
+                from: "remote!u@s2s".to_string(),
+                target: "#chat".to_string(),
+                text: text.to_string(),
+                origin: PEER.to_string(),
+                msgid: Some(msgid.to_string()),
+                sig,
+                account: did.map(str::to_string),
+                recipient_did: None,
+                replaces_msgid: None,
+                tags: HashMap::new(),
+                multiline_lines: None,
+            },
+        )
+        .await;
+
+        rx.try_recv().ok()
+    }
+
+    /// A signature that does not check out is evidence about the bytes, so
+    /// the message does not travel: no local client sees it, and nothing is
+    /// filed for a reader of history to find.
     #[tokio::test]
-    async fn a_relayed_message_whose_signature_fails_is_relayed_without_it() {
+    async fn a_relayed_message_whose_signature_fails_is_dropped() {
         let state = test_state_with_db();
         let mgr = test_manager();
         setup_authenticated_peer(&state, &mgr).await;
@@ -6798,7 +6845,7 @@ mod s2s_adversarial_tests {
 
         // Signed over one body, relayed with another.
         let sig = sign_channel_message(&key, SIGNER, "01TAMPERED", "#chat", "what was said");
-        let frame = relay_to_member(
+        let delivered = relay_to_member_maybe(
             &state,
             &mgr,
             "tampered",
@@ -6808,17 +6855,24 @@ mod s2s_adversarial_tests {
             Some(sig),
         )
         .await;
-
         assert!(
-            !frame.contains("+freeq.at/sig"),
-            "a signature that failed must not reach local clients: {frame}"
+            delivered.is_none(),
+            "a message whose signature failed must not reach local clients: {delivered:?}"
+        );
+        assert!(
+            state
+                .with_db(|db| db.find_message_by_msgid("01TAMPERED"))
+                .flatten()
+                .is_none(),
+            "nor may it be filed for a reader of history to find"
         );
 
         // The same rule for a signed event replayed somewhere it was never
         // sent: the venue is inside the document, so the signature does not
-        // survive the move and must not travel with it.
+        // survive the move — which reads as a failure, and the replay is
+        // refused rather than delivered shorn of its proof.
         let elsewhere = sign_channel_message(&key, SIGNER, "01REPLAYED", "#private", "for us only");
-        let frame = relay_to_member(
+        let delivered = relay_to_member_maybe(
             &state,
             &mgr,
             "replayed",
@@ -6829,19 +6883,9 @@ mod s2s_adversarial_tests {
         )
         .await;
         assert!(
-            !frame.contains("+freeq.at/sig"),
-            "a signed event replayed into another channel must lose its signature: {frame}"
+            delivered.is_none(),
+            "a signed event replayed into another channel must not arrive: {delivered:?}"
         );
-        // Nor is it filed — a reader of history must not find it either.
-        let row = state
-            .with_db(|db| db.find_message_by_msgid("01TAMPERED"))
-            .flatten()
-            .expect("the message itself is still stored");
-        assert!(
-            !row.tags.contains_key("+freeq.at/sig"),
-            "a signature that failed must not be stored"
-        );
-        assert_eq!(row.text, "what a liar substituted");
     }
 
     /// The other side of the same rule: a signature that checks out is

@@ -202,21 +202,25 @@ fn resolve_signature(
     tags: &HashMap<String, String>,
     client_sig: Option<&str>,
     state: &Arc<SharedState>,
-) -> Option<String> {
-    let did = conn.authenticated_did.as_ref()?;
+) -> SettledSignature {
+    let Some(did) = conn.authenticated_did.as_ref() else {
+        return SettledSignature::Attach(None);
+    };
     let venue = signing_venue(state, did, target);
 
     if let (Some(sig_tag), Some(venue)) = (client_sig, venue.as_deref()) {
         let doc = message_document(did, venue, fields, tags);
         match verify_client_signature(&doc, sig_tag, did, Some(&conn.id), state) {
-            ClientSigOutcome::Verified => return Some(sig_tag.to_string()),
+            ClientSigOutcome::Verified => {
+                return SettledSignature::Attach(Some(sig_tag.to_string()));
+            }
             ClientSigOutcome::Failed => {
                 tracing::warn!(
                     session = %conn.id, did = %did, msgid = %fields.msgid,
                     "Client signature did not verify against the key it names — \
-                     relaying the message unsigned rather than substituting ours"
+                     refusing the message"
                 );
-                return None;
+                return SettledSignature::Failed;
             }
             ClientSigOutcome::Unverifiable(why) => {
                 tracing::debug!(
@@ -235,9 +239,42 @@ fn resolve_signature(
     // Server signature over the same document. Without a venue there is no
     // document to sign, and inventing one would produce a signature nobody
     // could rebuild — the exact failure this canonical exists to end.
-    let venue = venue?;
+    let Some(venue) = venue else {
+        return SettledSignature::Attach(None);
+    };
     let doc = message_document(did, &venue, fields, tags);
-    Some(doc.sign(&state.msg_signing_key))
+    SettledSignature::Attach(Some(doc.sign(&state.msg_signing_key)))
+}
+
+/// Tell the sender their message carried a signature that did not verify.
+///
+/// `command` is the command being refused, per the standard-replies shape.
+fn send_signature_invalid(conn: &Connection, command: &str, state: &Arc<SharedState>) {
+    let reply = Message::from_server(
+        &state.server_name,
+        "FAIL",
+        vec![
+            command,
+            "SIGNATURE_INVALID",
+            "That signature does not verify against the key it names",
+        ],
+    );
+    if let Some(tx) = state.connections.lock().get(&conn.id) {
+        let _ = tx.try_send(format!("{reply}\r\n"));
+    }
+}
+
+/// What a message's signature settled to at ingress.
+pub(crate) enum SettledSignature {
+    /// Relay it, carrying this signature: the sender's own where it verified,
+    /// this server's vouch where there was nothing to check, and none at all
+    /// for a guest or a venue that does not resolve.
+    Attach(Option<String>),
+    /// The signature named a key this server holds and did not verify against
+    /// it. The bytes and the proof disagree, which is a fact about the
+    /// message — so it is refused rather than relayed with the disagreement
+    /// quietly dropped.
+    Failed,
 }
 
 /// What happened when we checked a client's signature — three outcomes, not
@@ -1769,10 +1806,13 @@ pub(super) fn handle_privmsg_with_multiline(
             reply: reply_reference(tags),
             edit: None,
         };
-        set_signature(
-            &mut full_tags,
-            resolve_signature(conn, target, &signed, tags, client_sig, state),
-        );
+        match resolve_signature(conn, target, &signed, tags, client_sig, state) {
+            SettledSignature::Attach(sig) => set_signature(&mut full_tags, sig),
+            SettledSignature::Failed => {
+                send_signature_invalid(conn, command, state);
+                return;
+            }
+        }
 
         // If this PRIVMSG is a commit-reveal `reveal` event, verify the
         // binding against the prior commit and stamp the outcome onto
@@ -2054,10 +2094,13 @@ pub(super) fn handle_privmsg_with_multiline(
             reply: reply_reference(tags),
             edit: None,
         };
-        set_signature(
-            &mut pm_tags,
-            resolve_signature(conn, target, &signed, tags, client_sig, state),
-        );
+        match resolve_signature(conn, target, &signed, tags, client_sig, state) {
+            SettledSignature::Attach(sig) => set_signature(&mut pm_tags, sig),
+            SettledSignature::Failed => {
+                send_signature_invalid(conn, command, state);
+                return;
+            }
+        }
 
         let mut pm_tags_with_time = pm_tags.clone();
         pm_tags_with_time.insert("time".to_string(), time_tag.clone());
@@ -3235,10 +3278,15 @@ fn handle_edit(
         }
     }
 
-    set_signature(
-        &mut full_tags,
-        resolve_signature(conn, target, &signed, tags, client_sig, state),
-    );
+    match resolve_signature(conn, target, &signed, tags, client_sig, state) {
+        SettledSignature::Attach(sig) => set_signature(&mut full_tags, sig),
+        // Unreachable: an edit whose signature failed was refused above, with
+        // the code that names an edit. Refuse again rather than file it.
+        SettledSignature::Failed => {
+            send_signature_invalid(conn, "EDIT", state);
+            return;
+        }
+    }
 
     // Multi-line breakdown for BATCH-wrapped outbound. Two sources, in
     // priority order:

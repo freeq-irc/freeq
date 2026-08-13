@@ -175,10 +175,10 @@ async fn a_peer_impersonating_a_local_nick_can_currently_delete_that_users_messa
 
 // ── signatures ───────────────────────────────────────────────────
 
-/// A peer that attaches a signature which does not check out. The words still
-/// arrive — a bad signature is not grounds to drop someone's message — but the
-/// signature does not, because a client that saw it would draw a lock beside
-/// text nobody proved.
+/// A peer that attaches a signature which does not check out. Nothing
+/// arrives: the words and the proof came together and disagreed, and relaying
+/// the words alone would put text under the author's name that the evidence
+/// on the wire says is not theirs.
 ///
 /// The forged signature names a key this server really holds (the author's own
 /// registered key id), so the verdict is a genuine failure rather than "cannot
@@ -208,18 +208,15 @@ async fn a_peer_cannot_attach_a_signature_that_does_not_check_out() {
     );
     peer.forge(msg).await;
 
-    let seen = wait_event(
+    let leaked = try_event(
         &mut rxw,
         |e| matches!(e, Event::Message { text: t, .. } if t == "words with a forged seal"),
-        "the peer's signed message",
+        NO_EFFECT_WINDOW,
     )
     .await;
-    let Event::Message { tags, .. } = &seen else {
-        unreachable!("matched above")
-    };
     assert!(
-        !tags.contains_key("+freeq.at/sig"),
-        "a signature that failed verification reached a local client: {tags:?}"
+        leaked.is_none(),
+        "a message whose signature failed verification reached a local client: {leaked:?}"
     );
 
     assert_link_alive(&mut peer, &mut rxw, "probe-after-forged-signature").await;
