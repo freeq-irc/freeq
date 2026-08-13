@@ -172,6 +172,102 @@ async fn a_peer_impersonating_a_local_nick_cannot_delete_that_users_message() {
     );
 }
 
+/// The sharpest version of the impersonation: the peer stamps the victim's
+/// **real** DID on a mutation, which is the one identity every authorization
+/// check here will accept. Naming it is free — a peer chooses what it sends —
+/// so the only thing separating the claim from the act is a signature by the
+/// key that DID registered.
+///
+/// Neither shape gets through: no signature at all, and one that names a key
+/// this server really holds but does not verify against it.
+#[tokio::test]
+async fn a_peer_stamping_the_victims_did_on_a_mutation_is_refused() {
+    let author = TestId::new("did:plc:lpstamped");
+    let watcher = TestId::new("did:plc:lpstampedwatch");
+    let (srv, mut peer, ha, mut rxw) = open_room(&author, &watcher).await;
+
+    // Posting registers the author's signing key here, so a forged signature
+    // can name a kid this server can actually resolve — a real failure rather
+    // than "cannot check".
+    let msgid = post(&ha, &mut rxw, "theirs to delete").await;
+    let kid = registered_kid(&srv.db_path, &author.did)
+        .expect("the author's client registered a signing key");
+    let forged_sig = format!("ed25519:{kid}:{}", "A".repeat(86));
+
+    // (1) A delete under the victim's DID, unsigned.
+    let forged = peer.delete("mallory", "#room", &msgid, Some(&author.did));
+    peer.forge(forged).await;
+    assert_link_alive(&mut peer, &mut rxw, "probe-after-unsigned-stamped-delete").await;
+    assert!(
+        !is_deleted(&srv.db_path, &msgid),
+        "an unsigned delete stamped with the victim's DID deleted their message"
+    );
+
+    // (2) The same delete, carrying a signature that does not verify against
+    // the DID it names.
+    let forged = peer.signed_delete(
+        "mallory",
+        "#room",
+        &msgid,
+        Some(&author.did),
+        &forged_sig,
+    );
+    peer.forge(forged).await;
+    assert_link_alive(&mut peer, &mut rxw, "probe-after-forged-stamped-delete").await;
+    assert!(
+        !is_deleted(&srv.db_path, &msgid),
+        "a delete whose signature failed against the victim's own key still applied"
+    );
+
+    // (3) Reactions and their removal, both shapes, under the victim's DID.
+    for (label, event) in [
+        (
+            "unsigned react",
+            peer.react("mallory", "#room", &msgid, "👍", Some(&author.did), None),
+        ),
+        (
+            "forged react",
+            peer.react(
+                "mallory",
+                "#room",
+                &msgid,
+                "👍",
+                Some(&author.did),
+                Some(&forged_sig),
+            ),
+        ),
+        (
+            "unsigned unreact",
+            peer.unreact("mallory", "#room", &msgid, "👍", Some(&author.did), None),
+        ),
+        (
+            "forged unreact",
+            peer.unreact(
+                "mallory",
+                "#room",
+                &msgid,
+                "👍",
+                Some(&author.did),
+                Some(&forged_sig),
+            ),
+        ),
+    ] {
+        peer.forge(event).await;
+        let leaked = try_event(
+            &mut rxw,
+            |e| matches!(e, Event::TagMsg { tags, .. } if tags.contains_key("+react")
+                || tags.contains_key("+freeq.at/unreact")),
+            NO_EFFECT_WINDOW,
+        )
+        .await;
+        assert!(
+            leaked.is_none(),
+            "a {label} stamped with the victim's DID reached a local client: {leaked:?}"
+        );
+    }
+    assert_link_alive(&mut peer, &mut rxw, "probe-after-stamped-reactions").await;
+}
+
 // ── signatures ───────────────────────────────────────────────────
 
 /// A peer that attaches a signature which does not check out. Nothing
