@@ -48,7 +48,7 @@ Building a bot? See **[`@freeq/bot-kit`](../freeq-bot-kit-js/)** for higher-leve
 - **E2EE** — Double Ratchet for DMs, AES-256-GCM for channels
 - **IRCv3** — message-tags, echo-message, CHATHISTORY, batch, away-notify
 - **Auto-reconnect** — exponential backoff with automatic channel rejoin
-- **Message signing** — Ed25519 per-session signing for non-repudiation
+- **Message signing** — Ed25519 per-session signing for non-repudiation; edits, deletes, and reactions are signed, and servers refuse unsigned changes from logged-in senders
 - **Profiles** — AT Protocol profile fetching with TTL cache
 
 ### Agent protocol (Phases 1–5)
