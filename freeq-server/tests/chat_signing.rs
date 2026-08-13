@@ -91,6 +91,28 @@ impl C {
         c
     }
 
+    /// Authenticated, and able to send/receive `draft/multiline` BATCHes — so a
+    /// test can sign a multi-line edit and watch it cross the wire.
+    fn authenticated_multiline(addr: SocketAddr, nick: &str, did: &str, key: PrivateKey) -> Self {
+        let mut c = Self::open(addr);
+        c.tx("CAP LS 302");
+        c.tx(&format!("NICK {nick}"));
+        c.tx(&format!("USER {nick} 0 * :test"));
+        c.tx("CAP REQ :sasl message-tags server-time echo-message draft/chathistory batch draft/multiline");
+        c.rx(|l| l.contains("ACK"), "CAP ACK");
+        c.tx("AUTHENTICATE ATPROTO-CHALLENGE");
+        let challenge_line = c.rx(|l| l.starts_with("AUTHENTICATE "), "challenge");
+        let challenge = challenge_line.strip_prefix("AUTHENTICATE ").unwrap();
+        let bytes = auth::decode_challenge_bytes(challenge).unwrap();
+        let signer = KeySigner::new(did.to_string(), key);
+        let resp = signer.respond(&bytes).unwrap();
+        c.tx(&format!("AUTHENTICATE {}", auth::encode_response(&resp)));
+        c.num("903");
+        c.tx("CAP END");
+        c.num("001");
+        c
+    }
+
     fn open(addr: SocketAddr) -> Self {
         let s = TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -948,6 +970,76 @@ async fn an_edit_signature_that_fails_is_refused_and_never_applied() {
         assert!(
             history_of(addr, "#editforge", "first draft").is_some(),
             "a refused edit must not have changed the original"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_signed_multiline_edit_verifies_and_a_tampered_one_is_refused() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated_multiline(addr, "bob", did_bob, kb);
+        bob.join("#mlsig");
+        let mut alice = C::authenticated_multiline(addr, "alice", DID_ALICE, ka);
+        alice.join("#mlsig");
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
+
+        // An original to edit.
+        let root = freeq_server::msgid::generate();
+        alice.send_with_id(&root, "#mlsig", "original");
+        bob.rx(|l| l.contains("original"), "the original");
+
+        // A signed multi-line edit: the signature covers the assembled body —
+        // two non-concat chunks joined with a newline — exactly the bytes the
+        // server reassembles from the BATCH before it verifies. An honest one
+        // must not be refused by the new failed-signature gate.
+        let assembled = "edit line A\nedit line B";
+        let edit_id = freeq_server::msgid::generate();
+        let sig = ChatDoc::message(DID_ALICE, &edit_id, &channel_venue("#mlsig"), assembled)
+            .with_edit(&root)
+            .sign(&signing);
+        alice.tx(&format!(
+            "@{EVENT_ID_TAG}={edit_id};+draft/edit={root};+freeq.at/sig={sig} \
+             BATCH +e draft/multiline #mlsig"
+        ));
+        alice.tx("@batch=e PRIVMSG #mlsig :edit line A");
+        alice.tx("@batch=e PRIVMSG #mlsig :edit line B");
+        alice.tx("BATCH -e");
+
+        bob.rx(
+            |l| l.contains("PRIVMSG #mlsig") && l.contains("edit line A") && l.contains("batch="),
+            "the honest edit is delivered, not refused",
+        );
+        assert!(
+            alice.maybe(|l| l.contains("SIGNATURE_INVALID"), 500).is_none(),
+            "an honest signed multiline edit must not be refused"
+        );
+
+        // A tampered one: the signature is over a different body than the chunks
+        // sent, so the reassembled bytes don't match. It must be refused — which
+        // is what proves the signature is actually checked on the multiline path
+        // (so the honest case above is delivered because it verified, not
+        // because the signature went unread).
+        let edit_id2 = freeq_server::msgid::generate();
+        let bad_sig =
+            ChatDoc::message(DID_ALICE, &edit_id2, &channel_venue("#mlsig"), "a different body")
+                .with_edit(&root)
+                .sign(&signing);
+        alice.tx(&format!(
+            "@{EVENT_ID_TAG}={edit_id2};+draft/edit={root};+freeq.at/sig={bad_sig} \
+             BATCH +f draft/multiline #mlsig"
+        ));
+        alice.tx("@batch=f PRIVMSG #mlsig :edit line A");
+        alice.tx("@batch=f PRIVMSG #mlsig :edit line B");
+        alice.tx("BATCH -f");
+
+        alice.rx(
+            |l| l.contains("SIGNATURE_INVALID"),
+            "the tampered multiline edit is refused",
         );
     })
     .await;
