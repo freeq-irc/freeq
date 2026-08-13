@@ -15,6 +15,13 @@
 //! Prints a human summary and exits 0 only if everything verifies. On any failure
 //! it prints `INVALID`/`TAMPERED` (to stdout, so tooling can scrape it) and exits 1.
 //!
+//! What this proves and does not: that the content was not altered *given* the
+//! key material in the bundle is the author's, plus the server's own attestation
+//! (the bundle signature). It does not prove the signing key belongs to the DID
+//! it claims — that binding is asserted by the server at key-registration time,
+//! and confirming it independently needs DID-document resolution (the trust-root
+//! work), which this offline tool does not do.
+//!
 //! Usage: `freeq-verify [--verbose] <bundle.json>`
 
 use base64::Engine;
@@ -88,18 +95,18 @@ fn verify(bundle: &serde_json::Value, verbose: bool) -> Result<(), String> {
         .and_then(|v| v.as_array())
         .ok_or("missing array field `messages`")?;
     for (i, m) in messages.iter().enumerate() {
-        let did = field(m, "sender_did")?;
-        let channel = field(m, "channel")?;
-        let text = field(m, "text")?;
-
         // A message may carry no signature (an unsigned or guest message);
-        // there is nothing to authenticate.
+        // there is nothing to authenticate, and a guest row has no `sender_did`
+        // — so this skip must come before that field is required.
         let Some(sig_tag) = m.get("signature").and_then(|v| v.as_str()) else {
             if verbose {
-                println!("message {i} ({did}): unsigned — nothing to check");
+                println!("message {i}: unsigned — nothing to check");
             }
             continue;
         };
+        let did = field(m, "sender_did")?;
+        let channel = field(m, "channel")?;
+        let text = field(m, "text")?;
 
         match freeq_sdk::sigtag::parse(sig_tag) {
             // Current format `ed25519:<kid>:<sig>`: rebuild the document with
@@ -114,9 +121,13 @@ fn verify(bundle: &serde_json::Value, verbose: bool) -> Result<(), String> {
                     .or_else(|| tags.get("+draft/reply"))
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty());
+                // A federated edit's link lives only in `replaces_msgid`, not
+                // the tag map (S2S strips `+draft/edit`), so fall back to it —
+                // the same rule the server's own rebuild follows.
                 let edit = tags
                     .get("+draft/edit")
                     .and_then(|v| v.as_str())
+                    .or_else(|| m.get("replaces_msgid").and_then(|v| v.as_str()))
                     .filter(|s| !s.is_empty());
                 let coord: Vec<(&str, &str)> = tags
                     .iter()

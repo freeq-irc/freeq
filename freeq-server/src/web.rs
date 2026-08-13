@@ -1191,9 +1191,11 @@ async fn api_actor_identity(
 /// the signing keys addressed by `kid`, the server signing key, and a server
 /// signature over the whole bundle. `freeq-verify` (the offline CLI) rebuilds
 /// each message's signed document with the shared `freeq_sdk::chatsig` builder
-/// and checks the signatures with no server contact — so a third party who
-/// trusts neither the participants nor the server can confirm nothing was
-/// altered. Legacy bare-base64 signatures on old history keep the retired
+/// and checks the signatures with no server contact — confirming the content
+/// was not altered, given the bundled key material is the authors'. (Binding a
+/// key to its DID is asserted by the server at registration; confirming that
+/// independently needs DID-document resolution, which the offline tool does
+/// not do.) Legacy bare-base64 signatures on old history keep the retired
 /// `{did}\0{channel}\0{text}\0{timestamp}` check via `did_keys`.
 ///
 /// Authorization mirrors CHATHISTORY/search: public channels export openly,
@@ -1225,26 +1227,31 @@ async fn api_channel_evidence(
     // that made it (its `kid`), and a DID may have rotated keys, so keys are
     // addressed by kid. `did_keys` (latest key per DID) is kept only for the
     // legacy bare-base64 signatures on pre-cutover history, which carry no kid.
-    let mut keys = serde_json::Map::new();
     let mut did_keys = serde_json::Map::new();
     {
         let by_did = state.did_msg_keys.lock();
         for row in &rows {
-            let Some(did) = &row.sender_did else { continue };
-            if !did_keys.contains_key(did)
+            if let Some(did) = &row.sender_did
+                && !did_keys.contains_key(did)
                 && let Some(pk) = by_did.get(did)
             {
                 did_keys.insert(did.clone(), serde_json::Value::String(pk.clone()));
             }
-            if let Some(sig) = row.tags.get("+freeq.at/sig")
-                && let Ok((kid, _)) = freeq_sdk::sigtag::parse(sig)
-                && !keys.contains_key(kid)
-                && let Some(bytes) = state
-                    .with_db(|db| db.get_signing_key_by_kid(did, kid))
-                    .flatten()
-            {
-                keys.insert(kid.to_string(), serde_json::Value::String(b64.encode(bytes)));
-            }
+        }
+    }
+    // Keys addressed by kid, looked up after the in-memory map's lock is dropped
+    // (each is a separate DB read).
+    let mut keys = serde_json::Map::new();
+    for row in &rows {
+        let Some(did) = &row.sender_did else { continue };
+        if let Some(sig) = row.tags.get("+freeq.at/sig")
+            && let Ok((kid, _)) = freeq_sdk::sigtag::parse(sig)
+            && !keys.contains_key(kid)
+            && let Some(bytes) = state
+                .with_db(|db| db.get_signing_key_by_kid(did, kid))
+                .flatten()
+        {
+            keys.insert(kid.to_string(), serde_json::Value::String(b64.encode(bytes)));
         }
     }
 
@@ -1269,6 +1276,9 @@ async fn api_channel_evidence(
                 "text": r.text,
                 "timestamp": r.timestamp,
                 "signature": r.tags.get("+freeq.at/sig"),
+                // A federated edit carries its edit link only in this column —
+                // S2S filters the tag map, so `+draft/edit` is not in `tags`.
+                "replaces_msgid": r.replaces_msgid,
                 "tags": tags,
             })
         })

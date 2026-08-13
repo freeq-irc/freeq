@@ -202,6 +202,121 @@ fn tampered_v2_message_fails() {
 }
 
 #[test]
+fn a_guest_message_in_the_bundle_is_skipped_not_fatal() {
+    // A public channel exports openly and routinely carries guest messages: no
+    // sender_did, no signature. They must be skipped, not abort the whole bundle.
+    let server = SigningKey::generate(&mut rand::rngs::OsRng);
+    let client = SigningKey::generate(&mut rand::rngs::OsRng);
+    let client_vk = client.verifying_key();
+    let kid = freeq_sdk::sigtag::derive_kid(&client_vk);
+    let did = "did:plc:alice";
+    let venue = freeq_sdk::chatsig::channel_venue("#freeq");
+    let sig_tag =
+        freeq_sdk::chatsig::ChatDoc::message(did, "01SIGNED000000000000000000", &venue, "signed hello")
+            .sign(&client);
+
+    let mut tags = serde_json::Map::new();
+    tags.insert("+freeq.at/sig".into(), json!(sig_tag.clone()));
+    let mut keys = serde_json::Map::new();
+    keys.insert(kid, json!(b64().encode(client_vk.as_bytes())));
+
+    let mut bundle = json!({
+        "bundle_version": "2",
+        "server_name": "irc.freeq.at",
+        "server_public_key": b64().encode(server.verifying_key().as_bytes()),
+        "channel": "#freeq",
+        "exported_at": "2026-08-12T00:00:00Z",
+        "message_count": 2,
+        "keys": keys,
+        "did_keys": {},
+        "messages": [
+            {
+                "msgid": "01GUEST0000000000000000000",
+                "channel": "#freeq",
+                "sender": "someguest!x@host",
+                "sender_did": serde_json::Value::Null,
+                "text": "hi from a guest",
+                "timestamp": 1_700_000_000u64,
+                "signature": serde_json::Value::Null,
+                "replaces_msgid": serde_json::Value::Null,
+                "tags": {},
+            },
+            {
+                "msgid": "01SIGNED000000000000000000",
+                "channel": "#freeq",
+                "sender": "alice!alice@freeq",
+                "sender_did": did,
+                "text": "signed hello",
+                "timestamp": 1_700_000_001u64,
+                "signature": sig_tag,
+                "replaces_msgid": serde_json::Value::Null,
+                "tags": tags,
+            },
+        ],
+    });
+    let canon = freeq_sdk::canonical::canonicalize(&bundle).unwrap();
+    bundle["bundle_signature"] = json!(b64().encode(server.sign(canon.as_bytes()).to_bytes()));
+
+    let out = run_verify(&bundle);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "a guest message must not abort the bundle: {stdout}");
+    assert!(stdout.contains("✓ VERIFIED"), "got: {stdout}");
+}
+
+#[test]
+fn a_federated_edit_link_in_replaces_msgid_verifies() {
+    // A federated edit carries its edit link only in `replaces_msgid` — S2S
+    // strips the +draft/edit tag — so the verifier must rebuild the `edit`
+    // field from that column, matching the server's own rebuild.
+    let server = SigningKey::generate(&mut rand::rngs::OsRng);
+    let client = SigningKey::generate(&mut rand::rngs::OsRng);
+    let client_vk = client.verifying_key();
+    let kid = freeq_sdk::sigtag::derive_kid(&client_vk);
+    let did = "did:plc:alice";
+    let root = "01ROOT00000000000000000000";
+    let msgid = "01EDIT00000000000000000000";
+    let venue = freeq_sdk::chatsig::channel_venue("#freeq");
+    let sig_tag = freeq_sdk::chatsig::ChatDoc::message(did, msgid, &venue, "the revised text")
+        .with_edit(root)
+        .sign(&client);
+
+    // No +draft/edit tag — the federated shape.
+    let mut tags = serde_json::Map::new();
+    tags.insert("+freeq.at/sig".into(), json!(sig_tag.clone()));
+    let mut keys = serde_json::Map::new();
+    keys.insert(kid, json!(b64().encode(client_vk.as_bytes())));
+
+    let mut bundle = json!({
+        "bundle_version": "2",
+        "server_name": "irc.freeq.at",
+        "server_public_key": b64().encode(server.verifying_key().as_bytes()),
+        "channel": "#freeq",
+        "exported_at": "2026-08-12T00:00:00Z",
+        "message_count": 1,
+        "keys": keys,
+        "did_keys": {},
+        "messages": [{
+            "msgid": msgid,
+            "channel": "#freeq",
+            "sender": "alice!alice@freeq",
+            "sender_did": did,
+            "text": "the revised text",
+            "timestamp": 1_700_000_000u64,
+            "signature": sig_tag,
+            "replaces_msgid": root,
+            "tags": tags,
+        }],
+    });
+    let canon = freeq_sdk::canonical::canonicalize(&bundle).unwrap();
+    bundle["bundle_signature"] = json!(b64().encode(server.sign(canon.as_bytes()).to_bytes()));
+
+    let out = run_verify(&bundle);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "a federated edit (link in replaces_msgid) must verify: {stdout}");
+    assert!(stdout.contains("VERIFIED (client key)"), "got: {stdout}");
+}
+
+#[test]
 fn tampered_bundle_signature_fails() {
     let server = SigningKey::generate(&mut rand::rngs::OsRng);
     let client = SigningKey::generate(&mut rand::rngs::OsRng);
