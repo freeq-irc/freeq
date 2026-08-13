@@ -1672,6 +1672,63 @@ async fn an_unreaction_leaves_the_event_that_removed_the_reaction() {
     assert_eq!(live, 0, "the reaction was taken back");
 }
 
+/// A reaction from outside a `+n` channel is refused at the door, and the
+/// door is what the row has to be behind: filing first left a reaction on
+/// file that no member ever received, visible to everyone on the next join.
+#[tokio::test]
+async fn a_non_members_reaction_leaves_nothing_behind() {
+    use freeq_sdk::chatsig::Mutation;
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, db_path, _h) =
+        start_with_db(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    let db_for_test = db_path.clone();
+    run(addr, move |addr| {
+        // Bob owns the channel; alice never joins it. `+n` is on by default.
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#members");
+        let msgid = freeq_server::msgid::generate();
+        bob.tx(&format!(
+            "@{EVENT_ID_TAG}={msgid} PRIVMSG #members :members only"
+        ));
+        bob.rx(|l| l.contains("members only"), "bob's message");
+
+        let mut outsider = C::authenticated(addr, "alice", DID_ALICE, ka);
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        outsider.msgsig(&signing);
+        let event_id = freeq_server::msgid::generate();
+        let tags = signed_mutation_tags(
+            Mutation::React,
+            "+react",
+            &msgid,
+            Some("👍"),
+            "#members",
+            &event_id,
+            &signing,
+        );
+        outsider.tx(&format!("@{tags} TAGMSG #members"));
+        outsider.rx(
+            |l| l.contains("Cannot send to channel"),
+            "the +n refusal",
+        );
+        assert!(
+            bob.maybe(|l| l.contains("+react"), 500).is_none(),
+            "a non-member's reaction must not reach the channel"
+        );
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let conn = rusqlite::Connection::open(&db_for_test).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM reactions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        rows, 0,
+        "a reaction nobody received must not be on file either"
+    );
+}
+
 /// The log records events, not signatures. A guest has no identity to bind and
 /// nothing to sign with — and their acts still happened, so they are still on
 /// file: a server-minted id, no signature, no canonical, and honest about all

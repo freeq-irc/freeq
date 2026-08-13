@@ -896,6 +896,50 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Whether a channel will take a TAGMSG from this sender: `+n` (members only)
+/// and `+m` (voiced or better), the same two gates a PRIVMSG passes.
+///
+/// Sends the refusal itself, so a caller only has to stop.
+fn channel_accepts_tagmsg(conn: &Connection, target: &str, state: &Arc<SharedState>) -> bool {
+    // Resolve sender DID once, before taking the channels lock.
+    let sender_did = state.session_dids.lock().get(&conn.id).cloned();
+    let refusal = {
+        let channels = state.channels.lock();
+        let Some(ch) = channels.get(target) else {
+            return true;
+        };
+        // Founder + persistent DID-ops bypass +m. (+n is membership-based;
+        // a non-member can't be founder anyway, so no bypass needed there.)
+        let is_did_authority = sender_did
+            .as_deref()
+            .is_some_and(|d| ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d));
+        if ch.no_ext_msg && !ch.members.contains(&conn.id) {
+            Some("Cannot send to channel (+n)")
+        } else if ch.moderated
+            && !is_did_authority
+            && !ch.ops.contains(&conn.id)
+            && !ch.halfops.contains(&conn.id)
+            && !ch.voiced.contains(&conn.id)
+        {
+            Some("Cannot send to channel (+m)")
+        } else {
+            None
+        }
+    };
+    let Some(reason) = refusal else {
+        return true;
+    };
+    let reply = Message::from_server(
+        &state.server_name,
+        irc::ERR_CANNOTSENDTOCHAN,
+        vec![conn.nick_or_star(), target, reason],
+    );
+    if let Some(tx) = state.connections.lock().get(&conn.id) {
+        let _ = tx.try_send(format!("{reply}\r\n"));
+    }
+    false
+}
+
 pub(super) fn handle_tagmsg(
     conn: &Connection,
     target: &str,
@@ -1322,6 +1366,17 @@ pub(super) fn handle_tagmsg(
         .as_deref()
         .and_then(|did| signing_venue(state, did, target));
 
+    // The channel's own gates run before anything is filed. A reaction from
+    // outside a `+n` channel, or from an unvoiced sender in a `+m` one,
+    // reaches nobody — and filing it first left a row for a reaction no
+    // member ever received, which then surfaced for everyone on the next
+    // join.
+    if (target.starts_with('#') || target.starts_with('&'))
+        && !channel_accepts_tagmsg(conn, target, state)
+    {
+        return;
+    }
+
     // ── Persist reactions (+react with +reply) ──
     if let (Some(emoji), Some(target_msgid)) = (tags.get("+react"), tags.get("+reply")) {
         let nick = conn.nick_or_star().to_string();
@@ -1414,51 +1469,6 @@ pub(super) fn handle_tagmsg(
 
     // Rich clients get TAGMSG, plain clients get fallback PRIVMSG (if any)
     if target.starts_with('#') || target.starts_with('&') {
-        // Channel TAGMSG — enforce +n (no external messages) and +m (moderated)
-        // Resolve sender DID once, before taking the channels lock.
-        let sender_did = state.session_dids.lock().get(&conn.id).cloned();
-        {
-            let channels = state.channels.lock();
-            if let Some(ch) = channels.get(target) {
-                // Founder + persistent DID-ops bypass +m. (+n is membership-based;
-                // a non-member can't be founder anyway, so no bypass needed there.)
-                let is_did_authority = sender_did.as_deref().is_some_and(|d| {
-                    ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d)
-                });
-                // +n: must be a member to send
-                if ch.no_ext_msg && !ch.members.contains(&conn.id) {
-                    let nick = conn.nick_or_star();
-                    let reply = Message::from_server(
-                        &state.server_name,
-                        irc::ERR_CANNOTSENDTOCHAN,
-                        vec![nick, target, "Cannot send to channel (+n)"],
-                    );
-                    if let Some(tx) = state.connections.lock().get(&conn.id) {
-                        let _ = tx.try_send(format!("{reply}\r\n"));
-                    }
-                    return;
-                }
-                // +m: must be voiced or op to send
-                if ch.moderated
-                    && !is_did_authority
-                    && !ch.ops.contains(&conn.id)
-                    && !ch.halfops.contains(&conn.id)
-                    && !ch.voiced.contains(&conn.id)
-                {
-                    let nick = conn.nick_or_star();
-                    let reply = Message::from_server(
-                        &state.server_name,
-                        irc::ERR_CANNOTSENDTOCHAN,
-                        vec![nick, target, "Cannot send to channel (+m)"],
-                    );
-                    if let Some(tx) = state.connections.lock().get(&conn.id) {
-                        let _ = tx.try_send(format!("{reply}\r\n"));
-                    }
-                    return;
-                }
-            }
-        }
-
         let members: Vec<String> = state
             .channels
             .lock()
