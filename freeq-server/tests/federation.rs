@@ -314,6 +314,19 @@ fn connect(
     client::connect(config, Some(id.signer()))
 }
 
+/// A client with no identity — the other end of a thread that can never have
+/// a signed venue.
+fn connect_guest(server: &TestServer, nick: &str) -> (client::ClientHandle, mpsc::Receiver<Event>) {
+    let config = ConnectConfig {
+        server_addr: server.irc_addr.clone(),
+        nick: nick.to_string(),
+        user: nick.to_string(),
+        realname: "federation test".to_string(),
+        ..Default::default()
+    };
+    client::connect(config, None)
+}
+
 async fn wait_event(
     rx: &mut mpsc::Receiver<Event>,
     pred: impl Fn(&Event) -> bool,
@@ -645,6 +658,100 @@ async fn tagmsg_to_remote_did_relays_as_structured_tagmsg() {
     ha.quit(None).await.ok();
     hb.quit(None).await.ok();
     drop((srv_a, srv_b));
+}
+
+// ── a DM with a guest on the peer keeps its mutations ────────────
+//
+// The signature requirement asks for proof only where proof could exist. A
+// guest has no DID, so a DM thread with one has no venue: neither end can
+// build the document, so no signature can ever accompany a delete or an edit
+// there. The rule exempts that case locally; a relayed one arrives
+// account-stamped from the origin's authenticated sender and venue-less all
+// the same, and must be exempt on the receiving side too — otherwise the
+// delete applies where it was typed and nowhere else, and the two servers
+// hold different history for good.
+
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_dm_with_a_guest_on_the_peer_keeps_its_deletes() {
+    let alice = TestId::new("did:plc:aliceguestdm");
+    let (srv_a, srv_b) = spawn_pair(&[&alice]).await;
+
+    // A guest on B, an identity on A. Nothing about this thread is signable.
+    let (hg, mut rxg) = connect_guest(&srv_b, "gbob");
+    wait_event(
+        &mut rxg,
+        |e| matches!(e, Event::Registered { .. }),
+        "guest registered",
+    )
+    .await;
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+
+    // Resend until it lands, which also warms the link.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut delivered = None;
+    while tokio::time::Instant::now() < deadline {
+        ha.privmsg("gbob", "across to a guest").await.ok();
+        delivered =
+            msgid_of_message(&mut rxg, "across to a guest", Duration::from_secs(2)).await;
+        if delivered.is_some() {
+            break;
+        }
+    }
+    let msgid = delivered.expect("the guest received the cross-server DM");
+
+    // Alice deletes it. Neither server can check a signature that cannot
+    // exist, and both must apply the delete rather than demand one.
+    let mut del_tags = std::collections::HashMap::new();
+    del_tags.insert("+draft/delete".to_string(), msgid.clone());
+    ha.send_tagmsg("gbob", del_tags).await.unwrap();
+
+    let seen = wait_for_tagmsg(&mut rxg, "+draft/delete", EVENT_TIMEOUT).await;
+    assert!(
+        seen,
+        "a delete in a venue-less DM must cross the hop and apply at the far end"
+    );
+
+    ha.quit(None).await.ok();
+    hg.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+/// Wait for a message with `text`, returning its msgid.
+async fn msgid_of_message(
+    rx: &mut mpsc::Receiver<Event>,
+    text: &str,
+    within: Duration,
+) -> Option<String> {
+    timeout(within, async {
+        loop {
+            match rx.recv().await {
+                Some(Event::Message { text: t, tags, .. }) if t == text => {
+                    return tags.get("msgid").cloned();
+                }
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    })
+    .await
+    .unwrap_or(None)
+}
+
+/// Whether a TAGMSG carrying `tag` arrives within the window.
+async fn wait_for_tagmsg(rx: &mut mpsc::Receiver<Event>, tag: &str, within: Duration) -> bool {
+    timeout(within, async {
+        loop {
+            match rx.recv().await {
+                Some(Event::TagMsg { tags, .. }) if tags.contains_key(tag) => return true,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 // ── a mutation TAGMSG's signature tag crosses the hop byte-identical ─────
