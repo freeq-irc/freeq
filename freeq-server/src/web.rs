@@ -5204,6 +5204,33 @@ mod signature_verdict_tests {
         assert_eq!(out.0["sender_did"], did);
     }
 
+    /// The classifier resolves the key the signature's `kid` names, never the
+    /// identity's newest. The third of the three chat paths that must agree
+    /// on this (the other two are pinned in `server.rs`): a reader coming back
+    /// to old history after the signer reconnected must still get a verdict
+    /// about the message, not about which key is current.
+    #[test]
+    fn the_classifier_resolves_a_key_by_kid_not_by_latest() {
+        let state = test_state_with_db();
+        let old = SigningKey::from_bytes(&[21u8; 32]);
+        let newer = SigningKey::from_bytes(&[22u8; 32]);
+        for key in [&old, &newer] {
+            state
+                .with_db(|db| db.save_signing_key(DID, key.verifying_key().as_bytes()))
+                .expect("test state has a database");
+        }
+
+        let canonical = doc().canonical();
+        let sig = doc().sign(&old);
+        let (verdict, by, _) =
+            classify_message_signature(&state, Some(DID), Some(&canonical), Some(&sig));
+        assert_eq!(
+            (verdict, by),
+            ("valid", "client-session-key"),
+            "a signature from a retired key must still verify"
+        );
+    }
+
     /// A row that names no sender is answered as one, not guessed at. The
     /// endpoint used to fall back to whoever holds the sender's nick on this
     /// server, which rebuilt a document around a DID the signer never signed

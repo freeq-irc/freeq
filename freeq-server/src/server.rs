@@ -7197,6 +7197,67 @@ mod s2s_adversarial_tests {
         assert!(frame.contains("+react"), "{frame}");
     }
 
+    /// Every chat path resolves a key by the `kid` its signature names, never
+    /// by "the identity's current key". A device that rotates keys — or a
+    /// second device signing in — would otherwise invalidate every signature
+    /// the earlier key made, turning honest history into a wall of forgery
+    /// verdicts the moment someone reconnects.
+    ///
+    /// Two of the three paths are here: a relayed message, and a replayed
+    /// event checked against the bytes it travelled with. The third, the
+    /// verify endpoint's classifier, is pinned in `web.rs`.
+    #[tokio::test]
+    async fn chat_paths_resolve_a_key_by_kid_not_by_latest() {
+        let state = test_state_with_db();
+        // The key that signs, registered first…
+        let old = signer_on_file(&state, SIGNER);
+        // …and a newer one, which is what "the identity's current key" means.
+        let _new = signer_on_file(&state, SIGNER);
+
+        let sig = sign_channel_message(&old, SIGNER, "01OLDKEY", "#chat", "signed before rotating");
+        assert_eq!(
+            check_relayed(
+                &state,
+                Some(SIGNER),
+                "#chat",
+                Some("01OLDKEY"),
+                "signed before rotating",
+                &HashMap::new(),
+                Some(&sig),
+            ),
+            Some(crate::connection::messaging::ClientSigOutcome::Verified),
+            "a relayed message signed with a retired key must still verify"
+        );
+
+        // The replay path checks the bytes it was handed, by the same rule.
+        let canonical = freeq_sdk::chatsig::ChatDoc::mutation(
+            freeq_sdk::chatsig::Mutation::Delete,
+            SIGNER,
+            "01OLDKEYDELETE",
+            &freeq_sdk::chatsig::channel_venue("#chat"),
+            "01SUBJECTMSGID",
+        )
+        .canonical();
+        let mutation_sig = freeq_sdk::chatsig::ChatDoc::mutation(
+            freeq_sdk::chatsig::Mutation::Delete,
+            SIGNER,
+            "01OLDKEYDELETE",
+            &freeq_sdk::chatsig::channel_venue("#chat"),
+            "01SUBJECTMSGID",
+        )
+        .sign(&old);
+        assert_eq!(
+            crate::connection::messaging::verify_canonical_bytes(
+                &state,
+                SIGNER,
+                &canonical,
+                &mutation_sig,
+            ),
+            crate::connection::messaging::ClientSigOutcome::Verified,
+            "a replayed event signed with a retired key must still verify"
+        );
+    }
+
     /// A DM mutation that crossed the hop verifies here against the venue its
     /// signature covers.
     ///
