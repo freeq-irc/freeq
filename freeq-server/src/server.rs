@@ -3883,12 +3883,11 @@ pub(crate) async fn process_s2s_message(
                     if let Some(ref acct) = account {
                         tags.insert("account".to_string(), acct.clone());
                     }
-                    // Prefer the DID carried from the origin; fall back to a
-                    // local nick_owners lookup for peers that didn't send one.
-                    let sender_nick = from.split('!').next().unwrap_or(&from);
-                    let s2s_sender_did = account
-                        .clone()
-                        .or_else(|| state.nick_owners.lock().get(sender_nick).cloned());
+                    // Who sent this is the origin's to state, and only the
+                    // origin's: a nick is something a peer chooses, so
+                    // resolving one against our own records answered "who is
+                    // this" with the name of whoever holds that nick here.
+                    let s2s_sender_did = account.clone();
                     // File it before showing it. Persists the coordination
                     // tags (incl. +freeq.at/origin) so CHATHISTORY replay
                     // carries them, like the DM persist path — and if the
@@ -4071,14 +4070,11 @@ pub(crate) async fn process_s2s_message(
                 }
             } else {
                 // Persist first — a DM the store refuses (spent msgid) must
-                // not be delivered either. A durable row needs both DIDs:
-                // prefer the sender DID carried from the origin (a remote
-                // sender is not in our nick_owners); fall back to the local
-                // lookup.
-                let sender_nick = from.split('!').next().unwrap_or(&from);
-                let sender_did = account
-                    .clone()
-                    .or_else(|| state.nick_owners.lock().get(sender_nick).cloned());
+                // not be delivered either. A durable row needs both DIDs, and
+                // the sender's is the one the origin stamped or none: filing a
+                // DM under a DID resolved from a peer-chosen nick wrote one
+                // person's thread into another's.
+                let sender_did = account.clone();
                 // Recipient: honor the origin's stamp, cross-checked against our
                 // own resolution. On a mismatch we fall back (no durable row)
                 // rather than persist under a possibly-wrong identity.
@@ -4277,21 +4273,13 @@ pub(crate) async fn process_s2s_message(
         } => {
             let from = sanitize_s2s_str(&from, 512);
             let target = sanitize_s2s_str(&target, 200);
-            // Actor DID, origin-stamped. Older peers send none, so keep the
-            // nick lookup as the fallback — it resolves for anyone who has
-            // authenticated here, which is what we relied on before.
+            // Actor DID, origin-stamped or none. A peer chooses the nick it
+            // sends, so looking that nick up here answered "who is acting"
+            // with whoever holds it on this server — which is what let a peer
+            // delete a local user's message by wearing their name.
             let actor_nick = from.split('!').next().unwrap_or(&from).to_string();
-            // The DID the peer stamped, kept separate from `actor_did` below:
-            // this one the origin asserts about its own authenticated session,
-            // the other may have come from our nick map instead.
             let peer_account = account.map(|a| sanitize_s2s_str(&a, 512));
-            let actor_did = peer_account.clone().or_else(|| {
-                state
-                    .nick_owners
-                    .lock()
-                    .get(&actor_nick.to_lowercase())
-                    .cloned()
-            });
+            let actor_did = peer_account.clone();
 
             // ── verify before tidying ────────────────────────────────
             // Same rule the relayed-PRIVMSG path follows: the renames and the

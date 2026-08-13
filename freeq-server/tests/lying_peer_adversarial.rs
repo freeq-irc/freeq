@@ -145,17 +145,17 @@ async fn a_peer_cannot_delete_a_message_authored_by_someone_else() {
     assert!(leaked.is_none(), "a rejected delete was still fanned out to clients");
 }
 
-/// **Known gap, pinned deliberately.** A peer that puts a *local* user's nick
-/// in `from` and sends no `account` has the delete authorized: with no DID on
-/// the event, the receiver falls back to its own `nick_owners` map, resolves
-/// the nick to the local user who owns it, and concludes the author is acting.
+/// A peer that puts a *local* user's nick in `from` and sends no `account`
+/// used to have the delete authorized: with no DID on the event, the receiver
+/// looked the nick up in its own `nick_owners` map, resolved it to the local
+/// user who owns it, and concluded the author was acting. A nick is
+/// peer-assertable, so that was an impersonation route.
 ///
-/// The fallback exists for peers predating the `account` field, and a nick is
-/// peer-assertable, so it is an impersonation route. Closing it means deciding
-/// what to do about those older peers — out of scope here; this test states
-/// the current behaviour so a change to it is visible rather than silent.
+/// The receiver no longer answers "who is this" from a nick a peer chose.
+/// Without a DID the event is a stranger's, and a stranger cannot delete
+/// someone else's message.
 #[tokio::test]
-async fn a_peer_impersonating_a_local_nick_can_currently_delete_that_users_message() {
+async fn a_peer_impersonating_a_local_nick_cannot_delete_that_users_message() {
     let author = TestId::new("did:plc:lpauthor2");
     let watcher = TestId::new("did:plc:lpwatcher2");
     let (srv, mut peer, ha, mut rxw) = open_room(&author, &watcher).await;
@@ -167,9 +167,8 @@ async fn a_peer_impersonating_a_local_nick_can_currently_delete_that_users_messa
     assert_link_alive(&mut peer, &mut rxw, "probe-after-nick-impersonation").await;
 
     assert!(
-        is_deleted(&srv.db_path, &msgid),
-        "the nick fallback no longer authorizes a peer-asserted delete — \
-         if that was intentional, delete this test"
+        !is_deleted(&srv.db_path, &msgid),
+        "a peer wearing a local user's nick deleted that user's message"
     );
 }
 
