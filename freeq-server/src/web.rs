@@ -1187,13 +1187,14 @@ async fn api_actor_identity(
 /// GET /api/v1/channels/{name}/evidence?limit=&before=
 ///
 /// Exports a self-contained, offline-verifiable evidence bundle for a channel:
-/// the message range, each message's `+freeq.at/sig`, the per-DID client
-/// signing keys and the server signing key needed to check them, and a
-/// server signature over the whole bundle. `freeq-verify` (the offline CLI)
-/// recomputes each message's canonical form
-/// (`{did}\0{channel}\0{text}\0{timestamp}`) and checks the signatures with no
-/// server contact — so a third party who trusts neither the participants nor
-/// the server can confirm nothing was altered.
+/// the message range with each message's tags (so the document can be rebuilt),
+/// the signing keys addressed by `kid`, the server signing key, and a server
+/// signature over the whole bundle. `freeq-verify` (the offline CLI) rebuilds
+/// each message's signed document with the shared `freeq_sdk::chatsig` builder
+/// and checks the signatures with no server contact — so a third party who
+/// trusts neither the participants nor the server can confirm nothing was
+/// altered. Legacy bare-base64 signatures on old history keep the retired
+/// `{did}\0{channel}\0{text}\0{timestamp}` check via `did_keys`.
 ///
 /// Authorization mirrors CHATHISTORY/search: public channels export openly,
 /// restricted (+i/+k) channels require a member Bearer.
@@ -1220,23 +1221,46 @@ async fn api_channel_evidence(
     use base64::Engine;
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-    // Collect the per-DID client signing keys referenced by these messages.
+    // Signing keys the bundle needs. A current signature names the exact key
+    // that made it (its `kid`), and a DID may have rotated keys, so keys are
+    // addressed by kid. `did_keys` (latest key per DID) is kept only for the
+    // legacy bare-base64 signatures on pre-cutover history, which carry no kid.
+    let mut keys = serde_json::Map::new();
     let mut did_keys = serde_json::Map::new();
     {
-        let keys = state.did_msg_keys.lock();
+        let by_did = state.did_msg_keys.lock();
         for row in &rows {
-            if let Some(did) = &row.sender_did
-                && !did_keys.contains_key(did)
-                && let Some(pk) = keys.get(did)
+            let Some(did) = &row.sender_did else { continue };
+            if !did_keys.contains_key(did)
+                && let Some(pk) = by_did.get(did)
             {
                 did_keys.insert(did.clone(), serde_json::Value::String(pk.clone()));
+            }
+            if let Some(sig) = row.tags.get("+freeq.at/sig")
+                && let Ok((kid, _)) = freeq_sdk::sigtag::parse(sig)
+                && !keys.contains_key(kid)
+                && let Some(bytes) = state
+                    .with_db(|db| db.get_signing_key_by_kid(did, kid))
+                    .flatten()
+            {
+                keys.insert(kid.to_string(), serde_json::Value::String(b64.encode(bytes)));
             }
         }
     }
 
+    // The full tag map rides with each message so the offline verifier rebuilds
+    // the signed document with the same `freeq_sdk::chatsig` builder the client
+    // signed with — venue, reply, edit and covered coordination tags — instead
+    // of a canonical the server hands it. Reconstruction from parts is what
+    // keeps the check independent of this server.
     let messages: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
+            let tags: serde_json::Map<String, serde_json::Value> = r
+                .tags
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
             serde_json::json!({
                 "msgid": r.msgid,
                 "channel": r.channel,
@@ -1245,6 +1269,7 @@ async fn api_channel_evidence(
                 "text": r.text,
                 "timestamp": r.timestamp,
                 "signature": r.tags.get("+freeq.at/sig"),
+                "tags": tags,
             })
         })
         .collect();
@@ -1254,12 +1279,13 @@ async fn api_channel_evidence(
     // Everything except the signature, canonicalized, then server-signed so the
     // bundle itself is tamper-evident.
     let mut bundle = serde_json::json!({
-        "bundle_version": "1",
+        "bundle_version": "2",
         "server_name": state.server_name,
         "server_public_key": server_pubkey,
         "channel": channel,
         "exported_at": chrono::Utc::now().to_rfc3339(),
         "message_count": messages.len(),
+        "keys": keys,
         "did_keys": did_keys,
         "messages": messages,
     });
