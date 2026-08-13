@@ -4163,6 +4163,28 @@ pub(crate) async fn process_s2s_message(
                 crate::connection::helpers::root_msgid(state, &sanitize_s2s_str(&msgid, 100));
             let pinned_by = sanitize_s2s_str(&pinned_by, 64);
 
+            // ── S2S authorization: verify the pinner is an op ──
+            // Pinning is op-only where a user issues it (the PIN command
+            // checks); a relayed pin has to answer the same question.
+            {
+                let channels = state.channels.lock();
+                if let Some(ch) = channels.get(&channel) {
+                    let is_authorized = ch.remote_member(&pinned_by).is_some_and(|rm| {
+                        rm.is_op
+                            || rm.did.as_ref().is_some_and(|d| {
+                                ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d)
+                            })
+                    });
+                    if !is_authorized {
+                        tracing::warn!(
+                            channel = %channel, pinned_by = %pinned_by,
+                            "S2S Pin rejected: pinner is not an authorized op"
+                        );
+                        return;
+                    }
+                }
+            }
+
             let mut channels = state.channels.lock();
             if let Some(ch) = channels.get_mut(&channel) {
                 if adding {
@@ -8386,6 +8408,72 @@ mod s2s_adversarial_tests {
             ch.bans.is_empty(),
             "BUG: Non-op set ban via S2S — {} bans in list",
             ch.bans.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn s2s_pin_from_non_op_rejected() {
+        let state = test_state();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#pintest");
+
+        add_remote_member(&state, "#pintest", "non_op_pinner", false);
+
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Pin {
+                event_id: format!("{PEER}:8"),
+                channel: "#pintest".to_string(),
+                msgid: "01PINNED000000000000000000".to_string(),
+                pinned_by: "non_op_pinner".to_string(),
+                adding: true,
+                origin: PEER.to_string(),
+            },
+        )
+        .await;
+
+        let channels = state.channels.lock();
+        let ch = channels.get("#pintest").unwrap();
+        assert!(
+            ch.pins.is_empty(),
+            "a non-op's relayed pin must not be stored — {} pin(s) in list",
+            ch.pins.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn s2s_pin_from_an_op_is_stored() {
+        let state = test_state();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#pinok");
+
+        add_remote_member(&state, "#pinok", "op_pinner", true);
+
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Pin {
+                event_id: format!("{PEER}:9"),
+                channel: "#pinok".to_string(),
+                msgid: "01PINNED000000000000000000".to_string(),
+                pinned_by: "op_pinner".to_string(),
+                adding: true,
+                origin: PEER.to_string(),
+            },
+        )
+        .await;
+
+        let channels = state.channels.lock();
+        let ch = channels.get("#pinok").unwrap();
+        assert_eq!(
+            ch.pins.len(),
+            1,
+            "an op's relayed pin must still be stored"
         );
     }
 
