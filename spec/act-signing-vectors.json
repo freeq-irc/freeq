@@ -1,54 +1,80 @@
 {
-  "description": "Worked signing examples for freeq.at/act (RFC v0.4). Every implementation must reproduce canonical, kid, and sigTag byte-for-byte from tags + seed. Non-act tags in `tags` are present deliberately: they must NOT be covered.",
+  "description": "Worked signing examples for freeq.at/act (RFC v0.4). Every implementation must reproduce canonical, kid, and sigTag byte-for-byte from tags + target + msgid + seed, and must reject every negative: the named vector's own sigTag, checked against the negative's target and msgid, over the same tags. Non-act tags in `tags` are present deliberately: they must NOT be covered.",
+  "documentRule": "JCS (RFC 8785) over a flat string map: every act/act-* tag present, keyed by its name with the +freeq.at/ prefix stripped, plus `target` and `msgid`. No fixed field list — a kind may add tags freely.",
+  "eventIdRule": "An offer carries no act-id: its own event id is the task's id. Every later event in a task's life names that id in act-id, and mints its own id for itself.",
+  "injectedFieldRule": "target and msgid are supplied by the caller, never read from a tag: target is the normalized venue the message was delivered in, msgid is the id the signer minted (it rides the wire in +freeq.at/eventid). Neither name can collide with a covered tag, whose stripped name always starts with `act`.",
   "kidRule": "base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16])",
+  "negatives": [
+    {
+      "expected": "invalid",
+      "msgid": "01JABCDEF000000000000000EF",
+      "name": "re-venued-target",
+      "tamperedCanonical": "{\"act\":\"handoff\",\"act-caps\":\"freeq.at/web-search\",\"act-ctx-h\":\"sha256:9f00\",\"act-deadline\":\"1788000000\",\"act-from\":\"did:plc:eliza\",\"act-title\":\"Cite 3 sources on X\",\"act-to\":\"did:plc:scholar\",\"act-verb\":\"offer\",\"msgid\":\"01JABCDEF000000000000000EF\",\"target\":\"#random\"}",
+      "target": "#random",
+      "vector": "directed-offer"
+    },
+    {
+      "expected": "invalid",
+      "msgid": "01JOTHEREVENTID00000000000",
+      "name": "swapped-event-id",
+      "tamperedCanonical": "{\"act\":\"handoff\",\"act-caps\":\"freeq.at/web-search\",\"act-ctx-h\":\"sha256:9f00\",\"act-deadline\":\"1788000000\",\"act-from\":\"did:plc:eliza\",\"act-title\":\"Cite 3 sources on X\",\"act-to\":\"did:plc:scholar\",\"act-verb\":\"offer\",\"msgid\":\"01JOTHEREVENTID00000000000\",\"target\":\"#ops\"}",
+      "target": "#ops",
+      "vector": "directed-offer"
+    }
+  ],
+  "senderOnlyTagRule": "Only the sender ever writes act-* tags. A server that stamped one of its own would land inside the signature's coverage and break every act signature it relayed.",
   "sigTagFormat": "ed25519:<kid>:<base64url-nopad signature over the UTF-8 canonical bytes>",
   "vectors": [
     {
-      "canonical": "{\"act\":\"handoff\",\"act-caps\":\"freeq.at/web-search\",\"act-ctx-h\":\"sha256:9f00\",\"act-deadline\":\"1788000000\",\"act-from\":\"did:plc:eliza\",\"act-id\":\"01JABCDEF000000000000000EF\",\"act-title\":\"Cite 3 sources on X\",\"act-to\":\"did:plc:scholar\",\"act-verb\":\"offer\"}",
+      "canonical": "{\"act\":\"handoff\",\"act-caps\":\"freeq.at/web-search\",\"act-ctx-h\":\"sha256:9f00\",\"act-deadline\":\"1788000000\",\"act-from\":\"did:plc:eliza\",\"act-title\":\"Cite 3 sources on X\",\"act-to\":\"did:plc:scholar\",\"act-verb\":\"offer\",\"msgid\":\"01JABCDEF000000000000000EF\",\"target\":\"#ops\"}",
       "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+      "msgid": "01JABCDEF000000000000000EF",
       "name": "directed-offer",
       "publicKey": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
       "seed": "0101010101010101010101010101010101010101010101010101010101010101",
-      "sigTag": "ed25519:NHUPmL1Z_PyUbaRaqr6TOw:59iWBI1W00_xg_S2wUT94pFZ0ZnkxHEAmz62SQ6U-1n0mYZV4dbHMmxLqA_sPCgw4B1bG-AxR-J1TSGHF9XgDA",
+      "sigTag": "ed25519:NHUPmL1Z_PyUbaRaqr6TOw:Y0nWkPlR-Yjm4wxT9GuyPaf7KwTGB-swkDQ39hF6NeUNbTu6-WLqs2sjb1WGwMag82uwqjWrVibpbsOk4Ey9Bg",
       "tags": {
         "+freeq.at/act": "handoff",
         "+freeq.at/act-caps": "freeq.at/web-search",
         "+freeq.at/act-ctx-h": "sha256:9f00",
         "+freeq.at/act-deadline": "1788000000",
         "+freeq.at/act-from": "did:plc:eliza",
-        "+freeq.at/act-id": "01JABCDEF000000000000000EF",
         "+freeq.at/act-title": "Cite 3 sources on X",
         "+freeq.at/act-to": "did:plc:scholar",
         "+freeq.at/act-verb": "offer",
         "+freeq.at/actor-class": "agent",
+        "+freeq.at/eventid": "01JABCDEF000000000000000EF",
         "+freeq.at/sig": "ed25519:notcovered:notcovered",
         "msgid": "01JSERVERMINTED0000000000"
-      }
+      },
+      "target": "#ops"
     },
     {
-      "canonical": "{\"act\":\"handoff\",\"act-caps\":\"freeq.at/log-analysis\",\"act-ctx-h\":\"sha256:2c00\",\"act-from\":\"did:plc:eliza\",\"act-id\":\"01JXYZ0000000000000000000X\",\"act-title\":\"Summarize today's S2S logs\",\"act-verb\":\"offer\"}",
+      "canonical": "{\"act\":\"handoff\",\"act-caps\":\"freeq.at/log-analysis\",\"act-ctx-h\":\"sha256:2c00\",\"act-from\":\"did:plc:eliza\",\"act-title\":\"Summarize today's S2S logs\",\"act-verb\":\"offer\",\"msgid\":\"01JXYZ0000000000000000000X\",\"target\":\"#swarm\"}",
       "kid": "ajgD1fBZkCocba-8m6Rykg",
+      "msgid": "01JXYZ0000000000000000000X",
       "name": "open-offer-no-act-to",
       "publicKey": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
       "seed": "0202020202020202020202020202020202020202020202020202020202020202",
-      "sigTag": "ed25519:ajgD1fBZkCocba-8m6Rykg:WU1zAztgi50DEuMgTGcO9HsUdw8s02h4bqrNi31OQ_U22iEF1azvMhRhXQ5Wz1PW4QpGkAMBuxMKwnynh99tCg",
+      "sigTag": "ed25519:ajgD1fBZkCocba-8m6Rykg:4mRmWquQcJjew31ecDMHKbpJORbA6e-Y-TapYGFhyginU63tpU3LGRLp020bmewLnizhQk3Upw_FiG10MYEeCw",
       "tags": {
         "+freeq.at/act": "handoff",
         "+freeq.at/act-caps": "freeq.at/log-analysis",
         "+freeq.at/act-ctx-h": "sha256:2c00",
         "+freeq.at/act-from": "did:plc:eliza",
-        "+freeq.at/act-id": "01JXYZ0000000000000000000X",
         "+freeq.at/act-title": "Summarize today's S2S logs",
         "+freeq.at/act-verb": "offer"
-      }
+      },
+      "target": "#swarm"
     },
     {
-      "canonical": "{\"act\":\"approval\",\"act-ctx-h\":\"sha256:1a00\",\"act-from\":\"did:plc:factory\",\"act-id\":\"01KDEF0000000000000000000K\",\"act-scope\":\"deploy:factory-bot\",\"act-title\":\"Deploy factory-bot v12\",\"act-to\":\"did:plc:opslead\",\"act-verb\":\"request\"}",
+      "canonical": "{\"act\":\"approval\",\"act-ctx-h\":\"sha256:1a00\",\"act-from\":\"did:plc:factory\",\"act-id\":\"01KDEF0000000000000000000K\",\"act-scope\":\"deploy:factory-bot\",\"act-title\":\"Deploy factory-bot v12\",\"act-to\":\"did:plc:opslead\",\"act-verb\":\"request\",\"msgid\":\"01KDEF0000000000000000000K\",\"target\":\"dm:did:plc:factory,did:plc:opslead\"}",
       "kid": "ti6Gf6LzOv5i1daxZC4WIQ",
+      "msgid": "01KDEF0000000000000000000K",
       "name": "approval-with-kind-specific-field",
       "publicKey": "7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E",
       "seed": "0303030303030303030303030303030303030303030303030303030303030303",
-      "sigTag": "ed25519:ti6Gf6LzOv5i1daxZC4WIQ:73P-6cLM6zzgwEgpSqKN-fQs5vLaeUoeOQEwgi6aDAJtr5IiaMBgI_JDTBodCyjo-wsqhKuAxiVTmq3vdMLpBg",
+      "sigTag": "ed25519:ti6Gf6LzOv5i1daxZC4WIQ:DY5nsu5ZDfN12cwIj5brnd8NySbRGlu1trej11-B0zKSv_rlHmHG4ijtuNeafmkUdkh5q_MH09vhrdJtoUk6Dg",
       "tags": {
         "+freeq.at/act": "approval",
         "+freeq.at/act-ctx-h": "sha256:1a00",
@@ -58,15 +84,17 @@
         "+freeq.at/act-title": "Deploy factory-bot v12",
         "+freeq.at/act-to": "did:plc:opslead",
         "+freeq.at/act-verb": "request"
-      }
+      },
+      "target": "dm:did:plc:factory,did:plc:opslead"
     },
     {
-      "canonical": "{\"act\":\"handoff\",\"act-from\":\"did:plc:scholar\",\"act-id\":\"01JABCDEF000000000000000EF\",\"act-note\":\"ok — \\\"on it\\\" ✓\\n(eta 5m)\",\"act-ref\":\"01JOFFERMSGID000000000000\",\"act-verb\":\"accept\"}",
+      "canonical": "{\"act\":\"handoff\",\"act-from\":\"did:plc:scholar\",\"act-id\":\"01JABCDEF000000000000000EF\",\"act-note\":\"ok — \\\"on it\\\" ✓\\n(eta 5m)\",\"act-ref\":\"01JOFFERMSGID000000000000\",\"act-verb\":\"accept\",\"msgid\":\"01JACCEPTEVENTID0000000000\",\"target\":\"#ops\"}",
       "kid": "xblA7T9lw5GWXegpX8XSXw",
+      "msgid": "01JACCEPTEVENTID0000000000",
       "name": "accept-minimal-with-escaping",
       "publicKey": "ypOsFwUYcHHWe4PH_w7-gQjo7EUwV113JoeTM9vavnw",
       "seed": "0404040404040404040404040404040404040404040404040404040404040404",
-      "sigTag": "ed25519:xblA7T9lw5GWXegpX8XSXw:mabnZhQwhefhugV-LLgArjsxNi--HU-s1kD9l_9vk4UTo5LMn6JV3juInEVwmldHXk-GOghHZ5TJWisY-deiDw",
+      "sigTag": "ed25519:xblA7T9lw5GWXegpX8XSXw:8OZfMiMstOjYT2pmEsm4sWcyrMLrxZwGZXGtS6s9vF9scA_PYlbJcGu4XO_gDXl9rz2n-niPVRTcm6-ZFL3fCQ",
       "tags": {
         "+freeq.at/act": "handoff",
         "+freeq.at/act-from": "did:plc:scholar",
@@ -74,7 +102,9 @@
         "+freeq.at/act-note": "ok — \"on it\" ✓\n(eta 5m)",
         "+freeq.at/act-ref": "01JOFFERMSGID000000000000",
         "+freeq.at/act-verb": "accept"
-      }
+      },
+      "target": "#ops"
     }
-  ]
+  ],
+  "venueRule": "target is the normalized venue, never the wire target: a channel lowercased, or `dm:<did_a>,<did_b>` with the two DIDs sorted ascending."
 }

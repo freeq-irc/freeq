@@ -53,8 +53,9 @@ export type {
 } from "./delegation.js";
 
 // freeq.at/act signing — the act RFC's canonical (sign-what's-present over
-// act-* tags), kid derivation, and sign/verify. Byte-compatible with
-// freeq_sdk::act; contract fixtures in spec/act-signing-vectors.json.
+// act-* tags, plus the caller-supplied venue and event id), kid derivation,
+// and sign/verify. Byte-compatible with freeq_sdk::act; contract fixtures in
+// spec/act-signing-vectors.json.
 export {
   actCanonical,
   deriveKid,
