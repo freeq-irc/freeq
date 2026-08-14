@@ -72,10 +72,12 @@ export type { ActVerifyResult } from "./act.js";
 // can pre-check a move and reach the same verdict the server will.
 export {
   DEADLINE_TOLERANCE_MS,
+  checkOpen,
   checkTransition,
   eventTimeMs,
   initialState,
   isTerminal,
+  openingVerb,
   refusalDescription,
 } from "./act-transitions.js";
 export type {

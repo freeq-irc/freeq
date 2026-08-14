@@ -5,6 +5,11 @@
     "the Rust checker compiles it in, the TypeScript package carries a byte-identical copy a test pins.",
     "Adding a task kind means adding an entry here first — an event whose kind this file does not list is refused,",
     "so the rules a server enforces are never wider than the rules that were written down.",
+    "`opens` names the verb that CREATES a task of this kind, and the state it lands in — `directed` when the",
+    "message names a recipient in act-to, `open` when it does not. The transitions below are moves on a task",
+    "that already exists; without `opens` a server would refuse the one message that starts everything.",
+    "Any logged-in sender may open, so an opener has no `who`: opening is what makes the sender the offerer.",
+    "An opener carries no act-id — its own event id is the task's id — so one that names a task is an illegal step.",
     "`who` names the role a sender must hold: offerer, offeree, assignee, caps_match (declared capabilities cover",
     "the task's), or system (the server itself — expiry only). `from` is one state, a list of states, or",
     "`*nonterminal` for every state that is not terminal. `before_deadline` is data; the comparison is code."
@@ -12,7 +17,7 @@
   "version": 1,
   "kinds": {
     "handoff": {
-      "initial": { "directed": "offered", "open": "open" },
+      "opens": { "verb": "offer", "directed": "offered", "open": "open" },
       "terminal": ["completed", "failed", "cancelled", "declined", "expired"],
       "transitions": [
         { "verb": "accept", "from": "offered", "to": "assigned", "who": "offeree", "before_deadline": true },
@@ -43,6 +48,51 @@
     ],
     "tolerance_ms": 120000
   },
+  "opening_sequences": [
+    {
+      "name": "a directed offer opens a task in the offered state",
+      "kind": "handoff",
+      "verb": "offer",
+      "directed": true,
+      "expect": "offered"
+    },
+    {
+      "name": "an offer naming nobody opens a claimable task",
+      "kind": "handoff",
+      "verb": "offer",
+      "directed": false,
+      "expect": "open"
+    },
+    {
+      "name": "an opener that names an existing task is refused",
+      "kind": "handoff",
+      "verb": "offer",
+      "directed": true,
+      "names_task": true,
+      "expect_refused": "illegal-step"
+    },
+    {
+      "name": "a verb that neither opens nor moves a task is refused",
+      "kind": "handoff",
+      "verb": "post",
+      "directed": false,
+      "expect_refused": "unknown-verb"
+    },
+    {
+      "name": "a verb that moves a task cannot open one",
+      "kind": "handoff",
+      "verb": "accept",
+      "directed": true,
+      "expect_refused": "illegal-step"
+    },
+    {
+      "name": "an opener for a kind this file does not list is refused",
+      "kind": "bounty",
+      "verb": "offer",
+      "directed": false,
+      "expect_refused": "unknown-kind"
+    }
+  ],
   "sequences": [
     {
       "name": "a directed offer is accepted, worked, and completed",

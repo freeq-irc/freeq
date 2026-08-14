@@ -1,9 +1,10 @@
 //! The task lifecycle: which move is legal, from which state, and by whom.
 //!
 //! The rules live in `spec/act-transitions.json`, not in this file. A kind
-//! names its initial states, its terminal states, and a row per legal move —
-//! verb, the states it may be made from, the state it lands in, and the role
-//! the sender must hold. Adding a task kind is an edit to that file; this
+//! names the verb that **creates** one of its tasks and the state that lands
+//! in, its terminal states, and a row per legal move on a task that already
+//! exists — verb, the states it may be made from, the state it lands in, and
+//! the role the sender must hold. Adding a task kind is an edit to that file; this
 //! module is the code that reads it, and stays the same size as kinds are
 //! added. That is the whole point of the arrangement: an event whose kind the
 //! file does not list is refused, so a server's enforced rules are never wider
@@ -136,8 +137,73 @@ pub struct Sender<'a> {
 /// A directed offer (one naming a recipient) and an open one start in
 /// different states, which is why the file names both.
 pub fn initial_state(kind: &str, directed: bool) -> Option<&'static str> {
-    let key = if directed { "directed" } else { "open" };
-    spec().kinds.get(kind)?.initial.get(key).map(String::as_str)
+    let opens = &spec().kinds.get(kind)?.opens;
+    match directed {
+        true => opens.directed.as_deref(),
+        false => Some(opens.open.as_str()),
+    }
+}
+
+/// The verb that creates a task of this kind.
+pub fn opening_verb(kind: &str) -> Option<&'static str> {
+    spec().kinds.get(kind).map(|k| k.opens.verb.as_str())
+}
+
+/// Decide whether an event may open a new task of `kind`.
+///
+/// The move the transitions table cannot describe, because there is no task
+/// yet to move — and the one a server needs first, since nothing else can
+/// happen until something has been opened.
+///
+/// There is no sender to check: **any logged-in sender may open**, and
+/// opening is what makes them the offerer. `directed` is whether the message
+/// named a recipient; `names_task` is whether it also carried an `act-id`,
+/// which an opener never does — its own event id is the task's id, so an
+/// opener naming a task is describing two at once.
+pub fn check_open(
+    kind: &str,
+    verb: &str,
+    directed: bool,
+    names_task: bool,
+) -> Result<&'static str, Refusal> {
+    let k = spec().kinds.get(kind).ok_or(Refusal::UnknownKind)?;
+    if k.opens.verb != verb {
+        // A verb the kind moves tasks with is known but cannot start one;
+        // a verb it has never heard of is a different answer entirely.
+        return Err(match k.transitions.iter().any(|t| t.verb == verb) {
+            true => Refusal::IllegalStep,
+            false => Refusal::UnknownVerb,
+        });
+    }
+    if names_task {
+        return Err(Refusal::IllegalStep);
+    }
+    match directed {
+        // A kind with no directed form cannot be opened to one recipient.
+        true => k.opens.directed.as_deref().ok_or(Refusal::IllegalStep),
+        false => Ok(k.opens.open.as_str()),
+    }
+}
+
+/// Whether the rules file lists this kind at all.
+///
+/// The question a server asks before anything else about a task event: a kind
+/// nobody wrote down is refused rather than stored unrefereed, so adding a
+/// kind is an edit to the file and not a thing that happens by accident.
+pub fn knows_kind(kind: &str) -> bool {
+    spec().kinds.contains_key(kind)
+}
+
+/// Whether `kind`'s table has a transition with this verb, from any state.
+///
+/// Asked without reference to a particular task: "this kind has no such step"
+/// is a different answer from "not from where that task is now", and only the
+/// first can be given before any state exists.
+pub fn knows_verb(kind: &str, verb: &str) -> bool {
+    spec()
+        .kinds
+        .get(kind)
+        .is_some_and(|k| k.transitions.iter().any(|t| t.verb == verb))
 }
 
 /// Whether `state` is one this kind never leaves.
@@ -239,9 +305,21 @@ struct Spec {
 
 #[derive(Deserialize)]
 struct Kind {
-    initial: BTreeMap<String, String>,
+    opens: Opens,
     terminal: Vec<String>,
     transitions: Vec<Transition>,
+}
+
+/// How a task of this kind comes into being: the verb that creates one, and
+/// the state it lands in — which of the two depends on whether the message
+/// named a recipient.
+///
+/// A kind that can only be opened to the room at large carries no `directed`.
+#[derive(Deserialize)]
+struct Opens {
+    verb: String,
+    directed: Option<String>,
+    open: String,
 }
 
 #[derive(Deserialize)]
@@ -331,6 +409,108 @@ mod tests {
         assert_eq!(initial_state("bounty", false), None, "not a listed kind");
     }
 
+    // ── opening a task ──────────────────────────────────────────────────────
+
+    /// The move the transitions table cannot describe, because there is no
+    /// task yet to move. Anyone logged in may make it, and making it is what
+    /// makes them the offerer.
+    #[test]
+    fn the_opening_verb_creates_a_task_for_any_sender() {
+        assert_eq!(opening_verb("handoff"), Some("offer"));
+        assert_eq!(check_open("handoff", "offer", true, false), Ok("offered"));
+        assert_eq!(check_open("handoff", "offer", false, false), Ok("open"));
+    }
+
+    /// Whether the offer names a recipient is what decides which state it
+    /// lands in — the one question the opener asks about its own message.
+    #[test]
+    fn naming_a_recipient_is_what_makes_an_offer_directed() {
+        assert_ne!(
+            check_open("handoff", "offer", true, false),
+            check_open("handoff", "offer", false, false)
+        );
+    }
+
+    /// An opener's own event id *is* the task's id, so an opener that also
+    /// names a task is describing two tasks at once.
+    #[test]
+    fn an_opener_that_names_an_existing_task_is_refused() {
+        assert_eq!(
+            check_open("handoff", "offer", true, true),
+            Err(Refusal::IllegalStep)
+        );
+        assert_eq!(
+            check_open("handoff", "offer", false, true),
+            Err(Refusal::IllegalStep)
+        );
+    }
+
+    /// The two ways a verb can fail to open, kept apart: one the kind has
+    /// never heard of, and one it knows but cannot start with.
+    #[test]
+    fn a_verb_that_does_not_open_is_refused_by_whether_the_kind_knows_it() {
+        assert_eq!(
+            check_open("handoff", "post", false, false),
+            Err(Refusal::UnknownVerb),
+            "a verb this kind has no row for at all"
+        );
+        for verb in ["accept", "complete", "cancel", "expire"] {
+            assert_eq!(
+                check_open("handoff", verb, true, false),
+                Err(Refusal::IllegalStep),
+                "{verb} moves a task; it cannot start one"
+            );
+        }
+    }
+
+    #[test]
+    fn opening_a_kind_the_file_does_not_list_is_refused() {
+        assert_eq!(
+            check_open("bounty", "offer", false, false),
+            Err(Refusal::UnknownKind)
+        );
+        assert_eq!(opening_verb("bounty"), None);
+    }
+
+    /// The states an opener lands in are the states the transitions move from
+    /// — otherwise a task could be created into a state nothing can act on.
+    #[test]
+    fn every_opening_state_is_one_some_transition_moves_from() {
+        for (name, kind) in &spec().kinds {
+            for state in [
+                kind.opens.directed.as_deref(),
+                Some(kind.opens.open.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                assert!(
+                    kind.transitions.iter().any(|t| t.from.matches(state, kind)),
+                    "{name}: nothing can be done to a task opened into {state}"
+                );
+            }
+        }
+    }
+
+    /// What a server asks before a task has any state to reason about.
+    #[test]
+    fn a_kind_and_a_verb_can_be_recognized_without_a_task() {
+        assert!(knows_kind("handoff"));
+        assert!(!knows_kind("bounty"), "a real kind this file does not list");
+        assert!(!knows_kind("approval"), "deferred");
+
+        for verb in [
+            "accept", "decline", "claim", "progress", "complete", "fail", "cancel", "expire",
+        ] {
+            assert!(knows_verb("handoff", verb), "{verb}");
+        }
+        assert!(
+            !knows_verb("handoff", "award"),
+            "bounty's verb, not handoff's"
+        );
+        assert!(!knows_verb("bounty", "award"), "no table, no verbs");
+    }
+
     #[test]
     fn the_terminal_states_are_exactly_the_five_the_file_names() {
         for state in ["completed", "failed", "cancelled", "declined", "expired"] {
@@ -392,7 +572,8 @@ mod tests {
                     assert!(
                         s == ANY_NONTERMINAL
                             || kind.terminal.contains(s)
-                            || kind.initial.values().any(|i| i == s)
+                            || kind.opens.directed.as_ref() == Some(s)
+                            || &kind.opens.open == s
                             || kind.transitions.iter().any(|other| &other.to == s),
                         "{name}/{}: no transition or initial state reaches {s}",
                         t.verb
@@ -823,6 +1004,50 @@ mod tests {
                 (got, expect, refused) => {
                     panic!("{where_}: got {got:?}, but the step expects {expect:?} / {refused:?}")
                 }
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct OpeningFile {
+        opening_sequences: Vec<Opening>,
+    }
+
+    #[derive(Deserialize)]
+    struct Opening {
+        name: String,
+        kind: String,
+        verb: String,
+        directed: bool,
+        #[serde(default)]
+        names_task: bool,
+        expect: Option<String>,
+        expect_refused: Option<String>,
+    }
+
+    fn opening_sequences() -> Vec<Opening> {
+        let file: OpeningFile =
+            serde_json::from_str(include_str!("../../spec/act-transitions.json")).unwrap();
+        file.opening_sequences
+    }
+
+    #[test]
+    fn every_opening_sequence_in_the_rules_file_replays() {
+        let openings = opening_sequences();
+        assert!(openings.len() >= 5, "{}", openings.len());
+        for o in &openings {
+            let got = check_open(&o.kind, &o.verb, o.directed, o.names_task);
+            match (&o.expect, &o.expect_refused) {
+                (Some(state), None) => assert_eq!(got, Ok(state.as_str()), "{}", o.name),
+                (None, Some(reason)) => {
+                    assert_eq!(
+                        got.map_err(|r| r.code()),
+                        Err(reason.as_str()),
+                        "{}",
+                        o.name
+                    )
+                }
+                _ => panic!("{}: set exactly one of expect / expect_refused", o.name),
             }
         }
     }

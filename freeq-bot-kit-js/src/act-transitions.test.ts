@@ -11,10 +11,12 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   DEADLINE_TOLERANCE_MS,
+  checkOpen,
   checkTransition,
   eventTimeMs,
   initialState,
   isTerminal,
+  openingVerb,
   refusalDescription,
   type EventSender,
   type RefusalReason,
@@ -113,6 +115,66 @@ describe("the rules file", () => {
       expect(used.has(reason), `no sequence refuses with ${reason}`).toBe(true);
     }
   });
+});
+
+describe("opening a task", () => {
+  interface Opening {
+    name: string;
+    kind: string;
+    verb: string;
+    directed: boolean;
+    names_task?: boolean;
+    expect?: string;
+    expect_refused?: RefusalReason;
+  }
+
+  it("names the creating verb, which no transition row can", () => {
+    expect(openingVerb("handoff")).toBe("offer");
+    expect(openingVerb("bounty")).toBeNull();
+  });
+
+  it("lets any logged-in sender open, directed or not", () => {
+    expect(checkOpen("handoff", "offer", true, false)).toEqual({ ok: true, to: "offered" });
+    expect(checkOpen("handoff", "offer", false, false)).toEqual({ ok: true, to: "open" });
+  });
+
+  it("refuses an opener that also names an existing task", () => {
+    expect(checkOpen("handoff", "offer", true, true)).toEqual({
+      ok: false,
+      reason: "illegal-step",
+    });
+  });
+
+  it("tells an unknown verb apart from one that cannot open", () => {
+    expect(checkOpen("handoff", "post", false, false)).toEqual({
+      ok: false,
+      reason: "unknown-verb",
+    });
+    for (const verb of ["accept", "complete", "cancel", "expire"]) {
+      expect(checkOpen("handoff", verb, true, false), verb).toEqual({
+        ok: false,
+        reason: "illegal-step",
+      });
+    }
+  });
+
+  it("refuses to open a kind the file does not list", () => {
+    expect(checkOpen("bounty", "offer", false, false)).toEqual({
+      ok: false,
+      reason: "unknown-kind",
+    });
+  });
+
+  for (const o of canonical.opening_sequences as Opening[]) {
+    it(o.name, () => {
+      const got = checkOpen(o.kind, o.verb, o.directed, o.names_task ?? false);
+      if (o.expect !== undefined) {
+        expect(got).toEqual({ ok: true, to: o.expect });
+      } else {
+        expect(got).toEqual({ ok: false, reason: o.expect_refused });
+      }
+    });
+  }
 });
 
 describe("the happy path", () => {

@@ -71,8 +71,18 @@ interface Transition {
   before_deadline?: boolean;
 }
 
+/** How a task of this kind comes into being: the verb that creates one, and
+ * the state it lands in — which of the two depends on whether the message
+ * named a recipient. A kind that can only be opened to the room at large
+ * carries no `directed`. */
+interface Opens {
+  verb: string;
+  directed?: string;
+  open: string;
+}
+
 interface Kind {
-  initial: Record<string, string>;
+  opens: Opens;
   terminal: string[];
   transitions: Transition[];
 }
@@ -84,7 +94,48 @@ const refusals = spec.refusals as Record<string, string>;
 
 /** The state a new task of `kind` starts in. */
 export function initialState(kind: string, directed: boolean): string | null {
-  return kinds[kind]?.initial[directed ? "directed" : "open"] ?? null;
+  const opens = kinds[kind]?.opens;
+  if (!opens) return null;
+  return (directed ? opens.directed : opens.open) ?? null;
+}
+
+/** The verb that creates a task of this kind. */
+export function openingVerb(kind: string): string | null {
+  return kinds[kind]?.opens.verb ?? null;
+}
+
+/**
+ * Decide whether an event may open a new task of `kind`.
+ *
+ * The move the transitions table cannot describe, because there is no task yet
+ * to move. There is no sender to check: any logged-in sender may open, and
+ * opening is what makes them the offerer. `directed` is whether the message
+ * named a recipient; `namesTask` is whether it also carried an `act-id`, which
+ * an opener never does — its own event id is the task's id.
+ */
+export function checkOpen(
+  kind: string,
+  verb: string,
+  directed: boolean,
+  namesTask: boolean,
+): CheckResult {
+  const k = kinds[kind];
+  if (!k) return { ok: false, reason: "unknown-kind" };
+  if (k.opens.verb !== verb) {
+    // A verb the kind moves tasks with is known but cannot start one; a verb
+    // it has never heard of is a different answer entirely.
+    return k.transitions.some((t) => t.verb === verb)
+      ? { ok: false, reason: "illegal-step" }
+      : { ok: false, reason: "unknown-verb" };
+  }
+  if (namesTask) return { ok: false, reason: "illegal-step" };
+  if (directed) {
+    // A kind with no directed form cannot be opened to one recipient.
+    return k.opens.directed
+      ? { ok: true, to: k.opens.directed }
+      : { ok: false, reason: "illegal-step" };
+  }
+  return { ok: true, to: k.opens.open };
 }
 
 /** Whether `state` is one this kind never leaves. */
