@@ -66,6 +66,26 @@ export {
 } from "./act.js";
 export type { ActVerifyResult } from "./act.js";
 
+// The task lifecycle rules — which move is legal, from which state, by whom.
+// The rules are data (spec/act-transitions.json, copied into src/); this is
+// the checker that reads them, mirroring freeq_sdk::act_transitions so a bot
+// can pre-check a move and reach the same verdict the server will.
+export {
+  DEADLINE_TOLERANCE_MS,
+  checkTransition,
+  eventTimeMs,
+  initialState,
+  isTerminal,
+  refusalDescription,
+} from "./act-transitions.js";
+export type {
+  CheckResult,
+  EventSender,
+  RefusalReason,
+  Task,
+  TaskEvent,
+} from "./act-transitions.js";
+
 // Daemon CLI scaffold — Commander-based launch/stop/status/doctor/tail
 // for long-running freeq bot daemons. Caller provides runDaemon + paths;
 // bot-kit handles pid files, --detach forking, signal wiring, and the

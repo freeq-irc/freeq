@@ -1,0 +1,502 @@
+{
+  "_readme": [
+    "The task lifecycle: which move is legal, from which state, by whom.",
+    "Written by hand. Both SDKs load this file and must reach the same verdict on every sequence below;",
+    "the Rust checker compiles it in, the TypeScript package carries a byte-identical copy a test pins.",
+    "Adding a task kind means adding an entry here first — an event whose kind this file does not list is refused,",
+    "so the rules a server enforces are never wider than the rules that were written down.",
+    "`who` names the role a sender must hold: offerer, offeree, assignee, caps_match (declared capabilities cover",
+    "the task's), or system (the server itself — expiry only). `from` is one state, a list of states, or",
+    "`*nonterminal` for every state that is not terminal. `before_deadline` is data; the comparison is code."
+  ],
+  "version": 1,
+  "kinds": {
+    "handoff": {
+      "initial": { "directed": "offered", "open": "open" },
+      "terminal": ["completed", "failed", "cancelled", "declined", "expired"],
+      "transitions": [
+        { "verb": "accept", "from": "offered", "to": "assigned", "who": "offeree", "before_deadline": true },
+        { "verb": "decline", "from": "offered", "to": "declined", "who": "offeree" },
+        { "verb": "claim", "from": "open", "to": "assigned", "who": "caps_match" },
+        { "verb": "progress", "from": "assigned", "to": "assigned", "who": "assignee" },
+        { "verb": "complete", "from": "assigned", "to": "completed", "who": "assignee" },
+        { "verb": "fail", "from": "assigned", "to": "failed", "who": "assignee" },
+        { "verb": "cancel", "from": ["offered", "assigned"], "to": "cancelled", "who": "offerer" },
+        { "verb": "expire", "from": "*nonterminal", "to": "expired", "who": "system" }
+      ]
+    }
+  },
+  "refusals": {
+    "unknown-kind": "The kind is not in this file. Adding a kind means updating this file first.",
+    "unknown-verb": "The kind lists no transition with this verb.",
+    "terminal-task": "The task is finished. A later event never un-applies an earlier one.",
+    "illegal-step": "The verb is not legal from the task's current state.",
+    "wrong-sender": "The sender does not hold the role this transition requires.",
+    "caps-mismatch": "The sender's declared capabilities do not cover the task's.",
+    "deadline-passed": "The event was minted after the offer's deadline, beyond the clock tolerance."
+  },
+  "deadline_rule": {
+    "_note": [
+      "The clock is the incoming event's own id: a ULID embeds the millisecond its signer minted it,",
+      "so every verifier compares the same number instead of its own wall clock.",
+      "The tolerance is the one client-minted ids already get — federated machines are not in sync."
+    ],
+    "tolerance_ms": 120000
+  },
+  "sequences": [
+    {
+      "name": "a directed offer is accepted, worked, and completed",
+      "task": {
+        "kind": "handoff",
+        "offer": "directed",
+        "offerer": "did:plc:eliza",
+        "offeree": "did:plc:scholar",
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "accept", "sender": "did:plc:scholar", "expect": "assigned" },
+        { "verb": "progress", "sender": "did:plc:scholar", "expect": "assigned" },
+        { "verb": "progress", "sender": "did:plc:scholar", "expect": "assigned" },
+        { "verb": "complete", "sender": "did:plc:scholar", "expect": "completed" }
+      ]
+    },
+    {
+      "name": "a directed offer is declined",
+      "task": {
+        "kind": "handoff",
+        "offer": "directed",
+        "offerer": "did:plc:eliza",
+        "offeree": "did:plc:scholar",
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [{ "verb": "decline", "sender": "did:plc:scholar", "expect": "declined" }]
+    },
+    {
+      "name": "an open offer is claimed by a capable agent, then fails",
+      "task": {
+        "kind": "handoff",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "caps": ["freeq.at/log-analysis"],
+        "deadline": null
+      },
+      "steps": [
+        {
+          "verb": "claim",
+          "sender": "did:plc:scholar",
+          "sender_caps": ["freeq.at/log-analysis", "freeq.at/web-search"],
+          "expect": "assigned"
+        },
+        { "verb": "progress", "sender": "did:plc:scholar", "expect": "assigned" },
+        { "verb": "fail", "sender": "did:plc:scholar", "expect": "failed" }
+      ]
+    },
+    {
+      "name": "an open offer with no required capabilities is claimable by anyone",
+      "task": {
+        "kind": "handoff",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [{ "verb": "claim", "sender": "did:plc:nobody", "expect": "assigned" }]
+    },
+    {
+      "name": "the offerer cancels an offer nobody took",
+      "task": {
+        "kind": "handoff",
+        "offer": "directed",
+        "offerer": "did:plc:eliza",
+        "offeree": "did:plc:scholar",
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [{ "verb": "cancel", "sender": "did:plc:eliza", "expect": "cancelled" }]
+    },
+    {
+      "name": "the offerer cancels work already assigned",
+      "task": {
+        "kind": "handoff",
+        "offer": "directed",
+        "offerer": "did:plc:eliza",
+        "offeree": "did:plc:scholar",
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "accept", "sender": "did:plc:scholar", "expect": "assigned" },
+        { "verb": "cancel", "sender": "did:plc:eliza", "expect": "cancelled" }
+      ]
+    },
+    {
+      "name": "the server expires a task that was accepted and abandoned",
+      "task": {
+        "kind": "handoff",
+        "offer": "directed",
+        "offerer": "did:plc:eliza",
+        "offeree": "did:plc:scholar",
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "accept", "sender": "did:plc:scholar", "expect": "assigned" },
+        { "verb": "expire", "sender": "did:web:irc.example", "system": true, "expect": "expired" }
+      ]
+    },
+    {
+      "name": "the server expires an offer nobody ever took",
+      "task": {
+        "kind": "handoff",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "expire", "sender": "did:web:irc.example", "system": true, "expect": "expired" }
+      ]
+    },
+    {
+      "name": "an accept inside the deadline stands, and one at the edge of the tolerance still does",
+      "task": {
+        "kind": "handoff",
+        "offer": "directed",
+        "offerer": "did:plc:eliza",
+        "offeree": "did:plc:scholar",
+        "caps": [],
+        "deadline": 1788000000
+      },
+      "steps": [
+        {
+          "verb": "accept",
+          "sender": "did:plc:scholar",
+          "event_id": "01M16E7TC0ACCEPTINTIME0000",
+          "expect": "assigned"
+        }
+      ]
+    },
+    {
+      "name": "an accept exactly at the edge of the clock tolerance is allowed",
+      "task": {
+        "kind": "handoff",
+        "offer": "directed",
+        "offerer": "did:plc:eliza",
+        "offeree": "did:plc:scholar",
+        "caps": [],
+        "deadline": 1788000000
+      },
+      "steps": [
+        {
+          "verb": "accept",
+          "sender": "did:plc:scholar",
+          "event_id": "01M16HSB60ACCEPTATEDGE0000",
+          "expect": "assigned"
+        }
+      ]
+    },
+    {
+      "name": "an accept one second past the tolerance is refused, and the offer still stands",
+      "task": {
+        "kind": "handoff",
+        "offer": "directed",
+        "offerer": "did:plc:eliza",
+        "offeree": "did:plc:scholar",
+        "caps": [],
+        "deadline": 1788000000
+      },
+      "steps": [
+        {
+          "verb": "accept",
+          "sender": "did:plc:scholar",
+          "event_id": "01M16HSC58ACCEPTTOOLATE000",
+          "expect_refused": "deadline-passed"
+        },
+        {
+          "verb": "decline",
+          "sender": "did:plc:scholar",
+          "event_id": "01M16HSC58ACCEPTTOOLATE000",
+          "expect": "declined"
+        }
+      ]
+    },
+    {
+      "name": "only the offeree may accept",
+      "task": {
+        "kind": "handoff",
+        "offer": "directed",
+        "offerer": "did:plc:eliza",
+        "offeree": "did:plc:scholar",
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "accept", "sender": "did:plc:mallory", "expect_refused": "wrong-sender" },
+        { "verb": "accept", "sender": "did:plc:eliza", "expect_refused": "wrong-sender" },
+        { "verb": "accept", "sender": "did:plc:scholar", "expect": "assigned" }
+      ]
+    },
+    {
+      "name": "a bystander cannot report progress or completion on someone else's task",
+      "task": {
+        "kind": "handoff",
+        "offer": "directed",
+        "offerer": "did:plc:eliza",
+        "offeree": "did:plc:scholar",
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "accept", "sender": "did:plc:scholar", "expect": "assigned" },
+        { "verb": "progress", "sender": "did:plc:mallory", "expect_refused": "wrong-sender" },
+        { "verb": "complete", "sender": "did:plc:mallory", "expect_refused": "wrong-sender" },
+        { "verb": "complete", "sender": "did:plc:eliza", "expect_refused": "wrong-sender" },
+        { "verb": "complete", "sender": "did:plc:scholar", "expect": "completed" }
+      ]
+    },
+    {
+      "name": "only the offerer may cancel",
+      "task": {
+        "kind": "handoff",
+        "offer": "directed",
+        "offerer": "did:plc:eliza",
+        "offeree": "did:plc:scholar",
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "cancel", "sender": "did:plc:scholar", "expect_refused": "wrong-sender" },
+        { "verb": "cancel", "sender": "did:plc:eliza", "expect": "cancelled" }
+      ]
+    },
+    {
+      "name": "only the server may expire a task",
+      "task": {
+        "kind": "handoff",
+        "offer": "directed",
+        "offerer": "did:plc:eliza",
+        "offeree": "did:plc:scholar",
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "expire", "sender": "did:plc:eliza", "expect_refused": "wrong-sender" },
+        { "verb": "expire", "sender": "did:plc:scholar", "expect_refused": "wrong-sender" }
+      ]
+    },
+    {
+      "name": "a directed offer cannot be claimed, and an open one cannot be accepted",
+      "task": {
+        "kind": "handoff",
+        "offer": "directed",
+        "offerer": "did:plc:eliza",
+        "offeree": "did:plc:scholar",
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [
+        {
+          "verb": "claim",
+          "sender": "did:plc:mallory",
+          "sender_caps": ["freeq.at/web-search"],
+          "expect_refused": "illegal-step"
+        }
+      ]
+    },
+    {
+      "name": "an open offer cannot be accepted or declined",
+      "task": {
+        "kind": "handoff",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "accept", "sender": "did:plc:scholar", "expect_refused": "illegal-step" },
+        { "verb": "decline", "sender": "did:plc:scholar", "expect_refused": "illegal-step" }
+      ]
+    },
+    {
+      "name": "work cannot be completed before anyone was assigned",
+      "task": {
+        "kind": "handoff",
+        "offer": "directed",
+        "offerer": "did:plc:eliza",
+        "offeree": "did:plc:scholar",
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "complete", "sender": "did:plc:scholar", "expect_refused": "illegal-step" },
+        { "verb": "progress", "sender": "did:plc:scholar", "expect_refused": "illegal-step" }
+      ]
+    },
+    {
+      "name": "a task cannot be accepted twice",
+      "task": {
+        "kind": "handoff",
+        "offer": "directed",
+        "offerer": "did:plc:eliza",
+        "offeree": "did:plc:scholar",
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "accept", "sender": "did:plc:scholar", "expect": "assigned" },
+        { "verb": "accept", "sender": "did:plc:scholar", "expect_refused": "illegal-step" }
+      ]
+    },
+    {
+      "name": "two agents race to claim one open task and only the first wins",
+      "task": {
+        "kind": "handoff",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "caps": ["freeq.at/log-analysis"],
+        "deadline": null
+      },
+      "steps": [
+        {
+          "verb": "claim",
+          "sender": "did:plc:scholar",
+          "sender_caps": ["freeq.at/log-analysis"],
+          "expect": "assigned"
+        },
+        {
+          "verb": "claim",
+          "sender": "did:plc:rival",
+          "sender_caps": ["freeq.at/log-analysis"],
+          "expect_refused": "illegal-step"
+        }
+      ]
+    },
+    {
+      "name": "a finished task takes no further events",
+      "task": {
+        "kind": "handoff",
+        "offer": "directed",
+        "offerer": "did:plc:eliza",
+        "offeree": "did:plc:scholar",
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "accept", "sender": "did:plc:scholar", "expect": "assigned" },
+        { "verb": "complete", "sender": "did:plc:scholar", "expect": "completed" },
+        { "verb": "progress", "sender": "did:plc:scholar", "expect_refused": "terminal-task" },
+        { "verb": "cancel", "sender": "did:plc:eliza", "expect_refused": "terminal-task" },
+        {
+          "verb": "expire",
+          "sender": "did:web:irc.example",
+          "system": true,
+          "expect_refused": "terminal-task"
+        }
+      ]
+    },
+    {
+      "name": "a declined task is finished too",
+      "task": {
+        "kind": "handoff",
+        "offer": "directed",
+        "offerer": "did:plc:eliza",
+        "offeree": "did:plc:scholar",
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "decline", "sender": "did:plc:scholar", "expect": "declined" },
+        { "verb": "accept", "sender": "did:plc:scholar", "expect_refused": "terminal-task" }
+      ]
+    },
+    {
+      "name": "a claim without the declared capabilities is refused",
+      "task": {
+        "kind": "handoff",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "caps": ["freeq.at/log-analysis"],
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "claim", "sender": "did:plc:mallory", "expect_refused": "caps-mismatch" },
+        {
+          "verb": "claim",
+          "sender": "did:plc:mallory",
+          "sender_caps": ["freeq.at/web-search"],
+          "expect_refused": "caps-mismatch"
+        },
+        {
+          "verb": "claim",
+          "sender": "did:plc:scholar",
+          "sender_caps": ["freeq.at/log-analysis"],
+          "expect": "assigned"
+        }
+      ]
+    },
+    {
+      "name": "a claim must cover every capability the task asks for, not just one",
+      "task": {
+        "kind": "handoff",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "caps": ["freeq.at/log-analysis", "freeq.at/web-search"],
+        "deadline": null
+      },
+      "steps": [
+        {
+          "verb": "claim",
+          "sender": "did:plc:mallory",
+          "sender_caps": ["freeq.at/log-analysis"],
+          "expect_refused": "caps-mismatch"
+        },
+        {
+          "verb": "claim",
+          "sender": "did:plc:scholar",
+          "sender_caps": ["freeq.at/web-search", "freeq.at/log-analysis"],
+          "expect": "assigned"
+        }
+      ]
+    },
+    {
+      "name": "a verb this kind does not list is refused",
+      "task": {
+        "kind": "handoff",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "award", "sender": "did:plc:eliza", "expect_refused": "unknown-verb" },
+        { "verb": "bid", "sender": "did:plc:scholar", "expect_refused": "unknown-verb" }
+      ]
+    },
+    {
+      "name": "a kind this file does not list is refused",
+      "task": {
+        "kind": "bounty",
+        "offer": "open",
+        "state": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "caps": [],
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "bid", "sender": "did:plc:scholar", "expect_refused": "unknown-kind" },
+        { "verb": "cancel", "sender": "did:plc:eliza", "expect_refused": "unknown-kind" }
+      ]
+    }
+  ]
+}
