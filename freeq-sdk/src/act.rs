@@ -598,8 +598,9 @@ mod tests {
                 seed: 3,
                 tags: vec![
                     ("+freeq.at/act", "approval"),
+                    // `request` opens its kind, so its own event id (msgid
+                    // below) is the task's id — no act-id, same as an offer.
                     ("+freeq.at/act-verb", "request"),
-                    ("+freeq.at/act-id", "01KDEF0000000000000000000K"),
                     ("+freeq.at/act-from", "did:plc:factory"),
                     ("+freeq.at/act-to", "did:plc:opslead"),
                     ("+freeq.at/act-title", "Deploy factory-bot v12"),
@@ -617,9 +618,10 @@ mod tests {
                 tags: vec![
                     ("+freeq.at/act", "handoff"),
                     ("+freeq.at/act-verb", "accept"),
+                    // act-id names the task — which IS the offer's event id,
+                    // so a follow-up needs no act-ref to find its offer.
                     ("+freeq.at/act-id", OFFER_ID),
                     ("+freeq.at/act-from", "did:plc:scholar"),
-                    ("+freeq.at/act-ref", "01JOFFERMSGID000000000000"),
                     // Non-ASCII + JSON-escaping stress in a value.
                     ("+freeq.at/act-note", "ok — \"on it\" ✓\n(eta 5m)"),
                 ],

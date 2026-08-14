@@ -68,18 +68,17 @@
       "target": "#swarm"
     },
     {
-      "canonical": "{\"act\":\"approval\",\"act-ctx-h\":\"sha256:1a00\",\"act-from\":\"did:plc:factory\",\"act-id\":\"01KDEF0000000000000000000K\",\"act-scope\":\"deploy:factory-bot\",\"act-title\":\"Deploy factory-bot v12\",\"act-to\":\"did:plc:opslead\",\"act-verb\":\"request\",\"msgid\":\"01KDEF0000000000000000000K\",\"target\":\"dm:did:plc:factory,did:plc:opslead\"}",
+      "canonical": "{\"act\":\"approval\",\"act-ctx-h\":\"sha256:1a00\",\"act-from\":\"did:plc:factory\",\"act-scope\":\"deploy:factory-bot\",\"act-title\":\"Deploy factory-bot v12\",\"act-to\":\"did:plc:opslead\",\"act-verb\":\"request\",\"msgid\":\"01KDEF0000000000000000000K\",\"target\":\"dm:did:plc:factory,did:plc:opslead\"}",
       "kid": "ti6Gf6LzOv5i1daxZC4WIQ",
       "msgid": "01KDEF0000000000000000000K",
       "name": "approval-with-kind-specific-field",
       "publicKey": "7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E",
       "seed": "0303030303030303030303030303030303030303030303030303030303030303",
-      "sigTag": "ed25519:ti6Gf6LzOv5i1daxZC4WIQ:DY5nsu5ZDfN12cwIj5brnd8NySbRGlu1trej11-B0zKSv_rlHmHG4ijtuNeafmkUdkh5q_MH09vhrdJtoUk6Dg",
+      "sigTag": "ed25519:ti6Gf6LzOv5i1daxZC4WIQ:7reI39zKgTYnYiysiY2wRbvT-WymANTJoDRhd_j7RcGjb5w5AcDpo3ssJmykkK8a88MwhQ_CVF0hM6ZuS6cdAQ",
       "tags": {
         "+freeq.at/act": "approval",
         "+freeq.at/act-ctx-h": "sha256:1a00",
         "+freeq.at/act-from": "did:plc:factory",
-        "+freeq.at/act-id": "01KDEF0000000000000000000K",
         "+freeq.at/act-scope": "deploy:factory-bot",
         "+freeq.at/act-title": "Deploy factory-bot v12",
         "+freeq.at/act-to": "did:plc:opslead",
@@ -88,19 +87,18 @@
       "target": "dm:did:plc:factory,did:plc:opslead"
     },
     {
-      "canonical": "{\"act\":\"handoff\",\"act-from\":\"did:plc:scholar\",\"act-id\":\"01JABCDEF000000000000000EF\",\"act-note\":\"ok — \\\"on it\\\" ✓\\n(eta 5m)\",\"act-ref\":\"01JOFFERMSGID000000000000\",\"act-verb\":\"accept\",\"msgid\":\"01JACCEPTEVENTID0000000000\",\"target\":\"#ops\"}",
+      "canonical": "{\"act\":\"handoff\",\"act-from\":\"did:plc:scholar\",\"act-id\":\"01JABCDEF000000000000000EF\",\"act-note\":\"ok — \\\"on it\\\" ✓\\n(eta 5m)\",\"act-verb\":\"accept\",\"msgid\":\"01JACCEPTEVENTID0000000000\",\"target\":\"#ops\"}",
       "kid": "xblA7T9lw5GWXegpX8XSXw",
       "msgid": "01JACCEPTEVENTID0000000000",
       "name": "accept-minimal-with-escaping",
       "publicKey": "ypOsFwUYcHHWe4PH_w7-gQjo7EUwV113JoeTM9vavnw",
       "seed": "0404040404040404040404040404040404040404040404040404040404040404",
-      "sigTag": "ed25519:xblA7T9lw5GWXegpX8XSXw:8OZfMiMstOjYT2pmEsm4sWcyrMLrxZwGZXGtS6s9vF9scA_PYlbJcGu4XO_gDXl9rz2n-niPVRTcm6-ZFL3fCQ",
+      "sigTag": "ed25519:xblA7T9lw5GWXegpX8XSXw:hz6crbTIi6hO5MEjVrVZqMHQeO2QMSdHSuDLnpIL7TbNOytSDH7_S8GICgDgMwdjkb3RmJaU-MUmpuEv7HGxDg",
       "tags": {
         "+freeq.at/act": "handoff",
         "+freeq.at/act-from": "did:plc:scholar",
         "+freeq.at/act-id": "01JABCDEF000000000000000EF",
         "+freeq.at/act-note": "ok — \"on it\" ✓\n(eta 5m)",
-        "+freeq.at/act-ref": "01JOFFERMSGID000000000000",
         "+freeq.at/act-verb": "accept"
       },
       "target": "#ops"
