@@ -670,6 +670,10 @@ pub struct SharedState {
     pub cap_account_notify: Mutex<HashSet<String>>,
     pub cap_extended_join: Mutex<HashSet<String>>,
     pub cap_away_notify: Mutex<HashSet<String>>,
+    /// Sessions holding `freeq.at/act` — the only ones task messages reach.
+    /// A connection that did not ask for it sees the human-readable companion
+    /// line and nothing else.
+    pub cap_act: Mutex<HashSet<String>>,
     /// Sessions that have negotiated account-tag capability (IRCv3).
     /// When set, outbound PRIVMSG/NOTICE includes `account=<did>` if sender is authenticated.
     pub cap_account_tag: Mutex<HashSet<String>>,
@@ -1603,6 +1607,7 @@ impl Server {
             cap_account_notify: Mutex::new(HashSet::new()),
             cap_extended_join: Mutex::new(HashSet::new()),
             cap_away_notify: Mutex::new(HashSet::new()),
+            cap_act: Mutex::new(HashSet::new()),
             cap_account_tag: Mutex::new(HashSet::new()),
             cap_read_marker: Mutex::new(HashSet::new()),
             session_read_markers: Mutex::new(HashMap::new()),
@@ -6153,6 +6158,7 @@ mod s2s_adversarial_tests {
             cap_account_notify: Mutex::new(HashSet::new()),
             cap_extended_join: Mutex::new(HashSet::new()),
             cap_away_notify: Mutex::new(HashSet::new()),
+            cap_act: Mutex::new(HashSet::new()),
             cap_account_tag: Mutex::new(HashSet::new()),
             cap_read_marker: Mutex::new(HashSet::new()),
             session_read_markers: Mutex::new(HashMap::new()),

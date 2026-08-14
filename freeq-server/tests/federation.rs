@@ -728,6 +728,111 @@ async fn mutation_sig_tag_crosses_the_hop_byte_identical() {
     drop((srv_a, srv_b));
 }
 
+// ── an accepted task message crosses the hop with its signature ─────
+//
+// A task message is a TAGMSG, so it crosses in the raw `Tagmsg` tag map with
+// nothing stripped — the signature and the signer-minted id included. Both
+// have to survive: the act canonical is rebuilt from the act tags, the venue
+// and that id, so a peer that receives the message without the id cannot
+// check the signature at all, and one that receives it without the signature
+// has an unattributable task event.
+//
+// Phase 5 is what makes the far side *act* on one. This pins that the bytes
+// it will need are already crossing.
+
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn act_tagmsg_crosses_the_hop_with_its_signature() {
+    let alice = TestId::new("did:plc:aliceact");
+    let bob = TestId::new("did:plc:bobact");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#fact").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#fact").await.unwrap();
+
+    // A signing key of the test's own, so it can build the act canonical the
+    // way a task-sending client would. MSGSIG persists the key by (DID, kid),
+    // so it is findable however the session map happens to be ordered.
+    let signing = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+    let pubkey = {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing.verifying_key().as_bytes())
+    };
+    ha.raw(&format!("MSGSIG {pubkey}")).await.ok();
+
+    let venue = freeq_sdk::chatsig::channel_venue("#fact");
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut crossed: Option<(String, String)> = None;
+    while tokio::time::Instant::now() < deadline {
+        let id = freeq_sdk::chatsig::new_event_id();
+        let act_tags: Vec<(&str, &str)> = vec![
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "offer"),
+            ("+freeq.at/act-from", alice.did.as_str()),
+            ("+freeq.at/act-title", "cross-the-hop"),
+        ];
+        let sig = freeq_sdk::act::sign_act(act_tags.clone(), &venue, &id, &signing)
+            .expect("act tags present");
+        let wire: Vec<String> = act_tags
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .chain([
+                format!("{}={id}", freeq_sdk::chatsig::EVENT_ID_TAG),
+                format!("+freeq.at/sig={sig}"),
+            ])
+            .collect();
+        ha.raw(&format!("@{} TAGMSG #fact", wire.join(";")))
+            .await
+            .ok();
+
+        if let Ok(Some(tags)) = timeout(Duration::from_secs(2), async {
+            loop {
+                match rxb.recv().await {
+                    Some(Event::TagMsg { tags, .. }) if tags.contains_key("+freeq.at/act") => {
+                        return Some(tags);
+                    }
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+        })
+        .await
+        {
+            crossed = Some((
+                tags.get("+freeq.at/sig").cloned().unwrap_or_default(),
+                tags.get(freeq_sdk::chatsig::EVENT_ID_TAG)
+                    .cloned()
+                    .unwrap_or_default(),
+            ));
+            assert_eq!(
+                crossed.as_ref().unwrap().0,
+                sig,
+                "the signature must cross byte-identical"
+            );
+            assert_eq!(
+                crossed.as_ref().unwrap().1,
+                id,
+                "the id the signature covers must cross too, or nobody can rebuild the document"
+            );
+            break;
+        }
+    }
+    assert!(
+        crossed.is_some(),
+        "an accepted task message must reach the peer"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
 // ── a PRIVMSG's stamped signature crosses the hop byte-identical ─────
 //
 // The companion path to the mutation test above. PRIVMSG signatures cross
@@ -1070,7 +1175,10 @@ async fn a_signed_reply_and_a_signed_edit_reach_valid_at_the_receiver() {
     let edit_msgid = recv_channel_msgid(&mut rxb, "revised text", EVENT_TIMEOUT)
         .await
         .expect("alice's edit never reached bob's server");
-    assert_ne!(edit_msgid, root, "an edit is its own event, with its own id");
+    assert_ne!(
+        edit_msgid, root,
+        "an edit is its own event, with its own id"
+    );
     let verified = poll_verify(&srv_b.web_addr, &edit_msgid).await;
     assert_eq!(
         verified["verification"]["verdict"], "valid",
@@ -1180,7 +1288,12 @@ async fn wait_rows_cleared(db_path: &str, channel: &str) -> bool {
 }
 
 /// Everything a fresh joiner on this server is replayed for `channel`.
-async fn replayed_texts(server: &TestServer, id: &TestId, nick: &str, channel: &str) -> Vec<String> {
+async fn replayed_texts(
+    server: &TestServer,
+    id: &TestId,
+    nick: &str,
+    channel: &str,
+) -> Vec<String> {
     let (h, mut rx) = connect(server, id, nick);
     wait_auth_and_register(&mut rx).await;
     h.join(channel).await.unwrap();
@@ -1613,9 +1726,16 @@ async fn a_returning_peer_is_told_what_it_missed() {
     // that stays up on the harder side of it.
     const SEED_A: u8 = 202;
     const SEED_B: u8 = 203;
-    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32]).public().to_string();
-    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32]).public().to_string();
-    assert!(id_a < id_b, "the server that stays up keeps its outgoing link");
+    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32])
+        .public()
+        .to_string();
+    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32])
+        .public()
+        .to_string();
+    assert!(
+        id_a < id_b,
+        "the server that stays up keeps its outgoing link"
+    );
 
     let alice = TestId::new("did:plc:alicecatchup");
     let bob = TestId::new("did:plc:bobcatchup");
@@ -1745,8 +1865,12 @@ async fn a_peer_that_comes_back_is_linked_again() {
     // deriving it.
     const SEED_A: u8 = 200;
     const SEED_B: u8 = 201;
-    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32]).public().to_string();
-    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32]).public().to_string();
+    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32])
+        .public()
+        .to_string();
+    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32])
+        .public()
+        .to_string();
     assert!(
         id_a < id_b,
         "this test is about the server that keeps its outgoing link being the one left holding a dead one"
@@ -1887,7 +2011,11 @@ async fn an_attachment_reaches_a_reader_on_a_peer_server() {
         .unwrap_or_else(|| panic!("a reader on the peer server sees no preview: {tags:?}"));
     assert_eq!(parsed.url, preview.url, "{tags:?}");
     assert_eq!(parsed.title.as_deref(), Some("A post"), "{tags:?}");
-    assert_eq!(parsed.description.as_deref(), Some("about things"), "{tags:?}");
+    assert_eq!(
+        parsed.description.as_deref(),
+        Some("about things"),
+        "{tags:?}"
+    );
     assert_eq!(
         parsed.thumb_url.as_deref(),
         Some("https://cdn.example/og.png"),

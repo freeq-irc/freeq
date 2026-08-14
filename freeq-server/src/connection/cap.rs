@@ -29,8 +29,13 @@ pub(super) fn handle_cap(
             // the document form would be verified by nobody. The server needs
             // no per-session state for it, because the signature tag says
             // which form it is (`ed25519:<kid>:<sig>` vs a bare blob).
+            // `freeq.at/act` says this server understands task messages, and
+            // asks to be sent them. It gates delivery in both directions:
+            // without it a client neither receives task events live nor gets
+            // them replayed, only the human-readable companion lines. A client
+            // that cannot render a task card has no use for the machine half.
             let mut caps = String::from(
-                "sasl message-tags multi-prefix echo-message server-time batch draft/chathistory account-notify account-tag extended-join away-notify draft/read-marker freeq.at/msgsig",
+                "sasl message-tags multi-prefix echo-message server-time batch draft/chathistory account-notify account-tag extended-join away-notify draft/read-marker freeq.at/msgsig freeq.at/act",
             );
             // Advertise draft/multiline with our policy limits (spec requires
             // max-bytes; max-lines is recommended). See `draft_multiline` module
@@ -135,6 +140,11 @@ pub(super) fn handle_cap(
                             conn.cap_away_notify = true;
                             state.cap_away_notify.lock().insert(session_id.to_string());
                             acked.push("away-notify");
+                        }
+                        "freeq.at/act" => {
+                            conn.cap_act = true;
+                            state.cap_act.lock().insert(session_id.to_string());
+                            acked.push("freeq.at/act");
                         }
                         "draft/read-marker" => {
                             conn.cap_read_marker = true;

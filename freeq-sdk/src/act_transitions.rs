@@ -300,6 +300,7 @@ pub fn check(
 struct Spec {
     kinds: BTreeMap<String, Kind>,
     refusals: BTreeMap<String, String>,
+    #[allow(dead_code)]
     deadline_rule: DeadlineRule,
 }
 
@@ -354,6 +355,10 @@ impl FromStates {
 
 #[derive(Deserialize)]
 struct DeadlineRule {
+    /// Read only by the test that pins it to [`DEADLINE_TOLERANCE_MS`]. That
+    /// is its whole job: the constant is what the comparison uses, and this
+    /// is what stops the file and the code drifting apart.
+    #[allow(dead_code)]
     tolerance_ms: u64,
 }
 
