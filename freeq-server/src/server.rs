@@ -4341,7 +4341,11 @@ pub(crate) async fn process_s2s_message(
             // server configured is. That is worth an operator seeing, hence
             // the log naming both.
             if let Some(actor) = peer_account.as_deref()
-                && relayed_mutation_in(&tags).is_some()
+                // A mutation names the message it acts on. One that names none
+                // is not something a signer signs — the sender side reads the
+                // same tags and declines — so demanding proof for it would
+                // refuse an event nothing could ever have proven.
+                && relayed_mutation_in(&tags).is_some_and(|(.., subject, _)| subject.is_some())
                 && crate::connection::messaging::signing_venue(state, actor, &target).is_some()
                 && sig_verdict != Some(crate::connection::messaging::ClientSigOutcome::Verified)
             {

@@ -1718,13 +1718,11 @@ async fn a_dm_reaches_the_senders_own_session_on_the_receiving_server() {
          sent from the other one"
     );
 
-    // A reaction crosses as its own event and needs the same fan-out.
-    ha.raw(&format!(
-        "@+react=\u{1F44D};+reply={msgid} TAGMSG {}",
-        bob.did
-    ))
-    .await
-    .unwrap();
+    // A reaction crosses as its own event and needs the same fan-out. Sent
+    // through the client rather than as a raw line, because a reaction names
+    // the message it acts on and therefore has to carry the reactor's
+    // signature — a raw line skips the one place that signs it.
+    ha.react(&bob.did, "\u{1F44D}", &msgid).await.unwrap();
 
     assert!(saw_reaction(&mut rxb).await, "bob never saw the reaction");
     assert!(
