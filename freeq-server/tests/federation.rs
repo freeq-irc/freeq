@@ -497,6 +497,61 @@ async fn did_dm_reaches_all_recipient_devices_across_servers() {
     drop((srv_a, srv_b));
 }
 
+/// The sender's *own* other device, signed in on the receiving server.
+///
+/// The origin fans a DM out to the sender's other sessions on its send path;
+/// that code never runs on the far side of a link, so the far side unions the
+/// addressed user's sessions with the sessions of whoever the event names.
+/// That union is delivery into the named identity's own client, so it happens
+/// only on a signature this server checked — and this is the honest case that
+/// must keep working: alice really did send it, and her client really did
+/// sign it.
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_signed_dm_reaches_the_senders_own_device_on_the_far_server() {
+    let alice = TestId::new("did:plc:alicefanout");
+    let bob = TestId::new("did:plc:bobfanout");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    // Bob on B; alice on A, and also signed in on B — the device that only
+    // the far side's fan-out can reach.
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    let (ha2, mut rxa2) = connect(&srv_b, &alice, "alice2");
+    wait_auth_and_register(&mut rxa2).await;
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+
+    // Warming the link also gets alice's signing key onto B, which is what
+    // makes the signature checkable there rather than merely present.
+    warm_link(&ha, &bob.did, &mut rxb).await;
+
+    // Resend until her own far-side device sees it: the key lookup runs off
+    // the delivery path, so the first send can land before the key does.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut reached = false;
+    while tokio::time::Instant::now() < deadline {
+        ha.privmsg(&bob.did, "sent from my other device").await.ok();
+        if try_recv_message(&mut rxa2, "sent from my other device", Duration::from_secs(2))
+            .await
+            .is_some()
+        {
+            reached = true;
+            break;
+        }
+    }
+    assert!(
+        reached,
+        "a signed cross-server DM never reached the sender's own device on the \
+         receiving server"
+    );
+
+    ha.quit(None).await.ok();
+    ha2.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
 // ── receiver persists the DID-keyed DM (Element C stamp path) ─────
 
 #[tokio::test]

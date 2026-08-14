@@ -4144,11 +4144,20 @@ pub(crate) async fn process_s2s_message(
                 // …and the sender's own sessions here, if they have any. The
                 // origin fanned this out to their other devices on its send
                 // path; that code never runs on this side of the link.
+                //
+                // Only on a signature this server checked. This delivery is
+                // the one place a stamped DID does more than label a message:
+                // it routes the message into that identity's own client, in
+                // the position of something they sent. A peer that names a
+                // local user could put a line in their outbox for free.
                 crate::connection::routing::merge_sessions(
                     &mut sids,
                     crate::connection::routing::sender_sessions_for_account(
                         state,
-                        account.as_deref(),
+                        account.as_deref().filter(|_| {
+                            sig_verdict
+                                == Some(crate::connection::messaging::ClientSigOutcome::Verified)
+                        }),
                     ),
                 );
                 let tag_caps = state.cap_message_tags.lock();
@@ -4587,13 +4596,19 @@ pub(crate) async fn process_s2s_message(
             } else {
                 // Plus the sender's own sessions here — a reaction or delete
                 // they made from another server has to reach their other
-                // devices, the same as the DM PRIVMSG path.
+                // devices, the same as the DM PRIVMSG path, and on the same
+                // condition: a signature this server checked, because this
+                // delivery puts the event in the named identity's own client
+                // as something they did.
                 let mut sids = crate::connection::routing::local_sessions_for_target(state, &target);
                 crate::connection::routing::merge_sessions(
                     &mut sids,
                     crate::connection::routing::sender_sessions_for_account(
                         state,
-                        peer_account.as_deref(),
+                        peer_account.as_deref().filter(|_| {
+                            sig_verdict
+                                == Some(crate::connection::messaging::ClientSigOutcome::Verified)
+                        }),
                     ),
                 );
                 sids

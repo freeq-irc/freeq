@@ -268,6 +268,51 @@ async fn a_peer_stamping_the_victims_did_on_a_mutation_is_refused() {
     assert_link_alive(&mut peer, &mut rxw, "probe-after-stamped-reactions").await;
 }
 
+/// A DM the peer says a *local* user sent.
+///
+/// The receiving server unions the addressed user's sessions with the
+/// sessions of whoever the `account` names, so the sender's own devices see a
+/// message they sent from elsewhere. A peer that stamps a local user's DID on
+/// its own DM therefore reaches that user's client — and reaches it in the
+/// sender's position, as a line in their outbox that they never wrote.
+#[tokio::test]
+async fn a_peer_cannot_put_a_dm_in_a_local_users_outbox() {
+    let victim = TestId::new("did:plc:lpdmvictim");
+    let addressee = TestId::new("did:plc:lpdmaddressee");
+    let (srv, mut peer) = spawn_server_with_peer(&[&victim, &addressee]).await;
+
+    let (hv, mut rxv) = connect(&srv, &victim, "victim");
+    wait_auth_and_register(&mut rxv).await;
+    let (ha, mut rxa) = connect(&srv, &addressee, "addressee");
+    wait_auth_and_register(&mut rxa).await;
+
+    // Warm the link through a channel both share, so "nothing arrived" below
+    // cannot be a link that was never up.
+    hv.join("#room").await.unwrap();
+    wait_event(&mut rxv, |e| matches!(e, Event::Joined { .. }), "victim join").await;
+    warm_link(&mut peer, "mallory", "#room", &mut rxv).await;
+
+    // The peer's own DM to the addressee, stamped as the victim's.
+    let forged = peer.privmsg("mallory", "addressee", "did I send this?", Some(&victim.did));
+    peer.forge(forged).await;
+
+    let echoed = try_event(
+        &mut rxv,
+        |e| matches!(e, Event::Message { text: t, .. } if t == "did I send this?"),
+        NO_EFFECT_WINDOW,
+    )
+    .await;
+    assert!(
+        echoed.is_none(),
+        "a peer's DM stamped with a local user's DID reached that user's own \
+         session, where it reads as a message they sent: {echoed:?}"
+    );
+
+    assert_link_alive(&mut peer, &mut rxv, "probe-after-outbox-forgery").await;
+    hv.quit(None).await.ok();
+    ha.quit(None).await.ok();
+}
+
 // ── signatures ───────────────────────────────────────────────────
 
 /// A peer that attaches a signature which does not check out. Nothing
