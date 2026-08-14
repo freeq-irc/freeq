@@ -1808,7 +1808,7 @@ mod av_impl {
     /// doesn't special-case and see no peers. Flip to true only after the
     /// server is live, and flip web + iOS in the SAME release (a scoped and an
     /// unscoped client in one call root differently and can't see each other).
-    /// See docs/QUEUE-FOR-CHAD.md #3 and freeq-server/src/av_sfu.rs.
+    /// See freeq-server/src/av_sfu.rs for the server-side scoping rules.
     pub(super) const SCOPED_SESSIONS: bool = false;
 
     /// Whether a peer broadcast path belongs to our call. Unscoped: the SFU

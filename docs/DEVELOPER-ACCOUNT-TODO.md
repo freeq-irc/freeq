@@ -60,9 +60,9 @@ account-gated inputs those scripts need.
 - [ ] **MAS target** (separate from Developer ID) if App Store distribution is
       wanted — different provisioning, no Sparkle, `com.apple.application-*`
       review. Build matrix {MAS, Direct} × {debug, release}.
-- [ ] Re-install to `/Applications` as a **signed** build and re-run the
-      integration checklist in `docs/QUEUE-FOR-CHAD.md` (menu bar, hotkey,
-      intents, Writing Tools, Share Extension).
+- [ ] Re-install to `/Applications` as a **signed** build and re-run the macOS
+      integration checklist (menu bar, hotkey, intents, Writing Tools, Share
+      Extension).
 
 ---
 
@@ -121,7 +121,7 @@ No signing config, no push, no store presence yet. `applicationId com.freeq.app`
 - [ ] **S2 session-scoping flip** — the server half is live/deployable; flip
       `SCOPED_SESSIONS = true` in `freeq-sdk-ffi/src/lib.rs` and the web
       client's dial URL **in the same release across native + web + iOS**
-      (see `freeq-server/src/av_sfu.rs` header + `docs/QUEUE-FOR-CHAD.md #3`).
+      (see the `freeq-server/src/av_sfu.rs` header).
       Not signing-gated per se, but must ship as coordinated signed builds.
 - [ ] **App Review 4.8 assessment** (design §7.6): AT Protocol OAuth is a
       decentralized identity protocol, not third-party social login; guest
@@ -136,5 +136,5 @@ No signing config, no push, no store presence yet. `applicationId com.freeq.app`
 
 ---
 
-See also: `docs/QUEUE-FOR-CHAD.md` (participation items),
-`freeq-macos/DESIGN-APP-OF-THE-YEAR.md` §7 (quality gates / distribution).
+See also: `freeq-macos/DESIGN-APP-OF-THE-YEAR.md` §7 (quality gates /
+distribution).

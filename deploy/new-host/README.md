@@ -2,12 +2,12 @@
 
 Stand up **one** box that runs its own miren control plane and hosts all of
 freeq (server + web + docs), so deployment is entirely under your control — no
-shared clusters, no borrowed RBAC. This is the clean replacement for the split
-`club` / BlueYard setup.
+shared clusters, no borrowed RBAC. This is the clean replacement for a split
+setup across someone else's clusters.
 
 ## 1. Sizing (measured, not guessed)
 
-Footprint measured on the current production instance (`tech.blueyard.com`):
+Footprint measured on a live production instance:
 
 | Component | CPU | RAM | Disk |
 |---|---|---|---|

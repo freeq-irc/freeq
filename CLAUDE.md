@@ -7,7 +7,7 @@
 > iOS; release keystore + Play App Signing + FCM for Android; plus the
 > coordinated S2 session-scoping flip and store-compliance items). The code is
 > already ready — these are the identity/provisioning steps ad-hoc signing
-> can't do. See also `docs/QUEUE-FOR-CHAD.md` for other participation items.
+> can't do.
 
 **Requirements:**
 - `session_id` must be unique per TCP connection

@@ -1,6 +1,6 @@
 # Multi-Agent Voice Demo — Operator's Runbook
 
-A three-agent voice call where **Oblivion**, **Utopia**, and **Narrator** can converse with each other, listen attentively, and quietly build a shared whiteboard while you talk. Everything below is what you do in the freeq web app; the bots are already running on `tech.blueyard.com`.
+A three-agent voice call where **Oblivion**, **Utopia**, and **Narrator** can converse with each other, listen attentively, and quietly build a shared whiteboard while you talk. Everything below is what you do in the freeq web app; the bots run on the host you deployed them to (referred to below as `$FREEQ_AGENT_HOST`).
 
 Built on:
 
@@ -105,7 +105,7 @@ Suggested take:
 ### Bots don't respond
 1. Check whether they hear you. SSH:
    ```bash
-   ssh chad@tech.blueyard.com 'grep "transcribed utterance" ~/agents/logs/oblivion.log | tail -5'
+   ssh "$FREEQ_AGENT_HOST" 'grep "transcribed utterance" ~/agents/logs/oblivion.log | tail -5'
    ```
    If you see your nick with recent timestamps, they hear you. If not, your mic publish dropped — see below.
 
@@ -119,18 +119,18 @@ Each bot's STT is fuzzy on names (Zootopia → Utopia, Obliviion → Oblivion). 
 
 ### Restart the rig
 ```bash
-ssh chad@tech.blueyard.com '~/agents/restart-all.sh'
+ssh "$FREEQ_AGENT_HOST" '~/agents/restart-all.sh'
 ```
 
 Status:
 ```bash
-ssh chad@tech.blueyard.com '~/agents/status.sh'
+ssh "$FREEQ_AGENT_HOST" '~/agents/status.sh'
 ```
 
 Tail logs:
 ```bash
-ssh chad@tech.blueyard.com '~/agents/log.sh oblivion'    # one agent
-ssh chad@tech.blueyard.com '~/agents/log.sh'             # all interleaved
+ssh "$FREEQ_AGENT_HOST" '~/agents/log.sh oblivion'    # one agent
+ssh "$FREEQ_AGENT_HOST" '~/agents/log.sh'             # all interleaved
 ```
 
 ## Known sharp edges

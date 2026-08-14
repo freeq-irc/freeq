@@ -16,19 +16,25 @@
 #     verify  health-check the SFU (service, ports, cert, recent logs)
 #     all     cert + deploy + verify   (default)
 #
-# Overridable via environment:
-#   FREEQ_SERVER       ssh target              (default chad@tech.blueyard.com)
-#   FREEQ_REMOTE_REPO  repo path on server     (default /home/chad/src/freeq)
-#   FREEQ_CERT_DOMAIN  Let's Encrypt domain    (default tech.blueyard.com)
-#   FREEQ_CERT_DST     cert copy destination   (default /home/chad/freeq-certs)
+# Configure via environment (no host is baked into this script):
+#   FREEQ_SERVER       ssh target              (required, e.g. deploy@irc.example.com)
+#   FREEQ_CERT_DOMAIN  Let's Encrypt domain    (default: host part of FREEQ_SERVER)
+#   FREEQ_REMOTE_USER  service account on host (default: user part of FREEQ_SERVER)
+#   FREEQ_REMOTE_REPO  repo path on server     (default /srv/freeq)
+#   FREEQ_CERT_DST     cert copy destination   (default /srv/freeq-certs)
 #   FREEQ_QUIC_PORT    SFU QUIC/UDP port       (default 8080)
 set -euo pipefail
 
-SERVER="${FREEQ_SERVER:-chad@tech.blueyard.com}"
-REMOTE_REPO="${FREEQ_REMOTE_REPO:-/home/chad/src/freeq}"
-DOMAIN="${FREEQ_CERT_DOMAIN:-tech.blueyard.com}"
+SERVER="${FREEQ_SERVER:-}"
+if [ -z "$SERVER" ]; then
+  printf '\033[1;31m!! set FREEQ_SERVER (e.g. FREEQ_SERVER=deploy@irc.example.com %s)\033[0m\n' "$0" >&2
+  exit 1
+fi
+REMOTE_USER="${FREEQ_REMOTE_USER:-${SERVER%%@*}}"
+REMOTE_REPO="${FREEQ_REMOTE_REPO:-/srv/freeq}"
+DOMAIN="${FREEQ_CERT_DOMAIN:-${SERVER##*@}}"
 CERT_SRC="/etc/letsencrypt/live/${DOMAIN}"
-CERT_DST="${FREEQ_CERT_DST:-/home/chad/freeq-certs}"
+CERT_DST="${FREEQ_CERT_DST:-/srv/freeq-certs}"
 QUIC_PORT="${FREEQ_QUIC_PORT:-8080}"
 SERVICE="freeq-server"
 
@@ -38,9 +44,9 @@ ssh_do() { ssh -o BatchMode=yes "$SERVER" "$@"; }
 
 do_cert() {
   log "Cert: copying ${DOMAIN} cert into ${CERT_DST} (freeq-server-readable)"
-  ssh_do "sudo install -d -o chad -g chad -m 700 '${CERT_DST}' \
+  ssh_do "sudo install -d -o '${REMOTE_USER}' -g '${REMOTE_USER}' -m 700 '${CERT_DST}' \
     && sudo cp -L '${CERT_SRC}/fullchain.pem' '${CERT_SRC}/privkey.pem' '${CERT_DST}/' \
-    && sudo chown chad:chad '${CERT_DST}'/*.pem \
+    && sudo chown '${REMOTE_USER}:${REMOTE_USER}' '${CERT_DST}'/*.pem \
     && sudo chmod 600 '${CERT_DST}'/*.pem \
     && ls -l '${CERT_DST}'"
 
@@ -52,7 +58,7 @@ do_cert() {
 set -e
 cp -L /etc/letsencrypt/live/${DOMAIN}/fullchain.pem ${CERT_DST}/fullchain.pem
 cp -L /etc/letsencrypt/live/${DOMAIN}/privkey.pem   ${CERT_DST}/privkey.pem
-chown chad:chad ${CERT_DST}/*.pem
+chown ${REMOTE_USER}:${REMOTE_USER} ${CERT_DST}/*.pem
 chmod 600 ${CERT_DST}/*.pem
 systemctl restart ${SERVICE}
 HOOK

@@ -30,7 +30,7 @@
 - [x] Lint check
 - [ ] Commit (attribute to Chad only, no Claude co-author per global rules)
 - [ ] Push to GitHub (user already authorized in this turn)
-- [ ] Deploy: ssh chad@tech.blueyard.com, run `./deploy/deploy.sh`
+- [ ] Deploy: ssh to the production host, run `./deploy/deploy.sh`
 - [ ] Verify service is up
 
 ## Out of scope
