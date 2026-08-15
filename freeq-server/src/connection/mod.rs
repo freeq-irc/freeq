@@ -16,7 +16,7 @@
 //! - [`queries`] — WHOIS, WHO, LUSERS, AWAY
 //! - [`helpers`] — S2S broadcast, channel delivery, utility functions
 
-mod act;
+pub(crate) mod act;
 mod cap;
 mod channel;
 pub(crate) mod draft_multiline;

@@ -43,7 +43,11 @@ pub(super) enum Gate {
 /// The same rule the signer used, so what is recognized here is exactly what
 /// gets signed: a name that is `act` or starts with `act-`, under either
 /// spelling of the vendor prefix.
-pub(super) fn carries_act_tags(tags: &HashMap<String, String>) -> bool {
+///
+/// Reachable from the S2S receive path too: a task message relayed from a peer
+/// is gated on the capability exactly as a local one is, though this server
+/// neither verifies nor stores it until federation lands.
+pub(crate) fn carries_act_tags(tags: &HashMap<String, String>) -> bool {
     tags.keys().any(|name| is_act_tag(name))
 }
 

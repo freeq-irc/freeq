@@ -4562,19 +4562,29 @@ pub(crate) async fn process_s2s_message(
                 sids
             };
 
+            // A task message from a peer is delivered under the same
+            // capability gating as a local one (ruled 2026-08-15). This server
+            // does not verify or store it — that is federation's job, and it
+            // is not built — but relaying it is correct federation behaviour:
+            // a task-aware client can render the remote card, and any attempt
+            // to act on a task this server has never filed draws a clean
+            // refusal. Dropping them at the receive side would instead hide
+            // half of a conversation the companion lines already tell.
+            let is_act = crate::connection::act::carries_act_tags(&tags);
             let tag_caps = state.cap_message_tags.lock();
             let acct_caps = state.cap_account_tag.lock();
+            let act_caps = state.cap_act.lock();
             let conns = state.connections.lock();
             for sid in &recipients {
                 if let Some(tx) = conns.get(sid) {
-                    if tag_caps.contains(sid) {
+                    if tag_caps.contains(sid) && (!is_act || act_caps.contains(sid)) {
                         let line = if acct_caps.contains(sid) {
                             tagged_line_account.as_ref().unwrap_or(&tagged_line)
                         } else {
                             &tagged_line
                         };
                         let _ = tx.try_send(line.clone());
-                    } else if let Some(ref fallback) = plain_fallback {
+                    } else if !is_act && let Some(ref fallback) = plain_fallback {
                         let _ = tx.try_send(fallback.clone());
                     }
                 }
