@@ -3727,7 +3727,7 @@ mod tests {
                 db.conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                     .unwrap(),
-                5,
+                6,
                 "first open stamps the schema"
             );
         }
@@ -3739,7 +3739,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
         assert_eq!(db.root_of("id-2"), "id-1");
         assert_eq!(db.current_revision("id-1").unwrap().unwrap().text, "v2");
@@ -3769,7 +3769,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
     }
 
@@ -3812,7 +3812,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
     }
 
