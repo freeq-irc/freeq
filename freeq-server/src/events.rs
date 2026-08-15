@@ -212,6 +212,47 @@ pub fn derive_facts(canonical: &str) -> Option<EventFacts> {
     })
 }
 
+/// The fields a task event contributes to the live-task view, read out of the
+/// same bytes the log stores.
+///
+/// Separate from [`derive_facts`] because these are not columns of the log —
+/// they are what the view is materialized from. Both ingress and a rebuild go
+/// through here, which is what makes the rebuilt table equal the live one:
+/// there is one reading of the bytes, not two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActView {
+    /// The kind of task — the `act` value.
+    pub kind: String,
+    /// The verb this event performs.
+    pub verb: String,
+    /// `act-to`: the recipient a directed offer names. Its presence is what
+    /// makes an offer directed.
+    pub to: Option<String>,
+    /// `act-caps`, verbatim. Stored and filterable, never interpreted.
+    pub caps: Option<String>,
+    /// `act-deadline` in unix seconds, when the offer named one this server
+    /// can read as a number.
+    pub deadline: Option<i64>,
+}
+
+/// Read a task event's view fields out of its canonical.
+///
+/// `None` for bytes that are not a task document.
+pub fn derive_act_view(canonical: &str) -> Option<ActView> {
+    let doc: serde_json::Value = serde_json::from_str(canonical).ok()?;
+    let get = |k: &str| doc.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    Some(ActView {
+        kind: get("act")?,
+        verb: get("act-verb")?,
+        to: get("act-to"),
+        caps: get("act-caps"),
+        // A deadline nobody can read as a number is a deadline this server
+        // cannot enforce, so it is stored as absent rather than as a guess.
+        // The value stays in the canonical either way.
+        deadline: get("act-deadline").and_then(|d| d.parse::<i64>().ok()),
+    })
+}
+
 /// The venue a stored row belongs to: a channel key folded, anything else
 /// (a `dm:<a>,<b>` conversation key) already being a venue.
 ///
@@ -446,6 +487,74 @@ mod tests {
         )
         .unwrap();
         assert_eq!(derive_facts(&canonical), None);
+    }
+
+    #[test]
+    fn an_offer_contributes_its_declared_fields_to_the_view() {
+        let canonical = freeq_sdk::act::act_canonical(
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/act-from", "did:plc:eliza"),
+                ("+freeq.at/act-to", "did:plc:scholar"),
+                ("+freeq.at/act-caps", "freeq.at/web-search"),
+                ("+freeq.at/act-deadline", "1788000000"),
+            ],
+            "#ops",
+            "01JOFFER0000000000000000AA",
+        )
+        .unwrap();
+        let view = derive_act_view(&canonical).unwrap();
+        assert_eq!(view.kind, "handoff");
+        assert_eq!(view.verb, "offer");
+        assert_eq!(view.to.as_deref(), Some("did:plc:scholar"));
+        assert_eq!(view.caps.as_deref(), Some("freeq.at/web-search"));
+        assert_eq!(view.deadline, Some(1_788_000_000));
+    }
+
+    /// An open offer names nobody, which is what makes it claimable.
+    #[test]
+    fn an_open_offer_names_no_recipient() {
+        let canonical = freeq_sdk::act::act_canonical(
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/act-from", "did:plc:eliza"),
+            ],
+            "#ops",
+            "01JOPEN00000000000000000BB",
+        )
+        .unwrap();
+        let view = derive_act_view(&canonical).unwrap();
+        assert_eq!(view.to, None);
+        assert_eq!(view.caps, None);
+        assert_eq!(view.deadline, None);
+    }
+
+    /// A deadline this server cannot read as a number is stored as absent
+    /// rather than as a guess — the value itself survives in the canonical.
+    #[test]
+    fn a_deadline_that_is_not_a_number_is_not_enforced() {
+        let canonical = freeq_sdk::act::act_canonical(
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/act-from", "did:plc:eliza"),
+                ("+freeq.at/act-deadline", "next tuesday"),
+            ],
+            "#ops",
+            "01JBADDL00000000000000000C",
+        )
+        .unwrap();
+        assert_eq!(derive_act_view(&canonical).unwrap().deadline, None);
+        assert!(canonical.contains("next tuesday"), "the bytes keep it");
+    }
+
+    #[test]
+    fn a_chat_document_contributes_nothing_to_the_task_view() {
+        let canonical =
+            freeq_sdk::chatsig::ChatDoc::message("did:plc:a", "M1", "#c", "hi").canonical();
+        assert_eq!(derive_act_view(&canonical), None);
     }
 
     #[test]
