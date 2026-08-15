@@ -1,8 +1,8 @@
 //! The append-only event log — what happened, in the bytes it happened in.
 //!
-//! One table, `events`, holding every chat event this server accepted:
-//! messages, edits, deletes, reactions, unreactions, pins, and coordination
-//! events. `messages`, `reactions` and `pins` are derived from it — they are
+//! One table, `events`, holding every event this server accepted: messages,
+//! edits, deletes, reactions, unreactions, pins, coordination events, and
+//! task events. `messages`, `reactions` and `pins` are derived from it — they are
 //! the shape queries want, the log is the shape evidence wants.
 //!
 //! ## What a row stores, and why
@@ -103,7 +103,7 @@ pub struct EventFacts {
     /// The event's own id — the signer's, where there was a signer.
     pub event_id: String,
     /// `message` | `edit` | `delete` | `react` | `unreact` | `pin` | `unpin`
-    /// | `coordination`.
+    /// | `coordination` | `act`.
     pub kind: String,
     /// The normalized venue: a folded channel name, or `dm:<a>,<b>`.
     pub venue: String,
@@ -152,13 +152,37 @@ impl EventContext {
 /// The kind is read the way the document defines it: a mutation names its
 /// `kind` outright, and a message carries none — so the *absence* is the
 /// message kind, refined to `edit` when the document names the message it
-/// revises.
+/// revises. A task event is read on its own terms: it carries `act`, which
+/// names the kind of task rather than the kind of event, so it is recognized
+/// by that key before the chat rules are applied.
 pub fn derive_facts(canonical: &str) -> Option<EventFacts> {
     if canonical.is_empty() {
         return None;
     }
     let doc: serde_json::Value = serde_json::from_str(canonical).ok()?;
     let get = |k: &str| doc.get(k).and_then(|v| v.as_str()).map(str::to_string);
+
+    // A task event's document is not a chat document. It names the *kind of
+    // task* under `act` — a key no chat document carries — and its fields are
+    // the sender's `act-` tags rather than an enumerated set, so it is read on
+    // its own terms. The three columns every row needs are still in the bytes:
+    // the id and the venue because the act canonical binds both, and the actor
+    // because the view's offerer is derived from it and a row that could not
+    // name one could never be rebuilt from the log.
+    if doc.get("act").is_some() {
+        return Some(EventFacts {
+            event_id: get("msgid")?,
+            kind: "act".to_string(),
+            venue: get("target")?,
+            actor_did: Some(get("act-from")?),
+            // The task this event is about. An opener names none: its own id
+            // *is* the task's, which is the same relationship every other
+            // kind's `subject` records.
+            subject: get("act-id"),
+            body_hash: None,
+            emoji: None,
+        });
+    }
 
     let event_id = get("msgid")?;
     let venue = get("target")?;
@@ -227,7 +251,10 @@ pub fn message_canonical(
     if let Some(reply) = tags.get("+reply").or_else(|| tags.get("+draft/reply")) {
         doc = doc.with_reply(reply);
     }
-    let edit = tags.get("+draft/edit").map(String::as_str).or(replaces_msgid);
+    let edit = tags
+        .get("+draft/edit")
+        .map(String::as_str)
+        .or(replaces_msgid);
     if let Some(edit) = edit {
         doc = doc.with_edit(edit);
     }
@@ -248,8 +275,7 @@ pub fn mutation_canonical(
     subject: &str,
     emoji: Option<&str>,
 ) -> String {
-    let mut doc =
-        freeq_sdk::chatsig::ChatDoc::mutation(kind, actor_did, event_id, venue, subject);
+    let mut doc = freeq_sdk::chatsig::ChatDoc::mutation(kind, actor_did, event_id, venue, subject);
     if let Some(emoji) = emoji {
         doc = doc.with_emoji(emoji);
     }
@@ -335,6 +361,91 @@ mod tests {
         let venue = freeq_sdk::chatsig::dm_venue(ALICE, "did:plc:bob");
         let canonical = ChatDoc::message(ALICE, MSGID, &venue, "between us").canonical();
         assert_eq!(derive_facts(&canonical).unwrap().venue, venue);
+    }
+
+    /// A task event's document is not a chat document: it names the task's
+    /// kind under `act` rather than carrying `kind`, and its actor rides
+    /// `act-from`. Every column the log needs still comes out of the bytes.
+    #[test]
+    fn an_act_document_derives_its_own_columns() {
+        let canonical = freeq_sdk::act::act_canonical(
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/act-from", "did:plc:eliza"),
+                ("+freeq.at/act-to", "did:plc:scholar"),
+            ],
+            "#ops",
+            "01JOFFER0000000000000000AA",
+        )
+        .unwrap();
+        let facts = derive_facts(&canonical).expect("an act document is a document");
+        assert_eq!(facts.kind, "act");
+        assert_eq!(facts.event_id, "01JOFFER0000000000000000AA");
+        assert_eq!(facts.venue, "#ops");
+        assert_eq!(facts.actor_did.as_deref(), Some("did:plc:eliza"));
+        assert_eq!(facts.subject, None, "an opener names no earlier task");
+        assert_eq!(facts.body_hash, None);
+        assert_eq!(facts.emoji, None);
+    }
+
+    /// A follow-up names the task it is about in `act-id`, which is the same
+    /// thing every other kind's `subject` column holds: the id of the event
+    /// this one acts on.
+    #[test]
+    fn an_act_follow_up_files_its_task_as_its_subject() {
+        let canonical = freeq_sdk::act::act_canonical(
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "accept"),
+                ("+freeq.at/act-from", "did:plc:scholar"),
+                ("+freeq.at/act-id", "01JOFFER0000000000000000AA"),
+            ],
+            "#ops",
+            "01JACCEPT000000000000000BB",
+        )
+        .unwrap();
+        let facts = derive_facts(&canonical).unwrap();
+        assert_eq!(facts.kind, "act");
+        assert_eq!(facts.event_id, "01JACCEPT000000000000000BB");
+        assert_eq!(facts.subject.as_deref(), Some("01JOFFER0000000000000000AA"));
+        assert_eq!(facts.actor_did.as_deref(), Some("did:plc:scholar"));
+    }
+
+    /// A DM task files under the conversation key, exactly as a DM message
+    /// does — the venue comes out of the signed bytes either way.
+    #[test]
+    fn an_act_document_in_a_dm_files_under_the_conversation() {
+        let venue = freeq_sdk::chatsig::dm_venue("did:plc:eliza", "did:plc:scholar");
+        let canonical = freeq_sdk::act::act_canonical(
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/act-from", "did:plc:eliza"),
+            ],
+            &venue,
+            "01JDM000000000000000000CC",
+        )
+        .unwrap();
+        assert_eq!(derive_facts(&canonical).unwrap().venue, venue);
+    }
+
+    /// The invariant the log rests on, extended to the new kind: bytes the
+    /// reader cannot make columns out of are not filed at all. An act document
+    /// naming no actor is one of those — the view's offerer comes from that
+    /// field, so a row without it could never be rebuilt from the log.
+    #[test]
+    fn an_act_document_without_an_actor_is_not_a_document() {
+        let canonical = freeq_sdk::act::act_canonical(
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+            ],
+            "#ops",
+            "01JNOFROM000000000000000DD",
+        )
+        .unwrap();
+        assert_eq!(derive_facts(&canonical), None);
     }
 
     #[test]
