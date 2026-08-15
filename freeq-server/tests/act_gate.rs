@@ -193,6 +193,15 @@ impl C {
         self.rx(|l| l.contains(" FAIL TAGMSG "), "FAIL")
     }
 
+    /// The FAIL for a command other than TAGMSG — a delete or an edit.
+    fn fail_code_of(&mut self, command: &str) -> String {
+        let line = self.rx(|l| l.contains(&format!(" FAIL {command} ")), "FAIL");
+        line.split_whitespace()
+            .nth(3)
+            .expect("FAIL carries a code")
+            .to_string()
+    }
+
     fn fail_code(&mut self) -> String {
         let line = self.fail();
         line.split_whitespace()
@@ -775,6 +784,108 @@ async fn a_task_runs_from_offer_to_completion() {
             &bob_key,
         ));
         assert_eq!(b.fail_code(), "TERMINAL_TASK");
+    })
+    .await;
+}
+
+// ── task history cannot be rewritten ────────────────────────────────────────
+
+#[tokio::test]
+async fn a_delete_aimed_at_a_task_event_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        let task = open_task(&mut a, &signing, "#ops", None);
+
+        a.tx(&format!("@+draft/delete={task} TAGMSG #ops"));
+        assert_eq!(a.fail_code_of("DELETE"), "IMMUTABLE_EVENT");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_edit_aimed_at_a_task_event_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        let task = open_task(&mut a, &signing, "#ops", None);
+
+        a.tx(&format!("@+draft/edit={task} PRIVMSG #ops :rewritten"));
+        assert_eq!(a.fail_code_of("EDIT"), "IMMUTABLE_EVENT");
+    })
+    .await;
+}
+
+/// The DM path had no row to find for an unpersisted thread and relayed the
+/// delete live rather than refusing it. A task event is on file whether or not
+/// a message row is, so the log is what decides.
+#[tokio::test]
+async fn a_delete_aimed_at_a_task_event_in_a_dm_is_refused() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&SigningKey::from_bytes(&[8u8; 32]));
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+
+        // A task in the conversation between the two of them.
+        let id = fresh_id();
+        let venue = freeq_sdk::chatsig::dm_venue(DID_ALICE, DID_BOB);
+        let tags = offer_tags();
+        let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let sig = freeq_sdk::act::sign_act(pairs, &venue, &id, &alice_key).unwrap();
+        let mut wire: Vec<String> = tags.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        wire.push(format!("{EVENT_ID_TAG}={id}"));
+        wire.push(format!("+freeq.at/sig={sig}"));
+        a.tx(&format!("@{} TAGMSG {DID_BOB}", wire.join(";")));
+        b.rx(|l| l.contains("+freeq.at/act="), "the DM task reaches bob");
+
+        a.tx(&format!("@+draft/delete={id} TAGMSG {DID_BOB}"));
+        assert_eq!(a.fail_code_of("DELETE"), "IMMUTABLE_EVENT");
+        assert!(
+            b.maybe(|l| l.contains("+draft/delete"), 500).is_none(),
+            "and the delete does not reach the other side either"
+        );
+    })
+    .await;
+}
+
+/// The plain-text line a bot posts beside a task is an ordinary message — a
+/// rendering of the event, not the event — and stays deletable.
+#[tokio::test]
+async fn a_companion_line_beside_a_task_stays_deletable() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        let task = open_task(&mut a, &signing, "#ops", None);
+
+        // The companion, linked to the task the way a companion links.
+        let companion = fresh_id();
+        a.tx(&format!(
+            "@{EVENT_ID_TAG}={companion};+freeq.at/ref={task} PRIVMSG #ops :alice offered: a task"
+        ));
+        a.rx(|l| l.contains("alice offered"), "the companion");
+
+        a.tx(&format!("@+draft/delete={companion} TAGMSG #ops"));
+        assert!(
+            a.maybe(|l| l.contains("IMMUTABLE_EVENT"), 500).is_none(),
+            "a companion line is a message and deletes like one"
+        );
     })
     .await;
 }

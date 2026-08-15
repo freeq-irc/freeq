@@ -134,6 +134,39 @@ pub(super) fn refuse_body_with_act_tags(
     );
 }
 
+/// Refuse a mutation aimed at a task event, and say so.
+///
+/// Returns whether the caller should stop. Task events are immutable: the
+/// lifecycle is the only way a task changes, and a later event supersedes an
+/// earlier one — the log and the view never un-apply anything. The plain-text
+/// companion line a bot posts alongside is an ordinary message and stays
+/// deletable; it is a rendering of the event, not the event.
+///
+/// `command` is the word the client sent, so a delete hears DELETE and an edit
+/// hears EDIT.
+pub(super) fn refuse_if_task_event(
+    conn: &Connection,
+    command: &str,
+    subject: &str,
+    state: &Arc<SharedState>,
+) -> bool {
+    if state.with_db(|db| db.is_act_event(subject)) != Some(true) {
+        return false;
+    }
+    tracing::debug!(
+        session = %conn.id, command = %command, subject = %subject,
+        "Refused a mutation aimed at a task event"
+    );
+    refuse(
+        conn,
+        command,
+        "IMMUTABLE_EVENT",
+        "Task history cannot be changed or deleted",
+        state,
+    );
+    true
+}
+
 /// Check a task message, in the order the plan sets: what the message is,
 /// then who sent it, then whether the signature holds, then whether the rules
 /// file knows the move.

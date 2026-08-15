@@ -5631,6 +5631,22 @@ impl Db {
         Ok(())
     }
 
+    /// Whether `event_id` names a task event in the log.
+    ///
+    /// Asked by the delete and edit paths. Task events are immutable: the
+    /// lifecycle is the only way a task changes, and a later event supersedes
+    /// an earlier one rather than erasing it. A message row is not consulted,
+    /// because a task event has none — which is exactly how the DM path used
+    /// to end up relaying such a delete instead of refusing it.
+    pub fn is_act_event(&self, event_id: &str) -> SqlResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'act' AND event_id = ?1",
+            params![event_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// Whether the log has ever held an event opening this task.
     ///
     /// Asked only on the refusal path, to tell a finished task apart from one

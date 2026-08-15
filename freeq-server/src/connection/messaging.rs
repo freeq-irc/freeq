@@ -3153,6 +3153,15 @@ fn handle_edit(
     state: &Arc<SharedState>,
     inbound_multiline_lines: Option<&[super::draft_multiline::BatchLine]>,
 ) {
+    // ── Task history cannot be rewritten ──
+    //
+    // Checked against the id as sent, before the root resolution below: a task
+    // event has no revisions to resolve through, and the sender named it
+    // directly.
+    if super::act::refuse_if_task_event(conn, "EDIT", original_msgid, state) {
+        return;
+    }
+
     let hostmask = conn.hostmask();
     let nick = conn.nick_or_star();
     let is_channel = target.starts_with('#') || target.starts_with('&');
@@ -3682,6 +3691,15 @@ fn handle_delete(
     event_ctx: &crate::events::EventContext,
     state: &Arc<SharedState>,
 ) {
+    // ── Task history cannot be rewritten ──
+    //
+    // Asked before anything looks for a message row, because a task event has
+    // none: the DM path's no-row arm relayed such a delete live, which would
+    // have told every other client to drop an event the log still holds.
+    if super::act::refuse_if_task_event(conn, "DELETE", original_msgid, state) {
+        return;
+    }
+
     let hostmask = conn.hostmask();
     let nick = conn.nick_or_star();
     let is_channel = target.starts_with('#') || target.starts_with('&');
