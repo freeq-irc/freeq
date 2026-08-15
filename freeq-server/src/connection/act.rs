@@ -425,12 +425,141 @@ pub(super) fn gate(
         return Gate::Refused;
     }
 
+    // ── The task's own state ──
+    //
+    // Everything above could be decided from the message alone. What is left
+    // needs the task: whether it exists, whether it lives here, whether this
+    // step is legal from where it stands, and whether this sender may take it.
+    // The read, the decision and the write happen in one `with_db` call, which
+    // holds the database mutex throughout — two agents racing to claim the
+    // same open post are serialized by it, and exactly one wins.
+    let is_opener = freeq_sdk::act_transitions::opening_verb(kind) == Some(verb);
+    let act_id = match is_opener {
+        // An opener's own event id is the task's id.
+        true => msgid.clone(),
+        false => tags
+            .get("+freeq.at/act-id")
+            .or_else(|| tags.get("act-id"))
+            .cloned()
+            // A follow-up that names no task names one this server has not
+            // filed, which is the same answer.
+            .unwrap_or_default(),
+    };
+    let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let Some(canonical) = freeq_sdk::act::act_canonical(pairs, &venue, &msgid) else {
+        return Gate::Refused;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let written = state.with_db(|db| {
+        db.apply_act_event(&crate::db::ActEvent {
+            canonical: &canonical,
+            signature: Some(sig_tag),
+            event_id: &msgid,
+            act_id: &act_id,
+            opens: is_opener,
+            venue: &venue,
+            actor: did,
+            from_system: false,
+            origin: None,
+            timestamp: now,
+        })
+    });
+
+    match written {
+        // No database attached: nothing to referee against, and nothing to
+        // store. The message is still checked and delivered.
+        None => {}
+        Some(crate::db::ActWrite::Filed { .. }) => {}
+        Some(crate::db::ActWrite::UnknownTask) => {
+            refused(state);
+            tracing::debug!(
+                session = %conn.id, did = %did, act_id = %act_id,
+                "Refused a task event naming a task not on file"
+            );
+            refuse(
+                conn,
+                "TAGMSG",
+                "UNKNOWN_TASK",
+                "That task is not on file",
+                state,
+            );
+            return Gate::Refused;
+        }
+        Some(crate::db::ActWrite::WrongVenue) => {
+            refused(state);
+            refuse(
+                conn,
+                "TAGMSG",
+                "WRONG_VENUE",
+                "That task lives in a different conversation",
+                state,
+            );
+            return Gate::Refused;
+        }
+        Some(crate::db::ActWrite::Refused(reason)) => {
+            refused(state);
+            use freeq_sdk::act_transitions::Refusal;
+            let (code, sentence) = match reason {
+                Refusal::TerminalTask => (
+                    "TERMINAL_TASK",
+                    "That task is finished and takes no further steps",
+                ),
+                Refusal::IllegalStep => (
+                    "ILLEGAL_STEP",
+                    "That step cannot be taken from the task's current state",
+                ),
+                Refusal::WrongSender => ("WRONG_SENDER", "That step is not yours to take"),
+                Refusal::DeadlinePassed => ("DEADLINE_PASSED", "That offer's deadline has passed"),
+                Refusal::UnknownKind => {
+                    ("UNKNOWN_KIND", "This server does not know that task kind")
+                }
+                Refusal::UnknownVerb => ("UNKNOWN_VERB", "That task kind has no such step"),
+            };
+            tracing::debug!(
+                session = %conn.id, did = %did, act_id = %act_id, reason = %reason,
+                "Refused a task event against the task's state"
+            );
+            refuse(conn, "TAGMSG", code, sentence, state);
+            return Gate::Refused;
+        }
+        // The id is already in the log: a resend, or a client reusing an id.
+        // Nothing moved, and nothing should be delivered a second time.
+        Some(crate::db::ActWrite::Duplicate) => {
+            tracing::debug!(
+                session = %conn.id, did = %did, msgid = %msgid,
+                "Task event id already in the log; not filed again"
+            );
+            return Gate::Refused;
+        }
+        // The verification above rebuilt this canonical, so the log cannot
+        // fail to read it. Refuse rather than deliver something unfileable.
+        Some(crate::db::ActWrite::NotATaskEvent) => {
+            tracing::error!(
+                session = %conn.id, did = %did,
+                "A verified task message produced bytes the log cannot read"
+            );
+            return Gate::Refused;
+        }
+    }
+
     tracing::debug!(
         session = %conn.id, did = %did, target = %target,
-        kind = %kind, verb = %verb, msgid = %msgid,
+        kind = %kind, verb = %verb, msgid = %msgid, act_id = %act_id,
         "Accepted a task message"
     );
     Gate::Accepted
+}
+
+/// Count one refused task event.
+///
+/// Minimal on purpose: how many events the referee turned away is the number
+/// that says whether the rules are working or whether something is wedged.
+fn refused(state: &Arc<SharedState>) {
+    crate::server::Metrics::bump(&state.metrics.act_refused_total);
 }
 
 #[cfg(test)]

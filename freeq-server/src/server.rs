@@ -823,6 +823,9 @@ pub struct Metrics {
     pub messages_total: std::sync::atomic::AtomicU64,
     pub sasl_success_total: std::sync::atomic::AtomicU64,
     pub sasl_failure_total: std::sync::atomic::AtomicU64,
+    /// Task events the referee turned away — the one number that says whether
+    /// the rules are working or something is wedged.
+    pub act_refused_total: std::sync::atomic::AtomicU64,
     pub started_at: std::time::Instant,
 }
 
@@ -832,6 +835,7 @@ impl Default for Metrics {
             messages_total: std::sync::atomic::AtomicU64::new(0),
             sasl_success_total: std::sync::atomic::AtomicU64::new(0),
             sasl_failure_total: std::sync::atomic::AtomicU64::new(0),
+            act_refused_total: std::sync::atomic::AtomicU64::new(0),
             started_at: std::time::Instant::now(),
         }
     }

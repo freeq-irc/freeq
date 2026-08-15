@@ -515,6 +515,270 @@ async fn act_tags_mixed_with_a_stopgap_event_are_refused() {
     .await;
 }
 
+// ── refereeing, once a task is on file ──────────────────────────────────────
+
+/// Open a task and return its id, so a test can then act on it.
+fn open_task(c: &mut C, signing: &SigningKey, channel: &str, to: Option<&str>) -> String {
+    let id = fresh_id();
+    let mut tags = offer_tags();
+    if to.is_none() {
+        tags.retain(|(k, _)| k != "+freeq.at/act-to");
+    }
+    c.tx(&signed_line(&tags, channel, &id, signing));
+    // The sender holds the capability, so it sees its own accepted event echo.
+    c.rx(
+        |l| l.contains("+freeq.at/act=") && l.contains(&id),
+        "the offer",
+    );
+    id
+}
+
+/// A follow-up naming `task`, signed for `channel`.
+fn follow_up_line(
+    verb: &str,
+    from: &str,
+    task: &str,
+    channel: &str,
+    id: &str,
+    key: &SigningKey,
+) -> String {
+    let tags: Vec<(String, String)> = vec![
+        ("+freeq.at/act".into(), "handoff".into()),
+        ("+freeq.at/act-verb".into(), verb.into()),
+        ("+freeq.at/act-from".into(), from.into()),
+        ("+freeq.at/act-id".into(), task.into()),
+    ];
+    signed_line(&tags, channel, id, key)
+}
+
+#[tokio::test]
+async fn a_follow_up_naming_a_task_this_server_has_never_filed_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        a.tx(&follow_up_line(
+            "accept",
+            DID_ALICE,
+            "01JNOSUCHTASK00000000000X",
+            "#ops",
+            &fresh_id(),
+            &signing,
+        ));
+        assert_eq!(a.fail_code(), "UNKNOWN_TASK");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_follow_up_posted_in_another_conversation_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        a.join("#elsewhere");
+        let task = open_task(&mut a, &signing, "#ops", None);
+        a.tx(&follow_up_line(
+            "claim",
+            DID_ALICE,
+            &task,
+            "#elsewhere",
+            &fresh_id(),
+            &signing,
+        ));
+        assert_eq!(a.fail_code(), "WRONG_VENUE");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_step_the_task_state_does_not_allow_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        let task = open_task(&mut a, &signing, "#ops", None);
+        // Nobody has claimed it, so there is no work to complete.
+        a.tx(&follow_up_line(
+            "complete",
+            DID_ALICE,
+            &task,
+            "#ops",
+            &fresh_id(),
+            &signing,
+        ));
+        assert_eq!(a.fail_code(), "ILLEGAL_STEP");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_step_that_is_not_the_senders_to_take_is_refused() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+
+        // Offered to bob; alice cannot accept on his behalf, and the accept
+        // she signs names herself, so it is her own step to take or not.
+        let task = open_task(&mut a, &alice_key, "#ops", Some(DID_BOB));
+        a.tx(&follow_up_line(
+            "accept",
+            DID_ALICE,
+            &task,
+            "#ops",
+            &fresh_id(),
+            &alice_key,
+        ));
+        assert_eq!(a.fail_code(), "WRONG_SENDER");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_finished_task_takes_no_further_steps() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+
+        let task = open_task(&mut a, &alice_key, "#ops", Some(DID_BOB));
+        b.tx(&follow_up_line(
+            "decline",
+            DID_BOB,
+            &task,
+            "#ops",
+            &fresh_id(),
+            &bob_key,
+        ));
+        b.rx(|l| l.contains("act-verb=decline"), "the decline");
+
+        b.tx(&follow_up_line(
+            "accept",
+            DID_BOB,
+            &task,
+            "#ops",
+            &fresh_id(),
+            &bob_key,
+        ));
+        assert_eq!(b.fail_code(), "TERMINAL_TASK");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_accept_after_the_offers_deadline_is_refused() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+
+        // A deadline already in the past. The accept's own id carries the
+        // clock, and a freshly minted one is well past it.
+        let id = fresh_id();
+        let mut tags = offer_tags();
+        tags.push(("+freeq.at/act-deadline".into(), "1000000000".into()));
+        a.tx(&signed_line(&tags, "#ops", &id, &alice_key));
+        a.rx(|l| l.contains(&id), "the offer");
+
+        b.tx(&follow_up_line(
+            "accept",
+            DID_BOB,
+            &id,
+            "#ops",
+            &fresh_id(),
+            &bob_key,
+        ));
+        assert_eq!(b.fail_code(), "DEADLINE_PASSED");
+    })
+    .await;
+}
+
+/// The whole point: a task that is offered, accepted and completed, with each
+/// step landing where the rules say it should.
+#[tokio::test]
+async fn a_task_runs_from_offer_to_completion() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+
+        let task = open_task(&mut a, &alice_key, "#ops", Some(DID_BOB));
+        for (verb, key) in [
+            ("accept", &bob_key),
+            ("progress", &bob_key),
+            ("complete", &bob_key),
+        ] {
+            b.tx(&follow_up_line(
+                verb,
+                DID_BOB,
+                &task,
+                "#ops",
+                &fresh_id(),
+                key,
+            ));
+            b.rx(
+                |l| l.contains(&format!("act-verb={verb}")),
+                "the step is accepted and echoed",
+            );
+        }
+        // Finished: the task has left the live view, and the log is what
+        // still knows it existed — so the answer is that it is finished, not
+        // that nobody ever opened it.
+        b.tx(&follow_up_line(
+            "progress",
+            DID_BOB,
+            &task,
+            "#ops",
+            &fresh_id(),
+            &bob_key,
+        ));
+        assert_eq!(b.fail_code(), "TERMINAL_TASK");
+    })
+    .await;
+}
+
 // ── delivery ────────────────────────────────────────────────────────────────
 
 #[tokio::test]

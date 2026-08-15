@@ -5523,7 +5523,14 @@ impl Db {
             }
         } else {
             let Some(task) = self.act_task(ev.act_id)? else {
-                return Ok(ActWrite::UnknownTask);
+                // No live row. The view holds only unfinished work, so a task
+                // the log knows is one that finished — a different answer from
+                // one nobody ever opened, and the sender deserves the true
+                // one. The log is the record; this is what it is for.
+                return Ok(match self.act_task_is_on_file(ev.act_id)? {
+                    true => ActWrite::Refused(rules::Refusal::TerminalTask),
+                    false => ActWrite::UnknownTask,
+                });
             };
             // A follow-up belongs to its task's conversation. Without this a
             // signed event could move a task from a room its participants
@@ -5622,6 +5629,20 @@ impl Db {
             params![ev.act_id, landed, landed, ev.actor, ev.timestamp],
         )?;
         Ok(())
+    }
+
+    /// Whether the log has ever held an event opening this task.
+    ///
+    /// Asked only on the refusal path, to tell a finished task apart from one
+    /// that never existed. The view cannot answer it: it drops a task the
+    /// moment the task ends.
+    pub fn act_task_is_on_file(&self, act_id: &str) -> SqlResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'act' AND event_id = ?1",
+            params![act_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
     }
 
     /// One live task by id. `None` once it has finished — the log keeps the
