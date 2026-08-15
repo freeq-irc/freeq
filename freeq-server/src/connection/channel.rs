@@ -515,7 +515,38 @@ pub(super) fn handle_join(
                 send(state, session_id, batch_start);
             }
 
+            // The channel's task events, emitted inside this same batch in
+            // time order with the messages — and only to a joiner that asked
+            // for them.
+            let window = history
+                .iter()
+                .map(|h| h.timestamp as i64)
+                .fold((i64::MAX, i64::MIN), |(lo, hi), t| (lo.min(t), hi.max(t)));
+            let mut act_lines = super::act::replay_lines(
+                state,
+                session_id,
+                &crate::events::venue_of(channel),
+                channel,
+                if window.0 == i64::MAX { 0 } else { window.0 },
+                if window.1 == i64::MIN {
+                    i64::MAX
+                } else {
+                    window.1
+                },
+                history.len().max(1) * 4,
+                has_time_cap,
+                has_batch_cap.then_some(batch_id.as_str()),
+            );
+            act_lines.reverse();
+
             for hist in &history {
+                while act_lines
+                    .last()
+                    .is_some_and(|(ts, _)| *ts <= hist.timestamp as i64)
+                {
+                    let (_, line) = act_lines.pop().expect("just checked");
+                    send(state, session_id, line);
+                }
                 let mut msg_tags = if has_tags_cap {
                     hist.tags.clone()
                 } else {
@@ -652,6 +683,13 @@ pub(super) fn handle_join(
                     let line = format!(":{} PRIVMSG {} :{}\r\n", hist.from, channel, hist.text);
                     send(state, session_id, line);
                 }
+            }
+
+            // Whatever happened after the last message — sent whether or not
+            // this client batches, since the events are the point and the
+            // batch is only how they are framed.
+            while let Some((_, line)) = act_lines.pop() {
+                send(state, session_id, line);
             }
 
             // End batch

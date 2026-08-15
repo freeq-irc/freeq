@@ -2744,7 +2744,39 @@ fn replay_rows_as_batch(
         .with_db(|db| db.get_reactions_for_messages(&msgids))
         .unwrap_or_default();
 
+    // The venue's task events, to be emitted inside this same batch in time
+    // order with the messages. Empty unless this connection asked for them.
+    let window = messages
+        .iter()
+        .map(|r| r.timestamp as i64)
+        .fold((i64::MAX, i64::MIN), |(lo, hi), t| (lo.min(t), hi.max(t)));
+    let mut act_lines = super::act::replay_lines(
+        state,
+        session_id,
+        &crate::events::venue_of(&target),
+        &target,
+        if window.0 == i64::MAX { 0 } else { window.0 },
+        if window.1 == i64::MIN {
+            i64::MAX
+        } else {
+            window.1
+        },
+        messages.len().max(1) * 4,
+        has_time,
+        has_batch.then_some(batch_id.as_str()),
+    );
+    act_lines.reverse(); // popped from the back, so oldest goes last
+
     for row in &messages {
+        // Anything that happened at or before this message goes first, so a
+        // reader sees the task and the line about it in the order they landed.
+        while act_lines
+            .last()
+            .is_some_and(|(ts, _)| *ts <= row.timestamp as i64)
+        {
+            let (_, line) = act_lines.pop().expect("just checked");
+            send(state, session_id, line);
+        }
         let mut tags = if has_tags {
             row.tags.clone()
         } else {
@@ -2898,6 +2930,11 @@ fn replay_rows_as_batch(
                 format!(":{} PRIVMSG {} :{}\r\n", row.sender, target, row.text),
             );
         }
+    }
+
+    // Whatever happened after the last message, still inside the batch.
+    while let Some((_, line)) = act_lines.pop() {
+        send(state, session_id, line);
     }
 
     if has_batch {

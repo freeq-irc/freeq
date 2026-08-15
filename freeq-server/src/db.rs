@@ -5746,6 +5746,39 @@ impl Db {
         rows.collect()
     }
 
+    /// The task events stored for one venue, in time order.
+    ///
+    /// What replay emits. Bounded by the same window and limit the message
+    /// history uses, so a history request cannot be turned into a full-table
+    /// scan by asking for a wide enough range.
+    pub fn act_events_for_venue(
+        &self,
+        venue: &str,
+        from_ts: i64,
+        to_ts: i64,
+        limit: usize,
+    ) -> SqlResult<Vec<ActLoggedEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, canonical, signature, actor_did, venue, timestamp
+               FROM events
+              WHERE kind = 'act' AND venue = ?1
+                AND timestamp >= ?2 AND timestamp <= ?3
+              ORDER BY timestamp, event_id
+              LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![venue, from_ts, to_ts, limit as i64], |row| {
+            Ok(ActLoggedEvent {
+                event_id: row.get(0)?,
+                canonical: row.get(1)?,
+                signature: row.get(2)?,
+                actor_did: row.get(3)?,
+                venue: row.get(4)?,
+                timestamp: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     /// Every stored event of one task, oldest first: the opener, then each
     /// follow-up. This is the history a reader gets, and it outlives the view.
     pub fn act_task_events(&self, act_id: &str) -> SqlResult<Vec<ActLoggedEvent>> {

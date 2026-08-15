@@ -134,6 +134,94 @@ pub(super) fn refuse_body_with_act_tags(
     );
 }
 
+/// The wire lines for a venue's stored task events, each with its timestamp so
+/// a caller can interleave them with message history in time order.
+///
+/// Empty for a connection that did not ask for `freeq.at/act` — replay is
+/// gated exactly as live delivery is, so a client that cannot render a task
+/// card is not sent one it never asked for.
+///
+/// Each line is rebuilt from the stored canonical: the document's keys are the
+/// act tag names with the vendor prefix stripped, so re-prefixing them
+/// reproduces the tags the sender put on the wire, and the signature that
+/// travels alongside verifies against the very bytes the row holds.
+pub(super) fn replay_lines(
+    state: &Arc<SharedState>,
+    session_id: &str,
+    venue: &str,
+    target: &str,
+    from_ts: i64,
+    to_ts: i64,
+    limit: usize,
+    with_time: bool,
+    batch_id: Option<&str>,
+) -> Vec<(i64, String)> {
+    if !state.cap_act.lock().contains(session_id) {
+        return Vec::new();
+    }
+    let events = state
+        .with_db(|db| db.act_events_for_venue(venue, from_ts, to_ts, limit))
+        .unwrap_or_default();
+
+    events
+        .into_iter()
+        .filter_map(|ev| {
+            let doc: serde_json::Value = serde_json::from_str(&ev.canonical).ok()?;
+            let fields = doc.as_object()?;
+            let mut tags: HashMap<String, String> = HashMap::new();
+            for (key, value) in fields {
+                // `target` and `msgid` are the two the caller injected; they
+                // ride as the message's own target and id, not as act tags.
+                if key == "target" || key == "msgid" {
+                    continue;
+                }
+                tags.insert(format!("+freeq.at/{key}"), value.as_str()?.to_string());
+            }
+            tags.insert(
+                freeq_sdk::chatsig::EVENT_ID_TAG.to_string(),
+                ev.event_id.clone(),
+            );
+            tags.insert("msgid".to_string(), ev.event_id.clone());
+            if let Some(ref sig) = ev.signature {
+                tags.insert("+freeq.at/sig".to_string(), sig.clone());
+            }
+            if let Some(ref did) = ev.actor_did {
+                tags.insert("account".to_string(), did.clone());
+            }
+            if with_time {
+                tags.insert(
+                    "time".to_string(),
+                    chrono::DateTime::from_timestamp(ev.timestamp, 0)
+                        .unwrap_or_default()
+                        .format("%Y-%m-%dT%H:%M:%S.000Z")
+                        .to_string(),
+                );
+            }
+            if let Some(batch) = batch_id {
+                tags.insert("batch".to_string(), batch.to_string());
+            }
+            // The nick the actor holds now, when this server knows one — a
+            // replayed event carries no hostmask of its own, and the identity
+            // that matters rides the account tag either way.
+            let prefix = ev.actor_did.as_ref().map(|did| {
+                state
+                    .did_nicks
+                    .lock()
+                    .get(did)
+                    .cloned()
+                    .unwrap_or_else(|| did.clone())
+            });
+            let line = Message {
+                tags,
+                prefix,
+                command: "TAGMSG".to_string(),
+                params: vec![target.to_string()],
+            };
+            Some((ev.timestamp, format!("{line}\r\n")))
+        })
+        .collect()
+}
+
 /// Refuse a mutation aimed at a task event, and say so.
 ///
 /// Returns whether the caller should stop. Task events are immutable: the

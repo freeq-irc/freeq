@@ -931,6 +931,98 @@ async fn an_accepted_task_message_reaches_only_the_capability_holders() {
     .await;
 }
 
+// ── replay ──────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_joiner_holding_the_capability_replays_the_task_events() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        let task = open_task(&mut a, &signing, "#ops", None);
+        // A message too, so the batch carries both kinds.
+        a.tx("PRIVMSG #ops :a line about it");
+
+        // Someone arriving afterwards, holding the capability. The replay
+        // arrives before the end-of-names numeric, so the JOIN is not waited
+        // out first — doing that would read straight past it.
+        let mut late = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        late.tx("JOIN #ops");
+        let replayed = late.rx(|l| l.contains("+freeq.at/act="), "the task event replays");
+        assert!(
+            replayed.contains(&task),
+            "the task's own id rides: {replayed}"
+        );
+        assert!(
+            replayed.contains("+freeq.at/sig="),
+            "with its signature: {replayed}"
+        );
+        assert!(
+            replayed.contains("+freeq.at/act-verb=offer"),
+            "and its act tags: {replayed}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_joiner_without_the_capability_replays_no_task_events() {
+    let ka = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        open_task(&mut a, &signing, "#ops", None);
+        a.tx("PRIVMSG #ops :a line about it");
+
+        let mut late = C::guest(addr, "carol", BASE_CAPS);
+        late.tx("JOIN #ops");
+        // The ordinary message still replays…
+        late.rx(|l| l.contains("a line about it"), "the message replays");
+        // …and the end of the join burst arrives with no task event in it.
+        let ended = late.rx(
+            |l| l.contains("+freeq.at/act") || l.split_whitespace().nth(1) == Some("366"),
+            "a task event, or the end of the burst",
+        );
+        assert!(
+            !ended.contains("+freeq.at/act"),
+            "a connection that did not ask receives no task events, replayed either: {ended}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn chathistory_carries_task_events_to_capability_holders() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        a.tx("PRIVMSG #ops :before");
+        let task = open_task(&mut a, &signing, "#ops", None);
+
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.join("#ops");
+        b.tx("CHATHISTORY LATEST #ops * 50");
+        let replayed = b.rx(
+            |l| l.contains("+freeq.at/act="),
+            "the task event in history",
+        );
+        assert!(replayed.contains(&task), "{replayed}");
+    })
+    .await;
+}
+
 // ── flood ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]
