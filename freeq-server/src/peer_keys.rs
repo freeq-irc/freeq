@@ -91,6 +91,18 @@ fn base_for_origin(state: &Arc<SharedState>, origin: &str) -> Option<String> {
         .cloned()
 }
 
+/// Whether this peer has a key server at all (`--s2s-peer-api`).
+///
+/// A peer with none can never have its signatures checked here, which is
+/// honest for a message — it is labeled and delivered — but decides the fate
+/// of a mutation, which is refused when it cannot be checked. The refusal is
+/// worth naming the reason for: without this, an operator sees mutations from
+/// one peer quietly doing nothing and has no way to tell a forgery from a
+/// line missing from the command line.
+pub fn has_key_source(state: &Arc<SharedState>, origin: &str) -> bool {
+    base_for_origin(state, origin).is_some()
+}
+
 /// Look up the key a relayed signature names, without holding anything up.
 ///
 /// Call when a relayed event was uncheckable for want of a key. Returns

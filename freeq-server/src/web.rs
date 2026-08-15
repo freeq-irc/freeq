@@ -1493,17 +1493,13 @@ async fn api_verify_message(
     let sig_tag = msg.tags.get(freeq_sdk::sigtag::SIG_TAG).cloned();
 
     // The `account` tag is the origin's own statement of who sent this, which
-    // is what the document binds; the nick map is a last resort for rows
-    // predating it.
-    let sender_nick = msg.from.split('!').next().unwrap_or(&msg.from).to_string();
+    // is what the document binds. A row that carries neither it nor a stored
+    // sender names nobody, and this endpoint says so — `unverifiable-unknown-
+    // sender` below. Resolving the nick against our own records instead
+    // rebuilt the document around whoever holds that nick *here*, which is a
+    // verdict about a message the named identity may never have sent.
     if sender_did.is_none() {
-        sender_did = msg.tags.get("account").cloned().or_else(|| {
-            state
-                .nick_owners
-                .lock()
-                .get(&sender_nick.to_lowercase())
-                .cloned()
-        });
+        sender_did = msg.tags.get("account").cloned();
     }
 
     // Rebuild the exact document the signer signed, through the one builder
@@ -5206,6 +5202,91 @@ mod signature_verdict_tests {
         assert_eq!(out.0["verification"]["verdict"], "valid");
         assert_eq!(out.0["verification"]["verified_by"], "client-session-key");
         assert_eq!(out.0["sender_did"], did);
+    }
+
+    /// The classifier resolves the key the signature's `kid` names, never the
+    /// identity's newest. The third of the three chat paths that must agree
+    /// on this (the other two are pinned in `server.rs`): a reader coming back
+    /// to old history after the signer reconnected must still get a verdict
+    /// about the message, not about which key is current.
+    #[test]
+    fn the_classifier_resolves_a_key_by_kid_not_by_latest() {
+        let state = test_state_with_db();
+        let old = SigningKey::from_bytes(&[21u8; 32]);
+        let newer = SigningKey::from_bytes(&[22u8; 32]);
+        for key in [&old, &newer] {
+            state
+                .with_db(|db| db.save_signing_key(DID, key.verifying_key().as_bytes()))
+                .expect("test state has a database");
+        }
+
+        let canonical = doc().canonical();
+        let sig = doc().sign(&old);
+        let (verdict, by, _) =
+            classify_message_signature(&state, Some(DID), Some(&canonical), Some(&sig));
+        assert_eq!(
+            (verdict, by),
+            ("valid", "client-session-key"),
+            "a signature from a retired key must still verify"
+        );
+    }
+
+    /// A row that names no sender is answered as one, not guessed at. The
+    /// endpoint used to fall back to whoever holds the sender's nick on this
+    /// server, which rebuilt a document around a DID the signer never signed
+    /// — and then reported the mismatch as a verdict about the message.
+    #[tokio::test]
+    async fn a_row_with_no_sender_did_is_unverifiable_not_attributed_by_nick() {
+        let state = test_state_with_db();
+        let key = SigningKey::from_bytes(&[13u8; 32]);
+        let local = "did:plc:holdsthenick";
+        let msgid = "01KYVT5Z8Q00000000NONAME00";
+        state
+            .with_db(|db| db.save_signing_key(local, key.verifying_key().as_bytes()))
+            .expect("test state has a database");
+        // The nick belongs to a local identity here…
+        state
+            .nick_owners
+            .lock()
+            .insert("stranger".to_string(), local.to_string());
+
+        // …but the row names no sender, and carries a signature by whoever
+        // did write it. Nothing here can say who that was.
+        let sig = ChatDoc::message(
+            local,
+            msgid,
+            &freeq_sdk::chatsig::channel_venue("#nameless"),
+            "who wrote this",
+        )
+        .sign(&key);
+        let tags = std::collections::HashMap::from([(freeq_sdk::sigtag::SIG_TAG.to_string(), sig)]);
+        state
+            .with_db(|db| {
+                db.insert_message(
+                    "#nameless",
+                    "stranger!u@s2s",
+                    "who wrote this",
+                    0,
+                    &tags,
+                    Some(msgid),
+                    None,
+                )
+            })
+            .expect("test state has a database");
+
+        let out = api_verify_message(
+            axum::extract::State(state),
+            axum::extract::Path(msgid.to_string()),
+        )
+        .await
+        .expect("the message is on file");
+        assert_eq!(out.0["verification"]["verdict"], "unverifiable");
+        assert_eq!(
+            out.0["verification"]["verified_by"], "unverifiable-unknown-sender",
+            "a nick is not an identity, and the endpoint must say so rather \
+             than answer with whoever holds it: {:?}",
+            out.0["verification"]
+        );
     }
 
     /// A federated *edit*: the linkage it signs lives in the row's

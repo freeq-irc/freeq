@@ -202,21 +202,25 @@ fn resolve_signature(
     tags: &HashMap<String, String>,
     client_sig: Option<&str>,
     state: &Arc<SharedState>,
-) -> Option<String> {
-    let did = conn.authenticated_did.as_ref()?;
+) -> SettledSignature {
+    let Some(did) = conn.authenticated_did.as_ref() else {
+        return SettledSignature::Attach(None);
+    };
     let venue = signing_venue(state, did, target);
 
     if let (Some(sig_tag), Some(venue)) = (client_sig, venue.as_deref()) {
         let doc = message_document(did, venue, fields, tags);
         match verify_client_signature(&doc, sig_tag, did, Some(&conn.id), state) {
-            ClientSigOutcome::Verified => return Some(sig_tag.to_string()),
+            ClientSigOutcome::Verified => {
+                return SettledSignature::Attach(Some(sig_tag.to_string()));
+            }
             ClientSigOutcome::Failed => {
                 tracing::warn!(
                     session = %conn.id, did = %did, msgid = %fields.msgid,
                     "Client signature did not verify against the key it names — \
-                     relaying the message unsigned rather than substituting ours"
+                     refusing the message"
                 );
-                return None;
+                return SettledSignature::Failed;
             }
             ClientSigOutcome::Unverifiable(why) => {
                 tracing::debug!(
@@ -235,9 +239,42 @@ fn resolve_signature(
     // Server signature over the same document. Without a venue there is no
     // document to sign, and inventing one would produce a signature nobody
     // could rebuild — the exact failure this canonical exists to end.
-    let venue = venue?;
+    let Some(venue) = venue else {
+        return SettledSignature::Attach(None);
+    };
     let doc = message_document(did, &venue, fields, tags);
-    Some(doc.sign(&state.msg_signing_key))
+    SettledSignature::Attach(Some(doc.sign(&state.msg_signing_key)))
+}
+
+/// Tell the sender their message carried a signature that did not verify.
+///
+/// `command` is the command being refused, per the standard-replies shape.
+fn send_signature_invalid(conn: &Connection, command: &str, state: &Arc<SharedState>) {
+    let reply = Message::from_server(
+        &state.server_name,
+        "FAIL",
+        vec![
+            command,
+            "SIGNATURE_INVALID",
+            "That signature does not verify against the key it names",
+        ],
+    );
+    if let Some(tx) = state.connections.lock().get(&conn.id) {
+        let _ = tx.try_send(format!("{reply}\r\n"));
+    }
+}
+
+/// What a message's signature settled to at ingress.
+pub(crate) enum SettledSignature {
+    /// Relay it, carrying this signature: the sender's own where it verified,
+    /// this server's vouch where there was nothing to check, and none at all
+    /// for a guest or a venue that does not resolve.
+    Attach(Option<String>),
+    /// The signature named a key this server holds and did not verify against
+    /// it. The bytes and the proof disagree, which is a fact about the
+    /// message — so it is refused rather than relayed with the disagreement
+    /// quietly dropped.
+    Failed,
 }
 
 /// What happened when we checked a client's signature — three outcomes, not
@@ -820,76 +857,42 @@ fn keep_signature(checked: Option<&CheckedMutation>, tidied: &HashMap<String, St
 /// event is filed under, and the signature that goes with it.
 pub(crate) struct VouchedMutation {
     pub event_id: String,
-    /// The sender's own signature, or this server's over the same document.
-    /// `None` only for a guest — no identity, nothing to vouch for.
+    /// The sender's own signature. Never this server's: a mutation nobody
+    /// proved is refused rather than vouched for.
     pub signature: Option<String>,
 }
 
-/// Settle a mutation's signature the way a message's is settled.
+/// Settle a mutation's signature: the sender's own, or nothing.
 ///
-/// A note under a user's name means the same thing whether it is a sentence or
-/// a delete: *this server saw this authenticated account do this*. So the
-/// rules are the message rules, with no special case:
+/// A mutation changes a record that already exists, so the only thing worth
+/// attaching is proof from the key the actor registered. This server used to
+/// sign an unsigned one on the sender's behalf, which made the actor of a
+/// delete this server's word — indistinguishable, from the act alone, from
+/// the sender's own. Those events are now refused at ingress instead
+/// (`handle_tagmsg`), leaving this with one job: carry the sender's signature
+/// onward while it still covers what is on the wire.
 ///
-/// - the sender's signature, when it verifies and still covers what is on the
-///   wire — the only outcome with real non-repudiation;
-/// - **this server's signature** over the same document otherwise, which says
-///   only what it means. A reader tells the two apart by the key each names,
-///   which is what `verified_by` reports;
-/// - nothing at all for a guest, who has no identity to bind.
-///
-/// A signature that *failed* never reaches here: the caller refuses the event.
+/// `None` for a guest, who has no identity to bind, and for a verified
+/// signature whose subject this server has since re-rooted — the document a
+/// reader would rebuild is no longer the one the sender signed.
 fn vouch_mutation(
-    conn: &Connection,
-    target: &str,
     tidied: &HashMap<String, String>,
     checked: Option<&CheckedMutation>,
-    state: &Arc<SharedState>,
 ) -> Option<VouchedMutation> {
-    let (kind, subject, emoji) = mutation_in(tidied)?;
+    if !keep_signature(checked, tidied) {
+        return None;
+    }
     let event_id = tidied
         .get(freeq_sdk::chatsig::EVENT_ID_TAG)
         .or_else(|| tidied.get(freeq_sdk::chatsig::EVENT_ID_TAG_BARE))
-        .cloned();
-
-    // The sender's own, when it verified and nothing since has moved out from
-    // under it.
-    if keep_signature(checked, tidied)
-        && let (Some(event_id), Some(sig)) = (
-            event_id.clone(),
-            tidied
-                .get("+freeq.at/sig")
-                .or_else(|| tidied.get("freeq.at/sig"))
-                .cloned(),
-        )
-    {
-        return Some(VouchedMutation {
-            event_id,
-            signature: Some(sig),
-        });
-    }
-
-    let did = conn.authenticated_did.as_deref()?;
-    // Without a venue there is no document, and inventing one would produce a
-    // signature nobody could rebuild — the exact failure the canonical exists
-    // to end. The act still happens; it just isn't vouched for.
-    let venue = signing_venue(state, did, target)?;
-    // The sender's id is kept when it holds up, so the event this server
-    // vouches for and the one the sender named are the same event. Otherwise
-    // the act still needs an identity, and this server mints it.
-    let event_id = event_id
-        .filter(|id| crate::msgid::check_client_minted(id, now_ms()).is_ok())
-        .unwrap_or_else(crate::msgid::generate);
-
-    let mut doc =
-        freeq_sdk::chatsig::ChatDoc::mutation(kind, did, &event_id, &venue, &subject);
-    if let Some(ref emoji) = emoji {
-        doc = doc.with_emoji(emoji);
-    }
-    let signature = doc.sign(&state.msg_signing_key);
+        .cloned()?;
+    let sig = tidied
+        .get("+freeq.at/sig")
+        .or_else(|| tidied.get("freeq.at/sig"))
+        .cloned()?;
     Some(VouchedMutation {
         event_id,
-        signature: Some(signature),
+        signature: Some(sig),
     })
 }
 
@@ -928,6 +931,50 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Whether a channel will take a TAGMSG from this sender: `+n` (members only)
+/// and `+m` (voiced or better), the same two gates a PRIVMSG passes.
+///
+/// Sends the refusal itself, so a caller only has to stop.
+fn channel_accepts_tagmsg(conn: &Connection, target: &str, state: &Arc<SharedState>) -> bool {
+    // Resolve sender DID once, before taking the channels lock.
+    let sender_did = state.session_dids.lock().get(&conn.id).cloned();
+    let refusal = {
+        let channels = state.channels.lock();
+        let Some(ch) = channels.get(target) else {
+            return true;
+        };
+        // Founder + persistent DID-ops bypass +m. (+n is membership-based;
+        // a non-member can't be founder anyway, so no bypass needed there.)
+        let is_did_authority = sender_did
+            .as_deref()
+            .is_some_and(|d| ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d));
+        if ch.no_ext_msg && !ch.members.contains(&conn.id) {
+            Some("Cannot send to channel (+n)")
+        } else if ch.moderated
+            && !is_did_authority
+            && !ch.ops.contains(&conn.id)
+            && !ch.halfops.contains(&conn.id)
+            && !ch.voiced.contains(&conn.id)
+        {
+            Some("Cannot send to channel (+m)")
+        } else {
+            None
+        }
+    };
+    let Some(reason) = refusal else {
+        return true;
+    };
+    let reply = Message::from_server(
+        &state.server_name,
+        irc::ERR_CANNOTSENDTOCHAN,
+        vec![conn.nick_or_star(), target, reason],
+    );
+    if let Some(tx) = state.connections.lock().get(&conn.id) {
+        let _ = tx.try_send(format!("{reply}\r\n"));
+    }
+    false
 }
 
 pub(super) fn handle_tagmsg(
@@ -990,6 +1037,50 @@ pub(super) fn handle_tagmsg(
         return;
     }
 
+    // ── An identity's mutation must carry that identity's own proof ──
+    //
+    // A signature this server made over someone else's delete says only that
+    // this server believed them, and nothing downstream can tell the two
+    // apart from the act alone. So an authenticated sender whose mutation
+    // arrives unsigned — or with a signature no key here can check — is
+    // refused, and nothing is filed. `SIGNATURE_REQUIRED` stays distinct from
+    // `SIGNATURE_INVALID` above: one is a client that did not sign, the other
+    // is bytes that do not match, and they are different problems to fix.
+    //
+    // Two exemptions, both cases where the proof could not have existed:
+    // a guest, who has no identity to bind, and a thread with no venue — a
+    // DM with a guest, whose document names a DID the recipient does not
+    // have. Demanding a signature there would end deletes in those threads
+    // forever, and would end nothing else: no signature was ever attached to
+    // them, by the sender or by this server. A peer DID the *client* has not
+    // learned yet is not this case — that venue resolves here, and the client
+    // closes the gap by asking who the peer is before it acts.
+    if is_mutation
+        && let Some(did) = conn.authenticated_did.as_deref()
+        && signing_venue(state, did, target).is_some()
+        && arrived.as_ref().map(|c| c.outcome) != Some(ClientSigOutcome::Verified)
+    {
+        tracing::info!(
+            session = %conn.id, did = ?conn.authenticated_did, target = %target,
+            outcome = ?arrived.as_ref().map(|c| c.outcome),
+            "Mutation from an authenticated sender carries no signature this server can \
+             check — refusing the event"
+        );
+        let reply = Message::from_server(
+            &state.server_name,
+            "FAIL",
+            vec![
+                "TAGMSG",
+                "SIGNATURE_REQUIRED",
+                "A signed request is required to modify messages on this server",
+            ],
+        );
+        if let Some(tx) = state.connections.lock().get(&conn.id) {
+            let _ = tx.try_send(format!("{reply}\r\n"));
+        }
+        return;
+    }
+
     // Normalize IRCv3 draft tags to their canonical forms so all downstream
     // code (persistence, relay, fallback) only needs to check one name.
     let mut tags = tags.clone();
@@ -1016,14 +1107,13 @@ pub(super) fn handle_tagmsg(
             tags.insert("+draft/delete".to_string(), root);
         }
     }
-    // Settle what this server stands behind. The sender's signature when it
-    // verified and still covers what is on the wire; this server's over the
-    // same document otherwise; nothing at all for a guest. A signature the
+    // Settle what this server stands behind: the sender's signature while it
+    // still covers what is on the wire, and nothing otherwise. A signature the
     // server did not make and cannot vouch for never leaves the server — the
     // never-launder rule, which is also what stops a guest inventing a lock
     // badge for free.
     let vouched = if is_mutation {
-        vouch_mutation(conn, target, &tags, arrived.as_ref(), state)
+        vouch_mutation(&tags, arrived.as_ref())
     } else {
         None
     };
@@ -1313,6 +1403,17 @@ pub(super) fn handle_tagmsg(
         .as_deref()
         .and_then(|did| signing_venue(state, did, target));
 
+    // The channel's own gates run before anything is filed. A reaction from
+    // outside a `+n` channel, or from an unvoiced sender in a `+m` one,
+    // reaches nobody — and filing it first left a row for a reaction no
+    // member ever received, which then surfaced for everyone on the next
+    // join.
+    if (target.starts_with('#') || target.starts_with('&'))
+        && !channel_accepts_tagmsg(conn, target, state)
+    {
+        return;
+    }
+
     // ── Persist reactions (+react with +reply) ──
     if let (Some(emoji), Some(target_msgid)) = (tags.get("+react"), tags.get("+reply")) {
         let nick = conn.nick_or_star().to_string();
@@ -1405,51 +1506,6 @@ pub(super) fn handle_tagmsg(
 
     // Rich clients get TAGMSG, plain clients get fallback PRIVMSG (if any)
     if target.starts_with('#') || target.starts_with('&') {
-        // Channel TAGMSG — enforce +n (no external messages) and +m (moderated)
-        // Resolve sender DID once, before taking the channels lock.
-        let sender_did = state.session_dids.lock().get(&conn.id).cloned();
-        {
-            let channels = state.channels.lock();
-            if let Some(ch) = channels.get(target) {
-                // Founder + persistent DID-ops bypass +m. (+n is membership-based;
-                // a non-member can't be founder anyway, so no bypass needed there.)
-                let is_did_authority = sender_did.as_deref().is_some_and(|d| {
-                    ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d)
-                });
-                // +n: must be a member to send
-                if ch.no_ext_msg && !ch.members.contains(&conn.id) {
-                    let nick = conn.nick_or_star();
-                    let reply = Message::from_server(
-                        &state.server_name,
-                        irc::ERR_CANNOTSENDTOCHAN,
-                        vec![nick, target, "Cannot send to channel (+n)"],
-                    );
-                    if let Some(tx) = state.connections.lock().get(&conn.id) {
-                        let _ = tx.try_send(format!("{reply}\r\n"));
-                    }
-                    return;
-                }
-                // +m: must be voiced or op to send
-                if ch.moderated
-                    && !is_did_authority
-                    && !ch.ops.contains(&conn.id)
-                    && !ch.halfops.contains(&conn.id)
-                    && !ch.voiced.contains(&conn.id)
-                {
-                    let nick = conn.nick_or_star();
-                    let reply = Message::from_server(
-                        &state.server_name,
-                        irc::ERR_CANNOTSENDTOCHAN,
-                        vec![nick, target, "Cannot send to channel (+m)"],
-                    );
-                    if let Some(tx) = state.connections.lock().get(&conn.id) {
-                        let _ = tx.try_send(format!("{reply}\r\n"));
-                    }
-                    return;
-                }
-            }
-        }
-
         let members: Vec<String> = state
             .channels
             .lock()
@@ -1750,10 +1806,13 @@ pub(super) fn handle_privmsg_with_multiline(
             reply: reply_reference(tags),
             edit: None,
         };
-        set_signature(
-            &mut full_tags,
-            resolve_signature(conn, target, &signed, tags, client_sig, state),
-        );
+        match resolve_signature(conn, target, &signed, tags, client_sig, state) {
+            SettledSignature::Attach(sig) => set_signature(&mut full_tags, sig),
+            SettledSignature::Failed => {
+                send_signature_invalid(conn, command, state);
+                return;
+            }
+        }
 
         // If this PRIVMSG is a commit-reveal `reveal` event, verify the
         // binding against the prior commit and stamp the outcome onto
@@ -2035,10 +2094,13 @@ pub(super) fn handle_privmsg_with_multiline(
             reply: reply_reference(tags),
             edit: None,
         };
-        set_signature(
-            &mut pm_tags,
-            resolve_signature(conn, target, &signed, tags, client_sig, state),
-        );
+        match resolve_signature(conn, target, &signed, tags, client_sig, state) {
+            SettledSignature::Attach(sig) => set_signature(&mut pm_tags, sig),
+            SettledSignature::Failed => {
+                send_signature_invalid(conn, command, state);
+                return;
+            }
+        }
 
         let mut pm_tags_with_time = pm_tags.clone();
         pm_tags_with_time.insert("time".to_string(), time_tag.clone());
@@ -3170,31 +3232,45 @@ fn handle_edit(
         edit: Some(original_msgid),
     };
 
-    // Refuse an edit whose signature fails to verify — the same tamper rule
-    // delete/react/unreact already enforce. An edit changes an existing record,
-    // so a signature that fails against the key it names is evidence of
-    // tampering and must not apply. Absent and unverifiable signatures still
-    // fall through to the server vouch below; only a *failed* check is refused.
+    // An edit takes the editor's own proof, the same as a delete or a
+    // reaction: it rewrites a record that already exists, and a note saying
+    // this server believed them is not evidence of what they wrote.
+    //
+    // Two refusals, one rule, kept apart because they are different problems
+    // for the sender to fix. A signature that fails against the key it names
+    // is evidence the bytes moved. One this server cannot check at all —
+    // absent, or naming a key nobody registered — is a request nobody proved.
+    //
+    // A venue that does not resolve exempts the edit, as it does every other
+    // mutation: a DM with a guest has no document for anyone to sign, so
+    // requiring one would end editing in those threads and end nothing else.
     if let Some(did) = conn.authenticated_did.as_deref()
-        && let (Some(sig_tag), Some(venue)) = (client_sig, signing_venue(state, did, target))
+        && let Some(venue) = signing_venue(state, did, target)
     {
-        let doc = message_document(did, &venue, &signed, tags);
-        if verify_client_signature(&doc, sig_tag, did, Some(&conn.id), state)
-            == ClientSigOutcome::Failed
-        {
-            tracing::warn!(
-                session = %conn.id, did = %did, target = %target,
-                "Edit signature did not verify against the key it names — refusing the edit"
-            );
-            let reply = Message::from_server(
-                &state.server_name,
-                "FAIL",
-                vec![
-                    "EDIT",
+        let outcome = match client_sig {
+            Some(sig_tag) => {
+                let doc = message_document(did, &venue, &signed, tags);
+                verify_client_signature(&doc, sig_tag, did, Some(&conn.id), state)
+            }
+            None => ClientSigOutcome::Unverifiable("edit carries no signature"),
+        };
+        if outcome != ClientSigOutcome::Verified {
+            let (code, description) = match outcome {
+                ClientSigOutcome::Failed => (
                     "SIGNATURE_INVALID",
                     "That signature does not verify against the key it names",
-                ],
+                ),
+                _ => (
+                    "SIGNATURE_REQUIRED",
+                    "A signed request is required to modify messages on this server",
+                ),
+            };
+            tracing::warn!(
+                session = %conn.id, did = %did, target = %target, outcome = ?outcome,
+                "Edit refused: {code}"
             );
+            let reply =
+                Message::from_server(&state.server_name, "FAIL", vec!["EDIT", code, description]);
             if let Some(tx) = state.connections.lock().get(&conn.id) {
                 let _ = tx.try_send(format!("{reply}\r\n"));
             }
@@ -3202,10 +3278,15 @@ fn handle_edit(
         }
     }
 
-    set_signature(
-        &mut full_tags,
-        resolve_signature(conn, target, &signed, tags, client_sig, state),
-    );
+    match resolve_signature(conn, target, &signed, tags, client_sig, state) {
+        SettledSignature::Attach(sig) => set_signature(&mut full_tags, sig),
+        // Unreachable: an edit whose signature failed was refused above, with
+        // the code that names an edit. Refuse again rather than file it.
+        SettledSignature::Failed => {
+            send_signature_invalid(conn, "EDIT", state);
+            return;
+        }
+    }
 
     // Multi-line breakdown for BATCH-wrapped outbound. Two sources, in
     // priority order:

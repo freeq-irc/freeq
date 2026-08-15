@@ -314,6 +314,19 @@ fn connect(
     client::connect(config, Some(id.signer()))
 }
 
+/// A client with no identity — the other end of a thread that can never have
+/// a signed venue.
+fn connect_guest(server: &TestServer, nick: &str) -> (client::ClientHandle, mpsc::Receiver<Event>) {
+    let config = ConnectConfig {
+        server_addr: server.irc_addr.clone(),
+        nick: nick.to_string(),
+        user: nick.to_string(),
+        realname: "federation test".to_string(),
+        ..Default::default()
+    };
+    client::connect(config, None)
+}
+
 async fn wait_event(
     rx: &mut mpsc::Receiver<Event>,
     pred: impl Fn(&Event) -> bool,
@@ -484,6 +497,61 @@ async fn did_dm_reaches_all_recipient_devices_across_servers() {
     drop((srv_a, srv_b));
 }
 
+/// The sender's *own* other device, signed in on the receiving server.
+///
+/// The origin fans a DM out to the sender's other sessions on its send path;
+/// that code never runs on the far side of a link, so the far side unions the
+/// addressed user's sessions with the sessions of whoever the event names.
+/// That union is delivery into the named identity's own client, so it happens
+/// only on a signature this server checked — and this is the honest case that
+/// must keep working: alice really did send it, and her client really did
+/// sign it.
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_signed_dm_reaches_the_senders_own_device_on_the_far_server() {
+    let alice = TestId::new("did:plc:alicefanout");
+    let bob = TestId::new("did:plc:bobfanout");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    // Bob on B; alice on A, and also signed in on B — the device that only
+    // the far side's fan-out can reach.
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    let (ha2, mut rxa2) = connect(&srv_b, &alice, "alice2");
+    wait_auth_and_register(&mut rxa2).await;
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+
+    // Warming the link also gets alice's signing key onto B, which is what
+    // makes the signature checkable there rather than merely present.
+    warm_link(&ha, &bob.did, &mut rxb).await;
+
+    // Resend until her own far-side device sees it: the key lookup runs off
+    // the delivery path, so the first send can land before the key does.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut reached = false;
+    while tokio::time::Instant::now() < deadline {
+        ha.privmsg(&bob.did, "sent from my other device").await.ok();
+        if try_recv_message(&mut rxa2, "sent from my other device", Duration::from_secs(2))
+            .await
+            .is_some()
+        {
+            reached = true;
+            break;
+        }
+    }
+    assert!(
+        reached,
+        "a signed cross-server DM never reached the sender's own device on the \
+         receiving server"
+    );
+
+    ha.quit(None).await.ok();
+    ha2.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
 // ── receiver persists the DID-keyed DM (Element C stamp path) ─────
 
 #[tokio::test]
@@ -645,6 +713,100 @@ async fn tagmsg_to_remote_did_relays_as_structured_tagmsg() {
     ha.quit(None).await.ok();
     hb.quit(None).await.ok();
     drop((srv_a, srv_b));
+}
+
+// ── a DM with a guest on the peer keeps its mutations ────────────
+//
+// The signature requirement asks for proof only where proof could exist. A
+// guest has no DID, so a DM thread with one has no venue: neither end can
+// build the document, so no signature can ever accompany a delete or an edit
+// there. The rule exempts that case locally; a relayed one arrives
+// account-stamped from the origin's authenticated sender and venue-less all
+// the same, and must be exempt on the receiving side too — otherwise the
+// delete applies where it was typed and nowhere else, and the two servers
+// hold different history for good.
+
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_dm_with_a_guest_on_the_peer_keeps_its_deletes() {
+    let alice = TestId::new("did:plc:aliceguestdm");
+    let (srv_a, srv_b) = spawn_pair(&[&alice]).await;
+
+    // A guest on B, an identity on A. Nothing about this thread is signable.
+    let (hg, mut rxg) = connect_guest(&srv_b, "gbob");
+    wait_event(
+        &mut rxg,
+        |e| matches!(e, Event::Registered { .. }),
+        "guest registered",
+    )
+    .await;
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+
+    // Resend until it lands, which also warms the link.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut delivered = None;
+    while tokio::time::Instant::now() < deadline {
+        ha.privmsg("gbob", "across to a guest").await.ok();
+        delivered =
+            msgid_of_message(&mut rxg, "across to a guest", Duration::from_secs(2)).await;
+        if delivered.is_some() {
+            break;
+        }
+    }
+    let msgid = delivered.expect("the guest received the cross-server DM");
+
+    // Alice deletes it. Neither server can check a signature that cannot
+    // exist, and both must apply the delete rather than demand one.
+    let mut del_tags = std::collections::HashMap::new();
+    del_tags.insert("+draft/delete".to_string(), msgid.clone());
+    ha.send_tagmsg("gbob", del_tags).await.unwrap();
+
+    let seen = wait_for_tagmsg(&mut rxg, "+draft/delete", EVENT_TIMEOUT).await;
+    assert!(
+        seen,
+        "a delete in a venue-less DM must cross the hop and apply at the far end"
+    );
+
+    ha.quit(None).await.ok();
+    hg.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+/// Wait for a message with `text`, returning its msgid.
+async fn msgid_of_message(
+    rx: &mut mpsc::Receiver<Event>,
+    text: &str,
+    within: Duration,
+) -> Option<String> {
+    timeout(within, async {
+        loop {
+            match rx.recv().await {
+                Some(Event::Message { text: t, tags, .. }) if t == text => {
+                    return tags.get("msgid").cloned();
+                }
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    })
+    .await
+    .unwrap_or(None)
+}
+
+/// Whether a TAGMSG carrying `tag` arrives within the window.
+async fn wait_for_tagmsg(rx: &mut mpsc::Receiver<Event>, tag: &str, within: Duration) -> bool {
+    timeout(within, async {
+        loop {
+            match rx.recv().await {
+                Some(Event::TagMsg { tags, .. }) if tags.contains_key(tag) => return true,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 // ── a mutation TAGMSG's signature tag crosses the hop byte-identical ─────
@@ -1556,13 +1718,11 @@ async fn a_dm_reaches_the_senders_own_session_on_the_receiving_server() {
          sent from the other one"
     );
 
-    // A reaction crosses as its own event and needs the same fan-out.
-    ha.raw(&format!(
-        "@+react=\u{1F44D};+reply={msgid} TAGMSG {}",
-        bob.did
-    ))
-    .await
-    .unwrap();
+    // A reaction crosses as its own event and needs the same fan-out. Sent
+    // through the client rather than as a raw line, because a reaction names
+    // the message it acts on and therefore has to carry the reactor's
+    // signature — a raw line skips the one place that signs it.
+    ha.react(&bob.did, "\u{1F44D}", &msgid).await.unwrap();
 
     assert!(saw_reaction(&mut rxb).await, "bob never saw the reaction");
     assert!(

@@ -53,7 +53,7 @@ interface Negative {
 
 const spec = JSON.parse(
   readFileSync(join(__dirname, '../../spec/chat-signing-vectors.json'), 'utf8'),
-) as { vectors: Vector[]; negatives: Negative[] };
+) as { vectors: Vector[]; negatives: Negative[]; coordRule: string };
 
 beforeAll(() => {
   Object.defineProperty(globalThis, 'crypto', {
@@ -185,6 +185,44 @@ describe('chat signing vectors', () => {
     const [a, b] = dm.input.dmParticipants!;
     expect(signing.dmVenue(a!, b!)).toBe(dm.input.target);
     expect(signing.dmVenue(b!, a!)).toBe(dm.input.target);
+  });
+
+  // The covered list, named one by one, on this side of the contract too.
+  // The set is append-only forever in both languages at once: a document
+  // canonicalizes the tags it carries *from this list*, so dropping a name
+  // changes the bytes of every signature already made over a message that
+  // carried it. Comparing the constant to itself, or counting it, would pass
+  // through the one edit that matters — hence the literal names, which must
+  // equal the Rust list in `chatsig.rs`.
+  it('covers exactly these tag names', () => {
+    expect([...signing.COVERED_COORD_TAGS]).toEqual([
+      'event',
+      'evidence-type',
+      'link-desc',
+      'link-image',
+      'link-title',
+      'link-url',
+      'media-alt',
+      'media-blurhash',
+      'media-duration',
+      'media-filename',
+      'media-h',
+      'media-mime',
+      'media-size',
+      'media-url',
+      'media-w',
+      'payload',
+      'ref',
+      'task-id',
+    ]);
+  });
+
+  // …and the fixture states the same set in prose, so a reader of the spec
+  // and a reader of the code cannot be told different things.
+  it('states the same set in the fixture rule text', () => {
+    for (const name of signing.COVERED_COORD_TAGS) {
+      expect(spec.coordRule).toContain(name);
+    }
   });
 
   it('mints event ids a server will accept: ULID shape, current time', () => {
