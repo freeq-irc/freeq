@@ -191,6 +191,26 @@ pub(super) fn gate(
 
     // ── The id the signature covers ──
     //
+    // Demanded before the signature is checked, because the signature covers
+    // the id: with none on the wire there is no document to rebuild, and
+    // saying "your signature is wrong" about a document the sender never
+    // built would send them after the wrong problem.
+    if !tags.contains_key(freeq_sdk::chatsig::EVENT_ID_TAG)
+        && !tags.contains_key(freeq_sdk::chatsig::EVENT_ID_TAG_BARE)
+    {
+        tracing::debug!(
+            session = %conn.id, did = %did, target = %target,
+            "Refused a task message that carries no event id"
+        );
+        refuse(
+            conn,
+            "TAGMSG",
+            "EVENTID_REQUIRED",
+            "A task message must carry its sender's event id",
+            state,
+        );
+        return Gate::Refused;
+    }
     // Adopted through the same checks every signed event's id passes: well
     // formed, near our clock, not already taken, and only from an
     // authenticated sender.
@@ -201,6 +221,32 @@ pub(super) fn gate(
             return Gate::Refused;
         }
     };
+
+    // ── The actor it names ──
+    //
+    // The signature establishes who sent the message; `act-from` claims who
+    // acted. A message where those differ is either a mistake or an attempt
+    // to file an event under someone else's name, and neither is worth
+    // relaying. Checked before the signature because it is decidable without
+    // one, and the answer is more useful than a signature complaint.
+    if let Some(actor) = tags
+        .get("+freeq.at/act-from")
+        .or_else(|| tags.get("act-from"))
+        && actor != did
+    {
+        tracing::warn!(
+            session = %conn.id, did = %did, actor = %actor, target = %target,
+            "Refused a task message naming another actor than its sender"
+        );
+        refuse(
+            conn,
+            "TAGMSG",
+            "AUTHOR_MISMATCH",
+            "That message names someone else as its actor",
+            state,
+        );
+        return Gate::Refused;
+    }
 
     // ── The signature ──
     let Some(sig_tag) = tags

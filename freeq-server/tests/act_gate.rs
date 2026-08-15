@@ -416,6 +416,50 @@ async fn a_task_message_to_someone_without_an_account_is_refused() {
     .await;
 }
 
+#[tokio::test]
+async fn a_task_message_naming_someone_else_as_its_actor_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        // A correctly signed message whose act-from names somebody else. The
+        // signature proves who sent it; act-from claims who acted, and the
+        // two have to be the same person.
+        let mut tags = offer_tags();
+        tags[2].1 = DID_BOB.into();
+        a.tx(&signed_line(&tags, "#ops", &fresh_id(), &signing));
+        assert_eq!(a.fail_code(), "AUTHOR_MISMATCH");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_task_message_without_an_event_id_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        // The signature covers the id, so without one there is nothing to
+        // rebuild — and the sender should hear that rather than a signature
+        // complaint about a document it never built.
+        let tags = offer_tags();
+        let venue = channel_venue("#ops");
+        let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let sig = freeq_sdk::act::sign_act(pairs, &venue, &fresh_id(), &signing).unwrap();
+        let mut wire: Vec<String> = tags.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        wire.push(format!("+freeq.at/sig={sig}"));
+        a.tx(&format!("@{} TAGMSG #ops", wire.join(";")));
+        assert_eq!(a.fail_code(), "EVENTID_REQUIRED");
+    })
+    .await;
+}
+
 // ── one message, one job ────────────────────────────────────────────────────
 
 #[tokio::test]
