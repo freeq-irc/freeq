@@ -5746,6 +5746,19 @@ impl Db {
         rows.collect()
     }
 
+    /// Every venue that currently holds a live task.
+    ///
+    /// The listing endpoint runs each of these through the same authorization
+    /// a channel read gets, so the answer is bounded by what the caller may
+    /// already see rather than by a second, parallel rule.
+    pub fn act_venues(&self) -> SqlResult<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT venue FROM act_actions ORDER BY venue")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect()
+    }
+
     /// The task events stored for one venue, in time order.
     ///
     /// What replay emits. Bounded by the same window and limit the message
