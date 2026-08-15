@@ -15,9 +15,10 @@
 //! reach the same verdict the server will.
 //!
 //! What is *not* here: whether the signature checked out, whether the sender
-//! is a channel operator, and where a sender's declared capabilities come
-//! from. Those are the caller's to establish; this module answers one
-//! question, about one event, given what the caller already knows.
+//! is a channel operator, and whether anyone's declared capabilities suit the
+//! work — that last one by ruling, not omission: `act-caps` is a hint to store
+//! and filter on, never a gate. This module answers one question, about one
+//! event, given what the caller already knows.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -55,8 +56,6 @@ pub enum Refusal {
     IllegalStep,
     /// The sender does not hold the role the transition requires.
     WrongSender,
-    /// The sender's declared capabilities do not cover the task's.
-    CapsMismatch,
     /// The event was minted past the offer's deadline, beyond the tolerance.
     DeadlinePassed,
 }
@@ -71,7 +70,6 @@ impl Refusal {
             Refusal::TerminalTask => "terminal-task",
             Refusal::IllegalStep => "illegal-step",
             Refusal::WrongSender => "wrong-sender",
-            Refusal::CapsMismatch => "caps-mismatch",
             Refusal::DeadlinePassed => "deadline-passed",
         }
     }
@@ -96,9 +94,12 @@ impl std::error::Error for Refusal {}
 
 /// A task as the caller currently understands it.
 ///
-/// `assignee` is empty until somebody accepts or claims; `caps` is what the
-/// offer asked for, and `deadline` is its `act-deadline` in unix seconds, both
-/// empty when the offer named none.
+/// `assignee` is empty until somebody accepts or claims, and `deadline` is the
+/// offer's `act-deadline` in unix seconds, empty when it named none.
+///
+/// No capabilities here: `act-caps` is a self-declared hint the server stores,
+/// relays and can filter on, never a gate. A claim is open to any logged-in
+/// sender and the first valid one wins.
 #[derive(Debug, Clone)]
 pub struct Task<'a> {
     pub kind: &'a str,
@@ -106,7 +107,6 @@ pub struct Task<'a> {
     pub offerer: &'a str,
     pub offeree: Option<&'a str>,
     pub assignee: Option<&'a str>,
-    pub caps: &'a [&'a str],
     pub deadline: Option<i64>,
 }
 
@@ -124,9 +124,6 @@ pub struct Event<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct Sender<'a> {
     pub did: &'a str,
-    /// The capabilities this sender declares. Where they come from is the
-    /// caller's business.
-    pub caps: &'a [&'a str],
     /// The server itself, signing under its own identity — the only actor a
     /// `system` transition allows.
     pub is_system: bool,
@@ -268,10 +265,9 @@ pub fn check(
         "offeree" if task.offeree != Some(sender.did) => return Err(Refusal::WrongSender),
         "assignee" if task.assignee != Some(sender.did) => return Err(Refusal::WrongSender),
         "system" if !sender.is_system => return Err(Refusal::WrongSender),
-        "caps_match" if !task.caps.iter().all(|c| sender.caps.contains(c)) => {
-            return Err(Refusal::CapsMismatch);
-        }
-        "offerer" | "offeree" | "assignee" | "system" | "caps_match" => {}
+        // `anyone` is a real answer, not a missing check: an open post is
+        // claimable by any logged-in sender, first valid one wins.
+        "offerer" | "offeree" | "assignee" | "system" | "anyone" => {}
         // A role this checker does not implement grants nothing. Refusing
         // beats waving through a rule we cannot enforce.
         _ => return Err(Refusal::WrongSender),
@@ -388,7 +384,6 @@ mod tests {
             offerer: ELIZA,
             offeree: Some(SCHOLAR),
             assignee: None,
-            caps: &[],
             deadline: None,
         }
     }
@@ -400,7 +395,6 @@ mod tests {
     fn who(did: &'static str) -> Sender<'static> {
         Sender {
             did,
-            caps: &[],
             is_system: false,
         }
     }
@@ -542,7 +536,6 @@ mod tests {
             Refusal::TerminalTask,
             Refusal::IllegalStep,
             Refusal::WrongSender,
-            Refusal::CapsMismatch,
             Refusal::DeadlinePassed,
         ] {
             assert!(
@@ -558,7 +551,7 @@ mod tests {
     /// read as a broken kind rather than a typo. Catch it here instead.
     #[test]
     fn every_who_value_in_the_file_is_a_role_the_checker_knows() {
-        const ROLES: [&str; 5] = ["offerer", "offeree", "assignee", "caps_match", "system"];
+        const ROLES: [&str; 5] = ["offerer", "offeree", "assignee", "anyone", "system"];
         for (name, kind) in &spec().kinds {
             for t in &kind.transitions {
                 assert!(
@@ -667,7 +660,6 @@ mod tests {
         );
         let system = Sender {
             did: SERVER,
-            caps: &[],
             is_system: true,
         };
         assert_eq!(
@@ -721,7 +713,6 @@ mod tests {
             );
             let system = Sender {
                 did: SERVER,
-                caps: &[],
                 is_system: true,
             };
             assert_eq!(
@@ -759,59 +750,68 @@ mod tests {
 
     // ── capabilities ────────────────────────────────────────────────────────
 
-    fn open_task(caps: &'static [&'static str]) -> Task<'static> {
+    fn open_task() -> Task<'static> {
         Task {
             kind: "handoff",
             state: "open",
             offerer: ELIZA,
             offeree: None,
             assignee: None,
-            caps,
             deadline: None,
         }
     }
 
+    /// Ruled: capabilities are a self-declared hint, never a gate. An open
+    /// post is claimable by any logged-in sender, and the first valid claim
+    /// wins — there is no capability check and no refusal for failing one.
     #[test]
-    fn a_claim_needs_every_capability_the_task_asked_for() {
-        let task = open_task(&["freeq.at/log-analysis", "freeq.at/web-search"]);
-        let short = Sender {
-            did: MALLORY,
-            caps: &["freeq.at/log-analysis"],
-            is_system: false,
-        };
-        assert_eq!(
-            check(&task, &ev("claim"), &short),
-            Err(Refusal::CapsMismatch)
-        );
-
-        let full = Sender {
-            did: SCHOLAR,
-            caps: &[
-                "freeq.at/web-search",
-                "freeq.at/log-analysis",
-                "freeq.at/spare",
-            ],
-            is_system: false,
-        };
-        assert_eq!(check(&task, &ev("claim"), &full), Ok("assigned"));
+    fn an_open_post_is_claimable_by_any_logged_in_sender() {
+        for did in [SCHOLAR, MALLORY, "did:plc:nobody"] {
+            assert_eq!(
+                check(&open_task(), &ev("claim"), &who(did)),
+                Ok("assigned"),
+                "{did}"
+            );
+        }
     }
 
+    /// The offerer may withdraw an open post nobody took. Without this row a
+    /// mistaken post stayed claimable until the expiry sweep reached it.
     #[test]
-    fn an_open_task_asking_for_nothing_is_claimable_by_anyone() {
+    fn the_offerer_may_withdraw_an_open_post() {
         assert_eq!(
-            check(&open_task(&[]), &ev("claim"), &who(MALLORY)),
-            Ok("assigned")
+            check(&open_task(), &ev("cancel"), &who(ELIZA)),
+            Ok("cancelled")
         );
     }
 
+    /// …and only the offerer. Cancelling is the poster's act from every live
+    /// state, open included.
     #[test]
-    fn a_missing_capability_reads_as_caps_mismatch_not_wrong_sender() {
-        // The two are different problems: one is "declare more", the other is
-        // "this was never yours".
-        let task = open_task(&["freeq.at/log-analysis"]);
+    fn an_open_post_is_not_anyone_elses_to_withdraw() {
+        for did in [SCHOLAR, MALLORY] {
+            assert_eq!(
+                check(&open_task(), &ev("cancel"), &who(did)),
+                Err(Refusal::WrongSender),
+                "{did}"
+            );
+        }
+    }
+
+    /// Cancel now reaches every live state the kind has.
+    #[test]
+    fn cancel_is_legal_from_every_live_state() {
         assert_eq!(
-            check(&task, &ev("claim"), &who(MALLORY)),
-            Err(Refusal::CapsMismatch)
+            check(&directed("offered"), &ev("cancel"), &who(ELIZA)),
+            Ok("cancelled")
+        );
+        assert_eq!(
+            check(&directed("assigned"), &ev("cancel"), &who(ELIZA)),
+            Ok("cancelled")
+        );
+        assert_eq!(
+            check(&open_task(), &ev("cancel"), &who(ELIZA)),
+            Ok("cancelled")
         );
     }
 
@@ -858,6 +858,35 @@ mod tests {
             };
             assert_eq!(
                 check(&with_deadline(), &e, &who(SCHOLAR)),
+                Ok("assigned"),
+                "{id}"
+            );
+        }
+    }
+
+    /// A deadline bounds how long the offer stands, whichever way it was
+    /// taken up — the directed path and the open one alike.
+    #[test]
+    fn a_claim_is_deadline_bound_exactly_as_an_accept_is() {
+        let open_with_deadline = Task {
+            deadline: Some(DEADLINE),
+            ..open_task()
+        };
+        let late = Event {
+            verb: "claim",
+            msgid: TOO_LATE,
+        };
+        assert_eq!(
+            check(&open_with_deadline, &late, &who(SCHOLAR)),
+            Err(Refusal::DeadlinePassed)
+        );
+        for id in [IN_TIME, AT_EDGE] {
+            let e = Event {
+                verb: "claim",
+                msgid: id,
+            };
+            assert_eq!(
+                check(&open_with_deadline, &e, &who(SCHOLAR)),
                 Ok("assigned"),
                 "{id}"
             );
@@ -934,7 +963,6 @@ mod tests {
         state: Option<String>,
         offerer: String,
         offeree: Option<String>,
-        caps: Vec<String>,
         deadline: Option<i64>,
     }
 
@@ -942,8 +970,6 @@ mod tests {
     struct SeqStep {
         verb: String,
         sender: String,
-        #[serde(default)]
-        sender_caps: Vec<String>,
         event_id: Option<String>,
         #[serde(default)]
         system: bool,
@@ -969,17 +995,14 @@ mod tests {
                 .to_string(),
         };
         let mut assignee: Option<String> = None;
-        let caps: Vec<&str> = seq.task.caps.iter().map(String::as_str).collect();
 
         for (i, step) in seq.steps.iter().enumerate() {
-            let sender_caps: Vec<&str> = step.sender_caps.iter().map(String::as_str).collect();
             let task = Task {
                 kind: &seq.task.kind,
                 state: &state,
                 offerer: &seq.task.offerer,
                 offeree: seq.task.offeree.as_deref(),
                 assignee: assignee.as_deref(),
-                caps: &caps,
                 deadline: seq.task.deadline,
             };
             let event = Event {
@@ -988,7 +1011,6 @@ mod tests {
             };
             let sender = Sender {
                 did: &step.sender,
-                caps: &sender_caps,
                 is_system: step.system,
             };
             let where_ = format!("{} — step {} ({})", seq.name, i + 1, step.verb);

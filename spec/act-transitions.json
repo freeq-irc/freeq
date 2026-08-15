@@ -10,8 +10,9 @@
     "that already exists; without `opens` a server would refuse the one message that starts everything.",
     "Any logged-in sender may open, so an opener has no `who`: opening is what makes the sender the offerer.",
     "An opener carries no act-id — its own event id is the task's id — so one that names a task is an illegal step.",
-    "`who` names the role a sender must hold: offerer, offeree, assignee, caps_match (declared capabilities cover",
-    "the task's), or system (the server itself — expiry only). `from` is one state, a list of states, or",
+    "`who` names the role a sender must hold: offerer, offeree, assignee, anyone (any logged-in sender), or",
+    "system (the server itself — expiry only). act-caps is a self-declared hint — stored, filterable, signed,",
+    "never checked here. `from` is one state, a list of states, or",
     "`*nonterminal` for every state that is not terminal. `before_deadline` is data; the comparison is code."
   ],
   "version": 1,
@@ -22,11 +23,11 @@
       "transitions": [
         { "verb": "accept", "from": "offered", "to": "assigned", "who": "offeree", "before_deadline": true },
         { "verb": "decline", "from": "offered", "to": "declined", "who": "offeree" },
-        { "verb": "claim", "from": "open", "to": "assigned", "who": "caps_match" },
+        { "verb": "claim", "from": "open", "to": "assigned", "who": "anyone", "before_deadline": true },
         { "verb": "progress", "from": "assigned", "to": "assigned", "who": "assignee" },
         { "verb": "complete", "from": "assigned", "to": "completed", "who": "assignee" },
         { "verb": "fail", "from": "assigned", "to": "failed", "who": "assignee" },
-        { "verb": "cancel", "from": ["offered", "assigned"], "to": "cancelled", "who": "offerer" },
+        { "verb": "cancel", "from": ["offered", "assigned", "open"], "to": "cancelled", "who": "offerer" },
         { "verb": "expire", "from": "*nonterminal", "to": "expired", "who": "system" }
       ]
     }
@@ -37,7 +38,6 @@
     "terminal-task": "The task is finished. A later event never un-applies an earlier one.",
     "illegal-step": "The verb is not legal from the task's current state.",
     "wrong-sender": "The sender does not hold the role this transition requires.",
-    "caps-mismatch": "The sender's declared capabilities do not cover the task's.",
     "deadline-passed": "The event was minted after the offer's deadline, beyond the clock tolerance."
   },
   "deadline_rule": {
@@ -101,7 +101,6 @@
         "offer": "directed",
         "offerer": "did:plc:eliza",
         "offeree": "did:plc:scholar",
-        "caps": [],
         "deadline": null
       },
       "steps": [
@@ -118,43 +117,85 @@
         "offer": "directed",
         "offerer": "did:plc:eliza",
         "offeree": "did:plc:scholar",
-        "caps": [],
         "deadline": null
       },
       "steps": [{ "verb": "decline", "sender": "did:plc:scholar", "expect": "declined" }]
     },
     {
-      "name": "an open offer is claimed by a capable agent, then fails",
+      "name": "an open offer is claimed, then fails",
       "task": {
         "kind": "handoff",
         "offer": "open",
         "offerer": "did:plc:eliza",
         "offeree": null,
-        "caps": ["freeq.at/log-analysis"],
         "deadline": null
       },
       "steps": [
-        {
-          "verb": "claim",
-          "sender": "did:plc:scholar",
-          "sender_caps": ["freeq.at/log-analysis", "freeq.at/web-search"],
-          "expect": "assigned"
-        },
+        { "verb": "claim", "sender": "did:plc:scholar", "expect": "assigned" },
         { "verb": "progress", "sender": "did:plc:scholar", "expect": "assigned" },
         { "verb": "fail", "sender": "did:plc:scholar", "expect": "failed" }
       ]
     },
     {
-      "name": "an open offer with no required capabilities is claimable by anyone",
+      "name": "an open offer is claimable by any logged-in sender",
       "task": {
         "kind": "handoff",
         "offer": "open",
         "offerer": "did:plc:eliza",
         "offeree": null,
-        "caps": [],
         "deadline": null
       },
       "steps": [{ "verb": "claim", "sender": "did:plc:nobody", "expect": "assigned" }]
+    },
+    {
+      "name": "the offerer withdraws an open post nobody claimed",
+      "task": {
+        "kind": "handoff",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "deadline": null
+      },
+      "steps": [{ "verb": "cancel", "sender": "did:plc:eliza", "expect": "cancelled" }]
+    },
+    {
+      "name": "an open post is not anyone else's to withdraw",
+      "task": {
+        "kind": "handoff",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "cancel", "sender": "did:plc:mallory", "expect_refused": "wrong-sender" },
+        { "verb": "cancel", "sender": "did:plc:scholar", "expect_refused": "wrong-sender" },
+        { "verb": "claim", "sender": "did:plc:scholar", "expect": "assigned" }
+      ]
+    },
+    {
+      "name": "a claim after the deadline is refused, exactly as an accept is",
+      "task": {
+        "kind": "handoff",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "deadline": 1788000000
+      },
+      "steps": [
+        {
+          "verb": "claim",
+          "sender": "did:plc:scholar",
+          "event_id": "01M16HSC58ACCEPTTOOLATE000",
+          "expect_refused": "deadline-passed"
+        },
+        {
+          "verb": "claim",
+          "sender": "did:plc:scholar",
+          "event_id": "01M16HSB60ACCEPTATEDGE0000",
+          "expect": "assigned"
+        }
+      ]
     },
     {
       "name": "the offerer cancels an offer nobody took",
@@ -163,7 +204,6 @@
         "offer": "directed",
         "offerer": "did:plc:eliza",
         "offeree": "did:plc:scholar",
-        "caps": [],
         "deadline": null
       },
       "steps": [{ "verb": "cancel", "sender": "did:plc:eliza", "expect": "cancelled" }]
@@ -175,7 +215,6 @@
         "offer": "directed",
         "offerer": "did:plc:eliza",
         "offeree": "did:plc:scholar",
-        "caps": [],
         "deadline": null
       },
       "steps": [
@@ -190,7 +229,6 @@
         "offer": "directed",
         "offerer": "did:plc:eliza",
         "offeree": "did:plc:scholar",
-        "caps": [],
         "deadline": null
       },
       "steps": [
@@ -205,7 +243,6 @@
         "offer": "open",
         "offerer": "did:plc:eliza",
         "offeree": null,
-        "caps": [],
         "deadline": null
       },
       "steps": [
@@ -219,7 +256,6 @@
         "offer": "directed",
         "offerer": "did:plc:eliza",
         "offeree": "did:plc:scholar",
-        "caps": [],
         "deadline": 1788000000
       },
       "steps": [
@@ -238,7 +274,6 @@
         "offer": "directed",
         "offerer": "did:plc:eliza",
         "offeree": "did:plc:scholar",
-        "caps": [],
         "deadline": 1788000000
       },
       "steps": [
@@ -257,7 +292,6 @@
         "offer": "directed",
         "offerer": "did:plc:eliza",
         "offeree": "did:plc:scholar",
-        "caps": [],
         "deadline": 1788000000
       },
       "steps": [
@@ -282,7 +316,6 @@
         "offer": "directed",
         "offerer": "did:plc:eliza",
         "offeree": "did:plc:scholar",
-        "caps": [],
         "deadline": null
       },
       "steps": [
@@ -298,7 +331,6 @@
         "offer": "directed",
         "offerer": "did:plc:eliza",
         "offeree": "did:plc:scholar",
-        "caps": [],
         "deadline": null
       },
       "steps": [
@@ -316,7 +348,6 @@
         "offer": "directed",
         "offerer": "did:plc:eliza",
         "offeree": "did:plc:scholar",
-        "caps": [],
         "deadline": null
       },
       "steps": [
@@ -331,7 +362,6 @@
         "offer": "directed",
         "offerer": "did:plc:eliza",
         "offeree": "did:plc:scholar",
-        "caps": [],
         "deadline": null
       },
       "steps": [
@@ -346,14 +376,12 @@
         "offer": "directed",
         "offerer": "did:plc:eliza",
         "offeree": "did:plc:scholar",
-        "caps": [],
         "deadline": null
       },
       "steps": [
         {
           "verb": "claim",
           "sender": "did:plc:mallory",
-          "sender_caps": ["freeq.at/web-search"],
           "expect_refused": "illegal-step"
         }
       ]
@@ -365,7 +393,6 @@
         "offer": "open",
         "offerer": "did:plc:eliza",
         "offeree": null,
-        "caps": [],
         "deadline": null
       },
       "steps": [
@@ -380,7 +407,6 @@
         "offer": "directed",
         "offerer": "did:plc:eliza",
         "offeree": "did:plc:scholar",
-        "caps": [],
         "deadline": null
       },
       "steps": [
@@ -395,7 +421,6 @@
         "offer": "directed",
         "offerer": "did:plc:eliza",
         "offeree": "did:plc:scholar",
-        "caps": [],
         "deadline": null
       },
       "steps": [
@@ -410,20 +435,17 @@
         "offer": "open",
         "offerer": "did:plc:eliza",
         "offeree": null,
-        "caps": ["freeq.at/log-analysis"],
         "deadline": null
       },
       "steps": [
         {
           "verb": "claim",
           "sender": "did:plc:scholar",
-          "sender_caps": ["freeq.at/log-analysis"],
           "expect": "assigned"
         },
         {
           "verb": "claim",
           "sender": "did:plc:rival",
-          "sender_caps": ["freeq.at/log-analysis"],
           "expect_refused": "illegal-step"
         }
       ]
@@ -435,7 +457,6 @@
         "offer": "directed",
         "offerer": "did:plc:eliza",
         "offeree": "did:plc:scholar",
-        "caps": [],
         "deadline": null
       },
       "steps": [
@@ -458,63 +479,11 @@
         "offer": "directed",
         "offerer": "did:plc:eliza",
         "offeree": "did:plc:scholar",
-        "caps": [],
         "deadline": null
       },
       "steps": [
         { "verb": "decline", "sender": "did:plc:scholar", "expect": "declined" },
         { "verb": "accept", "sender": "did:plc:scholar", "expect_refused": "terminal-task" }
-      ]
-    },
-    {
-      "name": "a claim without the declared capabilities is refused",
-      "task": {
-        "kind": "handoff",
-        "offer": "open",
-        "offerer": "did:plc:eliza",
-        "offeree": null,
-        "caps": ["freeq.at/log-analysis"],
-        "deadline": null
-      },
-      "steps": [
-        { "verb": "claim", "sender": "did:plc:mallory", "expect_refused": "caps-mismatch" },
-        {
-          "verb": "claim",
-          "sender": "did:plc:mallory",
-          "sender_caps": ["freeq.at/web-search"],
-          "expect_refused": "caps-mismatch"
-        },
-        {
-          "verb": "claim",
-          "sender": "did:plc:scholar",
-          "sender_caps": ["freeq.at/log-analysis"],
-          "expect": "assigned"
-        }
-      ]
-    },
-    {
-      "name": "a claim must cover every capability the task asks for, not just one",
-      "task": {
-        "kind": "handoff",
-        "offer": "open",
-        "offerer": "did:plc:eliza",
-        "offeree": null,
-        "caps": ["freeq.at/log-analysis", "freeq.at/web-search"],
-        "deadline": null
-      },
-      "steps": [
-        {
-          "verb": "claim",
-          "sender": "did:plc:mallory",
-          "sender_caps": ["freeq.at/log-analysis"],
-          "expect_refused": "caps-mismatch"
-        },
-        {
-          "verb": "claim",
-          "sender": "did:plc:scholar",
-          "sender_caps": ["freeq.at/web-search", "freeq.at/log-analysis"],
-          "expect": "assigned"
-        }
       ]
     },
     {
@@ -524,7 +493,6 @@
         "offer": "open",
         "offerer": "did:plc:eliza",
         "offeree": null,
-        "caps": [],
         "deadline": null
       },
       "steps": [
@@ -540,7 +508,6 @@
         "state": "open",
         "offerer": "did:plc:eliza",
         "offeree": null,
-        "caps": [],
         "deadline": null
       },
       "steps": [

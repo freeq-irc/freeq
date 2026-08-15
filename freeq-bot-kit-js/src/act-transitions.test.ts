@@ -31,7 +31,6 @@ const canonical = JSON.parse(readFileSync(canonicalPath, "utf8"));
 interface Step {
   verb: string;
   sender: string;
-  sender_caps?: string[];
   event_id?: string;
   system?: boolean;
   expect?: string;
@@ -46,7 +45,6 @@ interface Sequence {
     state?: string;
     offerer: string;
     offeree: string | null;
-    caps: string[];
     deadline: number | null;
   };
   steps: Step[];
@@ -277,39 +275,46 @@ describe("refusals", () => {
   });
 });
 
-describe("capabilities", () => {
-  const openTask = (caps: string[]): Task => ({
+describe("claiming an open post", () => {
+  const openTask = (): Task => ({
     kind: "handoff",
     state: "open",
     offerer: ELIZA,
     offeree: null,
-    caps,
   });
 
-  it("a claim needs every capability the task asked for", () => {
-    const task = openTask(["freeq.at/log-analysis", "freeq.at/web-search"]);
-    expect(
-      checkTransition(task, ev("claim"), { did: MALLORY, caps: ["freeq.at/log-analysis"] }),
-    ).toEqual({ ok: false, reason: "caps-mismatch" });
-    expect(
-      checkTransition(task, ev("claim"), {
-        did: SCHOLAR,
-        caps: ["freeq.at/web-search", "freeq.at/log-analysis", "freeq.at/spare"],
-      }),
-    ).toEqual({ ok: true, to: "assigned" });
+  // Ruled: act-caps is a self-declared hint, never a gate. There is no
+  // capability check and no refusal for failing one.
+  it("is open to any logged-in sender, first valid claim wins", () => {
+    for (const did of [SCHOLAR, MALLORY, "did:plc:nobody"]) {
+      expect(checkTransition(openTask(), ev("claim"), who(did)), did).toEqual({
+        ok: true,
+        to: "assigned",
+      });
+    }
   });
 
-  it("an open task asking for nothing is claimable by anyone", () => {
-    expect(checkTransition(openTask([]), ev("claim"), who(MALLORY))).toEqual({
+  it("lets the offerer withdraw an open post, and nobody else", () => {
+    expect(checkTransition(openTask(), ev("cancel"), who(ELIZA))).toEqual({
       ok: true,
-      to: "assigned",
+      to: "cancelled",
     });
+    for (const did of [SCHOLAR, MALLORY]) {
+      expect(checkTransition(openTask(), ev("cancel"), who(did)), did).toEqual({
+        ok: false,
+        reason: "wrong-sender",
+      });
+    }
   });
 
-  it("a missing capability reads as caps-mismatch, not wrong-sender", () => {
+  it("binds a claim to the deadline exactly as an accept is bound", () => {
+    const withDeadline: Task = { ...openTask(), deadline: 1_788_000_000 };
     expect(
-      checkTransition(openTask(["freeq.at/log-analysis"]), ev("claim"), who(MALLORY)),
-    ).toEqual({ ok: false, reason: "caps-mismatch" });
+      checkTransition(withDeadline, { verb: "claim", msgid: "01M16HSC58ACCEPTTOOLATE000" }, who(SCHOLAR)),
+    ).toEqual({ ok: false, reason: "deadline-passed" });
+    expect(
+      checkTransition(withDeadline, { verb: "claim", msgid: "01M16HSB60ACCEPTATEDGE0000" }, who(SCHOLAR)),
+    ).toEqual({ ok: true, to: "assigned" });
   });
 });
 
@@ -382,13 +387,12 @@ describe("the shared sequences", () => {
           offerer: seq.task.offerer,
           offeree: seq.task.offeree,
           assignee,
-          caps: seq.task.caps,
           deadline: seq.task.deadline,
         };
         const result = checkTransition(
           task,
           { verb: step.verb, msgid: step.event_id ?? NOW },
-          { did: step.sender, caps: step.sender_caps ?? [], isSystem: step.system ?? false },
+          { did: step.sender, isSystem: step.system ?? false },
         );
         const where = `${seq.name} — step ${i + 1} (${step.verb})`;
 

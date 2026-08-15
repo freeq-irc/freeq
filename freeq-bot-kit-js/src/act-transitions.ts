@@ -8,8 +8,9 @@
 // same verdict the server will.
 //
 // What is not here: whether the signature checked out, whether the sender is
-// a channel operator, and where a sender's declared capabilities come from.
-// Those are the caller's to establish.
+// a channel operator, and whether anyone's declared capabilities suit the work
+// — that last one by ruling, not omission: act-caps is a hint to store and
+// filter on, never a gate.
 
 import spec from "./act-transitions.json";
 
@@ -25,7 +26,6 @@ export type RefusalReason =
   | "terminal-task"
   | "illegal-step"
   | "wrong-sender"
-  | "caps-mismatch"
   | "deadline-passed";
 
 /** Allowed, with the state the task lands in — or refused, with the reason. */
@@ -40,8 +40,6 @@ export interface Task {
   offeree?: string | null;
   /** Empty until somebody accepts or claims. */
   assignee?: string | null;
-  /** What the offer asked for. */
-  caps?: string[];
   /** `act-deadline`, unix seconds. */
   deadline?: number | null;
 }
@@ -57,8 +55,6 @@ export interface TaskEvent {
 /** Who sent it. */
 export interface EventSender {
   did: string;
-  /** The capabilities this sender declares. */
-  caps?: string[];
   /** The server itself — the only actor a `system` transition allows. */
   isSystem?: boolean;
 }
@@ -196,8 +192,6 @@ export function checkTransition(
 
   // Authority second: who the sender is only matters once the move itself
   // makes sense.
-  const taskCaps = task.caps ?? [];
-  const senderCaps = sender.caps ?? [];
   switch (row.who) {
     case "offerer":
       if (sender.did !== task.offerer) return { ok: false, reason: "wrong-sender" };
@@ -213,9 +207,9 @@ export function checkTransition(
     case "system":
       if (!sender.isSystem) return { ok: false, reason: "wrong-sender" };
       break;
-    case "caps_match":
-      if (!taskCaps.every((c) => senderCaps.includes(c)))
-        return { ok: false, reason: "caps-mismatch" };
+    // `anyone` is a real answer, not a missing check: an open post is
+    // claimable by any logged-in sender, first valid one wins.
+    case "anyone":
       break;
     // A role this checker does not implement grants nothing. Refusing beats
     // waving through a rule we cannot enforce.
