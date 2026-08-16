@@ -147,9 +147,9 @@ impl C {
     }
 
     fn maybe(&mut self, p: impl Fn(&str) -> bool, ms: u64) -> Option<String> {
-        // The timeout has to go on the fd this reads from. Setting it on a
-        // clone of the writer changes nothing about the read, which is how
-        // this quietly kept its 5-second default.
+        // Set the read timeout on the reader's own fd. Setting it on a writer
+        // clone also works — both fds dup the same socket, and the timeout is a
+        // socket property — but reading from the fd we set it on is clearer.
         self.reader
             .get_ref()
             .set_read_timeout(Some(Duration::from_millis(ms)))
@@ -1071,7 +1071,7 @@ async fn an_abandoned_task_expires_and_the_room_is_told() {
         a.join("#ops");
 
         let id = fresh_id();
-        let mut tags = offer_tags();
+        let tags = offer_tags();
         a.tx(&signed_line(&tags, "#ops", &id, &signing));
         a.rx(|l| l.contains(&id), "the offer");
 
@@ -1084,6 +1084,66 @@ async fn an_abandoned_task_expires_and_the_room_is_told() {
         assert!(
             notice.ends_with("Task expired without completion: review-the-deploy"),
             "the approved sentence, with the offer's own title: {notice}"
+        );
+    })
+    .await;
+}
+
+/// The notice carries a title its sender chose, so the title cannot be allowed
+/// to end the line. A title holding a whole second IRC line must arrive as text
+/// inside the one notice, never as a line of its own.
+#[tokio::test]
+async fn a_title_cannot_put_a_second_line_on_the_wire() {
+    let k = key();
+    let (addr, _h) = start_with_expiry(resolver_with(vec![(DID_ALICE, &k)]), 1).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+
+        // A real CRLF and a complete IRC line, signed by the offerer like any
+        // other title — the signature is no obstacle to its own author.
+        let mut tags = offer_tags();
+        tags[4].1 = "done\r\n:ghost!g@g PRIVMSG #ops :forged".into();
+        let id = fresh_id();
+        let venue = channel_venue("#ops");
+        let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let sig = freeq_sdk::act::sign_act(pairs, &venue, &id, &signing).expect("act tags present");
+        // The control bytes ride the wire escaped, as the tag encoding requires;
+        // the server unescapes them back to the bytes the signature covers.
+        let mut wire: Vec<String> = tags
+            .iter()
+            .map(|(k, v)| {
+                let escaped = v
+                    .replace('\\', "\\\\")
+                    .replace(';', "\\:")
+                    .replace(' ', "\\s")
+                    .replace('\r', "\\r")
+                    .replace('\n', "\\n");
+                format!("{k}={escaped}")
+            })
+            .collect();
+        wire.push(format!("{EVENT_ID_TAG}={id}"));
+        wire.push(format!("+freeq.at/sig={sig}"));
+        a.tx(&format!("@{} TAGMSG #ops", wire.join(";")));
+        a.rx(|l| l.contains(&id), "the offer");
+
+        let notice = a
+            .maybe(|l| l.contains("Task expired"), 90_000)
+            .expect("the room hears about the expiry");
+        // The line the author wrote is still there — as text, inside the one
+        // notice, its line break gone. That is the whole property: a title can
+        // say anything, and none of it can become a line.
+        assert_eq!(
+            notice,
+            ":test-act NOTICE #ops :Task expired without completion: \
+             done:ghost!g@g PRIVMSG #ops :forged",
+            "the title arrives as inert text on the approved sentence"
+        );
+        assert!(
+            a.maybe(|l| l.contains("forged"), 1_000).is_none(),
+            "no line the title author wrote may arrive on its own"
         );
     })
     .await;

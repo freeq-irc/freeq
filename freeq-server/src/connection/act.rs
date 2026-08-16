@@ -205,10 +205,36 @@ pub(crate) fn expire_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -
     true
 }
 
+/// A title is text its sender chose, and this notice is built as a wire line
+/// rather than through `Message`, which escapes tag values on the way out. So
+/// the bytes that end a line — and every other control byte — come out here,
+/// and the length is capped: otherwise a title could append lines of its own
+/// choosing to everyone in the room, spoken by the server.
+///
+/// Removed, not replaced: the title is a label, and a hole in a label reads
+/// better than a row of placeholders.
+fn title_for_wire(title: &str) -> String {
+    title
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_TITLE_CHARS)
+        .collect()
+}
+
+/// Long enough for any real task name, short enough that no notice is a wall.
+const MAX_TITLE_CHARS: usize = 200;
+
 /// Tell the room — or the two people in the conversation — that a task ended
 /// without finishing.
 fn announce_expiry(state: &Arc<SharedState>, task: &crate::db::ActTask, title: &str) {
-    let text = format!("Task expired without completion: {title}");
+    // A title of nothing but stripped bytes would announce a task by no name at
+    // all, so it falls back the same way a missing title does.
+    let cleaned = title_for_wire(title);
+    let shown = match cleaned.trim().is_empty() {
+        true => task.act_id.as_str(),
+        false => cleaned.as_str(),
+    };
+    let text = format!("Task expired without completion: {shown}");
     let sessions: Vec<String> = match task.venue.strip_prefix("dm:") {
         // A DM task belongs to two people and nobody else hears about it.
         Some(pair) => {
