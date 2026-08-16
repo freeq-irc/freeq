@@ -2689,6 +2689,10 @@ export class FreeqClient extends EventEmitter {
         // server's own confirmation that it verifies chat documents, and
         // signing is gated on it (see `SIGNING_CAP`).
         SIGNING_CAP,
+        // Task events reach only the connections that ask for them. This
+        // SDK's callers are agents, which are the audience — a bot that can
+        // send a task step and never see another one has half a conversation.
+        'freeq.at/act',
       ];
       for (const c of caps) {
         // `draft/multiline` advertises with params (`=max-bytes=…,max-lines=…`)
