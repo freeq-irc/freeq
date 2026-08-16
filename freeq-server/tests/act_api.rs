@@ -338,6 +338,36 @@ async fn one_task_comes_back_with_its_whole_event_history() {
     assert!(ids(&listing).is_empty());
 }
 
+/// The server signs the expiry events it makes, and a signature is only worth
+/// anything if a verifier can look its key up. This proves boot puts that key
+/// where every other signer's key lives, under the server's own identity.
+#[tokio::test]
+async fn the_servers_own_signing_key_is_registered_at_boot() {
+    let k = PrivateKey::generate_ed25519();
+    let (_irc, web, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+
+    let (status, body) = get(web, "/api/v1/signing-keys/did:web:test-act-api", None).await;
+    assert_eq!(
+        status, 200,
+        "the server's own key resolves after boot: {body}"
+    );
+    let published = body["publicKey"]
+        .as_str()
+        .or_else(|| body["public_key"].as_str())
+        .or_else(|| body["pubkey"].as_str())
+        .expect("the answer carries a key");
+    assert!(!published.is_empty());
+
+    // …and it is the same key the server publishes as its own.
+    let (_, own) = get(web, "/api/v1/signing-key", None).await;
+    let mine = own["publicKey"]
+        .as_str()
+        .or_else(|| own["public_key"].as_str())
+        .or_else(|| own["pubkey"].as_str())
+        .expect("the server publishes its key");
+    assert_eq!(published, mine, "one key, one identity");
+}
+
 #[tokio::test]
 async fn a_task_nobody_ever_opened_is_not_found() {
     let k = PrivateKey::generate_ed25519();

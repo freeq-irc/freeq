@@ -134,6 +134,113 @@ pub(super) fn refuse_body_with_act_tags(
     );
 }
 
+/// Expire one abandoned task: sign the event, run it through the same check
+/// and storage every other event goes through, and announce it.
+///
+/// The sweep has no client connection, which is why this is separate from the
+/// gate above — but it is not a separate path. The event is built the way a
+/// sender would build it, signed with this server's own key under its own
+/// identity, and applied through `apply_act_event` like anything else, so it
+/// lands in the log, the view and replay identically.
+///
+/// Returns whether the task was expired.
+pub(crate) fn expire_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -> bool {
+    let did = crate::server::server_did(&state.server_name);
+    let event_id = freeq_sdk::chatsig::new_event_id();
+    let tags = vec![
+        ("+freeq.at/act", task.kind.as_str()),
+        ("+freeq.at/act-verb", "expire"),
+        ("+freeq.at/act-from", did.as_str()),
+        ("+freeq.at/act-id", task.act_id.as_str()),
+    ];
+    let Some(canonical) = freeq_sdk::act::act_canonical(tags, &task.venue, &event_id) else {
+        return false;
+    };
+    let signature = freeq_sdk::sigtag::sign_canonical(&canonical, &state.msg_signing_key);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let written = state.with_db(|db| {
+        db.apply_act_event(&crate::db::ActEvent {
+            canonical: &canonical,
+            signature: Some(&signature),
+            event_id: &event_id,
+            act_id: &task.act_id,
+            opens: false,
+            venue: &task.venue,
+            actor: &did,
+            // Only the server may expire, and this is the server.
+            from_system: true,
+            origin: None,
+            timestamp: now,
+        })
+    });
+    match written {
+        Some(crate::db::ActWrite::Filed { .. }) => {}
+        other => {
+            tracing::warn!(
+                act_id = %task.act_id, venue = %task.venue, outcome = ?other,
+                "Expiry sweep could not file its own event"
+            );
+            return false;
+        }
+    }
+    crate::server::Metrics::bump(&state.metrics.act_expired_total);
+
+    // The event is the record; this is the human's notice that it happened.
+    // A NOTICE and not a message, because the server does not author message
+    // rows into history — so scrollback will not show the ending until
+    // clients render task events themselves.
+    let title = state
+        .with_db(|db| db.act_task_title(&task.act_id))
+        .flatten()
+        .unwrap_or_else(|| task.act_id.clone());
+    announce_expiry(state, task, &title);
+    tracing::info!(
+        act_id = %task.act_id, venue = %task.venue, state = %task.state,
+        "Expired an abandoned task"
+    );
+    true
+}
+
+/// Tell the room — or the two people in the conversation — that a task ended
+/// without finishing.
+fn announce_expiry(state: &Arc<SharedState>, task: &crate::db::ActTask, title: &str) {
+    let text = format!("Task expired without completion: {title}");
+    let sessions: Vec<String> = match task.venue.strip_prefix("dm:") {
+        // A DM task belongs to two people and nobody else hears about it.
+        Some(pair) => {
+            let dids: Vec<&str> = pair.split(',').collect();
+            let by_did = state.did_sessions.lock();
+            dids.iter()
+                .filter_map(|d| by_did.get(*d))
+                .flat_map(|s| s.iter().cloned())
+                .collect()
+        }
+        None => state
+            .channels
+            .lock()
+            .get(&task.venue)
+            .map(|ch| ch.members.iter().cloned().collect())
+            .unwrap_or_default(),
+    };
+    let target = match task.venue.starts_with("dm:") {
+        true => None,
+        false => Some(task.venue.as_str()),
+    };
+    let conns = state.connections.lock();
+    for sid in &sessions {
+        if let Some(tx) = conns.get(sid) {
+            // A DM notice is addressed to the reader; a channel notice to the
+            // channel, so a client files it where the conversation is.
+            let to = target.unwrap_or("*");
+            let _ = tx.try_send(format!(":{} NOTICE {to} :{text}\r\n", state.server_name));
+        }
+    }
+}
+
 /// The wire lines for a venue's stored task events, each with its timestamp so
 /// a caller can interleave them with message history in time order.
 ///

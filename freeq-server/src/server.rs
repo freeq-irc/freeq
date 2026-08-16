@@ -826,6 +826,8 @@ pub struct Metrics {
     /// Task events the referee turned away — the one number that says whether
     /// the rules are working or something is wedged.
     pub act_refused_total: std::sync::atomic::AtomicU64,
+    /// Tasks the sweep marked expired.
+    pub act_expired_total: std::sync::atomic::AtomicU64,
     pub started_at: std::time::Instant,
 }
 
@@ -836,6 +838,7 @@ impl Default for Metrics {
             sasl_success_total: std::sync::atomic::AtomicU64::new(0),
             sasl_failure_total: std::sync::atomic::AtomicU64::new(0),
             act_refused_total: std::sync::atomic::AtomicU64::new(0),
+            act_expired_total: std::sync::atomic::AtomicU64::new(0),
             started_at: std::time::Instant::now(),
         }
     }
@@ -1230,6 +1233,35 @@ fn derive_key_from_signing(signing_key: &ed25519_dalek::SigningKey) -> [u8; 32] 
 }
 
 /// Load or generate a persistent ed25519 signing key for message signing.
+/// The identity this server signs under: `did:web:<server name>`.
+///
+/// The same form the policy engine uses. A server is a participant like any
+/// other when it acts — the expiry sweep's events are its own — so it needs an
+/// identity a verifier can look a key up under.
+pub fn server_did(server_name: &str) -> String {
+    format!("did:web:{server_name}")
+}
+
+/// Put the server's own message key in the same `(did, kid)` store client keys
+/// live in, so a signature it makes resolves through the ordinary by-kid
+/// lookup.
+///
+/// Without this the expiry events the server signs would name a kid nothing
+/// could resolve, and every one of them would read as unverifiable — the
+/// server would be the only signer on the system whose signatures nobody
+/// could check.
+fn register_server_signing_key(state: &Arc<SharedState>) {
+    let did = server_did(&state.server_name);
+    let pubkey = state.msg_signing_key.verifying_key().to_bytes();
+    let registered = state.with_db(|db| db.save_signing_key(&did, &pubkey));
+    match registered {
+        Some(()) => tracing::info!(%did, "Registered this server's own message signing key"),
+        // No database attached: nothing to register into, and nothing that
+        // will need to verify a stored signature either.
+        None => tracing::debug!(%did, "No database; server signing key not registered"),
+    }
+}
+
 fn load_msg_signing_key(data_dir: &str) -> ed25519_dalek::SigningKey {
     let key_path = std::path::Path::new(data_dir).join("msg-signing-key.secret");
     if key_path.exists() {
@@ -1589,7 +1621,7 @@ impl Server {
             bundles
         };
 
-        Ok(Arc::new(SharedState {
+        let state = Arc::new(SharedState {
             server_name: self.config.server_name.clone(),
             challenge_store: ChallengeStore::new(self.config.challenge_timeout_secs),
             did_resolver: self.resolver.clone(),
@@ -1700,7 +1732,9 @@ impl Server {
             liveness_probes: Mutex::new(HashMap::new()),
             session_kill: Mutex::new(HashMap::new()),
             metrics: Metrics::default(),
-        }))
+        });
+        register_server_signing_key(&state);
+        Ok(state)
     }
 
     /// Run the server, blocking forever.
@@ -2116,6 +2150,8 @@ impl Server {
             }
         }
 
+        spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
+
         // Heartbeat expiry: check agent liveness every 15 seconds.
         // Agents that miss their TTL transition to degraded, then offline, then disconnect.
         {
@@ -2452,6 +2488,7 @@ impl Server {
         // to do this), this catches it within a minute. No-op when state
         // is consistent.
         spawn_phantom_sweeper(Arc::clone(&state));
+        spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -2498,6 +2535,7 @@ impl Server {
 
         // Phantom-session sweeper (defense-in-depth).
         spawn_phantom_sweeper(Arc::clone(&state));
+        spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
 
         let web_state = Arc::clone(&state);
         let router = crate::web::router(web_state);
@@ -2638,6 +2676,40 @@ const S2S_MAX_EVENTS_PER_SEC: u32 = 100;
 /// closing session_id behind in NickMap and session_dids. The connection
 /// path now removes them on close (mod.rs:2682-ish), but if anything
 /// slips through, this task catches it within a minute.
+/// Sweep abandoned tasks: anything that has sat in a non-finished state
+/// longer than the limit gets an `expire` event from this server.
+///
+/// What is measured is the limit, not the task's own deadline. A deadline
+/// bounds how long an *offer* stands and is optional; this catches work
+/// somebody accepted and then walked away from, which otherwise sits in the
+/// view forever. `0` disables it.
+fn spawn_act_expiry_sweep(state: Arc<SharedState>, limit_secs: u64) {
+    if limit_secs == 0 {
+        return;
+    }
+    let limit = limit_secs as i64;
+    tokio::spawn(async move {
+        // Often enough to be prompt, rarely enough to be free. A limit
+        // measured in days sweeps every minute; a short one configured for a
+        // test sweeps at its own pace.
+        let every = (limit_secs / 2).clamp(1, 60);
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(every));
+        interval.tick().await; // skip first tick
+        loop {
+            interval.tick().await;
+            let cutoff = chrono::Utc::now().timestamp() - limit;
+            // Bounded per pass: a server that was down for a month should not
+            // try to expire everything in one breath.
+            let stale = state
+                .with_db(|db| db.act_tasks_idle_since(cutoff, 100))
+                .unwrap_or_default();
+            for task in &stale {
+                crate::connection::act::expire_task(&state, task);
+            }
+        }
+    });
+}
+
 fn spawn_phantom_sweeper(state: Arc<SharedState>) {
     tokio::spawn(async move {
         loop {

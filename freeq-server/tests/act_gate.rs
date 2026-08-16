@@ -37,6 +37,13 @@ fn resolver_with(entries: Vec<(&str, &PrivateKey)>) -> DidResolver {
 }
 
 async fn start(resolver: DidResolver) -> (SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>) {
+    start_with_expiry(resolver, 604_800).await
+}
+
+async fn start_with_expiry(
+    resolver: DidResolver,
+    act_expiry_secs: u64,
+) -> (SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>) {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let db_path = tmp.path().to_str().unwrap().to_string();
     std::mem::forget(tmp);
@@ -45,6 +52,7 @@ async fn start(resolver: DidResolver) -> (SocketAddr, tokio::task::JoinHandle<an
         server_name: "test-act".to_string(),
         challenge_timeout_secs: 60,
         db_path: Some(db_path),
+        act_expiry_secs,
         ..Default::default()
     };
     freeq_server::server::Server::with_resolver(config, resolver)
@@ -139,9 +147,11 @@ impl C {
     }
 
     fn maybe(&mut self, p: impl Fn(&str) -> bool, ms: u64) -> Option<String> {
-        self.writer
-            .try_clone()
-            .unwrap()
+        // The timeout has to go on the fd this reads from. Setting it on a
+        // clone of the writer changes nothing about the read, which is how
+        // this quietly kept its 5-second default.
+        self.reader
+            .get_ref()
             .set_read_timeout(Some(Duration::from_millis(ms)))
             .ok();
         let mut b = String::new();
@@ -164,9 +174,8 @@ impl C {
                 Err(_) => break None,
             }
         };
-        self.writer
-            .try_clone()
-            .unwrap()
+        self.reader
+            .get_ref()
             .set_read_timeout(Some(Duration::from_secs(5)))
             .ok();
         found
@@ -1041,6 +1050,75 @@ async fn chathistory_carries_task_events_to_capability_holders() {
             "the task event in history",
         );
         assert!(replayed.contains(&task), "{replayed}");
+    })
+    .await;
+}
+
+// ── expiry ──────────────────────────────────────────────────────────────────
+
+/// Everything at once: the sweep signs its own event under the server's
+/// identity, that signature resolves through the ordinary key store, the
+/// event lands like any other, and the room is told in the approved words.
+#[tokio::test]
+async fn an_abandoned_task_expires_and_the_room_is_told() {
+    let k = key();
+    // Every task is abandoned the moment it exists.
+    let (addr, _h) = start_with_expiry(resolver_with(vec![(DID_ALICE, &k)]), 1).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+
+        let id = fresh_id();
+        let mut tags = offer_tags();
+        a.tx(&signed_line(&tags, "#ops", &id, &signing));
+        a.rx(|l| l.contains(&id), "the offer");
+
+        // The sweep runs on its own clock; give it room.
+        let notice = a.maybe(
+            |l| l.contains("NOTICE") && l.contains("Task expired"),
+            90_000,
+        );
+        let notice = notice.expect("the room hears about the expiry");
+        assert!(
+            notice.ends_with("Task expired without completion: review-the-deploy"),
+            "the approved sentence, with the offer's own title: {notice}"
+        );
+    })
+    .await;
+}
+
+/// The expiry event itself: filed, signed by the server, and refereed like
+/// anything else — so the task is finished and takes no further steps.
+#[tokio::test]
+async fn an_expired_task_is_finished_and_its_event_is_the_servers() {
+    let k = key();
+    let (addr, _h) = start_with_expiry(resolver_with(vec![(DID_ALICE, &k)]), 1).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        let task = open_task(&mut a, &signing, "#ops", None);
+
+        let expiry = a
+            .maybe(
+                |l| l.contains("act-verb=expire") || l.contains("Task expired"),
+                90_000,
+            )
+            .expect("the sweep runs");
+        // Whichever arrived first, the task is now finished.
+        let _ = expiry;
+        a.tx(&follow_up_line(
+            "claim",
+            DID_ALICE,
+            &task,
+            "#ops",
+            &fresh_id(),
+            &signing,
+        ));
+        assert_eq!(a.fail_code(), "TERMINAL_TASK");
     })
     .await;
 }

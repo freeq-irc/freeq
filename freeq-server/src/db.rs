@@ -5746,6 +5746,61 @@ impl Db {
         rows.collect()
     }
 
+    /// Live tasks whose last movement is older than `cutoff` — the sweep's
+    /// candidates.
+    ///
+    /// `updated` is what is measured, so a task that anyone touched recently
+    /// is not abandoned however old its opener is.
+    pub fn act_tasks_idle_since(&self, cutoff: i64, limit: usize) -> SqlResult<Vec<ActTask>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT act_id, kind, venue, origin, state, offerer, offeree, assignee,
+                    caps, deadline, updated
+               FROM act_actions
+              WHERE updated < ?1
+              ORDER BY updated
+              LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![cutoff, limit as i64], |row| {
+            Ok(ActTask {
+                act_id: row.get(0)?,
+                kind: row.get(1)?,
+                venue: row.get(2)?,
+                origin: row.get(3)?,
+                state: row.get(4)?,
+                offerer: row.get(5)?,
+                offeree: row.get(6)?,
+                assignee: row.get(7)?,
+                caps: row.get(8)?,
+                deadline: row.get(9)?,
+                updated: row.get(10)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// The title an offer declared, read back out of the opener's bytes.
+    ///
+    /// Not a column: `act-title` is one of the open set of act tags, and the
+    /// view holds only what it needs to referee. The expiry notice is the one
+    /// place a human-readable name is wanted, and the log has it.
+    pub fn act_task_title(&self, act_id: &str) -> SqlResult<Option<String>> {
+        let canonical: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT canonical FROM events WHERE kind = 'act' AND event_id = ?1",
+                params![act_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(canonical.and_then(|c| {
+            serde_json::from_str::<serde_json::Value>(&c)
+                .ok()?
+                .get("act-title")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        }))
+    }
+
     /// Every venue that currently holds a live task.
     ///
     /// The listing endpoint runs each of these through the same authorization

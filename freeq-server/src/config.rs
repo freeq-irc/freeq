@@ -123,6 +123,15 @@ pub struct ServerConfig {
     #[arg(long, default_value = "10000")]
     pub max_messages_per_channel: usize,
 
+    /// How long a task may sit in a non-finished state before the sweep marks
+    /// it expired, in seconds. This is the abandonment limit, not the offer's
+    /// own deadline: the deadline bounds how long an offer stands and is
+    /// optional, while this is what catches work somebody accepted and then
+    /// walked away from. Measured from the task's last movement. 0 = never
+    /// expire.
+    #[arg(long, default_value = "604800")]
+    pub act_expiry_secs: u64,
+
     /// Message of the Day text. If not set, no MOTD is sent.
     #[arg(long)]
     pub motd: Option<String>,
@@ -297,6 +306,7 @@ impl Default for ServerConfig {
             data_dir: None,
             did_resolver_static: vec![],
             max_messages_per_channel: 10000,
+            act_expiry_secs: 604_800,
             motd: None,
             motd_file: None,
             web_static_dir: None,
