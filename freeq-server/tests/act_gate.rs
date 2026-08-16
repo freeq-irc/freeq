@@ -440,7 +440,29 @@ async fn a_task_message_naming_someone_else_as_its_actor_is_refused() {
         let mut tags = offer_tags();
         tags[2].1 = DID_BOB.into();
         a.tx(&signed_line(&tags, "#ops", &fresh_id(), &signing));
-        assert_eq!(a.fail_code(), "AUTHOR_MISMATCH");
+        assert_eq!(a.fail_code(), "ACTOR_MISMATCH");
+    })
+    .await;
+}
+
+/// A task message that names no actor at all. Distinct from naming the wrong
+/// one: the storage layer refuses such bytes as unreadable, and without this
+/// the sender would learn nothing about why its event vanished.
+#[tokio::test]
+async fn a_task_message_naming_no_actor_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        let tags: Vec<(String, String)> = offer_tags()
+            .into_iter()
+            .filter(|(k, _)| k != "+freeq.at/act-from")
+            .collect();
+        a.tx(&signed_line(&tags, "#ops", &fresh_id(), &signing));
+        assert_eq!(a.fail_code(), "ACTOR_REQUIRED");
     })
     .await;
 }

@@ -349,16 +349,38 @@ pub(super) fn gate(
 
     // ── The actor it names ──
     //
+    // Two words that are never interchangeable: the *author* of a message is
+    // whoever wrote it; the *actor* of an event is whoever performed it. One
+    // event can hold both as different people — an op deleting someone's
+    // message is the actor, the person who wrote it is the author — which is
+    // why the edit and delete paths answer with AUTHOR_MISMATCH and a task
+    // step answers with ACTOR_MISMATCH.
+    //
     // The signature establishes who sent the message; `act-from` claims who
-    // acted. A message where those differ is either a mistake or an attempt
-    // to file an event under someone else's name, and neither is worth
-    // relaying. Checked before the signature because it is decidable without
-    // one, and the answer is more useful than a signature complaint.
-    if let Some(actor) = tags
+    // acted, and the two have to be the same person. Checked before the
+    // signature because both answers are decidable without one, and either is
+    // more useful than a signature complaint.
+    let Some(actor) = tags
         .get("+freeq.at/act-from")
         .or_else(|| tags.get("act-from"))
-        && actor != did
-    {
+    else {
+        // Naming nobody is its own answer. The log refuses such bytes as
+        // unreadable — the view's offerer comes from this field — so without
+        // a sentence here the event would vanish with nothing said about it.
+        tracing::debug!(
+            session = %conn.id, did = %did, target = %target,
+            "Refused a task message that names no actor"
+        );
+        refuse(
+            conn,
+            "TAGMSG",
+            "ACTOR_REQUIRED",
+            "A task message must name its actor",
+            state,
+        );
+        return Gate::Refused;
+    };
+    if actor != did {
         tracing::warn!(
             session = %conn.id, did = %did, actor = %actor, target = %target,
             "Refused a task message naming another actor than its sender"
@@ -366,7 +388,7 @@ pub(super) fn gate(
         refuse(
             conn,
             "TAGMSG",
-            "AUTHOR_MISMATCH",
+            "ACTOR_MISMATCH",
             "That message names someone else as its actor",
             state,
         );

@@ -107,7 +107,10 @@ pub struct EventFacts {
     pub kind: String,
     /// The normalized venue: a folded channel name, or `dm:<a>,<b>`.
     pub venue: String,
-    /// The acting identity. `None` for a guest.
+    /// The acting identity — the *actor*, whoever performed this event, which
+    /// is not always the *author* of what it acts on (an op deleting someone
+    /// else's message is the actor; the writer is the author). `None` for a
+    /// guest.
     pub actor_did: Option<String>,
     /// The root msgid this event acts on — a mutation's subject, an edit's
     /// original. `None` for a message that acts on nothing.

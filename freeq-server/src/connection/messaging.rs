@@ -3235,6 +3235,9 @@ fn handle_edit(
                 let original_nick = row.sender.split('!').next().unwrap_or("");
                 original_nick.eq_ignore_ascii_case(nick)
             };
+            // Author, not actor: an edit is refused because of who *wrote* the
+            // message, never because of who is doing the editing. (A task
+            // step is the mirror image and answers ACTOR_MISMATCH.)
             if !is_author {
                 let reply = Message::from_server(
                     &state.server_name,
@@ -3775,6 +3778,10 @@ fn handle_delete(
                         .get(target)
                         .map(|ch| ch.ops.contains(&conn.id))
                         .unwrap_or(false);
+                // The one place both words are live at once: the actor is
+                // whoever asked for the delete, the author is whoever wrote
+                // the message, and the rule is that the actor must be one or
+                // the other — the author, or an op.
                 if !is_op {
                     let reply = Message::from_server(
                         &state.server_name,
