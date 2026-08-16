@@ -66,6 +66,21 @@ export {
 } from "./act.js";
 export type { ActVerifyResult } from "./act.js";
 
+// The eight moves a bot can make on a task — one function per verb, each
+// doing the paired send (the signed task event, plus the line people read).
+// `expire` is absent on purpose: only the server makes that move.
+export {
+  offer,
+  accept,
+  decline,
+  claim,
+  progress,
+  complete,
+  fail,
+  cancel,
+} from "./act-verbs.js";
+export type { ActContext, OfferOptions, StepOptions } from "./act-verbs.js";
+
 // The task lifecycle rules — which move is legal, from which state, by whom.
 // The rules are data (spec/act-transitions.json, copied into src/); this is
 // the checker that reads them, mirroring freeq_sdk::act_transitions so a bot

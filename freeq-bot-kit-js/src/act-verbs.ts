@@ -1,0 +1,177 @@
+// The eight moves a bot can make on a task.
+//
+// One function per verb the RFC gives a sender. `expire` is not here: only
+// the server may make that move, and it makes it from the sweep.
+//
+// Every one does the same paired send — the signed task TAGMSG that *is* the
+// event, and the plain-text line that renders it for the people in the room,
+// linked back by `+freeq.at/ref`. Two documents, each signing its own id.
+//
+// Vocabulary, as the rest of the system uses it: the *author* of a message is
+// whoever wrote it; the *actor* of an event is whoever performed it. These
+// helpers always send as the bot itself, so for them the two are the same
+// identity — `act-from` names the actor, and the server refuses a task
+// message whose actor is not its sender.
+
+import type { FreeqClient } from "@freeq/sdk";
+
+/** What every task step needs: where it happens, and who is doing it. */
+export interface ActContext {
+  client: FreeqClient;
+  /** The channel, or the recipient's DID for a task in a direct conversation. */
+  target: string;
+  /** The acting identity — this bot's DID. */
+  did: string;
+}
+
+/** What an offer declares. Everything but a title is optional. */
+export interface OfferOptions {
+  title: string;
+  /** Name a recipient to make the offer directed; leave it out and anyone
+   *  may claim it. */
+  to?: string;
+  /** A self-declared hint. Stored, filterable, never a gate. */
+  caps?: string;
+  /** Unix seconds. Bounds how long the offer stands — not how long the work
+   *  may take. */
+  deadline?: number;
+  /** A link to the task's materials, and a hash of them. */
+  ctx?: string;
+  ctxHash?: string;
+  /** The line people see. Defaults to something plain. */
+  humanText?: string;
+}
+
+/** What a follow-up may carry. */
+export interface StepOptions {
+  /** A sentence for the record, covered by the signature like every act tag. */
+  note?: string;
+  /** The line people see. */
+  humanText?: string;
+}
+
+const KIND = "handoff";
+
+function stepTags(verb: string, did: string, taskId: string, note?: string) {
+  const tags: Record<string, string> = {
+    "+freeq.at/act": KIND,
+    "+freeq.at/act-verb": verb,
+    "+freeq.at/act-from": did,
+    "+freeq.at/act-id": taskId,
+  };
+  if (note) tags["+freeq.at/act-note"] = note;
+  return tags;
+}
+
+/**
+ * Open a task. Returns its id — the offer's own event id *is* the task's id,
+ * which is why an offer carries no `act-id` of its own.
+ */
+export async function offer(ctx: ActContext, opts: OfferOptions): Promise<string> {
+  const tags: Record<string, string> = {
+    "+freeq.at/act": KIND,
+    "+freeq.at/act-verb": "offer",
+    "+freeq.at/act-from": ctx.did,
+    "+freeq.at/act-title": opts.title,
+  };
+  if (opts.to) tags["+freeq.at/act-to"] = opts.to;
+  if (opts.caps) tags["+freeq.at/act-caps"] = opts.caps;
+  if (opts.deadline !== undefined) {
+    tags["+freeq.at/act-deadline"] = String(opts.deadline);
+  }
+  if (opts.ctx) tags["+freeq.at/act-ctx"] = opts.ctx;
+  if (opts.ctxHash) tags["+freeq.at/act-ctx-h"] = opts.ctxHash;
+  return ctx.client.sendAct(ctx.target, tags, {
+    humanText: opts.humanText ?? `offered: ${opts.title}`,
+  });
+}
+
+/** Take a task that was offered to you. */
+export async function accept(
+  ctx: ActContext,
+  taskId: string,
+  opts: StepOptions = {},
+): Promise<string> {
+  return ctx.client.sendAct(ctx.target, stepTags("accept", ctx.did, taskId, opts.note), {
+    humanText: opts.humanText ?? "accepted the task",
+    taskId,
+  });
+}
+
+/** Turn down a task that was offered to you. */
+export async function decline(
+  ctx: ActContext,
+  taskId: string,
+  opts: StepOptions = {},
+): Promise<string> {
+  return ctx.client.sendAct(ctx.target, stepTags("decline", ctx.did, taskId, opts.note), {
+    humanText: opts.humanText ?? "declined the task",
+    taskId,
+  });
+}
+
+/** Take an open task nobody was named for. First valid claim wins. */
+export async function claim(
+  ctx: ActContext,
+  taskId: string,
+  opts: StepOptions = {},
+): Promise<string> {
+  return ctx.client.sendAct(ctx.target, stepTags("claim", ctx.did, taskId, opts.note), {
+    humanText: opts.humanText ?? "claimed the task",
+    taskId,
+  });
+}
+
+/** Report progress on work you hold. Leaves the task assigned. */
+export async function progress(
+  ctx: ActContext,
+  taskId: string,
+  opts: StepOptions = {},
+): Promise<string> {
+  return ctx.client.sendAct(ctx.target, stepTags("progress", ctx.did, taskId, opts.note), {
+    humanText: opts.humanText ?? (opts.note ? `progress: ${opts.note}` : "made progress"),
+    taskId,
+  });
+}
+
+/** Finish work you hold. Terminal. */
+export async function complete(
+  ctx: ActContext,
+  taskId: string,
+  opts: StepOptions = {},
+): Promise<string> {
+  return ctx.client.sendAct(ctx.target, stepTags("complete", ctx.did, taskId, opts.note), {
+    humanText: opts.humanText ?? "completed the task",
+    taskId,
+  });
+}
+
+/**
+ * Give up work you hold. Terminal, and also the walk-away verb: the record
+ * cannot yet tell "tried and failed" from "handing it back untouched".
+ */
+export async function fail(
+  ctx: ActContext,
+  taskId: string,
+  opts: StepOptions = {},
+): Promise<string> {
+  return ctx.client.sendAct(ctx.target, stepTags("fail", ctx.did, taskId, opts.note), {
+    humanText: opts.humanText ?? "failed the task",
+    taskId,
+  });
+}
+
+/**
+ * Withdraw a task you posted. The poster's unilateral act, legal from every
+ * live state including mid-work — the worker gets the event, not a say.
+ */
+export async function cancel(
+  ctx: ActContext,
+  taskId: string,
+  opts: StepOptions = {},
+): Promise<string> {
+  return ctx.client.sendAct(ctx.target, stepTags("cancel", ctx.did, taskId, opts.note), {
+    humanText: opts.humanText ?? "cancelled the task",
+    taskId,
+  });
+}
