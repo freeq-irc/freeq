@@ -20,6 +20,100 @@ use axum::Router;
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 
+// ─── Shared upstream-fetch helpers ───────────────────────────────────────────
+
+/// Error classification for calls to upstream APIs (Bluesky AppView/PDS,
+/// GitHub, …). The distinction matters because verifiers must NEVER collapse
+/// a transient failure into a negative answer: "we couldn't reach the API"
+/// is not "the user doesn't follow the account".
+#[derive(Debug, Clone, PartialEq)]
+pub enum FetchError {
+    /// 429 / 5xx / network failure — worth retrying, and if retries are
+    /// exhausted the user must see a retryable error, not a denial.
+    Transient(String),
+    /// 4xx (other than 429) or unparseable response — retrying won't help.
+    Permanent(String),
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::Transient(m) => write!(f, "transient upstream error: {m}"),
+            FetchError::Permanent(m) => write!(f, "upstream error: {m}"),
+        }
+    }
+}
+
+impl FetchError {
+    /// Classify an HTTP status for retry purposes. `None` = success.
+    pub fn from_status(status: reqwest::StatusCode) -> Option<FetchError> {
+        if status.is_success() {
+            None
+        } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            Some(FetchError::Transient(format!("HTTP {status}")))
+        } else {
+            Some(FetchError::Permanent(format!("HTTP {status}")))
+        }
+    }
+}
+
+/// Run `f` with bounded retries on [`FetchError::Transient`].
+/// Permanent errors return immediately. `base_delay` scales linearly per
+/// attempt (attempt 1 sleeps `base_delay`, attempt 2 `2×base_delay`, …);
+/// pass `Duration::ZERO` in tests.
+pub async fn retry_loop<T, F, Fut>(
+    mut f: F,
+    max_retries: usize,
+    base_delay: std::time::Duration,
+) -> Result<T, FetchError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, FetchError>>,
+{
+    let mut attempt = 0usize;
+    loop {
+        match f().await {
+            Err(e @ FetchError::Transient(_)) if attempt < max_retries => {
+                attempt += 1;
+                let delay = base_delay * attempt as u32;
+                tracing::debug!(attempt, error = %e, "retrying transient upstream error");
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
+/// GET `url` as JSON with retries on 429/5xx/network errors.
+pub async fn get_json_with_retries(
+    http: &reqwest::Client,
+    url: &str,
+    max_retries: usize,
+    base_delay: std::time::Duration,
+) -> Result<serde_json::Value, FetchError> {
+    retry_loop(
+        || async {
+            let resp = http
+                .get(url)
+                .header("User-Agent", "freeq-verifier")
+                .send()
+                .await
+                .map_err(|e| FetchError::Transient(format!("request failed: {e}")))?;
+            if let Some(err) = FetchError::from_status(resp.status()) {
+                return Err(err);
+            }
+            resp.json::<serde_json::Value>()
+                .await
+                .map_err(|e| FetchError::Permanent(format!("invalid JSON: {e}")))
+        },
+        max_retries,
+        base_delay,
+    )
+    .await
+}
+
 /// Shared state for all verifiers.
 pub struct VerifierState {
     /// Ed25519 signing key for issuing credentials.
@@ -142,6 +236,88 @@ pub fn router(
     let app = app.with_state(Arc::clone(&state));
 
     Some((app, state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn retry_loop_succeeds_after_transient_failures() {
+        let calls = AtomicUsize::new(0);
+        let result = retry_loop(
+            || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n < 2 {
+                        Err(FetchError::Transient("429".into()))
+                    } else {
+                        Ok("ok")
+                    }
+                }
+            },
+            3,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result, Ok("ok"));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_loop_gives_up_after_max_retries() {
+        let calls = AtomicUsize::new(0);
+        let result: Result<(), FetchError> = retry_loop(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Err(FetchError::Transient("503".into())) }
+            },
+            2,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert!(matches!(result, Err(FetchError::Transient(_))));
+        // 1 initial + 2 retries
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_loop_does_not_retry_permanent_errors() {
+        let calls = AtomicUsize::new(0);
+        let result: Result<(), FetchError> = retry_loop(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Err(FetchError::Permanent("404".into())) }
+            },
+            5,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert!(matches!(result, Err(FetchError::Permanent(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn status_classification() {
+        assert_eq!(FetchError::from_status(reqwest::StatusCode::OK), None);
+        assert!(matches!(
+            FetchError::from_status(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            Some(FetchError::Transient(_))
+        ));
+        assert!(matches!(
+            FetchError::from_status(reqwest::StatusCode::BAD_GATEWAY),
+            Some(FetchError::Transient(_))
+        ));
+        assert!(matches!(
+            FetchError::from_status(reqwest::StatusCode::NOT_FOUND),
+            Some(FetchError::Permanent(_))
+        ));
+        assert!(matches!(
+            FetchError::from_status(reqwest::StatusCode::FORBIDDEN),
+            Some(FetchError::Permanent(_))
+        ));
+    }
 }
 
 /// Serve the verifier's DID document with Ed25519 public key.
