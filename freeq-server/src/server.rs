@@ -823,11 +823,10 @@ pub struct Metrics {
     pub messages_total: std::sync::atomic::AtomicU64,
     pub sasl_success_total: std::sync::atomic::AtomicU64,
     pub sasl_failure_total: std::sync::atomic::AtomicU64,
-    /// Task events the referee turned away — the one number that says whether
-    /// the rules are working or something is wedged.
-    pub act_refused_total: std::sync::atomic::AtomicU64,
-    /// Tasks the sweep marked expired.
-    pub act_expired_total: std::sync::atomic::AtomicU64,
+    /// Task events that arrived, whatever verdict each one earned. Says
+    /// whether tasks are being used at all; the refusal each event earns is
+    /// what tells its sender, and the log is what records it.
+    pub act_events_total: std::sync::atomic::AtomicU64,
     pub started_at: std::time::Instant,
 }
 
@@ -837,8 +836,7 @@ impl Default for Metrics {
             messages_total: std::sync::atomic::AtomicU64::new(0),
             sasl_success_total: std::sync::atomic::AtomicU64::new(0),
             sasl_failure_total: std::sync::atomic::AtomicU64::new(0),
-            act_refused_total: std::sync::atomic::AtomicU64::new(0),
-            act_expired_total: std::sync::atomic::AtomicU64::new(0),
+            act_events_total: std::sync::atomic::AtomicU64::new(0),
             started_at: std::time::Instant::now(),
         }
     }

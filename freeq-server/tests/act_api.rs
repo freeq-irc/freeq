@@ -71,6 +71,25 @@ async fn get(web: SocketAddr, path: &str, bearer: Option<&str>) -> (u16, serde_j
     )
 }
 
+/// One counter's value, read off `/metrics` the way a scraper would.
+async fn metric(web: SocketAddr, name: &str) -> u64 {
+    let body = reqwest::Client::new()
+        .get(format!("http://{web}/metrics"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    body.lines()
+        .find_map(|l| l.strip_prefix(&format!("{name} ")))
+        .unwrap_or_else(|| panic!("{name} is not published:\n{body}"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
 /// A raw IRC client, so a test can put a signed task message on the wire.
 struct C {
     reader: BufReader<TcpStream>,
@@ -366,6 +385,37 @@ async fn the_servers_own_signing_key_is_registered_at_boot() {
         .or_else(|| own["pubkey"].as_str())
         .expect("the server publishes its key");
     assert_eq!(published, mine, "one key, one identity");
+}
+
+/// The counter against a running server, not against the formatter.
+///
+/// The formatting test hands `format_metrics` numbers it made up, so it passes
+/// whether or not anything increments — which is exactly how a counter can read
+/// zero in production while its test stays green. This one sends a real task
+/// message and reads the number back off the endpoint.
+#[tokio::test]
+async fn a_task_event_moves_the_counter_on_the_metrics_endpoint() {
+    let k = PrivateKey::generate_ed25519();
+    let (irc, web, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+
+    let before = metric(web, "freeq_act_events_total").await;
+    assert_eq!(before, 0, "nothing has been sent yet");
+
+    tokio::task::spawn_blocking(move || {
+        let signing = SigningKey::from_bytes(&[11u8; 32]);
+        let mut a = C::authenticated(irc, "alice", DID_ALICE, k);
+        a.msgsig(&signing);
+        a.join("#work");
+        a.offer("#work", &channel_venue("#work"), DID_ALICE, &signing);
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        metric(web, "freeq_act_events_total").await,
+        1,
+        "one task event arrived, so the published number says one"
+    );
 }
 
 #[tokio::test]

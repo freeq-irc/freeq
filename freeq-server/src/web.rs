@@ -2173,6 +2173,7 @@ fn format_metrics(
     messages_total: u64,
     sasl_success_total: u64,
     sasl_failure_total: u64,
+    act_events_total: u64,
     uptime_seconds: u64,
 ) -> String {
     format!(
@@ -2194,6 +2195,9 @@ fn format_metrics(
          # HELP freeq_sasl_failure_total Failed SASL authentications since start\n\
          # TYPE freeq_sasl_failure_total counter\n\
          freeq_sasl_failure_total {sasl_failure_total}\n\
+         # HELP freeq_act_events_total Task events received since start\n\
+         # TYPE freeq_act_events_total counter\n\
+         freeq_act_events_total {act_events_total}\n\
          # HELP freeq_uptime_seconds Seconds since process start\n\
          # TYPE freeq_uptime_seconds gauge\n\
          freeq_uptime_seconds {uptime_seconds}\n"
@@ -2217,6 +2221,7 @@ async fn api_metrics(State(state): State<Arc<SharedState>>) -> impl axum::respon
         state.metrics.messages_total.load(Relaxed),
         state.metrics.sasl_success_total.load(Relaxed),
         state.metrics.sasl_failure_total.load(Relaxed),
+        state.metrics.act_events_total.load(Relaxed),
         state.metrics.started_at.elapsed().as_secs(),
     );
     (
@@ -5107,13 +5112,14 @@ mod metrics_tests {
 
     #[test]
     fn exposition_format_is_well_formed() {
-        let out = format_metrics(3, 7, 2, 100, 5, 1, 42);
+        let out = format_metrics(3, 7, 2, 100, 5, 1, 9, 42);
         assert!(out.contains("freeq_connections 3\n"));
         assert!(out.contains("freeq_channels 7\n"));
         assert!(out.contains("freeq_s2s_peers 2\n"));
         assert!(out.contains("freeq_messages_total 100\n"));
         assert!(out.contains("freeq_sasl_success_total 5\n"));
         assert!(out.contains("freeq_sasl_failure_total 1\n"));
+        assert!(out.contains("freeq_act_events_total 9\n"));
         assert!(out.contains("freeq_uptime_seconds 42\n"));
         // Every metric line is preceded by HELP + TYPE comments.
         for name in [
@@ -5123,6 +5129,7 @@ mod metrics_tests {
             "freeq_messages_total",
             "freeq_sasl_success_total",
             "freeq_sasl_failure_total",
+            "freeq_act_events_total",
             "freeq_uptime_seconds",
         ] {
             assert!(

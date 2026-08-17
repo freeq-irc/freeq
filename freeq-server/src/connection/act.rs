@@ -187,7 +187,6 @@ pub(crate) fn expire_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -
             return false;
         }
     }
-    crate::server::Metrics::bump(&state.metrics.act_expired_total);
 
     // The event is the record; this is the human's notice that it happened.
     // A NOTICE and not a message, because the server does not author message
@@ -403,6 +402,10 @@ pub(super) fn gate(
     if !carries_act_tags(tags) {
         return Gate::NotATaskMessage;
     }
+    // Counted here, before any verdict: this is task traffic arriving, which is
+    // the question the number answers. Whether each one is accepted or turned
+    // away is what the refusal it earns says, and what the log records.
+    crate::server::Metrics::bump(&state.metrics.act_events_total);
 
     // ── One message, one job ──
     if let Some(foreign) = foreign_family_tag(tags) {
@@ -751,7 +754,6 @@ pub(super) fn gate(
         None => {}
         Some(crate::db::ActWrite::Filed { .. }) => {}
         Some(crate::db::ActWrite::UnknownTask) => {
-            refused(state);
             tracing::debug!(
                 session = %conn.id, did = %did, act_id = %act_id,
                 "Refused a task event naming a task not on file"
@@ -766,7 +768,6 @@ pub(super) fn gate(
             return Gate::Refused;
         }
         Some(crate::db::ActWrite::WrongVenue) => {
-            refused(state);
             refuse(
                 conn,
                 "TAGMSG",
@@ -777,7 +778,6 @@ pub(super) fn gate(
             return Gate::Refused;
         }
         Some(crate::db::ActWrite::Refused(reason)) => {
-            refused(state);
             use freeq_sdk::act_transitions::Refusal;
             let (code, sentence) = match reason {
                 Refusal::TerminalTask => (
@@ -830,13 +830,6 @@ pub(super) fn gate(
     Gate::Accepted
 }
 
-/// Count one refused task event.
-///
-/// Minimal on purpose: how many events the referee turned away is the number
-/// that says whether the rules are working or whether something is wedged.
-fn refused(state: &Arc<SharedState>) {
-    crate::server::Metrics::bump(&state.metrics.act_refused_total);
-}
 
 #[cfg(test)]
 mod tests {
