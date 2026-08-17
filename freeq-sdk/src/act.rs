@@ -618,8 +618,8 @@ mod tests {
                 tags: vec![
                     ("+freeq.at/act", "handoff"),
                     ("+freeq.at/act-verb", "accept"),
-                    // act-id names the task — which IS the offer's event id,
-                    // so a follow-up needs no act-ref to find its offer.
+                    // act-id names the task, and that value IS the offer's own
+                    // event id — which is how a follow-up finds its offer.
                     ("+freeq.at/act-id", OFFER_ID),
                     ("+freeq.at/act-from", "did:plc:scholar"),
                     // Non-ASCII + JSON-escaping stress in a value.

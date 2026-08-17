@@ -904,7 +904,7 @@ mod tests {
             ("+freeq.at/act", "handoff"),
             ("+freeq.at/act-verb", "offer"),
             ("+freeq.at/act-to", "did:plc:bob"),
-            ("+freeq.at/act-ref", "01JOLDTASK"),
+            ("+freeq.at/act-deadline", "1760000000"),
             ("+freeq.at/eventid", "01JNEW"),
             ("+freeq.at/sig", "ed25519:kid:sig"),
         ]);

@@ -3238,9 +3238,9 @@ export class FreeqClient extends EventEmitter {
    *
    * The same paired send the coordination emitter does, and for the same
    * reason — two documents, each signing its own id. The companion links back
-   * with `+freeq.at/ref`, which is on chat's covered list; an `act-ref` there
-   * would sit outside every signature, and `act-` names belong to task
-   * messages alone.
+   * with `+freeq.at/ref`, which is on chat's covered list; an `act-` name there
+   * would sit outside every signature, because those belong to task messages
+   * alone.
    *
    * Returns the event's id — which, for an opener, is the task's id.
    */
