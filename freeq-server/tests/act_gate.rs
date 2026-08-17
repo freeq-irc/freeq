@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use freeq_sdk::auth::{self, ChallengeSigner, KeySigner};
-use freeq_sdk::chatsig::{EVENT_ID_TAG, channel_venue};
+use freeq_sdk::chatsig::{ChatDoc, EVENT_ID_TAG, Mutation, channel_venue};
 use freeq_sdk::crypto::PrivateKey;
 use freeq_sdk::did::{self, DidResolver};
 
@@ -832,7 +832,15 @@ async fn a_delete_aimed_at_a_task_event_is_refused() {
         a.join("#ops");
         let task = open_task(&mut a, &signing, "#ops", None);
 
-        a.tx(&format!("@+draft/delete={task} TAGMSG #ops"));
+        // Signed like any real delete: once signing enforcement is on, an
+        // unsigned mutation is refused at the signature gate before the act
+        // gate is ever consulted — and a signed one must still be refused here.
+        let del_id = fresh_id();
+        let sig = ChatDoc::mutation(Mutation::Delete, DID_ALICE, &del_id, &channel_venue("#ops"), &task)
+            .sign(&signing);
+        a.tx(&format!(
+            "@+draft/delete={task};{EVENT_ID_TAG}={del_id};+freeq.at/sig={sig} TAGMSG #ops"
+        ));
         assert_eq!(a.fail_code_of("DELETE"), "IMMUTABLE_EVENT");
     })
     .await;
@@ -882,7 +890,13 @@ async fn a_delete_aimed_at_a_task_event_in_a_dm_is_refused() {
         a.tx(&format!("@{} TAGMSG {DID_BOB}", wire.join(";")));
         b.rx(|l| l.contains("+freeq.at/act="), "the DM task reaches bob");
 
-        a.tx(&format!("@+draft/delete={id} TAGMSG {DID_BOB}"));
+        // Signed for the same reason as the channel variant above.
+        let del_id = fresh_id();
+        let sig =
+            ChatDoc::mutation(Mutation::Delete, DID_ALICE, &del_id, &venue, &id).sign(&alice_key);
+        a.tx(&format!(
+            "@+draft/delete={id};{EVENT_ID_TAG}={del_id};+freeq.at/sig={sig} TAGMSG {DID_BOB}"
+        ));
         assert_eq!(a.fail_code_of("DELETE"), "IMMUTABLE_EVENT");
         assert!(
             b.maybe(|l| l.contains("+draft/delete"), 500).is_none(),
