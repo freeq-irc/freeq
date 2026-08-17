@@ -523,6 +523,7 @@ Options:
   --iroh                          Enable iroh QUIC transport
   --iroh-port <PORT>              UDP port for iroh (default: random)
   --s2s-peers <ID,ID,...>         S2S peer iroh endpoint IDs
+  --s2s-peer-api <ID=URL,...>     Where each S2S peer serves its users' signing keys
 ```
 
 ### Persistence

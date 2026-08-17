@@ -73,7 +73,8 @@ The following operations from federated peers are authorized before execution:
 freeq-server \
   --iroh \
   --s2s-peers <peer-id-b> \
-  --s2s-allowed-peers <peer-id-b>
+  --s2s-allowed-peers <peer-id-b> \
+  --s2s-peer-api <peer-id-b>=https://server-b.example.com
 ```
 
 **Server B** (`peer-id-b`):
@@ -81,8 +82,11 @@ freeq-server \
 freeq-server \
   --iroh \
   --s2s-peers <peer-id-a> \
-  --s2s-allowed-peers <peer-id-a>
+  --s2s-allowed-peers <peer-id-a> \
+  --s2s-peer-api <peer-id-a>=https://server-a.example.com
 ```
+
+`--s2s-peer-api` tells this server where each peer serves its users' signing keys. Without it, a peer's message signatures are uncheckable here — reported as unverifiable, never as forged — so cross-server signature verification is inert. It is deliberately operator configuration rather than something a peer announces: no peer gets to choose where this server sends requests.
 
 ---
 
