@@ -72,6 +72,7 @@ impl PolicyEngine {
         requirements: Requirement,
         role_requirements: std::collections::BTreeMap<String, Requirement>,
     ) -> Result<(PolicyDocument, AuthoritySet), PolicyError> {
+        let channel_id = &super::store::canonical_channel_id(channel_id);
         // Validate requirements
         eval::validate_structure(&requirements).map_err(PolicyError::Validation)?;
         for (role, req) in &role_requirements {
@@ -131,6 +132,7 @@ impl PolicyEngine {
         requirements: Requirement,
         role_requirements: std::collections::BTreeMap<String, Requirement>,
     ) -> Result<PolicyDocument, PolicyError> {
+        let channel_id = &super::store::canonical_channel_id(channel_id);
         // Validate
         eval::validate_structure(&requirements).map_err(PolicyError::Validation)?;
 
@@ -171,6 +173,7 @@ impl PolicyEngine {
             crate::policy::types::CredentialEndpoint,
         >,
     ) -> Result<PolicyDocument, PolicyError> {
+        let channel_id = &super::store::canonical_channel_id(channel_id);
         eval::validate_structure(&requirements).map_err(PolicyError::Validation)?;
 
         let current = self
@@ -212,6 +215,7 @@ impl PolicyEngine {
         subject_did: &str,
         evidence: &UserEvidence,
     ) -> Result<JoinResult, PolicyError> {
+        let channel_id = &super::store::canonical_channel_id(channel_id);
         // Get current policy
         let policy = match self.store.get_current_policy(channel_id)? {
             Some(p) => p,
@@ -366,11 +370,13 @@ impl PolicyEngine {
         channel_id: &str,
         subject_did: &str,
     ) -> Result<Option<MembershipAttestation>, PolicyError> {
+        let channel_id = &super::store::canonical_channel_id(channel_id);
         self.store.get_attestation(channel_id, subject_did)
     }
 
     /// Get the current policy for a channel.
     pub fn get_policy(&self, channel_id: &str) -> Result<Option<PolicyDocument>, PolicyError> {
+        let channel_id = &super::store::canonical_channel_id(channel_id);
         self.store.get_current_policy(channel_id)
     }
 
@@ -541,6 +547,54 @@ mod tests {
             }
             other => panic!("Expected Confirmed, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn join_and_membership_are_case_insensitive() {
+        // Regression test: the IRC JOIN gate passes the raw user-typed
+        // channel name, while REST/S2S paths lowercase it. Before
+        // normalization, `JOIN #TEST` against a policy stored as `#test`
+        // silently bypassed the gate (fail-open), and accepting rules for
+        // `#Test` minted an attestation invisible to a later `JOIN #TEST`
+        // (sticky 477 denial). All paths must hit the same logical channel.
+        let engine = test_engine();
+
+        let rules_hash = canonical::sha256_hex(b"Be nice.");
+        engine
+            .create_channel_policy(
+                "#TestChan",
+                Requirement::Accept {
+                    hash: rules_hash.clone(),
+                },
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap();
+
+        // The stored policy is canonicalized.
+        let policy = engine.get_policy("#TESTCHAN").unwrap().unwrap();
+        assert_eq!(policy.channel_id, "#testchan");
+
+        // Join with yet another casing, accept rules.
+        let mut evidence = UserEvidence {
+            accepted_hashes: HashSet::new(),
+            credentials: vec![],
+            proofs: HashSet::new(),
+        };
+        evidence.accepted_hashes.insert(rules_hash);
+        let result = engine
+            .process_join("#TESTCHAN", "did:plc:user1", &evidence)
+            .unwrap();
+        assert!(matches!(result, JoinResult::Confirmed { .. }));
+
+        // Membership check under the original casing finds the attestation.
+        let att = engine
+            .check_membership("#TestChan", "did:plc:user1")
+            .unwrap()
+            .expect("attestation found");
+        assert_eq!(att.subject_did, "did:plc:user1");
+        // Attestation signature is computed over the canonical casing and
+        // must verify.
+        assert!(engine.verify_attestation(&att));
     }
 
     #[test]

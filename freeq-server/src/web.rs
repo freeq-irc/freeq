@@ -333,6 +333,24 @@ pub fn router(state: Arc<SharedState>) -> Router {
         crate::verifiers::router(issuer_did, github_config, data_dir).map(|(r, _)| r)
     };
 
+    // Loud failure for unmounted verifier routes. The SPA fallback below
+    // serves index.html for any unmatched path — including /verify/github/*
+    // when the GitHub verifier isn't configured (GITHUB_CLIENT_ID unset).
+    // That made a missing verifier look like a working one (the web app
+    // loads, no credential is ever issued, the join silently fails forever).
+    // Return 503 instead. Concrete verifier routes are more specific than
+    // this wildcard, so mounted verifiers are unaffected.
+    app = app.route(
+        "/verify/{*unmounted}",
+        get(unmounted_verifier).post(unmounted_verifier),
+    );
+
+    // Startup warnings: verifiers referenced by stored policies but not
+    // mounted on this server. A channel gated on an unmounted verifier can
+    // never be newly joined — existing credential holders still get in,
+    // which is exactly the "works for some people, not others" symptom.
+    warn_about_unmounted_verifiers(&state);
+
     // Serve static web client files if the directory exists
     if let Some(ref web_dir) = state.config.web_static_dir {
         let dir = std::path::PathBuf::from(web_dir);
@@ -382,6 +400,100 @@ pub fn router(state: Arc<SharedState>) -> Router {
     // Security headers as outermost layer so they apply to all responses
     // including static files served via fallback_service
     final_app.layer(axum::middleware::from_fn(security_headers))
+}
+
+/// Handler for /verify/* paths with no mounted verifier (e.g. GitHub when
+/// GITHUB_CLIENT_ID is unset). Returns 503 with a clear message instead of
+/// letting the SPA fallback pretend everything is fine.
+async fn unmounted_verifier(
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> impl axum::response::IntoResponse {
+    // Only the first path segment is used for the provider hint, and the
+    // user-controlled path is never echoed into the HTML unescaped.
+    let provider = path.split('/').next().unwrap_or("").to_string();
+    let provider = if provider.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        provider
+    } else {
+        "unknown".to_string()
+    };
+    tracing::warn!(provider = %provider, "request hit unmounted /verify route");
+    let html = format!(
+        r#"<!DOCTYPE html><html><head><title>freeq — Verifier not configured</title>
+<style>
+body {{ font-family: system-ui; max-width: 500px; margin: 40px auto; padding: 0 20px; background: #0a0a1a; color: #e0e0e0; }}
+.card {{ background: #1a1a2e; border-radius: 16px; padding: 32px; }}
+h1 {{ color: #e74c3c; font-size: 20px; }}
+code {{ background: #000; padding: 2px 6px; border-radius: 4px; }}
+</style></head><body>
+<div class="card">
+<h1>✗ Verification provider not configured</h1>
+<p>The <code>{provider}</code> verifier is not enabled on this server, so this
+channel's requirements cannot be verified right now.</p>
+<p>Please tell the server operator: this usually means
+<code>GITHUB_CLIENT_ID</code>/<code>GITHUB_CLIENT_SECRET</code> (or the OIDC
+equivalent) is missing from the server configuration.</p>
+</div>
+</body></html>"#,
+    );
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        axum::response::Html(html),
+    )
+}
+
+/// Log a loud startup warning for every stored policy whose credential
+/// endpoints point at verifier routes this server hasn't mounted (GitHub
+/// without GITHUB_CLIENT_ID, OIDC without OIDC_CLIENT_ID). Such channels are
+/// silently unjoinable for new members — exactly the "sometimes users can't
+/// join" symptom — so the operator needs to hear about it at boot.
+fn warn_about_unmounted_verifiers(state: &Arc<SharedState>) {
+    let github_mounted = state.config.github_client_id.is_some();
+    let oidc_mounted = crate::verifiers::oidc::OidcConfig::from_env().is_some();
+
+    if !github_mounted {
+        tracing::warn!(
+            "GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET not configured — /verify/github/* is disabled; \
+             channels gated on github_repo/github_membership credentials cannot verify new members"
+        );
+    }
+
+    let Some(ref engine) = state.policy_engine else {
+        return;
+    };
+    let channels = match engine.store().list_policy_channels() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not scan policies for unmounted verifiers");
+            return;
+        }
+    };
+    for channel in channels {
+        let Ok(Some(policy)) = engine.store().get_current_policy(&channel) else {
+            continue;
+        };
+        for (cred_type, ep) in &policy.credential_endpoints {
+            let url = &ep.url;
+            if !github_mounted && url.starts_with("/verify/github/") {
+                tracing::error!(
+                    channel = %channel,
+                    credential_type = %cred_type,
+                    endpoint = %url,
+                    "POLICY DEAD-END: channel requires a credential whose verifier is NOT mounted \
+                     (GitHub OAuth is not configured). New members cannot join. \
+                     Set GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET and restart."
+                );
+            }
+            if !oidc_mounted && url.starts_with("/verify/oidc/") {
+                tracing::error!(
+                    channel = %channel,
+                    credential_type = %cred_type,
+                    endpoint = %url,
+                    "POLICY DEAD-END: channel requires a credential whose verifier is NOT mounted \
+                     (OIDC is not configured). New members cannot join."
+                );
+            }
+        }
+    }
 }
 
 // ── WebSocket handler ──────────────────────────────────────────────────
@@ -5488,5 +5600,66 @@ mod audit_actor_name_tests {
             stranger,
             "an unknown DID resolves to itself — the audit row must treat this as no name",
         );
+    }
+}
+
+#[cfg(test)]
+mod verify_catchall_tests {
+    use axum::{Router, response::Html, routing::get};
+
+    /// The /verify/{*unmounted} catchall must 503 unmounted verifier routes
+    /// (so the SPA fallback can't silently swallow them) while leaving
+    /// mounted verifier routes untouched. This also proves axum allows the
+    /// wildcard to coexist with more-specific concrete routes.
+    #[tokio::test]
+    async fn catchall_503s_unmounted_but_mounted_routes_win() {
+        let app = Router::new()
+            .route(
+                "/verify/{*unmounted}",
+                get(super::unmounted_verifier).post(super::unmounted_verifier),
+            )
+            // Concrete verifier route, merged AFTER the wildcard exactly
+            // like verifiers::router is merged into final_app.
+            .merge(Router::new().route(
+                "/verify/bluesky/start",
+                get(|| async { Html("bluesky start page") }),
+            ));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+
+        // Mounted verifier route wins over the wildcard.
+        let resp = client
+            .get(format!("http://{addr}/verify/bluesky/start?subject_did=x"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "bluesky start page");
+
+        // Unmounted verifier route → loud 503 (was: 200 SPA index.html).
+        let resp = client
+            .get(format!("http://{addr}/verify/github/start?repo=foo/bar"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("not configured"), "got: {body}");
+        assert!(body.contains("github"), "names the provider: {body}");
+
+        // Unknown provider names are sanitized before being echoed.
+        let resp = client
+            .get(format!("http://{addr}/verify/%3Cscript%3E/start"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        assert!(!resp.text().await.unwrap().contains("<script"));
     }
 }

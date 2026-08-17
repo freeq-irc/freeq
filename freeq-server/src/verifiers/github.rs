@@ -202,28 +202,16 @@ async fn verify_org_membership(
     pending: &PendingVerification,
 ) -> axum::response::Response {
     // Authenticated membership endpoint (sees private memberships).
-    let membership = match get_status_with_retries(
+    // Single request: 200 → inspect the record's state; 404 → no record.
+    let membership = match get_status_and_json(
         http,
         &format!("https://api.github.com/user/memberships/orgs/{org}"),
-        Some(access_token),
+        access_token,
     )
     .await
     {
-        Ok(status) if status.is_success() => {
-            // 200 — a membership record exists; check its state (an
-            // unaccepted invitation must not count as membership).
-            match get_json_checked(
-                http,
-                &format!("https://api.github.com/user/memberships/orgs/{org}"),
-                access_token,
-            )
-            .await
-            {
-                Ok(body) => parse_membership_state(&body),
-                Err(e) => ApiCheck::Error(e.to_string()),
-            }
-        }
-        Ok(status) => classify_yes_no_status(status),
+        Ok((status, Some(body))) if status.is_success() => parse_membership_state(&body),
+        Ok((status, _)) => classify_yes_no_status(status),
         Err(e) => ApiCheck::Error(e.to_string()),
     };
 
@@ -565,6 +553,42 @@ async fn get_json_checked(
     .await
 }
 
+/// GET a GitHub API endpoint, returning the final status and (on success)
+/// the parsed JSON body, with bounded retries on 429/5xx/network errors.
+/// Non-2xx statuses (e.g. 404) are returned, not treated as errors.
+async fn get_status_and_json(
+    http: &reqwest::Client,
+    url: &str,
+    access_token: &str,
+) -> Result<(reqwest::StatusCode, Option<serde_json::Value>), FetchError> {
+    retry_loop(
+        || async {
+            let resp = http
+                .get(url)
+                .header("Authorization", format!("Bearer {access_token}"))
+                .header("User-Agent", "freeq-verifier")
+                .send()
+                .await
+                .map_err(|e| FetchError::Transient(format!("request failed: {e}")))?;
+            if let Some(err) = FetchError::from_status(resp.status()) {
+                return Err(err);
+            }
+            let status = resp.status();
+            if !status.is_success() {
+                return Ok((status, None));
+            }
+            let body = resp
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|e| FetchError::Permanent(format!("invalid JSON: {e}")))?;
+            Ok((status, Some(body)))
+        },
+        2,
+        std::time::Duration::from_millis(400),
+    )
+    .await
+}
+
 fn error_page(msg: &str) -> axum::response::Response {
     let safe_msg = msg
         .replace('&', "&amp;")
@@ -583,4 +607,47 @@ p {{ white-space: pre-wrap; text-align: left; }}
 </body></html>"#,
     );
     axum::response::Html(html).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_collaborator_status() {
+        use reqwest::StatusCode;
+        assert_eq!(classify_yes_no_status(StatusCode::NO_CONTENT), ApiCheck::Yes);
+        assert_eq!(classify_yes_no_status(StatusCode::NOT_FOUND), ApiCheck::No);
+        // Rate limits and server errors are Errors, never a denial.
+        assert!(matches!(
+            classify_yes_no_status(StatusCode::TOO_MANY_REQUESTS),
+            ApiCheck::Error(_)
+        ));
+        assert!(matches!(
+            classify_yes_no_status(StatusCode::INTERNAL_SERVER_ERROR),
+            ApiCheck::Error(_)
+        ));
+        // Even 403 (rate-limited unauthenticated) is an Error, not a No.
+        assert!(matches!(
+            classify_yes_no_status(StatusCode::FORBIDDEN),
+            ApiCheck::Error(_)
+        ));
+    }
+
+    #[test]
+    fn membership_state_active_counts_pending_does_not() {
+        assert_eq!(
+            parse_membership_state(&serde_json::json!({"state": "active"})),
+            ApiCheck::Yes
+        );
+        assert_eq!(
+            parse_membership_state(&serde_json::json!({"state": "pending"})),
+            ApiCheck::No
+        );
+        // Unknown shape on a 200 → membership record exists → Yes.
+        assert_eq!(
+            parse_membership_state(&serde_json::json!({})),
+            ApiCheck::Yes
+        );
+    }
 }
