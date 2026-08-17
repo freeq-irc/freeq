@@ -28,6 +28,8 @@
 # data_dir = "/data"
 # max_messages_per_channel = 10000
 # message_retention_days = 0
+## How long a task may sit unfinished before the sweep expires it (seconds; 0 = never):
+# act_expiry_secs = 604800
 
 ## ── Federation (iroh + S2S) ────────────────────────────────────────
 # iroh = true

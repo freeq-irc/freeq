@@ -440,6 +440,7 @@ struct FileConfig {
     data_dir: Option<String>,
     did_resolver_static: Option<MapOrPairs>,
     max_messages_per_channel: Option<usize>,
+    act_expiry_secs: Option<u64>,
     motd: Option<String>,
     motd_file: Option<String>,
     web_static_dir: Option<String>,
@@ -556,6 +557,7 @@ fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConf
         s2s_peers,
         s2s_allowed_peers,
         max_messages_per_channel,
+        act_expiry_secs,
         plugins,
         require_did_for_ops,
         oper_dids,
@@ -610,6 +612,7 @@ mod tests {
                 server_name = "toml-test"
                 max_messages_per_channel = 42
                 iroh = true
+                act_expiry_secs = 120
                 s2s_peer_api = ["abcd=https://irc.example.com"]
                 "#,
             ),
@@ -619,6 +622,7 @@ mod tests {
         assert_eq!(c.server_name, "toml-test");
         assert_eq!(c.max_messages_per_channel, 42);
         assert!(c.iroh);
+        assert_eq!(c.act_expiry_secs, 120);
         assert_eq!(c.s2s_peer_api, vec!["abcd=https://irc.example.com"]);
     }
 
