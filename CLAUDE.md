@@ -200,6 +200,23 @@ If something feels “too clever,” it’s probably wrong.
 
 ---
 
+## Production deploy (irc.freeq.at)
+
+Prod host `reth` (160.202.129.155, TLS cert CN tech.blueyard.com), SSH user
+`chad` (passwordless sudo). systemd unit `freeq-server`, repo at
+`/home/chad/src/freeq`, secrets in `/home/chad/src/freeq/.env.secrets`
+(not in git — that's where GITHUB_CLIENT_ID etc. belong).
+
+**Deploy ONLY via the script — never hand-run cargo/npm on the host:**
+
+    ssh chad@160.202.129.155 "cd ~/src/freeq && ./deploy/deploy.sh"
+
+The script builds with `--features av-native`; a plain `cargo build --release`
+produces a no-AV binary, and AV in prod silently went down for ~2h on
+2026-08-18 from exactly that mistake. The script hard-fails if
+`/api/v1/health` doesn't report `"av":true` after restart — if it fails,
+the deploy failed, fix the build before doing anything else.
+
 ## Hotspot Analysis
 
 Run `./scripts/hotspots.sh` at session start to identify high-risk files. Focus adversarial testing, careful review, and iterative refactoring on files with high gamma scores. Files with low gamma can be changed quickly.
