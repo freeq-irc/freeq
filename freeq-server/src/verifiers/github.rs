@@ -8,7 +8,7 @@
 //!   GET /verify/github/callback
 //!     → Exchange code, verify membership/collaborator, sign credential, POST to callback
 
-use super::{PendingVerification, VerifierState};
+use super::{FetchError, PendingVerification, VerifierState, retry_loop};
 use crate::policy::credentials;
 use crate::policy::types::VerifiableCredential;
 use axum::{
@@ -201,43 +201,72 @@ async fn verify_org_membership(
     org: &str,
     pending: &PendingVerification,
 ) -> axum::response::Response {
-    // Try authenticated membership endpoint first (sees private memberships)
-    let is_member = http
-        .get(format!(
-            "https://api.github.com/user/memberships/orgs/{}",
-            org
-        ))
-        .header("Authorization", format!("Bearer {access_token}"))
-        .header("User-Agent", "freeq-verifier")
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
+    // Authenticated membership endpoint (sees private memberships).
+    // Single request: 200 → inspect the record's state; 404 → no record.
+    let membership = match get_status_and_json(
+        http,
+        &format!("https://api.github.com/user/memberships/orgs/{org}"),
+        access_token,
+    )
+    .await
+    {
+        Ok((status, Some(body))) if status.is_success() => parse_membership_state(&body),
+        Ok((status, _)) => classify_yes_no_status(status),
+        Err(e) => ApiCheck::Error(e.to_string()),
+    };
 
-    if !is_member {
-        // Also check if they're a collaborator on any repo in the org
-        // GET /orgs/{org}/repos then check collaborator status
-        // For now, try the simpler public membership check as fallback
-        let is_public = http
-            .get(format!(
-                "https://api.github.com/orgs/{}/public_members/{}",
-                org, username
-            ))
-            .header("User-Agent", "freeq-verifier")
-            .send()
-            .await
-            .map(|r| r.status().as_u16() == 204)
-            .unwrap_or(false);
-
-        if !is_public {
+    let is_member = match membership {
+        ApiCheck::Yes => true,
+        ApiCheck::Error(e) => {
+            tracing::warn!(org = %org, error = %e, "GitHub org membership check failed");
             return error_page(&format!(
-                "{username} is not a member of the {org} organization.\n\n\
-                 Options:\n\
-                 • Make your membership public at https://github.com/orgs/{org}/people\n\
-                 • Ask the channel to accept repo collaborator verification instead:\n\
-                   /POLICY #channel REQUIRE github_repo issuer=... url=.../verify/github/start repo=owner/repo"
+                "GitHub is having trouble answering right now ({e}).\n\n\
+                 This is temporary — please go back and try the verification again."
             ));
         }
+        ApiCheck::No => {
+            // Fall back to the public membership check (covers members who
+            // flaunt their membership publicly but lack read:org scope).
+            // NOTE: unauthenticated — 60 req/hr per server IP. A 403 here is
+            // almost certainly rate limiting, so surface it as an Error.
+            match get_status_with_retries(
+                http,
+                &format!("https://api.github.com/orgs/{org}/public_members/{username}"),
+                None,
+            )
+            .await
+            {
+                Ok(status) => match classify_yes_no_status(status) {
+                    ApiCheck::Yes => true,
+                    ApiCheck::No => false,
+                    ApiCheck::Error(e) => {
+                        tracing::warn!(org = %org, error = %e, "GitHub public membership check failed");
+                        return error_page(&format!(
+                            "GitHub is having trouble answering right now ({e}).\n\n\
+                             This is temporary — please go back and try the verification again."
+                        ));
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(org = %org, error = %e, "GitHub public membership check failed");
+                    return error_page(&format!(
+                        "GitHub is having trouble answering right now ({e}).\n\n\
+                         This is temporary — please go back and try the verification again."
+                    ));
+                }
+            }
+        }
+    };
+
+    if !is_member {
+        return error_page(&format!(
+            "{username} is not a member of the {org} organization.\n\n\
+             Options:\n\
+             • If you were recently invited, accept the invitation first\n\
+             • Make your membership public at https://github.com/orgs/{org}/people\n\
+             • Ask the channel to accept repo collaborator verification instead:\n\
+               /POLICY #channel REQUIRE github_repo issuer=... url=.../verify/github/start repo=owner/repo"
+        ));
     }
 
     issue_credential(
@@ -266,61 +295,61 @@ async fn verify_repo_collaborator(
     pending: &PendingVerification,
 ) -> axum::response::Response {
     // Check if the user is a collaborator on the repo
-    // GET /repos/{owner}/{repo}/collaborators/{username} → 204 if yes
-    let is_collaborator = http
-        .get(format!(
-            "https://api.github.com/repos/{}/collaborators/{}",
-            repo, username
-        ))
-        .header("Authorization", format!("Bearer {access_token}"))
-        .header("User-Agent", "freeq-verifier")
-        .send()
-        .await
-        .map(|r| r.status().as_u16() == 204)
-        .unwrap_or(false);
-
-    if !is_collaborator {
-        // Also check if they have push access via the repo endpoint
-        let has_push = match http
-            .get(format!("https://api.github.com/repos/{}", repo))
-            .header("Authorization", format!("Bearer {access_token}"))
-            .header("User-Agent", "freeq-verifier")
-            .send()
-            .await
-        {
-            Ok(r) => {
-                let repo_json: serde_json::Value = r.json().await.unwrap_or_default();
-                repo_json
-                    .get("permissions")
-                    .and_then(|p| p.get("push"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
+    // GET /repos/{owner}/{repo}/collaborators/{username} → 204 if yes, 404 if no.
+    // Anything else (429/5xx/network) is a retryable error, NOT a denial.
+    let collaborator_url = format!("https://api.github.com/repos/{repo}/collaborators/{username}");
+    let is_collaborator = match get_status_with_retries(http, &collaborator_url, Some(access_token)).await {
+        Ok(status) => match classify_yes_no_status(status) {
+            ApiCheck::Yes => ApiCheck::Yes,
+            ApiCheck::No => {
+                // Also check if they have push access via the repo endpoint
+                // (covers permission shapes the collaborators endpoint misses).
+                match get_json_checked(http, &format!("https://api.github.com/repos/{repo}"), access_token).await {
+                    Ok(repo_json) => {
+                        let has_push = repo_json
+                            .get("permissions")
+                            .and_then(|p| p.get("push"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if has_push { ApiCheck::Yes } else { ApiCheck::No }
+                    }
+                    Err(e) => ApiCheck::Error(e.to_string()),
+                }
             }
-            Err(_) => false,
-        };
+            ApiCheck::Error(e) => ApiCheck::Error(e),
+        },
+        Err(e) => ApiCheck::Error(e.to_string()),
+    };
 
-        if !has_push {
-            return error_page(&format!(
-                "{username} is not a collaborator on {repo}.\n\n\
-                 You need push access or collaborator status on this repository."
-            ));
+    match is_collaborator {
+        ApiCheck::Yes => {
+            issue_credential(
+                state,
+                http,
+                pending,
+                username,
+                "github_repo",
+                serde_json::json!({
+                    "github_username": username,
+                    "repo": repo,
+                }),
+                &format!("{username} has access to {repo}"),
+                repo,
+            )
+            .await
+        }
+        ApiCheck::No => error_page(&format!(
+            "{username} is not a collaborator on {repo}.\n\n\
+             You need push access or collaborator status on this repository."
+        )),
+        ApiCheck::Error(e) => {
+            tracing::warn!(repo = %repo, error = %e, "GitHub collaborator check failed");
+            error_page(&format!(
+                "GitHub is having trouble answering right now ({e}).\n\n\
+                 This is temporary — please go back and try the verification again."
+            ))
         }
     }
-
-    issue_credential(
-        state,
-        http,
-        pending,
-        username,
-        "github_repo",
-        serde_json::json!({
-            "github_username": username,
-            "repo": repo,
-        }),
-        &format!("{username} has access to {repo}"),
-        repo,
-    )
-    .await
 }
 
 /// Issue a signed credential and POST it to the callback URL.
@@ -429,6 +458,137 @@ if (window.opener) {{
     axum::response::Html(html).into_response()
 }
 
+/// The result of a GitHub API yes/no check.
+///
+/// `Error` must never be presented to the user as "you don't have access" —
+/// a rate limit or 5xx is not a denial (the old code collapsed these, which
+/// produced intermittent false rejections whenever GitHub hiccuped).
+#[derive(Debug, Clone, PartialEq)]
+enum ApiCheck {
+    Yes,
+    No,
+    Error(String),
+}
+
+/// Classify the status of a "204 = yes, 404 = no" GitHub endpoint.
+/// Anything else (429, 5xx, …) is an Error, not a No.
+fn classify_yes_no_status(status: reqwest::StatusCode) -> ApiCheck {
+    match status.as_u16() {
+        204 | 200 => ApiCheck::Yes,
+        404 => ApiCheck::No,
+        _ => match FetchError::from_status(status) {
+            Some(e) => ApiCheck::Error(e.to_string()),
+            None => ApiCheck::Error(format!("unexpected HTTP {status}")),
+        },
+    }
+}
+
+/// Interpret the body of GET /user/memberships/orgs/{org}.
+/// 200 means a membership record exists; `state` distinguishes an active
+/// member from someone holding an unaccepted invitation.
+fn parse_membership_state(body: &serde_json::Value) -> ApiCheck {
+    match body["state"].as_str() {
+        Some("active") => ApiCheck::Yes,
+        Some("pending") => ApiCheck::No,
+        // 200 with an unrecognized body shape: the membership record exists,
+        // so treat as Yes (backwards-compatible with older API responses).
+        _ => ApiCheck::Yes,
+    }
+}
+
+/// GET a GitHub API endpoint, returning the final status code, with bounded
+/// retries on 429/5xx/network errors. Err(_) means the request could not be
+/// completed at all — callers must surface that as a retryable error.
+async fn get_status_with_retries(
+    http: &reqwest::Client,
+    url: &str,
+    access_token: Option<&str>,
+) -> Result<reqwest::StatusCode, FetchError> {
+    retry_loop(
+        || async {
+            let mut req = http.get(url).header("User-Agent", "freeq-verifier");
+            if let Some(token) = access_token {
+                req = req.header("Authorization", format!("Bearer {token}"));
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| FetchError::Transient(format!("request failed: {e}")))?;
+            if let Some(err) = FetchError::from_status(resp.status()) {
+                return Err(err);
+            }
+            Ok(resp.status())
+        },
+        2,
+        std::time::Duration::from_millis(400),
+    )
+    .await
+}
+
+/// GET a GitHub API endpoint and parse JSON, with bounded retries.
+async fn get_json_checked(
+    http: &reqwest::Client,
+    url: &str,
+    access_token: &str,
+) -> Result<serde_json::Value, FetchError> {
+    retry_loop(
+        || async {
+            let resp = http
+                .get(url)
+                .header("Authorization", format!("Bearer {access_token}"))
+                .header("User-Agent", "freeq-verifier")
+                .send()
+                .await
+                .map_err(|e| FetchError::Transient(format!("request failed: {e}")))?;
+            if let Some(err) = FetchError::from_status(resp.status()) {
+                return Err(err);
+            }
+            resp.json::<serde_json::Value>()
+                .await
+                .map_err(|e| FetchError::Permanent(format!("invalid JSON: {e}")))
+        },
+        2,
+        std::time::Duration::from_millis(400),
+    )
+    .await
+}
+
+/// GET a GitHub API endpoint, returning the final status and (on success)
+/// the parsed JSON body, with bounded retries on 429/5xx/network errors.
+/// Non-2xx statuses (e.g. 404) are returned, not treated as errors.
+async fn get_status_and_json(
+    http: &reqwest::Client,
+    url: &str,
+    access_token: &str,
+) -> Result<(reqwest::StatusCode, Option<serde_json::Value>), FetchError> {
+    retry_loop(
+        || async {
+            let resp = http
+                .get(url)
+                .header("Authorization", format!("Bearer {access_token}"))
+                .header("User-Agent", "freeq-verifier")
+                .send()
+                .await
+                .map_err(|e| FetchError::Transient(format!("request failed: {e}")))?;
+            if let Some(err) = FetchError::from_status(resp.status()) {
+                return Err(err);
+            }
+            let status = resp.status();
+            if !status.is_success() {
+                return Ok((status, None));
+            }
+            let body = resp
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|e| FetchError::Permanent(format!("invalid JSON: {e}")))?;
+            Ok((status, Some(body)))
+        },
+        2,
+        std::time::Duration::from_millis(400),
+    )
+    .await
+}
+
 fn error_page(msg: &str) -> axum::response::Response {
     let safe_msg = msg
         .replace('&', "&amp;")
@@ -447,4 +607,47 @@ p {{ white-space: pre-wrap; text-align: left; }}
 </body></html>"#,
     );
     axum::response::Html(html).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_collaborator_status() {
+        use reqwest::StatusCode;
+        assert_eq!(classify_yes_no_status(StatusCode::NO_CONTENT), ApiCheck::Yes);
+        assert_eq!(classify_yes_no_status(StatusCode::NOT_FOUND), ApiCheck::No);
+        // Rate limits and server errors are Errors, never a denial.
+        assert!(matches!(
+            classify_yes_no_status(StatusCode::TOO_MANY_REQUESTS),
+            ApiCheck::Error(_)
+        ));
+        assert!(matches!(
+            classify_yes_no_status(StatusCode::INTERNAL_SERVER_ERROR),
+            ApiCheck::Error(_)
+        ));
+        // Even 403 (rate-limited unauthenticated) is an Error, not a No.
+        assert!(matches!(
+            classify_yes_no_status(StatusCode::FORBIDDEN),
+            ApiCheck::Error(_)
+        ));
+    }
+
+    #[test]
+    fn membership_state_active_counts_pending_does_not() {
+        assert_eq!(
+            parse_membership_state(&serde_json::json!({"state": "active"})),
+            ApiCheck::Yes
+        );
+        assert_eq!(
+            parse_membership_state(&serde_json::json!({"state": "pending"})),
+            ApiCheck::No
+        );
+        // Unknown shape on a 200 → membership record exists → Yes.
+        assert_eq!(
+            parse_membership_state(&serde_json::json!({})),
+            ApiCheck::Yes
+        );
+    }
 }

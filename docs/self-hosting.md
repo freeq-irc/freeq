@@ -177,7 +177,8 @@ freeq-server --config /etc/freeq/server.toml
 freeq-server \
   --iroh \
   --s2s-peers <peer-id> \
-  --s2s-allowed-peers <peer-id>
+  --s2s-allowed-peers <peer-id> \
+  --s2s-peer-api <peer-id>=https://peer.example.com
 ```
 
 | Flag | Default | Description |
@@ -186,6 +187,7 @@ freeq-server \
 | `--iroh-port` | random | UDP port for iroh |
 | `--s2s-peers` | *(none)* | Peer endpoint IDs to connect to on startup |
 | `--s2s-allowed-peers` | *(none — open)* | Allowlist for incoming peer connections |
+| `--s2s-peer-api` | *(none — peer signatures stay uncheckable)* | Where each peer serves its users' signing keys: `<endpoint-id>=<https://base>` (the peer's REST API base URL). Deliberately operator configuration, never peer-announced |
 | `--s2s-peer-trust` | *(none)* | Trust levels per peer: `id:full`, `id:relay`, `id:readonly` |
 | `--server-did` | *(none)* | Server DID for federation identity (e.g. `did:web:irc.example.com`) |
 

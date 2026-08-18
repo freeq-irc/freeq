@@ -2306,9 +2306,22 @@ impl Db {
     }
 
     /// The DID's most-recently-registered signing key (raw 32-byte ed25519
-    /// public key), or None. Used by the existing verify path, which wants the
-    /// current key; a specific historical key is fetched via
-    /// [`Db::get_signing_key_by_kid`].
+    /// public key), or None.
+    ///
+    /// **Not a verification lookup.** This answers "what key is this identity
+    /// using now", which the public key endpoint publishes and the provenance
+    /// check needs — not "what key made this signature", which is the only
+    /// question chat verification asks. Every chat path resolves the key by
+    /// the `kid` the signature names ([`Db::get_signing_key_by_kid`]), so a
+    /// signature stays checkable after the session that made it ends and a
+    /// key rotation does not turn a body of honest history invalid.
+    ///
+    /// The retired signature format — a bare base64 blob over
+    /// `did\0target\0text\0timestamp`, naming no kid — is what a "latest key"
+    /// lookup existed for. It folded a client-minted wall clock that never
+    /// crossed the wire, so nothing could rebuild its bytes: it is
+    /// uncheckable on every path, classified `unverifiable-legacy-format`,
+    /// and never evidence of forgery.
     pub fn get_signing_key(&self, did: &str) -> SqlResult<Option<[u8; 32]>> {
         // rowid DESC breaks ties: registered_at is second-granularity, so two
         // keys registered in the same second must fall back to insertion order.

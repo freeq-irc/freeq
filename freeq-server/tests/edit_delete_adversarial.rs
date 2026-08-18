@@ -8,7 +8,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+use ed25519_dalek::SigningKey;
 use freeq_sdk::auth::{self, ChallengeSigner, KeySigner};
+use freeq_sdk::chatsig::{ChatDoc, EVENT_ID_TAG, Mutation, dm_venue};
 use freeq_sdk::crypto::PrivateKey;
 use freeq_sdk::did::{self, DidResolver};
 
@@ -1114,6 +1116,101 @@ impl C {
             "@+freeq.at/unreact={emoji};+reply={msgid} TAGMSG {target}"
         ));
     }
+    /// Register a session signing key, as every signing client does after auth.
+    fn msgsig(&mut self, key: &SigningKey) {
+        use base64::Engine;
+        let pubkey =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
+        self.tx(&format!("MSGSIG {pubkey}"));
+        self.rx(|l| l.contains("MSGSIG"), "MSGSIG ack");
+    }
+    /// The same reaction, carrying the proof an identity's mutation needs.
+    fn send_signed_react(
+        &mut self,
+        target: &str,
+        venue: &str,
+        did: &str,
+        msgid: &str,
+        emoji: &str,
+        key: &SigningKey,
+    ) {
+        self.send_signed_mutation(
+            Mutation::React,
+            "+react",
+            target,
+            venue,
+            did,
+            msgid,
+            Some(emoji),
+            key,
+        );
+    }
+    fn send_signed_unreact(
+        &mut self,
+        target: &str,
+        venue: &str,
+        did: &str,
+        msgid: &str,
+        emoji: &str,
+        key: &SigningKey,
+    ) {
+        self.send_signed_mutation(
+            Mutation::Unreact,
+            "+freeq.at/unreact",
+            target,
+            venue,
+            did,
+            msgid,
+            Some(emoji),
+            key,
+        );
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn send_signed_mutation(
+        &mut self,
+        kind: Mutation,
+        subject_tag: &str,
+        target: &str,
+        venue: &str,
+        did: &str,
+        subject: &str,
+        emoji: Option<&str>,
+        key: &SigningKey,
+    ) {
+        let event_id = freeq_server::msgid::generate();
+        let mut doc = ChatDoc::mutation(kind, did, &event_id, venue, subject);
+        if let Some(emoji) = emoji {
+            doc = doc.with_emoji(emoji);
+        }
+        let sig = doc.sign(key);
+        let head = match emoji {
+            Some(e) => format!("{subject_tag}={e};+reply={subject}"),
+            None => format!("{subject_tag}={subject}"),
+        };
+        self.tx(&format!(
+            "@{head};{EVENT_ID_TAG}={event_id};+freeq.at/sig={sig} TAGMSG {target}"
+        ));
+    }
+    /// An edit signed by its author — an edit is a message, and its document
+    /// covers the message it revises.
+    fn send_signed_edit(
+        &mut self,
+        target: &str,
+        venue: &str,
+        did: &str,
+        original_msgid: &str,
+        new_text: &str,
+        key: &SigningKey,
+    ) {
+        let edit_id = freeq_server::msgid::generate();
+        let sig = ChatDoc::message(did, &edit_id, venue, new_text)
+            .with_edit(original_msgid)
+            .sign(key);
+        self.tx(&format!(
+            "@{EVENT_ID_TAG}={edit_id};+draft/edit={original_msgid};+freeq.at/sig={sig} \
+             PRIVMSG {target} :{new_text}"
+        ));
+    }
     /// Send a message and an edit of it; returns (original id, edit's own id).
     fn say_then_edit(
         &mut self,
@@ -1418,22 +1515,29 @@ async fn a_dm_reaction_survives_an_edit() {
     let resolver = resolver_with(vec![(DID_ALICE, &key_a), (DID_BOB, &key_b)]);
     let (addr, _h) = start(resolver).await;
     run(addr, move |addr| {
+        // Both ends sign: an identity's edit and reactions are refused
+        // without proof from the key it registered.
         let mut alice = C::with_sasl(addr, "dmrid_a", DID_ALICE, key_a);
         alice.reg();
+        let signing_a = SigningKey::from_bytes(&[7u8; 32]);
+        alice.msgsig(&signing_a);
         alice.drain();
         let mut bob = C::with_sasl(addr, "dmrid_b", DID_BOB, key_b);
         bob.reg();
+        let signing_b = SigningKey::from_bytes(&[8u8; 32]);
+        bob.msgsig(&signing_b);
         bob.drain();
+        let venue = dm_venue(DID_ALICE, DID_BOB);
 
         alice.tx("PRIVMSG dmrid_b :dm v1");
         let first = bob.rx(|l| l.contains("PRIVMSG") && l.contains("dm v1"), "dm v1");
         let original = C::extract_msgid(&first);
-        alice.send_edit("dmrid_b", &original, "dm v2");
+        alice.send_signed_edit("dmrid_b", &venue, DID_ALICE, &original, "dm v2", &signing_a);
         let edit = bob.rx(|l| l.contains("PRIVMSG") && l.contains("dm v2"), "dm v2");
         let edit_id = C::extract_msgid(&edit);
         assert_ne!(original, edit_id);
 
-        bob.send_react("dmrid_a", &edit_id, "🔥");
+        bob.send_signed_react("dmrid_a", &venue, DID_BOB, &edit_id, "🔥", &signing_b);
         std::thread::sleep(Duration::from_millis(300));
         bob.drain();
         bob.tx("CHATHISTORY LATEST dmrid_a * 50");
@@ -1443,7 +1547,7 @@ async fn a_dm_reaction_survives_an_edit() {
             "a DM reaction filed against the edit id vanished from history"
         );
 
-        bob.send_unreact("dmrid_a", &original, "🔥");
+        bob.send_signed_unreact("dmrid_a", &venue, DID_BOB, &original, "🔥", &signing_b);
         std::thread::sleep(Duration::from_millis(300));
         bob.drain();
         bob.tx("CHATHISTORY LATEST dmrid_a * 50");
