@@ -2926,11 +2926,7 @@ fn verify_relayed_privmsg(
 /// applies, and an unsigned mutation has no signature to check.
 fn relayed_mutation_in(
     tags: &HashMap<String, String>,
-) -> Option<(
-    freeq_sdk::chatsig::Mutation,
-    Option<&str>,
-    Option<&str>,
-)> {
+) -> Option<(freeq_sdk::chatsig::Mutation, Option<&str>, Option<&str>)> {
     use freeq_sdk::chatsig::Mutation;
     let get = |a: &str, b: &str| tags.get(a).or_else(|| tags.get(b)).map(String::as_str);
     let subject = || get("+reply", "+draft/reply");
