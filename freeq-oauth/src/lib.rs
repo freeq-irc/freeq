@@ -38,8 +38,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 /// some PDSes verify the original grant scope is still permitted by current
 /// metadata. Fresh `/authorize` requests never ask for it. Remove once the
 /// PDS ecosystem has fully sunset transitional scopes.
-pub const CLIENT_METADATA_SCOPE: &str =
-    "atproto blob:image/* repo:blue.irc.media?action=create repo:app.bsky.feed.post transition:generic";
+pub const CLIENT_METADATA_SCOPE: &str = "atproto blob:image/* repo:blue.irc.media?action=create repo:app.bsky.feed.post transition:generic";
 
 /// Generate a PKCE (verifier, S256 challenge) pair.
 pub fn generate_pkce() -> (String, String) {
@@ -92,10 +91,16 @@ mod tests {
     #[test]
     fn client_id_loopback_vs_production() {
         assert_eq!(
-            build_client_id("https://auth.freeq.at", "https://auth.freeq.at/auth/callback"),
+            build_client_id(
+                "https://auth.freeq.at",
+                "https://auth.freeq.at/auth/callback"
+            ),
             "https://auth.freeq.at/client-metadata.json"
         );
-        let local = build_client_id("http://127.0.0.1:8081", "http://127.0.0.1:8081/auth/callback");
+        let local = build_client_id(
+            "http://127.0.0.1:8081",
+            "http://127.0.0.1:8081/auth/callback",
+        );
         assert!(local.starts_with("http://localhost?redirect_uri="));
         assert!(local.contains("scope="));
     }
@@ -104,6 +109,9 @@ mod tests {
     fn pkce_challenge_is_s256_of_verifier() {
         use sha2::{Digest, Sha256};
         let (verifier, challenge) = generate_pkce();
-        assert_eq!(challenge, URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())));
+        assert_eq!(
+            challenge,
+            URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+        );
     }
 }

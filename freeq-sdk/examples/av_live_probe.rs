@@ -42,8 +42,11 @@ async fn main() -> anyhow::Result<()> {
             }
             Event::TagMsg { tags, .. } => {
                 if let Some(code) = tags.get("+freeq.at/av-error") {
-                    println!("PROBE: got av-error={code} av-id={:?} reason={:?}",
-                        tags.get("+freeq.at/av-id"), tags.get("+freeq.at/av-reason"));
+                    println!(
+                        "PROBE: got av-error={code} av-id={:?} reason={:?}",
+                        tags.get("+freeq.at/av-id"),
+                        tags.get("+freeq.at/av-reason")
+                    );
                     got_error = true;
                     // 2. Now start a REAL session and expect started + token.
                     handle.raw("@+freeq.at/av-start;+freeq.at/av-instance=probe001 TAGMSG #avprobe-test").await?;
@@ -54,12 +57,21 @@ async fn main() -> anyhow::Result<()> {
                     got_started = true;
                 }
                 if let Some(tok) = tags.get("+freeq.at/av-token") {
-                    println!("PROBE: got av-token ({} chars) for {:?}", tok.len(), tags.get("+freeq.at/av-id"));
+                    println!(
+                        "PROBE: got av-token ({} chars) for {:?}",
+                        tok.len(),
+                        tags.get("+freeq.at/av-id")
+                    );
                     got_token = true;
                     // Clean up: end the probe session.
-                    handle.raw(&format!("@+freeq.at/av-end;+freeq.at/av-id={session_id} TAGMSG #avprobe-test")).await?;
+                    handle
+                        .raw(&format!(
+                            "@+freeq.at/av-end;+freeq.at/av-id={session_id} TAGMSG #avprobe-test"
+                        ))
+                        .await?;
                 }
-                if tags.get("+freeq.at/av-state").map(String::as_str) == Some("ended") && got_token {
+                if tags.get("+freeq.at/av-state").map(String::as_str) == Some("ended") && got_token
+                {
                     println!("PROBE: session ended cleanly");
                     break;
                 }
@@ -68,7 +80,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!("RESULT: registered={registered} av_error={got_error} started={got_started} token={got_token}");
+    println!(
+        "RESULT: registered={registered} av_error={got_error} started={got_started} token={got_token}"
+    );
     if registered && got_error && got_started && got_token {
         println!("LIVE PROBE PASSED");
         Ok(())

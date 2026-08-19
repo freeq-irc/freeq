@@ -773,7 +773,10 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
                 .map(|raw| parse_reactions_tag(raw))
                 .unwrap_or_default();
             let is_edited = edit_of.is_some()
-                || tags.get("+freeq.at/edited").map(|v| v == "1").unwrap_or(false);
+                || tags
+                    .get("+freeq.at/edited")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
             // Agent coordination event: the `+freeq.at/event` tag (with the
             // `freeq.at/` unprefixed fallback some senders use) turns this
             // message into a structured card on every client.
@@ -816,7 +819,12 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
                 },
             }
         }
-        Event::TagMsg { from, target, tags, dm_key } => {
+        Event::TagMsg {
+            from,
+            target,
+            tags,
+            dm_key,
+        } => {
             let tag_entries = tags
                 .iter()
                 .map(|(k, v)| TagEntry {
@@ -923,7 +931,11 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
             target: target.clone(),
         },
         Event::BatchEnd { id } => FreeqEvent::BatchEnd { id: id.clone() },
-        Event::ChatHistoryTarget { nick, timestamp, partner_did } => FreeqEvent::ChatHistoryTarget {
+        Event::ChatHistoryTarget {
+            nick,
+            timestamp,
+            partner_did,
+        } => FreeqEvent::ChatHistoryTarget {
             nick: nick.clone(),
             timestamp: timestamp.clone(),
             partner_did: partner_did.clone(),
@@ -1697,7 +1709,14 @@ mod av_impl {
                     .await
                     .map_err(|_| FreeqError::ConnectionFailed)?;
 
-                Ok::<_, FreeqError>((session, origin, sub_consumer, audio_backend, broadcast, client))
+                Ok::<_, FreeqError>((
+                    session,
+                    origin,
+                    sub_consumer,
+                    audio_backend,
+                    broadcast,
+                    client,
+                ))
             })?;
 
         tracing::info!(broadcast = %broadcast_name, "AV: connected to MoQ SFU");
@@ -2032,7 +2051,9 @@ mod av_impl {
                 let mut last = 0.0f32;
                 loop {
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    let Some(level) = handle.smoothed_peak_normalized() else { continue };
+                    let Some(level) = handle.smoothed_peak_normalized() else {
+                        continue;
+                    };
                     let activity_flipped = (level > 0.01) != (last > 0.01);
                     if (level - last).abs() > 0.02 || activity_flipped {
                         last = level;
@@ -2046,66 +2067,66 @@ mod av_impl {
         };
 
         let video_loop = async move {
-        loop {
-            match video.take() {
-                Some(mut v) => {
-                    tracing::info!(nick = %nick, screen = is_screen, decoder = %v.decoder_name(), "AV: remote video track present");
-                    handler.on_av_event(if is_screen {
-                        AvEvent::ScreenTrackStarted { nick: nick.clone() }
-                    } else {
-                        AvEvent::VideoTrackStarted { nick: nick.clone() }
-                    });
-                    while let Some(frame) = v.next_frame().await {
-                        let (w, h) = (frame.width(), frame.height());
-                        // Decoded frames arrive as I420/NV12/GPU depending on
-                        // backend. rgba_image() unifies them into packed RGBA;
-                        // swap R↔B for BGRA (kCVPixelFormatType_32BGRA), which
-                        // is what Swift's AVSampleBufferDisplayLayer expects.
-                        let rgba = frame.rgba_image();
-                        let mut bgra = rgba.as_raw().clone();
-                        for chunk in bgra.chunks_exact_mut(4) {
-                            chunk.swap(0, 2);
-                        }
+            loop {
+                match video.take() {
+                    Some(mut v) => {
+                        tracing::info!(nick = %nick, screen = is_screen, decoder = %v.decoder_name(), "AV: remote video track present");
                         handler.on_av_event(if is_screen {
-                            AvEvent::ScreenFrame {
-                                nick: nick.clone(),
-                                bgra,
-                                width: w,
-                                height: h,
-                            }
+                            AvEvent::ScreenTrackStarted { nick: nick.clone() }
                         } else {
-                            AvEvent::VideoFrame {
-                                nick: nick.clone(),
-                                bgra,
-                                width: w,
-                                height: h,
-                            }
+                            AvEvent::VideoTrackStarted { nick: nick.clone() }
                         });
-                    }
-                    tracing::info!(nick = %nick, screen = is_screen, "AV: remote video track ended; will re-subscribe if it returns");
-                    handler.on_av_event(if is_screen {
-                        AvEvent::ScreenTrackStopped { nick: nick.clone() }
-                    } else {
-                        AvEvent::VideoTrackStopped { nick: nick.clone() }
-                    });
-                    // Track ended — fall through and wait for video to come back.
-                }
-                None => {
-                    // No video yet (or it ended). Wait for it.
-                    match remote_for_watch.video_ready().await {
-                        Ok(v) => {
-                            video = Some(v);
+                        while let Some(frame) = v.next_frame().await {
+                            let (w, h) = (frame.width(), frame.height());
+                            // Decoded frames arrive as I420/NV12/GPU depending on
+                            // backend. rgba_image() unifies them into packed RGBA;
+                            // swap R↔B for BGRA (kCVPixelFormatType_32BGRA), which
+                            // is what Swift's AVSampleBufferDisplayLayer expects.
+                            let rgba = frame.rgba_image();
+                            let mut bgra = rgba.as_raw().clone();
+                            for chunk in bgra.chunks_exact_mut(4) {
+                                chunk.swap(0, 2);
+                            }
+                            handler.on_av_event(if is_screen {
+                                AvEvent::ScreenFrame {
+                                    nick: nick.clone(),
+                                    bgra,
+                                    width: w,
+                                    height: h,
+                                }
+                            } else {
+                                AvEvent::VideoFrame {
+                                    nick: nick.clone(),
+                                    bgra,
+                                    width: w,
+                                    height: h,
+                                }
+                            });
                         }
-                        Err(e) => {
-                            tracing::warn!(nick = %nick, "AV: video_ready error: {e}; staying audio-only");
-                            // Keep the function alive so audio + broadcast
-                            // stay subscribed until the caller cancels.
-                            std::future::pending::<()>().await;
+                        tracing::info!(nick = %nick, screen = is_screen, "AV: remote video track ended; will re-subscribe if it returns");
+                        handler.on_av_event(if is_screen {
+                            AvEvent::ScreenTrackStopped { nick: nick.clone() }
+                        } else {
+                            AvEvent::VideoTrackStopped { nick: nick.clone() }
+                        });
+                        // Track ended — fall through and wait for video to come back.
+                    }
+                    None => {
+                        // No video yet (or it ended). Wait for it.
+                        match remote_for_watch.video_ready().await {
+                            Ok(v) => {
+                                video = Some(v);
+                            }
+                            Err(e) => {
+                                tracing::warn!(nick = %nick, "AV: video_ready error: {e}; staying audio-only");
+                                // Keep the function alive so audio + broadcast
+                                // stay subscribed until the caller cancels.
+                                std::future::pending::<()>().await;
+                            }
                         }
                     }
                 }
             }
-        }
         };
 
         // Both loops run for the broadcast's lifetime; neither returns.
@@ -2305,7 +2326,10 @@ mod av_impl {
     }
 
     /// Route remote-audio playback to a device (None = system default).
-    pub(super) fn set_output_device(state: &State, device_id: Option<String>) -> Result<(), FreeqError> {
+    pub(super) fn set_output_device(
+        state: &State,
+        device_id: Option<String>,
+    ) -> Result<(), FreeqError> {
         use std::str::FromStr;
         let device = match device_id {
             None => None,
@@ -2796,8 +2820,11 @@ mod tests {
         let mut tags = std::collections::HashMap::new();
         tags.insert("freeq.at/event".to_string(), "task_complete".to_string());
         let ev = freeq_sdk::event::Event::Message {
-            from: "a".to_string(), target: "#c".to_string(), text: "done".to_string(),
-            tags, dm_key: None,
+            from: "a".to_string(),
+            target: "#c".to_string(),
+            text: "done".to_string(),
+            tags,
+            dm_key: None,
         };
         let FreeqEvent::Message { msg } = convert_event(&ev).expect("event") else {
             panic!("expected Message");
@@ -2810,8 +2837,11 @@ mod tests {
         let mut tags = std::collections::HashMap::new();
         tags.insert("msgid".to_string(), "01Q".to_string());
         let ev = freeq_sdk::event::Event::Message {
-            from: "a".to_string(), target: "#c".to_string(), text: "plain".to_string(),
-            tags, dm_key: None,
+            from: "a".to_string(),
+            target: "#c".to_string(),
+            text: "plain".to_string(),
+            tags,
+            dm_key: None,
         };
         let FreeqEvent::Message { msg } = convert_event(&ev).expect("event") else {
             panic!("expected Message");
@@ -2941,7 +2971,10 @@ mod tests {
         assert_eq!(relayed.did.as_deref(), Some("did:plc:abc"));
         assert_eq!(relayed.origin.as_deref(), Some("irc.freeq.at"));
         assert_eq!(relayed.label.as_deref(), Some("Relayed identity"));
-        assert!(relayed.line.unwrap().contains("irc.freeq.at vouches for it"));
+        assert!(relayed
+            .line
+            .unwrap()
+            .contains("irc.freeq.at vouches for it"));
         assert!(!relayed.shows_mark);
         assert!(!relayed.is_pending);
         assert!(!relayed.needs_key_card);

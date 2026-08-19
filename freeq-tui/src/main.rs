@@ -3314,10 +3314,8 @@ mod tests {
 
     #[test]
     fn an_unsigned_message_claims_nothing() {
-        let (signed, account) = signature_of(
-            &tags(&[("account", "did:plc:alice")]),
-            Some(SERVER_KID),
-        );
+        let (signed, account) =
+            signature_of(&tags(&[("account", "did:plc:alice")]), Some(SERVER_KID));
         assert!(!signed, "an account tag is not a signature");
         assert_eq!(account.as_deref(), Some("did:plc:alice"));
 
@@ -3342,7 +3340,10 @@ mod tests {
             &tags(&[("+freeq.at/sig", "HNKqMdYu9tHikBPgAqjrI3OM3s1wyERKFjGNjKjw")]),
             Some(SERVER_KID),
         );
-        assert!(!signed, "a signature we cannot attribute is not the sender's");
+        assert!(
+            !signed,
+            "a signature we cannot attribute is not the sender's"
+        );
     }
 
     /// A message relayed from another server was signed under a key that is
@@ -3362,7 +3363,10 @@ mod tests {
         let mut app = crate::app::App::new("me", false);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         app.hold_dm("bob", &body, deadline);
-        assert!(app.ready_dms(std::time::Instant::now(), |_| false).is_empty());
+        assert!(
+            app.ready_dms(std::time::Instant::now(), |_| false)
+                .is_empty()
+        );
 
         let ready = app.ready_dms(std::time::Instant::now(), |t| t == "bob");
         assert_eq!(ready, vec![("bob".to_string(), body)]);
@@ -3396,10 +3400,7 @@ mod tests {
     /// apart. Silence is the honest answer; a lock would be a guess.
     #[test]
     fn without_the_servers_key_nothing_is_marked() {
-        let (signed, _) = signature_of(
-            &tags(&[("+freeq.at/sig", "ed25519:senderkid:c2ln")]),
-            None,
-        );
+        let (signed, _) = signature_of(&tags(&[("+freeq.at/sig", "ed25519:senderkid:c2ln")]), None);
         assert!(!signed);
     }
 

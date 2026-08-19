@@ -184,7 +184,9 @@ async fn handle_event(
             from,
             target,
             text,
-            tags, .. } => {
+            tags,
+            ..
+        } => {
             if tags.contains_key("batch") {
                 return Ok(());
             }

@@ -100,7 +100,11 @@ mod tests {
         assert_eq!(text, "first", "the earliest row survives");
 
         let nulls: i64 = conn
-            .query_row("SELECT COUNT(*) FROM messages WHERE msgid IS NULL", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE msgid IS NULL",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(nulls, 2, "NULL msgids are not deduped");
 
@@ -109,7 +113,10 @@ mod tests {
                ('#c', 'a', 'again', 5, 'DUP')",
             [],
         );
-        assert!(dup_again.is_err(), "the index refuses a spent msgid at the schema layer");
+        assert!(
+            dup_again.is_err(),
+            "the index refuses a spent msgid at the schema layer"
+        );
     }
 
     /// The down migration restores the version-2 schema: plain lookup index,
@@ -134,7 +141,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(!index_sql.contains("UNIQUE"), "the lookup index is back: {index_sql}");
+        assert!(
+            !index_sql.contains("UNIQUE"),
+            "the lookup index is back: {index_sql}"
+        );
 
         // Data written under version 3 survives, and duplicates are tolerated
         // again, as any pre-3 binary expects.
@@ -145,7 +155,11 @@ mod tests {
         )
         .unwrap();
         let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM messages WHERE msgid = 'KEEP'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE msgid = 'KEEP'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(n, 2);
     }

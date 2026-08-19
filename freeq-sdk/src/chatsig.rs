@@ -446,7 +446,6 @@ impl<'a> ChatDoc<'a> {
             if let Some(evidence) = self.evidence.filter(|s| !s.is_empty()) {
                 put("evidence", evidence);
             }
-
         }
         if !self.coord.is_empty() {
             let coord: serde_json::Map<String, serde_json::Value> = self
@@ -652,7 +651,11 @@ mod tests {
             bare.canonical(),
             "a covered set a relay could dodge by rewriting the spelling covers nothing"
         );
-        assert!(prefixed.canonical().contains(r#""media-url":"https://cdn/cat.png""#));
+        assert!(
+            prefixed
+                .canonical()
+                .contains(r#""media-url":"https://cdn/cat.png""#)
+        );
 
         let key = test_key(1);
         let sig = prefixed.sign(&key);
@@ -777,8 +780,8 @@ mod tests {
     /// empty — the same rule every optional field follows.
     #[test]
     fn a_coordination_event_without_a_reference_omits_the_key() {
-        let doc = ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_request")
-            .with_payload("%7B%7D");
+        let doc =
+            ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_request").with_payload("%7B%7D");
         assert!(!doc.canonical().contains(r#""ref""#), "{}", doc.canonical());
     }
 
@@ -862,8 +865,8 @@ mod tests {
     /// before the field existed.
     #[test]
     fn a_coordination_event_without_evidence_signs_as_before() {
-        let doc = ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_request")
-            .with_payload("%7B%7D");
+        let doc =
+            ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_request").with_payload("%7B%7D");
         assert_eq!(
             doc.canonical(),
             format!(
@@ -1326,11 +1329,23 @@ mod tests {
     }
 
     fn doc_negative(name: &'static str, of: &'static str, tampered: ChatDoc<'static>) -> Negative {
-        Negative { name, of, tampered: Some(tampered), sig: None, expected: "invalid" }
+        Negative {
+            name,
+            of,
+            tampered: Some(tampered),
+            sig: None,
+            expected: "invalid",
+        }
     }
 
     fn sig_negative(name: &'static str, of: &'static str, sig: SigAttack) -> Negative {
-        Negative { name, of, tampered: None, sig: Some(sig), expected: "unverifiable" }
+        Negative {
+            name,
+            of,
+            tampered: None,
+            sig: Some(sig),
+            expected: "unverifiable",
+        }
     }
 
     fn negatives() -> Vec<Negative> {
@@ -1442,8 +1457,16 @@ mod tests {
                     .with_ref("01KYVT9ZZZ0000000000000000"),
             ),
             sig_negative("wrong-kid", "message-plain", SigAttack::WrongKid),
-            sig_negative("unknown-algorithm", "message-plain", SigAttack::UnknownAlgorithm),
-            sig_negative("legacy-bare-base64", "message-plain", SigAttack::LegacyBareBase64),
+            sig_negative(
+                "unknown-algorithm",
+                "message-plain",
+                SigAttack::UnknownAlgorithm,
+            ),
+            sig_negative(
+                "legacy-bare-base64",
+                "message-plain",
+                SigAttack::LegacyBareBase64,
+            ),
         ]
     }
 
@@ -1610,7 +1633,10 @@ mod tests {
             .with_ref("")
             .with_evidence("")
             .canonical();
-        assert_eq!(coord_empty, coord_absent, "empty ref/evidence must be skipped");
+        assert_eq!(
+            coord_empty, coord_absent,
+            "empty ref/evidence must be skipped"
+        );
     }
 
     /// Every positive vector verifies, and every negative reaches its stated

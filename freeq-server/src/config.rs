@@ -472,8 +472,8 @@ impl ServerConfig {
         let mut cfg = <Self as clap::FromArgMatches>::from_arg_matches(&matches)
             .map_err(|e| e.to_string())?;
         if let Some(path) = cfg.config.clone() {
-            let text = std::fs::read_to_string(&path)
-                .map_err(|e| format!("--config {path}: {e}"))?;
+            let text =
+                std::fs::read_to_string(&path).map_err(|e| format!("--config {path}: {e}"))?;
             let file: FileConfig =
                 toml::from_str(&text).map_err(|e| format!("--config {path}: {e}"))?;
             apply_file(&mut cfg, &matches, file);
@@ -643,7 +643,10 @@ mod tests {
     #[test]
     fn an_unknown_key_is_a_loud_error_naming_the_key() {
         let err = cfg(&[], Some(r#"lisen_addr = "typo""#)).unwrap_err();
-        assert!(err.contains("lisen_addr"), "error must name the bad key: {err}");
+        assert!(
+            err.contains("lisen_addr"),
+            "error must name the bad key: {err}"
+        );
     }
 
     #[test]
@@ -686,7 +689,11 @@ mod tests {
         assert_eq!(c.s2s_peer_api, vec!["abcd=https://irc.example.com"]);
         assert_eq!(c.s2s_peer_trust, vec!["abcd:relay"]);
 
-        let c = cfg(&[], Some(r#"s2s_peer_api = ["abcd=https://irc.example.com"]"#)).unwrap();
+        let c = cfg(
+            &[],
+            Some(r#"s2s_peer_api = ["abcd=https://irc.example.com"]"#),
+        )
+        .unwrap();
         assert_eq!(c.s2s_peer_api, vec!["abcd=https://irc.example.com"]);
 
         let c = cfg(

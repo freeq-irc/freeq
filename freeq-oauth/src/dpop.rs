@@ -93,8 +93,12 @@ mod tests {
     use super::*;
 
     fn payload(jwt: &str) -> serde_json::Value {
-        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(jwt.split('.').nth(1).unwrap()).unwrap())
-            .unwrap()
+        serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(jwt.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -112,7 +116,10 @@ mod tests {
     #[test]
     fn proof_claims_and_ath() {
         let key = DpopKey::generate();
-        let p = payload(&key.proof("POST", "https://pds/token", Some("N1"), Some("ATOK")).unwrap());
+        let p = payload(
+            &key.proof("POST", "https://pds/token", Some("N1"), Some("ATOK"))
+                .unwrap(),
+        );
         assert_eq!(p["htm"], "POST");
         assert_eq!(p["htu"], "https://pds/token");
         assert_eq!(p["nonce"], "N1");
@@ -128,9 +135,12 @@ mod tests {
         // Header carries the public JWK (typ/alg fixed).
         let key3 = DpopKey::generate();
         let proof = key3.proof("POST", "https://x", None, None).unwrap();
-        let header: serde_json::Value =
-            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(proof.split('.').next().unwrap()).unwrap())
-                .unwrap();
+        let header: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(proof.split('.').next().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(header["typ"], "dpop+jwt");
         assert_eq!(header["alg"], "ES256");
         assert_eq!(header["jwk"]["crv"], "P-256");

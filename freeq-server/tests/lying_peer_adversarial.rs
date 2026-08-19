@@ -18,12 +18,12 @@ use freeq_sdk::event::Event;
 #[path = "util/mod.rs"]
 mod util;
 
-use util::lying_peer::{
-    registered_kid,
-    LyingPeer, NO_EFFECT_WINDOW, TestId, TestServer, connect, is_deleted, msgid_of, revision_count,
-    spawn_server_with_peer, try_event, wait_auth_and_register, wait_event, warm_link,
-};
 use tokio::sync::mpsc;
+use util::lying_peer::{
+    LyingPeer, NO_EFFECT_WINDOW, TestId, TestServer, connect, is_deleted, msgid_of, registered_kid,
+    revision_count, spawn_server_with_peer, try_event, wait_auth_and_register, wait_event,
+    warm_link,
+};
 
 /// A DID the lying peer asserts but has never proven — the shape of a forged
 /// `account` on the wire. Deliberately not in `--did-resolver-static`: a peer
@@ -51,7 +51,12 @@ async fn open_room(
     let (ha, mut rxa) = connect(&srv, author, "author");
     wait_auth_and_register(&mut rxa).await;
     ha.join("#room").await.unwrap();
-    wait_event(&mut rxa, |e| matches!(e, Event::Joined { .. }), "author join").await;
+    wait_event(
+        &mut rxa,
+        |e| matches!(e, Event::Joined { .. }),
+        "author join",
+    )
+    .await;
 
     let (hw, mut rxw) = connect(&srv, watcher, "watcher");
     wait_auth_and_register(&mut rxw).await;
@@ -142,7 +147,10 @@ async fn a_peer_cannot_delete_a_message_authored_by_someone_else() {
         Duration::from_millis(500),
     )
     .await;
-    assert!(leaked.is_none(), "a rejected delete was still fanned out to clients");
+    assert!(
+        leaked.is_none(),
+        "a rejected delete was still fanned out to clients"
+    );
 }
 
 /// A peer that puts a *local* user's nick in `from` and sends no `account`
@@ -205,13 +213,7 @@ async fn a_peer_stamping_the_victims_did_on_a_mutation_is_refused() {
 
     // (2) The same delete, carrying a signature that does not verify against
     // the DID it names.
-    let forged = peer.signed_delete(
-        "mallory",
-        "#room",
-        &msgid,
-        Some(&author.did),
-        &forged_sig,
-    );
+    let forged = peer.signed_delete("mallory", "#room", &msgid, Some(&author.did), &forged_sig);
     peer.forge(forged).await;
     assert_link_alive(&mut peer, &mut rxw, "probe-after-forged-stamped-delete").await;
     assert!(
@@ -255,8 +257,10 @@ async fn a_peer_stamping_the_victims_did_on_a_mutation_is_refused() {
         peer.forge(event).await;
         let leaked = try_event(
             &mut rxw,
-            |e| matches!(e, Event::TagMsg { tags, .. } if tags.contains_key("+react")
-                || tags.contains_key("+freeq.at/unreact")),
+            |e| {
+                matches!(e, Event::TagMsg { tags, .. } if tags.contains_key("+react")
+                || tags.contains_key("+freeq.at/unreact"))
+            },
             NO_EFFECT_WINDOW,
         )
         .await;
@@ -289,11 +293,21 @@ async fn a_peer_cannot_put_a_dm_in_a_local_users_outbox() {
     // Warm the link through a channel both share, so "nothing arrived" below
     // cannot be a link that was never up.
     hv.join("#room").await.unwrap();
-    wait_event(&mut rxv, |e| matches!(e, Event::Joined { .. }), "victim join").await;
+    wait_event(
+        &mut rxv,
+        |e| matches!(e, Event::Joined { .. }),
+        "victim join",
+    )
+    .await;
     warm_link(&mut peer, "mallory", "#room", &mut rxv).await;
 
     // The peer's own DM to the addressee, stamped as the victim's.
-    let forged = peer.privmsg("mallory", "addressee", "did I send this?", Some(&victim.did));
+    let forged = peer.privmsg(
+        "mallory",
+        "addressee",
+        "did I send this?",
+        Some(&victim.did),
+    );
     peer.forge(forged).await;
 
     let echoed = try_event(
@@ -425,7 +439,10 @@ async fn a_peer_cannot_edit_a_message_authored_by_someone_else() {
             NO_EFFECT_WINDOW,
         )
         .await;
-        assert!(applied.is_none(), "a forged edit ({case}) was fanned out to clients");
+        assert!(
+            applied.is_none(),
+            "a forged edit ({case}) was fanned out to clients"
+        );
         assert_eq!(
             revision_count(&srv.db_path, &msgid),
             1,
@@ -456,7 +473,10 @@ async fn a_peer_whose_actor_is_not_an_op_cannot_kick_or_set_modes() {
         NO_EFFECT_WINDOW,
     )
     .await;
-    assert!(kicked.is_none(), "a non-op remote user kicked a local member");
+    assert!(
+        kicked.is_none(),
+        "a non-op remote user kicked a local member"
+    );
 
     // Same actor, now trying to op the watcher — a privilege grant, which is
     // the more damaging of the two because it persists.
@@ -479,7 +499,10 @@ async fn a_peer_whose_actor_is_not_an_op_cannot_kick_or_set_modes() {
         NO_EFFECT_WINDOW,
     )
     .await;
-    assert!(moded.is_none(), "a non-op remote user changed a channel mode");
+    assert!(
+        moded.is_none(),
+        "a non-op remote user changed a channel mode"
+    );
 
     assert_link_alive(&mut peer, &mut rxw, "probe-after-forged-kick-and-modes").await;
 }

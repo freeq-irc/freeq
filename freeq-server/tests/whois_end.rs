@@ -93,7 +93,12 @@ async fn a_whois_over_a_guest_ends_and_names_no_account() {
     let deadline = Duration::from_millis(3000);
     let start = tokio::time::Instant::now();
     loop {
-        match timeout(deadline.saturating_sub(start.elapsed()), asker_events.recv()).await {
+        match timeout(
+            deadline.saturating_sub(start.elapsed()),
+            asker_events.recv(),
+        )
+        .await
+        {
             Ok(Some(Event::MemberDid { nick, .. })) if nick.eq_ignore_ascii_case("whoisguest") => {
                 saw_account = true;
             }

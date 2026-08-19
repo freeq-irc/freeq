@@ -201,7 +201,9 @@ async fn run_once(cfg: Config) -> anyhow::Result<()> {
                 from,
                 target,
                 text,
-                tags, .. } => {
+                tags,
+                ..
+            } => {
                 if tags.contains_key("batch") {
                     continue;
                 }

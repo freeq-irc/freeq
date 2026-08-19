@@ -2759,9 +2759,10 @@ fn federated_delete_authorized(
     channels.get(roster_key).is_some_and(|ch| {
         ch.remote_member(actor_nick).is_some_and(|rm| {
             rm.is_op
-                || rm.did.as_ref().is_some_and(|d| {
-                    ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d)
-                })
+                || rm
+                    .did
+                    .as_ref()
+                    .is_some_and(|d| ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d))
         })
     })
 }
@@ -2923,9 +2924,13 @@ fn verify_relayed_privmsg(
 /// Separate from the signature check because the two questions are asked
 /// separately: *is this a mutation at all* decides whether the proof rule
 /// applies, and an unsigned mutation has no signature to check.
-fn relayed_mutation_in<'a>(
-    tags: &'a HashMap<String, String>,
-) -> Option<(freeq_sdk::chatsig::Mutation, Option<&'a str>, Option<&'a str>)> {
+fn relayed_mutation_in(
+    tags: &HashMap<String, String>,
+) -> Option<(
+    freeq_sdk::chatsig::Mutation,
+    Option<&str>,
+    Option<&str>,
+)> {
     use freeq_sdk::chatsig::Mutation;
     let get = |a: &str, b: &str| tags.get(a).or_else(|| tags.get(b)).map(String::as_str);
     let subject = || get("+reply", "+draft/reply");
@@ -3132,7 +3137,8 @@ fn replayed_signature_verdict(
     let Some(did) = ev.actor_did.as_deref() else {
         return ClientSigOutcome::Unverifiable("replayed event names no actor");
     };
-    let outcome = crate::connection::messaging::verify_canonical_bytes(state, did, &ev.canonical, sig);
+    let outcome =
+        crate::connection::messaging::verify_canonical_bytes(state, did, &ev.canonical, sig);
     // A signer we hold no key for: ask its home server, off this path, so the
     // next replay of theirs gets a real verdict.
     if let ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE) = outcome {
@@ -3629,9 +3635,11 @@ pub(crate) async fn process_s2s_message(
                         peer = %authenticated_peer_id,
                         "Relayed message was altered by our own sanitizer ({v:?} discarded)"
                     );
-                    Some(crate::connection::messaging::ClientSigOutcome::Unverifiable(
-                        "sanitized on receipt",
-                    ))
+                    Some(
+                        crate::connection::messaging::ClientSigOutcome::Unverifiable(
+                            "sanitized on receipt",
+                        ),
+                    )
                 }
                 other => other,
             };
@@ -3779,10 +3787,8 @@ pub(crate) async fn process_s2s_message(
                 .get("+reply")
                 .or_else(|| relayed_tags.get("+draft/reply"))
             {
-                let root = crate::connection::helpers::root_msgid(
-                    state,
-                    &sanitize_s2s_str(root, 100),
-                );
+                let root =
+                    crate::connection::helpers::root_msgid(state, &sanitize_s2s_str(root, 100));
                 relay_tags.insert("+reply".to_string(), root);
             }
             // Provenance: every message reaching here is from a remote origin
@@ -3798,10 +3804,9 @@ pub(crate) async fn process_s2s_message(
             let event_ctx = crate::events::EventContext {
                 sig_state: match (&sig, sig_verdict) {
                     (None, _) => crate::events::SigState::Unsigned,
-                    (
-                        Some(_),
-                        Some(crate::connection::messaging::ClientSigOutcome::Verified),
-                    ) => crate::events::SigState::Valid,
+                    (Some(_), Some(crate::connection::messaging::ClientSigOutcome::Verified)) => {
+                        crate::events::SigState::Valid
+                    }
                     _ => crate::events::SigState::Unverifiable,
                 },
                 origin: Some(origin_name.clone()),
@@ -4140,7 +4145,8 @@ pub(crate) async fn process_s2s_message(
                 // bound to the recipient (DID fan-out) — a federated DID-addressed
                 // DM must reach the same person here, with no per-server nick
                 // interpretation.
-                let mut sids = crate::connection::routing::local_sessions_for_target(state, &target);
+                let mut sids =
+                    crate::connection::routing::local_sessions_for_target(state, &target);
                 // …and the sender's own sessions here, if they have any. The
                 // origin fanned this out to their other devices on its send
                 // path; that code never runs on this side of the link.
@@ -4180,7 +4186,6 @@ pub(crate) async fn process_s2s_message(
                 drop(conns);
                 drop(acct_caps);
                 drop(tag_caps);
-
             }
         }
 
@@ -4294,7 +4299,8 @@ pub(crate) async fn process_s2s_message(
             // Same rule the relayed-PRIVMSG path follows: the renames and the
             // subject re-rooting below rewrite values the signature covers, so
             // the check reads the tags as they arrived.
-            let sig_verdict = verify_relayed_mutation_tags(state, peer_account.as_deref(), &target, &tags);
+            let sig_verdict =
+                verify_relayed_mutation_tags(state, peer_account.as_deref(), &target, &tags);
             if let Some(verdict) = sig_verdict {
                 use crate::connection::messaging::{ClientSigOutcome, NO_KEY_ON_FILE};
                 if let (ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE), Some(did), Some(sig)) = (
@@ -4518,8 +4524,14 @@ pub(crate) async fn process_s2s_message(
                     }
                 };
 
-                if federated_delete_authorized(state, &storage_key, &root, &actor_nick, actor_did.as_deref(), is_channel)
-                {
+                if federated_delete_authorized(
+                    state,
+                    &storage_key,
+                    &root,
+                    &actor_nick,
+                    actor_did.as_deref(),
+                    is_channel,
+                ) {
                     // Sweep under the key the row is actually filed beneath. A
                     // peer sends the channel spelled the way its user typed it
                     // and that spelling is what got stored, while `storage_key`
@@ -4549,7 +4561,8 @@ pub(crate) async fn process_s2s_message(
                     if is_channel {
                         let mut channels = state.channels.lock();
                         if let Some(ch) = channels.get_mut(&storage_key) {
-                            ch.history.retain(|h| h.msgid.as_deref() != Some(root.as_str()));
+                            ch.history
+                                .retain(|h| h.msgid.as_deref() != Some(root.as_str()));
                             ch.pins.retain(|p| p.msgid != root);
                         }
                     }
@@ -4604,7 +4617,8 @@ pub(crate) async fn process_s2s_message(
                 // condition: a signature this server checked, because this
                 // delivery puts the event in the named identity's own client
                 // as something they did.
-                let mut sids = crate::connection::routing::local_sessions_for_target(state, &target);
+                let mut sids =
+                    crate::connection::routing::local_sessions_for_target(state, &target);
                 crate::connection::routing::merge_sessions(
                     &mut sids,
                     crate::connection::routing::sender_sessions_for_account(
@@ -4956,7 +4970,11 @@ pub(crate) async fn process_s2s_message(
                 );
                 return;
             }
-            let limit = if limit == 0 { MAX_REPLAY } else { limit.min(MAX_REPLAY) };
+            let limit = if limit == 0 {
+                MAX_REPLAY
+            } else {
+                limit.min(MAX_REPLAY)
+            };
             let rows = state
                 .with_db(|db| db.events_since(since_ts, limit + 1))
                 .unwrap_or_default();
@@ -4996,7 +5014,11 @@ pub(crate) async fn process_s2s_message(
             }
         }
 
-        S2sMessage::CatchupEvents { origin, events, more } => {
+        S2sMessage::CatchupEvents {
+            origin,
+            events,
+            more,
+        } => {
             let count = events.len();
             let mut filed = 0usize;
             let mut conflicts = 0usize;
@@ -6382,9 +6404,7 @@ mod s2s_adversarial_tests {
         tags: &HashMap<String, String>,
         sig: Option<&str>,
     ) -> Option<crate::connection::messaging::ClientSigOutcome> {
-        verify_relayed_privmsg(
-            state, account, target, msgid, text, tags, None, None, sig,
-        )
+        verify_relayed_privmsg(state, account, target, msgid, text, tags, None, None, sig)
     }
 
     #[tokio::test]
@@ -7119,7 +7139,10 @@ mod s2s_adversarial_tests {
         let filed = state
             .with_db(|db| db.get_reactions_for_messages(&["01SOMEONEELSESMESSAGE"]))
             .expect("test state has a database");
-        assert!(filed.is_empty(), "and must not be on file either: {filed:?}");
+        assert!(
+            filed.is_empty(),
+            "and must not be on file either: {filed:?}"
+        );
     }
 
     /// The unsigned case, which is what an older peer sends: the actor is
@@ -8743,11 +8766,7 @@ mod s2s_adversarial_tests {
 
         let channels = state.channels.lock();
         let ch = channels.get("#pinok").unwrap();
-        assert_eq!(
-            ch.pins.len(),
-            1,
-            "an op's relayed pin must still be stored"
-        );
+        assert_eq!(ch.pins.len(), 1, "an op's relayed pin must still be stored");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -10662,7 +10681,10 @@ mod s2s_adversarial_tests {
         );
         // The DB keeps both revisions, joined by the root — the same shape a
         // local edit produces.
-        assert_eq!(state.with_db(|db| Ok(db.root_of("id-edit"))), Some("id-orig".to_string()));
+        assert_eq!(
+            state.with_db(|db| Ok(db.root_of("id-edit"))),
+            Some("id-orig".to_string())
+        );
         assert_eq!(
             state
                 .with_db(|db| db.current_revision("id-orig"))
@@ -10681,7 +10703,15 @@ mod s2s_adversarial_tests {
         setup_authenticated_peer(&state, &mgr).await;
         setup_channel(&state, "#fedunseen");
 
-        relay_message(&state, &mgr, "#fedunseen", "id-edit", "v2", Some("id-never")).await;
+        relay_message(
+            &state,
+            &mgr,
+            "#fedunseen",
+            "id-edit",
+            "v2",
+            Some("id-never"),
+        )
+        .await;
 
         assert_eq!(
             history_of(&state, "#fedunseen"),
@@ -10737,7 +10767,15 @@ mod s2s_adversarial_tests {
         setup_channel(&state, "#feddel");
 
         relay_message(&state, &mgr, "#feddel", "id-1", "secret", None).await;
-        relay_delete(&state, &mgr, "#feddel", "id-1", "alice!a@remote", Some(AUTHOR_DID)).await;
+        relay_delete(
+            &state,
+            &mgr,
+            "#feddel",
+            "id-1",
+            "alice!a@remote",
+            Some(AUTHOR_DID),
+        )
+        .await;
 
         assert!(
             history_of(&state, "#feddel").is_empty(),
@@ -10763,7 +10801,15 @@ mod s2s_adversarial_tests {
 
         relay_message(&state, &mgr, "#feddel2", "id-1", "v1", None).await;
         relay_message(&state, &mgr, "#feddel2", "id-2", "v2", Some("id-1")).await;
-        relay_delete(&state, &mgr, "#feddel2", "id-2", "alice!a@remote", Some(AUTHOR_DID)).await;
+        relay_delete(
+            &state,
+            &mgr,
+            "#feddel2",
+            "id-2",
+            "alice!a@remote",
+            Some(AUTHOR_DID),
+        )
+        .await;
 
         assert!(history_of(&state, "#feddel2").is_empty());
         assert!(
@@ -11141,7 +11187,10 @@ mod s2s_adversarial_tests {
             .with_db(|db| db.get_reactions_for_messages(&["id-1"]))
             .expect("db present");
         assert_eq!(
-            stored.get("id-1").and_then(|v| v.first()).and_then(|r| r.reactor_did.clone()),
+            stored
+                .get("id-1")
+                .and_then(|v| v.first())
+                .and_then(|r| r.reactor_did.clone()),
             Some(AUTHOR_DID.to_string()),
             "a remote reactor with no local identity was stored nick-only"
         );
@@ -11168,9 +11217,8 @@ mod s2s_adversarial_tests {
                 origin: PEER.to_string(),
                 msgid: Some(msgid.to_string()),
                 sig: replaces.and_then(|root| {
-                    let venue = crate::connection::messaging::signing_venue(
-                        state, AUTHOR_DID, to_nick,
-                    )?;
+                    let venue =
+                        crate::connection::messaging::signing_venue(state, AUTHOR_DID, to_nick)?;
                     let key = signer_on_file_opt(state, AUTHOR_DID)?;
                     Some(
                         freeq_sdk::chatsig::ChatDoc::message(AUTHOR_DID, msgid, &venue, text)
@@ -11249,7 +11297,15 @@ mod s2s_adversarial_tests {
         relay_dm(&state, &mgr, "bob", "dm-1", "regrettable", None).await;
         assert_eq!(live_dm_texts(&state, &dm_key).len(), 1, "dm persisted");
 
-        relay_delete(&state, &mgr, "bob", "dm-1", "alice!a@remote", Some(AUTHOR_DID)).await;
+        relay_delete(
+            &state,
+            &mgr,
+            "bob",
+            "dm-1",
+            "alice!a@remote",
+            Some(AUTHOR_DID),
+        )
+        .await;
 
         assert!(
             live_dm_texts(&state, &dm_key).is_empty(),
@@ -11420,15 +11476,15 @@ mod catchup_tests {
 
     use std::collections::HashMap;
 
-    use ed25519_dalek::SigningKey;
-        use std::sync::Arc;
-    use freeq_sdk::chatsig::ChatDoc;
-    use crate::events::SigState;
-    use crate::s2s::{CATCHUP, ReplayedEvent, S2sMessage, our_capabilities, peer_supports};
     use super::s2s_adversarial_tests::{setup_authenticated_peer, test_manager};
     use super::{
         ReplayOutcome, SharedState, apply_replayed_event, process_s2s_message, test_state_with_db,
     };
+    use crate::events::SigState;
+    use crate::s2s::{CATCHUP, ReplayedEvent, S2sMessage, our_capabilities, peer_supports};
+    use ed25519_dalek::SigningKey;
+    use freeq_sdk::chatsig::ChatDoc;
+    use std::sync::Arc;
     use tokio::sync::mpsc;
 
     const ALICE: &str = "did:plc:catchupalice";
@@ -11464,11 +11520,12 @@ mod catchup_tests {
         let key = SigningKey::from_bytes(&[3u8; 32]);
         let state = state_with_key(&key);
 
-        let ev = signed_event(&key, "01CATCH000000000000000001", "missed while you were out");
-        assert_eq!(
-            apply_replayed_event(&state, PEER, ev),
-            ReplayOutcome::Filed
+        let ev = signed_event(
+            &key,
+            "01CATCH000000000000000001",
+            "missed while you were out",
         );
+        assert_eq!(apply_replayed_event(&state, PEER, ev), ReplayOutcome::Filed);
 
         let row = state
             .with_db(|db| db.get_event("01CATCH000000000000000001"))
@@ -11479,7 +11536,11 @@ mod catchup_tests {
             SigState::Valid,
             "the receiver reached its own verdict against the bytes it was handed"
         );
-        assert_eq!(row.origin.as_deref(), Some(PEER), "and recorded who replayed it");
+        assert_eq!(
+            row.origin.as_deref(),
+            Some(PEER),
+            "and recorded who replayed it"
+        );
         assert_eq!(row.venue, "#caught");
     }
 
@@ -11567,8 +11628,13 @@ mod catchup_tests {
         let mut ev = signed_event(&key, "01CATCH000000000000000004", "what was signed");
         // The bytes the peer hands over no longer match the signature it hands
         // over with them.
-        ev.canonical = ChatDoc::message(ALICE, "01CATCH000000000000000004", "#caught", "what was sent")
-            .canonical();
+        ev.canonical = ChatDoc::message(
+            ALICE,
+            "01CATCH000000000000000004",
+            "#caught",
+            "what was sent",
+        )
+        .canonical();
 
         assert_eq!(
             apply_replayed_event(&state, PEER, ev),
@@ -11592,10 +11658,7 @@ mod catchup_tests {
         let state = test_state_with_db();
 
         let ev = signed_event(&key, "01CATCH000000000000000005", "who signed this");
-        assert_eq!(
-            apply_replayed_event(&state, PEER, ev),
-            ReplayOutcome::Filed
-        );
+        assert_eq!(apply_replayed_event(&state, PEER, ev), ReplayOutcome::Filed);
         assert_eq!(
             state
                 .with_db(|db| db.get_event("01CATCH000000000000000005"))
@@ -11623,10 +11686,7 @@ mod catchup_tests {
             emoji: None,
             timestamp: 1000,
         };
-        assert_eq!(
-            apply_replayed_event(&state, PEER, ev),
-            ReplayOutcome::Filed
-        );
+        assert_eq!(apply_replayed_event(&state, PEER, ev), ReplayOutcome::Filed);
         assert_eq!(
             state
                 .with_db(|db| db.get_event("01CATCH000000000000000006"))
@@ -11709,10 +11769,11 @@ mod catchup_tests {
 
         // A live link to answer down.
         let (tx, mut rx) = mpsc::channel(16);
-        manager.peers.lock().await.insert(
-            PEER.to_string(),
-            crate::s2s::PeerEntry { tx, conn_gen: 1 },
-        );
+        manager
+            .peers
+            .lock()
+            .await
+            .insert(PEER.to_string(), crate::s2s::PeerEntry { tx, conn_gen: 1 });
 
         process_s2s_message(
             &state,
@@ -11766,10 +11827,11 @@ mod catchup_tests {
             .unwrap();
 
         let (tx, mut rx) = mpsc::channel(16);
-        manager.peers.lock().await.insert(
-            PEER.to_string(),
-            crate::s2s::PeerEntry { tx, conn_gen: 1 },
-        );
+        manager
+            .peers
+            .lock()
+            .await
+            .insert(PEER.to_string(), crate::s2s::PeerEntry { tx, conn_gen: 1 });
 
         process_s2s_message(
             &state,
@@ -11830,5 +11892,4 @@ mod catchup_tests {
         assert_eq!(recent.len(), 1, "the window is respected");
         assert_eq!(recent[0].event_id, "01WINDOW00000000000000003");
     }
-
 }

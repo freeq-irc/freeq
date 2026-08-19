@@ -274,7 +274,9 @@ async fn speak_inbound(
         if cfg.external_brain_text {
             // Reply target: the brain's explicit `to` (e.g. DM the asker
             // privately) wins; otherwise the being's first channel.
-            let target = to.as_deref().or_else(|| cfg.channels.first().map(|s| s.as_str()));
+            let target = to
+                .as_deref()
+                .or_else(|| cfg.channels.first().map(|s| s.as_str()));
             if let (Some(handle), Some(target)) = (cfg.client_handle.get(), target) {
                 tracing::info!(%text, %target, "brain seam: posting brain reply as text");
                 let _ = handle.privmsg(target, &text).await;

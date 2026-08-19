@@ -227,7 +227,10 @@ pub fn message_canonical(
     if let Some(reply) = tags.get("+reply").or_else(|| tags.get("+draft/reply")) {
         doc = doc.with_reply(reply);
     }
-    let edit = tags.get("+draft/edit").map(String::as_str).or(replaces_msgid);
+    let edit = tags
+        .get("+draft/edit")
+        .map(String::as_str)
+        .or(replaces_msgid);
     if let Some(edit) = edit {
         doc = doc.with_edit(edit);
     }
@@ -248,8 +251,7 @@ pub fn mutation_canonical(
     subject: &str,
     emoji: Option<&str>,
 ) -> String {
-    let mut doc =
-        freeq_sdk::chatsig::ChatDoc::mutation(kind, actor_did, event_id, venue, subject);
+    let mut doc = freeq_sdk::chatsig::ChatDoc::mutation(kind, actor_did, event_id, venue, subject);
     if let Some(emoji) = emoji {
         doc = doc.with_emoji(emoji);
     }

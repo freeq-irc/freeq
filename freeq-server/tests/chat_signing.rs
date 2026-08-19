@@ -543,8 +543,13 @@ async fn a_message_whose_signature_fails_is_refused_at_the_origin() {
         // Signed over one body, sent with another — what a relay rewriting a
         // message in flight produces.
         let msgid = freeq_server::msgid::generate();
-        let sig = ChatDoc::message(DID_ALICE, &msgid, &channel_venue("#tampered"), "what she wrote")
-            .sign(&signing);
+        let sig = ChatDoc::message(
+            DID_ALICE,
+            &msgid,
+            &channel_venue("#tampered"),
+            "what she wrote",
+        )
+        .sign(&signing);
         alice.tx(&format!(
             "@{EVENT_ID_TAG}={msgid};+freeq.at/sig={sig} PRIVMSG #tampered :what arrived instead"
         ));
@@ -555,7 +560,8 @@ async fn a_message_whose_signature_fails_is_refused_at_the_origin() {
             "the refusal names the command and why: {fail}"
         );
         assert!(
-            bob.maybe(|l| l.contains("what arrived instead"), 500).is_none(),
+            bob.maybe(|l| l.contains("what arrived instead"), 500)
+                .is_none(),
             "a message whose signature failed must not reach anyone"
         );
     })
@@ -585,7 +591,9 @@ async fn an_uncheckable_signature_still_delivers() {
             "an uncheckable signature keeps the server's vouch: {seen}"
         );
         assert!(
-            alice.maybe(|l| l.contains("SIGNATURE_INVALID"), 300).is_none(),
+            alice
+                .maybe(|l| l.contains("SIGNATURE_INVALID"), 300)
+                .is_none(),
             "a signature nobody can check is not a signature that failed"
         );
     })
@@ -622,7 +630,8 @@ async fn the_signed_venue_is_the_folded_channel_not_the_case_the_sender_typed() 
         alice.send_signed(&id2, "#SIG", "signed the wrong venue", &unfolded);
         alice.rx(|l| l.contains("SIGNATURE_INVALID"), "FAIL to the sender");
         assert!(
-            bob.maybe(|l| l.contains("signed the wrong venue"), 500).is_none(),
+            bob.maybe(|l| l.contains("signed the wrong venue"), 500)
+                .is_none(),
             "a venue that isn't the folded one is not the venue, and a \
              signature over it does not verify"
         );
@@ -886,8 +895,7 @@ async fn a_signed_delete_relays_the_senders_own_signature() {
     let did_bob = "did:plc:sig_bob";
     let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
     run(addr, move |addr| {
-        let (mut bob, mut alice, signing, msgid) =
-            two_in_a_channel(addr, ka, kb, did_bob, "#del");
+        let (mut bob, mut alice, signing, msgid) = two_in_a_channel(addr, ka, kb, did_bob, "#del");
 
         let event_id = freeq_server::msgid::generate();
         let tags = signed_mutation_tags(
@@ -935,15 +943,8 @@ async fn a_signed_reaction_and_its_removal_relay_their_signatures() {
             (Mutation::Unreact, "+freeq.at/unreact"),
         ] {
             let event_id = freeq_server::msgid::generate();
-            let tags = signed_mutation_tags(
-                kind,
-                tag,
-                &msgid,
-                Some("👍"),
-                "#react",
-                &event_id,
-                &signing,
-            );
+            let tags =
+                signed_mutation_tags(kind, tag, &msgid, Some("👍"), "#react", &event_id, &signing);
             alice.tx(&format!("@{tags} TAGMSG #react"));
 
             let seen = bob.rx(|l| l.contains(tag), "the reaction");
@@ -1023,9 +1024,14 @@ async fn an_edit_signature_that_fails_is_refused_and_never_applied() {
         // and an edit changes an existing record, so it must be refused (the
         // same rule delete/react/unreact enforce).
         let edit_id = freeq_server::msgid::generate();
-        let sig = ChatDoc::message(DID_ALICE, &edit_id, &channel_venue("#editforge"), "honest revision")
-            .with_edit(&root)
-            .sign(&signing);
+        let sig = ChatDoc::message(
+            DID_ALICE,
+            &edit_id,
+            &channel_venue("#editforge"),
+            "honest revision",
+        )
+        .with_edit(&root)
+        .sign(&signing);
         alice.tx(&format!(
             "@{EVENT_ID_TAG}={edit_id};+draft/edit={root};+freeq.at/sig={sig} \
              PRIVMSG #editforge :tampered revision"
@@ -1033,7 +1039,8 @@ async fn an_edit_signature_that_fails_is_refused_and_never_applied() {
 
         alice.rx(|l| l.contains("SIGNATURE_INVALID"), "FAIL to the sender");
         assert!(
-            bob.maybe(|l| l.contains("tampered revision"), 500).is_none(),
+            bob.maybe(|l| l.contains("tampered revision"), 500)
+                .is_none(),
             "an edit whose signature failed must not reach anyone"
         );
         // The original still stands, unedited.
@@ -1072,7 +1079,8 @@ async fn an_unsigned_edit_from_an_identity_is_refused() {
             "the refusal names the command and why: {fail}"
         );
         assert!(
-            bob.maybe(|l| l.contains("revised without proof"), 500).is_none(),
+            bob.maybe(|l| l.contains("revised without proof"), 500)
+                .is_none(),
             "a refused edit must not reach anyone"
         );
         assert!(
@@ -1176,7 +1184,9 @@ async fn a_signed_multiline_edit_verifies_and_a_tampered_one_is_refused() {
             "the honest edit is delivered, not refused",
         );
         assert!(
-            alice.maybe(|l| l.contains("SIGNATURE_INVALID"), 500).is_none(),
+            alice
+                .maybe(|l| l.contains("SIGNATURE_INVALID"), 500)
+                .is_none(),
             "an honest signed multiline edit must not be refused"
         );
 
@@ -1186,10 +1196,14 @@ async fn a_signed_multiline_edit_verifies_and_a_tampered_one_is_refused() {
         // (so the honest case above is delivered because it verified, not
         // because the signature went unread).
         let edit_id2 = freeq_server::msgid::generate();
-        let bad_sig =
-            ChatDoc::message(DID_ALICE, &edit_id2, &channel_venue("#mlsig"), "a different body")
-                .with_edit(&root)
-                .sign(&signing);
+        let bad_sig = ChatDoc::message(
+            DID_ALICE,
+            &edit_id2,
+            &channel_venue("#mlsig"),
+            "a different body",
+        )
+        .with_edit(&root)
+        .sign(&signing);
         alice.tx(&format!(
             "@{EVENT_ID_TAG}={edit_id2};+draft/edit={root};+freeq.at/sig={bad_sig} \
              BATCH +f draft/multiline #mlsig"
@@ -1215,10 +1229,8 @@ async fn a_guest_cannot_attach_a_mutation_signature() {
         let mut guest = C::guest(addr, "nobody");
         guest.join("#guestreact");
 
-        guest.tx(
-            "@+react=👍;+reply=01SOMEMESSAGE000000000000;\
-             +freeq.at/sig=ed25519:AAAAAAAAAAAAAAAAAAAAAA:AAAA TAGMSG #guestreact",
-        );
+        guest.tx("@+react=👍;+reply=01SOMEMESSAGE000000000000;\
+             +freeq.at/sig=ed25519:AAAAAAAAAAAAAAAAAAAAAA:AAAA TAGMSG #guestreact");
         let seen = watcher.rx(|l| l.contains("+react"), "the reaction");
         assert_eq!(
             C::sig_of(&seen),
@@ -1492,8 +1504,13 @@ async fn a_signature_that_failed_is_not_replayed_by_history() {
         alice.msgsig(&signing);
 
         let id = freeq_server::msgid::generate();
-        let sig = ChatDoc::message(DID_ALICE, &id, &channel_venue("#notlaundered"), "what I signed")
-            .sign(&signing);
+        let sig = ChatDoc::message(
+            DID_ALICE,
+            &id,
+            &channel_venue("#notlaundered"),
+            "what I signed",
+        )
+        .sign(&signing);
         alice.send_signed(&id, "#notlaundered", "what I sent", &sig);
         alice.rx(|l| l.contains("SIGNATURE_INVALID"), "FAIL to the sender");
 
@@ -1552,14 +1569,9 @@ async fn a_replayed_edit_carries_the_signature_over_its_own_revision() {
         // message it revises.
         let edit_id = freeq_server::msgid::generate();
         let revised = "second draft";
-        let sig = ChatDoc::message(
-            DID_ALICE,
-            &edit_id,
-            &channel_venue("#editreplay"),
-            revised,
-        )
-        .with_edit(&root)
-        .sign(&signing);
+        let sig = ChatDoc::message(DID_ALICE, &edit_id, &channel_venue("#editreplay"), revised)
+            .with_edit(&root)
+            .sign(&signing);
         alice.tx(&format!(
             "@{EVENT_ID_TAG}={edit_id};+draft/edit={root};+freeq.at/sig={sig} \
              PRIVMSG #editreplay :{revised}"
@@ -1619,7 +1631,11 @@ fn events_in(db_path: &str, venue: &str) -> Vec<(String, String, Option<String>,
 /// A server whose database file the test can read back.
 async fn start_with_db(
     resolver: DidResolver,
-) -> (SocketAddr, String, tokio::task::JoinHandle<anyhow::Result<()>>) {
+) -> (
+    SocketAddr,
+    String,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let db_path = tmp.path().to_str().unwrap().to_string();
     std::mem::forget(tmp);
@@ -1724,7 +1740,10 @@ async fn an_unreaction_leaves_the_event_that_removed_the_reaction() {
     for (kind, _, actor, signature) in &events {
         if kind == "react" || kind == "unreact" {
             assert_eq!(actor.as_deref(), Some(DID_ALICE), "{kind} names its actor");
-            assert!(signature.is_some(), "{kind} keeps the signature that made it");
+            assert!(
+                signature.is_some(),
+                "{kind} keeps the signature that made it"
+            );
         }
     }
 
@@ -1772,10 +1791,7 @@ async fn a_non_members_reaction_leaves_nothing_behind() {
             &signing,
         );
         outsider.tx(&format!("@{tags} TAGMSG #members"));
-        outsider.rx(
-            |l| l.contains("Cannot send to channel"),
-            "the +n refusal",
-        );
+        outsider.rx(|l| l.contains("Cannot send to channel"), "the +n refusal");
         assert!(
             bob.maybe(|l| l.contains("+react"), 500).is_none(),
             "a non-member's reaction must not reach the channel"
@@ -1925,13 +1941,12 @@ async fn the_verify_endpoint_answers_for_a_mutation_event() {
     // The broadcast races the row by a hair; give the write a beat.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let v: serde_json::Value =
-        reqwest::get(format!("http://{web_addr}/api/v1/verify/{event_id}"))
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+    let v: serde_json::Value = reqwest::get(format!("http://{web_addr}/api/v1/verify/{event_id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(v["kind"], "react", "the filed act, by name: {v}");
     assert_eq!(v["actor_did"], DID_ALICE);
     assert_eq!(v["subject"], msgid.as_str());
@@ -2006,7 +2021,12 @@ async fn a_signed_dm_mutation_is_filed_under_the_venue_its_signature_covers() {
         let mut filed = Vec::new();
         for (kind, name, tag, emoji) in [
             (Mutation::React, "react", "+react", Some("👍")),
-            (Mutation::Unreact, "unreact", "+freeq.at/unreact", Some("👍")),
+            (
+                Mutation::Unreact,
+                "unreact",
+                "+freeq.at/unreact",
+                Some("👍"),
+            ),
             (Mutation::Delete, "delete", "+draft/delete", None),
         ] {
             let event_id = freeq_server::msgid::generate();
@@ -2070,7 +2090,11 @@ async fn a_signed_dm_mutation_is_filed_under_the_venue_its_signature_covers() {
 async fn start_web(
     resolver: DidResolver,
     name: &str,
-) -> (SocketAddr, SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>) {
+) -> (
+    SocketAddr,
+    SocketAddr,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let db_path = tmp.path().to_str().unwrap().to_string();
     std::mem::forget(tmp); // outlives the server
@@ -2106,8 +2130,9 @@ fn signed_coordination_tags(
         doc = doc.with_ref(ref_id);
     }
     let sig = doc.sign(signing);
-    let mut tags =
-        format!("+freeq.at/event={event_type};+freeq.at/payload={payload};{EVENT_ID_TAG}={event_id}");
+    let mut tags = format!(
+        "+freeq.at/event={event_type};+freeq.at/payload={payload};{EVENT_ID_TAG}={event_id}"
+    );
     if let Some(ref_id) = ref_id {
         tags.push_str(&format!(";+freeq.at/ref={ref_id}"));
     }
@@ -2191,12 +2216,13 @@ async fn a_signed_coordination_event_is_filed_under_the_id_it_signed() {
 
     // The reference survives as the event's subject, so a reader can walk
     // from a completion to the work it completed.
-    let done: serde_json::Value = reqwest::get(format!("http://{web_addr}/api/v1/verify/{done_id}"))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let done: serde_json::Value =
+        reqwest::get(format!("http://{web_addr}/api/v1/verify/{done_id}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
     assert_eq!(done["subject"], task_id, "{done}");
     assert_eq!(done["verification"]["verdict"], "valid", "{done}");
 
@@ -2468,8 +2494,10 @@ async fn a_re_filed_event_leaves_the_card_and_the_log_agreeing() {
     let rows = events["events"].as_array().unwrap();
 
     for id in [&same, &differing] {
-        let filed: Vec<&serde_json::Value> =
-            rows.iter().filter(|e| e["event_id"] == id.as_str()).collect();
+        let filed: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|e| e["event_id"] == id.as_str())
+            .collect();
         assert_eq!(filed.len(), 1, "one id, one card: {events}");
         assert_eq!(
             filed[0]["payload"]["budget"], 1,
@@ -2538,7 +2566,8 @@ async fn both_halves_of_a_signed_pair_relay_with_signatures_intact() {
         let doc = ChatDoc::message(DID_ALICE, &message_id, &venue, body)
             .with_coord([("+freeq.at/event", "task_request")]);
         assert!(
-            doc.canonical().contains(r#""coord":{"event":"task_request"}"#),
+            doc.canonical()
+                .contains(r#""coord":{"event":"task_request"}"#),
             "the message document must cover the event tag: {}",
             doc.canonical()
         );
@@ -2622,7 +2651,10 @@ async fn an_evidence_event_is_verified_with_the_type_it_names() {
         v["verification"]["verdict"], "valid",
         "the server rebuilt the same document the sender signed: {v}"
     );
-    assert_eq!(v["verification"]["verified_by"], "client-session-key", "{v}");
+    assert_eq!(
+        v["verification"]["verified_by"], "client-session-key",
+        "{v}"
+    );
     assert!(
         v["canonical_form"]
             .as_str()
@@ -2665,7 +2697,14 @@ async fn a_signature_this_server_cannot_check_yet_is_kept_and_answered_honestly(
         // resolve the kid this names.
         alice.tx(&format!(
             "@{} TAGMSG #unver",
-            signed_coordination_tags("#unver", &sent_id, "task_request", "%7B%7D", None, &sending_key)
+            signed_coordination_tags(
+                "#unver",
+                &sent_id,
+                "task_request",
+                "%7B%7D",
+                None,
+                &sending_key
+            )
         ));
         bob.rx(|l| l.contains("task_request"), "the event still relays");
         alice

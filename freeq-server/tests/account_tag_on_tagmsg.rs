@@ -84,7 +84,9 @@ impl C {
         let line = c.rx(|l| l.starts_with("AUTHENTICATE "), "challenge");
         let challenge = line.strip_prefix("AUTHENTICATE ").unwrap();
         let bytes = auth::decode_challenge_bytes(challenge).unwrap();
-        let resp = KeySigner::new(did.to_string(), key).respond(&bytes).unwrap();
+        let resp = KeySigner::new(did.to_string(), key)
+            .respond(&bytes)
+            .unwrap();
         c.tx(&format!("AUTHENTICATE {}", auth::encode_response(&resp)));
         c.num("903");
         c.tx("CAP END");
@@ -295,7 +297,10 @@ async fn delete_names_the_sender_for_a_recipient_that_asked_for_account_tag() {
         );
         alice.tx(&format!("@{tags} TAGMSG #atd"));
         let del = bob
-            .maybe(|l| l.contains("TAGMSG") && l.contains("+draft/delete"), 2000)
+            .maybe(
+                |l| l.contains("TAGMSG") && l.contains("+draft/delete"),
+                2000,
+            )
             .expect("bob receives the delete");
         assert_eq!(
             account_of(&del).as_deref(),
@@ -339,7 +344,10 @@ async fn delete_omits_account_for_a_recipient_that_did_not_ask() {
         );
         alice.tx(&format!("@{tags} TAGMSG #atd2"));
         let del = bob
-            .maybe(|l| l.contains("TAGMSG") && l.contains("+draft/delete"), 2000)
+            .maybe(
+                |l| l.contains("TAGMSG") && l.contains("+draft/delete"),
+                2000,
+            )
             .expect("bob still receives the delete itself");
         assert_eq!(
             account_of(&del),
@@ -374,7 +382,10 @@ async fn a_guests_delete_carries_no_account() {
 
         alice.tx(&format!("@+draft/delete={msgid} TAGMSG #atd3"));
         let del = bob
-            .maybe(|l| l.contains("TAGMSG") && l.contains("+draft/delete"), 2000)
+            .maybe(
+                |l| l.contains("TAGMSG") && l.contains("+draft/delete"),
+                2000,
+            )
             .expect("bob receives the guest's delete");
         assert_eq!(
             account_of(&del),

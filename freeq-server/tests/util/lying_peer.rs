@@ -398,7 +398,15 @@ impl LyingPeer {
         account: Option<&str>,
         sig: &str,
     ) -> S2sMessage {
-        self.mutation(from, target, "+draft/delete", msgid, None, account, Some(sig))
+        self.mutation(
+            from,
+            target,
+            "+draft/delete",
+            msgid,
+            None,
+            account,
+            Some(sig),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -624,7 +632,12 @@ pub async fn try_event(
 /// asynchronously after the dial, and this is the behavioural gate for it —
 /// no fixed sleep. Every test starts here, so a later forged event that
 /// produces nothing is known to have travelled a working link.
-pub async fn warm_link(peer: &mut LyingPeer, nick: &str, channel: &str, rx: &mut mpsc::Receiver<Event>) {
+pub async fn warm_link(
+    peer: &mut LyingPeer,
+    nick: &str,
+    channel: &str,
+    rx: &mut mpsc::Receiver<Event>,
+) {
     let deadline = tokio::time::Instant::now() + SETTLE;
     while tokio::time::Instant::now() < deadline {
         let join = peer.join(nick, channel, None);

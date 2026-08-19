@@ -264,7 +264,12 @@ mod tests {
         let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
         let sig = freeq_sdk::sigtag::sign_canonical("{}", &key);
 
-        fetch_on_miss(&state, "some-unconfigured-peer", "did:plc:unconfiguredpeer", &sig);
+        fetch_on_miss(
+            &state,
+            "some-unconfigured-peer",
+            "did:plc:unconfiguredpeer",
+            &sig,
+        );
         assert!(!lookup_pending("did:plc:unconfiguredpeer", &kid));
     }
 
@@ -344,7 +349,12 @@ mod tests {
                 .is_none()
         );
 
-        fetch_on_miss(&state, PEER, did, &freeq_sdk::sigtag::sign_canonical("{}", &key));
+        fetch_on_miss(
+            &state,
+            PEER,
+            did,
+            &freeq_sdk::sigtag::sign_canonical("{}", &key),
+        );
 
         assert_eq!(
             wait_for_key(&state, did, &kid).await,
@@ -369,7 +379,12 @@ mod tests {
         };
         let state = state_pointed_at(&format!("http://127.0.0.1:{dead}"));
 
-        fetch_on_miss(&state, PEER, did, &freeq_sdk::sigtag::sign_canonical("{}", &key));
+        fetch_on_miss(
+            &state,
+            PEER,
+            did,
+            &freeq_sdk::sigtag::sign_canonical("{}", &key),
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         assert!(
@@ -396,7 +411,12 @@ mod tests {
         let base = serve_api(crate::server::test_state_with_db()).await;
         let state = state_pointed_at(&base);
 
-        fetch_on_miss(&state, PEER, did, &freeq_sdk::sigtag::sign_canonical("{}", &key));
+        fetch_on_miss(
+            &state,
+            PEER,
+            did,
+            &freeq_sdk::sigtag::sign_canonical("{}", &key),
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         assert!(
@@ -494,8 +514,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             use base64::Engine;
-            let encoded =
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(other_pub);
+            let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(other_pub);
             let app = axum::Router::new().route(
                 "/api/v1/signing-keys/{did}/{kid}",
                 axum::routing::get(move || {

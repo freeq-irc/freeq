@@ -1585,7 +1585,12 @@ impl Db {
             None => EventRecord {
                 shape: EventShape::Bare(crate::events::EventFacts {
                     event_id: msgid.to_string(),
-                    kind: if replaces_msgid.is_some() { "edit" } else { "message" }.to_string(),
+                    kind: if replaces_msgid.is_some() {
+                        "edit"
+                    } else {
+                        "message"
+                    }
+                    .to_string(),
                     venue: crate::events::venue_of(channel),
                     actor_did: None,
                     subject: replaces_msgid.map(str::to_string),
@@ -1659,7 +1664,12 @@ impl Db {
         // facts, which happened either way, are stated instead.
         let canonical = match (ev.actor_did, ev.signature) {
             (Some(did), Some(_)) => Some(crate::events::mutation_canonical(
-                kind, did, ev.event_id, &venue, &subject, emoji,
+                kind,
+                did,
+                ev.event_id,
+                &venue,
+                &subject,
+                emoji,
             )),
             _ => None,
         };
@@ -1840,7 +1850,11 @@ impl Db {
                 format!("{body_hash:?}"),
                 format!("{:?}", derived.body_hash),
             );
-            note("emoji", format!("{emoji:?}"), format!("{:?}", derived.emoji));
+            note(
+                "emoji",
+                format!("{emoji:?}"),
+                format!("{:?}", derived.emoji),
+            );
         }
         Ok(bad)
     }
@@ -1921,7 +1935,15 @@ impl Db {
         emoji: &str,
         timestamp: u64,
     ) -> SqlResult<()> {
-        self.store_reaction_by(target_msgid, channel, reactor_nick, reactor_did, emoji, timestamp, None)
+        self.store_reaction_by(
+            target_msgid,
+            channel,
+            reactor_nick,
+            reactor_did,
+            emoji,
+            timestamp,
+            None,
+        )
     }
 
     /// [`Db::store_reaction`], logging the act as its own event.
@@ -2084,7 +2106,13 @@ impl Db {
         // this phase leaves unsigned on purpose — so the event records the
         // act without a document to back it. `pinned_by` is a nick, which is
         // exactly why the row cannot claim an actor identity.
-        self.file_bare_event("pin", channel, &root, pinned_at, &pin_event_id(channel, &root, pinned_at, true))?;
+        self.file_bare_event(
+            "pin",
+            channel,
+            &root,
+            pinned_at,
+            &pin_event_id(channel, &root, pinned_at, true),
+        )?;
         self.conn.execute(
             "INSERT OR IGNORE INTO pins (channel, msgid, pinned_by, pinned_at)
              VALUES (?1, ?2, ?3, ?4)",
@@ -2102,7 +2130,13 @@ impl Db {
             .unwrap_or_default()
             .as_secs();
         let tx = self.conn.unchecked_transaction()?;
-        self.file_bare_event("unpin", channel, &root, now, &pin_event_id(channel, &root, now, false))?;
+        self.file_bare_event(
+            "unpin",
+            channel,
+            &root,
+            now,
+            &pin_event_id(channel, &root, now, false),
+        )?;
         let changed = self.conn.execute(
             "DELETE FROM pins WHERE channel = ?1 AND msgid = ?2",
             params![channel, &root],
@@ -3436,13 +3470,29 @@ mod tests {
     #[test]
     fn duplicate_msgid_insert_is_ignored() {
         let db = Db::open_memory().unwrap();
-        db.insert_message("#c", "a!a@h", "original", 100, &HashMap::new(), Some("DUPID"), None)
-            .unwrap();
+        db.insert_message(
+            "#c",
+            "a!a@h",
+            "original",
+            100,
+            &HashMap::new(),
+            Some("DUPID"),
+            None,
+        )
+        .unwrap();
         // Same msgid arriving again (an S2S re-delivery, or a raced client
         // mint slipping past the pre-insert lookup): first write wins, the
         // second is a no-op, not an error and not a second row.
-        db.insert_message("#c", "a!a@h", "impostor", 200, &HashMap::new(), Some("DUPID"), None)
-            .unwrap();
+        db.insert_message(
+            "#c",
+            "a!a@h",
+            "impostor",
+            200,
+            &HashMap::new(),
+            Some("DUPID"),
+            None,
+        )
+        .unwrap();
         let msgs = db.get_messages("#c", 10, None).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].text, "original");
@@ -3454,32 +3504,83 @@ mod tests {
         // row — indexing the discarded text under it would bind that text to
         // the wrong message in search.
         let db = Db::open_memory().unwrap();
-        db.insert_message("#c", "a!a@h", "kept words", 100, &HashMap::new(), Some("DUPFTS"), None)
-            .unwrap();
-        db.insert_message("#c", "a!a@h", "phantom words", 200, &HashMap::new(), Some("DUPFTS"), None)
-            .unwrap();
-        assert!(db.search_messages("#c", "phantom", 10, None).unwrap().is_empty());
+        db.insert_message(
+            "#c",
+            "a!a@h",
+            "kept words",
+            100,
+            &HashMap::new(),
+            Some("DUPFTS"),
+            None,
+        )
+        .unwrap();
+        db.insert_message(
+            "#c",
+            "a!a@h",
+            "phantom words",
+            200,
+            &HashMap::new(),
+            Some("DUPFTS"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            db.search_messages("#c", "phantom", 10, None)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(db.search_messages("#c", "kept", 10, None).unwrap().len(), 1);
     }
 
     #[test]
     fn edit_claiming_spent_msgid_is_ignored() {
         let db = Db::open_memory().unwrap();
-        db.insert_message("#c", "a!a@h", "one", 100, &HashMap::new(), Some("SPENT"), None)
-            .unwrap();
-        db.insert_message("#c", "a!a@h", "two", 150, &HashMap::new(), Some("ORIG"), None)
-            .unwrap();
+        db.insert_message(
+            "#c",
+            "a!a@h",
+            "one",
+            100,
+            &HashMap::new(),
+            Some("SPENT"),
+            None,
+        )
+        .unwrap();
+        db.insert_message(
+            "#c",
+            "a!a@h",
+            "two",
+            150,
+            &HashMap::new(),
+            Some("ORIG"),
+            None,
+        )
+        .unwrap();
         // A revision row may not take over an id already on file.
-        db.insert_edit("#c", "a!a@h", "two edited", 200, &HashMap::new(), "SPENT", "ORIG", None)
-            .unwrap();
+        db.insert_edit(
+            "#c",
+            "a!a@h",
+            "two edited",
+            200,
+            &HashMap::new(),
+            "SPENT",
+            "ORIG",
+            None,
+        )
+        .unwrap();
         let n: i64 = db
             .conn
-            .query_row("SELECT COUNT(*) FROM messages WHERE msgid = 'SPENT'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE msgid = 'SPENT'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(n, 1);
         let text: String = db
             .conn
-            .query_row("SELECT text FROM messages WHERE msgid = 'SPENT'", [], |r| r.get(0))
+            .query_row("SELECT text FROM messages WHERE msgid = 'SPENT'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(text, "one");
     }
@@ -3691,11 +3792,9 @@ mod tests {
         // the upgrade, then confirm the stale revision really is searchable.
         let old_rowid: i64 = db
             .conn
-            .query_row(
-                "SELECT id FROM messages WHERE msgid = 'm1'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT id FROM messages WHERE msgid = 'm1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         db.conn
             .execute(
@@ -4340,10 +4439,20 @@ mod tests {
             ctx: crate::events::EventContext::default(),
             timestamp: 1000,
         };
-        db.store_reaction_by(subject, "#t", "alice", Some("did:plc:aaa"), "👍", 1000, Some(&react_ev))
-            .unwrap();
+        db.store_reaction_by(
+            subject,
+            "#t",
+            "alice",
+            Some("did:plc:aaa"),
+            "👍",
+            1000,
+            Some(&react_ev),
+        )
+        .unwrap();
         assert!(
-            db.get_event("01EVREACT00000000000000001").unwrap().is_some(),
+            db.get_event("01EVREACT00000000000000001")
+                .unwrap()
+                .is_some(),
             "the react on an unknown subject files its event"
         );
 
@@ -4356,11 +4465,20 @@ mod tests {
             timestamp: 1001,
         };
         let removed = db
-            .remove_reaction_by(subject, "alice", Some("did:plc:aaa"), "👍", "#t", Some(&unreact_ev))
+            .remove_reaction_by(
+                subject,
+                "alice",
+                Some("did:plc:aaa"),
+                "👍",
+                "#t",
+                Some(&unreact_ev),
+            )
             .unwrap();
         assert_eq!(removed, 1, "the reaction row itself must go");
         assert!(
-            db.get_event("01EVUNREACT000000000000001").unwrap().is_some(),
+            db.get_event("01EVUNREACT000000000000001")
+                .unwrap()
+                .is_some(),
             "the unreact must leave the same record the react did"
         );
     }
@@ -4382,7 +4500,9 @@ mod tests {
         db.soft_delete_message_by("#t", "2b92520e-7d46-463a-a1ae-05d8e93ea966", Some(&ev))
             .unwrap();
         assert!(
-            db.get_event("01EVDELETE0000000000000001").unwrap().is_some(),
+            db.get_event("01EVDELETE0000000000000001")
+                .unwrap()
+                .is_some(),
             "the delete leaves its record regardless of the subject's presence"
         );
     }
@@ -6021,11 +6141,23 @@ mod event_log_tests {
             ChatDoc::message(ALICE, "01AAAA0000000000000000000E", "#room", "coordinated")
                 .with_coord([("+freeq.at/event", "task_request")])
                 .canonical(),
-            ChatDoc::mutation(Mutation::Delete, ALICE, "01AAAA0000000000000000000F", "#room", root)
-                .canonical(),
-            ChatDoc::mutation(Mutation::React, ALICE, "01AAAA0000000000000000000G", "#room", root)
-                .with_emoji("👍")
-                .canonical(),
+            ChatDoc::mutation(
+                Mutation::Delete,
+                ALICE,
+                "01AAAA0000000000000000000F",
+                "#room",
+                root,
+            )
+            .canonical(),
+            ChatDoc::mutation(
+                Mutation::React,
+                ALICE,
+                "01AAAA0000000000000000000G",
+                "#room",
+                root,
+            )
+            .with_emoji("👍")
+            .canonical(),
             ChatDoc::mutation(
                 Mutation::Unreact,
                 ALICE,
@@ -6038,7 +6170,13 @@ mod event_log_tests {
         ];
         for (i, canonical) in docs.iter().enumerate() {
             assert!(
-                file(&db, canonical, Some("ed25519:kid:sig"), EventContext::verified(), i as u64),
+                file(
+                    &db,
+                    canonical,
+                    Some("ed25519:kid:sig"),
+                    EventContext::verified(),
+                    i as u64
+                ),
                 "each document files a row"
             );
         }
@@ -6071,7 +6209,8 @@ mod event_log_tests {
     #[test]
     fn the_audit_catches_a_column_that_drifted_from_its_bytes() {
         let db = Db::open_memory().unwrap();
-        let canonical = ChatDoc::message(ALICE, "01DRIFT000000000000000000A", "#room", "hi").canonical();
+        let canonical =
+            ChatDoc::message(ALICE, "01DRIFT000000000000000000A", "#room", "hi").canonical();
         file(&db, &canonical, None, EventContext::default(), 1);
 
         db.conn
@@ -6087,7 +6226,13 @@ mod event_log_tests {
     #[test]
     fn bytes_that_are_not_a_document_are_refused() {
         let db = Db::open_memory().unwrap();
-        assert!(!file(&db, "{\"nope\":true}", None, EventContext::default(), 1));
+        assert!(!file(
+            &db,
+            "{\"nope\":true}",
+            None,
+            EventContext::default(),
+            1
+        ));
         assert!(db.all_events().unwrap().is_empty());
     }
 
@@ -6096,10 +6241,14 @@ mod event_log_tests {
     #[test]
     fn a_row_with_no_signature_is_unsigned_whatever_the_caller_claimed() {
         let db = Db::open_memory().unwrap();
-        let canonical = ChatDoc::message(ALICE, "01NOSIG000000000000000000A", "#room", "hi").canonical();
+        let canonical =
+            ChatDoc::message(ALICE, "01NOSIG000000000000000000A", "#room", "hi").canonical();
         file(&db, &canonical, None, EventContext::verified(), 1);
         assert_eq!(
-            db.get_event("01NOSIG000000000000000000A").unwrap().unwrap().sig_state,
+            db.get_event("01NOSIG000000000000000000A")
+                .unwrap()
+                .unwrap()
+                .sig_state,
             SigState::Unsigned
         );
     }
@@ -6109,10 +6258,20 @@ mod event_log_tests {
     #[test]
     fn a_signature_nobody_checked_files_as_unverifiable() {
         let db = Db::open_memory().unwrap();
-        let canonical = ChatDoc::message(ALICE, "01UNCHK000000000000000000A", "#room", "hi").canonical();
-        file(&db, &canonical, Some("ed25519:kid:sig"), EventContext::default(), 1);
+        let canonical =
+            ChatDoc::message(ALICE, "01UNCHK000000000000000000A", "#room", "hi").canonical();
+        file(
+            &db,
+            &canonical,
+            Some("ed25519:kid:sig"),
+            EventContext::default(),
+            1,
+        );
         assert_eq!(
-            db.get_event("01UNCHK000000000000000000A").unwrap().unwrap().sig_state,
+            db.get_event("01UNCHK000000000000000000A")
+                .unwrap()
+                .unwrap()
+                .sig_state,
             SigState::Unverifiable
         );
     }
@@ -6126,12 +6285,18 @@ mod event_log_tests {
         let first = ChatDoc::message(ALICE, id, "#room", "what I said").canonical();
         let second = ChatDoc::message(ALICE, id, "#room", "what they claim I said").canonical();
         assert!(file(&db, &first, None, EventContext::default(), 1));
-        assert!(!file(&db, &second, None, EventContext::default(), 2), "first write wins");
+        assert!(
+            !file(&db, &second, None, EventContext::default(), 2),
+            "first write wins"
+        );
 
         db.record_event_conflict(id, &crate::events::fingerprint(&second))
             .unwrap();
         let row = db.get_event(id).unwrap().unwrap();
-        assert_eq!(row.canonical, first, "the row still holds what arrived first");
+        assert_eq!(
+            row.canonical, first,
+            "the row still holds what arrived first"
+        );
         assert_eq!(
             row.conflict.as_deref(),
             Some(crate::events::fingerprint(&second).as_str()),
@@ -6157,7 +6322,13 @@ mod event_log_tests {
             .enumerate()
         {
             let canonical = ChatDoc::message(ALICE, id, "#room", "x").canonical();
-            file(&db, &canonical, None, EventContext::default(), i as u64 * 1000);
+            file(
+                &db,
+                &canonical,
+                None,
+                EventContext::default(),
+                i as u64 * 1000,
+            );
         }
         assert_eq!(db.all_events().unwrap().len(), 2);
         assert_eq!(db.prune_events_older_than(500).unwrap(), 1);
@@ -6185,12 +6356,37 @@ mod dual_write_tests {
     #[test]
     fn every_message_written_lands_in_the_log_too() {
         let db = Db::open_memory().unwrap();
-        db.insert_message("#Room", "a!u@h", "hello", 10, &HashMap::new(), Some("M1"), Some(ALICE))
-            .unwrap();
-        db.insert_message("#Room", "g!u@h", "guest here", 11, &HashMap::new(), Some("M2"), None)
-            .unwrap();
-        db.insert_edit("#Room", "a!u@h", "revised", 12, &HashMap::new(), "M3", "M1", Some(ALICE))
-            .unwrap();
+        db.insert_message(
+            "#Room",
+            "a!u@h",
+            "hello",
+            10,
+            &HashMap::new(),
+            Some("M1"),
+            Some(ALICE),
+        )
+        .unwrap();
+        db.insert_message(
+            "#Room",
+            "g!u@h",
+            "guest here",
+            11,
+            &HashMap::new(),
+            Some("M2"),
+            None,
+        )
+        .unwrap();
+        db.insert_edit(
+            "#Room",
+            "a!u@h",
+            "revised",
+            12,
+            &HashMap::new(),
+            "M3",
+            "M1",
+            Some(ALICE),
+        )
+        .unwrap();
 
         assert_eq!(
             db.messages_without_events().unwrap(),
@@ -6217,7 +6413,10 @@ mod dual_write_tests {
         assert_eq!(guest.actor_did, None);
 
         let edit = db.get_event("M3").unwrap().unwrap();
-        assert_eq!((edit.kind.as_str(), edit.subject.as_deref()), ("edit", Some("M1")));
+        assert_eq!(
+            (edit.kind.as_str(), edit.subject.as_deref()),
+            ("edit", Some("M1"))
+        );
     }
 
     /// The log holds hashes, never bodies. A table that quietly accumulated a
@@ -6226,8 +6425,16 @@ mod dual_write_tests {
     fn no_body_ever_reaches_the_log() {
         let db = Db::open_memory().unwrap();
         let secret = "the passphrase is hunter2";
-        db.insert_message("#Room", "a!u@h", secret, 10, &HashMap::new(), Some("M1"), Some(ALICE))
-            .unwrap();
+        db.insert_message(
+            "#Room",
+            "a!u@h",
+            secret,
+            10,
+            &HashMap::new(),
+            Some("M1"),
+            Some(ALICE),
+        )
+        .unwrap();
 
         let hits: i64 = db
             .conn
@@ -6242,7 +6449,11 @@ mod dual_write_tests {
             .unwrap();
         assert_eq!(hits, 0, "the body is in `messages`, and only there");
         assert!(
-            db.get_event("M1").unwrap().unwrap().canonical.contains("sha256:"),
+            db.get_event("M1")
+                .unwrap()
+                .unwrap()
+                .canonical
+                .contains("sha256:"),
             "what the log holds is the hash the document carries"
         );
     }
@@ -6293,12 +6504,30 @@ mod dual_write_tests {
     #[test]
     fn a_conflicting_message_leaves_a_receipt_on_the_event_it_lost_to() {
         let db = Db::open_memory().unwrap();
-        assert!(db
-            .insert_message("#Room", "a!u@h", "what I said", 10, &HashMap::new(), Some("M1"), Some(ALICE))
-            .unwrap());
-        assert!(!db
-            .insert_message("#Room", "a!u@h", "what they claim", 11, &HashMap::new(), Some("M1"), Some(ALICE))
-            .unwrap());
+        assert!(
+            db.insert_message(
+                "#Room",
+                "a!u@h",
+                "what I said",
+                10,
+                &HashMap::new(),
+                Some("M1"),
+                Some(ALICE)
+            )
+            .unwrap()
+        );
+        assert!(
+            !db.insert_message(
+                "#Room",
+                "a!u@h",
+                "what they claim",
+                11,
+                &HashMap::new(),
+                Some("M1"),
+                Some(ALICE)
+            )
+            .unwrap()
+        );
 
         let row = db.get_event("M1").unwrap().unwrap();
         assert_eq!(
@@ -6314,10 +6543,26 @@ mod dual_write_tests {
         // A re-delivery of the *same* content is not a conflict and leaves no
         // receipt — peers re-deliver all the time.
         let db2 = Db::open_memory().unwrap();
-        db2.insert_message("#Room", "a!u@h", "same", 10, &HashMap::new(), Some("M9"), Some(ALICE))
-            .unwrap();
-        db2.insert_message("#Room", "a!u@h", "same", 10, &HashMap::new(), Some("M9"), Some(ALICE))
-            .unwrap();
+        db2.insert_message(
+            "#Room",
+            "a!u@h",
+            "same",
+            10,
+            &HashMap::new(),
+            Some("M9"),
+            Some(ALICE),
+        )
+        .unwrap();
+        db2.insert_message(
+            "#Room",
+            "a!u@h",
+            "same",
+            10,
+            &HashMap::new(),
+            Some("M9"),
+            Some(ALICE),
+        )
+        .unwrap();
         assert_eq!(db2.get_event("M9").unwrap().unwrap().conflict, None);
     }
 
@@ -6327,8 +6572,16 @@ mod dual_write_tests {
     #[test]
     fn the_pair_is_written_together_or_not_at_all() {
         let db = Db::open_memory().unwrap();
-        db.insert_message("#Room", "a!u@h", "hi", 10, &HashMap::new(), Some("M1"), Some(ALICE))
-            .unwrap();
+        db.insert_message(
+            "#Room",
+            "a!u@h",
+            "hi",
+            10,
+            &HashMap::new(),
+            Some("M1"),
+            Some(ALICE),
+        )
+        .unwrap();
         let (msgs, events): (i64, i64) = db
             .conn
             .query_row(
@@ -6340,8 +6593,16 @@ mod dual_write_tests {
         assert_eq!((msgs, events), (1, 1));
 
         // A refused message writes neither.
-        db.insert_message("#Room", "a!u@h", "different", 11, &HashMap::new(), Some("M1"), Some(ALICE))
-            .unwrap();
+        db.insert_message(
+            "#Room",
+            "a!u@h",
+            "different",
+            11,
+            &HashMap::new(),
+            Some("M1"),
+            Some(ALICE),
+        )
+        .unwrap();
         let (msgs, events): (i64, i64) = db
             .conn
             .query_row(
@@ -6360,8 +6621,16 @@ mod dual_write_tests {
         let plain = Db::open_memory().unwrap();
         let sealed = Db::open_encrypted_memory([7u8; 32]).unwrap();
         for db in [&plain, &sealed] {
-            db.insert_message("#Room", "a!u@h", "same body", 10, &HashMap::new(), Some("M1"), Some(ALICE))
-                .unwrap();
+            db.insert_message(
+                "#Room",
+                "a!u@h",
+                "same body",
+                10,
+                &HashMap::new(),
+                Some("M1"),
+                Some(ALICE),
+            )
+            .unwrap();
         }
         assert_eq!(
             plain.get_event("M1").unwrap().unwrap().canonical,
@@ -6379,7 +6648,8 @@ mod dual_write_tests {
 /// free, which a random id could never do.
 fn pin_event_id(channel: &str, msgid: &str, at: u64, pinning: bool) -> String {
     let verb = if pinning { "pin" } else { "unpin" };
-    let digest = freeq_sdk::chatsig::body_hash(&format!("{verb}\u{0}{channel}\u{0}{msgid}\u{0}{at}"));
+    let digest =
+        freeq_sdk::chatsig::body_hash(&format!("{verb}\u{0}{channel}\u{0}{msgid}\u{0}{at}"));
     // `sha256:` + 26 hex characters: the same width as a ULID, so nothing
     // downstream that assumed an id's shape has to widen for these.
     format!("pin-{}", &digest["sha256:".len().."sha256:".len() + 22])
@@ -6399,7 +6669,6 @@ impl Db {
         let rows = stmt.query_map(params![since_ts as i64, limit as i64], map_stored_event)?;
         rows.collect()
     }
-
 }
 
 #[cfg(test)]

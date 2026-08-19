@@ -287,16 +287,51 @@ pub fn is_agentic_task(question: &str) -> bool {
     }
     // Imperative "do something" verbs …
     const VERBS: [&str; 18] = [
-        "write ", "build ", "create ", "implement ", "refactor ", "fix ", "debug ",
-        "add a", "add an", "set up", "run ", "deploy", "generate ", "install ",
-        "configure ", "commit", "make a", "rewrite ",
+        "write ",
+        "build ",
+        "create ",
+        "implement ",
+        "refactor ",
+        "fix ",
+        "debug ",
+        "add a",
+        "add an",
+        "set up",
+        "run ",
+        "deploy",
+        "generate ",
+        "install ",
+        "configure ",
+        "commit",
+        "make a",
+        "rewrite ",
     ];
     // … paired with a technical / code / file / system object.
     const OBJECTS: [&str; 24] = [
-        "script", "program", "code", "function", "file", "repo", "repository",
-        "test", "bug", "feature", "app", "server", "endpoint", "api", "class",
-        "module", "package", "branch", "pull request", " pr", "command", "project",
-        "database", "migration",
+        "script",
+        "program",
+        "code",
+        "function",
+        "file",
+        "repo",
+        "repository",
+        "test",
+        "bug",
+        "feature",
+        "app",
+        "server",
+        "endpoint",
+        "api",
+        "class",
+        "module",
+        "package",
+        "branch",
+        "pull request",
+        " pr",
+        "command",
+        "project",
+        "database",
+        "migration",
     ];
     let has_verb = VERBS.iter().any(|v| q.contains(v));
     let has_object = OBJECTS.iter().any(|o| q.contains(o));
@@ -309,7 +344,9 @@ mod agent_route_tests {
 
     #[test]
     fn delegates_real_coding_tasks() {
-        assert!(is_agentic_task("write a python script that reverses a string"));
+        assert!(is_agentic_task(
+            "write a python script that reverses a string"
+        ));
         assert!(is_agentic_task("fix the bug in the login function"));
         assert!(is_agentic_task("add a feature to the app"));
         assert!(is_agentic_task("refactor the auth module"));

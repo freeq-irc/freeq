@@ -3025,7 +3025,10 @@ async fn media_tags_passthrough() {
             tags.get("+freeq.at/media-alt").map(|s| s.as_str()),
             Some("A sunset")
         );
-        assert_eq!(tags.get("+freeq.at/media-w").map(|s| s.as_str()), Some("1200"));
+        assert_eq!(
+            tags.get("+freeq.at/media-w").map(|s| s.as_str()),
+            Some("1200")
+        );
         assert!(
             !tags.contains_key("content-type"),
             "an HTTP header name is not this field: {tags:?}"

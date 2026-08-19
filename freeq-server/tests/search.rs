@@ -237,7 +237,9 @@ async fn search_hit_for_edited_message_carries_the_root_msgid() {
             .unwrap()
             .to_string();
 
-        alice.tx(&format!("@+draft/edit={root} PRIVMSG #edits :revised wording here"));
+        alice.tx(&format!(
+            "@+draft/edit={root} PRIVMSG #edits :revised wording here"
+        ));
         settle();
         alice.drain();
         bob.drain();

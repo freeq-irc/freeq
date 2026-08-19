@@ -244,7 +244,10 @@ async fn discover_active_session(
     base: &str,
     channel: &str,
 ) -> Option<String> {
-    let url = format!("{base}/api/v1/channels/{}/sessions", encode_channel(channel));
+    let url = format!(
+        "{base}/api/v1/channels/{}/sessions",
+        encode_channel(channel)
+    );
     let resp = http
         .get(&url)
         .timeout(Duration::from_secs(5))
@@ -403,7 +406,10 @@ async fn main() -> anyhow::Result<()> {
     // 6. Wait for the worker to join + tap our video, then ask the
     //    vision question. Print any inbound chat from the bot.
     let settle = Duration::from_secs(args.settle_secs);
-    tracing::info!(secs = args.settle_secs, "waiting for worker to join + tap video");
+    tracing::info!(
+        secs = args.settle_secs,
+        "waiting for worker to join + tap video"
+    );
     let deadline = Instant::now() + Duration::from_secs(args.keepalive_secs);
 
     let settle_until = Instant::now() + settle;
@@ -424,9 +430,14 @@ async fn main() -> anyhow::Result<()> {
         }
         // Pump events so we can surface the bot's chat replies.
         match tokio::time::timeout(Duration::from_millis(500), events.recv()).await {
-            Ok(Some(Event::Message { from, target, text, .. })) => {
+            Ok(Some(Event::Message {
+                from, target, text, ..
+            })) => {
                 tracing::info!(%from, %target, %text, "inbound message");
-                if from.to_ascii_lowercase().contains(&args.bot.to_ascii_lowercase()) {
+                if from
+                    .to_ascii_lowercase()
+                    .contains(&args.bot.to_ascii_lowercase())
+                {
                     tracing::info!(%from, reply = %text, "BOT REPLY (chat)");
                 }
             }

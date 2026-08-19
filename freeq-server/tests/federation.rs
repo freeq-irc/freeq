@@ -532,9 +532,13 @@ async fn a_signed_dm_reaches_the_senders_own_device_on_the_far_server() {
     let mut reached = false;
     while tokio::time::Instant::now() < deadline {
         ha.privmsg(&bob.did, "sent from my other device").await.ok();
-        if try_recv_message(&mut rxa2, "sent from my other device", Duration::from_secs(2))
-            .await
-            .is_some()
+        if try_recv_message(
+            &mut rxa2,
+            "sent from my other device",
+            Duration::from_secs(2),
+        )
+        .await
+        .is_some()
         {
             reached = true;
             break;
@@ -748,8 +752,7 @@ async fn a_dm_with_a_guest_on_the_peer_keeps_its_deletes() {
     let mut delivered = None;
     while tokio::time::Instant::now() < deadline {
         ha.privmsg("gbob", "across to a guest").await.ok();
-        delivered =
-            msgid_of_message(&mut rxg, "across to a guest", Duration::from_secs(2)).await;
+        delivered = msgid_of_message(&mut rxg, "across to a guest", Duration::from_secs(2)).await;
         if delivered.is_some() {
             break;
         }
@@ -1232,7 +1235,10 @@ async fn a_signed_reply_and_a_signed_edit_reach_valid_at_the_receiver() {
     let edit_msgid = recv_channel_msgid(&mut rxb, "revised text", EVENT_TIMEOUT)
         .await
         .expect("alice's edit never reached bob's server");
-    assert_ne!(edit_msgid, root, "an edit is its own event, with its own id");
+    assert_ne!(
+        edit_msgid, root,
+        "an edit is its own event, with its own id"
+    );
     let verified = poll_verify(&srv_b.web_addr, &edit_msgid).await;
     assert_eq!(
         verified["verification"]["verdict"], "valid",
@@ -1342,7 +1348,12 @@ async fn wait_rows_cleared(db_path: &str, channel: &str) -> bool {
 }
 
 /// Everything a fresh joiner on this server is replayed for `channel`.
-async fn replayed_texts(server: &TestServer, id: &TestId, nick: &str, channel: &str) -> Vec<String> {
+async fn replayed_texts(
+    server: &TestServer,
+    id: &TestId,
+    nick: &str,
+    channel: &str,
+) -> Vec<String> {
     let (h, mut rx) = connect(server, id, nick);
     wait_auth_and_register(&mut rx).await;
     h.join(channel).await.unwrap();
@@ -1773,9 +1784,16 @@ async fn a_returning_peer_is_told_what_it_missed() {
     // that stays up on the harder side of it.
     const SEED_A: u8 = 202;
     const SEED_B: u8 = 203;
-    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32]).public().to_string();
-    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32]).public().to_string();
-    assert!(id_a < id_b, "the server that stays up keeps its outgoing link");
+    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32])
+        .public()
+        .to_string();
+    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32])
+        .public()
+        .to_string();
+    assert!(
+        id_a < id_b,
+        "the server that stays up keeps its outgoing link"
+    );
 
     let alice = TestId::new("did:plc:alicecatchup");
     let bob = TestId::new("did:plc:bobcatchup");
@@ -1905,8 +1923,12 @@ async fn a_peer_that_comes_back_is_linked_again() {
     // deriving it.
     const SEED_A: u8 = 200;
     const SEED_B: u8 = 201;
-    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32]).public().to_string();
-    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32]).public().to_string();
+    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32])
+        .public()
+        .to_string();
+    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32])
+        .public()
+        .to_string();
     assert!(
         id_a < id_b,
         "this test is about the server that keeps its outgoing link being the one left holding a dead one"
@@ -2047,7 +2069,11 @@ async fn an_attachment_reaches_a_reader_on_a_peer_server() {
         .unwrap_or_else(|| panic!("a reader on the peer server sees no preview: {tags:?}"));
     assert_eq!(parsed.url, preview.url, "{tags:?}");
     assert_eq!(parsed.title.as_deref(), Some("A post"), "{tags:?}");
-    assert_eq!(parsed.description.as_deref(), Some("about things"), "{tags:?}");
+    assert_eq!(
+        parsed.description.as_deref(),
+        Some("about things"),
+        "{tags:?}"
+    );
     assert_eq!(
         parsed.thumb_url.as_deref(),
         Some("https://cdn.example/og.png"),

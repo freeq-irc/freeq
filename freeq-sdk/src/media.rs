@@ -779,7 +779,10 @@ mod tests {
 
     fn ts_media_tags() -> HashMap<String, String> {
         HashMap::from([
-            ("+freeq.at/media-url".to_string(), "https://cdn/cat.png".to_string()),
+            (
+                "+freeq.at/media-url".to_string(),
+                "https://cdn/cat.png".to_string(),
+            ),
             ("+freeq.at/media-mime".to_string(), "image/png".to_string()),
             ("+freeq.at/media-alt".to_string(), "a cat".to_string()),
             ("+freeq.at/media-w".to_string(), "640".to_string()),
@@ -914,19 +917,35 @@ mod tests {
         // A declared type is the answer whenever there is one, extension or
         // not — inference fills a gap, it does not overrule.
         let declared_text = HashMap::from([
-            ("+freeq.at/media-url".to_string(), "https://cdn/cat.png".to_string()),
+            (
+                "+freeq.at/media-url".to_string(),
+                "https://cdn/cat.png".to_string(),
+            ),
             ("+freeq.at/media-mime".to_string(), "text/plain".to_string()),
         ]);
-        assert!(!MediaAttachment::from_tags(&declared_text).unwrap().is_image());
+        assert!(
+            !MediaAttachment::from_tags(&declared_text)
+                .unwrap()
+                .is_image()
+        );
     }
 
     #[test]
     fn both_sdks_link_previews_read_as_the_same_preview() {
         let ts = HashMap::from([
-            ("+freeq.at/link-url".to_string(), "https://example.com/post".to_string()),
+            (
+                "+freeq.at/link-url".to_string(),
+                "https://example.com/post".to_string(),
+            ),
             ("+freeq.at/link-title".to_string(), "A post".to_string()),
-            ("+freeq.at/link-desc".to_string(), "about things".to_string()),
-            ("+freeq.at/link-image".to_string(), "https://cdn/thumb.png".to_string()),
+            (
+                "+freeq.at/link-desc".to_string(),
+                "about things".to_string(),
+            ),
+            (
+                "+freeq.at/link-image".to_string(),
+                "https://cdn/thumb.png".to_string(),
+            ),
         ]);
         let rust = LinkPreview {
             url: "https://example.com/post".to_string(),
@@ -960,7 +979,10 @@ mod tests {
         assert!(MediaAttachment::from_tags(&rust_preview).is_none());
 
         let ts_preview = HashMap::from([
-            ("+freeq.at/link-url".to_string(), "https://example.com/post".to_string()),
+            (
+                "+freeq.at/link-url".to_string(),
+                "https://example.com/post".to_string(),
+            ),
             ("+freeq.at/link-title".to_string(), "A post".to_string()),
         ]);
         assert!(MediaAttachment::from_tags(&ts_preview).is_none());

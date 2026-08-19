@@ -170,7 +170,11 @@ fn emoji_of(ev: &freeq_server::db::StoredEvent) -> String {
     ev.emoji.clone().unwrap_or_default()
 }
 
-fn mutation(event_id: &str, did: Option<&str>, ts: u64) -> freeq_server::db::MutationEvent<'static> {
+fn mutation(
+    event_id: &str,
+    did: Option<&str>,
+    ts: u64,
+) -> freeq_server::db::MutationEvent<'static> {
     // Leaked so the borrow outlives the call — a test-only convenience.
     freeq_server::db::MutationEvent {
         event_id: Box::leak(event_id.to_string().into_boxed_str()),
@@ -195,29 +199,101 @@ fn replaying_the_log_reproduces_the_derived_state() {
     let db = Db::open(&path).unwrap();
 
     // A message, a reply, an edit of the first, a second author.
-    db.insert_message("#Rebuild", "a!u@h", "first", 10, &HashMap::new(), Some("M1"), Some(ALICE))
-        .unwrap();
+    db.insert_message(
+        "#Rebuild",
+        "a!u@h",
+        "first",
+        10,
+        &HashMap::new(),
+        Some("M1"),
+        Some(ALICE),
+    )
+    .unwrap();
     let reply_tags: HashMap<String, String> =
         HashMap::from([("+reply".to_string(), "M1".to_string())]);
-    db.insert_message("#Rebuild", "b!u@h", "answering", 20, &reply_tags, Some("M2"), Some(BOB))
-        .unwrap();
-    db.insert_edit("#Rebuild", "a!u@h", "first, revised", 30, &HashMap::new(), "M3", "M1", Some(ALICE))
-        .unwrap();
-    db.insert_message("#Rebuild", "g!u@h", "a guest speaks", 40, &HashMap::new(), Some("M4"), None)
-        .unwrap();
+    db.insert_message(
+        "#Rebuild",
+        "b!u@h",
+        "answering",
+        20,
+        &reply_tags,
+        Some("M2"),
+        Some(BOB),
+    )
+    .unwrap();
+    db.insert_edit(
+        "#Rebuild",
+        "a!u@h",
+        "first, revised",
+        30,
+        &HashMap::new(),
+        "M3",
+        "M1",
+        Some(ALICE),
+    )
+    .unwrap();
+    db.insert_message(
+        "#Rebuild",
+        "g!u@h",
+        "a guest speaks",
+        40,
+        &HashMap::new(),
+        Some("M4"),
+        None,
+    )
+    .unwrap();
     // A message in another venue, so the rebuild has to keep them apart.
-    db.insert_message("dm:did:plc:x,did:plc:y", "a!u@h", "elsewhere", 45, &HashMap::new(), Some("M5"), Some(ALICE))
-        .unwrap();
+    db.insert_message(
+        "dm:did:plc:x,did:plc:y",
+        "a!u@h",
+        "elsewhere",
+        45,
+        &HashMap::new(),
+        Some("M5"),
+        Some(ALICE),
+    )
+    .unwrap();
 
     // Reactions: two that stay, one taken back.
-    db.store_reaction_by("M1", "#Rebuild", "b", Some(BOB), "👍", 50, Some(&mutation("R1", Some(BOB), 50)))
-        .unwrap();
-    db.store_reaction_by("M2", "#Rebuild", "a", Some(ALICE), "🎉", 51, Some(&mutation("R2", Some(ALICE), 51)))
-        .unwrap();
-    db.store_reaction_by("M2", "#Rebuild", "b", Some(BOB), "🔥", 52, Some(&mutation("R3", Some(BOB), 52)))
-        .unwrap();
-    db.remove_reaction_by("M2", "b", Some(BOB), "🔥", "#Rebuild", Some(&mutation("R4", Some(BOB), 53)))
-        .unwrap();
+    db.store_reaction_by(
+        "M1",
+        "#Rebuild",
+        "b",
+        Some(BOB),
+        "👍",
+        50,
+        Some(&mutation("R1", Some(BOB), 50)),
+    )
+    .unwrap();
+    db.store_reaction_by(
+        "M2",
+        "#Rebuild",
+        "a",
+        Some(ALICE),
+        "🎉",
+        51,
+        Some(&mutation("R2", Some(ALICE), 51)),
+    )
+    .unwrap();
+    db.store_reaction_by(
+        "M2",
+        "#Rebuild",
+        "b",
+        Some(BOB),
+        "🔥",
+        52,
+        Some(&mutation("R3", Some(BOB), 52)),
+    )
+    .unwrap();
+    db.remove_reaction_by(
+        "M2",
+        "b",
+        Some(BOB),
+        "🔥",
+        "#Rebuild",
+        Some(&mutation("R4", Some(BOB), 53)),
+    )
+    .unwrap();
 
     // Pins: one that stays, one lifted.
     db.store_pin("#Rebuild", "M1", "a", 60).unwrap();
@@ -228,8 +304,16 @@ fn replaying_the_log_reproduces_the_derived_state() {
     // acts still have to come back out of the log. The reaction is on a
     // message that survives, so it has to survive the rebuild too — a guest
     // reaction has no canonical for its emoji to hide in.
-    db.store_reaction_by("M2", "#Rebuild", "g", None, "😀", 54, Some(&mutation("R5", None, 54)))
-        .unwrap();
+    db.store_reaction_by(
+        "M2",
+        "#Rebuild",
+        "g",
+        None,
+        "😀",
+        54,
+        Some(&mutation("R5", None, 54)),
+    )
+    .unwrap();
     db.soft_delete_message_by("#Rebuild", "M4", Some(&mutation("D0", None, 55)))
         .unwrap();
 
@@ -250,7 +334,11 @@ fn replaying_the_log_reproduces_the_derived_state() {
         conn.execute_batch("DELETE FROM messages; DELETE FROM reactions; DELETE FROM pins;")
             .unwrap();
         let after_drop = read_derived(&conn);
-        assert_eq!(after_drop.messages.len(), 0, "the derived tables really are gone");
+        assert_eq!(
+            after_drop.messages.len(),
+            0,
+            "the derived tables really are gone"
+        );
     }
 
     let rebuilt = replay(&events);
@@ -299,8 +387,16 @@ fn a_rebuild_cannot_produce_a_body_and_that_is_the_point() {
 fn every_message_has_an_event_and_the_log_may_outlive_them() {
     let db = Db::open_memory().unwrap();
     for (i, id) in ["M1", "M2", "M3"].iter().enumerate() {
-        db.insert_message("#Parity", "a!u@h", "x", i as u64, &HashMap::new(), Some(id), Some(ALICE))
-            .unwrap();
+        db.insert_message(
+            "#Parity",
+            "a!u@h",
+            "x",
+            i as u64,
+            &HashMap::new(),
+            Some(id),
+            Some(ALICE),
+        )
+        .unwrap();
     }
     assert!(db.messages_without_events().unwrap().is_empty());
 

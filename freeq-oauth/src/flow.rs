@@ -144,9 +144,14 @@ pub async fn exchange_code(
                 let text = resp2.text().await.unwrap_or_default();
                 anyhow::bail!("Token exchange failed ({status}): {text}");
             }
-            resp2.json().await.context("Failed to parse token response")?
+            resp2
+                .json()
+                .await
+                .context("Failed to parse token response")?
         } else if status.is_success() {
-            resp.json().await.context("Failed to parse token response")?
+            resp.json()
+                .await
+                .context("Failed to parse token response")?
         } else {
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("Token exchange failed ({status}): {text}");

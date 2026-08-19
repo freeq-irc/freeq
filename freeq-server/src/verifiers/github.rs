@@ -298,28 +298,39 @@ async fn verify_repo_collaborator(
     // GET /repos/{owner}/{repo}/collaborators/{username} → 204 if yes, 404 if no.
     // Anything else (429/5xx/network) is a retryable error, NOT a denial.
     let collaborator_url = format!("https://api.github.com/repos/{repo}/collaborators/{username}");
-    let is_collaborator = match get_status_with_retries(http, &collaborator_url, Some(access_token)).await {
-        Ok(status) => match classify_yes_no_status(status) {
-            ApiCheck::Yes => ApiCheck::Yes,
-            ApiCheck::No => {
-                // Also check if they have push access via the repo endpoint
-                // (covers permission shapes the collaborators endpoint misses).
-                match get_json_checked(http, &format!("https://api.github.com/repos/{repo}"), access_token).await {
-                    Ok(repo_json) => {
-                        let has_push = repo_json
-                            .get("permissions")
-                            .and_then(|p| p.get("push"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        if has_push { ApiCheck::Yes } else { ApiCheck::No }
+    let is_collaborator =
+        match get_status_with_retries(http, &collaborator_url, Some(access_token)).await {
+            Ok(status) => match classify_yes_no_status(status) {
+                ApiCheck::Yes => ApiCheck::Yes,
+                ApiCheck::No => {
+                    // Also check if they have push access via the repo endpoint
+                    // (covers permission shapes the collaborators endpoint misses).
+                    match get_json_checked(
+                        http,
+                        &format!("https://api.github.com/repos/{repo}"),
+                        access_token,
+                    )
+                    .await
+                    {
+                        Ok(repo_json) => {
+                            let has_push = repo_json
+                                .get("permissions")
+                                .and_then(|p| p.get("push"))
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            if has_push {
+                                ApiCheck::Yes
+                            } else {
+                                ApiCheck::No
+                            }
+                        }
+                        Err(e) => ApiCheck::Error(e.to_string()),
                     }
-                    Err(e) => ApiCheck::Error(e.to_string()),
                 }
-            }
-            ApiCheck::Error(e) => ApiCheck::Error(e),
-        },
-        Err(e) => ApiCheck::Error(e.to_string()),
-    };
+                ApiCheck::Error(e) => ApiCheck::Error(e),
+            },
+            Err(e) => ApiCheck::Error(e.to_string()),
+        };
 
     match is_collaborator {
         ApiCheck::Yes => {
@@ -616,7 +627,10 @@ mod tests {
     #[test]
     fn classify_collaborator_status() {
         use reqwest::StatusCode;
-        assert_eq!(classify_yes_no_status(StatusCode::NO_CONTENT), ApiCheck::Yes);
+        assert_eq!(
+            classify_yes_no_status(StatusCode::NO_CONTENT),
+            ApiCheck::Yes
+        );
         assert_eq!(classify_yes_no_status(StatusCode::NOT_FOUND), ApiCheck::No);
         // Rate limits and server errors are Errors, never a denial.
         assert!(matches!(

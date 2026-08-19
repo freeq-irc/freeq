@@ -1096,9 +1096,7 @@ pub(super) fn handle_tagmsg(
     {
         let acts_on_a_message =
             tags.contains_key("+react") || tags.contains_key("+freeq.at/unreact");
-        if acts_on_a_message
-            && let Some(target_msgid) = tags.get("+reply")
-        {
+        if acts_on_a_message && let Some(target_msgid) = tags.get("+reply") {
             let root = super::helpers::root_msgid(state, target_msgid);
             tags.insert("+reply".to_string(), root);
         }
@@ -1334,10 +1332,12 @@ pub(super) fn handle_tagmsg(
         let stored = state.with_db(|db| {
             db.store_coordination_event(
                 &event,
-                signed.as_ref().map(|(canonical, state)| crate::db::SignedCoordination {
-                    canonical,
-                    state: *state,
-                }),
+                signed
+                    .as_ref()
+                    .map(|(canonical, state)| crate::db::SignedCoordination {
+                        canonical,
+                        state: *state,
+                    }),
             )
         });
         if stored == Some(crate::db::CoordinationWrite::Refused) {
@@ -1473,7 +1473,14 @@ pub(super) fn handle_tagmsg(
         );
         let channel = target.to_string();
         state.with_db(|db| {
-            db.remove_reaction_by(&target_msgid, &nick, did.as_deref(), &emoji, &channel, Some(&ev))
+            db.remove_reaction_by(
+                &target_msgid,
+                &nick,
+                did.as_deref(),
+                &emoji,
+                &channel,
+                Some(&ev),
+            )
         });
     }
 
@@ -3792,10 +3799,7 @@ fn handle_delete(
     // cannot do from a nick.
     let mut del_tags = std::collections::HashMap::new();
     del_tags.insert("+draft/delete".to_string(), original_msgid.to_string());
-    for name in [
-        "+freeq.at/sig",
-        freeq_sdk::chatsig::EVENT_ID_TAG,
-    ] {
+    for name in ["+freeq.at/sig", freeq_sdk::chatsig::EVENT_ID_TAG] {
         if let Some(v) = event_tags.get(name) {
             del_tags.insert(name.to_string(), v.clone());
         }

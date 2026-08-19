@@ -802,7 +802,10 @@ mod tests {
         assert_eq!(loaded.handle, session.handle);
         assert_eq!(loaded.access_token, session.access_token);
         assert_eq!(loaded.pds_url, session.pds_url);
-        assert_eq!(loaded.dpop_key.to_base64url(), session.dpop_key.to_base64url());
+        assert_eq!(
+            loaded.dpop_key.to_base64url(),
+            session.dpop_key.to_base64url()
+        );
         let _ = std::fs::remove_file(&path);
     }
 

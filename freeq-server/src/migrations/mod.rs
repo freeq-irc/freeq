@@ -86,8 +86,7 @@ fn stamped_version(conn: &rusqlite::Connection) -> Result<usize, String> {
 /// (migration 2 is irreversible by design); the database is left at the
 /// last rung reached.
 pub fn migrate_to(path: &str, target: usize) -> Result<(usize, usize), String> {
-    let mut conn = rusqlite::Connection::open(path)
-        .map_err(|e| format!("open {path}: {e}"))?;
+    let mut conn = rusqlite::Connection::open(path).map_err(|e| format!("open {path}: {e}"))?;
     let before = stamped_version(&conn)?;
     migration_ladder()
         .to_version(&mut conn, target)
@@ -147,7 +146,13 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        for expected in ["msgid", "replaces_msgid", "root_msgid", "deleted_at", "sender_did"] {
+        for expected in [
+            "msgid",
+            "replaces_msgid",
+            "root_msgid",
+            "deleted_at",
+            "sender_did",
+        ] {
             assert!(
                 cols.iter().any(|c| c == expected),
                 "migration 1 must converge `messages.{expected}`; got {cols:?}"
@@ -178,7 +183,6 @@ mod tests {
         );
     }
 
-
     /// Climbing straight to the top lands in the same place as stepping.
     #[test]
     fn to_latest_matches_stepping_rung_by_rung() {
@@ -194,7 +198,11 @@ mod tests {
 
         assert_eq!(version(&stepped), version(&direct));
         assert_eq!(tables(&stepped), tables(&direct));
-        assert_eq!(version(&direct), ladder_top(), "the stamp must equal the rung count");
+        assert_eq!(
+            version(&direct),
+            ladder_top(),
+            "the stamp must equal the rung count"
+        );
     }
 
     /// The `--migrate-to` entry point: a real file, up to latest, down one
@@ -217,7 +225,11 @@ mod tests {
             "descending past an irreversible rung must error, got success"
         );
         let conn = Connection::open(path).unwrap();
-        assert_eq!(version(&conn), 2, "the database stays at the last rung reached");
+        assert_eq!(
+            version(&conn),
+            2,
+            "the database stays at the last rung reached"
+        );
     }
 
     /// Re-running the ladder against an already-current database is a no-op,

@@ -37,11 +37,7 @@ pub const MAX_BACKLOG_SAMPLES: usize = (PUSH_AUDIO_RATE as usize) / 5;
 /// bound by dropping the oldest overflow. Runs on every push, so the queue
 /// stays bounded regardless of whether the consumer is keeping up (or running
 /// at all).
-pub fn push_capped<I: IntoIterator<Item = f32>>(
-    queue: &mut VecDeque<f32>,
-    samples: I,
-    cap: usize,
-) {
+pub fn push_capped<I: IntoIterator<Item = f32>>(queue: &mut VecDeque<f32>, samples: I, cap: usize) {
     queue.extend(samples);
     if queue.len() > cap {
         let excess = queue.len() - cap;
@@ -144,8 +140,15 @@ mod tests {
     #[test]
     fn bounded_backlog_caps_recovery_latency() {
         let mut q = VecDeque::new();
-        push_capped(&mut q, std::iter::repeat(0.2).take(PUSH_AUDIO_RATE as usize * 5), MAX_BACKLOG_SAMPLES);
+        push_capped(
+            &mut q,
+            std::iter::repeat(0.2).take(PUSH_AUDIO_RATE as usize * 5),
+            MAX_BACKLOG_SAMPLES,
+        );
         let latency_ms = q.len() as f64 / PUSH_AUDIO_RATE as f64 * 1000.0;
-        assert!(latency_ms <= 200.0, "buffered latency {latency_ms}ms must stay ≤200ms");
+        assert!(
+            latency_ms <= 200.0,
+            "buffered latency {latency_ms}ms must stay ≤200ms"
+        );
     }
 }

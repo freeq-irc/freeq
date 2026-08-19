@@ -411,7 +411,10 @@ async fn unmounted_verifier(
     // Only the first path segment is used for the provider hint, and the
     // user-controlled path is never echoed into the HTML unescaped.
     let provider = path.split('/').next().unwrap_or("").to_string();
-    let provider = if provider.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+    let provider = if provider
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
         provider
     } else {
         "unknown".to_string()
@@ -1363,7 +1366,10 @@ async fn api_channel_evidence(
                 .with_db(|db| db.get_signing_key_by_kid(did, kid))
                 .flatten()
         {
-            keys.insert(kid.to_string(), serde_json::Value::String(b64.encode(bytes)));
+            keys.insert(
+                kid.to_string(),
+                serde_json::Value::String(b64.encode(bytes)),
+            );
         }
     }
 
@@ -5499,8 +5505,7 @@ mod signature_verdict_tests {
         .expect("the message is on file");
 
         assert_eq!(
-            out.0["verification"]["verified_by"],
-            "unverifiable-unknown-key",
+            out.0["verification"]["verified_by"], "unverifiable-unknown-key",
             "the read reports what is true now, not what a lookup might find"
         );
         assert!(

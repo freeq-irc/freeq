@@ -166,7 +166,10 @@ fn did_doc_url(did: &str) -> Option<String> {
         if segments.len() == 1 {
             Some(format!("https://{host}/.well-known/did.json"))
         } else {
-            Some(format!("https://{host}/{}/did.json", segments[1..].join("/")))
+            Some(format!(
+                "https://{host}/{}/did.json",
+                segments[1..].join("/")
+            ))
         }
     } else {
         None
@@ -543,7 +546,9 @@ mod tests {
     fn scripted_source(
         pages: Vec<Vec<String>>,
         fail_on_page: Option<usize>,
-    ) -> impl FnMut(Option<String>) -> std::pin::Pin<
+    ) -> impl FnMut(
+        Option<String>,
+    ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Page, String>> + Send>,
     > {
         let state = Arc::new(Mutex::new((pages, 0usize)));
@@ -576,11 +581,7 @@ mod tests {
         // 15 pages × 100 follows; the target sits on the last page — the
         // pre-fix code (10-page cap) would have falsely denied this user.
         let mut pages: Vec<Vec<String>> = (0..14)
-            .map(|p| {
-                (0..100)
-                    .map(|i| format!("did:plc:user-p{p}-{i}"))
-                    .collect()
-            })
+            .map(|p| (0..100).map(|i| format!("did:plc:user-p{p}-{i}")).collect())
             .collect();
         pages.push(vec!["did:plc:target".to_string()]);
 
@@ -590,10 +591,7 @@ mod tests {
 
     #[tokio::test]
     async fn not_following_only_when_list_exhausted() {
-        let pages = vec![
-            vec!["did:plc:a".to_string()],
-            vec!["did:plc:b".to_string()],
-        ];
+        let pages = vec![vec!["did:plc:a".to_string()], vec!["did:plc:b".to_string()]];
         let result = walk_for_target("did:plc:target", scripted_source(pages, None)).await;
         assert_eq!(result, FollowCheck::NotFollowing);
     }
@@ -623,9 +621,8 @@ mod tests {
                     dids: vec![format!("did:plc:user-{n}")],
                     cursor: Some("more".into()),
                 })
-            }) as std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<Page, String>> + Send>,
-            >
+            })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Result<Page, String>> + Send>>
         };
         let result = walk_for_target("did:plc:target", fetch).await;
         assert!(matches!(result, FollowCheck::Error(ref m) if m.contains("too large")));
@@ -726,7 +723,11 @@ mod tests {
 
     #[test]
     fn pds_page_url_encodes_params() {
-        let url = pds_page_url("https://pds.example.com/", "did:plc:me", Some("cur/sor+x".into()));
+        let url = pds_page_url(
+            "https://pds.example.com/",
+            "did:plc:me",
+            Some("cur/sor+x".into()),
+        );
         assert_eq!(
             url,
             "https://pds.example.com/xrpc/com.atproto.repo.listRecords?repo=did%3Aplc%3Ame&collection=app.bsky.graph.follow&limit=100&cursor=cur%2Fsor%2Bx"

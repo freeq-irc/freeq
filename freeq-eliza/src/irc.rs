@@ -810,7 +810,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             Event::TagMsg {
                 from: _,
                 target,
-                tags, .. } => {
+                tags,
+                ..
+            } => {
                 let actor = tags.get("+freeq.at/av-actor").cloned().unwrap_or_default();
                 match classify_av_event(&target, &tags, &cfg.channels, &cfg.nick) {
                     AvAction::Start {
@@ -1055,7 +1057,10 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                         let q = text.trim().to_string();
                         if !q.is_empty() {
                             tracing::info!(%from, question = %q, "external-brain(text): forwarding DM to brain");
-                            seam.send(crate::brain_seam::Outbound::Utterance { nick: from.clone(), text: q });
+                            seam.send(crate::brain_seam::Outbound::Utterance {
+                                nick: from.clone(),
+                                text: q,
+                            });
                         }
                     }
                     continue;
@@ -1807,7 +1812,8 @@ async fn answer_and_speak(
                         tracing::info!(
                             turn,
                             elapsed_ms = t0.elapsed().as_millis() as u64,
-                            since_speech_end_ms = clock.map(|c| c.speech_end.elapsed().as_millis() as u64),
+                            since_speech_end_ms =
+                                clock.map(|c| c.speech_end.elapsed().as_millis() as u64),
                             "latency: first sentence reached TTS"
                         );
                         first = false;
@@ -1972,8 +1978,7 @@ async fn answer_and_speak(
     // back via the seam, so we take no native answer here.
     // Router verdict UNION the cue-list heuristic (small router models miss
     // clear coding tasks); a visual question stays local regardless.
-    let wants_agent =
-        route.is_some_and(|r| r.agent) || qa::is_agentic_task(&question);
+    let wants_agent = route.is_some_and(|r| r.agent) || qa::is_agentic_task(&question);
     let is_visual_route = route.is_some_and(|r| r.visual);
     if is_voice
         && !cfg.external_brain
@@ -2015,8 +2020,17 @@ async fn answer_and_speak(
     // Always fall back to the other source if the preferred one has no frame.
     let q_low = question.to_lowercase();
     let asks_self_cam = [
-        "see me", "look at me", "my face", "how do i look", "how do i look like",
-        "wearing", "holding", "behind me", "my camera", "the camera", "at me",
+        "see me",
+        "look at me",
+        "my face",
+        "how do i look",
+        "how do i look like",
+        "wearing",
+        "holding",
+        "behind me",
+        "my camera",
+        "the camera",
+        "at me",
     ]
     .iter()
     .any(|w| q_low.contains(w));
@@ -2447,7 +2461,10 @@ sharpen the thread. Do NOT address yourself."
 /// agent in the call it is 250–1000 ms of pure pre-speech latency with no
 /// benefit. On the solo path we return as soon as the quiet HOLD passes —
 /// the single biggest win for conversational rhythm.
-pub(crate) async fn wait_for_room_quiet(peer_level: &Arc<std::sync::atomic::AtomicU32>, solo: bool) {
+pub(crate) async fn wait_for_room_quiet(
+    peer_level: &Arc<std::sync::atomic::AtomicU32>,
+    solo: bool,
+) {
     use std::sync::atomic::Ordering;
     const THRESHOLD: f32 = 0.04;
     // 150 ms (was 250): on the answer path the VAD already waited ~450 ms of
@@ -2459,7 +2476,11 @@ pub(crate) async fn wait_for_room_quiet(peer_level: &Arc<std::sync::atomic::Atom
     let start = Instant::now();
     'outer: loop {
         if start.elapsed() >= MAX_WAIT {
-            tracing::info!(waited_ms = start.elapsed().as_millis() as u64, solo, "latency: wait_for_room_quiet (max-wait timeout)");
+            tracing::info!(
+                waited_ms = start.elapsed().as_millis() as u64,
+                solo,
+                "latency: wait_for_room_quiet (max-wait timeout)"
+            );
             return;
         }
         // ── Stage 1: classic quiet wait ──
@@ -2482,7 +2503,11 @@ pub(crate) async fn wait_for_room_quiet(peer_level: &Arc<std::sync::atomic::Atom
         }
         // Solo: no other bot to collide with — the quiet hold is enough.
         if solo {
-            tracing::info!(waited_ms = start.elapsed().as_millis() as u64, solo, "latency: wait_for_room_quiet (solo, no jitter)");
+            tracing::info!(
+                waited_ms = start.elapsed().as_millis() as u64,
+                solo,
+                "latency: wait_for_room_quiet (solo, no jitter)"
+            );
             return;
         }
         // ── Stage 2: anti-collision confirmation jitter ──
@@ -3781,401 +3806,393 @@ async fn dispatch_utterance(
     t_flush: Instant,
     text: String,
 ) {
-                    if text.is_empty() || is_hallucination(&text) {
-                        tracing::info!(%nick, %text, "dropped empty/hallucinated utterance");
-                        return;
-                    }
-                    // Own-TTS echo: a participant without echo
-                    // cancellation plays our voice out their speakers,
-                    // their mic picks it up, and it comes back
-                    // transcribed under their nick. Answering it = the
-                    // bot talking to itself in a loop. Drop it before
-                    // it reaches the transcript or the addressing gate.
-                    if is_own_echo(&cfg.recent_tts, &text) {
-                        tracing::info!(%nick, %text, "dropped own-TTS echo");
-                        return;
-                    }
-                    tracing::info!(%nick, %text, "transcribed utterance");
+    if text.is_empty() || is_hallucination(&text) {
+        tracing::info!(%nick, %text, "dropped empty/hallucinated utterance");
+        return;
+    }
+    // Own-TTS echo: a participant without echo
+    // cancellation plays our voice out their speakers,
+    // their mic picks it up, and it comes back
+    // transcribed under their nick. Answering it = the
+    // bot talking to itself in a loop. Drop it before
+    // it reaches the transcript or the addressing gate.
+    if is_own_echo(&cfg.recent_tts, &text) {
+        tracing::info!(%nick, %text, "dropped own-TTS echo");
+        return;
+    }
+    tracing::info!(%nick, %text, "transcribed utterance");
 
-                    // Discussion-mode trigger. A human cue ("discuss
-                    // it", "debate this", …) unlocks bot↔bot replies
-                    // for 90 s, letting the agents converse without
-                    // the operator having to address each one. The
-                    // window is per-bot (each bot maintains its own
-                    // copy of `discussion_until`); each one sees the
-                    // same human cue so they all extend in lockstep.
-                    if !is_peer_nick(&cfg.peer_agents, &nick)
-                        && crate::social::is_discussion_trigger(&text)
-                        && let Ok(mut deadline) = cfg.discussion_until.lock()
-                    {
-                        *deadline = Instant::now() + Duration::from_secs(90);
-                        tracing::info!("discussion mode armed — bot↔bot replies allowed for 90 s");
-                    }
+    // Discussion-mode trigger. A human cue ("discuss
+    // it", "debate this", …) unlocks bot↔bot replies
+    // for 90 s, letting the agents converse without
+    // the operator having to address each one. The
+    // window is per-bot (each bot maintains its own
+    // copy of `discussion_until`); each one sees the
+    // same human cue so they all extend in lockstep.
+    if !is_peer_nick(&cfg.peer_agents, &nick)
+        && crate::social::is_discussion_trigger(&text)
+        && let Ok(mut deadline) = cfg.discussion_until.lock()
+    {
+        *deadline = Instant::now() + Duration::from_secs(90);
+        tracing::info!("discussion mode armed — bot↔bot replies allowed for 90 s");
+    }
 
-                    // Peer-aware gaze: if this utterance is a human
-                    // addressing one of the OTHER agents in the room,
-                    // swing our head toward that peer. Reads as a real
-                    // meeting — three people in a room, when one is
-                    // called on, the others look at them.
-                    if !is_peer_nick(&cfg.peer_agents, &nick) {
-                        let peer_names: Vec<&str> =
-                            cfg.peer_agents.iter().map(|s| s.as_str()).collect();
-                        if let Some(addressee) =
-                            crate::social::extract_addressee(&text, &peer_names)
-                        {
-                            // Only swing gaze when the addressee is
-                            // NOT us — when WE are being addressed,
-                            // the answer flow's FocusGuard already
-                            // points our eyes at the asker.
-                            let self_canonical = cfg
-                                .nick
-                                .split_once('-')
-                                .map(|(p, _)| p)
-                                .unwrap_or(cfg.nick.as_str())
-                                .to_ascii_lowercase();
-                            if addressee != self_canonical
-                                && let Some(call) = active.lock().await.as_ref()
-                            {
-                                call.video.set_focus_nick(Some(addressee.clone()));
-                                tracing::info!(
-                                    target = %addressee,
-                                    "peer-aware gaze — looking at addressed peer"
-                                );
-                            }
-                        }
+    // Peer-aware gaze: if this utterance is a human
+    // addressing one of the OTHER agents in the room,
+    // swing our head toward that peer. Reads as a real
+    // meeting — three people in a room, when one is
+    // called on, the others look at them.
+    if !is_peer_nick(&cfg.peer_agents, &nick) {
+        let peer_names: Vec<&str> = cfg.peer_agents.iter().map(|s| s.as_str()).collect();
+        if let Some(addressee) = crate::social::extract_addressee(&text, &peer_names) {
+            // Only swing gaze when the addressee is
+            // NOT us — when WE are being addressed,
+            // the answer flow's FocusGuard already
+            // points our eyes at the asker.
+            let self_canonical = cfg
+                .nick
+                .split_once('-')
+                .map(|(p, _)| p)
+                .unwrap_or(cfg.nick.as_str())
+                .to_ascii_lowercase();
+            if addressee != self_canonical
+                && let Some(call) = active.lock().await.as_ref()
+            {
+                call.video.set_focus_nick(Some(addressee.clone()));
+                tracing::info!(
+                    target = %addressee,
+                    "peer-aware gaze — looking at addressed peer"
+                );
+            }
+        }
 
-                        // Hand-raise: my name was dropped mid-
-                        // sentence but not directly addressed.
-                        // Brighten the halo briefly so the operator
-                        // sees "I have something to add" without me
-                        // actually speaking.
-                        if crate::social::mention_without_address(&text, &cfg.nick)
-                            && let Some(call) = active.lock().await.as_ref()
-                        {
-                            call.video.flash_hand_raise();
-                            tracing::info!("hand-raise — my name was mentioned");
-                        }
-                    }
+        // Hand-raise: my name was dropped mid-
+        // sentence but not directly addressed.
+        // Brighten the halo briefly so the operator
+        // sees "I have something to add" without me
+        // actually speaking.
+        if crate::social::mention_without_address(&text, &cfg.nick)
+            && let Some(call) = active.lock().await.as_ref()
+        {
+            call.video.flash_hand_raise();
+            tracing::info!("hand-raise — my name was mentioned");
+        }
+    }
 
-                    // Voice-addressed Q&A. People don't say someone's name to
-                    // address them, so neither should they have to say ours —
-                    // but we must NOT answer every ambient line either. So:
-                    //  • named ("eliza, …")  → always addressed
-                    //  • a question          → addressed (any call size)
-                    //  • 1:1 + substantive   → addressed (conversational mode:
-                    //    alone with one human, every real sentence is for us —
-                    //    STT name-mangling kept dropping legitimate requests)
-                    //  • bare declaratives in a group → ignored (ambient)
-                    // We're always transcribing regardless; this only decides
-                    // when to *answer*. `humans` is the live count of humans in
-                    // the call (1 == one-on-one with us; peer agents excluded).
-                    let mut named = address_with_aliases(&text, &cfg.nick);
-                    let humans = humans.load(std::sync::atomic::Ordering::Relaxed);
+    // Voice-addressed Q&A. People don't say someone's name to
+    // address them, so neither should they have to say ours —
+    // but we must NOT answer every ambient line either. So:
+    //  • named ("eliza, …")  → always addressed
+    //  • a question          → addressed (any call size)
+    //  • 1:1 + substantive   → addressed (conversational mode:
+    //    alone with one human, every real sentence is for us —
+    //    STT name-mangling kept dropping legitimate requests)
+    //  • bare declaratives in a group → ignored (ambient)
+    // We're always transcribing regardless; this only decides
+    // when to *answer*. `humans` is the live count of humans in
+    // the call (1 == one-on-one with us; peer agents excluded).
+    let mut named = address_with_aliases(&text, &cfg.nick);
+    let humans = humans.load(std::sync::atomic::Ordering::Relaxed);
 
-                    // Other participants + configured peers — used for
-                    // "addressed to someone else" checks. Candidates come
-                    // from the live call roster (so this works even when
-                    // --peer-agents wasn't configured) plus the peer list.
-                    let others: Vec<String> = {
-                        let mut others: Vec<String> = roster
-                            .lock()
-                            .map(|r| {
-                                r.iter()
-                                    .map(|n| {
-                                        n.split_once('-').map(|(p, _)| p).unwrap_or(n).to_string()
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        others.extend(cfg.peer_agents.iter().cloned());
-                        others.sort();
-                        others.dedup();
-                        others
-                    };
+    // Other participants + configured peers — used for
+    // "addressed to someone else" checks. Candidates come
+    // from the live call roster (so this works even when
+    // --peer-agents wasn't configured) plus the peer list.
+    let others: Vec<String> = {
+        let mut others: Vec<String> = roster
+            .lock()
+            .map(|r| {
+                r.iter()
+                    .map(|n| n.split_once('-').map(|(p, _)| p).unwrap_or(n).to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        others.extend(cfg.peer_agents.iter().cloned());
+        others.sort();
+        others.dedup();
+        others
+    };
 
-                    // Name-primed merge: a bare "Yokota." segment (the VAD
-                    // cutting at the comma of "Yokota, please read…") makes
-                    // the speaker's NEXT segment addressed, so the split
-                    // question still lands.
-                    if named.is_none() && is_bare_name(&text, &cfg.nick) {
-                        if let Ok(mut primed) = name_primed.lock() {
-                            *primed = Some(Instant::now());
-                        }
-                        tracing::info!(%nick, "bare name heard — priming next segment as addressed");
-                        return;
-                    }
-                    // Mirror: a bare PEER name primes the next segment as
-                    // addressed to THEM, so we don't steal it via the 1:1
-                    // gate. (The bare line itself already suppresses via
-                    // `addressed_to_other` below.)
-                    if named.is_none() && others.iter().any(|o| is_bare_name(&text, o)) {
-                        if let Ok(mut primed) = other_primed.lock() {
-                            *primed = Some(Instant::now());
-                        }
-                        tracing::info!(
-                            %nick,
-                            "bare peer name heard — priming next segment as addressed to other"
-                        );
-                    }
-                    if named.is_none() {
-                        let was_primed = name_primed
-                            .lock()
-                            .ok()
-                            .and_then(|mut p| p.take())
-                            .is_some_and(|t| t.elapsed() <= NAME_PRIME_WINDOW);
-                        if was_primed && is_substantive(&text) {
-                            tracing::info!(%nick, "name-primed segment — treating as addressed");
-                            named = Some(text.trim().to_string());
-                        }
-                    }
-                    // Consume an other-agent prime: within the window, an
-                    // unnamed follow-up segment belongs to the primed peer.
-                    let other_primed_hit = named.is_none()
-                        && other_primed
-                            .lock()
-                            .ok()
-                            .and_then(|mut p| p.take())
-                            .is_some_and(|t| t.elapsed() <= NAME_PRIME_WINDOW);
+    // Name-primed merge: a bare "Yokota." segment (the VAD
+    // cutting at the comma of "Yokota, please read…") makes
+    // the speaker's NEXT segment addressed, so the split
+    // question still lands.
+    if named.is_none() && is_bare_name(&text, &cfg.nick) {
+        if let Ok(mut primed) = name_primed.lock() {
+            *primed = Some(Instant::now());
+        }
+        tracing::info!(%nick, "bare name heard — priming next segment as addressed");
+        return;
+    }
+    // Mirror: a bare PEER name primes the next segment as
+    // addressed to THEM, so we don't steal it via the 1:1
+    // gate. (The bare line itself already suppresses via
+    // `addressed_to_other` below.)
+    if named.is_none() && others.iter().any(|o| is_bare_name(&text, o)) {
+        if let Ok(mut primed) = other_primed.lock() {
+            *primed = Some(Instant::now());
+        }
+        tracing::info!(
+            %nick,
+            "bare peer name heard — priming next segment as addressed to other"
+        );
+    }
+    if named.is_none() {
+        let was_primed = name_primed
+            .lock()
+            .ok()
+            .and_then(|mut p| p.take())
+            .is_some_and(|t| t.elapsed() <= NAME_PRIME_WINDOW);
+        if was_primed && is_substantive(&text) {
+            tracing::info!(%nick, "name-primed segment — treating as addressed");
+            named = Some(text.trim().to_string());
+        }
+    }
+    // Consume an other-agent prime: within the window, an
+    // unnamed follow-up segment belongs to the primed peer.
+    let other_primed_hit = named.is_none()
+        && other_primed
+            .lock()
+            .ok()
+            .and_then(|mut p| p.take())
+            .is_some_and(|t| t.elapsed() <= NAME_PRIME_WINDOW);
 
-                    // Owner lifecycle command by voice ("go to sleep", "join #x",
-                    // "leave") — owner-only, past the call-join grace (so replayed
-                    // audio can't re-sleep us). Checked BEFORE the Q&A gate: a
-                    // command isn't a question/request, so it must not depend on
-                    // being "addressed". Match on the name-stripped remainder when
-                    // named, else the raw line ("olive, go to sleep" / "go to sleep").
-                    if is_owner(&cfg, &nick) {
-                        let past_grace = active
-                            .lock()
-                            .await
-                            .as_ref()
-                            .is_some_and(|c| c.joined_at.elapsed() >= CALL_JOIN_GRACE);
-                        if past_grace {
-                            let cmd_text = named.as_deref().unwrap_or(&text);
-                            if let Some(cmd) = parse_owner_command(cmd_text) {
-                                tracing::info!(%nick, "owner lifecycle command by voice");
-                                if let OwnerCmd::Fork(utt) = cmd {
-                                    // Mitosis: own task + spoken progress.
-                                    let speaker =
-                                        active.lock().await.as_ref().map(|c| c.speaker.clone());
-                                    crate::mitosis::spawn(
-                                        cfg.clone(),
-                                        handle.clone(),
-                                        channel.clone(),
-                                        utt,
-                                        speaker,
-                                    );
-                                } else {
-                                    run_owner_command(&handle, Some(&channel), cmd).await;
-                                }
-                                return;
-                            }
-                        }
-                    }
-
-                    // A question that opens by naming a DIFFERENT
-                    // participant or peer agent is theirs, not ours —
-                    // "Yokota, what is two plus two?" must not be
-                    // answered by Olive just because it's a question.
-                    // `other_primed_hit` covers the VAD-split variant
-                    // ("Yokota." … "what is two plus two?").
-                    let to_other = named.is_none()
-                        && (other_primed_hit || addressed_to_other(&text, &cfg.nick, &others));
-                    let inferred: Option<String> = named.clone().or_else(|| {
-                        if !is_substantive(&text) || to_other {
-                            None
-                        } else if looks_like_question(&text) || humans <= 1 {
-                            Some(text.trim().to_string())
-                        } else {
-                            None
-                        }
-                    });
-                    tracing::info!(
-                        %nick, humans,
-                        named = named.is_some(),
-                        to_other,
-                        addressed = inferred.is_some(),
-                        "voice addressing decision"
+    // Owner lifecycle command by voice ("go to sleep", "join #x",
+    // "leave") — owner-only, past the call-join grace (so replayed
+    // audio can't re-sleep us). Checked BEFORE the Q&A gate: a
+    // command isn't a question/request, so it must not depend on
+    // being "addressed". Match on the name-stripped remainder when
+    // named, else the raw line ("olive, go to sleep" / "go to sleep").
+    if is_owner(&cfg, &nick) {
+        let past_grace = active
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|c| c.joined_at.elapsed() >= CALL_JOIN_GRACE);
+        if past_grace {
+            let cmd_text = named.as_deref().unwrap_or(&text);
+            if let Some(cmd) = parse_owner_command(cmd_text) {
+                tracing::info!(%nick, "owner lifecycle command by voice");
+                if let OwnerCmd::Fork(utt) = cmd {
+                    // Mitosis: own task + spoken progress.
+                    let speaker = active.lock().await.as_ref().map(|c| c.speaker.clone());
+                    crate::mitosis::spawn(
+                        cfg.clone(),
+                        handle.clone(),
+                        channel.clone(),
+                        utt,
+                        speaker,
                     );
-                    if let Some(question) = inferred {
-                        // External-brain mode: eliza does NOT answer with
-                        // its own model. Forward the addressed utterance to
-                        // yokota over the seam and stop — yokota decides
-                        // what (if anything) to say back, which arrives as
-                        // a `say` line and is spoken via the seam reader.
-                        // Off-flag (default) = unchanged behavior below.
-                        if cfg.external_brain {
-                            if let Some(seam) = cfg.brain_seam.get() {
-                                seam.send(crate::brain_seam::Outbound::Utterance {
-                                    nick: nick.clone(),
-                                    text: question.clone(),
-                                });
-                                tracing::info!(%nick, %question, "external-brain: forwarded utterance to yokota");
-                            } else {
-                                tracing::debug!(%nick, "external-brain: no seam handle; dropping utterance");
-                            }
-                            return;
-                        }
-                        // Multi-agent chatter guard: see is_address_allowed.
-                        if !is_address_allowed(&cfg, &nick) {
-                            tracing::info!(
-                                %nick,
-                                "suppressing voice reply — recent addressers all peer agents"
-                            );
-                            return;
-                        }
-                        // Debounce: a speaker joined from several devices
-                        // is tapped once per broadcast, so the same
-                        // question arrives two or three times. Answer the
-                        // first; drop the rest.
-                        let dispatch = {
-                            let mut guard = active.lock().await;
-                            match guard.as_mut() {
-                                // Startup grace: ignore the backlog of
-                                // audio the SFU can replay right after the
-                                // bot joins (a stale "monologue").
-                                Some(call) if call.joined_at.elapsed() < CALL_JOIN_GRACE => {
-                                    tracing::info!(%nick, "ignoring addressed question (call-join grace)");
-                                    None
-                                }
-                                // Barge-in: Eliza is mid-answer and a
-                                // participant re-addressed her by name.
-                                // Stop her immediately and take the new
-                                // question — bypassing the dedupe debounce,
-                                // since a keyword *while she's speaking* is
-                                // a genuine interrupt, not a duplicate.
-                                // `clear()` empties the speech queue so the
-                                // 2-3 duplicate transcriptions that follow
-                                // see `is_speaking() == false` and get
-                                // caught by the debounce arm below.
-                                Some(call) if call.speaker.is_speaking() => {
-                                    tracing::info!(%nick, "barge-in — interrupting current answer");
-                                    call.speaker.clear();
-                                    call.last_answer = Some(Instant::now());
-                                    call.last_question = Some(question.clone());
-                                    // Snapshot the context BEFORE pushing the
-                                    // question — then record the question as a
-                                    // transcript line so the conversation log
-                                    // is symmetric (questions used to vanish:
-                                    // this arm returned before the push below).
-                                    let snapshot =
-                                        recent_lines(&call.transcript, TRANSCRIPT_PROMPT_LINES);
-                                    call.transcript.push(format!("{nick}: {text}"));
-                                    Some((snapshot, call.speaker.clone(), call.video.clone()))
-                                }
-                                // Content-aware debounce: drop a repeat only
-                                // when it MATCHES the last answered question
-                                // within the short window (a multi-device
-                                // duplicate broadcast). A different question —
-                                // a real conversational follow-up — always
-                                // goes through, even seconds later.
-                                Some(call)
-                                    if !(call
-                                        .last_answer
-                                        .is_some_and(|t| t.elapsed() < ANSWER_DEBOUNCE)
-                                        && call
-                                            .last_question
-                                            .as_deref()
-                                            .is_some_and(|q| is_near_duplicate(q, &question))) =>
-                                {
-                                    call.last_answer = Some(Instant::now());
-                                    call.last_question = Some(question.clone());
-                                    let snapshot =
-                                        recent_lines(&call.transcript, TRANSCRIPT_PROMPT_LINES);
-                                    call.transcript.push(format!("{nick}: {text}"));
-                                    Some((snapshot, call.speaker.clone(), call.video.clone()))
-                                }
-                                Some(_) => {
-                                    tracing::info!(%nick, %question, "ignoring duplicate addressed question (content-debounce)");
-                                    None
-                                }
-                                None => None,
-                            }
-                        };
-                        if let Some((transcript, speaker, video)) = dispatch {
-                            let screen_video =
-                                lookup_tap_video(&video_taps_for_screen, "screen");
-                            answer_and_speak(
-                                cfg,
-                                handle,
-                                channel,
-                                nick,
-                                question,
-                                transcript,
-                                Some(speaker),
-                                Some(video),
-                                Some(asker_video),
-                                screen_video,
-                                Some(active.clone()),
-                                Some(TurnClock { id: turn, speech_end: t_flush }),
-                            )
-                            .await;
-                        }
-                        return;
-                    }
+                } else {
+                    run_owner_command(&handle, Some(&channel), cmd).await;
+                }
+                return;
+            }
+        }
+    }
 
-                    // Buffer the line — the bot no longer firehoses every
-                    // utterance to the channel. A `dump` request posts
-                    // what's accumulated.
-                    let log_line = format!("{nick}: {text}");
-                    let video_snapshot = {
-                        let mut guard = active.lock().await;
-                        if let Some(call) = guard.as_mut() {
-                            call.transcript.push(log_line);
-                            Some(call.video.clone())
-                        } else {
-                            None
-                        }
-                    };
-                    // Live diagram: feed every transcribed utterance to
-                    // the per-channel graph. When new edges appear, push
-                    // the updated step list to the whiteboard AND
-                    // broadcast each fresh triple to peer agents over
-                    // IRC so every tile in the room renders the same
-                    // shared whiteboard.
-                    if let Some(video) = video_snapshot {
-                        let edges_before = {
-                            let log = cfg.diagrams.lock().expect("diagrams poisoned");
-                            log.get(&channel).map(|d| d.edge_count()).unwrap_or(0)
-                        };
-                        let added = {
-                            let mut log = cfg.diagrams.lock().expect("diagrams poisoned");
-                            log.entry(channel.clone()).or_default().ingest(&text)
-                        };
-                        if added > 0 {
-                            // Snapshot the new edges (those appended
-                            // after `edges_before`) so we broadcast
-                            // exactly the deltas, not the whole graph.
-                            let (steps, new_edges) = {
-                                let log = cfg.diagrams.lock().expect("diagrams poisoned");
-                                let d = log.get(&channel);
-                                let steps = d.map(|d| d.to_steps()).unwrap_or_default();
-                                let new_edges: Vec<(String, String, String)> = d
-                                    .map(|d| {
-                                        d.edges()
-                                            .skip(edges_before)
-                                            .map(|e| {
-                                                (e.from.clone(), e.relation.clone(), e.to.clone())
-                                            })
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                (steps, new_edges)
-                            };
-                            if !steps.is_empty() {
-                                video.show_board(steps, "#7FE7CB".into());
-                            }
-                            // Broadcast the new triples so peer bots
-                            // merge them into their local diagram.
-                            // Format: `[diag] from|relation|to` — peers
-                            // parse this on PRIVMSG, humans see it as
-                            // small structured bullet they can ignore.
-                            for (f, r, t) in new_edges {
-                                let _ = handle
-                                    .privmsg(&channel, &format!("[diag] {f}|{r}|{t}"))
-                                    .await;
-                            }
-                        }
-                    }
+    // A question that opens by naming a DIFFERENT
+    // participant or peer agent is theirs, not ours —
+    // "Yokota, what is two plus two?" must not be
+    // answered by Olive just because it's a question.
+    // `other_primed_hit` covers the VAD-split variant
+    // ("Yokota." … "what is two plus two?").
+    let to_other =
+        named.is_none() && (other_primed_hit || addressed_to_other(&text, &cfg.nick, &others));
+    let inferred: Option<String> = named.clone().or_else(|| {
+        if !is_substantive(&text) || to_other {
+            None
+        } else if looks_like_question(&text) || humans <= 1 {
+            Some(text.trim().to_string())
+        } else {
+            None
+        }
+    });
+    tracing::info!(
+        %nick, humans,
+        named = named.is_some(),
+        to_other,
+        addressed = inferred.is_some(),
+        "voice addressing decision"
+    );
+    if let Some(question) = inferred {
+        // External-brain mode: eliza does NOT answer with
+        // its own model. Forward the addressed utterance to
+        // yokota over the seam and stop — yokota decides
+        // what (if anything) to say back, which arrives as
+        // a `say` line and is spoken via the seam reader.
+        // Off-flag (default) = unchanged behavior below.
+        if cfg.external_brain {
+            if let Some(seam) = cfg.brain_seam.get() {
+                seam.send(crate::brain_seam::Outbound::Utterance {
+                    nick: nick.clone(),
+                    text: question.clone(),
+                });
+                tracing::info!(%nick, %question, "external-brain: forwarded utterance to yokota");
+            } else {
+                tracing::debug!(%nick, "external-brain: no seam handle; dropping utterance");
+            }
+            return;
+        }
+        // Multi-agent chatter guard: see is_address_allowed.
+        if !is_address_allowed(&cfg, &nick) {
+            tracing::info!(
+                %nick,
+                "suppressing voice reply — recent addressers all peer agents"
+            );
+            return;
+        }
+        // Debounce: a speaker joined from several devices
+        // is tapped once per broadcast, so the same
+        // question arrives two or three times. Answer the
+        // first; drop the rest.
+        let dispatch = {
+            let mut guard = active.lock().await;
+            match guard.as_mut() {
+                // Startup grace: ignore the backlog of
+                // audio the SFU can replay right after the
+                // bot joins (a stale "monologue").
+                Some(call) if call.joined_at.elapsed() < CALL_JOIN_GRACE => {
+                    tracing::info!(%nick, "ignoring addressed question (call-join grace)");
+                    None
+                }
+                // Barge-in: Eliza is mid-answer and a
+                // participant re-addressed her by name.
+                // Stop her immediately and take the new
+                // question — bypassing the dedupe debounce,
+                // since a keyword *while she's speaking* is
+                // a genuine interrupt, not a duplicate.
+                // `clear()` empties the speech queue so the
+                // 2-3 duplicate transcriptions that follow
+                // see `is_speaking() == false` and get
+                // caught by the debounce arm below.
+                Some(call) if call.speaker.is_speaking() => {
+                    tracing::info!(%nick, "barge-in — interrupting current answer");
+                    call.speaker.clear();
+                    call.last_answer = Some(Instant::now());
+                    call.last_question = Some(question.clone());
+                    // Snapshot the context BEFORE pushing the
+                    // question — then record the question as a
+                    // transcript line so the conversation log
+                    // is symmetric (questions used to vanish:
+                    // this arm returned before the push below).
+                    let snapshot = recent_lines(&call.transcript, TRANSCRIPT_PROMPT_LINES);
+                    call.transcript.push(format!("{nick}: {text}"));
+                    Some((snapshot, call.speaker.clone(), call.video.clone()))
+                }
+                // Content-aware debounce: drop a repeat only
+                // when it MATCHES the last answered question
+                // within the short window (a multi-device
+                // duplicate broadcast). A different question —
+                // a real conversational follow-up — always
+                // goes through, even seconds later.
+                Some(call)
+                    if !(call
+                        .last_answer
+                        .is_some_and(|t| t.elapsed() < ANSWER_DEBOUNCE)
+                        && call
+                            .last_question
+                            .as_deref()
+                            .is_some_and(|q| is_near_duplicate(q, &question))) =>
+                {
+                    call.last_answer = Some(Instant::now());
+                    call.last_question = Some(question.clone());
+                    let snapshot = recent_lines(&call.transcript, TRANSCRIPT_PROMPT_LINES);
+                    call.transcript.push(format!("{nick}: {text}"));
+                    Some((snapshot, call.speaker.clone(), call.video.clone()))
+                }
+                Some(_) => {
+                    tracing::info!(%nick, %question, "ignoring duplicate addressed question (content-debounce)");
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some((transcript, speaker, video)) = dispatch {
+            let screen_video = lookup_tap_video(&video_taps_for_screen, "screen");
+            answer_and_speak(
+                cfg,
+                handle,
+                channel,
+                nick,
+                question,
+                transcript,
+                Some(speaker),
+                Some(video),
+                Some(asker_video),
+                screen_video,
+                Some(active.clone()),
+                Some(TurnClock {
+                    id: turn,
+                    speech_end: t_flush,
+                }),
+            )
+            .await;
+        }
+        return;
+    }
+
+    // Buffer the line — the bot no longer firehoses every
+    // utterance to the channel. A `dump` request posts
+    // what's accumulated.
+    let log_line = format!("{nick}: {text}");
+    let video_snapshot = {
+        let mut guard = active.lock().await;
+        if let Some(call) = guard.as_mut() {
+            call.transcript.push(log_line);
+            Some(call.video.clone())
+        } else {
+            None
+        }
+    };
+    // Live diagram: feed every transcribed utterance to
+    // the per-channel graph. When new edges appear, push
+    // the updated step list to the whiteboard AND
+    // broadcast each fresh triple to peer agents over
+    // IRC so every tile in the room renders the same
+    // shared whiteboard.
+    if let Some(video) = video_snapshot {
+        let edges_before = {
+            let log = cfg.diagrams.lock().expect("diagrams poisoned");
+            log.get(&channel).map(|d| d.edge_count()).unwrap_or(0)
+        };
+        let added = {
+            let mut log = cfg.diagrams.lock().expect("diagrams poisoned");
+            log.entry(channel.clone()).or_default().ingest(&text)
+        };
+        if added > 0 {
+            // Snapshot the new edges (those appended
+            // after `edges_before`) so we broadcast
+            // exactly the deltas, not the whole graph.
+            let (steps, new_edges) = {
+                let log = cfg.diagrams.lock().expect("diagrams poisoned");
+                let d = log.get(&channel);
+                let steps = d.map(|d| d.to_steps()).unwrap_or_default();
+                let new_edges: Vec<(String, String, String)> = d
+                    .map(|d| {
+                        d.edges()
+                            .skip(edges_before)
+                            .map(|e| (e.from.clone(), e.relation.clone(), e.to.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (steps, new_edges)
+            };
+            if !steps.is_empty() {
+                video.show_board(steps, "#7FE7CB".into());
+            }
+            // Broadcast the new triples so peer bots
+            // merge them into their local diagram.
+            // Format: `[diag] from|relation|to` — peers
+            // parse this on PRIVMSG, humans see it as
+            // small structured bullet they can ignore.
+            for (f, r, t) in new_edges {
+                let _ = handle
+                    .privmsg(&channel, &format!("[diag] {f}|{r}|{t}"))
+                    .await;
+            }
+        }
+    }
 }
 
 /// Stream one participant's audio to Deepgram and dispatch every
@@ -4304,7 +4321,11 @@ async fn stream_participant_deepgram(
                     {
                         use std::sync::atomic::Ordering;
                         let prev = f32::from_bits(peer_level.load(Ordering::Relaxed));
-                        let smoothed = if peak > prev { peak } else { prev * 0.9 + peak * 0.1 };
+                        let smoothed = if peak > prev {
+                            peak
+                        } else {
+                            prev * 0.9 + peak * 0.1
+                        };
                         peer_level.store(smoothed.to_bits(), Ordering::Relaxed);
                     }
                     // AGC: fast attack (jump to a louder peak immediately),
@@ -4317,7 +4338,8 @@ async fn stream_participant_deepgram(
                         agc_env * 0.95 + peak * 0.05
                     };
                     let gain = (AGC_TARGET / agc_env.max(AGC_FLOOR)).clamp(1.0, AGC_MAX);
-                    let boosted: Vec<f32> = pcm.iter().map(|&s| (s * gain).clamp(-1.0, 1.0)).collect();
+                    let boosted: Vec<f32> =
+                        pcm.iter().map(|&s| (s * gain).clamp(-1.0, 1.0)).collect();
                     if frames_seen == 1 || frames_seen.is_multiple_of(250) {
                         tracing::info!(
                             %nick, frames_seen, peak,

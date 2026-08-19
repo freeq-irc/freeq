@@ -136,7 +136,9 @@ pub fn convert_event(event: &freeq_sdk::event::Event) -> DomainEvent {
             from,
             target,
             text,
-            tags, .. } => {
+            tags,
+            ..
+        } => {
             let msgid = tags.get("msgid").cloned();
             let reply_to = tags.get("+reply").cloned();
             let edit_of = tags.get("+draft/edit").cloned();
@@ -166,7 +168,9 @@ pub fn convert_event(event: &freeq_sdk::event::Event) -> DomainEvent {
                 timestamp_ms: ts,
             })
         }
-        Event::TagMsg { from, target, tags, .. } => DomainEvent::TagMsg(TagMsgData {
+        Event::TagMsg {
+            from, target, tags, ..
+        } => DomainEvent::TagMsg(TagMsgData {
             from: from.clone(),
             target: target.clone(),
             tags: tags.clone(),
@@ -270,7 +274,9 @@ pub fn convert_event(event: &freeq_sdk::event::Event) -> DomainEvent {
         Event::WhoisEnd { .. } => DomainEvent::Notice {
             text: String::new(),
         },
-        Event::ChatHistoryTarget { nick, timestamp, .. } => DomainEvent::Notice {
+        Event::ChatHistoryTarget {
+            nick, timestamp, ..
+        } => DomainEvent::Notice {
             text: format!("DM: {nick} (last: {})", timestamp.as_deref().unwrap_or("?")),
         },
         Event::ReadMarker { target, timestamp } => DomainEvent::Notice {
@@ -282,7 +288,9 @@ pub fn convert_event(event: &freeq_sdk::event::Event) -> DomainEvent {
         Event::RawLine(line) => DomainEvent::Notice { text: line.clone() },
         // Nick<->DID binding learned. Not yet modeled as a DomainEvent —
         // adopted in the Windows DID-DM pass; inert empty notice until then.
-        Event::MemberDid { .. } => DomainEvent::Notice { text: String::new() },
+        Event::MemberDid { .. } => DomainEvent::Notice {
+            text: String::new(),
+        },
     }
 }
 
