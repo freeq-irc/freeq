@@ -854,7 +854,7 @@ describe('coordination event methods', () => {
     client.updateTask('#foo', 'task-abc', 'reviewing', 'looking');
     await flushAsync();
     const line = ws.sent.find((l) => l.includes('TAGMSG'));
-    expect(line).toContain('+freeq.at/task-id=task-abc');
+    expect(line).toContain('+freeq.at/ref=task-abc');
   });
 
   it('completeTask() emits task_complete', async () => {
@@ -2316,7 +2316,7 @@ describe('signed mutations', () => {
       tags: {
         '+freeq.at/event': 'evidence_attach',
         '+freeq.at/payload': payload,
-        '+freeq.at/task-id': '01KYVT1W2P0000000000000000',
+        '+freeq.at/ref': '01KYVT1W2P0000000000000000',
         '+freeq.at/evidence-type': 'code_review',
       },
     });
@@ -2412,7 +2412,11 @@ describe('signed mutations', () => {
     expect(noMime).toContain('"media-url"');
   });
 
-  it('an emitted event against a legacy server is byte-identical to before', async () => {
+  // A server that never offered the signing cap gets exactly the shape it
+  // always got — legacy id in `msgid`, the pair of frames, no signature. The
+  // one field that moved is the reference, which both spellings have always
+  // meant and which readers still accept under either.
+  it('an emitted event against a legacy server keeps its unsigned shape', async () => {
     const { client, ws } = await makeRegistered();
     client.signing.setSigningDid('did:plc:mutator');
     await client.signing.generateSigningKey();
@@ -2424,7 +2428,7 @@ describe('signed mutations', () => {
     expect(eventId, 'the legacy id format is what a legacy server files').toMatch(/^[0-9a-f]+$/);
     const tags =
       `msgid=${eventId};+freeq.at/event=task_request;` +
-      '+freeq.at/payload={"description":"ship%20it"};+freeq.at/task-id=task-abc';
+      '+freeq.at/payload={"description":"ship%20it"};+freeq.at/ref=task-abc';
     expect(ws.sent).toEqual([
       `@${tags} TAGMSG #room`,
       `@${tags} PRIVMSG #room :📋 New task: ship it`,

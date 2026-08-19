@@ -354,6 +354,95 @@ impl LyingPeer {
         }
     }
 
+    /// A reaction to `msgid`, claimed by `from` and (optionally) `account`,
+    /// carrying `sig` when the peer chose to attach one.
+    pub fn react(
+        &mut self,
+        from: &str,
+        target: &str,
+        msgid: &str,
+        emoji: &str,
+        account: Option<&str>,
+        sig: Option<&str>,
+    ) -> S2sMessage {
+        self.mutation(from, target, "+react", emoji, Some(msgid), account, sig)
+    }
+
+    /// The removal of one, same shape.
+    pub fn unreact(
+        &mut self,
+        from: &str,
+        target: &str,
+        msgid: &str,
+        emoji: &str,
+        account: Option<&str>,
+        sig: Option<&str>,
+    ) -> S2sMessage {
+        self.mutation(
+            from,
+            target,
+            "+freeq.at/unreact",
+            emoji,
+            Some(msgid),
+            account,
+            sig,
+        )
+    }
+
+    /// A delete carrying a signature the peer chose.
+    pub fn signed_delete(
+        &mut self,
+        from: &str,
+        target: &str,
+        msgid: &str,
+        account: Option<&str>,
+        sig: &str,
+    ) -> S2sMessage {
+        self.mutation(
+            from,
+            target,
+            "+draft/delete",
+            msgid,
+            None,
+            account,
+            Some(sig),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mutation(
+        &mut self,
+        from: &str,
+        target: &str,
+        tag: &str,
+        value: &str,
+        subject: Option<&str>,
+        account: Option<&str>,
+        sig: Option<&str>,
+    ) -> S2sMessage {
+        let mut tags = HashMap::from([(tag.to_string(), value.to_string())]);
+        if let Some(subject) = subject {
+            tags.insert("+reply".to_string(), subject.to_string());
+        }
+        if let Some(sig) = sig {
+            tags.insert("+freeq.at/sig".to_string(), sig.to_string());
+            // A signature covers an event id, so one has to be there — and
+            // shaped like an id a server would adopt.
+            tags.insert(
+                freeq_sdk::chatsig::EVENT_ID_TAG.to_string(),
+                freeq_server::msgid::generate(),
+            );
+        }
+        S2sMessage::Tagmsg {
+            event_id: self.next_event_id(),
+            from: from.to_string(),
+            target: target.to_string(),
+            tags,
+            origin: self.id.clone(),
+            account: account.map(str::to_string),
+        }
+    }
+
     /// An edit that rewrites `replaces` with `text`.
     pub fn edit(
         &mut self,
@@ -543,7 +632,12 @@ pub async fn try_event(
 /// asynchronously after the dial, and this is the behavioural gate for it —
 /// no fixed sleep. Every test starts here, so a later forged event that
 /// produces nothing is known to have travelled a working link.
-pub async fn warm_link(peer: &mut LyingPeer, nick: &str, channel: &str, rx: &mut mpsc::Receiver<Event>) {
+pub async fn warm_link(
+    peer: &mut LyingPeer,
+    nick: &str,
+    channel: &str,
+    rx: &mut mpsc::Receiver<Event>,
+) {
     let deadline = tokio::time::Instant::now() + SETTLE;
     while tokio::time::Instant::now() < deadline {
         let join = peer.join(nick, channel, None);

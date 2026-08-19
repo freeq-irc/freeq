@@ -1,11 +1,29 @@
 //! Database storage for policy framework objects.
 //!
 //! Uses SQLite (via rusqlite) alongside the existing IRC database.
+//!
+//! # Channel-key normalization
+//!
+//! Channel names are case-insensitive in IRC (`#Foo` == `#foo`), but callers
+//! reach this store through paths with different casing conventions (the IRC
+//! JOIN gate uses the raw user-typed name, the REST API lowercases, S2S
+//! passes whatever the origin used). Every method that takes a `channel_id`
+//! therefore normalizes it with [`canonical_channel_id`] — both for the key
+//! column and, on writes, for the `channel_id` field embedded in the stored
+//! document *before* hashing, so content hashes are computed over the
+//! canonical form. `migrate()` lowercases the key columns of any
+//! pre-normalization rows so old databases stay reachable.
 
 use super::canonical;
 use super::types::*;
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
+
+/// Canonical key for a channel: IRC channel names are case-insensitive, so
+/// all channel-keyed rows are stored and queried under the lowercased name.
+pub(crate) fn canonical_channel_id(channel: &str) -> String {
+    channel.trim().to_lowercase()
+}
 
 pub struct PolicyStore {
     db: Mutex<Connection>,
@@ -135,6 +153,48 @@ impl PolicyStore {
             );
             ",
         )?;
+        self.migrate_lowercase_channel_ids(&db)?;
+        Ok(())
+    }
+
+    /// Lowercase the `channel_id` key columns of rows written before
+    /// channel-key normalization existed. Idempotent (no-op when everything
+    /// is already lowercase), so it runs on every open.
+    ///
+    /// Only the key columns are rewritten — the embedded document JSON keeps
+    /// its original `channel_id`, since rewriting it would invalidate the
+    /// stored content hashes and attestation HMAC signatures. Lookups are by
+    /// key column, so old rows become reachable again under any casing.
+    ///
+    /// `policies` has UNIQUE(channel_id, version): `UPDATE OR REPLACE` drops
+    /// the losing row if two casings of the same channel+version collide
+    /// (shouldn't happen in practice; logged if it does).
+    fn migrate_lowercase_channel_ids(&self, db: &Connection) -> Result<(), rusqlite::Error> {
+        let mut total = db.execute(
+            "UPDATE OR REPLACE policies SET channel_id = LOWER(channel_id)
+             WHERE channel_id <> LOWER(channel_id)",
+            [],
+        )?;
+        for table in [
+            "authority_sets",
+            "join_receipts",
+            "membership_attestations",
+            "transparency_log",
+        ] {
+            total += db.execute(
+                &format!(
+                    "UPDATE {table} SET channel_id = LOWER(channel_id)
+                     WHERE channel_id <> LOWER(channel_id)"
+                ),
+                [],
+            )?;
+        }
+        if total > 0 {
+            tracing::info!(
+                rows = total,
+                "policy store: lowercased legacy mixed-case channel keys"
+            );
+        }
         Ok(())
     }
 
@@ -142,6 +202,9 @@ impl PolicyStore {
 
     /// Store a policy document. Computes policy_id from JCS hash.
     pub fn store_policy(&self, mut policy: PolicyDocument) -> Result<PolicyDocument, PolicyError> {
+        // Normalize BEFORE hashing so content hashes are casing-independent
+        // and all federation peers compute the same policy_id.
+        policy.channel_id = canonical_channel_id(&policy.channel_id);
         // Compute policy_id by hashing the document without the policy_id field
         policy.policy_id = None;
         let policy_id = canonical::hash_canonical(&policy)
@@ -175,6 +238,7 @@ impl PolicyStore {
         &self,
         channel_id: &str,
     ) -> Result<Option<PolicyDocument>, PolicyError> {
+        let channel_id = canonical_channel_id(channel_id);
         let db = self.db.lock();
         let json: Option<String> = db
             .query_row(
@@ -222,6 +286,7 @@ impl PolicyStore {
 
     /// Get all policy versions for a channel, oldest first.
     pub fn get_policy_chain(&self, channel_id: &str) -> Result<Vec<PolicyDocument>, PolicyError> {
+        let channel_id = canonical_channel_id(channel_id);
         let db = self.db.lock();
         let mut stmt = db
             .prepare(
@@ -249,6 +314,7 @@ impl PolicyStore {
         &self,
         mut auth_set: AuthoritySet,
     ) -> Result<AuthoritySet, PolicyError> {
+        auth_set.channel_id = canonical_channel_id(&auth_set.channel_id);
         auth_set.authority_set_hash = None;
         let hash = canonical::hash_canonical(&auth_set)
             .map_err(|e| PolicyError::Serialization(e.to_string()))?;
@@ -331,7 +397,9 @@ impl PolicyStore {
 
     /// Store a join receipt.
     pub fn store_join_receipt(&self, receipt: &JoinReceipt) -> Result<(), PolicyError> {
-        let json = serde_json::to_string(receipt)
+        let mut receipt = receipt.clone();
+        receipt.channel_id = canonical_channel_id(&receipt.channel_id);
+        let json = serde_json::to_string(&receipt)
             .map_err(|e| PolicyError::Serialization(e.to_string()))?;
 
         let db = self.db.lock();
@@ -398,6 +466,12 @@ impl PolicyStore {
         &self,
         attestation: &MembershipAttestation,
     ) -> Result<(), PolicyError> {
+        // Normalization is a no-op for engine-produced attestations (the
+        // engine canonicalizes before signing, so the HMAC stays valid);
+        // it matters for any direct store callers.
+        let mut attestation = attestation.clone();
+        attestation.channel_id = canonical_channel_id(&attestation.channel_id);
+        let attestation = &attestation;
         let json = serde_json::to_string(attestation)
             .map_err(|e| PolicyError::Serialization(e.to_string()))?;
         let attestation_hash = canonical::hash_canonical(attestation)
@@ -450,6 +524,7 @@ impl PolicyStore {
         channel_id: &str,
         subject_did: &str,
     ) -> Result<Option<MembershipAttestation>, PolicyError> {
+        let channel_id = canonical_channel_id(channel_id);
         let db = self.db.lock();
         let json: Option<String> = db
             .query_row(
@@ -477,6 +552,7 @@ impl PolicyStore {
         &self,
         channel_id: &str,
     ) -> Result<Vec<MembershipAttestation>, PolicyError> {
+        let channel_id = canonical_channel_id(channel_id);
         let db = self.db.lock();
         let mut stmt = db
             .prepare(
@@ -539,6 +615,7 @@ impl PolicyStore {
     /// Remove all policy data for a channel.
     /// Returns true if anything was removed.
     pub fn remove_channel_policy(&self, channel_id: &str) -> Result<bool, PolicyError> {
+        let channel_id = canonical_channel_id(channel_id);
         let db = self.db.lock();
         let total: usize = [
             "policies",
@@ -558,6 +635,22 @@ impl PolicyStore {
         Ok(total > 0)
     }
 
+    /// Distinct channel IDs that have at least one policy version stored.
+    pub fn list_policy_channels(&self) -> Result<Vec<String>, PolicyError> {
+        let db = self.db.lock();
+        let mut stmt = db
+            .prepare("SELECT DISTINCT channel_id FROM policies")
+            .map_err(|e| PolicyError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| PolicyError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| PolicyError::Database(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
     // ─── Transparency Log ────────────────────────────────────────────────
 
     /// Get transparency log entries for a channel.
@@ -566,6 +659,7 @@ impl PolicyStore {
         channel_id: &str,
         since: Option<i64>,
     ) -> Result<Vec<TransparencyLogEntry>, PolicyError> {
+        let channel_id = canonical_channel_id(channel_id);
         let db = self.db.lock();
         let mut stmt = db
             .prepare(
@@ -681,4 +775,171 @@ pub enum PolicyError {
     Serialization(String),
     #[error("Validation error: {0}")]
     Validation(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn test_store() -> PolicyStore {
+        PolicyStore::open(":memory:").unwrap()
+    }
+
+    fn make_policy(channel: &str, version: i64, previous: Option<String>) -> PolicyDocument {
+        PolicyDocument {
+            channel_id: channel.to_string(),
+            policy_id: None,
+            version,
+            effective_at: "2026-01-01T00:00:00Z".to_string(),
+            previous_policy_hash: previous,
+            authority_set_hash: "authhash".to_string(),
+            requirements: Requirement::Accept {
+                hash: "deadbeef".to_string(),
+            },
+            role_requirements: BTreeMap::new(),
+            validity_model: ValidityModel::JoinTime,
+            receipt_embedding: ReceiptEmbedding::Require,
+            policy_locations: vec![],
+            limits: None,
+            transparency: None,
+            credential_endpoints: BTreeMap::new(),
+            agent_budget: None,
+            agent_budgets: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn policy_lookup_is_case_insensitive() {
+        let store = test_store();
+        let stored = store.store_policy(make_policy("#FooBar", 1, None)).unwrap();
+        // Stored document is canonicalized (lowercase) BEFORE hashing.
+        assert_eq!(stored.channel_id, "#foobar");
+
+        for q in ["#foobar", "#FooBar", "#FOOBAR"] {
+            let p = store.get_current_policy(q).unwrap().expect("policy found");
+            assert_eq!(p.policy_id, stored.policy_id);
+        }
+    }
+
+    #[test]
+    fn versions_chain_across_casings() {
+        let store = test_store();
+        let v1 = store.store_policy(make_policy("#Chan", 1, None)).unwrap();
+        // v2 set with a different casing must land on the same logical channel.
+        let v2 = store
+            .store_policy(make_policy("#CHAN", 2, v1.policy_id.clone()))
+            .unwrap();
+
+        let current = store.get_current_policy("#chan").unwrap().unwrap();
+        assert_eq!(current.version, 2);
+        assert_eq!(current.policy_id, v2.policy_id);
+        assert_eq!(current.previous_policy_hash, v1.policy_id);
+
+        let chain = store.get_policy_chain("#cHaN").unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].version, 1);
+        assert_eq!(chain[1].version, 2);
+    }
+
+    #[test]
+    fn remove_policy_is_case_insensitive() {
+        let store = test_store();
+        store.store_policy(make_policy("#Gone", 1, None)).unwrap();
+        assert!(store.remove_channel_policy("#GONE").unwrap());
+        assert!(store.get_current_policy("#gone").unwrap().is_none());
+    }
+
+    #[test]
+    fn attestation_lookup_is_case_insensitive() {
+        let store = test_store();
+        let att = MembershipAttestation {
+            attestation_id: "att1".into(),
+            channel_id: "#MixedCase".into(),
+            policy_id: "p1".into(),
+            authority_set_hash: "a1".into(),
+            subject_did: "did:plc:u1".into(),
+            role: "member".into(),
+            issued_at: "2026-01-01T00:00:00Z".into(),
+            expires_at: None,
+            join_id: Some("j1".into()),
+            signature: "sig".into(),
+            issuer_did: "did:plc:issuer".into(),
+        };
+        store.store_attestation(&att).unwrap();
+
+        for q in ["#mixedcase", "#MixedCase", "#MIXEDCASE"] {
+            assert!(
+                store.get_attestation(q, "did:plc:u1").unwrap().is_some(),
+                "attestation found via {q}"
+            );
+        }
+        let members = store.get_channel_members("#MIXEDCASE").unwrap();
+        assert_eq!(members.len(), 1);
+        // Transparency log is keyed the same way.
+        let log = store.get_log_entries("#MixedCase", None).unwrap();
+        assert_eq!(log.len(), 1);
+    }
+
+    #[test]
+    fn legacy_mixed_case_rows_are_migrated() {
+        // Simulate a pre-normalization database: rows whose channel_id key
+        // column is mixed-case. The migration at open() lowercases the key
+        // columns (leaving embedded JSON untouched).
+        let store = test_store();
+        {
+            let db = store.db.lock();
+            db.execute(
+                "INSERT INTO policies (policy_id, channel_id, version, effective_at, previous_policy_hash, authority_set_hash, document_json)
+                 VALUES ('legacyhash', '#LegacyChan', 1, '2025-01-01T00:00:00Z', NULL, 'ah', '{}')",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO transparency_log (entry_version, channel_id, policy_id, attestation_hash, issued_at, issuer_authority_id)
+                 VALUES (1, '#LegacyChan', 'legacyhash', 'ath', '2025-01-01T00:00:00Z', 'did:plc:x')",
+                [],
+            )
+            .unwrap();
+        }
+        // Run the migration step directly (open() already ran it as a no-op).
+        {
+            let db = store.db.lock();
+            store.migrate_lowercase_channel_ids(&db).unwrap();
+        }
+        // Reachable under the lowercase key now. (document_json is the legacy
+        // '{}' — deserialization would fail, so check the key column directly.)
+        {
+            let db = store.db.lock();
+            let key: String = db
+                .query_row(
+                    "SELECT channel_id FROM policies WHERE policy_id = 'legacyhash'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(key, "#legacychan");
+            let log_key: String = db
+                .query_row(
+                    "SELECT channel_id FROM transparency_log WHERE policy_id = 'legacyhash'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(log_key, "#legacychan");
+        }
+        // And get_log_entries (which selects by the key column) finds it.
+        let log = store.get_log_entries("#legacychan", None).unwrap();
+        assert_eq!(log.len(), 1);
+    }
+
+    #[test]
+    fn list_policy_channels() {
+        let store = test_store();
+        store.store_policy(make_policy("#A", 1, None)).unwrap();
+        store.store_policy(make_policy("#b", 1, None)).unwrap();
+        let mut channels = store.list_policy_channels().unwrap();
+        channels.sort();
+        assert_eq!(channels, vec!["#a".to_string(), "#b".to_string()]);
+    }
 }

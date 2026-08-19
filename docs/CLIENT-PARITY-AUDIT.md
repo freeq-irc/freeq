@@ -205,8 +205,8 @@ arrives on every client).
   verified iOS onboarding + cards render in the simulator.
 
 ### Also landed 2026-07-24 (post-deploy)
-- **Production server deploy** — done via `ssh chad@tech.blueyard.com`
-  (systemd `freeq-server`, git checkout; NOT the Miren `club` app). Shipped
+- **Production server deploy** — done over SSH to the production host
+  (systemd `freeq-server`, git checkout; not the Miren app). Shipped
   the reaction-durability + coordination-tag-replay fixes and rebuilt the
   live web client. Verified: fresh coordination events now replay with
   `+freeq.at/event`; `/api/v1/favorites` gated (401 unauth).

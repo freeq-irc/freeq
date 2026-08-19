@@ -241,7 +241,9 @@ pub fn our_capabilities() -> Vec<String> {
 /// `false` for everything, which is precisely the intended answer: send it
 /// nothing it cannot parse.
 pub fn peer_supports(peer_caps: &[String], name: &str) -> bool {
-    peer_caps.iter().any(|c| c == name || c.starts_with(&format!("{name}=")))
+    peer_caps
+        .iter()
+        .any(|c| c == name || c.starts_with(&format!("{name}=")))
 }
 
 /// One event, as it travels in a catch-up reply.
@@ -1777,7 +1779,9 @@ async fn handle_s2s_connection(
         let peer_id = peer_id.clone();
         let server_id = server_id.clone();
         tokio::spawn(async move {
-            manager.request_catchup_when_supported(&peer_id, &server_id).await;
+            manager
+                .request_catchup_when_supported(&peer_id, &server_id)
+                .await;
         });
     }
 
@@ -2515,18 +2519,20 @@ mod capability_tests {
     /// the constant has to be *named* at a send site, not merely exist.
     #[test]
     fn every_registered_capability_gates_a_real_send_site() {
-        let sources = [
-            include_str!("s2s.rs"),
-            include_str!("server.rs"),
-        ];
+        let sources = [include_str!("s2s.rs"), include_str!("server.rs")];
         for cap in CAPABILITIES {
             // The const identifier, not the wire string: call sites use the
             // constant, which is what makes a typo a compile error.
             let ident = cap.name.to_uppercase();
             let uses: usize = sources
                 .iter()
-                .map(|src| src.matches(&format!("peer_supports(&declared, {ident})")).count()
-                    + src.matches(&format!("peer_supports(caps, {ident})")).count())
+                .map(|src| {
+                    src.matches(&format!("peer_supports(&declared, {ident})"))
+                        .count()
+                        + src
+                            .matches(&format!("peer_supports(caps, {ident})"))
+                            .count()
+                })
                 .sum();
             assert!(
                 uses > 0,

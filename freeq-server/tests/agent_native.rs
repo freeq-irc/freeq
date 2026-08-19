@@ -1724,7 +1724,10 @@ async fn coordination_events_rest_api() {
         .unwrap();
     assert_eq!(v["kind"], "coordination", "{v}");
     assert_eq!(v["verification"]["verdict"], "valid", "{v}");
-    assert_eq!(v["verification"]["verified_by"], "client-session-key", "{v}");
+    assert_eq!(
+        v["verification"]["verified_by"], "client-session-key",
+        "{v}"
+    );
 
     bot_handle.quit(None).await.unwrap();
     server_handle.abort();

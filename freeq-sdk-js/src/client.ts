@@ -1127,7 +1127,7 @@ export class FreeqClient extends EventEmitter {
       }
     }
     const did = this.getDidForNick(from);
-    const taskId = tags['+freeq.at/task-id'] || tags['+freeq.at/ref'];
+    const taskId = tags['+freeq.at/ref'] || tags['+freeq.at/task-id'];
     const evidenceType = tags['+freeq.at/evidence-type'];
     const eventPayload: CoordinationEventPayload = {
       channel,
@@ -3169,7 +3169,7 @@ export class FreeqClient extends EventEmitter {
       '+freeq.at/event': eventType,
       '+freeq.at/payload': encoded,
     };
-    if (opts.refId) tags['+freeq.at/task-id'] = opts.refId;
+    if (opts.refId) tags['+freeq.at/ref'] = opts.refId;
     if (opts.extraTags) Object.assign(tags, opts.extraTags);
     const humanText = opts.humanText ?? `${eventType}`;
     if (!signable) {

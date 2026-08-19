@@ -59,12 +59,17 @@ EOF
 # Remove any nested .miren dirs that came from source copies
 find "$TMPDIR" -mindepth 2 -name ".miren" -type d -exec rm -rf {} + 2>/dev/null || true
 
+# Optional cluster pin — `MIREN_CLUSTER=<name>` targets a specific cluster;
+# unset uses whatever the CLI is currently logged into.
+CLUSTER_ARGS=()
+[ -n "${MIREN_CLUSTER:-}" ] && CLUSTER_ARGS=(-C "$MIREN_CLUSTER")
+
 cd "$TMPDIR"
 echo "Deploying from $TMPDIR..."
-miren deploy -f -C blueyard-projects
+miren deploy -f "${CLUSTER_ARGS[@]}"
 
 echo "Setting route..."
-miren route set staging.freeq.at freeq-staging -C blueyard-projects 2>/dev/null || true
+miren route set staging.freeq.at freeq-staging "${CLUSTER_ARGS[@]}" 2>/dev/null || true
 
 # Cleanup
 rm -rf "$TMPDIR"

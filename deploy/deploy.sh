@@ -32,5 +32,27 @@ fi
 echo "==> Restarting service..."
 sudo systemctl restart freeq-server
 
+# Verify, don't assume. A binary built without --features av-native (e.g. a
+# hand-run `cargo build --release` that bypasses this script) restarts fine
+# and silently serves no AV — this exact mistake took AV down in prod on
+# 2026-08-18. Fail loudly instead.
+echo "==> Verifying deployment..."
+sleep 3
+if ! systemctl is-active --quiet freeq-server; then
+    echo "ERROR: freeq-server is not active after restart" >&2
+    sudo systemctl status freeq-server --no-pager >&2 || true
+    exit 1
+fi
+if ! HEALTH=$(curl -sf --max-time 10 http://127.0.0.1:8080/api/v1/health); then
+    echo "ERROR: health endpoint unreachable after restart" >&2
+    exit 1
+fi
+echo "    health: $HEALTH"
+if ! grep -q '"av":true' <<<"$HEALTH"; then
+    echo "ERROR: health reports av:false — binary was built WITHOUT --features av-native." >&2
+    echo "       Never hand-run cargo for a prod deploy; use this script." >&2
+    exit 1
+fi
+
 echo "==> Status:"
 sudo systemctl status freeq-server --no-pager

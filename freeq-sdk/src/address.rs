@@ -89,7 +89,10 @@ mod tests {
     #[test]
     fn dm_peer_key_resolves_a_known_nick_so_nick_and_did_collapse() {
         assert_eq!(dm_peer_key("bob", resolver), "did:plc:bob");
-        assert_eq!(dm_peer_key("bob", resolver), dm_peer_key("did:plc:bob", resolver));
+        assert_eq!(
+            dm_peer_key("bob", resolver),
+            dm_peer_key("did:plc:bob", resolver)
+        );
     }
 
     #[test]

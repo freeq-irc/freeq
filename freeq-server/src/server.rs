@@ -2838,9 +2838,10 @@ fn federated_delete_authorized(
     channels.get(roster_key).is_some_and(|ch| {
         ch.remote_member(actor_nick).is_some_and(|rm| {
             rm.is_op
-                || rm.did.as_ref().is_some_and(|d| {
-                    ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d)
-                })
+                || rm
+                    .did
+                    .as_ref()
+                    .is_some_and(|d| ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d))
         })
     })
 }
@@ -2996,15 +2997,37 @@ fn verify_relayed_privmsg(
     ))
 }
 
+/// The mutation a relayed TAGMSG's tags describe, if any — read before the
+/// draft names are canonicalized, like every other reader of the wire.
+///
+/// Separate from the signature check because the two questions are asked
+/// separately: *is this a mutation at all* decides whether the proof rule
+/// applies, and an unsigned mutation has no signature to check.
+fn relayed_mutation_in(
+    tags: &HashMap<String, String>,
+) -> Option<(freeq_sdk::chatsig::Mutation, Option<&str>, Option<&str>)> {
+    use freeq_sdk::chatsig::Mutation;
+    let get = |a: &str, b: &str| tags.get(a).or_else(|| tags.get(b)).map(String::as_str);
+    let subject = || get("+reply", "+draft/reply");
+    if let Some(subject) = get("+draft/delete", "+delete") {
+        return Some((Mutation::Delete, Some(subject), None));
+    }
+    if let Some(emoji) = get("+react", "+draft/react") {
+        return Some((Mutation::React, subject(), Some(emoji)));
+    }
+    if let Some(emoji) = tags.get("+freeq.at/unreact").map(String::as_str) {
+        return Some((Mutation::Unreact, subject(), Some(emoji)));
+    }
+    None
+}
+
 /// Check a relayed mutation's signature against the event as transmitted.
 ///
 /// `None` when the event carries no signature, or carries no mutation at all
 /// (a typing notification is not a signed event).
 ///
 /// Read before the receive path renames draft tags and resolves the subject to
-/// a local root: both rewrite values the signature covers. A sender that mints
-/// no event id leaves nothing to rebuild, which reads unverifiable — the state
-/// of every mutation on the wire until senders sign them.
+/// a local root: both rewrite values the signature covers.
 fn verify_relayed_mutation_tags(
     state: &Arc<SharedState>,
     account: Option<&str>,
@@ -3012,19 +3035,9 @@ fn verify_relayed_mutation_tags(
     tags: &HashMap<String, String>,
 ) -> Option<crate::connection::messaging::ClientSigOutcome> {
     use crate::connection::messaging::{ClientSigOutcome, verify_relayed_mutation};
-    use freeq_sdk::chatsig::Mutation;
 
     let get = |a: &str, b: &str| tags.get(a).or_else(|| tags.get(b)).map(String::as_str);
-    let subject = || get("+reply", "+draft/reply");
-    let (kind, subject, emoji) = if let Some(subject) = get("+draft/delete", "+delete") {
-        (Mutation::Delete, Some(subject), None)
-    } else if let Some(emoji) = get("+react", "+draft/react") {
-        (Mutation::React, subject(), Some(emoji))
-    } else if let Some(emoji) = tags.get("+freeq.at/unreact").map(String::as_str) {
-        (Mutation::Unreact, subject(), Some(emoji))
-    } else {
-        return None;
-    };
+    let (kind, subject, emoji) = relayed_mutation_in(tags)?;
 
     let sig = tags.get("+freeq.at/sig").map(String::as_str)?;
     let Some(did) = account else {
@@ -3199,7 +3212,8 @@ fn replayed_signature_verdict(
     let Some(did) = ev.actor_did.as_deref() else {
         return ClientSigOutcome::Unverifiable("replayed event names no actor");
     };
-    let outcome = crate::connection::messaging::verify_canonical_bytes(state, did, &ev.canonical, sig);
+    let outcome =
+        crate::connection::messaging::verify_canonical_bytes(state, did, &ev.canonical, sig);
     // A signer we hold no key for: ask its home server, off this path, so the
     // next replay of theirs gets a real verdict.
     if let ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE) = outcome {
@@ -3696,9 +3710,11 @@ pub(crate) async fn process_s2s_message(
                         peer = %authenticated_peer_id,
                         "Relayed message was altered by our own sanitizer ({v:?} discarded)"
                     );
-                    Some(crate::connection::messaging::ClientSigOutcome::Unverifiable(
-                        "sanitized on receipt",
-                    ))
+                    Some(
+                        crate::connection::messaging::ClientSigOutcome::Unverifiable(
+                            "sanitized on receipt",
+                        ),
+                    )
                 }
                 other => other,
             };
@@ -3721,7 +3737,7 @@ pub(crate) async fn process_s2s_message(
                         peer = %authenticated_peer_id, target = %target, from = %from,
                         account = ?account, msgid = ?msgid,
                         "Relayed message signature did not verify against the key it names — \
-                         stripping it before relay"
+                         dropping the message"
                     ),
                     ClientSigOutcome::Unverifiable(why) => tracing::debug!(
                         peer = %authenticated_peer_id, target = %target, why = %why,
@@ -3729,15 +3745,15 @@ pub(crate) async fn process_s2s_message(
                     ),
                 }
             }
-            // A signature that did not check out is evidence about the bytes,
-            // and it must not travel any further under it: no local client
-            // sees it, nothing files it. The same never-launder rule the
-            // origin follows — a signature this server cannot stand behind
-            // does not leave this server.
-            let sig = match sig_verdict {
-                Some(crate::connection::messaging::ClientSigOutcome::Failed) => None,
-                _ => sig,
-            };
+            // A signature that did not check out is evidence about the bytes:
+            // the words and the proof arrived together and disagree. The
+            // message is dropped rather than relayed without the half that
+            // disagreed — passing on the words alone would put text under the
+            // sender's name that the evidence on the wire says is not theirs,
+            // and would hide the one fact worth knowing about it.
+            if sig_verdict == Some(crate::connection::messaging::ClientSigOutcome::Failed) {
+                return;
+            }
 
             // Generate a local msgid if the remote didn't send one
             let msgid = msgid.unwrap_or_else(crate::msgid::generate);
@@ -3792,6 +3808,23 @@ pub(crate) async fn process_s2s_message(
             // it as new text would put words in the channel that the origin's
             // user never asked to send as a new message.
             let actor_nick = from.split('!').next().unwrap_or(&from).to_string();
+            // An edit rewrites a record, so it answers to the mutation rule
+            // rather than the message one: the actor's own proof, or nothing
+            // happens. Same two exemptions — no account is a guest's edit, and
+            // a venue that does not resolve had no document to sign.
+            if edit_of.is_some()
+                && let Some(actor) = account.as_deref()
+                && crate::connection::messaging::signing_venue(state, actor, &target).is_some()
+                && sig_verdict != Some(crate::connection::messaging::ClientSigOutcome::Verified)
+            {
+                tracing::warn!(
+                    peer = %authenticated_peer_id, origin = %origin, target = %target,
+                    account = %actor, verdict = ?sig_verdict,
+                    key_source = crate::peer_keys::has_key_source(state, &origin),
+                    "Relayed edit carries no signature this server can check — dropping it"
+                );
+                return;
+            }
             if let Some(ref root) = edit_of {
                 let history_key = (target.starts_with('#') || target.starts_with('&'))
                     .then(|| target.to_lowercase());
@@ -3829,10 +3862,8 @@ pub(crate) async fn process_s2s_message(
                 .get("+reply")
                 .or_else(|| relayed_tags.get("+draft/reply"))
             {
-                let root = crate::connection::helpers::root_msgid(
-                    state,
-                    &sanitize_s2s_str(root, 100),
-                );
+                let root =
+                    crate::connection::helpers::root_msgid(state, &sanitize_s2s_str(root, 100));
                 relay_tags.insert("+reply".to_string(), root);
             }
             // Provenance: every message reaching here is from a remote origin
@@ -3848,10 +3879,9 @@ pub(crate) async fn process_s2s_message(
             let event_ctx = crate::events::EventContext {
                 sig_state: match (&sig, sig_verdict) {
                     (None, _) => crate::events::SigState::Unsigned,
-                    (
-                        Some(_),
-                        Some(crate::connection::messaging::ClientSigOutcome::Verified),
-                    ) => crate::events::SigState::Valid,
+                    (Some(_), Some(crate::connection::messaging::ClientSigOutcome::Verified)) => {
+                        crate::events::SigState::Valid
+                    }
                     _ => crate::events::SigState::Unverifiable,
                 },
                 origin: Some(origin_name.clone()),
@@ -3933,12 +3963,11 @@ pub(crate) async fn process_s2s_message(
                     if let Some(ref acct) = account {
                         tags.insert("account".to_string(), acct.clone());
                     }
-                    // Prefer the DID carried from the origin; fall back to a
-                    // local nick_owners lookup for peers that didn't send one.
-                    let sender_nick = from.split('!').next().unwrap_or(&from);
-                    let s2s_sender_did = account
-                        .clone()
-                        .or_else(|| state.nick_owners.lock().get(sender_nick).cloned());
+                    // Who sent this is the origin's to state, and only the
+                    // origin's: a nick is something a peer chooses, so
+                    // resolving one against our own records answered "who is
+                    // this" with the name of whoever holds that nick here.
+                    let s2s_sender_did = account.clone();
                     // File it before showing it. Persists the coordination
                     // tags (incl. +freeq.at/origin) so CHATHISTORY replay
                     // carries them, like the DM persist path — and if the
@@ -4121,14 +4150,11 @@ pub(crate) async fn process_s2s_message(
                 }
             } else {
                 // Persist first — a DM the store refuses (spent msgid) must
-                // not be delivered either. A durable row needs both DIDs:
-                // prefer the sender DID carried from the origin (a remote
-                // sender is not in our nick_owners); fall back to the local
-                // lookup.
-                let sender_nick = from.split('!').next().unwrap_or(&from);
-                let sender_did = account
-                    .clone()
-                    .or_else(|| state.nick_owners.lock().get(sender_nick).cloned());
+                // not be delivered either. A durable row needs both DIDs, and
+                // the sender's is the one the origin stamped or none: filing a
+                // DM under a DID resolved from a peer-chosen nick wrote one
+                // person's thread into another's.
+                let sender_did = account.clone();
                 // Recipient: honor the origin's stamp, cross-checked against our
                 // own resolution. On a mismatch we fall back (no durable row)
                 // rather than persist under a possibly-wrong identity.
@@ -4194,15 +4220,25 @@ pub(crate) async fn process_s2s_message(
                 // bound to the recipient (DID fan-out) — a federated DID-addressed
                 // DM must reach the same person here, with no per-server nick
                 // interpretation.
-                let mut sids = crate::connection::routing::local_sessions_for_target(state, &target);
+                let mut sids =
+                    crate::connection::routing::local_sessions_for_target(state, &target);
                 // …and the sender's own sessions here, if they have any. The
                 // origin fanned this out to their other devices on its send
                 // path; that code never runs on this side of the link.
+                //
+                // Only on a signature this server checked. This delivery is
+                // the one place a stamped DID does more than label a message:
+                // it routes the message into that identity's own client, in
+                // the position of something they sent. A peer that names a
+                // local user could put a line in their outbox for free.
                 crate::connection::routing::merge_sessions(
                     &mut sids,
                     crate::connection::routing::sender_sessions_for_account(
                         state,
-                        account.as_deref(),
+                        account.as_deref().filter(|_| {
+                            sig_verdict
+                                == Some(crate::connection::messaging::ClientSigOutcome::Verified)
+                        }),
                     ),
                 );
                 let tag_caps = state.cap_message_tags.lock();
@@ -4225,7 +4261,6 @@ pub(crate) async fn process_s2s_message(
                 drop(conns);
                 drop(acct_caps);
                 drop(tag_caps);
-
             }
         }
 
@@ -4327,27 +4362,20 @@ pub(crate) async fn process_s2s_message(
         } => {
             let from = sanitize_s2s_str(&from, 512);
             let target = sanitize_s2s_str(&target, 200);
-            // Actor DID, origin-stamped. Older peers send none, so keep the
-            // nick lookup as the fallback — it resolves for anyone who has
-            // authenticated here, which is what we relied on before.
+            // Actor DID, origin-stamped or none. A peer chooses the nick it
+            // sends, so looking that nick up here answered "who is acting"
+            // with whoever holds it on this server — which is what let a peer
+            // delete a local user's message by wearing their name.
             let actor_nick = from.split('!').next().unwrap_or(&from).to_string();
-            // The DID the peer stamped, kept separate from `actor_did` below:
-            // this one the origin asserts about its own authenticated session,
-            // the other may have come from our nick map instead.
             let peer_account = account.map(|a| sanitize_s2s_str(&a, 512));
-            let actor_did = peer_account.clone().or_else(|| {
-                state
-                    .nick_owners
-                    .lock()
-                    .get(&actor_nick.to_lowercase())
-                    .cloned()
-            });
+            let actor_did = peer_account.clone();
 
             // ── verify before tidying ────────────────────────────────
             // Same rule the relayed-PRIVMSG path follows: the renames and the
             // subject re-rooting below rewrite values the signature covers, so
             // the check reads the tags as they arrived.
-            let sig_verdict = verify_relayed_mutation_tags(state, peer_account.as_deref(), &target, &tags);
+            let sig_verdict =
+                verify_relayed_mutation_tags(state, peer_account.as_deref(), &target, &tags);
             if let Some(verdict) = sig_verdict {
                 use crate::connection::messaging::{ClientSigOutcome, NO_KEY_ON_FILE};
                 if let (ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE), Some(did), Some(sig)) = (
@@ -4375,6 +4403,42 @@ pub(crate) async fn process_s2s_message(
                 }
             }
 
+            // ── A relayed mutation takes the actor's own proof ──────────
+            //
+            // The peer names who acted; only a signature from that account's
+            // key makes the claim something this server can check rather than
+            // something it is told. Without one the event is dropped here —
+            // not applied on the peer's word, and not shown to anyone.
+            //
+            // Two exemptions, the same two as local ingress, both cases where
+            // no proof could exist: an event naming no account is a guest's
+            // and keeps the nick rules, and a venue that does not resolve (a
+            // DM with a guest here) has no document for anyone to sign.
+            //
+            // A signature this server cannot check *yet* is dropped like any
+            // other: the key lookup runs off this path and never holds an
+            // event back, so the first mutation from a signer whose key is not
+            // cached is lost, and every mutation from a peer with no key
+            // server configured is. That is worth an operator seeing, hence
+            // the log naming both.
+            if let Some(actor) = peer_account.as_deref()
+                // A mutation names the message it acts on. One that names none
+                // is not something a signer signs — the sender side reads the
+                // same tags and declines — so demanding proof for it would
+                // refuse an event nothing could ever have proven.
+                && relayed_mutation_in(&tags).is_some_and(|(.., subject, _)| subject.is_some())
+                && crate::connection::messaging::signing_venue(state, actor, &target).is_some()
+                && sig_verdict != Some(crate::connection::messaging::ClientSigOutcome::Verified)
+            {
+                tracing::warn!(
+                    peer = %authenticated_peer_id, origin = %origin, target = %target,
+                    account = %actor, verdict = ?sig_verdict,
+                    key_source = crate::peer_keys::has_key_source(state, &origin),
+                    "Relayed mutation carries no signature this server can check — dropping it"
+                );
+                return;
+            }
+
             // The subject as it arrived, before the re-rooting below rewrites
             // it. The signature covers this value, so a filed document may only
             // claim the signature when the two still agree.
@@ -4387,13 +4451,6 @@ pub(crate) async fn process_s2s_message(
 
             // Normalize draft tags
             let mut tags = tags.clone();
-            // A mutation signature that did not check out does not travel
-            // under it — the same rule the relayed-PRIVMSG path follows. The
-            // mutation itself still applies: authorization is a separate
-            // question, answered by the checks further down.
-            if sig_verdict == Some(crate::connection::messaging::ClientSigOutcome::Failed) {
-                tags.remove("+freeq.at/sig");
-            }
             for (draft, canonical) in [("+draft/react", "+react"), ("+draft/reply", "+reply")] {
                 if let Some(v) = tags.remove(draft) {
                     tags.entry(canonical.to_string()).or_insert(v);
@@ -4542,8 +4599,14 @@ pub(crate) async fn process_s2s_message(
                     }
                 };
 
-                if federated_delete_authorized(state, &storage_key, &root, &actor_nick, actor_did.as_deref(), is_channel)
-                {
+                if federated_delete_authorized(
+                    state,
+                    &storage_key,
+                    &root,
+                    &actor_nick,
+                    actor_did.as_deref(),
+                    is_channel,
+                ) {
                     // Sweep under the key the row is actually filed beneath. A
                     // peer sends the channel spelled the way its user typed it
                     // and that spelling is what got stored, while `storage_key`
@@ -4573,7 +4636,8 @@ pub(crate) async fn process_s2s_message(
                     if is_channel {
                         let mut channels = state.channels.lock();
                         if let Some(ch) = channels.get_mut(&storage_key) {
-                            ch.history.retain(|h| h.msgid.as_deref() != Some(root.as_str()));
+                            ch.history
+                                .retain(|h| h.msgid.as_deref() != Some(root.as_str()));
                             ch.pins.retain(|p| p.msgid != root);
                         }
                     }
@@ -4624,13 +4688,20 @@ pub(crate) async fn process_s2s_message(
             } else {
                 // Plus the sender's own sessions here — a reaction or delete
                 // they made from another server has to reach their other
-                // devices, the same as the DM PRIVMSG path.
-                let mut sids = crate::connection::routing::local_sessions_for_target(state, &target);
+                // devices, the same as the DM PRIVMSG path, and on the same
+                // condition: a signature this server checked, because this
+                // delivery puts the event in the named identity's own client
+                // as something they did.
+                let mut sids =
+                    crate::connection::routing::local_sessions_for_target(state, &target);
                 crate::connection::routing::merge_sessions(
                     &mut sids,
                     crate::connection::routing::sender_sessions_for_account(
                         state,
-                        peer_account.as_deref(),
+                        peer_account.as_deref().filter(|_| {
+                            sig_verdict
+                                == Some(crate::connection::messaging::ClientSigOutcome::Verified)
+                        }),
                     ),
                 );
                 sids
@@ -4984,7 +5055,11 @@ pub(crate) async fn process_s2s_message(
                 );
                 return;
             }
-            let limit = if limit == 0 { MAX_REPLAY } else { limit.min(MAX_REPLAY) };
+            let limit = if limit == 0 {
+                MAX_REPLAY
+            } else {
+                limit.min(MAX_REPLAY)
+            };
             let rows = state
                 .with_db(|db| db.events_since(since_ts, limit + 1))
                 .unwrap_or_default();
@@ -5024,7 +5099,11 @@ pub(crate) async fn process_s2s_message(
             }
         }
 
-        S2sMessage::CatchupEvents { origin, events, more } => {
+        S2sMessage::CatchupEvents {
+            origin,
+            events,
+            more,
+        } => {
             let count = events.len();
             let mut filed = 0usize;
             let mut conflicts = 0usize;
@@ -6363,6 +6442,18 @@ mod s2s_adversarial_tests {
     const SIGNER: &str = "did:plc:relayedsigner";
 
     /// A signer whose key is on file here, as a key lookup would leave it.
+    /// [`signer_on_file`] where a database may be absent. A server without one
+    /// resolves no keys, so there is nothing a signature could be checked
+    /// against and nothing to register.
+    fn signer_on_file_opt(
+        state: &Arc<SharedState>,
+        did: &str,
+    ) -> Option<ed25519_dalek::SigningKey> {
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        state.with_db(|db| db.save_signing_key(did, key.verifying_key().as_bytes()))?;
+        Some(key)
+    }
+
     fn signer_on_file(state: &Arc<SharedState>, did: &str) -> ed25519_dalek::SigningKey {
         let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         state
@@ -6399,9 +6490,7 @@ mod s2s_adversarial_tests {
         tags: &HashMap<String, String>,
         sig: Option<&str>,
     ) -> Option<crate::connection::messaging::ClientSigOutcome> {
-        verify_relayed_privmsg(
-            state, account, target, msgid, text, tags, None, None, sig,
-        )
+        verify_relayed_privmsg(state, account, target, msgid, text, tags, None, None, sig)
     }
 
     #[tokio::test]
@@ -6809,11 +6898,58 @@ mod s2s_adversarial_tests {
         rx.try_recv().expect("the message reached the member")
     }
 
-    /// A signature that does not check out is evidence of tampering, so it
-    /// must not travel any further: no local client sees it, and nothing
-    /// downstream can mistake it for a signature this server stood behind.
+    /// The same, for a relay that may legitimately deliver nothing.
+    #[allow(clippy::too_many_arguments)]
+    async fn relay_to_member_maybe(
+        state: &Arc<SharedState>,
+        mgr: &Arc<S2sManager>,
+        envelope: &str,
+        did: Option<&str>,
+        msgid: &str,
+        text: &str,
+        sig: Option<String>,
+    ) -> Option<String> {
+        let (tx, mut rx) = mpsc::channel(16);
+        let session = format!("w-{envelope}");
+        state.connections.lock().insert(session.clone(), tx);
+        state.cap_message_tags.lock().insert(session.clone());
+        state
+            .channels
+            .lock()
+            .get_mut("#chat")
+            .unwrap()
+            .members
+            .insert(session.clone());
+
+        process_s2s_message(
+            state,
+            mgr,
+            PEER,
+            S2sMessage::Privmsg {
+                event_id: format!("{PEER}:{envelope}"),
+                from: "remote!u@s2s".to_string(),
+                target: "#chat".to_string(),
+                text: text.to_string(),
+                origin: PEER.to_string(),
+                msgid: Some(msgid.to_string()),
+                sig,
+                account: did.map(str::to_string),
+                recipient_did: None,
+                replaces_msgid: None,
+                tags: HashMap::new(),
+                multiline_lines: None,
+            },
+        )
+        .await;
+
+        rx.try_recv().ok()
+    }
+
+    /// A signature that does not check out is evidence about the bytes, so
+    /// the message does not travel: no local client sees it, and nothing is
+    /// filed for a reader of history to find.
     #[tokio::test]
-    async fn a_relayed_message_whose_signature_fails_is_relayed_without_it() {
+    async fn a_relayed_message_whose_signature_fails_is_dropped() {
         let state = test_state_with_db();
         let mgr = test_manager();
         setup_authenticated_peer(&state, &mgr).await;
@@ -6822,7 +6958,7 @@ mod s2s_adversarial_tests {
 
         // Signed over one body, relayed with another.
         let sig = sign_channel_message(&key, SIGNER, "01TAMPERED", "#chat", "what was said");
-        let frame = relay_to_member(
+        let delivered = relay_to_member_maybe(
             &state,
             &mgr,
             "tampered",
@@ -6832,17 +6968,24 @@ mod s2s_adversarial_tests {
             Some(sig),
         )
         .await;
-
         assert!(
-            !frame.contains("+freeq.at/sig"),
-            "a signature that failed must not reach local clients: {frame}"
+            delivered.is_none(),
+            "a message whose signature failed must not reach local clients: {delivered:?}"
+        );
+        assert!(
+            state
+                .with_db(|db| db.find_message_by_msgid("01TAMPERED"))
+                .flatten()
+                .is_none(),
+            "nor may it be filed for a reader of history to find"
         );
 
         // The same rule for a signed event replayed somewhere it was never
         // sent: the venue is inside the document, so the signature does not
-        // survive the move and must not travel with it.
+        // survive the move — which reads as a failure, and the replay is
+        // refused rather than delivered shorn of its proof.
         let elsewhere = sign_channel_message(&key, SIGNER, "01REPLAYED", "#private", "for us only");
-        let frame = relay_to_member(
+        let delivered = relay_to_member_maybe(
             &state,
             &mgr,
             "replayed",
@@ -6853,19 +6996,9 @@ mod s2s_adversarial_tests {
         )
         .await;
         assert!(
-            !frame.contains("+freeq.at/sig"),
-            "a signed event replayed into another channel must lose its signature: {frame}"
+            delivered.is_none(),
+            "a signed event replayed into another channel must not arrive: {delivered:?}"
         );
-        // Nor is it filed — a reader of history must not find it either.
-        let row = state
-            .with_db(|db| db.find_message_by_msgid("01TAMPERED"))
-            .flatten()
-            .expect("the message itself is still stored");
-        assert!(
-            !row.tags.contains_key("+freeq.at/sig"),
-            "a signature that failed must not be stored"
-        );
-        assert_eq!(row.text, "what a liar substituted");
     }
 
     /// The other side of the same rule: a signature that checks out is
@@ -7027,11 +7160,13 @@ mod s2s_adversarial_tests {
         ));
     }
 
-    /// The mutation half of the never-launder rule: a reaction whose subject
-    /// was swapped in flight is relayed without the signature that no longer
-    /// covers it.
+    /// A reaction whose subject was swapped in flight is not relayed at all.
+    /// The signature stopped covering the event, and a mutation this server
+    /// cannot stand behind does not get applied on the peer's word — the
+    /// swapped-onto message is someone else's, and moving a reaction onto it
+    /// is the whole attack.
     #[tokio::test]
-    async fn a_relayed_mutation_whose_signature_fails_is_relayed_without_it() {
+    async fn a_relayed_mutation_whose_signature_fails_is_dropped() {
         let state = test_state_with_db();
         let mgr = test_manager();
         setup_authenticated_peer(&state, &mgr).await;
@@ -7083,14 +7218,171 @@ mod s2s_adversarial_tests {
         )
         .await;
 
-        let frame = rx.try_recv().expect("the reaction reached the member");
         assert!(
-            !frame.contains("+freeq.at/sig"),
-            "a mutation signature that failed must not reach local clients: {frame}"
+            rx.try_recv().is_err(),
+            "a mutation whose signature failed must not reach local clients at all"
         );
+        let filed = state
+            .with_db(|db| db.get_reactions_for_messages(&["01SOMEONEELSESMESSAGE"]))
+            .expect("test state has a database");
         assert!(
-            frame.contains("+react"),
-            "the reaction itself still relays: {frame}"
+            filed.is_empty(),
+            "and must not be on file either: {filed:?}"
+        );
+    }
+
+    /// The unsigned case, which is what an older peer sends: the actor is
+    /// named, nothing proves it, and the event does not apply.
+    #[tokio::test]
+    async fn a_relayed_mutation_with_no_signature_is_dropped() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#chat");
+
+        let (tx, mut rx) = mpsc::channel(16);
+        state.connections.lock().insert("m".to_string(), tx);
+        state.cap_message_tags.lock().insert("m".to_string());
+        state
+            .channels
+            .lock()
+            .get_mut("#chat")
+            .unwrap()
+            .members
+            .insert("m".to_string());
+
+        for tags in [
+            HashMap::from([("+draft/delete".to_string(), "01SUBJECTMSGID".to_string())]),
+            HashMap::from([
+                ("+react".to_string(), "👍".to_string()),
+                ("+reply".to_string(), "01SUBJECTMSGID".to_string()),
+            ]),
+            HashMap::from([
+                ("+freeq.at/unreact".to_string(), "👍".to_string()),
+                ("+reply".to_string(), "01SUBJECTMSGID".to_string()),
+            ]),
+        ] {
+            process_s2s_message(
+                &state,
+                &mgr,
+                PEER,
+                S2sMessage::Tagmsg {
+                    event_id: format!("{PEER}:unsigned"),
+                    from: "remote!u@s2s".to_string(),
+                    target: "#chat".to_string(),
+                    tags: tags.clone(),
+                    origin: PEER.to_string(),
+                    account: Some(SIGNER.to_string()),
+                },
+            )
+            .await;
+            assert!(
+                rx.try_recv().is_err(),
+                "an unsigned relayed mutation must not reach local clients: {tags:?}"
+            );
+        }
+    }
+
+    /// A mutation naming no account is a guest's, and a guest's mutations
+    /// have never been signed by anyone. They keep the rules they had.
+    #[tokio::test]
+    async fn a_relayed_guest_mutation_still_applies() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#chat");
+
+        let (tx, mut rx) = mpsc::channel(16);
+        state.connections.lock().insert("m".to_string(), tx);
+        state.cap_message_tags.lock().insert("m".to_string());
+        state
+            .channels
+            .lock()
+            .get_mut("#chat")
+            .unwrap()
+            .members
+            .insert("m".to_string());
+
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Tagmsg {
+                event_id: format!("{PEER}:guestreact"),
+                from: "guest!u@s2s".to_string(),
+                target: "#chat".to_string(),
+                tags: HashMap::from([
+                    ("+react".to_string(), "👍".to_string()),
+                    ("+reply".to_string(), "01SUBJECTMSGID".to_string()),
+                ]),
+                origin: PEER.to_string(),
+                account: None,
+            },
+        )
+        .await;
+
+        let frame = rx.try_recv().expect("a guest's reaction still relays");
+        assert!(frame.contains("+react"), "{frame}");
+    }
+
+    /// Every chat path resolves a key by the `kid` its signature names, never
+    /// by "the identity's current key". A device that rotates keys — or a
+    /// second device signing in — would otherwise invalidate every signature
+    /// the earlier key made, turning honest history into a wall of forgery
+    /// verdicts the moment someone reconnects.
+    ///
+    /// Two of the three paths are here: a relayed message, and a replayed
+    /// event checked against the bytes it travelled with. The third, the
+    /// verify endpoint's classifier, is pinned in `web.rs`.
+    #[tokio::test]
+    async fn chat_paths_resolve_a_key_by_kid_not_by_latest() {
+        let state = test_state_with_db();
+        // The key that signs, registered first…
+        let old = signer_on_file(&state, SIGNER);
+        // …and a newer one, which is what "the identity's current key" means.
+        let _new = signer_on_file(&state, SIGNER);
+
+        let sig = sign_channel_message(&old, SIGNER, "01OLDKEY", "#chat", "signed before rotating");
+        assert_eq!(
+            check_relayed(
+                &state,
+                Some(SIGNER),
+                "#chat",
+                Some("01OLDKEY"),
+                "signed before rotating",
+                &HashMap::new(),
+                Some(&sig),
+            ),
+            Some(crate::connection::messaging::ClientSigOutcome::Verified),
+            "a relayed message signed with a retired key must still verify"
+        );
+
+        // The replay path checks the bytes it was handed, by the same rule.
+        let canonical = freeq_sdk::chatsig::ChatDoc::mutation(
+            freeq_sdk::chatsig::Mutation::Delete,
+            SIGNER,
+            "01OLDKEYDELETE",
+            &freeq_sdk::chatsig::channel_venue("#chat"),
+            "01SUBJECTMSGID",
+        )
+        .canonical();
+        let mutation_sig = freeq_sdk::chatsig::ChatDoc::mutation(
+            freeq_sdk::chatsig::Mutation::Delete,
+            SIGNER,
+            "01OLDKEYDELETE",
+            &freeq_sdk::chatsig::channel_venue("#chat"),
+            "01SUBJECTMSGID",
+        )
+        .sign(&old);
+        assert_eq!(
+            crate::connection::messaging::verify_canonical_bytes(
+                &state,
+                SIGNER,
+                &canonical,
+                &mutation_sig,
+            ),
+            crate::connection::messaging::ClientSigOutcome::Verified,
+            "a replayed event signed with a retired key must still verify"
         );
     }
 
@@ -8560,11 +8852,7 @@ mod s2s_adversarial_tests {
 
         let channels = state.channels.lock();
         let ch = channels.get("#pinok").unwrap();
-        assert_eq!(
-            ch.pins.len(),
-            1,
-            "an op's relayed pin must still be stored"
-        );
+        assert_eq!(ch.pins.len(), 1, "an op's relayed pin must still be stored");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -9023,7 +9311,9 @@ mod s2s_adversarial_tests {
     #[tokio::test]
     async fn s2s_tagmsg_carries_the_origin_stamped_account() {
         const REMOTE_DID: &str = "did:plc:remoteactor";
-        let state = test_state();
+        // A database, because the reaction now has to carry a signature and a
+        // signature is checked against a key this server holds.
+        let state = test_state_with_db();
         let mgr = test_manager();
         setup_authenticated_peer(&state, &mgr).await;
         setup_channel(&state, "#acct-test");
@@ -9052,6 +9342,15 @@ mod s2s_adversarial_tests {
         let mut tags = HashMap::new();
         tags.insert("+react".to_string(), "👍".to_string());
         tags.insert("+reply".to_string(), "msg001".to_string());
+        sign_relayed_mutation(
+            &state,
+            Some(REMOTE_DID),
+            "#acct-test",
+            freeq_sdk::chatsig::Mutation::React,
+            "msg001",
+            Some("👍"),
+            &mut tags,
+        );
 
         process_s2s_message(
             &state,
@@ -10332,6 +10631,18 @@ mod s2s_adversarial_tests {
         from: &str,
         account: Option<&str>,
     ) {
+        // An edit is a mutation, so it crosses the hop with the editor's own
+        // signature or not at all. A plain message needs none.
+        let sig = replaces.and_then(|root| {
+            let did = account?;
+            let venue = crate::connection::messaging::signing_venue(state, did, channel)?;
+            let key = signer_on_file_opt(state, did)?;
+            Some(
+                freeq_sdk::chatsig::ChatDoc::message(did, msgid, &venue, text)
+                    .with_edit(root)
+                    .sign(&key),
+            )
+        });
         process_s2s_message(
             state,
             mgr,
@@ -10343,7 +10654,7 @@ mod s2s_adversarial_tests {
                 text: text.to_string(),
                 origin: PEER.to_string(),
                 msgid: Some(msgid.to_string()),
-                sig: None,
+                sig,
                 account: account.map(|a| a.to_string()),
                 recipient_did: None,
                 replaces_msgid: replaces.map(|r| r.to_string()),
@@ -10352,6 +10663,38 @@ mod s2s_adversarial_tests {
             },
         )
         .await;
+    }
+
+    /// Sign a relayed mutation the way a current peer's client does: the
+    /// actor's own key, over the venue the receiving server rebuilds.
+    ///
+    /// Registers the key as the peer's key server would have supplied it. A
+    /// venue that does not resolve leaves the event unsigned, because nothing
+    /// could have signed it — the exemption, reproduced rather than
+    /// worked around.
+    fn sign_relayed_mutation(
+        state: &Arc<SharedState>,
+        account: Option<&str>,
+        target: &str,
+        kind: freeq_sdk::chatsig::Mutation,
+        subject: &str,
+        emoji: Option<&str>,
+        tags: &mut HashMap<String, String>,
+    ) {
+        let Some(did) = account else { return };
+        let Some(venue) = crate::connection::messaging::signing_venue(state, did, target) else {
+            return;
+        };
+        let Some(key) = signer_on_file_opt(state, did) else {
+            return;
+        };
+        let event_id = crate::msgid::generate();
+        let mut doc = freeq_sdk::chatsig::ChatDoc::mutation(kind, did, &event_id, &venue, subject);
+        if let Some(emoji) = emoji {
+            doc = doc.with_emoji(emoji);
+        }
+        tags.insert("+freeq.at/sig".to_string(), doc.sign(&key));
+        tags.insert(freeq_sdk::chatsig::EVENT_ID_TAG.to_string(), event_id);
     }
 
     async fn relay_delete(
@@ -10364,6 +10707,15 @@ mod s2s_adversarial_tests {
     ) {
         let mut tags = HashMap::new();
         tags.insert("+draft/delete".to_string(), msgid.to_string());
+        sign_relayed_mutation(
+            state,
+            account,
+            channel,
+            freeq_sdk::chatsig::Mutation::Delete,
+            msgid,
+            None,
+            &mut tags,
+        );
         process_s2s_message(
             state,
             mgr,
@@ -10415,7 +10767,10 @@ mod s2s_adversarial_tests {
         );
         // The DB keeps both revisions, joined by the root — the same shape a
         // local edit produces.
-        assert_eq!(state.with_db(|db| Ok(db.root_of("id-edit"))), Some("id-orig".to_string()));
+        assert_eq!(
+            state.with_db(|db| Ok(db.root_of("id-edit"))),
+            Some("id-orig".to_string())
+        );
         assert_eq!(
             state
                 .with_db(|db| db.current_revision("id-orig"))
@@ -10434,7 +10789,15 @@ mod s2s_adversarial_tests {
         setup_authenticated_peer(&state, &mgr).await;
         setup_channel(&state, "#fedunseen");
 
-        relay_message(&state, &mgr, "#fedunseen", "id-edit", "v2", Some("id-never")).await;
+        relay_message(
+            &state,
+            &mgr,
+            "#fedunseen",
+            "id-edit",
+            "v2",
+            Some("id-never"),
+        )
+        .await;
 
         assert_eq!(
             history_of(&state, "#fedunseen"),
@@ -10490,7 +10853,15 @@ mod s2s_adversarial_tests {
         setup_channel(&state, "#feddel");
 
         relay_message(&state, &mgr, "#feddel", "id-1", "secret", None).await;
-        relay_delete(&state, &mgr, "#feddel", "id-1", "alice!a@remote", Some(AUTHOR_DID)).await;
+        relay_delete(
+            &state,
+            &mgr,
+            "#feddel",
+            "id-1",
+            "alice!a@remote",
+            Some(AUTHOR_DID),
+        )
+        .await;
 
         assert!(
             history_of(&state, "#feddel").is_empty(),
@@ -10516,7 +10887,15 @@ mod s2s_adversarial_tests {
 
         relay_message(&state, &mgr, "#feddel2", "id-1", "v1", None).await;
         relay_message(&state, &mgr, "#feddel2", "id-2", "v2", Some("id-1")).await;
-        relay_delete(&state, &mgr, "#feddel2", "id-2", "alice!a@remote", Some(AUTHOR_DID)).await;
+        relay_delete(
+            &state,
+            &mgr,
+            "#feddel2",
+            "id-2",
+            "alice!a@remote",
+            Some(AUTHOR_DID),
+        )
+        .await;
 
         assert!(history_of(&state, "#feddel2").is_empty());
         assert!(
@@ -10866,6 +11245,15 @@ mod s2s_adversarial_tests {
         let mut tags = HashMap::new();
         tags.insert("+react".to_string(), "🔥".to_string());
         tags.insert("+reply".to_string(), "id-1".to_string());
+        sign_relayed_mutation(
+            &state,
+            Some(AUTHOR_DID),
+            "#fedreact",
+            freeq_sdk::chatsig::Mutation::React,
+            "id-1",
+            Some("🔥"),
+            &mut tags,
+        );
         process_s2s_message(
             &state,
             &mgr,
@@ -10885,7 +11273,10 @@ mod s2s_adversarial_tests {
             .with_db(|db| db.get_reactions_for_messages(&["id-1"]))
             .expect("db present");
         assert_eq!(
-            stored.get("id-1").and_then(|v| v.first()).and_then(|r| r.reactor_did.clone()),
+            stored
+                .get("id-1")
+                .and_then(|v| v.first())
+                .and_then(|r| r.reactor_did.clone()),
             Some(AUTHOR_DID.to_string()),
             "a remote reactor with no local identity was stored nick-only"
         );
@@ -10911,7 +11302,16 @@ mod s2s_adversarial_tests {
                 text: text.to_string(),
                 origin: PEER.to_string(),
                 msgid: Some(msgid.to_string()),
-                sig: None,
+                sig: replaces.and_then(|root| {
+                    let venue =
+                        crate::connection::messaging::signing_venue(state, AUTHOR_DID, to_nick)?;
+                    let key = signer_on_file_opt(state, AUTHOR_DID)?;
+                    Some(
+                        freeq_sdk::chatsig::ChatDoc::message(AUTHOR_DID, msgid, &venue, text)
+                            .with_edit(root)
+                            .sign(&key),
+                    )
+                }),
                 account: Some(AUTHOR_DID.to_string()),
                 recipient_did: None,
                 replaces_msgid: replaces.map(|r| r.to_string()),
@@ -10983,7 +11383,15 @@ mod s2s_adversarial_tests {
         relay_dm(&state, &mgr, "bob", "dm-1", "regrettable", None).await;
         assert_eq!(live_dm_texts(&state, &dm_key).len(), 1, "dm persisted");
 
-        relay_delete(&state, &mgr, "bob", "dm-1", "alice!a@remote", Some(AUTHOR_DID)).await;
+        relay_delete(
+            &state,
+            &mgr,
+            "bob",
+            "dm-1",
+            "alice!a@remote",
+            Some(AUTHOR_DID),
+        )
+        .await;
 
         assert!(
             live_dm_texts(&state, &dm_key).is_empty(),
@@ -11154,15 +11562,15 @@ mod catchup_tests {
 
     use std::collections::HashMap;
 
-    use ed25519_dalek::SigningKey;
-        use std::sync::Arc;
-    use freeq_sdk::chatsig::ChatDoc;
-    use crate::events::SigState;
-    use crate::s2s::{CATCHUP, ReplayedEvent, S2sMessage, our_capabilities, peer_supports};
     use super::s2s_adversarial_tests::{setup_authenticated_peer, test_manager};
     use super::{
         ReplayOutcome, SharedState, apply_replayed_event, process_s2s_message, test_state_with_db,
     };
+    use crate::events::SigState;
+    use crate::s2s::{CATCHUP, ReplayedEvent, S2sMessage, our_capabilities, peer_supports};
+    use ed25519_dalek::SigningKey;
+    use freeq_sdk::chatsig::ChatDoc;
+    use std::sync::Arc;
     use tokio::sync::mpsc;
 
     const ALICE: &str = "did:plc:catchupalice";
@@ -11198,11 +11606,12 @@ mod catchup_tests {
         let key = SigningKey::from_bytes(&[3u8; 32]);
         let state = state_with_key(&key);
 
-        let ev = signed_event(&key, "01CATCH000000000000000001", "missed while you were out");
-        assert_eq!(
-            apply_replayed_event(&state, PEER, ev),
-            ReplayOutcome::Filed
+        let ev = signed_event(
+            &key,
+            "01CATCH000000000000000001",
+            "missed while you were out",
         );
+        assert_eq!(apply_replayed_event(&state, PEER, ev), ReplayOutcome::Filed);
 
         let row = state
             .with_db(|db| db.get_event("01CATCH000000000000000001"))
@@ -11213,7 +11622,11 @@ mod catchup_tests {
             SigState::Valid,
             "the receiver reached its own verdict against the bytes it was handed"
         );
-        assert_eq!(row.origin.as_deref(), Some(PEER), "and recorded who replayed it");
+        assert_eq!(
+            row.origin.as_deref(),
+            Some(PEER),
+            "and recorded who replayed it"
+        );
         assert_eq!(row.venue, "#caught");
     }
 
@@ -11301,8 +11714,13 @@ mod catchup_tests {
         let mut ev = signed_event(&key, "01CATCH000000000000000004", "what was signed");
         // The bytes the peer hands over no longer match the signature it hands
         // over with them.
-        ev.canonical = ChatDoc::message(ALICE, "01CATCH000000000000000004", "#caught", "what was sent")
-            .canonical();
+        ev.canonical = ChatDoc::message(
+            ALICE,
+            "01CATCH000000000000000004",
+            "#caught",
+            "what was sent",
+        )
+        .canonical();
 
         assert_eq!(
             apply_replayed_event(&state, PEER, ev),
@@ -11326,10 +11744,7 @@ mod catchup_tests {
         let state = test_state_with_db();
 
         let ev = signed_event(&key, "01CATCH000000000000000005", "who signed this");
-        assert_eq!(
-            apply_replayed_event(&state, PEER, ev),
-            ReplayOutcome::Filed
-        );
+        assert_eq!(apply_replayed_event(&state, PEER, ev), ReplayOutcome::Filed);
         assert_eq!(
             state
                 .with_db(|db| db.get_event("01CATCH000000000000000005"))
@@ -11357,10 +11772,7 @@ mod catchup_tests {
             emoji: None,
             timestamp: 1000,
         };
-        assert_eq!(
-            apply_replayed_event(&state, PEER, ev),
-            ReplayOutcome::Filed
-        );
+        assert_eq!(apply_replayed_event(&state, PEER, ev), ReplayOutcome::Filed);
         assert_eq!(
             state
                 .with_db(|db| db.get_event("01CATCH000000000000000006"))
@@ -11443,10 +11855,11 @@ mod catchup_tests {
 
         // A live link to answer down.
         let (tx, mut rx) = mpsc::channel(16);
-        manager.peers.lock().await.insert(
-            PEER.to_string(),
-            crate::s2s::PeerEntry { tx, conn_gen: 1 },
-        );
+        manager
+            .peers
+            .lock()
+            .await
+            .insert(PEER.to_string(), crate::s2s::PeerEntry { tx, conn_gen: 1 });
 
         process_s2s_message(
             &state,
@@ -11500,10 +11913,11 @@ mod catchup_tests {
             .unwrap();
 
         let (tx, mut rx) = mpsc::channel(16);
-        manager.peers.lock().await.insert(
-            PEER.to_string(),
-            crate::s2s::PeerEntry { tx, conn_gen: 1 },
-        );
+        manager
+            .peers
+            .lock()
+            .await
+            .insert(PEER.to_string(), crate::s2s::PeerEntry { tx, conn_gen: 1 });
 
         process_s2s_message(
             &state,
@@ -11564,5 +11978,4 @@ mod catchup_tests {
         assert_eq!(recent.len(), 1, "the window is respected");
         assert_eq!(recent[0].event_id, "01WINDOW00000000000000003");
     }
-
 }

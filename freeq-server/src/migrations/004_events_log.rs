@@ -169,23 +169,51 @@ mod tests {
         let mut conn = at_v3_with_messages();
         migration_ladder().to_version(&mut conn, 4).unwrap();
 
-        let row = |id: &str| -> (String, String, String, Option<String>, Option<String>, String, Option<String>) {
+        let row = |id: &str| -> (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+        ) {
             conn.query_row(
                 "SELECT canonical, kind, venue, actor_did, subject, sig_state, signature
                  FROM events WHERE event_id = ?1",
                 rusqlite::params![id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
             )
             .unwrap()
         };
 
         let (canonical, kind, venue, actor, subject, sig_state, signature) = row("M1");
-        assert_eq!(canonical, "", "the log begins here; earlier bytes are not ours to invent");
+        assert_eq!(
+            canonical, "",
+            "the log begins here; earlier bytes are not ours to invent"
+        );
         assert_eq!(kind, "message");
-        assert_eq!(venue, "#room", "folded, the way a signer would have signed it");
+        assert_eq!(
+            venue, "#room",
+            "folded, the way a signer would have signed it"
+        );
         assert_eq!(actor.as_deref(), Some("did:plc:a"));
         assert_eq!(subject, None);
-        assert_eq!(signature.as_deref(), Some("ed25519:kid:sig"), "the signature was on file and stays on file");
+        assert_eq!(
+            signature.as_deref(),
+            Some("ed25519:kid:sig"),
+            "the signature was on file and stays on file"
+        );
         assert_eq!(
             sig_state, "unverifiable",
             "nothing re-checked it during the migration, so nothing may claim it valid"
@@ -193,13 +221,23 @@ mod tests {
 
         let (_, kind, _, _, subject, sig_state, _) = row("M2");
         assert_eq!((kind.as_str(), subject.as_deref()), ("edit", Some("M1")));
-        assert_eq!(sig_state, "unsigned", "no signature was on file for the revision");
+        assert_eq!(
+            sig_state, "unsigned",
+            "no signature was on file for the revision"
+        );
 
         let (_, _, venue, _, _, _, _) = row("M3");
-        assert_eq!(venue, "dm:did:plc:a,did:plc:b", "a DM venue is already a venue");
+        assert_eq!(
+            venue, "dm:did:plc:a,did:plc:b",
+            "a DM venue is already a venue"
+        );
 
         let (_, _, _, actor, _, sig_state, _) = row("M4");
-        assert_eq!((actor, sig_state.as_str()), (None, "unsigned"), "a guest has no identity to bind");
+        assert_eq!(
+            (actor, sig_state.as_str()),
+            (None, "unsigned"),
+            "a guest has no identity to bind"
+        );
     }
 
     /// Climbing the rung twice is what a restart does.

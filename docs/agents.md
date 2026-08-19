@@ -170,6 +170,12 @@ The IRC convention that nothing auto-replies to a notice still holds and is a re
 
 Nearly every notice on a freeq server is the server's own — command results, errors, the `API-BEARER` handshake, the approval notification above — and those are exactly the ephemeral case.
 
+### Changing messages requires a signature
+
+A logged-in sender's edit, delete, react, and unreact must carry a valid signature; unsigned ones are refused with a visible error. Current clients and SDKs sign automatically, and bots on bot-kit/SDK defaults are unaffected — but a bot that explicitly disabled signing will have these actions refused. Plain messages are unchanged. Guest behavior is unchanged, including DMs with a guest, which can never be signed and keep the old rules.
+
+In a DM, signing needs the peer's identity known — resolve the peer (WHOIS) before changing messages in a fresh DM thread.
+
 ### Commit-Reveal
 
 A convention layered on signed PRIVMSGs for sealed-then-revealed messages. Participants commit to an answer before anyone reveals theirs, so nobody can be influenced by others' early posts. The hash binds the future reveal to its earlier commit cryptographically.

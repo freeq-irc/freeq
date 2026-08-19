@@ -17,7 +17,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+use ed25519_dalek::SigningKey;
 use freeq_sdk::auth::{self, ChallengeSigner, KeySigner};
+use freeq_sdk::chatsig::{ChatDoc, EVENT_ID_TAG, Mutation, channel_venue};
 use freeq_sdk::crypto::PrivateKey;
 use freeq_sdk::did::{self, DidResolver};
 
@@ -82,7 +84,9 @@ impl C {
         let line = c.rx(|l| l.starts_with("AUTHENTICATE "), "challenge");
         let challenge = line.strip_prefix("AUTHENTICATE ").unwrap();
         let bytes = auth::decode_challenge_bytes(challenge).unwrap();
-        let resp = KeySigner::new(did.to_string(), key).respond(&bytes).unwrap();
+        let resp = KeySigner::new(did.to_string(), key)
+            .respond(&bytes)
+            .unwrap();
         c.tx(&format!("AUTHENTICATE {}", auth::encode_response(&resp)));
         c.num("903");
         c.tx("CAP END");
@@ -211,6 +215,40 @@ impl C {
             })
             .unwrap_or_default()
     }
+
+    /// Register a session signing key, as every signing client does after auth.
+    fn msgsig(&mut self, key: &SigningKey) {
+        use base64::Engine;
+        let pubkey =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
+        self.tx(&format!("MSGSIG {pubkey}"));
+        self.rx(|l| l.contains("MSGSIG"), "MSGSIG ack");
+    }
+}
+
+/// The tags of a mutation an identity signed. An authenticated sender's
+/// delete or reaction is refused without one, so every such test here sends
+/// the real thing.
+fn signed_mutation_tags(
+    kind: Mutation,
+    subject_tag: &str,
+    subject: &str,
+    emoji: Option<&str>,
+    channel: &str,
+    key: &SigningKey,
+) -> String {
+    let event_id = freeq_server::msgid::generate();
+    let venue = channel_venue(channel);
+    let mut doc = ChatDoc::mutation(kind, DID_ALICE, &event_id, &venue, subject);
+    if let Some(emoji) = emoji {
+        doc = doc.with_emoji(emoji);
+    }
+    let sig = doc.sign(key);
+    let head = match emoji {
+        Some(e) => format!("{subject_tag}={e};+reply={subject}"),
+        None => format!("{subject_tag}={subject}"),
+    };
+    format!("{head};{EVENT_ID_TAG}={event_id};+freeq.at/sig={sig}")
 }
 
 /// The `account` tag value on an IRC line, if it carries one. Matches the
@@ -234,6 +272,8 @@ async fn delete_names_the_sender_for_a_recipient_that_asked_for_account_tag() {
     run(addr, move |addr| {
         let mut alice = C::authed(addr, "at_alice", CAPS_WITH_ACCOUNT, DID_ALICE, key);
         alice.reg();
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
         alice.drain();
         let mut bob = C::guest(addr, "at_bob", CAPS_WITH_ACCOUNT);
         bob.reg();
@@ -247,9 +287,20 @@ async fn delete_names_the_sender_for_a_recipient_that_asked_for_account_tag() {
         assert!(!msgid.is_empty(), "no msgid on the message: {seen}");
         bob.drain();
 
-        alice.tx(&format!("@+draft/delete={msgid} TAGMSG #atd"));
+        let tags = signed_mutation_tags(
+            Mutation::Delete,
+            "+draft/delete",
+            &msgid,
+            None,
+            "#atd",
+            &signing,
+        );
+        alice.tx(&format!("@{tags} TAGMSG #atd"));
         let del = bob
-            .maybe(|l| l.contains("TAGMSG") && l.contains("+draft/delete"), 2000)
+            .maybe(
+                |l| l.contains("TAGMSG") && l.contains("+draft/delete"),
+                2000,
+            )
             .expect("bob receives the delete");
         assert_eq!(
             account_of(&del).as_deref(),
@@ -268,6 +319,8 @@ async fn delete_omits_account_for_a_recipient_that_did_not_ask() {
     run(addr, move |addr| {
         let mut alice = C::authed(addr, "at2_alice", CAPS_WITH_ACCOUNT, DID_ALICE, key);
         alice.reg();
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
         alice.drain();
         // Bob negotiated message-tags but NOT account-tag.
         let mut bob = C::guest(addr, "at2_bob", CAPS_WITHOUT_ACCOUNT);
@@ -281,9 +334,20 @@ async fn delete_omits_account_for_a_recipient_that_did_not_ask() {
         let msgid = C::extract_msgid(&seen);
         bob.drain();
 
-        alice.tx(&format!("@+draft/delete={msgid} TAGMSG #atd2"));
+        let tags = signed_mutation_tags(
+            Mutation::Delete,
+            "+draft/delete",
+            &msgid,
+            None,
+            "#atd2",
+            &signing,
+        );
+        alice.tx(&format!("@{tags} TAGMSG #atd2"));
         let del = bob
-            .maybe(|l| l.contains("TAGMSG") && l.contains("+draft/delete"), 2000)
+            .maybe(
+                |l| l.contains("TAGMSG") && l.contains("+draft/delete"),
+                2000,
+            )
             .expect("bob still receives the delete itself");
         assert_eq!(
             account_of(&del),
@@ -318,7 +382,10 @@ async fn a_guests_delete_carries_no_account() {
 
         alice.tx(&format!("@+draft/delete={msgid} TAGMSG #atd3"));
         let del = bob
-            .maybe(|l| l.contains("TAGMSG") && l.contains("+draft/delete"), 2000)
+            .maybe(
+                |l| l.contains("TAGMSG") && l.contains("+draft/delete"),
+                2000,
+            )
             .expect("bob receives the guest's delete");
         assert_eq!(
             account_of(&del),
@@ -339,6 +406,8 @@ async fn a_channel_reaction_names_the_sender() {
     run(addr, move |addr| {
         let mut alice = C::authed(addr, "at4_alice", CAPS_WITH_ACCOUNT, DID_ALICE, key);
         alice.reg();
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
         alice.drain();
         let mut bob = C::guest(addr, "at4_bob", CAPS_WITH_ACCOUNT);
         bob.reg();
@@ -351,7 +420,15 @@ async fn a_channel_reaction_names_the_sender() {
         let msgid = C::extract_msgid(&seen);
         bob.drain();
 
-        alice.tx(&format!("@+react=\u{1F44D};+reply={msgid} TAGMSG #atr"));
+        let tags = signed_mutation_tags(
+            Mutation::React,
+            "+react",
+            &msgid,
+            Some("\u{1F44D}"),
+            "#atr",
+            &signing,
+        );
+        alice.tx(&format!("@{tags} TAGMSG #atr"));
         let tagmsg = bob
             .maybe(|l| l.contains("TAGMSG") && l.contains("+react"), 2000)
             .expect("bob receives the reaction");

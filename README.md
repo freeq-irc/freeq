@@ -26,7 +26,7 @@ The web client at `irc.freeq.at` provides:
 - **Moderator appointments** — ops issue signed credentials for halfop (+h)
 - **Automatic role escalation** — credentials auto-grant IRC modes (op, halfop, voice)
 - **Shareable invite links** — `https://irc.freeq.at/join/#channel`
-- **Message editing, deletion, reactions, threads**
+- **Message editing, deletion, reactions, threads** — changing a message requires the sender's signature; current clients sign automatically
 - **End-to-end encrypted channels**
 
 ### Demo Channels
@@ -523,6 +523,7 @@ Options:
   --iroh                          Enable iroh QUIC transport
   --iroh-port <PORT>              UDP port for iroh (default: random)
   --s2s-peers <ID,ID,...>         S2S peer iroh endpoint IDs
+  --s2s-peer-api <ID=URL,...>     Where each S2S peer serves its users' signing keys
 ```
 
 ### Persistence

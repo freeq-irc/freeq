@@ -163,9 +163,7 @@ pub fn claim_for_message(input: &MessageClaimInput) -> IdentityClaim {
     // stored after servers stamped tags; before that it proves nothing, and a
     // row that cannot prove its age is treated the same way.
     match input.row_time_unix {
-        Some(t) if t >= spec().stamping_epoch_unix => {
-            render(IdentityClaimState::Guest, None, None)
-        }
+        Some(t) if t >= spec().stamping_epoch_unix => render(IdentityClaimState::Guest, None, None),
         _ => render(IdentityClaimState::Unknown, None, None),
     }
 }
@@ -242,21 +240,17 @@ fn by_did(did: &str) -> IdentityClaimState {
     }
 }
 
-fn nonblank<'a>(s: Option<&'a str>) -> Option<&'a str> {
+fn nonblank(s: Option<&str>) -> Option<&str> {
     s.filter(|v| !v.trim().is_empty())
 }
 
 /// A guest claim reached through a peer keeps a name for the origin even when
 /// the peer's name was never learned, mirroring the relayed line's fallback.
-fn origin_or_fallback<'a>(origin: Option<&'a str>) -> Option<&'a str> {
+fn origin_or_fallback(origin: Option<&str>) -> Option<&str> {
     origin.or(Some(spec().states.relayed.origin_fallback.as_str()))
 }
 
-fn render(
-    state: IdentityClaimState,
-    did: Option<&str>,
-    origin: Option<&str>,
-) -> IdentityClaim {
+fn render(state: IdentityClaimState, did: Option<&str>, origin: Option<&str>) -> IdentityClaim {
     let s = spec();
     let (label, flags, line) = match state {
         IdentityClaimState::AtProtocol => {

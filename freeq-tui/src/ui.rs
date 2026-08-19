@@ -855,9 +855,7 @@ mod tests {
         // cell count is what the eye reads down the screen.
         let col_of = |needle: &str| {
             rows.iter()
-                .find_map(|row| {
-                    (0..row.len()).find(|&i| row[i..].concat().starts_with(needle))
-                })
+                .find_map(|row| (0..row.len()).find(|&i| row[i..].concat().starts_with(needle)))
                 .unwrap_or_else(|| {
                     let shown: Vec<String> = rows.iter().map(|r| r.concat()).collect();
                     panic!("{needle:?} not rendered in:\n{}", shown.join("\n"))
@@ -867,12 +865,18 @@ mod tests {
             col_of("signed body"),
             col_of("plain body"),
             "bodies must line up:\n{}",
-            rows.iter().map(|r| r.concat()).collect::<Vec<_>>().join("\n")
+            rows.iter()
+                .map(|r| r.concat())
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         assert!(
             !rows.iter().any(|r| r.concat().contains('✓')),
             "a signed message must wear no resting marker:\n{}",
-            rows.iter().map(|r| r.concat()).collect::<Vec<_>>().join("\n")
+            rows.iter()
+                .map(|r| r.concat())
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 

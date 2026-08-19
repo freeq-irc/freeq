@@ -113,8 +113,7 @@ pub(crate) fn relay_to_nick(
         let origin = state.server_iroh_id.lock().clone().unwrap_or_default();
         let manager = state.s2s_manager.lock().clone();
         if let Some(m) = manager {
-            let (s2s_text, s2s_tags) =
-                crate::s2s::encode_privmsg_text_for_s2s(text, identity.tags);
+            let (s2s_text, s2s_tags) = crate::s2s::encode_privmsg_text_for_s2s(text, identity.tags);
             m.broadcast(crate::s2s::S2sMessage::Privmsg {
                 event_id,
                 from: from.to_string(),
@@ -247,6 +246,13 @@ pub(crate) fn reconcile_recipient_did(stamp: Option<&str>, local: Option<&str>) 
 /// `account` is looked up strictly as an identity in `did_sessions`, never
 /// resolved as a nick. The value is peer-asserted: routing a nick-shaped one
 /// through the nick map would let a peer address whoever holds that nick here.
+///
+/// **Callers pass `None` unless the event's signature verified.** Everywhere
+/// else a stamped DID only labels an event; here it decides delivery *into
+/// that identity's own client*, where the event reads as something they sent.
+/// A peer naming a local user could otherwise put a line in their outbox, or
+/// a delete in their history, that they never issued — the claim has to be
+/// one this server checked, not one it was told.
 pub(crate) fn sender_sessions_for_account(
     state: &SharedState,
     account: Option<&str>,

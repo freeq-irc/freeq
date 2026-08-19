@@ -830,7 +830,6 @@ pub(super) fn gate(
     Gate::Accepted
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -68,8 +68,8 @@ pub(crate) fn backfill_root_msgids(conn: &Connection) -> SqlResult<()> {
 fn migration_root_of(conn: &Connection, channel: &str, msgid: &str) -> SqlResult<String> {
     let mut root = msgid.to_string();
     for _ in 0..64 {
-        let mut stmt = conn
-            .prepare("SELECT replaces_msgid FROM messages WHERE channel = ?1 AND msgid = ?2")?;
+        let mut stmt =
+            conn.prepare("SELECT replaces_msgid FROM messages WHERE channel = ?1 AND msgid = ?2")?;
         let parent: Option<String> = stmt
             .query_map(params![channel, &root], |r| r.get::<_, Option<String>>(0))?
             .next()

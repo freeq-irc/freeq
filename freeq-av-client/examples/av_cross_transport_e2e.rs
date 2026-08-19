@@ -57,7 +57,10 @@ struct ToneSource {
 }
 impl AudioSource for ToneSource {
     fn format(&self) -> AudioFormat {
-        AudioFormat { sample_rate: 48_000, channel_count: 1 }
+        AudioFormat {
+            sample_rate: 48_000,
+            channel_count: 1,
+        }
     }
     fn pop_samples(&mut self, buf: &mut [f32]) -> anyhow::Result<Option<usize>> {
         let step = std::f32::consts::TAU * self.freq / 48_000.0;
@@ -83,7 +86,10 @@ impl VideoSource for ColorSource {
         "xtest-color"
     }
     fn format(&self) -> VideoFormat {
-        VideoFormat { pixel_format: PixelFormat::Bgra, dimensions: [VID_W, VID_H] }
+        VideoFormat {
+            pixel_format: PixelFormat::Bgra,
+            dimensions: [VID_W, VID_H],
+        }
     }
     fn pop_frame(&mut self) -> anyhow::Result<Option<VideoFrame>> {
         let mut buf = vec![0u8; (VID_W * VID_H * 4) as usize];
@@ -120,10 +126,10 @@ type Matrix = Arc<Mutex<BTreeMap<(String, String), Cell>>>;
 
 #[derive(Clone)]
 struct Agent {
-    label: String,      // e.g. "qbot0" (also the IRC nick when --channel is set)
-    transport: String,  // "QUIC" | "WS"
+    label: String,     // e.g. "qbot0" (also the IRC nick when --channel is set)
+    transport: String, // "QUIC" | "WS"
     url: String,
-    instance: String,   // per-agent broadcast instance suffix
+    instance: String, // per-agent broadcast instance suffix
     // Distinct fingerprints.
     freq: f32,
     bgra: [u8; 4],
@@ -144,14 +150,21 @@ struct Args {
 
 fn parse_args() -> Args {
     let a: Vec<String> = std::env::args().collect();
-    let get = |k: &str| a.iter().position(|x| x == k).and_then(|i| a.get(i + 1)).cloned();
+    let get = |k: &str| {
+        a.iter()
+            .position(|x| x == k)
+            .and_then(|i| a.get(i + 1))
+            .cloned()
+    };
     Args {
         quic_url: get("--quic-url").unwrap_or_else(|| "https://irc.freeq.at:8080/av/moq".into()),
         ws_url: get("--ws-url").unwrap_or_else(|| "wss://irc.freeq.at/av/moq".into()),
         quic: get("--quic").and_then(|s| s.parse().ok()).unwrap_or(1),
         ws: get("--ws").and_then(|s| s.parse().ok()).unwrap_or(1),
         secs: get("--secs").and_then(|s| s.parse().ok()).unwrap_or(12),
-        out: get("--out").map(PathBuf::from).unwrap_or_else(|| "/tmp/freeq-av-e2e".into()),
+        out: get("--out")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| "/tmp/freeq-av-e2e".into()),
         session: get("--session").unwrap_or_else(|| format!("xtest-{}", std::process::id())),
         capture_only: a.iter().any(|x| x == "--capture-only"),
         channel: get("--channel"),
@@ -235,7 +248,17 @@ async fn main() -> Result<()> {
         let channel = args.channel.clone();
         let irc_ws = args.irc_ws.clone();
         tasks.spawn(async move {
-            if let Err(e) = run_agent(ag.clone(), session, out, matrix, capture_only, channel, irc_ws).await {
+            if let Err(e) = run_agent(
+                ag.clone(),
+                session,
+                out,
+                matrix,
+                capture_only,
+                channel,
+                irc_ws,
+            )
+            .await
+            {
                 eprintln!("  [{}] agent error: {e:#}", ag.label);
             }
         });
@@ -307,7 +330,10 @@ async fn run_agent(
 
     if let (false, Some(chan)) = (capture_only, channel.as_deref()) {
         if let Err(e) = irc_av_join(&irc_ws, chan, &session, &me.label, &me.instance).await {
-            eprintln!("  [{}] av-join failed (will still publish to SFU): {e:#}", me.label);
+            eprintln!(
+                "  [{}] av-join failed (will still publish to SFU): {e:#}",
+                me.label
+            );
         }
     }
 
@@ -322,7 +348,10 @@ async fn run_agent(
         broadcast
             .audio()
             .set(
-                ToneSource { freq: me.freq, phase: 0.0 },
+                ToneSource {
+                    freq: me.freq,
+                    phase: 0.0,
+                },
                 AudioCodec::Opus,
                 [AudioPreset::Hq],
             )
@@ -330,7 +359,10 @@ async fn run_agent(
         broadcast
             .video()
             .set_source(
-                ColorSource { bgra_pixel: me.bgra, idx: 0 },
+                ColorSource {
+                    bgra_pixel: me.bgra,
+                    idx: 0,
+                },
                 VideoCodec::H264,
                 [VideoPreset::P360],
             )
@@ -477,8 +509,14 @@ fn print_matrix(agents: &[Agent], matrix: &Matrix) {
                 continue;
             }
             let cell = g.get(&(r.label.clone(), c.label.clone()));
-            let (a, v) = cell.map(|x| (x.audio_frames, x.video_frames)).unwrap_or((0, 0));
-            let tag = format!("{}{}", if a > 0 { "A" } else { "." }, if v > 0 { "V" } else { "." });
+            let (a, v) = cell
+                .map(|x| (x.audio_frames, x.video_frames))
+                .unwrap_or((0, 0));
+            let tag = format!(
+                "{}{}",
+                if a > 0 { "A" } else { "." },
+                if v > 0 { "V" } else { "." }
+            );
             print!("{:>9}", tag);
             if r.transport != c.transport {
                 cross_pairs += 1;
@@ -501,7 +539,11 @@ fn print_matrix(agents: &[Agent], matrix: &Matrix) {
     println!(
         "\n  RESULT: {}  (audio across every QUIC<->WS pair{})",
         if pass { "PASS" } else { "FAIL" },
-        if cross_ok_video == cross_pairs { " + video" } else { "; video incomplete" },
+        if cross_ok_video == cross_pairs {
+            " + video"
+        } else {
+            "; video incomplete"
+        },
     );
     if !pass {
         println!(

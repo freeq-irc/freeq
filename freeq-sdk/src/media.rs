@@ -34,16 +34,14 @@ pub struct MediaAttachment {
     pub filename: Option<String>,
 }
 
-/// A tag value under either spelling: the vendor-prefixed name a client tag
-/// must use to cross a federation link, or the bare name this SDK wrote
-/// before it did.
+/// A client tag's value, under the vendor-prefixed name every writer uses.
 ///
-/// Both are read because the writers moved and the wire did not: a message
-/// composed by an older build, or replayed out of history, still carries the
-/// bare form. The prefixed one wins where both appear.
+/// Only the prefixed spelling is read. A bare name never crossed a federation
+/// link — the relay carries vendor-prefixed client tags and drops the rest —
+/// so a bare field only ever reached readers on the sender's own server, and
+/// no writer has produced one since the writers moved.
 fn tag<'a>(tags: &'a HashMap<String, String>, name: &str) -> Option<&'a String> {
     tags.get(&format!("+freeq.at/{name}"))
-        .or_else(|| tags.get(name))
 }
 
 impl MediaAttachment {
@@ -51,9 +49,10 @@ impl MediaAttachment {
     ///
     /// Vendor-prefixed throughout: the S2S relay carries client tags and
     /// drops everything else, so a bare name is a field that reaches nobody
-    /// on a peer server. `media-mime` rather than `content-type` because the
-    /// latter is an HTTP header name and arrives carrying the header's
-    /// semantics, parameters included.
+    /// on a peer server — which is why the bare spelling is not read either.
+    /// `media-mime` rather than `content-type` because the latter is an HTTP
+    /// header name and arrives carrying the header's semantics, parameters
+    /// included.
     pub fn to_tags(&self) -> HashMap<String, String> {
         let mut tags = HashMap::new();
         tags.insert(
@@ -82,7 +81,7 @@ impl MediaAttachment {
         tags
     }
 
-    /// Parse from IRCv3 message tags, in either spelling.
+    /// Parse from IRCv3 message tags.
     ///
     /// `None` for a link preview: it carries a URL and a type like any
     /// attachment, so a reader that runs first would claim it and render it
@@ -96,7 +95,6 @@ impl MediaAttachment {
         // that names none is still an attachment — a file rather than an
         // image — and declining it would hide exactly what this reads for.
         let content_type = tag(tags, "media-mime")
-            .or_else(|| tag(tags, "content-type"))
             .cloned()
             .unwrap_or_else(|| UNDECLARED_TYPE.to_string());
         Some(Self {
@@ -178,12 +176,11 @@ fn url_looks_like_image(url: &str) -> bool {
 
 /// Whether these tags describe a link preview rather than an attachment.
 ///
-/// Either the explicit URL field or the discriminator the older shape used.
+/// The explicit URL field, which is the only thing that says so on the wire.
 /// One question, asked in one place, so the two readers cannot disagree about
 /// which of them owns a message.
 fn is_link_preview(tags: &HashMap<String, String>) -> bool {
     tag(tags, "link-url").is_some()
-        || tag(tags, "content-type").map(String::as_str) == Some("text/x-link-preview")
 }
 
 impl LinkPreview {
@@ -209,24 +206,21 @@ impl LinkPreview {
         tags
     }
 
-    /// Parse from IRCv3 message tags, in either spelling.
+    /// Parse from IRCv3 message tags.
     ///
-    /// A preview announces itself two ways: an explicit `link-url`, or the
-    /// `content-type` discriminator this SDK used to write. The discriminator
-    /// cannot federate — it is a bare tag, and the relay carries only
-    /// prefixed ones — so the explicit field is the shape that survives, and
-    /// the old one is read for what is already on the wire.
+    /// A preview announces itself with an explicit `link-url`. The
+    /// `content-type` discriminator this SDK once wrote could not federate —
+    /// it was a bare tag, and the relay carries only prefixed ones — so it
+    /// described a preview to nobody but its own server.
     pub fn from_tags(tags: &HashMap<String, String>) -> Option<Self> {
         if !is_link_preview(tags) {
             return None;
         }
         Some(Self {
-            url: tag(tags, "link-url").or_else(|| tag(tags, "media-url"))?.clone(),
+            url: tag(tags, "link-url")?.clone(),
             title: tag(tags, "link-title").cloned(),
             description: tag(tags, "link-desc").cloned(),
-            thumb_url: tag(tags, "link-image")
-                .or_else(|| tag(tags, "link-thumb"))
-                .cloned(),
+            thumb_url: tag(tags, "link-image").cloned(),
         })
     }
 }
@@ -774,18 +768,21 @@ mod tests {
         assert!(allowed.contains(&"application/pdf"));
     }
 
-    // ── Reading both attachment shapes ──────────────────────────────
+    // ── Reading an attachment ───────────────────────────────────────
     //
-    // Two SDKs described an attachment differently at the field level: this
-    // one wrote bare names and worked out a link preview from a
-    // `content-type` discriminator, the TypeScript one writes vendor-prefixed
-    // names with an explicit `link-url`. Only the prefixed spelling crosses a
-    // federation link, so that shape wins — but a reader has to understand
-    // both, or moving the writers breaks everything already on the wire.
+    // Two SDKs once described an attachment differently at the field level:
+    // this one wrote bare names and worked out a link preview from a
+    // `content-type` discriminator, the TypeScript one vendor-prefixed names
+    // with an explicit `link-url`. Only the prefixed spelling crosses a
+    // federation link, so it is the only shape any reader ever received from
+    // elsewhere — and now the only one read.
 
     fn ts_media_tags() -> HashMap<String, String> {
         HashMap::from([
-            ("+freeq.at/media-url".to_string(), "https://cdn/cat.png".to_string()),
+            (
+                "+freeq.at/media-url".to_string(),
+                "https://cdn/cat.png".to_string(),
+            ),
             ("+freeq.at/media-mime".to_string(), "image/png".to_string()),
             ("+freeq.at/media-alt".to_string(), "a cat".to_string()),
             ("+freeq.at/media-w".to_string(), "640".to_string()),
@@ -794,15 +791,20 @@ mod tests {
         ])
     }
 
+    /// The same attachment as [`ts_media_tags`], written field-for-field the
+    /// way this SDK writes one.
     fn rust_media_tags() -> HashMap<String, String> {
-        HashMap::from([
-            ("media-url".to_string(), "https://cdn/cat.png".to_string()),
-            ("content-type".to_string(), "image/png".to_string()),
-            ("media-alt".to_string(), "a cat".to_string()),
-            ("media-w".to_string(), "640".to_string()),
-            ("media-h".to_string(), "480".to_string()),
-            ("media-size".to_string(), "1024".to_string()),
-        ])
+        MediaAttachment {
+            content_type: "image/png".to_string(),
+            url: "https://cdn/cat.png".to_string(),
+            alt: Some("a cat".to_string()),
+            width: Some(640),
+            height: Some(480),
+            blurhash: None,
+            size: Some(1024),
+            filename: None,
+        }
+        .to_tags()
     }
 
     /// Every tag this SDK writes has to survive a federation hop, and the
@@ -862,7 +864,7 @@ mod tests {
     }
 
     #[test]
-    fn the_two_attachment_shapes_read_as_the_same_media() {
+    fn both_sdks_attachments_read_as_the_same_media() {
         let from_ts = MediaAttachment::from_tags(&ts_media_tags())
             .expect("a TypeScript attachment must parse — nothing rendered them before");
         let from_rust = MediaAttachment::from_tags(&rust_media_tags()).expect("and this one still");
@@ -915,27 +917,43 @@ mod tests {
         // A declared type is the answer whenever there is one, extension or
         // not — inference fills a gap, it does not overrule.
         let declared_text = HashMap::from([
-            ("+freeq.at/media-url".to_string(), "https://cdn/cat.png".to_string()),
+            (
+                "+freeq.at/media-url".to_string(),
+                "https://cdn/cat.png".to_string(),
+            ),
             ("+freeq.at/media-mime".to_string(), "text/plain".to_string()),
         ]);
-        assert!(!MediaAttachment::from_tags(&declared_text).unwrap().is_image());
+        assert!(
+            !MediaAttachment::from_tags(&declared_text)
+                .unwrap()
+                .is_image()
+        );
     }
 
     #[test]
-    fn the_two_link_preview_shapes_read_as_the_same_preview() {
+    fn both_sdks_link_previews_read_as_the_same_preview() {
         let ts = HashMap::from([
-            ("+freeq.at/link-url".to_string(), "https://example.com/post".to_string()),
+            (
+                "+freeq.at/link-url".to_string(),
+                "https://example.com/post".to_string(),
+            ),
             ("+freeq.at/link-title".to_string(), "A post".to_string()),
-            ("+freeq.at/link-desc".to_string(), "about things".to_string()),
-            ("+freeq.at/link-image".to_string(), "https://cdn/thumb.png".to_string()),
+            (
+                "+freeq.at/link-desc".to_string(),
+                "about things".to_string(),
+            ),
+            (
+                "+freeq.at/link-image".to_string(),
+                "https://cdn/thumb.png".to_string(),
+            ),
         ]);
-        let rust = HashMap::from([
-            ("content-type".to_string(), "text/x-link-preview".to_string()),
-            ("media-url".to_string(), "https://example.com/post".to_string()),
-            ("link-title".to_string(), "A post".to_string()),
-            ("link-desc".to_string(), "about things".to_string()),
-            ("link-thumb".to_string(), "https://cdn/thumb.png".to_string()),
-        ]);
+        let rust = LinkPreview {
+            url: "https://example.com/post".to_string(),
+            title: Some("A post".to_string()),
+            description: Some("about things".to_string()),
+            thumb_url: Some("https://cdn/thumb.png".to_string()),
+        }
+        .to_tags();
         let from_ts = LinkPreview::from_tags(&ts).expect("a TypeScript preview must parse");
         let from_rust = LinkPreview::from_tags(&rust).expect("and this one still");
         assert_eq!(from_ts.url, from_rust.url);
@@ -951,15 +969,20 @@ mod tests {
     /// never reached.
     #[test]
     fn a_link_preview_does_not_read_as_media() {
-        let rust_preview = HashMap::from([
-            ("content-type".to_string(), "text/x-link-preview".to_string()),
-            ("media-url".to_string(), "https://example.com/post".to_string()),
-            ("link-title".to_string(), "A post".to_string()),
-        ]);
+        let rust_preview = LinkPreview {
+            url: "https://example.com/post".to_string(),
+            title: Some("A post".to_string()),
+            description: None,
+            thumb_url: None,
+        }
+        .to_tags();
         assert!(MediaAttachment::from_tags(&rust_preview).is_none());
 
         let ts_preview = HashMap::from([
-            ("+freeq.at/link-url".to_string(), "https://example.com/post".to_string()),
+            (
+                "+freeq.at/link-url".to_string(),
+                "https://example.com/post".to_string(),
+            ),
             ("+freeq.at/link-title".to_string(), "A post".to_string()),
         ]);
         assert!(MediaAttachment::from_tags(&ts_preview).is_none());

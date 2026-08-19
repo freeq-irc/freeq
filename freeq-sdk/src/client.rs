@@ -3078,7 +3078,9 @@ async fn execute_command<W: AsyncWrite + Unpin>(
                 command: "PRIVMSG".to_string(),
                 params: vec![channel, human_text],
             };
-            writer.write_all(format!("{privmsg}\r\n").as_bytes()).await?;
+            writer
+                .write_all(format!("{privmsg}\r\n").as_bytes())
+                .await?;
         }
         Command::Raw(line) => {
             // Strip CRLF/NUL to prevent protocol injection via raw commands
@@ -4279,8 +4281,7 @@ mod multiline_tests {
             .expect("the companion signs too");
         assert_ne!(message_id, &task_id, "each document signs its own id");
         let venue = crate::chatsig::channel_venue("#room");
-        let mut doc =
-            crate::chatsig::ChatDoc::message(did, message_id, &venue, &privmsg.params[1]);
+        let mut doc = crate::chatsig::ChatDoc::message(did, message_id, &venue, &privmsg.params[1]);
         let coord: Vec<(String, String)> = privmsg
             .tags
             .iter()

@@ -17,6 +17,9 @@ final class MetricKitReporter: NSObject, MXMetricManagerSubscriber {
     private let log = Logger(subsystem: "at.freeq.macos", category: "diagnostics")
 
     func start() {
+        // MetricKit exists on macOS only from 26; on older systems the
+        // manager symbol isn't there and the call would crash.
+        guard #available(macOS 26.0, *) else { return }
         MXMetricManager.shared.add(self)
     }
 

@@ -91,6 +91,18 @@ fn base_for_origin(state: &Arc<SharedState>, origin: &str) -> Option<String> {
         .cloned()
 }
 
+/// Whether this peer has a key server at all (`--s2s-peer-api`).
+///
+/// A peer with none can never have its signatures checked here, which is
+/// honest for a message — it is labeled and delivered — but decides the fate
+/// of a mutation, which is refused when it cannot be checked. The refusal is
+/// worth naming the reason for: without this, an operator sees mutations from
+/// one peer quietly doing nothing and has no way to tell a forgery from a
+/// line missing from the command line.
+pub fn has_key_source(state: &Arc<SharedState>, origin: &str) -> bool {
+    base_for_origin(state, origin).is_some()
+}
+
 /// Look up the key a relayed signature names, without holding anything up.
 ///
 /// Call when a relayed event was uncheckable for want of a key. Returns
@@ -252,7 +264,12 @@ mod tests {
         let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
         let sig = freeq_sdk::sigtag::sign_canonical("{}", &key);
 
-        fetch_on_miss(&state, "some-unconfigured-peer", "did:plc:unconfiguredpeer", &sig);
+        fetch_on_miss(
+            &state,
+            "some-unconfigured-peer",
+            "did:plc:unconfiguredpeer",
+            &sig,
+        );
         assert!(!lookup_pending("did:plc:unconfiguredpeer", &kid));
     }
 
@@ -332,7 +349,12 @@ mod tests {
                 .is_none()
         );
 
-        fetch_on_miss(&state, PEER, did, &freeq_sdk::sigtag::sign_canonical("{}", &key));
+        fetch_on_miss(
+            &state,
+            PEER,
+            did,
+            &freeq_sdk::sigtag::sign_canonical("{}", &key),
+        );
 
         assert_eq!(
             wait_for_key(&state, did, &kid).await,
@@ -357,7 +379,12 @@ mod tests {
         };
         let state = state_pointed_at(&format!("http://127.0.0.1:{dead}"));
 
-        fetch_on_miss(&state, PEER, did, &freeq_sdk::sigtag::sign_canonical("{}", &key));
+        fetch_on_miss(
+            &state,
+            PEER,
+            did,
+            &freeq_sdk::sigtag::sign_canonical("{}", &key),
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         assert!(
@@ -384,7 +411,12 @@ mod tests {
         let base = serve_api(crate::server::test_state_with_db()).await;
         let state = state_pointed_at(&base);
 
-        fetch_on_miss(&state, PEER, did, &freeq_sdk::sigtag::sign_canonical("{}", &key));
+        fetch_on_miss(
+            &state,
+            PEER,
+            did,
+            &freeq_sdk::sigtag::sign_canonical("{}", &key),
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         assert!(
@@ -482,8 +514,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             use base64::Engine;
-            let encoded =
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(other_pub);
+            let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(other_pub);
             let app = axum::Router::new().route(
                 "/api/v1/signing-keys/{did}/{kid}",
                 axum::routing::get(move || {

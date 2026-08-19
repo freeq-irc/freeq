@@ -446,7 +446,6 @@ impl<'a> ChatDoc<'a> {
             if let Some(evidence) = self.evidence.filter(|s| !s.is_empty()) {
                 put("evidence", evidence);
             }
-
         }
         if !self.coord.is_empty() {
             let coord: serde_json::Map<String, serde_json::Value> = self
@@ -652,7 +651,11 @@ mod tests {
             bare.canonical(),
             "a covered set a relay could dodge by rewriting the spelling covers nothing"
         );
-        assert!(prefixed.canonical().contains(r#""media-url":"https://cdn/cat.png""#));
+        assert!(
+            prefixed
+                .canonical()
+                .contains(r#""media-url":"https://cdn/cat.png""#)
+        );
 
         let key = test_key(1);
         let sig = prefixed.sign(&key);
@@ -777,8 +780,8 @@ mod tests {
     /// empty — the same rule every optional field follows.
     #[test]
     fn a_coordination_event_without_a_reference_omits_the_key() {
-        let doc = ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_request")
-            .with_payload("%7B%7D");
+        let doc =
+            ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_request").with_payload("%7B%7D");
         assert!(!doc.canonical().contains(r#""ref""#), "{}", doc.canonical());
     }
 
@@ -862,8 +865,8 @@ mod tests {
     /// before the field existed.
     #[test]
     fn a_coordination_event_without_evidence_signs_as_before() {
-        let doc = ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_request")
-            .with_payload("%7B%7D");
+        let doc =
+            ChatDoc::coordination(ALICE, MSGID, "#swarm", "task_request").with_payload("%7B%7D");
         assert_eq!(
             doc.canonical(),
             format!(
@@ -1326,11 +1329,23 @@ mod tests {
     }
 
     fn doc_negative(name: &'static str, of: &'static str, tampered: ChatDoc<'static>) -> Negative {
-        Negative { name, of, tampered: Some(tampered), sig: None, expected: "invalid" }
+        Negative {
+            name,
+            of,
+            tampered: Some(tampered),
+            sig: None,
+            expected: "invalid",
+        }
     }
 
     fn sig_negative(name: &'static str, of: &'static str, sig: SigAttack) -> Negative {
-        Negative { name, of, tampered: None, sig: Some(sig), expected: "unverifiable" }
+        Negative {
+            name,
+            of,
+            tampered: None,
+            sig: Some(sig),
+            expected: "unverifiable",
+        }
     }
 
     fn negatives() -> Vec<Negative> {
@@ -1442,8 +1457,16 @@ mod tests {
                     .with_ref("01KYVT9ZZZ0000000000000000"),
             ),
             sig_negative("wrong-kid", "message-plain", SigAttack::WrongKid),
-            sig_negative("unknown-algorithm", "message-plain", SigAttack::UnknownAlgorithm),
-            sig_negative("legacy-bare-base64", "message-plain", SigAttack::LegacyBareBase64),
+            sig_negative(
+                "unknown-algorithm",
+                "message-plain",
+                SigAttack::UnknownAlgorithm,
+            ),
+            sig_negative(
+                "legacy-bare-base64",
+                "message-plain",
+                SigAttack::LegacyBareBase64,
+            ),
         ]
     }
 
@@ -1502,7 +1525,19 @@ mod tests {
             "bodyRule": "body = \"sha256:\" + lowercase hex of SHA-256 over the UTF-8 wire body — ciphertext under E2EE, and the assembled body (real newlines) for a draft/multiline batch.",
             "payloadRule": "payload = \"sha256:\" + lowercase hex of SHA-256 over the UTF-8 wire value of +freeq.at/payload, IRC-unescaped and otherwise verbatim — any app-level encoding inside it is opaque bytes to the signature.",
             "venueRule": "target is the normalized venue, never the wire target: a channel lowercased, or `dm:<did_a>,<did_b>` with the two DIDs sorted ascending.",
-            "coordRule": "coord covers exactly the client-authored coordination and attachment tags event, evidence-type, link-desc, link-image, link-title, link-url, media-alt, media-blurhash, media-duration, media-filename, media-h, media-mime, media-size, media-url, media-w, payload, ref, task-id (canonical keys; wire names carry a +freeq.at/ prefix), IRC-unescaped, verbatim. An event is its TAGMSG, which carries its id in +freeq.at/eventid under its own signature; a message carrying event tags is a rendering of the event, never a carrier of its id. Every other tag — server stamps, tallies, verdicts, provenance, ephemera, framing — is excluded.",
+            // The names come from the constant rather than a copy of it: a
+            // hand-written list in the spec is a second source of truth for
+            // the one set both implementations must agree on, and the copy is
+            // the one that goes stale.
+            "coordRule": format!(
+                "coord covers exactly the client-authored coordination and attachment tags {} \
+                 (canonical keys; wire names carry a +freeq.at/ prefix), IRC-unescaped, verbatim. \
+                 An event is its TAGMSG, which carries its id in +freeq.at/eventid under its own \
+                 signature; a message carrying event tags is a rendering of the event, never a \
+                 carrier of its id. Every other tag — server stamps, tallies, verdicts, \
+                 provenance, ephemera, framing — is excluded.",
+                COVERED_COORD_TAGS.join(", "),
+            ),
             "referenceRule": "edit, reply and subject always name root msgids. A signed event naming a revision is refused, never rewritten.",
             "kidRule": "base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16])",
             "sigTagFormat": "ed25519:<kid>:<base64url-nopad signature over the UTF-8 canonical bytes>",
@@ -1532,6 +1567,46 @@ mod tests {
         assert_eq!(on_disk, build_fixtures_json());
     }
 
+    /// The covered list, named one by one.
+    ///
+    /// This set is append-only forever, in both languages at once: a document
+    /// canonicalizes the tags it carries *from this list*, so removing a name
+    /// changes the bytes of every signature already made over a message that
+    /// carried it — retroactively, and only for the readers who updated.
+    /// Adding one costs nothing, because a document without the tag
+    /// canonicalizes exactly as it did before.
+    ///
+    /// Spelling them out is the point. A test that compared the constant to
+    /// itself, or counted it, would pass through the one edit that matters.
+    #[test]
+    fn the_covered_tag_list_is_exactly_these_names() {
+        assert_eq!(
+            COVERED_COORD_TAGS,
+            [
+                "event",
+                "evidence-type",
+                "link-desc",
+                "link-image",
+                "link-title",
+                "link-url",
+                "media-alt",
+                "media-blurhash",
+                "media-duration",
+                "media-filename",
+                "media-h",
+                "media-mime",
+                "media-size",
+                "media-url",
+                "media-w",
+                "payload",
+                "ref",
+                "task-id",
+            ],
+            "the covered list is append-only, and the TypeScript one must match \
+             it name for name (see signing.ts)"
+        );
+    }
+
     #[test]
     fn empty_optional_fields_are_skipped_not_emitted() {
         // Every optional covered string field: an empty value canonicalizes
@@ -1558,7 +1633,10 @@ mod tests {
             .with_ref("")
             .with_evidence("")
             .canonical();
-        assert_eq!(coord_empty, coord_absent, "empty ref/evidence must be skipped");
+        assert_eq!(
+            coord_empty, coord_absent,
+            "empty ref/evidence must be skipped"
+        );
     }
 
     /// Every positive vector verifies, and every negative reaches its stated

@@ -158,7 +158,7 @@ else exists.
 
 ### Demo C — "The inter-company channel" (policy layer, ~large, the money demo)
 
-Two freeq servers, run by two different orgs (e.g. the Hetzner box + reth),
+Two freeq servers, run by two different orgs on independent hosts,
 federate one channel:
 1. Each side's members admitted by *their own* OIDC verifier (`ALL(ANY(
    PRESENT oidc_domain@issuerA, PRESENT oidc_domain@issuerB), ACCEPT rules)`).
@@ -247,11 +247,10 @@ pattern) generalizes:
 - **Enforcement lag:** several trust features ship server-side before all
   clients present them (AV tokens now; S2 scoping earlier). Each needs its
   flip actually flipped — an unflipped flag is a hole with better docs.
-  Tracked in `QUEUE-FOR-CHAD.md` §3.
 - **Key custody:** all of this rests on `*.secret` files on one box and on
   laptops. Before Demo C, produce a KEY-CUSTODY.md (what exists where, what
-  rotation looks like, what's fatal to lose — `MIGRATION-RETH-TO-HETZNER.md`
-  already knows `db-encryption-key.secret` is make-or-break).
+  rotation looks like, what's fatal to lose — `db-encryption-key.secret` is
+  make-or-break).
 - **Moderation roster is in-memory** (`verifiers/moderation.rs`) — a
   credential-issuing component that forgets on restart undermines the policy
   story; persist it when touching that file next.

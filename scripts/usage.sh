@@ -16,7 +16,7 @@
 #   freeq/guest    = throwaway, inherently uncountable (no stable identity)
 #
 #   On the server:   ./scripts/usage.sh
-#   From your box:    ssh chad@tech.blueyard.com 'cd src/freeq && ./scripts/usage.sh'
+#   From your box:   ssh "$FREEQ_SERVER" 'cd src/freeq && ./scripts/usage.sh'
 #
 # Env: DB=path/to/irc.db (default ./irc.db), DAYS=window for cohort (default 14)
 set -euo pipefail

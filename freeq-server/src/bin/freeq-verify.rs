@@ -83,7 +83,10 @@ fn verify(bundle: &serde_json::Value, verbose: bool) -> Result<(), String> {
     let empty = serde_json::Map::new();
     // Current signatures name their key by `kid`; legacy bare-base64 ones carry
     // no kid and fall back to the latest key per DID.
-    let keys = bundle.get("keys").and_then(|v| v.as_object()).unwrap_or(&empty);
+    let keys = bundle
+        .get("keys")
+        .and_then(|v| v.as_object())
+        .unwrap_or(&empty);
     let did_keys = bundle
         .get("did_keys")
         .and_then(|v| v.as_object())
@@ -144,16 +147,16 @@ fn verify(bundle: &serde_json::Value, verbose: bool) -> Result<(), String> {
                 let canonical = doc.canonical();
 
                 let (vk, which) = if kid == server_kid {
-                    (server_vk.clone(), "server key")
+                    (server_vk, "server key")
                 } else {
-                    let key_b64 = keys
-                        .get(kid)
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| format!("message {i} ({did}): no key in bundle for kid {kid}"))?;
+                    let key_b64 = keys.get(kid).and_then(|v| v.as_str()).ok_or_else(|| {
+                        format!("message {i} ({did}): no key in bundle for kid {kid}")
+                    })?;
                     (decode_key(key_b64)?, "client key")
                 };
-                freeq_sdk::sigtag::verify_canonical(&canonical, sig_tag, &vk)
-                    .map_err(|_| format!("message {i} ({did}): TAMPERED — signature does not verify"))?;
+                freeq_sdk::sigtag::verify_canonical(&canonical, sig_tag, &vk).map_err(|_| {
+                    format!("message {i} ({did}): TAMPERED — signature does not verify")
+                })?;
                 if verbose {
                     println!("message {i} ({did}): VERIFIED ({which})");
                 }
@@ -174,7 +177,9 @@ fn verify(bundle: &serde_json::Value, verbose: bool) -> Result<(), String> {
                 let msg_canonical = format!("{did}\0{channel}\0{text}\0{ts}");
                 client_key
                     .verify(msg_canonical.as_bytes(), &sig)
-                    .map_err(|_| format!("message {i} ({did}): TAMPERED — signature does not verify"))?;
+                    .map_err(|_| {
+                        format!("message {i} ({did}): TAMPERED — signature does not verify")
+                    })?;
                 if verbose {
                     println!("message {i} ({did}): VERIFIED (legacy client key)");
                 }

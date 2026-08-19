@@ -386,9 +386,19 @@ void uniffi_freeq_sdk_ffi_fn_method_freeqclient_connect(void*_Nonnull ptr, RustC
 RustBuffer uniffi_freeq_sdk_ffi_fn_method_freeqclient_current_nick(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_DELETE_MESSAGE
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_DELETE_MESSAGE
+void uniffi_freeq_sdk_ffi_fn_method_freeqclient_delete_message(void*_Nonnull ptr, RustBuffer target, RustBuffer msgid, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_DISCONNECT
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_DISCONNECT
 void uniffi_freeq_sdk_ffi_fn_method_freeqclient_disconnect(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_EDIT_MESSAGE
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_EDIT_MESSAGE
+void uniffi_freeq_sdk_ffi_fn_method_freeqclient_edit_message(void*_Nonnull ptr, RustBuffer target, RustBuffer msgid, RustBuffer new_text, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_IS_CONNECTED
@@ -411,6 +421,21 @@ void uniffi_freeq_sdk_ffi_fn_method_freeqclient_nick(void*_Nonnull ptr, RustBuff
 void uniffi_freeq_sdk_ffi_fn_method_freeqclient_part(void*_Nonnull ptr, RustBuffer channel, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_REACT
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_REACT
+void uniffi_freeq_sdk_ffi_fn_method_freeqclient_react(void*_Nonnull ptr, RustBuffer target, RustBuffer emoji, RustBuffer msgid, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_REPLY
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_REPLY
+void uniffi_freeq_sdk_ffi_fn_method_freeqclient_reply(void*_Nonnull ptr, RustBuffer target, RustBuffer msgid, RustBuffer text, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_REQUEST_WHOIS
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_REQUEST_WHOIS
+void uniffi_freeq_sdk_ffi_fn_method_freeqclient_request_whois(void*_Nonnull ptr, RustBuffer nick, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SEND_MESSAGE
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SEND_MESSAGE
 void uniffi_freeq_sdk_ffi_fn_method_freeqclient_send_message(void*_Nonnull ptr, RustBuffer target, RustBuffer text, RustCallStatus *_Nonnull out_status
@@ -419,6 +444,11 @@ void uniffi_freeq_sdk_ffi_fn_method_freeqclient_send_message(void*_Nonnull ptr, 
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SEND_RAW
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SEND_RAW
 void uniffi_freeq_sdk_ffi_fn_method_freeqclient_send_raw(void*_Nonnull ptr, RustBuffer line, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SEND_TAGGED
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SEND_TAGGED
+void uniffi_freeq_sdk_ffi_fn_method_freeqclient_send_tagged(void*_Nonnull ptr, RustBuffer target, RustBuffer text, RustBuffer tags, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_PLATFORM
@@ -439,6 +469,21 @@ void uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_web_token(void*_Nonnull ptr,
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_WEBSOCKET_URL
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_WEBSOCKET_URL
 void uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_websocket_url(void*_Nonnull ptr, RustBuffer url, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_TYPING_START
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_TYPING_START
+void uniffi_freeq_sdk_ffi_fn_method_freeqclient_typing_start(void*_Nonnull ptr, RustBuffer target, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_TYPING_STOP
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_TYPING_STOP
+void uniffi_freeq_sdk_ffi_fn_method_freeqclient_typing_stop(void*_Nonnull ptr, RustBuffer target, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_UNREACT
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_UNREACT
+void uniffi_freeq_sdk_ffi_fn_method_freeqclient_unreact(void*_Nonnull ptr, RustBuffer target, RustBuffer emoji, RustBuffer msgid, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_CLONE_FREEQE2EE
@@ -565,6 +610,27 @@ void uniffi_freeq_sdk_ffi_fn_init_callback_vtable_eventhandler(const UniffiVTabl
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_INIT_CALLBACK_VTABLE_P2PEVENTHANDLER
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_INIT_CALLBACK_VTABLE_P2PEVENTHANDLER
 void uniffi_freeq_sdk_ffi_fn_init_callback_vtable_p2peventhandler(const UniffiVTableCallbackInterfaceP2pEventHandler* _Nonnull vtable
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_FUNC_CLAIM_FOR_MESSAGE
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_FUNC_CLAIM_FOR_MESSAGE
+RustBuffer uniffi_freeq_sdk_ffi_fn_func_claim_for_message(RustBuffer input, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_FUNC_CLAIM_FOR_PERSON
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_FUNC_CLAIM_FOR_PERSON
+RustBuffer uniffi_freeq_sdk_ffi_fn_func_claim_for_person(RustBuffer input, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_FUNC_CLAIM_FOR_SENDER
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_FUNC_CLAIM_FOR_SENDER
+RustBuffer uniffi_freeq_sdk_ffi_fn_func_claim_for_sender(RustBuffer input, RustBuffer lookup, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_FUNC_IDENTITY_STAMPING_EPOCH_UNIX
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_FUNC_IDENTITY_STAMPING_EPOCH_UNIX
+uint64_t uniffi_freeq_sdk_ffi_fn_func_identity_stamping_epoch_unix(RustCallStatus *_Nonnull out_status
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_FREEQ_SDK_FFI_RUSTBUFFER_ALLOC
@@ -847,6 +913,30 @@ void ffi_freeq_sdk_ffi_rust_future_free_void(uint64_t handle
 void ffi_freeq_sdk_ffi_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_FUNC_CLAIM_FOR_MESSAGE
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_FUNC_CLAIM_FOR_MESSAGE
+uint16_t uniffi_freeq_sdk_ffi_checksum_func_claim_for_message(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_FUNC_CLAIM_FOR_PERSON
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_FUNC_CLAIM_FOR_PERSON
+uint16_t uniffi_freeq_sdk_ffi_checksum_func_claim_for_person(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_FUNC_CLAIM_FOR_SENDER
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_FUNC_CLAIM_FOR_SENDER
+uint16_t uniffi_freeq_sdk_ffi_checksum_func_claim_for_sender(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_FUNC_IDENTITY_STAMPING_EPOCH_UNIX
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_FUNC_IDENTITY_STAMPING_EPOCH_UNIX
+uint16_t uniffi_freeq_sdk_ffi_checksum_func_identity_stamping_epoch_unix(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQAV_IS_CONNECTED
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQAV_IS_CONNECTED
 uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqav_is_connected(void
@@ -919,9 +1009,21 @@ uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_current_nick(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_DELETE_MESSAGE
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_DELETE_MESSAGE
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_delete_message(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_DISCONNECT
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_DISCONNECT
 uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_disconnect(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_EDIT_MESSAGE
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_EDIT_MESSAGE
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_edit_message(void
     
 );
 #endif
@@ -949,6 +1051,24 @@ uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_part(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_REACT
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_REACT
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_react(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_REPLY
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_REPLY
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_reply(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_REQUEST_WHOIS
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_REQUEST_WHOIS
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_request_whois(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SEND_MESSAGE
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SEND_MESSAGE
 uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_send_message(void
@@ -958,6 +1078,12 @@ uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_send_message(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SEND_RAW
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SEND_RAW
 uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_send_raw(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SEND_TAGGED
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SEND_TAGGED
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_send_tagged(void
     
 );
 #endif
@@ -982,6 +1108,24 @@ uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_web_token(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_WEBSOCKET_URL
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_WEBSOCKET_URL
 uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_websocket_url(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_TYPING_START
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_TYPING_START
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_typing_start(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_TYPING_STOP
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_TYPING_STOP
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_typing_stop(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_UNREACT
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_UNREACT
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_unreact(void
     
 );
 #endif

@@ -14,6 +14,7 @@ import Foundation
 final class DebugBridge {
     private weak var appState: AppState?
     private let path: String
+    private let snapshotPath: String
     private var processedLines = 0
     private var timer: Timer?
 
@@ -24,8 +25,23 @@ final class DebugBridge {
         // actually works sandboxed; FREEQ_CMD_FILE still overrides. External
         // writers (ui-sweep.sh / test drivers) must target this container path:
         //   ~/Library/Containers/at.freeq.macos/Data/tmp/freeq-cmd
-        self.path = ProcessInfo.processInfo.environment["FREEQ_CMD_FILE"]
+        let env = ProcessInfo.processInfo.environment
+        self.path = env["FREEQ_CMD_FILE"]
             ?? (NSTemporaryDirectory() as NSString).appendingPathComponent("freeq-cmd")
+        // The snapshot must land where the harness reads it. When the build
+        // is unsigned (CI: CODE_SIGNING_ALLOWED=NO) no entitlements apply and
+        // the app is NOT sandboxed, so NSTemporaryDirectory() is /var/folders/…
+        // instead of the container — anchoring the snapshot next to the cmd
+        // file keeps writer and reader on the same path either way.
+        if let snap = env["FREEQ_SNAPSHOT_FILE"] {
+            self.snapshotPath = snap
+        } else if let cmd = env["FREEQ_CMD_FILE"] {
+            self.snapshotPath = ((cmd as NSString).deletingLastPathComponent as NSString)
+                .appendingPathComponent("freeq-snapshot.json")
+        } else {
+            self.snapshotPath = (NSTemporaryDirectory() as NSString)
+                .appendingPathComponent("freeq-snapshot.json")
+        }
     }
 
     func start() {
@@ -286,11 +302,14 @@ final class DebugBridge {
             channels: app.channels.map(\.name),
             dms: app.dmBuffers.map(\.name),
             messages: msgs)
-        let url = URL(fileURLWithPath:
-            (NSTemporaryDirectory() as NSString).appendingPathComponent("freeq-snapshot.json"))
-        if let data = try? JSONEncoder().encode(snap) {
-            try? data.write(to: url)
+        let url = URL(fileURLWithPath: snapshotPath)
+        do {
+            let data = try JSONEncoder().encode(snap)
+            try data.write(to: url)
             NSLog("[debug-bridge] snapshot written (\(msgs.count) msgs) → \(url.path)")
+        } catch {
+            // Silent failure here cost a CI run to diagnose — always log.
+            NSLog("[debug-bridge] snapshot write FAILED → \(url.path): \(error)")
         }
     }
 }

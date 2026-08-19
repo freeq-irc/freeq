@@ -7,7 +7,7 @@
 > iOS; release keystore + Play App Signing + FCM for Android; plus the
 > coordinated S2 session-scoping flip and store-compliance items). The code is
 > already ready — these are the identity/provisioning steps ad-hoc signing
-> can't do. See also `docs/QUEUE-FOR-CHAD.md` for other participation items.
+> can't do.
 
 **Requirements:**
 - `session_id` must be unique per TCP connection
@@ -199,6 +199,23 @@ The goal is to modernize identity without:
 If something feels “too clever,” it’s probably wrong.
 
 ---
+
+## Production deploy (irc.freeq.at)
+
+Prod host `reth` (160.202.129.155, TLS cert CN tech.blueyard.com), SSH user
+`chad` (passwordless sudo). systemd unit `freeq-server`, repo at
+`/home/chad/src/freeq`, secrets in `/home/chad/src/freeq/.env.secrets`
+(not in git — that's where GITHUB_CLIENT_ID etc. belong).
+
+**Deploy ONLY via the script — never hand-run cargo/npm on the host:**
+
+    ssh chad@160.202.129.155 "cd ~/src/freeq && ./deploy/deploy.sh"
+
+The script builds with `--features av-native`; a plain `cargo build --release`
+produces a no-AV binary, and AV in prod silently went down for ~2h on
+2026-08-18 from exactly that mistake. The script hard-fails if
+`/api/v1/health` doesn't report `"av":true` after restart — if it fails,
+the deploy failed, fix the build before doing anything else.
 
 ## Hotspot Analysis
 

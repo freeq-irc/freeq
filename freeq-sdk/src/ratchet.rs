@@ -104,7 +104,10 @@ pub fn intro_of(wire: &str) -> Result<Option<Intro>, RatchetError> {
     let Some(body) = wire.strip_prefix(ENC4_PREFIX) else {
         return Ok(None);
     };
-    let field = body.split(':').next().ok_or(RatchetError::MalformedMessage)?;
+    let field = body
+        .split(':')
+        .next()
+        .ok_or(RatchetError::MalformedMessage)?;
     let bytes = B64
         .decode(field)
         .map_err(|_| RatchetError::MalformedMessage)?;
@@ -316,7 +319,11 @@ impl Session {
     /// a repeated nonce under one key breaks AES-GCM outright.
     /// Encrypt the first message of a session, carrying the key agreement's
     /// opening so the responder can derive the secret it needs to read it.
-    pub fn encrypt_first(&mut self, intro: &Intro, plaintext: &str) -> Result<String, RatchetError> {
+    pub fn encrypt_first(
+        &mut self,
+        intro: &Intro,
+        plaintext: &str,
+    ) -> Result<String, RatchetError> {
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         self.encrypt_inner(plaintext, nonce.into(), Some(intro))
     }
@@ -681,7 +688,10 @@ mod tests {
         let bob_spk = SignedPreKey::from_parts(
             1,
             bob_spk_secret,
-            bob_did_key.sign(bob_spk_public.as_bytes()).to_bytes().to_vec(),
+            bob_did_key
+                .sign(bob_spk_public.as_bytes())
+                .to_bytes()
+                .to_vec(),
         );
         let bundle = PreKeyBundle::new("did:plc:bob", &bob_identity, &bob_spk);
         let alice_identity = IdentityKeyPair::from_secret(seed(0x0a));
@@ -770,7 +780,9 @@ mod tests {
             .expect("encrypt first");
         let mut opening_bob = Session::init_bob(shared_secret, bob_spk_secret);
         assert_eq!(
-            opening_bob.decrypt(&opening_wire).expect("bob reads the opening"),
+            opening_bob
+                .decrypt(&opening_wire)
+                .expect("bob reads the opening"),
             "an opening message"
         );
 
@@ -779,7 +791,10 @@ mod tests {
         // is the point of it. That direction is covered by the round-trip
         // tests, where both sides are live.
         let bob_reply = bob.encrypt("a reply from bob").expect("bob encrypts");
-        assert_eq!(alice.decrypt(&bob_reply).expect("alice decrypts"), "a reply from bob");
+        assert_eq!(
+            alice.decrypt(&bob_reply).expect("alice decrypts"),
+            "a reply from bob"
+        );
 
         // The two KDFs, pinned on their own so a mismatch says which one.
         let (root_out, chain_out) = kdf_root(&seed(0x01), &seed(0x02));
@@ -922,13 +937,18 @@ mod tests {
         let intro = crate::ratchet::intro_of(opening["wire"].as_str().unwrap())
             .unwrap()
             .expect("an opening message carries its intro");
-        assert_eq!(hex(&intro.to_bytes()), opening["intro"]["bytes"].as_str().unwrap());
+        assert_eq!(
+            hex(&intro.to_bytes()),
+            opening["intro"]["bytes"].as_str().unwrap()
+        );
         let mut fresh_bob = Session::init_bob(
             un_hex(session["sharedSecret"].as_str().unwrap()),
             un_hex(session["bobSignedPreKeySecret"].as_str().unwrap()),
         );
         assert_eq!(
-            fresh_bob.decrypt(opening["wire"].as_str().unwrap()).unwrap(),
+            fresh_bob
+                .decrypt(opening["wire"].as_str().unwrap())
+                .unwrap(),
             opening["plaintext"].as_str().unwrap()
         );
 
@@ -1005,7 +1025,11 @@ mod tests {
             ephemeral_key: seed(0xff),
             spk_id: 1,
         };
-        let parts: Vec<&str> = wire.strip_prefix(ENC4_PREFIX).unwrap().splitn(4, ':').collect();
+        let parts: Vec<&str> = wire
+            .strip_prefix(ENC4_PREFIX)
+            .unwrap()
+            .splitn(4, ':')
+            .collect();
         let tampered = format!(
             "{ENC4_PREFIX}{}:{}:{}:{}",
             B64.encode(forged.to_bytes()),

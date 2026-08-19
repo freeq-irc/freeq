@@ -88,7 +88,12 @@ async fn a_channel_message_teaches_a_binding_the_join_never_did() {
         PrivateKey::ed25519_from_bytes(&key.secret_bytes()).unwrap(),
     ));
     let (sender, mut sender_rx) = connect(addr, "teacher", Some(signer));
-    wait_event(&mut sender_rx, |e| matches!(e, Event::Registered { .. }), "sender registered").await;
+    wait_event(
+        &mut sender_rx,
+        |e| matches!(e, Event::Registered { .. }),
+        "sender registered",
+    )
+    .await;
     sender.join("#lesson").await.unwrap();
     wait_event(
         &mut sender_rx,
@@ -100,7 +105,12 @@ async fn a_channel_message_teaches_a_binding_the_join_never_did() {
     // The cold session arrives after — it never sees the sender's JOIN, and
     // NAMES carries no DIDs, so at this point it cannot name the sender.
     let (receiver, mut receiver_rx) = connect(addr, "coldseat", None);
-    wait_event(&mut receiver_rx, |e| matches!(e, Event::Registered { .. }), "receiver registered").await;
+    wait_event(
+        &mut receiver_rx,
+        |e| matches!(e, Event::Registered { .. }),
+        "receiver registered",
+    )
+    .await;
     receiver.join("#lesson").await.unwrap();
     wait_event(
         &mut receiver_rx,
@@ -112,7 +122,10 @@ async fn a_channel_message_teaches_a_binding_the_join_never_did() {
     // The sender speaks in the channel. The server stamps the account tag on
     // that message, and the tag is the receiver's first and only chance to
     // learn who "teacher" is without asking.
-    sender.privmsg("#lesson", "the tag is the lesson").await.unwrap();
+    sender
+        .privmsg("#lesson", "the tag is the lesson")
+        .await
+        .unwrap();
 
     let ev = wait_event(
         &mut receiver_rx,

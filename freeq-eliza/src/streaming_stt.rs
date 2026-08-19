@@ -149,7 +149,9 @@ pub fn parse_final_transcript(text: &str) -> Option<String> {
 /// transcripts and closes cleanly.
 pub async fn close_stream(writer: &mut SplitSink<WsStream, Message>) -> Result<()> {
     writer
-        .send(Message::Text(r#"{"type":"CloseStream"}"#.to_string().into()))
+        .send(Message::Text(
+            r#"{"type":"CloseStream"}"#.to_string().into(),
+        ))
         .await
         .context("sending CloseStream")
 }
@@ -183,7 +185,8 @@ mod tests {
 
     #[test]
     fn drops_empty_finalised() {
-        let raw = r#"{"type":"Results","channel":{"alternatives":[{"transcript":""}]},"is_final":true}"#;
+        let raw =
+            r#"{"type":"Results","channel":{"alternatives":[{"transcript":""}]},"is_final":true}"#;
         assert!(parse_final_transcript(raw).is_none());
     }
 

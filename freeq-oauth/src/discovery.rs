@@ -226,7 +226,9 @@ mod tests {
             "pushed_authorization_request_endpoint": "https://as.example/par",
         })))
         .await;
-        let meta = discover_auth_server(&crate::SharedClient(client()), &base).await.unwrap();
+        let meta = discover_auth_server(&crate::SharedClient(client()), &base)
+            .await
+            .unwrap();
         assert_eq!(meta.issuer, "https://as.example");
         assert_eq!(meta.token_endpoint, "https://as.example/token");
         assert_eq!(
@@ -242,14 +244,22 @@ mod tests {
             get(|| async { axum::Json(serde_json::json!({ "authorization_servers": [] })) }),
         ))
         .await;
-        assert!(discover_auth_server(&crate::SharedClient(client()), &base).await.is_err());
+        assert!(
+            discover_auth_server(&crate::SharedClient(client()), &base)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn protected_resource_http_error_is_error() {
         // No routes → 404 on the well-known fetch.
         let base = spawn(Router::new()).await;
-        assert!(discover_auth_server(&crate::SharedClient(client()), &base).await.is_err());
+        assert!(
+            discover_auth_server(&crate::SharedClient(client()), &base)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -259,7 +269,11 @@ mod tests {
             get(|| async { "not json" }),
         ))
         .await;
-        assert!(discover_auth_server(&crate::SharedClient(client()), &base).await.is_err());
+        assert!(
+            discover_auth_server(&crate::SharedClient(client()), &base)
+                .await
+                .is_err()
+        );
     }
 
     // ── pushed_authorization_request ────────────────────────────────────

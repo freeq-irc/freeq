@@ -73,7 +73,8 @@ fn build_bundle_v2(
     let kid = freeq_sdk::sigtag::derive_kid(&client_vk);
     let msgid = "01KYVT5Z8Q0000000000000000";
     let venue = freeq_sdk::chatsig::channel_venue(channel);
-    let sig_tag = freeq_sdk::chatsig::ChatDoc::message(client_did, msgid, &venue, text).sign(client_key);
+    let sig_tag =
+        freeq_sdk::chatsig::ChatDoc::message(client_did, msgid, &venue, text).sign(client_key);
 
     let mut tags = serde_json::Map::new();
     tags.insert("+freeq.at/sig".into(), json!(sig_tag));
@@ -139,7 +140,10 @@ fn valid_bundle_verifies() {
     let out = run_verify(&bundle);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "expected exit 0, got: {stdout}");
-    assert!(stdout.contains("VERIFIED (legacy client key)"), "got: {stdout}");
+    assert!(
+        stdout.contains("VERIFIED (legacy client key)"),
+        "got: {stdout}"
+    );
     assert!(stdout.contains("✓ VERIFIED"));
 }
 
@@ -211,9 +215,13 @@ fn a_guest_message_in_the_bundle_is_skipped_not_fatal() {
     let kid = freeq_sdk::sigtag::derive_kid(&client_vk);
     let did = "did:plc:alice";
     let venue = freeq_sdk::chatsig::channel_venue("#freeq");
-    let sig_tag =
-        freeq_sdk::chatsig::ChatDoc::message(did, "01SIGNED000000000000000000", &venue, "signed hello")
-            .sign(&client);
+    let sig_tag = freeq_sdk::chatsig::ChatDoc::message(
+        did,
+        "01SIGNED000000000000000000",
+        &venue,
+        "signed hello",
+    )
+    .sign(&client);
 
     let mut tags = serde_json::Map::new();
     tags.insert("+freeq.at/sig".into(), json!(sig_tag.clone()));
@@ -259,7 +267,10 @@ fn a_guest_message_in_the_bundle_is_skipped_not_fatal() {
 
     let out = run_verify(&bundle);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "a guest message must not abort the bundle: {stdout}");
+    assert!(
+        out.status.success(),
+        "a guest message must not abort the bundle: {stdout}"
+    );
     assert!(stdout.contains("✓ VERIFIED"), "got: {stdout}");
 }
 
@@ -312,7 +323,10 @@ fn a_federated_edit_link_in_replaces_msgid_verifies() {
 
     let out = run_verify(&bundle);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "a federated edit (link in replaces_msgid) must verify: {stdout}");
+    assert!(
+        out.status.success(),
+        "a federated edit (link in replaces_msgid) must verify: {stdout}"
+    );
     assert!(stdout.contains("VERIFIED (client key)"), "got: {stdout}");
 }
 

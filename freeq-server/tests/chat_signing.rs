@@ -511,12 +511,90 @@ async fn a_signature_that_fails_is_not_quietly_replaced_with_the_servers() {
             .sign(&signing);
         alice.send_signed(&id, "#sig", "what I sent", &sig);
 
-        let seen = bob.rx(|l| l.contains("what I sent"), "delivery");
-        assert_eq!(
-            C::sig_of(&seen),
-            None,
+        // Neither laundered into a server signature nor delivered without the
+        // half that disagreed: refused outright.
+        assert!(
+            bob.maybe(|l| l.contains("what I sent"), 500).is_none(),
             "a signature that didn't check out must not be laundered into a \
-             server signature: {seen}"
+             server signature, and its message must not be relayed either"
+        );
+    })
+    .await;
+}
+
+/// A message whose signature fails against the key it names is evidence the
+/// bytes moved between the signer and here. It is refused rather than
+/// relayed stripped of the signature: the words and the proof arrived
+/// together and disagreed, and passing on the half that still looks fine
+/// hides exactly the fact worth knowing.
+#[tokio::test]
+async fn a_message_whose_signature_fails_is_refused_at_the_origin() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#tampered");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#tampered");
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        alice.msgsig(&signing);
+
+        // Signed over one body, sent with another — what a relay rewriting a
+        // message in flight produces.
+        let msgid = freeq_server::msgid::generate();
+        let sig = ChatDoc::message(
+            DID_ALICE,
+            &msgid,
+            &channel_venue("#tampered"),
+            "what she wrote",
+        )
+        .sign(&signing);
+        alice.tx(&format!(
+            "@{EVENT_ID_TAG}={msgid};+freeq.at/sig={sig} PRIVMSG #tampered :what arrived instead"
+        ));
+
+        let fail = alice.rx(|l| l.contains("SIGNATURE_INVALID"), "FAIL to the sender");
+        assert!(
+            fail.contains("FAIL PRIVMSG SIGNATURE_INVALID"),
+            "the refusal names the command and why: {fail}"
+        );
+        assert!(
+            bob.maybe(|l| l.contains("what arrived instead"), 500)
+                .is_none(),
+            "a message whose signature failed must not reach anyone"
+        );
+    })
+    .await;
+}
+
+/// The other two verdicts are untouched: a message nobody signed still goes,
+/// carrying this server's vouch, and so does one signed under the retired
+/// format — which no key can check and which is therefore never evidence of
+/// tampering.
+#[tokio::test]
+async fn an_uncheckable_signature_still_delivers() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#legacy");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#legacy");
+
+        // A legacy signature: a bare base64 blob over the retired canonical.
+        alice.tx("@+freeq.at/sig=bGVnYWN5c2lnbmF0dXJl PRIVMSG #legacy :from an old client");
+        let seen = bob.rx(|l| l.contains("from an old client"), "the message");
+        assert!(
+            C::sig_of(&seen).is_some(),
+            "an uncheckable signature keeps the server's vouch: {seen}"
+        );
+        assert!(
+            alice
+                .maybe(|l| l.contains("SIGNATURE_INVALID"), 300)
+                .is_none(),
+            "a signature nobody can check is not a signature that failed"
         );
     })
     .await;
@@ -550,11 +628,12 @@ async fn the_signed_venue_is_the_folded_channel_not_the_case_the_sender_typed() 
         let unfolded =
             ChatDoc::message(DID_ALICE, &id2, "#SIG", "signed the wrong venue").sign(&signing);
         alice.send_signed(&id2, "#SIG", "signed the wrong venue", &unfolded);
-        let seen2 = bob.rx(|l| l.contains("signed the wrong venue"), "delivery");
-        assert_eq!(
-            C::sig_of(&seen2),
-            None,
-            "a venue that isn't the folded one is not the venue: {seen2}"
+        alice.rx(|l| l.contains("SIGNATURE_INVALID"), "FAIL to the sender");
+        assert!(
+            bob.maybe(|l| l.contains("signed the wrong venue"), 500)
+                .is_none(),
+            "a venue that isn't the folded one is not the venue, and a \
+             signature over it does not verify"
         );
     })
     .await;
@@ -816,8 +895,7 @@ async fn a_signed_delete_relays_the_senders_own_signature() {
     let did_bob = "did:plc:sig_bob";
     let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
     run(addr, move |addr| {
-        let (mut bob, mut alice, signing, msgid) =
-            two_in_a_channel(addr, ka, kb, did_bob, "#del");
+        let (mut bob, mut alice, signing, msgid) = two_in_a_channel(addr, ka, kb, did_bob, "#del");
 
         let event_id = freeq_server::msgid::generate();
         let tags = signed_mutation_tags(
@@ -865,15 +943,8 @@ async fn a_signed_reaction_and_its_removal_relay_their_signatures() {
             (Mutation::Unreact, "+freeq.at/unreact"),
         ] {
             let event_id = freeq_server::msgid::generate();
-            let tags = signed_mutation_tags(
-                kind,
-                tag,
-                &msgid,
-                Some("👍"),
-                "#react",
-                &event_id,
-                &signing,
-            );
+            let tags =
+                signed_mutation_tags(kind, tag, &msgid, Some("👍"), "#react", &event_id, &signing);
             alice.tx(&format!("@{tags} TAGMSG #react"));
 
             let seen = bob.rx(|l| l.contains(tag), "the reaction");
@@ -953,9 +1024,14 @@ async fn an_edit_signature_that_fails_is_refused_and_never_applied() {
         // and an edit changes an existing record, so it must be refused (the
         // same rule delete/react/unreact enforce).
         let edit_id = freeq_server::msgid::generate();
-        let sig = ChatDoc::message(DID_ALICE, &edit_id, &channel_venue("#editforge"), "honest revision")
-            .with_edit(&root)
-            .sign(&signing);
+        let sig = ChatDoc::message(
+            DID_ALICE,
+            &edit_id,
+            &channel_venue("#editforge"),
+            "honest revision",
+        )
+        .with_edit(&root)
+        .sign(&signing);
         alice.tx(&format!(
             "@{EVENT_ID_TAG}={edit_id};+draft/edit={root};+freeq.at/sig={sig} \
              PRIVMSG #editforge :tampered revision"
@@ -963,12 +1039,105 @@ async fn an_edit_signature_that_fails_is_refused_and_never_applied() {
 
         alice.rx(|l| l.contains("SIGNATURE_INVALID"), "FAIL to the sender");
         assert!(
-            bob.maybe(|l| l.contains("tampered revision"), 500).is_none(),
+            bob.maybe(|l| l.contains("tampered revision"), 500)
+                .is_none(),
             "an edit whose signature failed must not reach anyone"
         );
         // The original still stands, unedited.
         assert!(
             history_of(addr, "#editforge", "first draft").is_some(),
+            "a refused edit must not have changed the original"
+        );
+    })
+    .await;
+}
+
+/// An edit is a mutation like any other: it rewrites a record that already
+/// exists, so it takes the editor's own proof. Refused rather than vouched
+/// for, and the original stands.
+#[tokio::test]
+async fn an_unsigned_edit_from_an_identity_is_refused() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#unsignededit");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#unsignededit");
+
+        let root = freeq_server::msgid::generate();
+        alice.send_with_id(&root, "#unsignededit", "first draft");
+        bob.rx(|l| l.contains("first draft"), "the original");
+
+        alice.tx(&format!(
+            "@+draft/edit={root} PRIVMSG #unsignededit :revised without proof"
+        ));
+        let fail = alice.rx(|l| l.contains("SIGNATURE_REQUIRED"), "FAIL to the sender");
+        assert!(
+            fail.contains("FAIL EDIT SIGNATURE_REQUIRED"),
+            "the refusal names the command and why: {fail}"
+        );
+        assert!(
+            bob.maybe(|l| l.contains("revised without proof"), 500)
+                .is_none(),
+            "a refused edit must not reach anyone"
+        );
+        assert!(
+            history_of(addr, "#unsignededit", "first draft").is_some(),
+            "a refused edit must not have changed the original"
+        );
+    })
+    .await;
+}
+
+/// The other half of the same rule. A signature this server cannot check —
+/// here, one naming a key nobody registered — is not proof, and an edit is
+/// refused for want of proof rather than filed on the server's word.
+#[tokio::test]
+async fn an_edit_signed_with_a_key_this_server_cannot_resolve_is_refused() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    run(addr, move |addr| {
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#unresolvable");
+        let mut alice = C::authenticated(addr, "alice", DID_ALICE, ka);
+        alice.join("#unresolvable");
+
+        let root = freeq_server::msgid::generate();
+        alice.send_with_id(&root, "#unresolvable", "first draft");
+        bob.rx(|l| l.contains("first draft"), "the original");
+
+        // Signed honestly, with a key never registered by MSGSIG: the kid
+        // resolves to nothing here, so the verdict is can't-check.
+        let stranger = SigningKey::from_bytes(&[99u8; 32]);
+        let edit_id = freeq_server::msgid::generate();
+        let sig = ChatDoc::message(
+            DID_ALICE,
+            &edit_id,
+            &channel_venue("#unresolvable"),
+            "revised with an unknown key",
+        )
+        .with_edit(&root)
+        .sign(&stranger);
+        alice.tx(&format!(
+            "@{EVENT_ID_TAG}={edit_id};+draft/edit={root};+freeq.at/sig={sig} \
+             PRIVMSG #unresolvable :revised with an unknown key"
+        ));
+
+        let fail = alice.rx(|l| l.contains("SIGNATURE_REQUIRED"), "FAIL to the sender");
+        assert!(
+            fail.contains("FAIL EDIT SIGNATURE_REQUIRED"),
+            "an unresolvable key is a missing proof, not a bad one: {fail}"
+        );
+        assert!(
+            bob.maybe(|l| l.contains("revised with an unknown key"), 500)
+                .is_none(),
+            "a refused edit must not reach anyone"
+        );
+        assert!(
+            history_of(addr, "#unresolvable", "first draft").is_some(),
             "a refused edit must not have changed the original"
         );
     })
@@ -1015,7 +1184,9 @@ async fn a_signed_multiline_edit_verifies_and_a_tampered_one_is_refused() {
             "the honest edit is delivered, not refused",
         );
         assert!(
-            alice.maybe(|l| l.contains("SIGNATURE_INVALID"), 500).is_none(),
+            alice
+                .maybe(|l| l.contains("SIGNATURE_INVALID"), 500)
+                .is_none(),
             "an honest signed multiline edit must not be refused"
         );
 
@@ -1025,10 +1196,14 @@ async fn a_signed_multiline_edit_verifies_and_a_tampered_one_is_refused() {
         // (so the honest case above is delivered because it verified, not
         // because the signature went unread).
         let edit_id2 = freeq_server::msgid::generate();
-        let bad_sig =
-            ChatDoc::message(DID_ALICE, &edit_id2, &channel_venue("#mlsig"), "a different body")
-                .with_edit(&root)
-                .sign(&signing);
+        let bad_sig = ChatDoc::message(
+            DID_ALICE,
+            &edit_id2,
+            &channel_venue("#mlsig"),
+            "a different body",
+        )
+        .with_edit(&root)
+        .sign(&signing);
         alice.tx(&format!(
             "@{EVENT_ID_TAG}={edit_id2};+draft/edit={root};+freeq.at/sig={bad_sig} \
              BATCH +f draft/multiline #mlsig"
@@ -1054,10 +1229,8 @@ async fn a_guest_cannot_attach_a_mutation_signature() {
         let mut guest = C::guest(addr, "nobody");
         guest.join("#guestreact");
 
-        guest.tx(
-            "@+react=👍;+reply=01SOMEMESSAGE000000000000;\
-             +freeq.at/sig=ed25519:AAAAAAAAAAAAAAAAAAAAAA:AAAA TAGMSG #guestreact",
-        );
+        guest.tx("@+react=👍;+reply=01SOMEMESSAGE000000000000;\
+             +freeq.at/sig=ed25519:AAAAAAAAAAAAAAAAAAAAAA:AAAA TAGMSG #guestreact");
         let seen = watcher.rx(|l| l.contains("+react"), "the reaction");
         assert_eq!(
             C::sig_of(&seen),
@@ -1068,35 +1241,121 @@ async fn a_guest_cannot_attach_a_mutation_signature() {
     .await;
 }
 
-/// An unsigned mutation from an identity is vouched for by the server, the
-/// same way an unsigned message is. The note means the same thing in both
-/// cases — *this server saw this authenticated account do this* — and a
-/// reader tells a vouch from a device's proof by the key each names.
+/// Changing an existing message takes the sender's own proof. A server
+/// signature over someone else's delete says only that this server believes
+/// them, and a reader cannot tell that from the act itself — so the act is
+/// refused rather than vouched for.
 #[tokio::test]
-async fn an_unsigned_delete_is_vouched_for_by_the_server() {
+async fn an_unsigned_delete_from_an_identity_is_refused() {
     let (ka, kb) = (key(), key());
     let did_bob = "did:plc:sig_bob";
     let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
     run(addr, move |addr| {
-        let (mut bob, mut alice, signing, msgid) =
+        let (mut bob, mut alice, _signing, msgid) =
             two_in_a_channel(addr, ka, kb, did_bob, "#plain");
 
         alice.tx(&format!("@+draft/delete={msgid} TAGMSG #plain"));
-        let seen = bob.rx(|l| l.contains("+draft/delete"), "the delete");
-        let sig = C::sig_of(&seen).expect("the server vouches for it");
-        let (kid, _) = freeq_sdk::sigtag::parse(&sig).expect("sig tag is alg:kid:sig");
-        assert_ne!(
-            kid,
-            freeq_sdk::sigtag::derive_kid(&signing.verifying_key()),
-            "a server vouch must not claim to be the sender's key: {seen}"
+        let fail = alice.rx(|l| l.contains("SIGNATURE_REQUIRED"), "FAIL to the sender");
+        assert!(
+            fail.contains("FAIL TAGMSG SIGNATURE_REQUIRED"),
+            "the refusal names the command and why: {fail}"
         );
         assert!(
-            seen.contains(EVENT_ID_TAG),
-            "a signature covers an id, so the act gets one: {seen}"
+            bob.maybe(|l| l.contains("+draft/delete"), 500).is_none(),
+            "a refused delete must not reach anyone"
         );
-        assert!(seen.contains(&msgid), "the delete still names its subject: {seen}");
+        // And it deleted nothing.
+        alice.tx("CHATHISTORY LATEST #plain * 10");
+        assert!(
+            alice.maybe(|l| l.contains("act on me"), 1000).is_some(),
+            "a refused delete must not have deleted anything"
+        );
     })
     .await;
+}
+
+/// The same rule for a reaction, which had no refusal branch at all: an
+/// unsigned one from an identity is refused, and no row is written.
+#[tokio::test]
+async fn an_unsigned_reaction_from_an_identity_is_refused() {
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, db_path, _h) =
+        start_with_db(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    let db_for_test = db_path.clone();
+    run(addr, move |addr| {
+        let (mut bob, mut alice, _signing, msgid) =
+            two_in_a_channel(addr, ka, kb, did_bob, "#unsignedreact");
+
+        alice.tx(&format!("@+react=👍;+reply={msgid} TAGMSG #unsignedreact"));
+        let fail = alice.rx(|l| l.contains("SIGNATURE_REQUIRED"), "FAIL to the sender");
+        assert!(
+            fail.contains("FAIL TAGMSG SIGNATURE_REQUIRED"),
+            "the refusal names the command and why: {fail}"
+        );
+        assert!(
+            bob.maybe(|l| l.contains("+react"), 500).is_none(),
+            "a refused reaction must not reach anyone"
+        );
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let conn = rusqlite::Connection::open(&db_for_test).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM reactions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "a refused reaction must file nothing");
+}
+
+/// And for taking one back. The signed reaction lands first, so what this
+/// pins is that the refusal leaves it standing rather than removing it.
+#[tokio::test]
+async fn an_unsigned_unreaction_from_an_identity_is_refused() {
+    use freeq_sdk::chatsig::Mutation;
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, db_path, _h) =
+        start_with_db(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    let db_for_test = db_path.clone();
+    run(addr, move |addr| {
+        let (mut bob, mut alice, signing, msgid) =
+            two_in_a_channel(addr, ka, kb, did_bob, "#unsignedunreact");
+
+        let event_id = freeq_server::msgid::generate();
+        let tags = signed_mutation_tags(
+            Mutation::React,
+            "+react",
+            &msgid,
+            Some("👍"),
+            "#unsignedunreact",
+            &event_id,
+            &signing,
+        );
+        alice.tx(&format!("@{tags} TAGMSG #unsignedunreact"));
+        bob.rx(|l| l.contains("+react"), "the signed reaction");
+
+        alice.tx(&format!(
+            "@+freeq.at/unreact=👍;+reply={msgid} TAGMSG #unsignedunreact"
+        ));
+        let fail = alice.rx(|l| l.contains("SIGNATURE_REQUIRED"), "FAIL to the sender");
+        assert!(
+            fail.contains("FAIL TAGMSG SIGNATURE_REQUIRED"),
+            "the refusal names the command and why: {fail}"
+        );
+        assert!(
+            bob.maybe(|l| l.contains("unreact"), 500).is_none(),
+            "a refused unreaction must not reach anyone"
+        );
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let conn = rusqlite::Connection::open(&db_for_test).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM reactions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "a refused unreaction must not remove the reaction");
 }
 
 /// A guest has no identity to bind, so there is nothing to vouch for and
@@ -1245,19 +1504,19 @@ async fn a_signature_that_failed_is_not_replayed_by_history() {
         alice.msgsig(&signing);
 
         let id = freeq_server::msgid::generate();
-        let sig = ChatDoc::message(DID_ALICE, &id, &channel_venue("#notlaundered"), "what I signed")
-            .sign(&signing);
+        let sig = ChatDoc::message(
+            DID_ALICE,
+            &id,
+            &channel_venue("#notlaundered"),
+            "what I signed",
+        )
+        .sign(&signing);
         alice.send_signed(&id, "#notlaundered", "what I sent", &sig);
-        let live = bob.rx(|l| l.contains("what I sent"), "live delivery");
-        assert_eq!(C::sig_of(&live), None, "live delivery strips it: {live}");
+        alice.rx(|l| l.contains("SIGNATURE_INVALID"), "FAIL to the sender");
 
-        let replayed =
-            history_of(addr, "#notlaundered", "what I sent").expect("history replays the message");
-        assert_eq!(
-            C::sig_of(&replayed),
-            None,
-            "and history must not resurrect a signature the server refused to \
-             stand behind: {replayed}"
+        assert!(
+            history_of(addr, "#notlaundered", "what I sent").is_none(),
+            "a message the server refused must not be on file to replay"
         );
     })
     .await;
@@ -1310,14 +1569,9 @@ async fn a_replayed_edit_carries_the_signature_over_its_own_revision() {
         // message it revises.
         let edit_id = freeq_server::msgid::generate();
         let revised = "second draft";
-        let sig = ChatDoc::message(
-            DID_ALICE,
-            &edit_id,
-            &channel_venue("#editreplay"),
-            revised,
-        )
-        .with_edit(&root)
-        .sign(&signing);
+        let sig = ChatDoc::message(DID_ALICE, &edit_id, &channel_venue("#editreplay"), revised)
+            .with_edit(&root)
+            .sign(&signing);
         alice.tx(&format!(
             "@{EVENT_ID_TAG}={edit_id};+draft/edit={root};+freeq.at/sig={sig} \
              PRIVMSG #editreplay :{revised}"
@@ -1377,7 +1631,11 @@ fn events_in(db_path: &str, venue: &str) -> Vec<(String, String, Option<String>,
 /// A server whose database file the test can read back.
 async fn start_with_db(
     resolver: DidResolver,
-) -> (SocketAddr, String, tokio::task::JoinHandle<anyhow::Result<()>>) {
+) -> (
+    SocketAddr,
+    String,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let db_path = tmp.path().to_str().unwrap().to_string();
     std::mem::forget(tmp);
@@ -1482,7 +1740,10 @@ async fn an_unreaction_leaves_the_event_that_removed_the_reaction() {
     for (kind, _, actor, signature) in &events {
         if kind == "react" || kind == "unreact" {
             assert_eq!(actor.as_deref(), Some(DID_ALICE), "{kind} names its actor");
-            assert!(signature.is_some(), "{kind} keeps the signature that made it");
+            assert!(
+                signature.is_some(),
+                "{kind} keeps the signature that made it"
+            );
         }
     }
 
@@ -1493,6 +1754,60 @@ async fn an_unreaction_leaves_the_event_that_removed_the_reaction() {
         .query_row("SELECT COUNT(*) FROM reactions", [], |r| r.get(0))
         .unwrap();
     assert_eq!(live, 0, "the reaction was taken back");
+}
+
+/// A reaction from outside a `+n` channel is refused at the door, and the
+/// door is what the row has to be behind: filing first left a reaction on
+/// file that no member ever received, visible to everyone on the next join.
+#[tokio::test]
+async fn a_non_members_reaction_leaves_nothing_behind() {
+    use freeq_sdk::chatsig::Mutation;
+    let (ka, kb) = (key(), key());
+    let did_bob = "did:plc:sig_bob";
+    let (addr, db_path, _h) =
+        start_with_db(resolver_with(vec![(DID_ALICE, &ka), (did_bob, &kb)])).await;
+    let db_for_test = db_path.clone();
+    run(addr, move |addr| {
+        // Bob owns the channel; alice never joins it. `+n` is on by default.
+        let mut bob = C::authenticated(addr, "bob", did_bob, kb);
+        bob.join("#members");
+        let msgid = freeq_server::msgid::generate();
+        bob.tx(&format!(
+            "@{EVENT_ID_TAG}={msgid} PRIVMSG #members :members only"
+        ));
+        bob.rx(|l| l.contains("members only"), "bob's message");
+
+        let mut outsider = C::authenticated(addr, "alice", DID_ALICE, ka);
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        outsider.msgsig(&signing);
+        let event_id = freeq_server::msgid::generate();
+        let tags = signed_mutation_tags(
+            Mutation::React,
+            "+react",
+            &msgid,
+            Some("👍"),
+            "#members",
+            &event_id,
+            &signing,
+        );
+        outsider.tx(&format!("@{tags} TAGMSG #members"));
+        outsider.rx(|l| l.contains("Cannot send to channel"), "the +n refusal");
+        assert!(
+            bob.maybe(|l| l.contains("+react"), 500).is_none(),
+            "a non-member's reaction must not reach the channel"
+        );
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let conn = rusqlite::Connection::open(&db_for_test).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM reactions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        rows, 0,
+        "a reaction nobody received must not be on file either"
+    );
 }
 
 /// The log records events, not signatures. A guest has no identity to bind and
@@ -1626,13 +1941,12 @@ async fn the_verify_endpoint_answers_for_a_mutation_event() {
     // The broadcast races the row by a hair; give the write a beat.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let v: serde_json::Value =
-        reqwest::get(format!("http://{web_addr}/api/v1/verify/{event_id}"))
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+    let v: serde_json::Value = reqwest::get(format!("http://{web_addr}/api/v1/verify/{event_id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(v["kind"], "react", "the filed act, by name: {v}");
     assert_eq!(v["actor_did"], DID_ALICE);
     assert_eq!(v["subject"], msgid.as_str());
@@ -1707,7 +2021,12 @@ async fn a_signed_dm_mutation_is_filed_under_the_venue_its_signature_covers() {
         let mut filed = Vec::new();
         for (kind, name, tag, emoji) in [
             (Mutation::React, "react", "+react", Some("👍")),
-            (Mutation::Unreact, "unreact", "+freeq.at/unreact", Some("👍")),
+            (
+                Mutation::Unreact,
+                "unreact",
+                "+freeq.at/unreact",
+                Some("👍"),
+            ),
             (Mutation::Delete, "delete", "+draft/delete", None),
         ] {
             let event_id = freeq_server::msgid::generate();
@@ -1771,7 +2090,11 @@ async fn a_signed_dm_mutation_is_filed_under_the_venue_its_signature_covers() {
 async fn start_web(
     resolver: DidResolver,
     name: &str,
-) -> (SocketAddr, SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>) {
+) -> (
+    SocketAddr,
+    SocketAddr,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let db_path = tmp.path().to_str().unwrap().to_string();
     std::mem::forget(tmp); // outlives the server
@@ -1807,8 +2130,9 @@ fn signed_coordination_tags(
         doc = doc.with_ref(ref_id);
     }
     let sig = doc.sign(signing);
-    let mut tags =
-        format!("+freeq.at/event={event_type};+freeq.at/payload={payload};{EVENT_ID_TAG}={event_id}");
+    let mut tags = format!(
+        "+freeq.at/event={event_type};+freeq.at/payload={payload};{EVENT_ID_TAG}={event_id}"
+    );
     if let Some(ref_id) = ref_id {
         tags.push_str(&format!(";+freeq.at/ref={ref_id}"));
     }
@@ -1892,12 +2216,13 @@ async fn a_signed_coordination_event_is_filed_under_the_id_it_signed() {
 
     // The reference survives as the event's subject, so a reader can walk
     // from a completion to the work it completed.
-    let done: serde_json::Value = reqwest::get(format!("http://{web_addr}/api/v1/verify/{done_id}"))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let done: serde_json::Value =
+        reqwest::get(format!("http://{web_addr}/api/v1/verify/{done_id}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
     assert_eq!(done["subject"], task_id, "{done}");
     assert_eq!(done["verification"]["verdict"], "valid", "{done}");
 
@@ -2169,8 +2494,10 @@ async fn a_re_filed_event_leaves_the_card_and_the_log_agreeing() {
     let rows = events["events"].as_array().unwrap();
 
     for id in [&same, &differing] {
-        let filed: Vec<&serde_json::Value> =
-            rows.iter().filter(|e| e["event_id"] == id.as_str()).collect();
+        let filed: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|e| e["event_id"] == id.as_str())
+            .collect();
         assert_eq!(filed.len(), 1, "one id, one card: {events}");
         assert_eq!(
             filed[0]["payload"]["budget"], 1,
@@ -2239,7 +2566,8 @@ async fn both_halves_of_a_signed_pair_relay_with_signatures_intact() {
         let doc = ChatDoc::message(DID_ALICE, &message_id, &venue, body)
             .with_coord([("+freeq.at/event", "task_request")]);
         assert!(
-            doc.canonical().contains(r#""coord":{"event":"task_request"}"#),
+            doc.canonical()
+                .contains(r#""coord":{"event":"task_request"}"#),
             "the message document must cover the event tag: {}",
             doc.canonical()
         );
@@ -2323,7 +2651,10 @@ async fn an_evidence_event_is_verified_with_the_type_it_names() {
         v["verification"]["verdict"], "valid",
         "the server rebuilt the same document the sender signed: {v}"
     );
-    assert_eq!(v["verification"]["verified_by"], "client-session-key", "{v}");
+    assert_eq!(
+        v["verification"]["verified_by"], "client-session-key",
+        "{v}"
+    );
     assert!(
         v["canonical_form"]
             .as_str()
@@ -2366,7 +2697,14 @@ async fn a_signature_this_server_cannot_check_yet_is_kept_and_answered_honestly(
         // resolve the kid this names.
         alice.tx(&format!(
             "@{} TAGMSG #unver",
-            signed_coordination_tags("#unver", &sent_id, "task_request", "%7B%7D", None, &sending_key)
+            signed_coordination_tags(
+                "#unver",
+                &sent_id,
+                "task_request",
+                "%7B%7D",
+                None,
+                &sending_key
+            )
         ));
         bob.rx(|l| l.contains("task_request"), "the event still relays");
         alice

@@ -17,10 +17,10 @@ use futures_util::StreamExt;
 use iroh_live::media::format::AudioFormat;
 use tokio_tungstenite::tungstenite::Message;
 
-use freeq_eliza::stt::to_whisper_pcm;
 use freeq_eliza::streaming_stt::{
     StreamingSttConfig, close_stream, connect, f32_mono_to_i16le, parse_final_transcript,
 };
+use freeq_eliza::stt::to_whisper_pcm;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,7 +29,9 @@ async fn main() -> Result<()> {
     // because main.rs installs this; the standalone example must too).
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let path = std::env::args().nth(1).context("usage: stream_probe <wav>")?;
+    let path = std::env::args()
+        .nth(1)
+        .context("usage: stream_probe <wav>")?;
     let key = std::env::var("DEEPGRAM_API_KEY").context("DEEPGRAM_API_KEY not set")?;
 
     // Read the WAV; strip a 44-byte RIFF header if present, else treat
@@ -54,7 +56,13 @@ async fn main() -> Result<()> {
 
     // EXACT tap conditioning: resample/sanitise (no-op at 16k mono) then
     // pack to linear16 in the same per-chunk shape as the live feed.
-    let pcm = to_whisper_pcm(&samples, AudioFormat { sample_rate: 16_000, channel_count: 1 });
+    let pcm = to_whisper_pcm(
+        &samples,
+        AudioFormat {
+            sample_rate: 16_000,
+            channel_count: 1,
+        },
+    );
 
     let cfg = StreamingSttConfig::nova_3(key);
     let (mut writer, mut reader) = connect(&cfg).await.context("deepgram connect")?;
@@ -105,10 +113,7 @@ async fn main() -> Result<()> {
 }
 
 async fn send_chunk(
-    writer: &mut futures_util::stream::SplitSink<
-        freeq_eliza::streaming_stt::WsStream,
-        Message,
-    >,
+    writer: &mut futures_util::stream::SplitSink<freeq_eliza::streaming_stt::WsStream, Message>,
     chunk: &[f32],
 ) -> Result<()> {
     freeq_eliza::streaming_stt::send_pcm(writer, f32_mono_to_i16le(chunk)).await

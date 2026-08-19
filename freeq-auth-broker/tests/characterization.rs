@@ -18,9 +18,9 @@ use axum::body::Bytes;
 use axum::http::HeaderMap;
 use base64::Engine;
 use freeq_auth_broker::{
-    BrokerConfig, BrokerSessionRecord, BrokerState, DpopKey, PendingAuth, RemoteWriter, SqliteStore,
-    build_client_id, decrypt_field, derive_encryption_key, encrypt_field, is_valid_return_to,
-    router, sign_body,
+    BrokerConfig, BrokerSessionRecord, BrokerState, DpopKey, PendingAuth, RemoteWriter,
+    SqliteStore, build_client_id, decrypt_field, derive_encryption_key, encrypt_field,
+    is_valid_return_to, router, sign_body,
 };
 use tokio::sync::Mutex;
 
@@ -186,15 +186,18 @@ fn mock_freeq_server(cap: Arc<std::sync::Mutex<ServerCapture>>) -> axum::Router 
                 let cap = cap_wt.clone();
                 async move {
                     if !verify_push_signature(&headers, &body) {
-                        return (axum::http::StatusCode::UNAUTHORIZED, "bad signature").into_response();
+                        return (axum::http::StatusCode::UNAUTHORIZED, "bad signature")
+                            .into_response();
                     }
                     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
                     let mut c = cap.lock().unwrap();
                     c.web_token_bodies.push(json);
                     if c.fail_web_token {
-                        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+                        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom")
+                            .into_response();
                     }
-                    axum::Json(serde_json::json!({"token": "WEBTOK", "nick": "alice"})).into_response()
+                    axum::Json(serde_json::json!({"token": "WEBTOK", "nick": "alice"}))
+                        .into_response()
                 }
             }),
         )
@@ -204,11 +207,13 @@ fn mock_freeq_server(cap: Arc<std::sync::Mutex<ServerCapture>>) -> axum::Router 
                 let cap = cap_sess.clone();
                 async move {
                     if !verify_push_signature(&headers, &body) {
-                        return (axum::http::StatusCode::UNAUTHORIZED, "bad signature").into_response();
+                        return (axum::http::StatusCode::UNAUTHORIZED, "bad signature")
+                            .into_response();
                     }
                     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
                     cap.lock().unwrap().session_bodies.push(json);
-                    axum::Json(serde_json::json!({"ok": true, "upload_token": "UPTOK"})).into_response()
+                    axum::Json(serde_json::json!({"ok": true, "upload_token": "UPTOK"}))
+                        .into_response()
                 }
             }),
         )
@@ -240,7 +245,10 @@ fn mock_token_endpoint(cap: Arc<std::sync::Mutex<ExchangeCapture>>) -> axum::Rou
                 let form: std::collections::HashMap<String, String> =
                     serde_urlencoded::from_bytes(&body).unwrap();
                 let proof = jwt_payload(headers.get("dpop").unwrap().to_str().unwrap());
-                let proof_nonce = proof.get("nonce").and_then(|n| n.as_str()).map(String::from);
+                let proof_nonce = proof
+                    .get("nonce")
+                    .and_then(|n| n.as_str())
+                    .map(String::from);
                 let (required, delay_ms) = {
                     let mut c = cap.lock().unwrap();
                     c.requests.push((form, proof));
@@ -300,7 +308,10 @@ fn mock_refresh_endpoint(state: Arc<std::sync::Mutex<RefreshState>>) -> axum::Ro
                 let form: std::collections::HashMap<String, String> =
                     serde_urlencoded::from_bytes(&body).unwrap();
                 let token = form.get("refresh_token").cloned().unwrap_or_default();
-                assert_eq!(form.get("grant_type").map(String::as_str), Some("refresh_token"));
+                assert_eq!(
+                    form.get("grant_type").map(String::as_str),
+                    Some("refresh_token")
+                );
                 let mut s = state.lock().unwrap();
                 s.seen.push(token.clone());
                 match s.mode {
@@ -351,24 +362,26 @@ fn mock_pds(cap: Arc<std::sync::Mutex<PdsCapture>>) -> axum::Router {
     use axum::routing::post;
     axum::Router::new().route(
         "/xrpc/{method}",
-        post(move |Path(method): Path<String>, headers: HeaderMap, body: Bytes| {
-            let cap = cap.clone();
-            async move {
-                let auth = headers
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-                let proof = jwt_payload(headers.get("dpop").unwrap().to_str().unwrap());
-                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                cap.lock().unwrap().calls.push((method, auth, proof, json));
-                axum::Json(serde_json::json!({
-                    "uri": "at://did:plc:alice123/app.bsky.graph.follow/3kabc",
-                    "cid": "bafyfake",
-                }))
-                .into_response()
-            }
-        }),
+        post(
+            move |Path(method): Path<String>, headers: HeaderMap, body: Bytes| {
+                let cap = cap.clone();
+                async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let proof = jwt_payload(headers.get("dpop").unwrap().to_str().unwrap());
+                    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    cap.lock().unwrap().calls.push((method, auth, proof, json));
+                    axum::Json(serde_json::json!({
+                        "uri": "at://did:plc:alice123/app.bsky.graph.follow/3kabc",
+                        "cid": "bafyfake",
+                    }))
+                    .into_response()
+                }
+            },
+        ),
     )
 }
 
@@ -406,9 +419,15 @@ fn return_to_allowlist() {
 
 #[test]
 fn client_id_loopback_vs_production() {
-    let prod = build_client_id("https://auth.freeq.at", "https://auth.freeq.at/auth/callback");
+    let prod = build_client_id(
+        "https://auth.freeq.at",
+        "https://auth.freeq.at/auth/callback",
+    );
     assert_eq!(prod, "https://auth.freeq.at/client-metadata.json");
-    let local = build_client_id("http://127.0.0.1:8081", "http://127.0.0.1:8081/auth/callback");
+    let local = build_client_id(
+        "http://127.0.0.1:8081",
+        "http://127.0.0.1:8081/auth/callback",
+    );
     assert!(local.starts_with("http://localhost?redirect_uri="));
     assert!(local.contains("scope="));
 }
@@ -450,7 +469,12 @@ async fn dpop_proof_shape() {
     // Round-trips through base64url.
     let restored = DpopKey::from_base64url(&key.to_base64url()).unwrap();
     let proof = restored
-        .proof("POST", "https://pds.example/token", Some("N1"), Some("ATOK"))
+        .proof(
+            "POST",
+            "https://pds.example/token",
+            Some("N1"),
+            Some("ATOK"),
+        )
         .unwrap();
     let payload = jwt_payload(&proof);
     assert_eq!(payload["htm"], "POST");
@@ -493,7 +517,10 @@ async fn client_metadata_document() {
         .json()
         .await
         .unwrap();
-    assert_eq!(json["client_id"], "https://auth.test.example/client-metadata.json");
+    assert_eq!(
+        json["client_id"],
+        "https://auth.test.example/client-metadata.json"
+    );
     assert_eq!(
         json["redirect_uris"],
         serde_json::json!(["https://auth.test.example/auth/callback"])
@@ -503,7 +530,10 @@ async fn client_metadata_document() {
         json["scope"],
         "atproto blob:image/* repo:app.bsky.actor.profile repo:blue.irc.media?action=create repo:app.bsky.feed.post transition:generic"
     );
-    assert_eq!(json["grant_types"], serde_json::json!(["authorization_code", "refresh_token"]));
+    assert_eq!(
+        json["grant_types"],
+        serde_json::json!(["authorization_code", "refresh_token"])
+    );
     assert_eq!(json["token_endpoint_auth_method"], "none");
     assert_eq!(json["dpop_bound_access_tokens"], true);
 }
@@ -518,7 +548,12 @@ async fn callback_happy_path_web() {
     let token_url = spawn(mock_token_endpoint(exch.clone())).await;
 
     let state = broker_state(&server_url);
-    seed_pending(&state, "st1", pending(&format!("{token_url}/token"), "https://pds.example")).await;
+    seed_pending(
+        &state,
+        "st1",
+        pending(&format!("{token_url}/token"), "https://pds.example"),
+    )
+    .await;
     let base = spawn(router(state.clone())).await;
 
     let resp = http()
@@ -548,8 +583,14 @@ async fn callback_happy_path_web() {
         assert_eq!(form["grant_type"], "authorization_code");
         assert_eq!(form["code"], "CODE1");
         assert_eq!(form["code_verifier"], "test-verifier");
-        assert_eq!(form["client_id"], "https://auth.test.example/client-metadata.json");
-        assert_eq!(form["redirect_uri"], "https://auth.test.example/auth/callback");
+        assert_eq!(
+            form["client_id"],
+            "https://auth.test.example/client-metadata.json"
+        );
+        assert_eq!(
+            form["redirect_uri"],
+            "https://auth.test.example/auth/callback"
+        );
     }
 
     // Both pushes hit the server with VALID HMAC signatures (the mock
@@ -566,7 +607,11 @@ async fn callback_happy_path_web() {
     // The session persisted and round-trips through the store (encryption at
     // rest is pinned separately by the SqliteStore unit test in lib.rs).
     {
-        let rec = state.store.get(&broker_token).await.expect("session stored");
+        let rec = state
+            .store
+            .get(&broker_token)
+            .await
+            .expect("session stored");
         assert_eq!(rec.refresh_token, "REFRESH1");
         assert_eq!(rec.did, "did:plc:alice123");
     }
@@ -581,9 +626,16 @@ async fn callback_happy_path_web() {
         .send()
         .await
         .unwrap();
-    assert!(replay.status().is_redirection(), "replay got {}", replay.status());
+    assert!(
+        replay.status().is_redirection(),
+        "replay got {}",
+        replay.status()
+    );
     let replay_loc = replay.headers()["location"].to_str().unwrap().to_string();
-    assert_eq!(replay_loc, loc, "duplicate callback replays the same redirect");
+    assert_eq!(
+        replay_loc, loc,
+        "duplicate callback replays the same redirect"
+    );
     // ...and did NOT re-run the single-use token exchange.
     assert_eq!(
         exch.lock().unwrap().requests.len(),
@@ -605,20 +657,45 @@ async fn callback_sequential_duplicate_replays_and_no_reexchange() {
     let token_url = spawn(mock_token_endpoint(exch.clone())).await;
 
     let state = broker_state(&server_url);
-    seed_pending(&state, "st1", pending(&format!("{token_url}/token"), "https://pds.example")).await;
+    seed_pending(
+        &state,
+        "st1",
+        pending(&format!("{token_url}/token"), "https://pds.example"),
+    )
+    .await;
     let base = spawn(router(state)).await;
 
-    let first = http().get(format!("{base}/auth/callback?state=st1&code=CODE1")).send().await.unwrap();
+    let first = http()
+        .get(format!("{base}/auth/callback?state=st1&code=CODE1"))
+        .send()
+        .await
+        .unwrap();
     let first_loc = first.headers()["location"].to_str().unwrap().to_string();
 
     // Three more hits with the same state — all replay the same redirect.
     for i in 0..3 {
-        let dup = http().get(format!("{base}/auth/callback?state=st1&code=CODE1")).send().await.unwrap();
-        assert!(dup.status().is_redirection(), "dup {i} got {}", dup.status());
-        assert_eq!(dup.headers()["location"].to_str().unwrap(), first_loc, "dup {i} redirect");
+        let dup = http()
+            .get(format!("{base}/auth/callback?state=st1&code=CODE1"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            dup.status().is_redirection(),
+            "dup {i} got {}",
+            dup.status()
+        );
+        assert_eq!(
+            dup.headers()["location"].to_str().unwrap(),
+            first_loc,
+            "dup {i} redirect"
+        );
     }
     // The single-use code was exchanged exactly once across all four requests.
-    assert_eq!(exch.lock().unwrap().requests.len(), 1, "code exchanged more than once");
+    assert_eq!(
+        exch.lock().unwrap().requests.len(),
+        1,
+        "code exchanged more than once"
+    );
 }
 
 /// CONCURRENT duplicates — two callbacks for the same state arrive WHILE the
@@ -635,26 +712,39 @@ async fn callback_concurrent_duplicates_both_succeed() {
     let token_url = spawn(mock_token_endpoint(exch.clone())).await;
 
     let state = broker_state(&server_url);
-    seed_pending(&state, "st1", pending(&format!("{token_url}/token"), "https://pds.example")).await;
+    seed_pending(
+        &state,
+        "st1",
+        pending(&format!("{token_url}/token"), "https://pds.example"),
+    )
+    .await;
     let base = spawn(router(state)).await;
 
     let url = format!("{base}/auth/callback?state=st1&code=CODE1");
-    let (a, b) = tokio::join!(
-        async { http().get(&url).send().await.unwrap() },
-        async {
-            // Stagger slightly so B lands inside A's exchange window.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            http().get(&url).send().await.unwrap()
-        },
-    );
+    let (a, b) = tokio::join!(async { http().get(&url).send().await.unwrap() }, async {
+        // Stagger slightly so B lands inside A's exchange window.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        http().get(&url).send().await.unwrap()
+    },);
 
     for (name, resp) in [("A", a), ("B", b)] {
-        assert!(resp.status().is_redirection(), "{name} got {} (expected redirect)", resp.status());
+        assert!(
+            resp.status().is_redirection(),
+            "{name} got {} (expected redirect)",
+            resp.status()
+        );
         let loc = resp.headers()["location"].to_str().unwrap();
-        assert!(loc.starts_with("https://irc.freeq.at#oauth="), "{name} redirect: {loc}");
+        assert!(
+            loc.starts_with("https://irc.freeq.at#oauth="),
+            "{name} redirect: {loc}"
+        );
     }
     // Exactly one code exchange despite two concurrent callbacks.
-    assert_eq!(exch.lock().unwrap().requests.len(), 1, "concurrent duplicates re-exchanged the code");
+    assert_eq!(
+        exch.lock().unwrap().requests.len(),
+        1,
+        "concurrent duplicates re-exchanged the code"
+    );
 }
 
 /// A genuinely unknown state (never seen) must STILL error — idempotency
@@ -666,8 +756,15 @@ async fn callback_unknown_state_still_errors() {
     let state = broker_state(&server_url);
     let base = spawn(router(state)).await;
 
-    let resp = http().get(format!("{base}/auth/callback?state=never-seen&code=X")).send().await.unwrap();
-    assert!(!resp.status().is_redirection(), "unknown state must not redirect");
+    let resp = http()
+        .get(format!("{base}/auth/callback?state=never-seen&code=X"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !resp.status().is_redirection(),
+        "unknown state must not redirect"
+    );
     assert!(resp.text().await.unwrap().contains("Invalid OAuth state"));
 }
 
@@ -680,12 +777,25 @@ async fn callback_replay_is_scoped_to_its_state() {
     let token_url = spawn(mock_token_endpoint(exch)).await;
 
     let state = broker_state(&server_url);
-    seed_pending(&state, "st1", pending(&format!("{token_url}/token"), "https://pds.example")).await;
+    seed_pending(
+        &state,
+        "st1",
+        pending(&format!("{token_url}/token"), "https://pds.example"),
+    )
+    .await;
     let base = spawn(router(state)).await;
 
     // Complete st1, then hit a DIFFERENT unknown state — it must error.
-    let _ = http().get(format!("{base}/auth/callback?state=st1&code=CODE1")).send().await.unwrap();
-    let other = http().get(format!("{base}/auth/callback?state=st2&code=CODE1")).send().await.unwrap();
+    let _ = http()
+        .get(format!("{base}/auth/callback?state=st1&code=CODE1"))
+        .send()
+        .await
+        .unwrap();
+    let other = http()
+        .get(format!("{base}/auth/callback?state=st2&code=CODE1"))
+        .send()
+        .await
+        .unwrap();
     assert!(!other.status().is_redirection());
     assert!(other.text().await.unwrap().contains("Invalid OAuth state"));
 }
@@ -731,7 +841,12 @@ async fn callback_nonce_retry_dance() {
     let token_url = spawn(mock_token_endpoint(exch.clone())).await;
 
     let state = broker_state(&server_url);
-    seed_pending(&state, "st1", pending(&format!("{token_url}/token"), "https://pds.example")).await;
+    seed_pending(
+        &state,
+        "st1",
+        pending(&format!("{token_url}/token"), "https://pds.example"),
+    )
+    .await;
     let base = spawn(router(state)).await;
 
     let resp = http()
@@ -789,7 +904,12 @@ async fn callback_degrades_to_identity_only_when_server_push_fails() {
     let token_url = spawn(mock_token_endpoint(exch)).await;
 
     let state = broker_state(&server_url);
-    seed_pending(&state, "st1", pending(&format!("{token_url}/token"), "https://pds.example")).await;
+    seed_pending(
+        &state,
+        "st1",
+        pending(&format!("{token_url}/token"), "https://pds.example"),
+    )
+    .await;
     let base = spawn(router(state)).await;
 
     let resp = http()
@@ -811,7 +931,9 @@ async fn callback_error_paths() {
 
     // Upstream OAuth error → friendly page, no crash.
     let resp = http()
-        .get(format!("{base}/auth/callback?error=access_denied&error_description=nope"))
+        .get(format!(
+            "{base}/auth/callback?error=access_denied&error_description=nope"
+        ))
         .send()
         .await
         .unwrap();
@@ -862,7 +984,14 @@ async fn session_refresh_rotates_and_persists() {
     let token_url = spawn(mock_refresh_endpoint(refresh.clone())).await;
 
     let state = broker_state(&server_url);
-    seed_session(&state, "BT1", "R0", &format!("{token_url}/token"), "https://pds.example").await;
+    seed_session(
+        &state,
+        "BT1",
+        "R0",
+        &format!("{token_url}/token"),
+        "https://pds.example",
+    )
+    .await;
     let base = spawn(router(state)).await;
 
     // First call refreshes R0 → R1.
@@ -898,7 +1027,14 @@ async fn session_concurrent_calls_serialize_on_refresh_lock() {
     let token_url = spawn(mock_refresh_endpoint(refresh.clone())).await;
 
     let state = broker_state(&server_url);
-    seed_session(&state, "BT1", "R0", &format!("{token_url}/token"), "https://pds.example").await;
+    seed_session(
+        &state,
+        "BT1",
+        "R0",
+        &format!("{token_url}/token"),
+        "https://pds.example",
+    )
+    .await;
     let base = spawn(router(state)).await;
 
     let calls = (0..5).map(|_| {
@@ -909,7 +1045,10 @@ async fn session_concurrent_calls_serialize_on_refresh_lock() {
         assert_eq!(handle.await.unwrap(), 200);
     }
     // Strict rotation order proves serialization: R0, R1, R2, R3, R4.
-    assert_eq!(refresh.lock().unwrap().seen, vec!["R0", "R1", "R2", "R3", "R4"]);
+    assert_eq!(
+        refresh.lock().unwrap().seen,
+        vec!["R0", "R1", "R2", "R3", "R4"]
+    );
 }
 
 #[tokio::test]
@@ -927,12 +1066,24 @@ async fn session_invalid_grant_is_401() {
     let token_url = spawn(mock_refresh_endpoint(refresh)).await;
 
     let state = broker_state(&server_url);
-    seed_session(&state, "BT1", "R0", &format!("{token_url}/token"), "https://pds.example").await;
+    seed_session(
+        &state,
+        "BT1",
+        "R0",
+        &format!("{token_url}/token"),
+        "https://pds.example",
+    )
+    .await;
     let base = spawn(router(state)).await;
 
     let resp = session_call(&base, "BT1").await;
     assert_eq!(resp.status(), 401);
-    assert!(resp.text().await.unwrap().contains("re-authentication required"));
+    assert!(
+        resp.text()
+            .await
+            .unwrap()
+            .contains("re-authentication required")
+    );
 }
 
 #[tokio::test]
@@ -950,7 +1101,14 @@ async fn session_transient_failure_is_502() {
     let token_url = spawn(mock_refresh_endpoint(refresh)).await;
 
     let state = broker_state(&server_url);
-    seed_session(&state, "BT1", "R0", &format!("{token_url}/token"), "https://pds.example").await;
+    seed_session(
+        &state,
+        "BT1",
+        "R0",
+        &format!("{token_url}/token"),
+        "https://pds.example",
+    )
+    .await;
     let base = spawn(router(state)).await;
 
     assert_eq!(session_call(&base, "BT1").await.status(), 502);
@@ -988,12 +1146,22 @@ async fn session_missing_scope_defaults_to_wide_legacy_grant() {
     let token_url = spawn(mock_refresh_endpoint(refresh)).await;
 
     let state = broker_state(&server_url);
-    seed_session(&state, "BT1", "R0", &format!("{token_url}/token"), "https://pds.example").await;
+    seed_session(
+        &state,
+        "BT1",
+        "R0",
+        &format!("{token_url}/token"),
+        "https://pds.example",
+    )
+    .await;
     let base = spawn(router(state)).await;
 
     assert_eq!(session_call(&base, "BT1").await.status(), 200);
     let c = server_cap.lock().unwrap();
-    assert_eq!(c.session_bodies[0]["granted_scope"], "atproto transition:generic");
+    assert_eq!(
+        c.session_bodies[0]["granted_scope"],
+        "atproto transition:generic"
+    );
 }
 
 // ═══ /api/graph/follow + /api/graph/unfollow ═══════════════════════════
@@ -1101,7 +1269,9 @@ async fn pfp_set_avatar_preserves_profile_and_posts() {
     let (base, cap) = pfp_setup().await;
     let resp = http()
         .post(format!("{base}/api/pfp/set-avatar"))
-        .json(&serde_json::json!({"broker_token": "BT1", "image_b64": tiny_png_b64(), "post": true}))
+        .json(
+            &serde_json::json!({"broker_token": "BT1", "image_b64": tiny_png_b64(), "post": true}),
+        )
         .send()
         .await
         .unwrap();
@@ -1127,9 +1297,15 @@ async fn pfp_set_avatar_preserves_profile_and_posts() {
     assert!(post["record"]["embed"]["images"][0]["image"]["$type"] == "blob");
     let text = post["record"]["text"].as_str().unwrap();
     let f = &post["record"]["facets"][0]["index"];
-    let (s, e) = (f["byteStart"].as_u64().unwrap() as usize, f["byteEnd"].as_u64().unwrap() as usize);
+    let (s, e) = (
+        f["byteStart"].as_u64().unwrap() as usize,
+        f["byteEnd"].as_u64().unwrap() as usize,
+    );
     assert_eq!(&text.as_bytes()[s..e], b"pfp.freeq.at");
-    assert_eq!(post["record"]["facets"][0]["features"][0]["uri"], "https://pfp.freeq.at");
+    assert_eq!(
+        post["record"]["facets"][0]["features"][0]["uri"],
+        "https://pfp.freeq.at"
+    );
 }
 
 #[tokio::test]
@@ -1139,7 +1315,9 @@ async fn pfp_set_avatar_rejections() {
     let resp = http()
         .post(format!("{base}/api/pfp/set-avatar"))
         .json(&serde_json::json!({"broker_token": "WRONG", "image_b64": tiny_png_b64()}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 401);
     // non-PNG bytes → 400 before any auth work
     let resp = http()
@@ -1152,7 +1330,9 @@ async fn pfp_set_avatar_rejections() {
         .post(format!("{base}/api/pfp/set-avatar"))
         .header("origin", "https://evil.example")
         .json(&serde_json::json!({"broker_token": "BT1", "image_b64": tiny_png_b64()}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 403);
 }
 

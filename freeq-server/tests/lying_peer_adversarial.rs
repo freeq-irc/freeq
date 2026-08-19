@@ -18,12 +18,12 @@ use freeq_sdk::event::Event;
 #[path = "util/mod.rs"]
 mod util;
 
-use util::lying_peer::{
-    registered_kid,
-    LyingPeer, NO_EFFECT_WINDOW, TestId, TestServer, connect, is_deleted, msgid_of, revision_count,
-    spawn_server_with_peer, try_event, wait_auth_and_register, wait_event, warm_link,
-};
 use tokio::sync::mpsc;
+use util::lying_peer::{
+    LyingPeer, NO_EFFECT_WINDOW, TestId, TestServer, connect, is_deleted, msgid_of, registered_kid,
+    revision_count, spawn_server_with_peer, try_event, wait_auth_and_register, wait_event,
+    warm_link,
+};
 
 /// A DID the lying peer asserts but has never proven — the shape of a forged
 /// `account` on the wire. Deliberately not in `--did-resolver-static`: a peer
@@ -51,7 +51,12 @@ async fn open_room(
     let (ha, mut rxa) = connect(&srv, author, "author");
     wait_auth_and_register(&mut rxa).await;
     ha.join("#room").await.unwrap();
-    wait_event(&mut rxa, |e| matches!(e, Event::Joined { .. }), "author join").await;
+    wait_event(
+        &mut rxa,
+        |e| matches!(e, Event::Joined { .. }),
+        "author join",
+    )
+    .await;
 
     let (hw, mut rxw) = connect(&srv, watcher, "watcher");
     wait_auth_and_register(&mut rxw).await;
@@ -142,20 +147,23 @@ async fn a_peer_cannot_delete_a_message_authored_by_someone_else() {
         Duration::from_millis(500),
     )
     .await;
-    assert!(leaked.is_none(), "a rejected delete was still fanned out to clients");
+    assert!(
+        leaked.is_none(),
+        "a rejected delete was still fanned out to clients"
+    );
 }
 
-/// **Known gap, pinned deliberately.** A peer that puts a *local* user's nick
-/// in `from` and sends no `account` has the delete authorized: with no DID on
-/// the event, the receiver falls back to its own `nick_owners` map, resolves
-/// the nick to the local user who owns it, and concludes the author is acting.
+/// A peer that puts a *local* user's nick in `from` and sends no `account`
+/// used to have the delete authorized: with no DID on the event, the receiver
+/// looked the nick up in its own `nick_owners` map, resolved it to the local
+/// user who owns it, and concluded the author was acting. A nick is
+/// peer-assertable, so that was an impersonation route.
 ///
-/// The fallback exists for peers predating the `account` field, and a nick is
-/// peer-assertable, so it is an impersonation route. Closing it means deciding
-/// what to do about those older peers — out of scope here; this test states
-/// the current behaviour so a change to it is visible rather than silent.
+/// The receiver no longer answers "who is this" from a nick a peer chose.
+/// Without a DID the event is a stranger's, and a stranger cannot delete
+/// someone else's message.
 #[tokio::test]
-async fn a_peer_impersonating_a_local_nick_can_currently_delete_that_users_message() {
+async fn a_peer_impersonating_a_local_nick_cannot_delete_that_users_message() {
     let author = TestId::new("did:plc:lpauthor2");
     let watcher = TestId::new("did:plc:lpwatcher2");
     let (srv, mut peer, ha, mut rxw) = open_room(&author, &watcher).await;
@@ -167,18 +175,164 @@ async fn a_peer_impersonating_a_local_nick_can_currently_delete_that_users_messa
     assert_link_alive(&mut peer, &mut rxw, "probe-after-nick-impersonation").await;
 
     assert!(
-        is_deleted(&srv.db_path, &msgid),
-        "the nick fallback no longer authorizes a peer-asserted delete — \
-         if that was intentional, delete this test"
+        !is_deleted(&srv.db_path, &msgid),
+        "a peer wearing a local user's nick deleted that user's message"
     );
+}
+
+/// The sharpest version of the impersonation: the peer stamps the victim's
+/// **real** DID on a mutation, which is the one identity every authorization
+/// check here will accept. Naming it is free — a peer chooses what it sends —
+/// so the only thing separating the claim from the act is a signature by the
+/// key that DID registered.
+///
+/// Neither shape gets through: no signature at all, and one that names a key
+/// this server really holds but does not verify against it.
+#[tokio::test]
+async fn a_peer_stamping_the_victims_did_on_a_mutation_is_refused() {
+    let author = TestId::new("did:plc:lpstamped");
+    let watcher = TestId::new("did:plc:lpstampedwatch");
+    let (srv, mut peer, ha, mut rxw) = open_room(&author, &watcher).await;
+
+    // Posting registers the author's signing key here, so a forged signature
+    // can name a kid this server can actually resolve — a real failure rather
+    // than "cannot check".
+    let msgid = post(&ha, &mut rxw, "theirs to delete").await;
+    let kid = registered_kid(&srv.db_path, &author.did)
+        .expect("the author's client registered a signing key");
+    let forged_sig = format!("ed25519:{kid}:{}", "A".repeat(86));
+
+    // (1) A delete under the victim's DID, unsigned.
+    let forged = peer.delete("mallory", "#room", &msgid, Some(&author.did));
+    peer.forge(forged).await;
+    assert_link_alive(&mut peer, &mut rxw, "probe-after-unsigned-stamped-delete").await;
+    assert!(
+        !is_deleted(&srv.db_path, &msgid),
+        "an unsigned delete stamped with the victim's DID deleted their message"
+    );
+
+    // (2) The same delete, carrying a signature that does not verify against
+    // the DID it names.
+    let forged = peer.signed_delete("mallory", "#room", &msgid, Some(&author.did), &forged_sig);
+    peer.forge(forged).await;
+    assert_link_alive(&mut peer, &mut rxw, "probe-after-forged-stamped-delete").await;
+    assert!(
+        !is_deleted(&srv.db_path, &msgid),
+        "a delete whose signature failed against the victim's own key still applied"
+    );
+
+    // (3) Reactions and their removal, both shapes, under the victim's DID.
+    for (label, event) in [
+        (
+            "unsigned react",
+            peer.react("mallory", "#room", &msgid, "👍", Some(&author.did), None),
+        ),
+        (
+            "forged react",
+            peer.react(
+                "mallory",
+                "#room",
+                &msgid,
+                "👍",
+                Some(&author.did),
+                Some(&forged_sig),
+            ),
+        ),
+        (
+            "unsigned unreact",
+            peer.unreact("mallory", "#room", &msgid, "👍", Some(&author.did), None),
+        ),
+        (
+            "forged unreact",
+            peer.unreact(
+                "mallory",
+                "#room",
+                &msgid,
+                "👍",
+                Some(&author.did),
+                Some(&forged_sig),
+            ),
+        ),
+    ] {
+        peer.forge(event).await;
+        let leaked = try_event(
+            &mut rxw,
+            |e| {
+                matches!(e, Event::TagMsg { tags, .. } if tags.contains_key("+react")
+                || tags.contains_key("+freeq.at/unreact"))
+            },
+            NO_EFFECT_WINDOW,
+        )
+        .await;
+        assert!(
+            leaked.is_none(),
+            "a {label} stamped with the victim's DID reached a local client: {leaked:?}"
+        );
+    }
+    assert_link_alive(&mut peer, &mut rxw, "probe-after-stamped-reactions").await;
+}
+
+/// A DM the peer says a *local* user sent.
+///
+/// The receiving server unions the addressed user's sessions with the
+/// sessions of whoever the `account` names, so the sender's own devices see a
+/// message they sent from elsewhere. A peer that stamps a local user's DID on
+/// its own DM therefore reaches that user's client — and reaches it in the
+/// sender's position, as a line in their outbox that they never wrote.
+#[tokio::test]
+async fn a_peer_cannot_put_a_dm_in_a_local_users_outbox() {
+    let victim = TestId::new("did:plc:lpdmvictim");
+    let addressee = TestId::new("did:plc:lpdmaddressee");
+    let (srv, mut peer) = spawn_server_with_peer(&[&victim, &addressee]).await;
+
+    let (hv, mut rxv) = connect(&srv, &victim, "victim");
+    wait_auth_and_register(&mut rxv).await;
+    let (ha, mut rxa) = connect(&srv, &addressee, "addressee");
+    wait_auth_and_register(&mut rxa).await;
+
+    // Warm the link through a channel both share, so "nothing arrived" below
+    // cannot be a link that was never up.
+    hv.join("#room").await.unwrap();
+    wait_event(
+        &mut rxv,
+        |e| matches!(e, Event::Joined { .. }),
+        "victim join",
+    )
+    .await;
+    warm_link(&mut peer, "mallory", "#room", &mut rxv).await;
+
+    // The peer's own DM to the addressee, stamped as the victim's.
+    let forged = peer.privmsg(
+        "mallory",
+        "addressee",
+        "did I send this?",
+        Some(&victim.did),
+    );
+    peer.forge(forged).await;
+
+    let echoed = try_event(
+        &mut rxv,
+        |e| matches!(e, Event::Message { text: t, .. } if t == "did I send this?"),
+        NO_EFFECT_WINDOW,
+    )
+    .await;
+    assert!(
+        echoed.is_none(),
+        "a peer's DM stamped with a local user's DID reached that user's own \
+         session, where it reads as a message they sent: {echoed:?}"
+    );
+
+    assert_link_alive(&mut peer, &mut rxv, "probe-after-outbox-forgery").await;
+    hv.quit(None).await.ok();
+    ha.quit(None).await.ok();
 }
 
 // ── signatures ───────────────────────────────────────────────────
 
-/// A peer that attaches a signature which does not check out. The words still
-/// arrive — a bad signature is not grounds to drop someone's message — but the
-/// signature does not, because a client that saw it would draw a lock beside
-/// text nobody proved.
+/// A peer that attaches a signature which does not check out. Nothing
+/// arrives: the words and the proof came together and disagreed, and relaying
+/// the words alone would put text under the author's name that the evidence
+/// on the wire says is not theirs.
 ///
 /// The forged signature names a key this server really holds (the author's own
 /// registered key id), so the verdict is a genuine failure rather than "cannot
@@ -208,18 +362,15 @@ async fn a_peer_cannot_attach_a_signature_that_does_not_check_out() {
     );
     peer.forge(msg).await;
 
-    let seen = wait_event(
+    let leaked = try_event(
         &mut rxw,
         |e| matches!(e, Event::Message { text: t, .. } if t == "words with a forged seal"),
-        "the peer's signed message",
+        NO_EFFECT_WINDOW,
     )
     .await;
-    let Event::Message { tags, .. } = &seen else {
-        unreachable!("matched above")
-    };
     assert!(
-        !tags.contains_key("+freeq.at/sig"),
-        "a signature that failed verification reached a local client: {tags:?}"
+        leaked.is_none(),
+        "a message whose signature failed verification reached a local client: {leaked:?}"
     );
 
     assert_link_alive(&mut peer, &mut rxw, "probe-after-forged-signature").await;
@@ -288,7 +439,10 @@ async fn a_peer_cannot_edit_a_message_authored_by_someone_else() {
             NO_EFFECT_WINDOW,
         )
         .await;
-        assert!(applied.is_none(), "a forged edit ({case}) was fanned out to clients");
+        assert!(
+            applied.is_none(),
+            "a forged edit ({case}) was fanned out to clients"
+        );
         assert_eq!(
             revision_count(&srv.db_path, &msgid),
             1,
@@ -319,7 +473,10 @@ async fn a_peer_whose_actor_is_not_an_op_cannot_kick_or_set_modes() {
         NO_EFFECT_WINDOW,
     )
     .await;
-    assert!(kicked.is_none(), "a non-op remote user kicked a local member");
+    assert!(
+        kicked.is_none(),
+        "a non-op remote user kicked a local member"
+    );
 
     // Same actor, now trying to op the watcher — a privilege grant, which is
     // the more damaging of the two because it persists.
@@ -342,7 +499,10 @@ async fn a_peer_whose_actor_is_not_an_op_cannot_kick_or_set_modes() {
         NO_EFFECT_WINDOW,
     )
     .await;
-    assert!(moded.is_none(), "a non-op remote user changed a channel mode");
+    assert!(
+        moded.is_none(),
+        "a non-op remote user changed a channel mode"
+    );
 
     assert_link_alive(&mut peer, &mut rxw, "probe-after-forged-kick-and-modes").await;
 }

@@ -169,7 +169,9 @@ async fn resolve_handle(handle: &str) -> Result<String, anyhow::Error> {
             Ok(resp) => tracing::debug!(
                 handle, status = %resp.status(), "resolve: well-known non-success, trying appview"
             ),
-            Err(e) => tracing::debug!(handle, attempt, error = %e, "resolve: well-known request failed"),
+            Err(e) => {
+                tracing::debug!(handle, attempt, error = %e, "resolve: well-known request failed")
+            }
         }
     }
 
@@ -1266,7 +1268,10 @@ async fn graph_follow(
 
     let (record, access_token, nonce) = authed_access_token(&state, &req.broker_token).await?;
     if subject == record.did {
-        return Err((StatusCode::BAD_REQUEST, "Cannot follow yourself".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Cannot follow yourself".to_string(),
+        ));
     }
 
     let url = format!("{}/xrpc/com.atproto.repo.createRecord", record.pds_url);
@@ -1285,10 +1290,15 @@ async fn graph_follow(
 
     if !status.is_success() {
         tracing::warn!(did = %record.did, status = %status, "follow createRecord failed");
-        return Err((StatusCode::BAD_GATEWAY, format!("PDS rejected follow: {text}")));
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("PDS rejected follow: {text}"),
+        ));
     }
     let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::json!({}));
-    Ok(Json(serde_json::json!({ "ok": true, "uri": parsed.get("uri") })))
+    Ok(Json(
+        serde_json::json!({ "ok": true, "uri": parsed.get("uri") }),
+    ))
 }
 
 /// POST /api/graph/unfollow {broker_token, follow_uri} — delete the follow
@@ -1330,7 +1340,10 @@ async fn graph_unfollow(
                 .map_err(|e| (StatusCode::BAD_GATEWAY, format!("PDS call failed: {e}")))?;
             if !status.is_success() {
                 tracing::warn!(did = %record.did, status = %status, "unfollow deleteRecord failed");
-                return Err((StatusCode::BAD_GATEWAY, format!("PDS rejected unfollow: {text}")));
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("PDS rejected unfollow: {text}"),
+                ));
             }
             Ok(Json(serde_json::json!({ "ok": true })))
         }
@@ -1443,12 +1456,20 @@ async fn pfp_set_avatar(
 
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(req.image_b64.trim())
-        .map_err(|_| (StatusCode::BAD_REQUEST, "image_b64 is not valid base64".to_string()))?;
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "image_b64 is not valid base64".to_string(),
+            )
+        })?;
     if bytes.len() < 8 || &bytes[0..8] != b"\x89PNG\r\n\x1a\n" {
         return Err((StatusCode::BAD_REQUEST, "image must be a PNG".to_string()));
     }
     if bytes.len() > 1_000_000 {
-        return Err((StatusCode::BAD_REQUEST, "image too large (max 1MB)".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "image too large (max 1MB)".to_string(),
+        ));
     }
 
     let (record, access_token, nonce) = authed_access_token(&state, &req.broker_token).await?;
@@ -1456,17 +1477,28 @@ async fn pfp_set_avatar(
     // 1. uploadBlob (avatar)
     let upload_url = format!("{}/xrpc/com.atproto.repo.uploadBlob", record.pds_url);
     let (status, text) = pds_dpop_post_bytes(
-        &record, &access_token, nonce.clone(), &upload_url, "image/png", bytes.clone(),
+        &record,
+        &access_token,
+        nonce.clone(),
+        &upload_url,
+        "image/png",
+        bytes.clone(),
     )
     .await
     .map_err(|e| (StatusCode::BAD_GATEWAY, format!("uploadBlob failed: {e}")))?;
     if !status.is_success() {
-        return Err((StatusCode::BAD_GATEWAY, format!("PDS rejected uploadBlob: {text}")));
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("PDS rejected uploadBlob: {text}"),
+        ));
     }
     let avatar_blob = serde_json::from_str::<serde_json::Value>(&text)
         .ok()
         .and_then(|v| v.get("blob").cloned())
-        .ok_or((StatusCode::BAD_GATEWAY, "uploadBlob returned no blob".to_string()))?;
+        .ok_or((
+            StatusCode::BAD_GATEWAY,
+            "uploadBlob returned no blob".to_string(),
+        ))?;
 
     // 2. read-merge-write the profile (swap avatar only)
     let mut profile = fetch_profile_record(&record.pds_url, &record.did)
@@ -1476,7 +1508,10 @@ async fn pfp_set_avatar(
         profile = serde_json::json!({});
     }
     if let Some(obj) = profile.as_object_mut() {
-        obj.insert("$type".to_string(), serde_json::json!("app.bsky.actor.profile"));
+        obj.insert(
+            "$type".to_string(),
+            serde_json::json!("app.bsky.actor.profile"),
+        );
         obj.insert("avatar".to_string(), avatar_blob.clone());
     }
     let put_url = format!("{}/xrpc/com.atproto.repo.putRecord", record.pds_url);
@@ -1491,17 +1526,30 @@ async fn pfp_set_avatar(
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("putRecord failed: {e}")))?;
     if !status.is_success() {
         tracing::warn!(did = %record.did, status = %status, "pfp putRecord failed");
-        return Err((StatusCode::BAD_GATEWAY, format!("PDS rejected profile: {text}")));
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("PDS rejected profile: {text}"),
+        ));
     }
 
     // 3. optional post (fresh blob — blobs are referenced per-record)
     let mut post_uri = serde_json::Value::Null;
     if req.post {
         let (status, text) = pds_dpop_post_bytes(
-            &record, &access_token, nonce.clone(), &upload_url, "image/png", bytes,
+            &record,
+            &access_token,
+            nonce.clone(),
+            &upload_url,
+            "image/png",
+            bytes,
         )
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("post uploadBlob failed: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("post uploadBlob failed: {e}"),
+            )
+        })?;
         let post_blob = serde_json::from_str::<serde_json::Value>(&text)
             .ok()
             .and_then(|v| v.get("blob").cloned());
@@ -1592,7 +1640,12 @@ async fn refresh_access_token(
         record.dpop_nonce.as_deref(),
     )
     .await?;
-    Ok((t.access_token, t.refresh_token, t.dpop_nonce, t.granted_scope))
+    Ok((
+        t.access_token,
+        t.refresh_token,
+        t.dpop_nonce,
+        t.granted_scope,
+    ))
 }
 
 /// The server-side web session a writer installs: a fresh PDS access token plus
@@ -1612,8 +1665,11 @@ pub struct SessionPush<'a> {
 #[async_trait::async_trait]
 pub trait SessionWriter: Send + Sync {
     /// Mint a one-time SASL web-token for this identity → `(token, nick)`.
-    async fn mint_web_token(&self, did: &str, handle: &str)
-    -> Result<(String, String), anyhow::Error>;
+    async fn mint_web_token(
+        &self,
+        did: &str,
+        handle: &str,
+    ) -> Result<(String, String), anyhow::Error>;
     /// Install / refresh the server-side web session for proxied PDS ops.
     async fn push_session(&self, push: &SessionPush<'_>) -> Result<(), anyhow::Error>;
 }
@@ -1767,7 +1823,10 @@ pub fn is_valid_return_to(url: &str) -> bool {
 
 /// Sign a request body with HMAC-SHA256. Returns (signature, timestamp) pair.
 /// The MAC covers `ts={timestamp}\n` || body_bytes to prevent replay attacks.
-pub fn sign_body(secret: &str, body: &serde_json::Value) -> Result<(String, String), anyhow::Error> {
+pub fn sign_body(
+    secret: &str,
+    body: &serde_json::Value,
+) -> Result<(String, String), anyhow::Error> {
     use base64::Engine;
     use hmac::{Hmac, Mac};
     let timestamp = std::time::SystemTime::now()
@@ -1891,7 +1950,8 @@ mod tests {
     #[tokio::test]
     async fn sqlite_store_encrypts_refresh_token_at_rest() {
         let key = derive_encryption_key("k");
-        let path = std::env::temp_dir().join(format!("freeq-broker-test-{}.db", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("freeq-broker-test-{}.db", std::process::id()));
         std::fs::remove_file(&path).ok();
         let path_str = path.to_str().unwrap();
         {

@@ -226,8 +226,7 @@ impl Orchestrator {
             }
 
             let http = reqwest::Client::new();
-            let session_id = match discover_active_session(&http, &cfg.server, &cfg.channel).await
-            {
+            let session_id = match discover_active_session(&http, &cfg.server, &cfg.channel).await {
                 Some(sid) => {
                     tracing::info!(%sid, "joining existing AV session");
                     sid

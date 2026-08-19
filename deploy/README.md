@@ -73,11 +73,11 @@ sudo journalctl -u freeq-server -f   # Tail logs
 | `deploy.sh` | Subsequent deploys (pull, build, restart) |
 | `freeq-server.service.template` | Systemd unit template (setup.sh substitutes variables) |
 | `nginx.conf.template` | Nginx config template (setup.sh substitutes variables) |
-| `freeq-server.service` | Chad's example systemd unit (reference only) |
-| `nginx-irc-freeq-at.conf` | Chad's production nginx config (reference only) |
 | `miren/` | **Recommended** generalized Miren deployment (see below) |
-| `irc/` | Maintainer's Miren deploy of irc.freeq.at (reference only) |
-| `staging/` | Maintainer's Miren deploy of staging.freeq.at (reference only) |
+| `irc/` | Reference Miren deploy of a production instance |
+| `staging/` | Reference Miren deploy of a staging instance |
+| `av-deploy.sh` | Push/build/restart + AV TLS plumbing over SSH (set `FREEQ_SERVER`) |
+| `new-host/` | Terraform + cloud-init for a self-contained single-box host |
 
 ## Recommended: Miren Deployment
 
@@ -104,9 +104,9 @@ cluster.
 Full quickstart (DNS/TLS, secrets, backups, upgrades, federation, native
 IRC): [deploy/miren/README.md](miren/README.md).
 
-`irc/` and `staging/` are the maintainer's hardcoded production/staging
-variants of the same approach — useful as reference, not meant to be run by
-self-hosters.
+`irc/` and `staging/` are opinionated production/staging variants of the same
+approach with the app name, route, and MOTD baked in — useful as reference,
+not meant to be run unmodified by self-hosters.
 
 ## Paths
 

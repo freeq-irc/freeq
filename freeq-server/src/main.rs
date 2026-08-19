@@ -33,7 +33,9 @@ async fn main() -> Result<()> {
     // down migrations get run without hand-written SQL.
     if let Some(target) = config.migrate_to {
         let Some(ref db_path) = config.db_path else {
-            anyhow::bail!("--migrate-to requires --db-path (in-memory storage has nothing to migrate)");
+            anyhow::bail!(
+                "--migrate-to requires --db-path (in-memory storage has nothing to migrate)"
+            );
         };
         let (before, after) = freeq_server::migrations::migrate_to(db_path, target)
             .map_err(|e| anyhow::anyhow!("migration failed: {e}"))?;

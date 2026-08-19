@@ -836,8 +836,14 @@ async fn a_delete_aimed_at_a_task_event_is_refused() {
         // unsigned mutation is refused at the signature gate before the act
         // gate is ever consulted — and a signed one must still be refused here.
         let del_id = fresh_id();
-        let sig = ChatDoc::mutation(Mutation::Delete, DID_ALICE, &del_id, &channel_venue("#ops"), &task)
-            .sign(&signing);
+        let sig = ChatDoc::mutation(
+            Mutation::Delete,
+            DID_ALICE,
+            &del_id,
+            &channel_venue("#ops"),
+            &task,
+        )
+        .sign(&signing);
         a.tx(&format!(
             "@+draft/delete={task};{EVENT_ID_TAG}={del_id};+freeq.at/sig={sig} TAGMSG #ops"
         ));

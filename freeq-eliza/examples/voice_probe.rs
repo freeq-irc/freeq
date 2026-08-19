@@ -47,7 +47,9 @@ const TILE_H: u32 = 240;
 const FPS: f64 = 15.0;
 
 #[derive(Parser)]
-#[command(about = "Publish spoken audio (a WAV) into a freeq call and drive the eliza voice pipeline")]
+#[command(
+    about = "Publish spoken audio (a WAV) into a freeq call and drive the eliza voice pipeline"
+)]
 struct Args {
     /// IRC server URL (wss://host/irc).
     #[arg(long, default_value = "wss://staging.freeq.at/irc")]
@@ -146,7 +148,8 @@ fn decode_wav(path: &str) -> anyhow::Result<(Vec<f32>, u32)> {
     anyhow::ensure!(&bytes[0..4] == b"RIFF", "not a RIFF file");
     anyhow::ensure!(&bytes[8..12] == b"WAVE", "not a WAVE file");
 
-    let read_u32 = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+    let read_u32 =
+        |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
     let read_u16 = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]);
 
     let mut sample_rate: Option<u32> = None;
@@ -180,7 +183,10 @@ fn decode_wav(path: &str) -> anyhow::Result<(Vec<f32>, u32)> {
 
     let sample_rate = sample_rate.context("WAV missing fmt chunk")?;
     let data = data.context("WAV missing data chunk")?;
-    anyhow::ensure!(audio_fmt == 1, "only PCM WAV supported (audio_fmt={audio_fmt})");
+    anyhow::ensure!(
+        audio_fmt == 1,
+        "only PCM WAV supported (audio_fmt={audio_fmt})"
+    );
     anyhow::ensure!(bits == 16, "only 16-bit PCM supported (bits={bits})");
 
     let bytes_per_sample = 2usize;
@@ -281,7 +287,10 @@ async fn discover_active_session(
     base: &str,
     channel: &str,
 ) -> Option<String> {
-    let url = format!("{base}/api/v1/channels/{}/sessions", encode_channel(channel));
+    let url = format!(
+        "{base}/api/v1/channels/{}/sessions",
+        encode_channel(channel)
+    );
     let resp = http
         .get(&url)
         .timeout(Duration::from_secs(5))
@@ -444,7 +453,10 @@ async fn main() -> anyhow::Result<()> {
 
     // 6. Let the worker join + subscribe to our audio broadcast, then
     //    enqueue the spoken question.
-    tracing::info!(secs = args.settle_secs, "settling — waiting for worker to subscribe to audio");
+    tracing::info!(
+        secs = args.settle_secs,
+        "settling — waiting for worker to subscribe to audio"
+    );
     // Pump events during the settle so the connection stays healthy.
     pump_events(&mut events, Duration::from_secs(args.settle_secs)).await?;
 
@@ -455,10 +467,16 @@ async fn main() -> anyhow::Result<()> {
     );
     speaker.enqueue(&pcm, wav_rate);
     let queued = speaker.queued_secs();
-    tracing::info!(queued_secs = queued, "audio enqueued — speaker is now speaking");
+    tracing::info!(
+        queued_secs = queued,
+        "audio enqueued — speaker is now speaking"
+    );
 
     // 7. Keep alive so the worker can transcribe + compose + speak.
-    tracing::info!(secs = args.keepalive_secs, "keepalive — letting worker run the pipeline");
+    tracing::info!(
+        secs = args.keepalive_secs,
+        "keepalive — letting worker run the pipeline"
+    );
     pump_events(&mut events, Duration::from_secs(args.keepalive_secs)).await?;
 
     tracing::info!("keepalive window elapsed — quitting");
@@ -479,7 +497,9 @@ async fn pump_events(
         }
         let remaining = deadline - now;
         match tokio::time::timeout(remaining.min(Duration::from_millis(500)), events.recv()).await {
-            Ok(Some(Event::Message { from, target, text, .. })) => {
+            Ok(Some(Event::Message {
+                from, target, text, ..
+            })) => {
                 tracing::info!(%from, %target, %text, "inbound message");
             }
             Ok(Some(Event::Disconnected { reason })) => {

@@ -16,7 +16,7 @@ size_gb = 2
 key = "BROKER_SHARED_SECRET"
 required = true
 sensitive = true
-description = "Shared secret with freeq-server (matches reth .env.secrets)"
+description = "Shared secret with freeq-server (must match the value in the freeq-server secrets file)"
 
 [[services.web.env]]
 key = "BROKER_PUBLIC_URL"
