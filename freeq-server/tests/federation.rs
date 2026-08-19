@@ -893,6 +893,214 @@ async fn mutation_sig_tag_crosses_the_hop_byte_identical() {
     drop((srv_a, srv_b));
 }
 
+/// A raw IRC connection, so a test can negotiate a capability the SDK client
+/// does not know about. The servers here are subprocesses, so blocking reads
+/// are safe inside these tests.
+struct Raw {
+    reader: std::io::BufReader<std::net::TcpStream>,
+    writer: std::net::TcpStream,
+}
+
+impl Raw {
+    /// A guest holding exactly `caps`. Guests may hold `freeq.at/act` — the
+    /// capability says what a client can render, not who it is.
+    fn guest(addr: &str, nick: &str, caps: &str) -> Self {
+        let sock = std::net::TcpStream::connect(addr).expect("connect");
+        sock.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let writer = sock.try_clone().unwrap();
+        let mut c = Raw {
+            reader: std::io::BufReader::new(sock),
+            writer,
+        };
+        c.tx("CAP LS 302");
+        c.tx(&format!("NICK {nick}"));
+        c.tx(&format!("USER {nick} 0 * :raw"));
+        c.tx(&format!("CAP REQ :{caps}"));
+        c.wait(|l| l.contains("ACK"), "CAP ACK");
+        c.tx("CAP END");
+        c.wait(|l| l.split_whitespace().nth(1) == Some("001"), "001");
+        c
+    }
+
+    fn tx(&mut self, line: &str) {
+        use std::io::Write;
+        writeln!(self.writer, "{line}\r").unwrap();
+        self.writer.flush().ok();
+    }
+
+    fn wait(&mut self, pred: impl Fn(&str) -> bool, what: &str) -> String {
+        use std::io::BufRead;
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match self.reader.read_line(&mut buf) {
+                Ok(0) => panic!("EOF waiting for {what}"),
+                Ok(_) => {
+                    let l = buf.trim_end();
+                    if l.starts_with("PING") {
+                        let t = l.strip_prefix("PING ").unwrap_or(":x").to_string();
+                        self.tx(&format!("PONG {t}"));
+                        continue;
+                    }
+                    if pred(l) {
+                        return l.to_string();
+                    }
+                }
+                Err(e) => panic!("{what}: {e}"),
+            }
+        }
+    }
+
+    fn join(&mut self, channel: &str) {
+        self.tx(&format!("JOIN {channel}"));
+        self.wait(
+            |l| l.split_whitespace().nth(1) == Some("366"),
+            "end of names",
+        );
+    }
+
+    /// Up to `ms` for a matching line; `None` if it never comes.
+    fn maybe(&mut self, pred: impl Fn(&str) -> bool, ms: u64) -> Option<String> {
+        use std::io::BufRead;
+        self.writer
+            .set_read_timeout(Some(Duration::from_millis(ms)))
+            .ok();
+        let sock = self.reader.get_ref();
+        sock.set_read_timeout(Some(Duration::from_millis(ms))).ok();
+        let mut buf = String::new();
+        let found = loop {
+            buf.clear();
+            match self.reader.read_line(&mut buf) {
+                Ok(0) => break None,
+                Ok(_) => {
+                    let l = buf.trim_end();
+                    if l.starts_with("PING") {
+                        let t = l.strip_prefix("PING ").unwrap_or(":x").to_string();
+                        self.tx(&format!("PONG {t}"));
+                        continue;
+                    }
+                    if pred(l) {
+                        break Some(l.to_string());
+                    }
+                }
+                Err(_) => break None,
+            }
+        };
+        let sock = self.reader.get_ref();
+        sock.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        found
+    }
+}
+
+// ── an accepted task message crosses the hop with its signature ─────
+//
+// A task message is a TAGMSG, so it crosses in the raw `Tagmsg` tag map with
+// nothing stripped — the signature and the signer-minted id included. Both
+// have to survive: the act canonical is rebuilt from the act tags, the venue
+// and that id, so a peer that receives the message without the id cannot
+// check the signature at all, and one that receives it without the signature
+// has an unattributable task event.
+//
+// Phase 5 is what makes the far side *act* on one. This pins that the bytes
+// it will need are already crossing.
+
+// Multi-threaded on purpose: the raw observers below block their thread on
+// socket reads, and the SDK handle's writer task has to keep running while
+// they do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn act_tagmsg_crosses_the_hop_with_its_signature() {
+    let alice = TestId::new("did:plc:aliceact");
+    let bob = TestId::new("did:plc:bobact");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#fact").await.unwrap();
+
+    // The receiving side gates task messages on the capability, so the
+    // observer that must see one asks for it; the SDK client does not.
+    let mut watcher = Raw::guest(
+        &srv_b.irc_addr,
+        "watcher",
+        "message-tags server-time freeq.at/act",
+    );
+    watcher.join("#fact");
+    // …and one that did not ask, to prove the gate rather than assume it.
+    let mut deaf = Raw::guest(&srv_b.irc_addr, "deaf", "message-tags server-time");
+    deaf.join("#fact");
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#fact").await.unwrap();
+
+    // A signing key of the test's own, so it can build the act canonical the
+    // way a task-sending client would. MSGSIG persists the key by (DID, kid),
+    // so it is findable however the session map happens to be ordered.
+    let signing = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+    let pubkey = {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing.verifying_key().as_bytes())
+    };
+    ha.raw(&format!("MSGSIG {pubkey}")).await.ok();
+
+    let venue = freeq_sdk::chatsig::channel_venue("#fact");
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut crossed: Option<(String, String)> = None;
+    while tokio::time::Instant::now() < deadline {
+        let id = freeq_sdk::chatsig::new_event_id();
+        let act_tags: Vec<(&str, &str)> = vec![
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "offer"),
+            ("+freeq.at/act-from", alice.did.as_str()),
+            ("+freeq.at/act-title", "cross-the-hop"),
+        ];
+        let sig = freeq_sdk::act::sign_act(act_tags.clone(), &venue, &id, &signing)
+            .expect("act tags present");
+        let wire: Vec<String> = act_tags
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .chain([
+                format!("{}={id}", freeq_sdk::chatsig::EVENT_ID_TAG),
+                format!("+freeq.at/sig={sig}"),
+            ])
+            .collect();
+        ha.raw(&format!("@{} TAGMSG #fact", wire.join(";")))
+            .await
+            .ok();
+
+        if let Some(line) = watcher.maybe(|l| l.contains("+freeq.at/act="), 2000) {
+            assert!(
+                line.contains(&format!("+freeq.at/sig={sig}")),
+                "the signature must cross byte-identical: {line}"
+            );
+            assert!(
+                line.contains(&format!("{}={id}", freeq_sdk::chatsig::EVENT_ID_TAG)),
+                "the id the signature covers must cross too, or nobody can \
+                 rebuild the document: {line}"
+            );
+            crossed = Some((sig.clone(), id.clone()));
+            break;
+        }
+    }
+    assert!(
+        crossed.is_some(),
+        "an accepted task message must reach a capability-holding peer client"
+    );
+
+    // The same message, on the same server, to a client that did not ask:
+    // nothing. Relayed task messages are gated exactly as local ones are.
+    assert!(
+        deaf.maybe(|l| l.contains("+freeq.at/act"), 800).is_none(),
+        "a relayed task message must not reach a connection without the capability"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
 // ── a PRIVMSG's stamped signature crosses the hop byte-identical ─────
 //
 // The companion path to the mutation test above. PRIVMSG signatures cross

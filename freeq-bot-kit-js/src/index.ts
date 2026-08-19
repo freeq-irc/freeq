@@ -53,8 +53,9 @@ export type {
 } from "./delegation.js";
 
 // freeq.at/act signing — the act RFC's canonical (sign-what's-present over
-// act-* tags), kid derivation, and sign/verify. Byte-compatible with
-// freeq_sdk::act; contract fixtures in spec/act-signing-vectors.json.
+// act-* tags, plus the caller-supplied venue and event id), kid derivation,
+// and sign/verify. Byte-compatible with freeq_sdk::act; contract fixtures in
+// spec/act-signing-vectors.json.
 export {
   actCanonical,
   deriveKid,
@@ -64,6 +65,43 @@ export {
   ACT_SIG_TAG,
 } from "./act.js";
 export type { ActVerifyResult } from "./act.js";
+
+// The eight moves a bot can make on a task — one function per verb, each
+// doing the paired send (the signed task event, plus the line people read).
+// `expire` is absent on purpose: only the server makes that move.
+export {
+  offer,
+  accept,
+  decline,
+  claim,
+  progress,
+  complete,
+  fail,
+  cancel,
+} from "./act-verbs.js";
+export type { ActContext, OfferOptions, StepOptions } from "./act-verbs.js";
+
+// The task lifecycle rules — which move is legal, from which state, by whom.
+// The rules are data (spec/act-transitions.json, copied into src/); this is
+// the checker that reads them, mirroring freeq_sdk::act_transitions so a bot
+// can pre-check a move and reach the same verdict the server will.
+export {
+  DEADLINE_TOLERANCE_MS,
+  checkOpen,
+  checkTransition,
+  eventTimeMs,
+  initialState,
+  isTerminal,
+  openingVerb,
+  refusalDescription,
+} from "./act-transitions.js";
+export type {
+  CheckResult,
+  EventSender,
+  RefusalReason,
+  Task,
+  TaskEvent,
+} from "./act-transitions.js";
 
 // Daemon CLI scaffold — Commander-based launch/stop/status/doctor/tail
 // for long-running freeq bot daemons. Caller provides runDaemon + paths;

@@ -7,10 +7,28 @@
 // contract is `spec/act-signing-vectors.json`, which both test suites
 // reproduce exactly.
 //
+//
+// Only the sender ever writes `act-` tags. The open coverage rule is what
+// lets a new task kind add fields without anyone updating a canonical, and it
+// only works under that discipline: a server that stamped a tag of its own
+// under this prefix would land it inside the signature's coverage and break
+// every act signature it relayed. Server attestations go in their own
+// namespaces (`account`, `time`, `msgid`, `+freeq.at/origin`).
+//
 // Canonical mapping rules (see the Rust module for the full rationale):
 // - covered iff the tag name, after stripping `+freeq.at/`, is `act` or
 //   starts with `act-` (`actor-class` and `sig` are NOT covered)
 // - canonical keys are the stripped names; values verbatim, always strings
+// - two more keys are injected by the caller, never read from a tag — the
+//   same two chat's documents carry: `target`, the normalized venue (a
+//   channel lowercased, or `dm:<did_a>,<did_b>` with the DIDs sorted), and
+//   `msgid`, the event id the signer minted (`+freeq.at/eventid` on the
+//   wire). Neither can collide with a covered key, which always starts with
+//   `act`. Without the venue an offer signed in one room replays into
+//   another intact; without the id a task's identity is the one unsigned
+//   thing about it.
+// - an offer carries no `act-id`: its own event id is the task's id. Later
+//   events name that id in `act-id` and mint their own id for themselves.
 // - sig tag value: `ed25519:<kid>:<base64url sig>`, kid =
 //   base64url-nopad(sha256(raw 32-byte public key)[0..16])
 
@@ -48,14 +66,24 @@ function isActTag(tagName: string): boolean {
 
 /**
  * Build the canonical string over the act tags in `tags` (wire names,
- * unescaped values). Returns null if no act tags are present.
+ * unescaped values), the venue, and the event id.
+ *
+ * `target` and `msgid` are supplied by the caller — a verifier rebuilds them
+ * from delivery context rather than reading either off a tag. Returns null if
+ * no act tags are present: delivery context alone is not a document.
  */
-export function actCanonical(tags: Record<string, string>): string | null {
+export function actCanonical(
+  tags: Record<string, string>,
+  target: string,
+  msgid: string,
+): string | null {
   const covered: Record<string, string> = {};
   for (const [name, value] of Object.entries(tags)) {
     if (isActTag(name)) covered[strippedName(name)] = value;
   }
   if (Object.keys(covered).length === 0) return null;
+  covered.target = target;
+  covered.msgid = msgid;
   return canonicalizeForSigning(covered);
 }
 
@@ -66,23 +94,34 @@ export async function deriveKid(rawPublicKey: Uint8Array): Promise<string> {
 }
 
 /**
- * Sign the act tags with a DidKey. Returns the sig tag value
- * (`ed25519:<kid>:<base64url sig>`), or null if no act tags are present.
+ * Sign the act tags, posted to `target` under `msgid`, with a DidKey. Returns
+ * the sig tag value (`ed25519:<kid>:<base64url sig>`), or null if no act tags
+ * are present.
  */
 export async function signActTags(
   tags: Record<string, string>,
+  target: string,
+  msgid: string,
   key: DidKey,
 ): Promise<string | null> {
-  const canonical = actCanonical(tags);
+  const canonical = actCanonical(tags, target, msgid);
   if (canonical === null) return null;
   const sig = await key.signer(new TextEncoder().encode(canonical));
   const kid = await deriveKid(publicKeyFromMultibase(key.publicKeyMultibase));
   return `ed25519:${kid}:${sig}`;
 }
 
-/** Verify an act sig tag over `tags` against a raw 32-byte public key. */
+/**
+ * Verify an act sig tag over `tags` against a raw 32-byte public key.
+ *
+ * `target` and `msgid` come from the receiver's own view of the delivery — the
+ * venue the message arrived in and the id it is being filed under — so a
+ * message replayed elsewhere, or filed under another id, reads as tampering.
+ */
 export async function verifyActTags(
   tags: Record<string, string>,
+  target: string,
+  msgid: string,
   sigTag: string,
   rawPublicKey: Uint8Array,
 ): Promise<ActVerifyResult> {
@@ -91,7 +130,7 @@ export async function verifyActTags(
   const [alg, kid, sigB64] = parts;
   if (alg !== "ed25519") return { ok: false, reason: "unsupported-algorithm" };
   if ((await deriveKid(rawPublicKey)) !== kid) return { ok: false, reason: "kid-mismatch" };
-  const canonical = actCanonical(tags);
+  const canonical = actCanonical(tags, target, msgid);
   if (canonical === null) return { ok: false, reason: "no-act-tags" };
   let sig: Uint8Array;
   try {

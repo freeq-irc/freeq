@@ -19,6 +19,7 @@
 //! - [`irc`] — IRC message parsing/formatting
 
 pub mod act;
+pub mod act_transitions;
 pub mod address;
 pub mod auth;
 pub mod av;

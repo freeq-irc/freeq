@@ -191,6 +191,73 @@ pub enum EventShape<'a> {
     Bare(crate::events::EventFacts),
 }
 
+/// A live task, as the view holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActTask {
+    pub act_id: String,
+    pub kind: String,
+    pub venue: String,
+    /// Empty = created on this server.
+    pub origin: String,
+    pub state: String,
+    pub offerer: String,
+    pub offeree: Option<String>,
+    pub assignee: Option<String>,
+    pub caps: Option<String>,
+    pub deadline: Option<i64>,
+    pub updated: i64,
+}
+
+/// One stored task event, as a reader gets it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActLoggedEvent {
+    pub event_id: String,
+    pub canonical: String,
+    pub signature: Option<String>,
+    pub actor_did: Option<String>,
+    pub venue: String,
+    pub timestamp: i64,
+}
+
+/// An accepted task event on its way into the log and the view.
+pub struct ActEvent<'a> {
+    /// The exact bytes the signature covers.
+    pub canonical: &'a str,
+    pub signature: Option<&'a str>,
+    /// This event's own id.
+    pub event_id: &'a str,
+    /// The task it belongs to: its own id when it opens one, `act-id`
+    /// otherwise.
+    pub act_id: &'a str,
+    /// Whether this event opens the task.
+    pub opens: bool,
+    pub venue: &'a str,
+    pub actor: &'a str,
+    /// The server itself, for the expiry sweep's own events.
+    pub from_system: bool,
+    /// The peer this arrived from; `None` for local ingress.
+    pub origin: Option<&'a str>,
+    pub timestamp: i64,
+}
+
+/// What happened to a task event offered to the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActWrite {
+    /// Filed, and the task now sits in this state.
+    Filed { state: String },
+    /// The rules refused the move.
+    Refused(freeq_sdk::act_transitions::Refusal),
+    /// The event names a task this server has never filed — including any
+    /// task belonging to another server, until federation lands.
+    UnknownTask,
+    /// The event was posted outside its task's conversation.
+    WrongVenue,
+    /// That id is already in the log.
+    Duplicate,
+    /// The bytes are not a task document at all.
+    NotATaskEvent,
+}
+
 /// An event on its way into the log.
 pub struct EventRecord<'a> {
     pub shape: EventShape<'a>,
@@ -2634,6 +2701,289 @@ mod tests {
         .unwrap();
     }
 
+    // ── Task events: the log, and the view derived from it ────────────────
+
+    const ELIZA: &str = "did:plc:eliza";
+    const SCHOLAR: &str = "did:plc:scholar";
+    const MALLORY: &str = "did:plc:mallory";
+
+    /// Build a task event's canonical the way a signer would.
+    fn act_doc(tags: &[(&str, &str)], venue: &str, id: &str) -> String {
+        freeq_sdk::act::act_canonical(tags.to_vec(), venue, id).expect("act tags present")
+    }
+
+    fn offer(db: &Db, id: &str, venue: &str, to: Option<&str>, ts: i64) -> ActWrite {
+        let mut tags = vec![
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "offer"),
+            ("+freeq.at/act-from", ELIZA),
+        ];
+        if let Some(to) = to {
+            tags.push(("+freeq.at/act-to", to));
+        }
+        let canonical = act_doc(&tags, venue, id);
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: id,
+            act_id: id,
+            opens: true,
+            venue,
+            actor: ELIZA,
+            from_system: false,
+            origin: None,
+            timestamp: ts,
+        })
+        .unwrap()
+    }
+
+    fn follow_up(
+        db: &Db,
+        verb: &str,
+        actor: &str,
+        task: &str,
+        id: &str,
+        venue: &str,
+        ts: i64,
+    ) -> ActWrite {
+        let canonical = act_doc(
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", verb),
+                ("+freeq.at/act-from", actor),
+                ("+freeq.at/act-id", task),
+            ],
+            venue,
+            id,
+        );
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: id,
+            act_id: task,
+            opens: false,
+            venue,
+            actor,
+            from_system: false,
+            origin: None,
+            timestamp: ts,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn an_offer_creates_the_task_it_opens() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(
+            offer(&db, "T1", "#ops", Some(SCHOLAR), 10),
+            ActWrite::Filed {
+                state: "offered".into()
+            }
+        );
+        let task = db.act_task("T1").unwrap().expect("the task is live");
+        assert_eq!(task.kind, "handoff");
+        assert_eq!(task.venue, "#ops");
+        assert_eq!(task.state, "offered");
+        assert_eq!(task.offerer, ELIZA);
+        assert_eq!(task.offeree.as_deref(), Some(SCHOLAR));
+        assert_eq!(task.assignee, None);
+        assert_eq!(task.origin, "", "created here");
+    }
+
+    #[test]
+    fn an_open_offer_names_no_offeree_and_lands_open() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", None, 10);
+        let task = db.act_task("T1").unwrap().unwrap();
+        assert_eq!(task.state, "open");
+        assert_eq!(task.offeree, None);
+    }
+
+    #[test]
+    fn whoever_moves_a_task_to_assigned_becomes_its_assignee() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
+        follow_up(&db, "accept", SCHOLAR, "T1", "E1", "#ops", 11);
+        assert_eq!(
+            db.act_task("T1").unwrap().unwrap().assignee.as_deref(),
+            Some(SCHOLAR)
+        );
+
+        // …and a progress report does not reassign the work it reports on.
+        follow_up(&db, "progress", SCHOLAR, "T1", "E2", "#ops", 12);
+        let task = db.act_task("T1").unwrap().unwrap();
+        assert_eq!(task.assignee.as_deref(), Some(SCHOLAR));
+        assert_eq!(task.state, "assigned");
+    }
+
+    #[test]
+    fn a_terminal_event_removes_the_row_and_leaves_the_history() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
+        follow_up(&db, "accept", SCHOLAR, "T1", "E1", "#ops", 11);
+        follow_up(&db, "complete", SCHOLAR, "T1", "E2", "#ops", 12);
+        assert_eq!(db.act_task("T1").unwrap(), None, "the view holds live work");
+        assert_eq!(
+            db.act_task_events("T1").unwrap().len(),
+            3,
+            "the log holds the whole story"
+        );
+    }
+
+    /// The state read, the check and the write happen in one call, so the
+    /// second claim sees the first one's result. Two agents racing for the
+    /// same open post reach this method through `with_db`, which holds the
+    /// database mutex for the whole closure — that serialization is what makes
+    /// exactly one of them the winner.
+    #[test]
+    fn two_claims_on_one_open_task_leave_exactly_one_winner() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", None, 10);
+
+        let first = follow_up(&db, "claim", SCHOLAR, "T1", "E1", "#ops", 11);
+        let second = follow_up(&db, "claim", MALLORY, "T1", "E2", "#ops", 11);
+
+        assert_eq!(
+            first,
+            ActWrite::Filed {
+                state: "assigned".into()
+            }
+        );
+        assert_eq!(
+            second,
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::IllegalStep),
+            "the loser is told the step is illegal, not that it lost a race"
+        );
+        assert_eq!(
+            db.act_task("T1").unwrap().unwrap().assignee.as_deref(),
+            Some(SCHOLAR)
+        );
+    }
+
+    #[test]
+    fn a_follow_up_naming_no_filed_task_is_unknown() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(
+            follow_up(&db, "accept", SCHOLAR, "NOSUCH", "E1", "#ops", 11),
+            ActWrite::UnknownTask
+        );
+    }
+
+    #[test]
+    fn a_follow_up_from_another_conversation_is_refused() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
+        assert_eq!(
+            follow_up(&db, "accept", SCHOLAR, "T1", "E1", "#elsewhere", 11),
+            ActWrite::WrongVenue
+        );
+        assert_eq!(db.act_task("T1").unwrap().unwrap().state, "offered");
+    }
+
+    #[test]
+    fn the_rules_refuse_a_wrong_sender_and_the_view_does_not_move() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
+        assert_eq!(
+            follow_up(&db, "accept", MALLORY, "T1", "E1", "#ops", 11),
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::WrongSender)
+        );
+        let task = db.act_task("T1").unwrap().unwrap();
+        assert_eq!(task.state, "offered");
+        assert_eq!(task.assignee, None);
+        assert_eq!(
+            db.act_task_events("T1").unwrap().len(),
+            1,
+            "a refused event is not filed"
+        );
+    }
+
+    #[test]
+    fn a_second_event_under_one_id_is_a_duplicate() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
+        assert_eq!(
+            offer(&db, "T1", "#ops", Some(SCHOLAR), 10),
+            ActWrite::Duplicate
+        );
+    }
+
+    /// The whole point of deriving the view: replaying the log reproduces it.
+    /// A mismatch means something wrote the view without going through the
+    /// log, and the log would have stopped being the record.
+    #[test]
+    fn the_view_rebuilt_from_the_log_equals_the_live_view() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
+        follow_up(&db, "accept", SCHOLAR, "T1", "E1", "#ops", 11);
+        follow_up(&db, "progress", SCHOLAR, "T1", "E2", "#ops", 12);
+
+        offer(&db, "T2", "#ops", None, 20);
+        follow_up(&db, "claim", MALLORY, "T2", "E3", "#ops", 21);
+
+        offer(&db, "T3", "#other", Some(SCHOLAR), 30);
+        follow_up(&db, "decline", SCHOLAR, "T3", "E4", "#other", 31);
+
+        offer(&db, "T4", "#ops", None, 40);
+
+        let venues = vec!["#ops".to_string(), "#other".to_string()];
+        let mut live = db.act_tasks(&venues, None, None, None, 100).unwrap();
+        live.sort_by(|a, b| a.act_id.cmp(&b.act_id));
+        let mut rebuilt = db.rebuild_act_actions().unwrap();
+        rebuilt.sort_by(|a, b| a.act_id.cmp(&b.act_id));
+
+        assert_eq!(live.len(), 3, "T3 declined, so it left the view");
+        assert_eq!(rebuilt, live);
+    }
+
+    #[test]
+    fn the_listing_filters_by_kind_assignee_and_state() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
+        follow_up(&db, "accept", SCHOLAR, "T1", "E1", "#ops", 11);
+        offer(&db, "T2", "#ops", None, 20);
+
+        let venues = vec!["#ops".to_string()];
+        let all = db.act_tasks(&venues, None, None, None, 100).unwrap();
+        assert_eq!(all.len(), 2);
+
+        let assigned = db
+            .act_tasks(&venues, None, None, Some("assigned"), 100)
+            .unwrap();
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].act_id, "T1");
+
+        let scholars = db
+            .act_tasks(&venues, None, Some(SCHOLAR), None, 100)
+            .unwrap();
+        assert_eq!(scholars.len(), 1);
+
+        let handoffs = db
+            .act_tasks(&venues, Some("handoff"), None, None, 100)
+            .unwrap();
+        assert_eq!(handoffs.len(), 2);
+        let bounties = db
+            .act_tasks(&venues, Some("bounty"), None, None, 100)
+            .unwrap();
+        assert!(bounties.is_empty());
+    }
+
+    /// A venue the reader may not see contributes nothing, which is what the
+    /// endpoints lean on to keep DM tasks private.
+    #[test]
+    fn the_listing_answers_only_for_the_venues_it_was_given() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
+        offer(&db, "T2", "dm:did:plc:a,did:plc:b", Some(SCHOLAR), 20);
+
+        let public = db
+            .act_tasks(&["#ops".to_string()], None, None, None, 100)
+            .unwrap();
+        assert_eq!(public.len(), 1);
+        assert_eq!(public[0].act_id, "T1");
+        assert!(db.act_tasks(&[], None, None, None, 100).unwrap().is_empty());
+    }
+
     // ── Effective capabilities ────────────────────────────────────────────
     //
     // PHASE-4 says a spawned child gets "the intersection of the parent's caps
@@ -3839,7 +4189,7 @@ mod tests {
                 db.conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                     .unwrap(),
-                5,
+                6,
                 "first open stamps the schema"
             );
         }
@@ -3851,7 +4201,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
         assert_eq!(db.root_of("id-2"), "id-1");
         assert_eq!(db.current_revision("id-1").unwrap().unwrap().text, "v2");
@@ -3881,7 +4231,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
     }
 
@@ -3924,7 +4274,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
     }
 
@@ -5270,6 +5620,499 @@ impl Db {
         }
         tx.commit()?;
         Ok(CoordinationWrite::Filed)
+    }
+
+    // ── task events: the log, and the live-task view derived from it ────────
+
+    /// Apply an accepted task event: check it against the task's current
+    /// state, file it in the log, and update the view — all in one critical
+    /// section.
+    ///
+    /// The three have to happen together. `with_db` holds the database mutex
+    /// for the whole closure, so a caller that reads state, decides, and
+    /// writes inside a single call is serialized against every other
+    /// connection; split across two calls, two agents claiming the same open
+    /// task could both read `open` and both win. That race is what the
+    /// two-claims test exists to pin.
+    ///
+    /// The checker is the shared one from `freeq_sdk::act_transitions`, fed
+    /// from the view row — so the server and a bot pre-checking the same move
+    /// reach the same verdict from the same rules file.
+    pub fn apply_act_event(&self, ev: &ActEvent<'_>) -> SqlResult<ActWrite> {
+        use freeq_sdk::act_transitions as rules;
+
+        let tx = self.conn.unchecked_transaction()?;
+        let Some(view) = crate::events::derive_act_view(ev.canonical) else {
+            return Ok(ActWrite::NotATaskEvent);
+        };
+
+        // What the event does to the task, and what the task looks like now.
+        let landed = if ev.opens {
+            // The opener's own id is the task's id. A second opener under the
+            // same id is the log's duplicate case, handled by the write below.
+            match rules::check_open(&view.kind, &view.verb, view.to.is_some(), false) {
+                Ok(state) => state.to_string(),
+                Err(refusal) => return Ok(ActWrite::Refused(refusal)),
+            }
+        } else {
+            let Some(task) = self.act_task(ev.act_id)? else {
+                // No live row. The view holds only unfinished work, so a task
+                // the log knows is one that finished — a different answer from
+                // one nobody ever opened, and the sender deserves the true
+                // one. The log is the record; this is what it is for.
+                return Ok(match self.act_task_is_on_file(ev.act_id)? {
+                    true => ActWrite::Refused(rules::Refusal::TerminalTask),
+                    false => ActWrite::UnknownTask,
+                });
+            };
+            // A follow-up belongs to its task's conversation. Without this a
+            // signed event could move a task from a room its participants
+            // cannot see.
+            if task.venue != ev.venue {
+                return Ok(ActWrite::WrongVenue);
+            }
+            let event = rules::Event {
+                verb: &view.verb,
+                msgid: ev.event_id,
+            };
+            let sender = rules::Sender {
+                did: ev.actor,
+                is_system: ev.from_system,
+            };
+            let checked = rules::Task {
+                kind: &task.kind,
+                state: &task.state,
+                offerer: &task.offerer,
+                offeree: task.offeree.as_deref(),
+                assignee: task.assignee.as_deref(),
+                deadline: task.deadline,
+            };
+            match rules::check(&checked, &event, &sender) {
+                Ok(state) => state.to_string(),
+                Err(refusal) => return Ok(ActWrite::Refused(refusal)),
+            }
+        };
+
+        // The log is append-only and first-write-wins. If it declines the id,
+        // the view must not move either — one of them showing an event the
+        // other does not is the disagreement this path exists to prevent.
+        let record = EventRecord {
+            shape: EventShape::Document(ev.canonical),
+            signature: ev.signature,
+            ctx: crate::events::EventContext::verified(),
+            timestamp: ev.timestamp as u64,
+        };
+        if !self.insert_event(&record)? {
+            return Ok(ActWrite::Duplicate);
+        }
+        self.materialize_act(ev, &view, &landed)?;
+        tx.commit()?;
+        Ok(ActWrite::Filed { state: landed })
+    }
+
+    /// Move the view to match an event that was just accepted.
+    ///
+    /// The rules, in full: an opener creates the row and sets what the offer
+    /// declared; whoever moves a task into `assigned` becomes its assignee;
+    /// a terminal state removes the row, because the view holds live tasks and
+    /// the log holds the history.
+    fn materialize_act(
+        &self,
+        ev: &ActEvent<'_>,
+        view: &crate::events::ActView,
+        landed: &str,
+    ) -> SqlResult<()> {
+        if freeq_sdk::act_transitions::is_terminal(&view.kind, landed) {
+            self.conn.execute(
+                "DELETE FROM act_actions WHERE act_id = ?1",
+                params![ev.act_id],
+            )?;
+            return Ok(());
+        }
+        if ev.opens {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO act_actions
+                     (act_id, kind, venue, origin, state, offerer, offeree, caps, deadline, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    ev.act_id,
+                    view.kind,
+                    ev.venue,
+                    ev.origin.unwrap_or(""),
+                    landed,
+                    ev.actor,
+                    view.to,
+                    view.caps,
+                    view.deadline,
+                    ev.timestamp,
+                ],
+            )?;
+            return Ok(());
+        }
+        // Whoever moves a task into `assigned` becomes its assignee — and only
+        // the first one does, so a progress report does not reassign the work
+        // it is reporting on.
+        self.conn.execute(
+            "UPDATE act_actions
+                SET state = ?2,
+                    assignee = CASE WHEN assignee IS NULL AND ?3 = 'assigned'
+                                    THEN ?4 ELSE assignee END,
+                    updated = ?5
+              WHERE act_id = ?1",
+            params![ev.act_id, landed, landed, ev.actor, ev.timestamp],
+        )?;
+        Ok(())
+    }
+
+    /// Whether `event_id` names a task event in the log.
+    ///
+    /// Asked by the delete and edit paths. Task events are immutable: the
+    /// lifecycle is the only way a task changes, and a later event supersedes
+    /// an earlier one rather than erasing it. A message row is not consulted,
+    /// because a task event has none — which is exactly how the DM path used
+    /// to end up relaying such a delete instead of refusing it.
+    pub fn is_act_event(&self, event_id: &str) -> SqlResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'act' AND event_id = ?1",
+            params![event_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Whether the log has ever held an event opening this task.
+    ///
+    /// Asked only on the refusal path, to tell a finished task apart from one
+    /// that never existed. The view cannot answer it: it drops a task the
+    /// moment the task ends.
+    pub fn act_task_is_on_file(&self, act_id: &str) -> SqlResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'act' AND event_id = ?1",
+            params![act_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// One live task by id. `None` once it has finished — the log keeps the
+    /// history, the view keeps the work.
+    pub fn act_task(&self, act_id: &str) -> SqlResult<Option<ActTask>> {
+        self.conn
+            .query_row(
+                "SELECT act_id, kind, venue, origin, state, offerer, offeree, assignee,
+                        caps, deadline, updated
+                 FROM act_actions WHERE act_id = ?1",
+                params![act_id],
+                |row| {
+                    Ok(ActTask {
+                        act_id: row.get(0)?,
+                        kind: row.get(1)?,
+                        venue: row.get(2)?,
+                        origin: row.get(3)?,
+                        state: row.get(4)?,
+                        offerer: row.get(5)?,
+                        offeree: row.get(6)?,
+                        assignee: row.get(7)?,
+                        caps: row.get(8)?,
+                        deadline: row.get(9)?,
+                        updated: row.get(10)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Live tasks, newest movement first, filtered by whatever the caller
+    /// named. `venues` bounds the answer to conversations the reader may see.
+    pub fn act_tasks(
+        &self,
+        venues: &[String],
+        kind: Option<&str>,
+        assignee: Option<&str>,
+        state: Option<&str>,
+        limit: usize,
+    ) -> SqlResult<Vec<ActTask>> {
+        if venues.is_empty() {
+            return Ok(Vec::new());
+        }
+        let places = venues.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT act_id, kind, venue, origin, state, offerer, offeree, assignee,
+                    caps, deadline, updated
+               FROM act_actions
+              WHERE venue IN ({places})
+                AND (?{k} IS NULL OR kind = ?{k})
+                AND (?{a} IS NULL OR assignee = ?{a})
+                AND (?{s} IS NULL OR state = ?{s})
+              ORDER BY updated DESC, act_id
+              LIMIT ?{l}",
+            k = venues.len() + 1,
+            a = venues.len() + 2,
+            s = venues.len() + 3,
+            l = venues.len() + 4,
+        );
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        for v in venues {
+            args.push(Box::new(v.clone()));
+        }
+        args.push(Box::new(kind.map(str::to_string)));
+        args.push(Box::new(assignee.map(str::to_string)));
+        args.push(Box::new(state.map(str::to_string)));
+        args.push(Box::new(limit as i64));
+        let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|a| a.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(refs.as_slice(), |row| {
+            Ok(ActTask {
+                act_id: row.get(0)?,
+                kind: row.get(1)?,
+                venue: row.get(2)?,
+                origin: row.get(3)?,
+                state: row.get(4)?,
+                offerer: row.get(5)?,
+                offeree: row.get(6)?,
+                assignee: row.get(7)?,
+                caps: row.get(8)?,
+                deadline: row.get(9)?,
+                updated: row.get(10)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Live tasks whose last movement is older than `cutoff` — the sweep's
+    /// candidates.
+    ///
+    /// `updated` is what is measured, so a task that anyone touched recently
+    /// is not abandoned however old its opener is.
+    pub fn act_tasks_idle_since(&self, cutoff: i64, limit: usize) -> SqlResult<Vec<ActTask>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT act_id, kind, venue, origin, state, offerer, offeree, assignee,
+                    caps, deadline, updated
+               FROM act_actions
+              WHERE updated < ?1
+              ORDER BY updated
+              LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![cutoff, limit as i64], |row| {
+            Ok(ActTask {
+                act_id: row.get(0)?,
+                kind: row.get(1)?,
+                venue: row.get(2)?,
+                origin: row.get(3)?,
+                state: row.get(4)?,
+                offerer: row.get(5)?,
+                offeree: row.get(6)?,
+                assignee: row.get(7)?,
+                caps: row.get(8)?,
+                deadline: row.get(9)?,
+                updated: row.get(10)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// The title an offer declared, read back out of the opener's bytes.
+    ///
+    /// Not a column: `act-title` is one of the open set of act tags, and the
+    /// view holds only what it needs to referee. The expiry notice is the one
+    /// place a human-readable name is wanted, and the log has it.
+    pub fn act_task_title(&self, act_id: &str) -> SqlResult<Option<String>> {
+        let canonical: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT canonical FROM events WHERE kind = 'act' AND event_id = ?1",
+                params![act_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(canonical.and_then(|c| {
+            serde_json::from_str::<serde_json::Value>(&c)
+                .ok()?
+                .get("act-title")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        }))
+    }
+
+    /// Every venue that currently holds a live task.
+    ///
+    /// The listing endpoint runs each of these through the same authorization
+    /// a channel read gets, so the answer is bounded by what the caller may
+    /// already see rather than by a second, parallel rule.
+    pub fn act_venues(&self) -> SqlResult<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT venue FROM act_actions ORDER BY venue")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect()
+    }
+
+    /// The task events stored for one venue, in time order.
+    ///
+    /// What replay emits. Bounded by the same window and limit the message
+    /// history uses, so a history request cannot be turned into a full-table
+    /// scan by asking for a wide enough range.
+    pub fn act_events_for_venue(
+        &self,
+        venue: &str,
+        from_ts: i64,
+        to_ts: i64,
+        limit: usize,
+    ) -> SqlResult<Vec<ActLoggedEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, canonical, signature, actor_did, venue, timestamp
+               FROM events
+              WHERE kind = 'act' AND venue = ?1
+                AND timestamp >= ?2 AND timestamp <= ?3
+              ORDER BY timestamp, event_id
+              LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![venue, from_ts, to_ts, limit as i64], |row| {
+            Ok(ActLoggedEvent {
+                event_id: row.get(0)?,
+                canonical: row.get(1)?,
+                signature: row.get(2)?,
+                actor_did: row.get(3)?,
+                venue: row.get(4)?,
+                timestamp: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Every stored event of one task, oldest first: the opener, then each
+    /// follow-up. This is the history a reader gets, and it outlives the view.
+    pub fn act_task_events(&self, act_id: &str) -> SqlResult<Vec<ActLoggedEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, canonical, signature, actor_did, venue, timestamp
+               FROM events
+              WHERE kind = 'act' AND (event_id = ?1 OR subject = ?1)
+              ORDER BY timestamp, event_id",
+        )?;
+        let rows = stmt.query_map(params![act_id], |row| {
+            Ok(ActLoggedEvent {
+                event_id: row.get(0)?,
+                canonical: row.get(1)?,
+                signature: row.get(2)?,
+                actor_did: row.get(3)?,
+                venue: row.get(4)?,
+                timestamp: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Rebuild the whole view from the log, replaying every task event in
+    /// order — the proof that the view is derived and not authored.
+    ///
+    /// Used by the test that compares a rebuild against the live table. A
+    /// mismatch means some path wrote the view without going through the log,
+    /// which is the one thing that would make the log stop being the record.
+    pub fn rebuild_act_actions(&self) -> SqlResult<Vec<ActTask>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, canonical, actor_did, venue, subject, origin, timestamp
+               FROM events WHERE kind = 'act' ORDER BY timestamp, event_id",
+        )?;
+        struct Row {
+            event_id: String,
+            canonical: String,
+            actor: String,
+            venue: String,
+            subject: Option<String>,
+            origin: Option<String>,
+            timestamp: i64,
+        }
+        let rows: Vec<Row> = stmt
+            .query_map([], |row| {
+                Ok(Row {
+                    event_id: row.get(0)?,
+                    canonical: row.get(1)?,
+                    actor: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    venue: row.get(3)?,
+                    subject: row.get(4)?,
+                    origin: row.get(5)?,
+                    timestamp: row.get(6)?,
+                })
+            })?
+            .collect::<SqlResult<_>>()?;
+
+        let mut live: std::collections::BTreeMap<String, ActTask> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let Some(view) = crate::events::derive_act_view(&row.canonical) else {
+                continue;
+            };
+            let act_id = row.subject.clone().unwrap_or_else(|| row.event_id.clone());
+            let opens = row.subject.is_none();
+            let landed = if opens {
+                match freeq_sdk::act_transitions::check_open(
+                    &view.kind,
+                    &view.verb,
+                    view.to.is_some(),
+                    false,
+                ) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => continue,
+                }
+            } else {
+                let Some(task) = live.get(&act_id) else {
+                    continue;
+                };
+                match freeq_sdk::act_transitions::check(
+                    &freeq_sdk::act_transitions::Task {
+                        kind: &task.kind,
+                        state: &task.state,
+                        offerer: &task.offerer,
+                        offeree: task.offeree.as_deref(),
+                        assignee: task.assignee.as_deref(),
+                        deadline: task.deadline,
+                    },
+                    &freeq_sdk::act_transitions::Event {
+                        verb: &view.verb,
+                        msgid: &row.event_id,
+                    },
+                    &freeq_sdk::act_transitions::Sender {
+                        did: &row.actor,
+                        // The log holds only events this server accepted, and
+                        // it accepted this one — including an expiry it signed
+                        // itself, whose sender check already passed.
+                        is_system: true,
+                    },
+                ) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => continue,
+                }
+            };
+            if freeq_sdk::act_transitions::is_terminal(&view.kind, &landed) {
+                live.remove(&act_id);
+                continue;
+            }
+            if opens {
+                live.insert(
+                    act_id.clone(),
+                    ActTask {
+                        act_id,
+                        kind: view.kind.clone(),
+                        venue: row.venue.clone(),
+                        origin: row.origin.clone().unwrap_or_default(),
+                        state: landed,
+                        offerer: row.actor.clone(),
+                        offeree: view.to.clone(),
+                        assignee: None,
+                        caps: view.caps.clone(),
+                        deadline: view.deadline,
+                        updated: row.timestamp,
+                    },
+                );
+            } else if let Some(task) = live.get_mut(&act_id) {
+                if task.assignee.is_none() && landed == "assigned" {
+                    task.assignee = Some(row.actor.clone());
+                }
+                task.state = landed;
+                task.updated = row.timestamp;
+            }
+        }
+        Ok(live.into_values().collect())
     }
 
     /// A coordination event by id, whatever kind it is.

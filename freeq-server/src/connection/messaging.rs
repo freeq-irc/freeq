@@ -36,7 +36,7 @@ const PRUNE_INTERVAL: u32 = 256;
 /// believes it sent a signed event, and filing that event under an id its
 /// signature doesn't cover would produce history that looks tampered with. The
 /// caller reports `FAIL` and drops the message instead.
-fn resolve_event_msgid(
+pub(super) fn resolve_event_msgid(
     conn: &Connection,
     tags: &HashMap<String, String>,
     state: &Arc<SharedState>,
@@ -295,6 +295,60 @@ pub(crate) enum ClientSigOutcome {
 /// [`crate::peer_keys`].
 pub(crate) const NO_KEY_ON_FILE: &str = "no key on file for that kid";
 
+/// The key a `kid` names, for a signer we hold something for.
+///
+/// The session's registered key first (the common case: sign, then send),
+/// then the durable per-(DID, kid) history, which is what keeps a signature
+/// checkable after the session that made it has ended.
+fn verifying_key_for(
+    did: &str,
+    kid: &str,
+    session: Option<&str>,
+    state: &Arc<SharedState>,
+) -> Option<ed25519_dalek::VerifyingKey> {
+    let session_key = session
+        .and_then(|s| state.session_msg_keys.lock().get(s).copied())
+        .filter(|vk| freeq_sdk::sigtag::derive_kid(vk) == kid);
+    match session_key {
+        Some(vk) => Some(vk),
+        None => state
+            .with_db(|db| db.get_signing_key_by_kid(did, kid))
+            .flatten()
+            .and_then(|bytes| ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok()),
+    }
+}
+
+/// Verify a task message's signature, rebuilding the act canonical exactly as
+/// the signer built it: the wire act tags, the venue, and the id it minted.
+///
+/// A different profile from the chat documents above and deliberately so — an
+/// act signature covers every `act-` tag present rather than an enumerated
+/// field list, which is what lets a new task kind add fields without anyone
+/// touching a canonical.
+pub(super) fn verify_act_signature<'a>(
+    tags: Vec<(&'a str, &'a str)>,
+    venue: &'a str,
+    msgid: &'a str,
+    sig_tag: &str,
+    did: &str,
+    session: &str,
+    state: &Arc<SharedState>,
+) -> ClientSigOutcome {
+    let Ok((kid, _)) = freeq_sdk::sigtag::parse(sig_tag) else {
+        return ClientSigOutcome::Unverifiable("unparseable or legacy signature format");
+    };
+    let Some(key) = verifying_key_for(did, kid, Some(session), state) else {
+        return ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE);
+    };
+    match freeq_sdk::act::verify_act(tags, venue, msgid, sig_tag, &key) {
+        Ok(()) => ClientSigOutcome::Verified,
+        Err(freeq_sdk::act::ActSigError::SigInvalid) => ClientSigOutcome::Failed,
+        // A kid that does not match, a format we cannot read, or no act tags
+        // at all: none of these is evidence of forgery.
+        Err(_) => ClientSigOutcome::Unverifiable("unusable signature tag"),
+    }
+}
+
 /// Verify `sig_tag` over `doc`, using the key its `kid` names.
 ///
 /// `session` is the local session that registered the key, when there is one.
@@ -315,22 +369,8 @@ fn verify_client_signature(
         return ClientSigOutcome::Unverifiable("unparseable or legacy signature format");
     };
 
-    // The session's registered key first (the common case: sign, then send),
-    // then the durable per-(DID, kid) history, which is what keeps a signature
-    // checkable after the session that made it has ended.
-    let session_key = session
-        .and_then(|s| state.session_msg_keys.lock().get(s).copied())
-        .filter(|vk| freeq_sdk::sigtag::derive_kid(vk) == kid);
-    let key = match session_key {
-        Some(vk) => vk,
-        None => match state
-            .with_db(|db| db.get_signing_key_by_kid(did, kid))
-            .flatten()
-            .and_then(|bytes| ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok())
-        {
-            Some(vk) => vk,
-            None => return ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE),
-        },
+    let Some(key) = verifying_key_for(did, kid, session, state) else {
+        return ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE);
     };
 
     match doc.verify(sig_tag, &key) {
@@ -933,6 +973,47 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// The per-connection budget for tag-only events: 5 in any 2 seconds.
+///
+/// One counter, shared by every family that spends from it — the stopgap
+/// coordination events and task messages both. Two counters would let a
+/// connection send twice as much by alternating between the families, which
+/// is the same flood the limit exists to stop. Sends the `FAIL` itself when
+/// the budget is gone, so a caller only has to decide what to log.
+pub(super) fn event_flood_exceeded(conn: &Connection, state: &Arc<SharedState>) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let over = {
+        let key = format!("event:{}", conn.id);
+        let mut ts_map = state.msg_timestamps.lock();
+        let ts = ts_map.entry(key).or_default();
+        ts.retain(|&t| now.saturating_sub(t) < 2000);
+        if ts.len() >= 5 {
+            true
+        } else {
+            ts.push(now);
+            false
+        }
+    };
+    if over {
+        let reply = Message::from_server(
+            &state.server_name,
+            "FAIL",
+            vec![
+                "TAGMSG",
+                "RATE_LIMITED",
+                "At most 5 events per 2 seconds per session",
+            ],
+        );
+        if let Some(tx) = state.connections.lock().get(&conn.id) {
+            let _ = tx.try_send(format!("{reply}\r\n"));
+        }
+    }
+    over
+}
+
 /// Whether a channel will take a TAGMSG from this sender: `+n` (members only)
 /// and `+m` (voiced or better), the same two gates a PRIVMSG passes.
 ///
@@ -1000,6 +1081,19 @@ pub(super) fn handle_tagmsg(
         &normalized_target
     } else {
         target
+    };
+
+    // ── Task messages ──
+    //
+    // Judged first, and by their own canonical. First because the mixed check
+    // has to answer a message carrying both act tags and a mutation before
+    // the mutation path does — otherwise a mix reads as a bad delete rather
+    // than as the two documents it is. An accepted task message falls through
+    // to the fan-out below, which sends it only where it was asked for.
+    let is_act = match super::act::gate(conn, target, tags, state) {
+        super::act::Gate::NotATaskMessage => false,
+        super::act::Gate::Accepted => true,
+        super::act::Gate::Refused => return,
     };
 
     // ── Check the signature before rewriting anything it covers ──
@@ -1161,36 +1255,12 @@ pub(super) fn handle_tagmsg(
         //
         // Reuses msg_timestamps under a session-derived synthetic
         // key so this counter is independent of the PRIVMSG one.
-        {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let key = format!("event:{}", conn.id);
-            let mut ts_map = state.msg_timestamps.lock();
-            let ts = ts_map.entry(key).or_default();
-            ts.retain(|&t| now.saturating_sub(t) < 2000);
-            if ts.len() >= 5 {
-                let nick = conn.nick_or_star();
-                let reply = Message::from_server(
-                    &state.server_name,
-                    "FAIL",
-                    vec![
-                        "TAGMSG",
-                        "RATE_LIMITED",
-                        "event-storage TAGMSG flood: 5 events / 2s per session",
-                    ],
-                );
-                if let Some(tx) = state.connections.lock().get(&conn.id) {
-                    let _ = tx.try_send(format!("{reply}\r\n"));
-                }
-                tracing::warn!(
-                    actor = %did, nick = %nick,
-                    "Rate-limited coordination-event TAGMSG flood",
-                );
-                return;
-            }
-            ts.push(now);
+        if event_flood_exceeded(conn, state) {
+            tracing::warn!(
+                actor = %did, nick = %conn.nick_or_star(),
+                "Rate-limited coordination-event TAGMSG flood",
+            );
+            return;
         }
         // SECURITY (CTF-20 cont.): also cap payload size before
         // decoding + storing. The 8 KB IRC line cap already bounds
@@ -1524,6 +1594,7 @@ pub(super) fn handle_tagmsg(
         let time_caps = state.cap_server_time.lock();
         let acct_caps = state.cap_account_tag.lock();
         let echo_caps = state.cap_echo_message.lock();
+        let act_caps = state.cap_act.lock();
         let conns = state.connections.lock();
         for member_session in &members {
             // Skip sender unless they have echo-message
@@ -1531,7 +1602,12 @@ pub(super) fn handle_tagmsg(
                 continue;
             }
             if let Some(tx) = conns.get(member_session) {
-                if tag_caps.contains(member_session) {
+                // A task message reaches only the connections that asked for
+                // it. Everyone else in the room sees the companion line the
+                // sender posts alongside, and nothing of the machine half.
+                if tag_caps.contains(member_session)
+                    && (!is_act || act_caps.contains(member_session))
+                {
                     let line = lines.pick(
                         time_caps.contains(member_session),
                         acct_caps.contains(member_session),
@@ -1584,10 +1660,11 @@ pub(super) fn handle_tagmsg(
             let tag_caps = state.cap_message_tags.lock();
             let time_caps = state.cap_server_time.lock();
             let acct_caps = state.cap_account_tag.lock();
+            let act_caps = state.cap_act.lock();
             let conns = state.connections.lock();
             for session in &sessions {
                 if let Some(tx) = conns.get(session) {
-                    if tag_caps.contains(session) {
+                    if tag_caps.contains(session) && (!is_act || act_caps.contains(session)) {
                         let line =
                             lines.pick(time_caps.contains(session), acct_caps.contains(session));
                         let _ = tx.try_send(line.to_string());
@@ -1646,6 +1723,17 @@ pub(super) fn handle_privmsg_with_multiline(
     multiline_lines: Option<&[super::draft_multiline::BatchLine]>,
 ) {
     crate::server::Metrics::bump(&state.metrics.messages_total);
+
+    // ── One message, one job ──
+    //
+    // A body is a chat document and act tags are a task document; a message
+    // carrying both would need one signature tag to sign two of them. Refused
+    // before anything reads either half.
+    if super::act::carries_act_tags(tags) {
+        super::act::refuse_body_with_act_tags(conn, command, state);
+        return;
+    }
+
     let hostmask = conn.hostmask();
 
     let timestamp = std::time::SystemTime::now()
@@ -2723,7 +2811,39 @@ fn replay_rows_as_batch(
         .with_db(|db| db.get_reactions_for_messages(&msgids))
         .unwrap_or_default();
 
+    // The venue's task events, to be emitted inside this same batch in time
+    // order with the messages. Empty unless this connection asked for them.
+    let window = messages
+        .iter()
+        .map(|r| r.timestamp as i64)
+        .fold((i64::MAX, i64::MIN), |(lo, hi), t| (lo.min(t), hi.max(t)));
+    let mut act_lines = super::act::replay_lines(
+        state,
+        session_id,
+        &crate::events::venue_of(&target),
+        &target,
+        if window.0 == i64::MAX { 0 } else { window.0 },
+        if window.1 == i64::MIN {
+            i64::MAX
+        } else {
+            window.1
+        },
+        messages.len().max(1) * 4,
+        has_time,
+        has_batch.then_some(batch_id.as_str()),
+    );
+    act_lines.reverse(); // popped from the back, so oldest goes last
+
     for row in &messages {
+        // Anything that happened at or before this message goes first, so a
+        // reader sees the task and the line about it in the order they landed.
+        while act_lines
+            .last()
+            .is_some_and(|(ts, _)| *ts <= row.timestamp as i64)
+        {
+            let (_, line) = act_lines.pop().expect("just checked");
+            send(state, session_id, line);
+        }
         let mut tags = if has_tags {
             row.tags.clone()
         } else {
@@ -2877,6 +2997,11 @@ fn replay_rows_as_batch(
                 format!(":{} PRIVMSG {} :{}\r\n", row.sender, target, row.text),
             );
         }
+    }
+
+    // Whatever happened after the last message, still inside the batch.
+    while let Some((_, line)) = act_lines.pop() {
+        send(state, session_id, line);
     }
 
     if has_batch {
@@ -3132,6 +3257,15 @@ fn handle_edit(
     state: &Arc<SharedState>,
     inbound_multiline_lines: Option<&[super::draft_multiline::BatchLine]>,
 ) {
+    // ── Task history cannot be rewritten ──
+    //
+    // Checked against the id as sent, before the root resolution below: a task
+    // event has no revisions to resolve through, and the sender named it
+    // directly.
+    if super::act::refuse_if_task_event(conn, "EDIT", original_msgid, state) {
+        return;
+    }
+
     let hostmask = conn.hostmask();
     let nick = conn.nick_or_star();
     let is_channel = target.starts_with('#') || target.starts_with('&');
@@ -3168,6 +3302,9 @@ fn handle_edit(
                 let original_nick = row.sender.split('!').next().unwrap_or("");
                 original_nick.eq_ignore_ascii_case(nick)
             };
+            // Author, not actor: an edit is refused because of who *wrote* the
+            // message, never because of who is doing the editing. (A task
+            // step is the mirror image and answers ACTOR_MISMATCH.)
             if !is_author {
                 let reply = Message::from_server(
                     &state.server_name,
@@ -3680,6 +3817,15 @@ fn handle_delete(
     event_ctx: &crate::events::EventContext,
     state: &Arc<SharedState>,
 ) {
+    // ── Task history cannot be rewritten ──
+    //
+    // Asked before anything looks for a message row, because a task event has
+    // none: the DM path's no-row arm relayed such a delete live, which would
+    // have told every other client to drop an event the log still holds.
+    if super::act::refuse_if_task_event(conn, "DELETE", original_msgid, state) {
+        return;
+    }
+
     let hostmask = conn.hostmask();
     let nick = conn.nick_or_star();
     let is_channel = target.starts_with('#') || target.starts_with('&');
@@ -3718,6 +3864,10 @@ fn handle_delete(
                         .get(target)
                         .map(|ch| ch.ops.contains(&conn.id))
                         .unwrap_or(false);
+                // The one place both words are live at once: the actor is
+                // whoever asked for the delete, the author is whoever wrote
+                // the message, and the rule is that the actor must be one or
+                // the other — the author, or an op.
                 if !is_op {
                     let reply = Message::from_server(
                         &state.server_name,

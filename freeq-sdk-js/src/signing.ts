@@ -259,6 +259,35 @@ export async function coordinationCanonical(fields: {
 }
 
 /** Derive a key id: base64url of the first 16 bytes of SHA-256 over the key. */
+/**
+ * The canonical a task event's signature covers: every `act`/`act-*` tag on
+ * the message, keyed by its name with the vendor prefix stripped, plus the
+ * venue and the signer's event id.
+ *
+ * Byte-identical to `freeq_sdk::act::act_canonical` and to bot-kit's copy —
+ * the shared fixtures in `spec/act-signing-vectors.json` are what hold the
+ * three together.
+ */
+export function actCanonical(
+  tags: Record<string, string>,
+  target: string,
+  msgid: string,
+): string | null {
+  const covered: Record<string, string> = {};
+  for (const [name, value] of Object.entries(tags)) {
+    const stripped = name.startsWith('+freeq.at/')
+      ? name.slice('+freeq.at/'.length)
+      : name.startsWith('freeq.at/')
+        ? name.slice('freeq.at/'.length)
+        : name;
+    if (stripped === 'act' || stripped.startsWith('act-')) covered[stripped] = value;
+  }
+  if (Object.keys(covered).length === 0) return null;
+  covered.target = target;
+  covered.msgid = msgid;
+  return canonicalize(covered);
+}
+
 export async function deriveKid(rawPublicKey: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', rawPublicKey as unknown as ArrayBuffer);
   return b64url(new Uint8Array(digest).slice(0, 16));
@@ -432,6 +461,32 @@ export class SessionSigning {
       ref: opts.ref,
       evidence: opts.evidence,
     });
+    const sigTag = await this.signCanonical(canonical);
+    return sigTag ? { eventId, sigTag } : null;
+  }
+
+  /**
+   * Sign a task event — the `act-` tag family.
+   *
+   * A different profile from the documents above and deliberately so: an act
+   * signature covers every `act-` tag present rather than an enumerated field
+   * list, which is what lets a new task kind add fields without anyone
+   * touching a canonical. The two injected fields are the same two every
+   * profile carries: the venue, and the id the signer minted.
+   *
+   * `tags` are wire names (`+freeq.at/act-…`); anything else in the map is
+   * ignored by the canonical, exactly as the server's rebuild ignores it.
+   */
+  async signAct(
+    target: string,
+    tags: Record<string, string>,
+    eventId: string,
+  ): Promise<SignedEvent | null> {
+    if (!this.signingKey?.privateKey || !this.authenticatedDid) return null;
+    const venue = venueForTarget(target, this.authenticatedDid);
+    if (!venue) return null;
+    const canonical = actCanonical(tags, venue, eventId);
+    if (canonical === null) return null;
     const sigTag = await this.signCanonical(canonical);
     return sigTag ? { eventId, sigTag } : null;
   }

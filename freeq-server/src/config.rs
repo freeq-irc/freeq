@@ -123,6 +123,15 @@ pub struct ServerConfig {
     #[arg(long, default_value = "10000")]
     pub max_messages_per_channel: usize,
 
+    /// How long a task may sit in a non-finished state before the sweep marks
+    /// it expired, in seconds. This is the abandonment limit, not the offer's
+    /// own deadline: the deadline bounds how long an offer stands and is
+    /// optional, while this is what catches work somebody accepted and then
+    /// walked away from. Measured from the task's last movement. 0 = never
+    /// expire.
+    #[arg(long, default_value = "604800")]
+    pub act_expiry_secs: u64,
+
     /// Message of the Day text. If not set, no MOTD is sent.
     #[arg(long)]
     pub motd: Option<String>,
@@ -297,6 +306,7 @@ impl Default for ServerConfig {
             data_dir: None,
             did_resolver_static: vec![],
             max_messages_per_channel: 10000,
+            act_expiry_secs: 604_800,
             motd: None,
             motd_file: None,
             web_static_dir: None,
@@ -430,6 +440,7 @@ struct FileConfig {
     data_dir: Option<String>,
     did_resolver_static: Option<MapOrPairs>,
     max_messages_per_channel: Option<usize>,
+    act_expiry_secs: Option<u64>,
     motd: Option<String>,
     motd_file: Option<String>,
     web_static_dir: Option<String>,
@@ -546,6 +557,7 @@ fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConf
         s2s_peers,
         s2s_allowed_peers,
         max_messages_per_channel,
+        act_expiry_secs,
         plugins,
         require_did_for_ops,
         oper_dids,
@@ -600,6 +612,7 @@ mod tests {
                 server_name = "toml-test"
                 max_messages_per_channel = 42
                 iroh = true
+                act_expiry_secs = 120
                 s2s_peer_api = ["abcd=https://irc.example.com"]
                 "#,
             ),
@@ -609,6 +622,7 @@ mod tests {
         assert_eq!(c.server_name, "toml-test");
         assert_eq!(c.max_messages_per_channel, 42);
         assert!(c.iroh);
+        assert_eq!(c.act_expiry_secs, 120);
         assert_eq!(c.s2s_peer_api, vec!["abcd=https://irc.example.com"]);
     }
 

@@ -25,11 +25,28 @@ interface Vector {
   publicKey: string;
   kid: string;
   tags: Record<string, string>;
+  /** The normalized venue — injected by the caller, never read from a tag. */
+  target: string;
+  /** The event id the signer minted (`+freeq.at/eventid` on the wire). */
+  msgid: string;
   canonical: string;
   sigTag: string;
 }
 
-const fixtures: { vectors: Vector[] } = JSON.parse(
+/**
+ * The named vector's own tags and signature, checked against delivery context
+ * its signer never wrote.
+ */
+interface Negative {
+  name: string;
+  vector: string;
+  expected: "invalid";
+  target: string;
+  msgid: string;
+  tamperedCanonical: string;
+}
+
+const fixtures: { vectors: Vector[]; negatives: Negative[] } = JSON.parse(
   readFileSync(
     fileURLToPath(new URL("../../spec/act-signing-vectors.json", import.meta.url)),
     "utf8",
@@ -50,7 +67,7 @@ describe("act signing vectors (shared with Rust)", () => {
   for (const v of fixtures.vectors) {
     describe(v.name, () => {
       it("reproduces the canonical byte-for-byte", () => {
-        expect(actCanonical(v.tags)).toBe(v.canonical);
+        expect(actCanonical(v.tags, v.target, v.msgid)).toBe(v.canonical);
       });
 
       it("derives the same kid", async () => {
@@ -58,9 +75,9 @@ describe("act signing vectors (shared with Rust)", () => {
       });
 
       it("verifies the Rust-minted signature", async () => {
-        expect(await verifyActTags(v.tags, v.sigTag, b64urlDecode(v.publicKey))).toEqual({
-          ok: true,
-        });
+        expect(
+          await verifyActTags(v.tags, v.target, v.msgid, v.sigTag, b64urlDecode(v.publicKey)),
+        ).toEqual({ ok: true });
       });
 
       it("signs to the identical sigTag from the same seed (deterministic ed25519)", async () => {
@@ -68,8 +85,29 @@ describe("act signing vectors (shared with Rust)", () => {
         expect(publicKeyFromMultibase(key.publicKeyMultibase)).toEqual(
           b64urlDecode(v.publicKey),
         );
-        expect(await signActTags(v.tags, key)).toBe(v.sigTag);
+        expect(await signActTags(v.tags, v.target, v.msgid, key)).toBe(v.sigTag);
       });
+    });
+  }
+});
+
+describe("act signing negatives (shared with Rust)", () => {
+  it("carries the negatives the fixture file publishes", () => {
+    expect(fixtures.negatives.length).toBeGreaterThan(1);
+  });
+
+  for (const n of fixtures.negatives) {
+    const v = fixtures.vectors.find((x) => x.name === n.vector)!;
+
+    it(`${n.name}: rebuilds the tampered canonical byte-for-byte`, () => {
+      expect(v).toBeDefined();
+      expect(actCanonical(v.tags, n.target, n.msgid)).toBe(n.tamperedCanonical);
+    });
+
+    it(`${n.name}: the vector's own signature reads as ${n.expected}`, async () => {
+      expect(
+        await verifyActTags(v.tags, n.target, n.msgid, v.sigTag, b64urlDecode(v.publicKey)),
+      ).toEqual({ ok: false, reason: "sig-invalid" });
     });
   }
 });
@@ -80,7 +118,7 @@ describe("verification failures", () => {
 
   it("altered covered tag → sig-invalid", async () => {
     const tampered = { ...v.tags, "+freeq.at/act-title": "Cite 4 sources on X" };
-    expect(await verifyActTags(tampered, v.sigTag, pub())).toEqual({
+    expect(await verifyActTags(tampered, v.target, v.msgid, v.sigTag, pub())).toEqual({
       ok: false,
       reason: "sig-invalid",
     });
@@ -88,28 +126,47 @@ describe("verification failures", () => {
 
   it("added act tag → sig-invalid; altered non-covered tag → still valid", async () => {
     const added = { ...v.tags, "+freeq.at/act-priority": "urgent" };
-    expect(await verifyActTags(added, v.sigTag, pub())).toEqual({
+    expect(await verifyActTags(added, v.target, v.msgid, v.sigTag, pub())).toEqual({
       ok: false,
       reason: "sig-invalid",
     });
-    const remintedMsgid = { ...v.tags, msgid: "01JREMINTEDBYPEER00000000" };
-    expect(await verifyActTags(remintedMsgid, v.sigTag, pub())).toEqual({ ok: true });
+    // The server's own msgid stamp and the wire copy of the event id: the
+    // signed id is the parameter, not either tag.
+    const rewritten = {
+      ...v.tags,
+      msgid: "01JREMINTEDBYPEER00000000",
+      "+freeq.at/eventid": "01JREWRITTENBYPEER0000000",
+    };
+    expect(await verifyActTags(rewritten, v.target, v.msgid, v.sigTag, pub())).toEqual({
+      ok: true,
+    });
+  });
+
+  it("the venue and the event id come from the caller, not from a tag", async () => {
+    const spoofed = {
+      ...v.tags,
+      target: "#random",
+      msgid: "01JSPOOFED000000000000000X",
+    };
+    expect(actCanonical(spoofed, v.target, v.msgid)).toBe(v.canonical);
+    expect(await verifyActTags(spoofed, v.target, v.msgid, v.sigTag, pub())).toEqual({
+      ok: true,
+    });
   });
 
   it("wrong key → kid-mismatch", async () => {
     const otherPub = b64urlDecode(fixtures.vectors[1].publicKey);
-    expect(await verifyActTags(v.tags, v.sigTag, otherPub)).toEqual({
+    expect(await verifyActTags(v.tags, v.target, v.msgid, v.sigTag, otherPub)).toEqual({
       ok: false,
       reason: "kid-mismatch",
     });
   });
 
   it("malformed sig tag / unknown algorithm", async () => {
-    expect(await verifyActTags(v.tags, "ed25519:only-one-colon", pub())).toEqual({
-      ok: false,
-      reason: "bad-sig-format",
-    });
-    expect(await verifyActTags(v.tags, "rsa:kid:c2ln", pub())).toEqual({
+    expect(
+      await verifyActTags(v.tags, v.target, v.msgid, "ed25519:only-one-colon", pub()),
+    ).toEqual({ ok: false, reason: "bad-sig-format" });
+    expect(await verifyActTags(v.tags, v.target, v.msgid, "rsa:kid:c2ln", pub())).toEqual({
       ok: false,
       reason: "unsupported-algorithm",
     });
@@ -120,19 +177,19 @@ describe("verification failures", () => {
     // 64. base64url tolerates it silently, so without the length guard this
     // would fall through to a `sig-invalid` — diverging from Rust.
     const kid = v.sigTag.split(":")[1];
-    expect(await verifyActTags(v.tags, `ed25519:${kid}:AAAA`, pub())).toEqual({
-      ok: false,
-      reason: "bad-sig-format",
-    });
+    expect(await verifyActTags(v.tags, v.target, v.msgid, `ed25519:${kid}:AAAA`, pub())).toEqual(
+      { ok: false, reason: "bad-sig-format" },
+    );
   });
 
   it("no act tags → no-act-tags (and signing returns null)", async () => {
+    // Delivery context alone is not a document.
     const none = { msgid: "01J", account: "did:plc:x" };
-    expect(await verifyActTags(none, v.sigTag, pub())).toEqual({
+    expect(await verifyActTags(none, v.target, v.msgid, v.sigTag, pub())).toEqual({
       ok: false,
       reason: "no-act-tags",
     });
     const key = await importDidKey(hexToBytes(v.seed));
-    expect(await signActTags(none, key)).toBeNull();
+    expect(await signActTags(none, v.target, v.msgid, key)).toBeNull();
   });
 });

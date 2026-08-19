@@ -197,6 +197,8 @@ pub fn router(state: Arc<SharedState>) -> Router {
             post(crate::model_proxy::chat_completions),
         )
         .route("/metrics", get(api_metrics))
+        .route("/api/v1/act/tasks", get(api_act_tasks))
+        .route("/api/v1/act/tasks/{act_id}", get(api_act_task))
         .route("/api/v1/channels", get(api_channels))
         .route("/api/v1/channels/{name}/history", get(api_channel_history))
         .route("/api/v1/search", get(api_search))
@@ -826,6 +828,124 @@ async fn api_channel_events(
     Ok(Json(
         serde_json::json!({ "channel": channel, "events": events }),
     ))
+}
+
+/// Whether the caller may read what happens in `venue`.
+///
+/// A channel goes through the same check a channel read gets. A direct
+/// conversation is readable only by its two participants — channel
+/// authorization says nothing about DMs, and without this the listing would
+/// publish who is tasking whom.
+fn authorize_venue_read(state: &SharedState, venue: &str, headers: &axum::http::HeaderMap) -> bool {
+    match venue.strip_prefix("dm:") {
+        Some(pair) => caller_did_from_bearer(state, headers)
+            .is_some_and(|did| pair.split(',').any(|p| p == did)),
+        None => authorize_channel_read(state, venue, headers).is_ok(),
+    }
+}
+
+fn act_task_json(task: &crate::db::ActTask) -> serde_json::Value {
+    serde_json::json!({
+        "act_id": task.act_id,
+        "kind": task.kind,
+        "venue": task.venue,
+        "origin": task.origin,
+        "state": task.state,
+        "offerer": task.offerer,
+        "offeree": task.offeree,
+        "assignee": task.assignee,
+        "caps": task.caps,
+        "deadline": task.deadline,
+        "updated": task.updated,
+    })
+}
+
+/// GET /api/v1/act/tasks — the live tasks this caller may see.
+///
+/// Filters: `kind`, `assignee`, `state`. Open work is the question this
+/// answers, so finished tasks are not here — their history is at the
+/// single-task endpoint, which still serves them from the log.
+async fn api_act_tasks(
+    State(state): State<Arc<SharedState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let venues: Vec<String> = state
+        .with_db(|db| db.act_venues())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|v| authorize_venue_read(&state, v, &headers))
+        .collect();
+
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100usize)
+        .min(500);
+    let tasks: Vec<serde_json::Value> = state
+        .with_db(|db| {
+            db.act_tasks(
+                &venues,
+                params.get("kind").map(|s| s.as_str()),
+                params.get("assignee").map(|s| s.as_str()),
+                params.get("state").map(|s| s.as_str()),
+                limit,
+            )
+        })
+        .unwrap_or_default()
+        .iter()
+        .map(act_task_json)
+        .collect();
+
+    Ok(Json(serde_json::json!({ "tasks": tasks })))
+}
+
+/// GET /api/v1/act/tasks/{act_id} — one task and every event of it.
+///
+/// Serves a finished task too: the view drops it, the log keeps it, and the
+/// history is what a reader came for. `task` is null once it has ended.
+async fn api_act_task(
+    State(state): State<Arc<SharedState>>,
+    axum::extract::Path(act_id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let events = state
+        .with_db(|db| db.act_task_events(&act_id))
+        .unwrap_or_default();
+    // The venue comes from the events themselves, so a finished task is
+    // authorized by where it happened rather than by a row that is gone.
+    let Some(venue) = events.first().map(|e| e.venue.clone()) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    if !authorize_venue_read(&state, &venue, &headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let task = state
+        .with_db(|db| db.act_task(&act_id))
+        .flatten()
+        .as_ref()
+        .map(act_task_json);
+    let history: Vec<serde_json::Value> = events
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "event_id": e.event_id,
+                "canonical": e.canonical,
+                "signature": e.signature,
+                "actor_did": e.actor_did,
+                "venue": e.venue,
+                "timestamp": e.timestamp,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "act_id": act_id,
+        "venue": venue,
+        "task": task,
+        "events": history,
+    })))
 }
 
 /// GET /api/v1/tasks/{task_id} — task detail with all related events.
@@ -2163,6 +2283,7 @@ fn format_metrics(
     messages_total: u64,
     sasl_success_total: u64,
     sasl_failure_total: u64,
+    act_events_total: u64,
     uptime_seconds: u64,
 ) -> String {
     format!(
@@ -2184,6 +2305,9 @@ fn format_metrics(
          # HELP freeq_sasl_failure_total Failed SASL authentications since start\n\
          # TYPE freeq_sasl_failure_total counter\n\
          freeq_sasl_failure_total {sasl_failure_total}\n\
+         # HELP freeq_act_events_total Task events received since start\n\
+         # TYPE freeq_act_events_total counter\n\
+         freeq_act_events_total {act_events_total}\n\
          # HELP freeq_uptime_seconds Seconds since process start\n\
          # TYPE freeq_uptime_seconds gauge\n\
          freeq_uptime_seconds {uptime_seconds}\n"
@@ -2207,6 +2331,7 @@ async fn api_metrics(State(state): State<Arc<SharedState>>) -> impl axum::respon
         state.metrics.messages_total.load(Relaxed),
         state.metrics.sasl_success_total.load(Relaxed),
         state.metrics.sasl_failure_total.load(Relaxed),
+        state.metrics.act_events_total.load(Relaxed),
         state.metrics.started_at.elapsed().as_secs(),
     );
     (
@@ -5097,13 +5222,14 @@ mod metrics_tests {
 
     #[test]
     fn exposition_format_is_well_formed() {
-        let out = format_metrics(3, 7, 2, 100, 5, 1, 42);
+        let out = format_metrics(3, 7, 2, 100, 5, 1, 9, 42);
         assert!(out.contains("freeq_connections 3\n"));
         assert!(out.contains("freeq_channels 7\n"));
         assert!(out.contains("freeq_s2s_peers 2\n"));
         assert!(out.contains("freeq_messages_total 100\n"));
         assert!(out.contains("freeq_sasl_success_total 5\n"));
         assert!(out.contains("freeq_sasl_failure_total 1\n"));
+        assert!(out.contains("freeq_act_events_total 9\n"));
         assert!(out.contains("freeq_uptime_seconds 42\n"));
         // Every metric line is preceded by HELP + TYPE comments.
         for name in [
@@ -5113,6 +5239,7 @@ mod metrics_tests {
             "freeq_messages_total",
             "freeq_sasl_success_total",
             "freeq_sasl_failure_total",
+            "freeq_act_events_total",
             "freeq_uptime_seconds",
         ] {
             assert!(

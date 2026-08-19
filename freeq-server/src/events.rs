@@ -1,8 +1,8 @@
 //! The append-only event log — what happened, in the bytes it happened in.
 //!
-//! One table, `events`, holding every chat event this server accepted:
-//! messages, edits, deletes, reactions, unreactions, pins, and coordination
-//! events. `messages`, `reactions` and `pins` are derived from it — they are
+//! One table, `events`, holding every event this server accepted: messages,
+//! edits, deletes, reactions, unreactions, pins, coordination events, and
+//! task events. `messages`, `reactions` and `pins` are derived from it — they are
 //! the shape queries want, the log is the shape evidence wants.
 //!
 //! ## What a row stores, and why
@@ -103,11 +103,14 @@ pub struct EventFacts {
     /// The event's own id — the signer's, where there was a signer.
     pub event_id: String,
     /// `message` | `edit` | `delete` | `react` | `unreact` | `pin` | `unpin`
-    /// | `coordination`.
+    /// | `coordination` | `act`.
     pub kind: String,
     /// The normalized venue: a folded channel name, or `dm:<a>,<b>`.
     pub venue: String,
-    /// The acting identity. `None` for a guest.
+    /// The acting identity — the *actor*, whoever performed this event, which
+    /// is not always the *author* of what it acts on (an op deleting someone
+    /// else's message is the actor; the writer is the author). `None` for a
+    /// guest.
     pub actor_did: Option<String>,
     /// The root msgid this event acts on — a mutation's subject, an edit's
     /// original. `None` for a message that acts on nothing.
@@ -152,13 +155,37 @@ impl EventContext {
 /// The kind is read the way the document defines it: a mutation names its
 /// `kind` outright, and a message carries none — so the *absence* is the
 /// message kind, refined to `edit` when the document names the message it
-/// revises.
+/// revises. A task event is read on its own terms: it carries `act`, which
+/// names the kind of task rather than the kind of event, so it is recognized
+/// by that key before the chat rules are applied.
 pub fn derive_facts(canonical: &str) -> Option<EventFacts> {
     if canonical.is_empty() {
         return None;
     }
     let doc: serde_json::Value = serde_json::from_str(canonical).ok()?;
     let get = |k: &str| doc.get(k).and_then(|v| v.as_str()).map(str::to_string);
+
+    // A task event's document is not a chat document. It names the *kind of
+    // task* under `act` — a key no chat document carries — and its fields are
+    // the sender's `act-` tags rather than an enumerated set, so it is read on
+    // its own terms. The three columns every row needs are still in the bytes:
+    // the id and the venue because the act canonical binds both, and the actor
+    // because the view's offerer is derived from it and a row that could not
+    // name one could never be rebuilt from the log.
+    if doc.get("act").is_some() {
+        return Some(EventFacts {
+            event_id: get("msgid")?,
+            kind: "act".to_string(),
+            venue: get("target")?,
+            actor_did: Some(get("act-from")?),
+            // The task this event is about. An opener names none: its own id
+            // *is* the task's, which is the same relationship every other
+            // kind's `subject` records.
+            subject: get("act-id"),
+            body_hash: None,
+            emoji: None,
+        });
+    }
 
     let event_id = get("msgid")?;
     let venue = get("target")?;
@@ -185,6 +212,47 @@ pub fn derive_facts(canonical: &str) -> Option<EventFacts> {
         subject,
         body_hash,
         emoji: get("emoji"),
+    })
+}
+
+/// The fields a task event contributes to the live-task view, read out of the
+/// same bytes the log stores.
+///
+/// Separate from [`derive_facts`] because these are not columns of the log —
+/// they are what the view is materialized from. Both ingress and a rebuild go
+/// through here, which is what makes the rebuilt table equal the live one:
+/// there is one reading of the bytes, not two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActView {
+    /// The kind of task — the `act` value.
+    pub kind: String,
+    /// The verb this event performs.
+    pub verb: String,
+    /// `act-to`: the recipient a directed offer names. Its presence is what
+    /// makes an offer directed.
+    pub to: Option<String>,
+    /// `act-caps`, verbatim. Stored and filterable, never interpreted.
+    pub caps: Option<String>,
+    /// `act-deadline` in unix seconds, when the offer named one this server
+    /// can read as a number.
+    pub deadline: Option<i64>,
+}
+
+/// Read a task event's view fields out of its canonical.
+///
+/// `None` for bytes that are not a task document.
+pub fn derive_act_view(canonical: &str) -> Option<ActView> {
+    let doc: serde_json::Value = serde_json::from_str(canonical).ok()?;
+    let get = |k: &str| doc.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    Some(ActView {
+        kind: get("act")?,
+        verb: get("act-verb")?,
+        to: get("act-to"),
+        caps: get("act-caps"),
+        // A deadline nobody can read as a number is a deadline this server
+        // cannot enforce, so it is stored as absent rather than as a guess.
+        // The value stays in the canonical either way.
+        deadline: get("act-deadline").and_then(|d| d.parse::<i64>().ok()),
     })
 }
 
@@ -337,6 +405,159 @@ mod tests {
         let venue = freeq_sdk::chatsig::dm_venue(ALICE, "did:plc:bob");
         let canonical = ChatDoc::message(ALICE, MSGID, &venue, "between us").canonical();
         assert_eq!(derive_facts(&canonical).unwrap().venue, venue);
+    }
+
+    /// A task event's document is not a chat document: it names the task's
+    /// kind under `act` rather than carrying `kind`, and its actor rides
+    /// `act-from`. Every column the log needs still comes out of the bytes.
+    #[test]
+    fn an_act_document_derives_its_own_columns() {
+        let canonical = freeq_sdk::act::act_canonical(
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/act-from", "did:plc:eliza"),
+                ("+freeq.at/act-to", "did:plc:scholar"),
+            ],
+            "#ops",
+            "01JOFFER0000000000000000AA",
+        )
+        .unwrap();
+        let facts = derive_facts(&canonical).expect("an act document is a document");
+        assert_eq!(facts.kind, "act");
+        assert_eq!(facts.event_id, "01JOFFER0000000000000000AA");
+        assert_eq!(facts.venue, "#ops");
+        assert_eq!(facts.actor_did.as_deref(), Some("did:plc:eliza"));
+        assert_eq!(facts.subject, None, "an opener names no earlier task");
+        assert_eq!(facts.body_hash, None);
+        assert_eq!(facts.emoji, None);
+    }
+
+    /// A follow-up names the task it is about in `act-id`, which is the same
+    /// thing every other kind's `subject` column holds: the id of the event
+    /// this one acts on.
+    #[test]
+    fn an_act_follow_up_files_its_task_as_its_subject() {
+        let canonical = freeq_sdk::act::act_canonical(
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "accept"),
+                ("+freeq.at/act-from", "did:plc:scholar"),
+                ("+freeq.at/act-id", "01JOFFER0000000000000000AA"),
+            ],
+            "#ops",
+            "01JACCEPT000000000000000BB",
+        )
+        .unwrap();
+        let facts = derive_facts(&canonical).unwrap();
+        assert_eq!(facts.kind, "act");
+        assert_eq!(facts.event_id, "01JACCEPT000000000000000BB");
+        assert_eq!(facts.subject.as_deref(), Some("01JOFFER0000000000000000AA"));
+        assert_eq!(facts.actor_did.as_deref(), Some("did:plc:scholar"));
+    }
+
+    /// A DM task files under the conversation key, exactly as a DM message
+    /// does — the venue comes out of the signed bytes either way.
+    #[test]
+    fn an_act_document_in_a_dm_files_under_the_conversation() {
+        let venue = freeq_sdk::chatsig::dm_venue("did:plc:eliza", "did:plc:scholar");
+        let canonical = freeq_sdk::act::act_canonical(
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/act-from", "did:plc:eliza"),
+            ],
+            &venue,
+            "01JDM000000000000000000CC",
+        )
+        .unwrap();
+        assert_eq!(derive_facts(&canonical).unwrap().venue, venue);
+    }
+
+    /// The invariant the log rests on, extended to the new kind: bytes the
+    /// reader cannot make columns out of are not filed at all. An act document
+    /// naming no actor is one of those — the view's offerer comes from that
+    /// field, so a row without it could never be rebuilt from the log.
+    #[test]
+    fn an_act_document_without_an_actor_is_not_a_document() {
+        let canonical = freeq_sdk::act::act_canonical(
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+            ],
+            "#ops",
+            "01JNOFROM000000000000000DD",
+        )
+        .unwrap();
+        assert_eq!(derive_facts(&canonical), None);
+    }
+
+    #[test]
+    fn an_offer_contributes_its_declared_fields_to_the_view() {
+        let canonical = freeq_sdk::act::act_canonical(
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/act-from", "did:plc:eliza"),
+                ("+freeq.at/act-to", "did:plc:scholar"),
+                ("+freeq.at/act-caps", "freeq.at/web-search"),
+                ("+freeq.at/act-deadline", "1788000000"),
+            ],
+            "#ops",
+            "01JOFFER0000000000000000AA",
+        )
+        .unwrap();
+        let view = derive_act_view(&canonical).unwrap();
+        assert_eq!(view.kind, "handoff");
+        assert_eq!(view.verb, "offer");
+        assert_eq!(view.to.as_deref(), Some("did:plc:scholar"));
+        assert_eq!(view.caps.as_deref(), Some("freeq.at/web-search"));
+        assert_eq!(view.deadline, Some(1_788_000_000));
+    }
+
+    /// An open offer names nobody, which is what makes it claimable.
+    #[test]
+    fn an_open_offer_names_no_recipient() {
+        let canonical = freeq_sdk::act::act_canonical(
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/act-from", "did:plc:eliza"),
+            ],
+            "#ops",
+            "01JOPEN00000000000000000BB",
+        )
+        .unwrap();
+        let view = derive_act_view(&canonical).unwrap();
+        assert_eq!(view.to, None);
+        assert_eq!(view.caps, None);
+        assert_eq!(view.deadline, None);
+    }
+
+    /// A deadline this server cannot read as a number is stored as absent
+    /// rather than as a guess — the value itself survives in the canonical.
+    #[test]
+    fn a_deadline_that_is_not_a_number_is_not_enforced() {
+        let canonical = freeq_sdk::act::act_canonical(
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/act-from", "did:plc:eliza"),
+                ("+freeq.at/act-deadline", "next tuesday"),
+            ],
+            "#ops",
+            "01JBADDL00000000000000000C",
+        )
+        .unwrap();
+        assert_eq!(derive_act_view(&canonical).unwrap().deadline, None);
+        assert!(canonical.contains("next tuesday"), "the bytes keep it");
+    }
+
+    #[test]
+    fn a_chat_document_contributes_nothing_to_the_task_view() {
+        let canonical =
+            freeq_sdk::chatsig::ChatDoc::message("did:plc:a", "M1", "#c", "hi").canonical();
+        assert_eq!(derive_act_view(&canonical), None);
     }
 
     #[test]

@@ -2689,6 +2689,10 @@ export class FreeqClient extends EventEmitter {
         // server's own confirmation that it verifies chat documents, and
         // signing is gated on it (see `SIGNING_CAP`).
         SIGNING_CAP,
+        // Task events reach only the connections that ask for them. This
+        // SDK's callers are agents, which are the audience — a bot that can
+        // send a task step and never see another one has half a conversation.
+        'freeq.at/act',
       ];
       for (const c of caps) {
         // `draft/multiline` advertises with params (`=max-bytes=…,max-lines=…`)
@@ -3226,6 +3230,47 @@ export class FreeqClient extends EventEmitter {
     // the companion is a rendering of it: it carries the event tags a
     // reader draws a card from, and no claim to the event's id.
     await this.writeSignedMessage('PRIVMSG', channel, humanText, { ...tags });
+  }
+
+  /**
+   * Put a task event on the wire: the signed TAGMSG that *is* the event, then
+   * the plain-text companion that renders it for people.
+   *
+   * The same paired send the coordination emitter does, and for the same
+   * reason — two documents, each signing its own id. The companion links back
+   * with `+freeq.at/ref`, which is on chat's covered list; an `act-` name there
+   * would sit outside every signature, because those belong to task messages
+   * alone.
+   *
+   * Returns the event's id — which, for an opener, is the task's id.
+   */
+  async sendAct(
+    target: string,
+    actTags: Record<string, string>,
+    opts: { humanText: string; taskId?: string } = { humanText: '' },
+  ): Promise<string> {
+    const eventId = signing.newEventId();
+    const signed = await this.signing.signAct(target, actTags, eventId);
+    if (!signed) {
+      throw new Error(
+        'a task event must be signed: authenticate, register a signing key, ' +
+          'and address a channel or a DID',
+      );
+    }
+    const wireTags = {
+      ...actTags,
+      [signing.EVENT_ID_TAG]: eventId,
+      [signing.SIG_TAG]: signed.sigTag,
+    };
+    this.raw(format('TAGMSG', [target], wireTags));
+    if (opts.humanText) {
+      // The companion is an ordinary message signing its own id, carrying
+      // only the reference that joins it to the task.
+      await this.writeSignedMessage('PRIVMSG', target, opts.humanText, {
+        '+freeq.at/ref': opts.taskId ?? eventId,
+      });
+    }
+    return eventId;
   }
 
   /** Sugar over `emitEvent` for `task_request`. Returns the task ID. */

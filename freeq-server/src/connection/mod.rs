@@ -16,6 +16,7 @@
 //! - [`queries`] — WHOIS, WHO, LUSERS, AWAY
 //! - [`helpers`] — S2S broadcast, channel delivery, utility functions
 
+pub(crate) mod act;
 mod cap;
 mod channel;
 pub(crate) mod draft_multiline;
@@ -167,6 +168,10 @@ pub struct Connection {
     pub(crate) cap_account_notify: bool,
     pub(crate) cap_extended_join: bool,
     pub(crate) cap_away_notify: bool,
+    /// Client asked for `freeq.at/act`, so it receives task messages. Without
+    /// it a client sees only the companion lines, which is what keeps a
+    /// human's client from filling with machine traffic it cannot render.
+    pub(crate) cap_act: bool,
     pub(crate) cap_account_tag: bool,
     /// Client supports IRCv3 `draft/read-marker` — cross-device read markers
     /// via MARKREAD. See https://ircv3.net/specs/extensions/read-marker.
@@ -210,6 +215,7 @@ impl Connection {
             cap_account_notify: false,
             cap_extended_join: false,
             cap_away_notify: false,
+            cap_act: false,
             cap_account_tag: false,
             cap_read_marker: false,
             cap_e2ee: false,
@@ -3896,6 +3902,7 @@ fn cleanup_session_state(state: &Arc<SharedState>, session_id: &str) {
     state.cap_account_notify.lock().remove(session_id);
     state.cap_extended_join.lock().remove(session_id);
     state.cap_away_notify.lock().remove(session_id);
+    state.cap_act.lock().remove(session_id);
     state.cap_account_tag.lock().remove(session_id);
     state.cap_read_marker.lock().remove(session_id);
     state.session_read_markers.lock().remove(session_id);
