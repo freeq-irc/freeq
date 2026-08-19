@@ -58,6 +58,7 @@
 		7CA52334C990D1462FB32DE9 /* MessageBlocksView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08D72CE9AC9784183A6C8DB1 /* MessageBlocksView.swift */; };
 		80AAB9C3511F63855AFF87FF /* AudioLevelMeter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F52BF9F99E9D9772373AA39 /* AudioLevelMeter.swift */; };
 		814109482C3020E4DFB6F5DC /* FreeqSDK.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4BCCB41ADB5F3934945B6E85 /* FreeqSDK.xcframework */; };
+		82909B1F27845D317DFE69FA /* OutboundSend.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFE0F43442FE810AC4267283 /* OutboundSend.swift */; };
 		82F06962C82E36993AC3F92C /* AppKitMessageList.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2FF7FE3348FFE303622668A /* AppKitMessageList.swift */; };
 		86DD4B8F48BBEA4F40BE6D9D /* SelfPartResolve.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7244978703DC2ECAD43DFEB1 /* SelfPartResolve.swift */; };
 		87278B03BA72D53ADC27DB97 /* MainView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61EB9E0F12CF280B8BADFA41 /* MainView.swift */; };
@@ -89,8 +90,10 @@
 		C5A5186C1534C70E22BC2912 /* CoordinationCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03305544EF084785B6229CD6 /* CoordinationCard.swift */; };
 		C724476B94820275BA16E55F /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B11355062BDD7B9062AC22F /* ChatView.swift */; };
 		CAF04BC63962B2AD1BCB86FE /* FreeqAppIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99635569CD2711503B3DCF7E /* FreeqAppIntents.swift */; };
+		CB1EC774D4444A86144B5263 /* DmResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49F502D18AE018377ED62923 /* DmResolver.swift */; };
 		CCD46F07817FFF1625133C74 /* Jumbomoji.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06D79754C3E6C19E87D67F6E /* Jumbomoji.swift */; };
 		D0330D3B94FAB33F96D04BE8 /* ThreadView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 53A3EEB6BC19DB7746A55502 /* ThreadView.swift */; };
+		D20651B63332FC9534E8BF08 /* SendPathTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9711A6474348D203111AC49 /* SendPathTests.swift */; };
 		D29F998C6DF599EA13C38C85 /* ConnectView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 313F00E499C37E94C9855F4F /* ConnectView.swift */; };
 		D2DC1C78722C6743877143B7 /* MessageTimeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94E7AF9D701F15529729BA91 /* MessageTimeline.swift */; };
 		D520A6580822EF5314066E14 /* LinkPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1561609D65E3676C79D46E2 /* LinkPreview.swift */; };
@@ -104,6 +107,7 @@
 		E7D65B5702985BB69725442A /* MediaViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = DB6D944E494A3AE591F53C28 /* MediaViews.swift */; };
 		E8ABEEDF45BB77FFA7112E96 /* MessageStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41E19D6BE7C80AAE06A5EB97 /* MessageStore.swift */; };
 		E915DE84D6C922B1A64D4FE0 /* MessageBlocks.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62B0B9FB9D87D335C6B9327D /* MessageBlocks.swift */; };
+		EC17044DE0222489BF5FD85D /* IdentityClaim.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49CC1244CD3756E771AE3933 /* IdentityClaim.swift */; };
 		ECC92464E4422B5DCFDC770B /* KeychainHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D0D657E5F637E5EFD232E19 /* KeychainHelper.swift */; };
 		F09B5C0D9F467AE052B47824 /* CoordinationCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7DFCEDBA7A1F2BA99F60CA4 /* CoordinationCardView.swift */; };
 		F13BBF3DAA2C028548D91551 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04D3AAFE430FB0DC2DA62F57 /* Theme.swift */; };
@@ -113,9 +117,6 @@
 		F564EDD064F706DA1FED48B0 /* QuickSwitcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B36CCCF8041100BDA937EAB /* QuickSwitcher.swift */; };
 		F804DF96FC5F782461D42394 /* SearchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5BFC0A0C4F585C97716A8C4B /* SearchView.swift */; };
 		FDC15A8F819924DB11EA2B88 /* Validation.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2DFA3935D1A36696CF3DBC0 /* Validation.swift */; };
-		A10000000000000000000001 /* DmResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000004 /* DmResolver.swift */; };
-		A10000000000000000000002 /* IdentityClaim.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000005 /* IdentityClaim.swift */; };
-		A10000000000000000000003 /* OutboundSend.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000006 /* OutboundSend.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -125,6 +126,13 @@
 			proxyType = 1;
 			remoteGlobalIDString = B42D8262A9BDCD5F639B9E54;
 			remoteInfo = "freeq-share";
+		};
+		A499DE7B2291F09C995A497E /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = EFFD196B0E2C16958702061B /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A88AEE1BC1C4F7F824101B6F;
+			remoteInfo = "freeq-macos";
 		};
 /* End PBXContainerItemProxy section */
 
@@ -168,7 +176,10 @@
 		38E7280ECF55468ACAA820E4 /* ShareViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareViewController.swift; sourceTree = "<group>"; };
 		41E19D6BE7C80AAE06A5EB97 /* MessageStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageStore.swift; sourceTree = "<group>"; };
 		47A5B3D14480CBFFC56453C1 /* freeq-share.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = "freeq-share.appex"; sourceTree = BUILT_PRODUCTS_DIR; };
+		49CC1244CD3756E771AE3933 /* IdentityClaim.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IdentityClaim.swift; sourceTree = "<group>"; };
 		49DCC7DD970BA3640B37934D /* BookmarksPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BookmarksPanel.swift; sourceTree = "<group>"; };
+		49F502D18AE018377ED62923 /* DmResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DmResolver.swift; sourceTree = "<group>"; };
+		4A008B932015026EF12243AD /* freeq-macosTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "freeq-macosTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		4BCCB41ADB5F3934945B6E85 /* FreeqSDK.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = FreeqSDK.xcframework; sourceTree = "<group>"; };
 		4F8EFFA45A91FBAF437F7ADF /* UploadResponse.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UploadResponse.swift; sourceTree = "<group>"; };
 		50E8C4C51998A707446B885B /* AvStartRace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AvStartRace.swift; sourceTree = "<group>"; };
@@ -230,12 +241,10 @@
 		C4A0D1088653AEFB4125FCF7 /* NewDMSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NewDMSheet.swift; sourceTree = "<group>"; };
 		C89E834D837706F1C070EF33 /* SelfStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfStatus.swift; sourceTree = "<group>"; };
 		CECE4CB96A2A81AB72EC2324 /* freeq-macos.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "freeq-macos.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		CFE0F43442FE810AC4267283 /* OutboundSend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutboundSend.swift; sourceTree = "<group>"; };
 		D1561609D65E3676C79D46E2 /* LinkPreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LinkPreview.swift; sourceTree = "<group>"; };
 		D17E048D6D4D5A5BBEA1FABA /* AudioOutputDevices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioOutputDevices.swift; sourceTree = "<group>"; };
 		D2DFA3935D1A36696CF3DBC0 /* Validation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Validation.swift; sourceTree = "<group>"; };
-		A10000000000000000000004 /* DmResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DmResolver.swift; sourceTree = "<group>"; };
-		A10000000000000000000005 /* IdentityClaim.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IdentityClaim.swift; sourceTree = "<group>"; };
-		A10000000000000000000006 /* OutboundSend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutboundSend.swift; sourceTree = "<group>"; };
 		D2FF7FE3348FFE303622668A /* AppKitMessageList.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppKitMessageList.swift; sourceTree = "<group>"; };
 		D90D45494AECECE10448CB0E /* ComposeCommands.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposeCommands.swift; sourceTree = "<group>"; };
 		DA3E838FFB8176761B9DAA50 /* ChatMessage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMessage.swift; sourceTree = "<group>"; };
@@ -247,6 +256,7 @@
 		E4206386FFE3870AE9485C50 /* SyntaxHighlighter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyntaxHighlighter.swift; sourceTree = "<group>"; };
 		E582C3CB551AF3FC85159BD0 /* SignatureProof.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignatureProof.swift; sourceTree = "<group>"; };
 		E71A46E52B4FC4C2F32D7F34 /* ServerConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerConfig.swift; sourceTree = "<group>"; };
+		E9711A6474348D203111AC49 /* SendPathTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SendPathTests.swift; sourceTree = "<group>"; };
 		EBCA3FB47D495913D7C6FD49 /* HelpView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HelpView.swift; sourceTree = "<group>"; };
 		ECC9CABA22036B8DCCD1C135 /* CameraFrameRatePolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraFrameRatePolicy.swift; sourceTree = "<group>"; };
 		ED9F5A69D81B1BA80FC4782A /* ChannelState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelState.swift; sourceTree = "<group>"; };
@@ -279,10 +289,19 @@
 			path = Auth;
 			sourceTree = "<group>";
 		};
+		1F4479681912BE1B7168BAE2 /* freeq-macosTests */ = {
+			isa = PBXGroup;
+			children = (
+				E9711A6474348D203111AC49 /* SendPathTests.swift */,
+			);
+			path = "freeq-macosTests";
+			sourceTree = "<group>";
+		};
 		20C10B5BC807908C13D0B198 = {
 			isa = PBXGroup;
 			children = (
 				6F86DE6A257960A7020A8471 /* freeq-macos */,
+				1F4479681912BE1B7168BAE2 /* freeq-macosTests */,
 				8DDD9B549FDFE8C5F3EC1E47 /* Generated */,
 				5CA1DDA4C2AC7750470D8A5D /* ShareExtension */,
 				A4A3FBF0761FED3375CE6931 /* Frameworks */,
@@ -426,11 +445,13 @@
 				03305544EF084785B6229CD6 /* CoordinationCard.swift */,
 				0BD56638DA817D921B8F261C /* DebugBridge.swift */,
 				635E43C3825BFA51AFB89DF6 /* DidDisplay.swift */,
+				49F502D18AE018377ED62923 /* DmResolver.swift */,
 				20B3BED9F9A6237942DD0971 /* E2eeManager.swift */,
 				F16CD5A75774E1DD5AE3565B /* FavoritesSync.swift */,
 				F0D2221C3627158CF392EC73 /* FrameHitchMonitor.swift */,
 				99635569CD2711503B3DCF7E /* FreeqAppIntents.swift */,
 				9194BD66D242EE2DD6C3BA20 /* GlobalHotKey.swift */,
+				49CC1244CD3756E771AE3933 /* IdentityClaim.swift */,
 				06D79754C3E6C19E87D67F6E /* Jumbomoji.swift */,
 				6D0D657E5F637E5EFD232E19 /* KeychainHelper.swift */,
 				DB1B29BA8601FC220D46B705 /* Logger.swift */,
@@ -443,6 +464,7 @@
 				8CE91AA69A0B23B9029BF617 /* MessageTranscript.swift */,
 				A7D12A148B4822BCB055DECD /* MetricKitReporter.swift */,
 				6AD26F0F8B6173EE7643F964 /* NotificationManager.swift */,
+				CFE0F43442FE810AC4267283 /* OutboundSend.swift */,
 				FA3DBEC5B2360C6BABC6CCA7 /* PerfSignposts.swift */,
 				71D02469D6C6FADFE295A523 /* ReconnectPolicy.swift */,
 				568A6384EFD5C7CA0D2820AF /* Safety.swift */,
@@ -454,9 +476,6 @@
 				E582C3CB551AF3FC85159BD0 /* SignatureProof.swift */,
 				E4206386FFE3870AE9485C50 /* SyntaxHighlighter.swift */,
 				4F8EFFA45A91FBAF437F7ADF /* UploadResponse.swift */,
-				A10000000000000000000004 /* DmResolver.swift */,
-				A10000000000000000000005 /* IdentityClaim.swift */,
-				A10000000000000000000006 /* OutboundSend.swift */,
 				D2DFA3935D1A36696CF3DBC0 /* Validation.swift */,
 			);
 			path = Models;
@@ -474,6 +493,7 @@
 			isa = PBXGroup;
 			children = (
 				CECE4CB96A2A81AB72EC2324 /* freeq-macos.app */,
+				4A008B932015026EF12243AD /* freeq-macosTests.xctest */,
 				47A5B3D14480CBFFC56453C1 /* freeq-share.appex */,
 			);
 			name = Products;
@@ -490,6 +510,24 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		A6ECEB2F6FA698BAFF9A62B9 /* freeq-macosTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 22822D982EAE561F0F996A41 /* Build configuration list for PBXNativeTarget "freeq-macosTests" */;
+			buildPhases = (
+				78D622E1513C795A7C7F78B5 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				DD2DBE809198E5AB0805B551 /* PBXTargetDependency */,
+			);
+			name = "freeq-macosTests";
+			packageProductDependencies = (
+			);
+			productName = "freeq-macosTests";
+			productReference = 4A008B932015026EF12243AD /* freeq-macosTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		A88AEE1BC1C4F7F824101B6F /* freeq-macos */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = FFCC7582359AA1CA2AE6B069 /* Build configuration list for PBXNativeTarget "freeq-macos" */;
@@ -555,6 +593,7 @@
 			projectRoot = "";
 			targets = (
 				A88AEE1BC1C4F7F824101B6F /* freeq-macos */,
+				A6ECEB2F6FA698BAFF9A62B9 /* freeq-macosTests */,
 				B42D8262A9BDCD5F639B9E54 /* freeq-share */,
 			);
 		};
@@ -646,6 +685,7 @@
 				111A631DD747383DB85200BF /* DebugBridge.swift in Sources */,
 				40B19B4620E1FFA3196FBFAD /* DetailPanel.swift in Sources */,
 				07D5F9F88AB063BD44F20162 /* DidDisplay.swift in Sources */,
+				CB1EC774D4444A86144B5263 /* DmResolver.swift in Sources */,
 				E1AB7FC16F690AF9462DBBAC /* E2eeManager.swift in Sources */,
 				07099D5FA366BA1EFAB46AE4 /* FavoritesSync.swift in Sources */,
 				3ACCE0099E0E97EC7A321EDC /* FileUpload.swift in Sources */,
@@ -654,6 +694,7 @@
 				CAF04BC63962B2AD1BCB86FE /* FreeqAppIntents.swift in Sources */,
 				E04A550CE7A7BD40DA6CFD36 /* GlobalHotKey.swift in Sources */,
 				3CBF7B5A0C44366BC7D7399D /* HelpView.swift in Sources */,
+				EC17044DE0222489BF5FD85D /* IdentityClaim.swift in Sources */,
 				B8AB7DBFF62520564B9DDE52 /* JoinChannelSheet.swift in Sources */,
 				CCD46F07817FFF1625133C74 /* Jumbomoji.swift in Sources */,
 				ECC92464E4422B5DCFDC770B /* KeychainHelper.swift in Sources */,
@@ -675,6 +716,7 @@
 				5CEE21156F7BF1D6DCA2A34E /* NewDMSheet.swift in Sources */,
 				17A620DB2C6864A47C10F0C0 /* NotificationManager.swift in Sources */,
 				49E784D589512E3A936DA345 /* OnboardingView.swift in Sources */,
+				82909B1F27845D317DFE69FA /* OutboundSend.swift in Sources */,
 				643F1C899816A54E913DF822 /* PerfSignposts.swift in Sources */,
 				C1395A0B767D4843076ECA59 /* PinnedMessagesBar.swift in Sources */,
 				D78576DC05AD84FE32E408D2 /* QuickSendPanel.swift in Sources */,
@@ -697,9 +739,6 @@
 				D0330D3B94FAB33F96D04BE8 /* ThreadView.swift in Sources */,
 				5086A6E848B828951BFC3044 /* UploadResponse.swift in Sources */,
 				A115ABF32733643ACB3F34DF /* UserProfileSheet.swift in Sources */,
-				A10000000000000000000001 /* DmResolver.swift in Sources */,
-				A10000000000000000000002 /* IdentityClaim.swift in Sources */,
-				A10000000000000000000003 /* OutboundSend.swift in Sources */,
 				FDC15A8F819924DB11EA2B88 /* Validation.swift in Sources */,
 				3BA358A98EDB3F19D087205E /* VerifiedProofSheet.swift in Sources */,
 				530E3783C385009D658962CB /* freeq.swift in Sources */,
@@ -714,6 +753,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		78D622E1513C795A7C7F78B5 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D20651B63332FC9534E8BF08 /* SendPathTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -721,6 +768,11 @@
 			isa = PBXTargetDependency;
 			target = B42D8262A9BDCD5F639B9E54 /* freeq-share */;
 			targetProxy = 1C7011A2A1987DD812AF8BFF /* PBXContainerItemProxy */;
+		};
+		DD2DBE809198E5AB0805B551 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A88AEE1BC1C4F7F824101B6F /* freeq-macos */;
+			targetProxy = A499DE7B2291F09C995A497E /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -740,6 +792,24 @@
 				PRODUCT_NAME = "freeq-share";
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
+			};
+			name = Release;
+		};
+		3BE1ADBDD91758A6FC8B7B85 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.4;
+				PRODUCT_BUNDLE_IDENTIFIER = at.freeq.macos.tests;
+				SDKROOT = macosx;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/freeq.app/Contents/MacOS/freeq";
 			};
 			name = Release;
 		};
@@ -913,6 +983,24 @@
 			};
 			name = Debug;
 		};
+		9AA4EC746EE293AA84744C26 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.4;
+				PRODUCT_BUNDLE_IDENTIFIER = at.freeq.macos.tests;
+				SDKROOT = macosx;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/freeq.app/Contents/MacOS/freeq";
+			};
+			name = Debug;
+		};
 		AD31918B0F3C79EE7961A140 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -985,6 +1073,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		22822D982EAE561F0F996A41 /* Build configuration list for PBXNativeTarget "freeq-macosTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				9AA4EC746EE293AA84744C26 /* Debug */,
+				3BE1ADBDD91758A6FC8B7B85 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
 		BD9DC688F0069EE17592B144 /* Build configuration list for PBXProject "freeq-macos" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
