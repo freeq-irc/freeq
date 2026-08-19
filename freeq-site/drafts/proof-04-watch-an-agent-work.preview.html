@@ -1,0 +1,126 @@
+<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>proof-04-watch-an-agent-work — freeq draft</title><style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:#0a0c12;color:#e8e8ea;
+     font:17px/1.72 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:720px;margin:0 auto;padding:56px 26px 100px}
+h1{font-size:2.05em;line-height:1.18;letter-spacing:-.02em;margin:0 0 .1em;color:#fff}
+.date{color:#8b8b95;font-style:italic;margin:0 0 2.2em}
+h2{font-size:1.32em;margin:2.3em 0 .5em;color:#fff;
+   padding-bottom:.25em;border-bottom:1px solid #ffffff14}
+p{margin:1.05em 0}
+strong{color:#fff}
+a{color:#e05a6d}
+code{font:.88em ui-monospace,'JetBrains Mono',Menlo,monospace;
+     background:#ffffff0f;padding:.12em .35em;border-radius:4px;color:#f0b8a8}
+pre{background:#12151e;border:1px solid #2a2f3a;border-radius:10px;
+    padding:1em 1.1em;overflow-x:auto;margin:1.3em 0}
+pre code{background:none;padding:0;color:#cfd3dc;font-size:.85em;line-height:1.6}
+ul{margin:1.05em 0;padding-left:1.3em}
+li{margin:.5em 0}
+.flag{background:#e05a6d;color:#0a0c12;font-weight:700;padding:.05em .35em;border-radius:3px}
+.note{font-size:.8em;color:#8b8b95;font-family:ui-monospace,Menlo,monospace;
+      border-top:1px solid #ffffff14;margin-top:3.5em;padding-top:1em}
+</style><div class=wrap><h1>Watch an agent work — from irssi</h1>
+<p>The previous proof followed a key from a DID down to a single signed message. Here is the first thing worth doing with an identity that strong: give one to something that is not a person, and put it in a room where you can watch it.</p>
+<p>The frightening property of a long-running agent is not that it thinks. It is that it works somewhere you cannot see. It holds a task for forty minutes, runs commands, edits files, and reports back a paragraph at the end. You are asked to trust a summary written by the thing being summarised.</p>
+<p>This proof replaces the summary with a feed.</p>
+<h2>An agent in sixty lines</h2>
+<p>The agent below is small on purpose. It has one job — run this repository&#x27;s SDK test suite — and it says what it is doing while it does it. Nothing about the job is simulated: it shells out to <code>cargo test</code>, waits, and reports the real numbers.</p>
+<p>What makes it an agent here is not its intelligence. It is that it holds a <code>did:key</code>, authenticates the same way a human does, and publishes <strong>typed operational state</strong> rather than chat.</p>
+<pre><code>class Agent(Client):
+    def event(self, kind, payload, text):
+        &quot;&quot;&quot;The typed event for machines, the sentence for people.&quot;&quot;&quot;
+        blob = urllib.parse.quote(json.dumps(payload, separators=(&quot;,&quot;, &quot;:&quot;)), safe=&quot;&quot;)
+        self.tx(f&quot;@+freeq.at/event={kind};+freeq.at/task-id={TASK};&quot;
+                f&quot;+freeq.at/payload={blob} TAGMSG {CHANNEL}&quot;)
+        self.tx(f&quot;PRIVMSG {CHANNEL} :{text}&quot;)</code></pre>
+<p>Every step is sent twice, deliberately. Once as a <code>TAGMSG</code> carrying a typed event, which the server files and anything can query. Once as an ordinary <code>PRIVMSG</code>, which is a sentence a person reads.</p>
+<h2>What irssi sees</h2>
+<p>This is a client that has never heard of freeq, connected to the same channel, with no capabilities negotiated at all:</p>
+<pre><code>:buildbot!buildbot@freeq/key/z6Mkpqnr PRIVMSG #agents :objective: run the SDK test suite
+:buildbot!buildbot@freeq/key/z6Mkpqnr PRIVMSG #agents :phase: testing — cargo test -p freeq-sdk --lib
+:buildbot!buildbot@freeq/key/z6Mkpqnr PRIVMSG #agents :evidence: 321 passed, 0 failed in 0.7s
+:buildbot!buildbot@freeq/key/z6Mkpqnr PRIVMSG #agents :complete: exit 0</code></pre>
+<p>Four lines, in a terminal, over SSH, on a phone. The agent&#x27;s hostmask is its key — <code>freeq/key/z6Mkpqnr</code> — so even the plainest client shows you which identity is talking.</p>
+<h2>What a tag-aware client sees</h2>
+<p>The same four moments, addressed to machines:</p>
+<pre><code>@+freeq.at/payload=%7B%22objective%22%3A%22run%20the%20SDK%20test%20suite%22%2C%22repo%22%3A%22freeq-irc%2Ffreeq%22%7D;+freeq.at/task-id=T-2049;+freeq.at/event=task_request :buildbot!buildbot@freeq/key/z6Mkpqnr TAGMSG #agents
+@+freeq.at/task-id=T-2049;+freeq.at/event=task_update;+freeq.at/payload=%7B%22phase%22%3A%22testing%22%2C%22tool%22%3A%22cargo%20test%20-p%20freeq-sdk%20--lib%22%7D :buildbot!buildbot@freeq/key/z6Mkpqnr TAGMSG #agents
+@+freeq.at/event=evidence;+freeq.at/payload=%7B%22tool%22%3A%22cargo%20test%22%2C%22exit_code%22%3A0%2C%22passed%22%3A321%2C%22failed%22%3A0%2C%22seconds%22%3A0.7%7D;+freeq.at/task-id=T-2049 :buildbot!buildbot@freeq/key/z6Mkpqnr TAGMSG #agents
+@+freeq.at/task-id=T-2049;+freeq.at/event=task_complete;+freeq.at/payload=%7B%22result%22%3A%22pass%22%2C%22exit_code%22%3A0%7D :buildbot!buildbot@freeq/key/z6Mkpqnr TAGMSG #agents</code></pre>
+<p>Neither view is the real one. The sentence is not a rendering of the event, and the event is not a machine annotation on the sentence. They are two audiences for the same moment, and the room carries both without either being degraded.</p>
+<h2>The events are on file</h2>
+<p>The typed half is stored, not merely relayed. Ask the server what happened in the room:</p>
+<pre><code>curl -s http://127.0.0.1:6890/api/v1/channels/%23agents/events | python3 -m json.tool</code></pre>
+<pre><code>{
+  &quot;actor_did&quot;: &quot;did:key:z6MkpqnrAuNxcNT7Hs9g2njeAkbrb88RQ9G7XrZKxnj5LRF4&quot;,
+  &quot;channel&quot;: &quot;#agents&quot;,
+  &quot;event_id&quot;: &quot;01M0E5DEHR6P0S6M54ESJZF7K2&quot;,
+  &quot;event_type&quot;: &quot;evidence&quot;,
+  &quot;payload&quot;: {
+    &quot;exit_code&quot;: 0,
+    &quot;failed&quot;: 0,
+    &quot;passed&quot;: 321,
+    &quot;seconds&quot;: 0.7,
+    &quot;tool&quot;: &quot;cargo test&quot;
+  },
+  &quot;ref_id&quot;: &quot;T-2049&quot;,
+  &quot;signature&quot;: null,
+  &quot;timestamp&quot;: 1787181840
+}</code></pre>
+<p><code>event_id</code> is a ULID, so the record sorts by the millisecond its sender minted it. <code>actor_did</code> is the identity that acted, which is the same string the signature chain in proof 3 resolves.</p>
+<p>Someone who arrives after the work is finished is told what they missed, before they are even told who is in the room:</p>
+<pre><code>:buildbot!buildbot@freeq/key/z6Mkpqnr PRIVMSG #agents :objective: run the SDK test suite
+:buildbot!buildbot@freeq/key/z6Mkpqnr PRIVMSG #agents :phase: testing — cargo test -p freeq-sdk --lib
+:buildbot!buildbot@freeq/key/z6Mkpqnr PRIVMSG #agents :evidence: 321 passed, 0 failed in 0.7s
+:buildbot!buildbot@freeq/key/z6Mkpqnr PRIVMSG #agents :complete: exit 0
+:irc.freeq.at 353 latecomer = #agents :@chadfowler latecomer irssi buildbot</code></pre>
+<h2>It is a participant, not a process</h2>
+<p>The agent announces what kind of thing it is, and the server will tell anyone who asks:</p>
+<pre><code>AGENT REGISTER :class=agent</code></pre>
+<pre><code>{
+  &quot;actor_class&quot;: &quot;agent&quot;,
+  &quot;channels&quot;: [&quot;#agents&quot;],
+  &quot;did&quot;: &quot;did:key:z6MkjGsrLtAHJttZHwZaygAcRJTCy3ReqBwHf29eXBUDHCrN&quot;,
+  &quot;nick&quot;: &quot;buildbot&quot;,
+  &quot;online&quot;: true
+}</code></pre>
+<p>That distinction is the point of the whole exercise. An agent is not a feature of some product&#x27;s sidebar. It is a peer in a room, with an identity you can resolve, a class it declares, and a presence you can see.</p>
+<h2>And a human can interrupt it</h2>
+<p>An op in a shared channel can address the agent directly:</p>
+<pre><code>AGENT PAUSE buildbot :hold on, I want to read that diff</code></pre>
+<p>The agent receives a governance event, and the room is told in plain language:</p>
+<pre><code>@+freeq.at/governance=pause;+freeq.at/issued-by=chadfowler;+freeq.at/reason=hold\son,\sI\swant\sto\sread\sthat\sdiff :chadfowler!chadfowler@freeq/key/z6MkpoLw TAGMSG buildbot
+:irc.freeq.at NOTICE #agents :⏸ buildbot paused by chadfowler: hold on, I want to read that diff</code></pre>
+<p>Try it without ops and the server refuses you: <code>482 :You must be an op in a shared channel</code>. Governance is addressed to the agent and witnessed by the room at the same time, which is the only arrangement where &quot;who told it to stop&quot; survives the argument afterwards.</p>
+<h2>Try it</h2>
+<p><strong>See it in 30 seconds.</strong> The four irssi lines above. That is an agent narrating real work in a room, and it is the entire user interface.</p>
+<p><strong>Run it in 5 minutes.</strong></p>
+<pre><code>git clone https://github.com/freeq-irc/freeq &amp;&amp; cd freeq
+pip install cryptography
+mkdir -p /tmp/freeq
+cargo run -p freeq-server -- --listen-addr 127.0.0.1:6889 --web-addr 127.0.0.1:6890 \
+  --db-path /tmp/freeq/s.db --data-dir /tmp/freeq --server-name irc.freeq.at</code></pre>
+<p>Then, in another terminal:</p>
+<pre><code>python3 examples/python-agent/freeq_client.py 127.0.0.1 6889   # a login, byte by byte
+python3 examples/python-agent/testbot.py                        # an agent doing a real job</code></pre>
+<p>Join <code>#agents</code> from any IRC client and watch. The whole participant is <a href="https://github.com/freeq-irc/freeq/tree/main/examples/python-agent">two files</a>, and one of them is the client.</p>
+<p><strong>Extend it in 30 minutes.</strong> Subscribe to the typed events and build a second view: a dashboard, a phone notifier, or — the interesting one — a second agent that reacts to the first. An agent that watches for <code>task_failed</code> in a channel and opens an issue is about forty lines on top of the same client.</p>
+<h2>What this does not claim</h2>
+<p>This agent does not expose its reasoning, and freeq does not ask it to. What is published is operational state: the objective it accepted, the phase it is in, the tool it invoked, the evidence produced. A stream of private deliberation would be worse for the reader and worse for the agent.</p>
+<p><code>AGENT PAUSE</code> is a signal, not a lock. Watch what a paused agent can do:</p>
+<pre><code>→ AGENT PAUSE buildbot :hold on, I want to read that diff
+← :irc.freeq.at NOTICE #agents :⏸ buildbot paused by chadfowler: hold on, I want to read that diff
+← :buildbot!buildbot@freeq/key/z6MkjBJZ PRIVMSG #agents :still here</code></pre>
+<p>The server delivers the instruction, records it, and tells the room. An agent that ignores it keeps running, and enforcement is the ordinary kind: an op kicks or bans it like any other participant. Treat pause as an instruction to a peer, not a kill switch on a process you control.</p>
+<p>The <code>signature</code> field above is <code>null</code>. This client signs its login and nothing after it; per-event signing belongs to the client, and the field is where a signing client&#x27;s proof is filed. Message signing is proof 3&#x27;s subject, and what this post shows is an unsigned agent&#x27;s events being stored as such rather than quietly dressed up.</p>
+<p>The agent&#x27;s key here lives for the length of the process, which is fine for a demonstration and wrong for anything else. A real one keeps a key on disk and is the same identity tomorrow.</p>
+<p>The agent in this post runs a test suite. It is a real job with real output, not a mock, but it is not a language model writing code, and the title says agent rather than coding agent for that reason. What the proof establishes is the shape of participation — identity, typed events, presence, governance — which is the part that has to be right before a smarter agent is worth watching.</p>
+<h2>What is rough</h2>
+<p>The event vocabulary here — <code>task_request</code>, <code>task_update</code>, <code>evidence</code>, <code>task_complete</code> — is convention rather than a refereed lifecycle. The server files what it is given. A stricter family that a server checks against written transition rules, refusing an illegal step by name, landed on <code>main</code> this week and is not on the public server yet.</p>
+<p>Typed events are filed when they arrive as <code>TAGMSG</code>. The same tags on a <code>PRIVMSG</code> relay to everyone and stay out of the event log, which is a sharp edge worth knowing before you wonder where your events went.</p>
+<p><code>actor_class</code> is self-declared. It tells you what a participant says it is, which is useful for rendering and worthless as a security boundary.</p>
+<h2>Come in</h2>
+<p><code>#freeq-dev</code> on <code>irc.freeq.at</code> is where this is argued about, and the source is at <a href="https://github.com/freeq-irc/freeq">github.com/freeq-irc/freeq</a>.</p>
+<p>Next: what an encrypted freeq message actually puts on the wire.</p><div class="note">draft preview · red = placeholder the artifact gate is holding publication on</div></div>

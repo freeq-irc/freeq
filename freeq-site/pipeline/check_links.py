@@ -20,6 +20,13 @@ import sys
 URL_RE = re.compile(r"https?://[^\s)\]<>\"'`]+")
 CONNECT_RE = re.compile(r"/connect\s+([a-z0-9.-]+)\s+(\d{2,5})", re.I)
 
+# A URL written as `url=<...>` is a value a server stores, not a link a reader
+# clicks: the credential endpoint in a channel policy, for instance, is a
+# template a client completes with the subject's DID before fetching it, so it
+# answers 4xx on its own. Those are checked for a live host rather than a 2xx,
+# which keeps the gate strict about everything a reader can actually click.
+CONFIG_URL_RE = re.compile(r"url=(https?://[^\s)\]<>\"'`]+)")
+
 
 def check_url(url: str, timeout: int = 12):
     url = url.rstrip(".,;:")
@@ -47,11 +54,19 @@ def main() -> int:
     fails = 0
     for f in files:
         text = open(f).read()
-        urls = sorted(set(URL_RE.findall(text)))
+        config = set(CONFIG_URL_RE.findall(text))
+        urls = sorted(set(URL_RE.findall(text)) - config)
         print(f"=== {f} ===")
         for u in urls:
             ok, code = check_url(u)
             print(f"  [{'x' if ok else ' '}] {u}  ({code})")
+            if not ok:
+                fails += 1
+        for u in sorted(config):
+            host = u.split("/")[2].split(":")[0]
+            ok = check_port(host, 443 if u.startswith("https") else 80)
+            print(f"  [{'x' if ok else ' '}] {u}  "
+                  f"(config value; host {'reachable' if ok else 'NOT reachable'})")
             if not ok:
                 fails += 1
         for host, port in set(CONNECT_RE.findall(text)):

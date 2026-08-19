@@ -169,4 +169,5 @@ is a gap we should close.
 to bring it, and it will be the most welcome kind of contribution: the kind that
 tells us we are wrong in public. `#freeq` is the general channel.
 
-Next: what an encrypted freeq message actually puts on the wire.
+Next: we give one of these identities to something that is not a person, and
+watch it work from irssi.

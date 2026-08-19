@@ -1,0 +1,123 @@
+<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>proof-09-bring-your-own-gatekeeper — freeq draft</title><style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:#0a0c12;color:#e8e8ea;
+     font:17px/1.72 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:720px;margin:0 auto;padding:56px 26px 100px}
+h1{font-size:2.05em;line-height:1.18;letter-spacing:-.02em;margin:0 0 .1em;color:#fff}
+.date{color:#8b8b95;font-style:italic;margin:0 0 2.2em}
+h2{font-size:1.32em;margin:2.3em 0 .5em;color:#fff;
+   padding-bottom:.25em;border-bottom:1px solid #ffffff14}
+p{margin:1.05em 0}
+strong{color:#fff}
+a{color:#e05a6d}
+code{font:.88em ui-monospace,'JetBrains Mono',Menlo,monospace;
+     background:#ffffff0f;padding:.12em .35em;border-radius:4px;color:#f0b8a8}
+pre{background:#12151e;border:1px solid #2a2f3a;border-radius:10px;
+    padding:1em 1.1em;overflow-x:auto;margin:1.3em 0}
+pre code{background:none;padding:0;color:#cfd3dc;font-size:.85em;line-height:1.6}
+ul{margin:1.05em 0;padding-left:1.3em}
+li{margin:.5em 0}
+.flag{background:#e05a6d;color:#0a0c12;font-weight:700;padding:.05em .35em;border-radius:3px}
+.note{font-size:.8em;color:#8b8b95;font-family:ui-monospace,Menlo,monospace;
+      border-top:1px solid #ffffff14;margin-top:3.5em;padding-top:1em}
+</style><div class=wrap><h1>Bring your own gatekeeper</h1>
+<p>Every interesting room ends up asking a question about the outside world. Are you an employee. Do you have a ticket. Did you contribute to this repository. The usual way to answer is to teach the server about Okta, or GitHub, or the ticketing vendor, and then to teach it about the next one, until the relay is a directory of integrations that its operator controls.</p>
+<p>freeq answers a different way. A <strong>verifier</strong> learns the external fact, and hands back something the room can act on without ever learning the system the fact came from.</p>
+<p>Earlier proofs established who a participant is — a DID that signs in, and signs what it says, whether it is a person or an agent. This one is about what a room is allowed to conclude from that.</p>
+<h2>Three things that are not the same thing</h2>
+<p>The failure mode of every access-control design is collapsing these into one:</p>
+<pre><code>external fact          &quot;chad can push to freeq-irc/freeq&quot;
+  → credential         a signed statement that this DID holds that fact
+  → policy             what this room decides follows from holding it
+  → capability         what you may do here, for how long</code></pre>
+<p>A credential <em>states</em>. A policy <em>decides</em>. A capability <em>authorises</em>. Keeping them separate is what makes revocation, caching and audit explainable later — and it is the difference between a system you can reason about and a pile of booleans.</p>
+<h2>A room that already does this</h2>
+<p><code>#freeq-dev</code> — the channel where freeq itself is argued about — grants ops to people who can prove they contribute to freeq. Ask the server what its rules are. No authentication required; the rules of a room are public:</p>
+<pre><code>curl -s https://irc.freeq.at/api/v1/policy/%23freeq-dev | python3 -m json.tool</code></pre>
+<pre><code>&quot;requirements&quot;: { &quot;type&quot;: &quot;ACCEPT&quot;, &quot;hash&quot;: &quot;ee8804db43de3efc5aea2559aee94bf2fee80923f176c3beeb034c545de5e4a4&quot; },
+&quot;role_requirements&quot;: {
+    &quot;op&quot;: {
+        &quot;type&quot;: &quot;PRESENT&quot;,
+        &quot;credential_type&quot;: &quot;github_repo&quot;,
+        &quot;issuer&quot;: &quot;did:web:irc.freeq.at:verify&quot;
+    }
+},
+&quot;validity_model&quot;: &quot;join_time&quot;</code></pre>
+<p>Anyone may walk in. Holding ops requires a <code>github_repo</code> credential from a named issuer. The record also carries a <code>credential_endpoints</code> entry for that credential type — the issuer again, a label for the button, and the address where a client sends you to get one. That address is a template: the client completes it with the DID the credential should be issued to, which is why fetching it bare answers <code>400</code>.</p>
+<h2>The issuer is a DID, not a hostname you trust</h2>
+<p><code>did:web:irc.freeq.at:verify</code> resolves to a document, and the document publishes the key that signs credentials:</p>
+<pre><code>curl -s https://irc.freeq.at/verify/did.json | python3 -m json.tool</code></pre>
+<pre><code>{
+  &quot;id&quot;: &quot;did:web:irc.freeq.at:verify&quot;,
+  &quot;assertionMethod&quot;: [&quot;did:web:irc.freeq.at:verify#key-1&quot;],
+  &quot;verificationMethod&quot;: [{
+    &quot;controller&quot;: &quot;did:web:irc.freeq.at:verify&quot;,
+    &quot;id&quot;: &quot;did:web:irc.freeq.at:verify#key-1&quot;,
+    &quot;publicKeyMultibase&quot;: &quot;z6Mkm2soeBDDSJTH8JpBYBVgfUeYEKYy7PgUsgpsL7TjUJcY&quot;,
+    &quot;type&quot;: &quot;Multikey&quot;
+  }]
+}</code></pre>
+<p>That is the part that makes this an extension point rather than a plugin slot. A verifier is a DID with a published key and a URL. It happens to run on the same host here; nothing in the policy says it must. Point a room at an issuer you control and the room does not change — it evaluates the same requirement against a different key.</p>
+<p>Credentials already issued to an identity are readable the same way:</p>
+<pre><code>curl -s https://irc.freeq.at/api/v1/credentials/did:plc:4qsyxmnsblo4luuycm3572bq</code></pre>
+<pre><code>[{&quot;credential_type&quot;: &quot;github_repo&quot;,
+  &quot;issuer&quot;: &quot;did:web:irc.freeq.at:verify&quot;,
+  &quot;metadata_json&quot;: &quot;{\&quot;github_username\&quot;:\&quot;chad\&quot;,\&quot;repo\&quot;:\&quot;chad/freeq\&quot;}&quot;,
+  &quot;issued_at&quot;: &quot;2026-02-25 21:24:30&quot;}]</code></pre>
+<h2>What the room never learns</h2>
+<p>Getting that credential is an OAuth round trip with GitHub:</p>
+<pre><code>GET /verify/github/start?subject_did=did:plc:4qsyxmnsblo4luuycm3572bq&amp;repo=chad/freeq
+307 → https://github.com/login/oauth/authorize
+        ?client_id=&lt;the verifier&#x27;s public app id&gt;
+        &amp;scope=repo
+        &amp;state=19e0a8470f5ac137f57ec9d9610b0fed</code></pre>
+<p>The token GitHub issues is used inside that request and never stored. What reaches the room is one signed statement about one DID. The channel does not hold a GitHub token, cannot enumerate your repositories, and does not learn your username unless the credential says so. Swap GitHub for an SSO provider and the room is unchanged, because the room was never the thing that integrated.</p>
+<h2>The door actually holds</h2>
+<p>Run a server locally and watch a requirement refuse someone. An op writes the rules:</p>
+<pre><code>→ POLICY #gate SET Be excellent to each other. Ops must prove they contribute to the repo.
+← :irc.freeq.at NOTICE chadfowler :Policy set for #gate (version 1, rules_hash=ec8b73ecafb4, policy_id=8d7abfafc7a6)
+→ POLICY #gate REQUIRE github_repo issuer=did:web:irc.freeq.at:verify url=https://irc.freeq.at/verify/github/start?repo=chad/freeq
+← :irc.freeq.at NOTICE chadfowler :Credential endpoint &#x27;github_repo&#x27; added to #gate (issuer=did:web:irc.freeq.at:verify, version 2)</code></pre>
+<p>Someone without the credential tries the door:</p>
+<pre><code>→ JOIN #gate
+← :irc.freeq.at 477 visitor #gate :This channel requires policy acceptance — use POLICY &lt;channel&gt; ACCEPT
+→ POLICY #gate INFO
+← :irc.freeq.at NOTICE visitor :  Requirement: ALL(ACCEPT(ec8b73ecafb4...), PRESENT(github_repo, issuer=did:web:irc.freeq.at:verify))
+→ POLICY #gate ACCEPT
+← :irc.freeq.at NOTICE visitor :Policy acceptance failed: Missing credential: github_repo from did:web:irc.freeq.at:verify
+→ JOIN #gate
+← :irc.freeq.at 477 visitor #gate :This channel requires policy acceptance — use POLICY &lt;channel&gt; ACCEPT</code></pre>
+<p>Agreeing to the terms is not enough, and the refusal names exactly what is missing and who would have to say it. The rules themselves are readable by the person being refused:</p>
+<pre><code>→ POLICY #gate RULES
+← :irc.freeq.at NOTICE visitor :Rules for #gate (rules_hash=ec8b73ecafb46d34e852a2eb9b9784f6e4da05b3e8638f710cc1bcd03adc7430):
+← :irc.freeq.at NOTICE visitor :Be excellent to each other. Ops must prove they contribute to the repo.</code></pre>
+<h2>Changing the rules leaves a trail</h2>
+<p>Each edit writes a new version that names the one before it:</p>
+<pre><code>curl -s https://irc.freeq.at/api/v1/policy/%23freeq-dev/history | python3 -m json.tool</code></pre>
+<pre><code>{&quot;version&quot;: 2,
+ &quot;policy_id&quot;: &quot;037d84725180b8485646c625e16731118566eca433b805e204ae1d28b05f91c8&quot;,
+ &quot;previous_policy_hash&quot;: &quot;b5098051c425e018c8adb05a5cea05e5b646548942b14b878b101ef79e5a1afd&quot;}</code></pre>
+<p>&quot;Who changed the entry requirements, and to what&quot; is a question with an answer, which is not the normal state of affairs for chat.</p>
+<h2>Try it</h2>
+<p><strong>See it in 30 seconds.</strong> The two <code>curl</code> commands above, against the live server. A room&#x27;s rules and an issuer&#x27;s key are both public documents.</p>
+<p><strong>Run it in 5 minutes.</strong> Gate a channel of your own:</p>
+<pre><code>cargo run -p freeq-server -- --listen-addr 127.0.0.1:6889 --web-addr 127.0.0.1:6890 \
+  --db-path /tmp/freeq/s.db --data-dir /tmp/freeq --server-name irc.freeq.at</code></pre>
+<pre><code>POLICY #gate SET House rules: be excellent to each other.
+POLICY #gate REQUIRE github_repo issuer=did:web:irc.freeq.at:verify url=https://irc.freeq.at/verify/github/start?repo=chad/freeq
+POLICY #gate INFO</code></pre>
+<p><strong>Extend it in 30 minutes.</strong> Write a verifier for a fact of your own. It needs three things: a <code>did:web</code> document publishing an ed25519 key, an endpoint that establishes the fact however you like, and a signed credential handed back for a subject DID. The shipped GitHub one is <a href="https://github.com/freeq-irc/freeq/blob/main/freeq-server/src/verifiers/github.rs">350 lines</a> and most of it is OAuth bookkeeping. Point a room at yours with <code>POLICY #room REQUIRE conference_2026 issuer=&lt;your did:web&gt; url=&lt;your start endpoint&gt;</code>. The room learns nothing about your badge system, and you did not modify the server to add it.</p>
+<h2>What this does not claim</h2>
+<p>A credential is not an authorisation. What the room grants is scoped to the room and decided by its policy; the statement from the issuer is evidence, not a key. Confusing the two is how &quot;signed in with GitHub&quot; becomes &quot;admin everywhere&quot;.</p>
+<p>The requirement matches on credential type and issuer. It does not compare the claim inside the credential against the room&#x27;s expectation — a <code>github_repo</code> credential from the named issuer satisfies the rule, whatever repository is written in it. If you run an issuer that certifies many facts of one type, that is one bucket to a room today.</p>
+<p><code>validity_model: join_time</code> means the question is asked when you enter. Losing the underlying fact afterwards does not eject you from the room. Continuous models exist in the engine; what this proof demonstrates is the join-time one.</p>
+<p>The verifier is a trusted third party by construction. It sees your GitHub session during the exchange, and a room trusting <code>did:web:irc.freeq.at:verify</code> is trusting whoever operates that key. That is the honest shape of every attestation system; the improvement here is that the trust is <em>named</em> in the policy rather than implied by the software.</p>
+<h2>What is rough</h2>
+<p>Credentials are ed25519-signed by a key you can fetch, so anyone can check one. The membership receipt a server writes after a successful check is HMAC-signed with a key only that server holds — verifiable by the issuing server, opaque to everybody else. Room admission is therefore independently auditable one step back (the credential) and locally attested at the last step (the receipt).</p>
+<p>The authority set for a policy currently lists a single signer — the server itself. Multi-signer authority is expressed in the format and the threshold field is there; one server signing its own rooms&#x27; policies is what runs today.</p>
+<p>A credential is stamped with a thirty-day expiry when it is issued, and the admission check does not read that field — it looks for a credential of the right type and issuer that has not been revoked. Revocation is the lever that works today; the clock in the credential is a claim the issuer makes and nobody currently enforces.</p>
+<p>Rules text lives on the server where it was set. Peers receive the hash, so a federated reader can tell you the rules changed and prove which rules were accepted, while the sentence itself is fetched from home.</p>
+<h2>Come in</h2>
+<p><code>#freeq-dev</code> on <code>irc.freeq.at</code> — the room described above, gated by the policy above. Source at <a href="https://github.com/freeq-irc/freeq">github.com/freeq-irc/freeq</a>.</p>
+<p>Next: offboard someone from a room and rotate the keys, without changing the server.</p><div class="note">draft preview · red = placeholder the artifact gate is holding publication on</div></div>
