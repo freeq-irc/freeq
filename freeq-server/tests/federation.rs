@@ -905,7 +905,6 @@ impl Raw {
     /// A guest holding exactly `caps`. Guests may hold `freeq.at/act` — the
     /// capability says what a client can render, not who it is.
     fn guest(addr: &str, nick: &str, caps: &str) -> Self {
-        use std::io::Write;
         let sock = std::net::TcpStream::connect(addr).expect("connect");
         sock.set_read_timeout(Some(Duration::from_secs(10))).ok();
         let writer = sock.try_clone().unwrap();
