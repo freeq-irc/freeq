@@ -274,7 +274,7 @@ export async function revise(
   opts: StepOptions = {},
 ): Promise<string> {
   return ctx.client.sendAct(ctx.target, stepTags("revise", ctx.did, taskId, opts.note, BOUNTY), {
-    humanText: opts.humanText ?? "asked for changes",
+    humanText: opts.humanText ?? "asked for revisions",
     taskId,
   });
 }
