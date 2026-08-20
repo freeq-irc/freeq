@@ -21,9 +21,9 @@
 // Canonical mapping rules (see the Rust module for the full rationale):
 // - covered iff the tag name, after stripping `+freeq.at/`, is `act` or
 //   starts with `act-` (`actor-class` and `sig` are NOT covered)
-// - canonical keys are the stripped names; values verbatim, always strings.
-//   One exception: `act-from` never appears under its own name — its value
-//   is the document's `from`, the signer's semantic key, same as chat.
+// - canonical keys are the stripped names; values verbatim, always strings
+// - the signer rides the `+freeq.at/from` envelope tag — not an act tag,
+//   read explicitly, entering the document under the same name
 // - two more keys are injected by the caller, never read from a tag:
 //   `target`, the normalized venue (a channel lowercased, or
 //   `dm:<did_a>,<did_b>` with the DIDs sorted), and `id`, the event id the
@@ -78,9 +78,9 @@ function isActTag(tagName: string): boolean {
  *
  * `target` and `id` are supplied by the caller — a verifier rebuilds them
  * from delivery context rather than reading either off a tag. The signer's
- * DID is read from the `act-from` tag and enters the document as `from`.
- * Returns null when there is no document to build: no act tags at all, or
- * act tags missing their signer (`verifyActTags` tells those two apart).
+ * DID rides the `from` envelope tag, entering the document under the same
+ * name. Returns null when there is no document to build: no act tags at
+ * all, or act tags missing their signer (`verifyActTags` tells those apart).
  */
 export function actCanonical(
   tags: Record<string, string>,
@@ -91,11 +91,15 @@ export function actCanonical(
   const covered: Record<string, string> = {};
   let from: string | null = null;
   for (const [name, value] of Object.entries(tags)) {
-    if (!isActTag(name)) continue;
     const stripped = strippedName(name);
-    if (stripped === "act-from") from = value;
-    else covered[stripped] = value;
+    if (stripped === "from") {
+      from = value;
+      continue;
+    }
+    if (!isActTag(name)) continue;
+    covered[stripped] = value;
   }
+  if (Object.keys(covered).length === 0) return null;
   if (from === null) return null;
   covered.from = from;
   covered.id = id;

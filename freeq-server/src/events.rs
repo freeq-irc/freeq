@@ -408,15 +408,15 @@ mod tests {
     }
 
     /// A task event's document is not a chat document: it names the task's
-    /// kind under `act` rather than carrying `kind`, and its actor rides
-    /// `act-from`. Every column the log needs still comes out of the bytes.
+    /// kind under `act` rather than carrying `kind`, and its actor rides the
+    /// `from` envelope tag. Every column the log needs still comes out of the bytes.
     #[test]
     fn an_act_document_derives_its_own_columns() {
         let canonical = freeq_sdk::act::act_canonical(
             vec![
                 ("+freeq.at/act", "handoff"),
                 ("+freeq.at/act-verb", "offer"),
-                ("+freeq.at/act-from", "did:plc:eliza"),
+                ("+freeq.at/from", "did:plc:eliza"),
                 ("+freeq.at/act-to", "did:plc:scholar"),
             ],
             "#ops",
@@ -442,7 +442,7 @@ mod tests {
             vec![
                 ("+freeq.at/act", "handoff"),
                 ("+freeq.at/act-verb", "accept"),
-                ("+freeq.at/act-from", "did:plc:scholar"),
+                ("+freeq.at/from", "did:plc:scholar"),
                 ("+freeq.at/act-id", "01JOFFER0000000000000000AA"),
             ],
             "#ops",
@@ -465,7 +465,7 @@ mod tests {
             vec![
                 ("+freeq.at/act", "handoff"),
                 ("+freeq.at/act-verb", "offer"),
-                ("+freeq.at/act-from", "did:plc:eliza"),
+                ("+freeq.at/from", "did:plc:eliza"),
             ],
             &venue,
             "01JDM000000000000000000CC",
@@ -506,7 +506,7 @@ mod tests {
             vec![
                 ("+freeq.at/act", "handoff"),
                 ("+freeq.at/act-verb", "offer"),
-                ("+freeq.at/act-from", "did:plc:eliza"),
+                ("+freeq.at/from", "did:plc:eliza"),
                 ("+freeq.at/act-to", "did:plc:scholar"),
                 ("+freeq.at/act-caps", "freeq.at/web-search"),
                 ("+freeq.at/act-deadline", "1788000000"),
@@ -530,7 +530,7 @@ mod tests {
             vec![
                 ("+freeq.at/act", "handoff"),
                 ("+freeq.at/act-verb", "offer"),
-                ("+freeq.at/act-from", "did:plc:eliza"),
+                ("+freeq.at/from", "did:plc:eliza"),
             ],
             "#ops",
             "01JOPEN00000000000000000BB",
@@ -550,7 +550,7 @@ mod tests {
             vec![
                 ("+freeq.at/act", "handoff"),
                 ("+freeq.at/act-verb", "offer"),
-                ("+freeq.at/act-from", "did:plc:eliza"),
+                ("+freeq.at/from", "did:plc:eliza"),
                 ("+freeq.at/act-deadline", "next tuesday"),
             ],
             "#ops",

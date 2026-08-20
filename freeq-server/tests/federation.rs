@@ -1053,7 +1053,7 @@ async fn act_tagmsg_crosses_the_hop_with_its_signature() {
         let act_tags: Vec<(&str, &str)> = vec![
             ("+freeq.at/act", "handoff"),
             ("+freeq.at/act-verb", "offer"),
-            ("+freeq.at/act-from", alice.did.as_str()),
+            ("+freeq.at/from", alice.did.as_str()),
             ("+freeq.at/act-title", "cross-the-hop"),
         ];
         let sig = freeq_sdk::act::sign_act(act_tags.clone(), &venue, &id, &signing)

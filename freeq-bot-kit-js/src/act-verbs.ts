@@ -10,7 +10,7 @@
 // Vocabulary, as the rest of the system uses it: the *author* of a message is
 // whoever wrote it; the *actor* of an event is whoever performed it. These
 // helpers always send as the bot itself, so for them the two are the same
-// identity — `act-from` names the actor, and the server refuses a task
+// identity — the `from` tag names the actor, and the server refuses a task
 // message whose actor is not its sender.
 
 import type { FreeqClient } from "@freeq/sdk";
@@ -56,7 +56,7 @@ function stepTags(verb: string, did: string, taskId: string, note?: string) {
   const tags: Record<string, string> = {
     "+freeq.at/act": KIND,
     "+freeq.at/act-verb": verb,
-    "+freeq.at/act-from": did,
+    "+freeq.at/from": did,
     "+freeq.at/act-id": taskId,
   };
   if (note) tags["+freeq.at/act-note"] = note;
@@ -71,7 +71,7 @@ export async function offer(ctx: ActContext, opts: OfferOptions): Promise<string
   const tags: Record<string, string> = {
     "+freeq.at/act": KIND,
     "+freeq.at/act-verb": "offer",
-    "+freeq.at/act-from": ctx.did,
+    "+freeq.at/from": ctx.did,
     "+freeq.at/act-title": opts.title,
   };
   if (opts.to) tags["+freeq.at/act-to"] = opts.to;

@@ -40,7 +40,7 @@ describe("offer", () => {
     const { tags } = sent[0];
     expect(tags["+freeq.at/act"]).toBe("handoff");
     expect(tags["+freeq.at/act-verb"]).toBe("offer");
-    expect(tags["+freeq.at/act-from"]).toBe("did:plc:bot");
+    expect(tags["+freeq.at/from"]).toBe("did:plc:bot");
     expect(tags["+freeq.at/act-title"]).toBe("review the deploy");
     // An opener's own event id is the task's id, so it names no other task.
     expect(tags["+freeq.at/act-id"]).toBeUndefined();
@@ -95,7 +95,7 @@ describe("the follow-ups", () => {
       await fn(ctxWith(sent), "01JTASK00000000000000000BB");
       const { tags } = sent[0];
       expect(tags["+freeq.at/act-verb"]).toBe(name);
-      expect(tags["+freeq.at/act-from"]).toBe("did:plc:bot");
+      expect(tags["+freeq.at/from"]).toBe("did:plc:bot");
       expect(tags["+freeq.at/act-id"]).toBe("01JTASK00000000000000000BB");
       expect(tags["+freeq.at/act"]).toBe("handoff");
       // The companion links to the task, not to the step.

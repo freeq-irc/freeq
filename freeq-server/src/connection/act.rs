@@ -150,7 +150,7 @@ pub(crate) fn expire_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -
     let tags = vec![
         ("+freeq.at/act", task.kind.as_str()),
         ("+freeq.at/act-verb", "expire"),
-        ("+freeq.at/act-from", did.as_str()),
+        ("+freeq.at/from", did.as_str()),
         ("+freeq.at/act-id", task.act_id.as_str()),
     ];
     let Ok(canonical) = freeq_sdk::act::act_canonical(tags, &task.venue, &event_id) else {
@@ -307,13 +307,10 @@ pub(super) fn replay_lines(
                 if key == "target" || key == "id" {
                     continue;
                 }
-                // The signer's document key is `from`; its wire tag is
-                // act-from. Replay re-frames the document as the wire.
+                // The signer's envelope tag: same name on the wire and in
+                // the document.
                 if key == "from" {
-                    tags.insert(
-                        "+freeq.at/act-from".to_string(),
-                        value.as_str()?.to_string(),
-                    );
+                    tags.insert("+freeq.at/from".to_string(), value.as_str()?.to_string());
                     continue;
                 }
                 tags.insert(format!("+freeq.at/{key}"), value.as_str()?.to_string());
@@ -501,13 +498,13 @@ pub(super) fn gate(
     // why the edit and delete paths answer with AUTHOR_MISMATCH and a task
     // step answers with ACTOR_MISMATCH.
     //
-    // The signature establishes who sent the message; `act-from` claims who
-    // acted, and the two have to be the same person. Checked before the
+    // The signature establishes who sent the message; the `from` tag claims
+    // who acted, and the two have to be the same person. Checked before the
     // signature because both answers are decidable without one, and either is
     // more useful than a signature complaint.
     let Some(actor) = tags
-        .get("+freeq.at/act-from")
-        .or_else(|| tags.get("act-from"))
+        .get("+freeq.at/from")
+        .or_else(|| tags.get("from"))
     else {
         // Naming nobody is its own answer. The log refuses such bytes as
         // unreadable — the view's offerer comes from this field — so without

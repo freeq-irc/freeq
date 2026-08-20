@@ -180,7 +180,7 @@ impl C {
         let tags: Vec<(String, String)> = vec![
             ("+freeq.at/act".into(), "handoff".into()),
             ("+freeq.at/act-verb".into(), "offer".into()),
-            ("+freeq.at/act-from".into(), from.into()),
+            ("+freeq.at/from".into(), from.into()),
             ("+freeq.at/act-caps".into(), "freeq.at/web-search".into()),
         ];
         let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
@@ -314,7 +314,7 @@ async fn one_task_comes_back_with_its_whole_event_history() {
             let tags: Vec<(String, String)> = vec![
                 ("+freeq.at/act".into(), "handoff".into()),
                 ("+freeq.at/act-verb".into(), verb.into()),
-                ("+freeq.at/act-from".into(), DID_BOB.into()),
+                ("+freeq.at/from".into(), DID_BOB.into()),
                 ("+freeq.at/act-id".into(), id.clone()),
             ];
             let pairs: Vec<(&str, &str)> =

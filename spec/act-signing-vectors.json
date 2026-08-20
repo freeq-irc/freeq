@@ -1,8 +1,8 @@
 {
-  "description": "Worked signing examples for freeq.at/act. Canonical keys follow the thread agreement frozen 2026-08-02 (semantic names; from/id/target mandatory) — this file replaced the pre-agreement form that signed act-from/msgid, and no history survives under the old keys. Every implementation must reproduce canonical, kid, and sigTag byte-for-byte from tags + target + id + seed, and must reach each negative's expected verdict. Non-act tags in `tags` are present deliberately: they must NOT be covered.",
-  "documentRule": "JCS (RFC 8785) over a flat string map: every act/act-* tag present keyed by its name with the +freeq.at/ prefix stripped — EXCEPT act-from, whose value enters as `from` — plus `id` and `target`. No fixed field list — a kind may add tags freely.",
+  "description": "Worked signing examples for freeq.at/act. Canonical keys follow the thread agreement frozen 2026-08-02: semantic names, with from/id/target mandatory and a missing one reading unverifiable. Every implementation must reproduce canonical, kid, and sigTag byte-for-byte from tags + target + id + seed, and must reach each negative's expected verdict. Non-act tags in `tags` are present deliberately: they must NOT be covered.",
+  "documentRule": "JCS (RFC 8785) over a flat string map: every act/act-* tag present keyed by its name with the +freeq.at/ prefix stripped, plus the three envelope fields `from`, `id` and `target`. No fixed field list — a kind may add tags freely.",
+  "envelopeRule": "The three envelope fields are not act tags: from rides the +freeq.at/from tag, id rides +freeq.at/eventid, and target is the normalized venue the message was delivered in — the last two supplied by the caller, never read from a tag. No envelope name can collide with a covered tag, whose stripped name always starts with `act`.",
   "eventIdRule": "An offer carries no act-id: its own event id is the task's id. Every later event in a task's life names that id in act-id, and mints its own id for itself.",
-  "injectedFieldRule": "target and id are supplied by the caller, never read from a tag: target is the normalized venue the message was delivered in, id is the event id the signer minted (it rides the wire in +freeq.at/eventid). from is read from the act-from wire tag. No mandatory name can collide with a covered tag, whose stripped name always starts with `act`.",
   "kidRule": "base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16])",
   "mandatoryFieldRule": "`from`, `id` and `target` are mandatory. A document missing one reads unverifiable, never invalid: none is act-prefixed, so tag coverage cannot strip-detect it, and an absence is not evidence about the sender.",
   "negatives": [
@@ -26,7 +26,7 @@
       "expected": "unverifiable",
       "id": "01JABCDEF000000000000000EF",
       "name": "missing-from",
-      "strippedTag": "+freeq.at/act-from",
+      "strippedTag": "+freeq.at/from",
       "target": "#ops",
       "vector": "directed-offer"
     },
@@ -55,12 +55,12 @@
         "+freeq.at/act-caps": "freeq.at/web-search",
         "+freeq.at/act-ctx-h": "sha256:9f00",
         "+freeq.at/act-deadline": "1788000000",
-        "+freeq.at/act-from": "did:plc:eliza",
         "+freeq.at/act-title": "Cite 3 sources on X",
         "+freeq.at/act-to": "did:plc:scholar",
         "+freeq.at/act-verb": "offer",
         "+freeq.at/actor-class": "agent",
         "+freeq.at/eventid": "01JABCDEF000000000000000EF",
+        "+freeq.at/from": "did:plc:eliza",
         "+freeq.at/sig": "ed25519:notcovered:notcovered",
         "msgid": "01JSERVERMINTED0000000000"
       },
@@ -78,9 +78,9 @@
         "+freeq.at/act": "handoff",
         "+freeq.at/act-caps": "freeq.at/log-analysis",
         "+freeq.at/act-ctx-h": "sha256:2c00",
-        "+freeq.at/act-from": "did:plc:eliza",
         "+freeq.at/act-title": "Summarize today's S2S logs",
-        "+freeq.at/act-verb": "offer"
+        "+freeq.at/act-verb": "offer",
+        "+freeq.at/from": "did:plc:eliza"
       },
       "target": "#swarm"
     },
@@ -95,11 +95,11 @@
       "tags": {
         "+freeq.at/act": "approval",
         "+freeq.at/act-ctx-h": "sha256:1a00",
-        "+freeq.at/act-from": "did:plc:factory",
         "+freeq.at/act-scope": "deploy:factory-bot",
         "+freeq.at/act-title": "Deploy factory-bot v12",
         "+freeq.at/act-to": "did:plc:opslead",
-        "+freeq.at/act-verb": "request"
+        "+freeq.at/act-verb": "request",
+        "+freeq.at/from": "did:plc:factory"
       },
       "target": "dm:did:plc:factory,did:plc:opslead"
     },
@@ -113,10 +113,10 @@
       "sigTag": "ed25519:xblA7T9lw5GWXegpX8XSXw:zblRGn3cGtPLC2voiMS7eH2oC4G1vtsQdgEU-ZheK4HOenDWJpP4wvfVAoeUwTRwMSVkzXwC5uhsDVVUWeUYBA",
       "tags": {
         "+freeq.at/act": "handoff",
-        "+freeq.at/act-from": "did:plc:scholar",
         "+freeq.at/act-id": "01JABCDEF000000000000000EF",
         "+freeq.at/act-note": "ok — \"on it\" ✓\n(eta 5m)",
-        "+freeq.at/act-verb": "accept"
+        "+freeq.at/act-verb": "accept",
+        "+freeq.at/from": "did:plc:scholar"
       },
       "target": "#ops"
     }

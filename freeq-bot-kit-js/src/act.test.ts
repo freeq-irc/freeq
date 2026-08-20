@@ -215,9 +215,9 @@ describe("verification failures", () => {
     expect(await signActTags(none, v.target, v.id, key)).toBeNull();
   });
 
-  it("act tags without act-from → missing-from, never invalid or no-act-tags", async () => {
+  it("act tags without a from tag → missing-from, never invalid or no-act-tags", async () => {
     const tags = { ...v.tags };
-    delete tags["+freeq.at/act-from"];
+    delete tags["+freeq.at/from"];
     expect(await verifyActTags(tags, v.target, v.id, v.sigTag, pub())).toEqual({
       ok: false,
       reason: "missing-from",
@@ -231,8 +231,8 @@ describe("verification failures", () => {
     expect(actCanonical(v.tags, "", v.id)).toBeNull();
   });
 
-  it("a rewritten act-from breaks the signature like any covered value", async () => {
-    const tags = { ...v.tags, "+freeq.at/act-from": "did:plc:mallory" };
+  it("a rewritten from tag breaks the signature like any signed value", async () => {
+    const tags = { ...v.tags, "+freeq.at/from": "did:plc:mallory" };
     expect(await verifyActTags(tags, v.target, v.id, v.sigTag, pub())).toEqual({
       ok: false,
       reason: "sig-invalid",

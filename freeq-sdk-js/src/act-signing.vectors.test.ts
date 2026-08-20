@@ -43,10 +43,10 @@ describe('act canonical', () => {
     expect(actCanonical(v.tags, '', v.id)).toBeNull();
   });
 
-  it('act tags without act-from build no document (missing mandatory field)', () => {
+  it('act tags without a from tag build no document (missing mandatory field)', () => {
     const v = spec.vectors[0];
     const tags = { ...v.tags };
-    delete tags['+freeq.at/act-from'];
+    delete tags['+freeq.at/from'];
     expect(actCanonical(tags, v.target, v.id)).toBeNull();
   });
 

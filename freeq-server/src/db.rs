@@ -2716,7 +2716,7 @@ mod tests {
         let mut tags = vec![
             ("+freeq.at/act", "handoff"),
             ("+freeq.at/act-verb", "offer"),
-            ("+freeq.at/act-from", ELIZA),
+            ("+freeq.at/from", ELIZA),
         ];
         if let Some(to) = to {
             tags.push(("+freeq.at/act-to", to));
@@ -2750,7 +2750,7 @@ mod tests {
             &[
                 ("+freeq.at/act", "handoff"),
                 ("+freeq.at/act-verb", verb),
-                ("+freeq.at/act-from", actor),
+                ("+freeq.at/from", actor),
                 ("+freeq.at/act-id", task),
             ],
             venue,

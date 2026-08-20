@@ -231,7 +231,7 @@ fn offer_tags() -> Vec<(String, String)> {
     vec![
         ("+freeq.at/act".into(), "handoff".into()),
         ("+freeq.at/act-verb".into(), "offer".into()),
-        ("+freeq.at/act-from".into(), DID_ALICE.into()),
+        ("+freeq.at/from".into(), DID_ALICE.into()),
         ("+freeq.at/act-to".into(), DID_BOB.into()),
         ("+freeq.at/act-title".into(), "review-the-deploy".into()),
     ]
@@ -472,7 +472,7 @@ async fn a_task_message_naming_no_actor_is_refused() {
         a.join("#ops");
         // An actor-less document cannot even be signed since the realignment
         // (`from` is mandatory), so this line carries a real signature over
-        // the full tags with act-from then stripped from the wire — the
+        // the full tags with the from tag then stripped from the wire — the
         // shape a stripping relay would produce. The gate answers before any
         // signature check runs.
         let id = fresh_id();
@@ -482,7 +482,7 @@ async fn a_task_message_naming_no_actor_is_refused() {
             .expect("act tags present");
         let tags: Vec<(String, String)> = full
             .into_iter()
-            .filter(|(k, _)| k != "+freeq.at/act-from")
+            .filter(|(k, _)| k != "+freeq.at/from")
             .collect();
         a.tx(&line_with_sig(&tags, "#ops", &id, &sig));
         assert_eq!(a.fail_code(), "ACTOR_REQUIRED");
@@ -626,7 +626,7 @@ fn follow_up_line(
     let tags: Vec<(String, String)> = vec![
         ("+freeq.at/act".into(), "handoff".into()),
         ("+freeq.at/act-verb".into(), verb.into()),
-        ("+freeq.at/act-from".into(), from.into()),
+        ("+freeq.at/from".into(), from.into()),
         ("+freeq.at/act-id".into(), task.into()),
     ];
     signed_line(&tags, channel, id, key)

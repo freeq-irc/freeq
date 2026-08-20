@@ -261,8 +261,8 @@ export async function coordinationCanonical(fields: {
 /** Derive a key id: base64url of the first 16 bytes of SHA-256 over the key. */
 /**
  * The canonical a task event's signature covers: every `act`/`act-*` tag on
- * the message keyed by its name with the vendor prefix stripped — except
- * `act-from`, whose value enters as `from`, the signer's semantic key — plus
+ * the message keyed by its name with the vendor prefix stripped, plus
+ * `from` (the signer, riding the `+freeq.at/from` envelope tag),
  * `id` (the signer's event id) and `target` (the venue). `from`/`id`/`target`
  * are mandatory (thread agreement 2026-08-02); a document that cannot be
  * built is null, and a verifier reads that as unverifiable, never invalid.
@@ -285,9 +285,10 @@ export function actCanonical(
       : name.startsWith('freeq.at/')
         ? name.slice('freeq.at/'.length)
         : name;
-    if (stripped === 'act-from') from = value;
+    if (stripped === 'from') from = value;
     else if (stripped === 'act' || stripped.startsWith('act-')) covered[stripped] = value;
   }
+  if (Object.keys(covered).length === 0) return null;
   if (from === null) return null;
   covered.from = from;
   covered.id = id;
