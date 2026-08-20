@@ -627,7 +627,7 @@ pub(super) fn gate(
                 conn,
                 "TAGMSG",
                 "SIGNATURE_UNVERIFIABLE",
-                "That signature cannot be checked here",
+                "That signature cannot be checked by this server",
                 state,
             );
             return Gate::Refused;
