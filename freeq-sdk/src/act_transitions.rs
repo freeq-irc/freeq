@@ -779,7 +779,16 @@ mod tests {
             "bounty's verb, not handoff's"
         );
         for verb in [
-            "bid", "award", "progress", "complete", "fail", "cancel", "expire",
+            "bid",
+            "award",
+            "progress",
+            "submit",
+            "revise",
+            "accept-work",
+            "forfeit",
+            "auto-accept",
+            "cancel",
+            "expire",
         ] {
             assert!(knows_verb("bounty", verb), "{verb}");
         }
@@ -787,6 +796,12 @@ mod tests {
             !knows_verb("bounty", "accept"),
             "handoff's verb, not bounty's — a bounty has no offeree to accept"
         );
+        for verb in ["complete", "fail"] {
+            assert!(
+                !knows_verb("bounty", verb),
+                "{verb}: a bounty ends on the poster's word, not the worker's"
+            );
+        }
         assert!(!knows_verb("approval", "request"), "no table, no verbs");
     }
 

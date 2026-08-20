@@ -3164,7 +3164,7 @@ mod tests {
         assert_eq!(db.act_task("B1").unwrap().unwrap().state, "open");
     }
 
-    /// The loser bid and was not taken, so the work is not theirs to finish.
+    /// The loser bid and was not taken, so the work is not theirs to hand in.
     #[test]
     fn the_loser_of_a_bounty_cannot_finish_the_work() {
         let db = Db::open_memory().unwrap();
@@ -3174,7 +3174,7 @@ mod tests {
         bounty_step(&db, "award", ELIZA, "B1", "AW", Some("BID0"), "#ops", 20);
 
         assert_eq!(
-            bounty_step(&db, "complete", MALLORY, "B1", "C1", None, "#ops", 21),
+            bounty_step(&db, "submit", MALLORY, "B1", "C1", None, "#ops", 21),
             ActWrite::Refused(freeq_sdk::act_transitions::Refusal::WrongSender)
         );
         assert_eq!(
@@ -3183,10 +3183,165 @@ mod tests {
             "an awarded bounty takes no further bids"
         );
         assert!(matches!(
-            bounty_step(&db, "complete", SCHOLAR, "B1", "C2", None, "#ops", 23),
+            bounty_step(&db, "submit", SCHOLAR, "B1", "C2", None, "#ops", 23),
             ActWrite::Filed { .. }
         ));
-        assert_eq!(db.act_task("B1").unwrap(), None, "completed and gone");
+        assert!(matches!(
+            bounty_step(&db, "accept-work", ELIZA, "B1", "C3", None, "#ops", 24),
+            ActWrite::Filed { .. }
+        ));
+        assert_eq!(db.act_task("B1").unwrap(), None, "accepted and gone");
+    }
+
+    /// The difference between this kind and a handoff: the worker says the
+    /// work is in, and the poster says whether it is done. A submission
+    /// parks the bounty in review and moves nothing else.
+    #[test]
+    fn a_bounty_ends_on_the_posters_word_and_not_the_workers() {
+        let db = Db::open_memory().unwrap();
+        bounty_offer(&db, "B1", "#ops", 10);
+        bounty_step(&db, "bid", SCHOLAR, "B1", "BID0", None, "#ops", 11);
+        bounty_step(&db, "award", ELIZA, "B1", "AW", Some("BID0"), "#ops", 12);
+
+        assert_eq!(
+            bounty_step(&db, "submit", SCHOLAR, "B1", "S1", None, "#ops", 13),
+            ActWrite::Filed {
+                was: Some("assigned".into()),
+                state: "under_review".into()
+            }
+        );
+        assert_eq!(
+            bounty_step(&db, "accept-work", SCHOLAR, "B1", "A1", None, "#ops", 14),
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::WrongSender),
+            "the worker cannot sign off on their own work"
+        );
+        // Sent back, worked again, handed in again.
+        assert_eq!(
+            bounty_step(&db, "revise", ELIZA, "B1", "R1", None, "#ops", 15),
+            ActWrite::Filed {
+                was: Some("under_review".into()),
+                state: "assigned".into()
+            }
+        );
+        assert!(matches!(
+            bounty_step(&db, "submit", SCHOLAR, "B1", "S2", None, "#ops", 16),
+            ActWrite::Filed { .. }
+        ));
+        assert_eq!(
+            bounty_step(&db, "accept-work", ELIZA, "B1", "A2", None, "#ops", 17),
+            ActWrite::Filed {
+                was: Some("under_review".into()),
+                state: "accepted".into()
+            }
+        );
+        assert_eq!(
+            db.act_task("B1").unwrap(),
+            None,
+            "accepted is the end of it"
+        );
+    }
+
+    /// Once work is in, the poster's only moves are taking it and sending it
+    /// back. Cancelling delivered work is the cheap unfairness the table
+    /// closes: the row simply does not reach under_review.
+    #[test]
+    fn delivered_work_is_not_something_the_poster_can_cancel() {
+        let db = Db::open_memory().unwrap();
+        bounty_offer(&db, "B1", "#ops", 10);
+        bounty_step(&db, "bid", SCHOLAR, "B1", "BID0", None, "#ops", 11);
+        bounty_step(&db, "award", ELIZA, "B1", "AW", Some("BID0"), "#ops", 12);
+        // Before it lands, cancelling is the poster's to do.
+        assert!(matches!(
+            bounty_step(&db, "cancel", ELIZA, "B1", "X0", None, "#ops", 13),
+            ActWrite::Filed { .. }
+        ));
+
+        bounty_offer(&db, "B2", "#ops", 20);
+        bounty_step(&db, "bid", SCHOLAR, "B2", "BID1", None, "#ops", 21);
+        bounty_step(&db, "award", ELIZA, "B2", "AW2", Some("BID1"), "#ops", 22);
+        bounty_step(&db, "submit", SCHOLAR, "B2", "S1", None, "#ops", 23);
+        assert_eq!(
+            bounty_step(&db, "cancel", ELIZA, "B2", "X1", None, "#ops", 24),
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::IllegalStep)
+        );
+        assert_eq!(db.act_task("B2").unwrap().unwrap().state, "under_review");
+    }
+
+    /// The worker's exit, from either state they may hold the work in. It is
+    /// terminal, so re-running the job is a new bounty naming this one.
+    #[test]
+    fn the_worker_forfeits_work_they_hold_before_or_after_handing_it_in() {
+        let db = Db::open_memory().unwrap();
+        for (task, submit_first) in [("B1", false), ("B2", true)] {
+            bounty_offer(&db, task, "#ops", 10);
+            bounty_step(
+                &db,
+                "bid",
+                SCHOLAR,
+                task,
+                &format!("{task}BID"),
+                None,
+                "#ops",
+                11,
+            );
+            bounty_step(
+                &db,
+                "award",
+                ELIZA,
+                task,
+                &format!("{task}AW"),
+                Some(&format!("{task}BID")),
+                "#ops",
+                12,
+            );
+            if submit_first {
+                bounty_step(
+                    &db,
+                    "submit",
+                    SCHOLAR,
+                    task,
+                    &format!("{task}S"),
+                    None,
+                    "#ops",
+                    13,
+                );
+            }
+            assert_eq!(
+                bounty_step(
+                    &db,
+                    "forfeit",
+                    ELIZA,
+                    task,
+                    &format!("{task}FE"),
+                    None,
+                    "#ops",
+                    14
+                ),
+                ActWrite::Refused(freeq_sdk::act_transitions::Refusal::WrongSender),
+                "{task}: the poster does not forfeit the worker's work"
+            );
+            assert_eq!(
+                bounty_step(
+                    &db,
+                    "forfeit",
+                    SCHOLAR,
+                    task,
+                    &format!("{task}F"),
+                    None,
+                    "#ops",
+                    15
+                ),
+                ActWrite::Filed {
+                    was: Some(match submit_first {
+                        true => "under_review".to_string(),
+                        false => "assigned".to_string(),
+                    }),
+                    state: "forfeited".into()
+                },
+                "{task}"
+            );
+            assert_eq!(db.act_task(task).unwrap(), None, "{task}: terminal");
+        }
     }
 
     /// An award points at one event, and only a bid on this action answers.
@@ -3402,6 +3557,11 @@ mod tests {
         bounty_step(&db, "bid", MALLORY, "B1", "BID1", None, "#ops", 52);
         bounty_step(&db, "award", ELIZA, "B1", "AW", Some("BID1"), "#ops", 53);
         bounty_step(&db, "progress", MALLORY, "B1", "PR", None, "#ops", 54);
+        // …and into review and back out again, so the rebuild replays the
+        // states only a bounty has.
+        bounty_step(&db, "submit", MALLORY, "B1", "SB", None, "#ops", 55);
+        bounty_step(&db, "revise", ELIZA, "B1", "RV", None, "#ops", 56);
+        bounty_step(&db, "submit", MALLORY, "B1", "SB2", None, "#ops", 57);
 
         let venues = vec!["#ops".to_string(), "#other".to_string()];
         let mut live = db.act_tasks(&venues, None, None, None, 100).unwrap();

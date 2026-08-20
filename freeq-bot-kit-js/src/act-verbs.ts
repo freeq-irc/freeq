@@ -1,9 +1,9 @@
 // The moves a bot can make on a task.
 //
-// One function per verb the RFC gives a sender. `expire` is not here: only
-// the server may make that move, and it makes it from the sweep, and neither
-// is `confirm`: a receipt is the action's home writing about an event it
-// filed.
+// One function per verb the RFC gives a sender. `expire` and `auto-accept` are
+// not here: only the server may make those moves, and it makes them from the
+// sweep. Neither is `confirm`: a receipt is the action's home writing about an
+// event it filed.
 //
 // Every one does the same paired send — the signed task TAGMSG that *is* the
 // event, and the plain-text line that renders it for the people in the room,
@@ -219,6 +219,78 @@ export async function award(
   tags["+freeq.at/act-accepts"] = bidEventId;
   return ctx.client.sendAct(ctx.target, tags, {
     humanText: opts.humanText ?? 'awarded the bounty',
+    taskId,
+  });
+}
+
+/**
+ * Hand in the work on a bounty you hold. The bounty waits for the poster from
+ * here: nothing about a submission says the work is done, only that it is in.
+ */
+export async function submit(
+  ctx: ActContext,
+  taskId: string,
+  opts: StepOptions = {},
+): Promise<string> {
+  return ctx.client.sendAct(ctx.target, stepTags("submit", ctx.did, taskId, opts.note, BOUNTY), {
+    humanText: opts.humanText ?? "submitted the work",
+    taskId,
+  });
+}
+
+/**
+ * Send submitted work back for another pass. The bounty is assigned again and
+ * the worker still holds it — asking for changes is the poster answering, so
+ * it also stops the review clock and starts a fresh one on the next
+ * submission.
+ */
+export async function revise(
+  ctx: ActContext,
+  taskId: string,
+  opts: StepOptions = {},
+): Promise<string> {
+  return ctx.client.sendAct(ctx.target, stepTags("revise", ctx.did, taskId, opts.note, BOUNTY), {
+    humanText: opts.humanText ?? "asked for changes",
+    taskId,
+  });
+}
+
+/**
+ * Accept submitted work on a bounty you posted. Terminal, and the poster's
+ * word rather than the worker's — which is the whole difference between this
+ * kind and a handoff.
+ *
+ * A payment reference rides along as an ordinary act tag if there is one. The
+ * server stores and relays it and never reads it: what settled, and whether it
+ * settled, live above this.
+ */
+export async function acceptWork(
+  ctx: ActContext,
+  taskId: string,
+  opts: StepOptions = {},
+): Promise<string> {
+  return ctx.client.sendAct(
+    ctx.target,
+    stepTags("accept-work", ctx.did, taskId, opts.note, BOUNTY),
+    {
+      humanText: opts.humanText ?? "accepted the work",
+      taskId,
+    },
+  );
+}
+
+/**
+ * Give up a bounty you hold, before or after handing the work in. Terminal:
+ * re-listing it is a new bounty naming this one in `replaces`, because the
+ * machine only runs forward.
+ */
+export async function forfeit(
+  ctx: ActContext,
+  taskId: string,
+  opts: StepOptions = {},
+): Promise<string> {
+  return ctx.client.sendAct(ctx.target, stepTags("forfeit", ctx.did, taskId, opts.note, BOUNTY), {
+    humanText: opts.humanText ?? "forfeited the bounty",
     taskId,
   });
 }

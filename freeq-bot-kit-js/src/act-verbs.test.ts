@@ -8,6 +8,10 @@ import { describe, expect, it } from "vitest";
 import {
   accept,
   award,
+  submit,
+  revise,
+  acceptWork,
+  forfeit,
   bid,
   cancel,
   claim,
@@ -186,6 +190,30 @@ describe("the bounty verbs", () => {
     // own — two sources for one fact is what naming a DID here would be.
     expect(tags["+freeq.at/act-to"]).toBeUndefined();
     expect(tags["+freeq.at/from"]).toBe("did:plc:bot");
+  });
+
+  it("hands the work in without saying it is done", async () => {
+    const sent: Sent[] = [];
+    await submit(ctxWith(sent), "01JTASK00000000000000000AA", { note: "branch pushed" });
+    const { tags } = sent[0];
+    expect(tags["+freeq.at/act"]).toBe("bounty");
+    expect(tags["+freeq.at/act-verb"]).toBe("submit");
+    expect(tags["+freeq.at/act-id"]).toBe("01JTASK00000000000000000AA");
+    expect(tags["+freeq.at/act-note"]).toBe("branch pushed");
+  });
+
+  it("sends the work back, accepts it, or walks away from it", async () => {
+    for (const [move, verb] of [
+      [revise, "revise"],
+      [acceptWork, "accept-work"],
+      [forfeit, "forfeit"],
+    ] as const) {
+      const sent: Sent[] = [];
+      await move(ctxWith(sent), "01JTASK00000000000000000AA");
+      expect(sent[0].tags["+freeq.at/act-verb"], verb).toBe(verb);
+      expect(sent[0].tags["+freeq.at/act"], verb).toBe("bounty");
+      expect(sent[0].taskId, verb).toBe("01JTASK00000000000000000AA");
+    }
   });
 
   it("carries the kind on a bounty's follow-ups too", async () => {

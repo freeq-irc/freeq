@@ -1137,6 +1137,51 @@ fn bounty_line(
     signed_line(&tags, channel, id, key)
 }
 
+/// Open a bounty and return its id.
+fn open_bounty(c: &mut C, signing: &SigningKey, channel: &str) -> String {
+    let id = fresh_id();
+    c.tx(&bounty_line(
+        "offer", DID_ALICE, None, None, channel, &id, signing,
+    ));
+    c.rx(|l| l.contains(&id), "the bounty opens");
+    id
+}
+
+/// Open a bounty, take bob's bid on it, and return its id — the setup every
+/// test of the review half starts from.
+fn award_to_bob(
+    a: &mut C,
+    b: &mut C,
+    alice_key: &SigningKey,
+    bob_key: &SigningKey,
+    channel: &str,
+) -> String {
+    let bounty = open_bounty(a, alice_key, channel);
+    let bid = fresh_id();
+    b.tx(&bounty_line(
+        "bid",
+        DID_BOB,
+        Some(&bounty),
+        None,
+        channel,
+        &bid,
+        bob_key,
+    ));
+    b.rx(|l| l.contains(&bid), "the bid is accepted");
+    let award = fresh_id();
+    a.tx(&bounty_line(
+        "award",
+        DID_ALICE,
+        Some(&bounty),
+        Some(&bid),
+        channel,
+        &award,
+        alice_key,
+    ));
+    b.rx(|l| l.contains(&award), "the award is accepted");
+    bounty
+}
+
 /// A bounty opener carrying a recipient, which is the one thing it cannot do.
 fn directed_bounty_line(from: &str, channel: &str, id: &str, key: &SigningKey) -> String {
     let tags: Vec<(String, String)> = vec![
@@ -1200,9 +1245,9 @@ async fn a_bounty_awards_the_bid_it_names_and_the_bidder_becomes_assignee() {
         ));
         b.rx(|l| l.contains(&award), "the award is accepted");
 
-        // The loser cannot finish work that is not theirs…
+        // The loser cannot hand in work that is not theirs…
         a.tx(&bounty_line(
-            "complete",
+            "submit",
             DID_ALICE,
             Some(&bounty),
             None,
@@ -1215,7 +1260,7 @@ async fn a_bounty_awards_the_bid_it_names_and_the_bidder_becomes_assignee() {
         // …and the winner can.
         let done = fresh_id();
         b.tx(&bounty_line(
-            "complete",
+            "submit",
             DID_BOB,
             Some(&bounty),
             None,
@@ -1223,7 +1268,207 @@ async fn a_bounty_awards_the_bid_it_names_and_the_bidder_becomes_assignee() {
             &done,
             &bob_key,
         ));
-        b.rx(|l| l.contains(&done), "the winner finishes it");
+        b.rx(|l| l.contains(&done), "the winner hands it in");
+    })
+    .await;
+}
+
+/// The bounty's own half of the lifecycle, on the wire: the worker hands the
+/// work in, the poster sends it back once, the worker hands it in again, and
+/// the poster takes it. The poster's word ends it, not the worker's — which is
+/// the whole difference from a handoff.
+#[tokio::test]
+async fn submitted_work_is_sent_back_once_and_then_accepted_by_the_poster() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+        let bounty = award_to_bob(&mut a, &mut b, &alice_key, &bob_key, "#ops");
+
+        for verb in ["revise", "accept-work"] {
+            let handed_in = fresh_id();
+            b.tx(&bounty_line(
+                "submit",
+                DID_BOB,
+                Some(&bounty),
+                None,
+                "#ops",
+                &handed_in,
+                &bob_key,
+            ));
+            b.rx(|l| l.contains(&handed_in), "the work is handed in");
+
+            let answer = fresh_id();
+            a.tx(&bounty_line(
+                verb,
+                DID_ALICE,
+                Some(&bounty),
+                None,
+                "#ops",
+                &answer,
+                &alice_key,
+            ));
+            b.rx(|l| l.contains(&answer), verb);
+        }
+
+        // Accepted is terminal: there is nothing further to hand in.
+        b.tx(&bounty_line(
+            "submit",
+            DID_BOB,
+            Some(&bounty),
+            None,
+            "#ops",
+            &fresh_id(),
+            &bob_key,
+        ));
+        assert_eq!(b.fail_code(), "TERMINAL_TASK");
+    })
+    .await;
+}
+
+/// Once the work is in, the poster's only moves are taking it and sending it
+/// back — and signing off on the work is not the worker's to do.
+#[tokio::test]
+async fn delivered_work_is_neither_withdrawn_nor_self_accepted() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+        let bounty = award_to_bob(&mut a, &mut b, &alice_key, &bob_key, "#ops");
+
+        let handed_in = fresh_id();
+        b.tx(&bounty_line(
+            "submit",
+            DID_BOB,
+            Some(&bounty),
+            None,
+            "#ops",
+            &handed_in,
+            &bob_key,
+        ));
+        b.rx(|l| l.contains(&handed_in), "the work is handed in");
+
+        a.tx(&bounty_line(
+            "cancel",
+            DID_ALICE,
+            Some(&bounty),
+            None,
+            "#ops",
+            &fresh_id(),
+            &alice_key,
+        ));
+        assert_eq!(a.fail_code(), "ILLEGAL_STEP");
+
+        b.tx(&bounty_line(
+            "accept-work",
+            DID_BOB,
+            Some(&bounty),
+            None,
+            "#ops",
+            &fresh_id(),
+            &bob_key,
+        ));
+        assert_eq!(b.fail_code(), "WRONG_SENDER");
+    })
+    .await;
+}
+
+/// A bounty is not a handoff, and its worker has no verb that ends it. The
+/// two that would are ones the kind's table simply does not list.
+#[tokio::test]
+async fn a_bounty_has_no_complete_and_no_fail() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        let bounty = open_bounty(&mut a, &signing, "#ops");
+        for verb in ["complete", "fail"] {
+            a.tx(&bounty_line(
+                verb,
+                DID_ALICE,
+                Some(&bounty),
+                None,
+                "#ops",
+                &fresh_id(),
+                &signing,
+            ));
+            assert_eq!(a.fail_code(), "UNKNOWN_VERB", "{verb}");
+        }
+    })
+    .await;
+}
+
+/// The worker's exit, from either state they may hold the work in.
+#[tokio::test]
+async fn the_worker_forfeits_the_work_and_the_bounty_is_finished() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+
+        let bounty = award_to_bob(&mut a, &mut b, &alice_key, &bob_key, "#ops");
+
+        // Not the poster's to give up on the worker's behalf.
+        a.tx(&bounty_line(
+            "forfeit",
+            DID_ALICE,
+            Some(&bounty),
+            None,
+            "#ops",
+            &fresh_id(),
+            &alice_key,
+        ));
+        assert_eq!(a.fail_code(), "WRONG_SENDER");
+
+        let gone = fresh_id();
+        b.tx(&bounty_line(
+            "forfeit",
+            DID_BOB,
+            Some(&bounty),
+            None,
+            "#ops",
+            &gone,
+            &bob_key,
+        ));
+        b.rx(|l| l.contains(&gone), "the worker walks away");
+
+        a.tx(&bounty_line(
+            "revise",
+            DID_ALICE,
+            Some(&bounty),
+            None,
+            "#ops",
+            &fresh_id(),
+            &alice_key,
+        ));
+        assert_eq!(a.fail_code(), "TERMINAL_TASK");
     })
     .await;
 }
