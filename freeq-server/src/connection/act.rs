@@ -502,10 +502,7 @@ pub(super) fn gate(
     // who acted, and the two have to be the same person. Checked before the
     // signature because both answers are decidable without one, and either is
     // more useful than a signature complaint.
-    let Some(actor) = tags
-        .get("+freeq.at/from")
-        .or_else(|| tags.get("from"))
-    else {
+    let Some(actor) = tags.get("+freeq.at/from").or_else(|| tags.get("from")) else {
         // Naming nobody is its own answer. The log refuses such bytes as
         // unreadable — the view's offerer comes from this field — so without
         // a sentence here the event would vanish with nothing said about it.

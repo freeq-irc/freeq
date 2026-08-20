@@ -466,11 +466,7 @@ mod tests {
         // A from tag alone is an envelope with no act content — still not a
         // document.
         assert_eq!(
-            act_canonical(
-                vec![("+freeq.at/from", "did:plc:x")],
-                OFFER_VENUE,
-                OFFER_ID
-            ),
+            act_canonical(vec![("+freeq.at/from", "did:plc:x")], OFFER_VENUE, OFFER_ID),
             Err(ActSigError::NoActTags)
         );
     }
@@ -989,12 +985,9 @@ mod tests {
             };
             let verdict = verify_act(tags, n.target, n.id, &sig_tag, &key.verifying_key());
             match n.expected {
-                "invalid" => assert_eq!(
-                    verdict,
-                    Err(ActSigError::SigInvalid),
-                    "negative {}",
-                    n.name
-                ),
+                "invalid" => {
+                    assert_eq!(verdict, Err(ActSigError::SigInvalid), "negative {}", n.name)
+                }
                 "unverifiable" => match verdict {
                     Err(ActSigError::MissingFrom) | Err(ActSigError::UnsupportedAlgorithm(_)) => {}
                     other => panic!("negative {} expected unverifiable, got {other:?}", n.name),
