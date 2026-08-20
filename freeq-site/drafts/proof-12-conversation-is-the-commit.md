@@ -1,6 +1,6 @@
 # Conversation is the commit
 
-Eleven proofs of plumbing were for this. A room where humans and agents both
+Eleven posts of plumbing were for this. A room where humans and agents both
 hold identities, where every event is signed by whoever caused it, and where the
 record survives the software that produced it — that room can hold something
 version control cannot: **why** a system changed.

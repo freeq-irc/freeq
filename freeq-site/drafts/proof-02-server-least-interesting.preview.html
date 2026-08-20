@@ -22,7 +22,7 @@ li{margin:.5em 0}
 .note{font-size:.8em;color:#8b8b95;font-family:ui-monospace,Menlo,monospace;
       border-top:1px solid #ffffff14;margin-top:3.5em;padding-top:1em}
 </style><div class=wrap><h1>The server is the least interesting part</h1>
-<p>The previous proof showed a pixel world and a terminal sharing one room. That only works because of something boring: the server in the middle does very little.</p>
+<p>A pixel world and a terminal shared one room in the last post. That only works because of something boring: the server in the middle does very little.</p>
 <p>freeq is a shared environment where humans, agents, services, and media sources participate as identifiable, programmable peers. IRC is its narrow waist, not its product category. Identity, signing, policy, encryption, media, and intelligence live at the edges.</p>
 <p>This post is about the waist.</p>
 <h2>What the server actually does</h2>
@@ -54,12 +54,12 @@ msgid=01KK7DHD8AVQW99HEGF2ZZNJCF :chadfowler.com!chadfowler.com@freeq/plc/4qsyxm
 <h2>Why this matters for agents and media</h2>
 <p>If a capability has to be a server feature, then the server operator decides who gets it, and every new capability is a negotiation with whoever runs the relay.</p>
 <p>freeq puts them at the edges instead. An agent authenticates with the same SASL mechanism a human uses and emits typed events as tags. A voice call sets some channel metadata with an ordinary <code>TAGMSG</code> while the media travels separately over MoQ. The server carries the metadata and never touches the audio. A client that does not know about calls sees messages and is unharmed.</p>
-<p>That is why the pixel world in proof 1 could exist without anyone adding a world-mode to the server. It reads the same events every other client reads.</p>
+<p>That is why the pixel world could exist without anyone adding a world-mode to the server. It reads the same events every other client reads.</p>
 <h2>Try it</h2>
 <p><strong>Run it in 5 minutes.</strong> The <code>openssl s_client</code> sequence above. Join <code>#lobby</code> and read the tags going by. That is the whole substrate, visible.</p>
 <p><strong>Extend it in 30 minutes.</strong> Add a client-side feature keyed on a tag, with zero server changes. Pick an unused name in your own namespace, emit it from one client, and render it in another. If it works, you have just extended the system without asking permission from the thing in the middle. That exercise is the thesis of this post.</p>
 <h2>What this does not claim</h2>
-<p>A thin server is not a trustless one. The relay still sees plaintext in unencrypted channels, still knows who is connected, and can still drop or delay messages. Nothing in this post prevents that. What it changes is what the relay can forge without being caught, and that argument depends on the signature chain, which is the next proof and is not finished.</p>
+<p>A thin server is not a trustless one. The relay still sees plaintext in unencrypted channels, still knows who is connected, and can still drop or delay messages. Nothing in this post prevents that. What it changes is what the relay can forge without being caught, and that argument depends on the signature chain, which the next post takes apart and which is not finished.</p>
 <p>&quot;Nothing was forked&quot; is a claim about the wire protocol, not about clients. A client that wants to render task cards has to learn the tags.</p>
 <h2>What is rough</h2>
 <p>The <code>+freeq.at/</code> namespace is a public contract by intention, and it is versioned informally. It is documented in the repo and stable in practice, but it has not been through the IRCv3 process.</p>

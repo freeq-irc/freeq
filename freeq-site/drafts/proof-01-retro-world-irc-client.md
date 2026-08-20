@@ -76,9 +76,9 @@ ways because the room is protocol rather than product. It is not a security
 claim.
 
 `#lobby` is a public channel and proves nothing about privacy. Encrypted rooms
-exist and are a separate proof. You can see that messages carry signatures, but
-whether that identity chain holds up against a hostile relay is the subject of
-proof 3, and it deserves the scrutiny. A deterministic sprite makes people
+exist and are a separate matter entirely. You can see that messages carry
+signatures, but whether that identity chain holds up against a hostile relay is
+the subject of a later post, and it deserves the scrutiny. A deterministic sprite makes people
 recognizable to other people. It is not an authentication factor.
 
 ## What is rough

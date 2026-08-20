@@ -138,7 +138,7 @@ verify the signature with an ed25519 library.
 the signature, then check whether the key binding can be confirmed independently
 of the relay, and **flag every message where it cannot**. Today that verifier
 will flag every `did:plc` message on the server. That is the correct output, and
-it is the most useful contribution anyone could make to this proof.
+it is the most useful contribution anyone could make here.
 
 ## What this does not claim
 
@@ -146,14 +146,14 @@ A signature proves integrity and authorship relative to a key. Binding that key
 to an account is a separate step, complete for agents and incomplete for humans.
 
 Nothing here protects message contents in an unencrypted channel. The relay sees
-plaintext. Encryption is a different mechanism and a later proof.
+plaintext. Encryption is a different mechanism, and it gets its own post.
 
 A verified signature says nothing about whether the signer was compromised.
 
 ## What is rough
 
 The human key binding, described above, is the largest open item and the reason
-this post is proof 3 rather than a finished story.
+this post is a progress report rather than a finished story.
 
 Revocation for session keys is expiry-based. Immediate revocation for `did:plc`
 sessions is not implemented, so a compromised session key stays valid until it

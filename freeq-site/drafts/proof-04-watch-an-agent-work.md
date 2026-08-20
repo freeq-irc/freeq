@@ -1,6 +1,6 @@
 # Watch an agent work — from irssi
 
-The previous proof followed a key from a DID down to a single signed message.
+The last post followed a key from a DID down to a single signed message.
 Here is the first thing worth doing with an identity that strong: give one to
 something that is not a person, and put it in a room where you can watch it.
 
@@ -9,7 +9,7 @@ that it works somewhere you cannot see. It holds a task for forty minutes,
 runs commands, edits files, and reports back a paragraph at the end. You are
 asked to trust a summary written by the thing being summarised.
 
-This proof replaces the summary with a feed.
+This one replaces the summary with a feed.
 
 ## An agent in sixty lines
 
@@ -97,7 +97,7 @@ curl -s http://127.0.0.1:6890/api/v1/channels/%23agents/events | python3 -m json
 
 `event_id` is a ULID, so the record sorts by the millisecond its sender minted
 it. `actor_did` is the identity that acted, which is the same string the
-signature chain in proof 3 resolves.
+signature chain resolves.
 
 Someone who arrives after the work is finished is told what they missed, before
 they are even told who is in the room:
@@ -206,8 +206,8 @@ not a kill switch on a process you control.
 
 The `signature` field above is `null`. This client signs its login and nothing
 after it; per-event signing belongs to the client, and the field is where a
-signing client's proof is filed. Message signing is proof 3's subject, and what
-this post shows is an unsigned agent's events being stored as such rather than
+signing client's proof is filed. Per-message signing had its own post, and what
+this one shows is an unsigned agent's events being stored as such rather than
 quietly dressed up.
 
 The agent's key here lives for the length of the process, which is fine for a
@@ -216,7 +216,7 @@ is the same identity tomorrow.
 
 The agent in this post runs a test suite. It is a real job with real output, not
 a mock, but it is not a language model writing code, and the title says agent
-rather than coding agent for that reason. What the proof establishes is the
+rather than coding agent for that reason. What it establishes is the
 shape of participation — identity, typed events, presence, governance — which is
 the part that has to be right before a smarter agent is worth watching.
 

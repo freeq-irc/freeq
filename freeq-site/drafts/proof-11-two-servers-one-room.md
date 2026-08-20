@@ -1,6 +1,6 @@
 # Two servers, one room, and no address between them
 
-Everything so far happened on one server. This proof takes the room apart and
+Everything so far happened on one server. This post takes the room apart and
 runs it on two machines that were never introduced.
 
 Start a server. It prints a name for itself:

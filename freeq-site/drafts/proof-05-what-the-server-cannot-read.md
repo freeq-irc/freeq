@@ -1,7 +1,7 @@
 # What the server sees when it cannot read your message
 
-Every proof so far has been about what a room can prove. This one is about what
-it cannot see — and, more usefully, about the part it still can.
+Everything so far has been about what a room can show you. This post is about
+what it cannot see — and, more usefully, about the part it still can.
 
 A direct message between two accounts is sealed at the sending edge. Here is the
 whole of it, with nothing hidden.
@@ -53,7 +53,7 @@ Now the honest inventory. Everything the relay learns from that line:
 - **who sent it** — `alice`, and more durably `freeq/key/z6MksZ1D`: the first
   eight characters of her `did:key`, cloaked into the hostmask and stable across
   sessions. The full DID resolves to her ed25519 public key, which is the point
-  of proof 3 and the reason the relay cannot forge her.
+  of the signature chain, and the reason the relay cannot forge her.
 - **who receives it** — `bob`, by name, resolved to an account.
 - **when** — arrival time, to the millisecond, and the ULID in `msgid` embeds
   the sender's own clock.
@@ -97,8 +97,8 @@ everywhere.
 
 The other is sender-keys with a random group secret sealed individually to each
 member's published key, so the server relays the sealed blob and can never open
-it. That scheme gets its own proof later in this series, because the interesting
-question is not encryption — it is what happens the day you throw someone out.
+it. That scheme gets its own post later on, because the interesting question is
+not encryption — it is what happens the day you throw someone out.
 
 ## Try it
 

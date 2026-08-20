@@ -10,7 +10,7 @@ freeq answers a different way. A **verifier** learns the external fact, and
 hands back something the room can act on without ever learning the system the
 fact came from.
 
-Earlier proofs established who a participant is — a DID that signs in, and signs
+Earlier posts established who a participant is — a DID that signs in, and signs
 what it says, whether it is a person or an agent. This one is about what a room
 is allowed to conclude from that.
 
@@ -212,7 +212,7 @@ is one bucket to a room today.
 
 `validity_model: join_time` means the question is asked when you enter. Losing
 the underlying fact afterwards does not eject you from the room. Continuous
-models exist in the engine; what this proof demonstrates is the join-time one.
+models exist in the engine; what is demonstrated here is the join-time one.
 
 The verifier is a trusted third party by construction. It sees your GitHub
 session during the exchange, and a room trusting `did:web:irc.freeq.at:verify`

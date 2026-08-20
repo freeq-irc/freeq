@@ -66,13 +66,13 @@ li{margin:.5em 0}
 <h2>Try it</h2>
 <p><strong>See it in 30 seconds.</strong> Fetch a signing key with the curl above and read the JSON.</p>
 <p><strong>Run it in 5 minutes.</strong> Capture a signed message from <code>#lobby</code>, fetch the key, verify the signature with an ed25519 library.</p>
-<p><strong>Extend it in 30 minutes.</strong> Write a verifier that does the honest thing: check the signature, then check whether the key binding can be confirmed independently of the relay, and <strong>flag every message where it cannot</strong>. Today that verifier will flag every <code>did:plc</code> message on the server. That is the correct output, and it is the most useful contribution anyone could make to this proof.</p>
+<p><strong>Extend it in 30 minutes.</strong> Write a verifier that does the honest thing: check the signature, then check whether the key binding can be confirmed independently of the relay, and <strong>flag every message where it cannot</strong>. Today that verifier will flag every <code>did:plc</code> message on the server. That is the correct output, and it is the most useful contribution anyone could make here.</p>
 <h2>What this does not claim</h2>
 <p>A signature proves integrity and authorship relative to a key. Binding that key to an account is a separate step, complete for agents and incomplete for humans.</p>
-<p>Nothing here protects message contents in an unencrypted channel. The relay sees plaintext. Encryption is a different mechanism and a later proof.</p>
+<p>Nothing here protects message contents in an unencrypted channel. The relay sees plaintext. Encryption is a different mechanism, and it gets its own post.</p>
 <p>A verified signature says nothing about whether the signer was compromised.</p>
 <h2>What is rough</h2>
-<p>The human key binding, described above, is the largest open item and the reason this post is proof 3 rather than a finished story.</p>
+<p>The human key binding, described above, is the largest open item and the reason this post is a progress report rather than a finished story.</p>
 <p>Revocation for session keys is expiry-based. Immediate revocation for <code>did:plc</code> sessions is not implemented, so a compromised session key stays valid until it expires.</p>
 <p>There is no published test vector set. If you write a verifier, you are working from the running server rather than from a specification with fixtures, and that is a gap we should close.</p>
 <h2>Come in</h2>

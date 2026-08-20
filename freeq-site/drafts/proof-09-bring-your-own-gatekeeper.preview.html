@@ -24,7 +24,7 @@ li{margin:.5em 0}
 </style><div class=wrap><h1>Bring your own gatekeeper</h1>
 <p>Every interesting room ends up asking a question about the outside world. Are you an employee. Do you have a ticket. Did you contribute to this repository. The usual way to answer is to teach the server about Okta, or GitHub, or the ticketing vendor, and then to teach it about the next one, until the relay is a directory of integrations that its operator controls.</p>
 <p>freeq answers a different way. A <strong>verifier</strong> learns the external fact, and hands back something the room can act on without ever learning the system the fact came from.</p>
-<p>Earlier proofs established who a participant is — a DID that signs in, and signs what it says, whether it is a person or an agent. This one is about what a room is allowed to conclude from that.</p>
+<p>Earlier posts established who a participant is — a DID that signs in, and signs what it says, whether it is a person or an agent. This one is about what a room is allowed to conclude from that.</p>
 <h2>Three things that are not the same thing</h2>
 <p>The failure mode of every access-control design is collapsing these into one:</p>
 <pre><code>external fact          &quot;chad can push to freeq-irc/freeq&quot;
@@ -111,7 +111,7 @@ POLICY #gate INFO</code></pre>
 <h2>What this does not claim</h2>
 <p>A credential is not an authorisation. What the room grants is scoped to the room and decided by its policy; the statement from the issuer is evidence, not a key. Confusing the two is how &quot;signed in with GitHub&quot; becomes &quot;admin everywhere&quot;.</p>
 <p>The requirement matches on credential type and issuer. It does not compare the claim inside the credential against the room&#x27;s expectation — a <code>github_repo</code> credential from the named issuer satisfies the rule, whatever repository is written in it. If you run an issuer that certifies many facts of one type, that is one bucket to a room today.</p>
-<p><code>validity_model: join_time</code> means the question is asked when you enter. Losing the underlying fact afterwards does not eject you from the room. Continuous models exist in the engine; what this proof demonstrates is the join-time one.</p>
+<p><code>validity_model: join_time</code> means the question is asked when you enter. Losing the underlying fact afterwards does not eject you from the room. Continuous models exist in the engine; what is demonstrated here is the join-time one.</p>
 <p>The verifier is a trusted third party by construction. It sees your GitHub session during the exchange, and a room trusting <code>did:web:irc.freeq.at:verify</code> is trusting whoever operates that key. That is the honest shape of every attestation system; the improvement here is that the trust is <em>named</em> in the policy rather than implied by the software.</p>
 <h2>What is rough</h2>
 <p>Credentials are ed25519-signed by a key you can fetch, so anyone can check one. The membership receipt a server writes after a successful check is HMAC-signed with a key only that server holds — verifiable by the issuing server, opaque to everybody else. Room admission is therefore independently auditable one step back (the credential) and locally attested at the last step (the receipt).</p>

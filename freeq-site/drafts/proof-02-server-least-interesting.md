@@ -1,7 +1,7 @@
 # The server is the least interesting part
 
-The previous proof showed a pixel world and a terminal sharing one room. That
-only works because of something boring: the server in the middle does very
+A pixel world and a terminal shared one room in the last post. That only works
+because of something boring: the server in the middle does very
 little.
 
 freeq is a shared environment where humans, agents, services, and media sources
@@ -90,8 +90,8 @@ channel metadata with an ordinary `TAGMSG` while the media travels separately
 over MoQ. The server carries the metadata and never touches the audio. A client
 that does not know about calls sees messages and is unharmed.
 
-That is why the pixel world in proof 1 could exist without anyone adding a
-world-mode to the server. It reads the same events every other client reads.
+That is why the pixel world could exist without anyone adding a world-mode to
+the server. It reads the same events every other client reads.
 
 ## Try it
 
@@ -110,7 +110,7 @@ A thin server is not a trustless one. The relay still sees plaintext in
 unencrypted channels, still knows who is connected, and can still drop or delay
 messages. Nothing in this post prevents that. What it changes is what the relay
 can forge without being caught, and that argument depends on the signature
-chain, which is the next proof and is not finished.
+chain, which the next post takes apart and which is not finished.
 
 "Nothing was forked" is a claim about the wire protocol, not about clients. A
 client that wants to render task cards has to learn the tags.

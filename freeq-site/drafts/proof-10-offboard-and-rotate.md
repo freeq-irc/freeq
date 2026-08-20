@@ -1,7 +1,7 @@
 # Throw someone out of a sealed room
 
-The previous proof sealed a conversation between two people. A room is harder,
-and the hard part is not the sealing. It is the day somebody leaves.
+The last post sealed a conversation between two people. A room is harder, and
+the hard part is not the sealing. It is the day somebody leaves.
 
 Shared-passphrase encryption fails this test completely: everyone who ever knew
 the phrase can read everything encrypted under it, forever, and "removing" a
@@ -98,8 +98,9 @@ of rotation, a departed member reads nothing new.*
 ## Where admission comes from
 
 The steward does not decide membership by taste. It seals to the members the
-room's policy admitted — the same chain from proof 9, where an external fact
-becomes a signed credential and the channel's rules decide what follows.
+room's policy admitted — the same chain the gatekeeper post described, where an
+external fact becomes a signed credential and the channel's rules decide what
+follows.
 Authorization and key access share one source of truth, which is the property
 that keeps a "removed" member from lingering in the key list because someone
 forgot.
@@ -133,8 +134,8 @@ above.
 **Extend it in 30 minutes.** Write the steward. It is a bot that watches JOIN
 and KICK in a channel, keeps the current epoch, seals to each admitted member's
 published key, and rotates on departure. Everything it needs is in the SDK and
-none of it requires a server change — which is the claim in the title of the
-previous proof, tested by doing it.
+none of it requires a server change — which is the claim this whole thread
+rests on, tested by doing it.
 
 ## What this does not claim
 
@@ -144,7 +145,7 @@ membership and rotates without being asked is the missing piece, and this post
 does not pretend otherwise. What is demonstrated here is the mechanism, driven
 by hand.
 
-**Not reviewed.** Like the ratchet in the previous proof: a small, readable
+**Not reviewed.** Like the ratchet before it: a small, readable
 implementation of a construction that is standard in shape, with no external
 audit and no published vectors. Judge it accordingly.
 

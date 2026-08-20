@@ -22,7 +22,7 @@ li{margin:.5em 0}
 .note{font-size:.8em;color:#8b8b95;font-family:ui-monospace,Menlo,monospace;
       border-top:1px solid #ffffff14;margin-top:3.5em;padding-top:1em}
 </style><div class=wrap><h1>What the server sees when it cannot read your message</h1>
-<p>Every proof so far has been about what a room can prove. This one is about what it cannot see — and, more usefully, about the part it still can.</p>
+<p>Everything so far has been about what a room can show you. This post is about what it cannot see — and, more usefully, about the part it still can.</p>
 <p>A direct message between two accounts is sealed at the sending edge. Here is the whole of it, with nothing hidden.</p>
 <h2>One sentence, on the wire</h2>
 <pre><code>plaintext   : the invoice is attached, do not forward it
@@ -42,7 +42,7 @@ identical?  : false</code></pre>
 <p>Now the honest inventory. Everything the relay learns from that line:</p>
 <ul>
 <li><strong>who sent it</strong> — <code>alice</code>, and more durably <code>freeq/key/z6MksZ1D</code>: the first</li>
-<p>eight characters of her <code>did:key</code>, cloaked into the hostmask and stable across sessions. The full DID resolves to her ed25519 public key, which is the point of proof 3 and the reason the relay cannot forge her.</p>
+<p>eight characters of her <code>did:key</code>, cloaked into the hostmask and stable across sessions. The full DID resolves to her ed25519 public key, which is the point of the signature chain, and the reason the relay cannot forge her.</p>
 <li><strong>who receives it</strong> — <code>bob</code>, by name, resolved to an account.</li>
 <li><strong>when</strong> — arrival time, to the millisecond, and the ULID in <code>msgid</code> embeds</li>
 <p>the sender&#x27;s own clock.</p>
@@ -60,7 +60,7 @@ identical?  : false</code></pre>
 <p>The primitives, all of them: X25519 for the agreement and the DH ratchet, HKDF-SHA256 for key derivation, HMAC-SHA256 for the KDF chains, AES-256-GCM for message encryption. The construction follows Signal&#x27;s published Double Ratchet specification. It is not Signal&#x27;s implementation, and it has not been reviewed by anyone outside this project.</p>
 <h2>Channels are a different, weaker story</h2>
 <p>A channel has more than two ends, so the ratchet does not apply. Two mechanisms exist. The one you can drive from the terminal today is a passphrase: <code>/encrypt &lt;passphrase&gt;</code> in the TUI derives a channel key that every member types in out of band. It keeps content away from the relay, and it has the property every shared-passphrase scheme has: anyone who ever learns the phrase reads everything encrypted under it, and removing a member means changing it everywhere.</p>
-<p>The other is sender-keys with a random group secret sealed individually to each member&#x27;s published key, so the server relays the sealed blob and can never open it. That scheme gets its own proof later in this series, because the interesting question is not encryption — it is what happens the day you throw someone out.</p>
+<p>The other is sender-keys with a random group secret sealed individually to each member&#x27;s published key, so the server relays the sealed blob and can never open it. That scheme gets its own post later on, because the interesting question is not encryption — it is what happens the day you throw someone out.</p>
 <h2>Try it</h2>
 <p><strong>See it in 30 seconds.</strong> The relay line above. A server carrying a sentence it cannot read, with the sender, the recipient and the size in plain view.</p>
 <p><strong>Run it in 5 minutes.</strong> The ratchet is in the SDK, and its tests are the cheapest way to watch it work:</p>
