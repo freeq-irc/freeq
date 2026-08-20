@@ -1,0 +1,83 @@
+<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>proof-05-what-the-server-cannot-read — freeq draft</title><style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:#0a0c12;color:#e8e8ea;
+     font:17px/1.72 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:720px;margin:0 auto;padding:56px 26px 100px}
+h1{font-size:2.05em;line-height:1.18;letter-spacing:-.02em;margin:0 0 .1em;color:#fff}
+.date{color:#8b8b95;font-style:italic;margin:0 0 2.2em}
+h2{font-size:1.32em;margin:2.3em 0 .5em;color:#fff;
+   padding-bottom:.25em;border-bottom:1px solid #ffffff14}
+p{margin:1.05em 0}
+strong{color:#fff}
+a{color:#e05a6d}
+code{font:.88em ui-monospace,'JetBrains Mono',Menlo,monospace;
+     background:#ffffff0f;padding:.12em .35em;border-radius:4px;color:#f0b8a8}
+pre{background:#12151e;border:1px solid #2a2f3a;border-radius:10px;
+    padding:1em 1.1em;overflow-x:auto;margin:1.3em 0}
+pre code{background:none;padding:0;color:#cfd3dc;font-size:.85em;line-height:1.6}
+ul{margin:1.05em 0;padding-left:1.3em}
+li{margin:.5em 0}
+.flag{background:#e05a6d;color:#0a0c12;font-weight:700;padding:.05em .35em;border-radius:3px}
+.note{font-size:.8em;color:#8b8b95;font-family:ui-monospace,Menlo,monospace;
+      border-top:1px solid #ffffff14;margin-top:3.5em;padding-top:1em}
+</style><div class=wrap><h1>What the server sees when it cannot read your message</h1>
+<p>Every proof so far has been about what a room can prove. This one is about what it cannot see — and, more usefully, about the part it still can.</p>
+<p>A direct message between two accounts is sealed at the sending edge. Here is the whole of it, with nothing hidden.</p>
+<h2>One sentence, on the wire</h2>
+<pre><code>plaintext   : the invoice is attached, do not forward it
+on the wire : ENC3:kxSSzGB9Tkbd1WY2mZnLh4QqnkkUFXYdCTYUtwSueVkAAAAAAAAAAA:AkRVwNPZ_Mts_3X-:tELEFNqaIiKUWZUkQpZM9voWCBXD8qSjIo4AoOFUSnhmK86kzIiTsJBXpEF80CHirbOSxLxytQwTrw
+sizes       : plaintext 42 bytes, wire 155 bytes
+bob reads   : the invoice is attached, do not forward it</code></pre>
+<p>Three colon-separated fields after the tag: a 40-byte header, a 12-byte nonce, and the ciphertext. The header carries the sender&#x27;s current ratchet public key, the length of the previous chain, and this message&#x27;s number — and it is fed to AES-GCM as additional authenticated data, so tampering with the counters breaks the tag rather than silently reordering your conversation.</p>
+<p>Send the same sentence twice and nothing repeats:</p>
+<pre><code>same sentence again: ENC3:kxSSzGB9Tkbd1WY2mZnLh4QqnkkUFXYdCTYUtwSueVkAAAAAAAAAAQ:Jb7XFmvaJLOELj8r:lej1WaP6p7LJ0wPweNN3AiMfTBk9KpNMen-3Pn-T6UTSle378SQPzIq5ooFnlKeF-5HMBD5pZnrezw
+identical?  : false</code></pre>
+<p>The only visible difference in the header is the last byte — message number 0 became 1 — and every other byte changed, because the message key changed with it. When the other side answers, the header&#x27;s key changes too:</p>
+<pre><code>bob replies : ENC3:GdSziEUg0H73qjIt47CCsRlgGcbn9Du4_wApBywQ_HsAAAAAAAAAAA:PPK8IKNESP-WsIRE:6qeGui6_pjJqLGNdjF0FNeDaR9gNDJTg0ev_9ynhSWY_EKh-iUw</code></pre>
+<p>A new ratchet key, a chain that starts again at zero. That is the Diffie-Hellman ratchet stepping: each direction change mixes in fresh key material, so a key recovered today does not unlock what was said before it.</p>
+<h2>What the machine in the middle gets</h2>
+<p>Hand that exact ciphertext to a server and watch what it relays:</p>
+<pre><code>@msgid=01M0E6ZYHSBC3DF0FNHSWCTJCH :alice!alice@freeq/key/z6MksZ1D PRIVMSG bob ENC3:kxSSzGB9Tkbd1WY2mZnLh4QqnkkUFXYdCTYUtwSueVkAAAAAAAAAAA:AkRVwNPZ_Mts_3X-:tELEFNqaIiKUWZUkQpZM9voWCBXD8qSjIo4AoOFUSnhmK86kzIiTsJBXpEF80CHirbOSxLxytQwTrw</code></pre>
+<p>Now the honest inventory. Everything the relay learns from that line:</p>
+<ul>
+<li><strong>who sent it</strong> — <code>alice</code>, and more durably <code>freeq/key/z6MksZ1D</code>: the first</li>
+<p>eight characters of her <code>did:key</code>, cloaked into the hostmask and stable across sessions. The full DID resolves to her ed25519 public key, which is the point of proof 3 and the reason the relay cannot forge her.</p>
+<li><strong>who receives it</strong> — <code>bob</code>, by name, resolved to an account.</li>
+<li><strong>when</strong> — arrival time, to the millisecond, and the ULID in <code>msgid</code> embeds</li>
+<p>the sender&#x27;s own clock.</p>
+<li><strong>how much</strong> — 155 bytes on the wire for 42 bytes of text. Length is not</li>
+<p>padded, so message size leaks approximate message size.</p>
+<li><strong>that a conversation exists at all</strong>, its rhythm, its bursts, who answered</li>
+<p>whom and how fast.</p>
+<li><strong>the ratchet header</strong>, which is public by design: the current public key and</li>
+<p>the counters.</p>
+</ul>
+<p>What it does not get is the sentence. There is no configuration, no operator role, and no subpoena that turns those bytes into &quot;the invoice is attached&quot; — the key never left the two endpoints.</p>
+<p>Both statements are true at once, and a system that only tells you the second one is selling you something.</p>
+<h2>Where the first key comes from</h2>
+<p>A ratchet needs a shared secret before it can start. The opening message carries one — that is the <code>ENC4</code> form, which wraps the same three fields plus the agreement that begins the session, so a recipient who has never spoken to you can derive the root key on receipt. The agreement is X3DH-style: long-term identity keys plus a per-session ephemeral, mixed into one secret over X25519.</p>
+<p>The primitives, all of them: X25519 for the agreement and the DH ratchet, HKDF-SHA256 for key derivation, HMAC-SHA256 for the KDF chains, AES-256-GCM for message encryption. The construction follows Signal&#x27;s published Double Ratchet specification. It is not Signal&#x27;s implementation, and it has not been reviewed by anyone outside this project.</p>
+<h2>Channels are a different, weaker story</h2>
+<p>A channel has more than two ends, so the ratchet does not apply. Two mechanisms exist. The one you can drive from the terminal today is a passphrase: <code>/encrypt &lt;passphrase&gt;</code> in the TUI derives a channel key that every member types in out of band. It keeps content away from the relay, and it has the property every shared-passphrase scheme has: anyone who ever learns the phrase reads everything encrypted under it, and removing a member means changing it everywhere.</p>
+<p>The other is sender-keys with a random group secret sealed individually to each member&#x27;s published key, so the server relays the sealed blob and can never open it. That scheme gets its own proof later in this series, because the interesting question is not encryption — it is what happens the day you throw someone out.</p>
+<h2>Try it</h2>
+<p><strong>See it in 30 seconds.</strong> The relay line above. A server carrying a sentence it cannot read, with the sender, the recipient and the size in plain view.</p>
+<p><strong>Run it in 5 minutes.</strong> The ratchet is in the SDK, and its tests are the cheapest way to watch it work:</p>
+<pre><code>git clone https://github.com/freeq-irc/freeq &amp;&amp; cd freeq
+cargo test -p freeq-sdk ratchet -- --nocapture</code></pre>
+<p>Then start a server and send one of those ciphertexts through it yourself with <a href="https://github.com/freeq-irc/freeq/tree/main/examples/python-agent">the ninety-line client</a>: the server relays a string it has no way to interpret.</p>
+<p><strong>Extend it in 30 minutes.</strong> Write a passive observer: join a channel, log every DM line you can see, and produce the report a hostile relay would produce — who talks to whom, when, how often, how much. Then decide whether the content being sealed is the part you cared about. That exercise is worth more than any threat-model diagram.</p>
+<h2>What this does not claim</h2>
+<p><strong>Not reviewed.</strong> No external audit, no published test vectors. The construction follows a public specification and the code is small and readable, which is not the same as being correct. Until someone independent has looked, the confidentiality claim rests on our own testing.</p>
+<p><strong>Metadata is not protected, at all.</strong> Read the inventory above again. Sender, recipient, timing, size, and the social graph they draw are visible to the relay and to anyone who can see the relay&#x27;s traffic. Sealing content is not anonymity, and freeq does not offer anonymity.</p>
+<p><strong>Compromise of an endpoint ends the discussion.</strong> The ratchet limits what a key recovered later can open. It does nothing about a device someone else is holding, a screenshot, or a client that logs plaintext locally — which clients do, because that is what scrollback is.</p>
+<p><strong>Forward secrecy is a property of the construction, not a promise about your disk.</strong> Keys advance and old message keys are dropped in memory; what your client persists is a client decision.</p>
+<p><strong>Channel passphrases are not equivalent to the DM path.</strong> Anyone with the phrase reads the channel. Saying &quot;the channel is encrypted&quot; without saying that is the exact overclaim this post exists to avoid.</p>
+<h2>What is rough</h2>
+<p>Session state lives with the client. Two devices on one account do not share a ratchet, so a DM read on your laptop is not automatically readable on your phone.</p>
+<p>Key agreement uses long-term identity keys published for the account. Rotating one is a manual affair, and there is no automatic re-agreement for sessions already running.</p>
+<p>The ciphertext is not padded, so length leaks. Padding is cheap and absent.</p>
+<h2>Come in</h2>
+<p><code>#freeq-dev</code> on <code>irc.freeq.at</code>, and the source is at <a href="https://github.com/freeq-irc/freeq">github.com/freeq-irc/freeq</a>. A hostile reading of <code>freeq-sdk/src/ratchet.rs</code> is the most welcome contribution this post could produce.</p>
+<p>Next: calls, and why the server carrying them knows almost nothing about them.</p><div class="note">draft preview · red = placeholder the artifact gate is holding publication on</div></div>

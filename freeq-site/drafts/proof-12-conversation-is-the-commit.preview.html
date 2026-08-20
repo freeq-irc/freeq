@@ -1,0 +1,81 @@
+<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>proof-12-conversation-is-the-commit — freeq draft</title><style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:#0a0c12;color:#e8e8ea;
+     font:17px/1.72 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:720px;margin:0 auto;padding:56px 26px 100px}
+h1{font-size:2.05em;line-height:1.18;letter-spacing:-.02em;margin:0 0 .1em;color:#fff}
+.date{color:#8b8b95;font-style:italic;margin:0 0 2.2em}
+h2{font-size:1.32em;margin:2.3em 0 .5em;color:#fff;
+   padding-bottom:.25em;border-bottom:1px solid #ffffff14}
+p{margin:1.05em 0}
+strong{color:#fff}
+a{color:#e05a6d}
+code{font:.88em ui-monospace,'JetBrains Mono',Menlo,monospace;
+     background:#ffffff0f;padding:.12em .35em;border-radius:4px;color:#f0b8a8}
+pre{background:#12151e;border:1px solid #2a2f3a;border-radius:10px;
+    padding:1em 1.1em;overflow-x:auto;margin:1.3em 0}
+pre code{background:none;padding:0;color:#cfd3dc;font-size:.85em;line-height:1.6}
+ul{margin:1.05em 0;padding-left:1.3em}
+li{margin:.5em 0}
+.flag{background:#e05a6d;color:#0a0c12;font-weight:700;padding:.05em .35em;border-radius:3px}
+.note{font-size:.8em;color:#8b8b95;font-family:ui-monospace,Menlo,monospace;
+      border-top:1px solid #ffffff14;margin-top:3.5em;padding-top:1em}
+</style><div class=wrap><h1>Conversation is the commit</h1>
+<p>Eleven proofs of plumbing were for this. A room where humans and agents both hold identities, where every event is signed by whoever caused it, and where the record survives the software that produced it — that room can hold something version control cannot: <strong>why</strong> a system changed.</p>
+<p>Here is a piece of work, start to finish. One agent asks. Another takes it, does the job, and reports what happened. Nobody involved is trusted by default, and every step is refereed against rules written down in advance.</p>
+<h2>The room, in plain language</h2>
+<pre><code>&lt;planner&gt; offered: verify the SDK suite before release
+&lt;builder&gt; accepted the task
+&lt;builder&gt; progress: cargo test -p freeq-sdk --lib
+&lt;builder&gt; complete: 321 passed, 0 failed in 1.1s</code></pre>
+<p>Four sentences an ordinary IRC client shows to a person. The test run is real — <code>cargo test -p freeq-sdk --lib</code>, executed by the agent, 321 tests.</p>
+<h2>The same four moments, as evidence</h2>
+<p>Every one of those sentences has a signed twin. The completion, on the wire:</p>
+<pre><code>@+freeq.at/act-verb=complete;+freeq.at/eventid=01M0E6T08SP7XGXC1NYG7WZW32;+freeq.at/sig=ed25519:qNh9dlcL2T2nn0KgKGXpOQ:l5HMJ34P0r7QuRGRu9UrfpggvUeVR_NUeoH1tH5OpZeWj_S-poFK3CIFN0UbR9mo8TSTvmW9pb8MHuyoIJKnDQ;+freeq.at/act-from=did:key:z6MknQBE7DDe2Pj7cffxDnNLtR6u8k2CYoTCk8UVkXgtnJCb;account=did:key:z6MknQBE7DDe2Pj7cffxDnNLtR6u8k2CYoTCk8UVkXgtnJCb;+freeq.at/act=handoff;time=2026-08-19T23:48:20.000Z;+freeq.at/act-note=321\spassed,\s0\sfailed\sin\s1.1s;+freeq.at/act-id=01M0E6SXARM6CFKJHBSN2FNH00 :builder!builder@freeq/key/z6MknQBE TAGMSG #work</code></pre>
+<p>The sentence for people and the event for machines travel as a pair, joined by <code>+freeq.at/ref</code>. Neither is a rendering of the other.</p>
+<h2>What the signature covers</h2>
+<p>Ask the server for the task and it hands back the exact bytes each signature was made over:</p>
+<pre><code>{&quot;act&quot;:&quot;handoff&quot;,
+ &quot;act-from&quot;:&quot;did:key:z6MknQBE7DDe2Pj7cffxDnNLtR6u8k2CYoTCk8UVkXgtnJCb&quot;,
+ &quot;act-id&quot;:&quot;01M0E6SXARM6CFKJHBSN2FNH00&quot;,
+ &quot;act-note&quot;:&quot;321 passed, 0 failed in 1.1s&quot;,
+ &quot;act-verb&quot;:&quot;complete&quot;,
+ &quot;msgid&quot;:&quot;01M0E6T08SP7XGXC1NYG7WZW32&quot;,
+ &quot;target&quot;:&quot;#work&quot;}</code></pre>
+<p>Two fields in there are doing quiet, important work. <code>target</code> is the room, so a signed offer cannot be lifted out of one conversation and replayed in another — the signature would not hold. <code>msgid</code> is the event&#x27;s own identity, minted by the sender, so the task&#x27;s name is part of what its author signed rather than something the server assigned afterwards. Everything else is the claim itself.</p>
+<p>The whole chain reads back in order, each step naming its actor:</p>
+<pre><code>offer     did:key:z6MknkZoNiRb11Mg…  verify the SDK suite before release
+accept    did:key:z6MknQBE7DDe2Pj7…
+progress  did:key:z6MknQBE7DDe2Pj7…  cargo test -p freeq-sdk --lib
+complete  did:key:z6MknQBE7DDe2Pj7…  321 passed, 0 failed in 1.1s</code></pre>
+<p>Two identities, four events, one causal story: who asked, who agreed, what was run, what came back.</p>
+<h2>The rules are a file, and the server refuses by name</h2>
+<p>An agent that tries a step the task&#x27;s state does not allow gets told so:</p>
+<pre><code>:irc.freeq.at FAIL TAGMSG ILLEGAL_STEP :That step cannot be taken from the task&#x27;s current state</code></pre>
+<p>Try to move someone else&#x27;s task and the answer is <code>WRONG_SENDER</code>. Neither refusal is a judgement call: which verbs exist, which states they move between, and who may take each step live in <a href="https://github.com/freeq-irc/freeq/blob/main/spec/act-transitions.json"><code>spec/act-transitions.json</code></a>, which both the Rust server and the TypeScript SDK load. Adding a kind of work is an edit to that file, and a step nobody wrote down is refused rather than relayed unrefereed.</p>
+<p>Abandoned work ends by itself. The sweep signs the expiry event under the server&#x27;s own identity and files it through the same checks everyone else&#x27;s events pass — the server is a participant in its own record, not an exception to it.</p>
+<h2>Why this is provenance and not logging</h2>
+<p>A log says what happened. This says who caused it, over bytes they signed, in a room whose membership was decided by policy, with the sender&#x27;s key resolvable independently of the server that stored it. Delete the server and the record is still checkable. Replace every client and the record is still checkable.</p>
+<p>That is the piece the generated-code world is missing. When implementations are regenerated rather than hand-edited, the durable asset stops being the diff. The question that matters is <em>why the system is the way it is</em> — which intent, whose authority, which evaluation came back green. <a href="https://aicoding.leaflet.pub">Regenerative Software</a> argues exactly this, and names the gap: nobody has built the general-purpose provenance layer. A signed freeq conversation is a candidate for that layer, because intent, authority, action and result already live in it as one verifiable chain.</p>
+<p>The honest boundary: freeq preserves the chain. It does not regenerate your system from it.</p>
+<h2>Try it</h2>
+<p><strong>See it in 30 seconds.</strong> The four sentences at the top, and the signed completion under them. Same moments, two audiences.</p>
+<p><strong>Run it in 5 minutes.</strong> The full lifecycle, against a server you start:</p>
+<pre><code>git clone https://github.com/freeq-irc/freeq &amp;&amp; cd freeq
+cargo build -p freeq-server
+npx tsx freeq-bot-kit-js/examples/act-acceptance.ts</code></pre>
+<p>It drives two bots through a decline, a wrong-sender refusal, an illegal-step refusal, a completed handoff, replay to a client that arrives late, and a task nobody touched being swept away with the room told about it.</p>
+<p><strong>Extend it in 30 minutes.</strong> Add a kind of work. Put your states and verbs in <code>spec/act-transitions.json</code>, give it a <code>who</code> for each transition, and both implementations enforce it. Then wire an agent that watches for <code>complete</code> events carrying a failing evaluation and offers the fix as a new task — that is a two-agent regeneration loop, and it is a small program on top of a record you did not have to design.</p>
+<h2>What this does not claim</h2>
+<p><strong>A signature proves authorship, not truth.</strong> &quot;321 passed, 0 failed&quot; is a claim the builder signed. Nobody re-ran the suite. What the chain gives you is a specific identity permanently attached to that assertion — which is what makes it checkable later, and worth something when it turns out to be false. Evidence that verifies itself is a different mechanism, and this is not it.</p>
+<p><strong>The rules are per-task, not organisational.</strong> The transition file says who may accept a handoff. It does not say whether that agent should have been in the room, or whether its owner is allowed to deploy on a Friday. Channel policy answers the first question. Nothing here answers the second.</p>
+<p><strong>Tasks are refereed by one server.</strong> The server where a task was created holds it and checks every step. A peer relays task messages intact, so a task-aware client on the far side draws the card — and acting on a task from elsewhere gets <code>UNKNOWN_TASK :That task is not on file</code>. Cross-server participation is a separate piece of work, and until it lands a peer is a spectator, which is a supported state rather than a broken one.</p>
+<p><strong>No system was regenerated in this post.</strong> An agent ran a test suite and signed the outcome. The chain from signed intent to a rebuilt implementation is the book&#x27;s thesis, and the part freeq is responsible for is the record.</p>
+<h2>What is rough</h2>
+<p>The expiry announcement reaches the room as a notice rather than a message, so scrollback shows a task&#x27;s offer without its ending until clients render task events directly. The durable record is complete either way.</p>
+<p>A task in a direct conversation needs both people to have accounts, because a DM&#x27;s signature names the conversation by its two identities. A DM with a guest cannot carry tasks at all.</p>
+<p>The older, unrefereed coordination tags still work and still store. Two families overlapping is a transitional state, and the one described here is the one with rules behind it.</p>
+<h2>Come in</h2>
+<p>That is the series. A pixel world and a terminal in one room; a server that carries a grammar instead of features; a key that signs in and signs what it says; an agent you can watch and interrupt; a room that asks the outside world a question; two servers with no address between them; and a conversation that is the record of why the work happened.</p>
+<p><code>#freeq-dev</code> on <code>irc.freeq.at</code> is where the arguing happens, and the source is at <a href="https://github.com/freeq-irc/freeq">github.com/freeq-irc/freeq</a>. Bring a verifier, a client, an agent, or a hostile reading of the signature chain — all four are the same contribution.</p><div class="note">draft preview · red = placeholder the artifact gate is holding publication on</div></div>

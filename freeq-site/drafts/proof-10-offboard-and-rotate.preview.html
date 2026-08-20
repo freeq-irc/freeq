@@ -1,0 +1,88 @@
+<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>proof-10-offboard-and-rotate — freeq draft</title><style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:#0a0c12;color:#e8e8ea;
+     font:17px/1.72 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:720px;margin:0 auto;padding:56px 26px 100px}
+h1{font-size:2.05em;line-height:1.18;letter-spacing:-.02em;margin:0 0 .1em;color:#fff}
+.date{color:#8b8b95;font-style:italic;margin:0 0 2.2em}
+h2{font-size:1.32em;margin:2.3em 0 .5em;color:#fff;
+   padding-bottom:.25em;border-bottom:1px solid #ffffff14}
+p{margin:1.05em 0}
+strong{color:#fff}
+a{color:#e05a6d}
+code{font:.88em ui-monospace,'JetBrains Mono',Menlo,monospace;
+     background:#ffffff0f;padding:.12em .35em;border-radius:4px;color:#f0b8a8}
+pre{background:#12151e;border:1px solid #2a2f3a;border-radius:10px;
+    padding:1em 1.1em;overflow-x:auto;margin:1.3em 0}
+pre code{background:none;padding:0;color:#cfd3dc;font-size:.85em;line-height:1.6}
+ul{margin:1.05em 0;padding-left:1.3em}
+li{margin:.5em 0}
+.flag{background:#e05a6d;color:#0a0c12;font-weight:700;padding:.05em .35em;border-radius:3px}
+.note{font-size:.8em;color:#8b8b95;font-family:ui-monospace,Menlo,monospace;
+      border-top:1px solid #ffffff14;margin-top:3.5em;padding-top:1em}
+</style><div class=wrap><h1>Throw someone out of a sealed room</h1>
+<p>The previous proof sealed a conversation between two people. A room is harder, and the hard part is not the sealing. It is the day somebody leaves.</p>
+<p>Shared-passphrase encryption fails this test completely: everyone who ever knew the phrase can read everything encrypted under it, forever, and &quot;removing&quot; a member means asking the others to re-type a new secret. The scheme below fails it honestly instead — it draws a line at the moment of departure, and it tells you exactly which side of that line each message is on.</p>
+<h2>A key nobody shares</h2>
+<p>The channel&#x27;s key is a random 32-byte secret that only members hold. Nobody derives it from the channel name or the member list, so the server cannot recompute it. It reaches each member sealed to their own published key:</p>
+<pre><code>epoch 1 minted for #board
+  sealed to ann   : EGK1:#board:1:rkKkmMf_cIyg_eSMpdfOzCwC3cGlJUAHNFV6f5MyvmM:sHK7xV6SDYE_8ItJ:0XTxh11IBWt47eKYfHmTy
+  sealed to bob   : EGK1:#board:1:Yq91BDhR2z8-dzvuxAwL3V1a9NThy2BpSHSrRGgWUQs:RSs0kPEneNcX37mC:FFh0adx78_MAiFEH0ivBx
+  sealed to cara  : EGK1:#board:1:f4JristX9MpP_WW6DILdZYTlDcuCLML2w9eRVzw4gBM:aH4UQDnhd3rZWoeW:5uNHXJDVvv5etJmQsj2N9</code></pre>
+<p>Three envelopes carrying the same secret, each openable by exactly one person — the recipient named by the <code>did:key</code> whose X25519 sealing key the steward looked up. Traffic under it names its epoch and nothing else:</p>
+<pre><code>message at epoch 1:
+  EG1:1:NVknypsyout6Tu14:TU1OYdybi_2imVKmXsRwTbQgc-X4cD3c5LIdOPA7r5SvbWLISE7lu-HcaNJuFMik-snhIg
+  bob reads: board packet is in the shared folder</code></pre>
+<p>Those envelopes travel as ordinary messages. Hand one to a server and it does what it does with everything else — carries it:</p>
+<pre><code>→ PRIVMSG #board :EGK1:#board:1:Yq91BDhR2z8-dzvuxAwL3V1a9NThy2BpSHSrRGgWUQs:RSs0kPEneNcX37mC:FFh0adx78_MAiFEH0ivBx</code></pre>
+<p>No key-distribution service, no server feature, no operator with a master copy. Key distribution is a message.</p>
+<h2>Bob leaves</h2>
+<p>Two things happen, and they are deliberately independent.</p>
+<p>The room&#x27;s membership is revoked the ordinary way, by an op, in public:</p>
+<pre><code>→ MODE #board +b bob!*@*
+→ KICK #board bob :board membership ended</code></pre>
+<pre><code>:steward!steward@freeq/key/z6Mkrmmz MODE #board +b bob!*@*
+:steward!steward@freeq/key/z6Mkrmmz KICK #board bob :board membership ended
+:irc.freeq.at 474 bob #board :Cannot join channel (+b)</code></pre>
+<p>And the key moves on. The steward mints a fresh secret at the next epoch and seals it only to the people still there:</p>
+<pre><code>bob is removed → epoch 2
+message at epoch 2:
+  EG1:2:Zc_z0USCwo7zpUT-:OyIRaKVcH8RkUhXF9w9d5p8C63xw5sJRzcpMlUSJ9khrBFmA3_byUhklXc-vnj1J</code></pre>
+<p>Bob holds a perfectly valid key. It is valid for a conversation that has moved:</p>
+<pre><code>bob still holds epoch 1 and tries to read epoch 2:
+  refused: epoch mismatch: have 1, got 2 (need the sealed key for that epoch)
+ann, re-sealed at epoch 2: new packet, bob is off the board</code></pre>
+<p>The refusal is not a permission check that Bob&#x27;s software chose to honour. There is no epoch-2 key inside anything Bob has, and no amount of pretending to still be a member produces one.</p>
+<h2>The line, and which side things fall on</h2>
+<pre><code>bob re-reads epoch 1 traffic: board packet is in the shared folder</code></pre>
+<p>That is the honest half. Revocation removes access to <strong>future</strong> keys and future messages. It cannot reach into what Bob already read, already copied, or already decrypted onto his own disk. Anyone who tells you their system can un-send a message that was successfully delivered is describing a UI, not cryptography.</p>
+<p>So the guarantee is precise and worth stating in one sentence: <em>from the moment of rotation, a departed member reads nothing new.</em></p>
+<h2>Where admission comes from</h2>
+<p>The steward does not decide membership by taste. It seals to the members the room&#x27;s policy admitted — the same chain from proof 9, where an external fact becomes a signed credential and the channel&#x27;s rules decide what follows. Authorization and key access share one source of truth, which is the property that keeps a &quot;removed&quot; member from lingering in the key list because someone forgot.</p>
+<p>The complete path, end to end:</p>
+<pre><code>external fact  →  signed credential  →  policy admits  →  sealed key at epoch N
+                                                       ↓
+                        membership revoked  →  rotate  →  sealed key at epoch N+1
+                                                          (to everyone else)</code></pre>
+<h2>Try it</h2>
+<p><strong>See it in 30 seconds.</strong> The refusal line. A former member, a valid key, and a conversation that moved without him.</p>
+<p><strong>Run it in 5 minutes.</strong> The group scheme lives in the SDK with the same wire format in Rust and TypeScript:</p>
+<pre><code>git clone https://github.com/freeq-irc/freeq &amp;&amp; cd freeq
+cargo test -p freeq-sdk e2ee_group -- --nocapture
+cd freeq-sdk-js &amp;&amp; npm ci &amp;&amp; npx vitest run e2ee_group</code></pre>
+<p>Both suites cover the same vectors: seal, open, rotate, and the epoch mismatch above.</p>
+<p><strong>Extend it in 30 minutes.</strong> Write the steward. It is a bot that watches JOIN and KICK in a channel, keeps the current epoch, seals to each admitted member&#x27;s published key, and rotates on departure. Everything it needs is in the SDK and none of it requires a server change — which is the claim in the title of the previous proof, tested by doing it.</p>
+<h2>What this does not claim</h2>
+<p><strong>No shipped client does this automatically.</strong> The scheme, the wire formats and the cross-language tests are real and runnable today. The steward that watches membership and rotates without being asked is the missing piece, and this post does not pretend otherwise. What is demonstrated here is the mechanism, driven by hand.</p>
+<p><strong>Not reviewed.</strong> Like the ratchet in the previous proof: a small, readable implementation of a construction that is standard in shape, with no external audit and no published vectors. Judge it accordingly.</p>
+<p><strong>Rotation is not retroactive.</strong> Stated above, repeated here because it is the sentence people skip: Bob keeps what Bob already had.</p>
+<p><strong>A steward is a role with power.</strong> Whoever holds it can seal the key to an identity that policy never admitted. The scheme removes the <em>server</em> from the trusted set; it does not remove the steward, and a compromised steward is a compromised room.</p>
+<p><strong>Kicking is not sealing.</strong> The <code>MODE +b</code> and <code>KICK</code> above are ordinary IRC enforcement — visible, auditable, and completely independent of the key. A room that kicks without rotating has removed someone from the conversation and left them able to read it if they can still see the traffic.</p>
+<h2>What is rough</h2>
+<p>Rotation is a manual call in this post. Automating it is the steward bot above, and until one ships, an operator has to remember.</p>
+<p>Members publish one X25519 key for sealing. Rotating that key means re-sealing every group they are in, and nothing coordinates that today.</p>
+<p>A member who is offline during a rotation gets the new epoch when they next receive the sealed envelope. Messages sent in between are readable to them afterwards, because the envelope carries the key, not a time window.</p>
+<h2>Come in</h2>
+<p><code>#freeq-dev</code> on <code>irc.freeq.at</code>, source at <a href="https://github.com/freeq-irc/freeq">github.com/freeq-irc/freeq</a>. If you write the steward before we do, that is the best possible outcome for this post.</p>
+<p>Next: two servers with no address between them.</p><div class="note">draft preview · red = placeholder the artifact gate is holding publication on</div></div>
