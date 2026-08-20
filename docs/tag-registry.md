@@ -46,17 +46,20 @@ values are strings per the IRCv3 escaping rules.
 ## Signed action cards (`act`)
 
 The handoff/action system — signed, structured "cards" (see the act RFC in
-the repo). The signature in `+freeq.at/sig` covers **every** `act-*` tag,
-JCS-canonicalized; byte-compatible across the Rust and TypeScript SDKs with
-shared test vectors (`spec/act-signing-vectors.json`).
+the repo). The signature in `+freeq.at/sig` covers **every** `act-*` tag plus
+three mandatory envelope fields — the signer (`+freeq.at/from`), the event id
+(`+freeq.at/eventid`), and the venue — JCS-canonicalized; byte-compatible
+across the Rust and TypeScript SDKs with shared test vectors
+(`spec/act-signing-vectors.json`).
 
 | Tag | Meaning |
 |---|---|
-| `+freeq.at/act` | Card type/version. |
-| `+freeq.at/act-id` | Stable card id. |
+| `+freeq.at/act` | The task kind (`handoff`, …). |
+| `+freeq.at/act-id` | The action a follow-up belongs to — the opener's own event id. Openers carry none. |
 | `+freeq.at/act-verb` | What is being asked/done. |
 | `+freeq.at/act-title` | Human-readable title. |
-| `+freeq.at/act-from` | Originating actor. |
+| `+freeq.at/from` | The signer/actor (envelope tag; the document key is `from`). |
+| `+freeq.at/eventid` | The event id the signer minted; the server adopts it (shared with chat). |
 
 ## Governance & budgets
 
