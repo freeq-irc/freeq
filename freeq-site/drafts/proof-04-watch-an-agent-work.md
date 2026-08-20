@@ -240,4 +240,4 @@ which is useful for rendering and worthless as a security boundary.
 `#freeq-dev` on `irc.freeq.at` is where this is argued about, and the source is
 at [github.com/freeq-irc/freeq](https://github.com/freeq-irc/freeq).
 
-Next: what an encrypted freeq message actually puts on the wire.
+Next: what a server sees when it cannot read your message.

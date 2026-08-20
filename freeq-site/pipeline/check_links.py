@@ -27,6 +27,12 @@ CONNECT_RE = re.compile(r"/connect\s+([a-z0-9.-]+)\s+(\d{2,5})", re.I)
 # which keeps the gate strict about everything a reader can actually click.
 CONFIG_URL_RE = re.compile(r"url=(https?://[^\s)\]<>\"'`]+)")
 
+# A localhost URL is an instruction for the reader's own machine, not a link
+# anyone clicks from the post. Checking it would make the gate's verdict depend
+# on whether the author happens to have a server running, which is exactly the
+# kind of result that teaches people to ignore a gate.
+LOCAL_RE = re.compile(r"^https?://(127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(:\d+)?(/|$)")
+
 
 def check_url(url: str, timeout: int = 12):
     url = url.rstrip(".,;:")
@@ -55,7 +61,11 @@ def main() -> int:
     for f in files:
         text = open(f).read()
         config = set(CONFIG_URL_RE.findall(text))
-        urls = sorted(set(URL_RE.findall(text)) - config)
+        found = set(URL_RE.findall(text))
+        local = {u for u in found if LOCAL_RE.match(u)}
+        urls = sorted(found - config - local)
+        for u in sorted(local):
+            print(f"  [-] {u}  (localhost; the reader runs this one)")
         print(f"=== {f} ===")
         for u in urls:
             ok, code = check_url(u)
