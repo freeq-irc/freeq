@@ -989,6 +989,17 @@ pub(super) fn gate(
                 }
                 Refusal::UnknownVerb => ("UNKNOWN_VERB", "That task kind has no such step"),
                 Refusal::ClientConfirm => ("WRONG_SENDER", "Only the action's home confirms it"),
+                Refusal::ReplacesNotOpener => (
+                    "REPLACES_NOT_OPENER",
+                    "Only a new action replaces an earlier one",
+                ),
+                Refusal::ReplacesMalformed => {
+                    ("REPLACES_MALFORMED", "That is not the id of an action")
+                }
+                Refusal::ReplacesNotTerminal => (
+                    "REPLACES_NOT_TERMINAL",
+                    "The action it replaces is not finished",
+                ),
             };
             tracing::debug!(
                 session = %conn.id, did = %did, act_id = %act_id, reason = %reason,

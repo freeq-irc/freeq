@@ -117,6 +117,23 @@
       "target": "dm:did:plc:factory,did:plc:opslead"
     },
     {
+      "canonical": "{\"act\":\"handoff\",\"act-replaces\":\"01JABCDEF000000000000000EF\",\"act-title\":\"Cite 3 sources on X\",\"act-verb\":\"offer\",\"from\":\"did:plc:eliza\",\"id\":\"01JREOFFEREVENTID000000000\",\"target\":\"#ops\"}",
+      "id": "01JREOFFEREVENTID000000000",
+      "kid": "ckVnIEEgN6azOfiEzm2Ruw",
+      "name": "re-offer-replacing-a-failed-handoff",
+      "publicKey": "iodf_x6zhFFXes1a_uQFRWVo3XyJ4JCGOgVXvHr0nxc",
+      "seed": "0606060606060606060606060606060606060606060606060606060606060606",
+      "sigTag": "ed25519:ckVnIEEgN6azOfiEzm2Ruw:EdjZIKc0BF54ho69jWZJJcqs071xtL8sgih_a43iVj2RVnBn-H7BnHA7nh2x1PpIIn1hGS4_Uv0OWLKkv3uRDw",
+      "tags": {
+        "+freeq.at/act": "handoff",
+        "+freeq.at/act-replaces": "01JABCDEF000000000000000EF",
+        "+freeq.at/act-title": "Cite 3 sources on X",
+        "+freeq.at/act-verb": "offer",
+        "+freeq.at/from": "did:plc:eliza"
+      },
+      "target": "#ops"
+    },
+    {
       "canonical": "{\"act\":\"handoff\",\"act-id\":\"01JABCDEF000000000000000EF\",\"act-subject\":\"01JACCEPTEVENTID0000000000\",\"act-verb\":\"confirm\",\"from\":\"did:web:irc.example\",\"id\":\"01JCONFIRMEVENTID000000000\",\"target\":\"#ops\"}",
       "id": "01JCONFIRMEVENTID000000000",
       "kid": "dZl3bDCF4_naDRMHHrC0qw",

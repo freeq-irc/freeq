@@ -60,6 +60,12 @@ pub enum Refusal {
     DeadlinePassed,
     /// A sender wrote the confirmation verb. Receipts are the home's.
     ClientConfirm,
+    /// The revival relation rode an event that opens nothing.
+    ReplacesNotOpener,
+    /// The revival relation's value is not shaped like an action id.
+    ReplacesMalformed,
+    /// The action a revival names is on file and has not finished.
+    ReplacesNotTerminal,
 }
 
 impl Refusal {
@@ -74,6 +80,9 @@ impl Refusal {
             Refusal::WrongSender => "wrong-sender",
             Refusal::DeadlinePassed => "deadline-passed",
             Refusal::ClientConfirm => "client-confirm",
+            Refusal::ReplacesNotOpener => "replaces-not-opener",
+            Refusal::ReplacesMalformed => "replaces-malformed",
+            Refusal::ReplacesNotTerminal => "replaces-not-terminal",
         }
     }
 
@@ -168,6 +177,60 @@ pub fn confirmation_subject_tag() -> &'static str {
 /// invitation to add the row, and the row must not exist.
 pub fn is_confirmation(verb: &str) -> bool {
     verb == confirmation_verb()
+}
+
+/// The tag a new action names the finished one it revives in.
+pub fn revival_tag() -> &'static str {
+    spec().revival.tag.as_str()
+}
+
+/// What the caller's log knows about the action a revival names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Predecessor {
+    /// Never filed here. Accepted and annotated — see [`check_revival`].
+    Unknown,
+    /// On file, and still running.
+    Live,
+    /// On file, and finished.
+    Finished,
+}
+
+/// Whether `id` is shaped like an event id: a 26-character Crockford ULID.
+///
+/// Shape only. Whether anything was ever filed under it is the log's answer,
+/// not this one's.
+pub fn is_event_id(id: &str) -> bool {
+    const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    id.len() == 26 && id.bytes().all(|b| CROCKFORD.contains(&b))
+}
+
+/// Decide whether an event may carry the revival relation
+/// ([`revival_tag`]), given what the caller's log knows about the action it
+/// names.
+///
+/// Three rules, cheapest first. Only an opener revives anything: a step on an
+/// action that already exists names no other. The value names an action, so it
+/// is shaped like one. And the action it names must have finished — reviving
+/// something still running would leave two live actions each claiming to be
+/// the work.
+///
+/// [`Predecessor::Unknown`] is accepted, and that is the load-bearing part:
+/// receivers must tolerate a link to an action they never filed and annotate
+/// rather than refuse. On one server that is a client's typo; under federation
+/// it is the ordinary case, because the predecessor lived on somebody else's
+/// machine. A caller with no log at all — a bot pre-checking its own move —
+/// passes `Unknown` and gets the two rules a message decides on its own.
+pub fn check_revival(opens: bool, named: &str, predecessor: Predecessor) -> Result<(), Refusal> {
+    if !opens {
+        return Err(Refusal::ReplacesNotOpener);
+    }
+    if !is_event_id(named) {
+        return Err(Refusal::ReplacesMalformed);
+    }
+    match predecessor {
+        Predecessor::Live => Err(Refusal::ReplacesNotTerminal),
+        Predecessor::Unknown | Predecessor::Finished => Ok(()),
+    }
 }
 
 /// Decide whether an event may open a new task of `kind`.
@@ -331,6 +394,7 @@ pub fn check(
 struct Spec {
     kinds: BTreeMap<String, Kind>,
     confirmation: Confirmation,
+    revival: Revival,
     refusals: BTreeMap<String, String>,
     #[allow(dead_code)]
     deadline_rule: DeadlineRule,
@@ -342,6 +406,13 @@ struct Spec {
 struct Confirmation {
     verb: String,
     subject: String,
+}
+
+/// The tag a new action names the finished one it revives in. Outside `kinds`
+/// for the same reason: the relation is every kind's, so it is none's.
+#[derive(Deserialize)]
+struct Revival {
+    tag: String,
 }
 
 #[derive(Deserialize)]
@@ -626,6 +697,56 @@ mod tests {
         }
     }
 
+    // ── the revival relation ────────────────────────────────────────────────
+
+    /// The two rules a message decides on its own, and the one that needs the
+    /// log. An unknown predecessor is accepted on purpose — see
+    /// [`super::check_revival`].
+    #[test]
+    fn only_an_opener_revives_a_finished_action() {
+        const DEAD: &str = "01M16E7TC0ENDED00000000000";
+        assert_eq!(revival_tag(), "act-replaces");
+        assert_eq!(check_revival(true, DEAD, Predecessor::Finished), Ok(()));
+        assert_eq!(check_revival(true, DEAD, Predecessor::Unknown), Ok(()));
+        assert_eq!(
+            check_revival(true, DEAD, Predecessor::Live),
+            Err(Refusal::ReplacesNotTerminal)
+        );
+        assert_eq!(
+            check_revival(false, DEAD, Predecessor::Finished),
+            Err(Refusal::ReplacesNotOpener)
+        );
+        for bad in [
+            "",
+            "not-a-ulid",
+            "01M16E7TC0SHRT",
+            &format!("{DEAD}X"),
+            "01M16E7TC0ended00000000000",
+        ] {
+            assert_eq!(
+                check_revival(true, bad, Predecessor::Unknown),
+                Err(Refusal::ReplacesMalformed),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Shape, and nothing about whether anything was filed under it.
+    #[test]
+    fn an_action_id_is_twenty_six_crockford_characters() {
+        assert!(is_event_id("01M16E7TC0ENDED00000000000"));
+        assert!(!is_event_id("01M16E7TC0ENDED0000000000"), "too short");
+        assert!(!is_event_id("01M16E7TC0ENDED000000000000"), "too long");
+        // I, L, O and U are not in the alphabet, which is what keeps a ULID
+        // from being confused for something typed by hand.
+        for c in ['I', 'L', 'O', 'U', 'a', '-'] {
+            assert!(
+                !is_event_id(&format!("01M16E7TC0ENDED0000000000{c}")),
+                "{c}"
+            );
+        }
+    }
+
     #[test]
     fn every_refusal_reason_is_documented_in_the_file() {
         for r in [
@@ -636,6 +757,9 @@ mod tests {
             Refusal::WrongSender,
             Refusal::DeadlinePassed,
             Refusal::ClientConfirm,
+            Refusal::ReplacesNotOpener,
+            Refusal::ReplacesMalformed,
+            Refusal::ReplacesNotTerminal,
         ] {
             assert!(
                 spec().refusals.contains_key(r.code()),
@@ -1157,6 +1281,55 @@ mod tests {
         file.opening_sequences
     }
 
+    #[derive(Deserialize)]
+    struct RevivalFile {
+        revival_sequences: Vec<RevivalCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct RevivalCase {
+        name: String,
+        opens: bool,
+        names: String,
+        predecessor: String,
+        expect: Option<String>,
+        expect_refused: Option<String>,
+    }
+
+    fn revival_sequences() -> Vec<RevivalCase> {
+        let file: RevivalFile =
+            serde_json::from_str(include_str!("../../spec/act-transitions.json")).unwrap();
+        file.revival_sequences
+    }
+
+    #[test]
+    fn every_revival_sequence_in_the_rules_file_replays() {
+        let cases = revival_sequences();
+        assert!(cases.len() >= 5, "{}", cases.len());
+        for c in &cases {
+            let predecessor = match c.predecessor.as_str() {
+                "unknown" => Predecessor::Unknown,
+                "live" => Predecessor::Live,
+                "finished" => Predecessor::Finished,
+                other => panic!("{}: unknown predecessor {other}", c.name),
+            };
+            let got = check_revival(c.opens, &c.names, predecessor);
+            match (&c.expect, &c.expect_refused) {
+                (Some(word), None) => {
+                    assert_eq!(word, "accepted", "{}", c.name);
+                    assert_eq!(got, Ok(()), "{}", c.name);
+                }
+                (None, Some(reason)) => assert_eq!(
+                    got.map_err(|r| r.code()),
+                    Err(reason.as_str()),
+                    "{}",
+                    c.name
+                ),
+                _ => panic!("{}: set exactly one of expect / expect_refused", c.name),
+            }
+        }
+    }
+
     #[test]
     fn every_opening_sequence_in_the_rules_file_replays() {
         let openings = opening_sequences();
@@ -1218,7 +1391,8 @@ mod tests {
 
     /// The sequences have to exercise every refusal the checker can reach —
     /// otherwise the other implementation could pass them all and still get a
-    /// reason wrong. Both lists count: some reasons only an opener can earn.
+    /// reason wrong. Every list counts: some reasons only an opener can earn,
+    /// and some only a revival can.
     #[test]
     fn the_sequences_cover_every_refusal_reason() {
         let mut seen: Vec<String> = sequences()
@@ -1228,6 +1402,11 @@ mod tests {
                 opening_sequences()
                     .iter()
                     .filter_map(|o| o.expect_refused.clone()),
+            )
+            .chain(
+                revival_sequences()
+                    .iter()
+                    .filter_map(|r| r.expect_refused.clone()),
             )
             .collect();
         seen.sort();

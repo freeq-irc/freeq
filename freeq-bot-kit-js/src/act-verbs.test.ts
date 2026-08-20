@@ -60,7 +60,7 @@ describe("offer", () => {
   it("carries the optional fields only when given", async () => {
     const bare: Sent[] = [];
     await offer(ctxWith(bare), { title: "t" });
-    for (const k of ["act-caps", "act-deadline", "act-ctx", "act-ctx-h"]) {
+    for (const k of ["act-caps", "act-deadline", "act-ctx", "act-ctx-h", "act-replaces"]) {
       expect(bare[0].tags[`+freeq.at/${k}`]).toBeUndefined();
     }
     const full: Sent[] = [];
@@ -75,6 +75,19 @@ describe("offer", () => {
     expect(full[0].tags["+freeq.at/act-deadline"]).toBe("1788000000");
     expect(full[0].tags["+freeq.at/act-ctx"]).toBe("https://example/brief");
     expect(full[0].tags["+freeq.at/act-ctx-h"]).toBe("sha256:9f00");
+  });
+
+  /// The revival relation is an opener's, and it is the whole of what the
+  /// re-offer says about the action it replaces.
+  it("names the finished action it revives, when it revives one", async () => {
+    const sent: Sent[] = [];
+    await offer(ctxWith(sent), {
+      title: "review the deploy, again",
+      replaces: "01M16E7TC0ENDED00000000000",
+    });
+    expect(sent[0].tags["+freeq.at/act-replaces"]).toBe("01M16E7TC0ENDED00000000000");
+    // Still an opener: its own event id is the new action's id.
+    expect(sent[0].tags["+freeq.at/act-id"]).toBeUndefined();
   });
 });
 

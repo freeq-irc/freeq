@@ -236,6 +236,10 @@ pub struct ActView {
     /// `act-deadline` in unix seconds, when the offer named one this server
     /// can read as a number.
     pub deadline: Option<i64>,
+    /// The revival relation: the finished action this one replaces. An
+    /// annotation, and possibly one naming an action this server never filed —
+    /// which is the case the rule is written for.
+    pub replaces: Option<String>,
 }
 
 /// Read a task event's view fields out of its canonical.
@@ -253,6 +257,9 @@ pub fn derive_act_view(canonical: &str) -> Option<ActView> {
         // cannot enforce, so it is stored as absent rather than as a guess.
         // The value stays in the canonical either way.
         deadline: get("act-deadline").and_then(|d| d.parse::<i64>().ok()),
+        // Read under the name the rules file gives the relation, so the tag
+        // is spelled in one place across all three implementations.
+        replaces: get(freeq_sdk::act_transitions::revival_tag()),
     })
 }
 

@@ -205,6 +205,9 @@ pub struct ActTask {
     pub assignee: Option<String>,
     pub caps: Option<String>,
     pub deadline: Option<i64>,
+    /// The finished action this one revives, when its opener named one. An
+    /// annotation: the named action may be one this server never filed.
+    pub replaces: Option<String>,
     pub updated: i64,
 }
 
@@ -2714,6 +2717,12 @@ mod tests {
     const ELIZA: &str = "did:plc:eliza";
     const SCHOLAR: &str = "did:plc:scholar";
     const MALLORY: &str = "did:plc:mallory";
+    /// Action ids, in the shape the revival relation insists on: a real ULID.
+    /// The short ids elsewhere in these tests are fine — nothing else reads an
+    /// id's shape — but `act-replaces` refuses a value that names no action.
+    const ONE: &str = "01M16E7TC00000000000000001";
+    const TWO: &str = "01M16E7TC00000000000000002";
+    const NEVER_SEEN: &str = "01M16E7TC0NEVERSEEN0000000";
 
     /// Build a task event's canonical the way a signer would.
     fn act_doc(tags: &[(&str, &str)], venue: &str, id: &str) -> String {
@@ -3029,6 +3038,132 @@ mod tests {
         );
     }
 
+    // ── the revival relation ──────────────────────────────────────────────
+
+    /// An opener that names a finished action it revives.
+    fn re_offer(db: &Db, id: &str, venue: &str, replaces: &str, ts: i64) -> ActWrite {
+        let canonical = act_doc(
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", ELIZA),
+                ("+freeq.at/act-replaces", replaces),
+            ],
+            venue,
+            id,
+        );
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: id,
+            act_id: id,
+            opens: true,
+            venue,
+            actor: ELIZA,
+            from_system: false,
+            origin: None,
+            timestamp: ts,
+        })
+        .unwrap()
+    }
+
+    /// A dead handoff, re-offered. The link is on the new action; the old one
+    /// is untouched, because nothing un-applies.
+    #[test]
+    fn a_re_offer_carries_the_link_to_the_action_it_revives() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, ONE, "#ops", Some(SCHOLAR), 10);
+        follow_up(&db, "accept", SCHOLAR, ONE, "E1", "#ops", 11);
+        follow_up(&db, "fail", SCHOLAR, ONE, "E2", "#ops", 12);
+        assert_eq!(db.act_task(ONE).unwrap(), None, "the first one is finished");
+
+        assert!(matches!(
+            re_offer(&db, TWO, "#ops", ONE, 20),
+            ActWrite::Filed { .. }
+        ));
+        let revived = db.act_task(TWO).unwrap().unwrap();
+        assert_eq!(revived.replaces.as_deref(), Some(ONE));
+        assert_eq!(
+            db.act_task_events(ONE).unwrap().len(),
+            3,
+            "and the action it replaces keeps exactly the history it had"
+        );
+    }
+
+    /// Reviving something still running would leave two live actions each
+    /// claiming to be the work.
+    #[test]
+    fn an_action_still_running_is_not_something_to_revive() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, ONE, "#ops", Some(SCHOLAR), 10);
+        assert_eq!(
+            re_offer(&db, TWO, "#ops", ONE, 20),
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::ReplacesNotTerminal)
+        );
+        assert_eq!(db.act_task(TWO).unwrap(), None, "and nothing was filed");
+    }
+
+    /// The rule that is load-bearing for federation: a link to an action this
+    /// server never filed is annotation, not a claim to check.
+    #[test]
+    fn a_link_to_an_action_this_server_never_saw_is_annotated_not_refused() {
+        let db = Db::open_memory().unwrap();
+        assert!(matches!(
+            re_offer(&db, ONE, "#ops", NEVER_SEEN, 10),
+            ActWrite::Filed { .. }
+        ));
+        assert_eq!(
+            db.act_task(ONE).unwrap().unwrap().replaces.as_deref(),
+            Some(NEVER_SEEN)
+        );
+    }
+
+    #[test]
+    fn a_step_on_an_action_revives_nothing() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, ONE, "#ops", Some(SCHOLAR), 10);
+        offer(&db, TWO, "#ops", None, 11);
+        let canonical = act_doc(
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "accept"),
+                ("+freeq.at/from", SCHOLAR),
+                ("+freeq.at/act-id", ONE),
+                ("+freeq.at/act-replaces", TWO),
+            ],
+            "#ops",
+            "E1",
+        );
+        let written = db
+            .apply_act_event(&ActEvent {
+                canonical: &canonical,
+                signature: Some("ed25519:kid:sig"),
+                event_id: "E1",
+                act_id: ONE,
+                opens: false,
+                venue: "#ops",
+                actor: SCHOLAR,
+                from_system: false,
+                origin: None,
+                timestamp: 12,
+            })
+            .unwrap();
+        assert_eq!(
+            written,
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::ReplacesNotOpener)
+        );
+        assert_eq!(db.act_task(ONE).unwrap().unwrap().state, "offered");
+    }
+
+    #[test]
+    fn a_value_that_is_not_an_action_id_names_no_action() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(
+            re_offer(&db, ONE, "#ops", "not-a-ulid", 10),
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::ReplacesMalformed)
+        );
+    }
+
     /// The whole point of deriving the view: replaying the log reproduces it.
     /// A mismatch means something wrote the view without going through the
     /// log, and the log would have stopped being the record.
@@ -3043,12 +3178,15 @@ mod tests {
         offer(&db, "T2", "#ops", None, 20);
         follow_up(&db, "claim", MALLORY, "T2", "E3", "#ops", 21);
 
-        offer(&db, "T3", "#other", Some(SCHOLAR), 30);
-        follow_up(&db, "decline", SCHOLAR, "T3", "E4", "#other", 31);
+        offer(&db, ONE, "#other", Some(SCHOLAR), 30);
+        follow_up(&db, "decline", SCHOLAR, ONE, "E4", "#other", 31);
         // A receipt for the event that ended a task — the rebuild has to pass
         // over it exactly as ingress did, or the replay would try to apply a
         // verb no kind has.
-        receipt(&db, "T3", "E4", "R2", "#other", true, 31);
+        receipt(&db, ONE, "E4", "R2", "#other", true, 31);
+        // …and the declined one re-offered, so the rebuild has to reproduce
+        // the link as well as the row.
+        re_offer(&db, "T5", "#other", ONE, 32);
 
         offer(&db, "T4", "#ops", None, 40);
 
@@ -3058,7 +3196,11 @@ mod tests {
         let mut rebuilt = db.rebuild_act_actions().unwrap();
         rebuilt.sort_by(|a, b| a.act_id.cmp(&b.act_id));
 
-        assert_eq!(live.len(), 3, "T3 declined, so it left the view");
+        assert_eq!(
+            live.len(),
+            4,
+            "the declined one left the view; its revival did not"
+        );
         assert_eq!(rebuilt, live);
     }
 
@@ -4315,7 +4457,7 @@ mod tests {
                 db.conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                     .unwrap(),
-                6,
+                crate::migrations::ladder_top() as i64,
                 "first open stamps the schema"
             );
         }
@@ -4327,7 +4469,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            6
+            crate::migrations::ladder_top() as i64
         );
         assert_eq!(db.root_of("id-2"), "id-1");
         assert_eq!(db.current_revision("id-1").unwrap().unwrap().text, "v2");
@@ -4357,7 +4499,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            6
+            crate::migrations::ladder_top() as i64
         );
     }
 
@@ -4400,7 +4542,7 @@ mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            6
+            crate::migrations::ladder_top() as i64
         );
     }
 
@@ -5797,6 +5939,27 @@ impl Db {
             return Ok(ActWrite::Recorded);
         }
 
+        // ── The revival relation ──
+        //
+        // Answered before the move itself, because it is a claim about a
+        // *different* action: whether this event may carry the link at all,
+        // and whether the action it names is in a fit state to be revived. An
+        // action nobody here ever filed is accepted and annotated — a client's
+        // typo today, and under federation the ordinary case, since the
+        // predecessor lived on another machine.
+        if let Some(named) = view.replaces.as_deref() {
+            let predecessor = match self.act_task(named)? {
+                Some(_) => rules::Predecessor::Live,
+                None => match self.act_task_is_on_file(named)? {
+                    true => rules::Predecessor::Finished,
+                    false => rules::Predecessor::Unknown,
+                },
+            };
+            if let Err(refusal) = rules::check_revival(ev.opens, named, predecessor) {
+                return Ok(ActWrite::Refused(refusal));
+            }
+        }
+
         // What the event does to the task, where the task stood before it, and
         // what it looks like now.
         let mut was: Option<String> = None;
@@ -5888,8 +6051,9 @@ impl Db {
         if ev.opens {
             self.conn.execute(
                 "INSERT OR REPLACE INTO act_actions
-                     (act_id, kind, venue, origin, state, offerer, offeree, caps, deadline, updated)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     (act_id, kind, venue, origin, state, offerer, offeree, caps, deadline,
+                      replaces, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     ev.act_id,
                     view.kind,
@@ -5900,6 +6064,7 @@ impl Db {
                     view.to,
                     view.caps,
                     view.deadline,
+                    view.replaces,
                     ev.timestamp,
                 ],
             )?;
@@ -5956,7 +6121,7 @@ impl Db {
         self.conn
             .query_row(
                 "SELECT act_id, kind, venue, origin, state, offerer, offeree, assignee,
-                        caps, deadline, updated
+                        caps, deadline, replaces, updated
                  FROM act_actions WHERE act_id = ?1",
                 params![act_id],
                 |row| {
@@ -5971,7 +6136,8 @@ impl Db {
                         assignee: row.get(7)?,
                         caps: row.get(8)?,
                         deadline: row.get(9)?,
-                        updated: row.get(10)?,
+                        replaces: row.get(10)?,
+                        updated: row.get(11)?,
                     })
                 },
             )
@@ -5994,7 +6160,7 @@ impl Db {
         let places = venues.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
             "SELECT act_id, kind, venue, origin, state, offerer, offeree, assignee,
-                    caps, deadline, updated
+                    caps, deadline, replaces, updated
                FROM act_actions
               WHERE venue IN ({places})
                 AND (?{k} IS NULL OR kind = ?{k})
@@ -6029,7 +6195,8 @@ impl Db {
                 assignee: row.get(7)?,
                 caps: row.get(8)?,
                 deadline: row.get(9)?,
-                updated: row.get(10)?,
+                replaces: row.get(10)?,
+                updated: row.get(11)?,
             })
         })?;
         rows.collect()
@@ -6043,7 +6210,7 @@ impl Db {
     pub fn act_tasks_idle_since(&self, cutoff: i64, limit: usize) -> SqlResult<Vec<ActTask>> {
         let mut stmt = self.conn.prepare(
             "SELECT act_id, kind, venue, origin, state, offerer, offeree, assignee,
-                    caps, deadline, updated
+                    caps, deadline, replaces, updated
                FROM act_actions
               WHERE updated < ?1
               ORDER BY updated
@@ -6061,7 +6228,8 @@ impl Db {
                 assignee: row.get(7)?,
                 caps: row.get(8)?,
                 deadline: row.get(9)?,
-                updated: row.get(10)?,
+                replaces: row.get(10)?,
+                updated: row.get(11)?,
             })
         })?;
         rows.collect()
@@ -6271,6 +6439,7 @@ impl Db {
                         assignee: None,
                         caps: view.caps.clone(),
                         deadline: view.deadline,
+                        replaces: view.replaces.clone(),
                         updated: row.timestamp,
                     },
                 );

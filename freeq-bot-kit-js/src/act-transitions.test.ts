@@ -13,8 +13,12 @@ import {
   DEADLINE_TOLERANCE_MS,
   checkOpen,
   CONFIRMATION_VERB,
+  REVIVAL_TAG,
+  checkRevival,
   checkTransition,
   isConfirmation,
+  isEventId,
+  type Predecessor,
   eventTimeMs,
   initialState,
   isTerminal,
@@ -116,6 +120,9 @@ describe("the rules file", () => {
       ) as string[]),
       ...((canonical.opening_sequences as { expect_refused?: string }[])
         .map((o) => o.expect_refused)
+        .filter(Boolean) as string[]),
+      ...((canonical.revival_sequences as { expect_refused?: string }[])
+        .map((r) => r.expect_refused)
         .filter(Boolean) as string[]),
     ]);
     for (const reason of used) {
@@ -247,6 +254,53 @@ describe("the receipt verb", () => {
       expect(isConfirmation(kind.opens.verb), name).toBe(false);
     }
   });
+});
+
+describe("the revival relation", () => {
+  const refused = (reason: RefusalReason) => ({ ok: false, reason });
+  const DEAD = "01M16E7TC0ENDED00000000000";
+
+  it("only an opener revives a finished action", () => {
+    expect(REVIVAL_TAG).toBe("act-replaces");
+    expect(checkRevival(true, DEAD, "finished")).toEqual({ ok: true });
+    expect(checkRevival(true, DEAD, "unknown")).toEqual({ ok: true });
+    expect(checkRevival(true, DEAD, "live")).toEqual(refused("replaces-not-terminal"));
+    expect(checkRevival(false, DEAD, "finished")).toEqual(refused("replaces-not-opener"));
+    for (const bad of ["", "not-a-ulid", "01M16E7TC0SHRT", `${DEAD}X`, DEAD.toLowerCase()]) {
+      expect(checkRevival(true, bad, "unknown"), bad).toEqual(refused("replaces-malformed"));
+    }
+  });
+
+  it("reads an action id as twenty-six Crockford characters", () => {
+    expect(isEventId(DEAD)).toBe(true);
+    expect(isEventId(DEAD.slice(0, 25))).toBe(false);
+    // I, L, O and U are not in the alphabet, which is what keeps a ULID from
+    // being confused for something typed by hand.
+    for (const c of ["I", "L", "O", "U", "a", "-"]) {
+      expect(isEventId(DEAD.slice(0, 25) + c), c).toBe(false);
+    }
+  });
+
+  interface RevivalCase {
+    name: string;
+    opens: boolean;
+    names: string;
+    predecessor: Predecessor;
+    expect?: string;
+    expect_refused?: RefusalReason;
+  }
+
+  for (const c of canonical.revival_sequences as RevivalCase[]) {
+    it(c.name, () => {
+      const got = checkRevival(c.opens, c.names, c.predecessor);
+      if (c.expect !== undefined) {
+        expect(c.expect).toBe("accepted");
+        expect(got).toEqual({ ok: true });
+      } else {
+        expect(got).toEqual(refused(c.expect_refused!));
+      }
+    });
+  }
 });
 
 describe("refusals", () => {

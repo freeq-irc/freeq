@@ -27,7 +27,10 @@ export type RefusalReason =
   | "illegal-step"
   | "wrong-sender"
   | "deadline-passed"
-  | "client-confirm";
+  | "client-confirm"
+  | "replaces-not-opener"
+  | "replaces-malformed"
+  | "replaces-not-terminal";
 
 /** Allowed, with the state the task lands in — or refused, with the reason. */
 export type CheckResult = { ok: true; to: string } | { ok: false; reason: RefusalReason };
@@ -118,6 +121,53 @@ export const CONFIRMATION_SUBJECT_TAG = spec.confirmation.subject;
  */
 export function isConfirmation(verb: string): boolean {
   return verb === CONFIRMATION_VERB;
+}
+
+/** The tag a new action names the finished one it revives in. */
+export const REVIVAL_TAG = spec.revival.tag;
+
+/** What the caller's log knows about the action a revival names. */
+export type Predecessor = "unknown" | "live" | "finished";
+
+const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/**
+ * Whether `id` is shaped like an event id: a 26-character Crockford ULID.
+ *
+ * Shape only. Whether anything was ever filed under it is the log's answer,
+ * not this one's.
+ */
+export function isEventId(id: string): boolean {
+  return id.length === 26 && [...id].every((c) => CROCKFORD.includes(c));
+}
+
+/** Allowed, or refused with the reason. */
+export type RevivalResult = { ok: true } | { ok: false; reason: RefusalReason };
+
+/**
+ * Decide whether an event may carry the revival relation (`REVIVAL_TAG`),
+ * given what the caller's log knows about the action it names.
+ *
+ * Three rules, cheapest first. Only an opener revives anything: a step on an
+ * action that already exists names no other. The value names an action, so it
+ * is shaped like one. And the action it names must have finished — reviving
+ * something still running would leave two live actions each claiming to be the
+ * work.
+ *
+ * `"unknown"` is accepted, and that is the load-bearing part: receivers must
+ * tolerate a link to an action they never filed and annotate rather than
+ * refuse. A bot pre-checking its own move has no log at all — it passes
+ * `"unknown"` and gets the two rules a message decides on its own.
+ */
+export function checkRevival(
+  opens: boolean,
+  named: string,
+  predecessor: Predecessor,
+): RevivalResult {
+  if (!opens) return { ok: false, reason: "replaces-not-opener" };
+  if (!isEventId(named)) return { ok: false, reason: "replaces-malformed" };
+  if (predecessor === "live") return { ok: false, reason: "replaces-not-terminal" };
+  return { ok: true };
 }
 
 /**

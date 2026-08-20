@@ -765,6 +765,23 @@ mod tests {
                 id: "01KDEF0000000000000000000K",
             },
             Case {
+                // A re-offer naming the finished handoff it revives. Another
+                // tag the sweep covers by name and nothing else has to know
+                // about: the relation is signed because it is present, which
+                // is what stops a relay quietly re-pointing it.
+                name: "re-offer-replacing-a-failed-handoff",
+                seed: 6,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "offer"),
+                    ("+freeq.at/from", "did:plc:eliza"),
+                    ("+freeq.at/act-title", "Cite 3 sources on X"),
+                    ("+freeq.at/act-replaces", OFFER_ID),
+                ],
+                target: OFFER_VENUE,
+                id: "01JREOFFEREVENTID000000000",
+            },
+            Case {
                 // The home's receipt for the accept below: same document as
                 // any other event, signed under the server's own DID, naming
                 // the confirmed event in `act-subject`. Nothing about the

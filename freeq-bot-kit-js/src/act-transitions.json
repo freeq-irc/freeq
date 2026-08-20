@@ -53,6 +53,21 @@
     "verb": "confirm",
     "subject": "act-subject"
   },
+  "revival": {
+    "_note": [
+      "The typed relation a new action uses to name a finished one it revives: a failed handoff re-offered,",
+      "a forfeited bounty re-listed. Named for its relation rather than carried on a generic pointer, so the",
+      "checker knows what the link claims and can hold it to it — which is the whole argument for one tag",
+      "per relation in the _readme above.",
+      "Only an opener revives anything: a step on an action that already exists names no other. The value",
+      "names an action, so it is shaped like one. And the action it names must be finished — reviving",
+      "something still running would leave two live actions each claiming to be the work.",
+      "An action this server never saw is the case that matters later: receivers must tolerate a link to one",
+      "they never filed, and annotate rather than refuse. On one server that is the link a client mistyped;",
+      "under federation it is the ordinary case, since the predecessor lived on somebody else's machine."
+    ],
+    "tag": "act-replaces"
+  },
   "refusals": {
     "unknown-kind": "The kind is not in this file. Adding a kind means updating this file first.",
     "unknown-verb": "The kind lists no transition with this verb.",
@@ -60,7 +75,10 @@
     "illegal-step": "The verb is not legal from the task's current state.",
     "wrong-sender": "The sender does not hold the role this transition requires.",
     "deadline-passed": "The event was minted after the offer's deadline, beyond the clock tolerance.",
-    "client-confirm": "A confirmation is the home's record of an event it filed, never a sender's step."
+    "client-confirm": "A confirmation is the home's record of an event it filed, never a sender's step.",
+    "replaces-not-opener": "The revival relation belongs to an opener. A step on an action names no other.",
+    "replaces-malformed": "The value does not name an action. An action id is a 26-character ULID.",
+    "replaces-not-terminal": "The action it replaces is not finished."
   },
   "deadline_rule": {
     "_note": [
@@ -120,6 +138,43 @@
       "verb": "offer",
       "directed": false,
       "expect_refused": "unknown-kind"
+    }
+  ],
+  "revival_sequences": [
+    {
+      "name": "a re-offer revives the failed action it names",
+      "opens": true,
+      "names": "01M16E7TC0ENDED00000000000",
+      "predecessor": "finished",
+      "expect": "accepted"
+    },
+    {
+      "name": "a re-offer naming an action this server never saw is annotated, not refused",
+      "opens": true,
+      "names": "01M16E7TC0NEVERSEEN0000000",
+      "predecessor": "unknown",
+      "expect": "accepted"
+    },
+    {
+      "name": "an action still running is not something to revive",
+      "opens": true,
+      "names": "01M16E7TC0STANDSYET0000000",
+      "predecessor": "live",
+      "expect_refused": "replaces-not-terminal"
+    },
+    {
+      "name": "a step on an action revives nothing",
+      "opens": false,
+      "names": "01M16E7TC0ENDED00000000000",
+      "predecessor": "finished",
+      "expect_refused": "replaces-not-opener"
+    },
+    {
+      "name": "a value that is not an action id names no action",
+      "opens": true,
+      "names": "01M16E7TC0SHRT",
+      "predecessor": "unknown",
+      "expect_refused": "replaces-malformed"
     }
   ],
   "sequences": [

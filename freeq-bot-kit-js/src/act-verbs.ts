@@ -14,6 +14,7 @@
 // message whose actor is not its sender.
 
 import type { FreeqClient } from "@freeq/sdk";
+import { REVIVAL_TAG } from "./act-transitions.js";
 
 /** What every task step needs: where it happens, and who is doing it. */
 export interface ActContext {
@@ -38,6 +39,9 @@ export interface OfferOptions {
   /** A link to the task's materials, and a hash of them. */
   ctx?: string;
   ctxHash?: string;
+  /** The finished action this one revives — a failed handoff re-offered, a
+   *  forfeited bounty re-listed. Legal only here, on the opener. */
+  replaces?: string;
   /** The line people see. Defaults to something plain. */
   humanText?: string;
 }
@@ -81,6 +85,9 @@ export async function offer(ctx: ActContext, opts: OfferOptions): Promise<string
   }
   if (opts.ctx) tags["+freeq.at/act-ctx"] = opts.ctx;
   if (opts.ctxHash) tags["+freeq.at/act-ctx-h"] = opts.ctxHash;
+  // Tagged only when there is something to revive: an absent relation and an
+  // empty one are different claims, and the signature covers whichever is here.
+  if (opts.replaces) tags[`+freeq.at/${REVIVAL_TAG}`] = opts.replaces;
   return ctx.client.sendAct(ctx.target, tags, {
     humanText: opts.humanText ?? `offered: ${opts.title}`,
   });

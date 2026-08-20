@@ -220,6 +220,32 @@ async function main() {
       check(verdict.ok === true, 'and its signature verifies against the key the server publishes');
     }
 
+    // ── the revival relation ──
+    step('replaces', 'the finished task is re-offered, naming what it revives');
+    const revived = await act.offer(poster.ctx, {
+      title: 'ship the release, again',
+      to: worker.ctx.did,
+      replaces: task,
+    });
+    await sleep(700);
+    check(
+      (await openWork()).find((t) => t.act_id === revived)?.replaces === task,
+      `the new task names the one it revives (${revived} → ${task})`,
+    );
+    check(
+      (await api(`/api/v1/actions/${task}`)).events.length === 6,
+      'and the task it replaces is exactly as it ended',
+    );
+
+    step('replaces refused', 'a re-offer naming a task that has not finished');
+    poster.seen.fails.length = 0;
+    await act.offer(poster.ctx, { title: 'too soon', replaces: revived }).catch(() => {});
+    await sleep(700);
+    check(
+      poster.seen.fails.some((l) => l.includes('REPLACES_NOT_TERMINAL')),
+      'refused: REPLACES_NOT_TERMINAL',
+    );
+
     // ── replay ──
     step('replay', 'a third client joins late and is given the history');
     const late = await spawnBot('acceptance-latecomer');

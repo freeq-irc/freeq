@@ -856,6 +856,10 @@ fn act_task_json(task: &crate::db::ActTask) -> serde_json::Value {
         "assignee": task.assignee,
         "caps": task.caps,
         "deadline": task.deadline,
+        // The finished action this one revives, when its opener named one.
+        // Null otherwise, and null is the honest answer for an action that
+        // revives nothing — the same shape `offeree` and `caps` already have.
+        "replaces": task.replaces,
         "updated": task.updated,
     })
 }

@@ -1110,6 +1110,155 @@ async fn replay_carries_the_receipts_to_capability_holders_only() {
     .await;
 }
 
+// ── the revival relation ────────────────────────────────────────────────────
+
+/// An opener that names the finished action it revives.
+fn re_offer_line(from: &str, replaces: &str, channel: &str, id: &str, key: &SigningKey) -> String {
+    let tags: Vec<(String, String)> = vec![
+        ("+freeq.at/act".into(), "handoff".into()),
+        ("+freeq.at/act-verb".into(), "offer".into()),
+        ("+freeq.at/from".into(), from.into()),
+        (
+            "+freeq.at/act-title".into(),
+            "review-the-deploy-again".into(),
+        ),
+        ("+freeq.at/act-replaces".into(), replaces.into()),
+    ];
+    signed_line(&tags, channel, id, key)
+}
+
+/// A failed handoff, re-offered: the new action carries the link and the old
+/// one is left exactly as it ended.
+#[tokio::test]
+async fn a_re_offer_carries_the_link_to_the_action_it_revives() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+
+        let dead = open_task(&mut a, &alice_key, "#ops", Some(DID_BOB));
+        for verb in ["accept", "fail"] {
+            b.tx(&follow_up_line(
+                verb,
+                DID_BOB,
+                &dead,
+                "#ops",
+                &fresh_id(),
+                &bob_key,
+            ));
+            b.rx(|l| l.contains(&format!("act-verb={verb}")), verb);
+        }
+
+        let revived = fresh_id();
+        a.tx(&re_offer_line(
+            DID_ALICE, &dead, "#ops", &revived, &alice_key,
+        ));
+        let line = a.rx(|l| l.contains(&revived), "the re-offer is accepted");
+        assert!(
+            line.contains(&format!("+freeq.at/act-replaces={dead}")),
+            "the link rides the wire, inside the signature: {line}"
+        );
+    })
+    .await;
+}
+
+/// Reviving something still running would leave two live actions each
+/// claiming to be the work.
+#[tokio::test]
+async fn a_re_offer_naming_a_live_action_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        let live = open_task(&mut a, &signing, "#ops", None);
+
+        a.tx(&re_offer_line(
+            DID_ALICE,
+            &live,
+            "#ops",
+            &fresh_id(),
+            &signing,
+        ));
+        let line = a.fail();
+        assert!(line.contains(" REPLACES_NOT_TERMINAL "), "{line}");
+        assert!(
+            line.ends_with("The action it replaces is not finished"),
+            "the approved sentence: {line}"
+        );
+    })
+    .await;
+}
+
+/// The relation belongs to an opener. A step on an action that already exists
+/// names no other.
+#[tokio::test]
+async fn a_step_that_carries_the_revival_relation_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        let task = open_task(&mut a, &signing, "#ops", None);
+
+        let tags: Vec<(String, String)> = vec![
+            ("+freeq.at/act".into(), "handoff".into()),
+            ("+freeq.at/act-verb".into(), "claim".into()),
+            ("+freeq.at/from".into(), DID_ALICE.into()),
+            ("+freeq.at/act-id".into(), task.clone()),
+            ("+freeq.at/act-replaces".into(), task.clone()),
+        ];
+        a.tx(&signed_line(&tags, "#ops", &fresh_id(), &signing));
+        let line = a.fail();
+        assert!(line.contains(" REPLACES_NOT_OPENER "), "{line}");
+        assert!(
+            line.ends_with("Only a new action replaces an earlier one"),
+            "the approved sentence: {line}"
+        );
+    })
+    .await;
+}
+
+/// A value that could not be an action id is answered as itself, rather than
+/// as a link to an action nobody filed.
+#[tokio::test]
+async fn a_revival_naming_something_that_is_not_an_action_id_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        a.tx(&re_offer_line(
+            DID_ALICE,
+            "the-last-one",
+            "#ops",
+            &fresh_id(),
+            &signing,
+        ));
+        let line = a.fail();
+        assert!(line.contains(" REPLACES_MALFORMED "), "{line}");
+        assert!(
+            line.ends_with("That is not the id of an action"),
+            "the approved sentence: {line}"
+        );
+    })
+    .await;
+}
+
 // ── task history cannot be rewritten ────────────────────────────────────────
 
 #[tokio::test]
