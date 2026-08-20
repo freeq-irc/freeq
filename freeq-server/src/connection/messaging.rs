@@ -671,7 +671,7 @@ pub(crate) fn verify_commit_reveal(
 ///
 /// The account forms are `None` for a guest — no DID, nothing to name — and
 /// such a sender's events fall back to the forms without it.
-struct TagmsgLines {
+pub(super) struct TagmsgLines {
     plain: String,
     with_time: String,
     account: Option<String>,
@@ -679,7 +679,7 @@ struct TagmsgLines {
 }
 
 impl TagmsgLines {
-    fn build(
+    pub(super) fn build(
         tags: &std::collections::HashMap<String, String>,
         hostmask: &str,
         target: &str,
@@ -711,7 +711,7 @@ impl TagmsgLines {
     }
 
     /// The form this receiver negotiated.
-    fn pick(&self, has_time: bool, wants_account: bool) -> &str {
+    pub(super) fn pick(&self, has_time: bool, wants_account: bool) -> &str {
         match (has_time, wants_account) {
             (true, true) => self.time_account.as_deref().unwrap_or(&self.with_time),
             (true, false) => &self.with_time,
@@ -1095,9 +1095,12 @@ pub(super) fn handle_tagmsg(
     // the mutation path does — otherwise a mix reads as a bad delete rather
     // than as the two documents it is. An accepted task message falls through
     // to the fan-out below, which sends it only where it was asked for.
-    let is_act = match super::act::gate(conn, target, tags, state) {
-        super::act::Gate::NotATaskMessage => false,
-        super::act::Gate::Accepted => true,
+    // A receipt travels with the event it confirms: filed by the gate beside
+    // it, and put on the wire after it, so a reader sees the move before this
+    // server's word about the move.
+    let (is_act, receipt) = match super::act::gate(conn, target, tags, state) {
+        super::act::Gate::NotATaskMessage => (false, None),
+        super::act::Gate::Accepted(receipt) => (true, receipt),
         super::act::Gate::Refused => return,
     };
 
@@ -1692,6 +1695,10 @@ pub(super) fn handle_tagmsg(
                 account: conn.authenticated_did.clone(),
             },
         );
+    }
+
+    if let Some(receipt) = receipt {
+        super::act::broadcast_receipt(state, &receipt, target);
     }
 }
 

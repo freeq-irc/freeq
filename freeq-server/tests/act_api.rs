@@ -336,8 +336,9 @@ async fn one_task_comes_back_with_its_whole_event_history() {
     assert_eq!(status, 200);
     assert_eq!(
         body["events"].as_array().unwrap().len(),
-        4,
-        "the offer and its three follow-ups"
+        6,
+        "the offer, its three follow-ups, and a receipt for each of the two \
+         that moved the task"
     );
     assert!(
         body["events"][0]["canonical"]
@@ -355,6 +356,85 @@ async fn one_task_comes_back_with_its_whole_event_history() {
     // …and it is gone from the open-work listing.
     let (_, listing) = get(web, "/api/v1/actions", None).await;
     assert!(ids(&listing).is_empty());
+}
+
+/// A receipt is served from the log like any other event, and the bytes served
+/// are the bytes signed: this checks the stored canonical against the very key
+/// the server publishes as its own, which is the whole worth of a receipt.
+#[tokio::test]
+async fn the_event_list_carries_the_receipts_and_their_signatures_verify() {
+    use base64::Engine;
+
+    let ka = PrivateKey::generate_ed25519();
+    let kb = PrivateKey::generate_ed25519();
+    let (irc, web, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    let (task, accept_id) = tokio::task::spawn_blocking(move || {
+        let alice_key = SigningKey::from_bytes(&[21u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[22u8; 32]);
+        let mut a = C::authenticated(irc, "alice", DID_ALICE, ka);
+        a.msgsig(&alice_key);
+        a.join("#work");
+        let mut b = C::authenticated(irc, "bob", DID_BOB, kb);
+        b.msgsig(&bob_key);
+        b.join("#work");
+
+        let id = a.offer("#work", &channel_venue("#work"), DID_ALICE, &alice_key);
+        let ev = freeq_sdk::chatsig::new_event_id();
+        let tags: Vec<(String, String)> = vec![
+            ("+freeq.at/act".into(), "handoff".into()),
+            ("+freeq.at/act-verb".into(), "claim".into()),
+            ("+freeq.at/from".into(), DID_BOB.into()),
+            ("+freeq.at/act-id".into(), id.clone()),
+        ];
+        let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let sig = freeq_sdk::act::sign_act(pairs, &channel_venue("#work"), &ev, &bob_key).unwrap();
+        let mut wire: Vec<String> = tags.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        wire.push(format!("{EVENT_ID_TAG}={ev}"));
+        wire.push(format!("+freeq.at/sig={sig}"));
+        b.tx(&format!("@{} TAGMSG #work", wire.join(";")));
+        b.rx(|l| l.contains(&ev), "the claim is accepted");
+        (id, ev)
+    })
+    .await
+    .unwrap();
+
+    let (_, own) = get(web, "/api/v1/signing-key", None).await;
+    let published = own["publicKey"]
+        .as_str()
+        .or_else(|| own["public_key"].as_str())
+        .or_else(|| own["pubkey"].as_str())
+        .expect("the server publishes its key");
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(published)
+        .expect("base64url");
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&raw.try_into().unwrap()).unwrap();
+
+    let (_, body) = get(web, &format!("/api/v1/actions/{task}"), None).await;
+    let events = body["events"].as_array().unwrap();
+    let receipt = events
+        .iter()
+        .find(|e| {
+            e["canonical"]
+                .as_str()
+                .is_some_and(|c| c.contains(r#""act-verb":"confirm""#))
+        })
+        .expect("the receipt is on file and served");
+
+    let canonical = receipt["canonical"].as_str().unwrap();
+    assert!(
+        canonical.contains(&format!(r#""act-subject":"{accept_id}""#)),
+        "it names the event it confirms: {canonical}"
+    );
+    assert!(
+        canonical.contains(r#""from":"did:web:test-act-api""#),
+        "signed under the server's own identity: {canonical}"
+    );
+    freeq_sdk::sigtag::verify_canonical(
+        canonical,
+        receipt["signature"].as_str().expect("a receipt is signed"),
+        &key,
+    )
+    .expect("the receipt verifies against the key the server publishes");
 }
 
 /// The server signs the expiry events it makes, and a signature is only worth

@@ -26,7 +26,8 @@ export type RefusalReason =
   | "terminal-task"
   | "illegal-step"
   | "wrong-sender"
-  | "deadline-passed";
+  | "deadline-passed"
+  | "client-confirm";
 
 /** Allowed, with the state the task lands in — or refused, with the reason. */
 export type CheckResult = { ok: true; to: string } | { ok: false; reason: RefusalReason };
@@ -100,6 +101,25 @@ export function openingVerb(kind: string): string | null {
   return kinds[kind]?.opens.verb ?? null;
 }
 
+/** The verb an action's home writes its receipts under. */
+export const CONFIRMATION_VERB = spec.confirmation.verb;
+
+/** The tag a receipt names the event it confirms in. */
+export const CONFIRMATION_SUBJECT_TAG = spec.confirmation.subject;
+
+/**
+ * Whether this verb is the home's receipt verb.
+ *
+ * Asked before any kind's table is consulted, by every caller that reads a
+ * verb at all. A receipt is a statement about an event, not a move on a task:
+ * no kind lists `confirm`, and letting one fall through to the per-kind lookup
+ * would answer "that kind has no such step" — which reads as an invitation to
+ * add the row, and the row must not exist.
+ */
+export function isConfirmation(verb: string): boolean {
+  return verb === CONFIRMATION_VERB;
+}
+
 /**
  * Decide whether an event may open a new task of `kind`.
  *
@@ -115,6 +135,9 @@ export function checkOpen(
   directed: boolean,
   namesTask: boolean,
 ): CheckResult {
+  // Before the kind is even looked up: a receipt opens nothing, and the answer
+  // must not depend on which kind it named.
+  if (isConfirmation(verb)) return { ok: false, reason: "client-confirm" };
   const k = kinds[kind];
   if (!k) return { ok: false, reason: "unknown-kind" };
   if (k.opens.verb !== verb) {
@@ -175,6 +198,10 @@ export function checkTransition(
   event: TaskEvent,
   sender: EventSender,
 ): CheckResult {
+  // The receipt verb, before the kind lookup and before anything about this
+  // task: a confirmation is not a move, and no table has a row for it. The
+  // home files its own receipts past this checker entirely.
+  if (isConfirmation(event.verb)) return { ok: false, reason: "client-confirm" };
   const kind = kinds[task.kind];
   if (!kind) return { ok: false, reason: "unknown-kind" };
 

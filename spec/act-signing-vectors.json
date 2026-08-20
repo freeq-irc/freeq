@@ -5,6 +5,7 @@
   "eventIdRule": "An offer carries no act-id: its own event id is the task's id. Every later event in a task's life names that id in act-id, and mints its own id for itself.",
   "kidRule": "base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16])",
   "mandatoryFieldRule": "`from`, `id` and `target` are mandatory. A document missing one reads unverifiable, never invalid: none is act-prefixed, so tag coverage cannot strip-detect it, and an absence is not evidence about the sender.",
+  "negativeRule": "A negative names a vector and the conditions to check it under. `strippedTag` removes a wire tag and `swappedTag` rewrites one before verifying; `sigAlgorithm` relabels the signature's algorithm; `target` and `id` are the delivery context to rebuild from. Every `invalid` negative also carries the canonical those conditions rebuild to, so a byte-level suite with no verifier can still check it; an `unverifiable` one carries none, because having no canonical to rebuild is what unverifiable means.",
   "negatives": [
     {
       "expected": "invalid",
@@ -21,6 +22,18 @@
       "tamperedCanonical": "{\"act\":\"handoff\",\"act-caps\":\"freeq.at/web-search\",\"act-ctx-h\":\"sha256:9f00\",\"act-deadline\":\"1788000000\",\"act-title\":\"Cite 3 sources on X\",\"act-to\":\"did:plc:scholar\",\"act-verb\":\"offer\",\"from\":\"did:plc:eliza\",\"id\":\"01JOTHEREVENTID00000000000\",\"target\":\"#ops\"}",
       "target": "#ops",
       "vector": "directed-offer"
+    },
+    {
+      "expected": "invalid",
+      "id": "01JCONFIRMEVENTID000000000",
+      "name": "receipt-with-a-swapped-subject",
+      "swappedTag": {
+        "name": "+freeq.at/act-subject",
+        "value": "01JOTHEREVENTID00000000000"
+      },
+      "tamperedCanonical": "{\"act\":\"handoff\",\"act-id\":\"01JABCDEF000000000000000EF\",\"act-subject\":\"01JOTHEREVENTID00000000000\",\"act-verb\":\"confirm\",\"from\":\"did:web:irc.example\",\"id\":\"01JCONFIRMEVENTID000000000\",\"target\":\"#ops\"}",
+      "target": "#ops",
+      "vector": "receipt-confirming-an-accept"
     },
     {
       "expected": "unverifiable",
@@ -102,6 +115,23 @@
         "+freeq.at/from": "did:plc:factory"
       },
       "target": "dm:did:plc:factory,did:plc:opslead"
+    },
+    {
+      "canonical": "{\"act\":\"handoff\",\"act-id\":\"01JABCDEF000000000000000EF\",\"act-subject\":\"01JACCEPTEVENTID0000000000\",\"act-verb\":\"confirm\",\"from\":\"did:web:irc.example\",\"id\":\"01JCONFIRMEVENTID000000000\",\"target\":\"#ops\"}",
+      "id": "01JCONFIRMEVENTID000000000",
+      "kid": "dZl3bDCF4_naDRMHHrC0qw",
+      "name": "receipt-confirming-an-accept",
+      "publicKey": "bnoc3Smwt4_ROvTFWY_v9O8qlxZuPKby5Pv8zYBQW_E",
+      "seed": "0505050505050505050505050505050505050505050505050505050505050505",
+      "sigTag": "ed25519:dZl3bDCF4_naDRMHHrC0qw:lIseSzDKJIuQWdYOncVtJUd5mr6YwcQSfXwAI7DqPQceRs7YN6QPkIsrSg26KNH0y9dUYNO9vP4pSHMd_VejAQ",
+      "tags": {
+        "+freeq.at/act": "handoff",
+        "+freeq.at/act-id": "01JABCDEF000000000000000EF",
+        "+freeq.at/act-subject": "01JACCEPTEVENTID0000000000",
+        "+freeq.at/act-verb": "confirm",
+        "+freeq.at/from": "did:web:irc.example"
+      },
+      "target": "#ops"
     },
     {
       "canonical": "{\"act\":\"handoff\",\"act-id\":\"01JABCDEF000000000000000EF\",\"act-note\":\"ok — \\\"on it\\\" ✓\\n(eta 5m)\",\"act-verb\":\"accept\",\"from\":\"did:plc:scholar\",\"id\":\"01JACCEPTEVENTID0000000000\",\"target\":\"#ops\"}",

@@ -58,6 +58,8 @@ pub enum Refusal {
     WrongSender,
     /// The event was minted past the offer's deadline, beyond the tolerance.
     DeadlinePassed,
+    /// A sender wrote the confirmation verb. Receipts are the home's.
+    ClientConfirm,
 }
 
 impl Refusal {
@@ -71,6 +73,7 @@ impl Refusal {
             Refusal::IllegalStep => "illegal-step",
             Refusal::WrongSender => "wrong-sender",
             Refusal::DeadlinePassed => "deadline-passed",
+            Refusal::ClientConfirm => "client-confirm",
         }
     }
 
@@ -146,6 +149,27 @@ pub fn opening_verb(kind: &str) -> Option<&'static str> {
     spec().kinds.get(kind).map(|k| k.opens.verb.as_str())
 }
 
+/// The verb an action's home writes its receipts under.
+pub fn confirmation_verb() -> &'static str {
+    spec().confirmation.verb.as_str()
+}
+
+/// The tag a receipt names the event it confirms in.
+pub fn confirmation_subject_tag() -> &'static str {
+    spec().confirmation.subject.as_str()
+}
+
+/// Whether this verb is the home's receipt verb.
+///
+/// Asked before any kind's table is consulted, by every caller that reads a
+/// verb at all. A receipt is a statement about an event, not a move on a task:
+/// no kind lists `confirm`, and letting one fall through to the per-kind
+/// lookup would answer "that kind has no such step" — which reads as an
+/// invitation to add the row, and the row must not exist.
+pub fn is_confirmation(verb: &str) -> bool {
+    verb == confirmation_verb()
+}
+
 /// Decide whether an event may open a new task of `kind`.
 ///
 /// The move the transitions table cannot describe, because there is no task
@@ -163,6 +187,11 @@ pub fn check_open(
     directed: bool,
     names_task: bool,
 ) -> Result<&'static str, Refusal> {
+    // Before the kind is even looked up: a receipt opens nothing, and the
+    // answer must not depend on which kind it named.
+    if is_confirmation(verb) {
+        return Err(Refusal::ClientConfirm);
+    }
     let k = spec().kinds.get(kind).ok_or(Refusal::UnknownKind)?;
     if k.opens.verb != verb {
         // A verb the kind moves tasks with is known but cannot start one;
@@ -234,6 +263,12 @@ pub fn check(
     event: &Event<'_>,
     sender: &Sender<'_>,
 ) -> Result<&'static str, Refusal> {
+    // The receipt verb, before the kind lookup and before anything about this
+    // task: a confirmation is not a move, and no table has a row for it. The
+    // home files its own receipts past this checker entirely.
+    if is_confirmation(event.verb) {
+        return Err(Refusal::ClientConfirm);
+    }
     let kind = spec().kinds.get(task.kind).ok_or(Refusal::UnknownKind)?;
 
     // Is this a move the kind has at all? Asked before anything about this
@@ -295,9 +330,18 @@ pub fn check(
 #[derive(Deserialize)]
 struct Spec {
     kinds: BTreeMap<String, Kind>,
+    confirmation: Confirmation,
     refusals: BTreeMap<String, String>,
     #[allow(dead_code)]
     deadline_rule: DeadlineRule,
+}
+
+/// The receipt verb, and the tag a receipt names its subject in. Outside
+/// `kinds` because it belongs to none of them.
+#[derive(Deserialize)]
+struct Confirmation {
+    verb: String,
+    subject: String,
 }
 
 #[derive(Deserialize)]
@@ -528,6 +572,60 @@ mod tests {
         assert_eq!(spec().kinds.len(), 1, "handoff is the only kind so far");
     }
 
+    // ── the receipt verb ────────────────────────────────────────────────────
+
+    /// A receipt is the home's word about an event, so a sender's `confirm`
+    /// is refused wherever it appears — opening or moving, whatever kind it
+    /// names, and even when the sender claims to be the server. The home
+    /// files its own past this checker.
+    #[test]
+    fn a_sender_never_writes_a_confirmation() {
+        assert_eq!(confirmation_verb(), "confirm");
+        assert_eq!(
+            check(&directed("offered"), &ev("confirm"), &who(SCHOLAR)),
+            Err(Refusal::ClientConfirm)
+        );
+        let system = Sender {
+            did: SERVER,
+            is_system: true,
+        };
+        assert_eq!(
+            check(&directed("offered"), &ev("confirm"), &system),
+            Err(Refusal::ClientConfirm)
+        );
+        assert_eq!(
+            check_open("handoff", "confirm", false, false),
+            Err(Refusal::ClientConfirm)
+        );
+    }
+
+    /// The answer must not read as "this kind has no such row yet", which
+    /// would say a kind could add one. It cannot: the verb is recognized
+    /// before any kind is consulted, unlisted kinds included.
+    #[test]
+    fn a_confirmation_never_reads_as_a_verb_a_kind_could_add() {
+        let unlisted = Task {
+            kind: "no-such-kind",
+            ..directed("offered")
+        };
+        assert_eq!(
+            check(&unlisted, &ev("confirm"), &who(SCHOLAR)),
+            Err(Refusal::ClientConfirm),
+            "not unknown-kind either — the verb is answered first"
+        );
+        assert_eq!(
+            check_open("no-such-kind", "confirm", false, false),
+            Err(Refusal::ClientConfirm)
+        );
+        for (name, kind) in &spec().kinds {
+            assert!(
+                !kind.transitions.iter().any(|t| is_confirmation(&t.verb)),
+                "{name} claims the receipt verb, which belongs to no kind"
+            );
+            assert!(!is_confirmation(&kind.opens.verb), "{name}");
+        }
+    }
+
     #[test]
     fn every_refusal_reason_is_documented_in_the_file() {
         for r in [
@@ -537,6 +635,7 @@ mod tests {
             Refusal::IllegalStep,
             Refusal::WrongSender,
             Refusal::DeadlinePassed,
+            Refusal::ClientConfirm,
         ] {
             assert!(
                 spec().refusals.contains_key(r.code()),
@@ -1119,12 +1218,17 @@ mod tests {
 
     /// The sequences have to exercise every refusal the checker can reach —
     /// otherwise the other implementation could pass them all and still get a
-    /// reason wrong.
+    /// reason wrong. Both lists count: some reasons only an opener can earn.
     #[test]
     fn the_sequences_cover_every_refusal_reason() {
         let mut seen: Vec<String> = sequences()
             .iter()
             .flat_map(|s| s.steps.iter().filter_map(|st| st.expect_refused.clone()))
+            .chain(
+                opening_sequences()
+                    .iter()
+                    .filter_map(|o| o.expect_refused.clone()),
+            )
             .collect();
         seen.sort();
         seen.dedup();

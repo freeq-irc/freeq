@@ -243,8 +243,16 @@ pub struct ActEvent<'a> {
 /// What happened to a task event offered to the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActWrite {
-    /// Filed, and the task now sits in this state.
-    Filed { state: String },
+    /// Filed, and the task now sits in this state. `was` is the state it
+    /// came from — `None` for the event that opened it, which came from
+    /// nowhere. The two together are what tells a step that moved the task
+    /// from one that only reported on it, which is the question a receipt
+    /// answers.
+    Filed { was: Option<String>, state: String },
+    /// Filed as a record, with the view left where it stood: a receipt. The
+    /// state it names was moved by the event it confirms, and confirming
+    /// something twice must not move anything twice.
+    Recorded,
     /// The rules refused the move.
     Refused(freeq_sdk::act_transitions::Refusal),
     /// The event names a task this server has never filed — including any
@@ -2777,6 +2785,7 @@ mod tests {
         assert_eq!(
             offer(&db, "T1", "#ops", Some(SCHOLAR), 10),
             ActWrite::Filed {
+                was: None,
                 state: "offered".into()
             }
         );
@@ -2846,6 +2855,7 @@ mod tests {
         assert_eq!(
             first,
             ActWrite::Filed {
+                was: Some("open".into()),
                 state: "assigned".into()
             }
         );
@@ -2908,6 +2918,117 @@ mod tests {
         );
     }
 
+    // ── receipts ──────────────────────────────────────────────────────────
+
+    const HOME: &str = "did:web:test";
+
+    /// A receipt, filed the way the home files one: its own event id, the
+    /// task in `act-id`, and the confirmed event in `act-subject`.
+    fn receipt(
+        db: &Db,
+        task: &str,
+        subject: &str,
+        id: &str,
+        venue: &str,
+        from_system: bool,
+        ts: i64,
+    ) -> ActWrite {
+        let canonical = act_doc(
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "confirm"),
+                ("+freeq.at/from", HOME),
+                ("+freeq.at/act-id", task),
+                ("+freeq.at/act-subject", subject),
+            ],
+            venue,
+            id,
+        );
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: id,
+            act_id: task,
+            opens: false,
+            venue,
+            actor: HOME,
+            from_system,
+            origin: None,
+            timestamp: ts,
+        })
+        .unwrap()
+    }
+
+    /// A receipt is an appended record and nothing else: the state it names
+    /// was moved by the event it confirms, and confirming that twice must not
+    /// move anything twice.
+    #[test]
+    fn a_receipt_is_filed_without_moving_the_view() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
+        follow_up(&db, "accept", SCHOLAR, "T1", "E1", "#ops", 11);
+        let before = db.act_task("T1").unwrap().unwrap();
+
+        assert_eq!(
+            receipt(&db, "T1", "E1", "R1", "#ops", true, 11),
+            ActWrite::Recorded
+        );
+        assert_eq!(db.act_task("T1").unwrap().unwrap(), before);
+        assert_eq!(
+            db.act_task_events("T1").unwrap().len(),
+            3,
+            "the offer, the accept, and the home's word about the accept"
+        );
+    }
+
+    /// A receipt confirming the event that ended a task is still filed: the
+    /// row is gone, the log is the record, and the receipt belongs to it.
+    #[test]
+    fn a_receipt_outlives_the_task_it_confirms() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
+        follow_up(&db, "accept", SCHOLAR, "T1", "E1", "#ops", 11);
+        follow_up(&db, "complete", SCHOLAR, "T1", "E2", "#ops", 12);
+        assert_eq!(db.act_task("T1").unwrap(), None);
+
+        assert_eq!(
+            receipt(&db, "T1", "E2", "R1", "#ops", true, 12),
+            ActWrite::Recorded
+        );
+        assert_eq!(db.act_task("T1").unwrap(), None, "and nothing came back");
+        assert_eq!(db.act_task_events("T1").unwrap().len(), 4);
+    }
+
+    /// The verb is the home's. Bytes arriving from anywhere else carrying it
+    /// are refused here as well as at the gate — this path is reachable from a
+    /// rebuild and, later, from a peer.
+    #[test]
+    fn only_the_home_writes_a_receipt() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
+        assert_eq!(
+            receipt(&db, "T1", "T1", "R1", "#ops", false, 11),
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::ClientConfirm)
+        );
+        assert_eq!(
+            db.act_task_events("T1").unwrap().len(),
+            1,
+            "a refused receipt is not filed"
+        );
+    }
+
+    #[test]
+    fn a_second_receipt_under_one_id_is_a_duplicate() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
+        follow_up(&db, "accept", SCHOLAR, "T1", "E1", "#ops", 11);
+        receipt(&db, "T1", "E1", "R1", "#ops", true, 11);
+        assert_eq!(
+            receipt(&db, "T1", "E1", "R1", "#ops", true, 11),
+            ActWrite::Duplicate
+        );
+    }
+
     /// The whole point of deriving the view: replaying the log reproduces it.
     /// A mismatch means something wrote the view without going through the
     /// log, and the log would have stopped being the record.
@@ -2916,6 +3037,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
         follow_up(&db, "accept", SCHOLAR, "T1", "E1", "#ops", 11);
+        receipt(&db, "T1", "E1", "R1", "#ops", true, 11);
         follow_up(&db, "progress", SCHOLAR, "T1", "E2", "#ops", 12);
 
         offer(&db, "T2", "#ops", None, 20);
@@ -2923,6 +3045,10 @@ mod tests {
 
         offer(&db, "T3", "#other", Some(SCHOLAR), 30);
         follow_up(&db, "decline", SCHOLAR, "T3", "E4", "#other", 31);
+        // A receipt for the event that ended a task — the rebuild has to pass
+        // over it exactly as ingress did, or the replay would try to apply a
+        // verb no kind has.
+        receipt(&db, "T3", "E4", "R2", "#other", true, 31);
 
         offer(&db, "T4", "#ops", None, 40);
 
@@ -5646,7 +5772,34 @@ impl Db {
             return Ok(ActWrite::NotATaskEvent);
         };
 
-        // What the event does to the task, and what the task looks like now.
+        // ── A receipt ──
+        //
+        // Recognized before the task is read, because it asks nothing of the
+        // task: the home writes it about an event it has already refereed and
+        // filed, and the state that event landed in was set then. Filing a
+        // receipt appends a row and stops. Only the home writes one, so a
+        // sender's confirm is refused here as it is at the gate — this path
+        // is also reachable from a rebuild and from a peer.
+        if rules::is_confirmation(&view.verb) {
+            if !ev.from_system {
+                return Ok(ActWrite::Refused(rules::Refusal::ClientConfirm));
+            }
+            let record = EventRecord {
+                shape: EventShape::Document(ev.canonical),
+                signature: ev.signature,
+                ctx: crate::events::EventContext::verified(),
+                timestamp: ev.timestamp as u64,
+            };
+            if !self.insert_event(&record)? {
+                return Ok(ActWrite::Duplicate);
+            }
+            tx.commit()?;
+            return Ok(ActWrite::Recorded);
+        }
+
+        // What the event does to the task, where the task stood before it, and
+        // what it looks like now.
+        let mut was: Option<String> = None;
         let landed = if ev.opens {
             // The opener's own id is the task's id. A second opener under the
             // same id is the log's duplicate case, handled by the write below.
@@ -5688,7 +5841,10 @@ impl Db {
                 deadline: task.deadline,
             };
             match rules::check(&checked, &event, &sender) {
-                Ok(state) => state.to_string(),
+                Ok(state) => {
+                    was = Some(task.state.clone());
+                    state.to_string()
+                }
                 Err(refusal) => return Ok(ActWrite::Refused(refusal)),
             }
         };
@@ -5707,7 +5863,7 @@ impl Db {
         }
         self.materialize_act(ev, &view, &landed)?;
         tx.commit()?;
-        Ok(ActWrite::Filed { state: landed })
+        Ok(ActWrite::Filed { was, state: landed })
     }
 
     /// Move the view to match an event that was just accepted.
@@ -6049,6 +6205,13 @@ impl Db {
             let Some(view) = crate::events::derive_act_view(&row.canonical) else {
                 continue;
             };
+            // A receipt moves nothing — the event it names did the moving, and
+            // is in this same log. A rebuild passes over it exactly as the
+            // ingress path does, or replaying the log would try to apply a
+            // verb no kind has.
+            if freeq_sdk::act_transitions::is_confirmation(&view.verb) {
+                continue;
+            }
             let act_id = row.subject.clone().unwrap_or_else(|| row.event_id.clone());
             let opens = row.subject.is_none();
             let landed = if opens {

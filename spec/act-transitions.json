@@ -19,7 +19,9 @@
     "`who` names the role a sender must hold: offerer, offeree, assignee, anyone (any logged-in sender), or",
     "system (the server itself — expiry only). act-caps is a self-declared hint — stored, filterable, signed,",
     "never checked here. `from` is one state, a list of states, or",
-    "`*nonterminal` for every state that is not terminal. `before_deadline` is data; the comparison is code."
+    "`*nonterminal` for every state that is not terminal. `before_deadline` is data; the comparison is code.",
+    "`confirmation` sits outside `kinds` because the receipt verb belongs to no kind and no kind may claim it:",
+    "a receipt is the home server's word about an event it filed, not a step anybody takes."
   ],
   "version": 1,
   "kinds": {
@@ -38,13 +40,27 @@
       ]
     }
   },
+  "confirmation": {
+    "_note": [
+      "The receipt an action's home writes for a participant-authored step it has filed: same document as",
+      "any other event, signed under the server's own DID, naming the confirmed event in act-subject.",
+      "The verb is generic on purpose. No kind lists it and no kind may add its own row for it — a receipt",
+      "is a statement about an event, not a move on a task — so the checker recognizes it before it looks",
+      "the verb up in any kind's table, and answers `client-confirm` rather than `unknown-verb`. The second",
+      "answer would say a kind could define confirm for itself, which it cannot.",
+      "A receipt carries no state: whatever moved was moved by the event it names."
+    ],
+    "verb": "confirm",
+    "subject": "act-subject"
+  },
   "refusals": {
     "unknown-kind": "The kind is not in this file. Adding a kind means updating this file first.",
     "unknown-verb": "The kind lists no transition with this verb.",
     "terminal-task": "The task is finished. A later event never un-applies an earlier one.",
     "illegal-step": "The verb is not legal from the task's current state.",
     "wrong-sender": "The sender does not hold the role this transition requires.",
-    "deadline-passed": "The event was minted after the offer's deadline, beyond the clock tolerance."
+    "deadline-passed": "The event was minted after the offer's deadline, beyond the clock tolerance.",
+    "client-confirm": "A confirmation is the home's record of an event it filed, never a sender's step."
   },
   "deadline_rule": {
     "_note": [
@@ -90,6 +106,13 @@
       "verb": "accept",
       "directed": true,
       "expect_refused": "illegal-step"
+    },
+    {
+      "name": "a confirmation opens nothing, whatever kind it names",
+      "kind": "handoff",
+      "verb": "confirm",
+      "directed": false,
+      "expect_refused": "client-confirm"
     },
     {
       "name": "an opener for a kind this file does not list is refused",
@@ -504,6 +527,27 @@
       "steps": [
         { "verb": "award", "sender": "did:plc:eliza", "expect_refused": "unknown-verb" },
         { "verb": "bid", "sender": "did:plc:scholar", "expect_refused": "unknown-verb" }
+      ]
+    },
+    {
+      "name": "nobody but the home confirms, and no kind can claim the verb for itself",
+      "task": {
+        "kind": "handoff",
+        "offer": "directed",
+        "offerer": "did:plc:eliza",
+        "offeree": "did:plc:scholar",
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "confirm", "sender": "did:plc:scholar", "expect_refused": "client-confirm" },
+        { "verb": "confirm", "sender": "did:plc:eliza", "expect_refused": "client-confirm" },
+        {
+          "verb": "confirm",
+          "sender": "did:web:irc.example",
+          "system": true,
+          "expect_refused": "client-confirm"
+        },
+        { "verb": "accept", "sender": "did:plc:scholar", "expect": "assigned" }
       ]
     },
     {

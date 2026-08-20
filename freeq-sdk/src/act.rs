@@ -765,6 +765,24 @@ mod tests {
                 id: "01KDEF0000000000000000000K",
             },
             Case {
+                // The home's receipt for the accept below: same document as
+                // any other event, signed under the server's own DID, naming
+                // the confirmed event in `act-subject`. Nothing about the
+                // canonical is special — the sweep covers the new tag by
+                // name, which is the whole point of covering by prefix.
+                name: "receipt-confirming-an-accept",
+                seed: 5,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "confirm"),
+                    ("+freeq.at/from", "did:web:irc.example"),
+                    ("+freeq.at/act-id", OFFER_ID),
+                    ("+freeq.at/act-subject", "01JACCEPTEVENTID0000000000"),
+                ],
+                target: OFFER_VENUE,
+                id: "01JCONFIRMEVENTID000000000",
+            },
+            Case {
                 // A follow-up: it names the task it is about in `act-id` —
                 // the offer's event id — and mints its own id for itself.
                 name: "accept-minimal-with-escaping",
@@ -795,10 +813,26 @@ mod tests {
         expected: &'static str,
         target: &'static str,
         id: &'static str,
-        /// Strip this wire tag before verifying (missing-mandatory case).
+        /// Strip this wire tag before verifying.
         strip_tag: Option<&'static str>,
+        /// Rewrite this wire tag's value before verifying (tamper case).
+        swap_tag: Option<(&'static str, &'static str)>,
         /// Replace the sig tag's algorithm label (unknown-algorithm case).
         swap_alg: Option<&'static str>,
+    }
+
+    impl Negative {
+        /// The vector's tags as this negative presents them to a verifier.
+        fn tags_of(&self, case: &Case) -> Vec<(&'static str, &'static str)> {
+            case.tags
+                .iter()
+                .filter(|(name, _)| self.strip_tag != Some(*name))
+                .map(|(name, value)| match self.swap_tag {
+                    Some((swapped, to)) if swapped == *name => (*name, to),
+                    _ => (*name, *value),
+                })
+                .collect()
+        }
     }
 
     fn negatives() -> Vec<Negative> {
@@ -810,6 +844,7 @@ mod tests {
                 target: "#random",
                 id: OFFER_ID,
                 strip_tag: None,
+                swap_tag: None,
                 swap_alg: None,
             },
             Negative {
@@ -819,6 +854,21 @@ mod tests {
                 target: OFFER_VENUE,
                 id: "01JOTHEREVENTID00000000000",
                 strip_tag: None,
+                swap_tag: None,
+                swap_alg: None,
+            },
+            Negative {
+                // A receipt re-pointed at another event. The subject is the
+                // whole content of a receipt — "the home confirms *this*" —
+                // so rewriting it must read as tampering, not as a new fact.
+                // The sweep covers act-subject by name, like every act tag.
+                name: "receipt-with-a-swapped-subject",
+                of: "receipt-confirming-an-accept",
+                expected: "invalid",
+                target: OFFER_VENUE,
+                id: "01JCONFIRMEVENTID000000000",
+                strip_tag: None,
+                swap_tag: Some(("+freeq.at/act-subject", "01JOTHEREVENTID00000000000")),
                 swap_alg: None,
             },
             Negative {
@@ -831,6 +881,7 @@ mod tests {
                 target: OFFER_VENUE,
                 id: OFFER_ID,
                 strip_tag: Some("+freeq.at/from"),
+                swap_tag: None,
                 swap_alg: None,
             },
             Negative {
@@ -843,6 +894,7 @@ mod tests {
                 target: OFFER_VENUE,
                 id: OFFER_ID,
                 strip_tag: None,
+                swap_tag: None,
                 swap_alg: Some("rsa4096"),
             },
         ]
@@ -894,15 +946,21 @@ mod tests {
                 });
                 if let Some(tag) = n.strip_tag {
                     entry["strippedTag"] = serde_json::Value::String(tag.to_string());
-                } else if let Some(alg) = n.swap_alg {
+                }
+                if let Some((tag, to)) = n.swap_tag {
+                    entry["swappedTag"] = serde_json::json!({ "name": tag, "value": to });
+                }
+                if let Some(alg) = n.swap_alg {
                     entry["sigAlgorithm"] = serde_json::Value::String(alg.to_string());
-                } else {
-                    // Tamper-class negatives rebuild a real canonical under
-                    // the wrong delivery context; the byte-level suites
-                    // reproduce it. Unverifiable-class negatives have no
-                    // canonical to rebuild — that is what unverifiable means.
+                }
+                // Tamper-class negatives rebuild a real canonical — under the
+                // wrong delivery context, or over a rewritten tag — and the
+                // byte-level suites reproduce it. Unverifiable-class negatives
+                // have no canonical to rebuild; that is what unverifiable
+                // means.
+                if n.expected == "invalid" {
                     entry["tamperedCanonical"] = serde_json::Value::String(
-                        act_canonical(case.tags, n.target, n.id).unwrap(),
+                        act_canonical(n.tags_of(&case), n.target, n.id).unwrap(),
                     );
                 }
                 entry
@@ -916,6 +974,7 @@ mod tests {
             "venueRule": "target is the normalized venue, never the wire target: a channel lowercased, or `dm:<did_a>,<did_b>` with the two DIDs sorted ascending.",
             "eventIdRule": "An offer carries no act-id: its own event id is the task's id. Every later event in a task's life names that id in act-id, and mints its own id for itself.",
             "senderOnlyTagRule": "Only the sender ever writes act-* tags. A server that stamped one of its own would land inside the signature's coverage and break every act signature it relayed.",
+            "negativeRule": "A negative names a vector and the conditions to check it under. `strippedTag` removes a wire tag and `swappedTag` rewrites one before verifying; `sigAlgorithm` relabels the signature's algorithm; `target` and `id` are the delivery context to rebuild from. Every `invalid` negative also carries the canonical those conditions rebuild to, so a byte-level suite with no verifier can still check it; an `unverifiable` one carries none, because having no canonical to rebuild is what unverifiable means.",
             "kidRule": "base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16])",
             "sigTagFormat": "ed25519:<kid>:<base64url-nopad signature over the UTF-8 canonical bytes>",
             "vectors": vectors,
@@ -971,11 +1030,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("negative {} names unknown vector {}", n.name, n.of));
             let key = test_key(case.seed);
             let real_sig = sign_act(case.tags.clone(), case.target, case.id, &key).unwrap();
-            let tags: Vec<_> = case
-                .tags
-                .into_iter()
-                .filter(|(name, _)| n.strip_tag != Some(*name))
-                .collect();
+            let tags = n.tags_of(&case);
             let sig_tag = match n.swap_alg {
                 Some(alg) => {
                     let rest = real_sig.split_once(':').expect("alg:kid:sig").1;

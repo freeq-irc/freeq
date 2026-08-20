@@ -860,6 +860,256 @@ async fn a_task_runs_from_offer_to_completion() {
     .await;
 }
 
+// ── receipts ────────────────────────────────────────────────────────────────
+
+/// The `act-subject` of a receipt line, if the line is one.
+fn receipt_subject(line: &str) -> Option<String> {
+    if !line.contains("+freeq.at/act-verb=confirm") {
+        return None;
+    }
+    line.trim_start_matches('@')
+        .split(&[' ', ';'][..])
+        .find_map(|t| t.strip_prefix("+freeq.at/act-subject="))
+        .map(str::to_string)
+}
+
+/// The home's word about a move it filed: signed under `did:web:`, naming the
+/// event it confirms, and verifying against the key that server publishes.
+#[tokio::test]
+async fn a_state_transition_earns_a_receipt_the_home_signed() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+
+        let task = open_task(&mut a, &alice_key, "#ops", Some(DID_BOB));
+        let accept_id = fresh_id();
+        b.tx(&follow_up_line(
+            "accept", DID_BOB, &task, "#ops", &accept_id, &bob_key,
+        ));
+
+        let receipt = b
+            .maybe(|l| l.contains("+freeq.at/act-verb=confirm"), 3_000)
+            .expect("the home confirms a move it filed");
+        assert_eq!(
+            receipt_subject(&receipt).as_deref(),
+            Some(accept_id.as_str()),
+            "the receipt names the event it confirms: {receipt}"
+        );
+        assert!(
+            receipt.contains(&format!("+freeq.at/act-id={task}")),
+            "and the action it belongs to: {receipt}"
+        );
+        assert!(
+            receipt.contains("+freeq.at/from=did:web:test-act"),
+            "signed under this server's own identity: {receipt}"
+        );
+        assert!(
+            receipt.contains("+freeq.at/sig=ed25519:"),
+            "with a signature: {receipt}"
+        );
+    })
+    .await;
+}
+
+/// One receipt per move, and none for anything that moved nothing: an opener
+/// (opening is the action), a progress report (`from` and `to` are the same
+/// state), or the server's own expiry (home-signed already).
+#[tokio::test]
+async fn only_a_move_earns_a_receipt_and_it_earns_exactly_one() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+
+        // The offer opens the task; nothing raced it, so nothing confirms it.
+        let task = open_task(&mut a, &alice_key, "#ops", Some(DID_BOB));
+        assert!(
+            b.maybe(|l| l.contains("act-verb=confirm"), 600).is_none(),
+            "an opener is not confirmed"
+        );
+
+        let mut confirmed: Vec<String> = Vec::new();
+        for (verb, expect_receipt) in [("accept", true), ("progress", false), ("complete", true)] {
+            let id = fresh_id();
+            b.tx(&follow_up_line(verb, DID_BOB, &task, "#ops", &id, &bob_key));
+            match expect_receipt {
+                true => {
+                    let line = b
+                        .maybe(|l| l.contains("act-verb=confirm"), 3_000)
+                        .unwrap_or_else(|| panic!("{verb} moved the task and earns a receipt"));
+                    assert_eq!(receipt_subject(&line).as_deref(), Some(id.as_str()));
+                    confirmed.push(id);
+                }
+                // A report that leaves the task where it stood has no move to
+                // confirm. Waited out against the *next* step's receipt, which
+                // is what would arrive if this one were wrong.
+                false => assert!(
+                    b.maybe(|l| l.contains("act-verb=confirm"), 800).is_none(),
+                    "{verb} leaves the task where it stood and earns no receipt"
+                ),
+            }
+        }
+        assert_eq!(confirmed.len(), 2, "one receipt each, and no more");
+    })
+    .await;
+}
+
+/// A sender writing the home's verb is refused before any kind's table is
+/// consulted — not with UNKNOWN_VERB, which would say the kind is merely
+/// missing a row for it.
+#[tokio::test]
+async fn a_confirmation_from_a_sender_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        let task = open_task(&mut a, &signing, "#ops", None);
+
+        let tags: Vec<(String, String)> = vec![
+            ("+freeq.at/act".into(), "handoff".into()),
+            ("+freeq.at/act-verb".into(), "confirm".into()),
+            ("+freeq.at/from".into(), DID_ALICE.into()),
+            ("+freeq.at/act-id".into(), task.clone()),
+            ("+freeq.at/act-subject".into(), task.clone()),
+        ];
+        a.tx(&signed_line(&tags, "#ops", &fresh_id(), &signing));
+        let line = a.fail();
+        assert!(line.contains(" WRONG_SENDER "), "{line}");
+        assert!(
+            line.ends_with("Only the action's home confirms it"),
+            "the approved sentence: {line}"
+        );
+    })
+    .await;
+}
+
+/// A task in a direct conversation is confirmed too, and to both ends of it.
+/// The line names the thread from the sender's side — the same limitation the
+/// expiry notice carries, since a server-authored line has only the one target
+/// to write.
+#[tokio::test]
+async fn a_receipt_in_a_direct_conversation_reaches_both_participants() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+
+        let venue = freeq_sdk::chatsig::dm_venue(DID_ALICE, DID_BOB);
+        let id = fresh_id();
+        let tags = offer_tags();
+        let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let sig = freeq_sdk::act::sign_act(pairs, &venue, &id, &alice_key).unwrap();
+        let mut wire: Vec<String> = tags.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        wire.push(format!("{EVENT_ID_TAG}={id}"));
+        wire.push(format!("+freeq.at/sig={sig}"));
+        a.tx(&format!("@{} TAGMSG {DID_BOB}", wire.join(";")));
+        b.rx(|l| l.contains("+freeq.at/act="), "the DM task reaches bob");
+
+        // Bob accepts, in the same conversation, addressing alice.
+        let accept_id = fresh_id();
+        let steps: Vec<(String, String)> = vec![
+            ("+freeq.at/act".into(), "handoff".into()),
+            ("+freeq.at/act-verb".into(), "accept".into()),
+            ("+freeq.at/from".into(), DID_BOB.into()),
+            ("+freeq.at/act-id".into(), id.clone()),
+        ];
+        let pairs: Vec<(&str, &str)> = steps
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let sig = freeq_sdk::act::sign_act(pairs, &venue, &accept_id, &bob_key).unwrap();
+        let mut wire: Vec<String> = steps.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        wire.push(format!("{EVENT_ID_TAG}={accept_id}"));
+        wire.push(format!("+freeq.at/sig={sig}"));
+        b.tx(&format!("@{} TAGMSG {DID_ALICE}", wire.join(";")));
+
+        for c in [&mut a, &mut b] {
+            let line = c
+                .maybe(|l| l.contains("act-verb=confirm"), 3_000)
+                .expect("both ends of the conversation hear the receipt");
+            assert_eq!(receipt_subject(&line).as_deref(), Some(accept_id.as_str()));
+        }
+    })
+    .await;
+}
+
+/// Replay is where a late arrival learns what happened, receipts included —
+/// and a connection that did not ask for the capability gets none of it.
+#[tokio::test]
+async fn replay_carries_the_receipts_to_capability_holders_only() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let task = open_task(&mut a, &alice_key, "#ops", None);
+        let claim_id = fresh_id();
+        a.tx(&follow_up_line(
+            "claim", DID_ALICE, &task, "#ops", &claim_id, &alice_key,
+        ));
+        a.maybe(|l| l.contains("act-verb=confirm"), 3_000)
+            .expect("the claim is confirmed");
+        // A message too: the join replay interleaves task events with message
+        // history, so the batch needs one of each.
+        a.tx("PRIVMSG #ops :a line about it");
+
+        let mut late = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        late.tx("JOIN #ops");
+        let replayed = late
+            .maybe(|l| l.contains("act-verb=confirm"), 3_000)
+            .expect("the receipt replays like any other stored task event");
+        assert_eq!(
+            receipt_subject(&replayed).as_deref(),
+            Some(claim_id.as_str())
+        );
+        assert!(
+            replayed.contains("+freeq.at/sig="),
+            "with its signature, so a late arrival can check it: {replayed}"
+        );
+
+        let mut plain = C::guest(addr, "carol", BASE_CAPS);
+        plain.tx("JOIN #ops");
+        let ended = plain.rx(
+            |l| l.contains("+freeq.at/act") || l.split_whitespace().nth(1) == Some("366"),
+            "a task event, or the end of the burst",
+        );
+        assert!(
+            !ended.contains("+freeq.at/act"),
+            "no capability, no receipts either: {ended}"
+        );
+    })
+    .await;
+}
+
 // ── task history cannot be rewritten ────────────────────────────────────────
 
 #[tokio::test]

@@ -19,6 +19,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FreeqBot } from '../src/index.js';
 import * as act from '../src/act-verbs.js';
+import { verifyActTags } from '../src/act.js';
 
 const SERVER = process.env.FREEQ_SERVER_BIN ?? 'target/debug/freeq-server';
 const CHANNEL = '#acceptance';
@@ -60,6 +61,30 @@ async function main() {
     return r.json().catch(() => null);
   };
   const openWork = async () => (await api('/api/v1/actions')).tasks ?? [];
+  /** The key this server publishes as its own — what a receipt is checked against. */
+  const homeKey = async () =>
+    new Uint8Array(Buffer.from((await api('/api/v1/signing-key')).public_key, 'base64url'));
+  /**
+   * A stored event, back in the shape a verifier wants: the wire tags its
+   * canonical rebuilds to, plus the two fields the caller injects.
+   */
+  const asWire = (event) => {
+    const doc = JSON.parse(event.canonical);
+    const tags = {};
+    for (const [k, v] of Object.entries(doc)) {
+      if (k !== 'target' && k !== 'id') tags[`+freeq.at/${k}`] = v;
+    }
+    return { tags, target: doc.target, id: doc.id, sig: event.signature };
+  };
+  /** Every receipt in an event list, keyed by the event each one confirms. */
+  const receiptsBySubject = (events) => {
+    const out = new Map();
+    for (const e of events) {
+      const doc = JSON.parse(e.canonical);
+      if (doc['act-verb'] === 'confirm') out.set(doc['act-subject'], e);
+    }
+    return out;
+  };
   // The WebSocket endpoint lives on the web listener, not the IRC one.
   const url = `ws://127.0.0.1:${webPort}/irc`;
 
@@ -108,7 +133,10 @@ async function main() {
     await sleep(700);
     check(!(await openWork()).some((t) => t.act_id === declined), 'declined — gone from open work');
     const declinedHistory = await api(`/api/v1/actions/${declined}`);
-    check(declinedHistory.events.length === 2, 'its history keeps the offer and the decline');
+    check(
+      declinedHistory.events.length === 3,
+      'its history keeps the offer, the decline, and the home\'s word about the decline',
+    );
     check(declinedHistory.task === null, 'and it holds no live row');
 
     // ── the full run ──
@@ -134,7 +162,7 @@ async function main() {
     );
 
     step('accept', 'the worker takes it');
-    await act.accept(worker.ctx, task);
+    const acceptId = await act.accept(worker.ctx, task);
     await sleep(700);
     let row = (await openWork()).find((t) => t.act_id === task);
     check(row?.state === 'assigned', 'assigned');
@@ -158,11 +186,14 @@ async function main() {
     );
 
     step('complete', 'the worker finishes');
-    await act.complete(worker.ctx, task);
+    const completeId = await act.complete(worker.ctx, task);
     await sleep(700);
     check(!(await openWork()).some((t) => t.act_id === task), 'completed — gone from open work');
     const full = await api(`/api/v1/actions/${task}`);
-    check(full.events.length === 4, 'four events on file: offer, accept, progress, complete');
+    check(
+      full.events.length === 6,
+      'six events on file: offer, accept, progress, complete, and a receipt for each move',
+    );
     check(
       full.events.every((e) => typeof e.signature === 'string' && e.signature.startsWith('ed25519:')),
       'each one signed',
@@ -171,6 +202,23 @@ async function main() {
       full.events.every((e) => e.canonical.includes('"act-verb"')),
       'and stored as the exact bytes its signature covers',
     );
+
+    // ── the home's receipts ──
+    step('receipts', 'the home confirms every move, and only the moves');
+    const receipts = receiptsBySubject(full.events);
+    check(receipts.has(acceptId), 'the accept is confirmed');
+    check(receipts.has(completeId), 'the complete is confirmed');
+    check(receipts.size === 2, 'and nothing else is — an offer opens, a progress moves nothing');
+    const key = await homeKey();
+    for (const [subject, event] of receipts) {
+      const wire = asWire(event);
+      check(
+        wire.tags['+freeq.at/from'] === 'did:web:acceptance',
+        `signed under the server's own identity (${subject.slice(0, 8)}…)`,
+      );
+      const verdict = await verifyActTags(wire.tags, wire.target, wire.id, wire.sig, key);
+      check(verdict.ok === true, 'and its signature verifies against the key the server publishes');
+    }
 
     // ── replay ──
     step('replay', 'a third client joins late and is given the history');

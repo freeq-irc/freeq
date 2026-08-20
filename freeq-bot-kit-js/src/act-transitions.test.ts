@@ -12,7 +12,9 @@ import { fileURLToPath } from "node:url";
 import {
   DEADLINE_TOLERANCE_MS,
   checkOpen,
+  CONFIRMATION_VERB,
   checkTransition,
+  isConfirmation,
   eventTimeMs,
   initialState,
   isTerminal,
@@ -35,6 +37,13 @@ interface Step {
   system?: boolean;
   expect?: string;
   expect_refused?: RefusalReason;
+}
+
+/** Just enough of a kind's shape for the tests that read the file directly. */
+interface Kind {
+  opens: { verb: string; directed?: string; open: string };
+  terminal: string[];
+  transitions: { verb: string; from: string | string[]; to: string; who: string }[];
 }
 
 interface Sequence {
@@ -100,11 +109,15 @@ describe("the rules file", () => {
   });
 
   it("documents every refusal reason it uses", () => {
-    const used = new Set<string>(
-      (canonical.sequences as Sequence[]).flatMap((s) =>
+    // Both lists count: some reasons only an opener can earn.
+    const used = new Set<string>([
+      ...((canonical.sequences as Sequence[]).flatMap((s) =>
         s.steps.map((st) => st.expect_refused).filter(Boolean),
-      ) as string[],
-    );
+      ) as string[]),
+      ...((canonical.opening_sequences as { expect_refused?: string }[])
+        .map((o) => o.expect_refused)
+        .filter(Boolean) as string[]),
+    ]);
     for (const reason of used) {
       expect(refusalDescription(reason as RefusalReason), reason).not.toBe("refused");
     }
@@ -198,6 +211,40 @@ describe("the happy path", () => {
         ok: true,
         to: "cancelled",
       });
+    }
+  });
+});
+
+describe("the receipt verb", () => {
+  const refused = (reason: RefusalReason) => ({ ok: false, reason });
+
+  // A receipt is the home's word about an event, so a sender's `confirm` is
+  // refused wherever it appears — opening or moving, whatever kind it names,
+  // and even when the sender claims to be the server.
+  it("is never a sender's to write", () => {
+    expect(CONFIRMATION_VERB).toBe("confirm");
+    expect(checkTransition(directed("offered"), ev("confirm"), who(SCHOLAR))).toEqual(
+      refused("client-confirm"),
+    );
+    expect(
+      checkTransition(directed("offered"), ev("confirm"), { did: SERVER, isSystem: true }),
+    ).toEqual(refused("client-confirm"));
+    expect(checkOpen("handoff", "confirm", false, false)).toEqual(refused("client-confirm"));
+  });
+
+  // The answer must not read as "this kind has no such row yet", which would
+  // say a kind could add one. It cannot.
+  it("never reads as a verb a kind could add", () => {
+    expect(checkTransition({ ...directed("offered"), kind: "no-such-kind" }, ev("confirm"), who(SCHOLAR))).toEqual(
+      refused("client-confirm"),
+    );
+    expect(checkOpen("no-such-kind", "confirm", false, false)).toEqual(refused("client-confirm"));
+    for (const [name, kind] of Object.entries(canonical.kinds as Record<string, Kind>)) {
+      expect(
+        kind.transitions.some((t) => isConfirmation(t.verb)),
+        `${name} claims the receipt verb, which belongs to no kind`,
+      ).toBe(false);
+      expect(isConfirmation(kind.opens.verb), name).toBe(false);
     }
   });
 });

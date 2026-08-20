@@ -35,10 +35,11 @@ interface Vector {
 
 /**
  * The named vector's own tags and signature, checked under conditions that
- * must produce the named verdict class. `invalid` negatives carry delivery
- * context the signer never wrote (and the canonical those bytes rebuild to);
- * `unverifiable` negatives describe a check that cannot run — a stripped
- * mandatory tag, an unknown algorithm — where no canonical exists to rebuild.
+ * must produce the named verdict class. `invalid` negatives carry a signed
+ * fact the signer never wrote — delivery context, or a rewritten tag — and the
+ * canonical those bytes rebuild to; `unverifiable` negatives describe a check
+ * that cannot run — a stripped mandatory tag, an unknown algorithm — where no
+ * canonical exists to rebuild.
  */
 interface Negative {
   name: string;
@@ -48,7 +49,16 @@ interface Negative {
   id: string;
   tamperedCanonical?: string;
   strippedTag?: string;
+  swappedTag?: { name: string; value: string };
   sigAlgorithm?: string;
+}
+
+/** The vector's tags as a negative presents them to a verifier. */
+function tagsFor(n: Negative, v: Vector): Record<string, string> {
+  const tags = { ...v.tags };
+  if (n.strippedTag !== undefined) delete tags[n.strippedTag];
+  if (n.swappedTag !== undefined) tags[n.swappedTag.name] = n.swappedTag.value;
+  return tags;
 }
 
 const fixtures: { vectors: Vector[]; negatives: Negative[] } = JSON.parse(
@@ -107,20 +117,30 @@ describe("act signing negatives (shared with Rust)", () => {
     if (n.expected === "invalid") {
       it(`${n.name}: rebuilds the tampered canonical byte-for-byte`, () => {
         expect(v).toBeDefined();
-        expect(actCanonical(v.tags, n.target, n.id)).toBe(n.tamperedCanonical);
+        expect(actCanonical(tagsFor(n, v), n.target, n.id)).toBe(n.tamperedCanonical);
       });
 
       it(`${n.name}: the vector's own signature reads invalid`, async () => {
         expect(
-          await verifyActTags(v.tags, n.target, n.id, v.sigTag, b64urlDecode(v.publicKey)),
+          await verifyActTags(
+            tagsFor(n, v),
+            n.target,
+            n.id,
+            v.sigTag,
+            b64urlDecode(v.publicKey),
+          ),
         ).toEqual({ ok: false, reason: "sig-invalid" });
       });
     } else if (n.strippedTag !== undefined) {
       it(`${n.name}: a stripped mandatory tag reads unverifiable, never invalid`, async () => {
-        const tags = { ...v.tags };
-        delete tags[n.strippedTag!];
         expect(
-          await verifyActTags(tags, n.target, n.id, v.sigTag, b64urlDecode(v.publicKey)),
+          await verifyActTags(
+            tagsFor(n, v),
+            n.target,
+            n.id,
+            v.sigTag,
+            b64urlDecode(v.publicKey),
+          ),
         ).toEqual({ ok: false, reason: "missing-from" });
       });
     } else if (n.sigAlgorithm !== undefined) {
