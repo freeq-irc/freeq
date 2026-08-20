@@ -1012,6 +1012,10 @@ pub(super) fn gate(
                     missing = format!("That step must carry {field}");
                     ("MISSING_REQUIREMENT", missing.as_str())
                 }
+                Refusal::AcceptsNotABid => (
+                    "ACCEPTS_NOT_A_BID",
+                    "The award names an event that is not a bid on this action",
+                ),
             };
             tracing::debug!(
                 session = %conn.id, did = %did, act_id = %act_id, reason = %reason,

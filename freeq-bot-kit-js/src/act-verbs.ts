@@ -200,23 +200,25 @@ export async function bid(
 }
 
 /**
- * Pick the winner of a bounty you posted, and assign the work to them.
+ * Take one of the bids on a bounty you posted, and assign the work to whoever
+ * wrote it.
  *
- * The poster names a winner rather than becoming one, which is why `act-to`
- * is on the award and why the view reads the assignee from it. Nothing checks
- * that the winner bid: the server never picks, and that cuts both ways — this
- * signed choice is the record.
+ * `bidEventId` is the bid's own event id, not the bidder's DID: a bounty's
+ * terms live in the bid, and bids are the one place several candidates sit
+ * side by side, so taking one means naming the exact event. The server checks
+ * only that the named event is a bid on this action — which of them is worth
+ * taking stays the poster's signed choice.
  */
 export async function award(
   ctx: ActContext,
   taskId: string,
-  winnerDid: string,
+  bidEventId: string,
   opts: StepOptions = {},
 ): Promise<string> {
   const tags = stepTags("award", ctx.did, taskId, opts.note, BOUNTY);
-  tags["+freeq.at/act-to"] = winnerDid;
+  tags["+freeq.at/act-accepts"] = bidEventId;
   return ctx.client.sendAct(ctx.target, tags, {
-    humanText: opts.humanText ?? `awarded the bounty to ${winnerDid}`,
+    humanText: opts.humanText ?? 'awarded the bounty',
     taskId,
   });
 }

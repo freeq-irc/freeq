@@ -176,14 +176,16 @@ describe("the bounty verbs", () => {
     expect(sent[0].taskId).toBe("01JTASK00000000000000000AA");
   });
 
-  it("awards the work to the winner it names, not to the poster naming them", async () => {
+  it("takes the bid it names, and names no DID at all", async () => {
     const sent: Sent[] = [];
-    await award(ctxWith(sent), "01JTASK00000000000000000AA", "did:plc:worker");
+    await award(ctxWith(sent), "01JTASK00000000000000000AA", "01JBID000000000000000000BB");
     const { tags } = sent[0];
     expect(tags["+freeq.at/act-verb"]).toBe("award");
-    expect(tags["+freeq.at/act-to"]).toBe("did:plc:worker");
+    expect(tags["+freeq.at/act-accepts"]).toBe("01JBID000000000000000000BB");
+    // The winner is the bid's author, so the award names no recipient of its
+    // own — two sources for one fact is what naming a DID here would be.
+    expect(tags["+freeq.at/act-to"]).toBeUndefined();
     expect(tags["+freeq.at/from"]).toBe("did:plc:bot");
-    expect(sent[0].humanText).toContain("did:plc:worker");
   });
 
   it("carries the kind on a bounty's follow-ups too", async () => {

@@ -287,6 +287,10 @@ mod tests {
     /// event id, exactly as a handoff's is.
     const BOUNTY_ID: &str = "01JBOUNTYEVENTID00000000B";
 
+    /// The bid on it, and so the value the award names in `act-accepts`: an
+    /// award takes an event, not a DID.
+    const BID_ID: &str = "01JBIDEVENTID00000000000B";
+
     /// The RFC's directed-offer example, as a wire tag map (plus tags that
     /// must NOT be covered as tags: sig, eventid, msgid, actor-class).
     fn offer_tags() -> Vec<(&'static str, &'static str)> {
@@ -782,13 +786,13 @@ mod tests {
                     ("+freeq.at/act-note", "two days, sources included"),
                 ],
                 target: "#swarm",
-                id: "01JBIDEVENTID00000000000B",
+                id: BID_ID,
             },
             Case {
-                // The award: the poster names a winner in act-to, and the
-                // view reads the assignee from that field rather than from
-                // the actor. Both are covered by the signature, so neither
-                // can be re-pointed in transit.
+                // The award: the poster takes one bid by naming its event id,
+                // and the view reads the assignee from that bid's author
+                // rather than from the actor. The pointer is covered by the
+                // signature, so it cannot be re-pointed in transit.
                 name: "bounty-award",
                 seed: 8,
                 tags: vec![
@@ -796,7 +800,7 @@ mod tests {
                     ("+freeq.at/act-verb", "award"),
                     ("+freeq.at/from", "did:plc:eliza"),
                     ("+freeq.at/act-id", BOUNTY_ID),
-                    ("+freeq.at/act-to", "did:plc:scholar"),
+                    ("+freeq.at/act-accepts", BID_ID),
                 ],
                 target: "#swarm",
                 id: "01JAWARDEVENTID000000000A",
@@ -926,16 +930,16 @@ mod tests {
                 swap_alg: None,
             },
             Negative {
-                // An award with its winner stripped. Unlike a missing
-                // envelope field this is strip-*detectable*: act-to is an act
-                // tag, so the sweep covered it and the document rebuilds
+                // An award with the bid it takes stripped. Unlike a missing
+                // envelope field this is strip-*detectable*: act-accepts is an
+                // act tag, so the sweep covered it and the document rebuilds
                 // without it into bytes the signature contradicts.
-                name: "award-with-its-winner-stripped",
+                name: "award-with-its-bid-stripped",
                 of: "bounty-award",
                 expected: "invalid",
                 target: "#swarm",
                 id: "01JAWARDEVENTID000000000A",
-                strip_tag: Some("+freeq.at/act-to"),
+                strip_tag: Some("+freeq.at/act-accepts"),
                 swap_tag: None,
                 swap_alg: None,
             },

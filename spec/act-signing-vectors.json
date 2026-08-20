@@ -38,8 +38,8 @@
     {
       "expected": "invalid",
       "id": "01JAWARDEVENTID000000000A",
-      "name": "award-with-its-winner-stripped",
-      "strippedTag": "+freeq.at/act-to",
+      "name": "award-with-its-bid-stripped",
+      "strippedTag": "+freeq.at/act-accepts",
       "tamperedCanonical": "{\"act\":\"bounty\",\"act-id\":\"01JBOUNTYEVENTID00000000B\",\"act-verb\":\"award\",\"from\":\"did:plc:eliza\",\"id\":\"01JAWARDEVENTID000000000A\",\"target\":\"#swarm\"}",
       "target": "#swarm",
       "vector": "bounty-award"
@@ -143,17 +143,17 @@
       "target": "#swarm"
     },
     {
-      "canonical": "{\"act\":\"bounty\",\"act-id\":\"01JBOUNTYEVENTID00000000B\",\"act-to\":\"did:plc:scholar\",\"act-verb\":\"award\",\"from\":\"did:plc:eliza\",\"id\":\"01JAWARDEVENTID000000000A\",\"target\":\"#swarm\"}",
+      "canonical": "{\"act\":\"bounty\",\"act-accepts\":\"01JBIDEVENTID00000000000B\",\"act-id\":\"01JBOUNTYEVENTID00000000B\",\"act-verb\":\"award\",\"from\":\"did:plc:eliza\",\"id\":\"01JAWARDEVENTID000000000A\",\"target\":\"#swarm\"}",
       "id": "01JAWARDEVENTID000000000A",
       "kid": "XCm3jxCjWkmmIx0I7oQKBA",
       "name": "bounty-award",
       "publicKey": "E5j2LG0aRXxRumpLXz29L2n8qTIWIY3ImX5Ba9F9k8o",
       "seed": "0808080808080808080808080808080808080808080808080808080808080808",
-      "sigTag": "ed25519:XCm3jxCjWkmmIx0I7oQKBA:812WbPDfzcqaVteOZykVBA6VfGzmUrr1JFJMMdTEdmeRQrd5BI45326wKNoBkAKRaRagqGFsN7Q02RO5VhkuCg",
+      "sigTag": "ed25519:XCm3jxCjWkmmIx0I7oQKBA:wrN_n38AQwose1bwTeLVs9cH5BvIilDESRG-dCkPfIjHIBnnS04FJmFMGxdFpSgezg3sJC0trQJ2xbb_1CtUAg",
       "tags": {
         "+freeq.at/act": "bounty",
+        "+freeq.at/act-accepts": "01JBIDEVENTID00000000000B",
         "+freeq.at/act-id": "01JBOUNTYEVENTID00000000B",
-        "+freeq.at/act-to": "did:plc:scholar",
         "+freeq.at/act-verb": "award",
         "+freeq.at/from": "did:plc:eliza"
       },

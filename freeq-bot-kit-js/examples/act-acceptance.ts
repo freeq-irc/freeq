@@ -271,7 +271,7 @@ async function main() {
       `open (${bounty})`,
     );
 
-    await act.bid(worker.ctx, bounty, { note: 'two days' });
+    const workerBid = await act.bid(worker.ctx, bounty, { note: 'two days' });
     await act.bid(rival.ctx, bounty, { note: 'one day, no sources' });
     await sleep(900);
     check(
@@ -284,14 +284,14 @@ async function main() {
       'both bids are on file, neither superseding the other',
     );
 
-    step('award', 'the poster picks the winner');
-    const awardId = await act.award(poster.ctx, bounty, worker.ctx.did);
+    step('award', 'the poster takes one of the bids');
+    const awardId = await act.award(poster.ctx, bounty, workerBid);
     await sleep(700);
     const awarded = (await openWork()).find((t) => t.act_id === bounty);
     check(awarded?.state === 'assigned', 'assigned');
     check(
       awarded?.assignee === worker.ctx.did,
-      'and the assignee is the winner the poster named, not the poster',
+      'and the assignee is the author of the bid it took, not the poster',
     );
     check(
       receiptsBySubject((await api(`/api/v1/actions/${bounty}`)).events).has(awardId),

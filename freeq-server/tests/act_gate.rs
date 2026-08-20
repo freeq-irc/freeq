@@ -1112,12 +1112,12 @@ async fn replay_carries_the_receipts_to_capability_holders_only() {
 
 // ── bounty: the second kind, and no code of its own ─────────────────────────
 
-/// A bounty step, signed. `to` is the winner an award names.
+/// A bounty step, signed. `accepts` is the bid an award takes.
 fn bounty_line(
     verb: &str,
     from: &str,
     task: Option<&str>,
-    to: Option<&str>,
+    accepts: Option<&str>,
     channel: &str,
     id: &str,
     key: &SigningKey,
@@ -1131,17 +1131,29 @@ fn bounty_line(
         Some(t) => tags.push(("+freeq.at/act-id".into(), t.into())),
         None => tags.push(("+freeq.at/act-title".into(), "index-the-archive".into())),
     }
-    if let Some(to) = to {
-        tags.push(("+freeq.at/act-to".into(), to.into()));
+    if let Some(accepts) = accepts {
+        tags.push(("+freeq.at/act-accepts".into(), accepts.into()));
     }
     signed_line(&tags, channel, id, key)
 }
 
+/// A bounty opener carrying a recipient, which is the one thing it cannot do.
+fn directed_bounty_line(from: &str, channel: &str, id: &str, key: &SigningKey) -> String {
+    let tags: Vec<(String, String)> = vec![
+        ("+freeq.at/act".into(), "bounty".into()),
+        ("+freeq.at/act-verb".into(), "offer".into()),
+        ("+freeq.at/from".into(), from.into()),
+        ("+freeq.at/act-title".into(), "index-the-archive".into()),
+        ("+freeq.at/act-to".into(), DID_BOB.into()),
+    ];
+    signed_line(&tags, channel, id, key)
+}
+
 /// The test of generality: a second kind that needed a table row and no code.
-/// Bids pile up without moving anything, the poster names a winner, and the
-/// winner — not the poster who named them — is the one who can finish it.
+/// Bids pile up without moving anything, the poster takes one of them, and its
+/// author — not the poster who took it — is the one who can finish the work.
 #[tokio::test]
-async fn a_bounty_takes_bids_and_the_poster_awards_the_winner() {
+async fn a_bounty_awards_the_bid_it_names_and_the_bidder_becomes_assignee() {
     let ka = key();
     let kb = key();
     let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
@@ -1162,6 +1174,7 @@ async fn a_bounty_takes_bids_and_the_poster_awards_the_winner() {
         a.rx(|l| l.contains(&bounty), "the bounty opens");
 
         // Two bids, from two agents, neither of which moves it.
+        let mut bids = Vec::new();
         for (did, k) in [(DID_ALICE, &alice_key), (DID_BOB, &bob_key)] {
             let bid = fresh_id();
             let line = bounty_line("bid", did, Some(&bounty), None, "#ops", &bid, k);
@@ -1170,16 +1183,17 @@ async fn a_bounty_takes_bids_and_the_poster_awards_the_winner() {
                 false => b.tx(&line),
             }
             b.rx(|l| l.contains(&bid), "the bid is accepted");
+            bids.push(bid);
         }
 
-        // The poster picks. Bob is the winner; alice named him and did not
-        // become him.
+        // The poster takes bob's bid — the second one, so the assignee cannot
+        // have come from the sender or from whichever bid arrived first.
         let award = fresh_id();
         a.tx(&bounty_line(
             "award",
             DID_ALICE,
             Some(&bounty),
-            Some(DID_BOB),
+            Some(&bids[1]),
             "#ops",
             &award,
             &alice_key,
@@ -1214,11 +1228,11 @@ async fn a_bounty_takes_bids_and_the_poster_awards_the_winner() {
     .await;
 }
 
-/// An award naming nobody assigns nobody, so the row's `requires` refuses it —
+/// An award naming no bid takes nothing, so the row's `requires` refuses it —
 /// and the sentence names the field rather than the verb, because which field
 /// a step needs is the rules file's to say.
 #[tokio::test]
-async fn an_award_that_names_no_winner_is_refused() {
+async fn an_award_that_names_no_bid_is_refused() {
     let k = key();
     let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
     run(addr, move |addr| {
@@ -1245,9 +1259,75 @@ async fn an_award_that_names_no_winner_is_refused() {
         let line = a.fail();
         assert!(line.contains(" MISSING_REQUIREMENT "), "{line}");
         assert!(
-            line.ends_with("That step must carry act-to"),
+            line.ends_with("That step must carry act-accepts"),
             "the approved sentence names the missing field: {line}"
         );
+    })
+    .await;
+}
+
+/// An award points at one event, and only a bid on the same action answers.
+/// The bounty's own opener is not one, and neither is an id nobody filed.
+#[tokio::test]
+async fn an_award_naming_a_non_bid_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+
+        let bounty = fresh_id();
+        a.tx(&bounty_line(
+            "offer", DID_ALICE, None, None, "#ops", &bounty, &signing,
+        ));
+        a.rx(|l| l.contains(&bounty), "the bounty opens");
+
+        let bid = fresh_id();
+        a.tx(&bounty_line(
+            "bid",
+            DID_ALICE,
+            Some(&bounty),
+            None,
+            "#ops",
+            &bid,
+            &signing,
+        ));
+        a.rx(|l| l.contains(&bid), "the bid is accepted");
+
+        // The opener, and then an id this server never filed at all.
+        for named in [bounty.clone(), fresh_id()] {
+            a.tx(&bounty_line(
+                "award",
+                DID_ALICE,
+                Some(&bounty),
+                Some(&named),
+                "#ops",
+                &fresh_id(),
+                &signing,
+            ));
+            let line = a.fail();
+            assert!(line.contains(" ACCEPTS_NOT_A_BID "), "{named}: {line}");
+            assert!(
+                line.ends_with("The award names an event that is not a bid on this action"),
+                "{line}"
+            );
+        }
+
+        // …and the bid itself still works, so the refusals were about what
+        // was named and not about the award.
+        let done = fresh_id();
+        a.tx(&bounty_line(
+            "award",
+            DID_ALICE,
+            Some(&bounty),
+            Some(&bid),
+            "#ops",
+            &done,
+            &signing,
+        ));
+        a.rx(|l| l.contains(&done), "the award is accepted");
     })
     .await;
 }
@@ -1263,11 +1343,8 @@ async fn a_bounty_opened_to_one_recipient_is_refused() {
         let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
         a.msgsig(&signing);
         a.join("#ops");
-        a.tx(&bounty_line(
-            "offer",
+        a.tx(&directed_bounty_line(
             DID_ALICE,
-            None,
-            Some(DID_BOB),
             "#ops",
             &fresh_id(),
             &signing,
