@@ -59,7 +59,7 @@ async function main() {
     const r = await fetch(`http://127.0.0.1:${webPort}${path}`);
     return r.json().catch(() => null);
   };
-  const openWork = async () => (await api('/api/v1/act/tasks')).tasks ?? [];
+  const openWork = async () => (await api('/api/v1/actions')).tasks ?? [];
   // The WebSocket endpoint lives on the web listener, not the IRC one.
   const url = `ws://127.0.0.1:${webPort}/irc`;
 
@@ -107,7 +107,7 @@ async function main() {
     await act.decline(worker.ctx, declined);
     await sleep(700);
     check(!(await openWork()).some((t) => t.act_id === declined), 'declined — gone from open work');
-    const declinedHistory = await api(`/api/v1/act/tasks/${declined}`);
+    const declinedHistory = await api(`/api/v1/actions/${declined}`);
     check(declinedHistory.events.length === 2, 'its history keeps the offer and the decline');
     check(declinedHistory.task === null, 'and it holds no live row');
 
@@ -161,7 +161,7 @@ async function main() {
     await act.complete(worker.ctx, task);
     await sleep(700);
     check(!(await openWork()).some((t) => t.act_id === task), 'completed — gone from open work');
-    const full = await api(`/api/v1/act/tasks/${task}`);
+    const full = await api(`/api/v1/actions/${task}`);
     check(full.events.length === 4, 'four events on file: offer, accept, progress, complete');
     check(
       full.events.every((e) => typeof e.signature === 'string' && e.signature.startsWith('ed25519:')),
@@ -192,7 +192,7 @@ async function main() {
       !(await openWork()).some((t) => t.act_id === abandoned),
       'expired out of the live view',
     );
-    const swept = await api(`/api/v1/act/tasks/${abandoned}`);
+    const swept = await api(`/api/v1/actions/${abandoned}`);
     check(
       swept.events.some((e) => e.canonical.includes('"act-verb":"expire"')),
       "the server's own expire event is on file",

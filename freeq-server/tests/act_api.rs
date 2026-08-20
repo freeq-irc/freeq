@@ -217,7 +217,7 @@ async fn the_listing_answers_with_open_work_and_its_declared_fields() {
     .await
     .unwrap();
 
-    let (status, body) = get(web, "/api/v1/act/tasks", None).await;
+    let (status, body) = get(web, "/api/v1/actions", None).await;
     assert_eq!(status, 200);
     assert_eq!(ids(&body), vec![task.clone()]);
     let row = &body["tasks"][0];
@@ -243,11 +243,11 @@ async fn the_listing_filters_by_kind_and_state() {
     .await
     .unwrap();
 
-    let (_, open) = get(web, "/api/v1/act/tasks?state=open", None).await;
+    let (_, open) = get(web, "/api/v1/actions?state=open", None).await;
     assert_eq!(open["tasks"].as_array().unwrap().len(), 1);
-    let (_, assigned) = get(web, "/api/v1/act/tasks?state=assigned", None).await;
+    let (_, assigned) = get(web, "/api/v1/actions?state=assigned", None).await;
     assert!(assigned["tasks"].as_array().unwrap().is_empty());
-    let (_, bounty) = get(web, "/api/v1/act/tasks?kind=bounty", None).await;
+    let (_, bounty) = get(web, "/api/v1/actions?kind=bounty", None).await;
     assert!(bounty["tasks"].as_array().unwrap().is_empty());
 }
 
@@ -274,20 +274,20 @@ async fn a_task_in_a_direct_conversation_is_private_to_its_two_participants() {
     .unwrap();
 
     // Anonymous sees nothing of it.
-    let (_, anon) = get(web, "/api/v1/act/tasks", None).await;
+    let (_, anon) = get(web, "/api/v1/actions", None).await;
     assert!(
         ids(&anon).is_empty(),
         "a DM task must not appear for an anonymous caller: {anon}"
     );
-    let (status, _) = get(web, &format!("/api/v1/act/tasks/{task}"), None).await;
+    let (status, _) = get(web, &format!("/api/v1/actions/{task}"), None).await;
     assert_eq!(status, 403);
 
     eprintln!("DEBUG alice_bearer={alice_bearer:?} bob_bearer={bob_bearer:?}");
     // Both participants see it.
     for bearer in [&alice_bearer, &bob_bearer] {
-        let (_, body) = get(web, "/api/v1/act/tasks", Some(bearer)).await;
+        let (_, body) = get(web, "/api/v1/actions", Some(bearer)).await;
         assert_eq!(ids(&body), vec![task.clone()]);
-        let (status, one) = get(web, &format!("/api/v1/act/tasks/{task}"), Some(bearer)).await;
+        let (status, one) = get(web, &format!("/api/v1/actions/{task}"), Some(bearer)).await;
         assert_eq!(status, 200);
         assert_eq!(one["task"]["venue"], one["venue"]);
     }
@@ -332,7 +332,7 @@ async fn one_task_comes_back_with_its_whole_event_history() {
     .await
     .unwrap();
 
-    let (status, body) = get(web, &format!("/api/v1/act/tasks/{task}"), None).await;
+    let (status, body) = get(web, &format!("/api/v1/actions/{task}"), None).await;
     assert_eq!(status, 200);
     assert_eq!(
         body["events"].as_array().unwrap().len(),
@@ -353,7 +353,7 @@ async fn one_task_comes_back_with_its_whole_event_history() {
     );
 
     // …and it is gone from the open-work listing.
-    let (_, listing) = get(web, "/api/v1/act/tasks", None).await;
+    let (_, listing) = get(web, "/api/v1/actions", None).await;
     assert!(ids(&listing).is_empty());
 }
 
@@ -422,6 +422,6 @@ async fn a_task_event_moves_the_counter_on_the_metrics_endpoint() {
 async fn a_task_nobody_ever_opened_is_not_found() {
     let k = PrivateKey::generate_ed25519();
     let (_irc, web, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
-    let (status, _) = get(web, "/api/v1/act/tasks/01JNOSUCHTASK00000000000X", None).await;
+    let (status, _) = get(web, "/api/v1/actions/01JNOSUCHTASK00000000000X", None).await;
     assert_eq!(status, 404);
 }

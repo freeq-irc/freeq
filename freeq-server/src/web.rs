@@ -197,8 +197,8 @@ pub fn router(state: Arc<SharedState>) -> Router {
             post(crate::model_proxy::chat_completions),
         )
         .route("/metrics", get(api_metrics))
-        .route("/api/v1/act/tasks", get(api_act_tasks))
-        .route("/api/v1/act/tasks/{act_id}", get(api_act_task))
+        .route("/api/v1/actions", get(api_act_tasks))
+        .route("/api/v1/actions/{act_id}", get(api_act_task))
         .route("/api/v1/channels", get(api_channels))
         .route("/api/v1/channels/{name}/history", get(api_channel_history))
         .route("/api/v1/search", get(api_search))
@@ -860,7 +860,7 @@ fn act_task_json(task: &crate::db::ActTask) -> serde_json::Value {
     })
 }
 
-/// GET /api/v1/act/tasks — the live tasks this caller may see.
+/// GET /api/v1/actions — the live tasks this caller may see.
 ///
 /// Filters: `kind`, `assignee`, `state`. Open work is the question this
 /// answers, so finished tasks are not here — their history is at the
@@ -900,7 +900,7 @@ async fn api_act_tasks(
     Ok(Json(serde_json::json!({ "tasks": tasks })))
 }
 
-/// GET /api/v1/act/tasks/{act_id} — one task and every event of it.
+/// GET /api/v1/actions/{act_id} — one task and every event of it.
 ///
 /// Serves a finished task too: the view drops it, the log keeps it, and the
 /// history is what a reader came for. `task` is null once it has ended.
