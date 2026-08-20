@@ -153,7 +153,7 @@ pub(crate) fn expire_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -
         ("+freeq.at/act-from", did.as_str()),
         ("+freeq.at/act-id", task.act_id.as_str()),
     ];
-    let Some(canonical) = freeq_sdk::act::act_canonical(tags, &task.venue, &event_id) else {
+    let Ok(canonical) = freeq_sdk::act::act_canonical(tags, &task.venue, &event_id) else {
         return false;
     };
     let signature = freeq_sdk::sigtag::sign_canonical(&canonical, &state.msg_signing_key);
@@ -302,9 +302,18 @@ pub(super) fn replay_lines(
             let fields = doc.as_object()?;
             let mut tags: HashMap<String, String> = HashMap::new();
             for (key, value) in fields {
-                // `target` and `msgid` are the two the caller injected; they
+                // `target` and `id` are the two the caller injected; they
                 // ride as the message's own target and id, not as act tags.
-                if key == "target" || key == "msgid" {
+                if key == "target" || key == "id" {
+                    continue;
+                }
+                // The signer's document key is `from`; its wire tag is
+                // act-from. Replay re-frames the document as the wire.
+                if key == "from" {
+                    tags.insert(
+                        "+freeq.at/act-from".to_string(),
+                        value.as_str()?.to_string(),
+                    );
                     continue;
                 }
                 tags.insert(format!("+freeq.at/{key}"), value.as_str()?.to_string());
@@ -725,7 +734,7 @@ pub(super) fn gate(
             .unwrap_or_default(),
     };
     let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let Some(canonical) = freeq_sdk::act::act_canonical(pairs, &venue, &msgid) else {
+    let Ok(canonical) = freeq_sdk::act::act_canonical(pairs, &venue, &msgid) else {
         return Gate::Refused;
     };
     let now = std::time::SystemTime::now()

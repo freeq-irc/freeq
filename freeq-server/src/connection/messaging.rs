@@ -343,6 +343,11 @@ pub(super) fn verify_act_signature<'a>(
     match freeq_sdk::act::verify_act(tags, venue, msgid, sig_tag, &key) {
         Ok(()) => ClientSigOutcome::Verified,
         Err(freeq_sdk::act::ActSigError::SigInvalid) => ClientSigOutcome::Failed,
+        // A mandatory canonical field is absent. Not evidence about the
+        // sender — unverifiable, never invalid (thread agreement 2026-08-02).
+        Err(freeq_sdk::act::ActSigError::MissingFrom) => {
+            ClientSigOutcome::Unverifiable("missing mandatory field: from")
+        }
         // A kid that does not match, a format we cannot read, or no act tags
         // at all: none of these is evidence of forgery.
         Err(_) => ClientSigOutcome::Unverifiable("unusable signature tag"),

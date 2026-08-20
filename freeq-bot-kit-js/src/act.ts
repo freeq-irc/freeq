@@ -1,8 +1,11 @@
 // Signing and verification for `freeq.at/act` action messages.
 //
-// Implements the act canonical from the act RFC (docs/HANDOFF-RFC.md, v0.4):
-// the signature covers every `act-*` tag present on the message — not a
-// fixed field list — JCS-canonicalized with sorted keys. Must stay
+// Implements the act canonical from the act RFC (the gist body plus the
+// comment thread, which is part of the RFC): the signature covers every
+// `act-*` tag present on the message — not a fixed field list —
+// JCS-canonicalized with sorted keys. Canonical keys follow the thread
+// agreement frozen 2026-08-02: semantic names, with `from`/`id`/`target`
+// mandatory and a missing one reading unverifiable, never invalid. Must stay
 // byte-compatible with `freeq_sdk::act` on the Rust side; the shared
 // contract is `spec/act-signing-vectors.json`, which both test suites
 // reproduce exactly.
@@ -18,15 +21,19 @@
 // Canonical mapping rules (see the Rust module for the full rationale):
 // - covered iff the tag name, after stripping `+freeq.at/`, is `act` or
 //   starts with `act-` (`actor-class` and `sig` are NOT covered)
-// - canonical keys are the stripped names; values verbatim, always strings
-// - two more keys are injected by the caller, never read from a tag — the
-//   same two chat's documents carry: `target`, the normalized venue (a
-//   channel lowercased, or `dm:<did_a>,<did_b>` with the DIDs sorted), and
-//   `msgid`, the event id the signer minted (`+freeq.at/eventid` on the
-//   wire). Neither can collide with a covered key, which always starts with
-//   `act`. Without the venue an offer signed in one room replays into
-//   another intact; without the id a task's identity is the one unsigned
-//   thing about it.
+// - canonical keys are the stripped names; values verbatim, always strings.
+//   One exception: `act-from` never appears under its own name — its value
+//   is the document's `from`, the signer's semantic key, same as chat.
+// - two more keys are injected by the caller, never read from a tag:
+//   `target`, the normalized venue (a channel lowercased, or
+//   `dm:<did_a>,<did_b>` with the DIDs sorted), and `id`, the event id the
+//   signer minted (`+freeq.at/eventid` on the wire). No mandatory name can
+//   collide with a covered key, which always starts with `act`. Without the
+//   venue an offer signed in one room replays into another intact; without
+//   the id a task's identity is the one unsigned thing about it.
+// - `from`/`id`/`target` are mandatory: a document missing one reads
+//   unverifiable ("missing-from" here), never invalid — an absence is not
+//   evidence about the sender.
 // - an offer carries no `act-id`: its own event id is the task's id. Later
 //   events name that id in `act-id` and mint their own id for themselves.
 // - sig tag value: `ed25519:<kid>:<base64url sig>`, kid =
@@ -47,6 +54,7 @@ export type ActVerifyResult =
       ok: false;
       reason:
         | "no-act-tags"
+        | "missing-from"
         | "bad-sig-format"
         | "unsupported-algorithm"
         | "kid-mismatch"
@@ -68,22 +76,29 @@ function isActTag(tagName: string): boolean {
  * Build the canonical string over the act tags in `tags` (wire names,
  * unescaped values), the venue, and the event id.
  *
- * `target` and `msgid` are supplied by the caller — a verifier rebuilds them
- * from delivery context rather than reading either off a tag. Returns null if
- * no act tags are present: delivery context alone is not a document.
+ * `target` and `id` are supplied by the caller — a verifier rebuilds them
+ * from delivery context rather than reading either off a tag. The signer's
+ * DID is read from the `act-from` tag and enters the document as `from`.
+ * Returns null when there is no document to build: no act tags at all, or
+ * act tags missing their signer (`verifyActTags` tells those two apart).
  */
 export function actCanonical(
   tags: Record<string, string>,
   target: string,
-  msgid: string,
+  id: string,
 ): string | null {
   const covered: Record<string, string> = {};
+  let from: string | null = null;
   for (const [name, value] of Object.entries(tags)) {
-    if (isActTag(name)) covered[strippedName(name)] = value;
+    if (!isActTag(name)) continue;
+    const stripped = strippedName(name);
+    if (stripped === "act-from") from = value;
+    else covered[stripped] = value;
   }
-  if (Object.keys(covered).length === 0) return null;
+  if (from === null) return null;
+  covered.from = from;
+  covered.id = id;
   covered.target = target;
-  covered.msgid = msgid;
   return canonicalizeForSigning(covered);
 }
 
@@ -94,17 +109,17 @@ export async function deriveKid(rawPublicKey: Uint8Array): Promise<string> {
 }
 
 /**
- * Sign the act tags, posted to `target` under `msgid`, with a DidKey. Returns
- * the sig tag value (`ed25519:<kid>:<base64url sig>`), or null if no act tags
- * are present.
+ * Sign the act tags, posted to `target` under `id`, with a DidKey. Returns
+ * the sig tag value (`ed25519:<kid>:<base64url sig>`), or null when there is
+ * no document to sign (no act tags, or none naming the signer).
  */
 export async function signActTags(
   tags: Record<string, string>,
   target: string,
-  msgid: string,
+  id: string,
   key: DidKey,
 ): Promise<string | null> {
-  const canonical = actCanonical(tags, target, msgid);
+  const canonical = actCanonical(tags, target, id);
   if (canonical === null) return null;
   const sig = await key.signer(new TextEncoder().encode(canonical));
   const kid = await deriveKid(publicKeyFromMultibase(key.publicKeyMultibase));
@@ -114,14 +129,16 @@ export async function signActTags(
 /**
  * Verify an act sig tag over `tags` against a raw 32-byte public key.
  *
- * `target` and `msgid` come from the receiver's own view of the delivery — the
+ * `target` and `id` come from the receiver's own view of the delivery — the
  * venue the message arrived in and the id it is being filed under — so a
  * message replayed elsewhere, or filed under another id, reads as tampering.
+ * A missing mandatory field reads unverifiable ("missing-from"), never
+ * invalid.
  */
 export async function verifyActTags(
   tags: Record<string, string>,
   target: string,
-  msgid: string,
+  id: string,
   sigTag: string,
   rawPublicKey: Uint8Array,
 ): Promise<ActVerifyResult> {
@@ -129,9 +146,16 @@ export async function verifyActTags(
   if (parts.length !== 3) return { ok: false, reason: "bad-sig-format" };
   const [alg, kid, sigB64] = parts;
   if (alg !== "ed25519") return { ok: false, reason: "unsupported-algorithm" };
+  // The document before the kid, mirroring Rust: a missing mandatory field is
+  // reported as itself, not as whatever later check happens to fail first.
+  const canonical = actCanonical(tags, target, id);
+  if (canonical === null) {
+    const anyActTag = Object.keys(tags).some(isActTag);
+    // Both are unverifiable-class: an absence is not evidence about the
+    // sender (thread agreement 2026-08-02).
+    return { ok: false, reason: anyActTag ? "missing-from" : "no-act-tags" };
+  }
   if ((await deriveKid(rawPublicKey)) !== kid) return { ok: false, reason: "kid-mismatch" };
-  const canonical = actCanonical(tags, target, msgid);
-  if (canonical === null) return { ok: false, reason: "no-act-tags" };
   let sig: Uint8Array;
   try {
     sig = b64urlDecode(sigB64);

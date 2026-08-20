@@ -261,8 +261,11 @@ export async function coordinationCanonical(fields: {
 /** Derive a key id: base64url of the first 16 bytes of SHA-256 over the key. */
 /**
  * The canonical a task event's signature covers: every `act`/`act-*` tag on
- * the message, keyed by its name with the vendor prefix stripped, plus the
- * venue and the signer's event id.
+ * the message keyed by its name with the vendor prefix stripped — except
+ * `act-from`, whose value enters as `from`, the signer's semantic key — plus
+ * `id` (the signer's event id) and `target` (the venue). `from`/`id`/`target`
+ * are mandatory (thread agreement 2026-08-02); a document that cannot be
+ * built is null, and a verifier reads that as unverifiable, never invalid.
  *
  * Byte-identical to `freeq_sdk::act::act_canonical` and to bot-kit's copy —
  * the shared fixtures in `spec/act-signing-vectors.json` are what hold the
@@ -271,20 +274,23 @@ export async function coordinationCanonical(fields: {
 export function actCanonical(
   tags: Record<string, string>,
   target: string,
-  msgid: string,
+  id: string,
 ): string | null {
   const covered: Record<string, string> = {};
+  let from: string | null = null;
   for (const [name, value] of Object.entries(tags)) {
     const stripped = name.startsWith('+freeq.at/')
       ? name.slice('+freeq.at/'.length)
       : name.startsWith('freeq.at/')
         ? name.slice('freeq.at/'.length)
         : name;
-    if (stripped === 'act' || stripped.startsWith('act-')) covered[stripped] = value;
+    if (stripped === 'act-from') from = value;
+    else if (stripped === 'act' || stripped.startsWith('act-')) covered[stripped] = value;
   }
-  if (Object.keys(covered).length === 0) return null;
+  if (from === null) return null;
+  covered.from = from;
+  covered.id = id;
   covered.target = target;
-  covered.msgid = msgid;
   return canonicalize(covered);
 }
 

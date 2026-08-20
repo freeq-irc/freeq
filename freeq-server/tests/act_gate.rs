@@ -466,11 +466,21 @@ async fn a_task_message_naming_no_actor_is_refused() {
         let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
         a.msgsig(&signing);
         a.join("#ops");
-        let tags: Vec<(String, String)> = offer_tags()
+        // An actor-less document cannot even be signed since the realignment
+        // (`from` is mandatory), so this line carries a real signature over
+        // the full tags with act-from then stripped from the wire — the
+        // shape a stripping relay would produce. The gate answers before any
+        // signature check runs.
+        let id = fresh_id();
+        let full = offer_tags();
+        let pairs: Vec<(&str, &str)> = full.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let sig = freeq_sdk::act::sign_act(pairs, &channel_venue("#ops"), &id, &signing)
+            .expect("act tags present");
+        let tags: Vec<(String, String)> = full
             .into_iter()
             .filter(|(k, _)| k != "+freeq.at/act-from")
             .collect();
-        a.tx(&signed_line(&tags, "#ops", &fresh_id(), &signing));
+        a.tx(&line_with_sig(&tags, "#ops", &id, &sig));
         assert_eq!(a.fail_code(), "ACTOR_REQUIRED");
     })
     .await;

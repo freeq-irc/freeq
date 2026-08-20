@@ -174,10 +174,10 @@ pub fn derive_facts(canonical: &str) -> Option<EventFacts> {
     // name one could never be rebuilt from the log.
     if doc.get("act").is_some() {
         return Some(EventFacts {
-            event_id: get("msgid")?,
+            event_id: get("id")?,
             kind: "act".to_string(),
             venue: get("target")?,
-            actor_did: Some(get("act-from")?),
+            actor_did: Some(get("from")?),
             // The task this event is about. An opener names none: its own id
             // *is* the task's, which is the same relationship every other
             // kind's `subject` records.
@@ -477,19 +477,27 @@ mod tests {
     /// The invariant the log rests on, extended to the new kind: bytes the
     /// reader cannot make columns out of are not filed at all. An act document
     /// naming no actor is one of those — the view's offerer comes from that
-    /// field, so a row without it could never be rebuilt from the log.
+    /// field, so a row without it could never be rebuilt from the log. Since
+    /// the canonical realignment, such a document cannot even be built
+    /// (`from` is mandatory); bytes arriving from elsewhere without it still
+    /// derive to nothing.
     #[test]
     fn an_act_document_without_an_actor_is_not_a_document() {
-        let canonical = freeq_sdk::act::act_canonical(
-            vec![
-                ("+freeq.at/act", "handoff"),
-                ("+freeq.at/act-verb", "offer"),
-            ],
-            "#ops",
-            "01JNOFROM000000000000000DD",
-        )
-        .unwrap();
-        assert_eq!(derive_facts(&canonical), None);
+        assert_eq!(
+            freeq_sdk::act::act_canonical(
+                vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "offer"),
+                ],
+                "#ops",
+                "01JNOFROM000000000000000DD",
+            ),
+            Err(freeq_sdk::act::ActSigError::MissingFrom)
+        );
+        // Hand-built from-less bytes (what a hostile or buggy peer could
+        // store) still make no columns.
+        let bytes = r##"{"act":"handoff","act-verb":"offer","id":"01JNOFROM000000000000000DD","target":"#ops"}"##;
+        assert_eq!(derive_facts(bytes), None);
     }
 
     #[test]

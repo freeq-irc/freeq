@@ -1,10 +1,38 @@
 //! Signing and verification for `freeq.at/act` action messages.
 //!
-//! Implements the act canonical from the act RFC (docs/HANDOFF-RFC.md, v0.4):
-//! the signature covers **every `act-*` tag present** on the message — not a
-//! fixed field list — JCS-canonicalized (RFC 8785) with sorted keys. Adding or
-//! stripping an `act-*` tag in transit changes the rebuilt canonical, so
-//! tampering is detected by construction.
+//! Implements the act canonical from the act RFC — the gist body plus the
+//! comment thread, which is part of the RFC. The signature covers **every
+//! `act-*` tag present** on the message — not a fixed field list —
+//! JCS-canonicalized (RFC 8785) with sorted keys. Adding or stripping an
+//! `act-*` tag in transit changes the rebuilt canonical, so tampering is
+//! detected by construction.
+//!
+//! ## Canonical keys are semantic names (thread agreement, 2026-08-02)
+//!
+//! The document's key for a field is the field's semantic name; the wire tag
+//! name is framing. Three keys are **mandatory** in every act document:
+//!
+//! - **`from`** — the signer's DID. It rides the wire in `+freeq.at/act-from`,
+//!   which is exempted from name-based coverage: its value enters the
+//!   document under `from`, never under the tag's own name.
+//! - **`id`** — the event id the signer minted, riding the wire in
+//!   [`crate::chatsig::EVENT_ID_TAG`]. A task's id is its identity for the
+//!   rest of its life, so it cannot be the one unsigned thing about it.
+//! - **`target`** — the normalized venue ([`crate::chatsig::channel_venue`] /
+//!   [`crate::chatsig::dm_venue`]), supplied by the signer and rebuilt by the
+//!   verifier from delivery context. The channel is the queue: without it, an
+//!   offer signed in one room replays into another with its signature intact.
+//!
+//! A document missing a mandatory field reads **unverifiable, never
+//! invalid** — `from`/`id`/`target` are not `act-`prefixed, so sign-every-
+//! `act-*` alone cannot strip-detect them, and an absence is not evidence
+//! about the sender ([`ActSigError::MissingFrom`]; `id` and `target` are
+//! caller-supplied here, so their absence is the caller's to report).
+//!
+//! (Until 2026-08 this module signed the pre-agreement keys `act-from` and
+//! `msgid`. That never matched what the thread froze on 2026-08-02; the
+//! realignment replaced the keys and regenerated the vector file. No history
+//! survives under the old keys — pre-realignment act events were discarded.)
 //!
 //! ## Only the sender writes `act-` tags
 //!
@@ -17,30 +45,23 @@
 //! `+freeq.at/origin`), exactly as they do for chat.
 //!
 //! Canonical mapping rules (frozen by the fixtures in
-//! `spec/act-signing-vectors.json`, which the TS implementation must
+//! `spec/act-signing-vectors.json`, which the TS implementations must
 //! reproduce byte-for-byte):
 //!
 //! - A tag is covered iff its name, after stripping the `+freeq.at/`
 //!   client-tag prefix, is `act` or starts with `act-`. (`actor-class` does
 //!   NOT match; `sig` does not match.) The unprefixed forms are accepted too.
-//! - Canonical keys are the **stripped** names — the vendor prefix is wire
-//!   framing, not semantics, so signatures survive a future de-vendoring of
-//!   the tag names.
+//! - `act-from` is the one covered-name exception: its value becomes the
+//!   document's `from` (see above), so the signer's key is the same in both
+//!   profiles and never appears twice.
+//! - All other canonical keys are the **stripped** tag names — the vendor
+//!   prefix is wire framing, not semantics, so signatures survive a future
+//!   de-vendoring of the tag names.
 //! - Values are the (IRC-unescaped) tag values, verbatim, always JSON
 //!   strings — `act-deadline` is not coerced to a number.
-//! - Two more keys are **injected by the caller**, never read from a tag, and
-//!   the same two chat's documents carry (see [`crate::chatsig`]):
-//!   - **`target`** — the normalized venue ([`crate::chatsig::channel_venue`]
-//!     / [`crate::chatsig::dm_venue`]), supplied by the signer and rebuilt by
-//!     the verifier from delivery context. The channel is the queue: without
-//!     it, an offer signed in one room replays into another with its
-//!     signature intact.
-//!   - **`msgid`** — the event id the signer minted, riding the wire in
-//!     [`crate::chatsig::EVENT_ID_TAG`]. A task's id is its identity for the
-//!     rest of its life, so it cannot be the one unsigned thing about it.
-//!
-//!   Neither name can collide with a covered tag: every covered key starts
-//!   with `act`.
+//! - `id` and `target` are injected by the caller, never read from a tag.
+//!   No injected name can collide with a covered tag: every covered key
+//!   starts with `act`.
 //! - An offer carries no `act-id` — its own event id *is* the task's id. The
 //!   later events in a task's life name that id in `act-id` and mint their
 //!   own id for themselves.
@@ -69,10 +90,17 @@ const TAG_PREFIX: &str = "freeq.at/";
 /// `KidMismatch` is worth distinguishing: it means "this is not the key the
 /// signature names" — a lookup-layer problem — where `SigInvalid` means the
 /// named key was used and the bytes still don't verify (tampering/forgery).
+/// `MissingFrom` is the unverifiable-mandatory-field case: the absence of a
+/// mandatory key is not evidence about the sender, so it must never be
+/// reported as invalid.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ActSigError {
     /// No `act`/`act-*` tags present — nothing to sign or verify.
     NoActTags,
+    /// Act tags are present but no `act-from` names the signer. A mandatory
+    /// canonical field (`from`/`id`/`target`) missing reads *unverifiable*,
+    /// never invalid (thread agreement, 2026-08-02).
+    MissingFrom,
     /// The sig tag is not `alg:kid:sig`.
     BadSigFormat,
     /// The sig tag names an algorithm other than `ed25519`.
@@ -88,6 +116,9 @@ impl std::fmt::Display for ActSigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ActSigError::NoActTags => write!(f, "no act-* tags present"),
+            ActSigError::MissingFrom => {
+                write!(f, "act tags present but no act-from names the signer")
+            }
             ActSigError::BadSigFormat => write!(f, "sig tag is not alg:kid:sig"),
             ActSigError::UnsupportedAlgorithm(a) => write!(f, "unsupported sig algorithm {a}"),
             ActSigError::KidMismatch => write!(f, "public key does not match the sig's kid"),
@@ -129,40 +160,66 @@ fn is_act_tag(tag_name: &str) -> bool {
 /// event id.
 ///
 /// `tags` is the message's tag map with wire names (prefixed or not) and
-/// unescaped values. `target` is the normalized venue and `msgid` the id the
-/// signer minted; both are supplied by the caller — a verifier rebuilds them
-/// from delivery context rather than reading either off a tag. Returns `None`
-/// if no act tags are present: delivery context alone is not a document.
-pub fn act_canonical<'a, I>(tags: I, target: &'a str, msgid: &'a str) -> Option<String>
+/// unescaped values. `target` is the normalized venue and `id` the event id
+/// the signer minted; both are supplied by the caller — a verifier rebuilds
+/// them from delivery context rather than reading either off a tag. The
+/// signer's DID is read from the `act-from` tag and enters the document as
+/// `from`.
+///
+/// Errors: [`ActSigError::NoActTags`] when nothing on the message is an act
+/// tag (delivery context alone is not a document), and
+/// [`ActSigError::MissingFrom`] when act tags are present but none names the
+/// signer — the unverifiable-mandatory-field case, never invalid.
+pub fn act_canonical<'a, I>(tags: I, target: &'a str, id: &'a str) -> Result<String, ActSigError>
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
-    let mut covered: BTreeMap<&str, &str> = tags
-        .into_iter()
-        .filter(|(name, _)| is_act_tag(name))
-        .map(|(name, value)| (stripped_name(name), value))
-        .collect();
-    if covered.is_empty() {
-        return None;
+    let mut covered: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut from: Option<&str> = None;
+    for (name, value) in tags {
+        if !is_act_tag(name) {
+            continue;
+        }
+        let stripped = stripped_name(name);
+        if stripped == "act-from" {
+            // The signer enters the document under its semantic name, the
+            // same key every chat document carries — never under the tag's.
+            from = Some(value);
+        } else {
+            covered.insert(stripped, value);
+        }
     }
-    // Injected by the caller, never read from a tag — and they cannot collide
-    // with a covered key, every one of which starts with `act`.
+    if covered.is_empty() && from.is_none() {
+        return Err(ActSigError::NoActTags);
+    }
+    let Some(from) = from else {
+        return Err(ActSigError::MissingFrom);
+    };
+    // Injected by the caller (or mapped from act-from), never read from a
+    // covered tag — and none can collide with one, every one of which starts
+    // with `act`.
+    covered.insert("from", from);
+    covered.insert("id", id);
     covered.insert("target", target);
-    covered.insert("msgid", msgid);
     // BTreeMap serializes with sorted keys; canonicalize re-sorts per JCS
     // (codepoint order) and applies JSON string escaping.
-    Some(crate::canonical::canonicalize(&covered).expect("string map serializes"))
+    Ok(crate::canonical::canonicalize(&covered).expect("string map serializes"))
 }
 
-/// Sign the act tags in `tags`, posted to `target` under `msgid`, with `key`.
-/// Returns the sig tag value (`ed25519:<kid>:<base64url sig>`), or `None` if
-/// no act tags are present.
-pub fn sign_act<'a, I>(tags: I, target: &'a str, msgid: &'a str, key: &SigningKey) -> Option<String>
+/// Sign the act tags in `tags`, posted to `target` under `id`, with `key`.
+/// Returns the sig tag value (`ed25519:<kid>:<base64url sig>`), or the same
+/// errors as [`act_canonical`] when there is no document to sign.
+pub fn sign_act<'a, I>(
+    tags: I,
+    target: &'a str,
+    id: &'a str,
+    key: &SigningKey,
+) -> Result<String, ActSigError>
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
-    Some(crate::sigtag::sign_canonical(
-        &act_canonical(tags, target, msgid)?,
+    Ok(crate::sigtag::sign_canonical(
+        &act_canonical(tags, target, id)?,
         key,
     ))
 }
@@ -174,13 +231,15 @@ pub fn parse_sig_tag(sig_tag: &str) -> Result<(&str, [u8; 64]), ActSigError> {
 
 /// Verify an act signature over the act tags in `tags` against `key`.
 ///
-/// `target` and `msgid` come from the receiver's own view of the delivery —
-/// the venue the message arrived in and the id it is being filed under — so a
+/// `target` and `id` come from the receiver's own view of the delivery — the
+/// venue the message arrived in and the id it is being filed under — so a
 /// message replayed elsewhere, or filed under another id, reads as tampering.
+/// A missing mandatory field ([`ActSigError::MissingFrom`]) is unverifiable,
+/// never invalid.
 pub fn verify_act<'a, I>(
     tags: I,
     target: &'a str,
-    msgid: &'a str,
+    id: &'a str,
     sig_tag: &str,
     key: &VerifyingKey,
 ) -> Result<(), ActSigError>
@@ -190,7 +249,7 @@ where
     // Shape and kid first, so a missing canonical isn't reported as a format
     // problem and a wrong key isn't reported as tampering.
     crate::sigtag::parse(sig_tag).map_err(ActSigError::from)?;
-    let canonical = act_canonical(tags, target, msgid).ok_or(ActSigError::NoActTags)?;
+    let canonical = act_canonical(tags, target, id)?;
     crate::sigtag::verify_canonical(&canonical, sig_tag, key).map_err(ActSigError::from)
 }
 
@@ -229,11 +288,47 @@ mod tests {
     }
 
     #[test]
-    fn canonical_covers_act_tags_the_venue_and_the_event_id() {
+    fn canonical_covers_act_tags_the_signer_the_venue_and_the_event_id() {
         let canonical = act_canonical(offer_tags(), OFFER_VENUE, OFFER_ID).unwrap();
         assert_eq!(
             canonical,
-            r##"{"act":"handoff","act-caps":"freeq.at/web-search","act-ctx-h":"sha256:9f00","act-deadline":"1788000000","act-from":"did:plc:eliza","act-title":"Cite 3 sources on X","act-to":"did:plc:scholar","act-verb":"offer","msgid":"01JABCDEF000000000000000EF","target":"#ops"}"##
+            r##"{"act":"handoff","act-caps":"freeq.at/web-search","act-ctx-h":"sha256:9f00","act-deadline":"1788000000","act-title":"Cite 3 sources on X","act-to":"did:plc:scholar","act-verb":"offer","from":"did:plc:eliza","id":"01JABCDEF000000000000000EF","target":"#ops"}"##
+        );
+    }
+
+    /// The signer rides the wire in `act-from` but the document says `from` —
+    /// the semantic name, the same key chat documents carry. The tag's own
+    /// stripped name never appears.
+    #[test]
+    fn act_from_maps_to_from_and_never_appears_under_its_tag_name() {
+        let canonical = act_canonical(offer_tags(), OFFER_VENUE, OFFER_ID).unwrap();
+        assert!(canonical.contains(r#""from":"did:plc:eliza""#));
+        assert!(!canonical.contains("act-from"));
+    }
+
+    /// Act tags without an actor: unverifiable, never "no act tags" and never
+    /// invalid — an absence is not evidence about the sender (2026-08-02).
+    #[test]
+    fn missing_act_from_is_unverifiable_not_invalid() {
+        let without_from: Vec<_> = offer_tags()
+            .into_iter()
+            .filter(|(n, _)| *n != "+freeq.at/act-from")
+            .collect();
+        assert_eq!(
+            act_canonical(without_from.clone(), OFFER_VENUE, OFFER_ID),
+            Err(ActSigError::MissingFrom)
+        );
+        let key = test_key(1);
+        let sig_tag = sign_act(offer_tags(), OFFER_VENUE, OFFER_ID, &key).unwrap();
+        assert_eq!(
+            verify_act(
+                without_from,
+                OFFER_VENUE,
+                OFFER_ID,
+                &sig_tag,
+                &key.verifying_key()
+            ),
+            Err(ActSigError::MissingFrom)
         );
     }
 
@@ -251,22 +346,24 @@ mod tests {
         );
     }
 
-    /// The two injected fields come from the caller — the venue the delivery
+    /// The injected fields come from the caller — the venue the delivery
     /// happened in, and the id the signer minted — never from a tag. A tag
-    /// literally named `target` or `msgid` is not an act tag and cannot reach
-    /// the document; changing the parameter always does.
+    /// literally named `from`, `target` or `id` is not an act tag and cannot
+    /// reach the document; changing the parameter always does.
     #[test]
-    fn the_venue_and_the_event_id_come_from_the_caller_not_from_a_tag() {
+    fn the_mandatory_fields_come_from_the_caller_not_from_lookalike_tags() {
         let plain = act_canonical(offer_tags(), OFFER_VENUE, OFFER_ID).unwrap();
 
         let mut spoofed = offer_tags();
+        spoofed.push(("from", "did:plc:mallory"));
         spoofed.push(("target", "#random"));
+        spoofed.push(("id", "01JSPOOFED000000000000000X"));
         spoofed.push(("msgid", "01JSPOOFED000000000000000X"));
         spoofed.push(("+freeq.at/eventid", "01JSPOOFED000000000000000X"));
         assert_eq!(
             act_canonical(spoofed, OFFER_VENUE, OFFER_ID).unwrap(),
             plain,
-            "no tag may write the venue or the id into the document"
+            "no lookalike tag may write a mandatory field into the document"
         );
 
         assert_ne!(
@@ -289,7 +386,7 @@ mod tests {
             !canonical.contains("act-id"),
             "an offer carries no act-id: {canonical}"
         );
-        assert!(canonical.contains(r#""msgid":"01JABCDEF000000000000000EF""#));
+        assert!(canonical.contains(r#""id":"01JABCDEF000000000000000EF""#));
     }
 
     #[test]
@@ -298,6 +395,7 @@ mod tests {
             vec![
                 ("+freeq.at/act", "handoff"),
                 ("+freeq.at/act-verb", "accept"),
+                ("+freeq.at/act-from", "did:plc:x"),
                 ("+freeq.at/act-id", "01J"),
             ],
             OFFER_VENUE,
@@ -307,6 +405,7 @@ mod tests {
             vec![
                 ("freeq.at/act", "handoff"),
                 ("act-verb", "accept"),
+                ("act-from", "did:plc:x"),
                 ("act-id", "01J"),
             ],
             OFFER_VENUE,
@@ -316,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn no_act_tags_is_none() {
+    fn no_act_tags_is_an_error() {
         // The venue and the id alone are not a document: with no act tags
         // there is nothing to sign, however much delivery context we hold.
         assert_eq!(
@@ -325,7 +424,7 @@ mod tests {
                 OFFER_VENUE,
                 OFFER_ID
             ),
-            None
+            Err(ActSigError::NoActTags)
         );
         assert_eq!(
             act_canonical(
@@ -333,7 +432,7 @@ mod tests {
                 OFFER_VENUE,
                 OFFER_ID
             ),
-            None
+            Err(ActSigError::NoActTags)
         );
     }
 
@@ -342,6 +441,7 @@ mod tests {
         let canonical = act_canonical(
             vec![
                 ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-from", "did:plc:eliza"),
                 ("+freeq.at/act-title", "say \"hi\"\nplease"),
             ],
             OFFER_VENUE,
@@ -350,7 +450,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             canonical,
-            r##"{"act":"handoff","act-title":"say \"hi\"\nplease","msgid":"01JABCDEF000000000000000EF","target":"#ops"}"##
+            r##"{"act":"handoff","act-title":"say \"hi\"\nplease","from":"did:plc:eliza","id":"01JABCDEF000000000000000EF","target":"#ops"}"##
         );
     }
 
@@ -420,6 +520,25 @@ mod tests {
         assert_eq!(
             verify_act(
                 stripped,
+                OFFER_VENUE,
+                OFFER_ID,
+                &sig_tag,
+                &key.verifying_key()
+            ),
+            Err(ActSigError::SigInvalid)
+        );
+
+        // An altered actor is tampering like any other covered value: the
+        // act-from tag maps into the document, so rewriting it breaks the sig.
+        let mut reactored = offer_tags();
+        reactored.iter_mut().for_each(|(n, v)| {
+            if *n == "+freeq.at/act-from" {
+                *v = "did:plc:mallory";
+            }
+        });
+        assert_eq!(
+            verify_act(
+                reactored,
                 OFFER_VENUE,
                 OFFER_ID,
                 &sig_tag,
@@ -562,7 +681,7 @@ mod tests {
         seed: u8,
         tags: Vec<(&'static str, &'static str)>,
         target: &'static str,
-        msgid: &'static str,
+        id: &'static str,
     }
 
     /// The four shared vectors. Kept in one place so the generator and the
@@ -574,7 +693,7 @@ mod tests {
                 seed: 1,
                 tags: offer_tags(),
                 target: OFFER_VENUE,
-                msgid: OFFER_ID,
+                id: OFFER_ID,
             },
             Case {
                 name: "open-offer-no-act-to",
@@ -588,7 +707,7 @@ mod tests {
                     ("+freeq.at/act-caps", "freeq.at/log-analysis"),
                 ],
                 target: "#swarm",
-                msgid: "01JXYZ0000000000000000000X",
+                id: "01JXYZ0000000000000000000X",
             },
             Case {
                 // A non-handoff kind carrying a field handoff never defined —
@@ -598,7 +717,7 @@ mod tests {
                 seed: 3,
                 tags: vec![
                     ("+freeq.at/act", "approval"),
-                    // `request` opens its kind, so its own event id (msgid
+                    // `request` opens its kind, so its own event id (id
                     // below) is the task's id — no act-id, same as an offer.
                     ("+freeq.at/act-verb", "request"),
                     ("+freeq.at/act-from", "did:plc:factory"),
@@ -608,7 +727,7 @@ mod tests {
                     ("+freeq.at/act-ctx-h", "sha256:1a00"),
                 ],
                 target: "dm:did:plc:factory,did:plc:opslead",
-                msgid: "01KDEF0000000000000000000K",
+                id: "01KDEF0000000000000000000K",
             },
             Case {
                 // A follow-up: it names the task it is about in `act-id` —
@@ -626,20 +745,25 @@ mod tests {
                     ("+freeq.at/act-note", "ok — \"on it\" ✓\n(eta 5m)"),
                 ],
                 target: OFFER_VENUE,
-                msgid: "01JACCEPTEVENTID0000000000",
+                id: "01JACCEPTEVENTID0000000000",
             },
         ]
     }
 
-    /// A negative vector: the same tags and the same signature, checked
-    /// against delivery context the signer never wrote. Both attacks are on
-    /// the injected fields, since every attack on the tags themselves is
-    /// already covered by the sign-what's-present rule.
+    /// A negative vector. Two classes, and the split is the point:
+    /// `invalid` — a signed fact was changed (tampering evidence);
+    /// `unverifiable` — the check cannot run (a missing mandatory field, an
+    /// unknown algorithm), which is not evidence about the sender.
     struct Negative {
         name: &'static str,
         of: &'static str,
+        expected: &'static str,
         target: &'static str,
-        msgid: &'static str,
+        id: &'static str,
+        /// Strip this wire tag before verifying (missing-mandatory case).
+        strip_tag: Option<&'static str>,
+        /// Replace the sig tag's algorithm label (unknown-algorithm case).
+        swap_alg: Option<&'static str>,
     }
 
     fn negatives() -> Vec<Negative> {
@@ -647,14 +771,44 @@ mod tests {
             Negative {
                 name: "re-venued-target",
                 of: "directed-offer",
+                expected: "invalid",
                 target: "#random",
-                msgid: OFFER_ID,
+                id: OFFER_ID,
+                strip_tag: None,
+                swap_alg: None,
             },
             Negative {
                 name: "swapped-event-id",
                 of: "directed-offer",
+                expected: "invalid",
                 target: OFFER_VENUE,
-                msgid: "01JOTHEREVENTID00000000000",
+                id: "01JOTHEREVENTID00000000000",
+                strip_tag: None,
+                swap_alg: None,
+            },
+            Negative {
+                // act tags with the signer stripped: a mandatory field is
+                // absent, and absence is not evidence — unverifiable, never
+                // invalid (2026-08-02).
+                name: "missing-from",
+                of: "directed-offer",
+                expected: "unverifiable",
+                target: OFFER_VENUE,
+                id: OFFER_ID,
+                strip_tag: Some("+freeq.at/act-from"),
+                swap_alg: None,
+            },
+            Negative {
+                // A sig tag naming an algorithm this verifier has never heard
+                // of: it cannot run the check, which is not a verdict about
+                // the bytes — unverifiable, never invalid.
+                name: "unknown-algorithm",
+                of: "directed-offer",
+                expected: "unverifiable",
+                target: OFFER_VENUE,
+                id: OFFER_ID,
+                strip_tag: None,
+                swap_alg: Some("rsa4096"),
             },
         ]
     }
@@ -683,9 +837,9 @@ mod tests {
                     "kid": derive_kid(&key.verifying_key()),
                     "tags": tag_map,
                     "target": case.target,
-                    "msgid": case.msgid,
-                    "canonical": act_canonical(case.tags.clone(), case.target, case.msgid).unwrap(),
-                    "sigTag": sign_act(case.tags, case.target, case.msgid, &key).unwrap(),
+                    "id": case.id,
+                    "canonical": act_canonical(case.tags.clone(), case.target, case.id).unwrap(),
+                    "sigTag": sign_act(case.tags, case.target, case.id, &key).unwrap(),
                 })
             })
             .collect();
@@ -696,20 +850,34 @@ mod tests {
                     .into_iter()
                     .find(|c| c.name == n.of)
                     .expect("a negative names a vector");
-                serde_json::json!({
+                let mut entry = serde_json::json!({
                     "name": n.name,
                     "vector": n.of,
-                    "expected": "invalid",
+                    "expected": n.expected,
                     "target": n.target,
-                    "msgid": n.msgid,
-                    "tamperedCanonical": act_canonical(case.tags, n.target, n.msgid).unwrap(),
-                })
+                    "id": n.id,
+                });
+                if let Some(tag) = n.strip_tag {
+                    entry["strippedTag"] = serde_json::Value::String(tag.to_string());
+                } else if let Some(alg) = n.swap_alg {
+                    entry["sigAlgorithm"] = serde_json::Value::String(alg.to_string());
+                } else {
+                    // Tamper-class negatives rebuild a real canonical under
+                    // the wrong delivery context; the byte-level suites
+                    // reproduce it. Unverifiable-class negatives have no
+                    // canonical to rebuild — that is what unverifiable means.
+                    entry["tamperedCanonical"] = serde_json::Value::String(
+                        act_canonical(case.tags, n.target, n.id).unwrap(),
+                    );
+                }
+                entry
             })
             .collect();
         serde_json::json!({
-            "description": "Worked signing examples for freeq.at/act (RFC v0.4). Every implementation must reproduce canonical, kid, and sigTag byte-for-byte from tags + target + msgid + seed, and must reject every negative: the named vector's own sigTag, checked against the negative's target and msgid, over the same tags. Non-act tags in `tags` are present deliberately: they must NOT be covered.",
-            "documentRule": "JCS (RFC 8785) over a flat string map: every act/act-* tag present, keyed by its name with the +freeq.at/ prefix stripped, plus `target` and `msgid`. No fixed field list — a kind may add tags freely.",
-            "injectedFieldRule": "target and msgid are supplied by the caller, never read from a tag: target is the normalized venue the message was delivered in, msgid is the id the signer minted (it rides the wire in +freeq.at/eventid). Neither name can collide with a covered tag, whose stripped name always starts with `act`.",
+            "description": "Worked signing examples for freeq.at/act. Canonical keys follow the thread agreement frozen 2026-08-02 (semantic names; from/id/target mandatory) — this file replaced the pre-agreement form that signed act-from/msgid, and no history survives under the old keys. Every implementation must reproduce canonical, kid, and sigTag byte-for-byte from tags + target + id + seed, and must reach each negative's expected verdict. Non-act tags in `tags` are present deliberately: they must NOT be covered.",
+            "documentRule": "JCS (RFC 8785) over a flat string map: every act/act-* tag present keyed by its name with the +freeq.at/ prefix stripped — EXCEPT act-from, whose value enters as `from` — plus `id` and `target`. No fixed field list — a kind may add tags freely.",
+            "mandatoryFieldRule": "`from`, `id` and `target` are mandatory. A document missing one reads unverifiable, never invalid: none is act-prefixed, so tag coverage cannot strip-detect it, and an absence is not evidence about the sender.",
+            "injectedFieldRule": "target and id are supplied by the caller, never read from a tag: target is the normalized venue the message was delivered in, id is the event id the signer minted (it rides the wire in +freeq.at/eventid). from is read from the act-from wire tag. No mandatory name can collide with a covered tag, whose stripped name always starts with `act`.",
             "venueRule": "target is the normalized venue, never the wire target: a channel lowercased, or `dm:<did_a>,<did_b>` with the two DIDs sorted ascending.",
             "eventIdRule": "An offer carries no act-id: its own event id is the task's id. Every later event in a task's life names that id in act-id, and mints its own id for itself.",
             "senderOnlyTagRule": "Only the sender ever writes act-* tags. A server that stamped one of its own would land inside the signature's coverage and break every act signature it relayed.",
@@ -744,17 +912,18 @@ mod tests {
         assert_eq!(on_disk, build_fixtures_json());
     }
 
-    /// Every vector verifies, and every negative is refused as tampering — so
-    /// the fixture file can't drift from the semantics it publishes.
+    /// Every vector verifies, and every negative reaches its expected verdict
+    /// class — so the fixture file can't drift from the semantics it
+    /// publishes, including the invalid/unverifiable split.
     #[test]
-    fn every_vector_verifies_and_every_negative_is_invalid() {
+    fn every_vector_verifies_and_every_negative_reaches_its_verdict() {
         for case in fixture_cases() {
             let key = test_key(case.seed);
-            let sig_tag = sign_act(case.tags.clone(), case.target, case.msgid, &key).unwrap();
+            let sig_tag = sign_act(case.tags.clone(), case.target, case.id, &key).unwrap();
             verify_act(
                 case.tags,
                 case.target,
-                case.msgid,
+                case.id,
                 &sig_tag,
                 &key.verifying_key(),
             )
@@ -766,19 +935,33 @@ mod tests {
                 .find(|c| c.name == n.of)
                 .unwrap_or_else(|| panic!("negative {} names unknown vector {}", n.name, n.of));
             let key = test_key(case.seed);
-            let real_sig = sign_act(case.tags.clone(), case.target, case.msgid, &key).unwrap();
-            assert_eq!(
-                verify_act(
-                    case.tags,
-                    n.target,
-                    n.msgid,
-                    &real_sig,
-                    &key.verifying_key()
+            let real_sig = sign_act(case.tags.clone(), case.target, case.id, &key).unwrap();
+            let tags: Vec<_> = case
+                .tags
+                .into_iter()
+                .filter(|(name, _)| n.strip_tag != Some(*name))
+                .collect();
+            let sig_tag = match n.swap_alg {
+                Some(alg) => {
+                    let rest = real_sig.split_once(':').expect("alg:kid:sig").1;
+                    format!("{alg}:{rest}")
+                }
+                None => real_sig,
+            };
+            let verdict = verify_act(tags, n.target, n.id, &sig_tag, &key.verifying_key());
+            match n.expected {
+                "invalid" => assert_eq!(
+                    verdict,
+                    Err(ActSigError::SigInvalid),
+                    "negative {}",
+                    n.name
                 ),
-                Err(ActSigError::SigInvalid),
-                "negative {}",
-                n.name
-            );
+                "unverifiable" => match verdict {
+                    Err(ActSigError::MissingFrom) | Err(ActSigError::UnsupportedAlgorithm(_)) => {}
+                    other => panic!("negative {} expected unverifiable, got {other:?}", n.name),
+                },
+                other => panic!("negative {} names unknown verdict {other}", n.name),
+            }
         }
     }
 
