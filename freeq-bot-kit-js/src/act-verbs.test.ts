@@ -5,7 +5,18 @@
 // a follow-up and never on an opener, and a companion line linked back.
 
 import { describe, expect, it } from "vitest";
-import { accept, cancel, claim, complete, decline, fail, offer, progress } from "./act-verbs.js";
+import {
+  accept,
+  award,
+  bid,
+  cancel,
+  claim,
+  complete,
+  decline,
+  fail,
+  offer,
+  progress,
+} from "./act-verbs.js";
 import type { ActContext } from "./act-verbs.js";
 
 interface Sent {
@@ -139,5 +150,45 @@ describe("what is not here", () => {
   it("has no expire helper: that move is the server's alone", async () => {
     const mod = await import("./act-verbs.js");
     expect(Object.keys(mod)).not.toContain("expire");
+  });
+});
+
+describe("the bounty verbs", () => {
+  it("opens a bounty with the same verb, under its own kind", async () => {
+    const sent: Sent[] = [];
+    await offer(ctxWith(sent), { title: "index the archive", kind: "bounty" });
+    expect(sent[0].tags["+freeq.at/act"]).toBe("bounty");
+    expect(sent[0].tags["+freeq.at/act-verb"]).toBe("offer");
+    // A bounty is open by construction: nothing here names a recipient.
+    expect(sent[0].tags["+freeq.at/act-to"]).toBeUndefined();
+  });
+
+  it("bids on the task it names, and moves nothing else", async () => {
+    const sent: Sent[] = [];
+    await bid(ctxWith(sent), "01JTASK00000000000000000AA", { note: "two days" });
+    const { tags } = sent[0];
+    expect(tags["+freeq.at/act"]).toBe("bounty");
+    expect(tags["+freeq.at/act-verb"]).toBe("bid");
+    expect(tags["+freeq.at/act-id"]).toBe("01JTASK00000000000000000AA");
+    expect(tags["+freeq.at/act-note"]).toBe("two days");
+    // Pricing is the agents' to agree, so there is no tag for it.
+    expect(tags["+freeq.at/act-bid"]).toBeUndefined();
+    expect(sent[0].taskId).toBe("01JTASK00000000000000000AA");
+  });
+
+  it("awards the work to the winner it names, not to the poster naming them", async () => {
+    const sent: Sent[] = [];
+    await award(ctxWith(sent), "01JTASK00000000000000000AA", "did:plc:worker");
+    const { tags } = sent[0];
+    expect(tags["+freeq.at/act-verb"]).toBe("award");
+    expect(tags["+freeq.at/act-to"]).toBe("did:plc:worker");
+    expect(tags["+freeq.at/from"]).toBe("did:plc:bot");
+    expect(sent[0].humanText).toContain("did:plc:worker");
+  });
+
+  it("carries the kind on a bounty's follow-ups too", async () => {
+    const sent: Sent[] = [];
+    await complete(ctxWith(sent), "01JTASK00000000000000000AA", { kind: "bounty" });
+    expect(sent[0].tags["+freeq.at/act"]).toBe("bounty");
   });
 });

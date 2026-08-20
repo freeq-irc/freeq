@@ -1,7 +1,9 @@
-// The eight moves a bot can make on a task.
+// The moves a bot can make on a task.
 //
 // One function per verb the RFC gives a sender. `expire` is not here: only
-// the server may make that move, and it makes it from the sweep.
+// the server may make that move, and it makes it from the sweep, and neither
+// is `confirm`: a receipt is the action's home writing about an event it
+// filed.
 //
 // Every one does the same paired send — the signed task TAGMSG that *is* the
 // event, and the plain-text line that renders it for the people in the room,
@@ -28,6 +30,9 @@ export interface ActContext {
 /** What an offer declares. Everything but a title is optional. */
 export interface OfferOptions {
   title: string;
+  /** The kind of task. `handoff` unless something says otherwise — a bounty
+   *  is opened by the same verb, and takes bids instead of a recipient. */
+  kind?: string;
   /** Name a recipient to make the offer directed; leave it out and anyone
    *  may claim it. */
   to?: string;
@@ -50,15 +55,19 @@ export interface OfferOptions {
 export interface StepOptions {
   /** A sentence for the record, covered by the signature like every act tag. */
   note?: string;
+  /** The kind of task this step is on. `handoff` unless something says
+   *  otherwise — a step names the kind it belongs to, the way its opener did. */
+  kind?: string;
   /** The line people see. */
   humanText?: string;
 }
 
+/** What a task is when nobody says otherwise. */
 const KIND = "handoff";
 
-function stepTags(verb: string, did: string, taskId: string, note?: string) {
+function stepTags(verb: string, did: string, taskId: string, note?: string, kind?: string) {
   const tags: Record<string, string> = {
-    "+freeq.at/act": KIND,
+    "+freeq.at/act": kind ?? KIND,
     "+freeq.at/act-verb": verb,
     "+freeq.at/from": did,
     "+freeq.at/act-id": taskId,
@@ -73,7 +82,7 @@ function stepTags(verb: string, did: string, taskId: string, note?: string) {
  */
 export async function offer(ctx: ActContext, opts: OfferOptions): Promise<string> {
   const tags: Record<string, string> = {
-    "+freeq.at/act": KIND,
+    "+freeq.at/act": opts.kind ?? KIND,
     "+freeq.at/act-verb": "offer",
     "+freeq.at/from": ctx.did,
     "+freeq.at/act-title": opts.title,
@@ -99,7 +108,7 @@ export async function accept(
   taskId: string,
   opts: StepOptions = {},
 ): Promise<string> {
-  return ctx.client.sendAct(ctx.target, stepTags("accept", ctx.did, taskId, opts.note), {
+  return ctx.client.sendAct(ctx.target, stepTags("accept", ctx.did, taskId, opts.note, opts.kind), {
     humanText: opts.humanText ?? "accepted the task",
     taskId,
   });
@@ -111,7 +120,7 @@ export async function decline(
   taskId: string,
   opts: StepOptions = {},
 ): Promise<string> {
-  return ctx.client.sendAct(ctx.target, stepTags("decline", ctx.did, taskId, opts.note), {
+  return ctx.client.sendAct(ctx.target, stepTags("decline", ctx.did, taskId, opts.note, opts.kind), {
     humanText: opts.humanText ?? "declined the task",
     taskId,
   });
@@ -123,7 +132,7 @@ export async function claim(
   taskId: string,
   opts: StepOptions = {},
 ): Promise<string> {
-  return ctx.client.sendAct(ctx.target, stepTags("claim", ctx.did, taskId, opts.note), {
+  return ctx.client.sendAct(ctx.target, stepTags("claim", ctx.did, taskId, opts.note, opts.kind), {
     humanText: opts.humanText ?? "claimed the task",
     taskId,
   });
@@ -135,7 +144,7 @@ export async function progress(
   taskId: string,
   opts: StepOptions = {},
 ): Promise<string> {
-  return ctx.client.sendAct(ctx.target, stepTags("progress", ctx.did, taskId, opts.note), {
+  return ctx.client.sendAct(ctx.target, stepTags("progress", ctx.did, taskId, opts.note, opts.kind), {
     humanText: opts.humanText ?? (opts.note ? `progress: ${opts.note}` : "made progress"),
     taskId,
   });
@@ -147,7 +156,7 @@ export async function complete(
   taskId: string,
   opts: StepOptions = {},
 ): Promise<string> {
-  return ctx.client.sendAct(ctx.target, stepTags("complete", ctx.did, taskId, opts.note), {
+  return ctx.client.sendAct(ctx.target, stepTags("complete", ctx.did, taskId, opts.note, opts.kind), {
     humanText: opts.humanText ?? "completed the task",
     taskId,
   });
@@ -162,8 +171,52 @@ export async function fail(
   taskId: string,
   opts: StepOptions = {},
 ): Promise<string> {
-  return ctx.client.sendAct(ctx.target, stepTags("fail", ctx.did, taskId, opts.note), {
+  return ctx.client.sendAct(ctx.target, stepTags("fail", ctx.did, taskId, opts.note, opts.kind), {
     humanText: opts.humanText ?? "failed the task",
+    taskId,
+  });
+}
+
+/** The only kind that has bids to take and a winner to name. */
+const BOUNTY = "bounty";
+
+/**
+ * Put your name in for an open bounty. Additive: a bid leaves the bounty
+ * exactly where it found it, and every bid stays on file.
+ *
+ * A bid says nothing about price. `note` is freeform and signed like any act
+ * tag; pricing is the agents' to agree, not the substrate's to define.
+ */
+export async function bid(
+  ctx: ActContext,
+  taskId: string,
+  opts: StepOptions = {},
+): Promise<string> {
+  const tags = stepTags("bid", ctx.did, taskId, opts.note, BOUNTY);
+  return ctx.client.sendAct(ctx.target, tags, {
+    humanText: opts.humanText ?? (opts.note ? `bid: ${opts.note}` : "bid on the bounty"),
+    taskId,
+  });
+}
+
+/**
+ * Pick the winner of a bounty you posted, and assign the work to them.
+ *
+ * The poster names a winner rather than becoming one, which is why `act-to`
+ * is on the award and why the view reads the assignee from it. Nothing checks
+ * that the winner bid: the server never picks, and that cuts both ways — this
+ * signed choice is the record.
+ */
+export async function award(
+  ctx: ActContext,
+  taskId: string,
+  winnerDid: string,
+  opts: StepOptions = {},
+): Promise<string> {
+  const tags = stepTags("award", ctx.did, taskId, opts.note, BOUNTY);
+  tags["+freeq.at/act-to"] = winnerDid;
+  return ctx.client.sendAct(ctx.target, tags, {
+    humanText: opts.humanText ?? `awarded the bounty to ${winnerDid}`,
     taskId,
   });
 }
@@ -177,7 +230,7 @@ export async function cancel(
   taskId: string,
   opts: StepOptions = {},
 ): Promise<string> {
-  return ctx.client.sendAct(ctx.target, stepTags("cancel", ctx.did, taskId, opts.note), {
+  return ctx.client.sendAct(ctx.target, stepTags("cancel", ctx.did, taskId, opts.note, opts.kind), {
     humanText: opts.humanText ?? "cancelled the task",
     taskId,
   });

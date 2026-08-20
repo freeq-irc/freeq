@@ -257,6 +257,65 @@ async function main() {
       'with their signatures, so a late arrival can check them',
     );
 
+    // ── the second kind ──
+    step('bounty', 'a bounty two bots bid on, awarded to one of them');
+    const rival = await spawnBot('acceptance-rival');
+    await sleep(1500);
+    const bounty = await act.offer(poster.ctx, {
+      title: 'index the archive',
+      kind: 'bounty',
+    });
+    await sleep(700);
+    check(
+      (await openWork()).find((t) => t.act_id === bounty)?.state === 'open',
+      `open (${bounty})`,
+    );
+
+    await act.bid(worker.ctx, bounty, { note: 'two days' });
+    await act.bid(rival.ctx, bounty, { note: 'one day, no sources' });
+    await sleep(900);
+    check(
+      (await openWork()).find((t) => t.act_id === bounty)?.state === 'open',
+      'still open — a bid is additive and moves nothing',
+    );
+    const bidding = await api(`/api/v1/actions/${bounty}`);
+    check(
+      bidding.events.filter((e) => e.canonical.includes('"act-verb":"bid"')).length === 2,
+      'both bids are on file, neither superseding the other',
+    );
+
+    step('award', 'the poster picks the winner');
+    const awardId = await act.award(poster.ctx, bounty, worker.ctx.did);
+    await sleep(700);
+    const awarded = (await openWork()).find((t) => t.act_id === bounty);
+    check(awarded?.state === 'assigned', 'assigned');
+    check(
+      awarded?.assignee === worker.ctx.did,
+      'and the assignee is the winner the poster named, not the poster',
+    );
+    check(
+      receiptsBySubject((await api(`/api/v1/actions/${bounty}`)).events).has(awardId),
+      'the award is confirmed by the home',
+    );
+
+    step('the loser', 'the bot that did not win tries to finish the work');
+    rival.seen.fails.length = 0;
+    await act.complete(rival.ctx, bounty, { kind: 'bounty' }).catch(() => {});
+    await sleep(700);
+    check(
+      rival.seen.fails.some((l) => l.includes('WRONG_SENDER')),
+      'refused: WRONG_SENDER',
+    );
+
+    step('the winner', 'the winner finishes it');
+    const bountyDone = await act.complete(worker.ctx, bounty, { kind: 'bounty' });
+    await sleep(700);
+    check(!(await openWork()).some((t) => t.act_id === bounty), 'completed — gone from open work');
+    check(
+      receiptsBySubject((await api(`/api/v1/actions/${bounty}`)).events).has(bountyDone),
+      'and the completion is confirmed too',
+    );
+
     // ── expiry ──
     step('expiry', `a task nobody touches, swept after ${EXPIRY_SECS}s`);
     poster.seen.notices.length = 0;

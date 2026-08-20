@@ -367,7 +367,7 @@ async fn a_kind_the_rules_file_does_not_list_is_refused() {
         a.msgsig(&signing);
         a.join("#ops");
         let mut tags = offer_tags();
-        tags[0].1 = "bounty".into(); // a real kind, not one this server has
+        tags[0].1 = "approval".into(); // a real kind, not one this server has
         a.tx(&signed_line(&tags, "#ops", &fresh_id(), &signing));
         assert_eq!(a.fail_code(), "UNKNOWN_KIND");
     })
@@ -1106,6 +1106,173 @@ async fn replay_carries_the_receipts_to_capability_holders_only() {
             !ended.contains("+freeq.at/act"),
             "no capability, no receipts either: {ended}"
         );
+    })
+    .await;
+}
+
+// ── bounty: the second kind, and no code of its own ─────────────────────────
+
+/// A bounty step, signed. `to` is the winner an award names.
+fn bounty_line(
+    verb: &str,
+    from: &str,
+    task: Option<&str>,
+    to: Option<&str>,
+    channel: &str,
+    id: &str,
+    key: &SigningKey,
+) -> String {
+    let mut tags: Vec<(String, String)> = vec![
+        ("+freeq.at/act".into(), "bounty".into()),
+        ("+freeq.at/act-verb".into(), verb.into()),
+        ("+freeq.at/from".into(), from.into()),
+    ];
+    match task {
+        Some(t) => tags.push(("+freeq.at/act-id".into(), t.into())),
+        None => tags.push(("+freeq.at/act-title".into(), "index-the-archive".into())),
+    }
+    if let Some(to) = to {
+        tags.push(("+freeq.at/act-to".into(), to.into()));
+    }
+    signed_line(&tags, channel, id, key)
+}
+
+/// The test of generality: a second kind that needed a table row and no code.
+/// Bids pile up without moving anything, the poster names a winner, and the
+/// winner — not the poster who named them — is the one who can finish it.
+#[tokio::test]
+async fn a_bounty_takes_bids_and_the_poster_awards_the_winner() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+
+        let bounty = fresh_id();
+        a.tx(&bounty_line(
+            "offer", DID_ALICE, None, None, "#ops", &bounty, &alice_key,
+        ));
+        a.rx(|l| l.contains(&bounty), "the bounty opens");
+
+        // Two bids, from two agents, neither of which moves it.
+        for (did, k) in [(DID_ALICE, &alice_key), (DID_BOB, &bob_key)] {
+            let bid = fresh_id();
+            let line = bounty_line("bid", did, Some(&bounty), None, "#ops", &bid, k);
+            match did == DID_ALICE {
+                true => a.tx(&line),
+                false => b.tx(&line),
+            }
+            b.rx(|l| l.contains(&bid), "the bid is accepted");
+        }
+
+        // The poster picks. Bob is the winner; alice named him and did not
+        // become him.
+        let award = fresh_id();
+        a.tx(&bounty_line(
+            "award",
+            DID_ALICE,
+            Some(&bounty),
+            Some(DID_BOB),
+            "#ops",
+            &award,
+            &alice_key,
+        ));
+        b.rx(|l| l.contains(&award), "the award is accepted");
+
+        // The loser cannot finish work that is not theirs…
+        a.tx(&bounty_line(
+            "complete",
+            DID_ALICE,
+            Some(&bounty),
+            None,
+            "#ops",
+            &fresh_id(),
+            &alice_key,
+        ));
+        assert_eq!(a.fail_code(), "WRONG_SENDER");
+
+        // …and the winner can.
+        let done = fresh_id();
+        b.tx(&bounty_line(
+            "complete",
+            DID_BOB,
+            Some(&bounty),
+            None,
+            "#ops",
+            &done,
+            &bob_key,
+        ));
+        b.rx(|l| l.contains(&done), "the winner finishes it");
+    })
+    .await;
+}
+
+/// An award naming nobody assigns nobody, so the row's `requires` refuses it —
+/// and the sentence names the field rather than the verb, because which field
+/// a step needs is the rules file's to say.
+#[tokio::test]
+async fn an_award_that_names_no_winner_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+
+        let bounty = fresh_id();
+        a.tx(&bounty_line(
+            "offer", DID_ALICE, None, None, "#ops", &bounty, &signing,
+        ));
+        a.rx(|l| l.contains(&bounty), "the bounty opens");
+
+        a.tx(&bounty_line(
+            "award",
+            DID_ALICE,
+            Some(&bounty),
+            None,
+            "#ops",
+            &fresh_id(),
+            &signing,
+        ));
+        let line = a.fail();
+        assert!(line.contains(" MISSING_REQUIREMENT "), "{line}");
+        assert!(
+            line.ends_with("That step must carry act-to"),
+            "the approved sentence names the missing field: {line}"
+        );
+    })
+    .await;
+}
+
+/// A bounty is open by construction — a directed one is just a handoff — so
+/// an opener carrying a recipient is a step the kind cannot take.
+#[tokio::test]
+async fn a_bounty_opened_to_one_recipient_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        a.tx(&bounty_line(
+            "offer",
+            DID_ALICE,
+            None,
+            Some(DID_BOB),
+            "#ops",
+            &fresh_id(),
+            &signing,
+        ));
+        assert_eq!(a.fail_code(), "ILLEGAL_STEP");
     })
     .await;
 }

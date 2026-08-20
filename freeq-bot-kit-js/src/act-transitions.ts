@@ -30,7 +30,8 @@ export type RefusalReason =
   | "client-confirm"
   | "replaces-not-opener"
   | "replaces-malformed"
-  | "replaces-not-terminal";
+  | "replaces-not-terminal"
+  | "missing-requirement";
 
 /** Allowed, with the state the task lands in — or refused, with the reason. */
 export type CheckResult = { ok: true; to: string } | { ok: false; reason: RefusalReason };
@@ -54,6 +55,11 @@ export interface TaskEvent {
   /** The id the signer minted; its embedded ULID millisecond is the clock a
    * deadline is measured against. */
   msgid: string;
+  /** The act fields the event carries, by their document names (`act-to`,
+   * `act-note`, …). Presence only: what a transition's `requires` is checked
+   * against. The one place this checker points at a value is
+   * `assigneeSource`, which names the field rather than reading it. */
+  fields?: string[];
 }
 
 /** Who sent it. */
@@ -69,6 +75,10 @@ interface Transition {
   to: string;
   who: string;
   before_deadline?: boolean;
+  /** The field naming who this transition assigns. Absent = the actor. */
+  assignee_from?: string;
+  /** Fields the transition is illegal without. */
+  requires?: string[];
 }
 
 /** How a task of this kind comes into being: the verb that creates one, and
@@ -267,6 +277,14 @@ export function checkTransition(
   const row = rows.find((t) => fromMatches(t.from, task.state, kind));
   if (!row) return { ok: false, reason: "illegal-step" };
 
+  // What the move needs to be the move at all. Before authority for the same
+  // reason the state is: an award that names no winner is malformed for
+  // everybody, and "not you" would send the sender after the wrong problem.
+  const present = event.fields ?? [];
+  if ((row.requires ?? []).some((f) => !present.includes(f))) {
+    return { ok: false, reason: "missing-requirement" };
+  }
+
   // Authority second: who the sender is only matters once the move itself
   // makes sense.
   switch (row.who) {
@@ -303,4 +321,31 @@ export function checkTransition(
   }
 
   return { ok: true, to: row.to };
+}
+
+/** Who a transition assigns the work to. */
+export type AssigneeSource =
+  /** Whoever took the step — what `accept` and `claim` already mean. */
+  | { from: "actor" }
+  /** The act field named here, read off the event: a bounty's `award` names
+   *  its winner in `act-to`, because the poster picks rather than becomes. */
+  | { from: "field"; field: string };
+
+/**
+ * Where the assignee comes from when `verb` moves a `kind` task out of
+ * `fromState`.
+ *
+ * Data, not code: a kind that assigns someone other than the actor says so in
+ * its row. A verb with no row here answers `actor`, which changes nothing for
+ * a transition that assigns nobody.
+ */
+export function assigneeSource(
+  kind: string,
+  verb: string,
+  fromState: string,
+): AssigneeSource {
+  const k = kinds[kind];
+  if (!k) return { from: "actor" };
+  const row = k.transitions.find((t) => t.verb === verb && fromMatches(t.from, fromState, k));
+  return row?.assignee_from ? { from: "field", field: row.assignee_from } : { from: "actor" };
 }

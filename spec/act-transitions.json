@@ -21,7 +21,17 @@
     "never checked here. `from` is one state, a list of states, or",
     "`*nonterminal` for every state that is not terminal. `before_deadline` is data; the comparison is code.",
     "`confirmation` sits outside `kinds` because the receipt verb belongs to no kind and no kind may claim it:",
-    "a receipt is the home server's word about an event it filed, not a step anybody takes."
+    "a receipt is the home server's word about an event it filed, not a step anybody takes.",
+    "`assignee_from` names the field that says who a transition assigns. Absent means the actor, which is what",
+    "accept and claim already mean; a bounty's award sets it to act-to, because the poster names a winner",
+    "rather than becoming one. `requires` lists the act-* fields a transition is illegal without — the award's",
+    "act-to, since an award naming nobody assigns nobody. Both are data: a kind that assigns someone else, or",
+    "insists on a field, needs a row here and no code anywhere.",
+    "A kind whose `opens` has no `directed` can only be opened to the room, and an opener carrying act-to is an",
+    "illegal step: a bounty is open by construction, and a directed bounty is just a handoff.",
+    "What the file deliberately does not say: that an award must name someone who bid. Bids are sovereign and",
+    "so is the award — the server never picks, which cuts both ways, and the poster's signed choice is the",
+    "record. A checker that second-guessed it would be picking."
   ],
   "version": 1,
   "kinds": {
@@ -36,6 +46,27 @@
         { "verb": "complete", "from": "assigned", "to": "completed", "who": "assignee" },
         { "verb": "fail", "from": "assigned", "to": "failed", "who": "assignee" },
         { "verb": "cancel", "from": ["offered", "assigned", "open"], "to": "cancelled", "who": "offerer" },
+        { "verb": "expire", "from": "*nonterminal", "to": "expired", "who": "system" }
+      ]
+    },
+    "bounty": {
+      "opens": { "verb": "offer", "open": "open" },
+      "terminal": ["completed", "failed", "cancelled", "expired"],
+      "transitions": [
+        { "verb": "bid", "from": "open", "to": "open", "who": "anyone", "before_deadline": true },
+        {
+          "verb": "award",
+          "from": "open",
+          "to": "assigned",
+          "who": "offerer",
+          "before_deadline": true,
+          "assignee_from": "act-to",
+          "requires": ["act-to"]
+        },
+        { "verb": "progress", "from": "assigned", "to": "assigned", "who": "assignee" },
+        { "verb": "complete", "from": "assigned", "to": "completed", "who": "assignee" },
+        { "verb": "fail", "from": "assigned", "to": "failed", "who": "assignee" },
+        { "verb": "cancel", "from": ["open", "assigned"], "to": "cancelled", "who": "offerer" },
         { "verb": "expire", "from": "*nonterminal", "to": "expired", "who": "system" }
       ]
     }
@@ -78,7 +109,8 @@
     "client-confirm": "A confirmation is the home's record of an event it filed, never a sender's step.",
     "replaces-not-opener": "The revival relation belongs to an opener. A step on an action names no other.",
     "replaces-malformed": "The value does not name an action. An action id is a 26-character ULID.",
-    "replaces-not-terminal": "The action it replaces is not finished."
+    "replaces-not-terminal": "The action it replaces is not finished.",
+    "missing-requirement": "The transition requires a field the event does not carry."
   },
   "deadline_rule": {
     "_note": [
@@ -134,10 +166,24 @@
     },
     {
       "name": "an opener for a kind this file does not list is refused",
-      "kind": "bounty",
+      "kind": "approval",
       "verb": "offer",
       "directed": false,
       "expect_refused": "unknown-kind"
+    },
+    {
+      "name": "a bounty opens to the room, and naming a recipient is not something it can do",
+      "kind": "bounty",
+      "verb": "offer",
+      "directed": false,
+      "expect": "open"
+    },
+    {
+      "name": "a directed bounty is just a handoff, so the opener is refused",
+      "kind": "bounty",
+      "verb": "offer",
+      "directed": true,
+      "expect_refused": "illegal-step"
     }
   ],
   "revival_sequences": [
@@ -608,7 +654,7 @@
     {
       "name": "a kind this file does not list is refused",
       "task": {
-        "kind": "bounty",
+        "kind": "approval",
         "offer": "open",
         "state": "open",
         "offerer": "did:plc:eliza",
@@ -616,8 +662,160 @@
         "deadline": null
       },
       "steps": [
-        { "verb": "bid", "sender": "did:plc:scholar", "expect_refused": "unknown-kind" },
+        { "verb": "request", "sender": "did:plc:scholar", "expect_refused": "unknown-kind" },
         { "verb": "cancel", "sender": "did:plc:eliza", "expect_refused": "unknown-kind" }
+      ]
+    },
+    {
+      "name": "a bounty takes bids, the poster awards it, and the winner finishes the work",
+      "task": {
+        "kind": "bounty",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "bid", "sender": "did:plc:scholar", "expect": "open" },
+        { "verb": "bid", "sender": "did:plc:rival", "expect": "open" },
+        {
+          "verb": "award",
+          "sender": "did:plc:eliza",
+          "tags": ["act-to"],
+          "assigns": "did:plc:scholar",
+          "expect": "assigned"
+        },
+        { "verb": "progress", "sender": "did:plc:scholar", "expect": "assigned" },
+        { "verb": "complete", "sender": "did:plc:scholar", "expect": "completed" }
+      ]
+    },
+    {
+      "name": "the poster awards the work, and the loser is not the one who finishes it",
+      "task": {
+        "kind": "bounty",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "bid", "sender": "did:plc:scholar", "expect": "open" },
+        { "verb": "bid", "sender": "did:plc:rival", "expect": "open" },
+        {
+          "verb": "award",
+          "sender": "did:plc:eliza",
+          "tags": ["act-to"],
+          "assigns": "did:plc:scholar",
+          "expect": "assigned"
+        },
+        { "verb": "complete", "sender": "did:plc:rival", "expect_refused": "wrong-sender" },
+        { "verb": "bid", "sender": "did:plc:rival", "expect_refused": "illegal-step" }
+      ]
+    },
+    {
+      "name": "an award names its winner, or it assigns nobody",
+      "task": {
+        "kind": "bounty",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "deadline": null
+      },
+      "steps": [
+        {
+          "verb": "award",
+          "sender": "did:plc:eliza",
+          "expect_refused": "missing-requirement"
+        },
+        {
+          "verb": "award",
+          "sender": "did:plc:eliza",
+          "tags": ["act-to"],
+          "assigns": "did:plc:scholar",
+          "expect": "assigned"
+        }
+      ]
+    },
+    {
+      "name": "the poster is the only one who awards the work",
+      "task": {
+        "kind": "bounty",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "deadline": null
+      },
+      "steps": [
+        {
+          "verb": "award",
+          "sender": "did:plc:scholar",
+          "tags": ["act-to"],
+          "expect_refused": "wrong-sender"
+        },
+        {
+          "verb": "award",
+          "sender": "did:plc:mallory",
+          "tags": ["act-to"],
+          "expect_refused": "wrong-sender"
+        }
+      ]
+    },
+    {
+      "name": "a bid after the deadline is refused, exactly as an award is",
+      "task": {
+        "kind": "bounty",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "deadline": 1788000000
+      },
+      "steps": [
+        {
+          "verb": "bid",
+          "sender": "did:plc:scholar",
+          "event_id": "01M16HSC58ACCEPTTOOLATE000",
+          "expect_refused": "deadline-passed"
+        },
+        {
+          "verb": "bid",
+          "sender": "did:plc:scholar",
+          "event_id": "01M16HSB60ACCEPTATEDGE0000",
+          "expect": "open"
+        }
+      ]
+    },
+    {
+      "name": "an awarded bounty takes no further bids",
+      "task": {
+        "kind": "bounty",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "deadline": null
+      },
+      "steps": [
+        {
+          "verb": "award",
+          "sender": "did:plc:eliza",
+          "tags": ["act-to"],
+          "assigns": "did:plc:scholar",
+          "expect": "assigned"
+        },
+        { "verb": "bid", "sender": "did:plc:rival", "expect_refused": "illegal-step" }
+      ]
+    },
+    {
+      "name": "a bounty has no offeree, so it is never accepted or declined",
+      "task": {
+        "kind": "bounty",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "deadline": null
+      },
+      "steps": [
+        { "verb": "accept", "sender": "did:plc:scholar", "expect_refused": "unknown-verb" },
+        { "verb": "claim", "sender": "did:plc:scholar", "expect_refused": "unknown-verb" }
       ]
     }
   ]

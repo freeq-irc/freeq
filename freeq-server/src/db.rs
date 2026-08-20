@@ -3038,6 +3038,173 @@ mod tests {
         );
     }
 
+    // ── bounty: the second kind, and no code of its own ───────────────────
+
+    fn bounty_offer(db: &Db, id: &str, venue: &str, ts: i64) -> ActWrite {
+        let canonical = act_doc(
+            &[
+                ("+freeq.at/act", "bounty"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", ELIZA),
+                ("+freeq.at/act-title", "index the archive"),
+            ],
+            venue,
+            id,
+        );
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: id,
+            act_id: id,
+            opens: true,
+            venue,
+            actor: ELIZA,
+            from_system: false,
+            origin: None,
+            timestamp: ts,
+        })
+        .unwrap()
+    }
+
+    /// A bounty step. `to` is the winner an award names — the field the rules
+    /// file points `assignee_from` at.
+    fn bounty_step(
+        db: &Db,
+        verb: &str,
+        actor: &str,
+        task: &str,
+        id: &str,
+        to: Option<&str>,
+        venue: &str,
+        ts: i64,
+    ) -> ActWrite {
+        let mut tags = vec![
+            ("+freeq.at/act", "bounty"),
+            ("+freeq.at/act-verb", verb),
+            ("+freeq.at/from", actor),
+            ("+freeq.at/act-id", task),
+        ];
+        if let Some(to) = to {
+            tags.push(("+freeq.at/act-to", to));
+        }
+        let canonical = act_doc(&tags, venue, id);
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: id,
+            act_id: task,
+            opens: false,
+            venue,
+            actor,
+            from_system: false,
+            origin: None,
+            timestamp: ts,
+        })
+        .unwrap()
+    }
+
+    /// The whole point of the second kind: bids pile up without moving
+    /// anything, and the award assigns the DID it names rather than the one
+    /// who sent it.
+    #[test]
+    fn a_bounty_takes_bids_and_the_award_assigns_the_did_it_names() {
+        let db = Db::open_memory().unwrap();
+        bounty_offer(&db, "B1", "#ops", 10);
+        for (i, bidder) in [SCHOLAR, MALLORY].iter().enumerate() {
+            assert_eq!(
+                bounty_step(
+                    &db,
+                    "bid",
+                    bidder,
+                    "B1",
+                    &format!("BID{i}"),
+                    None,
+                    "#ops",
+                    11 + i as i64
+                ),
+                ActWrite::Filed {
+                    was: Some("open".into()),
+                    state: "open".into()
+                },
+                "a bid is additive: it leaves the bounty exactly where it was"
+            );
+        }
+        assert_eq!(db.act_task_events("B1").unwrap().len(), 3, "all on file");
+
+        assert_eq!(
+            bounty_step(&db, "award", ELIZA, "B1", "AW", Some(SCHOLAR), "#ops", 20),
+            ActWrite::Filed {
+                was: Some("open".into()),
+                state: "assigned".into()
+            }
+        );
+        let task = db.act_task("B1").unwrap().unwrap();
+        assert_eq!(
+            task.assignee.as_deref(),
+            Some(SCHOLAR),
+            "the winner the poster named, not the poster who named them"
+        );
+        assert_eq!(task.offerer, ELIZA);
+    }
+
+    /// An award naming nobody assigns nobody, so the transition is illegal
+    /// without the field its row requires.
+    #[test]
+    fn an_award_that_names_no_winner_is_refused() {
+        let db = Db::open_memory().unwrap();
+        bounty_offer(&db, "B1", "#ops", 10);
+        assert_eq!(
+            bounty_step(&db, "award", ELIZA, "B1", "AW", None, "#ops", 20),
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::MissingRequirement(
+                "act-to"
+            ))
+        );
+        assert_eq!(db.act_task("B1").unwrap().unwrap().state, "open");
+    }
+
+    /// The loser bid and did not win, so the work is not theirs to finish.
+    #[test]
+    fn the_loser_of_a_bounty_cannot_finish_the_work() {
+        let db = Db::open_memory().unwrap();
+        bounty_offer(&db, "B1", "#ops", 10);
+        bounty_step(&db, "bid", SCHOLAR, "B1", "BID0", None, "#ops", 11);
+        bounty_step(&db, "bid", MALLORY, "B1", "BID1", None, "#ops", 12);
+        bounty_step(&db, "award", ELIZA, "B1", "AW", Some(SCHOLAR), "#ops", 20);
+
+        assert_eq!(
+            bounty_step(&db, "complete", MALLORY, "B1", "C1", None, "#ops", 21),
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::WrongSender)
+        );
+        assert_eq!(
+            bounty_step(&db, "bid", MALLORY, "B1", "BID2", None, "#ops", 22),
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::IllegalStep),
+            "an awarded bounty takes no further bids"
+        );
+        assert!(matches!(
+            bounty_step(&db, "complete", SCHOLAR, "B1", "C2", None, "#ops", 23),
+            ActWrite::Filed { .. }
+        ));
+        assert_eq!(db.act_task("B1").unwrap(), None, "completed and gone");
+    }
+
+    /// The server never picks, and that cuts both ways: nothing here checks
+    /// that the awarded DID ever bid. The poster's signed choice is the
+    /// record.
+    #[test]
+    fn an_award_may_name_someone_who_never_bid() {
+        let db = Db::open_memory().unwrap();
+        bounty_offer(&db, "B1", "#ops", 10);
+        bounty_step(&db, "bid", SCHOLAR, "B1", "BID0", None, "#ops", 11);
+        assert!(matches!(
+            bounty_step(&db, "award", ELIZA, "B1", "AW", Some(MALLORY), "#ops", 20),
+            ActWrite::Filed { .. }
+        ));
+        assert_eq!(
+            db.act_task("B1").unwrap().unwrap().assignee.as_deref(),
+            Some(MALLORY)
+        );
+    }
+
     // ── the revival relation ──────────────────────────────────────────────
 
     /// An opener that names a finished action it revives.
@@ -3190,6 +3357,13 @@ mod tests {
 
         offer(&db, "T4", "#ops", None, 40);
 
+        // A bounty too: its award assigns the DID it names rather than the
+        // sender, and a rebuild that read the sender would disagree with the
+        // live row on exactly that column.
+        bounty_offer(&db, "B1", "#ops", 50);
+        bounty_step(&db, "bid", MALLORY, "B1", "BID0", None, "#ops", 51);
+        bounty_step(&db, "award", ELIZA, "B1", "AW", Some(SCHOLAR), "#ops", 52);
+
         let venues = vec!["#ops".to_string(), "#other".to_string()];
         let mut live = db.act_tasks(&venues, None, None, None, 100).unwrap();
         live.sort_by(|a, b| a.act_id.cmp(&b.act_id));
@@ -3198,8 +3372,8 @@ mod tests {
 
         assert_eq!(
             live.len(),
-            4,
-            "the declined one left the view; its revival did not"
+            5,
+            "the declined one left the view; its revival and the bounty did not"
         );
         assert_eq!(rebuilt, live);
     }
@@ -5962,7 +6136,14 @@ impl Db {
 
         // What the event does to the task, where the task stood before it, and
         // what it looks like now.
+        //
+        // `kind` is the *task's*, which for an opener is the one the event
+        // declares and for a follow-up is the one already on file. They should
+        // agree, and nothing downstream depends on their agreeing: a step that
+        // named the wrong kind is refereed by the task's rules and
+        // materialized by them too, rather than by whatever the sender wrote.
         let mut was: Option<String> = None;
+        let mut kind = view.kind.clone();
         let landed = if ev.opens {
             // The opener's own id is the task's id. A second opener under the
             // same id is the log's duplicate case, handled by the write below.
@@ -5987,9 +6168,11 @@ impl Db {
             if task.venue != ev.venue {
                 return Ok(ActWrite::WrongVenue);
             }
+            let present: Vec<&str> = view.fields.keys().map(String::as_str).collect();
             let event = rules::Event {
                 verb: &view.verb,
                 msgid: ev.event_id,
+                fields: &present,
             };
             let sender = rules::Sender {
                 did: ev.actor,
@@ -6006,6 +6189,7 @@ impl Db {
             match rules::check(&checked, &event, &sender) {
                 Ok(state) => {
                     was = Some(task.state.clone());
+                    kind = task.kind.clone();
                     state.to_string()
                 }
                 Err(refusal) => return Ok(ActWrite::Refused(refusal)),
@@ -6024,7 +6208,7 @@ impl Db {
         if !self.insert_event(&record)? {
             return Ok(ActWrite::Duplicate);
         }
-        self.materialize_act(ev, &view, &landed)?;
+        self.materialize_act(ev, &view, &kind, was.as_deref(), &landed)?;
         tx.commit()?;
         Ok(ActWrite::Filed { was, state: landed })
     }
@@ -6032,16 +6216,21 @@ impl Db {
     /// Move the view to match an event that was just accepted.
     ///
     /// The rules, in full: an opener creates the row and sets what the offer
-    /// declared; whoever moves a task into `assigned` becomes its assignee;
+    /// declared; a step that moves a task into `assigned` names its assignee;
     /// a terminal state removes the row, because the view holds live tasks and
     /// the log holds the history.
+    ///
+    /// `was` is the state the task came from — what the rules file is asked
+    /// about when it says where a transition's assignee comes from.
     fn materialize_act(
         &self,
         ev: &ActEvent<'_>,
         view: &crate::events::ActView,
+        kind: &str,
+        was: Option<&str>,
         landed: &str,
     ) -> SqlResult<()> {
-        if freeq_sdk::act_transitions::is_terminal(&view.kind, landed) {
+        if freeq_sdk::act_transitions::is_terminal(kind, landed) {
             self.conn.execute(
                 "DELETE FROM act_actions WHERE act_id = ?1",
                 params![ev.act_id],
@@ -6056,7 +6245,7 @@ impl Db {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     ev.act_id,
-                    view.kind,
+                    kind,
                     ev.venue,
                     ev.origin.unwrap_or(""),
                     landed,
@@ -6070,9 +6259,26 @@ impl Db {
             )?;
             return Ok(());
         }
-        // Whoever moves a task into `assigned` becomes its assignee — and only
-        // the first one does, so a progress report does not reassign the work
-        // it is reporting on.
+        // A step that moves a task into `assigned` names its assignee — and
+        // only the first one does, so a progress report does not reassign the
+        // work it is reporting on.
+        //
+        // Who it names is data. Accepting and claiming make the actor the
+        // assignee; a bounty's award names a winner in `act-to`, because the
+        // poster picks rather than becomes. A row whose field is absent names
+        // nobody and leaves the work unassigned — fail closed, though a
+        // `requires` on the same row is what actually keeps that from
+        // happening.
+        let assignee: Option<&str> = match freeq_sdk::act_transitions::assignee_source(
+            kind,
+            &view.verb,
+            was.unwrap_or_default(),
+        ) {
+            freeq_sdk::act_transitions::AssigneeSource::Actor => Some(ev.actor),
+            freeq_sdk::act_transitions::AssigneeSource::Field(name) => {
+                view.fields.get(name).map(String::as_str)
+            }
+        };
         self.conn.execute(
             "UPDATE act_actions
                 SET state = ?2,
@@ -6080,7 +6286,7 @@ impl Db {
                                     THEN ?4 ELSE assignee END,
                     updated = ?5
               WHERE act_id = ?1",
-            params![ev.act_id, landed, landed, ev.actor, ev.timestamp],
+            params![ev.act_id, landed, landed, assignee, ev.timestamp],
         )?;
         Ok(())
     }
@@ -6382,6 +6588,8 @@ impl Db {
             }
             let act_id = row.subject.clone().unwrap_or_else(|| row.event_id.clone());
             let opens = row.subject.is_none();
+            let mut was: Option<String> = None;
+            let mut kind = view.kind.clone();
             let landed = if opens {
                 match freeq_sdk::act_transitions::check_open(
                     &view.kind,
@@ -6396,6 +6604,9 @@ impl Db {
                 let Some(task) = live.get(&act_id) else {
                     continue;
                 };
+                was = Some(task.state.clone());
+                kind = task.kind.clone();
+                let present: Vec<&str> = view.fields.keys().map(String::as_str).collect();
                 match freeq_sdk::act_transitions::check(
                     &freeq_sdk::act_transitions::Task {
                         kind: &task.kind,
@@ -6408,6 +6619,7 @@ impl Db {
                     &freeq_sdk::act_transitions::Event {
                         verb: &view.verb,
                         msgid: &row.event_id,
+                        fields: &present,
                     },
                     &freeq_sdk::act_transitions::Sender {
                         did: &row.actor,
@@ -6421,7 +6633,7 @@ impl Db {
                     Err(_) => continue,
                 }
             };
-            if freeq_sdk::act_transitions::is_terminal(&view.kind, &landed) {
+            if freeq_sdk::act_transitions::is_terminal(&kind, &landed) {
                 live.remove(&act_id);
                 continue;
             }
@@ -6430,7 +6642,7 @@ impl Db {
                     act_id.clone(),
                     ActTask {
                         act_id,
-                        kind: view.kind.clone(),
+                        kind: kind.clone(),
                         venue: row.venue.clone(),
                         origin: row.origin.clone().unwrap_or_default(),
                         state: landed,
@@ -6445,7 +6657,21 @@ impl Db {
                 );
             } else if let Some(task) = live.get_mut(&act_id) {
                 if task.assignee.is_none() && landed == "assigned" {
-                    task.assignee = Some(row.actor.clone());
+                    // The same reading ingress does: who a step assigns is
+                    // what the rules file says — the actor unless a row names
+                    // a field instead.
+                    task.assignee = match freeq_sdk::act_transitions::assignee_source(
+                        &kind,
+                        &view.verb,
+                        was.as_deref().unwrap_or_default(),
+                    ) {
+                        freeq_sdk::act_transitions::AssigneeSource::Actor => {
+                            Some(row.actor.clone())
+                        }
+                        freeq_sdk::act_transitions::AssigneeSource::Field(name) => {
+                            view.fields.get(name).cloned()
+                        }
+                    };
                 }
                 task.state = landed;
                 task.updated = row.timestamp;

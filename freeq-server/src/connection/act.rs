@@ -973,6 +973,10 @@ pub(super) fn gate(
         }
         Some(crate::db::ActWrite::Refused(reason)) => {
             use freeq_sdk::act_transitions::Refusal;
+            // Every other sentence is a constant; this one names the field the
+            // step is missing, so it needs somewhere to live as long as the
+            // borrow.
+            let missing;
             let (code, sentence) = match reason {
                 Refusal::TerminalTask => (
                     "TERMINAL_TASK",
@@ -1000,6 +1004,14 @@ pub(super) fn gate(
                     "REPLACES_NOT_TERMINAL",
                     "The action it replaces is not finished",
                 ),
+                // The sentence names the field rather than the verb: which
+                // field a step needs is the rules file's to say, and a
+                // sentence per verb would be a kind's behaviour written into
+                // this server.
+                Refusal::MissingRequirement(field) => {
+                    missing = format!("That step must carry {field}");
+                    ("MISSING_REQUIREMENT", missing.as_str())
+                }
             };
             tracing::debug!(
                 session = %conn.id, did = %did, act_id = %act_id, reason = %reason,

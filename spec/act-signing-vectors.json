@@ -36,6 +36,15 @@
       "vector": "receipt-confirming-an-accept"
     },
     {
+      "expected": "invalid",
+      "id": "01JAWARDEVENTID000000000A",
+      "name": "award-with-its-winner-stripped",
+      "strippedTag": "+freeq.at/act-to",
+      "tamperedCanonical": "{\"act\":\"bounty\",\"act-id\":\"01JBOUNTYEVENTID00000000B\",\"act-verb\":\"award\",\"from\":\"did:plc:eliza\",\"id\":\"01JAWARDEVENTID000000000A\",\"target\":\"#swarm\"}",
+      "target": "#swarm",
+      "vector": "bounty-award"
+    },
+    {
       "expected": "unverifiable",
       "id": "01JABCDEF000000000000000EF",
       "name": "missing-from",
@@ -115,6 +124,40 @@
         "+freeq.at/from": "did:plc:factory"
       },
       "target": "dm:did:plc:factory,did:plc:opslead"
+    },
+    {
+      "canonical": "{\"act\":\"bounty\",\"act-id\":\"01JBOUNTYEVENTID00000000B\",\"act-note\":\"two days, sources included\",\"act-verb\":\"bid\",\"from\":\"did:plc:scholar\",\"id\":\"01JBIDEVENTID00000000000B\",\"target\":\"#swarm\"}",
+      "id": "01JBIDEVENTID00000000000B",
+      "kid": "_oEsEvOrTOasXbaaw1L5Bg",
+      "name": "bounty-bid",
+      "publicKey": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+      "seed": "0707070707070707070707070707070707070707070707070707070707070707",
+      "sigTag": "ed25519:_oEsEvOrTOasXbaaw1L5Bg:qmW9LGYR9JC6x10bmWFGcgbZuwvE20lEvnaraOlJ_m1sHKDLOChk8K2pUgjmKx2mkAhJlGbIR8REvqNT8Nj4Dg",
+      "tags": {
+        "+freeq.at/act": "bounty",
+        "+freeq.at/act-id": "01JBOUNTYEVENTID00000000B",
+        "+freeq.at/act-note": "two days, sources included",
+        "+freeq.at/act-verb": "bid",
+        "+freeq.at/from": "did:plc:scholar"
+      },
+      "target": "#swarm"
+    },
+    {
+      "canonical": "{\"act\":\"bounty\",\"act-id\":\"01JBOUNTYEVENTID00000000B\",\"act-to\":\"did:plc:scholar\",\"act-verb\":\"award\",\"from\":\"did:plc:eliza\",\"id\":\"01JAWARDEVENTID000000000A\",\"target\":\"#swarm\"}",
+      "id": "01JAWARDEVENTID000000000A",
+      "kid": "XCm3jxCjWkmmIx0I7oQKBA",
+      "name": "bounty-award",
+      "publicKey": "E5j2LG0aRXxRumpLXz29L2n8qTIWIY3ImX5Ba9F9k8o",
+      "seed": "0808080808080808080808080808080808080808080808080808080808080808",
+      "sigTag": "ed25519:XCm3jxCjWkmmIx0I7oQKBA:812WbPDfzcqaVteOZykVBA6VfGzmUrr1JFJMMdTEdmeRQrd5BI45326wKNoBkAKRaRagqGFsN7Q02RO5VhkuCg",
+      "tags": {
+        "+freeq.at/act": "bounty",
+        "+freeq.at/act-id": "01JBOUNTYEVENTID00000000B",
+        "+freeq.at/act-to": "did:plc:scholar",
+        "+freeq.at/act-verb": "award",
+        "+freeq.at/from": "did:plc:eliza"
+      },
+      "target": "#swarm"
     },
     {
       "canonical": "{\"act\":\"handoff\",\"act-replaces\":\"01JABCDEF000000000000000EF\",\"act-title\":\"Cite 3 sources on X\",\"act-verb\":\"offer\",\"from\":\"did:plc:eliza\",\"id\":\"01JREOFFEREVENTID000000000\",\"target\":\"#ops\"}",
