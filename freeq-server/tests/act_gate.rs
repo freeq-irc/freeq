@@ -1581,7 +1581,7 @@ async fn an_award_naming_a_non_bid_is_refused() {
             let line = a.fail();
             assert!(line.contains(" ACCEPTS_NOT_A_BID "), "{named}: {line}");
             assert!(
-                line.ends_with("The award names an event that is not a bid on this action"),
+                line.ends_with("That award names no bid on this task"),
                 "{line}"
             );
         }
