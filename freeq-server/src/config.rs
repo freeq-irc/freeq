@@ -132,6 +132,17 @@ pub struct ServerConfig {
     #[arg(long, default_value = "604800")]
     pub act_expiry_secs: u64,
 
+    /// How long submitted work may wait on the poster before it is deemed
+    /// accepted, in seconds. Separate from the abandonment limit because it
+    /// does the opposite job: that one is neutral and catches work nobody is
+    /// doing, this one favours the worker and catches a poster who took
+    /// delivery and then went quiet. Measured from the last movement, so
+    /// asking for changes stops the clock and a fresh submission starts a new
+    /// one. Fixed and documented rather than per-task, so every bidder knows
+    /// the window before they bid. 0 = never auto-accept.
+    #[arg(long, default_value = "1209600")]
+    pub act_review_secs: u64,
+
     /// Message of the Day text. If not set, no MOTD is sent.
     #[arg(long)]
     pub motd: Option<String>,
@@ -307,6 +318,7 @@ impl Default for ServerConfig {
             did_resolver_static: vec![],
             max_messages_per_channel: 10000,
             act_expiry_secs: 604_800,
+            act_review_secs: 1_209_600,
             motd: None,
             motd_file: None,
             web_static_dir: None,
@@ -441,6 +453,7 @@ struct FileConfig {
     did_resolver_static: Option<MapOrPairs>,
     max_messages_per_channel: Option<usize>,
     act_expiry_secs: Option<u64>,
+    act_review_secs: Option<u64>,
     motd: Option<String>,
     motd_file: Option<String>,
     web_static_dir: Option<String>,
@@ -558,6 +571,7 @@ fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConf
         s2s_allowed_peers,
         max_messages_per_channel,
         act_expiry_secs,
+        act_review_secs,
         plugins,
         require_did_for_ops,
         oper_dids,
@@ -613,6 +627,7 @@ mod tests {
                 max_messages_per_channel = 42
                 iroh = true
                 act_expiry_secs = 120
+                act_review_secs = 240
                 s2s_peer_api = ["abcd=https://irc.example.com"]
                 "#,
             ),
@@ -623,6 +638,7 @@ mod tests {
         assert_eq!(c.max_messages_per_channel, 42);
         assert!(c.iroh);
         assert_eq!(c.act_expiry_secs, 120);
+        assert_eq!(c.act_review_secs, 240);
         assert_eq!(c.s2s_peer_api, vec!["abcd=https://irc.example.com"]);
     }
 

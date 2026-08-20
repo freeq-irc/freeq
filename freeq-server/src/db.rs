@@ -6636,21 +6636,77 @@ impl Db {
         rows.collect()
     }
 
-    /// Live tasks whose last movement is older than `cutoff` — the sweep's
-    /// candidates.
+    /// Live tasks whose last movement is older than `cutoff` and whose state
+    /// is one of `states` — the review sweep's candidates.
     ///
     /// `updated` is what is measured, so a task that anyone touched recently
-    /// is not abandoned however old its opener is.
-    pub fn act_tasks_idle_since(&self, cutoff: i64, limit: usize) -> SqlResult<Vec<ActTask>> {
-        let mut stmt = self.conn.prepare(
+    /// is not abandoned however old its opener is. On a review window that is
+    /// exactly the behaviour wanted: asking for changes moves the task, which
+    /// stops the clock, and the next submission starts a fresh one.
+    pub fn act_tasks_idle_in_states(
+        &self,
+        states: &[&str],
+        cutoff: i64,
+        limit: usize,
+    ) -> SqlResult<Vec<ActTask>> {
+        self.act_tasks_idle(states, true, cutoff, limit)
+    }
+
+    /// Live tasks idle since `cutoff` whose state is **not** one of `states` —
+    /// the expiry sweep's candidates.
+    ///
+    /// The complement of the query above, so the two clocks cannot both claim
+    /// a task. They pull in opposite directions: a review window favours the
+    /// worker and the idle limit is neutral, so a task sitting inside its
+    /// review window must not be expired out from under it by whichever of
+    /// the two numbers an operator happened to set lower.
+    pub fn act_tasks_idle_outside_states(
+        &self,
+        states: &[&str],
+        cutoff: i64,
+        limit: usize,
+    ) -> SqlResult<Vec<ActTask>> {
+        self.act_tasks_idle(states, false, cutoff, limit)
+    }
+
+    fn act_tasks_idle(
+        &self,
+        states: &[&str],
+        within: bool,
+        cutoff: i64,
+        limit: usize,
+    ) -> SqlResult<Vec<ActTask>> {
+        // A state name is a rules-file constant, never anything a sender
+        // wrote, but the list is built at runtime — so the placeholders are
+        // counted rather than the values interpolated. Numbered rather than
+        // bare: SQLite numbers a bare `?` from the highest index it has seen,
+        // which would collide with the `?2` the LIMIT further down already
+        // holds.
+        let holes = (0..states.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect::<Vec<_>>()
+            .join(",");
+        let test = match (states.is_empty(), within) {
+            // Nothing to be within, and everything is outside nothing.
+            (true, true) => "0".to_string(),
+            (true, false) => "1".to_string(),
+            (false, true) => format!("state IN ({holes})"),
+            (false, false) => format!("state NOT IN ({holes})"),
+        };
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT act_id, kind, venue, origin, state, offerer, offeree, assignee,
                     caps, deadline, replaces, updated
                FROM act_actions
-              WHERE updated < ?1
+              WHERE updated < ?1 AND {test}
               ORDER BY updated
-              LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![cutoff, limit as i64], |row| {
+              LIMIT ?2"
+        ))?;
+        let limit = limit as i64;
+        let mut args: Vec<&dyn rusqlite::ToSql> = vec![&cutoff, &limit];
+        for state in states {
+            args.push(state);
+        }
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), |row| {
             Ok(ActTask {
                 act_id: row.get(0)?,
                 kind: row.get(1)?,

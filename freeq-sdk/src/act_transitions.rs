@@ -335,6 +335,33 @@ const BID_AUTHOR: &str = "bid-author";
 /// rules rather than spelling a kind's verb into itself.
 pub const BID_VERB: &str = "bid";
 
+/// The verb a home files when a review window runs out.
+///
+/// Distinct from `expire` on purpose: the log should say what happened, and
+/// "the review window closed and the work is deemed accepted" is not the same
+/// event as "nobody touched this for a month". A sweep that reused `expire`
+/// would tell every reader the worker dropped the job.
+pub const REVIEW_TIMEOUT_VERB: &str = "auto-accept";
+
+/// Every state some kind's review-timeout row moves a task out of.
+///
+/// The sweep asks this rather than knowing which kinds have a review window:
+/// a kind that writes the row is swept, a kind that does not is left to the
+/// neutral idle limit. Sorted and deduplicated, so two kinds naming the same
+/// state name it once.
+pub fn review_timeout_states() -> Vec<&'static str> {
+    let mut states: Vec<&'static str> = spec()
+        .kinds
+        .values()
+        .flat_map(|k| k.transitions.iter())
+        .filter(|t| t.verb == REVIEW_TIMEOUT_VERB)
+        .flat_map(|t| t.from.states())
+        .collect();
+    states.sort_unstable();
+    states.dedup();
+    states
+}
+
 /// Where the assignee comes from when `verb` moves a `kind` task out of
 /// `from_state`.
 ///
@@ -567,6 +594,16 @@ enum FromStates {
 const ANY_NONTERMINAL: &str = "*nonterminal";
 
 impl FromStates {
+    /// The states named outright. Empty for `*nonterminal`, which names none
+    /// of them: it is a rule about the kind's table rather than a list.
+    fn states(&'static self) -> Vec<&'static str> {
+        match self {
+            FromStates::One(s) if s == ANY_NONTERMINAL => Vec::new(),
+            FromStates::One(s) => vec![s.as_str()],
+            FromStates::Many(states) => states.iter().map(String::as_str).collect(),
+        }
+    }
+
     fn matches(&self, state: &str, kind: &Kind) -> bool {
         match self {
             FromStates::One(s) if s == ANY_NONTERMINAL => !kind.terminal.iter().any(|t| t == state),
@@ -1066,6 +1103,48 @@ mod tests {
         assert_eq!(
             check(&bounty("assigned"), &ev("bid"), &who(MALLORY)),
             Err(Refusal::IllegalStep)
+        );
+    }
+
+    /// The sweep reads which states have a review window off the tables, so a
+    /// kind that adds the row is swept and one that does not is left alone.
+    #[test]
+    fn the_review_timeout_states_come_from_the_tables() {
+        assert_eq!(REVIEW_TIMEOUT_VERB, "auto-accept");
+        assert_eq!(review_timeout_states(), vec!["under_review"]);
+        // Handoff has no review window, so none of its states are swept by
+        // this clock — its work ends when the assignee says so.
+        for state in ["offered", "open", "assigned"] {
+            assert!(!review_timeout_states().contains(&state), "{state}");
+        }
+    }
+
+    /// A bounty's review window is the server's to close, and only from the
+    /// state the work is actually sitting in.
+    #[test]
+    fn only_the_server_closes_a_review_window() {
+        assert_eq!(
+            check(&bounty("under_review"), &ev("auto-accept"), &who(ELIZA)),
+            Err(Refusal::WrongSender),
+            "not the poster whose silence started the clock"
+        );
+        assert_eq!(
+            check(&bounty("under_review"), &ev("auto-accept"), &who(SCHOLAR)),
+            Err(Refusal::WrongSender)
+        );
+        let system = Sender {
+            did: SERVER,
+            is_system: true,
+            accepted_bid: None,
+        };
+        assert_eq!(
+            check(&bounty("under_review"), &ev("auto-accept"), &system),
+            Ok("accepted")
+        );
+        assert_eq!(
+            check(&bounty("assigned"), &ev("auto-accept"), &system),
+            Err(Refusal::IllegalStep),
+            "there is no window until the work is in"
         );
     }
 

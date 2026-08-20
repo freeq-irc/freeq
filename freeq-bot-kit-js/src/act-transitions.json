@@ -35,7 +35,11 @@
     "poster either takes it or sends it back. So there is no complete on a bounty — the worker says the work",
     "is in, and accept-work says it is done — and cancel does not reach under_review: once work is delivered",
     "the poster's only moves are accept-work and revise. What a poster who instead goes silent gets is a",
-    "clock, not a further verb."
+    "clock, not a further verb: auto-accept is the server's, it fires on work left unanswered past a window",
+    "every bidder knew before bidding, and it is its own verb rather than a reused expire so the log says",
+    "which of the two happened. The window is one number the operator sets. A per-task act-review-deadline",
+    "the offer declares, read like act-deadline and overriding the global for that task, is the additive",
+    "follow-on: the sweep would change only which number it reads, so nothing here is built to be undone."
   ],
   "version": 1,
   "kinds": {

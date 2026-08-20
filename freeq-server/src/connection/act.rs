@@ -251,6 +251,41 @@ pub(crate) fn expire_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -
     true
 }
 
+/// Close the review window on one task: sign the event, run it through the
+/// same check and storage every other event goes through, and let it go out.
+///
+/// The other clock, and the mirror of `expire_task` — the difference is what
+/// the log ends up saying. Work that was handed in and never answered is
+/// deemed accepted, under a verb of its own, because "the window you were
+/// told about closed" and "nobody touched this for a month" are different
+/// things to have on the record.
+///
+/// No notice to the room. The expiry sweep announces because a task ending
+/// unfinished is news nobody asked for; an acceptance is the ordinary end of
+/// the work, and the event itself is what says so.
+///
+/// Returns whether the task was accepted.
+pub(crate) fn auto_accept_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -> bool {
+    let verb = freeq_sdk::act_transitions::REVIEW_TIMEOUT_VERB;
+    match file_own_event(state, &task.kind, verb, &task.act_id, &[], &task.venue) {
+        Some((_, crate::db::ActWrite::Filed { .. })) => {
+            tracing::info!(
+                act_id = %task.act_id, venue = %task.venue, state = %task.state,
+                "Review window closed; the work is accepted"
+            );
+            true
+        }
+        other => {
+            tracing::warn!(
+                act_id = %task.act_id, venue = %task.venue,
+                outcome = ?other.map(|(_, w)| w),
+                "Review sweep could not file its own event"
+            );
+            false
+        }
+    }
+}
+
 /// A title is text its sender chose, and this notice is built as a wire line
 /// rather than through `Message`, which escapes tag values on the way out. So
 /// the bytes that end a line — and every other control byte — come out here,

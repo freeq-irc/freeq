@@ -37,12 +37,22 @@ fn resolver_with(entries: Vec<(&str, &PrivateKey)>) -> DidResolver {
 }
 
 async fn start(resolver: DidResolver) -> (SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>) {
-    start_with_expiry(resolver, 604_800).await
+    start_with_clocks(resolver, 604_800, 1_209_600).await
 }
 
 async fn start_with_expiry(
     resolver: DidResolver,
     act_expiry_secs: u64,
+) -> (SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>) {
+    start_with_clocks(resolver, act_expiry_secs, 1_209_600).await
+}
+
+/// The two sweeps' limits: how long unfinished work may sit before it is
+/// expired, and how long submitted work may wait on its poster.
+async fn start_with_clocks(
+    resolver: DidResolver,
+    act_expiry_secs: u64,
+    act_review_secs: u64,
 ) -> (SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>) {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let db_path = tmp.path().to_str().unwrap().to_string();
@@ -53,6 +63,7 @@ async fn start_with_expiry(
         challenge_timeout_secs: 60,
         db_path: Some(db_path),
         act_expiry_secs,
+        act_review_secs,
         ..Default::default()
     };
     freeq_server::server::Server::with_resolver(config, resolver)
@@ -1137,6 +1148,21 @@ fn bounty_line(
     signed_line(&tags, channel, id, key)
 }
 
+/// Every task event this server serves back for a room, as wire lines.
+///
+/// What a sweep's own event is read back through: the server files those and
+/// does not put them on the wire live, so history is where they surface.
+fn act_events_in_history(c: &mut C, channel: &str) -> Vec<String> {
+    c.tx(&format!("CHATHISTORY LATEST {channel} * 50"));
+    let mut lines = Vec::new();
+    while let Some(line) = c.maybe(|_| true, 900) {
+        if line.contains("+freeq.at/act-verb=") {
+            lines.push(line);
+        }
+    }
+    lines
+}
+
 /// Open a bounty and return its id.
 fn open_bounty(c: &mut C, signing: &SigningKey, channel: &str) -> String {
     let id = fresh_id();
@@ -2096,6 +2122,143 @@ async fn chathistory_carries_a_task_posted_after_the_last_message() {
     .await;
 }
 
+// ── the review window ───────────────────────────────────────────────────────
+
+/// Work handed in and left unanswered is deemed accepted when the window
+/// closes — under the home's own signature, and under a verb of its own so the
+/// log says which of the two clocks fired.
+#[tokio::test]
+async fn work_left_unanswered_past_the_review_window_is_accepted() {
+    let ka = key();
+    let kb = key();
+    // The review window is a second; the abandonment limit is a week away, so
+    // whatever happens here is the review sweep's doing.
+    let (addr, _h) = start_with_clocks(
+        resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)]),
+        604_800,
+        1,
+    )
+    .await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+        let bounty = award_to_bob(&mut a, &mut b, &alice_key, &bob_key, "#ops");
+
+        let handed_in = fresh_id();
+        b.tx(&bounty_line(
+            "submit",
+            DID_BOB,
+            Some(&bounty),
+            None,
+            "#ops",
+            &handed_in,
+            &bob_key,
+        ));
+        b.rx(|l| l.contains(&handed_in), "the work is handed in");
+
+        // Alice says nothing at all. The sweep runs on its own clock, and
+        // files rather than announces — like the expiry sweep's own event, it
+        // is read back out of the log.
+        std::thread::sleep(Duration::from_secs(6));
+        let events = act_events_in_history(&mut b, "#ops");
+        let closed = events
+            .iter()
+            .find(|l| l.contains("+freeq.at/act-verb=auto-accept"))
+            .unwrap_or_else(|| panic!("the review window closes on its own: {events:?}"));
+        assert!(
+            closed.contains(&format!("+freeq.at/act-id={bounty}")),
+            "on the bounty that was waiting: {closed}"
+        );
+        assert!(
+            closed.contains("+freeq.at/from=did:web:test-act"),
+            "signed under the home's own identity: {closed}"
+        );
+        assert!(closed.contains("+freeq.at/sig="), "{closed}");
+        assert!(
+            !events.iter().any(|l| l.contains("act-verb=expire")),
+            "and not as an expiry, which would read as the worker dropping it"
+        );
+
+        // Terminal: the bounty takes nothing further.
+        b.tx(&bounty_line(
+            "submit",
+            DID_BOB,
+            Some(&bounty),
+            None,
+            "#ops",
+            &fresh_id(),
+            &bob_key,
+        ));
+        assert_eq!(b.fail_code(), "TERMINAL_TASK");
+    })
+    .await;
+}
+
+/// The clock is per-submission: asking for changes is the poster meeting the
+/// window, and it moves the task, so the window starts again from there.
+#[tokio::test]
+async fn asking_for_changes_stops_the_review_clock() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start_with_clocks(
+        resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)]),
+        604_800,
+        4,
+    )
+    .await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+        let bounty = award_to_bob(&mut a, &mut b, &alice_key, &bob_key, "#ops");
+
+        let handed_in = fresh_id();
+        b.tx(&bounty_line(
+            "submit",
+            DID_BOB,
+            Some(&bounty),
+            None,
+            "#ops",
+            &handed_in,
+            &bob_key,
+        ));
+        b.rx(|l| l.contains(&handed_in), "the work is handed in");
+
+        let sent_back = fresh_id();
+        a.tx(&bounty_line(
+            "revise",
+            DID_ALICE,
+            Some(&bounty),
+            None,
+            "#ops",
+            &sent_back,
+            &alice_key,
+        ));
+        b.rx(|l| l.contains(&sent_back), "the work is sent back");
+
+        // The task is assigned again, which is not a state this clock owns —
+        // so nothing closes it, however many passes the sweep makes.
+        std::thread::sleep(Duration::from_secs(12));
+        let events = act_events_in_history(&mut b, "#ops");
+        assert!(
+            !events.iter().any(|l| l.contains("act-verb=auto-accept")),
+            "a poster who answered is never auto-accepted: {events:?}"
+        );
+    })
+    .await;
+}
+
 // ── expiry ──────────────────────────────────────────────────────────────────
 
 /// Everything at once: the sweep signs its own event under the server's
@@ -2126,6 +2289,47 @@ async fn an_abandoned_task_expires_and_the_room_is_told() {
         assert!(
             notice.ends_with("Task expired without completion: review-the-deploy"),
             "the approved sentence, with the offer's own title: {notice}"
+        );
+    })
+    .await;
+}
+
+/// The neutral clock still catches work somebody took and walked away from.
+/// The two sweeps own different states, so a bounty that was never handed in
+/// is expired rather than accepted.
+#[tokio::test]
+async fn assigned_work_nobody_touches_still_expires() {
+    let ka = key();
+    let kb = key();
+    // Both clocks short, and the review one shorter — so if the review sweep
+    // reached beyond its own states this would come back as an acceptance.
+    let (addr, _h) =
+        start_with_clocks(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)]), 2, 1).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+        award_to_bob(&mut a, &mut b, &alice_key, &bob_key, "#ops");
+
+        // Bob never hands anything in.
+        b.maybe(
+            |l| l.contains("NOTICE") && l.contains("Task expired"),
+            90_000,
+        )
+        .expect("the abandonment sweep reaches it");
+        let events = act_events_in_history(&mut b, "#ops");
+        assert!(
+            events.iter().any(|l| l.contains("act-verb=expire")),
+            "expired, because nothing was ever delivered: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|l| l.contains("act-verb=auto-accept")),
+            "and the review clock did not reach past the states it owns: {events:?}"
         );
     })
     .await;
