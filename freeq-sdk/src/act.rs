@@ -773,9 +773,11 @@ mod tests {
                 id: "01KDEF0000000000000000000K",
             },
             Case {
-                // A bid on a bounty. Additive and unremarkable to the
-                // canonical, which is the point: a second kind needed a row
-                // in the transitions file and nothing at all here.
+                // A bid on a bounty, with terms. Additive and unremarkable
+                // to the canonical, which is the point: a second kind needed
+                // a row in the transitions file and nothing at all here, and
+                // its money tags are covered because they are present rather
+                // than because anything knows what they mean.
                 name: "bounty-bid",
                 seed: 7,
                 tags: vec![
@@ -783,6 +785,12 @@ mod tests {
                     ("+freeq.at/act-verb", "bid"),
                     ("+freeq.at/from", "did:plc:scholar"),
                     ("+freeq.at/act-id", BOUNTY_ID),
+                    // What the bidder asks and where they want it paid.
+                    // Opaque to every server that handles them — the point of
+                    // the vector is that two signers agree on bytes neither of
+                    // them interprets.
+                    ("+freeq.at/act-bid", "250 USD"),
+                    ("+freeq.at/act-pay-to", "did:plc:scholar"),
                     ("+freeq.at/act-note", "two days, sources included"),
                 ],
                 target: "#swarm",

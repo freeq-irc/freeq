@@ -126,17 +126,19 @@
       "target": "dm:did:plc:factory,did:plc:opslead"
     },
     {
-      "canonical": "{\"act\":\"bounty\",\"act-id\":\"01JBOUNTYEVENTID00000000B\",\"act-note\":\"two days, sources included\",\"act-verb\":\"bid\",\"from\":\"did:plc:scholar\",\"id\":\"01JBIDEVENTID00000000000B\",\"target\":\"#swarm\"}",
+      "canonical": "{\"act\":\"bounty\",\"act-bid\":\"250 USD\",\"act-id\":\"01JBOUNTYEVENTID00000000B\",\"act-note\":\"two days, sources included\",\"act-pay-to\":\"did:plc:scholar\",\"act-verb\":\"bid\",\"from\":\"did:plc:scholar\",\"id\":\"01JBIDEVENTID00000000000B\",\"target\":\"#swarm\"}",
       "id": "01JBIDEVENTID00000000000B",
       "kid": "_oEsEvOrTOasXbaaw1L5Bg",
       "name": "bounty-bid",
       "publicKey": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
       "seed": "0707070707070707070707070707070707070707070707070707070707070707",
-      "sigTag": "ed25519:_oEsEvOrTOasXbaaw1L5Bg:qmW9LGYR9JC6x10bmWFGcgbZuwvE20lEvnaraOlJ_m1sHKDLOChk8K2pUgjmKx2mkAhJlGbIR8REvqNT8Nj4Dg",
+      "sigTag": "ed25519:_oEsEvOrTOasXbaaw1L5Bg:vEPW9qAXNEUR-A_jtlHzP1thuNJ_gy2py2sAWarLLmnZxBVUWZXXUpL1O_5EQnEYlQ2-w27ZmG81r_d3X_TyCg",
       "tags": {
         "+freeq.at/act": "bounty",
+        "+freeq.at/act-bid": "250 USD",
         "+freeq.at/act-id": "01JBOUNTYEVENTID00000000B",
         "+freeq.at/act-note": "two days, sources included",
+        "+freeq.at/act-pay-to": "did:plc:scholar",
         "+freeq.at/act-verb": "bid",
         "+freeq.at/from": "did:plc:scholar"
       },

@@ -20,6 +20,9 @@
     "system (the server itself, on the events no participant sends). act-caps is a self-declared hint — stored,",
     "filterable, signed, never checked here. `from` is one state, a list of states, or",
     "`*nonterminal` for every state that is not terminal. `before_deadline` is data; the comparison is code.",
+    "`before_bid_deadline` is the same comparison against a second time on the same opener: act-deadline",
+    "bounds how long the offer stands, act-bid-deadline how long it takes bids, and a kind that collects",
+    "them wants both. A time the offer never named bounds nothing.",
     "`confirmation` sits outside `kinds` because the receipt verb belongs to no kind and no kind may claim it:",
     "a receipt is the home server's word about an event it filed, not a step anybody takes.",
     "`assignee_from` names where a transition's assignee comes from. Absent means the actor, which is what",
@@ -29,6 +32,11 @@
     "someone else, or insists on a field, needs a row here and no code anywhere.",
     "A kind whose `opens` has no `directed` can only be opened to the room, and an opener carrying act-to is an",
     "illegal step: a bounty is open by construction, and a directed bounty is just a handoff.",
+    "What a bounty is worth is nobody's business here: act-price on the offer, act-bid and act-pay-to on a",
+    "bid, act-tx on the acceptance. Stored, relayed, replayed, inside the signature because every act tag is,",
+    "and never read. The server records that a payment was claimed; it never confirms one, and settlement",
+    "lives above this entirely. act-bid-deadline is deliberately not in that list: it is a time the referee",
+    "compares, exactly like act-deadline.",
     "`act-accepts` names the bid an award takes — the bid's own event id. The assignee is that bid's author.",
     "The server still never picks: it checks only that the named event is a `bid` on this action.",
     "A bounty ends on the offerer's word, not the worker's: submitted work waits in under_review, and the",
@@ -61,7 +69,13 @@
       "opens": { "verb": "offer", "open": "open" },
       "terminal": ["accepted", "forfeited", "cancelled", "expired"],
       "transitions": [
-        { "verb": "bid", "from": "open", "to": "open", "who": "anyone", "before_deadline": true },
+        {
+          "verb": "bid",
+          "from": "open",
+          "to": "open",
+          "who": "anyone",
+          "before_bid_deadline": true
+        },
         {
           "verb": "award",
           "from": "open",
@@ -983,13 +997,14 @@
       ]
     },
     {
-      "name": "a bid after the deadline is refused, exactly as an award is",
+      "name": "a bounty stops taking bids at its own cutoff",
       "task": {
         "kind": "bounty",
         "offer": "open",
         "offerer": "did:plc:eliza",
         "offeree": null,
-        "deadline": 1788000000
+        "deadline": null,
+        "bid_deadline": 1788000000
       },
       "steps": [
         {
@@ -1002,6 +1017,46 @@
           "verb": "bid",
           "sender": "did:plc:scholar",
           "event_id": "01M16HSB60ACCEPTATEDGE0000",
+          "expect": "open"
+        }
+      ]
+    },
+    {
+      "name": "bidding closing does not stop the poster picking",
+      "task": {
+        "kind": "bounty",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "deadline": null,
+        "bid_deadline": 1788000000
+      },
+      "steps": [
+        {
+          "verb": "award",
+          "sender": "did:plc:eliza",
+          "event_id": "01M16HSC58ACCEPTTOOLATE000",
+          "tags": ["act-accepts"],
+          "accepts": "01M16E7TC0BDTAKEN000000000",
+          "accepted_bid": "did:plc:scholar",
+          "expect": "assigned"
+        }
+      ]
+    },
+    {
+      "name": "a bounty that named no bid cutoff takes bids as long as it stands",
+      "task": {
+        "kind": "bounty",
+        "offer": "open",
+        "offerer": "did:plc:eliza",
+        "offeree": null,
+        "deadline": null
+      },
+      "steps": [
+        {
+          "verb": "bid",
+          "sender": "did:plc:scholar",
+          "event_id": "01M16HSC58ACCEPTTOOLATE000",
           "expect": "open"
         }
       ]

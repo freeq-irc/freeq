@@ -1625,6 +1625,88 @@ async fn a_bounty_opened_to_one_recipient_is_refused() {
     .await;
 }
 
+/// A bounty takes bids until the cutoff its offer named, which the server
+/// reads back out of the opener rather than out of a column. The offer's own
+/// deadline is a different time and bounds a different move.
+#[tokio::test]
+async fn a_bounty_stops_taking_bids_at_the_cutoff_its_offer_named() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        // Relative to now, because the ids these bids are minted with have to
+        // be near this server's clock to be adopted at all.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+
+        // A bounty whose bidding closed an hour ago…
+        let closed = open_priced_bounty(&mut a, &signing, "#ops", now - 3_600);
+        a.tx(&bounty_line(
+            "bid",
+            DID_ALICE,
+            Some(&closed),
+            None,
+            "#ops",
+            &fresh_id(),
+            &signing,
+        ));
+        assert_eq!(a.fail_code(), "DEADLINE_PASSED");
+
+        // …and one that is still taking them. Sent after a pause, because the
+        // act flood counter is per connection and this is the sixth event.
+        std::thread::sleep(Duration::from_millis(2_500));
+        let open = open_priced_bounty(&mut a, &signing, "#ops", now + 3_600);
+        let bid = fresh_id();
+        a.tx(&bounty_line(
+            "bid",
+            DID_ALICE,
+            Some(&open),
+            None,
+            "#ops",
+            &bid,
+            &signing,
+        ));
+        a.rx(|l| l.contains(&bid), "a bid inside the cutoff");
+
+        // The award is bound by act-deadline, which neither offer named, so
+        // bidding closing does not stop the poster picking.
+        let award = fresh_id();
+        a.tx(&bounty_line(
+            "award",
+            DID_ALICE,
+            Some(&open),
+            Some(&bid),
+            "#ops",
+            &award,
+            &signing,
+        ));
+        a.rx(|l| l.contains(&award), "the award is accepted");
+    })
+    .await;
+}
+
+/// A bounty naming what it pays and how long it takes bids. The price is
+/// carried and never read; the cutoff is a time the referee compares.
+fn open_priced_bounty(c: &mut C, signing: &SigningKey, channel: &str, cutoff: i64) -> String {
+    let id = fresh_id();
+    let tags: Vec<(String, String)> = vec![
+        ("+freeq.at/act".into(), "bounty".into()),
+        ("+freeq.at/act-verb".into(), "offer".into()),
+        ("+freeq.at/from".into(), DID_ALICE.into()),
+        ("+freeq.at/act-title".into(), "index-the-archive".into()),
+        ("+freeq.at/act-bid-deadline".into(), cutoff.to_string()),
+        ("+freeq.at/act-price".into(), "250-USD".into()),
+    ];
+    c.tx(&signed_line(&tags, channel, &id, signing));
+    c.rx(|l| l.contains(&id), "the bounty opens");
+    id
+}
+
 // ── the revival relation ────────────────────────────────────────────────────
 
 /// An opener that names the finished action it revives.

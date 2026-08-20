@@ -192,6 +192,42 @@ describe("the bounty verbs", () => {
     expect(tags["+freeq.at/from"]).toBe("did:plc:bot");
   });
 
+  it("carries a bid's terms as tags nothing interprets", async () => {
+    const sent: Sent[] = [];
+    await bid(ctxWith(sent), "01JTASK00000000000000000AA", {
+      amount: "250 USD",
+      payTo: "did:plc:worker",
+    });
+    const { tags } = sent[0];
+    expect(tags["+freeq.at/act-bid"]).toBe("250 USD");
+    expect(tags["+freeq.at/act-pay-to"]).toBe("did:plc:worker");
+  });
+
+  it("carries a bounty's price and bid cutoff on the offer", async () => {
+    const sent: Sent[] = [];
+    await offer(ctxWith(sent), {
+      title: "index the archive",
+      kind: "bounty",
+      price: "250 USD",
+      bidDeadline: 1_788_000_000,
+      deadline: 1_788_600_000,
+    });
+    const { tags } = sent[0];
+    expect(tags["+freeq.at/act-price"]).toBe("250 USD");
+    expect(tags["+freeq.at/act-bid-deadline"]).toBe("1788000000");
+    // Two different times, both on the offer.
+    expect(tags["+freeq.at/act-deadline"]).toBe("1788600000");
+  });
+
+  it("carries a payment reference on the acceptance, and none by default", async () => {
+    const sent: Sent[] = [];
+    await acceptWork(ctxWith(sent), "01JTASK00000000000000000AA", { tx: "eth:0xabc" });
+    expect(sent[0].tags["+freeq.at/act-tx"]).toBe("eth:0xabc");
+    const bare: Sent[] = [];
+    await acceptWork(ctxWith(bare), "01JTASK00000000000000000AA");
+    expect(bare[0].tags["+freeq.at/act-tx"]).toBeUndefined();
+  });
+
   it("hands the work in without saying it is done", async () => {
     const sent: Sent[] = [];
     await submit(ctxWith(sent), "01JTASK00000000000000000AA", { note: "branch pushed" });

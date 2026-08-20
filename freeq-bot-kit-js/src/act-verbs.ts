@@ -41,6 +41,13 @@ export interface OfferOptions {
   /** Unix seconds. Bounds how long the offer stands — not how long the work
    *  may take. */
   deadline?: number;
+  /** Unix seconds. Bounds how long a bounty takes bids, which closes sooner
+   *  than the offer does. A second time on the same offer, compared the same
+   *  way. */
+  bidDeadline?: number;
+  /** What a bounty offers to pay. Opaque: stored, relayed, replayed, covered
+   *  by the signature because it is present, and never read by any server. */
+  price?: string;
   /** A link to the task's materials, and a hash of them. */
   ctx?: string;
   ctxHash?: string;
@@ -92,6 +99,10 @@ export async function offer(ctx: ActContext, opts: OfferOptions): Promise<string
   if (opts.deadline !== undefined) {
     tags["+freeq.at/act-deadline"] = String(opts.deadline);
   }
+  if (opts.bidDeadline !== undefined) {
+    tags["+freeq.at/act-bid-deadline"] = String(opts.bidDeadline);
+  }
+  if (opts.price) tags["+freeq.at/act-price"] = opts.price;
   if (opts.ctx) tags["+freeq.at/act-ctx"] = opts.ctx;
   if (opts.ctxHash) tags["+freeq.at/act-ctx-h"] = opts.ctxHash;
   // Tagged only when there is something to revive: an absent relation and an
@@ -180,19 +191,32 @@ export async function fail(
 /** The only kind that has bids to take and a winner to name. */
 const BOUNTY = "bounty";
 
+/** What a bid may say about terms, on top of what any step carries. */
+export interface BidOptions extends StepOptions {
+  /** What you are asking for. Opaque to every server that handles it: stored,
+   *  relayed, replayed, and covered by the signature because it is present,
+   *  never because anything knows what it means. */
+  amount?: string;
+  /** Where you want paying. Opaque in the same way. */
+  payTo?: string;
+}
+
 /**
  * Put your name in for an open bounty. Additive: a bid leaves the bounty
- * exactly where it found it, and every bid stays on file.
+ * exactly where it found it, and every bid stays on file — which is what lets
+ * an award name one of them.
  *
- * A bid says nothing about price. `note` is freeform and signed like any act
- * tag; pricing is the agents' to agree, not the substrate's to define.
+ * Terms ride as tags nobody interprets. What settled, and whether it settled,
+ * is the agents' to agree and never the substrate's to say.
  */
 export async function bid(
   ctx: ActContext,
   taskId: string,
-  opts: StepOptions = {},
+  opts: BidOptions = {},
 ): Promise<string> {
   const tags = stepTags("bid", ctx.did, taskId, opts.note, BOUNTY);
+  if (opts.amount) tags["+freeq.at/act-bid"] = opts.amount;
+  if (opts.payTo) tags["+freeq.at/act-pay-to"] = opts.payTo;
   return ctx.client.sendAct(ctx.target, tags, {
     humanText: opts.humanText ?? (opts.note ? `bid: ${opts.note}` : "bid on the bounty"),
     taskId,
@@ -255,6 +279,13 @@ export async function revise(
   });
 }
 
+/** What an acceptance may carry, on top of what any step carries. */
+export interface AcceptWorkOptions extends StepOptions {
+  /** A payment reference. Opaque: a claim on the record that something was
+   *  paid, never a confirmation that it was. */
+  tx?: string;
+}
+
 /**
  * Accept submitted work on a bounty you posted. Terminal, and the poster's
  * word rather than the worker's — which is the whole difference between this
@@ -267,11 +298,13 @@ export async function revise(
 export async function acceptWork(
   ctx: ActContext,
   taskId: string,
-  opts: StepOptions = {},
+  opts: AcceptWorkOptions = {},
 ): Promise<string> {
+  const tags = stepTags("accept-work", ctx.did, taskId, opts.note, BOUNTY);
+  if (opts.tx) tags["+freeq.at/act-tx"] = opts.tx;
   return ctx.client.sendAct(
     ctx.target,
-    stepTags("accept-work", ctx.did, taskId, opts.note, BOUNTY),
+    tags,
     {
       humanText: opts.humanText ?? "accepted the work",
       taskId,

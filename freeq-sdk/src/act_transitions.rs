@@ -130,6 +130,11 @@ pub struct Task<'a> {
     pub offeree: Option<&'a str>,
     pub assignee: Option<&'a str>,
     pub deadline: Option<i64>,
+    /// The offer's `act-bid-deadline` in unix seconds, empty when it named
+    /// none. A second time on the same opener, compared the same way: it
+    /// bounds how long a bounty collects bids, which is a shorter question
+    /// than how long the offer stands.
+    pub bid_deadline: Option<i64>,
 }
 
 /// The event being checked.
@@ -503,8 +508,18 @@ pub fn check(
         _ => return Err(Refusal::WrongSender),
     }
 
-    if row.before_deadline
-        && let Some(deadline) = task.deadline
+    // Two deadlines, one comparison. A row declares which of the offer's
+    // times bounds it: how long the offer stands, or — on a kind that
+    // collects them — how long it takes bids. A time the offer never named
+    // bounds nothing.
+    for deadline in [
+        row.before_deadline.then_some(task.deadline).flatten(),
+        row.before_bid_deadline
+            .then_some(task.bid_deadline)
+            .flatten(),
+    ]
+    .into_iter()
+    .flatten()
     {
         let limit = deadline
             .saturating_mul(1_000)
@@ -574,6 +589,11 @@ struct Transition {
     who: String,
     #[serde(default)]
     before_deadline: bool,
+    /// Bounded by the offer's `act-bid-deadline` rather than its
+    /// `act-deadline`. Data, like its sibling; the comparison is the same
+    /// code.
+    #[serde(default)]
+    before_bid_deadline: bool,
     /// The field naming who this transition assigns. Absent = the actor.
     #[serde(default)]
     assignee_from: Option<String>,
@@ -649,6 +669,7 @@ mod tests {
             offeree: Some(SCHOLAR),
             assignee: None,
             deadline: None,
+            bid_deadline: None,
         }
     }
 
@@ -975,6 +996,7 @@ mod tests {
             offeree: None,
             assignee: None,
             deadline: None,
+            bid_deadline: None,
         }
     }
 
@@ -1386,6 +1408,7 @@ mod tests {
             offeree: None,
             assignee: None,
             deadline: None,
+            bid_deadline: None,
         }
     }
 
@@ -1569,6 +1592,73 @@ mod tests {
         );
     }
 
+    /// A bounty takes bids until its own cutoff, which is a shorter question
+    /// than how long the offer stands. Both times sit on the same opener and
+    /// are compared the same way.
+    #[test]
+    fn a_bid_is_bound_by_the_offers_bid_deadline() {
+        let taking_bids = Task {
+            bid_deadline: Some(DEADLINE),
+            ..bounty("open")
+        };
+        let late = Event {
+            verb: "bid",
+            msgid: TOO_LATE,
+            accepts: None,
+            fields: &[],
+        };
+        assert_eq!(
+            check(&taking_bids, &late, &who(SCHOLAR)),
+            Err(Refusal::DeadlinePassed)
+        );
+        for id in [IN_TIME, AT_EDGE] {
+            let e = Event {
+                verb: "bid",
+                msgid: id,
+                accepts: None,
+                fields: &[],
+            };
+            assert_eq!(check(&taking_bids, &e, &who(SCHOLAR)), Ok("open"), "{id}");
+        }
+    }
+
+    /// The two times are separate: bidding may close long before the offer
+    /// does, and a bounty that named no bid cutoff takes bids for as long as
+    /// it stands.
+    #[test]
+    fn the_two_deadlines_bound_different_moves() {
+        // Bidding closed; the offer has not.
+        let closed = Task {
+            deadline: None,
+            bid_deadline: Some(DEADLINE),
+            ..bounty("open")
+        };
+        let late = Event {
+            verb: "bid",
+            msgid: TOO_LATE,
+            accepts: None,
+            fields: &[],
+        };
+        assert_eq!(
+            check(&closed, &late, &who(SCHOLAR)),
+            Err(Refusal::DeadlinePassed)
+        );
+        // The award is bound by the offer's own deadline, not by the bid one.
+        let award_late = Event {
+            verb: "award",
+            msgid: TOO_LATE,
+            accepts: Some(BID),
+            fields: &["act-accepts"],
+        };
+        assert_eq!(
+            check(&closed, &award_late, &who_took(ELIZA, SCHOLAR)),
+            Ok("assigned"),
+            "bidding closing does not stop the poster picking"
+        );
+        // …and no bid cutoff means no bid cutoff.
+        assert_eq!(check(&bounty("open"), &late, &who(SCHOLAR)), Ok("open"));
+    }
+
     /// Fail closed: an id whose clock cannot be read cannot be shown to be
     /// inside the deadline, so it is treated as outside it.
     #[test]
@@ -1608,6 +1698,9 @@ mod tests {
         offerer: String,
         offeree: Option<String>,
         deadline: Option<i64>,
+        /// `act-bid-deadline`: how long the offer takes bids, when it named a
+        /// second time.
+        bid_deadline: Option<i64>,
     }
 
     #[derive(Deserialize)]
@@ -1660,6 +1753,7 @@ mod tests {
                 offeree: seq.task.offeree.as_deref(),
                 assignee: assignee.as_deref(),
                 deadline: seq.task.deadline,
+                bid_deadline: seq.task.bid_deadline,
             };
             let fields: Vec<&str> = step.tags.iter().map(String::as_str).collect();
             let event = Event {

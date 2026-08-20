@@ -3066,6 +3066,35 @@ mod tests {
         .unwrap()
     }
 
+    /// A bounty whose offer names how long it takes bids.
+    fn bounty_offer_with_cutoff(db: &Db, id: &str, venue: &str, cutoff: i64, ts: i64) -> ActWrite {
+        let cutoff = cutoff.to_string();
+        let canonical = act_doc(
+            &[
+                ("+freeq.at/act", "bounty"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", ELIZA),
+                ("+freeq.at/act-title", "index the archive"),
+                ("+freeq.at/act-bid-deadline", &cutoff),
+            ],
+            venue,
+            id,
+        );
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: id,
+            act_id: id,
+            opens: true,
+            venue,
+            actor: ELIZA,
+            from_system: false,
+            origin: None,
+            timestamp: ts,
+        })
+        .unwrap()
+    }
+
     /// A bounty step. `accepts` is the bid an award takes — the event the
     /// rules file points `assignee_from` at, whose author gets the work.
     fn bounty_step(
@@ -3344,6 +3373,92 @@ mod tests {
         }
     }
 
+    /// A bounty takes bids until its own cutoff, which is read back out of
+    /// the opener's bytes like every other tag the view has no column for.
+    #[test]
+    fn a_bounty_stops_taking_bids_at_the_cutoff_its_offer_named() {
+        let db = Db::open_memory().unwrap();
+        // 1788000000 unix seconds, as the fixtures use it, and the two ids
+        // that sit either side of the tolerance around it.
+        const TOO_LATE: &str = "01M16HSC58ACCEPTTOOLATE000";
+        const AT_EDGE: &str = "01M16HSB60ACCEPTATEDGE0000";
+        let canonical = act_doc(
+            &[
+                ("+freeq.at/act", "bounty"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", ELIZA),
+                ("+freeq.at/act-title", "index the archive"),
+                ("+freeq.at/act-bid-deadline", "1788000000"),
+            ],
+            "#ops",
+            "B1",
+        );
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: "B1",
+            act_id: "B1",
+            opens: true,
+            venue: "#ops",
+            actor: ELIZA,
+            from_system: false,
+            origin: None,
+            timestamp: 10,
+        })
+        .unwrap();
+        assert_eq!(db.act_task_bid_deadline("B1").unwrap(), Some(1_788_000_000));
+
+        assert_eq!(
+            bounty_step(&db, "bid", SCHOLAR, "B1", TOO_LATE, None, "#ops", 11),
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::DeadlinePassed)
+        );
+        assert!(matches!(
+            bounty_step(&db, "bid", SCHOLAR, "B1", AT_EDGE, None, "#ops", 12),
+            ActWrite::Filed { .. }
+        ));
+        // Bidding closing does not stop the poster picking: the award is
+        // bound by act-deadline, which this offer never named.
+        assert!(matches!(
+            bounty_step(
+                &db,
+                "award",
+                ELIZA,
+                "B1",
+                TOO_LATE,
+                Some(AT_EDGE),
+                "#ops",
+                13
+            ),
+            ActWrite::Filed { .. }
+        ));
+        assert_eq!(
+            db.act_task("B1").unwrap().unwrap().assignee.as_deref(),
+            Some(SCHOLAR)
+        );
+    }
+
+    /// A bounty whose offer named no cutoff takes bids for as long as it
+    /// stands.
+    #[test]
+    fn a_bounty_with_no_cutoff_takes_bids_whenever_they_arrive() {
+        let db = Db::open_memory().unwrap();
+        bounty_offer(&db, "B1", "#ops", 10);
+        assert_eq!(db.act_task_bid_deadline("B1").unwrap(), None);
+        assert!(matches!(
+            bounty_step(
+                &db,
+                "bid",
+                SCHOLAR,
+                "B1",
+                "01M16HSC58ACCEPTTOOLATE000",
+                None,
+                "#ops",
+                11
+            ),
+            ActWrite::Filed { .. }
+        ));
+    }
+
     /// An award points at one event, and only a bid on this action answers.
     /// The bounty's own opener is not one, whatever else it is.
     #[test]
@@ -3553,6 +3668,19 @@ mod tests {
         // sender, or the first bid, would disagree with the live row on
         // exactly that column — so there are two bids and the second is taken.
         bounty_offer(&db, "B1", "#ops", 50);
+        // …and one whose offer named a bid cutoff, which the rebuild has to
+        // read back out of the opener exactly as ingress did.
+        bounty_offer_with_cutoff(&db, "B3", "#ops", 1_788_000_000, 50);
+        bounty_step(
+            &db,
+            "bid",
+            SCHOLAR,
+            "B3",
+            "01M16HSB60ACCEPTATEDGE0000",
+            None,
+            "#ops",
+            51,
+        );
         bounty_step(&db, "bid", SCHOLAR, "B1", "BID0", None, "#ops", 51);
         bounty_step(&db, "bid", MALLORY, "B1", "BID1", None, "#ops", 52);
         bounty_step(&db, "award", ELIZA, "B1", "AW", Some("BID1"), "#ops", 53);
@@ -3571,8 +3699,8 @@ mod tests {
 
         assert_eq!(
             live.len(),
-            5,
-            "the declined one left the view; its revival and the bounty did not"
+            6,
+            "the declined one left the view; its revival and the bounties did not"
         );
         assert_eq!(rebuilt, live);
     }
@@ -6401,6 +6529,11 @@ impl Db {
                 offeree: task.offeree.as_deref(),
                 assignee: task.assignee.as_deref(),
                 deadline: task.deadline,
+                // Read back out of the opener rather than carried in a
+                // column: it is one of the open set of act tags, and the view
+                // holds only what it needs to referee. The bytes are the
+                // record and they still have it.
+                bid_deadline: self.act_task_bid_deadline(ev.act_id)?,
             };
             match rules::check(&checked, &event, &sender) {
                 Ok(state) => {
@@ -6748,6 +6881,32 @@ impl Db {
         }))
     }
 
+    /// The bid cutoff an offer declared, read back out of the opener's bytes.
+    ///
+    /// The same reading `act_task_title` does, for the same reason: a second
+    /// deadline is one of the open set of act tags, and the view carries only
+    /// the columns it referees on. A value nobody can read as a number is a
+    /// cutoff this server cannot enforce, so it answers as absent — the tag
+    /// stays in the canonical either way.
+    pub fn act_task_bid_deadline(&self, act_id: &str) -> SqlResult<Option<i64>> {
+        let canonical: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT canonical FROM events WHERE kind = 'act' AND event_id = ?1",
+                params![act_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(canonical.and_then(|c| {
+            serde_json::from_str::<serde_json::Value>(&c)
+                .ok()?
+                .get("act-bid-deadline")
+                .and_then(|v| v.as_str())?
+                .parse::<i64>()
+                .ok()
+        }))
+    }
+
     /// Every venue that currently holds a live task.
     ///
     /// The listing endpoint runs each of these through the same authorization
@@ -6888,6 +7047,11 @@ impl Db {
         // replayed its bid is here.
         let mut bids: std::collections::BTreeMap<(String, String), String> =
             std::collections::BTreeMap::new();
+        // And each opener's bid cutoff, which ingress reads back out of the
+        // opener's bytes. Kept here rather than looked up, because the bytes
+        // in question are the ones this replay has already passed.
+        let mut bid_deadlines: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
         for row in rows {
             let Some(view) = crate::events::derive_act_view(&row.canonical) else {
                 continue;
@@ -6935,6 +7099,7 @@ impl Db {
                         offeree: task.offeree.as_deref(),
                         assignee: task.assignee.as_deref(),
                         deadline: task.deadline,
+                        bid_deadline: bid_deadlines.get(&act_id).copied(),
                     },
                     &freeq_sdk::act_transitions::Event {
                         verb: &view.verb,
@@ -6966,6 +7131,13 @@ impl Db {
                 continue;
             }
             if opens {
+                if let Some(cutoff) = view
+                    .fields
+                    .get("act-bid-deadline")
+                    .and_then(|v| v.parse::<i64>().ok())
+                {
+                    bid_deadlines.insert(act_id.clone(), cutoff);
+                }
                 live.insert(
                     act_id.clone(),
                     ActTask {

@@ -70,6 +70,7 @@ interface Sequence {
     offerer: string;
     offeree: string | null;
     deadline: number | null;
+    bid_deadline?: number | null;
   };
   steps: Step[];
 }
@@ -567,6 +568,35 @@ describe("the two schema additions bounty needed", () => {
     expect(assigneeSource("approval", "request", "open")).toEqual({ from: "actor" });
   });
 
+  // A bounty takes bids until its own cutoff, which is a shorter question
+  // than how long the offer stands.
+  it("binds a bid to the offer's bid deadline, and the award to its own", () => {
+    const DEADLINE = 1_788_000_000;
+    const TOO_LATE = "01M16HSC58ACCEPTTOOLATE000";
+    const AT_EDGE = "01M16HSB60ACCEPTATEDGE0000";
+    const takingBids: Task = { ...bounty("open"), bidDeadline: DEADLINE };
+    expect(
+      checkTransition(takingBids, { verb: "bid", msgid: TOO_LATE }, who(SCHOLAR)),
+    ).toEqual(refused("deadline-passed"));
+    expect(checkTransition(takingBids, { verb: "bid", msgid: AT_EDGE }, who(SCHOLAR))).toEqual({
+      ok: true,
+      to: "open",
+    });
+    // Bidding closing does not stop the poster picking: the award is bound by
+    // the offer's own deadline, which this bounty never named.
+    expect(
+      checkTransition(
+        takingBids,
+        { verb: "award", msgid: TOO_LATE, accepts: BID, fields: ["act-accepts"] },
+        took(ELIZA, SCHOLAR),
+      ),
+    ).toEqual({ ok: true, to: "assigned" });
+    // …and no bid cutoff means no bid cutoff.
+    expect(
+      checkTransition(bounty("open"), { verb: "bid", msgid: TOO_LATE }, who(SCHOLAR)),
+    ).toEqual({ ok: true, to: "open" });
+  });
+
   it("takes bids additively until the work is awarded", () => {
     expect(checkTransition(bounty("open"), ev("bid"), who(SCHOLAR))).toEqual({
       ok: true,
@@ -598,6 +628,7 @@ describe("the shared sequences", () => {
           offeree: seq.task.offeree,
           assignee,
           deadline: seq.task.deadline,
+          bidDeadline: seq.task.bid_deadline,
         };
         const result = checkTransition(
           task,

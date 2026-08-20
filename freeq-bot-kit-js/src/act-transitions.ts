@@ -48,6 +48,10 @@ export interface Task {
   assignee?: string | null;
   /** `act-deadline`, unix seconds. */
   deadline?: number | null;
+  /** `act-bid-deadline`, unix seconds. A second time on the same opener,
+   * compared the same way: it bounds how long a bounty collects bids, which
+   * is a shorter question than how long the offer stands. */
+  bidDeadline?: number | null;
 }
 
 /** The event being checked. */
@@ -97,6 +101,9 @@ interface Transition {
   to: string;
   who: string;
   before_deadline?: boolean;
+  /** Bounded by the offer's `act-bid-deadline` rather than its
+   *  `act-deadline`. Data, like its sibling; the comparison is the same code. */
+  before_bid_deadline?: boolean;
   /** The field naming who this transition assigns. Absent = the actor. */
   assignee_from?: string;
   /** Fields the transition is illegal without. */
@@ -353,8 +360,16 @@ export function checkTransition(
       return { ok: false, reason: "wrong-sender" };
   }
 
-  if (row.before_deadline && task.deadline != null) {
-    const limit = task.deadline * 1000 + DEADLINE_TOLERANCE_MS;
+  // Two deadlines, one comparison. A row declares which of the offer's times
+  // bounds it: how long the offer stands, or — on a kind that collects them —
+  // how long it takes bids. A time the offer never named bounds nothing.
+  const bounds = [
+    row.before_deadline ? task.deadline : null,
+    row.before_bid_deadline ? task.bidDeadline : null,
+  ];
+  for (const deadline of bounds) {
+    if (deadline == null) continue;
+    const limit = deadline * 1000 + DEADLINE_TOLERANCE_MS;
     const minted = eventTimeMs(event.msgid);
     // Fail closed: an id whose clock cannot be read cannot be shown to be
     // inside the deadline.
