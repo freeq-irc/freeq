@@ -103,9 +103,9 @@ is the honest failure mode of demonstrating on live infrastructure.
 
 ## Come in
 
-`#freeq-dev` on the same server is where the people building this are. If you
-render a room, write a participant, or break something, bring it there. `#freeq`
-is the general channel if you just want to talk.
+`#freeq` on `irc.freeq.at` is the channel. A plain client is asked to accept the house rules on the way in — `POLICY #freeq ACCEPT`, then `JOIN #freeq` — which is the gatekeeping described in this series, pointed at its own front door.
+
+If you render a room, write a participant, or break something, bring it there.
 
 Next: the server is the least interesting part of freeq. We open a raw socket
 and look at the grammar this world is standing on.

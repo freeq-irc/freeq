@@ -32,16 +32,16 @@ booleans.
 
 ## A room that already does this
 
-`#freeq-dev` — the channel where freeq itself is argued about — grants ops to
-people who can prove they contribute to freeq. Ask the server what its rules
-are. No authentication required; the rules of a room are public:
+`#freeq` — the channel where freeq itself is argued about — grants ops to people
+who can prove they contribute to freeq. Ask the server what its rules are. No
+authentication required; the rules of a room are public:
 
 ```bash
-curl -s https://irc.freeq.at/api/v1/policy/%23freeq-dev | python3 -m json.tool
+curl -s https://irc.freeq.at/api/v1/policy/%23freeq | python3 -m json.tool
 ```
 
 ```json
-"requirements": { "type": "ACCEPT", "hash": "ee8804db43de3efc5aea2559aee94bf2fee80923f176c3beeb034c545de5e4a4" },
+"requirements": { "type": "ACCEPT", "hash": "0b5752faf791ed46e09cd1dd12d787695437fcb8c7bd6392791c8efcab2b9e7f" },
 "role_requirements": {
     "op": {
         "type": "PRESENT",
@@ -158,14 +158,16 @@ person being refused:
 Each edit writes a new version that names the one before it:
 
 ```bash
-curl -s https://irc.freeq.at/api/v1/policy/%23freeq-dev/history | python3 -m json.tool
+curl -s https://irc.freeq.at/api/v1/policy/%23freeq/history | python3 -m json.tool
 ```
 
 ```json
-{"version": 2,
- "policy_id": "037d84725180b8485646c625e16731118566eca433b805e204ae1d28b05f91c8",
- "previous_policy_hash": "b5098051c425e018c8adb05a5cea05e5b646548942b14b878b101ef79e5a1afd"}
+{"version": 5,
+ "policy_id": "ccb8c230ae03474b10a45deb391cc374b30cb18fca78614febf2d76c04d1c351",
+ "previous_policy_hash": "6c0a64c9f91698b3bee3443d5c942fa448af7c1bfb067aa3c96b19d4c0090317"}
 ```
+
+Five versions deep, each naming the one before it.
 
 "Who changed the entry requirements, and to what" is a question with an answer,
 which is not the normal state of affairs for chat.
@@ -244,8 +246,10 @@ accepted, while the sentence itself is fetched from home.
 
 ## Come in
 
-`#freeq-dev` on `irc.freeq.at` — the room described above, gated by the policy
-above. Source at [github.com/freeq-irc/freeq](https://github.com/freeq-irc/freeq).
+`#freeq` on `irc.freeq.at` — the room described above, admitting people under the
+policy above. A plain client is asked to accept the house rules on the way in:
+`POLICY #freeq ACCEPT`, then `JOIN #freeq`. Source at
+[github.com/freeq-irc/freeq](https://github.com/freeq-irc/freeq).
 
 Next: offboard someone from a room and rotate the keys, without changing the
 server.

@@ -130,8 +130,9 @@ for the single-server case today.
 
 ## Come in
 
-`#freeq-dev` on `irc.freeq.at` is where this gets argued about, and `#freeq` is
-the general channel. Source is at `github.com/freeq-irc/freeq`.
+`#freeq` on `irc.freeq.at` is the channel. A plain client is asked to accept the house rules on the way in — `POLICY #freeq ACCEPT`, then `JOIN #freeq` — which is the gatekeeping described in this series, pointed at its own front door.
+
+Source is at `github.com/freeq-irc/freeq`.
 
 Next: your identity signs in, and signs what it says. We follow the key from a
 DID down to a single message, and we are honest about where that chain is

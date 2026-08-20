@@ -175,7 +175,9 @@ says; an agent you can watch and interrupt; a room that asks the outside world a
 question; two servers with no address between them; and a conversation that is
 the record of why the work happened.
 
-`#freeq-dev` on `irc.freeq.at` is where the arguing happens, and the source is at
-[github.com/freeq-irc/freeq](https://github.com/freeq-irc/freeq). Bring a
-verifier, a client, an agent, or a hostile reading of the signature chain — all
-four are the same contribution.
+`#freeq` on `irc.freeq.at` is the channel. A plain client is asked to accept
+the house rules on the way in — `POLICY #freeq ACCEPT`, then `JOIN #freeq`.
+
+Source at [github.com/freeq-irc/freeq](https://github.com/freeq-irc/freeq).
+Bring a verifier, a client, an agent, or a hostile reading of the signature
+chain — all four are the same contribution.

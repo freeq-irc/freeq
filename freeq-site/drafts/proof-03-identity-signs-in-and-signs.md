@@ -165,9 +165,11 @@ is a gap we should close.
 
 ## Come in
 
-`#freeq-dev` on `irc.freeq.at`. If you build the flagging verifier, that is where
-to bring it, and it will be the most welcome kind of contribution: the kind that
-tells us we are wrong in public. `#freeq` is the general channel.
+`#freeq` on `irc.freeq.at` is the channel. A plain client is asked to accept
+the house rules on the way in — `POLICY #freeq ACCEPT`, then `JOIN #freeq`.
+
+If you build the flagging verifier, bring it there: it will be the most welcome
+kind of contribution, the kind that tells us we are wrong in public.
 
 Next: we give one of these identities to something that is not a person, and
 watch it work from irssi.

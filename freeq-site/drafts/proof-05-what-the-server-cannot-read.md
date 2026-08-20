@@ -161,9 +161,11 @@ The ciphertext is not padded, so length leaks. Padding is cheap and absent.
 
 ## Come in
 
-`#freeq-dev` on `irc.freeq.at`, and the source is at
-[github.com/freeq-irc/freeq](https://github.com/freeq-irc/freeq). A hostile
-reading of `freeq-sdk/src/ratchet.rs` is the most welcome contribution this
-post could produce.
+`#freeq` on `irc.freeq.at` is the channel. A plain client is asked to accept
+the house rules on the way in — `POLICY #freeq ACCEPT`, then `JOIN #freeq`.
+
+Source at [github.com/freeq-irc/freeq](https://github.com/freeq-irc/freeq). A
+hostile reading of `freeq-sdk/src/ratchet.rs` is the most welcome contribution
+this post could produce.
 
 Next: calls, and why the server carrying them knows almost nothing about them.

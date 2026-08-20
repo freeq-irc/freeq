@@ -237,7 +237,9 @@ which is useful for rendering and worthless as a security boundary.
 
 ## Come in
 
-`#freeq-dev` on `irc.freeq.at` is where this is argued about, and the source is
-at [github.com/freeq-irc/freeq](https://github.com/freeq-irc/freeq).
+`#freeq` on `irc.freeq.at` is the channel. A plain client is asked to accept
+the house rules on the way in — `POLICY #freeq ACCEPT`, then `JOIN #freeq`.
+
+Source at [github.com/freeq-irc/freeq](https://github.com/freeq-irc/freeq).
 
 Next: what a server sees when it cannot read your message.
