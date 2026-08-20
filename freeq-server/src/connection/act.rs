@@ -266,8 +266,9 @@ fn announce_expiry(state: &Arc<SharedState>, task: &crate::db::ActTask, title: &
     }
 }
 
-/// The wire lines for a venue's stored task events, each with its timestamp so
-/// a caller can interleave them with message history in time order.
+/// The wire lines for a venue's stored task events within `[from_ts, to_ts]`
+/// — the newest `limit` of them, oldest first — each with its timestamp so a
+/// caller can interleave them with message history in time order.
 ///
 /// Empty for a connection that did not ask for `freeq.at/act` — replay is
 /// gated exactly as live delivery is, so a client that cannot render a task

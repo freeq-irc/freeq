@@ -5947,11 +5947,13 @@ impl Db {
         rows.collect()
     }
 
-    /// The task events stored for one venue, in time order.
+    /// The task events stored for one venue within `[from_ts, to_ts]`, the
+    /// newest `limit` of them, returned oldest first.
     ///
-    /// What replay emits. Bounded by the same window and limit the message
-    /// history uses, so a history request cannot be turned into a full-table
-    /// scan by asking for a wide enough range.
+    /// What replay emits. The window and limit come from the request being
+    /// answered — a JOIN burst or a CHATHISTORY subcommand — never from the
+    /// message rows that happened to come back, so a task posted after the
+    /// last chat line is still served.
     pub fn act_events_for_venue(
         &self,
         venue: &str,
@@ -5959,12 +5961,15 @@ impl Db {
         to_ts: i64,
         limit: usize,
     ) -> SqlResult<Vec<ActLoggedEvent>> {
+        // Newest first under the cap — a reader catching up wants the latest
+        // events, not the oldest `limit` of them — then oldest first to the
+        // caller, which interleaves them with messages in time order.
         let mut stmt = self.conn.prepare(
             "SELECT event_id, canonical, signature, actor_did, venue, timestamp
                FROM events
               WHERE kind = 'act' AND venue = ?1
                 AND timestamp >= ?2 AND timestamp <= ?3
-              ORDER BY timestamp, event_id
+              ORDER BY timestamp DESC, event_id DESC
               LIMIT ?4",
         )?;
         let rows = stmt.query_map(params![venue, from_ts, to_ts, limit as i64], |row| {
@@ -5977,7 +5982,9 @@ impl Db {
                 timestamp: row.get(5)?,
             })
         })?;
-        rows.collect()
+        let mut events: Vec<ActLoggedEvent> = rows.collect::<SqlResult<_>>()?;
+        events.reverse();
+        Ok(events)
     }
 
     /// Every stored event of one task, oldest first: the opener, then each

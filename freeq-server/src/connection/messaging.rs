@@ -2635,64 +2635,74 @@ pub(super) fn handle_chathistory(
     let has_batch = state.cap_batch.lock().contains(session_id);
     let has_multiline = state.cap_draft_multiline.lock().contains(session_id);
 
-    // Fetch messages from DB based on subcommand
-    let messages: Vec<crate::db::MessageRow> = match subcmd.as_str() {
-        "BEFORE" => {
-            if msg.params.len() < 4 {
-                vec![]
-            } else {
-                let ts = parse_chathistory_ts(&msg.params[2]).unwrap_or(u64::MAX);
-                let limit = msg.params[3].parse::<usize>().unwrap_or(50).min(500);
-                state
-                    .with_db(|db| db.get_messages(&db_key, limit, Some(ts)))
-                    .unwrap_or_default()
-            }
-        }
-        "AFTER" => {
-            if msg.params.len() < 4 {
-                vec![]
-            } else {
-                let ts = parse_chathistory_ts(&msg.params[2]).unwrap_or(0);
-                let limit = msg.params[3].parse::<usize>().unwrap_or(50).min(500);
-                state
-                    .with_db(|db| db.get_messages_after(&db_key, ts, limit))
-                    .unwrap_or_default()
-            }
-        }
-        "LATEST" => {
-            if msg.params.len() < 4 {
-                vec![]
-            } else {
-                let limit = msg.params[3].parse::<usize>().unwrap_or(50).min(500);
-                if msg.params[2] == "*" {
-                    state
-                        .with_db(|db| db.get_messages(&db_key, limit, None))
-                        .unwrap_or_default()
+    // Fetch messages from DB based on subcommand. The task events served
+    // alongside them answer to the same request bounds — the subcommand's
+    // own window and limit — not to the span of whatever messages came back.
+    let secs = |ts: u64| ts.min(i64::MAX as u64) as i64;
+    let (messages, act_window): (Vec<crate::db::MessageRow>, Option<(i64, i64, usize)>) =
+        match subcmd.as_str() {
+            "BEFORE" => {
+                if msg.params.len() < 4 {
+                    (vec![], None)
                 } else {
-                    let ts = parse_chathistory_ts(&msg.params[2]).unwrap_or(0);
-                    state
-                        .with_db(|db| db.get_messages_after(&db_key, ts, limit))
-                        .unwrap_or_default()
+                    let ts = parse_chathistory_ts(&msg.params[2]).unwrap_or(u64::MAX);
+                    let limit = msg.params[3].parse::<usize>().unwrap_or(50).min(500);
+                    let rows = state
+                        .with_db(|db| db.get_messages(&db_key, limit, Some(ts)))
+                        .unwrap_or_default();
+                    (rows, Some((0, secs(ts), limit)))
                 }
             }
-        }
-        "BETWEEN" => {
-            if msg.params.len() < 5 {
-                vec![]
-            } else {
-                let start = parse_chathistory_ts(&msg.params[2]).unwrap_or(0);
-                let end = parse_chathistory_ts(&msg.params[3]).unwrap_or(u64::MAX);
-                let limit = msg.params[4].parse::<usize>().unwrap_or(50).min(500);
-                state
-                    .with_db(|db| db.get_messages_between(&db_key, start, end, limit))
-                    .unwrap_or_default()
+            "AFTER" => {
+                if msg.params.len() < 4 {
+                    (vec![], None)
+                } else {
+                    let ts = parse_chathistory_ts(&msg.params[2]).unwrap_or(0);
+                    let limit = msg.params[3].parse::<usize>().unwrap_or(50).min(500);
+                    let rows = state
+                        .with_db(|db| db.get_messages_after(&db_key, ts, limit))
+                        .unwrap_or_default();
+                    (rows, Some((secs(ts), i64::MAX, limit)))
+                }
             }
-        }
-        _ => vec![],
-    };
+            "LATEST" => {
+                if msg.params.len() < 4 {
+                    (vec![], None)
+                } else {
+                    let limit = msg.params[3].parse::<usize>().unwrap_or(50).min(500);
+                    if msg.params[2] == "*" {
+                        let rows = state
+                            .with_db(|db| db.get_messages(&db_key, limit, None))
+                            .unwrap_or_default();
+                        (rows, Some((0, i64::MAX, limit)))
+                    } else {
+                        let ts = parse_chathistory_ts(&msg.params[2]).unwrap_or(0);
+                        let rows = state
+                            .with_db(|db| db.get_messages_after(&db_key, ts, limit))
+                            .unwrap_or_default();
+                        (rows, Some((secs(ts), i64::MAX, limit)))
+                    }
+                }
+            }
+            "BETWEEN" => {
+                if msg.params.len() < 5 {
+                    (vec![], None)
+                } else {
+                    let start = parse_chathistory_ts(&msg.params[2]).unwrap_or(0);
+                    let end = parse_chathistory_ts(&msg.params[3]).unwrap_or(u64::MAX);
+                    let limit = msg.params[4].parse::<usize>().unwrap_or(50).min(500);
+                    let rows = state
+                        .with_db(|db| db.get_messages_between(&db_key, start, end, limit))
+                        .unwrap_or_default();
+                    (rows, Some((secs(start), secs(end), limit)))
+                }
+            }
+            _ => (vec![], None),
+        };
 
     replay_rows_as_batch(
         messages,
+        act_window,
         &target,
         "chathistory",
         state,
@@ -2766,8 +2776,11 @@ pub(super) fn handle_search(
     let has_batch = state.cap_batch.lock().contains(session_id);
     let has_multiline = state.cap_draft_multiline.lock().contains(session_id);
 
+    // A search answers with the messages that matched; it has no time window
+    // for task events to answer to, so none ride along.
     replay_rows_as_batch(
         messages,
+        None,
         &target,
         "freeq.at/search",
         state,
@@ -2784,9 +2797,15 @@ pub(super) fn handle_search(
 /// Replay stored message rows to one session as an (optionally batched)
 /// sequence of PRIVMSGs, preserving msgid/account/reaction tags and
 /// multiline emission shapes. Shared by CHATHISTORY and SEARCH.
+///
+/// `act_window` is `(from_ts, to_ts, limit)` for the venue's task events to
+/// interleave with the rows — the request's own bounds, so a task that
+/// landed after the last matching message is served too — or `None` to
+/// replay messages alone.
 #[allow(clippy::too_many_arguments)]
 fn replay_rows_as_batch(
     messages: Vec<crate::db::MessageRow>,
+    act_window: Option<(i64, i64, usize)>,
     target: &str,
     batch_type: &str,
     state: &Arc<SharedState>,
@@ -2818,25 +2837,20 @@ fn replay_rows_as_batch(
 
     // The venue's task events, to be emitted inside this same batch in time
     // order with the messages. Empty unless this connection asked for them.
-    let window = messages
-        .iter()
-        .map(|r| r.timestamp as i64)
-        .fold((i64::MAX, i64::MIN), |(lo, hi), t| (lo.min(t), hi.max(t)));
-    let mut act_lines = super::act::replay_lines(
-        state,
-        session_id,
-        &crate::events::venue_of(&target),
-        &target,
-        if window.0 == i64::MAX { 0 } else { window.0 },
-        if window.1 == i64::MIN {
-            i64::MAX
-        } else {
-            window.1
-        },
-        messages.len().max(1) * 4,
-        has_time,
-        has_batch.then_some(batch_id.as_str()),
-    );
+    let mut act_lines = match act_window {
+        Some((from_ts, to_ts, limit)) => super::act::replay_lines(
+            state,
+            session_id,
+            &crate::events::venue_of(&target),
+            &target,
+            from_ts,
+            to_ts,
+            limit,
+            has_time,
+            has_batch.then_some(batch_id.as_str()),
+        ),
+        None => Vec::new(),
+    };
     act_lines.reverse(); // popped from the back, so oldest goes last
 
     for row in &messages {

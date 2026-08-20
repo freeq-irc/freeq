@@ -1115,6 +1115,99 @@ async fn chathistory_carries_task_events_to_capability_holders() {
     .await;
 }
 
+/// Wait for the wall clock to tick into the next second, so the next thing
+/// stored lands on a later timestamp than the last — the boundary a replay
+/// window derived from message timestamps used to cut on.
+fn next_second() {
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    };
+    let start = now();
+    while now() == start {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The task is the newest thing in the room: no chat line follows it. A
+/// joiner still gets it — the replay answers for the channel, not for the
+/// span of the messages that happened to be in the buffer.
+#[tokio::test]
+async fn a_task_posted_after_the_last_message_replays_to_a_joiner() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        a.tx("PRIVMSG #ops :the last word, for now");
+        a.rx(|l| l.contains("the last word"), "the message echoes");
+        next_second();
+        let task = open_task(&mut a, &signing, "#ops", None);
+
+        let mut late = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        late.tx("JOIN #ops");
+        let replayed = late.rx(|l| l.contains("+freeq.at/act="), "the task event replays");
+        assert!(replayed.contains(&task), "{replayed}");
+    })
+    .await;
+}
+
+/// Nobody has chatted in the room at all — it is only tasks. A joiner who
+/// asked for them gets them.
+#[tokio::test]
+async fn a_room_with_only_task_events_replays_them_to_a_joiner() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        let task = open_task(&mut a, &signing, "#ops", None);
+
+        let mut late = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        late.tx("JOIN #ops");
+        let replayed = late.rx(|l| l.contains("+freeq.at/act="), "the task event replays");
+        assert!(replayed.contains(&task), "{replayed}");
+    })
+    .await;
+}
+
+/// The same for an explicit history request: LATEST answers with the newest
+/// task events under its own limit, whether or not a message follows them.
+#[tokio::test]
+async fn chathistory_carries_a_task_posted_after_the_last_message() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        a.tx("PRIVMSG #ops :before");
+        a.rx(|l| l.contains("before"), "the message echoes");
+        next_second();
+        let task = open_task(&mut a, &signing, "#ops", None);
+
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.join("#ops");
+        b.tx("CHATHISTORY LATEST #ops * 50");
+        let replayed = b.rx(
+            |l| l.contains("+freeq.at/act="),
+            "the task event in history",
+        );
+        assert!(replayed.contains(&task), "{replayed}");
+    })
+    .await;
+}
+
 // ── expiry ──────────────────────────────────────────────────────────────────
 
 /// Everything at once: the sweep signs its own event under the server's

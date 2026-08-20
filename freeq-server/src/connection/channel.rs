@@ -491,7 +491,26 @@ pub(super) fn handle_join(
                 .unwrap_or_default()
         };
 
-        if !history.is_empty() {
+        // The channel's task events, for a joiner that asked for them: the
+        // newest MAX_HISTORY, the same cap the messages get. Fetched on their
+        // own terms, not within the span of the message buffer — a task
+        // posted after the last chat line, or into a room nobody has chatted
+        // in, replays too.
+        let batch_id = format!("hist{}", crate::msgid::generate());
+        let mut act_lines = super::act::replay_lines(
+            state,
+            session_id,
+            &crate::events::venue_of(channel),
+            channel,
+            0,
+            i64::MAX,
+            crate::server::MAX_HISTORY,
+            has_time_cap,
+            has_batch_cap.then_some(batch_id.as_str()),
+        );
+        act_lines.reverse();
+
+        if !history.is_empty() || !act_lines.is_empty() {
             // Fetch persisted reactions for this batch so they ride on
             // the replayed messages — mirrors the explicit CHATHISTORY
             // emission path (messaging.rs). Without this, joiners see
@@ -508,36 +527,14 @@ pub(super) fn handle_join(
                 };
 
             // Start batch if client supports it
-            let batch_id = format!("hist{}", crate::msgid::generate());
             if has_batch_cap {
                 let batch_start =
                     format!(":{server_name} BATCH +{batch_id} chathistory {channel}\r\n");
                 send(state, session_id, batch_start);
             }
 
-            // The channel's task events, emitted inside this same batch in
-            // time order with the messages — and only to a joiner that asked
-            // for them.
-            let window = history
-                .iter()
-                .map(|h| h.timestamp as i64)
-                .fold((i64::MAX, i64::MIN), |(lo, hi), t| (lo.min(t), hi.max(t)));
-            let mut act_lines = super::act::replay_lines(
-                state,
-                session_id,
-                &crate::events::venue_of(channel),
-                channel,
-                if window.0 == i64::MAX { 0 } else { window.0 },
-                if window.1 == i64::MIN {
-                    i64::MAX
-                } else {
-                    window.1
-                },
-                history.len().max(1) * 4,
-                has_time_cap,
-                has_batch_cap.then_some(batch_id.as_str()),
-            );
-            act_lines.reverse();
+            // Messages and task events interleave in time order: each task
+            // event goes out before the first message that landed after it.
 
             for hist in &history {
                 while act_lines
