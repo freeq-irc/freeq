@@ -86,7 +86,13 @@ export {
   acceptWork,
   forfeit,
 } from "./act-verbs.js";
-export type { ActContext, OfferOptions, StepOptions } from "./act-verbs.js";
+export type {
+  ActContext,
+  OfferOptions,
+  StepOptions,
+  BidOptions,
+  AcceptWorkOptions,
+} from "./act-verbs.js";
 
 // The task lifecycle rules — which move is legal, from which state, by whom.
 // The rules are data (spec/act-transitions.json, copied into src/); this is

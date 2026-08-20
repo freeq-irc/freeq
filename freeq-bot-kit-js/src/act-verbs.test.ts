@@ -252,9 +252,57 @@ describe("the bounty verbs", () => {
     }
   });
 
-  it("carries the kind on a bounty's follow-ups too", async () => {
+  it("carries the kind on the steps both kinds share", async () => {
     const sent: Sent[] = [];
-    await complete(ctxWith(sent), "01JTASK00000000000000000AA", { kind: "bounty" });
+    await progress(ctxWith(sent), "01JTASK00000000000000000AA", { kind: "bounty" });
     expect(sent[0].tags["+freeq.at/act"]).toBe("bounty");
+  });
+
+  it("names the kind it was given on every step about the posting, and the task when given none", async () => {
+    for (const [move, past] of [
+      [accept, "accepted"],
+      [decline, "declined"],
+      [claim, "claimed"],
+      [complete, "completed"],
+      [fail, "failed"],
+    ] as const) {
+      const plain: Sent[] = [];
+      await move(ctxWith(plain), "01JTASK00000000000000000AA");
+      expect(plain[0].humanText, past).toBe(`${past} the task`);
+      const named: Sent[] = [];
+      await move(ctxWith(named), "01JTASK00000000000000000AA", { kind: "handoff" });
+      expect(named[0].humanText, past).toBe(`${past} the handoff`);
+    }
+  });
+
+  it("names the kind it was given when cancelling, and the task when given none", async () => {
+    const sent: Sent[] = [];
+    await cancel(ctxWith(sent), "01JTASK00000000000000000AA", { kind: "bounty" });
+    expect(sent[0].tags["+freeq.at/act"]).toBe("bounty");
+    expect(sent[0].humanText).toBe("cancelled the bounty");
+    const plain: Sent[] = [];
+    await cancel(ctxWith(plain), "01JTASK00000000000000000AA");
+    expect(plain[0].humanText).toBe("cancelled the task");
+    const named: Sent[] = [];
+    await cancel(ctxWith(named), "01JTASK00000000000000000AA", { kind: "handoff" });
+    expect(named[0].humanText).toBe("cancelled the handoff");
+  });
+
+  it("says each bounty step the way the handoff steps are said", async () => {
+    const lines: [(...a: any[]) => Promise<string>, string][] = [
+      [bid, "bid on the bounty"],
+      [submit, "submitted the work"],
+      [revise, "asked for revisions"],
+      [acceptWork, "accepted the work"],
+      [forfeit, "forfeited the bounty"],
+    ];
+    for (const [move, line] of lines) {
+      const sent: Sent[] = [];
+      await move(ctxWith(sent), "01JTASK00000000000000000AA");
+      expect(sent[0].humanText, line).toBe(line);
+    }
+    const sent: Sent[] = [];
+    await award(ctxWith(sent), "01JTASK00000000000000000AA", "01JBID000000000000000000BB");
+    expect(sent[0].humanText).toBe("awarded the bounty");
   });
 });

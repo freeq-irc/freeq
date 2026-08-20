@@ -83,6 +83,11 @@ function stepTags(verb: string, did: string, taskId: string, note?: string, kind
   return tags;
 }
 
+/** What a step's default line calls the thing it acts on: the kind, or "task". */
+function named(kind?: string): string {
+  return kind ?? "task";
+}
+
 /**
  * Open a task. Returns its id — the offer's own event id *is* the task's id,
  * which is why an offer carries no `act-id` of its own.
@@ -120,7 +125,7 @@ export async function accept(
   opts: StepOptions = {},
 ): Promise<string> {
   return ctx.client.sendAct(ctx.target, stepTags("accept", ctx.did, taskId, opts.note, opts.kind), {
-    humanText: opts.humanText ?? "accepted the task",
+    humanText: opts.humanText ?? `accepted the ${named(opts.kind)}`,
     taskId,
   });
 }
@@ -132,7 +137,7 @@ export async function decline(
   opts: StepOptions = {},
 ): Promise<string> {
   return ctx.client.sendAct(ctx.target, stepTags("decline", ctx.did, taskId, opts.note, opts.kind), {
-    humanText: opts.humanText ?? "declined the task",
+    humanText: opts.humanText ?? `declined the ${named(opts.kind)}`,
     taskId,
   });
 }
@@ -144,7 +149,7 @@ export async function claim(
   opts: StepOptions = {},
 ): Promise<string> {
   return ctx.client.sendAct(ctx.target, stepTags("claim", ctx.did, taskId, opts.note, opts.kind), {
-    humanText: opts.humanText ?? "claimed the task",
+    humanText: opts.humanText ?? `claimed the ${named(opts.kind)}`,
     taskId,
   });
 }
@@ -168,7 +173,7 @@ export async function complete(
   opts: StepOptions = {},
 ): Promise<string> {
   return ctx.client.sendAct(ctx.target, stepTags("complete", ctx.did, taskId, opts.note, opts.kind), {
-    humanText: opts.humanText ?? "completed the task",
+    humanText: opts.humanText ?? `completed the ${named(opts.kind)}`,
     taskId,
   });
 }
@@ -183,7 +188,7 @@ export async function fail(
   opts: StepOptions = {},
 ): Promise<string> {
   return ctx.client.sendAct(ctx.target, stepTags("fail", ctx.did, taskId, opts.note, opts.kind), {
-    humanText: opts.humanText ?? "failed the task",
+    humanText: opts.humanText ?? `failed the ${named(opts.kind)}`,
     taskId,
   });
 }
@@ -242,7 +247,7 @@ export async function award(
   const tags = stepTags("award", ctx.did, taskId, opts.note, BOUNTY);
   tags["+freeq.at/act-accepts"] = bidEventId;
   return ctx.client.sendAct(ctx.target, tags, {
-    humanText: opts.humanText ?? 'awarded the bounty',
+    humanText: opts.humanText ?? "awarded the bounty",
     taskId,
   });
 }
@@ -302,14 +307,10 @@ export async function acceptWork(
 ): Promise<string> {
   const tags = stepTags("accept-work", ctx.did, taskId, opts.note, BOUNTY);
   if (opts.tx) tags["+freeq.at/act-tx"] = opts.tx;
-  return ctx.client.sendAct(
-    ctx.target,
-    tags,
-    {
-      humanText: opts.humanText ?? "accepted the work",
-      taskId,
-    },
-  );
+  return ctx.client.sendAct(ctx.target, tags, {
+    humanText: opts.humanText ?? "accepted the work",
+    taskId,
+  });
 }
 
 /**
@@ -329,8 +330,10 @@ export async function forfeit(
 }
 
 /**
- * Withdraw a task you posted. The poster's unilateral act, legal from every
- * live state including mid-work — the worker gets the event, not a say.
+ * Withdraw a task you posted. The poster's unilateral act: on a handoff, legal
+ * from every live state including mid-work; on a bounty, only until the work
+ * is handed in — from there the poster's moves are to accept it or ask for
+ * revisions. Either way the worker gets the event, not a say.
  */
 export async function cancel(
   ctx: ActContext,
@@ -338,7 +341,7 @@ export async function cancel(
   opts: StepOptions = {},
 ): Promise<string> {
   return ctx.client.sendAct(ctx.target, stepTags("cancel", ctx.did, taskId, opts.note, opts.kind), {
-    humanText: opts.humanText ?? "cancelled the task",
+    humanText: opts.humanText ?? `cancelled the ${named(opts.kind)}`,
     taskId,
   });
 }
