@@ -2781,8 +2781,8 @@ async fn client_metadata(headers: axum::http::HeaderMap) -> Json<serde_json::Val
         "client_name": "freeq",
         "client_uri": web_origin,
         "logo_uri": format!("{web_origin}/freeq.png"),
-        "tos_uri": format!("{web_origin}"),
-        "policy_uri": format!("{web_origin}"),
+        "tos_uri": web_origin,
+        "policy_uri": web_origin,
         "redirect_uris": [redirect_uri],
         // Advertise the union of scopes any flow may request. The AT
         // Proto OAuth spec requires that scopes used at /authorize time
