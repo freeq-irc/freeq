@@ -391,8 +391,14 @@ async fn a_verb_the_kind_does_not_have_is_refused() {
     .await;
 }
 
+/// Not `alg:kid:sig`, so it names no key and no check can run. Invalid is
+/// reserved for bytes that contradict a key; a check that never ran produced
+/// no such evidence — unverifiable, the same reading the chat profile gives
+/// an unparseable or legacy signature format. (This test asserted
+/// SIGNATURE_INVALID until 2026-08-20; that pinned the wrong half of the
+/// frozen invalid/unverifiable split.)
 #[tokio::test]
-async fn a_malformed_signature_tag_is_refused_as_invalid() {
+async fn a_malformed_signature_tag_reads_unverifiable() {
     let k = key();
     let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
     run(addr, move |addr| {
@@ -400,15 +406,13 @@ async fn a_malformed_signature_tag_is_refused_as_invalid() {
         let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
         a.msgsig(&signing);
         a.join("#ops");
-        // Not `alg:kid:sig`, so it names no key at all. It cannot be a
-        // key-availability problem, and it will never become checkable.
         a.tx(&line_with_sig(
             &offer_tags(),
             "#ops",
             &fresh_id(),
             "garbage",
         ));
-        assert_eq!(a.fail_code(), "SIGNATURE_INVALID");
+        assert_eq!(a.fail_code(), "SIGNATURE_UNVERIFIABLE");
     })
     .await;
 }
@@ -482,6 +486,33 @@ async fn a_task_message_naming_no_actor_is_refused() {
             .collect();
         a.tx(&line_with_sig(&tags, "#ops", &id, &sig));
         assert_eq!(a.fail_code(), "ACTOR_REQUIRED");
+    })
+    .await;
+}
+
+/// The invalid/unverifiable split, at the gate: a signature naming an
+/// algorithm this server has never heard of cannot be checked, and that is
+/// not evidence about the sender — the answer is SIGNATURE_UNVERIFIABLE,
+/// never SIGNATURE_INVALID. Until 2026-08-20 this case was answered as
+/// invalid, telling a sender with a future algorithm its signature was
+/// forged.
+#[tokio::test]
+async fn an_unknown_signature_algorithm_reads_unverifiable_not_invalid() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        let id = fresh_id();
+        let tags = offer_tags();
+        let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let real = freeq_sdk::act::sign_act(pairs, &channel_venue("#ops"), &id, &signing)
+            .expect("act tags present");
+        let swapped = format!("rsa4096:{}", real.split_once(':').expect("alg:kid:sig").1);
+        a.tx(&line_with_sig(&tags, "#ops", &id, &swapped));
+        assert_eq!(a.fail_code(), "SIGNATURE_UNVERIFIABLE");
     })
     .await;
 }

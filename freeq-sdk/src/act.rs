@@ -54,9 +54,12 @@
 //! - `act-from` is the one covered-name exception: its value becomes the
 //!   document's `from` (see above), so the signer's key is the same in both
 //!   profiles and never appears twice.
-//! - All other canonical keys are the **stripped** tag names — the vendor
-//!   prefix is wire framing, not semantics, so signatures survive a future
-//!   de-vendoring of the tag names.
+//! - All other canonical keys are the **stripped** tag names. The vendor
+//!   prefix never reaches a document, so a future de-vendoring of the tag
+//!   names changes no signature — with one honest caveat: the coverage
+//!   predicate below recognizes the current wire spellings, so a renamed
+//!   wire tag also needs its spelling added there (a code change, not a
+//!   canonical change).
 //! - Values are the (IRC-unescaped) tag values, verbatim, always JSON
 //!   strings — `act-deadline` is not coerced to a number.
 //! - `id` and `target` are injected by the caller, never read from a tag.
@@ -101,6 +104,11 @@ pub enum ActSigError {
     /// canonical field (`from`/`id`/`target`) missing reads *unverifiable*,
     /// never invalid (thread agreement, 2026-08-02).
     MissingFrom,
+    /// The caller supplied no event id. Same mandatory-field rule as
+    /// `MissingFrom`; parameter-level because the id is injected, not a tag.
+    MissingId,
+    /// The caller supplied no venue. Same mandatory-field rule.
+    MissingTarget,
     /// The sig tag is not `alg:kid:sig`.
     BadSigFormat,
     /// The sig tag names an algorithm other than `ed25519`.
@@ -119,6 +127,8 @@ impl std::fmt::Display for ActSigError {
             ActSigError::MissingFrom => {
                 write!(f, "act tags present but no act-from names the signer")
             }
+            ActSigError::MissingId => write!(f, "no event id supplied for the act document"),
+            ActSigError::MissingTarget => write!(f, "no venue supplied for the act document"),
             ActSigError::BadSigFormat => write!(f, "sig tag is not alg:kid:sig"),
             ActSigError::UnsupportedAlgorithm(a) => write!(f, "unsupported sig algorithm {a}"),
             ActSigError::KidMismatch => write!(f, "public key does not match the sig's kid"),
@@ -174,6 +184,14 @@ pub fn act_canonical<'a, I>(tags: I, target: &'a str, id: &'a str) -> Result<Str
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
+    // All three mandatory fields, or no document — the same rule whether the
+    // field is a tag (from) or a parameter (id, target).
+    if id.is_empty() {
+        return Err(ActSigError::MissingId);
+    }
+    if target.is_empty() {
+        return Err(ActSigError::MissingTarget);
+    }
     let mut covered: BTreeMap<&str, &str> = BTreeMap::new();
     let mut from: Option<&str> = None;
     for (name, value) in tags {
@@ -412,6 +430,21 @@ mod tests {
             OFFER_ID,
         );
         assert_eq!(prefixed, bare);
+    }
+
+    /// `id` and `target` are as mandatory as `from`; they are parameters
+    /// rather than tags, so the guard is parameter-level. Unverifiable-class,
+    /// like every missing mandatory field.
+    #[test]
+    fn an_empty_id_or_venue_is_a_missing_mandatory_field() {
+        assert_eq!(
+            act_canonical(offer_tags(), OFFER_VENUE, ""),
+            Err(ActSigError::MissingId)
+        );
+        assert_eq!(
+            act_canonical(offer_tags(), "", OFFER_ID),
+            Err(ActSigError::MissingTarget)
+        );
     }
 
     #[test]

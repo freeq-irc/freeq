@@ -226,6 +226,11 @@ describe("verification failures", () => {
     expect(await signActTags(tags, v.target, v.id, key)).toBeNull();
   });
 
+  it("an empty id or venue builds no document (mandatory fields)", () => {
+    expect(actCanonical(v.tags, v.target, "")).toBeNull();
+    expect(actCanonical(v.tags, "", v.id)).toBeNull();
+  });
+
   it("a rewritten act-from breaks the signature like any covered value", async () => {
     const tags = { ...v.tags, "+freeq.at/act-from": "did:plc:mallory" };
     expect(await verifyActTags(tags, v.target, v.id, v.sigTag, pub())).toEqual({

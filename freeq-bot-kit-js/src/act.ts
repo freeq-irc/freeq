@@ -87,6 +87,7 @@ export function actCanonical(
   target: string,
   id: string,
 ): string | null {
+  if (id === "" || target === "") return null;
   const covered: Record<string, string> = {};
   let from: string | null = null;
   for (const [name, value] of Object.entries(tags)) {

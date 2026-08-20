@@ -617,20 +617,23 @@ pub(super) fn gate(
             );
             return Gate::Refused;
         }
-        // Anything else uncheckable is malformed rather than pending: a tag
-        // that is not `alg:kid:sig` names no key, so no lookup will ever make
-        // it verify. It does not check out against the key it names, and
-        // saying so is true of it.
+        // Everything else uncheckable — an unknown algorithm, a tag that is
+        // not `alg:kid:sig`, a missing mandatory field — answers as what it
+        // is. The invalid/unverifiable split is frozen on the thread: invalid
+        // is reserved for bytes that contradict a key, and none of these ever
+        // reached a key. Answering SIGNATURE_INVALID here (as this arm did
+        // until 2026-08-20) told a sender with a future signature algorithm
+        // that its signature was forged.
         super::messaging::ClientSigOutcome::Unverifiable(why) => {
             tracing::warn!(
                 session = %conn.id, did = %did, target = %target, why = %why,
-                "Task-message signature is malformed — refusing the event"
+                "Task-message signature cannot be checked — refusing the event"
             );
             refuse(
                 conn,
                 "TAGMSG",
-                "SIGNATURE_INVALID",
-                "That signature does not verify against the key it names",
+                "SIGNATURE_UNVERIFIABLE",
+                "That signature cannot be checked here",
                 state,
             );
             return Gate::Refused;

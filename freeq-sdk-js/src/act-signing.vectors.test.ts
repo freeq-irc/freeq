@@ -37,6 +37,12 @@ describe('act canonical', () => {
     });
   }
 
+  it('an empty id or venue builds no document (mandatory fields)', () => {
+    const v = spec.vectors[0];
+    expect(actCanonical(v.tags, v.target, '')).toBeNull();
+    expect(actCanonical(v.tags, '', v.id)).toBeNull();
+  });
+
   it('act tags without act-from build no document (missing mandatory field)', () => {
     const v = spec.vectors[0];
     const tags = { ...v.tags };
