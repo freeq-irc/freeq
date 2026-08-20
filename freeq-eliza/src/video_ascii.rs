@@ -85,7 +85,8 @@ impl GlyphAtlas {
             // glyph's coverage.
             let data = pixmap.data();
             let mut mask = Vec::with_capacity((CELL_W * CELL_H) as usize);
-            for px in data.chunks_exact(4) {
+            let (px4, _) = data.as_chunks::<4>();
+            for px in px4 {
                 mask.push(px[3]);
             }
             masks.push(mask);
@@ -162,7 +163,8 @@ impl AsciiRenderer {
 
         let mut buf = vec![0u8; (VIDEO_W * VIDEO_H * 4) as usize];
         // Opaque black background.
-        for px in buf.chunks_exact_mut(4) {
+        let (px4, _) = buf.as_chunks_mut::<4>();
+        for px in px4 {
             px[3] = 255;
         }
 
@@ -404,7 +406,8 @@ impl AsciiRainRenderer {
         };
 
         let mut buf = vec![0u8; (VIDEO_W * VIDEO_H * 4) as usize];
-        for px in buf.chunks_exact_mut(4) {
+        let (px4, _) = buf.as_chunks_mut::<4>();
+        for px in px4 {
             px[3] = 255;
         }
 
@@ -583,7 +586,8 @@ impl AsciiGlitchRenderer {
         let chan = (2.0 + 12.0 * g) as i32; // chromatic split, px
 
         let mut buf = vec![0u8; (VIDEO_W * VIDEO_H * 4) as usize];
-        for px in buf.chunks_exact_mut(4) {
+        let (px4, _) = buf.as_chunks_mut::<4>();
+        for px in px4 {
             px[3] = 255;
         }
 
@@ -768,7 +772,8 @@ impl AsciiBotRenderer {
         };
 
         let mut buf = vec![0u8; (VIDEO_W * VIDEO_H * 4) as usize];
-        for px in buf.chunks_exact_mut(4) {
+        let (px4, _) = buf.as_chunks_mut::<4>();
+        for px in px4 {
             px[3] = 255;
         }
 
