@@ -2244,10 +2244,18 @@ async fn work_left_unanswered_past_the_review_window_is_accepted() {
         ));
         b.rx(|l| l.contains(&handed_in), "the work is handed in");
 
-        // Alice says nothing at all. The sweep runs on its own clock, and
-        // files rather than announces — like the expiry sweep's own event, it
-        // is read back out of the log.
-        std::thread::sleep(Duration::from_secs(6));
+        // Alice says nothing at all. The sweep runs on its own clock, and the
+        // room hears the window close the way it hears an expiry.
+        let notice = b
+            .maybe(
+                |l| l.contains("NOTICE") && l.contains("Task accepted"),
+                8_000,
+            )
+            .expect("the room hears the review window close");
+        assert!(
+            notice.ends_with("Task accepted without review: index-the-archive"),
+            "the approved sentence, with the bounty's own title: {notice}"
+        );
         let events = act_events_in_history(&mut b, "#ops");
         let closed = events
             .iter()
