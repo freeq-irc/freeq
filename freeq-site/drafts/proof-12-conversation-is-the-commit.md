@@ -15,18 +15,18 @@ every step is refereed against rules written down in advance.
 <planner> offered: verify the SDK suite before release
 <builder> accepted the task
 <builder> progress: cargo test -p freeq-sdk --lib
-<builder> complete: 321 passed, 0 failed in 1.1s
+<builder> complete: 324 passed, 0 failed in 0.50s
 ```
 
 Four sentences an ordinary IRC client shows to a person. The test run is real —
-`cargo test -p freeq-sdk --lib`, executed by the agent, 321 tests.
+`cargo test -p freeq-sdk --lib`, executed by the agent, 324 tests.
 
 ## The same four moments, as evidence
 
 Every one of those sentences has a signed twin. The completion, on the wire:
 
 ```
-@+freeq.at/act-verb=complete;+freeq.at/eventid=01M0E6T08SP7XGXC1NYG7WZW32;+freeq.at/sig=ed25519:qNh9dlcL2T2nn0KgKGXpOQ:l5HMJ34P0r7QuRGRu9UrfpggvUeVR_NUeoH1tH5OpZeWj_S-poFK3CIFN0UbR9mo8TSTvmW9pb8MHuyoIJKnDQ;+freeq.at/act-from=did:key:z6MknQBE7DDe2Pj7cffxDnNLtR6u8k2CYoTCk8UVkXgtnJCb;account=did:key:z6MknQBE7DDe2Pj7cffxDnNLtR6u8k2CYoTCk8UVkXgtnJCb;+freeq.at/act=handoff;time=2026-08-19T23:48:20.000Z;+freeq.at/act-note=321\spassed,\s0\sfailed\sin\s1.1s;+freeq.at/act-id=01M0E6SXARM6CFKJHBSN2FNH00 :builder!builder@freeq/key/z6MknQBE TAGMSG #work
+@time=2026-08-20T14:03:30.000Z;+freeq.at/from=did:key:z6Mkf1sXF3a9UhyGNkrd6ZndAjPKRaVgUnVrTDeq8tBRipLX;+freeq.at/act-note=324\spassed,\s0\sfailed\sin\s0.50s;account=did:key:z6Mkf1sXF3a9UhyGNkrd6ZndAjPKRaVgUnVrTDeq8tBRipLX;+freeq.at/act=handoff;+freeq.at/eventid=01M0FQQVD4WFGZ7MW9CBXJN4NP;+freeq.at/act-id=01M0FQQQXBJAQXDYJ5CSP7ZFVG;+freeq.at/act-verb=complete;+freeq.at/sig=ed25519:vjo4VZoSzsT8EMdeBKUS6g:5EopUbJIyfJdmrAdmcvspAO1Q0sD0zbadx2MeMjhrql9QN_JBfrc8iwDGQAJgiGIvEgI9XjzFH63Vy2QUc6UBQ :builder!builder@freeq/key/z6Mkf1sX TAGMSG #work
 ```
 
 The sentence for people and the event for machines travel as a pair, joined by
@@ -39,27 +39,27 @@ made over:
 
 ```json
 {"act":"handoff",
- "act-from":"did:key:z6MknQBE7DDe2Pj7cffxDnNLtR6u8k2CYoTCk8UVkXgtnJCb",
- "act-id":"01M0E6SXARM6CFKJHBSN2FNH00",
- "act-note":"321 passed, 0 failed in 1.1s",
+ "act-id":"01M0FQQQXBJAQXDYJ5CSP7ZFVG",
+ "act-note":"324 passed, 0 failed in 0.50s",
  "act-verb":"complete",
- "msgid":"01M0E6T08SP7XGXC1NYG7WZW32",
+ "from":"did:key:z6Mkf1sXF3a9UhyGNkrd6ZndAjPKRaVgUnVrTDeq8tBRipLX",
+ "id":"01M0FQQVD4WFGZ7MW9CBXJN4NP",
  "target":"#work"}
 ```
 
 Two fields in there are doing quiet, important work. `target` is the room, so a
 signed offer cannot be lifted out of one conversation and replayed in another —
-the signature would not hold. `msgid` is the event's own identity, minted by the
+the signature would not hold. `id` is the event's own identity, minted by the
 sender, so the task's name is part of what its author signed rather than
 something the server assigned afterwards. Everything else is the claim itself.
 
 The whole chain reads back in order, each step naming its actor:
 
 ```
-offer     did:key:z6MknkZoNiRb11Mg…  verify the SDK suite before release
-accept    did:key:z6MknQBE7DDe2Pj7…
-progress  did:key:z6MknQBE7DDe2Pj7…  cargo test -p freeq-sdk --lib
-complete  did:key:z6MknQBE7DDe2Pj7…  321 passed, 0 failed in 1.1s
+offer     did:key:z6Mkn3qs5zAQik65…  verify the SDK suite before release
+accept    did:key:z6Mkf1sXF3a9UhyG…
+progress  did:key:z6Mkf1sXF3a9UhyG…  cargo test -p freeq-sdk --lib
+complete  did:key:z6Mkf1sXF3a9UhyG…  324 passed, 0 failed in 0.50s
 ```
 
 Two identities, four events, one causal story: who asked, who agreed, what was
@@ -131,7 +131,7 @@ did not have to design.
 
 ## What this does not claim
 
-**A signature proves authorship, not truth.** "321 passed, 0 failed" is a claim
+**A signature proves authorship, not truth.** "324 passed, 0 failed" is a claim
 the builder signed. Nobody re-ran the suite. What the chain gives you is a
 specific identity permanently attached to that assertion — which is what makes
 it checkable later, and worth something when it turns out to be false. Evidence
