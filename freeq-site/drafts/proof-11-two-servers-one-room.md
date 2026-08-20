@@ -180,10 +180,12 @@ sentence from home.
 
 ## Come in
 
-`#freeq-dev` on `irc.freeq.at`, and the source is at
-[github.com/freeq-irc/freeq](https://github.com/freeq-irc/freeq). If you run a
-node and it fails to converge with someone else's, that is the bug report we
-most want.
+`#freeq` on `irc.freeq.at` is the channel. A plain client is asked to accept
+the house rules on the way in — `POLICY #freeq ACCEPT`, then `JOIN #freeq`.
+
+Source at [github.com/freeq-irc/freeq](https://github.com/freeq-irc/freeq). If
+you run a node and it fails to converge with someone else's, that is the bug
+report we most want.
 
 Next: the conversation is the commit — signed intent, an agent that acts on it,
 and a record of why a system changed.

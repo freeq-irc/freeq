@@ -32,6 +32,7 @@ import urllib.request
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+import atproto_blog  # noqa: E402
 import leaflet_publish as lp  # noqa: E402
 
 PUBLICATION = "at://did:plc:4qsyxmnsblo4luuycm3572bq/site.standard.publication/3mri2ajri7c2w"
@@ -84,6 +85,10 @@ def main() -> int:
     ap.add_argument("draft", nargs="?", help="markdown file")
     ap.add_argument("--delete", metavar="RKEY",
                     help="delete a document record instead of publishing")
+    ap.add_argument("--update", metavar="RKEY",
+                    help="replace an already-published record with this draft, "
+                         "keeping its rkey (so the URL survives) and its "
+                         "original publishedAt (so the date does not move)")
     ap.add_argument("--write", action="store_true", help="actually create the record")
     ap.add_argument("--publication", default=PUBLICATION)
     ap.add_argument("--identifier", default=DEFAULT_IDENTIFIER)
@@ -113,7 +118,7 @@ def main() -> int:
     if not args.draft:
         raise SystemExit("need a draft file (or --delete RKEY)")
     md = pathlib.Path(args.draft).read_text()
-    rkey = make_tid()
+    rkey = args.update or make_tid()
     tags = [t.strip() for t in args.tags.split(",") if t.strip()]
     value = lp.build_document(md, publication=args.publication, tags=tags, rkey=rkey)
 
@@ -146,8 +151,22 @@ def main() -> int:
     did, token = session["did"], session["accessJwt"]
     print(f"\nauthenticated as {session.get('handle')} ({did})")
 
+    if args.update:
+        # An edit is a replacement at the same key. Keep the original
+        # publishedAt: the post is being corrected, not re-dated, and readers
+        # sort by that field.
+        existing = xrpc(
+            f"{args.pds}/xrpc/com.atproto.repo.getRecord"
+            f"?repo={did}&collection={lp.DOC_TYPE}&rkey={rkey}"
+        )
+        first_published = existing.get("value", {}).get("publishedAt")
+        if first_published:
+            value["publishedAt"] = first_published
+            print(f"keeping publishedAt {first_published}")
+
+    verb = "putRecord" if args.update else "createRecord"
     created = xrpc(
-        f"{args.pds}/xrpc/com.atproto.repo.createRecord",
+        f"{args.pds}/xrpc/com.atproto.repo.{verb}",
         {
             "repo": did,
             "collection": lp.DOC_TYPE,
@@ -156,9 +175,12 @@ def main() -> int:
         },
         token=token,
     )
-    print(f"created {created['uri']}")
+    print(f"{'updated' if args.update else 'created'} {created['uri']}")
     print(f"cid     {created.get('cid')}")
-    print(f"\nLeaflet:  https://leaflet.pub/lish/{did}/{rkey}")
+    # The permalink readers get. Leaflet only serves documents in repos it
+    # knows about, so a post written to a collaborator's repo has no
+    # leaflet.pub page — which is the point of reading straight from the PDS.
+    print(f"\nLive:     https://freeq.at/blog/{atproto_blog.slugify(value['title'])}")
     print("To remove:")
     print(
         f"  com.atproto.repo.deleteRecord repo={did} "

@@ -24,10 +24,18 @@ never met draw the same person the same way, because the input is a public
 identifier rather than a local profile.
 
 **The NPCs are agents.** The things standing around that are not people are
-processes holding their own keys. `cartographer` and `archivist` are in `#lobby`
-as you read this, with hostmasks `freeq/key/z6Mkp5we` and `freeq/key/z6Mku6cV`.
-A human who signed in with Bluesky gets `freeq/plc/4qsyxmns` instead. Same shape,
-different kind of key. There is no bot API here that differs from the human one.
+processes holding their own keys. `cartographer` and `archivist` are two of
+them, and the server will tell you who they are whether or not they happen to be
+awake:
+
+```bash
+curl -s https://irc.freeq.at/api/v1/users/cartographer
+{"nick":"cartographer","online":false,"did":"did:key:z6Mkp5wegrxZR62h54HwR329yz7TJ8Ccx4shCpSBTCA1rN8P","handle":null}
+```
+
+In the room they wear that key as a hostmask — `freeq/key/z6Mkp5we`. A human who
+signed in with Bluesky gets `freeq/plc/4qsyxmns` instead. Same shape, different
+kind of key. There is no bot API here that differs from the human one.
 
 **Doors are policy.** A room you cannot enter is not a locked graphic. It is a
 channel whose policy you do not satisfy, drawn honestly.
@@ -51,8 +59,8 @@ prints a sentence.
 
 ## Try it
 
-**See it in 30 seconds.** The clip: the world on one side, irssi on the other,
-one message crossing between them.
+**See it in 30 seconds.** Open `world.freeq.at` and walk into the lobby. The
+sprites you see are channel members, and the speech bubbles are `PRIVMSG`.
 
 **Run it in 5 minutes.** Open `world.freeq.at`, walk into the lobby, say
 something. Then point any IRC client at the same room:
@@ -95,9 +103,9 @@ is the honest failure mode of demonstrating on live infrastructure.
 
 ## Come in
 
-`#freeq-dev` on the same server is where the people building this are. If you
-render a room, write a participant, or break something, bring it there. `#freeq`
-is the general channel if you just want to talk.
+`#freeq` on `irc.freeq.at` is the channel. A plain client is asked to accept the house rules on the way in — `POLICY #freeq ACCEPT`, then `JOIN #freeq` — which is the gatekeeping described in this series, pointed at its own front door.
+
+If you render a room, write a participant, or break something, bring it there.
 
 Next: the server is the least interesting part of freeq. We open a raw socket
 and look at the grammar this world is standing on.

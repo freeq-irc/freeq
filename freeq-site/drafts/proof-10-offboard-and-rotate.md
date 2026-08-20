@@ -176,8 +176,11 @@ afterwards, because the envelope carries the key, not a time window.
 
 ## Come in
 
-`#freeq-dev` on `irc.freeq.at`, source at
-[github.com/freeq-irc/freeq](https://github.com/freeq-irc/freeq). If you write
-the steward before we do, that is the best possible outcome for this post.
+`#freeq` on `irc.freeq.at` is the channel. A plain client is asked to accept
+the house rules on the way in — `POLICY #freeq ACCEPT`, then `JOIN #freeq`.
+
+Source at [github.com/freeq-irc/freeq](https://github.com/freeq-irc/freeq). If
+you write the steward before we do, that is the best possible outcome for this
+post.
 
 Next: two servers with no address between them.

@@ -25,8 +25,11 @@ CHECKS = [
      lambda t: re.search(r"did:|ed25519|ircv3|\+freeq|ATPROTO|sasl", t, re.I)),
     ("a 'what this does NOT claim / protect' section",
      lambda t: re.search(r"does ?n.?t (claim|protect)|not claim|what this (is not|does not)|limitations", t, re.I)),
-    ("builder-channel entry point",
-     lambda t: re.search(r"#freeq-dev\b|builder|irc\.freeq\.at/join|join/#", t, re.I)),
+    # The funnel target. `#freeq` is the room the series sends people to; the
+    # older `#freeq-dev` still counts so an unrevised draft is not silently
+    # judged against a channel name that changed under it.
+    ("community-channel entry point",
+     lambda t: re.search(r"#freeq\b|#freeq-dev\b|builder|irc\.freeq\.at/join|join/#", t, re.I)),
 ]
 NEVER_OPTIONAL = {
     "a 'what this does NOT claim / protect' section",

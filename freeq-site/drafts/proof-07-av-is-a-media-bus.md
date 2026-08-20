@@ -159,9 +159,11 @@ one.
 
 ## Come in
 
-`#freeq-dev` on `irc.freeq.at`, source at
-[github.com/freeq-irc/freeq](https://github.com/freeq-irc/freeq). If you build a
-sink that does something strange with per-participant audio, that is the
-contribution this post is fishing for.
+`#freeq` on `irc.freeq.at` is the channel. A plain client is asked to accept
+the house rules on the way in — `POLICY #freeq ACCEPT`, then `JOIN #freeq`.
+
+Source at [github.com/freeq-irc/freeq](https://github.com/freeq-irc/freeq). If
+you build a sink that does something strange with per-participant audio, that
+is the contribution this post is fishing for.
 
 Next: a room that asks the outside world a question before it lets you in.
