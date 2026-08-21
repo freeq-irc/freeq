@@ -26,6 +26,7 @@ CMD="$CONTAINER/freeq-cmd"
 SNAP="$CONTAINER/freeq-snapshot.json"
 rm -f "$CMD" "$SNAP"; touch "$CMD"
 
+ROWDUMP="$CONTAINER/freeq-rowdump.json"
 PRECRASH="$(ls -t "$HOME"/Library/Logs/DiagnosticReports/freeq* 2>/dev/null | head -1)"
 FAILURES=0
 
@@ -92,11 +93,51 @@ snap >/dev/null
 assert "switched back to #smoke"     "s['activeChannel']=='#smoke'"
 assert "both channels exist"         "'#smoke' in s['channels'] and '#other' in s['channels']"
 
+echo "== row geometry: no row shorter than its content =="
+# The buried-wrapped-line / halved-reaction-chip class: after reactions and
+# edits have mutated rows in place, every row's height must still fit its
+# hosted content. Caught numerically, not by eyeballing screenshots.
+rm -f "$ROWDUMP"; send "#rowdump"
+for _ in $(seq 1 20); do [ -f "$ROWDUMP" ] && break; sleep 0.2; done
+GEO=$(python3 - "$ROWDUMP" <<'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    print(f"ERR:{e}"); raise SystemExit
+bad = [r for r in d["rows"]
+       if "intrinsicH" in r and r["rectH"] + 0.5 < r["intrinsicH"]]
+print("PASS" if not bad else "FAIL:" + ",".join(
+    f"{r['id']}({r['rectH']}<{r['intrinsicH']})" for r in bad))
+PYEOF
+)
+if [ "$GEO" = "PASS" ]; then echo "  ✅ all rows fit their content"
+else echo "  ❌ under-measured rows: $GEO"; FAILURES=$((FAILURES+1)); fi
+
 echo "== stress + no crash =="
 send "#stress 2000"
 send "#editstorm 60"
 sleep 3
 kill -0 "$APP_PID" 2>/dev/null && echo "  ✅ alive after stress + editstorm" || { echo "  ❌ crashed under stress"; FAILURES=$((FAILURES+1)); }
+
+# And again after the storm: streaming edits are the other in-place mutation
+# that historically froze row heights.
+rm -f "$ROWDUMP"; send "#rowdump"
+for _ in $(seq 1 20); do [ -f "$ROWDUMP" ] && break; sleep 0.2; done
+GEO2=$(python3 - "$ROWDUMP" <<'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    print(f"ERR:{e}"); raise SystemExit
+bad = [r for r in d["rows"]
+       if "intrinsicH" in r and r["rectH"] + 0.5 < r["intrinsicH"]]
+print("PASS" if not bad else "FAIL:" + ",".join(
+    f"{r['id']}({r['rectH']}<{r['intrinsicH']})" for r in bad))
+PYEOF
+)
+if [ "$GEO2" = "PASS" ]; then echo "  ✅ rows still fit after the edit storm"
+else echo "  ❌ under-measured rows after storm: $GEO2"; FAILURES=$((FAILURES+1)); fi
 
 POSTCRASH="$(ls -t "$HOME"/Library/Logs/DiagnosticReports/freeq* 2>/dev/null | head -1)"
 if [ "$POSTCRASH" != "$PRECRASH" ]; then

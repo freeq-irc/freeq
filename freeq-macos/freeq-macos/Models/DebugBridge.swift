@@ -261,6 +261,45 @@ final class DebugBridge {
             // Force a message row into its hovered state so the hover action
             // bar can be screenshot-verified. `#hover <id>` / `#hover` clears.
             app.debugForceHoverMsgId = arg.isEmpty ? nil : arg
+        case "inject":
+            // Inject a message from an ARBITRARY sender — unlike #localmsg,
+            // which always authors as us — so the harness can build the mixed-
+            // author timelines every grouping/header rendering state needs.
+            // `#inject <id> <from> <text…>`; from `-` means system (empty).
+            guard let ch = app.activeChannelState else { return }
+            let p = arg.split(separator: " ", maxSplits: 2).map(String.init)
+            guard p.count >= 3 else {
+                NSLog("[debug-bridge] usage: #inject <id> <from> <text>")
+                return
+            }
+            ch.appendIfNew(ChatMessage(
+                id: p[0], from: p[1] == "-" ? "" : p[1],
+                text: p[2].replacingOccurrences(of: "\\n", with: "\n"),
+                isAction: false, timestamp: Date(), replyTo: nil))
+        case "injectreply":
+            // A reply row: `#injectreply <id> <from> <replyToId> <text…>`.
+            guard let ch = app.activeChannelState else { return }
+            let p = arg.split(separator: " ", maxSplits: 3).map(String.init)
+            guard p.count >= 4 else {
+                NSLog("[debug-bridge] usage: #injectreply <id> <from> <replyTo> <text>")
+                return
+            }
+            ch.appendIfNew(ChatMessage(
+                id: p[0], from: p[1], text: p[3],
+                isAction: false, timestamp: Date(), replyTo: p[2]))
+        case "reactlocal":
+            // Attach a reaction locally — no server round-trip — so chip
+            // states (count, self-reacted tint, many-emoji wrap) can be
+            // screenshot-verified deterministically.
+            // `#reactlocal <msgid> <emoji> <nick>`
+            guard let ch = app.activeChannelState else { return }
+            let p = arg.split(separator: " ").map(String.init)
+            guard p.count >= 3,
+                  let idx = ch.messages.firstIndex(where: { $0.id == p[0] }) else {
+                NSLog("[debug-bridge] reactlocal: message not found: \(arg)")
+                return
+            }
+            ch.messages[idx].reactions[p[1], default: []].insert(p[2])
         case "sysmsg":
             // Inject a join/part/quit system line (empty `from`) into the active
             // channel — lets the harness screenshot-verify the coalesced row.
@@ -268,6 +307,17 @@ final class DebugBridge {
             ch.appendIfNew(ChatMessage(
                 id: "sys-\(ch.messages.count)-\(arg.hashValue)", from: "", text: arg,
                 isAction: false, timestamp: Date(), replyTo: nil))
+        case "rowdump":
+            // Ask the AppKit list to write per-row geometry (row rect height vs
+            // the hosted content's intrinsic height) so a harness can catch
+            // under-measured rows — the buried-wrapped-line / clipped-chip bug —
+            // as numbers instead of eyeballed pixels. The path rides along,
+            // anchored beside the cmd file for the same reason the snapshot is:
+            // an unsigned build is not sandboxed and its NSTemporaryDirectory()
+            // is not the container the harness reads.
+            let dumpPath = (path as NSString).deletingLastPathComponent + "/freeq-rowdump.json"
+            NotificationCenter.default.post(
+                name: .freeqDebugRowDump, object: nil, userInfo: ["path": dumpPath])
         case "snapshot":
             // Serialize key app state to JSON in the container so an external
             // smoke-test driver can ASSERT outcomes (not just "didn't crash").

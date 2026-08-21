@@ -78,6 +78,14 @@ struct AppKitMessageListView: NSViewRepresentable {
         private var appState: AppState?
         private var onLoadOlder: () -> Void = {}
 
+        /// Measured row heights by item id — the delegate's source of truth.
+        /// Filled when a cell is hosted (synchronously, from the hosted
+        /// content's intrinsic size at the pinned width) and corrected by the
+        /// cell whenever SwiftUI invalidates its intrinsic size afterwards.
+        /// Cleared wholesale when every row's width or density changes
+        /// (resize, panel toggle, compact mode, channel switch).
+        private var rowHeights: [String: CGFloat] = [:]
+
         // Change-detection tokens so we only react to real transitions.
         private var lastChannelToken: String?
         private var lastScrollTarget: String?
@@ -115,8 +123,19 @@ struct AppKitMessageListView: NSViewRepresentable {
             table.headerView = nil
             table.backgroundColor = .clear
             table.selectionHighlightStyle = .none
-            table.usesAutomaticRowHeights = true
-            table.rowHeight = 44 // fallback estimate before a row self-sizes
+            // NOT usesAutomaticRowHeights. The automatic path measures a row
+            // once, when its cell is created, and never again: with it on,
+            // `noteHeightOfRows` is a no-op and `reloadData(forRowIndexes:)`
+            // keeps the old height — measured and logged, not folklore. So a
+            // row that grew in place (a reaction landing, a streaming edit
+            // wrapping onto a second line) kept its stale height forever and
+            // its content painted over the next row. Heights come from the
+            // delegate instead, backed by `rowHeights`, which the cells keep
+            // honest: every host() and every SwiftUI intrinsic-size change
+            // re-measures and, on a real difference, updates the cache and
+            // notes the row — and against a delegate, noting actually works.
+            table.usesAutomaticRowHeights = false
+            table.rowHeight = 44 // estimate for rows not yet measured
             table.intercellSpacing = NSSize(width: 0, height: 0)
             table.style = .plain
             table.gridStyleMask = []
@@ -136,6 +155,7 @@ struct AppKitMessageListView: NSViewRepresentable {
             table.onWidthChange = { [weak self, weak table] in
                 guard let self, let table, table.numberOfRows > 0 else { return }
                 let atBottom = self.isAtBottom()
+                self.rowHeights.removeAll()   // wrap points moved; re-measure
                 table.reloadData()
                 if atBottom { self.scrollToBottom() }
             }
@@ -157,6 +177,9 @@ struct AppKitMessageListView: NSViewRepresentable {
             NotificationCenter.default.addObserver(
                 self, selector: #selector(clipBoundsChanged),
                 name: NSView.boundsDidChangeNotification, object: scroll.contentView)
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(dumpRowGeometry),
+                name: .freeqDebugRowDump, object: nil)
 
             self.scrollView = scroll
             self.tableView = table
@@ -283,6 +306,8 @@ struct AppKitMessageListView: NSViewRepresentable {
             lastChannelToken = parent.channelToken
             lastCompactToken = parent.compactToken
 
+            if channelChanged { rowHeights.removeAll() }
+            if compactChanged { rowHeights.removeAll() }
             if channelChanged || items.isEmpty || newItems.isEmpty {
                 // New channel (or first/last paint): reload wholesale and snap
                 // to the bottom with no animation — never a visible top→bottom
@@ -470,6 +495,32 @@ struct AppKitMessageListView: NSViewRepresentable {
 
         func numberOfRows(in tableView: NSTableView) -> Int { items.count }
 
+        func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+            guard row >= 0, row < items.count else { return tableView.rowHeight }
+            return rowHeights[items[row].id] ?? tableView.rowHeight
+        }
+
+        /// A cell reporting the settled height of its hosted content. On a real
+        /// change, remember it and re-ask the delegate for that row — inside a
+        /// zero-duration context so a streaming edit's growth doesn't animate
+        /// the whole tail of the list on every chunk. Bottom-pin is preserved:
+        /// a reader at the bottom stays there as rows above grow.
+        func rowMeasured(id: String, height: CGFloat) {
+            guard height > 1 else { return }   // transient/degenerate layout pass
+            let known = rowHeights[id]
+            guard known == nil || abs(known! - height) > 0.5 else { return }
+            rowHeights[id] = height
+            guard let table = tableView,
+                  let idx = items.firstIndex(where: { $0.id == id }) else { return }
+            let atBottom = isAtBottom()
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0
+                ctx.allowsImplicitAnimation = false
+                table.noteHeightOfRows(withIndexesChanged: IndexSet(integer: idx))
+            }
+            if atBottom { scrollToBottom() }
+        }
+
         func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { false }
 
         func tableView(_ tableView: NSTableView,
@@ -480,17 +531,77 @@ struct AppKitMessageListView: NSViewRepresentable {
                 c.identifier = cellIdentifier
                 return c
             }()
-            cell.host(content(for: items[row]))
-            cell.clamp.overscroll = overscroll(forRow: row)
-            cell.setSelected(appState?.selectedMessageIds.contains(items[row].id) == true)
+            let id = items[row].id
+            cell.host(content(for: items[row]), rowId: id) { [weak self] measuredId, height in
+                self?.rowMeasured(id: measuredId, height: height)
+            }
+            cell.clamp.topGap = topGap(forRow: row)
+            cell.setSelected(appState?.selectedMessageIds.contains(id) == true)
+            // Measure NOW, synchronously, from the hosted content's intrinsic
+            // size — the rootView pins the width, so the wrapped height is
+            // valid before the cell is even parented. This primes the delegate
+            // for rows scrolling in and keeps reloads from inheriting stale
+            // heights.
+            if let h = cell.currentContentHeight(), h > 1 {
+                if let known = rowHeights[id], abs(known - h) <= 0.5 {
+                    // agree — nothing to do
+                } else {
+                    rowHeights[id] = h
+                    if tableView.rect(ofRow: row).height != h {
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self, let table = self.tableView,
+                                  let idx = self.items.firstIndex(where: { $0.id == id })
+                            else { return }
+                            let atBottom = self.isAtBottom()
+                            NSAnimationContext.runAnimationGroup { ctx in
+                                ctx.duration = 0
+                                ctx.allowsImplicitAnimation = false
+                                table.noteHeightOfRows(withIndexesChanged: IndexSet(integer: idx))
+                            }
+                            if atBottom { self.scrollToBottom() }
+                        }
+                    }
+                }
+            }
             return cell
         }
 
-        /// How far `row`'s top has scrolled above the visible top edge (0 when
-        /// fully below it). Drives the hover bar's downward clamp.
-        private func overscroll(forRow row: Int) -> CGFloat {
-            guard let table = tableView, let scroll = scrollView, row >= 0 else { return 0 }
-            return max(0, scroll.documentVisibleRect.minY - table.rect(ofRow: row).minY)
+        /// Where `row`'s top sits relative to the visible top edge
+        /// (rowTop − visibleTop; negative once scrolled past it). Drives the
+        /// hover bar's straddle-vs-slide positioning.
+        private func topGap(forRow row: Int) -> CGFloat {
+            guard let table = tableView, let scroll = scrollView, row >= 0
+            else { return .greatestFiniteMagnitude }
+            return table.rect(ofRow: row).minY - scroll.documentVisibleRect.minY
+        }
+
+        /// Debug-bridge: write every row's table-rect height beside its hosted
+        /// content's intrinsic height. A row whose rect is shorter than its
+        /// content is the buried-line/clipped-chip bug, caught numerically.
+        @objc private func dumpRowGeometry(_ note: Notification) {
+            guard let table = tableView else { return }
+            var rows: [[String: Any]] = []
+            for (i, item) in items.enumerated() {
+                let rect = table.rect(ofRow: i)
+                var entry: [String: Any] = [
+                    "id": item.id, "row": i,
+                    "rectH": Double(rect.height),
+                ]
+                if let cell = table.view(atColumn: 0, row: i, makeIfNecessary: false)
+                    as? HostingCellView {
+                    entry["intrinsicH"] = Double(cell.hostingIntrinsicHeight)
+                    entry["fittingH"] = Double(cell.hostingFittingHeight)
+                }
+                rows.append(entry)
+            }
+            let payload: [String: Any] = ["width": Double(table.bounds.width), "rows": rows]
+            let path = (note.userInfo?["path"] as? String)
+                ?? (NSTemporaryDirectory() as NSString).appendingPathComponent("freeq-rowdump.json")
+            let url = URL(fileURLWithPath: path)
+            if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) {
+                try? data.write(to: url)
+                NSLog("[debug-bridge] rowdump written (%d rows) → %@", rows.count, url.path)
+            }
         }
 
         /// Refresh every visible cell's clamp — called as the list scrolls.
@@ -501,8 +612,8 @@ struct AppKitMessageListView: NSViewRepresentable {
             for r in range.location..<(range.location + range.length) {
                 guard let cell = table.view(atColumn: 0, row: r, makeIfNecessary: false)
                     as? HostingCellView else { continue }
-                let value = overscroll(forRow: r)
-                if abs(cell.clamp.overscroll - value) > 0.5 { cell.clamp.overscroll = value }
+                let value = topGap(forRow: r)
+                if abs(cell.clamp.topGap - value) > 0.5 { cell.clamp.topGap = value }
             }
         }
 
@@ -575,6 +686,11 @@ private final class HostingCellView: NSTableCellView {
     private var hosting: ReportingHostingView?
     private var heightSyncScheduled = false
     private var isSelectedRow = false
+    /// Which row this cell currently hosts, and where to report its measured
+    /// height. Reassigned on every reuse — a recycled cell must never report
+    /// under its previous row's id.
+    private var rowId: String = ""
+    private var onMeasured: ((String, CGFloat) -> Void)?
 
     /// Tint the row when it's part of a block selection. The hosted SwiftUI
     /// content draws on a clear background, so a subtle accent fill on the
@@ -588,7 +704,15 @@ private final class HostingCellView: NSTableCellView {
             : NSColor.clear.cgColor
     }
 
-    func host(_ view: AnyView) {
+    /// The hosted content's current intrinsic height, computed on demand at
+    /// the pinned width — valid even before the cell is parented.
+    func currentContentHeight() -> CGFloat? {
+        hosting.map { $0.intrinsicContentSize.height }
+    }
+
+    func host(_ view: AnyView, rowId: String, onMeasured: @escaping (String, CGFloat) -> Void) {
+        self.rowId = rowId
+        self.onMeasured = onMeasured
         let rooted = AnyView(view.environment(clamp))
         // On hover: stop clipping the (taller-than-row) action bar and lift this
         // row's z above its neighbours so the overflow draws on top of them.
@@ -633,50 +757,34 @@ private final class HostingCellView: NSTableCellView {
         hosting = h
     }
 
-    /// When the hosted SwiftUI content changes intrinsic height (e.g. a
-    /// coalesced presence pill expands/collapses), tell the table to re-measure
-    /// THIS row so it grows/shrinks to fit instead of clipping the new content.
-    /// Deferred + de-duped so we never mutate the table mid-layout or loop.
+    /// When the hosted SwiftUI content changes intrinsic height in place — a
+    /// reaction badge landing, a streaming edit wrapping onto a new line, a
+    /// coalesced presence pill expanding — report the settled height to the
+    /// coordinator, which owns the delegate's height cache and notes the row.
+    /// Deferred + de-duped so a burst of invalidations in one layout pass
+    /// reports once, from settled numbers.
     private func scheduleHeightSync() {
         guard !heightSyncScheduled else { return }
         heightSyncScheduled = true
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.heightSyncScheduled = false
-            guard let h = self.hosting, let table = self.enclosingTableView() else { return }
-            let row = table.row(for: self)
-            guard row >= 0 else { return }
-            // Compare the SwiftUI content's settled intrinsic height to the
-            // height the table currently gives this row. They diverge exactly
-            // when the hosted content changed in place (a reaction badge added,
-            // an edit, a coalesced pill expanding) but the row hasn't been
-            // re-measured yet — so the taller content overflows into the next
-            // row. Note the row so the table re-measures it. Keying off the
-            // ACTUAL row height (not a stored baseline) makes this both cell-
-            // identity-independent (reloadData may hand us a recycled cell) and
-            // timing-independent (fires on whatever layout pass SwiftUI finally
-            // settles on, so it covers a neighbour that's a taller reply row).
-            // It converges: after the re-measure the heights match, so no loop
-            // and no spurious note during scroll reuse (heights already agree).
-            let intrinsic = h.intrinsicContentSize.height
-            let current = table.rect(ofRow: row).height
-            // Only re-measure on a real, sane change. Guard against latching a
-            // transient/degenerate height (0 or noIntrinsicMetric) that a
-            // mid-layout invalidation can briefly report — that would collapse
-            // the row and overlap its neighbours.
-            guard intrinsic > 1, abs(intrinsic - current) > 0.5 else { return }
-            table.noteHeightOfRows(withIndexesChanged: IndexSet(integer: row))
+            guard let h = self.hosting, !self.rowId.isEmpty else { return }
+            self.onMeasured?(self.rowId, h.intrinsicContentSize.height)
         }
     }
 
-    private func enclosingTableView() -> NSTableView? {
-        var view: NSView? = superview
-        while let current = view {
-            if let table = current as? NSTableView { return table }
-            view = current.superview
-        }
-        return nil
-    }
+    /// Debug instrumentation: the hosted content's current intrinsic height.
+    var hostingIntrinsicHeight: CGFloat { hosting?.intrinsicContentSize.height ?? -1 }
+    /// Debug instrumentation: the height AppKit would fit this cell to now.
+    var hostingFittingHeight: CGFloat { hosting?.fittingSize.height ?? -1 }
+}
+
+extension Notification.Name {
+    /// Debug-bridge request: dump per-row geometry to the container tmp so a
+    /// test harness can assert "no row is shorter than its content" from
+    /// numbers rather than screenshots.
+    static let freeqDebugRowDump = Notification.Name("freeq.debug.rowdump")
 }
 
 // MARK: - Table subclass

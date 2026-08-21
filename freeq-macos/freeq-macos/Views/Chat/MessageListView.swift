@@ -126,13 +126,15 @@ private struct SelectionHintBar: View {
 
 // MARK: - Hover-bar clamp
 
-/// How far a row's top has scrolled above the list's visible top edge. The
-/// AppKit list measures this per visible row (it owns the real viewport
-/// geometry — SwiftUI `.global` can't see across the per-row hosting views) and
-/// the hovered row shifts its action bar down by this much so the scroll view
-/// never clips it. The bar rides the visible top of the message, Slack-style.
+/// Where this row's top sits relative to the list's visible top edge
+/// (`topGap` = rowTop − visibleTop; negative once the row has scrolled past
+/// it). The AppKit list measures this per visible row — it owns the real
+/// viewport geometry; SwiftUI `.global` can't see across the per-row hosting
+/// views — and the hovered row positions its action bar off it: straddling
+/// the row's top boundary when there's room, sliding down just enough to
+/// stay inside the viewport when there isn't.
 @Observable final class RowClamp {
-    var overscroll: CGFloat = 0
+    var topGap: CGFloat = .greatestFiniteMagnitude
     /// Set by the hosting cell; the row calls it on hover so the cell can lift
     /// itself above its neighbours (and drop clipping) — otherwise the action
     /// bar, which is taller than a compact/grouped row, is clipped by the cell
@@ -893,6 +895,7 @@ struct MessageRow: View {
                     }
                 }
                 .padding(.top, 4)
+                .padding(.bottom, 3)
             }
         }
         .padding(.horizontal, 16)
@@ -915,17 +918,28 @@ struct MessageRow: View {
                 }
             }
         }
-        // The bar rides the top of the message but stays inside the viewport:
-        // the AppKit list reports how far this row's top has scrolled above the
-        // visible edge (`RowClamp.overscroll`) and the bar shifts down by that
-        // much — capped to the row — so the scroll view never clips it.
+        // The bar straddles the row's TOP BOUNDARY — half above, half below,
+        // Discord-style — so it never sits on the row's own header line or
+        // text. It overlaps the gap (and, on tight grouped rows, the tail) of
+        // the message above, which is why it draws as an opaque lifted card.
+        // Near the viewport's top edge it slides down just enough to stay
+        // fully visible, and once the row's top has scrolled past the edge it
+        // rides the visible top of the message — `topGap` from the AppKit
+        // list drives both. Capped to the row so it never walks off a short
+        // row's bottom while its message is still the one under the pointer.
         .overlay(alignment: .topTrailing) {
             if isHovered && !isSystem {
                 GeometryReader { geo in
-                    let shift = min(rowClamp?.overscroll ?? 0, max(0, geo.size.height - 30))
+                    // Legacy SwiftUI list has no viewport clamp and clips at
+                    // the row — keep the bar inside the row there.
+                    let straddle: CGFloat = rowClamp == nil ? 0 : -14
+                    let gap = rowClamp?.topGap ?? .greatestFiniteMagnitude
+                    // Slide down when straddling would poke above the visible
+                    // top edge (gap < 14); never slide past the row's bottom.
+                    let clampDown = max(0, 14 - min(gap, 14))
+                    let shift = min(straddle + clampDown, max(straddle, geo.size.height - 30))
                     HoverActionBar(message: message)
-                        .padding(.trailing, 8)
-                        .padding(.top, 1)
+                        .padding(.trailing, 12)
                         .offset(y: shift)
                         .frame(maxWidth: .infinity, alignment: .topTrailing)
                         .onHover { isBarHovered = $0 }
@@ -1267,9 +1281,12 @@ struct HoverActionBar: View {
         }
         .padding(.horizontal, 4)
         .padding(.vertical, 2)
-        .background(.regularMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .shadow(color: .black.opacity(0.1), radius: 4, y: 2)
+        .background(.thickMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color(nsColor: .separatorColor).opacity(0.6), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.22), radius: 6, y: 2)
     }
 }
 
