@@ -3753,6 +3753,115 @@ mod tests {
         assert!(db.act_tasks(&[], None, None, None, 100).unwrap().is_empty());
     }
 
+    // ── The sweeps' candidates ────────────────────────────────────────────
+
+    /// An opener filed from a peer's relay. Every other opener in these tests
+    /// leaves `origin` empty, the way a task created here carries it; this one
+    /// names the server the task belongs to.
+    fn remote_offer(
+        db: &Db,
+        tags: &[(&str, &str)],
+        id: &str,
+        venue: &str,
+        home: &str,
+        ts: i64,
+    ) -> ActWrite {
+        let canonical = act_doc(tags, venue, id);
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: id,
+            act_id: id,
+            opens: true,
+            venue,
+            actor: ELIZA,
+            from_system: false,
+            origin: Some(home),
+            timestamp: ts,
+        })
+        .unwrap()
+    }
+
+    /// Expiry belongs to the server that created a task: the sweep must not
+    /// offer up a task another server's event opened, however idle it is.
+    #[test]
+    fn the_idle_sweep_names_only_tasks_created_here() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T-local", "#ops", Some(SCHOLAR), 10);
+        remote_offer(
+            &db,
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", ELIZA),
+                ("+freeq.at/act-to", SCHOLAR),
+            ],
+            "T-remote",
+            "#ops",
+            "peer.example",
+            10,
+        );
+
+        let states = freeq_sdk::act_transitions::review_timeout_states();
+        let idle = db.act_tasks_idle_outside_states(&states, 100, 10).unwrap();
+        let ids: Vec<&str> = idle.iter().map(|t| t.act_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["T-local"],
+            "only the task created here is a sweep candidate"
+        );
+    }
+
+    /// The other clock, the same rule: the auto-accept a closed review window
+    /// files is the home server's own signed event, so a bounty another
+    /// server opened is not this one's to accept, however long its poster has
+    /// been silent.
+    #[test]
+    fn the_review_sweep_leaves_another_servers_bounty_under_review() {
+        let db = Db::open_memory().unwrap();
+
+        // Two bounties handed in and never answered: one opened here, one
+        // opened on the server it names.
+        bounty_offer(&db, "B-local", "#ops", 10);
+        remote_offer(
+            &db,
+            &[
+                ("+freeq.at/act", "bounty"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", ELIZA),
+                ("+freeq.at/act-title", "index the archive"),
+            ],
+            "B-remote",
+            "#ops",
+            "peer.example",
+            10,
+        );
+        for task in ["B-local", "B-remote"] {
+            let bid = format!("{task}-BID");
+            bounty_step(&db, "bid", SCHOLAR, task, &bid, None, "#ops", 11);
+            let award = format!("{task}-AW");
+            bounty_step(&db, "award", ELIZA, task, &award, Some(&bid), "#ops", 12);
+            let submit = format!("{task}-S");
+            bounty_step(&db, "submit", SCHOLAR, task, &submit, None, "#ops", 13);
+        }
+
+        let states = freeq_sdk::act_transitions::review_timeout_states();
+        let waiting = db.act_tasks_idle_in_states(&states, 100, 10).unwrap();
+        let ids: Vec<&str> = waiting.iter().map(|t| t.act_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["B-local"],
+            "only the bounty opened here is up for auto-accept"
+        );
+
+        // The sweep accepts what that query hands it and nothing else, so the
+        // peer's bounty is still on file, still waiting on its own home.
+        assert_eq!(
+            db.act_task("B-remote").unwrap().unwrap().state,
+            "under_review"
+        );
+    }
+
     // ── Effective capabilities ────────────────────────────────────────────
     //
     // PHASE-4 says a spawned child gets "the intersection of the parent's caps
@@ -6770,7 +6879,8 @@ impl Db {
     }
 
     /// Live tasks whose last movement is older than `cutoff` and whose state
-    /// is one of `states` — the review sweep's candidates.
+    /// is one of `states` — the review sweep's candidates, among the tasks
+    /// created here.
     ///
     /// `updated` is what is measured, so a task that anyone touched recently
     /// is not abandoned however old its opener is. On a review window that is
@@ -6786,7 +6896,7 @@ impl Db {
     }
 
     /// Live tasks idle since `cutoff` whose state is **not** one of `states` —
-    /// the expiry sweep's candidates.
+    /// the expiry sweep's candidates, among the tasks created here.
     ///
     /// The complement of the query above, so the two clocks cannot both claim
     /// a task. They pull in opposite directions: a review window favours the
@@ -6802,6 +6912,14 @@ impl Db {
         self.act_tasks_idle(states, false, cutoff, limit)
     }
 
+    /// Both sweeps' candidates, and both are limited to tasks created here.
+    ///
+    /// A sweep files an event of the server's own — an expiry, or a review
+    /// window deemed closed — and that belongs to the server the task was
+    /// created on, which is the one that orders what happens to it. `origin`
+    /// is empty for a task opened here and names the home server otherwise,
+    /// so the filter changes nothing while every stored task is local, and
+    /// starts carrying weight the moment a peer's task is stored.
     fn act_tasks_idle(
         &self,
         states: &[&str],
@@ -6830,7 +6948,7 @@ impl Db {
             "SELECT act_id, kind, venue, origin, state, offerer, offeree, assignee,
                     caps, deadline, replaces, updated
                FROM act_actions
-              WHERE updated < ?1 AND {test}
+              WHERE updated < ?1 AND origin = '' AND {test}
               ORDER BY updated
               LIMIT ?2"
         ))?;
