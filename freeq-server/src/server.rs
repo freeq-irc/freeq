@@ -3339,7 +3339,8 @@ pub(crate) fn apply_replayed_event(
         let fingerprint = crate::events::fingerprint(&ev.canonical);
         tracing::warn!(
             %origin, event_id = %event_id,
-            "S2S replay: a second claim on this id with different content — dropped,              and a receipt recorded against the copy we keep"
+            "S2S replay: a second claim on this id with different content — \
+             dropped, and a receipt recorded against the copy we keep"
         );
         state.with_db(|db| db.record_event_conflict(&event_id, &fingerprint));
         return ReplayOutcome::Conflicted;
