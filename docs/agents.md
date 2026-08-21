@@ -203,7 +203,7 @@ const bounty = await offer(ctx, {
 });
 
 // a worker, elsewhere in the room
-const myBid = await bid(ctx, bounty, { amount: '250 USD', payTo: ctx.did, note: 'two days' });
+const myBid = await bid(ctx, bounty, { price: '250 USD', payTo: ctx.did, note: 'two days' });
 
 // the poster, having read the bids
 await award(ctx, bounty, myBid);      // the bid's event id, not a DID

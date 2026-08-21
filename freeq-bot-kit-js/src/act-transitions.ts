@@ -73,7 +73,7 @@ export interface TaskEvent {
 
 /** The bid an award named, as the caller's log answered for it. */
 export interface AcceptedBid {
-  /** Who wrote the bid. The assignee an award's `bid-author` row lands on. */
+  /** Who wrote the bid. The assignee an award's `author_of` row lands on. */
   author: string;
 }
 
@@ -104,8 +104,9 @@ interface Transition {
   /** Bounded by the offer's `act-bid-deadline` rather than its
    *  `act-deadline`. Data, like its sibling; the comparison is the same code. */
   before_bid_deadline?: boolean;
-  /** The field naming who this transition assigns. Absent = the actor. */
-  assignee_from?: string;
+  /** Who this transition assigns. Absent = the actor; a tag name = the DID in
+   *  that tag; `{ author_of: tag }` = the author of the event that tag names. */
+  assignee_from?: string | { author_of: string };
   /** Fields the transition is illegal without. */
   requires?: string[];
 }
@@ -127,10 +128,6 @@ interface Kind {
 }
 
 const ANY_NONTERMINAL = "*nonterminal";
-
-/** The `assignee_from` value that means "the author of the bid this event
- *  names". */
-const BID_AUTHOR = "bid-author";
 
 /** The verb the event an award names must carry.
  *
@@ -329,7 +326,7 @@ export function checkTransition(
   // reads a log — and a name that found nothing named something that is not a
   // bid on this action. Alongside the requirement above for the same reason:
   // an award that takes no bid is malformed for everybody.
-  if (row.assignee_from === BID_AUTHOR && (!event.accepts || !sender.acceptedBid)) {
+  if (typeof row.assignee_from === "object" && (!event.accepts || !sender.acceptedBid)) {
     return { ok: false, reason: "accepts-not-a-bid" };
   }
 
@@ -385,11 +382,11 @@ export type AssigneeSource =
   | { from: "actor" }
   /** The act field named here, read off the event. */
   | { from: "field"; field: string }
-  /** Whoever wrote the bid the event names in `act-accepts`: a bounty's
-   *  `award` takes one bid, and the terms live in it, so the poster names the
-   *  event rather than a DID. Resolving it is the caller's — this checker
-   *  reads no log — and the answer arrives as `EventSender.acceptedBid`. */
-  | { from: "bid-author" };
+  /** The author of the event named in this act field: a bounty's `award`
+   *  takes one bid, and the terms live in it, so the poster names the event in
+   *  `act-accepts` rather than a DID. Resolving it is the caller's — this
+   *  checker reads no log — and the answer arrives as `EventSender.acceptedBid`. */
+  | { from: "author_of"; field: string };
 
 /**
  * Where the assignee comes from when `verb` moves a `kind` task out of
@@ -408,6 +405,8 @@ export function assigneeSource(
   if (!k) return { from: "actor" };
   const row = k.transitions.find((t) => t.verb === verb && fromMatches(t.from, fromState, k));
   if (!row?.assignee_from) return { from: "actor" };
-  if (row.assignee_from === BID_AUTHOR) return { from: "bid-author" };
+  if (typeof row.assignee_from === "object") {
+    return { from: "author_of", field: row.assignee_from.author_of };
+  }
   return { from: "field", field: row.assignee_from };
 }

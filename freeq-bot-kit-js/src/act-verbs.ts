@@ -201,7 +201,7 @@ export interface BidOptions extends StepOptions {
   /** What you are asking for. Opaque to every server that handles it: stored,
    *  relayed, replayed, and covered by the signature because it is present,
    *  never because anything knows what it means. */
-  amount?: string;
+  price?: string;
   /** Where you want paying. Opaque in the same way. */
   payTo?: string;
 }
@@ -220,7 +220,7 @@ export async function bid(
   opts: BidOptions = {},
 ): Promise<string> {
   const tags = stepTags("bid", ctx.did, taskId, opts.note, BOUNTY);
-  if (opts.amount) tags["+freeq.at/act-bid"] = opts.amount;
+  if (opts.price) tags["+freeq.at/act-bid"] = opts.price;
   if (opts.payTo) tags["+freeq.at/act-pay-to"] = opts.payTo;
   return ctx.client.sendAct(ctx.target, tags, {
     humanText: opts.humanText ?? (opts.note ? `bid: ${opts.note}` : "bid on the bounty"),

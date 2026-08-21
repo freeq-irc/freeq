@@ -26,7 +26,7 @@
     "`confirmation` sits outside `kinds` because the receipt verb belongs to no kind and no kind may claim it:",
     "a receipt is the home server's word about an event it filed, not a step anybody takes.",
     "`assignee_from` names where a transition's assignee comes from. Absent means the actor, which is what",
-    "accept and claim already mean; a bounty's award sets it to bid-author, because the poster picks a bid",
+    "accept and claim already mean; a bounty's award sets it to { \"author_of\": \"act-accepts\" }, because the poster picks a bid",
     "rather than becoming the worker. `requires` lists the act-* fields a transition is illegal without — the",
     "award's act-accepts, since an award naming no bid takes nothing. Both are data: a kind that assigns",
     "someone else, or insists on a field, needs a row here and no code anywhere.",
@@ -82,7 +82,7 @@
           "to": "assigned",
           "who": "offerer",
           "before_deadline": true,
-          "assignee_from": "bid-author",
+          "assignee_from": { "author_of": "act-accepts" },
           "requires": ["act-accepts"]
         },
         { "verb": "progress", "from": "assigned", "to": "assigned", "who": "assignee" },

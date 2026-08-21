@@ -557,7 +557,10 @@ describe("the two schema additions bounty needed", () => {
   });
 
   it("says where each transition's assignee comes from", () => {
-    expect(assigneeSource("bounty", "award", "open")).toEqual({ from: "bid-author" });
+    expect(assigneeSource("bounty", "award", "open")).toEqual({
+      from: "author_of",
+      field: "act-accepts",
+    });
     for (const [kind, verb, from] of [
       ["handoff", "accept", "offered"],
       ["handoff", "claim", "open"],
@@ -660,7 +663,7 @@ describe("the shared sequences", () => {
             const source = assigneeSource(seq.task.kind, step.verb, state);
             if (source.from === "actor") {
               assignee = step.sender;
-            } else if (source.from === "bid-author") {
+            } else if (source.from === "author_of") {
               if (!step.accepted_bid) {
                 throw new Error(
                   `${where}: this transition assigns the author of the bid it names, and none was resolved`,

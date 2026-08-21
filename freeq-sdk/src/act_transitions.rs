@@ -160,7 +160,7 @@ pub struct Event<'a> {
 /// The bid an award named, as the caller's log answered for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AcceptedBid<'a> {
-    /// Who wrote the bid. The assignee an award's `bid-author` row lands on.
+    /// Who wrote the bid. The assignee an award's `author_of` row lands on.
     pub author: &'a str,
 }
 
@@ -323,16 +323,22 @@ pub enum AssigneeSource {
     Actor,
     /// The act field named here, read off the event.
     Field(&'static str),
-    /// Whoever wrote the bid the event names in `act-accepts`: a bounty's
-    /// `award` takes one bid, and the terms live in it, so the poster names
-    /// the event rather than a DID. Resolving it is the caller's — this
+    /// The author of the event named in this act field: a bounty's `award`
+    /// takes one bid, and the terms live in it, so the poster names the event
+    /// in `act-accepts` rather than a DID. Resolving it is the caller's — this
     /// checker reads no log — and the answer arrives as
     /// [`Sender::accepted_bid`].
-    BidAuthor,
+    AuthorOf(&'static str),
 }
 
-/// The `assignee_from` value that means [`AssigneeSource::BidAuthor`].
-const BID_AUTHOR: &str = "bid-author";
+/// How a row spells `assignee_from`: a tag holding a DID, or the author of
+/// the event a tag names.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(untagged)]
+enum AssigneeFrom {
+    Field(String),
+    AuthorOf { author_of: String },
+}
 
 /// The verb the event an award names must carry.
 ///
@@ -381,10 +387,10 @@ pub fn assignee_source(kind: &str, verb: &str, from_state: &str) -> AssigneeSour
     k.transitions
         .iter()
         .find(|t| t.verb == verb && t.from.matches(from_state, k))
-        .and_then(|t| t.assignee_from.as_deref())
-        .map_or(AssigneeSource::Actor, |name| match name {
-            BID_AUTHOR => AssigneeSource::BidAuthor,
-            field => AssigneeSource::Field(field),
+        .and_then(|t| t.assignee_from.as_ref())
+        .map_or(AssigneeSource::Actor, |from| match from {
+            AssigneeFrom::Field(field) => AssigneeSource::Field(field),
+            AssigneeFrom::AuthorOf { author_of } => AssigneeSource::AuthorOf(author_of),
         })
 }
 
@@ -487,7 +493,7 @@ pub fn check(
     // here reads a log — and a name that found nothing named something that
     // is not a bid on this action. Alongside the requirement above for the
     // same reason: an award that takes no bid is malformed for everybody.
-    if row.assignee_from.as_deref() == Some(BID_AUTHOR)
+    if matches!(row.assignee_from, Some(AssigneeFrom::AuthorOf { .. }))
         && (event.accepts.is_none() || sender.accepted_bid.is_none())
     {
         return Err(Refusal::AcceptsNotABid);
@@ -594,9 +600,11 @@ struct Transition {
     /// code.
     #[serde(default)]
     before_bid_deadline: bool,
-    /// The field naming who this transition assigns. Absent = the actor.
+    /// Who this transition assigns. Absent = the actor; a tag name = the DID
+    /// in that tag; `{ "author_of": tag }` = the author of the event that tag
+    /// names.
     #[serde(default)]
-    assignee_from: Option<String>,
+    assignee_from: Option<AssigneeFrom>,
     /// Fields the transition is illegal without. Empty for almost every row,
     /// which is why an absent one has to change nothing.
     #[serde(default)]
@@ -1070,7 +1078,7 @@ mod tests {
     fn a_transition_says_where_its_assignee_comes_from() {
         assert_eq!(
             assignee_source("bounty", "award", "open"),
-            AssigneeSource::BidAuthor
+            AssigneeSource::AuthorOf("act-accepts")
         );
         for (kind, verb, from) in [
             ("handoff", "accept", "offered"),
@@ -1791,7 +1799,7 @@ mod tests {
                         assignee = Some(
                             match assignee_source(&seq.task.kind, &step.verb, &state) {
                                 AssigneeSource::Actor => step.sender.clone(),
-                                AssigneeSource::BidAuthor => step
+                                AssigneeSource::AuthorOf(_) => step
                                     .accepted_bid
                                     .clone()
                                     .unwrap_or_else(|| panic!("{where_}: this transition assigns the author of the bid it names, and none was resolved")),

@@ -6635,7 +6635,7 @@ impl Db {
             was.unwrap_or_default(),
         ) {
             freeq_sdk::act_transitions::AssigneeSource::Actor => Some(ev.actor),
-            freeq_sdk::act_transitions::AssigneeSource::BidAuthor => named,
+            freeq_sdk::act_transitions::AssigneeSource::AuthorOf(_) => named,
             freeq_sdk::act_transitions::AssigneeSource::Field(name) => {
                 view.fields.get(name).map(String::as_str)
             }
@@ -7168,7 +7168,7 @@ impl Db {
                         freeq_sdk::act_transitions::AssigneeSource::Actor => {
                             Some(row.actor.clone())
                         }
-                        freeq_sdk::act_transitions::AssigneeSource::BidAuthor => named.clone(),
+                        freeq_sdk::act_transitions::AssigneeSource::AuthorOf(_) => named.clone(),
                         freeq_sdk::act_transitions::AssigneeSource::Field(name) => {
                             view.fields.get(name).cloned()
                         }

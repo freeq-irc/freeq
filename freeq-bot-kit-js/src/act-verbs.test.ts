@@ -195,7 +195,7 @@ describe("the bounty verbs", () => {
   it("carries a bid's terms as tags nothing interprets", async () => {
     const sent: Sent[] = [];
     await bid(ctxWith(sent), "01JTASK00000000000000000AA", {
-      amount: "250 USD",
+      price: "250 USD",
       payTo: "did:plc:worker",
     });
     const { tags } = sent[0];
