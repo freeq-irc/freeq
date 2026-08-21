@@ -71,6 +71,9 @@ pub enum Refusal {
     /// outlives every event — so carrying it costs nothing and saves a round
     /// of guessing.
     MissingRequirement(&'static str),
+    /// An award named an event that is not a bid on this action. The caller
+    /// resolved the name against its own log and found nothing to take.
+    AcceptsNotABid,
 }
 
 impl Refusal {
@@ -89,6 +92,7 @@ impl Refusal {
             Refusal::ReplacesMalformed => "replaces-malformed",
             Refusal::ReplacesNotTerminal => "replaces-not-terminal",
             Refusal::MissingRequirement(_) => "missing-requirement",
+            Refusal::AcceptsNotABid => "accepts-not-a-bid",
         }
     }
 
@@ -126,6 +130,11 @@ pub struct Task<'a> {
     pub offeree: Option<&'a str>,
     pub assignee: Option<&'a str>,
     pub deadline: Option<i64>,
+    /// The offer's `act-bid-deadline` in unix seconds, empty when it named
+    /// none. A second time on the same opener, compared the same way: it
+    /// bounds how long a bounty collects bids, which is a shorter question
+    /// than how long the offer stands.
+    pub bid_deadline: Option<i64>,
 }
 
 /// The event being checked.
@@ -136,6 +145,10 @@ pub struct Event<'a> {
     /// deadline is measured against — every verifier then compares the same
     /// number instead of its own wall clock.
     pub msgid: &'a str,
+    /// `act-accepts`: the event an award takes. Named here rather than read
+    /// out of `fields` because it is the one act value a caller must resolve
+    /// before asking — see [`Sender::accepted_bid`].
+    pub accepts: Option<&'a str>,
     /// The act fields the event carries, by their document names (`act-to`,
     /// `act-note`, …). Presence only: what a transition's `requires` is
     /// checked against. Values are the caller's business — the one place this
@@ -144,13 +157,30 @@ pub struct Event<'a> {
     pub fields: &'a [&'a str],
 }
 
-/// Who sent it.
+/// The bid an award named, as the caller's log answered for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptedBid<'a> {
+    /// Who wrote the bid. The assignee an award's `author_of` row lands on.
+    pub author: &'a str,
+}
+
+/// Who sent it, and what their event resolved to.
 #[derive(Debug, Clone, Copy)]
 pub struct Sender<'a> {
     pub did: &'a str,
     /// The server itself, signing under its own identity — the only actor a
     /// `system` transition allows.
     pub is_system: bool,
+    /// The bid this event's `act-accepts` names, when the caller found one on
+    /// the action. `None` when it named something that is not a bid here —
+    /// including an id belonging to another action, and an id nobody filed.
+    ///
+    /// This checker reads no log, so the lookup is the caller's: it resolves
+    /// the named event among the action's own and hands back the bid's
+    /// author. A caller with no log — a bot pre-checking its own move —
+    /// passes `None` and is told its award takes nothing, which is the honest
+    /// answer from where it stands.
+    pub accepted_bid: Option<AcceptedBid<'a>>,
 }
 
 /// The state a new task of `kind` starts in.
@@ -291,9 +321,56 @@ pub fn check_open(
 pub enum AssigneeSource {
     /// Whoever took the step — what `accept` and `claim` already mean.
     Actor,
-    /// The act field named here, read off the event: a bounty's `award` names
-    /// its winner in `act-to`, because the poster picks rather than becomes.
+    /// The act field named here, read off the event.
     Field(&'static str),
+    /// The author of the event named in this act field: a bounty's `award`
+    /// takes one bid, and the terms live in it, so the poster names the event
+    /// in `act-accepts` rather than a DID. Resolving it is the caller's — this
+    /// checker reads no log — and the answer arrives as
+    /// [`Sender::accepted_bid`].
+    AuthorOf(&'static str),
+}
+
+/// How a row spells `assignee_from`: a tag holding a DID, or the author of
+/// the event a tag names.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(untagged)]
+enum AssigneeFrom {
+    Field(String),
+    AuthorOf { author_of: String },
+}
+
+/// The verb the event an award names must carry.
+///
+/// Written down once, here, so a caller resolving `act-accepts` asks the
+/// rules rather than spelling a kind's verb into itself.
+pub const BID_VERB: &str = "bid";
+
+/// The verb a home files when a review window runs out.
+///
+/// Distinct from `expire` on purpose: the log should say what happened, and
+/// "the review window closed and the work is deemed accepted" is not the same
+/// event as "nobody touched this for a month". A sweep that reused `expire`
+/// would tell every reader the worker dropped the job.
+pub const REVIEW_TIMEOUT_VERB: &str = "auto-accept";
+
+/// Every state some kind's review-timeout row moves a task out of.
+///
+/// The sweep asks this rather than knowing which kinds have a review window:
+/// a kind that writes the row is swept, a kind that does not is left to the
+/// neutral idle limit. Sorted and deduplicated, so two kinds naming the same
+/// state name it once.
+pub fn review_timeout_states() -> Vec<&'static str> {
+    let mut states: Vec<&'static str> = spec()
+        .kinds
+        .values()
+        .flat_map(|k| k.transitions.iter())
+        .filter(|t| t.verb == REVIEW_TIMEOUT_VERB)
+        .flat_map(|t| t.from.states())
+        .collect();
+    states.sort_unstable();
+    states.dedup();
+    states
 }
 
 /// Where the assignee comes from when `verb` moves a `kind` task out of
@@ -310,8 +387,11 @@ pub fn assignee_source(kind: &str, verb: &str, from_state: &str) -> AssigneeSour
     k.transitions
         .iter()
         .find(|t| t.verb == verb && t.from.matches(from_state, k))
-        .and_then(|t| t.assignee_from.as_deref())
-        .map_or(AssigneeSource::Actor, AssigneeSource::Field)
+        .and_then(|t| t.assignee_from.as_ref())
+        .map_or(AssigneeSource::Actor, |from| match from {
+            AssigneeFrom::Field(field) => AssigneeSource::Field(field),
+            AssigneeFrom::AuthorOf { author_of } => AssigneeSource::AuthorOf(author_of),
+        })
 }
 
 /// Whether the rules file lists this kind at all.
@@ -408,6 +488,17 @@ pub fn check(
         return Err(Refusal::MissingRequirement(missing.as_str()));
     }
 
+    // A row that takes its assignee from a named bid needs that bid. Whether
+    // the name found one is the caller's answer, not this checker's — nothing
+    // here reads a log — and a name that found nothing named something that
+    // is not a bid on this action. Alongside the requirement above for the
+    // same reason: an award that takes no bid is malformed for everybody.
+    if matches!(row.assignee_from, Some(AssigneeFrom::AuthorOf { .. }))
+        && (event.accepts.is_none() || sender.accepted_bid.is_none())
+    {
+        return Err(Refusal::AcceptsNotABid);
+    }
+
     // Authority second: who the sender is only matters once the move itself
     // makes sense.
     match row.who.as_str() {
@@ -423,8 +514,18 @@ pub fn check(
         _ => return Err(Refusal::WrongSender),
     }
 
-    if row.before_deadline
-        && let Some(deadline) = task.deadline
+    // Two deadlines, one comparison. A row declares which of the offer's
+    // times bounds it: how long the offer stands, or — on a kind that
+    // collects them — how long it takes bids. A time the offer never named
+    // bounds nothing.
+    for deadline in [
+        row.before_deadline.then_some(task.deadline).flatten(),
+        row.before_bid_deadline
+            .then_some(task.bid_deadline)
+            .flatten(),
+    ]
+    .into_iter()
+    .flatten()
     {
         let limit = deadline
             .saturating_mul(1_000)
@@ -494,9 +595,16 @@ struct Transition {
     who: String,
     #[serde(default)]
     before_deadline: bool,
-    /// The field naming who this transition assigns. Absent = the actor.
+    /// Bounded by the offer's `act-bid-deadline` rather than its
+    /// `act-deadline`. Data, like its sibling; the comparison is the same
+    /// code.
     #[serde(default)]
-    assignee_from: Option<String>,
+    before_bid_deadline: bool,
+    /// Who this transition assigns. Absent = the actor; a tag name = the DID
+    /// in that tag; `{ "author_of": tag }` = the author of the event that tag
+    /// names.
+    #[serde(default)]
+    assignee_from: Option<AssigneeFrom>,
     /// Fields the transition is illegal without. Empty for almost every row,
     /// which is why an absent one has to change nothing.
     #[serde(default)]
@@ -514,6 +622,16 @@ enum FromStates {
 const ANY_NONTERMINAL: &str = "*nonterminal";
 
 impl FromStates {
+    /// The states named outright. Empty for `*nonterminal`, which names none
+    /// of them: it is a rule about the kind's table rather than a list.
+    fn states(&'static self) -> Vec<&'static str> {
+        match self {
+            FromStates::One(s) if s == ANY_NONTERMINAL => Vec::new(),
+            FromStates::One(s) => vec![s.as_str()],
+            FromStates::Many(states) => states.iter().map(String::as_str).collect(),
+        }
+    }
+
     fn matches(&self, state: &str, kind: &Kind) -> bool {
         match self {
             FromStates::One(s) if s == ANY_NONTERMINAL => !kind.terminal.iter().any(|t| t == state),
@@ -559,6 +677,7 @@ mod tests {
             offeree: Some(SCHOLAR),
             assignee: None,
             deadline: None,
+            bid_deadline: None,
         }
     }
 
@@ -566,6 +685,7 @@ mod tests {
         Event {
             verb,
             msgid: NOW,
+            accepts: None,
             fields: &[],
         }
     }
@@ -574,6 +694,28 @@ mod tests {
         Sender {
             did,
             is_system: false,
+            accepted_bid: None,
+        }
+    }
+
+    /// A sender whose award named a bid the caller resolved to `author`.
+    fn who_took(did: &'static str, author: &'static str) -> Sender<'static> {
+        Sender {
+            accepted_bid: Some(AcceptedBid { author }),
+            ..who(did)
+        }
+    }
+
+    /// The bid an award names in these tests.
+    const BID: &str = "01M16E7TC0BDTAKEN000000000";
+
+    /// An award naming `BID`.
+    fn award() -> Event<'static> {
+        Event {
+            verb: "award",
+            msgid: NOW,
+            accepts: Some(BID),
+            fields: &["act-accepts"],
         }
     }
 
@@ -703,7 +845,16 @@ mod tests {
             "bounty's verb, not handoff's"
         );
         for verb in [
-            "bid", "award", "progress", "complete", "fail", "cancel", "expire",
+            "bid",
+            "award",
+            "progress",
+            "submit",
+            "revise",
+            "accept-work",
+            "forfeit",
+            "auto-accept",
+            "cancel",
+            "expire",
         ] {
             assert!(knows_verb("bounty", verb), "{verb}");
         }
@@ -711,6 +862,12 @@ mod tests {
             !knows_verb("bounty", "accept"),
             "handoff's verb, not bounty's — a bounty has no offeree to accept"
         );
+        for verb in ["complete", "fail"] {
+            assert!(
+                !knows_verb("bounty", verb),
+                "{verb}: a bounty ends on the poster's word, not the worker's"
+            );
+        }
         assert!(!knows_verb("approval", "request"), "no table, no verbs");
     }
 
@@ -748,6 +905,7 @@ mod tests {
         let system = Sender {
             did: SERVER,
             is_system: true,
+            accepted_bid: None,
         };
         assert_eq!(
             check(&directed("offered"), &ev("confirm"), &system),
@@ -846,34 +1004,51 @@ mod tests {
             offeree: None,
             assignee: None,
             deadline: None,
+            bid_deadline: None,
         }
     }
 
     /// A transition is illegal without the fields its row names, and the
     /// refusal says which one is missing. Checked before authority: an award
-    /// naming no winner is malformed for everybody.
+    /// naming no bid is malformed for everybody.
     #[test]
-    fn an_award_names_its_winner_or_it_is_no_award() {
+    fn an_award_names_the_bid_it_takes_or_it_is_no_award() {
         let bare = Event {
             verb: "award",
             msgid: NOW,
+            accepts: None,
             fields: &[],
         };
         assert_eq!(
-            check(&bounty("open"), &bare, &who(ELIZA)),
-            Err(Refusal::MissingRequirement("act-to"))
+            check(&bounty("open"), &bare, &who_took(ELIZA, SCHOLAR)),
+            Err(Refusal::MissingRequirement("act-accepts"))
         );
         assert_eq!(
-            check(&bounty("open"), &bare, &who(MALLORY)),
-            Err(Refusal::MissingRequirement("act-to")),
+            check(&bounty("open"), &bare, &who_took(MALLORY, SCHOLAR)),
+            Err(Refusal::MissingRequirement("act-accepts")),
             "malformed for everybody, so it does not read as 'not you'"
         );
-        let named = Event {
-            verb: "award",
-            msgid: NOW,
-            fields: &["act-to"],
-        };
-        assert_eq!(check(&bounty("open"), &named, &who(ELIZA)), Ok("assigned"));
+        assert_eq!(
+            check(&bounty("open"), &award(), &who_took(ELIZA, SCHOLAR)),
+            Ok("assigned")
+        );
+    }
+
+    /// The award names one event and the caller resolves it. A name that
+    /// found no bid on this action — the bounty's own opener, a bid filed
+    /// against something else, an id nobody ever used — takes nothing, and
+    /// says so rather than assigning the poster's own choice of stranger.
+    #[test]
+    fn an_award_naming_something_that_is_not_a_bid_takes_nothing() {
+        assert_eq!(
+            check(&bounty("open"), &award(), &who(ELIZA)),
+            Err(Refusal::AcceptsNotABid)
+        );
+        // Before authority, like the requirement above.
+        assert_eq!(
+            check(&bounty("open"), &award(), &who(MALLORY)),
+            Err(Refusal::AcceptsNotABid)
+        );
     }
 
     /// The guard has to be free for every row that names nothing, which is
@@ -885,6 +1060,7 @@ mod tests {
             let e = Event {
                 verb,
                 msgid: NOW,
+                accepts: None,
                 fields: &[],
             };
             assert!(
@@ -902,7 +1078,7 @@ mod tests {
     fn a_transition_says_where_its_assignee_comes_from() {
         assert_eq!(
             assignee_source("bounty", "award", "open"),
-            AssigneeSource::Field("act-to")
+            AssigneeSource::AuthorOf("act-accepts")
         );
         for (kind, verb, from) in [
             ("handoff", "accept", "offered"),
@@ -928,17 +1104,18 @@ mod tests {
         );
     }
 
-    /// The server never picks — which cuts both ways. Nothing here checks
-    /// that the awarded DID ever bid: the poster's signed choice is the
-    /// record, and a checker that second-guessed it would be picking.
+    /// The server still never picks. It checks only that the named event is a
+    /// bid on this action; which of the bids on the table is worth taking is
+    /// the poster's to decide and nothing here second-guesses it.
     #[test]
-    fn an_award_may_name_anyone_at_all() {
-        let named = Event {
-            verb: "award",
-            msgid: NOW,
-            fields: &["act-to"],
-        };
-        assert_eq!(check(&bounty("open"), &named, &who(ELIZA)), Ok("assigned"));
+    fn the_poster_takes_whichever_bid_they_name() {
+        for author in [SCHOLAR, MALLORY, "did:plc:nobody"] {
+            assert_eq!(
+                check(&bounty("open"), &award(), &who_took(ELIZA, author)),
+                Ok("assigned"),
+                "{author}"
+            );
+        }
     }
 
     /// Bids are additive: the state they leave is the state they found, so a
@@ -959,6 +1136,48 @@ mod tests {
         );
     }
 
+    /// The sweep reads which states have a review window off the tables, so a
+    /// kind that adds the row is swept and one that does not is left alone.
+    #[test]
+    fn the_review_timeout_states_come_from_the_tables() {
+        assert_eq!(REVIEW_TIMEOUT_VERB, "auto-accept");
+        assert_eq!(review_timeout_states(), vec!["under_review"]);
+        // Handoff has no review window, so none of its states are swept by
+        // this clock — its work ends when the assignee says so.
+        for state in ["offered", "open", "assigned"] {
+            assert!(!review_timeout_states().contains(&state), "{state}");
+        }
+    }
+
+    /// A bounty's review window is the server's to close, and only from the
+    /// state the work is actually sitting in.
+    #[test]
+    fn only_the_server_closes_a_review_window() {
+        assert_eq!(
+            check(&bounty("under_review"), &ev("auto-accept"), &who(ELIZA)),
+            Err(Refusal::WrongSender),
+            "not the poster whose silence started the clock"
+        );
+        assert_eq!(
+            check(&bounty("under_review"), &ev("auto-accept"), &who(SCHOLAR)),
+            Err(Refusal::WrongSender)
+        );
+        let system = Sender {
+            did: SERVER,
+            is_system: true,
+            accepted_bid: None,
+        };
+        assert_eq!(
+            check(&bounty("under_review"), &ev("auto-accept"), &system),
+            Ok("accepted")
+        );
+        assert_eq!(
+            check(&bounty("assigned"), &ev("auto-accept"), &system),
+            Err(Refusal::IllegalStep),
+            "there is no window until the work is in"
+        );
+    }
+
     #[test]
     fn every_refusal_reason_is_documented_in_the_file() {
         for r in [
@@ -972,7 +1191,8 @@ mod tests {
             Refusal::ReplacesNotOpener,
             Refusal::ReplacesMalformed,
             Refusal::ReplacesNotTerminal,
-            Refusal::MissingRequirement("act-to"),
+            Refusal::MissingRequirement("act-accepts"),
+            Refusal::AcceptsNotABid,
         ] {
             assert!(
                 spec().refusals.contains_key(r.code()),
@@ -1097,6 +1317,7 @@ mod tests {
         let system = Sender {
             did: SERVER,
             is_system: true,
+            accepted_bid: None,
         };
         assert_eq!(
             check(&directed("assigned"), &ev("expire"), &system),
@@ -1150,6 +1371,7 @@ mod tests {
             let system = Sender {
                 did: SERVER,
                 is_system: true,
+                accepted_bid: None,
             };
             assert_eq!(
                 check(&done, &ev("expire"), &system),
@@ -1194,6 +1416,7 @@ mod tests {
             offeree: None,
             assignee: None,
             deadline: None,
+            bid_deadline: None,
         }
     }
 
@@ -1278,6 +1501,7 @@ mod tests {
         let late = Event {
             verb: "accept",
             msgid: TOO_LATE,
+            accepts: None,
             fields: &[],
         };
         assert_eq!(
@@ -1292,6 +1516,7 @@ mod tests {
             let e = Event {
                 verb: "accept",
                 msgid: id,
+                accepts: None,
                 fields: &[],
             };
             assert_eq!(
@@ -1313,6 +1538,7 @@ mod tests {
         let late = Event {
             verb: "claim",
             msgid: TOO_LATE,
+            accepts: None,
             fields: &[],
         };
         assert_eq!(
@@ -1323,6 +1549,7 @@ mod tests {
             let e = Event {
                 verb: "claim",
                 msgid: id,
+                accepts: None,
                 fields: &[],
             };
             assert_eq!(
@@ -1340,6 +1567,7 @@ mod tests {
         let late = Event {
             verb: "decline",
             msgid: TOO_LATE,
+            accepts: None,
             fields: &[],
         };
         assert_eq!(
@@ -1349,6 +1577,7 @@ mod tests {
         let late_cancel = Event {
             verb: "cancel",
             msgid: TOO_LATE,
+            accepts: None,
             fields: &[],
         };
         assert_eq!(
@@ -1362,12 +1591,80 @@ mod tests {
         let late = Event {
             verb: "accept",
             msgid: TOO_LATE,
+            accepts: None,
             fields: &[],
         };
         assert_eq!(
             check(&directed("offered"), &late, &who(SCHOLAR)),
             Ok("assigned")
         );
+    }
+
+    /// A bounty takes bids until its own cutoff, which is a shorter question
+    /// than how long the offer stands. Both times sit on the same opener and
+    /// are compared the same way.
+    #[test]
+    fn a_bid_is_bound_by_the_offers_bid_deadline() {
+        let taking_bids = Task {
+            bid_deadline: Some(DEADLINE),
+            ..bounty("open")
+        };
+        let late = Event {
+            verb: "bid",
+            msgid: TOO_LATE,
+            accepts: None,
+            fields: &[],
+        };
+        assert_eq!(
+            check(&taking_bids, &late, &who(SCHOLAR)),
+            Err(Refusal::DeadlinePassed)
+        );
+        for id in [IN_TIME, AT_EDGE] {
+            let e = Event {
+                verb: "bid",
+                msgid: id,
+                accepts: None,
+                fields: &[],
+            };
+            assert_eq!(check(&taking_bids, &e, &who(SCHOLAR)), Ok("open"), "{id}");
+        }
+    }
+
+    /// The two times are separate: bidding may close long before the offer
+    /// does, and a bounty that named no bid cutoff takes bids for as long as
+    /// it stands.
+    #[test]
+    fn the_two_deadlines_bound_different_moves() {
+        // Bidding closed; the offer has not.
+        let closed = Task {
+            deadline: None,
+            bid_deadline: Some(DEADLINE),
+            ..bounty("open")
+        };
+        let late = Event {
+            verb: "bid",
+            msgid: TOO_LATE,
+            accepts: None,
+            fields: &[],
+        };
+        assert_eq!(
+            check(&closed, &late, &who(SCHOLAR)),
+            Err(Refusal::DeadlinePassed)
+        );
+        // The award is bound by the offer's own deadline, not by the bid one.
+        let award_late = Event {
+            verb: "award",
+            msgid: TOO_LATE,
+            accepts: Some(BID),
+            fields: &["act-accepts"],
+        };
+        assert_eq!(
+            check(&closed, &award_late, &who_took(ELIZA, SCHOLAR)),
+            Ok("assigned"),
+            "bidding closing does not stop the poster picking"
+        );
+        // …and no bid cutoff means no bid cutoff.
+        assert_eq!(check(&bounty("open"), &late, &who(SCHOLAR)), Ok("open"));
     }
 
     /// Fail closed: an id whose clock cannot be read cannot be shown to be
@@ -1377,6 +1674,7 @@ mod tests {
         let junk = Event {
             verb: "accept",
             msgid: "not-a-ulid",
+            accepts: None,
             fields: &[],
         };
         assert_eq!(
@@ -1408,6 +1706,9 @@ mod tests {
         offerer: String,
         offeree: Option<String>,
         deadline: Option<i64>,
+        /// `act-bid-deadline`: how long the offer takes bids, when it named a
+        /// second time.
+        bid_deadline: Option<i64>,
     }
 
     #[derive(Deserialize)]
@@ -1424,6 +1725,11 @@ mod tests {
         /// Who the step assigns, when it names someone other than its sender:
         /// the value the transition's `assignee_from` field would hold.
         assigns: Option<String>,
+        /// `act-accepts`: the event an award takes.
+        accepts: Option<String>,
+        /// Who wrote the bid that event turned out to be. Absent when the
+        /// name found no bid on this action.
+        accepted_bid: Option<String>,
         expect: Option<String>,
         expect_refused: Option<String>,
     }
@@ -1455,16 +1761,26 @@ mod tests {
                 offeree: seq.task.offeree.as_deref(),
                 assignee: assignee.as_deref(),
                 deadline: seq.task.deadline,
+                bid_deadline: seq.task.bid_deadline,
             };
             let fields: Vec<&str> = step.tags.iter().map(String::as_str).collect();
             let event = Event {
                 verb: &step.verb,
                 msgid: step.event_id.as_deref().unwrap_or(NOW),
+                accepts: step.accepts.as_deref(),
                 fields: &fields,
             };
             let sender = Sender {
                 did: &step.sender,
                 is_system: step.system,
+                // What the caller's log made of the event this one names. A
+                // step that sets nothing named nothing, or named something
+                // that is not a bid — the file does not distinguish, because
+                // neither does the checker.
+                accepted_bid: step
+                    .accepted_bid
+                    .as_deref()
+                    .map(|author| AcceptedBid { author }),
             };
             let where_ = format!("{} — step {} ({})", seq.name, i + 1, step.verb);
 
@@ -1483,6 +1799,10 @@ mod tests {
                         assignee = Some(
                             match assignee_source(&seq.task.kind, &step.verb, &state) {
                                 AssigneeSource::Actor => step.sender.clone(),
+                                AssigneeSource::AuthorOf(_) => step
+                                    .accepted_bid
+                                    .clone()
+                                    .unwrap_or_else(|| panic!("{where_}: this transition assigns the author of the bid it names, and none was resolved")),
                                 AssigneeSource::Field(name) => step
                                     .assigns
                                     .clone()

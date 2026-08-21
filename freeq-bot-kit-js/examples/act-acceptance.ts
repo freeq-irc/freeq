@@ -271,7 +271,7 @@ async function main() {
       `open (${bounty})`,
     );
 
-    await act.bid(worker.ctx, bounty, { note: 'two days' });
+    const workerBid = await act.bid(worker.ctx, bounty, { note: 'two days' });
     await act.bid(rival.ctx, bounty, { note: 'one day, no sources' });
     await sleep(900);
     check(
@@ -284,36 +284,59 @@ async function main() {
       'both bids are on file, neither superseding the other',
     );
 
-    step('award', 'the poster picks the winner');
-    const awardId = await act.award(poster.ctx, bounty, worker.ctx.did);
+    step('award', 'the poster takes one of the bids');
+    const awardId = await act.award(poster.ctx, bounty, workerBid);
     await sleep(700);
     const awarded = (await openWork()).find((t) => t.act_id === bounty);
     check(awarded?.state === 'assigned', 'assigned');
     check(
       awarded?.assignee === worker.ctx.did,
-      'and the assignee is the winner the poster named, not the poster',
+      'and the assignee is the author of the bid it took, not the poster',
     );
     check(
       receiptsBySubject((await api(`/api/v1/actions/${bounty}`)).events).has(awardId),
       'the award is confirmed by the home',
     );
 
-    step('the loser', 'the bot that did not win tries to finish the work');
+    step('the loser', 'the bot whose bid was not taken tries to hand work in');
     rival.seen.fails.length = 0;
-    await act.complete(rival.ctx, bounty, { kind: 'bounty' }).catch(() => {});
+    await act.submit(rival.ctx, bounty).catch(() => {});
     await sleep(700);
     check(
       rival.seen.fails.some((l) => l.includes('WRONG_SENDER')),
       'refused: WRONG_SENDER',
     );
 
-    step('the winner', 'the winner finishes it');
-    const bountyDone = await act.complete(worker.ctx, bounty, { kind: 'bounty' });
+    step('review', 'the winner hands the work in, and the poster sends it back');
+    await act.submit(worker.ctx, bounty);
     await sleep(700);
-    check(!(await openWork()).some((t) => t.act_id === bounty), 'completed — gone from open work');
+    check(
+      (await openWork()).find((t) => t.act_id === bounty)?.state === 'under_review',
+      'under review — handed in, not finished',
+    );
+    poster.seen.fails.length = 0;
+    await act.cancel(poster.ctx, bounty, { kind: 'bounty' }).catch(() => {});
+    await sleep(700);
+    check(
+      poster.seen.fails.some((l) => l.includes('ILLEGAL_STEP')),
+      'and delivered work is not the poster\'s to withdraw: ILLEGAL_STEP',
+    );
+    await act.revise(poster.ctx, bounty);
+    await sleep(700);
+    check(
+      (await openWork()).find((t) => t.act_id === bounty)?.state === 'assigned',
+      'sent back — assigned again, and the worker still holds it',
+    );
+
+    step('the poster accepts', 'the offerer\'s word is what ends a bounty');
+    await act.submit(worker.ctx, bounty);
+    await sleep(700);
+    const bountyDone = await act.acceptWork(poster.ctx, bounty);
+    await sleep(700);
+    check(!(await openWork()).some((t) => t.act_id === bounty), 'accepted — gone from open work');
     check(
       receiptsBySubject((await api(`/api/v1/actions/${bounty}`)).events).has(bountyDone),
-      'and the completion is confirmed too',
+      'and the acceptance is confirmed too',
     );
 
     // ── expiry ──

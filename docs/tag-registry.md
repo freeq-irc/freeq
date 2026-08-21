@@ -60,6 +60,13 @@ across the Rust and TypeScript SDKs with shared test vectors
 | `+freeq.at/act-title` | Human-readable title. |
 | `+freeq.at/from` | The signer/actor (envelope tag; the document key is `from`). |
 | `+freeq.at/eventid` | The event id the signer minted; the server adopts it (shared with chat). |
+| `+freeq.at/act-accepts` | The bid an award takes — that bid's own event id. The assignee is its author. |
+| `+freeq.at/act-deadline` | How long the offer stands, unix seconds. Compared by the referee. |
+| `+freeq.at/act-bid-deadline` | How long a bounty takes bids, unix seconds. Compared by the referee. |
+| `+freeq.at/act-price` | What a bounty offers to pay. Opaque: stored, relayed, signed, never read. |
+| `+freeq.at/act-bid` | What a bidder asks for. Opaque. |
+| `+freeq.at/act-pay-to` | Where a bidder wants paying. Opaque. |
+| `+freeq.at/act-tx` | A payment reference on the acceptance. Opaque — a claim on the record, never a confirmation. |
 
 ## Governance & budgets
 

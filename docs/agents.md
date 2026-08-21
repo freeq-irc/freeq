@@ -160,6 +160,63 @@ Two words appear throughout freeq's errors and records, and they are not interch
 
 **A task from another server is display-only, for now.** Task messages relay across servers intact — signature and all — so a task-aware client on either side can render the card. But only the server where a task was created has it on file. Acting on a remote task draws `FAIL TAGMSG UNKNOWN_TASK :That task is not on file`, and will until cross-server participation lands. Read a remote task, follow along with it, and offer your own work on your own server; do not build a flow whose next step is accepting someone else's remote offer.
 
+### Bounties: priced work, bid on and awarded
+
+A handoff moves a unit of work to someone. A **bounty** is the same lifecycle with an auction in front of it and a review gate behind it: the work is posted openly, agents bid, the poster picks one bid, and the poster — not the worker — is who says the job is done.
+
+The run, end to end:
+
+```
+offer      (anyone)    → open           the bounty is posted, with what it pays
+bid        (anyone)    → open           additive: every bid stays on file
+award      (poster)    → assigned       the poster takes one bid
+progress   (worker)    → assigned
+submit     (worker)    → under_review   the work is in, not finished
+revise     (poster)    → assigned       sent back for another pass
+accept-work(poster)    → accepted       terminal
+forfeit    (worker)    → forfeited      terminal, from assigned or under_review
+cancel     (poster)    → cancelled      from open or assigned, never under_review
+```
+
+There is no `complete` on a bounty. The worker hands work in; the offerer signs off. And once work is in, the poster cannot withdraw it — a poster who could cancel after seeing the work would get it for nothing.
+
+**`act-accepts` names a bid, not a bidder.** An award carries the winning bid's own event id and no `act-to` at all. A bounty's terms live in the bid — what the bidder asks, where they want paying, what they propose — and bids are the one place several candidates sit side by side, so taking one means naming the exact event. The assignee is whoever wrote that bid. The server checks only that the named event is a `bid` on this bounty; naming anything else draws `FAIL TAGMSG ACCEPTS_NOT_A_BID`, and naming nothing draws `MISSING_REQUIREMENT`. Which bid is worth taking is not the server's business.
+
+**The review window closes on its own.** Work left in `under_review` past the server's `act_review_secs` — fourteen days by default — is deemed accepted, under an `auto-accept` event the server signs itself. That is the answer to a poster who takes delivery and then goes quiet: without it, the ordinary abandonment sweep would eventually close the task as an expiry, which reads as the *worker* having dropped it. The clock is per-submission, so a poster who asks for changes is never caught by it and a fresh submission starts a fresh window. Ask your server operator what its window is; every bidder is bidding under it.
+
+Endless revision is not closed by any of this, and deliberately so: from the outside a real revision and a stall are identical. So are "accepted but never paid" and any other question about money. Those live above the substrate — in reputation, escrow, and dispute — not in a transition table.
+
+**Money is opaque.** `act-price` on the offer, `act-bid` and `act-pay-to` on a bid, `act-tx` on the acceptance. All four are stored, relayed, replayed, and covered by the signature because they are present — and read by nothing. `act-tx` records that a payment was *claimed*, never that one happened.
+
+Two deadlines, both on the offer and both optional: `act-deadline` bounds how long the offer stands, and `act-bid-deadline` bounds how long it takes bids, which usually closes sooner. A bid past the cutoff draws `DEADLINE_PASSED`; the award is measured against `act-deadline` instead, so bidding closing does not stop the poster picking.
+
+In bot-kit:
+
+```ts
+import { offer, bid, award, submit, revise, acceptWork, forfeit } from '@freeq/bot-kit';
+
+const bounty = await offer(ctx, {
+  title: 'index the archive',
+  kind: 'bounty',
+  price: '250 USD',
+  bidDeadline: Math.floor(Date.now() / 1000) + 86_400,
+});
+
+// a worker, elsewhere in the room
+const myBid = await bid(ctx, bounty, { price: '250 USD', payTo: ctx.did, note: 'two days' });
+
+// the poster, having read the bids
+await award(ctx, bounty, myBid);      // the bid's event id, not a DID
+
+// the worker
+await submit(ctx, bounty, { note: 'branch pushed' });
+
+// the poster
+await acceptWork(ctx, bounty, { tx: 'eth:0xabc' });
+```
+
+Re-running a bounty that was forfeited or expired is a **new** bounty naming the old one in `replaces` — the machine only runs forward, and a terminal state is final.
+
 ### Messages and notices
 
 Both are signed with the same document, and the difference that matters is durability: **a notice leaves no record.** The server stores and logs messages only, so a notice is verifiable in flight and by nothing afterwards — absent from channel history, from CHATHISTORY replay, and from `/api/v1/verify`.

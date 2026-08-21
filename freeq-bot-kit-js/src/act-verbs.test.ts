@@ -8,6 +8,10 @@ import { describe, expect, it } from "vitest";
 import {
   accept,
   award,
+  submit,
+  revise,
+  acceptWork,
+  forfeit,
   bid,
   cancel,
   claim,
@@ -176,19 +180,129 @@ describe("the bounty verbs", () => {
     expect(sent[0].taskId).toBe("01JTASK00000000000000000AA");
   });
 
-  it("awards the work to the winner it names, not to the poster naming them", async () => {
+  it("takes the bid it names, and names no DID at all", async () => {
     const sent: Sent[] = [];
-    await award(ctxWith(sent), "01JTASK00000000000000000AA", "did:plc:worker");
+    await award(ctxWith(sent), "01JTASK00000000000000000AA", "01JBID000000000000000000BB");
     const { tags } = sent[0];
     expect(tags["+freeq.at/act-verb"]).toBe("award");
-    expect(tags["+freeq.at/act-to"]).toBe("did:plc:worker");
+    expect(tags["+freeq.at/act-accepts"]).toBe("01JBID000000000000000000BB");
+    // The winner is the bid's author, so the award names no recipient of its
+    // own — two sources for one fact is what naming a DID here would be.
+    expect(tags["+freeq.at/act-to"]).toBeUndefined();
     expect(tags["+freeq.at/from"]).toBe("did:plc:bot");
-    expect(sent[0].humanText).toContain("did:plc:worker");
   });
 
-  it("carries the kind on a bounty's follow-ups too", async () => {
+  it("carries a bid's terms as tags nothing interprets", async () => {
     const sent: Sent[] = [];
-    await complete(ctxWith(sent), "01JTASK00000000000000000AA", { kind: "bounty" });
+    await bid(ctxWith(sent), "01JTASK00000000000000000AA", {
+      price: "250 USD",
+      payTo: "did:plc:worker",
+    });
+    const { tags } = sent[0];
+    expect(tags["+freeq.at/act-bid"]).toBe("250 USD");
+    expect(tags["+freeq.at/act-pay-to"]).toBe("did:plc:worker");
+  });
+
+  it("carries a bounty's price and bid cutoff on the offer", async () => {
+    const sent: Sent[] = [];
+    await offer(ctxWith(sent), {
+      title: "index the archive",
+      kind: "bounty",
+      price: "250 USD",
+      bidDeadline: 1_788_000_000,
+      deadline: 1_788_600_000,
+    });
+    const { tags } = sent[0];
+    expect(tags["+freeq.at/act-price"]).toBe("250 USD");
+    expect(tags["+freeq.at/act-bid-deadline"]).toBe("1788000000");
+    // Two different times, both on the offer.
+    expect(tags["+freeq.at/act-deadline"]).toBe("1788600000");
+  });
+
+  it("carries a payment reference on the acceptance, and none by default", async () => {
+    const sent: Sent[] = [];
+    await acceptWork(ctxWith(sent), "01JTASK00000000000000000AA", { tx: "eth:0xabc" });
+    expect(sent[0].tags["+freeq.at/act-tx"]).toBe("eth:0xabc");
+    const bare: Sent[] = [];
+    await acceptWork(ctxWith(bare), "01JTASK00000000000000000AA");
+    expect(bare[0].tags["+freeq.at/act-tx"]).toBeUndefined();
+  });
+
+  it("hands the work in without saying it is done", async () => {
+    const sent: Sent[] = [];
+    await submit(ctxWith(sent), "01JTASK00000000000000000AA", { note: "branch pushed" });
+    const { tags } = sent[0];
+    expect(tags["+freeq.at/act"]).toBe("bounty");
+    expect(tags["+freeq.at/act-verb"]).toBe("submit");
+    expect(tags["+freeq.at/act-id"]).toBe("01JTASK00000000000000000AA");
+    expect(tags["+freeq.at/act-note"]).toBe("branch pushed");
+  });
+
+  it("sends the work back, accepts it, or walks away from it", async () => {
+    for (const [move, verb] of [
+      [revise, "revise"],
+      [acceptWork, "accept-work"],
+      [forfeit, "forfeit"],
+    ] as const) {
+      const sent: Sent[] = [];
+      await move(ctxWith(sent), "01JTASK00000000000000000AA");
+      expect(sent[0].tags["+freeq.at/act-verb"], verb).toBe(verb);
+      expect(sent[0].tags["+freeq.at/act"], verb).toBe("bounty");
+      expect(sent[0].taskId, verb).toBe("01JTASK00000000000000000AA");
+    }
+  });
+
+  it("carries the kind on the steps both kinds share", async () => {
+    const sent: Sent[] = [];
+    await progress(ctxWith(sent), "01JTASK00000000000000000AA", { kind: "bounty" });
     expect(sent[0].tags["+freeq.at/act"]).toBe("bounty");
+  });
+
+  it("names the kind it was given on every step about the posting, and the task when given none", async () => {
+    for (const [move, past] of [
+      [accept, "accepted"],
+      [decline, "declined"],
+      [claim, "claimed"],
+      [complete, "completed"],
+      [fail, "failed"],
+    ] as const) {
+      const plain: Sent[] = [];
+      await move(ctxWith(plain), "01JTASK00000000000000000AA");
+      expect(plain[0].humanText, past).toBe(`${past} the task`);
+      const named: Sent[] = [];
+      await move(ctxWith(named), "01JTASK00000000000000000AA", { kind: "handoff" });
+      expect(named[0].humanText, past).toBe(`${past} the handoff`);
+    }
+  });
+
+  it("names the kind it was given when cancelling, and the task when given none", async () => {
+    const sent: Sent[] = [];
+    await cancel(ctxWith(sent), "01JTASK00000000000000000AA", { kind: "bounty" });
+    expect(sent[0].tags["+freeq.at/act"]).toBe("bounty");
+    expect(sent[0].humanText).toBe("cancelled the bounty");
+    const plain: Sent[] = [];
+    await cancel(ctxWith(plain), "01JTASK00000000000000000AA");
+    expect(plain[0].humanText).toBe("cancelled the task");
+    const named: Sent[] = [];
+    await cancel(ctxWith(named), "01JTASK00000000000000000AA", { kind: "handoff" });
+    expect(named[0].humanText).toBe("cancelled the handoff");
+  });
+
+  it("says each bounty step the way the handoff steps are said", async () => {
+    const lines: [(...a: any[]) => Promise<string>, string][] = [
+      [bid, "bid on the bounty"],
+      [submit, "submitted the work"],
+      [revise, "asked for revisions"],
+      [acceptWork, "accepted the work"],
+      [forfeit, "forfeited the bounty"],
+    ];
+    for (const [move, line] of lines) {
+      const sent: Sent[] = [];
+      await move(ctxWith(sent), "01JTASK00000000000000000AA");
+      expect(sent[0].humanText, line).toBe(line);
+    }
+    const sent: Sent[] = [];
+    await award(ctxWith(sent), "01JTASK00000000000000000AA", "01JBID000000000000000000BB");
+    expect(sent[0].humanText).toBe("awarded the bounty");
   });
 });

@@ -45,6 +45,11 @@ interface Step {
   tags?: string[];
   /** Who the step assigns, when it names someone other than its sender. */
   assigns?: string;
+  /** `act-accepts`: the event an award takes. */
+  accepts?: string;
+  /** Who wrote the bid that event turned out to be. Absent when the name
+   *  found no bid on this action. */
+  accepted_bid?: string;
   expect?: string;
   expect_refused?: RefusalReason;
 }
@@ -65,6 +70,7 @@ interface Sequence {
     offerer: string;
     offeree: string | null;
     deadline: number | null;
+    bid_deadline?: number | null;
   };
   steps: Step[];
 }
@@ -495,22 +501,50 @@ describe("the deadline", () => {
 describe("the two schema additions bounty needed", () => {
   const refused = (reason: RefusalReason) => ({ ok: false, reason });
   const bounty = (state: string): Task => ({ kind: "bounty", state, offerer: ELIZA });
+  /** The bid an award names in these tests. */
+  const BID = "01M16E7TC0BDTAKEN000000000";
+  const award = { verb: "award", msgid: NOW, accepts: BID, fields: ["act-accepts"] };
+  const took = (did: string, author: string): EventSender => ({
+    did,
+    acceptedBid: { author },
+  });
 
-  // Checked before authority: an award naming no winner is malformed for
+  // Checked before authority: an award naming no bid is malformed for
   // everybody, and "not you" would send the sender after the wrong problem.
-  it("an award names its winner, or it is no award", () => {
+  it("an award names the bid it takes, or it is no award", () => {
     const bare = { verb: "award", msgid: NOW, fields: [] };
-    expect(checkTransition(bounty("open"), bare, who(ELIZA))).toEqual(
+    expect(checkTransition(bounty("open"), bare, took(ELIZA, SCHOLAR))).toEqual(
       refused("missing-requirement"),
     );
-    expect(checkTransition(bounty("open"), bare, who(MALLORY))).toEqual(
+    expect(checkTransition(bounty("open"), bare, took(MALLORY, SCHOLAR))).toEqual(
       refused("missing-requirement"),
     );
-    const named = { verb: "award", msgid: NOW, fields: ["act-to"] };
-    expect(checkTransition(bounty("open"), named, who(ELIZA))).toEqual({
+    expect(checkTransition(bounty("open"), award, took(ELIZA, SCHOLAR))).toEqual({
       ok: true,
       to: "assigned",
     });
+  });
+
+  // The award names one event and the caller resolves it. A name that found
+  // no bid on this action takes nothing, and says so.
+  it("an award naming something that is not a bid takes nothing", () => {
+    expect(checkTransition(bounty("open"), award, who(ELIZA))).toEqual(
+      refused("accepts-not-a-bid"),
+    );
+    expect(checkTransition(bounty("open"), award, who(MALLORY))).toEqual(
+      refused("accepts-not-a-bid"),
+    );
+  });
+
+  // The server still never picks: which of the bids on the table is worth
+  // taking is the poster's to decide.
+  it("lets the poster take whichever bid they name", () => {
+    for (const author of [SCHOLAR, MALLORY, "did:plc:nobody"]) {
+      expect(checkTransition(bounty("open"), award, took(ELIZA, author)), author).toEqual({
+        ok: true,
+        to: "assigned",
+      });
+    }
   });
 
   // The guard has to be free for every row that names nothing, which is
@@ -524,8 +558,8 @@ describe("the two schema additions bounty needed", () => {
 
   it("says where each transition's assignee comes from", () => {
     expect(assigneeSource("bounty", "award", "open")).toEqual({
-      from: "field",
-      field: "act-to",
+      from: "author_of",
+      field: "act-accepts",
     });
     for (const [kind, verb, from] of [
       ["handoff", "accept", "offered"],
@@ -535,6 +569,35 @@ describe("the two schema additions bounty needed", () => {
       expect(assigneeSource(kind, verb, from), `${kind}/${verb}`).toEqual({ from: "actor" });
     }
     expect(assigneeSource("approval", "request", "open")).toEqual({ from: "actor" });
+  });
+
+  // A bounty takes bids until its own cutoff, which is a shorter question
+  // than how long the offer stands.
+  it("binds a bid to the offer's bid deadline, and the award to its own", () => {
+    const DEADLINE = 1_788_000_000;
+    const TOO_LATE = "01M16HSC58ACCEPTTOOLATE000";
+    const AT_EDGE = "01M16HSB60ACCEPTATEDGE0000";
+    const takingBids: Task = { ...bounty("open"), bidDeadline: DEADLINE };
+    expect(
+      checkTransition(takingBids, { verb: "bid", msgid: TOO_LATE }, who(SCHOLAR)),
+    ).toEqual(refused("deadline-passed"));
+    expect(checkTransition(takingBids, { verb: "bid", msgid: AT_EDGE }, who(SCHOLAR))).toEqual({
+      ok: true,
+      to: "open",
+    });
+    // Bidding closing does not stop the poster picking: the award is bound by
+    // the offer's own deadline, which this bounty never named.
+    expect(
+      checkTransition(
+        takingBids,
+        { verb: "award", msgid: TOO_LATE, accepts: BID, fields: ["act-accepts"] },
+        took(ELIZA, SCHOLAR),
+      ),
+    ).toEqual({ ok: true, to: "assigned" });
+    // …and no bid cutoff means no bid cutoff.
+    expect(
+      checkTransition(bounty("open"), { verb: "bid", msgid: TOO_LATE }, who(SCHOLAR)),
+    ).toEqual({ ok: true, to: "open" });
   });
 
   it("takes bids additively until the work is awarded", () => {
@@ -568,11 +631,25 @@ describe("the shared sequences", () => {
           offeree: seq.task.offeree,
           assignee,
           deadline: seq.task.deadline,
+          bidDeadline: seq.task.bid_deadline,
         };
         const result = checkTransition(
           task,
-          { verb: step.verb, msgid: step.event_id ?? NOW, fields: step.tags ?? [] },
-          { did: step.sender, isSystem: step.system ?? false },
+          {
+            verb: step.verb,
+            msgid: step.event_id ?? NOW,
+            accepts: step.accepts,
+            fields: step.tags ?? [],
+          },
+          {
+            did: step.sender,
+            isSystem: step.system ?? false,
+            // What the caller's log made of the event this one names. A step
+            // that sets nothing named nothing, or named something that is not
+            // a bid — the file does not distinguish, because neither does the
+            // checker.
+            acceptedBid: step.accepted_bid ? { author: step.accepted_bid } : null,
+          },
         );
         const where = `${seq.name} — step ${i + 1} (${step.verb})`;
 
@@ -584,15 +661,22 @@ describe("the shared sequences", () => {
           // its winner rather than becoming one.
           if (assignee === null && step.expect === "assigned") {
             const source = assigneeSource(seq.task.kind, step.verb, state);
-            assignee =
-              source.from === "actor"
-                ? step.sender
-                : (step.assigns ??
-                  (() => {
-                    throw new Error(
-                      `${where}: assigns is not set, but this transition takes its assignee from ${source.field}`,
-                    );
-                  })());
+            if (source.from === "actor") {
+              assignee = step.sender;
+            } else if (source.from === "author_of") {
+              if (!step.accepted_bid) {
+                throw new Error(
+                  `${where}: this transition assigns the author of the bid it names, and none was resolved`,
+                );
+              }
+              assignee = step.accepted_bid;
+            } else if (!step.assigns) {
+              throw new Error(
+                `${where}: assigns is not set, but this transition takes its assignee from ${source.field}`,
+              );
+            } else {
+              assignee = step.assigns;
+            }
           }
           state = step.expect;
         } else {

@@ -287,6 +287,10 @@ mod tests {
     /// event id, exactly as a handoff's is.
     const BOUNTY_ID: &str = "01JBOUNTYEVENTID00000000B";
 
+    /// The bid on it, and so the value the award names in `act-accepts`: an
+    /// award takes an event, not a DID.
+    const BID_ID: &str = "01JBIDEVENTID00000000000B";
+
     /// The RFC's directed-offer example, as a wire tag map (plus tags that
     /// must NOT be covered as tags: sig, eventid, msgid, actor-class).
     fn offer_tags() -> Vec<(&'static str, &'static str)> {
@@ -769,9 +773,11 @@ mod tests {
                 id: "01KDEF0000000000000000000K",
             },
             Case {
-                // A bid on a bounty. Additive and unremarkable to the
-                // canonical, which is the point: a second kind needed a row
-                // in the transitions file and nothing at all here.
+                // A bid on a bounty, with terms. Additive and unremarkable
+                // to the canonical, which is the point: a second kind needed
+                // a row in the transitions file and nothing at all here, and
+                // its money tags are covered because they are present rather
+                // than because anything knows what they mean.
                 name: "bounty-bid",
                 seed: 7,
                 tags: vec![
@@ -779,16 +785,22 @@ mod tests {
                     ("+freeq.at/act-verb", "bid"),
                     ("+freeq.at/from", "did:plc:scholar"),
                     ("+freeq.at/act-id", BOUNTY_ID),
+                    // What the bidder asks and where they want it paid.
+                    // Opaque to every server that handles them — the point of
+                    // the vector is that two signers agree on bytes neither of
+                    // them interprets.
+                    ("+freeq.at/act-bid", "250 USD"),
+                    ("+freeq.at/act-pay-to", "did:plc:scholar"),
                     ("+freeq.at/act-note", "two days, sources included"),
                 ],
                 target: "#swarm",
-                id: "01JBIDEVENTID00000000000B",
+                id: BID_ID,
             },
             Case {
-                // The award: the poster names a winner in act-to, and the
-                // view reads the assignee from that field rather than from
-                // the actor. Both are covered by the signature, so neither
-                // can be re-pointed in transit.
+                // The award: the poster takes one bid by naming its event id,
+                // and the view reads the assignee from that bid's author
+                // rather than from the actor. The pointer is covered by the
+                // signature, so it cannot be re-pointed in transit.
                 name: "bounty-award",
                 seed: 8,
                 tags: vec![
@@ -796,7 +808,7 @@ mod tests {
                     ("+freeq.at/act-verb", "award"),
                     ("+freeq.at/from", "did:plc:eliza"),
                     ("+freeq.at/act-id", BOUNTY_ID),
-                    ("+freeq.at/act-to", "did:plc:scholar"),
+                    ("+freeq.at/act-accepts", BID_ID),
                 ],
                 target: "#swarm",
                 id: "01JAWARDEVENTID000000000A",
@@ -926,16 +938,16 @@ mod tests {
                 swap_alg: None,
             },
             Negative {
-                // An award with its winner stripped. Unlike a missing
-                // envelope field this is strip-*detectable*: act-to is an act
-                // tag, so the sweep covered it and the document rebuilds
+                // An award with the bid it takes stripped. Unlike a missing
+                // envelope field this is strip-*detectable*: act-accepts is an
+                // act tag, so the sweep covered it and the document rebuilds
                 // without it into bytes the signature contradicts.
-                name: "award-with-its-winner-stripped",
+                name: "award-with-its-bid-stripped",
                 of: "bounty-award",
                 expected: "invalid",
                 target: "#swarm",
                 id: "01JAWARDEVENTID000000000A",
-                strip_tag: Some("+freeq.at/act-to"),
+                strip_tag: Some("+freeq.at/act-accepts"),
                 swap_tag: None,
                 swap_alg: None,
             },

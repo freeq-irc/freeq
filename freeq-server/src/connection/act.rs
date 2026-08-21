@@ -251,6 +251,46 @@ pub(crate) fn expire_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -
     true
 }
 
+/// Close the review window on one task: sign the event, run it through the
+/// same check and storage every other event goes through, and let it go out.
+///
+/// The other clock, and the mirror of `expire_task` — the difference is what
+/// the log ends up saying. Work that was handed in and never answered is
+/// deemed accepted, under a verb of its own, because "the window you were
+/// told about closed" and "nobody touched this for a month" are different
+/// things to have on the record.
+///
+/// Announced to the room the way an expiry is: the event is the record, and
+/// the notice is how the people in the conversation hear that the window
+/// closed and the work stands accepted.
+///
+/// Returns whether the task was accepted.
+pub(crate) fn auto_accept_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -> bool {
+    let verb = freeq_sdk::act_transitions::REVIEW_TIMEOUT_VERB;
+    match file_own_event(state, &task.kind, verb, &task.act_id, &[], &task.venue) {
+        Some((_, crate::db::ActWrite::Filed { .. })) => {
+            let title = state
+                .with_db(|db| db.act_task_title(&task.act_id))
+                .flatten()
+                .unwrap_or_else(|| task.act_id.clone());
+            announce_auto_accept(state, task, &title);
+            tracing::info!(
+                act_id = %task.act_id, venue = %task.venue, state = %task.state,
+                "Review window closed; the work is accepted"
+            );
+            true
+        }
+        other => {
+            tracing::warn!(
+                act_id = %task.act_id, venue = %task.venue,
+                outcome = ?other.map(|(_, w)| w),
+                "Review sweep could not file its own event"
+            );
+            false
+        }
+    }
+}
+
 /// A title is text its sender chose, and this notice is built as a wire line
 /// rather than through `Message`, which escapes tag values on the way out. So
 /// the bytes that end a line — and every other control byte — come out here,
@@ -294,6 +334,17 @@ fn venue_sessions(state: &Arc<SharedState>, venue: &str) -> Vec<String> {
 /// Tell the room — or the two people in the conversation — that a task ended
 /// without finishing.
 fn announce_expiry(state: &Arc<SharedState>, task: &crate::db::ActTask, title: &str) {
+    announce_ending(state, task, title, "Task expired without completion");
+}
+
+/// Tell the room the review window closed and the work stands accepted —
+/// the same line the expiry sweep speaks, with a different ending.
+fn announce_auto_accept(state: &Arc<SharedState>, task: &crate::db::ActTask, title: &str) {
+    announce_ending(state, task, title, "Task accepted without review");
+}
+
+/// One notice, two endings: `what` is the sentence up to the colon.
+fn announce_ending(state: &Arc<SharedState>, task: &crate::db::ActTask, title: &str, what: &str) {
     // A title of nothing but stripped bytes would announce a task by no name at
     // all, so it falls back the same way a missing title does.
     let cleaned = title_for_wire(title);
@@ -301,7 +352,7 @@ fn announce_expiry(state: &Arc<SharedState>, task: &crate::db::ActTask, title: &
         true => task.act_id.as_str(),
         false => cleaned.as_str(),
     };
-    let text = format!("Task expired without completion: {shown}");
+    let text = format!("{what}: {shown}");
     let sessions = venue_sessions(state, &task.venue);
     let target = match task.venue.starts_with("dm:") {
         true => None,
@@ -1011,6 +1062,9 @@ pub(super) fn gate(
                 Refusal::MissingRequirement(field) => {
                     missing = format!("That step must carry {field}");
                     ("MISSING_REQUIREMENT", missing.as_str())
+                }
+                Refusal::AcceptsNotABid => {
+                    ("ACCEPTS_NOT_A_BID", "That award names no bid on this task")
                 }
             };
             tracing::debug!(

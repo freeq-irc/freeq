@@ -3066,15 +3066,44 @@ mod tests {
         .unwrap()
     }
 
-    /// A bounty step. `to` is the winner an award names — the field the rules
-    /// file points `assignee_from` at.
+    /// A bounty whose offer names how long it takes bids.
+    fn bounty_offer_with_cutoff(db: &Db, id: &str, venue: &str, cutoff: i64, ts: i64) -> ActWrite {
+        let cutoff = cutoff.to_string();
+        let canonical = act_doc(
+            &[
+                ("+freeq.at/act", "bounty"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", ELIZA),
+                ("+freeq.at/act-title", "index the archive"),
+                ("+freeq.at/act-bid-deadline", &cutoff),
+            ],
+            venue,
+            id,
+        );
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: id,
+            act_id: id,
+            opens: true,
+            venue,
+            actor: ELIZA,
+            from_system: false,
+            origin: None,
+            timestamp: ts,
+        })
+        .unwrap()
+    }
+
+    /// A bounty step. `accepts` is the bid an award takes — the event the
+    /// rules file points `assignee_from` at, whose author gets the work.
     fn bounty_step(
         db: &Db,
         verb: &str,
         actor: &str,
         task: &str,
         id: &str,
-        to: Option<&str>,
+        accepts: Option<&str>,
         venue: &str,
         ts: i64,
     ) -> ActWrite {
@@ -3084,8 +3113,8 @@ mod tests {
             ("+freeq.at/from", actor),
             ("+freeq.at/act-id", task),
         ];
-        if let Some(to) = to {
-            tags.push(("+freeq.at/act-to", to));
+        if let Some(accepts) = accepts {
+            tags.push(("+freeq.at/act-accepts", accepts));
         }
         let canonical = act_doc(&tags, venue, id);
         db.apply_act_event(&ActEvent {
@@ -3104,10 +3133,10 @@ mod tests {
     }
 
     /// The whole point of the second kind: bids pile up without moving
-    /// anything, and the award assigns the DID it names rather than the one
-    /// who sent it.
+    /// anything, and the award assigns whoever wrote the bid it names rather
+    /// than the one who sent it.
     #[test]
-    fn a_bounty_takes_bids_and_the_award_assigns_the_did_it_names() {
+    fn a_bounty_award_assigns_the_author_of_the_bid_it_names() {
         let db = Db::open_memory().unwrap();
         bounty_offer(&db, "B1", "#ops", 10);
         for (i, bidder) in [SCHOLAR, MALLORY].iter().enumerate() {
@@ -3131,8 +3160,10 @@ mod tests {
         }
         assert_eq!(db.act_task_events("B1").unwrap().len(), 3, "all on file");
 
+        // The second bid, so the answer cannot come from "the first one" or
+        // from the sender.
         assert_eq!(
-            bounty_step(&db, "award", ELIZA, "B1", "AW", Some(SCHOLAR), "#ops", 20),
+            bounty_step(&db, "award", ELIZA, "B1", "AW", Some("BID1"), "#ops", 20),
             ActWrite::Filed {
                 was: Some("open".into()),
                 state: "assigned".into()
@@ -3141,38 +3172,38 @@ mod tests {
         let task = db.act_task("B1").unwrap().unwrap();
         assert_eq!(
             task.assignee.as_deref(),
-            Some(SCHOLAR),
-            "the winner the poster named, not the poster who named them"
+            Some(MALLORY),
+            "whoever wrote the bid the poster took, not the poster who took it"
         );
         assert_eq!(task.offerer, ELIZA);
     }
 
-    /// An award naming nobody assigns nobody, so the transition is illegal
+    /// An award naming no bid takes nothing, so the transition is illegal
     /// without the field its row requires.
     #[test]
-    fn an_award_that_names_no_winner_is_refused() {
+    fn an_award_that_names_no_bid_is_refused() {
         let db = Db::open_memory().unwrap();
         bounty_offer(&db, "B1", "#ops", 10);
         assert_eq!(
             bounty_step(&db, "award", ELIZA, "B1", "AW", None, "#ops", 20),
             ActWrite::Refused(freeq_sdk::act_transitions::Refusal::MissingRequirement(
-                "act-to"
+                "act-accepts"
             ))
         );
         assert_eq!(db.act_task("B1").unwrap().unwrap().state, "open");
     }
 
-    /// The loser bid and did not win, so the work is not theirs to finish.
+    /// The loser bid and was not taken, so the work is not theirs to hand in.
     #[test]
     fn the_loser_of_a_bounty_cannot_finish_the_work() {
         let db = Db::open_memory().unwrap();
         bounty_offer(&db, "B1", "#ops", 10);
         bounty_step(&db, "bid", SCHOLAR, "B1", "BID0", None, "#ops", 11);
         bounty_step(&db, "bid", MALLORY, "B1", "BID1", None, "#ops", 12);
-        bounty_step(&db, "award", ELIZA, "B1", "AW", Some(SCHOLAR), "#ops", 20);
+        bounty_step(&db, "award", ELIZA, "B1", "AW", Some("BID0"), "#ops", 20);
 
         assert_eq!(
-            bounty_step(&db, "complete", MALLORY, "B1", "C1", None, "#ops", 21),
+            bounty_step(&db, "submit", MALLORY, "B1", "C1", None, "#ops", 21),
             ActWrite::Refused(freeq_sdk::act_transitions::Refusal::WrongSender)
         );
         assert_eq!(
@@ -3181,22 +3212,296 @@ mod tests {
             "an awarded bounty takes no further bids"
         );
         assert!(matches!(
-            bounty_step(&db, "complete", SCHOLAR, "B1", "C2", None, "#ops", 23),
+            bounty_step(&db, "submit", SCHOLAR, "B1", "C2", None, "#ops", 23),
             ActWrite::Filed { .. }
         ));
-        assert_eq!(db.act_task("B1").unwrap(), None, "completed and gone");
+        assert!(matches!(
+            bounty_step(&db, "accept-work", ELIZA, "B1", "C3", None, "#ops", 24),
+            ActWrite::Filed { .. }
+        ));
+        assert_eq!(db.act_task("B1").unwrap(), None, "accepted and gone");
     }
 
-    /// The server never picks, and that cuts both ways: nothing here checks
-    /// that the awarded DID ever bid. The poster's signed choice is the
-    /// record.
+    /// The difference between this kind and a handoff: the worker says the
+    /// work is in, and the poster says whether it is done. A submission
+    /// parks the bounty in review and moves nothing else.
     #[test]
-    fn an_award_may_name_someone_who_never_bid() {
+    fn a_bounty_ends_on_the_posters_word_and_not_the_workers() {
         let db = Db::open_memory().unwrap();
         bounty_offer(&db, "B1", "#ops", 10);
         bounty_step(&db, "bid", SCHOLAR, "B1", "BID0", None, "#ops", 11);
+        bounty_step(&db, "award", ELIZA, "B1", "AW", Some("BID0"), "#ops", 12);
+
+        assert_eq!(
+            bounty_step(&db, "submit", SCHOLAR, "B1", "S1", None, "#ops", 13),
+            ActWrite::Filed {
+                was: Some("assigned".into()),
+                state: "under_review".into()
+            }
+        );
+        assert_eq!(
+            bounty_step(&db, "accept-work", SCHOLAR, "B1", "A1", None, "#ops", 14),
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::WrongSender),
+            "the worker cannot sign off on their own work"
+        );
+        // Sent back, worked again, handed in again.
+        assert_eq!(
+            bounty_step(&db, "revise", ELIZA, "B1", "R1", None, "#ops", 15),
+            ActWrite::Filed {
+                was: Some("under_review".into()),
+                state: "assigned".into()
+            }
+        );
         assert!(matches!(
-            bounty_step(&db, "award", ELIZA, "B1", "AW", Some(MALLORY), "#ops", 20),
+            bounty_step(&db, "submit", SCHOLAR, "B1", "S2", None, "#ops", 16),
+            ActWrite::Filed { .. }
+        ));
+        assert_eq!(
+            bounty_step(&db, "accept-work", ELIZA, "B1", "A2", None, "#ops", 17),
+            ActWrite::Filed {
+                was: Some("under_review".into()),
+                state: "accepted".into()
+            }
+        );
+        assert_eq!(
+            db.act_task("B1").unwrap(),
+            None,
+            "accepted is the end of it"
+        );
+    }
+
+    /// Once work is in, the poster's only moves are taking it and sending it
+    /// back. Cancelling delivered work is the cheap unfairness the table
+    /// closes: the row simply does not reach under_review.
+    #[test]
+    fn delivered_work_is_not_something_the_poster_can_cancel() {
+        let db = Db::open_memory().unwrap();
+        bounty_offer(&db, "B1", "#ops", 10);
+        bounty_step(&db, "bid", SCHOLAR, "B1", "BID0", None, "#ops", 11);
+        bounty_step(&db, "award", ELIZA, "B1", "AW", Some("BID0"), "#ops", 12);
+        // Before it lands, cancelling is the poster's to do.
+        assert!(matches!(
+            bounty_step(&db, "cancel", ELIZA, "B1", "X0", None, "#ops", 13),
+            ActWrite::Filed { .. }
+        ));
+
+        bounty_offer(&db, "B2", "#ops", 20);
+        bounty_step(&db, "bid", SCHOLAR, "B2", "BID1", None, "#ops", 21);
+        bounty_step(&db, "award", ELIZA, "B2", "AW2", Some("BID1"), "#ops", 22);
+        bounty_step(&db, "submit", SCHOLAR, "B2", "S1", None, "#ops", 23);
+        assert_eq!(
+            bounty_step(&db, "cancel", ELIZA, "B2", "X1", None, "#ops", 24),
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::IllegalStep)
+        );
+        assert_eq!(db.act_task("B2").unwrap().unwrap().state, "under_review");
+    }
+
+    /// The worker's exit, from either state they may hold the work in. It is
+    /// terminal, so re-running the job is a new bounty naming this one.
+    #[test]
+    fn the_worker_forfeits_work_they_hold_before_or_after_handing_it_in() {
+        let db = Db::open_memory().unwrap();
+        for (task, submit_first) in [("B1", false), ("B2", true)] {
+            bounty_offer(&db, task, "#ops", 10);
+            bounty_step(
+                &db,
+                "bid",
+                SCHOLAR,
+                task,
+                &format!("{task}BID"),
+                None,
+                "#ops",
+                11,
+            );
+            bounty_step(
+                &db,
+                "award",
+                ELIZA,
+                task,
+                &format!("{task}AW"),
+                Some(&format!("{task}BID")),
+                "#ops",
+                12,
+            );
+            if submit_first {
+                bounty_step(
+                    &db,
+                    "submit",
+                    SCHOLAR,
+                    task,
+                    &format!("{task}S"),
+                    None,
+                    "#ops",
+                    13,
+                );
+            }
+            assert_eq!(
+                bounty_step(
+                    &db,
+                    "forfeit",
+                    ELIZA,
+                    task,
+                    &format!("{task}FE"),
+                    None,
+                    "#ops",
+                    14
+                ),
+                ActWrite::Refused(freeq_sdk::act_transitions::Refusal::WrongSender),
+                "{task}: the poster does not forfeit the worker's work"
+            );
+            assert_eq!(
+                bounty_step(
+                    &db,
+                    "forfeit",
+                    SCHOLAR,
+                    task,
+                    &format!("{task}F"),
+                    None,
+                    "#ops",
+                    15
+                ),
+                ActWrite::Filed {
+                    was: Some(match submit_first {
+                        true => "under_review".to_string(),
+                        false => "assigned".to_string(),
+                    }),
+                    state: "forfeited".into()
+                },
+                "{task}"
+            );
+            assert_eq!(db.act_task(task).unwrap(), None, "{task}: terminal");
+        }
+    }
+
+    /// A bounty takes bids until its own cutoff, which is read back out of
+    /// the opener's bytes like every other tag the view has no column for.
+    #[test]
+    fn a_bounty_stops_taking_bids_at_the_cutoff_its_offer_named() {
+        let db = Db::open_memory().unwrap();
+        // 1788000000 unix seconds, as the fixtures use it, and the two ids
+        // that sit either side of the tolerance around it.
+        const TOO_LATE: &str = "01M16HSC58ACCEPTTOOLATE000";
+        const AT_EDGE: &str = "01M16HSB60ACCEPTATEDGE0000";
+        let canonical = act_doc(
+            &[
+                ("+freeq.at/act", "bounty"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", ELIZA),
+                ("+freeq.at/act-title", "index the archive"),
+                ("+freeq.at/act-bid-deadline", "1788000000"),
+            ],
+            "#ops",
+            "B1",
+        );
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: "B1",
+            act_id: "B1",
+            opens: true,
+            venue: "#ops",
+            actor: ELIZA,
+            from_system: false,
+            origin: None,
+            timestamp: 10,
+        })
+        .unwrap();
+        assert_eq!(db.act_task_bid_deadline("B1").unwrap(), Some(1_788_000_000));
+
+        assert_eq!(
+            bounty_step(&db, "bid", SCHOLAR, "B1", TOO_LATE, None, "#ops", 11),
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::DeadlinePassed)
+        );
+        assert!(matches!(
+            bounty_step(&db, "bid", SCHOLAR, "B1", AT_EDGE, None, "#ops", 12),
+            ActWrite::Filed { .. }
+        ));
+        // Bidding closing does not stop the poster picking: the award is
+        // bound by act-deadline, which this offer never named.
+        assert!(matches!(
+            bounty_step(
+                &db,
+                "award",
+                ELIZA,
+                "B1",
+                TOO_LATE,
+                Some(AT_EDGE),
+                "#ops",
+                13
+            ),
+            ActWrite::Filed { .. }
+        ));
+        assert_eq!(
+            db.act_task("B1").unwrap().unwrap().assignee.as_deref(),
+            Some(SCHOLAR)
+        );
+    }
+
+    /// A bounty whose offer named no cutoff takes bids for as long as it
+    /// stands.
+    #[test]
+    fn a_bounty_with_no_cutoff_takes_bids_whenever_they_arrive() {
+        let db = Db::open_memory().unwrap();
+        bounty_offer(&db, "B1", "#ops", 10);
+        assert_eq!(db.act_task_bid_deadline("B1").unwrap(), None);
+        assert!(matches!(
+            bounty_step(
+                &db,
+                "bid",
+                SCHOLAR,
+                "B1",
+                "01M16HSC58ACCEPTTOOLATE000",
+                None,
+                "#ops",
+                11
+            ),
+            ActWrite::Filed { .. }
+        ));
+    }
+
+    /// An award points at one event, and only a bid on this action answers.
+    /// The bounty's own opener is not one, whatever else it is.
+    #[test]
+    fn an_award_naming_the_bounty_itself_is_refused() {
+        let db = Db::open_memory().unwrap();
+        bounty_offer(&db, "B1", "#ops", 10);
+        bounty_step(&db, "bid", SCHOLAR, "B1", "BID0", None, "#ops", 11);
+        assert_eq!(
+            bounty_step(&db, "award", ELIZA, "B1", "AW", Some("B1"), "#ops", 20),
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::AcceptsNotABid)
+        );
+        assert_eq!(db.act_task("B1").unwrap().unwrap().state, "open");
+    }
+
+    /// A bid is a bid on one bounty. Naming another bounty's — or one nobody
+    /// ever filed — takes nothing here.
+    #[test]
+    fn an_award_naming_a_bid_on_another_bounty_is_refused() {
+        let db = Db::open_memory().unwrap();
+        bounty_offer(&db, "B1", "#ops", 10);
+        bounty_offer(&db, "B2", "#ops", 11);
+        bounty_step(&db, "bid", SCHOLAR, "B2", "ELSEWHERE", None, "#ops", 12);
+        for named in ["ELSEWHERE", "NEVERFILED"] {
+            assert_eq!(
+                bounty_step(&db, "award", ELIZA, "B1", "AW", Some(named), "#ops", 20),
+                ActWrite::Refused(freeq_sdk::act_transitions::Refusal::AcceptsNotABid),
+                "{named}"
+            );
+        }
+        assert_eq!(db.act_task("B1").unwrap().unwrap().state, "open");
+    }
+
+    /// The server still never picks: it checks that the named event is a bid
+    /// on this action and nothing further. A bid nobody would have taken is
+    /// still one the poster may take.
+    #[test]
+    fn the_poster_takes_whichever_bid_they_name() {
+        let db = Db::open_memory().unwrap();
+        bounty_offer(&db, "B1", "#ops", 10);
+        bounty_step(&db, "bid", SCHOLAR, "B1", "BID0", None, "#ops", 11);
+        bounty_step(&db, "bid", MALLORY, "B1", "BID1", None, "#ops", 12);
+        assert!(matches!(
+            bounty_step(&db, "award", ELIZA, "B1", "AW", Some("BID1"), "#ops", 20),
             ActWrite::Filed { .. }
         ));
         assert_eq!(
@@ -3357,12 +3662,34 @@ mod tests {
 
         offer(&db, "T4", "#ops", None, 40);
 
-        // A bounty too: its award assigns the DID it names rather than the
-        // sender, and a rebuild that read the sender would disagree with the
-        // live row on exactly that column.
+        // A bounty too: its award assigns the author of the bid it names
+        // rather than the sender, and that is a fact the rebuild has to look
+        // up in the log exactly as ingress did. A rebuild that read the
+        // sender, or the first bid, would disagree with the live row on
+        // exactly that column — so there are two bids and the second is taken.
         bounty_offer(&db, "B1", "#ops", 50);
-        bounty_step(&db, "bid", MALLORY, "B1", "BID0", None, "#ops", 51);
-        bounty_step(&db, "award", ELIZA, "B1", "AW", Some(SCHOLAR), "#ops", 52);
+        // …and one whose offer named a bid cutoff, which the rebuild has to
+        // read back out of the opener exactly as ingress did.
+        bounty_offer_with_cutoff(&db, "B3", "#ops", 1_788_000_000, 50);
+        bounty_step(
+            &db,
+            "bid",
+            SCHOLAR,
+            "B3",
+            "01M16HSB60ACCEPTATEDGE0000",
+            None,
+            "#ops",
+            51,
+        );
+        bounty_step(&db, "bid", SCHOLAR, "B1", "BID0", None, "#ops", 51);
+        bounty_step(&db, "bid", MALLORY, "B1", "BID1", None, "#ops", 52);
+        bounty_step(&db, "award", ELIZA, "B1", "AW", Some("BID1"), "#ops", 53);
+        bounty_step(&db, "progress", MALLORY, "B1", "PR", None, "#ops", 54);
+        // …and into review and back out again, so the rebuild replays the
+        // states only a bounty has.
+        bounty_step(&db, "submit", MALLORY, "B1", "SB", None, "#ops", 55);
+        bounty_step(&db, "revise", ELIZA, "B1", "RV", None, "#ops", 56);
+        bounty_step(&db, "submit", MALLORY, "B1", "SB2", None, "#ops", 57);
 
         let venues = vec!["#ops".to_string(), "#other".to_string()];
         let mut live = db.act_tasks(&venues, None, None, None, 100).unwrap();
@@ -3372,8 +3699,8 @@ mod tests {
 
         assert_eq!(
             live.len(),
-            5,
-            "the declined one left the view; its revival and the bounty did not"
+            6,
+            "the declined one left the view; its revival and the bounties did not"
         );
         assert_eq!(rebuilt, live);
     }
@@ -6144,6 +6471,9 @@ impl Db {
         // materialized by them too, rather than by whatever the sender wrote.
         let mut was: Option<String> = None;
         let mut kind = view.kind.clone();
+        // Who the step assigns, when the row takes its assignee from the bid
+        // the event names rather than from the actor.
+        let mut assignee_named: Option<String> = None;
         let landed = if ev.opens {
             // The opener's own id is the task's id. A second opener under the
             // same id is the log's duplicate case, handled by the write below.
@@ -6169,14 +6499,28 @@ impl Db {
                 return Ok(ActWrite::WrongVenue);
             }
             let present: Vec<&str> = view.fields.keys().map(String::as_str).collect();
+            // The bid an award takes, resolved before the checker is asked:
+            // the checker reads no log, so the lookup is ours. Only a bid
+            // filed against this same action answers, which is what makes an
+            // award naming the opener — or a bid on somebody else's bounty —
+            // take nothing.
+            let accepts = view.fields.get("act-accepts").map(String::as_str);
+            let bid_author = match accepts {
+                Some(named) => self.act_bid_author(ev.act_id, named)?,
+                None => None,
+            };
             let event = rules::Event {
                 verb: &view.verb,
                 msgid: ev.event_id,
+                accepts,
                 fields: &present,
             };
             let sender = rules::Sender {
                 did: ev.actor,
                 is_system: ev.from_system,
+                accepted_bid: bid_author
+                    .as_deref()
+                    .map(|author| rules::AcceptedBid { author }),
             };
             let checked = rules::Task {
                 kind: &task.kind,
@@ -6185,11 +6529,17 @@ impl Db {
                 offeree: task.offeree.as_deref(),
                 assignee: task.assignee.as_deref(),
                 deadline: task.deadline,
+                // Read back out of the opener rather than carried in a
+                // column: it is one of the open set of act tags, and the view
+                // holds only what it needs to referee. The bytes are the
+                // record and they still have it.
+                bid_deadline: self.act_task_bid_deadline(ev.act_id)?,
             };
             match rules::check(&checked, &event, &sender) {
                 Ok(state) => {
                     was = Some(task.state.clone());
                     kind = task.kind.clone();
+                    assignee_named = bid_author;
                     state.to_string()
                 }
                 Err(refusal) => return Ok(ActWrite::Refused(refusal)),
@@ -6208,7 +6558,14 @@ impl Db {
         if !self.insert_event(&record)? {
             return Ok(ActWrite::Duplicate);
         }
-        self.materialize_act(ev, &view, &kind, was.as_deref(), &landed)?;
+        self.materialize_act(
+            ev,
+            &view,
+            &kind,
+            was.as_deref(),
+            &landed,
+            assignee_named.as_deref(),
+        )?;
         tx.commit()?;
         Ok(ActWrite::Filed { was, state: landed })
     }
@@ -6221,7 +6578,9 @@ impl Db {
     /// the log holds the history.
     ///
     /// `was` is the state the task came from — what the rules file is asked
-    /// about when it says where a transition's assignee comes from.
+    /// about when it says where a transition's assignee comes from, and
+    /// `named` is who the caller resolved the event's `act-accepts` to when
+    /// the row takes its assignee from a bid.
     fn materialize_act(
         &self,
         ev: &ActEvent<'_>,
@@ -6229,6 +6588,7 @@ impl Db {
         kind: &str,
         was: Option<&str>,
         landed: &str,
+        named: Option<&str>,
     ) -> SqlResult<()> {
         if freeq_sdk::act_transitions::is_terminal(kind, landed) {
             self.conn.execute(
@@ -6264,17 +6624,18 @@ impl Db {
         // work it is reporting on.
         //
         // Who it names is data. Accepting and claiming make the actor the
-        // assignee; a bounty's award names a winner in `act-to`, because the
-        // poster picks rather than becomes. A row whose field is absent names
-        // nobody and leaves the work unassigned — fail closed, though a
-        // `requires` on the same row is what actually keeps that from
-        // happening.
+        // assignee; a bounty's award takes the bid it names, and the work goes
+        // to whoever wrote that bid, because the poster picks rather than
+        // becomes. A row whose source resolves to nobody leaves the work
+        // unassigned — fail closed, though the checker refusing the step is
+        // what actually keeps that from happening.
         let assignee: Option<&str> = match freeq_sdk::act_transitions::assignee_source(
             kind,
             &view.verb,
             was.unwrap_or_default(),
         ) {
             freeq_sdk::act_transitions::AssigneeSource::Actor => Some(ev.actor),
+            freeq_sdk::act_transitions::AssigneeSource::AuthorOf(_) => named,
             freeq_sdk::act_transitions::AssigneeSource::Field(name) => {
                 view.fields.get(name).map(String::as_str)
             }
@@ -6408,21 +6769,77 @@ impl Db {
         rows.collect()
     }
 
-    /// Live tasks whose last movement is older than `cutoff` — the sweep's
-    /// candidates.
+    /// Live tasks whose last movement is older than `cutoff` and whose state
+    /// is one of `states` — the review sweep's candidates.
     ///
     /// `updated` is what is measured, so a task that anyone touched recently
-    /// is not abandoned however old its opener is.
-    pub fn act_tasks_idle_since(&self, cutoff: i64, limit: usize) -> SqlResult<Vec<ActTask>> {
-        let mut stmt = self.conn.prepare(
+    /// is not abandoned however old its opener is. On a review window that is
+    /// exactly the behaviour wanted: asking for changes moves the task, which
+    /// stops the clock, and the next submission starts a fresh one.
+    pub fn act_tasks_idle_in_states(
+        &self,
+        states: &[&str],
+        cutoff: i64,
+        limit: usize,
+    ) -> SqlResult<Vec<ActTask>> {
+        self.act_tasks_idle(states, true, cutoff, limit)
+    }
+
+    /// Live tasks idle since `cutoff` whose state is **not** one of `states` —
+    /// the expiry sweep's candidates.
+    ///
+    /// The complement of the query above, so the two clocks cannot both claim
+    /// a task. They pull in opposite directions: a review window favours the
+    /// worker and the idle limit is neutral, so a task sitting inside its
+    /// review window must not be expired out from under it by whichever of
+    /// the two numbers an operator happened to set lower.
+    pub fn act_tasks_idle_outside_states(
+        &self,
+        states: &[&str],
+        cutoff: i64,
+        limit: usize,
+    ) -> SqlResult<Vec<ActTask>> {
+        self.act_tasks_idle(states, false, cutoff, limit)
+    }
+
+    fn act_tasks_idle(
+        &self,
+        states: &[&str],
+        within: bool,
+        cutoff: i64,
+        limit: usize,
+    ) -> SqlResult<Vec<ActTask>> {
+        // A state name is a rules-file constant, never anything a sender
+        // wrote, but the list is built at runtime — so the placeholders are
+        // counted rather than the values interpolated. Numbered rather than
+        // bare: SQLite numbers a bare `?` from the highest index it has seen,
+        // which would collide with the `?2` the LIMIT further down already
+        // holds.
+        let holes = (0..states.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect::<Vec<_>>()
+            .join(",");
+        let test = match (states.is_empty(), within) {
+            // Nothing to be within, and everything is outside nothing.
+            (true, true) => "0".to_string(),
+            (true, false) => "1".to_string(),
+            (false, true) => format!("state IN ({holes})"),
+            (false, false) => format!("state NOT IN ({holes})"),
+        };
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT act_id, kind, venue, origin, state, offerer, offeree, assignee,
                     caps, deadline, replaces, updated
                FROM act_actions
-              WHERE updated < ?1
+              WHERE updated < ?1 AND {test}
               ORDER BY updated
-              LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![cutoff, limit as i64], |row| {
+              LIMIT ?2"
+        ))?;
+        let limit = limit as i64;
+        let mut args: Vec<&dyn rusqlite::ToSql> = vec![&cutoff, &limit];
+        for state in states {
+            args.push(state);
+        }
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), |row| {
             Ok(ActTask {
                 act_id: row.get(0)?,
                 kind: row.get(1)?,
@@ -6461,6 +6878,32 @@ impl Db {
                 .get("act-title")
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
+        }))
+    }
+
+    /// The bid cutoff an offer declared, read back out of the opener's bytes.
+    ///
+    /// The same reading `act_task_title` does, for the same reason: a second
+    /// deadline is one of the open set of act tags, and the view carries only
+    /// the columns it referees on. A value nobody can read as a number is a
+    /// cutoff this server cannot enforce, so it answers as absent — the tag
+    /// stays in the canonical either way.
+    pub fn act_task_bid_deadline(&self, act_id: &str) -> SqlResult<Option<i64>> {
+        let canonical: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT canonical FROM events WHERE kind = 'act' AND event_id = ?1",
+                params![act_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(canonical.and_then(|c| {
+            serde_json::from_str::<serde_json::Value>(&c)
+                .ok()?
+                .get("act-bid-deadline")
+                .and_then(|v| v.as_str())?
+                .parse::<i64>()
+                .ok()
         }))
     }
 
@@ -6515,6 +6958,28 @@ impl Db {
         let mut events: Vec<ActLoggedEvent> = rows.collect::<SqlResult<_>>()?;
         events.reverse();
         Ok(events)
+    }
+
+    /// Who wrote the bid `event_id` names on this action, or `None` when it
+    /// names something else.
+    ///
+    /// What an award's `act-accepts` resolves to, and the reason the checker
+    /// can stay a function of its arguments: the log answers here, once, and
+    /// hands the checker a fact. The search runs over the action's own events,
+    /// so an id filed against another action answers `None` for the same
+    /// reason a non-bid does — this award has nothing to take.
+    fn act_bid_author(&self, act_id: &str, event_id: &str) -> SqlResult<Option<String>> {
+        Ok(self
+            .act_task_events(act_id)?
+            .into_iter()
+            .find(|e| e.event_id == event_id)
+            .and_then(|e| {
+                let view = crate::events::derive_act_view(&e.canonical)?;
+                match view.verb == freeq_sdk::act_transitions::BID_VERB {
+                    true => e.actor_did,
+                    false => None,
+                }
+            }))
     }
 
     /// Every stored event of one task, oldest first: the opener, then each
@@ -6575,6 +7040,18 @@ impl Db {
 
         let mut live: std::collections::BTreeMap<String, ActTask> =
             std::collections::BTreeMap::new();
+        // The bids replayed so far, by the action they were filed against and
+        // their own id. This is the rebuild's copy of the lookup ingress does
+        // against the log: events come back in id order and a bid is always
+        // filed before the award that names it, so by the time an award is
+        // replayed its bid is here.
+        let mut bids: std::collections::BTreeMap<(String, String), String> =
+            std::collections::BTreeMap::new();
+        // And each opener's bid cutoff, which ingress reads back out of the
+        // opener's bytes. Kept here rather than looked up, because the bytes
+        // in question are the ones this replay has already passed.
+        let mut bid_deadlines: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
         for row in rows {
             let Some(view) = crate::events::derive_act_view(&row.canonical) else {
                 continue;
@@ -6590,6 +7067,9 @@ impl Db {
             let opens = row.subject.is_none();
             let mut was: Option<String> = None;
             let mut kind = view.kind.clone();
+            // The same fact ingress resolves before it asks the checker: who
+            // wrote the bid this event names, when it names one.
+            let mut named: Option<String> = None;
             let landed = if opens {
                 match freeq_sdk::act_transitions::check_open(
                     &view.kind,
@@ -6607,6 +7087,10 @@ impl Db {
                 was = Some(task.state.clone());
                 kind = task.kind.clone();
                 let present: Vec<&str> = view.fields.keys().map(String::as_str).collect();
+                let accepts = view.fields.get("act-accepts").map(String::as_str);
+                named = accepts
+                    .and_then(|id| bids.get(&(act_id.clone(), id.to_string())))
+                    .cloned();
                 match freeq_sdk::act_transitions::check(
                     &freeq_sdk::act_transitions::Task {
                         kind: &task.kind,
@@ -6615,10 +7099,12 @@ impl Db {
                         offeree: task.offeree.as_deref(),
                         assignee: task.assignee.as_deref(),
                         deadline: task.deadline,
+                        bid_deadline: bid_deadlines.get(&act_id).copied(),
                     },
                     &freeq_sdk::act_transitions::Event {
                         verb: &view.verb,
                         msgid: &row.event_id,
+                        accepts,
                         fields: &present,
                     },
                     &freeq_sdk::act_transitions::Sender {
@@ -6627,17 +7113,31 @@ impl Db {
                         // it accepted this one — including an expiry it signed
                         // itself, whose sender check already passed.
                         is_system: true,
+                        accepted_bid: named
+                            .as_deref()
+                            .map(|author| freeq_sdk::act_transitions::AcceptedBid { author }),
                     },
                 ) {
                     Ok(s) => s.to_string(),
                     Err(_) => continue,
                 }
             };
+            // Filed, so it is one of the action's bids from here on.
+            if view.verb == freeq_sdk::act_transitions::BID_VERB {
+                bids.insert((act_id.clone(), row.event_id.clone()), row.actor.clone());
+            }
             if freeq_sdk::act_transitions::is_terminal(&kind, &landed) {
                 live.remove(&act_id);
                 continue;
             }
             if opens {
+                if let Some(cutoff) = view
+                    .fields
+                    .get("act-bid-deadline")
+                    .and_then(|v| v.parse::<i64>().ok())
+                {
+                    bid_deadlines.insert(act_id.clone(), cutoff);
+                }
                 live.insert(
                     act_id.clone(),
                     ActTask {
@@ -6668,6 +7168,7 @@ impl Db {
                         freeq_sdk::act_transitions::AssigneeSource::Actor => {
                             Some(row.actor.clone())
                         }
+                        freeq_sdk::act_transitions::AssigneeSource::AuthorOf(_) => named.clone(),
                         freeq_sdk::act_transitions::AssigneeSource::Field(name) => {
                             view.fields.get(name).cloned()
                         }

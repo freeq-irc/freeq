@@ -66,9 +66,10 @@ export {
 } from "./act.js";
 export type { ActVerifyResult } from "./act.js";
 
-// The eight moves a bot can make on a task — one function per verb, each
-// doing the paired send (the signed task event, plus the line people read).
-// `expire` is absent on purpose: only the server makes that move.
+// The moves a bot can make on a task — one function per verb, each doing the
+// paired send (the signed task event, plus the line people read). A handoff's
+// first, then the ones only a bounty has. `expire` and `auto-accept` are
+// absent on purpose: only the server makes those moves.
 export {
   offer,
   accept,
@@ -78,8 +79,20 @@ export {
   complete,
   fail,
   cancel,
+  bid,
+  award,
+  submit,
+  revise,
+  acceptWork,
+  forfeit,
 } from "./act-verbs.js";
-export type { ActContext, OfferOptions, StepOptions } from "./act-verbs.js";
+export type {
+  ActContext,
+  OfferOptions,
+  StepOptions,
+  BidOptions,
+  AcceptWorkOptions,
+} from "./act-verbs.js";
 
 // The task lifecycle rules — which move is legal, from which state, by whom.
 // The rules are data (spec/act-transitions.json, copied into src/); this is
