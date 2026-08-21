@@ -756,6 +756,11 @@ pub struct SharedState {
     /// Bounded and in memory only — a restart drops what is parked, which is
     /// the same thing an eviction drops: events nobody was shown.
     pub(crate) act_deferred: Mutex<crate::act_relay::DeferQueue>,
+    /// Transitions waiting to reach the server that owns their task. Bounded
+    /// and in memory only, beside the defer queue and for the same reason:
+    /// what is held here is already filed, so a restart costs a prompt ruling
+    /// rather than a record.
+    pub(crate) act_routes: Mutex<crate::act_relay::RouteQueue>,
     /// S2S manager (if clustering is active).
     pub s2s_manager: Mutex<Option<Arc<crate::s2s::S2sManager>>>,
     /// CRDT document for cluster state convergence.
@@ -1678,6 +1683,7 @@ impl Server {
                 self.config.act_defer_max_per_origin,
                 self.config.act_defer_max_total,
             )),
+            act_routes: Mutex::new(crate::act_relay::RouteQueue::new(MAX_PENDING_ROUTES)),
             s2s_manager: Mutex::new(None),
             cluster_doc: crate::crdt::ClusterDoc::new(&self.config.server_name),
             db: db.map(Mutex::new),
@@ -1900,6 +1906,11 @@ impl Server {
                 Ok((manager, mut s2s_rx)) => {
                     // Store manager in shared state so iroh accept loop can route S2S
                     *state.s2s_manager.lock() = Some(Arc::clone(&manager));
+
+                    // Transitions that could not reach the server owning their
+                    // task are retried from here. Only meaningful with
+                    // federation running, which is exactly where this is.
+                    spawn_act_route_retry(Arc::clone(&state));
 
                     // Connect to configured peers with auto-reconnection
                     for peer_id in &self.config.s2s_peers {
@@ -3424,6 +3435,7 @@ pub(crate) fn apply_replayed_event(
     let ctx = EventContext {
         sig_state,
         origin: (!origin.is_empty()).then(|| origin.to_string()),
+        ..Default::default()
     };
     let signature = ev.signature.as_deref();
     let filed = if ev.canonical.is_empty() {
@@ -3576,6 +3588,12 @@ pub(crate) enum TaskEventAction {
 ///
 /// One thing is settled ahead of the signature: an event that claims no
 /// origin is refused whatever its bytes say.
+///
+/// The second half of the answer is the receipt this server owes when the
+/// event was a move on a task it owns. Handed back rather than sent, so a
+/// caller puts it on the wire after the event it confirms — a reader sees the
+/// move before the confirmation of it.
+#[allow(clippy::too_many_arguments)]
 fn judge_relayed_task_event(
     state: &Arc<SharedState>,
     from: &str,
@@ -3585,7 +3603,7 @@ fn judge_relayed_task_event(
     peer: &str,
     peer_account: Option<&str>,
     peer_declared_act: bool,
-) -> TaskEventAction {
+) -> (TaskEventAction, Option<crate::connection::act::Receipt>) {
     let event_id = tags
         .get(freeq_sdk::chatsig::EVENT_ID_TAG)
         .or_else(|| tags.get(freeq_sdk::chatsig::EVENT_ID_TAG_BARE))
@@ -3607,7 +3625,7 @@ fn judge_relayed_task_event(
             "Refused a relayed task event that claims no origin — filing it \
              would make this server the task's home"
         );
-        return TaskEventAction::Drop;
+        return (TaskEventAction::Drop, None);
     }
 
     let dm_recipient = (!(target.starts_with('#') || target.starts_with('&')))
@@ -3642,10 +3660,10 @@ fn judge_relayed_task_event(
 
     match verdict {
         crate::act_relay::RelayVerdict::Valid => {
-            store_relayed_task_event(state, tags, target, origin, peer_account);
-            TaskEventAction::Deliver
+            let receipt = store_relayed_task_event(state, tags, target, origin, peer_account, from);
+            (TaskEventAction::Deliver, receipt)
         }
-        crate::act_relay::RelayVerdict::Invalid(_) => TaskEventAction::Drop,
+        crate::act_relay::RelayVerdict::Invalid(_) => (TaskEventAction::Drop, None),
         crate::act_relay::RelayVerdict::Unverifiable(why) => {
             // A key not held yet is the one unverifiable cause a lookup can
             // fix: ask the relay origin's key server for it, off the delivery
@@ -3679,9 +3697,158 @@ fn judge_relayed_task_event(
             for event in &dropped {
                 note_dropped_unchecked(state, event);
             }
-            TaskEventAction::Park
+            (TaskEventAction::Park, None)
         }
     }
+}
+
+/// How many transitions may be waiting for their homes at once.
+///
+/// A ceiling rather than a promise: a home that stays away long enough is
+/// healed by catch-up, which is what the log is for, so the queue exists to
+/// make the common case prompt and not to guarantee delivery.
+const MAX_PENDING_ROUTES: usize = 1024;
+
+/// How often the pending routes are looked at. Coarse on purpose — the backoff
+/// is measured in tens of seconds, so a finer tick would only spin.
+const ROUTE_TICK: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// One task event as it has to travel: the signed tags, and where they were
+/// delivered. Nothing here may be rebuilt or tidied — the signature covers the
+/// tags, and the venue is derived from the target.
+#[derive(Clone)]
+pub(crate) struct TaskEventWire {
+    pub act_id: String,
+    pub event_id: String,
+    pub tags: HashMap<String, String>,
+    pub target: String,
+    pub from: String,
+    pub account: Option<String>,
+}
+
+/// Ask the server that owns a task to rule on a transition it may not have
+/// ruled on yet.
+///
+/// The event has already been filed here, unconfirmed, and already gone out to
+/// every act-capable peer including the home. This is the addressed copy: a
+/// broadcast is best-effort, and a home that was away when it went out has no
+/// second chance at it, while a ruling is not optional.
+pub(crate) fn route_transition_home(state: &Arc<SharedState>, ev: TaskEventWire, home: &str) {
+    if home.is_empty() {
+        return;
+    }
+    let origin = state.server_iroh_id.lock().clone().unwrap_or_default();
+    let message = crate::s2s::S2sMessage::ActRoute {
+        // Stamped fresh at each attempt; see `PendingRoute::message`.
+        event_id: String::new(),
+        act_id: ev.act_id.clone(),
+        act_event_id: ev.event_id.clone(),
+        tags: ev.tags,
+        target: ev.target,
+        from: ev.from,
+        account: ev.account,
+        origin,
+    };
+    state
+        .act_routes
+        .lock()
+        .park(crate::act_relay::PendingRoute {
+            act_id: ev.act_id,
+            event_id: ev.event_id,
+            home: home.to_string(),
+            message,
+            attempts: 0,
+            next_attempt: std::time::Instant::now(),
+            seq: 0,
+        });
+    let state = Arc::clone(state);
+    tokio::spawn(async move { flush_pending_routes(&state).await });
+}
+
+/// Try every route that is due, and put back the ones that are still owed an
+/// answer.
+///
+/// **Every outcome goes back on the list**, so today a route is carried until
+/// the queue's own ceiling gives it up — [`crate::act_relay::RouteQueue::park`]
+/// drops the oldest with a warning once `MAX_PENDING_ROUTES` is reached, and
+/// that is the only end an unanswered ask reaches. None of the three outcomes
+/// is a ruling: a link accepts a send for as long as it takes to notice it is
+/// dead, a peer that will not take one may be mid-handshake, and an
+/// unreachable home may come back. What ends the asking properly is the event
+/// ceasing to be unconfirmed — and nothing on this server flips that yet,
+/// because the ruling that would is the home's receipt and receipts do not
+/// cross servers here. The check is written where it belongs and the backoff
+/// bounds the cost meanwhile.
+pub(crate) async fn flush_pending_routes(state: &Arc<SharedState>) {
+    let Some(manager) = state.s2s_manager.lock().clone() else {
+        // No federation running: there is nobody to ask, and the routes stay
+        // where they are in case one starts.
+        return;
+    };
+    let due = state.act_routes.lock().take_due(std::time::Instant::now());
+    for mut route in due {
+        // What the route is for, asked before every attempt: is this event
+        // still waiting on its home? Confirmed, superseded, or not on file —
+        // each is an end to the asking.
+        if state.with_db(|db| db.act_event_is_unconfirmed(&route.event_id)) != Some(true) {
+            tracing::debug!(
+                act_id = %route.act_id, event_id = %route.event_id, home = %route.home,
+                "This transition is no longer waiting on a ruling; nothing left to carry"
+            );
+            continue;
+        }
+        // A fresh envelope id per attempt. The receiver's dedup rejects a
+        // counter at or below the high-water mark it already holds from us, so
+        // a retry under the original id would be dropped as a replay of
+        // something that never arrived.
+        if let crate::s2s::S2sMessage::ActRoute { event_id, .. } = &mut route.message {
+            *event_id = manager.next_event_id();
+        }
+        match manager
+            .route_to_home(&route.home, route.message.clone())
+            .await
+        {
+            crate::s2s::RouteOutcome::Sent => tracing::debug!(
+                act_id = %route.act_id, event_id = %route.event_id, home = %route.home,
+                attempts = route.attempts,
+                "Carried a task transition to the server that owns the task"
+            ),
+            crate::s2s::RouteOutcome::Unreachable => tracing::debug!(
+                act_id = %route.act_id, event_id = %route.event_id, home = %route.home,
+                attempts = route.attempts,
+                "The server that owns this task is not reachable; will ask again"
+            ),
+            crate::s2s::RouteOutcome::Refused(why) => tracing::warn!(
+                act_id = %route.act_id, event_id = %route.event_id, home = %route.home,
+                reason = %why,
+                "Cannot carry a task transition to the server that owns the task \
+                 right now; will ask again"
+            ),
+        }
+        route.attempts += 1;
+        route.next_attempt =
+            std::time::Instant::now() + crate::act_relay::retry_backoff(route.attempts);
+        state.act_routes.lock().park(route);
+    }
+}
+
+/// The tick that retries what could not be delivered.
+///
+/// A tick rather than a peer-connect hook: a link coming back is not the only
+/// reason an attempt can newly succeed, and one timer covers every reason
+/// without a second mechanism to keep honest.
+fn spawn_act_route_retry(state: Arc<SharedState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(ROUTE_TICK);
+        interval.tick().await; // skip the immediate first tick
+        loop {
+            interval.tick().await;
+            if state.act_routes.lock().is_empty() {
+                continue;
+            }
+            flush_pending_routes(&state).await;
+        }
+    });
 }
 
 /// Store a task event this server verified itself, under the id its signer
@@ -3697,20 +3864,14 @@ fn store_relayed_task_event(
     target: &str,
     origin: &str,
     peer_account: Option<&str>,
-) {
-    let Some(signer) = crate::act_relay::claimed_signer(tags, peer_account) else {
-        return;
-    };
-    let Some(event_id) = tags
+    from: &str,
+) -> Option<crate::connection::act::Receipt> {
+    let signer = crate::act_relay::claimed_signer(tags, peer_account)?;
+    let event_id = tags
         .get(freeq_sdk::chatsig::EVENT_ID_TAG)
         .or_else(|| tags.get(freeq_sdk::chatsig::EVENT_ID_TAG_BARE))
-        .cloned()
-    else {
-        return;
-    };
-    let Some(venue) = crate::connection::messaging::signing_venue(state, signer, target) else {
-        return;
-    };
+        .cloned()?;
+    let venue = crate::connection::messaging::signing_venue(state, signer, target)?;
     let signature = tags
         .get("+freeq.at/sig")
         .or_else(|| tags.get("freeq.at/sig"))
@@ -3719,9 +3880,7 @@ fn store_relayed_task_event(
 
     if crate::connection::act::carries_act_tags(tags) {
         let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        let Ok(canonical) = freeq_sdk::act::act_canonical(pairs, &venue, &event_id) else {
-            return;
-        };
+        let canonical = freeq_sdk::act::act_canonical(pairs, &venue, &event_id).ok()?;
         let kind = tags
             .get("+freeq.at/act")
             .or_else(|| tags.get("freeq.at/act"))
@@ -3762,26 +3921,66 @@ fn store_relayed_task_event(
                 timestamp: now,
             })
         });
+        // A move on a task this server owns, applied here. Our word is what
+        // turns it from a claim into a decision, and the receipt is that word
+        // written down. Handed back rather than sent, so it goes out after the
+        // event it names.
+        if let Some(written) = written.as_ref() {
+            let receipt = crate::connection::act::receipt_for_applied_move(
+                state,
+                &crate::connection::act::AppliedMove {
+                    kind,
+                    act_id: &act_id,
+                    event_id: &event_id,
+                    venue: &venue,
+                    actor: signer,
+                    written,
+                },
+            );
+            if receipt.is_some() {
+                return receipt;
+            }
+        }
         match written {
             None | Some(crate::db::ActWrite::Filed { .. }) => {}
-            Some(crate::db::ActWrite::StoredNotApplied) => tracing::info!(
-                origin = %origin, act_id = %act_id, event_id = %event_id, verb = %verb,
-                "Filed a relayed task event without applying it: the task belongs to \
-                 another server, which is the authority over what it does"
-            ),
+            Some(crate::db::ActWrite::StoredNotApplied) => {
+                tracing::info!(
+                    origin = %origin, act_id = %act_id, event_id = %event_id, verb = %verb,
+                    "Filed a relayed task event without applying it: the task belongs to \
+                     another server, which is the authority over what it does"
+                );
+                // …and that server is asked for its ruling. A peer that holds
+                // the event unruled carries it too: on a network that is not a
+                // full mesh, that path may be the only one there is, and the
+                // home dedups a copy it already has.
+                let home = state
+                    .with_db(|db| db.act_task_origin(&act_id))
+                    .flatten()
+                    .unwrap_or_default();
+                route_transition_home(
+                    state,
+                    TaskEventWire {
+                        act_id: act_id.clone(),
+                        event_id: event_id.clone(),
+                        tags: tags.clone(),
+                        target: target.to_string(),
+                        from: from.to_string(),
+                        account: Some(signer.to_string()),
+                    },
+                    &home,
+                );
+            }
             Some(other) => tracing::debug!(
                 origin = %origin, act_id = %act_id, event_id = %event_id,
                 outcome = ?other,
                 "A relayed task event was not filed"
             ),
         }
-        return;
+        return None;
     }
 
     // The stopgap coordination family, filed the way local ingress files one.
-    let Some(event_type) = tags.get("+freeq.at/event").cloned() else {
-        return;
-    };
+    let event_type = tags.get("+freeq.at/event").cloned()?;
     let doc =
         crate::act_relay::coordination_doc_from_tags(tags, signer, &event_id, &venue, &event_type);
     let canonical = doc.canonical();
@@ -3819,6 +4018,9 @@ fn store_relayed_task_event(
             "Refused a relayed coordination event: that id is already on file"
         );
     }
+    // The stopgap family has no task view and no rulings; there is nothing for
+    // a caller to put on the wire.
+    None
 }
 
 /// Leave the visible trace of a dropped event: if it belonged to a task on
@@ -3886,7 +4088,7 @@ pub(crate) fn retry_deferred_task_events(state: &Arc<SharedState>, did: &str, ki
         "A signing key arrived; re-checking the task events that were waiting for it"
     );
     for event in waiting {
-        let action = judge_relayed_task_event(
+        let (action, receipt) = judge_relayed_task_event(
             state,
             &event.from,
             &event.target,
@@ -3907,6 +4109,9 @@ pub(crate) fn retry_deferred_task_events(state: &Arc<SharedState>, did: &str, ki
                 // the signer's own sessions get it like any checked event.
                 true,
             );
+        }
+        if let Some(receipt) = receipt {
+            crate::connection::act::broadcast_receipt(state, &receipt, &event.target);
         }
     }
 }
@@ -4168,6 +4373,9 @@ pub(crate) async fn process_s2s_message(
         S2sMessage::AvSessionEnded {
             event_id, origin, ..
         } => (event_id.clone(), origin.clone()),
+        S2sMessage::ActRoute {
+            event_id, origin, ..
+        } => (event_id.clone(), origin.clone()),
         S2sMessage::CrdtSync { origin, .. } => (String::new(), origin.clone()),
         S2sMessage::PeerDisconnected { .. } => (String::new(), String::new()),
         // Catch-up carries no event id of its own: the *replayed* events
@@ -4202,6 +4410,7 @@ pub(crate) async fn process_s2s_message(
         (
             S2sMessage::Privmsg { .. }
             | S2sMessage::Tagmsg { .. }
+            | S2sMessage::ActRoute { .. }
             | S2sMessage::Pin { .. }
             | S2sMessage::Join { .. }
             | S2sMessage::Part { .. }
@@ -4651,6 +4860,7 @@ pub(crate) async fn process_s2s_message(
                     _ => crate::events::SigState::Unverifiable,
                 },
                 origin: Some(origin_name.clone()),
+                ..Default::default()
             };
             relay_tags.insert("+freeq.at/origin".to_string(), origin_name);
 
@@ -5183,6 +5393,10 @@ pub(crate) async fn process_s2s_message(
             // covers them.
             let is_task_event = crate::connection::act::carries_act_tags(&tags)
                 || tags.contains_key("+freeq.at/event");
+            // The receipt this server owes if the event turns out to be a move
+            // on a task it owns. Held until after delivery below, so the room
+            // sees the move before the confirmation of it.
+            let mut owed_receipt = None;
             if is_task_event {
                 let peer_declared_act = crate::s2s::peer_supports(
                     &manager
@@ -5194,7 +5408,7 @@ pub(crate) async fn process_s2s_message(
                         .unwrap_or_default(),
                     crate::s2s::ACT,
                 );
-                if judge_relayed_task_event(
+                let (action, receipt) = judge_relayed_task_event(
                     state,
                     &from,
                     &target,
@@ -5203,10 +5417,11 @@ pub(crate) async fn process_s2s_message(
                     authenticated_peer_id,
                     peer_account.as_deref(),
                     peer_declared_act,
-                ) != TaskEventAction::Deliver
-                {
+                );
+                if action != TaskEventAction::Deliver {
                     return;
                 }
+                owed_receipt = receipt;
             }
 
             // ── A relayed mutation takes the actor's own proof ──────────
@@ -5330,6 +5545,7 @@ pub(crate) async fn process_s2s_message(
                         crate::events::SigState::Unverifiable
                     },
                     origin: Some(sanitize_s2s_str(&origin, 64)),
+                    ..Default::default()
                 },
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -5477,6 +5693,10 @@ pub(crate) async fn process_s2s_message(
                 sig_verdict == Some(crate::connection::messaging::ClientSigVerdict::Valid)
                     || is_task_event,
             );
+
+            if let Some(receipt) = owed_receipt {
+                crate::connection::act::broadcast_receipt(state, &receipt, &target);
+            }
         }
 
         S2sMessage::Join {
@@ -5846,6 +6066,75 @@ pub(crate) async fn process_s2s_message(
             };
             if let Some(entry) = manager.peers.lock().await.get(authenticated_peer_id) {
                 let _ = entry.tx.send(reply).await;
+            }
+        }
+
+        // ── a transition carried here because we own the task ──
+        //
+        // Verified exactly as any relayed task event is — the same judge, the
+        // same three-way verdict, the same defer queue when the signer's key
+        // has not arrived yet — and then decided, because deciding is what was
+        // asked for. When the rules take a move on a task of ours, the store
+        // path mints the receipt for it: the same always-emit rule a local
+        // sender's move gets. When the rules refuse it, nothing is filed and
+        // nothing goes out — the claim stays unconfirmed wherever it is held,
+        // which is the true account of a losing one.
+        //
+        // Not delivered to local clients. The event reaches them by the
+        // ordinary relay every task event takes, and delivering the addressed
+        // copy as well would put the same event in the room twice.
+        S2sMessage::ActRoute {
+            act_id,
+            act_event_id,
+            tags,
+            target,
+            from,
+            account,
+            ..
+        } => {
+            let act_id = sanitize_s2s_str(&act_id, 100);
+            let act_event_id = sanitize_s2s_str(&act_event_id, 100);
+            let target = sanitize_s2s_str(&target, 200);
+            let from = sanitize_s2s_str(&from, 512);
+            let peer_account = account.map(|a| sanitize_s2s_str(&a, 512));
+
+            // Ours to rule on, or misrouted. A task we have never seen opened
+            // is not ours either — the store path says so and files nothing.
+            let home = state
+                .with_db(|db| db.act_task_origin(&act_id))
+                .flatten()
+                .unwrap_or_default();
+            if !home.is_empty() {
+                tracing::warn!(
+                    peer = %authenticated_peer_id, act_id = %act_id,
+                    event_id = %act_event_id, home = %home,
+                    "A task transition was carried here for a task another server owns — dropped"
+                );
+                return;
+            }
+
+            let peer_declared_act = crate::s2s::peer_supports(
+                &manager
+                    .peer_capabilities
+                    .lock()
+                    .await
+                    .get(authenticated_peer_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                crate::s2s::ACT,
+            );
+            let (_, receipt) = judge_relayed_task_event(
+                state,
+                &from,
+                &target,
+                &tags,
+                &origin,
+                authenticated_peer_id,
+                peer_account.as_deref(),
+                peer_declared_act,
+            );
+            if let Some(receipt) = receipt {
+                crate::connection::act::broadcast_receipt(state, &receipt, &target);
             }
         }
 
@@ -7118,6 +7407,7 @@ mod s2s_adversarial_tests {
                 config.act_defer_max_per_origin,
                 config.act_defer_max_total,
             )),
+            act_routes: Mutex::new(crate::act_relay::RouteQueue::new(MAX_PENDING_ROUTES)),
             s2s_manager: Mutex::new(None),
             cluster_doc: crate::crdt::ClusterDoc::new("test-server-id"),
             db: db.map(Mutex::new),
@@ -13649,6 +13939,410 @@ mod relayed_task_verdict_tests {
             .await
             .expect("timeout waiting for delivery")
             .expect("channel closed")
+    }
+
+    // ── carrying a transition to the server that owns the task ───────────
+    //
+    // A transition on a task this server does not own is filed here and moves
+    // nothing, so the only way it is ever decided is for the server that owns
+    // the task to be asked. The ordinary relay already reaches that server,
+    // but a broadcast is best-effort and has no second try; the addressed copy
+    // is what closes the gap when the home was away.
+
+    /// Put `PEER` on the peers map with a link the test can read, optionally
+    /// declaring the capability that lets a routed transition be handed over.
+    async fn link_peer(
+        mgr: &Arc<crate::s2s::S2sManager>,
+        takes_routes: bool,
+    ) -> mpsc::Receiver<S2sMessage> {
+        let (tx, rx) = mpsc::channel(16);
+        mgr.peers
+            .lock()
+            .await
+            .insert(PEER.to_string(), crate::s2s::PeerEntry { tx, conn_gen: 1 });
+        if takes_routes {
+            mgr.peer_capabilities
+                .lock()
+                .await
+                .insert(PEER.to_string(), vec![crate::s2s::ACT_ROUTE.to_string()]);
+        }
+        rx
+    }
+
+    /// A task `PEER` owns, with one transition on it filed here unconfirmed
+    /// and a route to `PEER` waiting — the state every route test starts from.
+    ///
+    /// The transition arrives over a third server's link, which is what an
+    /// agent elsewhere claiming `PEER`'s task looks like on the wire.
+    async fn a_transition_waiting_for_its_home(
+        state: &Arc<SharedState>,
+        mgr: &Arc<crate::s2s::S2sManager>,
+        channel: &str,
+        act_id: &str,
+        claim: &str,
+        key: &ed25519_dalek::SigningKey,
+    ) {
+        relay(
+            state,
+            mgr,
+            channel,
+            act_id,
+            signed_offer_tags(channel, act_id, key),
+        )
+        .await;
+
+        const THIRD: &str = "fake-third-peer-id-for-testing";
+        mgr.authenticated_peers
+            .lock()
+            .await
+            .insert(THIRD.to_string());
+        super::S2S_RATE_LIMITS.lock().remove(THIRD);
+
+        process_s2s_message(
+            state,
+            mgr,
+            THIRD,
+            S2sMessage::Tagmsg {
+                event_id: format!("{THIRD}:{claim}"),
+                from: "scholar!s@third".to_string(),
+                target: channel.to_string(),
+                tags: signed_follow_up_tags(channel, claim, "claim", act_id, SIGNER, &[], key),
+                origin: THIRD.to_string(),
+                account: Some(SIGNER.to_string()),
+            },
+        )
+        .await;
+    }
+
+    /// Read every routed transition a peer's link was handed.
+    async fn routed_to_peer(rx: &mut mpsc::Receiver<S2sMessage>) -> Vec<String> {
+        let mut seen = Vec::new();
+        while let Ok(Some(msg)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+        {
+            if let S2sMessage::ActRoute { act_event_id, .. } = msg {
+                seen.push(act_event_id);
+            }
+        }
+        seen
+    }
+
+    /// What the log says about whose ruling one task event carries.
+    fn ruling_on(state: &Arc<SharedState>, act_id: &str, event_id: &str) -> String {
+        state
+            .with_db(|db| db.act_task_events(act_id))
+            .unwrap_or_default()
+            .into_iter()
+            .find(|e| e.event_id == event_id)
+            .map(|e| e.confirm.as_str().to_string())
+            .unwrap_or_else(|| "<not on file>".to_string())
+    }
+
+    /// Carry one transition here as the server holding it unruled would.
+    async fn route_here(
+        state: &Arc<SharedState>,
+        mgr: &Arc<crate::s2s::S2sManager>,
+        channel: &str,
+        act_id: &str,
+        event_id: &str,
+        tags: HashMap<String, String>,
+    ) {
+        process_s2s_message(
+            state,
+            mgr,
+            PEER,
+            S2sMessage::ActRoute {
+                event_id: format!("{PEER}:{event_id}"),
+                act_id: act_id.to_string(),
+                act_event_id: event_id.to_string(),
+                tags,
+                target: channel.to_string(),
+                from: "tasker!t@remote".to_string(),
+                account: Some(SIGNER.to_string()),
+                origin: PEER.to_string(),
+            },
+        )
+        .await;
+    }
+
+    /// A transition this server cannot decide is filed unconfirmed and carried
+    /// to the server that can decide it.
+    #[tokio::test]
+    async fn a_transition_on_a_peers_task_is_carried_to_that_peer() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#routeout");
+        let key = key_on_file(&state, SIGNER);
+
+        let act_id = "01ROUTEOUTOFFER00000000000";
+        let claim = "01ROUTEOUTCLAIM0000000000";
+        a_transition_waiting_for_its_home(&state, &mgr, "#routeout", act_id, claim, &key).await;
+
+        assert_eq!(
+            state
+                .with_db(|db| db.act_task(act_id))
+                .flatten()
+                .expect("still live")
+                .state,
+            "open",
+            "nothing here rules on a task it does not own"
+        );
+        assert_eq!(
+            ruling_on(&state, act_id, claim),
+            "unconfirmed",
+            "and the log says the claim is waiting on somebody"
+        );
+        let waiting = state.act_routes.lock().take_due(std::time::Instant::now());
+        assert_eq!(
+            waiting
+                .iter()
+                .map(|r| (r.event_id.as_str(), r.home.as_str()))
+                .collect::<Vec<_>>(),
+            [(claim, PEER)],
+            "the claim is on its way to the server that owns the task"
+        );
+    }
+
+    /// The copy carried to the home is the signed event, byte for byte.
+    ///
+    /// The signature covers every act tag, the venue and the id, so a tag
+    /// added, dropped or tidied on the way out would reach the home as a
+    /// forgery — and the home would refuse the very move it was being asked
+    /// to rule on.
+    #[tokio::test]
+    async fn a_routed_copy_carries_the_signed_tags_verbatim() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#routebytes");
+        let key = key_on_file(&state, SIGNER);
+
+        let act_id = "01ROUTEBYTESOFFER00000000";
+        let claim = "01ROUTEBYTESCLAIM00000000";
+        a_transition_waiting_for_its_home(&state, &mgr, "#routebytes", act_id, claim, &key).await;
+        let signed =
+            signed_follow_up_tags("#routebytes", claim, "claim", act_id, SIGNER, &[], &key);
+
+        let waiting = state.act_routes.lock().take_due(std::time::Instant::now());
+        let [route] = waiting.as_slice() else {
+            panic!("one transition is waiting for its home");
+        };
+        let crate::s2s::S2sMessage::ActRoute { tags, target, .. } = &route.message else {
+            panic!("a route carries an addressed copy");
+        };
+        assert_eq!(tags, &signed, "the tag map travels as the signer wrote it");
+        assert_eq!(
+            tags.get("+freeq.at/sig"),
+            signed.get("+freeq.at/sig"),
+            "the signature among them, unchanged"
+        );
+        assert_eq!(
+            target, "#routebytes",
+            "and the venue it was signed over is recoverable from the target"
+        );
+    }
+
+    /// The addressed copy is for the home to rule on, not for the room to see
+    /// again. The event has already reached every local client by the ordinary
+    /// relay, and delivering the ask as well would put one event in the room
+    /// twice.
+    #[tokio::test]
+    async fn a_routed_copy_is_not_delivered_to_local_clients_again() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let mut rx = capable_member(&state, "#routequiet");
+        let key = key_on_file(&state, SIGNER);
+
+        let act_id = "01ROUTEQUIETOFFER00000000";
+        our_own_task(&state, "#routequiet", act_id);
+
+        let claim = "01ROUTEQUIETCLAIM00000000";
+        let tags = signed_follow_up_tags("#routequiet", claim, "claim", act_id, SIGNER, &[], &key);
+        relay(&state, &mgr, "#routequiet", claim, tags.clone()).await;
+
+        let mut shown = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            shown.push(line);
+        }
+        assert!(
+            shown.iter().any(|line| {
+                line.contains(&format!("{}={claim}", freeq_sdk::chatsig::EVENT_ID_TAG))
+            }),
+            "the ordinary relay is what shows the claim in the room: {shown:?}"
+        );
+
+        route_here(&state, &mgr, "#routequiet", act_id, claim, tags).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "the same event carried here to be ruled on reaches nobody a second time"
+        );
+    }
+
+    /// A link taking a message says nothing about the home having ruled on it,
+    /// so the asking continues. Nothing flips a route's event to confirmed on
+    /// this server, so today that means it is carried without end — which is
+    /// the accepted cost until a home's ruling can cross.
+    #[tokio::test]
+    async fn a_route_the_link_accepted_is_still_waiting_on_a_ruling() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#routelife");
+        let key = key_on_file(&state, SIGNER);
+        let mut to_peer = link_peer(&mgr, true).await;
+
+        let act_id = "01ROUTELIFEOFFER000000000";
+        let claim = "01ROUTELIFECLAIM000000000";
+        a_transition_waiting_for_its_home(&state, &mgr, "#routelife", act_id, claim, &key).await;
+
+        assert_eq!(
+            routed_to_peer(&mut to_peer).await,
+            [claim],
+            "the transition was handed to the home's link"
+        );
+        assert_eq!(
+            ruling_on(&state, act_id, claim),
+            "unconfirmed",
+            "and no ruling has come back"
+        );
+        assert_eq!(
+            state.act_routes.lock().len(),
+            1,
+            "so it is still on the list to ask about — a link taking a message \
+             is not the home answering it"
+        );
+    }
+
+    /// A peer that will not take a routed transition right now may be one
+    /// whose Hello has not been processed yet, so that answer does not end the
+    /// asking either.
+    #[tokio::test]
+    async fn a_route_a_peer_would_not_take_is_still_waiting_on_a_ruling() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#routerefused");
+        let key = key_on_file(&state, SIGNER);
+        // Linked, but declaring nothing — the shape of a peer mid-handshake.
+        let mut to_peer = link_peer(&mgr, false).await;
+
+        let act_id = "01ROUTEREFUSEDOFFER000000";
+        let claim = "01ROUTEREFUSEDCLAIM000000";
+        a_transition_waiting_for_its_home(&state, &mgr, "#routerefused", act_id, claim, &key).await;
+
+        assert!(
+            routed_to_peer(&mut to_peer).await.is_empty(),
+            "nothing is handed to a peer that cannot take it"
+        );
+        assert_eq!(
+            state.act_routes.lock().len(),
+            1,
+            "and the transition stays on the list to ask about"
+        );
+    }
+
+    /// The home end: a transition carried here for a task this server owns is
+    /// decided, and the receipt this server owes for the move it just made is
+    /// in the log naming it — the same always-emit rule a local sender's move
+    /// gets at the front door.
+    #[tokio::test]
+    async fn a_routed_transition_applied_here_leaves_a_receipt_naming_it() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#routehome");
+        let key = key_on_file(&state, SIGNER);
+
+        let act_id = "01ROUTEHOMEOFFER0000000000";
+        our_own_task(&state, "#routehome", act_id);
+
+        let claim = "01ROUTEHOMECLAIM0000000000";
+        let tags = signed_follow_up_tags("#routehome", claim, "claim", act_id, SIGNER, &[], &key);
+        route_here(&state, &mgr, "#routehome", act_id, claim, tags).await;
+
+        let task = state
+            .with_db(|db| db.act_task(act_id))
+            .flatten()
+            .expect("our own task is still live");
+        assert_eq!(task.state, "assigned", "the home decided it");
+        assert_eq!(task.assignee.as_deref(), Some(SIGNER));
+        assert_eq!(
+            ruling_on(&state, act_id, claim),
+            "confirmed",
+            "an event on a task of ours waits on nobody"
+        );
+
+        let subject_tag = freeq_sdk::act_transitions::confirmation_subject_tag();
+        let receipts: Vec<String> = state
+            .with_db(|db| db.act_task_events(act_id))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|e| {
+                let view = crate::events::derive_act_view(&e.canonical)?;
+                freeq_sdk::act_transitions::is_confirmation(&view.verb)
+                    .then(|| view.fields.get(subject_tag).cloned().unwrap_or_default())
+            })
+            .collect();
+        assert_eq!(
+            receipts,
+            [claim.to_string()],
+            "the home's receipt for the move it applied names the event it confirms"
+        );
+    }
+
+    /// A transition carried here for a task some other server owns is
+    /// misrouted: logged and dropped, never ruled on. Two servers ruling on
+    /// one task is the disagreement this whole design exists to prevent.
+    #[tokio::test]
+    async fn a_transition_routed_here_for_someone_elses_task_is_dropped() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#routewrong");
+        let key = key_on_file(&state, SIGNER);
+
+        // A task PEER opened, which arrived here by ordinary relay.
+        let act_id = "01ROUTEWRONGOFFER000000000";
+        relay(
+            &state,
+            &mgr,
+            "#routewrong",
+            act_id,
+            signed_offer_tags("#routewrong", act_id, &key),
+        )
+        .await;
+        assert_eq!(
+            state
+                .with_db(|db| db.act_task(act_id))
+                .flatten()
+                .expect("on file")
+                .origin,
+            PEER
+        );
+
+        let (sink, _guard) = capture();
+        let claim = "01ROUTEWRONGCLAIM000000000";
+        route_here(
+            &state,
+            &mgr,
+            "#routewrong",
+            act_id,
+            claim,
+            signed_follow_up_tags("#routewrong", claim, "claim", act_id, SIGNER, &[], &key),
+        )
+        .await;
+
+        assert!(
+            !state.with_db(|db| db.is_act_event(claim)).unwrap(),
+            "a misrouted transition is not filed here"
+        );
+        let logs = sink.text();
+        assert!(
+            logs.contains("another server owns") && logs.contains(claim),
+            "the drop names the event: {logs}"
+        );
     }
 
     #[tokio::test]

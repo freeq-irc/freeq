@@ -45,6 +45,8 @@ mod m006_act_actions;
 mod m007_act_replaces;
 #[path = "008_act_dropped_unchecked.rs"]
 mod m008_act_dropped_unchecked;
+#[path = "009_event_confirm_state.rs"]
+mod m009_event_confirm_state;
 
 // db.rs unit tests exercise the backfill directly against hand-built rows.
 // Production reaches it only as a rung of the ladder below.
@@ -63,6 +65,7 @@ fn rungs() -> Vec<rusqlite_migration::M<'static>> {
         m006_act_actions::migration(),
         m007_act_replaces::migration(),
         m008_act_dropped_unchecked::migration(),
+        m009_event_confirm_state::migration(),
     ]
 }
 
@@ -204,6 +207,7 @@ mod tests {
         migration_ladder().to_version(&mut stepped, 6).unwrap();
         migration_ladder().to_version(&mut stepped, 7).unwrap();
         migration_ladder().to_version(&mut stepped, 8).unwrap();
+        migration_ladder().to_version(&mut stepped, 9).unwrap();
 
         let mut direct = Connection::open_in_memory().unwrap();
         migration_ladder().to_latest(&mut direct).unwrap();

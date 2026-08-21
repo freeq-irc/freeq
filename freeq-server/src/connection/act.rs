@@ -1057,13 +1057,30 @@ pub(super) fn gate(
         // but the log's answer for one, and nothing to deliver either way.
         Some(crate::db::ActWrite::Recorded) => {}
         // A local sender's move on a task another server owns. Filed, carried
-        // to the room, and not decided here — the owning server referees it.
-        // Nothing routes it there yet, so the sender sees their own event and
-        // no answer to it.
-        Some(crate::db::ActWrite::StoredNotApplied) => tracing::debug!(
-            session = %conn.id, did = %did, act_id = %act_id,
-            "Filed a task event without applying it: the task belongs to another server"
-        ),
+        // to the room, and not decided here — the owning server referees it,
+        // so it is carried there and asked about until that server rules.
+        Some(crate::db::ActWrite::StoredNotApplied) => {
+            tracing::debug!(
+                session = %conn.id, did = %did, act_id = %act_id,
+                "Filed a task event without applying it: the task belongs to another server"
+            );
+            let home = state
+                .with_db(|db| db.act_task_origin(&act_id))
+                .flatten()
+                .unwrap_or_default();
+            crate::server::route_transition_home(
+                state,
+                crate::server::TaskEventWire {
+                    act_id: act_id.clone(),
+                    event_id: msgid.clone(),
+                    tags: tags.clone(),
+                    target: target.to_string(),
+                    from: conn.nick.as_deref().unwrap_or("*").to_string(),
+                    account: Some(did.to_string()),
+                },
+                &home,
+            );
+        }
         Some(crate::db::ActWrite::UnknownTask) => {
             tracing::debug!(
                 session = %conn.id, did = %did, act_id = %act_id,

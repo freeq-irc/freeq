@@ -957,6 +957,12 @@ async fn api_act_task(
                 "signature": e.signature,
                 "actor_did": e.actor_did,
                 "venue": e.venue,
+                // Whose ruling this event carries. A reader has to be able to
+                // tell an event that decided something from one that is on
+                // file and waiting on the server that owns the task:
+                // "confirmed", "unconfirmed", or "superseded" — the last being
+                // a move a confirmed one outran.
+                "confirm_state": e.confirm.as_str(),
                 "timestamp": e.timestamp,
             })
         })

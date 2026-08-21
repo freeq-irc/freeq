@@ -133,6 +133,56 @@ pub struct EventContext {
     pub sig_state: SigState,
     /// The peer that relayed this event; `None` for local ingress.
     pub origin: Option<String>,
+    /// Whether a task event has been ruled on by the server that owns its
+    /// task. `None` for every event that is not a task event, which is the
+    /// default and most of them.
+    pub confirm: Option<ConfirmState>,
+}
+
+/// Whose ruling a task event carries.
+///
+/// The record and the ordering authority are separate things: an event is
+/// relayed, logged and shown wherever it lands, and only the server that owns
+/// the task decides whether it moves anything. This is that decision as this
+/// server currently knows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmState {
+    /// Applied through the rules here: this server owns the task, so nobody
+    /// else's word is owed.
+    Confirmed,
+    /// Filed and deliberately not applied — a transition on a task another
+    /// server owns, still waiting on that server's ruling.
+    Unconfirmed,
+    /// It was unconfirmed, a confirmed transition landed on the same task, and
+    /// the rules no longer admit this one: a losing claim. The log row stays —
+    /// the record is never lost, only the pending flag. Nothing writes this
+    /// yet: a home's ruling reaches only the people on the home, so no peer
+    /// has one to re-check its pending events against.
+    Superseded,
+}
+
+impl ConfirmState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConfirmState::Confirmed => "confirmed",
+            ConfirmState::Unconfirmed => "unconfirmed",
+            ConfirmState::Superseded => "superseded",
+        }
+    }
+
+    /// Read one back from the column.
+    ///
+    /// A task event filed before the column existed reads as confirmed: it was
+    /// applied or not by the rules of its day, and nothing is waiting on a
+    /// ruling for it. So does a receipt, which the column leaves empty because
+    /// a receipt is the ruling rather than something awaiting one.
+    pub fn from_column(value: Option<&str>) -> ConfirmState {
+        match value {
+            Some("unconfirmed") => ConfirmState::Unconfirmed,
+            Some("superseded") => ConfirmState::Superseded,
+            _ => ConfirmState::Confirmed,
+        }
+    }
 }
 
 impl EventContext {

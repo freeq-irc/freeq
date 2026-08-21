@@ -148,18 +148,22 @@ fn is_receipt(tags: &HashMap<String, String>) -> bool {
         .is_some_and(|verb| freeq_sdk::act_transitions::is_confirmation(verb))
 }
 
-/// The first wait before asking again for a key something is parked on, and
-/// the ceiling that doubling stops at.
-pub(crate) const KEY_FIRST_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
-pub(crate) const KEY_MAX_RETRY: std::time::Duration = std::time::Duration::from_secs(600);
+/// The first wait before asking again, and the ceiling that doubling stops at.
+pub(crate) const FIRST_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const MAX_RETRY: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How long to wait after `attempts` asks have gone unanswered: thirty
-/// seconds, doubling, ten minutes at the most. A key server that is down for
-/// an hour is asked a handful of times rather than a hundred.
-pub(crate) fn key_retry_backoff(attempts: u32) -> std::time::Duration {
-    KEY_FIRST_RETRY
+/// seconds, doubling, ten minutes at the most. A server that is down for an
+/// hour is asked a handful of times rather than a hundred.
+///
+/// One curve, two askers: the key a parked event waits for, and the ruling a
+/// routed transition waits for. They ask different servers different
+/// questions, but the reason for the shape is the same one, and two copies of
+/// it would drift.
+pub(crate) fn retry_backoff(attempts: u32) -> std::time::Duration {
+    FIRST_RETRY
         .saturating_mul(1u32 << attempts.min(5))
-        .min(KEY_MAX_RETRY)
+        .min(MAX_RETRY)
 }
 
 /// What is still owed to one signer's key: how many parked events it would
@@ -255,7 +259,7 @@ impl DeferQueue {
                 attempts: 0,
                 // The caller asks once as it parks; this is the first ask
                 // after that one goes unanswered.
-                next_attempt: std::time::Instant::now() + KEY_FIRST_RETRY,
+                next_attempt: std::time::Instant::now() + FIRST_RETRY,
             });
 
         let mut dropped = Vec::new();
@@ -433,9 +437,115 @@ impl DeferQueue {
             }
             due.push((origin.clone(), signer.clone(), kid.clone()));
             retry.attempts += 1;
-            retry.next_attempt = now + key_retry_backoff(retry.attempts);
+            retry.next_attempt = now + retry_backoff(retry.attempts);
         }
         due
+    }
+}
+
+// ── routing a transition to the server that owns the task ───────────────────
+
+/// One transition on its way to the server that owns its task.
+///
+/// The message travels whole because the signature covers its tags and nothing
+/// here may tidy them. `home` is the endpoint the task was opened under, which
+/// is the only server whose ruling on it counts.
+pub(crate) struct PendingRoute {
+    pub act_id: String,
+    /// The signed event's own id — what the log knows it by here, and what a
+    /// ruling on it names when one is built.
+    pub event_id: String,
+    /// Endpoint id of the server that owns the task.
+    pub home: String,
+    /// The message to send. Its envelope id is stamped fresh at every attempt:
+    /// a receiver's dedup rejects a counter at or below the high-water mark it
+    /// already holds from us, so a retry carrying the original id would be
+    /// discarded as a replay of something that never arrived.
+    pub message: crate::s2s::S2sMessage,
+    /// How many attempts have already been made.
+    pub attempts: u32,
+    /// The earliest moment worth trying again.
+    pub next_attempt: std::time::Instant,
+    /// Park order, assigned by [`RouteQueue::park`].
+    pub seq: u64,
+}
+
+/// Transitions waiting for the server that owns their task.
+///
+/// **In memory, like the defer queue beside it, and for the same reason.**
+/// Everything held here has already been filed and shown; what a restart costs
+/// is a prompt ruling, not a record, and catch-up carries the event round
+/// again anyway. Bounded for the same reason too — a home that stays away must
+/// not grow this without limit.
+pub(crate) struct RouteQueue {
+    by_event: HashMap<String, PendingRoute>,
+    next_seq: u64,
+    max: usize,
+}
+
+impl RouteQueue {
+    pub(crate) fn new(max: usize) -> Self {
+        RouteQueue {
+            by_event: HashMap::new(),
+            next_seq: 0,
+            max: max.max(1),
+        }
+    }
+
+    /// How many transitions are waiting. Only the tests ask; the queue's own
+    /// records of what it did are its log lines.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.by_event.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_event.is_empty()
+    }
+
+    /// Hold one route until it can be delivered. A route for an event already
+    /// waiting replaces it — same event, same destination, and the newer one
+    /// carries the fresher attempt count.
+    pub(crate) fn park(&mut self, mut route: PendingRoute) {
+        route.seq = self.next_seq;
+        self.next_seq += 1;
+        self.by_event.insert(route.event_id.clone(), route);
+        while self.by_event.len() > self.max {
+            let oldest = self
+                .by_event
+                .values()
+                .min_by_key(|r| r.seq)
+                .map(|r| r.event_id.clone());
+            let Some(oldest) = oldest else { break };
+            if let Some(dropped) = self.by_event.remove(&oldest) {
+                tracing::warn!(
+                    act_id = %dropped.act_id,
+                    event_id = %dropped.event_id,
+                    home = %dropped.home,
+                    max = self.max,
+                    "Gave up carrying a task transition to the server that owns it — \
+                     the queue is full. The event is on file and unconfirmed; \
+                     catch-up is what will settle it now"
+                );
+            }
+        }
+    }
+
+    /// Every route due at `now`, taken out. A caller that still cannot deliver
+    /// one parks it again with its attempt count raised.
+    pub(crate) fn take_due(&mut self, now: std::time::Instant) -> Vec<PendingRoute> {
+        let due: Vec<String> = self
+            .by_event
+            .values()
+            .filter(|r| r.next_attempt <= now)
+            .map(|r| r.event_id.clone())
+            .collect();
+        let mut taken: Vec<PendingRoute> = due
+            .into_iter()
+            .filter_map(|id| self.by_event.remove(&id))
+            .collect();
+        taken.sort_by_key(|r| r.seq);
+        taken
     }
 }
 
@@ -888,16 +998,106 @@ mod defer_tests {
     /// Thirty seconds, doubling, ten minutes at the most.
     #[test]
     fn the_backoff_doubles_up_to_its_ceiling() {
-        assert_eq!(key_retry_backoff(0), KEY_FIRST_RETRY);
-        assert_eq!(key_retry_backoff(1), KEY_FIRST_RETRY * 2);
-        assert_eq!(key_retry_backoff(2), KEY_FIRST_RETRY * 4);
+        assert_eq!(retry_backoff(0), FIRST_RETRY);
+        assert_eq!(retry_backoff(1), FIRST_RETRY * 2);
+        assert_eq!(retry_backoff(2), FIRST_RETRY * 4);
         for attempts in 5..64 {
             assert_eq!(
-                key_retry_backoff(attempts),
-                KEY_MAX_RETRY,
+                retry_backoff(attempts),
+                MAX_RETRY,
                 "the wait stops growing rather than overflowing"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    fn route(event_id: &str, home: &str) -> PendingRoute {
+        PendingRoute {
+            act_id: "01TASK".to_string(),
+            event_id: event_id.to_string(),
+            home: home.to_string(),
+            message: crate::s2s::S2sMessage::SyncRequest,
+            attempts: 0,
+            next_attempt: std::time::Instant::now(),
+            seq: 0,
+        }
+    }
+
+    /// Only what is due comes back, oldest first: a claim carried before a
+    /// completion has to be asked about before it.
+    #[test]
+    fn only_due_routes_come_back_and_in_park_order() {
+        let mut q = RouteQueue::new(16);
+        q.park(route("one", "home"));
+        q.park(route("two", "home"));
+        let mut later = route("later", "home");
+        later.next_attempt = std::time::Instant::now() + MAX_RETRY;
+        q.park(later);
+        assert_eq!(q.len(), 3);
+
+        let due = q.take_due(std::time::Instant::now());
+        assert_eq!(
+            due.iter().map(|r| r.event_id.as_str()).collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        assert_eq!(q.len(), 1, "the one still backing off keeps waiting");
+    }
+
+    /// A route for an event already waiting replaces it rather than doubling
+    /// it: same event, same destination.
+    #[test]
+    fn a_second_route_for_one_event_replaces_the_first() {
+        let mut q = RouteQueue::new(16);
+        q.park(route("one", "home"));
+        q.park(route("one", "home"));
+        assert_eq!(q.len(), 1);
+    }
+
+    /// The ceiling holds, and what falls off is loud: the event stays on file
+    /// and unconfirmed, and catch-up is what settles it after that.
+    #[test]
+    fn the_queue_has_a_ceiling_and_says_when_it_drops_something() {
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        struct Writer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let make = {
+            let sink = std::sync::Arc::clone(&sink);
+            move || Writer(std::sync::Arc::clone(&sink))
+        };
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(make)
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .finish(),
+        );
+
+        let mut q = RouteQueue::new(2);
+        q.park(route("one", "home"));
+        q.park(route("two", "home"));
+        q.park(route("three", "home"));
+
+        assert_eq!(q.len(), 2, "the ceiling holds");
+        let held: Vec<String> = q
+            .take_due(std::time::Instant::now())
+            .into_iter()
+            .map(|r| r.event_id)
+            .collect();
+        assert_eq!(held, ["two", "three"], "the oldest is what fell off");
+        let logs = String::from_utf8_lossy(&sink.lock().unwrap()).to_string();
+        assert!(logs.contains("one"), "the drop names the event: {logs}");
     }
 }
 

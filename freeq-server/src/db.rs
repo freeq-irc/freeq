@@ -219,6 +219,9 @@ pub struct ActLoggedEvent {
     pub signature: Option<String>,
     pub actor_did: Option<String>,
     pub venue: String,
+    /// Whether the server that owns the task has ruled on this event. A reader
+    /// sees an unconfirmed event and knows it decides nothing yet.
+    pub confirm: crate::events::ConfirmState,
     pub timestamp: i64,
 }
 
@@ -1843,8 +1846,9 @@ impl Db {
         self.conn.execute(
             "INSERT OR IGNORE INTO events
                  (event_id, canonical, signature, sig_state, kind, venue,
-                  actor_did, subject, body_hash, emoji, origin, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                  actor_did, subject, body_hash, emoji, origin, confirm_state,
+                  timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 facts.event_id,
                 canonical,
@@ -1857,6 +1861,7 @@ impl Db {
                 facts.body_hash,
                 facts.emoji,
                 rec.ctx.origin,
+                rec.ctx.confirm.map(crate::events::ConfirmState::as_str),
                 rec.timestamp as i64,
             ],
         )?;
@@ -2854,6 +2859,136 @@ mod tests {
         .unwrap()
     }
 
+    /// One relayed event of any kind: an opener when `task` is `None`, a
+    /// follow-up on that task otherwise. The pair above covers handoffs, which
+    /// is most of these tests; this one is for the cases that need a second
+    /// kind.
+    #[allow(clippy::too_many_arguments)]
+    fn relayed(
+        db: &Db,
+        id: &str,
+        task: Option<&str>,
+        kind: &str,
+        verb: &str,
+        actor: &str,
+        venue: &str,
+        origin: &str,
+        ts: i64,
+    ) -> ActWrite {
+        let mut tags = vec![
+            ("+freeq.at/act", kind),
+            ("+freeq.at/act-verb", verb),
+            ("+freeq.at/from", actor),
+        ];
+        if let Some(task) = task {
+            tags.push(("+freeq.at/act-id", task));
+        }
+        let canonical = act_doc(&tags, venue, id);
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: id,
+            act_id: task.unwrap_or(id),
+            opens: task.is_none(),
+            venue,
+            actor,
+            from_system: false,
+            origin: Some(origin),
+            timestamp: ts,
+        })
+        .unwrap()
+    }
+
+    // ── whose ruling an event carries ─────────────────────────────────────
+
+    /// What the log says about whose ruling an event carries.
+    fn confirm_of(db: &Db, event_id: &str) -> crate::events::ConfirmState {
+        let raw: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT confirm_state FROM events WHERE event_id = ?1",
+                params![event_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        crate::events::ConfirmState::from_column(raw.as_deref())
+    }
+
+    /// An event this server accepted for a task it owns needs nobody's word
+    /// but its own: it is confirmed the moment it is filed.
+    #[test]
+    fn an_event_on_our_own_task_is_confirmed_at_ingress() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", None, 10);
+        follow_up(&db, "claim", SCHOLAR, "T1", "T2", "#ops", 11);
+
+        for id in ["T1", "T2"] {
+            assert_eq!(
+                confirm_of(&db, id),
+                crate::events::ConfirmState::Confirmed,
+                "{id}: we are the authority over our own tasks"
+            );
+        }
+    }
+
+    /// The rebuild is the proof that the view is derived. It has to agree with
+    /// the live table for a foreign task with unruled events hanging off it,
+    /// which means passing over exactly the events the live path passed over.
+    #[test]
+    fn a_rebuild_matches_the_live_view_with_unconfirmed_events_on_file() {
+        let db = Db::open_memory().unwrap();
+        // Ours, moved by us.
+        offer(&db, "M1", "#ops", None, 10);
+        follow_up(&db, "claim", SCHOLAR, "M1", "M2", "#ops", 11);
+        // A peer's, with a claim from a third server nobody has ruled on.
+        relayed_offer(&db, "M3", "#ops", "peer-b", 12);
+        relayed_follow_up(&db, "claim", MALLORY, "M3", "M4", "#ops", "peer-c", 13);
+        // And a peer's bounty carrying a bid, which is additive — it leaves
+        // the action open, so it decides nothing exclusive and is applied and
+        // confirmed wherever it lands.
+        relayed(
+            &db, "M5", None, "bounty", "offer", ELIZA, "#ops", "peer-b", 14,
+        );
+        relayed(
+            &db,
+            "M6",
+            Some("M5"),
+            "bounty",
+            "bid",
+            MALLORY,
+            "#ops",
+            "peer-c",
+            15,
+        );
+
+        assert_eq!(
+            confirm_of(&db, "M4"),
+            crate::events::ConfirmState::Unconfirmed,
+            "a transition on a peer's task waits on that peer"
+        );
+        assert_eq!(
+            confirm_of(&db, "M6"),
+            crate::events::ConfirmState::Confirmed,
+            "an additive move decides nothing exclusive and waits on nobody"
+        );
+
+        let mut live = db
+            .act_tasks(&["#ops".to_string()], None, None, None, 100)
+            .unwrap();
+        let mut rebuilt = db.rebuild_act_actions().unwrap();
+        live.sort_by(|a, b| a.act_id.cmp(&b.act_id));
+        rebuilt.sort_by(|a, b| a.act_id.cmp(&b.act_id));
+        assert_eq!(
+            rebuilt, live,
+            "the log is the record, and the view is what it derives to"
+        );
+        assert_eq!(
+            rebuilt.iter().find(|t| t.act_id == "M3").unwrap().state,
+            "open",
+            "an unruled claim moves nothing, in the rebuild as in the view"
+        );
+    }
+
     // ── whose task is it ──────────────────────────────────────────────────
 
     /// An offer relayed from a peer creates the task here, stamped with the
@@ -2883,6 +3018,11 @@ mod tests {
         assert_eq!(
             relayed_follow_up(&db, "claim", SCHOLAR, "R2", "E2", "#ops", "peer-b", 20),
             ActWrite::StoredNotApplied
+        );
+        assert_eq!(
+            confirm_of(&db, "E2"),
+            crate::events::ConfirmState::Unconfirmed,
+            "and it is on file as what it is: waiting on peer-b's ruling"
         );
 
         let task = db.act_task("R2").unwrap().expect("still live");
@@ -6948,7 +7088,7 @@ impl Db {
             let record = EventRecord {
                 shape: EventShape::Document(ev.canonical),
                 signature: ev.signature,
-                ctx: self.act_context(ev),
+                ctx: self.act_context(ev, None),
                 timestamp: ev.timestamp as u64,
             };
             if !self.insert_event(&record)? {
@@ -7029,7 +7169,7 @@ impl Db {
                 let record = EventRecord {
                     shape: EventShape::Document(ev.canonical),
                     signature: ev.signature,
-                    ctx: self.act_context(ev),
+                    ctx: self.act_context(ev, Some(crate::events::ConfirmState::Unconfirmed)),
                     timestamp: ev.timestamp as u64,
                 };
                 if !self.insert_event(&record)? {
@@ -7100,7 +7240,7 @@ impl Db {
         let record = EventRecord {
             shape: EventShape::Document(ev.canonical),
             signature: ev.signature,
-            ctx: self.act_context(ev),
+            ctx: self.act_context(ev, Some(crate::events::ConfirmState::Confirmed)),
             timestamp: ev.timestamp as u64,
         };
         if !self.insert_event(&record)? {
@@ -7148,12 +7288,20 @@ impl Db {
     }
 
     /// The receipt facts for a task event's log row: this server checked the
-    /// signature itself before calling, and a relayed event says which link it
-    /// came in on, so a reader can tell a local event from a federated one.
-    fn act_context(&self, ev: &ActEvent<'_>) -> crate::events::EventContext {
+    /// signature itself before calling, a relayed event says which link it came
+    /// in on, so a reader can tell a local event from a federated one, and
+    /// `confirm` is whether the rules were run on it or it is still waiting on
+    /// its task's home. `None` for a receipt, which is a ruling rather than
+    /// something awaiting one.
+    fn act_context(
+        &self,
+        ev: &ActEvent<'_>,
+        confirm: Option<crate::events::ConfirmState>,
+    ) -> crate::events::EventContext {
         crate::events::EventContext {
             sig_state: crate::events::SigState::Valid,
             origin: ev.origin.map(str::to_string),
+            confirm,
         }
     }
 
@@ -7285,6 +7433,28 @@ impl Db {
                 |r| r.get(0),
             )
             .optional()
+    }
+
+    /// Whether one task event is still waiting on a ruling from its task's
+    /// home.
+    ///
+    /// `false` once the home has confirmed it, once something that outran it
+    /// has superseded it, and for an id that is not on file at all — three
+    /// different histories with one thing in common: nothing is owed on this
+    /// event any more.
+    pub fn act_event_is_unconfirmed(&self, event_id: &str) -> SqlResult<bool> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT confirm_state FROM events WHERE event_id = ?1 AND kind = 'act'",
+                params![event_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw.is_some_and(|column| {
+            crate::events::ConfirmState::from_column(column.as_deref())
+                == crate::events::ConfirmState::Unconfirmed
+        }))
     }
 
     /// One live task by id. `None` once it has finished — the log keeps the
@@ -7552,7 +7722,8 @@ impl Db {
         // events, not the oldest `limit` of them — then oldest first to the
         // caller, which interleaves them with messages in time order.
         let mut stmt = self.conn.prepare(
-            "SELECT event_id, canonical, signature, actor_did, venue, timestamp
+            "SELECT event_id, canonical, signature, actor_did, venue, confirm_state,
+                    timestamp
                FROM events
               WHERE kind = 'act' AND venue = ?1
                 AND timestamp >= ?2 AND timestamp <= ?3
@@ -7566,7 +7737,10 @@ impl Db {
                 signature: row.get(2)?,
                 actor_did: row.get(3)?,
                 venue: row.get(4)?,
-                timestamp: row.get(5)?,
+                confirm: crate::events::ConfirmState::from_column(
+                    row.get::<_, Option<String>>(5)?.as_deref(),
+                ),
+                timestamp: row.get(6)?,
             })
         })?;
         let mut events: Vec<ActLoggedEvent> = rows.collect::<SqlResult<_>>()?;
@@ -7600,7 +7774,8 @@ impl Db {
     /// follow-up. This is the history a reader gets, and it outlives the view.
     pub fn act_task_events(&self, act_id: &str) -> SqlResult<Vec<ActLoggedEvent>> {
         let mut stmt = self.conn.prepare(
-            "SELECT event_id, canonical, signature, actor_did, venue, timestamp
+            "SELECT event_id, canonical, signature, actor_did, venue, confirm_state,
+                    timestamp
                FROM events
               WHERE kind = 'act' AND (event_id = ?1 OR subject = ?1)
               ORDER BY timestamp, event_id",
@@ -7612,7 +7787,10 @@ impl Db {
                 signature: row.get(2)?,
                 actor_did: row.get(3)?,
                 venue: row.get(4)?,
-                timestamp: row.get(5)?,
+                confirm: crate::events::ConfirmState::from_column(
+                    row.get::<_, Option<String>>(5)?.as_deref(),
+                ),
+                timestamp: row.get(6)?,
             })
         })?;
         rows.collect()
@@ -7630,7 +7808,8 @@ impl Db {
         // events; a signed event id is a ULID, so its byte order is the order
         // its signers minted in and every server reads the same one out of it.
         let mut stmt = self.conn.prepare(
-            "SELECT event_id, canonical, actor_did, venue, subject, origin, timestamp
+            "SELECT event_id, canonical, actor_did, venue, subject, origin,
+                    confirm_state, timestamp
                FROM events WHERE kind = 'act' ORDER BY event_id",
         )?;
         struct Row {
@@ -7640,6 +7819,7 @@ impl Db {
             venue: String,
             subject: Option<String>,
             origin: Option<String>,
+            confirm: crate::events::ConfirmState,
             timestamp: i64,
         }
         let mut rows: Vec<Row> = stmt
@@ -7651,7 +7831,10 @@ impl Db {
                     venue: row.get(3)?,
                     subject: row.get(4)?,
                     origin: row.get(5)?,
-                    timestamp: row.get(6)?,
+                    confirm: crate::events::ConfirmState::from_column(
+                        row.get::<_, Option<String>>(6)?.as_deref(),
+                    ),
+                    timestamp: row.get(7)?,
                 })
             })?
             .collect::<SqlResult<_>>()?;
@@ -7717,6 +7900,15 @@ impl Db {
                 let Some(task) = live.get(&act_id) else {
                     continue;
                 };
+                // A task another server owns moves on that server's rulings
+                // and on nothing else. An event still waiting on one is on
+                // file and decides nothing, so a rebuild passes over it
+                // exactly as the live path did when it filed it — which is
+                // what makes the two agree about a foreign task.
+                if !task.origin.is_empty() && row.confirm != crate::events::ConfirmState::Confirmed
+                {
+                    continue;
+                }
                 was = Some(task.state.clone());
                 kind = task.kind.clone();
                 let present: Vec<&str> = view.fields.keys().map(String::as_str).collect();
@@ -9029,6 +9221,7 @@ mod dual_write_tests {
             &EventContext {
                 sig_state: SigState::Unverifiable,
                 origin: Some("peer.example".to_string()),
+                ..Default::default()
             },
         )
         .unwrap();

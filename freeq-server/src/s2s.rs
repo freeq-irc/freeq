@@ -231,6 +231,13 @@ pub const CAPABILITIES: &[Capability] = &[
         gates: "Tagmsg carrying task tags — a peer that cannot parse them could strip \
                 them in relay, and a stripped tag map breaks the signature downstream",
     },
+    Capability {
+        name: ACT_ROUTE,
+        // Added 2026-08-21. Retire at the next protocol_version bump, once no
+        // peer predates carrying transitions to the server that owns the task.
+        gates: "ActRoute — a transition on a task this server does not own, carried to \
+                the server that does so it can rule on it",
+    },
 ];
 
 /// Catch-up replay. A peer that does not declare this is never sent
@@ -243,6 +250,12 @@ pub const CATCHUP: &str = "catchup";
 /// know would break the signature over them, and downstream that reads as
 /// forgery when the real cause is an old server.
 pub const ACT: &str = "act";
+
+/// Carrying a transition to the server that owns the task. A peer that does
+/// not declare this is never sent [`S2sMessage::ActRoute`]: it would
+/// warn-and-skip a message type it cannot parse, and the transition would stay
+/// undecided while looking delivered.
+pub const ACT_ROUTE: &str = "act_route";
 
 /// The capability list this server advertises.
 pub fn our_capabilities() -> Vec<String> {
@@ -259,6 +272,18 @@ pub fn peer_supports(peer_caps: &[String], name: &str) -> bool {
     peer_caps
         .iter()
         .any(|c| c == name || c.starts_with(&format!("{name}=")))
+}
+
+/// What became of one attempt to carry a transition to a task's home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteOutcome {
+    /// Handed to the link.
+    Sent,
+    /// The home is not reachable right now.
+    Unreachable,
+    /// The home was not sent this: an older build, or a peer this server sends
+    /// no events to.
+    Refused(&'static str),
 }
 
 /// One event, as it travels in a catch-up reply.
@@ -593,6 +618,44 @@ pub enum S2sMessage {
         mode: String,
         arg: Option<String>,
         set_by: String,
+        origin: String,
+    },
+
+    /// A transition on a task this server does not own, carried to the server
+    /// that does.
+    ///
+    /// Every task event is already relayed to every act-capable peer, the home
+    /// included — this is the *addressed* copy, and it exists because a
+    /// broadcast is best-effort while a ruling is not optional. A home that was
+    /// away when the broadcast went out gets asked again; the relay has no
+    /// second try.
+    ///
+    /// The tag map travels exactly as it was signed, signature included:
+    /// rebuilding it or tidying it would break the very document the home has
+    /// to verify. `target` is the delivery target the venue was built from, so
+    /// the home resolves the same venue the signer did.
+    #[serde(rename = "act_route")]
+    ActRoute {
+        #[serde(default)]
+        event_id: String,
+        /// The task the transition moves — and therefore whose server this is
+        /// addressed to.
+        act_id: String,
+        /// The signed event's own id, which is what the log knows it by.
+        act_event_id: String,
+        /// The signed tags, verbatim.
+        tags: HashMap<String, String>,
+        /// The delivery target the venue was built from.
+        target: String,
+        /// The `nick!user@host` prefix the event travelled under.
+        from: String,
+        /// The actor's DID, stamped by the server the actor authenticated to —
+        /// never client-set, the same trust shape as `Tagmsg.account`.
+        #[serde(default)]
+        account: Option<String>,
+        /// The server carrying it, which is not necessarily the one whose user
+        /// authored it: a peer that holds the event unruled carries it too,
+        /// and on a network that is not a full mesh that is how it arrives.
         origin: String,
     },
 
@@ -1022,6 +1085,49 @@ impl S2sManager {
     /// no restriction, matching `--s2s-allowed-peers`.
     fn is_allowlisted(&self, peer_id: &str) -> bool {
         self.allowed_peers.is_empty() || self.allowed_peers.iter().any(|p| p == peer_id)
+    }
+
+    /// Carry one transition to the server that owns its task.
+    ///
+    /// Addressed, not broadcast: exactly one server referees a task, and the
+    /// message asks that one for a ruling. Two gates, both the ones an
+    /// ordinary relay passes — we do not send to a peer we would not relay
+    /// messages to ([`S2sManager::may_relay_to`], so trust is decided in one
+    /// place for every kind of traffic), and we do not send a message the peer
+    /// has not said it can parse.
+    ///
+    /// Whether it is worth trying again is the point of the answer: a link
+    /// that is down comes back, an old build does not.
+    pub async fn route_to_home(&self, home: &str, msg: S2sMessage) -> RouteOutcome {
+        // Capabilities first, then peers: the same lock order the broadcast
+        // path takes, never nested the other way round.
+        let declared = self
+            .peer_capabilities
+            .lock()
+            .await
+            .get(home)
+            .cloned()
+            .unwrap_or_default();
+        let peers = self.peers.lock().await;
+        // Not linked right now — including a peer we have never heard from,
+        // whose declaration would be missing for that reason alone.
+        if !peers.contains_key(home) {
+            return RouteOutcome::Unreachable;
+        }
+        if !self.may_relay_to(home, &peers) {
+            return RouteOutcome::Refused("this server sends that peer no events");
+        }
+        if !peer_supports(&declared, ACT_ROUTE) {
+            return RouteOutcome::Refused("the peer cannot receive routed transitions");
+        }
+        match peers.get(home) {
+            Some(entry) => match entry.tx.send(msg).await {
+                Ok(()) => RouteOutcome::Sent,
+                // The link died between the check and the send.
+                Err(_) => RouteOutcome::Unreachable,
+            },
+            None => RouteOutcome::Unreachable,
+        }
     }
 
     /// Internal: send a message directly to all connected peers (called by broadcast worker).
@@ -2636,6 +2742,117 @@ mod capability_tests {
         fn make_writer(&'a self) -> LogSink {
             self.clone()
         }
+    }
+
+    /// Routing a transition passes the same two gates an ordinary relay
+    /// passes, and says which one stopped it — because one of them is worth
+    /// retrying and the other never will be.
+    #[tokio::test]
+    async fn a_routed_transition_passes_the_capability_and_trust_gates() {
+        let secret = iroh::SecretKey::from_bytes(&rand::random::<[u8; 32]>());
+        let server_id = secret.public().to_string();
+        let (broadcast_tx, _) = mpsc::channel(1);
+        let (event_tx, _) = mpsc::channel(1);
+        let manager = S2sManager {
+            server_id,
+            server_name: "test".to_string(),
+            peers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            peer_names: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            event_tx,
+            event_counter: AtomicU64::new(0),
+            dedup: Arc::new(DedupSet::new()),
+            broadcast_tx,
+            conn_gen: Arc::new(AtomicU64::new(0)),
+            signing_key: Arc::new(secret),
+            trust_config: HashMap::new(),
+            pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            // The trust gate: only these two peers are spoken to at all.
+            allowed_peers: vec!["home".to_string(), "old-home".to_string()],
+        };
+
+        let (home_tx, mut home_rx) = mpsc::channel(8);
+        let (old_tx, mut old_rx) = mpsc::channel(8);
+        let (barred_tx, mut barred_rx) = mpsc::channel(8);
+        {
+            let mut peers = manager.peers.lock().await;
+            peers.insert(
+                "home".into(),
+                PeerEntry {
+                    tx: home_tx,
+                    conn_gen: 0,
+                },
+            );
+            peers.insert(
+                "old-home".into(),
+                PeerEntry {
+                    tx: old_tx,
+                    conn_gen: 0,
+                },
+            );
+            peers.insert(
+                "barred".into(),
+                PeerEntry {
+                    tx: barred_tx,
+                    conn_gen: 0,
+                },
+            );
+        }
+        {
+            let mut caps = manager.peer_capabilities.lock().await;
+            caps.insert("home".into(), vec![ACT.to_string(), ACT_ROUTE.to_string()]);
+            // Task-aware, but predating routed transitions.
+            caps.insert("old-home".into(), vec![ACT.to_string()]);
+            caps.insert(
+                "barred".into(),
+                vec![ACT.to_string(), ACT_ROUTE.to_string()],
+            );
+        }
+
+        let route = |id: &str| S2sMessage::ActRoute {
+            event_id: id.to_string(),
+            act_id: "01TASK".to_string(),
+            act_event_id: "01CLAIM".to_string(),
+            tags: HashMap::from([("+freeq.at/act".to_string(), "handoff".to_string())]),
+            target: "#ops".to_string(),
+            from: "scholar".to_string(),
+            account: Some("did:plc:scholar".to_string()),
+            origin: "us".to_string(),
+        };
+
+        assert_eq!(
+            manager.route_to_home("home", route("srv:1")).await,
+            RouteOutcome::Sent
+        );
+        assert!(matches!(
+            home_rx.try_recv(),
+            Ok(S2sMessage::ActRoute { .. })
+        ));
+
+        assert!(
+            matches!(
+                manager.route_to_home("old-home", route("srv:2")).await,
+                RouteOutcome::Refused(_)
+            ),
+            "an older build never gains the ability by being asked again"
+        );
+        assert!(old_rx.try_recv().is_err());
+
+        assert!(
+            matches!(
+                manager.route_to_home("barred", route("srv:3")).await,
+                RouteOutcome::Refused(_)
+            ),
+            "a peer this server relays nothing to is not handed a transition either"
+        );
+        assert!(barred_rx.try_recv().is_err());
+
+        assert_eq!(
+            manager.route_to_home("away", route("srv:4")).await,
+            RouteOutcome::Unreachable,
+            "a link that is down is worth asking again"
+        );
     }
 
     /// The act gate itself: a task-tagged Tagmsg reaches only peers that
