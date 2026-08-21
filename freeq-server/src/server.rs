@@ -4995,9 +4995,9 @@ pub(crate) async fn process_s2s_message(
             // must not read as a forgery. Read before the tidying below, so
             // the check sees the tags as they arrived — the signature covers
             // them.
-            if crate::connection::act::carries_act_tags(&tags)
-                || tags.contains_key("+freeq.at/event")
-            {
+            let is_task_event = crate::connection::act::carries_act_tags(&tags)
+                || tags.contains_key("+freeq.at/event");
+            if is_task_event {
                 let peer_declared_act = crate::s2s::peer_supports(
                     &manager
                         .peer_capabilities
@@ -5279,7 +5279,16 @@ pub(crate) async fn process_s2s_message(
                 // The sender's own other devices here get this only when the
                 // signature checked out: that delivery puts the event in the
                 // named identity's own client as something they did.
-                sig_verdict == Some(crate::connection::messaging::ClientSigVerdict::Valid),
+                //
+                // Two checks answer that, one per family. A mutation has the
+                // mutation verdict. A task event never does — it is not a
+                // mutation, so that verdict is absent for every one of them —
+                // and its evidence is the act checker above, which returns
+                // anything but `Deliver` for a signature that did not verify.
+                // Reaching here as a task event therefore means what a valid
+                // mutation verdict means.
+                sig_verdict == Some(crate::connection::messaging::ClientSigVerdict::Valid)
+                    || is_task_event,
             );
         }
 
@@ -13174,10 +13183,40 @@ mod relayed_task_verdict_tests {
         rx
     }
 
+    /// A local session bound to `did`, holding `message-tags` and
+    /// `freeq.at/act` — one of that identity's devices on this server.
+    fn capable_session_for(state: &Arc<SharedState>, did: &str) -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel(16);
+        let sid = format!("session-of-{did}");
+        state.connections.lock().insert(sid.clone(), tx);
+        state
+            .did_sessions
+            .lock()
+            .entry(did.to_string())
+            .or_default()
+            .insert(sid.clone());
+        state.cap_message_tags.lock().insert(sid.clone());
+        state.cap_act.lock().insert(sid);
+        rx
+    }
+
     /// The wire tags of a handoff offer, signed the way a task-sending client
     /// signs one: over the act tags, the folded venue, and the id it minted.
     fn signed_offer_tags(
         channel: &str,
+        event_id: &str,
+        key: &ed25519_dalek::SigningKey,
+    ) -> HashMap<String, String> {
+        signed_offer_tags_in(&freeq_sdk::chatsig::channel_venue(channel), event_id, key)
+    }
+
+    /// The DID a DM in these tests is addressed to.
+    const RECIPIENT: &str = "did:plc:dmrecipient";
+
+    /// The same, for a venue the caller folded — a DM binds its two DIDs
+    /// rather than the room.
+    fn signed_offer_tags_in(
+        venue: &str,
         event_id: &str,
         key: &ed25519_dalek::SigningKey,
     ) -> HashMap<String, String> {
@@ -13187,9 +13226,8 @@ mod relayed_task_verdict_tests {
             ("+freeq.at/from", SIGNER),
             ("+freeq.at/act-title", "verdict wiring"),
         ];
-        let venue = freeq_sdk::chatsig::channel_venue(channel);
         let sig =
-            freeq_sdk::act::sign_act(act.clone(), &venue, event_id, key).expect("act tags present");
+            freeq_sdk::act::sign_act(act.clone(), venue, event_id, key).expect("act tags present");
         let mut tags: HashMap<String, String> = act
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -13369,6 +13407,42 @@ mod relayed_task_verdict_tests {
     /// the signature is read — a signature says who signed, never whose task
     /// it is — and this one verifies, so the blank origin is the only thing
     /// wrong with the event.
+    /// A task event a peer relayed reaches the signer's own sessions here.
+    ///
+    /// The delivery that puts an event in the named identity's own client is
+    /// gated on this server having checked the signature. For a mutation that
+    /// answer is the mutation verdict; a task event is not a mutation and has
+    /// none, so the gate read absent and a DID logged in here and elsewhere
+    /// saw their own task events on every server but this one. The act
+    /// checker is the answer for this family, and it has already run.
+    #[tokio::test]
+    async fn a_relayed_task_event_reaches_the_signers_own_sessions() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        // The person the DM is addressed to, and the signer's own other
+        // device on this server: one identity logged in on two servers.
+        let mut theirs = capable_session_for(&state, RECIPIENT);
+        let mut signers_own = capable_session_for(&state, SIGNER);
+        let key = key_on_file(&state, SIGNER);
+
+        let event_id = "01DMLIVE0000000000000000AA";
+        let venue = freeq_sdk::chatsig::dm_venue(SIGNER, RECIPIENT);
+        let tags = signed_offer_tags_in(&venue, event_id, &key);
+        relay(&state, &mgr, RECIPIENT, event_id, tags).await;
+
+        let to_them = received(&mut theirs).await;
+        assert!(
+            to_them.contains(event_id),
+            "the recipient is told: {to_them}"
+        );
+        let to_signer = received(&mut signers_own).await;
+        assert!(
+            to_signer.contains(event_id),
+            "and so is the signer's own session here: {to_signer}"
+        );
+    }
+
     #[tokio::test]
     async fn a_relayed_task_event_that_names_no_origin_does_not_become_ours() {
         let state = test_state_with_db();
