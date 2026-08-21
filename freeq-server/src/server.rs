@@ -3258,6 +3258,36 @@ fn file_replayed_task_event(
             timestamp: ev.timestamp as i64,
         })
     });
+    // A move this server applied to a task it owns is a move it ruled on, and
+    // it owes a receipt for it — replay is a way in like any other. Without
+    // this the only server whose word settles the task says nothing on the one
+    // path nothing else covers: the addressed copy that follows is a duplicate,
+    // and a duplicate moves nothing and confirms nothing.
+    if let Some(written) = written.as_ref() {
+        let receipt = crate::connection::act::receipt_for_applied_move(
+            state,
+            &crate::connection::act::AppliedMove {
+                kind: &view.kind,
+                act_id: &act_id,
+                event_id,
+                venue: &facts.venue,
+                actor: &actor,
+                written,
+            },
+        );
+        if let Some(receipt) = receipt {
+            // A replay reaches no client, so nothing is racing this onto the
+            // wire. The venue is the target for a channel; a direct
+            // conversation has none anyone can address, and a server-authored
+            // line there goes out under `*`, as the sweep's notices do.
+            let target = match facts.venue.starts_with("dm:") {
+                true => "*",
+                false => facts.venue.as_str(),
+            };
+            crate::connection::act::broadcast_receipt(state, &receipt, target);
+        }
+    }
+
     Some(match written {
         // No database attached: nothing to file into, and nothing to claim.
         None => ReplayOutcome::Filed,
@@ -12969,6 +12999,122 @@ mod catchup_tests {
                 ("+freeq.at/act-id", act_id),
             ],
         )
+    }
+
+    /// The ids every receipt on this task names, oldest first.
+    fn receipts_naming(state: &Arc<SharedState>, act_id: &str) -> Vec<String> {
+        let subject_tag = freeq_sdk::act_transitions::confirmation_subject_tag();
+        state
+            .with_db(|db| db.act_task_events(act_id))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|e| {
+                let view = crate::events::derive_act_view(&e.canonical)?;
+                freeq_sdk::act_transitions::is_confirmation(&view.verb)
+                    .then(|| view.fields.get(subject_tag).cloned().unwrap_or_default())
+            })
+            .collect()
+    }
+
+    /// A move this server applied to a task it owns is a move it ruled on, and
+    /// it owes a receipt for it however the event reached here.
+    ///
+    /// Replay is a way in like any other: the participant's claim arrives, the
+    /// rules take it, our own task moves — and without this the one server
+    /// whose word settles the task said nothing, on a path nothing else
+    /// covers, because the addressed copy that follows is a duplicate and a
+    /// duplicate mints nothing.
+    #[test]
+    fn a_replayed_move_on_a_task_we_own_leaves_the_receipt_we_owe() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        const ID: &str = "01ACT00000000000000000031";
+        const CLAIMED: &str = "01ACT00000000000000000032";
+        our_own_task(&state, &key, ID);
+
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, claim(&key, CLAIMED, ID, "server-b")),
+            ReplayOutcome::Filed
+        );
+        let task = state.with_db(|db| db.act_task(ID)).flatten().unwrap();
+        assert_eq!(
+            task.state, "assigned",
+            "the rules took the claim, so this server moved its own task"
+        );
+        assert_eq!(
+            receipts_naming(&state, ID),
+            [CLAIMED],
+            "and said so: a receipt naming the event it confirms"
+        );
+
+        // The same claim again, by whatever path. The log knows the id, so
+        // nothing moved and nothing more is owed.
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, claim(&key, CLAIMED, ID, "server-b")),
+            ReplayOutcome::AlreadyHeld
+        );
+        assert_eq!(
+            receipts_naming(&state, ID),
+            [CLAIMED],
+            "a second arrival is not a second move"
+        );
+    }
+
+    /// And this server's own events coming home are not confirmed: they are
+    /// already signed by the server whose word settles the task, which is the
+    /// degenerate case a receipt exists to cover for everybody else.
+    #[test]
+    fn our_own_expiry_coming_home_is_not_confirmed_a_second_time() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        const ID: &str = "01ACT00000000000000000033";
+        our_own_task(&state, &key, ID);
+
+        let server_did = crate::server::server_did(&state.server_name);
+        let server_key = SigningKey::from_bytes(&[9u8; 32]);
+        state
+            .with_db(|db| db.save_signing_key(&server_did, server_key.verifying_key().as_bytes()))
+            .expect("test state has a database");
+        // Built here rather than through `act_event`, which signs as ALICE:
+        // this event's whole point is that the server itself authored it.
+        const EXPIRE: &str = "01ACT00000000000000000034";
+        let venue = caught_venue();
+        let canonical = freeq_sdk::act::act_canonical(
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "expire"),
+                ("+freeq.at/from", server_did.as_str()),
+                ("+freeq.at/act-id", ID),
+            ],
+            &venue,
+            EXPIRE,
+        )
+        .expect("act tags present");
+        let expire = ReplayedEvent {
+            event_id: EXPIRE.to_string(),
+            signature: Some(freeq_sdk::sigtag::sign_canonical(&canonical, &server_key)),
+            canonical,
+            kind: "act".to_string(),
+            venue,
+            actor_did: Some(server_did.clone()),
+            subject: Some(ID.to_string()),
+            emoji: None,
+            origin: OWN.to_string(),
+            timestamp: 1000,
+        };
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, expire),
+            ReplayOutcome::Filed
+        );
+
+        assert!(
+            state.with_db(|db| db.act_task(ID)).flatten().is_none(),
+            "the expiry ended the task"
+        );
+        assert!(
+            receipts_naming(&state, ID).is_empty(),
+            "and this server does not write itself a receipt for its own word"
+        );
     }
 
     /// A healed task event moves the task view, not only the log.

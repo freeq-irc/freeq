@@ -7269,6 +7269,24 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Where a task was opened, read off the opener's own log row: the empty
+    /// string when this server opened it, and `None` when the log has never
+    /// held that opener at all.
+    ///
+    /// The view answers the same question while a task is live and forgets it
+    /// the moment the task ends — which is precisely when the last move on it
+    /// is the one still needing an answer.
+    pub fn act_task_origin(&self, act_id: &str) -> SqlResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(origin, '') FROM events
+                  WHERE kind = 'act' AND event_id = ?1",
+                params![act_id],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
     /// One live task by id. `None` once it has finished — the log keeps the
     /// history, the view keeps the work.
     pub fn act_task(&self, act_id: &str) -> SqlResult<Option<ActTask>> {

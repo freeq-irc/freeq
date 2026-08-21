@@ -45,7 +45,7 @@ pub(super) enum Gate {
 /// the log holds one for every move whether or not delivery reaches anybody;
 /// handed back rather than sent, so it goes out *after* the event it names and
 /// a reader sees the move before the confirmation of it.
-pub(super) struct Receipt {
+pub(crate) struct Receipt {
     tags: HashMap<String, String>,
     venue: String,
 }
@@ -385,7 +385,7 @@ fn announce_ending(state: &Arc<SharedState>, task: &crate::db::ActTask, title: &
 /// A failure to file is logged and swallowed: the event this would have
 /// confirmed is already on file, and refusing it after the fact would be a
 /// second wrong.
-fn mint_receipt(
+pub(crate) fn mint_receipt(
     state: &Arc<SharedState>,
     kind: &str,
     act_id: &str,
@@ -419,6 +419,65 @@ fn mint_receipt(
     }
 }
 
+/// One task event this server has just written, and what the log said it did.
+///
+/// The arguments [`receipt_for_applied_move`] needs, gathered rather than
+/// listed: every path that files a task event already holds all of them.
+pub(crate) struct AppliedMove<'a> {
+    pub kind: &'a str,
+    pub act_id: &'a str,
+    /// The event's own id — what a receipt for it names.
+    pub event_id: &'a str,
+    pub venue: &'a str,
+    /// Who acted, as the document names them.
+    pub actor: &'a str,
+    /// What the log answered when this event was written.
+    pub written: &'a crate::db::ActWrite,
+}
+
+/// The receipt this server owes for a move it has just applied, or `None`
+/// when it owes none.
+///
+/// The home's rule, in one place because more than one path reaches it: an
+/// event arrives at the front door, over a peer's relay, addressed from the
+/// server holding it unruled, or in a replay of what we were away for, and
+/// every one of those can be the moment a task of ours moves. Which of them it
+/// was is not a property of the move.
+///
+/// Three things have to be true, each ruling out something that is not a move
+/// this server decided:
+///
+/// - the log filed it and the task changed state — an opener is not confirmed
+///   (nothing raced it; opening *is* the action) and a step that left the task
+///   where it stood has nothing to confirm;
+/// - a participant authored it — this server's own events are already signed
+///   by the server whose word settles the task, which is the degenerate case a
+///   receipt exists to cover for everyone else;
+/// - the task was opened here, so the ruling was ours to make.
+pub(crate) fn receipt_for_applied_move(
+    state: &Arc<SharedState>,
+    moved: &AppliedMove<'_>,
+) -> Option<Receipt> {
+    let crate::db::ActWrite::Filed {
+        was: Some(was),
+        state: landed,
+    } = moved.written
+    else {
+        return None;
+    };
+    if was == landed || crate::server::is_system_actor(moved.actor) {
+        return None;
+    }
+    let ours = state
+        .with_db(|db| db.act_task_origin(moved.act_id))
+        .flatten()
+        .is_some_and(|origin| origin.is_empty());
+    if !ours {
+        return None;
+    }
+    mint_receipt(state, moved.kind, moved.act_id, moved.event_id, moved.venue)
+}
+
 /// Put a filed receipt on the wire, to the same people the event it confirms
 /// reached.
 ///
@@ -432,7 +491,7 @@ fn mint_receipt(
 /// target is whatever the sender addressed, which is the known limitation the
 /// expiry notice states too: a server-authored line in a DM names the thread
 /// from the sender's side, and the reader's client has to know that.
-pub(super) fn broadcast_receipt(state: &Arc<SharedState>, receipt: &Receipt, target: &str) {
+pub(crate) fn broadcast_receipt(state: &Arc<SharedState>, receipt: &Receipt, target: &str) {
     let did = crate::server::server_did(&state.server_name);
     let time_tag = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S.000Z")
