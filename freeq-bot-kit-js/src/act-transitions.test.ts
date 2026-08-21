@@ -12,7 +12,14 @@ import { fileURLToPath } from "node:url";
 import {
   DEADLINE_TOLERANCE_MS,
   checkOpen,
+  CONFIRMATION_VERB,
+  REVIVAL_TAG,
+  assigneeSource,
+  checkRevival,
   checkTransition,
+  isConfirmation,
+  isEventId,
+  type Predecessor,
   eventTimeMs,
   initialState,
   isTerminal,
@@ -33,8 +40,25 @@ interface Step {
   sender: string;
   event_id?: string;
   system?: boolean;
+  /** The act fields the event carries, by document name. What a transition's
+   *  `requires` is checked against. */
+  tags?: string[];
+  /** Who the step assigns, when it names someone other than its sender. */
+  assigns?: string;
+  /** `act-accepts`: the event an award takes. */
+  accepts?: string;
+  /** Who wrote the bid that event turned out to be. Absent when the name
+   *  found no bid on this action. */
+  accepted_bid?: string;
   expect?: string;
   expect_refused?: RefusalReason;
+}
+
+/** Just enough of a kind's shape for the tests that read the file directly. */
+interface Kind {
+  opens: { verb: string; directed?: string; open: string };
+  terminal: string[];
+  transitions: { verb: string; from: string | string[]; to: string; who: string }[];
 }
 
 interface Sequence {
@@ -46,6 +70,7 @@ interface Sequence {
     offerer: string;
     offeree: string | null;
     deadline: number | null;
+    bid_deadline?: number | null;
   };
   steps: Step[];
 }
@@ -79,7 +104,11 @@ describe("the rules file", () => {
   it("names both initial states, and nothing for an unlisted kind", () => {
     expect(initialState("handoff", true)).toBe("offered");
     expect(initialState("handoff", false)).toBe("open");
-    expect(initialState("bounty", false)).toBeNull();
+    expect(initialState("approval", false)).toBeNull();
+    // A bounty opens to the room and nowhere else: it has no directed form,
+    // because a directed bounty is just a handoff.
+    expect(initialState("bounty", false)).toBe("open");
+    expect(initialState("bounty", true)).toBeNull();
   });
 
   it("carries the five terminal states and no others", () => {
@@ -91,8 +120,8 @@ describe("the rules file", () => {
     }
   });
 
-  it("does not carry the deferred approval kind", () => {
-    expect(Object.keys(canonical.kinds)).toEqual(["handoff"]);
+  it("carries the two kinds it lists, and not the deferred approval", () => {
+    expect(Object.keys(canonical.kinds).sort()).toEqual(["bounty", "handoff"]);
   });
 
   it("uses the same deadline tolerance as the Rust checker", () => {
@@ -100,11 +129,18 @@ describe("the rules file", () => {
   });
 
   it("documents every refusal reason it uses", () => {
-    const used = new Set<string>(
-      (canonical.sequences as Sequence[]).flatMap((s) =>
+    // Both lists count: some reasons only an opener can earn.
+    const used = new Set<string>([
+      ...((canonical.sequences as Sequence[]).flatMap((s) =>
         s.steps.map((st) => st.expect_refused).filter(Boolean),
-      ) as string[],
-    );
+      ) as string[]),
+      ...((canonical.opening_sequences as { expect_refused?: string }[])
+        .map((o) => o.expect_refused)
+        .filter(Boolean) as string[]),
+      ...((canonical.revival_sequences as { expect_refused?: string }[])
+        .map((r) => r.expect_refused)
+        .filter(Boolean) as string[]),
+    ]);
     for (const reason of used) {
       expect(refusalDescription(reason as RefusalReason), reason).not.toBe("refused");
     }
@@ -128,7 +164,8 @@ describe("opening a task", () => {
 
   it("names the creating verb, which no transition row can", () => {
     expect(openingVerb("handoff")).toBe("offer");
-    expect(openingVerb("bounty")).toBeNull();
+    expect(openingVerb("bounty")).toBe("offer");
+    expect(openingVerb("approval")).toBeNull();
   });
 
   it("lets any logged-in sender open, directed or not", () => {
@@ -157,9 +194,19 @@ describe("opening a task", () => {
   });
 
   it("refuses to open a kind the file does not list", () => {
-    expect(checkOpen("bounty", "offer", false, false)).toEqual({
+    expect(checkOpen("approval", "offer", false, false)).toEqual({
       ok: false,
       reason: "unknown-kind",
+    });
+  });
+
+  // The answer is illegal-step and not unknown-verb: `offer` is exactly the
+  // verb that opens a bounty, and naming a recipient is the part it cannot do.
+  it("refuses to open a bounty to one recipient", () => {
+    expect(checkOpen("bounty", "offer", false, false)).toEqual({ ok: true, to: "open" });
+    expect(checkOpen("bounty", "offer", true, false)).toEqual({
+      ok: false,
+      reason: "illegal-step",
     });
   });
 
@@ -200,6 +247,87 @@ describe("the happy path", () => {
       });
     }
   });
+});
+
+describe("the receipt verb", () => {
+  const refused = (reason: RefusalReason) => ({ ok: false, reason });
+
+  // A receipt is the home's word about an event, so a sender's `confirm` is
+  // refused wherever it appears — opening or moving, whatever kind it names,
+  // and even when the sender claims to be the server.
+  it("is never a sender's to write", () => {
+    expect(CONFIRMATION_VERB).toBe("confirm");
+    expect(checkTransition(directed("offered"), ev("confirm"), who(SCHOLAR))).toEqual(
+      refused("client-confirm"),
+    );
+    expect(
+      checkTransition(directed("offered"), ev("confirm"), { did: SERVER, isSystem: true }),
+    ).toEqual(refused("client-confirm"));
+    expect(checkOpen("handoff", "confirm", false, false)).toEqual(refused("client-confirm"));
+  });
+
+  // The answer must not read as "this kind has no such row yet", which would
+  // say a kind could add one. It cannot.
+  it("never reads as a verb a kind could add", () => {
+    expect(checkTransition({ ...directed("offered"), kind: "no-such-kind" }, ev("confirm"), who(SCHOLAR))).toEqual(
+      refused("client-confirm"),
+    );
+    expect(checkOpen("no-such-kind", "confirm", false, false)).toEqual(refused("client-confirm"));
+    for (const [name, kind] of Object.entries(canonical.kinds as Record<string, Kind>)) {
+      expect(
+        kind.transitions.some((t) => isConfirmation(t.verb)),
+        `${name} claims the receipt verb, which belongs to no kind`,
+      ).toBe(false);
+      expect(isConfirmation(kind.opens.verb), name).toBe(false);
+    }
+  });
+});
+
+describe("the revival relation", () => {
+  const refused = (reason: RefusalReason) => ({ ok: false, reason });
+  const DEAD = "01M16E7TC0ENDED00000000000";
+
+  it("only an opener revives a finished action", () => {
+    expect(REVIVAL_TAG).toBe("act-replaces");
+    expect(checkRevival(true, DEAD, "finished")).toEqual({ ok: true });
+    expect(checkRevival(true, DEAD, "unknown")).toEqual({ ok: true });
+    expect(checkRevival(true, DEAD, "live")).toEqual(refused("replaces-not-terminal"));
+    expect(checkRevival(false, DEAD, "finished")).toEqual(refused("replaces-not-opener"));
+    for (const bad of ["", "not-a-ulid", "01M16E7TC0SHRT", `${DEAD}X`, DEAD.toLowerCase()]) {
+      expect(checkRevival(true, bad, "unknown"), bad).toEqual(refused("replaces-malformed"));
+    }
+  });
+
+  it("reads an action id as twenty-six Crockford characters", () => {
+    expect(isEventId(DEAD)).toBe(true);
+    expect(isEventId(DEAD.slice(0, 25))).toBe(false);
+    // I, L, O and U are not in the alphabet, which is what keeps a ULID from
+    // being confused for something typed by hand.
+    for (const c of ["I", "L", "O", "U", "a", "-"]) {
+      expect(isEventId(DEAD.slice(0, 25) + c), c).toBe(false);
+    }
+  });
+
+  interface RevivalCase {
+    name: string;
+    opens: boolean;
+    names: string;
+    predecessor: Predecessor;
+    expect?: string;
+    expect_refused?: RefusalReason;
+  }
+
+  for (const c of canonical.revival_sequences as RevivalCase[]) {
+    it(c.name, () => {
+      const got = checkRevival(c.opens, c.names, c.predecessor);
+      if (c.expect !== undefined) {
+        expect(c.expect).toBe("accepted");
+        expect(got).toEqual({ ok: true });
+      } else {
+        expect(got).toEqual(refused(c.expect_refused!));
+      }
+    });
+  }
 });
 
 describe("refusals", () => {
@@ -269,9 +397,11 @@ describe("refusals", () => {
   });
 
   it("a kind the file does not list is refused, before the verb is even read", () => {
-    const bounty: Task = { ...directed("open"), kind: "bounty" };
-    expect(checkTransition(bounty, ev("bid"), who(SCHOLAR))).toEqual(refused("unknown-kind"));
-    expect(checkTransition(bounty, ev("cancel"), who(ELIZA))).toEqual(refused("unknown-kind"));
+    const approval: Task = { ...directed("open"), kind: "approval" };
+    expect(checkTransition(approval, ev("request"), who(SCHOLAR))).toEqual(
+      refused("unknown-kind"),
+    );
+    expect(checkTransition(approval, ev("cancel"), who(ELIZA))).toEqual(refused("unknown-kind"));
   });
 });
 
@@ -368,6 +498,119 @@ describe("the deadline", () => {
   });
 });
 
+describe("the two schema additions bounty needed", () => {
+  const refused = (reason: RefusalReason) => ({ ok: false, reason });
+  const bounty = (state: string): Task => ({ kind: "bounty", state, offerer: ELIZA });
+  /** The bid an award names in these tests. */
+  const BID = "01M16E7TC0BDTAKEN000000000";
+  const award = { verb: "award", msgid: NOW, accepts: BID, fields: ["act-accepts"] };
+  const took = (did: string, author: string): EventSender => ({
+    did,
+    acceptedBid: { author },
+  });
+
+  // Checked before authority: an award naming no bid is malformed for
+  // everybody, and "not you" would send the sender after the wrong problem.
+  it("an award names the bid it takes, or it is no award", () => {
+    const bare = { verb: "award", msgid: NOW, fields: [] };
+    expect(checkTransition(bounty("open"), bare, took(ELIZA, SCHOLAR))).toEqual(
+      refused("missing-requirement"),
+    );
+    expect(checkTransition(bounty("open"), bare, took(MALLORY, SCHOLAR))).toEqual(
+      refused("missing-requirement"),
+    );
+    expect(checkTransition(bounty("open"), award, took(ELIZA, SCHOLAR))).toEqual({
+      ok: true,
+      to: "assigned",
+    });
+  });
+
+  // The award names one event and the caller resolves it. A name that found
+  // no bid on this action takes nothing, and says so.
+  it("an award naming something that is not a bid takes nothing", () => {
+    expect(checkTransition(bounty("open"), award, who(ELIZA))).toEqual(
+      refused("accepts-not-a-bid"),
+    );
+    expect(checkTransition(bounty("open"), award, who(MALLORY))).toEqual(
+      refused("accepts-not-a-bid"),
+    );
+  });
+
+  // The server still never picks: which of the bids on the table is worth
+  // taking is the poster's to decide.
+  it("lets the poster take whichever bid they name", () => {
+    for (const author of [SCHOLAR, MALLORY, "did:plc:nobody"]) {
+      expect(checkTransition(bounty("open"), award, took(ELIZA, author)), author).toEqual({
+        ok: true,
+        to: "assigned",
+      });
+    }
+  });
+
+  // The guard has to be free for every row that names nothing, which is
+  // almost all of them.
+  it("leaves a transition that requires nothing exactly as it was", () => {
+    expect(checkTransition(directed("offered"), ev("accept"), who(SCHOLAR))).toEqual({
+      ok: true,
+      to: "assigned",
+    });
+  });
+
+  it("says where each transition's assignee comes from", () => {
+    expect(assigneeSource("bounty", "award", "open")).toEqual({
+      from: "author_of",
+      field: "act-accepts",
+    });
+    for (const [kind, verb, from] of [
+      ["handoff", "accept", "offered"],
+      ["handoff", "claim", "open"],
+      ["bounty", "bid", "open"],
+    ]) {
+      expect(assigneeSource(kind, verb, from), `${kind}/${verb}`).toEqual({ from: "actor" });
+    }
+    expect(assigneeSource("approval", "request", "open")).toEqual({ from: "actor" });
+  });
+
+  // A bounty takes bids until its own cutoff, which is a shorter question
+  // than how long the offer stands.
+  it("binds a bid to the offer's bid deadline, and the award to its own", () => {
+    const DEADLINE = 1_788_000_000;
+    const TOO_LATE = "01M16HSC58ACCEPTTOOLATE000";
+    const AT_EDGE = "01M16HSB60ACCEPTATEDGE0000";
+    const takingBids: Task = { ...bounty("open"), bidDeadline: DEADLINE };
+    expect(
+      checkTransition(takingBids, { verb: "bid", msgid: TOO_LATE }, who(SCHOLAR)),
+    ).toEqual(refused("deadline-passed"));
+    expect(checkTransition(takingBids, { verb: "bid", msgid: AT_EDGE }, who(SCHOLAR))).toEqual({
+      ok: true,
+      to: "open",
+    });
+    // Bidding closing does not stop the poster picking: the award is bound by
+    // the offer's own deadline, which this bounty never named.
+    expect(
+      checkTransition(
+        takingBids,
+        { verb: "award", msgid: TOO_LATE, accepts: BID, fields: ["act-accepts"] },
+        took(ELIZA, SCHOLAR),
+      ),
+    ).toEqual({ ok: true, to: "assigned" });
+    // …and no bid cutoff means no bid cutoff.
+    expect(
+      checkTransition(bounty("open"), { verb: "bid", msgid: TOO_LATE }, who(SCHOLAR)),
+    ).toEqual({ ok: true, to: "open" });
+  });
+
+  it("takes bids additively until the work is awarded", () => {
+    expect(checkTransition(bounty("open"), ev("bid"), who(SCHOLAR))).toEqual({
+      ok: true,
+      to: "open",
+    });
+    expect(checkTransition(bounty("assigned"), ev("bid"), who(MALLORY))).toEqual(
+      refused("illegal-step"),
+    );
+  });
+});
+
 describe("the shared sequences", () => {
   const sequences = canonical.sequences as Sequence[];
 
@@ -388,19 +631,53 @@ describe("the shared sequences", () => {
           offeree: seq.task.offeree,
           assignee,
           deadline: seq.task.deadline,
+          bidDeadline: seq.task.bid_deadline,
         };
         const result = checkTransition(
           task,
-          { verb: step.verb, msgid: step.event_id ?? NOW },
-          { did: step.sender, isSystem: step.system ?? false },
+          {
+            verb: step.verb,
+            msgid: step.event_id ?? NOW,
+            accepts: step.accepts,
+            fields: step.tags ?? [],
+          },
+          {
+            did: step.sender,
+            isSystem: step.system ?? false,
+            // What the caller's log made of the event this one names. A step
+            // that sets nothing named nothing, or named something that is not
+            // a bid — the file does not distinguish, because neither does the
+            // checker.
+            acceptedBid: step.accepted_bid ? { author: step.accepted_bid } : null,
+          },
         );
         const where = `${seq.name} — step ${i + 1} (${step.verb})`;
 
         if (step.expect !== undefined) {
           expect(result, where).toEqual({ ok: true, to: step.expect });
           // A refused step changes nothing; an accepted one may name the
-          // assignee, which is the sender who moved it into `assigned`.
-          if (assignee === null && step.expect === "assigned") assignee = step.sender;
+          // assignee. Who that is, is data: the actor by default, and whoever
+          // the transition's field names otherwise — a bounty's award names
+          // its winner rather than becoming one.
+          if (assignee === null && step.expect === "assigned") {
+            const source = assigneeSource(seq.task.kind, step.verb, state);
+            if (source.from === "actor") {
+              assignee = step.sender;
+            } else if (source.from === "author_of") {
+              if (!step.accepted_bid) {
+                throw new Error(
+                  `${where}: this transition assigns the author of the bid it names, and none was resolved`,
+                );
+              }
+              assignee = step.accepted_bid;
+            } else if (!step.assigns) {
+              throw new Error(
+                `${where}: assigns is not set, but this transition takes its assignee from ${source.field}`,
+              );
+            } else {
+              assignee = step.assigns;
+            }
+          }
           state = step.expect;
         } else {
           expect(result, where).toEqual({ ok: false, reason: step.expect_refused });

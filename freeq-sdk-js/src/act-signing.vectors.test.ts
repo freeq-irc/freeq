@@ -16,9 +16,26 @@ interface Vector {
   canonical: string;
 }
 
+interface Negative {
+  vector: string;
+  target: string;
+  id: string;
+  tamperedCanonical?: string;
+  strippedTag?: string;
+  swappedTag?: { name: string; value: string };
+}
+
 const spec = JSON.parse(
   readFileSync(join(__dirname, '../../spec/act-signing-vectors.json'), 'utf8'),
-) as { vectors: Vector[]; negatives: { vector: string; target: string; id: string; tamperedCanonical: string }[] };
+) as { vectors: Vector[]; negatives: Negative[] };
+
+/** The vector's tags as a negative presents them to a verifier. */
+function tagsFor(n: Negative, v: Vector): Record<string, string> {
+  const tags = { ...v.tags };
+  if (n.strippedTag !== undefined) delete tags[n.strippedTag];
+  if (n.swappedTag !== undefined) tags[n.swappedTag.name] = n.swappedTag.value;
+  return tags;
+}
 
 describe('act canonical', () => {
   for (const v of spec.vectors) {
@@ -31,9 +48,9 @@ describe('act canonical', () => {
   // algorithm) have no canonical to rebuild; this suite has no verifier, so
   // only the tamper-class negatives are byte-checked here.
   for (const n of spec.negatives.filter((x) => x.tamperedCanonical !== undefined)) {
-    it(`rebuilds ${n.vector} under other delivery context: ${n.tamperedCanonical!.length} bytes`, () => {
+    it(`rebuilds tampered ${n.vector}: ${n.tamperedCanonical!.length} bytes`, () => {
       const v = spec.vectors.find((x) => x.name === n.vector)!;
-      expect(actCanonical(v.tags, n.target, n.id)).toBe(n.tamperedCanonical);
+      expect(actCanonical(tagsFor(n, v), n.target, n.id)).toBe(n.tamperedCanonical);
     });
   }
 

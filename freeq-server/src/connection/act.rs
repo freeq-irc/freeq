@@ -32,10 +32,22 @@ const VERB_TAG_BARE: &str = "act-verb";
 pub(super) enum Gate {
     /// No act tags: not a task message, and none of this applies.
     NotATaskMessage,
-    /// A task message that passed every check.
-    Accepted,
+    /// A task message that passed every check, and the receipt this server
+    /// owes for it — `None` when the event moved nothing.
+    Accepted(Option<Receipt>),
     /// Refused. The `FAIL` has already been sent.
     Refused,
+}
+
+/// A receipt this server has already filed, on its way to the room.
+///
+/// Minted, signed and filed inside the gate beside the event it confirms, so
+/// the log holds one for every move whether or not delivery reaches anybody;
+/// handed back rather than sent, so it goes out *after* the event it names and
+/// a reader sees the move before the confirmation of it.
+pub(super) struct Receipt {
+    tags: HashMap<String, String>,
+    venue: String,
 }
 
 /// Whether any tag on this message is one the act canonical covers.
@@ -134,28 +146,37 @@ pub(super) fn refuse_body_with_act_tags(
     );
 }
 
-/// Expire one abandoned task: sign the event, run it through the same check
-/// and storage every other event goes through, and announce it.
+/// Mint, sign and file one event of this server's own.
 ///
-/// The sweep has no client connection, which is why this is separate from the
-/// gate above — but it is not a separate path. The event is built the way a
-/// sender would build it, signed with this server's own key under its own
-/// identity, and applied through `apply_act_event` like anything else, so it
-/// lands in the log, the view and replay identically.
+/// The shape every server-authored event shares — the expiry sweep's and the
+/// receipt path's alike. The document is built the way a sender builds one:
+/// this server's DID in `from`, a fresh ULID for the id, the standard act
+/// canonical over whatever act tags the caller named, signed with this
+/// server's own key and applied through `apply_act_event` like anything else,
+/// so it lands in the log, the view and replay identically.
 ///
-/// Returns whether the task was expired.
-pub(crate) fn expire_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -> bool {
+/// The caller names only what is particular to its event; `from`, the kind,
+/// the verb and the task are the shape. Returns the wire tag map — the act
+/// tags plus the id and the signature, ready to put on a line — and what the
+/// log made of it.
+fn file_own_event(
+    state: &Arc<SharedState>,
+    kind: &str,
+    verb: &str,
+    act_id: &str,
+    extra: &[(&str, &str)],
+    venue: &str,
+) -> Option<(HashMap<String, String>, crate::db::ActWrite)> {
     let did = crate::server::server_did(&state.server_name);
     let event_id = freeq_sdk::chatsig::new_event_id();
-    let tags = vec![
-        ("+freeq.at/act", task.kind.as_str()),
-        ("+freeq.at/act-verb", "expire"),
+    let mut pairs: Vec<(&str, &str)> = vec![
+        (KIND_TAG, kind),
+        (VERB_TAG, verb),
         ("+freeq.at/from", did.as_str()),
-        ("+freeq.at/act-id", task.act_id.as_str()),
+        ("+freeq.at/act-id", act_id),
     ];
-    let Ok(canonical) = freeq_sdk::act::act_canonical(tags, &task.venue, &event_id) else {
-        return false;
-    };
+    pairs.extend_from_slice(extra);
+    let canonical = freeq_sdk::act::act_canonical(pairs.clone(), venue, &event_id).ok()?;
     let signature = freeq_sdk::sigtag::sign_canonical(&canonical, &state.msg_signing_key);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -167,21 +188,47 @@ pub(crate) fn expire_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -
             canonical: &canonical,
             signature: Some(&signature),
             event_id: &event_id,
-            act_id: &task.act_id,
+            act_id,
             opens: false,
-            venue: &task.venue,
+            venue,
             actor: &did,
-            // Only the server may expire, and this is the server.
+            // This is the server, signing under its own identity — the only
+            // actor a `system` transition allows, and the only one that may
+            // write a receipt.
             from_system: true,
             origin: None,
             timestamp: now,
         })
-    });
+    })?;
+
+    let mut tags: HashMap<String, String> = pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    tags.insert(
+        freeq_sdk::chatsig::EVENT_ID_TAG.to_string(),
+        event_id.clone(),
+    );
+    tags.insert("msgid".to_string(), event_id);
+    tags.insert("+freeq.at/sig".to_string(), signature);
+    Some((tags, written))
+}
+
+/// Expire one abandoned task: sign the event, run it through the same check
+/// and storage every other event goes through, and announce it.
+///
+/// The sweep has no client connection, which is why this is separate from the
+/// gate above — but it is not a separate path.
+///
+/// Returns whether the task was expired.
+pub(crate) fn expire_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -> bool {
+    let written = file_own_event(state, &task.kind, "expire", &task.act_id, &[], &task.venue);
     match written {
-        Some(crate::db::ActWrite::Filed { .. }) => {}
+        Some((_, crate::db::ActWrite::Filed { .. })) => {}
         other => {
             tracing::warn!(
-                act_id = %task.act_id, venue = %task.venue, outcome = ?other,
+                act_id = %task.act_id, venue = %task.venue,
+                outcome = ?other.map(|(_, w)| w),
                 "Expiry sweep could not file its own event"
             );
             return false;
@@ -204,6 +251,46 @@ pub(crate) fn expire_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -
     true
 }
 
+/// Close the review window on one task: sign the event, run it through the
+/// same check and storage every other event goes through, and let it go out.
+///
+/// The other clock, and the mirror of `expire_task` — the difference is what
+/// the log ends up saying. Work that was handed in and never answered is
+/// deemed accepted, under a verb of its own, because "the window you were
+/// told about closed" and "nobody touched this for a month" are different
+/// things to have on the record.
+///
+/// Announced to the room the way an expiry is: the event is the record, and
+/// the notice is how the people in the conversation hear that the window
+/// closed and the work stands accepted.
+///
+/// Returns whether the task was accepted.
+pub(crate) fn auto_accept_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -> bool {
+    let verb = freeq_sdk::act_transitions::REVIEW_TIMEOUT_VERB;
+    match file_own_event(state, &task.kind, verb, &task.act_id, &[], &task.venue) {
+        Some((_, crate::db::ActWrite::Filed { .. })) => {
+            let title = state
+                .with_db(|db| db.act_task_title(&task.act_id))
+                .flatten()
+                .unwrap_or_else(|| task.act_id.clone());
+            announce_auto_accept(state, task, &title);
+            tracing::info!(
+                act_id = %task.act_id, venue = %task.venue, state = %task.state,
+                "Review window closed; the work is accepted"
+            );
+            true
+        }
+        other => {
+            tracing::warn!(
+                act_id = %task.act_id, venue = %task.venue,
+                outcome = ?other.map(|(_, w)| w),
+                "Review sweep could not file its own event"
+            );
+            false
+        }
+    }
+}
+
 /// A title is text its sender chose, and this notice is built as a wire line
 /// rather than through `Message`, which escapes tag values on the way out. So
 /// the bytes that end a line — and every other control byte — come out here,
@@ -223,19 +310,10 @@ fn title_for_wire(title: &str) -> String {
 /// Long enough for any real task name, short enough that no notice is a wall.
 const MAX_TITLE_CHARS: usize = 200;
 
-/// Tell the room — or the two people in the conversation — that a task ended
-/// without finishing.
-fn announce_expiry(state: &Arc<SharedState>, task: &crate::db::ActTask, title: &str) {
-    // A title of nothing but stripped bytes would announce a task by no name at
-    // all, so it falls back the same way a missing title does.
-    let cleaned = title_for_wire(title);
-    let shown = match cleaned.trim().is_empty() {
-        true => task.act_id.as_str(),
-        false => cleaned.as_str(),
-    };
-    let text = format!("Task expired without completion: {shown}");
-    let sessions: Vec<String> = match task.venue.strip_prefix("dm:") {
-        // A DM task belongs to two people and nobody else hears about it.
+/// Every local session that should hear about something happening in a venue:
+/// a channel's members, or both ends of a direct conversation and nobody else.
+fn venue_sessions(state: &Arc<SharedState>, venue: &str) -> Vec<String> {
+    match venue.strip_prefix("dm:") {
         Some(pair) => {
             let dids: Vec<&str> = pair.split(',').collect();
             let by_did = state.did_sessions.lock();
@@ -247,10 +325,35 @@ fn announce_expiry(state: &Arc<SharedState>, task: &crate::db::ActTask, title: &
         None => state
             .channels
             .lock()
-            .get(&task.venue)
+            .get(venue)
             .map(|ch| ch.members.iter().cloned().collect())
             .unwrap_or_default(),
+    }
+}
+
+/// Tell the room — or the two people in the conversation — that a task ended
+/// without finishing.
+fn announce_expiry(state: &Arc<SharedState>, task: &crate::db::ActTask, title: &str) {
+    announce_ending(state, task, title, "Task expired without completion");
+}
+
+/// Tell the room the review window closed and the work stands accepted —
+/// the same line the expiry sweep speaks, with a different ending.
+fn announce_auto_accept(state: &Arc<SharedState>, task: &crate::db::ActTask, title: &str) {
+    announce_ending(state, task, title, "Task accepted without review");
+}
+
+/// One notice, two endings: `what` is the sentence up to the colon.
+fn announce_ending(state: &Arc<SharedState>, task: &crate::db::ActTask, title: &str, what: &str) {
+    // A title of nothing but stripped bytes would announce a task by no name at
+    // all, so it falls back the same way a missing title does.
+    let cleaned = title_for_wire(title);
+    let shown = match cleaned.trim().is_empty() {
+        true => task.act_id.as_str(),
+        false => cleaned.as_str(),
     };
+    let text = format!("{what}: {shown}");
+    let sessions = venue_sessions(state, &task.venue);
     let target = match task.venue.starts_with("dm:") {
         true => None,
         false => Some(task.venue.as_str()),
@@ -262,6 +365,101 @@ fn announce_expiry(state: &Arc<SharedState>, task: &crate::db::ActTask, title: &
             // channel, so a client files it where the conversation is.
             let to = target.unwrap_or("*");
             let _ = tx.try_send(format!(":{} NOTICE {to} :{text}\r\n", state.server_name));
+        }
+    }
+}
+
+/// Mint the home's receipt for an event it has just filed.
+///
+/// The RFC leaves the trigger open — "an action other servers are involved
+/// in" — and this server resolves it the only way one server can answer it:
+/// **always emit**. Receipts are small, replay is free, and a rule with no
+/// condition cannot be implemented wrong. When federation lands, a
+/// condition can be added; a missing receipt could never be added back.
+///
+/// Called for a step that moved the task and nothing else. An opener is not
+/// confirmed (nothing raced it — opening *is* the action), a report that
+/// leaves the task where it stood is not confirmed (there is no move to
+/// confirm), and this server's own events are not confirmed (they are already
+/// home-signed, which is the degenerate case the RFC names).
+///
+/// A failure to file is logged and swallowed: the event this would have
+/// confirmed is already on file, and refusing it after the fact would be a
+/// second wrong.
+fn mint_receipt(
+    state: &Arc<SharedState>,
+    kind: &str,
+    act_id: &str,
+    subject: &str,
+    venue: &str,
+) -> Option<Receipt> {
+    let subject_tag = format!(
+        "+freeq.at/{}",
+        freeq_sdk::act_transitions::confirmation_subject_tag()
+    );
+    let (tags, written) = file_own_event(
+        state,
+        kind,
+        freeq_sdk::act_transitions::confirmation_verb(),
+        act_id,
+        &[(subject_tag.as_str(), subject)],
+        venue,
+    )?;
+    match written {
+        crate::db::ActWrite::Recorded => Some(Receipt {
+            tags,
+            venue: venue.to_string(),
+        }),
+        other => {
+            tracing::warn!(
+                act_id = %act_id, subject = %subject, venue = %venue, outcome = ?other,
+                "Could not file the receipt for a task event"
+            );
+            None
+        }
+    }
+}
+
+/// Put a filed receipt on the wire, to the same people the event it confirms
+/// reached.
+///
+/// Gated exactly as every act event is: a connection that did not ask for
+/// `freeq.at/act` gets no receipts either. There is no companion PRIVMSG — the
+/// confirmed event's companion already told the humans, and a receipt is
+/// machine record.
+///
+/// `target` is the one the confirmed event arrived on, so both lines are filed
+/// in the same place by whatever renders them. In a direct conversation that
+/// target is whatever the sender addressed, which is the known limitation the
+/// expiry notice states too: a server-authored line in a DM names the thread
+/// from the sender's side, and the reader's client has to know that.
+pub(super) fn broadcast_receipt(state: &Arc<SharedState>, receipt: &Receipt, target: &str) {
+    let did = crate::server::server_did(&state.server_name);
+    let time_tag = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S.000Z")
+        .to_string();
+    // Spoken by the server under its own name, the way a NOTICE from the
+    // expiry sweep is: the receipt's authorship is the whole point of it.
+    let lines = super::messaging::TagmsgLines::build(
+        &receipt.tags,
+        &state.server_name,
+        target,
+        &time_tag,
+        Some(&did),
+    );
+    let sessions = venue_sessions(state, &receipt.venue);
+    let tag_caps = state.cap_message_tags.lock();
+    let time_caps = state.cap_server_time.lock();
+    let acct_caps = state.cap_account_tag.lock();
+    let act_caps = state.cap_act.lock();
+    let conns = state.connections.lock();
+    for session in &sessions {
+        if !tag_caps.contains(session) || !act_caps.contains(session) {
+            continue;
+        }
+        if let Some(tx) = conns.get(session) {
+            let line = lines.pick(time_caps.contains(session), acct_caps.contains(session));
+            let _ = tx.try_send(line.to_string());
         }
     }
 }
@@ -665,6 +863,29 @@ pub(super) fn gate(
         .map(String::as_str)
         .unwrap_or("");
 
+    // ── The one verb no sender writes ──
+    //
+    // A receipt is this server's record of an event it filed, so a client
+    // sending one is answered before the kind's table is consulted at all.
+    // Falling through to UNKNOWN_VERB would say the kind is merely missing a
+    // row for `confirm` — and a kind adding its own is the thing the RFC
+    // forbids. The code is the one every wrong-hands refusal uses; only the
+    // sentence is particular.
+    if freeq_sdk::act_transitions::is_confirmation(verb) {
+        tracing::debug!(
+            session = %conn.id, did = %did, kind = %kind,
+            "Refused a confirmation from a sender"
+        );
+        refuse(
+            conn,
+            "TAGMSG",
+            "WRONG_SENDER",
+            "Only the action's home confirms it",
+            state,
+        );
+        return Gate::Refused;
+    }
+
     // Opening a task and moving one are different questions. The opener is
     // the only move that can be judged in full here: it needs no prior state,
     // because there is no prior task. For everything else this step can only
@@ -755,11 +976,28 @@ pub(super) fn gate(
         })
     });
 
+    // The receipt this server owes for the event, if the event moved the task.
+    let mut receipt = None;
     match written {
         // No database attached: nothing to referee against, and nothing to
         // store. The message is still checked and delivered.
         None => {}
-        Some(crate::db::ActWrite::Filed { .. }) => {}
+        Some(crate::db::ActWrite::Filed { was: None, .. }) => {}
+        Some(crate::db::ActWrite::Filed {
+            was: Some(was),
+            state: landed,
+        }) => {
+            // A move, or a report that left the task where it stood. Only the
+            // first is confirmed: a receipt says "this is where the action now
+            // stands, and this server says so", and there is nothing to say
+            // when nothing changed.
+            if was != landed {
+                receipt = mint_receipt(state, kind, &act_id, &msgid, &venue);
+            }
+        }
+        // Not reachable from here — a sender's confirm was refused above —
+        // but the log's answer for one, and nothing to deliver either way.
+        Some(crate::db::ActWrite::Recorded) => {}
         Some(crate::db::ActWrite::UnknownTask) => {
             tracing::debug!(
                 session = %conn.id, did = %did, act_id = %act_id,
@@ -786,6 +1024,10 @@ pub(super) fn gate(
         }
         Some(crate::db::ActWrite::Refused(reason)) => {
             use freeq_sdk::act_transitions::Refusal;
+            // Every other sentence is a constant; this one names the field the
+            // step is missing, so it needs somewhere to live as long as the
+            // borrow.
+            let missing;
             let (code, sentence) = match reason {
                 Refusal::TerminalTask => (
                     "TERMINAL_TASK",
@@ -801,6 +1043,29 @@ pub(super) fn gate(
                     ("UNKNOWN_KIND", "This server does not know that task kind")
                 }
                 Refusal::UnknownVerb => ("UNKNOWN_VERB", "That task kind has no such step"),
+                Refusal::ClientConfirm => ("WRONG_SENDER", "Only the action's home confirms it"),
+                Refusal::ReplacesNotOpener => (
+                    "REPLACES_NOT_OPENER",
+                    "Only a new action replaces an earlier one",
+                ),
+                Refusal::ReplacesMalformed => {
+                    ("REPLACES_MALFORMED", "That is not the id of an action")
+                }
+                Refusal::ReplacesNotTerminal => (
+                    "REPLACES_NOT_TERMINAL",
+                    "The action it replaces is not finished",
+                ),
+                // The sentence names the field rather than the verb: which
+                // field a step needs is the rules file's to say, and a
+                // sentence per verb would be a kind's behaviour written into
+                // this server.
+                Refusal::MissingRequirement(field) => {
+                    missing = format!("That step must carry {field}");
+                    ("MISSING_REQUIREMENT", missing.as_str())
+                }
+                Refusal::AcceptsNotABid => {
+                    ("ACCEPTS_NOT_A_BID", "That award names no bid on this task")
+                }
             };
             tracing::debug!(
                 session = %conn.id, did = %did, act_id = %act_id, reason = %reason,
@@ -834,7 +1099,7 @@ pub(super) fn gate(
         kind = %kind, verb = %verb, msgid = %msgid, act_id = %act_id,
         "Accepted a task message"
     );
-    Gate::Accepted
+    Gate::Accepted(receipt)
 }
 
 #[cfg(test)]

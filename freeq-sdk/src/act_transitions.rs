@@ -58,6 +58,22 @@ pub enum Refusal {
     WrongSender,
     /// The event was minted past the offer's deadline, beyond the tolerance.
     DeadlinePassed,
+    /// A sender wrote the confirmation verb. Receipts are the home's.
+    ClientConfirm,
+    /// The revival relation rode an event that opens nothing.
+    ReplacesNotOpener,
+    /// The revival relation's value is not shaped like an action id.
+    ReplacesMalformed,
+    /// The action a revival names is on file and has not finished.
+    ReplacesNotTerminal,
+    /// The transition requires a field the event does not carry, named here so
+    /// the sender is told which one. The name comes from the rules file, which
+    /// outlives every event — so carrying it costs nothing and saves a round
+    /// of guessing.
+    MissingRequirement(&'static str),
+    /// An award named an event that is not a bid on this action. The caller
+    /// resolved the name against its own log and found nothing to take.
+    AcceptsNotABid,
 }
 
 impl Refusal {
@@ -71,6 +87,12 @@ impl Refusal {
             Refusal::IllegalStep => "illegal-step",
             Refusal::WrongSender => "wrong-sender",
             Refusal::DeadlinePassed => "deadline-passed",
+            Refusal::ClientConfirm => "client-confirm",
+            Refusal::ReplacesNotOpener => "replaces-not-opener",
+            Refusal::ReplacesMalformed => "replaces-malformed",
+            Refusal::ReplacesNotTerminal => "replaces-not-terminal",
+            Refusal::MissingRequirement(_) => "missing-requirement",
+            Refusal::AcceptsNotABid => "accepts-not-a-bid",
         }
     }
 
@@ -108,6 +130,11 @@ pub struct Task<'a> {
     pub offeree: Option<&'a str>,
     pub assignee: Option<&'a str>,
     pub deadline: Option<i64>,
+    /// The offer's `act-bid-deadline` in unix seconds, empty when it named
+    /// none. A second time on the same opener, compared the same way: it
+    /// bounds how long a bounty collects bids, which is a shorter question
+    /// than how long the offer stands.
+    pub bid_deadline: Option<i64>,
 }
 
 /// The event being checked.
@@ -118,15 +145,42 @@ pub struct Event<'a> {
     /// deadline is measured against — every verifier then compares the same
     /// number instead of its own wall clock.
     pub msgid: &'a str,
+    /// `act-accepts`: the event an award takes. Named here rather than read
+    /// out of `fields` because it is the one act value a caller must resolve
+    /// before asking — see [`Sender::accepted_bid`].
+    pub accepts: Option<&'a str>,
+    /// The act fields the event carries, by their document names (`act-to`,
+    /// `act-note`, …). Presence only: what a transition's `requires` is
+    /// checked against. Values are the caller's business — the one place this
+    /// checker points at a value is [`assignee_source`], which names the field
+    /// rather than reading it.
+    pub fields: &'a [&'a str],
 }
 
-/// Who sent it.
+/// The bid an award named, as the caller's log answered for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptedBid<'a> {
+    /// Who wrote the bid. The assignee an award's `author_of` row lands on.
+    pub author: &'a str,
+}
+
+/// Who sent it, and what their event resolved to.
 #[derive(Debug, Clone, Copy)]
 pub struct Sender<'a> {
     pub did: &'a str,
     /// The server itself, signing under its own identity — the only actor a
     /// `system` transition allows.
     pub is_system: bool,
+    /// The bid this event's `act-accepts` names, when the caller found one on
+    /// the action. `None` when it named something that is not a bid here —
+    /// including an id belonging to another action, and an id nobody filed.
+    ///
+    /// This checker reads no log, so the lookup is the caller's: it resolves
+    /// the named event among the action's own and hands back the bid's
+    /// author. A caller with no log — a bot pre-checking its own move —
+    /// passes `None` and is told its award takes nothing, which is the honest
+    /// answer from where it stands.
+    pub accepted_bid: Option<AcceptedBid<'a>>,
 }
 
 /// The state a new task of `kind` starts in.
@@ -146,6 +200,81 @@ pub fn opening_verb(kind: &str) -> Option<&'static str> {
     spec().kinds.get(kind).map(|k| k.opens.verb.as_str())
 }
 
+/// The verb an action's home writes its receipts under.
+pub fn confirmation_verb() -> &'static str {
+    spec().confirmation.verb.as_str()
+}
+
+/// The tag a receipt names the event it confirms in.
+pub fn confirmation_subject_tag() -> &'static str {
+    spec().confirmation.subject.as_str()
+}
+
+/// Whether this verb is the home's receipt verb.
+///
+/// Asked before any kind's table is consulted, by every caller that reads a
+/// verb at all. A receipt is a statement about an event, not a move on a task:
+/// no kind lists `confirm`, and letting one fall through to the per-kind
+/// lookup would answer "that kind has no such step" — which reads as an
+/// invitation to add the row, and the row must not exist.
+pub fn is_confirmation(verb: &str) -> bool {
+    verb == confirmation_verb()
+}
+
+/// The tag a new action names the finished one it revives in.
+pub fn revival_tag() -> &'static str {
+    spec().revival.tag.as_str()
+}
+
+/// What the caller's log knows about the action a revival names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Predecessor {
+    /// Never filed here. Accepted and annotated — see [`check_revival`].
+    Unknown,
+    /// On file, and still running.
+    Live,
+    /// On file, and finished.
+    Finished,
+}
+
+/// Whether `id` is shaped like an event id: a 26-character Crockford ULID.
+///
+/// Shape only. Whether anything was ever filed under it is the log's answer,
+/// not this one's.
+pub fn is_event_id(id: &str) -> bool {
+    const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    id.len() == 26 && id.bytes().all(|b| CROCKFORD.contains(&b))
+}
+
+/// Decide whether an event may carry the revival relation
+/// ([`revival_tag`]), given what the caller's log knows about the action it
+/// names.
+///
+/// Three rules, cheapest first. Only an opener revives anything: a step on an
+/// action that already exists names no other. The value names an action, so it
+/// is shaped like one. And the action it names must have finished — reviving
+/// something still running would leave two live actions each claiming to be
+/// the work.
+///
+/// [`Predecessor::Unknown`] is accepted, and that is the load-bearing part:
+/// receivers must tolerate a link to an action they never filed and annotate
+/// rather than refuse. On one server that is a client's typo; under federation
+/// it is the ordinary case, because the predecessor lived on somebody else's
+/// machine. A caller with no log at all — a bot pre-checking its own move —
+/// passes `Unknown` and gets the two rules a message decides on its own.
+pub fn check_revival(opens: bool, named: &str, predecessor: Predecessor) -> Result<(), Refusal> {
+    if !opens {
+        return Err(Refusal::ReplacesNotOpener);
+    }
+    if !is_event_id(named) {
+        return Err(Refusal::ReplacesMalformed);
+    }
+    match predecessor {
+        Predecessor::Live => Err(Refusal::ReplacesNotTerminal),
+        Predecessor::Unknown | Predecessor::Finished => Ok(()),
+    }
+}
+
 /// Decide whether an event may open a new task of `kind`.
 ///
 /// The move the transitions table cannot describe, because there is no task
@@ -163,6 +292,11 @@ pub fn check_open(
     directed: bool,
     names_task: bool,
 ) -> Result<&'static str, Refusal> {
+    // Before the kind is even looked up: a receipt opens nothing, and the
+    // answer must not depend on which kind it named.
+    if is_confirmation(verb) {
+        return Err(Refusal::ClientConfirm);
+    }
     let k = spec().kinds.get(kind).ok_or(Refusal::UnknownKind)?;
     if k.opens.verb != verb {
         // A verb the kind moves tasks with is known but cannot start one;
@@ -180,6 +314,84 @@ pub fn check_open(
         true => k.opens.directed.as_deref().ok_or(Refusal::IllegalStep),
         false => Ok(k.opens.open.as_str()),
     }
+}
+
+/// Who a transition assigns the work to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssigneeSource {
+    /// Whoever took the step — what `accept` and `claim` already mean.
+    Actor,
+    /// The act field named here, read off the event.
+    Field(&'static str),
+    /// The author of the event named in this act field: a bounty's `award`
+    /// takes one bid, and the terms live in it, so the poster names the event
+    /// in `act-accepts` rather than a DID. Resolving it is the caller's — this
+    /// checker reads no log — and the answer arrives as
+    /// [`Sender::accepted_bid`].
+    AuthorOf(&'static str),
+}
+
+/// How a row spells `assignee_from`: a tag holding a DID, or the author of
+/// the event a tag names.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(untagged)]
+enum AssigneeFrom {
+    Field(String),
+    AuthorOf { author_of: String },
+}
+
+/// The verb the event an award names must carry.
+///
+/// Written down once, here, so a caller resolving `act-accepts` asks the
+/// rules rather than spelling a kind's verb into itself.
+pub const BID_VERB: &str = "bid";
+
+/// The verb a home files when a review window runs out.
+///
+/// Distinct from `expire` on purpose: the log should say what happened, and
+/// "the review window closed and the work is deemed accepted" is not the same
+/// event as "nobody touched this for a month". A sweep that reused `expire`
+/// would tell every reader the worker dropped the job.
+pub const REVIEW_TIMEOUT_VERB: &str = "auto-accept";
+
+/// Every state some kind's review-timeout row moves a task out of.
+///
+/// The sweep asks this rather than knowing which kinds have a review window:
+/// a kind that writes the row is swept, a kind that does not is left to the
+/// neutral idle limit. Sorted and deduplicated, so two kinds naming the same
+/// state name it once.
+pub fn review_timeout_states() -> Vec<&'static str> {
+    let mut states: Vec<&'static str> = spec()
+        .kinds
+        .values()
+        .flat_map(|k| k.transitions.iter())
+        .filter(|t| t.verb == REVIEW_TIMEOUT_VERB)
+        .flat_map(|t| t.from.states())
+        .collect();
+    states.sort_unstable();
+    states.dedup();
+    states
+}
+
+/// Where the assignee comes from when `verb` moves a `kind` task out of
+/// `from_state`.
+///
+/// Data, not code: a kind that assigns someone other than the actor says so in
+/// its row, and the view materializes it the same way for every kind. A verb
+/// with no row here answers `Actor`, which changes nothing for a transition
+/// that assigns nobody.
+pub fn assignee_source(kind: &str, verb: &str, from_state: &str) -> AssigneeSource {
+    let Some(k) = spec().kinds.get(kind) else {
+        return AssigneeSource::Actor;
+    };
+    k.transitions
+        .iter()
+        .find(|t| t.verb == verb && t.from.matches(from_state, k))
+        .and_then(|t| t.assignee_from.as_ref())
+        .map_or(AssigneeSource::Actor, |from| match from {
+            AssigneeFrom::Field(field) => AssigneeSource::Field(field),
+            AssigneeFrom::AuthorOf { author_of } => AssigneeSource::AuthorOf(author_of),
+        })
 }
 
 /// Whether the rules file lists this kind at all.
@@ -234,6 +446,12 @@ pub fn check(
     event: &Event<'_>,
     sender: &Sender<'_>,
 ) -> Result<&'static str, Refusal> {
+    // The receipt verb, before the kind lookup and before anything about this
+    // task: a confirmation is not a move, and no table has a row for it. The
+    // home files its own receipts past this checker entirely.
+    if is_confirmation(event.verb) {
+        return Err(Refusal::ClientConfirm);
+    }
     let kind = spec().kinds.get(task.kind).ok_or(Refusal::UnknownKind)?;
 
     // Is this a move the kind has at all? Asked before anything about this
@@ -258,6 +476,29 @@ pub fn check(
         .find(|t| t.from.matches(task.state, kind))
         .ok_or(Refusal::IllegalStep)?;
 
+    // What the move needs to be the move at all. Before authority for the
+    // same reason the state is: an award that names no winner is malformed
+    // for everybody, and "not you" would send the sender after the wrong
+    // problem.
+    if let Some(missing) = row
+        .requires
+        .iter()
+        .find(|f| !event.fields.contains(&f.as_str()))
+    {
+        return Err(Refusal::MissingRequirement(missing.as_str()));
+    }
+
+    // A row that takes its assignee from a named bid needs that bid. Whether
+    // the name found one is the caller's answer, not this checker's — nothing
+    // here reads a log — and a name that found nothing named something that
+    // is not a bid on this action. Alongside the requirement above for the
+    // same reason: an award that takes no bid is malformed for everybody.
+    if matches!(row.assignee_from, Some(AssigneeFrom::AuthorOf { .. }))
+        && (event.accepts.is_none() || sender.accepted_bid.is_none())
+    {
+        return Err(Refusal::AcceptsNotABid);
+    }
+
     // Authority second: who the sender is only matters once the move itself
     // makes sense.
     match row.who.as_str() {
@@ -273,8 +514,18 @@ pub fn check(
         _ => return Err(Refusal::WrongSender),
     }
 
-    if row.before_deadline
-        && let Some(deadline) = task.deadline
+    // Two deadlines, one comparison. A row declares which of the offer's
+    // times bounds it: how long the offer stands, or — on a kind that
+    // collects them — how long it takes bids. A time the offer never named
+    // bounds nothing.
+    for deadline in [
+        row.before_deadline.then_some(task.deadline).flatten(),
+        row.before_bid_deadline
+            .then_some(task.bid_deadline)
+            .flatten(),
+    ]
+    .into_iter()
+    .flatten()
     {
         let limit = deadline
             .saturating_mul(1_000)
@@ -295,9 +546,26 @@ pub fn check(
 #[derive(Deserialize)]
 struct Spec {
     kinds: BTreeMap<String, Kind>,
+    confirmation: Confirmation,
+    revival: Revival,
     refusals: BTreeMap<String, String>,
     #[allow(dead_code)]
     deadline_rule: DeadlineRule,
+}
+
+/// The receipt verb, and the tag a receipt names its subject in. Outside
+/// `kinds` because it belongs to none of them.
+#[derive(Deserialize)]
+struct Confirmation {
+    verb: String,
+    subject: String,
+}
+
+/// The tag a new action names the finished one it revives in. Outside `kinds`
+/// for the same reason: the relation is every kind's, so it is none's.
+#[derive(Deserialize)]
+struct Revival {
+    tag: String,
 }
 
 #[derive(Deserialize)]
@@ -327,6 +595,20 @@ struct Transition {
     who: String,
     #[serde(default)]
     before_deadline: bool,
+    /// Bounded by the offer's `act-bid-deadline` rather than its
+    /// `act-deadline`. Data, like its sibling; the comparison is the same
+    /// code.
+    #[serde(default)]
+    before_bid_deadline: bool,
+    /// Who this transition assigns. Absent = the actor; a tag name = the DID
+    /// in that tag; `{ "author_of": tag }` = the author of the event that tag
+    /// names.
+    #[serde(default)]
+    assignee_from: Option<AssigneeFrom>,
+    /// Fields the transition is illegal without. Empty for almost every row,
+    /// which is why an absent one has to change nothing.
+    #[serde(default)]
+    requires: Vec<String>,
 }
 
 /// A transition's `from`: one state, several, or every non-terminal one.
@@ -340,6 +622,16 @@ enum FromStates {
 const ANY_NONTERMINAL: &str = "*nonterminal";
 
 impl FromStates {
+    /// The states named outright. Empty for `*nonterminal`, which names none
+    /// of them: it is a rule about the kind's table rather than a list.
+    fn states(&'static self) -> Vec<&'static str> {
+        match self {
+            FromStates::One(s) if s == ANY_NONTERMINAL => Vec::new(),
+            FromStates::One(s) => vec![s.as_str()],
+            FromStates::Many(states) => states.iter().map(String::as_str).collect(),
+        }
+    }
+
     fn matches(&self, state: &str, kind: &Kind) -> bool {
         match self {
             FromStates::One(s) if s == ANY_NONTERMINAL => !kind.terminal.iter().any(|t| t == state),
@@ -385,17 +677,45 @@ mod tests {
             offeree: Some(SCHOLAR),
             assignee: None,
             deadline: None,
+            bid_deadline: None,
         }
     }
 
     fn ev(verb: &'static str) -> Event<'static> {
-        Event { verb, msgid: NOW }
+        Event {
+            verb,
+            msgid: NOW,
+            accepts: None,
+            fields: &[],
+        }
     }
 
     fn who(did: &'static str) -> Sender<'static> {
         Sender {
             did,
             is_system: false,
+            accepted_bid: None,
+        }
+    }
+
+    /// A sender whose award named a bid the caller resolved to `author`.
+    fn who_took(did: &'static str, author: &'static str) -> Sender<'static> {
+        Sender {
+            accepted_bid: Some(AcceptedBid { author }),
+            ..who(did)
+        }
+    }
+
+    /// The bid an award names in these tests.
+    const BID: &str = "01M16E7TC0BDTAKEN000000000";
+
+    /// An award naming `BID`.
+    fn award() -> Event<'static> {
+        Event {
+            verb: "award",
+            msgid: NOW,
+            accepts: Some(BID),
+            fields: &["act-accepts"],
         }
     }
 
@@ -405,7 +725,11 @@ mod tests {
     fn a_kind_names_its_two_initial_states() {
         assert_eq!(initial_state("handoff", true), Some("offered"));
         assert_eq!(initial_state("handoff", false), Some("open"));
-        assert_eq!(initial_state("bounty", false), None, "not a listed kind");
+        assert_eq!(initial_state("approval", false), None, "not a listed kind");
+        // A bounty opens to the room and nowhere else: it has no directed
+        // form, because a directed bounty is just a handoff.
+        assert_eq!(initial_state("bounty", false), Some("open"));
+        assert_eq!(initial_state("bounty", true), None);
     }
 
     // ── opening a task ──────────────────────────────────────────────────────
@@ -465,10 +789,23 @@ mod tests {
     #[test]
     fn opening_a_kind_the_file_does_not_list_is_refused() {
         assert_eq!(
-            check_open("bounty", "offer", false, false),
+            check_open("approval", "offer", false, false),
             Err(Refusal::UnknownKind)
         );
-        assert_eq!(opening_verb("bounty"), None);
+        assert_eq!(opening_verb("approval"), None);
+    }
+
+    /// A kind with no directed form cannot be opened to one recipient. The
+    /// answer is illegal-step and not unknown-verb: `offer` is exactly the
+    /// verb that opens a bounty, and naming a recipient is the part it cannot
+    /// do.
+    #[test]
+    fn a_bounty_cannot_be_opened_to_one_recipient() {
+        assert_eq!(check_open("bounty", "offer", false, false), Ok("open"));
+        assert_eq!(
+            check_open("bounty", "offer", true, false),
+            Err(Refusal::IllegalStep)
+        );
     }
 
     /// The states an opener lands in are the states the transitions move from
@@ -495,7 +832,7 @@ mod tests {
     #[test]
     fn a_kind_and_a_verb_can_be_recognized_without_a_task() {
         assert!(knows_kind("handoff"));
-        assert!(!knows_kind("bounty"), "a real kind this file does not list");
+        assert!(knows_kind("bounty"));
         assert!(!knows_kind("approval"), "deferred");
 
         for verb in [
@@ -507,7 +844,31 @@ mod tests {
             !knows_verb("handoff", "award"),
             "bounty's verb, not handoff's"
         );
-        assert!(!knows_verb("bounty", "award"), "no table, no verbs");
+        for verb in [
+            "bid",
+            "award",
+            "progress",
+            "submit",
+            "revise",
+            "accept-work",
+            "forfeit",
+            "auto-accept",
+            "cancel",
+            "expire",
+        ] {
+            assert!(knows_verb("bounty", verb), "{verb}");
+        }
+        assert!(
+            !knows_verb("bounty", "accept"),
+            "handoff's verb, not bounty's — a bounty has no offeree to accept"
+        );
+        for verb in ["complete", "fail"] {
+            assert!(
+                !knows_verb("bounty", verb),
+                "{verb}: a bounty ends on the poster's word, not the worker's"
+            );
+        }
+        assert!(!knows_verb("approval", "request"), "no table, no verbs");
     }
 
     #[test]
@@ -525,7 +886,296 @@ mod tests {
         // Deferred: it gets added as its own table if and when something needs
         // it. Until then an approval event is refused, not half-handled.
         assert!(spec().kinds.get("approval").is_none());
-        assert_eq!(spec().kinds.len(), 1, "handoff is the only kind so far");
+        assert_eq!(spec().kinds.len(), 2, "handoff and bounty");
+    }
+
+    // ── the receipt verb ────────────────────────────────────────────────────
+
+    /// A receipt is the home's word about an event, so a sender's `confirm`
+    /// is refused wherever it appears — opening or moving, whatever kind it
+    /// names, and even when the sender claims to be the server. The home
+    /// files its own past this checker.
+    #[test]
+    fn a_sender_never_writes_a_confirmation() {
+        assert_eq!(confirmation_verb(), "confirm");
+        assert_eq!(
+            check(&directed("offered"), &ev("confirm"), &who(SCHOLAR)),
+            Err(Refusal::ClientConfirm)
+        );
+        let system = Sender {
+            did: SERVER,
+            is_system: true,
+            accepted_bid: None,
+        };
+        assert_eq!(
+            check(&directed("offered"), &ev("confirm"), &system),
+            Err(Refusal::ClientConfirm)
+        );
+        assert_eq!(
+            check_open("handoff", "confirm", false, false),
+            Err(Refusal::ClientConfirm)
+        );
+    }
+
+    /// The answer must not read as "this kind has no such row yet", which
+    /// would say a kind could add one. It cannot: the verb is recognized
+    /// before any kind is consulted, unlisted kinds included.
+    #[test]
+    fn a_confirmation_never_reads_as_a_verb_a_kind_could_add() {
+        let unlisted = Task {
+            kind: "no-such-kind",
+            ..directed("offered")
+        };
+        assert_eq!(
+            check(&unlisted, &ev("confirm"), &who(SCHOLAR)),
+            Err(Refusal::ClientConfirm),
+            "not unknown-kind either — the verb is answered first"
+        );
+        assert_eq!(
+            check_open("no-such-kind", "confirm", false, false),
+            Err(Refusal::ClientConfirm)
+        );
+        for (name, kind) in &spec().kinds {
+            assert!(
+                !kind.transitions.iter().any(|t| is_confirmation(&t.verb)),
+                "{name} claims the receipt verb, which belongs to no kind"
+            );
+            assert!(!is_confirmation(&kind.opens.verb), "{name}");
+        }
+    }
+
+    // ── the revival relation ────────────────────────────────────────────────
+
+    /// The two rules a message decides on its own, and the one that needs the
+    /// log. An unknown predecessor is accepted on purpose — see
+    /// [`super::check_revival`].
+    #[test]
+    fn only_an_opener_revives_a_finished_action() {
+        const DEAD: &str = "01M16E7TC0ENDED00000000000";
+        assert_eq!(revival_tag(), "act-replaces");
+        assert_eq!(check_revival(true, DEAD, Predecessor::Finished), Ok(()));
+        assert_eq!(check_revival(true, DEAD, Predecessor::Unknown), Ok(()));
+        assert_eq!(
+            check_revival(true, DEAD, Predecessor::Live),
+            Err(Refusal::ReplacesNotTerminal)
+        );
+        assert_eq!(
+            check_revival(false, DEAD, Predecessor::Finished),
+            Err(Refusal::ReplacesNotOpener)
+        );
+        for bad in [
+            "",
+            "not-a-ulid",
+            "01M16E7TC0SHRT",
+            &format!("{DEAD}X"),
+            "01M16E7TC0ended00000000000",
+        ] {
+            assert_eq!(
+                check_revival(true, bad, Predecessor::Unknown),
+                Err(Refusal::ReplacesMalformed),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Shape, and nothing about whether anything was filed under it.
+    #[test]
+    fn an_action_id_is_twenty_six_crockford_characters() {
+        assert!(is_event_id("01M16E7TC0ENDED00000000000"));
+        assert!(!is_event_id("01M16E7TC0ENDED0000000000"), "too short");
+        assert!(!is_event_id("01M16E7TC0ENDED000000000000"), "too long");
+        // I, L, O and U are not in the alphabet, which is what keeps a ULID
+        // from being confused for something typed by hand.
+        for c in ['I', 'L', 'O', 'U', 'a', '-'] {
+            assert!(
+                !is_event_id(&format!("01M16E7TC0ENDED0000000000{c}")),
+                "{c}"
+            );
+        }
+    }
+
+    // ── the two schema additions bounty needed ──────────────────────────────
+
+    fn bounty(state: &'static str) -> Task<'static> {
+        Task {
+            kind: "bounty",
+            state,
+            offerer: ELIZA,
+            offeree: None,
+            assignee: None,
+            deadline: None,
+            bid_deadline: None,
+        }
+    }
+
+    /// A transition is illegal without the fields its row names, and the
+    /// refusal says which one is missing. Checked before authority: an award
+    /// naming no bid is malformed for everybody.
+    #[test]
+    fn an_award_names_the_bid_it_takes_or_it_is_no_award() {
+        let bare = Event {
+            verb: "award",
+            msgid: NOW,
+            accepts: None,
+            fields: &[],
+        };
+        assert_eq!(
+            check(&bounty("open"), &bare, &who_took(ELIZA, SCHOLAR)),
+            Err(Refusal::MissingRequirement("act-accepts"))
+        );
+        assert_eq!(
+            check(&bounty("open"), &bare, &who_took(MALLORY, SCHOLAR)),
+            Err(Refusal::MissingRequirement("act-accepts")),
+            "malformed for everybody, so it does not read as 'not you'"
+        );
+        assert_eq!(
+            check(&bounty("open"), &award(), &who_took(ELIZA, SCHOLAR)),
+            Ok("assigned")
+        );
+    }
+
+    /// The award names one event and the caller resolves it. A name that
+    /// found no bid on this action — the bounty's own opener, a bid filed
+    /// against something else, an id nobody ever used — takes nothing, and
+    /// says so rather than assigning the poster's own choice of stranger.
+    #[test]
+    fn an_award_naming_something_that_is_not_a_bid_takes_nothing() {
+        assert_eq!(
+            check(&bounty("open"), &award(), &who(ELIZA)),
+            Err(Refusal::AcceptsNotABid)
+        );
+        // Before authority, like the requirement above.
+        assert_eq!(
+            check(&bounty("open"), &award(), &who(MALLORY)),
+            Err(Refusal::AcceptsNotABid)
+        );
+    }
+
+    /// The guard has to be free for every row that names nothing, which is
+    /// almost all of them — otherwise adding `requires` would have changed
+    /// handoff.
+    #[test]
+    fn a_transition_that_requires_nothing_is_unaffected_by_the_check() {
+        for verb in ["accept", "decline", "cancel"] {
+            let e = Event {
+                verb,
+                msgid: NOW,
+                accepts: None,
+                fields: &[],
+            };
+            assert!(
+                check(&directed("offered"), &e, &who(SCHOLAR)).is_ok()
+                    || check(&directed("offered"), &e, &who(ELIZA)).is_ok(),
+                "{verb} carries no fields and is legal anyway"
+            );
+        }
+    }
+
+    /// Who a step assigns is data. Accept and claim mean the actor; a
+    /// bounty's award names its winner instead, and the poster does not become
+    /// the worker by picking one.
+    #[test]
+    fn a_transition_says_where_its_assignee_comes_from() {
+        assert_eq!(
+            assignee_source("bounty", "award", "open"),
+            AssigneeSource::AuthorOf("act-accepts")
+        );
+        for (kind, verb, from) in [
+            ("handoff", "accept", "offered"),
+            ("handoff", "claim", "open"),
+            ("bounty", "bid", "open"),
+            ("bounty", "complete", "assigned"),
+        ] {
+            assert_eq!(
+                assignee_source(kind, verb, from),
+                AssigneeSource::Actor,
+                "{kind}/{verb}"
+            );
+        }
+        // A row that does not exist grants nothing special either.
+        assert_eq!(
+            assignee_source("approval", "request", "open"),
+            AssigneeSource::Actor
+        );
+        assert_eq!(
+            assignee_source("bounty", "award", "assigned"),
+            AssigneeSource::Actor,
+            "no row matches from this state, so there is nothing to read"
+        );
+    }
+
+    /// The server still never picks. It checks only that the named event is a
+    /// bid on this action; which of the bids on the table is worth taking is
+    /// the poster's to decide and nothing here second-guesses it.
+    #[test]
+    fn the_poster_takes_whichever_bid_they_name() {
+        for author in [SCHOLAR, MALLORY, "did:plc:nobody"] {
+            assert_eq!(
+                check(&bounty("open"), &award(), &who_took(ELIZA, author)),
+                Ok("assigned"),
+                "{author}"
+            );
+        }
+    }
+
+    /// Bids are additive: the state they leave is the state they found, so a
+    /// bounty takes as many as arrive until it is awarded.
+    #[test]
+    fn bids_are_additive_and_stop_when_the_work_is_awarded() {
+        assert_eq!(
+            check(&bounty("open"), &ev("bid"), &who(SCHOLAR)),
+            Ok("open")
+        );
+        assert_eq!(
+            check(&bounty("open"), &ev("bid"), &who(MALLORY)),
+            Ok("open")
+        );
+        assert_eq!(
+            check(&bounty("assigned"), &ev("bid"), &who(MALLORY)),
+            Err(Refusal::IllegalStep)
+        );
+    }
+
+    /// The sweep reads which states have a review window off the tables, so a
+    /// kind that adds the row is swept and one that does not is left alone.
+    #[test]
+    fn the_review_timeout_states_come_from_the_tables() {
+        assert_eq!(REVIEW_TIMEOUT_VERB, "auto-accept");
+        assert_eq!(review_timeout_states(), vec!["under_review"]);
+        // Handoff has no review window, so none of its states are swept by
+        // this clock — its work ends when the assignee says so.
+        for state in ["offered", "open", "assigned"] {
+            assert!(!review_timeout_states().contains(&state), "{state}");
+        }
+    }
+
+    /// A bounty's review window is the server's to close, and only from the
+    /// state the work is actually sitting in.
+    #[test]
+    fn only_the_server_closes_a_review_window() {
+        assert_eq!(
+            check(&bounty("under_review"), &ev("auto-accept"), &who(ELIZA)),
+            Err(Refusal::WrongSender),
+            "not the poster whose silence started the clock"
+        );
+        assert_eq!(
+            check(&bounty("under_review"), &ev("auto-accept"), &who(SCHOLAR)),
+            Err(Refusal::WrongSender)
+        );
+        let system = Sender {
+            did: SERVER,
+            is_system: true,
+            accepted_bid: None,
+        };
+        assert_eq!(
+            check(&bounty("under_review"), &ev("auto-accept"), &system),
+            Ok("accepted")
+        );
+        assert_eq!(
+            check(&bounty("assigned"), &ev("auto-accept"), &system),
+            Err(Refusal::IllegalStep),
+            "there is no window until the work is in"
+        );
     }
 
     #[test]
@@ -537,6 +1187,12 @@ mod tests {
             Refusal::IllegalStep,
             Refusal::WrongSender,
             Refusal::DeadlinePassed,
+            Refusal::ClientConfirm,
+            Refusal::ReplacesNotOpener,
+            Refusal::ReplacesMalformed,
+            Refusal::ReplacesNotTerminal,
+            Refusal::MissingRequirement("act-accepts"),
+            Refusal::AcceptsNotABid,
         ] {
             assert!(
                 spec().refusals.contains_key(r.code()),
@@ -661,6 +1317,7 @@ mod tests {
         let system = Sender {
             did: SERVER,
             is_system: true,
+            accepted_bid: None,
         };
         assert_eq!(
             check(&directed("assigned"), &ev("expire"), &system),
@@ -714,6 +1371,7 @@ mod tests {
             let system = Sender {
                 did: SERVER,
                 is_system: true,
+                accepted_bid: None,
             };
             assert_eq!(
                 check(&done, &ev("expire"), &system),
@@ -733,17 +1391,17 @@ mod tests {
 
     #[test]
     fn a_kind_the_file_does_not_list_is_refused() {
-        let bounty = Task {
-            kind: "bounty",
+        let approval = Task {
+            kind: "approval",
             ..directed("open")
         };
         assert_eq!(
-            check(&bounty, &ev("bid"), &who(SCHOLAR)),
+            check(&approval, &ev("request"), &who(SCHOLAR)),
             Err(Refusal::UnknownKind)
         );
         // Even for a verb handoff does list — the kind is checked first.
         assert_eq!(
-            check(&bounty, &ev("cancel"), &who(ELIZA)),
+            check(&approval, &ev("cancel"), &who(ELIZA)),
             Err(Refusal::UnknownKind)
         );
     }
@@ -758,6 +1416,7 @@ mod tests {
             offeree: None,
             assignee: None,
             deadline: None,
+            bid_deadline: None,
         }
     }
 
@@ -842,6 +1501,8 @@ mod tests {
         let late = Event {
             verb: "accept",
             msgid: TOO_LATE,
+            accepts: None,
+            fields: &[],
         };
         assert_eq!(
             check(&with_deadline(), &late, &who(SCHOLAR)),
@@ -855,6 +1516,8 @@ mod tests {
             let e = Event {
                 verb: "accept",
                 msgid: id,
+                accepts: None,
+                fields: &[],
             };
             assert_eq!(
                 check(&with_deadline(), &e, &who(SCHOLAR)),
@@ -875,6 +1538,8 @@ mod tests {
         let late = Event {
             verb: "claim",
             msgid: TOO_LATE,
+            accepts: None,
+            fields: &[],
         };
         assert_eq!(
             check(&open_with_deadline, &late, &who(SCHOLAR)),
@@ -884,6 +1549,8 @@ mod tests {
             let e = Event {
                 verb: "claim",
                 msgid: id,
+                accepts: None,
+                fields: &[],
             };
             assert_eq!(
                 check(&open_with_deadline, &e, &who(SCHOLAR)),
@@ -900,6 +1567,8 @@ mod tests {
         let late = Event {
             verb: "decline",
             msgid: TOO_LATE,
+            accepts: None,
+            fields: &[],
         };
         assert_eq!(
             check(&with_deadline(), &late, &who(SCHOLAR)),
@@ -908,6 +1577,8 @@ mod tests {
         let late_cancel = Event {
             verb: "cancel",
             msgid: TOO_LATE,
+            accepts: None,
+            fields: &[],
         };
         assert_eq!(
             check(&with_deadline(), &late_cancel, &who(ELIZA)),
@@ -920,11 +1591,80 @@ mod tests {
         let late = Event {
             verb: "accept",
             msgid: TOO_LATE,
+            accepts: None,
+            fields: &[],
         };
         assert_eq!(
             check(&directed("offered"), &late, &who(SCHOLAR)),
             Ok("assigned")
         );
+    }
+
+    /// A bounty takes bids until its own cutoff, which is a shorter question
+    /// than how long the offer stands. Both times sit on the same opener and
+    /// are compared the same way.
+    #[test]
+    fn a_bid_is_bound_by_the_offers_bid_deadline() {
+        let taking_bids = Task {
+            bid_deadline: Some(DEADLINE),
+            ..bounty("open")
+        };
+        let late = Event {
+            verb: "bid",
+            msgid: TOO_LATE,
+            accepts: None,
+            fields: &[],
+        };
+        assert_eq!(
+            check(&taking_bids, &late, &who(SCHOLAR)),
+            Err(Refusal::DeadlinePassed)
+        );
+        for id in [IN_TIME, AT_EDGE] {
+            let e = Event {
+                verb: "bid",
+                msgid: id,
+                accepts: None,
+                fields: &[],
+            };
+            assert_eq!(check(&taking_bids, &e, &who(SCHOLAR)), Ok("open"), "{id}");
+        }
+    }
+
+    /// The two times are separate: bidding may close long before the offer
+    /// does, and a bounty that named no bid cutoff takes bids for as long as
+    /// it stands.
+    #[test]
+    fn the_two_deadlines_bound_different_moves() {
+        // Bidding closed; the offer has not.
+        let closed = Task {
+            deadline: None,
+            bid_deadline: Some(DEADLINE),
+            ..bounty("open")
+        };
+        let late = Event {
+            verb: "bid",
+            msgid: TOO_LATE,
+            accepts: None,
+            fields: &[],
+        };
+        assert_eq!(
+            check(&closed, &late, &who(SCHOLAR)),
+            Err(Refusal::DeadlinePassed)
+        );
+        // The award is bound by the offer's own deadline, not by the bid one.
+        let award_late = Event {
+            verb: "award",
+            msgid: TOO_LATE,
+            accepts: Some(BID),
+            fields: &["act-accepts"],
+        };
+        assert_eq!(
+            check(&closed, &award_late, &who_took(ELIZA, SCHOLAR)),
+            Ok("assigned"),
+            "bidding closing does not stop the poster picking"
+        );
+        // …and no bid cutoff means no bid cutoff.
+        assert_eq!(check(&bounty("open"), &late, &who(SCHOLAR)), Ok("open"));
     }
 
     /// Fail closed: an id whose clock cannot be read cannot be shown to be
@@ -934,6 +1674,8 @@ mod tests {
         let junk = Event {
             verb: "accept",
             msgid: "not-a-ulid",
+            accepts: None,
+            fields: &[],
         };
         assert_eq!(
             check(&with_deadline(), &junk, &who(SCHOLAR)),
@@ -964,6 +1706,9 @@ mod tests {
         offerer: String,
         offeree: Option<String>,
         deadline: Option<i64>,
+        /// `act-bid-deadline`: how long the offer takes bids, when it named a
+        /// second time.
+        bid_deadline: Option<i64>,
     }
 
     #[derive(Deserialize)]
@@ -973,6 +1718,18 @@ mod tests {
         event_id: Option<String>,
         #[serde(default)]
         system: bool,
+        /// The act fields the event carries, by document name. What a
+        /// transition's `requires` is checked against.
+        #[serde(default)]
+        tags: Vec<String>,
+        /// Who the step assigns, when it names someone other than its sender:
+        /// the value the transition's `assignee_from` field would hold.
+        assigns: Option<String>,
+        /// `act-accepts`: the event an award takes.
+        accepts: Option<String>,
+        /// Who wrote the bid that event turned out to be. Absent when the
+        /// name found no bid on this action.
+        accepted_bid: Option<String>,
         expect: Option<String>,
         expect_refused: Option<String>,
     }
@@ -1004,14 +1761,26 @@ mod tests {
                 offeree: seq.task.offeree.as_deref(),
                 assignee: assignee.as_deref(),
                 deadline: seq.task.deadline,
+                bid_deadline: seq.task.bid_deadline,
             };
+            let fields: Vec<&str> = step.tags.iter().map(String::as_str).collect();
             let event = Event {
                 verb: &step.verb,
                 msgid: step.event_id.as_deref().unwrap_or(NOW),
+                accepts: step.accepts.as_deref(),
+                fields: &fields,
             };
             let sender = Sender {
                 did: &step.sender,
                 is_system: step.system,
+                // What the caller's log made of the event this one names. A
+                // step that sets nothing named nothing, or named something
+                // that is not a bid — the file does not distinguish, because
+                // neither does the checker.
+                accepted_bid: step
+                    .accepted_bid
+                    .as_deref()
+                    .map(|author| AcceptedBid { author }),
             };
             let where_ = format!("{} — step {} ({})", seq.name, i + 1, step.verb);
 
@@ -1023,7 +1792,23 @@ mod tests {
                 (Ok(next), Some(want), None) => {
                     assert_eq!(next, want, "{where_}");
                     if assignee.is_none() && next == "assigned" {
-                        assignee = Some(step.sender.clone());
+                        // Who the step assigns is data: the actor by default,
+                        // and whoever the transition's field names otherwise.
+                        // A bounty's award names its winner rather than
+                        // becoming one, which is the whole difference.
+                        assignee = Some(
+                            match assignee_source(&seq.task.kind, &step.verb, &state) {
+                                AssigneeSource::Actor => step.sender.clone(),
+                                AssigneeSource::AuthorOf(_) => step
+                                    .accepted_bid
+                                    .clone()
+                                    .unwrap_or_else(|| panic!("{where_}: this transition assigns the author of the bid it names, and none was resolved")),
+                                AssigneeSource::Field(name) => step
+                                    .assigns
+                                    .clone()
+                                    .unwrap_or_else(|| panic!("{where_}: assigns is not set, but this transition takes its assignee from {name}")),
+                            },
+                        );
                     }
                     state = next.to_string();
                 }
@@ -1056,6 +1841,55 @@ mod tests {
         let file: OpeningFile =
             serde_json::from_str(include_str!("../../spec/act-transitions.json")).unwrap();
         file.opening_sequences
+    }
+
+    #[derive(Deserialize)]
+    struct RevivalFile {
+        revival_sequences: Vec<RevivalCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct RevivalCase {
+        name: String,
+        opens: bool,
+        names: String,
+        predecessor: String,
+        expect: Option<String>,
+        expect_refused: Option<String>,
+    }
+
+    fn revival_sequences() -> Vec<RevivalCase> {
+        let file: RevivalFile =
+            serde_json::from_str(include_str!("../../spec/act-transitions.json")).unwrap();
+        file.revival_sequences
+    }
+
+    #[test]
+    fn every_revival_sequence_in_the_rules_file_replays() {
+        let cases = revival_sequences();
+        assert!(cases.len() >= 5, "{}", cases.len());
+        for c in &cases {
+            let predecessor = match c.predecessor.as_str() {
+                "unknown" => Predecessor::Unknown,
+                "live" => Predecessor::Live,
+                "finished" => Predecessor::Finished,
+                other => panic!("{}: unknown predecessor {other}", c.name),
+            };
+            let got = check_revival(c.opens, &c.names, predecessor);
+            match (&c.expect, &c.expect_refused) {
+                (Some(word), None) => {
+                    assert_eq!(word, "accepted", "{}", c.name);
+                    assert_eq!(got, Ok(()), "{}", c.name);
+                }
+                (None, Some(reason)) => assert_eq!(
+                    got.map_err(|r| r.code()),
+                    Err(reason.as_str()),
+                    "{}",
+                    c.name
+                ),
+                _ => panic!("{}: set exactly one of expect / expect_refused", c.name),
+            }
+        }
     }
 
     #[test]
@@ -1119,12 +1953,23 @@ mod tests {
 
     /// The sequences have to exercise every refusal the checker can reach —
     /// otherwise the other implementation could pass them all and still get a
-    /// reason wrong.
+    /// reason wrong. Every list counts: some reasons only an opener can earn,
+    /// and some only a revival can.
     #[test]
     fn the_sequences_cover_every_refusal_reason() {
         let mut seen: Vec<String> = sequences()
             .iter()
             .flat_map(|s| s.steps.iter().filter_map(|st| st.expect_refused.clone()))
+            .chain(
+                opening_sequences()
+                    .iter()
+                    .filter_map(|o| o.expect_refused.clone()),
+            )
+            .chain(
+                revival_sequences()
+                    .iter()
+                    .filter_map(|r| r.expect_refused.clone()),
+            )
             .collect();
         seen.sort();
         seen.dedup();

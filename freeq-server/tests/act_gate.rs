@@ -37,12 +37,22 @@ fn resolver_with(entries: Vec<(&str, &PrivateKey)>) -> DidResolver {
 }
 
 async fn start(resolver: DidResolver) -> (SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>) {
-    start_with_expiry(resolver, 604_800).await
+    start_with_clocks(resolver, 604_800, 1_209_600).await
 }
 
 async fn start_with_expiry(
     resolver: DidResolver,
     act_expiry_secs: u64,
+) -> (SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>) {
+    start_with_clocks(resolver, act_expiry_secs, 1_209_600).await
+}
+
+/// The two sweeps' limits: how long unfinished work may sit before it is
+/// expired, and how long submitted work may wait on its poster.
+async fn start_with_clocks(
+    resolver: DidResolver,
+    act_expiry_secs: u64,
+    act_review_secs: u64,
 ) -> (SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>) {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let db_path = tmp.path().to_str().unwrap().to_string();
@@ -53,6 +63,7 @@ async fn start_with_expiry(
         challenge_timeout_secs: 60,
         db_path: Some(db_path),
         act_expiry_secs,
+        act_review_secs,
         ..Default::default()
     };
     freeq_server::server::Server::with_resolver(config, resolver)
@@ -367,7 +378,7 @@ async fn a_kind_the_rules_file_does_not_list_is_refused() {
         a.msgsig(&signing);
         a.join("#ops");
         let mut tags = offer_tags();
-        tags[0].1 = "bounty".into(); // a real kind, not one this server has
+        tags[0].1 = "approval".into(); // a real kind, not one this server has
         a.tx(&signed_line(&tags, "#ops", &fresh_id(), &signing));
         assert_eq!(a.fail_code(), "UNKNOWN_KIND");
     })
@@ -860,6 +871,991 @@ async fn a_task_runs_from_offer_to_completion() {
     .await;
 }
 
+// ── receipts ────────────────────────────────────────────────────────────────
+
+/// The `act-subject` of a receipt line, if the line is one.
+fn receipt_subject(line: &str) -> Option<String> {
+    if !line.contains("+freeq.at/act-verb=confirm") {
+        return None;
+    }
+    line.trim_start_matches('@')
+        .split(&[' ', ';'][..])
+        .find_map(|t| t.strip_prefix("+freeq.at/act-subject="))
+        .map(str::to_string)
+}
+
+/// The home's word about a move it filed: signed under `did:web:`, naming the
+/// event it confirms, and verifying against the key that server publishes.
+#[tokio::test]
+async fn a_state_transition_earns_a_receipt_the_home_signed() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+
+        let task = open_task(&mut a, &alice_key, "#ops", Some(DID_BOB));
+        let accept_id = fresh_id();
+        b.tx(&follow_up_line(
+            "accept", DID_BOB, &task, "#ops", &accept_id, &bob_key,
+        ));
+
+        let receipt = b
+            .maybe(|l| l.contains("+freeq.at/act-verb=confirm"), 3_000)
+            .expect("the home confirms a move it filed");
+        assert_eq!(
+            receipt_subject(&receipt).as_deref(),
+            Some(accept_id.as_str()),
+            "the receipt names the event it confirms: {receipt}"
+        );
+        assert!(
+            receipt.contains(&format!("+freeq.at/act-id={task}")),
+            "and the action it belongs to: {receipt}"
+        );
+        assert!(
+            receipt.contains("+freeq.at/from=did:web:test-act"),
+            "signed under this server's own identity: {receipt}"
+        );
+        assert!(
+            receipt.contains("+freeq.at/sig=ed25519:"),
+            "with a signature: {receipt}"
+        );
+    })
+    .await;
+}
+
+/// One receipt per move, and none for anything that moved nothing: an opener
+/// (opening is the action), a progress report (`from` and `to` are the same
+/// state), or the server's own expiry (home-signed already).
+#[tokio::test]
+async fn only_a_move_earns_a_receipt_and_it_earns_exactly_one() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+
+        // The offer opens the task; nothing raced it, so nothing confirms it.
+        let task = open_task(&mut a, &alice_key, "#ops", Some(DID_BOB));
+        assert!(
+            b.maybe(|l| l.contains("act-verb=confirm"), 600).is_none(),
+            "an opener is not confirmed"
+        );
+
+        let mut confirmed: Vec<String> = Vec::new();
+        for (verb, expect_receipt) in [("accept", true), ("progress", false), ("complete", true)] {
+            let id = fresh_id();
+            b.tx(&follow_up_line(verb, DID_BOB, &task, "#ops", &id, &bob_key));
+            match expect_receipt {
+                true => {
+                    let line = b
+                        .maybe(|l| l.contains("act-verb=confirm"), 3_000)
+                        .unwrap_or_else(|| panic!("{verb} moved the task and earns a receipt"));
+                    assert_eq!(receipt_subject(&line).as_deref(), Some(id.as_str()));
+                    confirmed.push(id);
+                }
+                // A report that leaves the task where it stood has no move to
+                // confirm. Waited out against the *next* step's receipt, which
+                // is what would arrive if this one were wrong.
+                false => assert!(
+                    b.maybe(|l| l.contains("act-verb=confirm"), 800).is_none(),
+                    "{verb} leaves the task where it stood and earns no receipt"
+                ),
+            }
+        }
+        assert_eq!(confirmed.len(), 2, "one receipt each, and no more");
+    })
+    .await;
+}
+
+/// A sender writing the home's verb is refused before any kind's table is
+/// consulted — not with UNKNOWN_VERB, which would say the kind is merely
+/// missing a row for it.
+#[tokio::test]
+async fn a_confirmation_from_a_sender_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        let task = open_task(&mut a, &signing, "#ops", None);
+
+        let tags: Vec<(String, String)> = vec![
+            ("+freeq.at/act".into(), "handoff".into()),
+            ("+freeq.at/act-verb".into(), "confirm".into()),
+            ("+freeq.at/from".into(), DID_ALICE.into()),
+            ("+freeq.at/act-id".into(), task.clone()),
+            ("+freeq.at/act-subject".into(), task.clone()),
+        ];
+        a.tx(&signed_line(&tags, "#ops", &fresh_id(), &signing));
+        let line = a.fail();
+        assert!(line.contains(" WRONG_SENDER "), "{line}");
+        assert!(
+            line.ends_with("Only the action's home confirms it"),
+            "the approved sentence: {line}"
+        );
+    })
+    .await;
+}
+
+/// A task in a direct conversation is confirmed too, and to both ends of it.
+/// The line names the thread from the sender's side — the same limitation the
+/// expiry notice carries, since a server-authored line has only the one target
+/// to write.
+#[tokio::test]
+async fn a_receipt_in_a_direct_conversation_reaches_both_participants() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+
+        let venue = freeq_sdk::chatsig::dm_venue(DID_ALICE, DID_BOB);
+        let id = fresh_id();
+        let tags = offer_tags();
+        let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let sig = freeq_sdk::act::sign_act(pairs, &venue, &id, &alice_key).unwrap();
+        let mut wire: Vec<String> = tags.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        wire.push(format!("{EVENT_ID_TAG}={id}"));
+        wire.push(format!("+freeq.at/sig={sig}"));
+        a.tx(&format!("@{} TAGMSG {DID_BOB}", wire.join(";")));
+        b.rx(|l| l.contains("+freeq.at/act="), "the DM task reaches bob");
+
+        // Bob accepts, in the same conversation, addressing alice.
+        let accept_id = fresh_id();
+        let steps: Vec<(String, String)> = vec![
+            ("+freeq.at/act".into(), "handoff".into()),
+            ("+freeq.at/act-verb".into(), "accept".into()),
+            ("+freeq.at/from".into(), DID_BOB.into()),
+            ("+freeq.at/act-id".into(), id.clone()),
+        ];
+        let pairs: Vec<(&str, &str)> = steps
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let sig = freeq_sdk::act::sign_act(pairs, &venue, &accept_id, &bob_key).unwrap();
+        let mut wire: Vec<String> = steps.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        wire.push(format!("{EVENT_ID_TAG}={accept_id}"));
+        wire.push(format!("+freeq.at/sig={sig}"));
+        b.tx(&format!("@{} TAGMSG {DID_ALICE}", wire.join(";")));
+
+        for c in [&mut a, &mut b] {
+            let line = c
+                .maybe(|l| l.contains("act-verb=confirm"), 3_000)
+                .expect("both ends of the conversation hear the receipt");
+            assert_eq!(receipt_subject(&line).as_deref(), Some(accept_id.as_str()));
+        }
+    })
+    .await;
+}
+
+/// Replay is where a late arrival learns what happened, receipts included —
+/// and a connection that did not ask for the capability gets none of it.
+#[tokio::test]
+async fn replay_carries_the_receipts_to_capability_holders_only() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let task = open_task(&mut a, &alice_key, "#ops", None);
+        let claim_id = fresh_id();
+        a.tx(&follow_up_line(
+            "claim", DID_ALICE, &task, "#ops", &claim_id, &alice_key,
+        ));
+        a.maybe(|l| l.contains("act-verb=confirm"), 3_000)
+            .expect("the claim is confirmed");
+        // A message too: the join replay interleaves task events with message
+        // history, so the batch needs one of each.
+        a.tx("PRIVMSG #ops :a line about it");
+
+        let mut late = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        late.tx("JOIN #ops");
+        let replayed = late
+            .maybe(|l| l.contains("act-verb=confirm"), 3_000)
+            .expect("the receipt replays like any other stored task event");
+        assert_eq!(
+            receipt_subject(&replayed).as_deref(),
+            Some(claim_id.as_str())
+        );
+        assert!(
+            replayed.contains("+freeq.at/sig="),
+            "with its signature, so a late arrival can check it: {replayed}"
+        );
+
+        let mut plain = C::guest(addr, "carol", BASE_CAPS);
+        plain.tx("JOIN #ops");
+        let ended = plain.rx(
+            |l| l.contains("+freeq.at/act") || l.split_whitespace().nth(1) == Some("366"),
+            "a task event, or the end of the burst",
+        );
+        assert!(
+            !ended.contains("+freeq.at/act"),
+            "no capability, no receipts either: {ended}"
+        );
+    })
+    .await;
+}
+
+// ── bounty: the second kind, and no code of its own ─────────────────────────
+
+/// A bounty step, signed. `accepts` is the bid an award takes.
+fn bounty_line(
+    verb: &str,
+    from: &str,
+    task: Option<&str>,
+    accepts: Option<&str>,
+    channel: &str,
+    id: &str,
+    key: &SigningKey,
+) -> String {
+    let mut tags: Vec<(String, String)> = vec![
+        ("+freeq.at/act".into(), "bounty".into()),
+        ("+freeq.at/act-verb".into(), verb.into()),
+        ("+freeq.at/from".into(), from.into()),
+    ];
+    match task {
+        Some(t) => tags.push(("+freeq.at/act-id".into(), t.into())),
+        None => tags.push(("+freeq.at/act-title".into(), "index-the-archive".into())),
+    }
+    if let Some(accepts) = accepts {
+        tags.push(("+freeq.at/act-accepts".into(), accepts.into()));
+    }
+    signed_line(&tags, channel, id, key)
+}
+
+/// Every task event this server serves back for a room, as wire lines.
+///
+/// What a sweep's own event is read back through: the server files those and
+/// does not put them on the wire live, so history is where they surface.
+fn act_events_in_history(c: &mut C, channel: &str) -> Vec<String> {
+    c.tx(&format!("CHATHISTORY LATEST {channel} * 50"));
+    let mut lines = Vec::new();
+    while let Some(line) = c.maybe(|_| true, 900) {
+        if line.contains("+freeq.at/act-verb=") {
+            lines.push(line);
+        }
+    }
+    lines
+}
+
+/// Open a bounty and return its id.
+fn open_bounty(c: &mut C, signing: &SigningKey, channel: &str) -> String {
+    let id = fresh_id();
+    c.tx(&bounty_line(
+        "offer", DID_ALICE, None, None, channel, &id, signing,
+    ));
+    c.rx(|l| l.contains(&id), "the bounty opens");
+    id
+}
+
+/// Open a bounty, take bob's bid on it, and return its id — the setup every
+/// test of the review half starts from.
+fn award_to_bob(
+    a: &mut C,
+    b: &mut C,
+    alice_key: &SigningKey,
+    bob_key: &SigningKey,
+    channel: &str,
+) -> String {
+    let bounty = open_bounty(a, alice_key, channel);
+    let bid = fresh_id();
+    b.tx(&bounty_line(
+        "bid",
+        DID_BOB,
+        Some(&bounty),
+        None,
+        channel,
+        &bid,
+        bob_key,
+    ));
+    b.rx(|l| l.contains(&bid), "the bid is accepted");
+    let award = fresh_id();
+    a.tx(&bounty_line(
+        "award",
+        DID_ALICE,
+        Some(&bounty),
+        Some(&bid),
+        channel,
+        &award,
+        alice_key,
+    ));
+    b.rx(|l| l.contains(&award), "the award is accepted");
+    bounty
+}
+
+/// A bounty opener carrying a recipient, which is the one thing it cannot do.
+fn directed_bounty_line(from: &str, channel: &str, id: &str, key: &SigningKey) -> String {
+    let tags: Vec<(String, String)> = vec![
+        ("+freeq.at/act".into(), "bounty".into()),
+        ("+freeq.at/act-verb".into(), "offer".into()),
+        ("+freeq.at/from".into(), from.into()),
+        ("+freeq.at/act-title".into(), "index-the-archive".into()),
+        ("+freeq.at/act-to".into(), DID_BOB.into()),
+    ];
+    signed_line(&tags, channel, id, key)
+}
+
+/// The test of generality: a second kind that needed a table row and no code.
+/// Bids pile up without moving anything, the poster takes one of them, and its
+/// author — not the poster who took it — is the one who can finish the work.
+#[tokio::test]
+async fn a_bounty_awards_the_bid_it_names_and_the_bidder_becomes_assignee() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+
+        let bounty = fresh_id();
+        a.tx(&bounty_line(
+            "offer", DID_ALICE, None, None, "#ops", &bounty, &alice_key,
+        ));
+        a.rx(|l| l.contains(&bounty), "the bounty opens");
+
+        // Two bids, from two agents, neither of which moves it.
+        let mut bids = Vec::new();
+        for (did, k) in [(DID_ALICE, &alice_key), (DID_BOB, &bob_key)] {
+            let bid = fresh_id();
+            let line = bounty_line("bid", did, Some(&bounty), None, "#ops", &bid, k);
+            match did == DID_ALICE {
+                true => a.tx(&line),
+                false => b.tx(&line),
+            }
+            b.rx(|l| l.contains(&bid), "the bid is accepted");
+            bids.push(bid);
+        }
+
+        // The poster takes bob's bid — the second one, so the assignee cannot
+        // have come from the sender or from whichever bid arrived first.
+        let award = fresh_id();
+        a.tx(&bounty_line(
+            "award",
+            DID_ALICE,
+            Some(&bounty),
+            Some(&bids[1]),
+            "#ops",
+            &award,
+            &alice_key,
+        ));
+        b.rx(|l| l.contains(&award), "the award is accepted");
+
+        // The loser cannot hand in work that is not theirs…
+        a.tx(&bounty_line(
+            "submit",
+            DID_ALICE,
+            Some(&bounty),
+            None,
+            "#ops",
+            &fresh_id(),
+            &alice_key,
+        ));
+        assert_eq!(a.fail_code(), "WRONG_SENDER");
+
+        // …and the winner can.
+        let done = fresh_id();
+        b.tx(&bounty_line(
+            "submit",
+            DID_BOB,
+            Some(&bounty),
+            None,
+            "#ops",
+            &done,
+            &bob_key,
+        ));
+        b.rx(|l| l.contains(&done), "the winner hands it in");
+    })
+    .await;
+}
+
+/// The bounty's own half of the lifecycle, on the wire: the worker hands the
+/// work in, the poster sends it back once, the worker hands it in again, and
+/// the poster takes it. The poster's word ends it, not the worker's — which is
+/// the whole difference from a handoff.
+#[tokio::test]
+async fn submitted_work_is_sent_back_once_and_then_accepted_by_the_poster() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+        let bounty = award_to_bob(&mut a, &mut b, &alice_key, &bob_key, "#ops");
+
+        for verb in ["revise", "accept-work"] {
+            let handed_in = fresh_id();
+            b.tx(&bounty_line(
+                "submit",
+                DID_BOB,
+                Some(&bounty),
+                None,
+                "#ops",
+                &handed_in,
+                &bob_key,
+            ));
+            b.rx(|l| l.contains(&handed_in), "the work is handed in");
+
+            let answer = fresh_id();
+            a.tx(&bounty_line(
+                verb,
+                DID_ALICE,
+                Some(&bounty),
+                None,
+                "#ops",
+                &answer,
+                &alice_key,
+            ));
+            b.rx(|l| l.contains(&answer), verb);
+        }
+
+        // Accepted is terminal: there is nothing further to hand in.
+        b.tx(&bounty_line(
+            "submit",
+            DID_BOB,
+            Some(&bounty),
+            None,
+            "#ops",
+            &fresh_id(),
+            &bob_key,
+        ));
+        assert_eq!(b.fail_code(), "TERMINAL_TASK");
+    })
+    .await;
+}
+
+/// Once the work is in, the poster's only moves are taking it and sending it
+/// back — and signing off on the work is not the worker's to do.
+#[tokio::test]
+async fn delivered_work_is_neither_withdrawn_nor_self_accepted() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+        let bounty = award_to_bob(&mut a, &mut b, &alice_key, &bob_key, "#ops");
+
+        let handed_in = fresh_id();
+        b.tx(&bounty_line(
+            "submit",
+            DID_BOB,
+            Some(&bounty),
+            None,
+            "#ops",
+            &handed_in,
+            &bob_key,
+        ));
+        b.rx(|l| l.contains(&handed_in), "the work is handed in");
+
+        a.tx(&bounty_line(
+            "cancel",
+            DID_ALICE,
+            Some(&bounty),
+            None,
+            "#ops",
+            &fresh_id(),
+            &alice_key,
+        ));
+        assert_eq!(a.fail_code(), "ILLEGAL_STEP");
+
+        b.tx(&bounty_line(
+            "accept-work",
+            DID_BOB,
+            Some(&bounty),
+            None,
+            "#ops",
+            &fresh_id(),
+            &bob_key,
+        ));
+        assert_eq!(b.fail_code(), "WRONG_SENDER");
+    })
+    .await;
+}
+
+/// A bounty is not a handoff, and its worker has no verb that ends it. The
+/// two that would are ones the kind's table simply does not list.
+#[tokio::test]
+async fn a_bounty_has_no_complete_and_no_fail() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        let bounty = open_bounty(&mut a, &signing, "#ops");
+        for verb in ["complete", "fail"] {
+            a.tx(&bounty_line(
+                verb,
+                DID_ALICE,
+                Some(&bounty),
+                None,
+                "#ops",
+                &fresh_id(),
+                &signing,
+            ));
+            assert_eq!(a.fail_code(), "UNKNOWN_VERB", "{verb}");
+        }
+    })
+    .await;
+}
+
+/// The worker's exit, from either state they may hold the work in.
+#[tokio::test]
+async fn the_worker_forfeits_the_work_and_the_bounty_is_finished() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+
+        let bounty = award_to_bob(&mut a, &mut b, &alice_key, &bob_key, "#ops");
+
+        // Not the poster's to give up on the worker's behalf.
+        a.tx(&bounty_line(
+            "forfeit",
+            DID_ALICE,
+            Some(&bounty),
+            None,
+            "#ops",
+            &fresh_id(),
+            &alice_key,
+        ));
+        assert_eq!(a.fail_code(), "WRONG_SENDER");
+
+        let gone = fresh_id();
+        b.tx(&bounty_line(
+            "forfeit",
+            DID_BOB,
+            Some(&bounty),
+            None,
+            "#ops",
+            &gone,
+            &bob_key,
+        ));
+        b.rx(|l| l.contains(&gone), "the worker walks away");
+
+        a.tx(&bounty_line(
+            "revise",
+            DID_ALICE,
+            Some(&bounty),
+            None,
+            "#ops",
+            &fresh_id(),
+            &alice_key,
+        ));
+        assert_eq!(a.fail_code(), "TERMINAL_TASK");
+    })
+    .await;
+}
+
+/// An award naming no bid takes nothing, so the row's `requires` refuses it —
+/// and the sentence names the field rather than the verb, because which field
+/// a step needs is the rules file's to say.
+#[tokio::test]
+async fn an_award_that_names_no_bid_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+
+        let bounty = fresh_id();
+        a.tx(&bounty_line(
+            "offer", DID_ALICE, None, None, "#ops", &bounty, &signing,
+        ));
+        a.rx(|l| l.contains(&bounty), "the bounty opens");
+
+        a.tx(&bounty_line(
+            "award",
+            DID_ALICE,
+            Some(&bounty),
+            None,
+            "#ops",
+            &fresh_id(),
+            &signing,
+        ));
+        let line = a.fail();
+        assert!(line.contains(" MISSING_REQUIREMENT "), "{line}");
+        assert!(
+            line.ends_with("That step must carry act-accepts"),
+            "the approved sentence names the missing field: {line}"
+        );
+    })
+    .await;
+}
+
+/// An award points at one event, and only a bid on the same action answers.
+/// The bounty's own opener is not one, and neither is an id nobody filed.
+#[tokio::test]
+async fn an_award_naming_a_non_bid_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+
+        let bounty = fresh_id();
+        a.tx(&bounty_line(
+            "offer", DID_ALICE, None, None, "#ops", &bounty, &signing,
+        ));
+        a.rx(|l| l.contains(&bounty), "the bounty opens");
+
+        let bid = fresh_id();
+        a.tx(&bounty_line(
+            "bid",
+            DID_ALICE,
+            Some(&bounty),
+            None,
+            "#ops",
+            &bid,
+            &signing,
+        ));
+        a.rx(|l| l.contains(&bid), "the bid is accepted");
+
+        // The opener, and then an id this server never filed at all.
+        for named in [bounty.clone(), fresh_id()] {
+            a.tx(&bounty_line(
+                "award",
+                DID_ALICE,
+                Some(&bounty),
+                Some(&named),
+                "#ops",
+                &fresh_id(),
+                &signing,
+            ));
+            let line = a.fail();
+            assert!(line.contains(" ACCEPTS_NOT_A_BID "), "{named}: {line}");
+            assert!(
+                line.ends_with("That award names no bid on this task"),
+                "{line}"
+            );
+        }
+
+        // …and the bid itself still works, so the refusals were about what
+        // was named and not about the award.
+        let done = fresh_id();
+        a.tx(&bounty_line(
+            "award",
+            DID_ALICE,
+            Some(&bounty),
+            Some(&bid),
+            "#ops",
+            &done,
+            &signing,
+        ));
+        a.rx(|l| l.contains(&done), "the award is accepted");
+    })
+    .await;
+}
+
+/// A bounty is open by construction — a directed one is just a handoff — so
+/// an opener carrying a recipient is a step the kind cannot take.
+#[tokio::test]
+async fn a_bounty_opened_to_one_recipient_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        a.tx(&directed_bounty_line(
+            DID_ALICE,
+            "#ops",
+            &fresh_id(),
+            &signing,
+        ));
+        assert_eq!(a.fail_code(), "ILLEGAL_STEP");
+    })
+    .await;
+}
+
+/// A bounty takes bids until the cutoff its offer named, which the server
+/// reads back out of the opener rather than out of a column. The offer's own
+/// deadline is a different time and bounds a different move.
+#[tokio::test]
+async fn a_bounty_stops_taking_bids_at_the_cutoff_its_offer_named() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        // Relative to now, because the ids these bids are minted with have to
+        // be near this server's clock to be adopted at all.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+
+        // A bounty whose bidding closed an hour ago…
+        let closed = open_priced_bounty(&mut a, &signing, "#ops", now - 3_600);
+        a.tx(&bounty_line(
+            "bid",
+            DID_ALICE,
+            Some(&closed),
+            None,
+            "#ops",
+            &fresh_id(),
+            &signing,
+        ));
+        assert_eq!(a.fail_code(), "DEADLINE_PASSED");
+
+        // …and one that is still taking them. Sent after a pause, because the
+        // act flood counter is per connection and this is the sixth event.
+        std::thread::sleep(Duration::from_millis(2_500));
+        let open = open_priced_bounty(&mut a, &signing, "#ops", now + 3_600);
+        let bid = fresh_id();
+        a.tx(&bounty_line(
+            "bid",
+            DID_ALICE,
+            Some(&open),
+            None,
+            "#ops",
+            &bid,
+            &signing,
+        ));
+        a.rx(|l| l.contains(&bid), "a bid inside the cutoff");
+
+        // The award is bound by act-deadline, which neither offer named, so
+        // bidding closing does not stop the poster picking.
+        let award = fresh_id();
+        a.tx(&bounty_line(
+            "award",
+            DID_ALICE,
+            Some(&open),
+            Some(&bid),
+            "#ops",
+            &award,
+            &signing,
+        ));
+        a.rx(|l| l.contains(&award), "the award is accepted");
+    })
+    .await;
+}
+
+/// A bounty naming what it pays and how long it takes bids. The price is
+/// carried and never read; the cutoff is a time the referee compares.
+fn open_priced_bounty(c: &mut C, signing: &SigningKey, channel: &str, cutoff: i64) -> String {
+    let id = fresh_id();
+    let tags: Vec<(String, String)> = vec![
+        ("+freeq.at/act".into(), "bounty".into()),
+        ("+freeq.at/act-verb".into(), "offer".into()),
+        ("+freeq.at/from".into(), DID_ALICE.into()),
+        ("+freeq.at/act-title".into(), "index-the-archive".into()),
+        ("+freeq.at/act-bid-deadline".into(), cutoff.to_string()),
+        ("+freeq.at/act-price".into(), "250-USD".into()),
+    ];
+    c.tx(&signed_line(&tags, channel, &id, signing));
+    c.rx(|l| l.contains(&id), "the bounty opens");
+    id
+}
+
+// ── the revival relation ────────────────────────────────────────────────────
+
+/// An opener that names the finished action it revives.
+fn re_offer_line(from: &str, replaces: &str, channel: &str, id: &str, key: &SigningKey) -> String {
+    let tags: Vec<(String, String)> = vec![
+        ("+freeq.at/act".into(), "handoff".into()),
+        ("+freeq.at/act-verb".into(), "offer".into()),
+        ("+freeq.at/from".into(), from.into()),
+        (
+            "+freeq.at/act-title".into(),
+            "review-the-deploy-again".into(),
+        ),
+        ("+freeq.at/act-replaces".into(), replaces.into()),
+    ];
+    signed_line(&tags, channel, id, key)
+}
+
+/// A failed handoff, re-offered: the new action carries the link and the old
+/// one is left exactly as it ended.
+#[tokio::test]
+async fn a_re_offer_carries_the_link_to_the_action_it_revives() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+
+        let dead = open_task(&mut a, &alice_key, "#ops", Some(DID_BOB));
+        for verb in ["accept", "fail"] {
+            b.tx(&follow_up_line(
+                verb,
+                DID_BOB,
+                &dead,
+                "#ops",
+                &fresh_id(),
+                &bob_key,
+            ));
+            b.rx(|l| l.contains(&format!("act-verb={verb}")), verb);
+        }
+
+        let revived = fresh_id();
+        a.tx(&re_offer_line(
+            DID_ALICE, &dead, "#ops", &revived, &alice_key,
+        ));
+        let line = a.rx(|l| l.contains(&revived), "the re-offer is accepted");
+        assert!(
+            line.contains(&format!("+freeq.at/act-replaces={dead}")),
+            "the link rides the wire, inside the signature: {line}"
+        );
+    })
+    .await;
+}
+
+/// Reviving something still running would leave two live actions each
+/// claiming to be the work.
+#[tokio::test]
+async fn a_re_offer_naming_a_live_action_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        let live = open_task(&mut a, &signing, "#ops", None);
+
+        a.tx(&re_offer_line(
+            DID_ALICE,
+            &live,
+            "#ops",
+            &fresh_id(),
+            &signing,
+        ));
+        let line = a.fail();
+        assert!(line.contains(" REPLACES_NOT_TERMINAL "), "{line}");
+        assert!(
+            line.ends_with("The action it replaces is not finished"),
+            "the approved sentence: {line}"
+        );
+    })
+    .await;
+}
+
+/// The relation belongs to an opener. A step on an action that already exists
+/// names no other.
+#[tokio::test]
+async fn a_step_that_carries_the_revival_relation_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        let task = open_task(&mut a, &signing, "#ops", None);
+
+        let tags: Vec<(String, String)> = vec![
+            ("+freeq.at/act".into(), "handoff".into()),
+            ("+freeq.at/act-verb".into(), "claim".into()),
+            ("+freeq.at/from".into(), DID_ALICE.into()),
+            ("+freeq.at/act-id".into(), task.clone()),
+            ("+freeq.at/act-replaces".into(), task.clone()),
+        ];
+        a.tx(&signed_line(&tags, "#ops", &fresh_id(), &signing));
+        let line = a.fail();
+        assert!(line.contains(" REPLACES_NOT_OPENER "), "{line}");
+        assert!(
+            line.ends_with("Only a new action replaces an earlier one"),
+            "the approved sentence: {line}"
+        );
+    })
+    .await;
+}
+
+/// A value that could not be an action id is answered as itself, rather than
+/// as a link to an action nobody filed.
+#[tokio::test]
+async fn a_revival_naming_something_that_is_not_an_action_id_is_refused() {
+    let k = key();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    run(addr, move |addr| {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
+        a.msgsig(&signing);
+        a.join("#ops");
+        a.tx(&re_offer_line(
+            DID_ALICE,
+            "the-last-one",
+            "#ops",
+            &fresh_id(),
+            &signing,
+        ));
+        let line = a.fail();
+        assert!(line.contains(" REPLACES_MALFORMED "), "{line}");
+        assert!(
+            line.ends_with("That is not the id of an action"),
+            "the approved sentence: {line}"
+        );
+    })
+    .await;
+}
+
 // ── task history cannot be rewritten ────────────────────────────────────────
 
 #[tokio::test]
@@ -1208,6 +2204,151 @@ async fn chathistory_carries_a_task_posted_after_the_last_message() {
     .await;
 }
 
+// ── the review window ───────────────────────────────────────────────────────
+
+/// Work handed in and left unanswered is deemed accepted when the window
+/// closes — under the home's own signature, and under a verb of its own so the
+/// log says which of the two clocks fired.
+#[tokio::test]
+async fn work_left_unanswered_past_the_review_window_is_accepted() {
+    let ka = key();
+    let kb = key();
+    // The review window is a second; the abandonment limit is a week away, so
+    // whatever happens here is the review sweep's doing.
+    let (addr, _h) = start_with_clocks(
+        resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)]),
+        604_800,
+        1,
+    )
+    .await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+        let bounty = award_to_bob(&mut a, &mut b, &alice_key, &bob_key, "#ops");
+
+        let handed_in = fresh_id();
+        b.tx(&bounty_line(
+            "submit",
+            DID_BOB,
+            Some(&bounty),
+            None,
+            "#ops",
+            &handed_in,
+            &bob_key,
+        ));
+        b.rx(|l| l.contains(&handed_in), "the work is handed in");
+
+        // Alice says nothing at all. The sweep runs on its own clock, and the
+        // room hears the window close the way it hears an expiry.
+        let notice = b
+            .maybe(
+                |l| l.contains("NOTICE") && l.contains("Task accepted"),
+                8_000,
+            )
+            .expect("the room hears the review window close");
+        assert!(
+            notice.ends_with("Task accepted without review: index-the-archive"),
+            "the approved sentence, with the bounty's own title: {notice}"
+        );
+        let events = act_events_in_history(&mut b, "#ops");
+        let closed = events
+            .iter()
+            .find(|l| l.contains("+freeq.at/act-verb=auto-accept"))
+            .unwrap_or_else(|| panic!("the review window closes on its own: {events:?}"));
+        assert!(
+            closed.contains(&format!("+freeq.at/act-id={bounty}")),
+            "on the bounty that was waiting: {closed}"
+        );
+        assert!(
+            closed.contains("+freeq.at/from=did:web:test-act"),
+            "signed under the home's own identity: {closed}"
+        );
+        assert!(closed.contains("+freeq.at/sig="), "{closed}");
+        assert!(
+            !events.iter().any(|l| l.contains("act-verb=expire")),
+            "and not as an expiry, which would read as the worker dropping it"
+        );
+
+        // Terminal: the bounty takes nothing further.
+        b.tx(&bounty_line(
+            "submit",
+            DID_BOB,
+            Some(&bounty),
+            None,
+            "#ops",
+            &fresh_id(),
+            &bob_key,
+        ));
+        assert_eq!(b.fail_code(), "TERMINAL_TASK");
+    })
+    .await;
+}
+
+/// The clock is per-submission: asking for changes is the poster meeting the
+/// window, and it moves the task, so the window starts again from there.
+#[tokio::test]
+async fn asking_for_changes_stops_the_review_clock() {
+    let ka = key();
+    let kb = key();
+    let (addr, _h) = start_with_clocks(
+        resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)]),
+        604_800,
+        4,
+    )
+    .await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+        let bounty = award_to_bob(&mut a, &mut b, &alice_key, &bob_key, "#ops");
+
+        let handed_in = fresh_id();
+        b.tx(&bounty_line(
+            "submit",
+            DID_BOB,
+            Some(&bounty),
+            None,
+            "#ops",
+            &handed_in,
+            &bob_key,
+        ));
+        b.rx(|l| l.contains(&handed_in), "the work is handed in");
+
+        let sent_back = fresh_id();
+        a.tx(&bounty_line(
+            "revise",
+            DID_ALICE,
+            Some(&bounty),
+            None,
+            "#ops",
+            &sent_back,
+            &alice_key,
+        ));
+        b.rx(|l| l.contains(&sent_back), "the work is sent back");
+
+        // The task is assigned again, which is not a state this clock owns —
+        // so nothing closes it, however many passes the sweep makes.
+        std::thread::sleep(Duration::from_secs(12));
+        let events = act_events_in_history(&mut b, "#ops");
+        assert!(
+            !events.iter().any(|l| l.contains("act-verb=auto-accept")),
+            "a poster who answered is never auto-accepted: {events:?}"
+        );
+    })
+    .await;
+}
+
 // ── expiry ──────────────────────────────────────────────────────────────────
 
 /// Everything at once: the sweep signs its own event under the server's
@@ -1238,6 +2379,47 @@ async fn an_abandoned_task_expires_and_the_room_is_told() {
         assert!(
             notice.ends_with("Task expired without completion: review-the-deploy"),
             "the approved sentence, with the offer's own title: {notice}"
+        );
+    })
+    .await;
+}
+
+/// The neutral clock still catches work somebody took and walked away from.
+/// The two sweeps own different states, so a bounty that was never handed in
+/// is expired rather than accepted.
+#[tokio::test]
+async fn assigned_work_nobody_touches_still_expires() {
+    let ka = key();
+    let kb = key();
+    // Both clocks short, and the review one shorter — so if the review sweep
+    // reached beyond its own states this would come back as an acceptance.
+    let (addr, _h) =
+        start_with_clocks(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)]), 2, 1).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+        a.join("#ops");
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        b.msgsig(&bob_key);
+        b.join("#ops");
+        award_to_bob(&mut a, &mut b, &alice_key, &bob_key, "#ops");
+
+        // Bob never hands anything in.
+        b.maybe(
+            |l| l.contains("NOTICE") && l.contains("Task expired"),
+            90_000,
+        )
+        .expect("the abandonment sweep reaches it");
+        let events = act_events_in_history(&mut b, "#ops");
+        assert!(
+            events.iter().any(|l| l.contains("act-verb=expire")),
+            "expired, because nothing was ever delivered: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|l| l.contains("act-verb=auto-accept")),
+            "and the review clock did not reach past the states it owns: {events:?}"
         );
     })
     .await;

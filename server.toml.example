@@ -30,6 +30,10 @@
 # message_retention_days = 0
 ## How long a task may sit unfinished before the sweep expires it (seconds; 0 = never):
 # act_expiry_secs = 604800
+## How long submitted work waits on the poster before it is deemed accepted
+## (seconds; 0 = never). Every bidder sees this window, so changing it changes
+## the terms they bid under:
+# act_review_secs = 1209600
 
 ## ── Federation (iroh + S2S) ────────────────────────────────────────
 # iroh = true

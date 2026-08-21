@@ -856,6 +856,10 @@ fn act_task_json(task: &crate::db::ActTask) -> serde_json::Value {
         "assignee": task.assignee,
         "caps": task.caps,
         "deadline": task.deadline,
+        // The finished action this one revives, when its opener named one.
+        // Null otherwise, and null is the honest answer for an action that
+        // revives nothing — the same shape `offeree` and `caps` already have.
+        "replaces": task.replaces,
         "updated": task.updated,
     })
 }
@@ -2777,8 +2781,8 @@ async fn client_metadata(headers: axum::http::HeaderMap) -> Json<serde_json::Val
         "client_name": "freeq",
         "client_uri": web_origin,
         "logo_uri": format!("{web_origin}/freeq.png"),
-        "tos_uri": format!("{web_origin}"),
-        "policy_uri": format!("{web_origin}"),
+        "tos_uri": web_origin,
+        "policy_uri": web_origin,
         "redirect_uris": [redirect_uri],
         // Advertise the union of scopes any flow may request. The AT
         // Proto OAuth spec requires that scopes used at /authorize time

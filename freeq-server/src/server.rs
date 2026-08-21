@@ -2149,6 +2149,7 @@ impl Server {
         }
 
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
+        spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
 
         // Heartbeat expiry: check agent liveness every 15 seconds.
         // Agents that miss their TTL transition to degraded, then offline, then disconnect.
@@ -2487,6 +2488,7 @@ impl Server {
         // is consistent.
         spawn_phantom_sweeper(Arc::clone(&state));
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
+        spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -2534,6 +2536,7 @@ impl Server {
         // Phantom-session sweeper (defense-in-depth).
         spawn_phantom_sweeper(Arc::clone(&state));
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
+        spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
 
         let web_state = Arc::clone(&state);
         let router = crate::web::router(web_state);
@@ -2699,10 +2702,47 @@ fn spawn_act_expiry_sweep(state: Arc<SharedState>, limit_secs: u64) {
             // Bounded per pass: a server that was down for a month should not
             // try to expire everything in one breath.
             let stale = state
-                .with_db(|db| db.act_tasks_idle_since(cutoff, 100))
+                .with_db(|db| {
+                    db.act_tasks_idle_outside_states(
+                        &freeq_sdk::act_transitions::review_timeout_states(),
+                        cutoff,
+                        100,
+                    )
+                })
                 .unwrap_or_default();
             for task in &stale {
                 crate::connection::act::expire_task(&state, task);
+            }
+        }
+    });
+}
+
+/// Close review windows: work that was handed in and left unanswered for
+/// longer than the limit is deemed accepted, under the home's own signature.
+///
+/// A second clock rather than a case of the first, because it does the
+/// opposite job. The abandonment sweep is neutral and catches work nobody is
+/// doing; this one favours the worker and catches a poster who took delivery
+/// and then went quiet — and the two would otherwise race, so the states this
+/// one owns are the states the other skips. `0` disables it.
+fn spawn_act_review_sweep(state: Arc<SharedState>, limit_secs: u64) {
+    let states = freeq_sdk::act_transitions::review_timeout_states();
+    if limit_secs == 0 || states.is_empty() {
+        return;
+    }
+    let limit = limit_secs as i64;
+    tokio::spawn(async move {
+        let every = (limit_secs / 2).clamp(1, 60);
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(every));
+        interval.tick().await; // skip first tick
+        loop {
+            interval.tick().await;
+            let cutoff = chrono::Utc::now().timestamp() - limit;
+            let waiting = state
+                .with_db(|db| db.act_tasks_idle_in_states(&states, cutoff, 100))
+                .unwrap_or_default();
+            for task in &waiting {
+                crate::connection::act::auto_accept_task(&state, task);
             }
         }
     });

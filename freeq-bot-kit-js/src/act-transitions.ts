@@ -26,7 +26,13 @@ export type RefusalReason =
   | "terminal-task"
   | "illegal-step"
   | "wrong-sender"
-  | "deadline-passed";
+  | "deadline-passed"
+  | "client-confirm"
+  | "replaces-not-opener"
+  | "replaces-malformed"
+  | "replaces-not-terminal"
+  | "missing-requirement"
+  | "accepts-not-a-bid";
 
 /** Allowed, with the state the task lands in — or refused, with the reason. */
 export type CheckResult = { ok: true; to: string } | { ok: false; reason: RefusalReason };
@@ -42,6 +48,10 @@ export interface Task {
   assignee?: string | null;
   /** `act-deadline`, unix seconds. */
   deadline?: number | null;
+  /** `act-bid-deadline`, unix seconds. A second time on the same opener,
+   * compared the same way: it bounds how long a bounty collects bids, which
+   * is a shorter question than how long the offer stands. */
+  bidDeadline?: number | null;
 }
 
 /** The event being checked. */
@@ -50,13 +60,39 @@ export interface TaskEvent {
   /** The id the signer minted; its embedded ULID millisecond is the clock a
    * deadline is measured against. */
   msgid: string;
+  /** `act-accepts`: the event an award takes. Named here rather than read out
+   * of `fields` because it is the one act value a caller must resolve before
+   * asking — see `EventSender.acceptedBid`. */
+  accepts?: string | null;
+  /** The act fields the event carries, by their document names (`act-to`,
+   * `act-note`, …). Presence only: what a transition's `requires` is checked
+   * against. The one place this checker points at a value is
+   * `assigneeSource`, which names the field rather than reading it. */
+  fields?: string[];
 }
 
-/** Who sent it. */
+/** The bid an award named, as the caller's log answered for it. */
+export interface AcceptedBid {
+  /** Who wrote the bid. The assignee an award's `author_of` row lands on. */
+  author: string;
+}
+
+/** Who sent it, and what their event resolved to. */
 export interface EventSender {
   did: string;
   /** The server itself — the only actor a `system` transition allows. */
   isSystem?: boolean;
+  /**
+   * The bid this event's `act-accepts` names, when the caller found one on the
+   * action. Absent when it named something that is not a bid here — including
+   * an id belonging to another action, and an id nobody filed.
+   *
+   * This checker reads no log, so the lookup is the caller's: it resolves the
+   * named event among the action's own and hands back the bid's author. A bot
+   * pre-checking its own move has no log — it passes nothing and is told its
+   * award takes nothing, which is the honest answer from where it stands.
+   */
+  acceptedBid?: AcceptedBid | null;
 }
 
 interface Transition {
@@ -65,6 +101,14 @@ interface Transition {
   to: string;
   who: string;
   before_deadline?: boolean;
+  /** Bounded by the offer's `act-bid-deadline` rather than its
+   *  `act-deadline`. Data, like its sibling; the comparison is the same code. */
+  before_bid_deadline?: boolean;
+  /** Who this transition assigns. Absent = the actor; a tag name = the DID in
+   *  that tag; `{ author_of: tag }` = the author of the event that tag names. */
+  assignee_from?: string | { author_of: string };
+  /** Fields the transition is illegal without. */
+  requires?: string[];
 }
 
 /** How a task of this kind comes into being: the verb that creates one, and
@@ -85,6 +129,12 @@ interface Kind {
 
 const ANY_NONTERMINAL = "*nonterminal";
 
+/** The verb the event an award names must carry.
+ *
+ * Written down once, here, so a caller resolving `act-accepts` asks the rules
+ * rather than spelling a kind's verb into itself. */
+export const BID_VERB = "bid";
+
 const kinds = spec.kinds as unknown as Record<string, Kind>;
 const refusals = spec.refusals as Record<string, string>;
 
@@ -98,6 +148,72 @@ export function initialState(kind: string, directed: boolean): string | null {
 /** The verb that creates a task of this kind. */
 export function openingVerb(kind: string): string | null {
   return kinds[kind]?.opens.verb ?? null;
+}
+
+/** The verb an action's home writes its receipts under. */
+export const CONFIRMATION_VERB = spec.confirmation.verb;
+
+/** The tag a receipt names the event it confirms in. */
+export const CONFIRMATION_SUBJECT_TAG = spec.confirmation.subject;
+
+/**
+ * Whether this verb is the home's receipt verb.
+ *
+ * Asked before any kind's table is consulted, by every caller that reads a
+ * verb at all. A receipt is a statement about an event, not a move on a task:
+ * no kind lists `confirm`, and letting one fall through to the per-kind lookup
+ * would answer "that kind has no such step" — which reads as an invitation to
+ * add the row, and the row must not exist.
+ */
+export function isConfirmation(verb: string): boolean {
+  return verb === CONFIRMATION_VERB;
+}
+
+/** The tag a new action names the finished one it revives in. */
+export const REVIVAL_TAG = spec.revival.tag;
+
+/** What the caller's log knows about the action a revival names. */
+export type Predecessor = "unknown" | "live" | "finished";
+
+const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/**
+ * Whether `id` is shaped like an event id: a 26-character Crockford ULID.
+ *
+ * Shape only. Whether anything was ever filed under it is the log's answer,
+ * not this one's.
+ */
+export function isEventId(id: string): boolean {
+  return id.length === 26 && [...id].every((c) => CROCKFORD.includes(c));
+}
+
+/** Allowed, or refused with the reason. */
+export type RevivalResult = { ok: true } | { ok: false; reason: RefusalReason };
+
+/**
+ * Decide whether an event may carry the revival relation (`REVIVAL_TAG`),
+ * given what the caller's log knows about the action it names.
+ *
+ * Three rules, cheapest first. Only an opener revives anything: a step on an
+ * action that already exists names no other. The value names an action, so it
+ * is shaped like one. And the action it names must have finished — reviving
+ * something still running would leave two live actions each claiming to be the
+ * work.
+ *
+ * `"unknown"` is accepted, and that is the load-bearing part: receivers must
+ * tolerate a link to an action they never filed and annotate rather than
+ * refuse. A bot pre-checking its own move has no log at all — it passes
+ * `"unknown"` and gets the two rules a message decides on its own.
+ */
+export function checkRevival(
+  opens: boolean,
+  named: string,
+  predecessor: Predecessor,
+): RevivalResult {
+  if (!opens) return { ok: false, reason: "replaces-not-opener" };
+  if (!isEventId(named)) return { ok: false, reason: "replaces-malformed" };
+  if (predecessor === "live") return { ok: false, reason: "replaces-not-terminal" };
+  return { ok: true };
 }
 
 /**
@@ -115,6 +231,9 @@ export function checkOpen(
   directed: boolean,
   namesTask: boolean,
 ): CheckResult {
+  // Before the kind is even looked up: a receipt opens nothing, and the answer
+  // must not depend on which kind it named.
+  if (isConfirmation(verb)) return { ok: false, reason: "client-confirm" };
   const k = kinds[kind];
   if (!k) return { ok: false, reason: "unknown-kind" };
   if (k.opens.verb !== verb) {
@@ -175,6 +294,10 @@ export function checkTransition(
   event: TaskEvent,
   sender: EventSender,
 ): CheckResult {
+  // The receipt verb, before the kind lookup and before anything about this
+  // task: a confirmation is not a move, and no table has a row for it. The
+  // home files its own receipts past this checker entirely.
+  if (isConfirmation(event.verb)) return { ok: false, reason: "client-confirm" };
   const kind = kinds[task.kind];
   if (!kind) return { ok: false, reason: "unknown-kind" };
 
@@ -189,6 +312,23 @@ export function checkTransition(
 
   const row = rows.find((t) => fromMatches(t.from, task.state, kind));
   if (!row) return { ok: false, reason: "illegal-step" };
+
+  // What the move needs to be the move at all. Before authority for the same
+  // reason the state is: an award that names no winner is malformed for
+  // everybody, and "not you" would send the sender after the wrong problem.
+  const present = event.fields ?? [];
+  if ((row.requires ?? []).some((f) => !present.includes(f))) {
+    return { ok: false, reason: "missing-requirement" };
+  }
+
+  // A row that takes its assignee from a named bid needs that bid. Whether the
+  // name found one is the caller's answer, not this checker's — nothing here
+  // reads a log — and a name that found nothing named something that is not a
+  // bid on this action. Alongside the requirement above for the same reason:
+  // an award that takes no bid is malformed for everybody.
+  if (typeof row.assignee_from === "object" && (!event.accepts || !sender.acceptedBid)) {
+    return { ok: false, reason: "accepts-not-a-bid" };
+  }
 
   // Authority second: who the sender is only matters once the move itself
   // makes sense.
@@ -217,8 +357,16 @@ export function checkTransition(
       return { ok: false, reason: "wrong-sender" };
   }
 
-  if (row.before_deadline && task.deadline != null) {
-    const limit = task.deadline * 1000 + DEADLINE_TOLERANCE_MS;
+  // Two deadlines, one comparison. A row declares which of the offer's times
+  // bounds it: how long the offer stands, or — on a kind that collects them —
+  // how long it takes bids. A time the offer never named bounds nothing.
+  const bounds = [
+    row.before_deadline ? task.deadline : null,
+    row.before_bid_deadline ? task.bidDeadline : null,
+  ];
+  for (const deadline of bounds) {
+    if (deadline == null) continue;
+    const limit = deadline * 1000 + DEADLINE_TOLERANCE_MS;
     const minted = eventTimeMs(event.msgid);
     // Fail closed: an id whose clock cannot be read cannot be shown to be
     // inside the deadline.
@@ -226,4 +374,39 @@ export function checkTransition(
   }
 
   return { ok: true, to: row.to };
+}
+
+/** Who a transition assigns the work to. */
+export type AssigneeSource =
+  /** Whoever took the step — what `accept` and `claim` already mean. */
+  | { from: "actor" }
+  /** The act field named here, read off the event. */
+  | { from: "field"; field: string }
+  /** The author of the event named in this act field: a bounty's `award`
+   *  takes one bid, and the terms live in it, so the poster names the event in
+   *  `act-accepts` rather than a DID. Resolving it is the caller's — this
+   *  checker reads no log — and the answer arrives as `EventSender.acceptedBid`. */
+  | { from: "author_of"; field: string };
+
+/**
+ * Where the assignee comes from when `verb` moves a `kind` task out of
+ * `fromState`.
+ *
+ * Data, not code: a kind that assigns someone other than the actor says so in
+ * its row. A verb with no row here answers `actor`, which changes nothing for
+ * a transition that assigns nobody.
+ */
+export function assigneeSource(
+  kind: string,
+  verb: string,
+  fromState: string,
+): AssigneeSource {
+  const k = kinds[kind];
+  if (!k) return { from: "actor" };
+  const row = k.transitions.find((t) => t.verb === verb && fromMatches(t.from, fromState, k));
+  if (!row?.assignee_from) return { from: "actor" };
+  if (typeof row.assignee_from === "object") {
+    return { from: "author_of", field: row.assignee_from.author_of };
+  }
+  return { from: "field", field: row.assignee_from };
 }

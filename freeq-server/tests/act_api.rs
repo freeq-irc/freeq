@@ -336,8 +336,9 @@ async fn one_task_comes_back_with_its_whole_event_history() {
     assert_eq!(status, 200);
     assert_eq!(
         body["events"].as_array().unwrap().len(),
-        4,
-        "the offer and its three follow-ups"
+        6,
+        "the offer, its three follow-ups, and a receipt for each of the two \
+         that moved the task"
     );
     assert!(
         body["events"][0]["canonical"]
@@ -355,6 +356,85 @@ async fn one_task_comes_back_with_its_whole_event_history() {
     // …and it is gone from the open-work listing.
     let (_, listing) = get(web, "/api/v1/actions", None).await;
     assert!(ids(&listing).is_empty());
+}
+
+/// A receipt is served from the log like any other event, and the bytes served
+/// are the bytes signed: this checks the stored canonical against the very key
+/// the server publishes as its own, which is the whole worth of a receipt.
+#[tokio::test]
+async fn the_event_list_carries_the_receipts_and_their_signatures_verify() {
+    use base64::Engine;
+
+    let ka = PrivateKey::generate_ed25519();
+    let kb = PrivateKey::generate_ed25519();
+    let (irc, web, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    let (task, accept_id) = tokio::task::spawn_blocking(move || {
+        let alice_key = SigningKey::from_bytes(&[21u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[22u8; 32]);
+        let mut a = C::authenticated(irc, "alice", DID_ALICE, ka);
+        a.msgsig(&alice_key);
+        a.join("#work");
+        let mut b = C::authenticated(irc, "bob", DID_BOB, kb);
+        b.msgsig(&bob_key);
+        b.join("#work");
+
+        let id = a.offer("#work", &channel_venue("#work"), DID_ALICE, &alice_key);
+        let ev = freeq_sdk::chatsig::new_event_id();
+        let tags: Vec<(String, String)> = vec![
+            ("+freeq.at/act".into(), "handoff".into()),
+            ("+freeq.at/act-verb".into(), "claim".into()),
+            ("+freeq.at/from".into(), DID_BOB.into()),
+            ("+freeq.at/act-id".into(), id.clone()),
+        ];
+        let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let sig = freeq_sdk::act::sign_act(pairs, &channel_venue("#work"), &ev, &bob_key).unwrap();
+        let mut wire: Vec<String> = tags.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        wire.push(format!("{EVENT_ID_TAG}={ev}"));
+        wire.push(format!("+freeq.at/sig={sig}"));
+        b.tx(&format!("@{} TAGMSG #work", wire.join(";")));
+        b.rx(|l| l.contains(&ev), "the claim is accepted");
+        (id, ev)
+    })
+    .await
+    .unwrap();
+
+    let (_, own) = get(web, "/api/v1/signing-key", None).await;
+    let published = own["publicKey"]
+        .as_str()
+        .or_else(|| own["public_key"].as_str())
+        .or_else(|| own["pubkey"].as_str())
+        .expect("the server publishes its key");
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(published)
+        .expect("base64url");
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&raw.try_into().unwrap()).unwrap();
+
+    let (_, body) = get(web, &format!("/api/v1/actions/{task}"), None).await;
+    let events = body["events"].as_array().unwrap();
+    let receipt = events
+        .iter()
+        .find(|e| {
+            e["canonical"]
+                .as_str()
+                .is_some_and(|c| c.contains(r#""act-verb":"confirm""#))
+        })
+        .expect("the receipt is on file and served");
+
+    let canonical = receipt["canonical"].as_str().unwrap();
+    assert!(
+        canonical.contains(&format!(r#""act-subject":"{accept_id}""#)),
+        "it names the event it confirms: {canonical}"
+    );
+    assert!(
+        canonical.contains(r#""from":"did:web:test-act-api""#),
+        "signed under the server's own identity: {canonical}"
+    );
+    freeq_sdk::sigtag::verify_canonical(
+        canonical,
+        receipt["signature"].as_str().expect("a receipt is signed"),
+        &key,
+    )
+    .expect("the receipt verifies against the key the server publishes");
 }
 
 /// The server signs the expiry events it makes, and a signature is only worth
@@ -416,6 +496,128 @@ async fn a_task_event_moves_the_counter_on_the_metrics_endpoint() {
         1,
         "one task event arrived, so the published number says one"
     );
+}
+
+/// The revival relation is a fact about the new action, so it reads off the
+/// action rather than out of the opener's bytes — in the listing and on the
+/// single fetch alike. An action that revives nothing says so.
+#[tokio::test]
+async fn a_revived_action_shows_what_it_replaces_on_both_endpoints() {
+    let k = PrivateKey::generate_ed25519();
+    let (irc, web, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    let (dead, revived, unrelated) = tokio::task::spawn_blocking(move || {
+        let signing = SigningKey::from_bytes(&[21u8; 32]);
+        let mut a = C::authenticated(irc, "alice", DID_ALICE, k);
+        a.msgsig(&signing);
+        a.join("#work");
+
+        let venue = channel_venue("#work");
+        let dead = a.offer("#work", &venue, DID_ALICE, &signing);
+        // The poster withdraws it, which finishes it.
+        let ev = freeq_sdk::chatsig::new_event_id();
+        let tags: Vec<(String, String)> = vec![
+            ("+freeq.at/act".into(), "handoff".into()),
+            ("+freeq.at/act-verb".into(), "cancel".into()),
+            ("+freeq.at/from".into(), DID_ALICE.into()),
+            ("+freeq.at/act-id".into(), dead.clone()),
+        ];
+        let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let sig = freeq_sdk::act::sign_act(pairs, &venue, &ev, &signing).unwrap();
+        let mut wire: Vec<String> = tags.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        wire.push(format!("{EVENT_ID_TAG}={ev}"));
+        wire.push(format!("+freeq.at/sig={sig}"));
+        a.tx(&format!("@{} TAGMSG #work", wire.join(";")));
+        a.rx(|l| l.contains(&ev), "the cancel is accepted");
+
+        // Re-listed, naming what it revives.
+        let revived = freeq_sdk::chatsig::new_event_id();
+        let tags: Vec<(String, String)> = vec![
+            ("+freeq.at/act".into(), "handoff".into()),
+            ("+freeq.at/act-verb".into(), "offer".into()),
+            ("+freeq.at/from".into(), DID_ALICE.into()),
+            ("+freeq.at/act-replaces".into(), dead.clone()),
+        ];
+        let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let sig = freeq_sdk::act::sign_act(pairs, &venue, &revived, &signing).unwrap();
+        let mut wire: Vec<String> = tags.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        wire.push(format!("{EVENT_ID_TAG}={revived}"));
+        wire.push(format!("+freeq.at/sig={sig}"));
+        a.tx(&format!("@{} TAGMSG #work", wire.join(";")));
+        a.rx(|l| l.contains(&revived), "the re-offer is accepted");
+
+        let unrelated = a.offer("#work", &venue, DID_ALICE, &signing);
+        (dead, revived, unrelated)
+    })
+    .await
+    .unwrap();
+
+    let (_, listing) = get(web, "/api/v1/actions", None).await;
+    let rows = listing["tasks"].as_array().unwrap();
+    let row = rows
+        .iter()
+        .find(|t| t["act_id"] == serde_json::json!(revived))
+        .expect("the revived action is live");
+    assert_eq!(row["replaces"], serde_json::json!(dead));
+    let other = rows
+        .iter()
+        .find(|t| t["act_id"] == serde_json::json!(unrelated))
+        .unwrap();
+    assert!(
+        other["replaces"].is_null(),
+        "an action that revives nothing says so: {other}"
+    );
+
+    let (status, one) = get(web, &format!("/api/v1/actions/{revived}"), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(one["task"]["replaces"], serde_json::json!(dead));
+
+    // …and the action it replaces is exactly as it ended.
+    let (_, old) = get(web, &format!("/api/v1/actions/{dead}"), None).await;
+    assert!(old["task"].is_null(), "cancelled, so it left the view");
+    assert_eq!(
+        old["events"].as_array().unwrap().len(),
+        3,
+        "the offer, the cancel, and the receipt for the cancel — nothing added \
+         by the revival"
+    );
+}
+
+/// The rule that is load-bearing for federation: a link to an action this
+/// server never filed is annotated, not refused, and the annotation is served.
+#[tokio::test]
+async fn a_link_to_an_action_this_server_never_saw_is_annotated_and_served() {
+    const NEVER_SEEN: &str = "01M16E7TC0NEVERSEEN0000000";
+    let k = PrivateKey::generate_ed25519();
+    let (irc, web, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    let revived = tokio::task::spawn_blocking(move || {
+        let signing = SigningKey::from_bytes(&[21u8; 32]);
+        let mut a = C::authenticated(irc, "alice", DID_ALICE, k);
+        a.msgsig(&signing);
+        a.join("#work");
+
+        let venue = channel_venue("#work");
+        let id = freeq_sdk::chatsig::new_event_id();
+        let tags: Vec<(String, String)> = vec![
+            ("+freeq.at/act".into(), "handoff".into()),
+            ("+freeq.at/act-verb".into(), "offer".into()),
+            ("+freeq.at/from".into(), DID_ALICE.into()),
+            ("+freeq.at/act-replaces".into(), NEVER_SEEN.into()),
+        ];
+        let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let sig = freeq_sdk::act::sign_act(pairs, &venue, &id, &signing).unwrap();
+        let mut wire: Vec<String> = tags.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        wire.push(format!("{EVENT_ID_TAG}={id}"));
+        wire.push(format!("+freeq.at/sig={sig}"));
+        a.tx(&format!("@{} TAGMSG #work", wire.join(";")));
+        a.rx(|l| l.contains(&id), "the re-offer is accepted anyway");
+        id
+    })
+    .await
+    .unwrap();
+
+    let (_, listing) = get(web, "/api/v1/actions", None).await;
+    assert_eq!(ids(&listing), vec![revived.clone()]);
+    assert_eq!(listing["tasks"][0]["replaces"], NEVER_SEEN);
 }
 
 #[tokio::test]

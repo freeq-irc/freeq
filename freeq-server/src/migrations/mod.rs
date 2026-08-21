@@ -41,6 +41,8 @@ mod m004_events_log;
 mod m005_event_emoji;
 #[path = "006_act_actions.rs"]
 mod m006_act_actions;
+#[path = "007_act_replaces.rs"]
+mod m007_act_replaces;
 
 // db.rs unit tests exercise the backfill directly against hand-built rows.
 // Production reaches it only as a rung of the ladder below.
@@ -57,6 +59,7 @@ fn rungs() -> Vec<rusqlite_migration::M<'static>> {
         m004_events_log::migration(),
         m005_event_emoji::migration(),
         m006_act_actions::migration(),
+        m007_act_replaces::migration(),
     ]
 }
 
@@ -196,6 +199,7 @@ mod tests {
         migration_ladder().to_version(&mut stepped, 4).unwrap();
         migration_ladder().to_version(&mut stepped, 5).unwrap();
         migration_ladder().to_version(&mut stepped, 6).unwrap();
+        migration_ladder().to_version(&mut stepped, 7).unwrap();
 
         let mut direct = Connection::open_in_memory().unwrap();
         migration_ladder().to_latest(&mut direct).unwrap();
@@ -244,7 +248,7 @@ mod tests {
         migration_ladder().to_latest(&mut conn).unwrap();
         let before = tables(&conn);
         migration_ladder().to_latest(&mut conn).unwrap();
-        assert_eq!(version(&conn), 6);
+        assert_eq!(version(&conn), ladder_top());
         assert_eq!(tables(&conn), before);
     }
 }

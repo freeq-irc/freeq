@@ -151,8 +151,10 @@ pub async fn synthesize(
 /// Decode raw 16-bit signed little-endian PCM into f32 `[-1, 1]`. A
 /// trailing odd byte (shouldn't happen for valid PCM) is ignored.
 pub(crate) fn decode_pcm_s16le(data: &[u8]) -> Vec<f32> {
-    data.chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+    let (samples, _) = data.as_chunks::<2>();
+    samples
+        .iter()
+        .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
         .collect()
 }
 

@@ -236,6 +236,19 @@ pub struct ActView {
     /// `act-deadline` in unix seconds, when the offer named one this server
     /// can read as a number.
     pub deadline: Option<i64>,
+    /// The revival relation: the finished action this one replaces. An
+    /// annotation, and possibly one naming an action this server never filed —
+    /// which is the case the rule is written for.
+    pub replaces: Option<String>,
+    /// Every `act-*` field the document carries, by its document name.
+    ///
+    /// The named fields above are the ones the view has columns for; this is
+    /// the whole set, and it exists because the rules file points at fields by
+    /// name: a transition's `requires` asks which are present, and its
+    /// `assignee_from` asks what one holds. Neither can be served by a fixed
+    /// list, which is the same reason the signature covers the tags by prefix
+    /// rather than by enumeration.
+    pub fields: std::collections::BTreeMap<String, String>,
 }
 
 /// Read a task event's view fields out of its canonical.
@@ -244,7 +257,17 @@ pub struct ActView {
 pub fn derive_act_view(canonical: &str) -> Option<ActView> {
     let doc: serde_json::Value = serde_json::from_str(canonical).ok()?;
     let get = |k: &str| doc.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    // The same rule the signer's sweep used, read back: a document key is an
+    // act field when it is `act` or starts with `act-`. The envelope fields
+    // (`from`, `id`, `target`) are not, and never collide with one.
+    let fields = doc
+        .as_object()?
+        .iter()
+        .filter(|(k, _)| k.as_str() == "act" || k.starts_with("act-"))
+        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+        .collect();
     Some(ActView {
+        fields,
         kind: get("act")?,
         verb: get("act-verb")?,
         to: get("act-to"),
@@ -253,6 +276,9 @@ pub fn derive_act_view(canonical: &str) -> Option<ActView> {
         // cannot enforce, so it is stored as absent rather than as a guess.
         // The value stays in the canonical either way.
         deadline: get("act-deadline").and_then(|d| d.parse::<i64>().ok()),
+        // Read under the name the rules file gives the relation, so the tag
+        // is spelled in one place across all three implementations.
+        replaces: get(freeq_sdk::act_transitions::revival_tag()),
     })
 }
 
