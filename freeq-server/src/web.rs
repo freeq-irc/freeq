@@ -844,7 +844,7 @@ fn authorize_venue_read(state: &SharedState, venue: &str, headers: &axum::http::
     }
 }
 
-fn act_task_json(task: &crate::db::ActTask) -> serde_json::Value {
+fn act_task_json(task: &crate::db::ActTask, dropped_unchecked: i64) -> serde_json::Value {
     serde_json::json!({
         "act_id": task.act_id,
         "kind": task.kind,
@@ -861,6 +861,10 @@ fn act_task_json(task: &crate::db::ActTask) -> serde_json::Value {
         // revives nothing — the same shape `offeree` and `caps` already have.
         "replaces": task.replaces,
         "updated": task.updated,
+        // How many events about this task were dropped from the defer queue
+        // unchecked — this server's own count, never relayed: a reader's
+        // notice that the record here may be incomplete.
+        "dropped_unchecked": dropped_unchecked,
     })
 }
 
@@ -898,7 +902,14 @@ async fn api_act_tasks(
         })
         .unwrap_or_default()
         .iter()
-        .map(act_task_json)
+        .map(|t| {
+            act_task_json(
+                t,
+                state
+                    .with_db(|db| db.act_dropped_unchecked(&t.act_id))
+                    .unwrap_or(0),
+            )
+        })
         .collect();
 
     Ok(Json(serde_json::json!({ "tasks": tasks })))
@@ -929,7 +940,14 @@ async fn api_act_task(
         .with_db(|db| db.act_task(&act_id))
         .flatten()
         .as_ref()
-        .map(act_task_json);
+        .map(|t| {
+            act_task_json(
+                t,
+                state
+                    .with_db(|db| db.act_dropped_unchecked(&t.act_id))
+                    .unwrap_or(0),
+            )
+        });
     let history: Vec<serde_json::Value> = events
         .iter()
         .map(|e| {

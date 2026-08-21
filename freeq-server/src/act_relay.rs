@@ -19,9 +19,9 @@
 //!   configured for the origin, an algorithm this build does not know, a
 //!   mandatory field missing. An outage or an old peer is not evidence about
 //!   the sender, so none of these may ever read as invalid and none is ever
-//!   refused. Neither stored nor shown: what this server cannot check it does
-//!   not present as a task. Holding one for the key that would settle it is
-//!   the queue's job, and the queue is a later step.
+//!   refused. Neither stored nor shown while it waits: what this server
+//!   cannot check it does not present as a task. It waits in [`DeferQueue`]
+//!   for the key that would settle it, and is judged again when one arrives.
 //!
 //! The verdict itself consults no server state: the caller resolves the DM
 //! recipient and supplies the key lookup, which is what makes the checker
@@ -103,6 +103,339 @@ pub(crate) fn log_relayed_verdict(
             peer_declared_act,
             "Relayed task event checked"
         ),
+    }
+}
+
+// ── the defer queue ─────────────────────────────────────────────────────────
+
+/// One relayed task event, held until the key that would settle it arrives.
+///
+/// Everything the receive side needs to reach the same conclusion later,
+/// captured as it arrived: the tags are what the signature covers and cannot
+/// be tidied first, and `peer_declared_act` is a fact about the link the event
+/// came in on that is not recoverable afterwards. The DM recipient is
+/// deliberately absent — it is re-resolved at retry, because who is here can
+/// change while an event waits.
+///
+/// Build one with `..Default::default()` for `seq`: park order is the queue's
+/// to assign, and [`DeferQueue::park`] stamps it on the way in.
+#[derive(Default)]
+pub(crate) struct ParkedEvent {
+    pub tags: HashMap<String, String>,
+    pub target: String,
+    /// The `nick!user@host` prefix delivery quotes back.
+    pub from: String,
+    pub peer_account: Option<String>,
+    pub origin: String,
+    pub peer: String,
+    pub peer_declared_act: bool,
+    pub event_id: String,
+    /// The identity whose key would settle this, and the key its signature
+    /// names. Empty when the event named neither — nothing will ever match
+    /// those, and they wait to be evicted, which is the visible ageing-out an
+    /// event that can never verify gets.
+    pub signer: String,
+    pub kid: String,
+    /// Park order across every origin. Overwritten by [`DeferQueue::park`].
+    pub seq: u64,
+}
+
+/// Whether a parked event is a receipt — the home server's own word about an
+/// event it filed, which is never the one thrown out to make room.
+fn is_receipt(tags: &HashMap<String, String>) -> bool {
+    tags.get("+freeq.at/act-verb")
+        .or_else(|| tags.get("act-verb"))
+        .is_some_and(|verb| freeq_sdk::act_transitions::is_confirmation(verb))
+}
+
+/// The first wait before asking again for a key something is parked on, and
+/// the ceiling that doubling stops at.
+pub(crate) const KEY_FIRST_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const KEY_MAX_RETRY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How long to wait after `attempts` asks have gone unanswered: thirty
+/// seconds, doubling, ten minutes at the most. A key server that is down for
+/// an hour is asked a handful of times rather than a hundred.
+pub(crate) fn key_retry_backoff(attempts: u32) -> std::time::Duration {
+    KEY_FIRST_RETRY
+        .saturating_mul(1u32 << attempts.min(5))
+        .min(KEY_MAX_RETRY)
+}
+
+/// What is still owed to one signer's key: how many parked events it would
+/// settle, and when to ask for it next.
+struct KeyRetry {
+    waiting: usize,
+    attempts: u32,
+    next_attempt: std::time::Instant,
+}
+
+/// Relayed task events waiting for a key, bounded twice.
+///
+/// **In memory only, on purpose.** A restart drops whatever is parked; those
+/// events were never delivered and never stored, so what is lost is the same
+/// thing an eviction loses. Persisting a queue of unverified events would mean
+/// carrying a peer's unchecked claims across restarts, which is a larger
+/// promise than deferring was meant to make. Catch-up is what heals a real
+/// gap.
+///
+/// Two ceilings rather than one. The per-origin bound stops a single noisy
+/// peer filling the queue for everybody; the total bound is what the process
+/// actually runs under, because enough peers each inside their own share add
+/// up to more than one server should hold. An origin here is the peer the
+/// link authenticated as, so nobody can invent one — the total bounds what
+/// real peers park between them, not a made-up name.
+///
+/// One kind of event is never the one evicted to make room: a receipt, the
+/// home server's ruling on somebody's move, whose loss leaves the people
+/// waiting on it with nothing. A bucket holding nothing but receipts turns
+/// away what arrives instead — with one exception, when what arrives is
+/// itself a receipt: then the oldest receipt goes, because the newest ruling
+/// is the one more likely to still matter and catch-up brings the older one
+/// back.
+pub(crate) struct DeferQueue {
+    by_origin: HashMap<String, std::collections::VecDeque<ParkedEvent>>,
+    /// Per `(origin, signer, kid)`: what is waiting, and when to ask again.
+    retries: HashMap<(String, String, String), KeyRetry>,
+    total: usize,
+    next_seq: u64,
+    max_per_origin: usize,
+    max_total: usize,
+}
+
+impl DeferQueue {
+    pub(crate) fn new(max_per_origin: usize, max_total: usize) -> Self {
+        DeferQueue {
+            by_origin: HashMap::new(),
+            retries: HashMap::new(),
+            total: 0,
+            next_seq: 0,
+            // A ceiling of zero would park an event and evict it in the same
+            // breath, which reads as silent loss rather than a disabled
+            // feature. One is the smallest honest queue.
+            max_per_origin: max_per_origin.max(1),
+            max_total: max_total.max(1),
+        }
+    }
+
+    /// How many events are waiting. Only the tests ask; the queue's own
+    /// records of what it did are its log lines and the count each dropped
+    /// event leaves on its task.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.total
+    }
+
+    /// Park one event, making room for it if either ceiling is reached.
+    ///
+    /// Returns whatever the queue threw away to stay inside its ceilings — the
+    /// events evicted, or the arriving one when nothing there could be evicted
+    /// — so the caller can leave a visible trace on each one's task beside the
+    /// log lines written here.
+    #[must_use = "dropped events deserve a visible trace, not just the log"]
+    pub(crate) fn park(&mut self, mut event: ParkedEvent) -> Vec<ParkedEvent> {
+        let arrival = self.next_seq;
+        // What arrives decides whether a parked receipt may be given up: only
+        // an arriving receipt outranks one.
+        let arrival_is_receipt = is_receipt(&event.tags);
+        event.seq = arrival;
+        self.next_seq += 1;
+        let origin = event.origin.clone();
+        let key = (origin.clone(), event.signer.clone(), event.kid.clone());
+        self.by_origin
+            .entry(origin.clone())
+            .or_default()
+            .push_back(event);
+        self.total += 1;
+        self.retries
+            .entry(key)
+            .and_modify(|r| r.waiting += 1)
+            .or_insert(KeyRetry {
+                waiting: 1,
+                attempts: 0,
+                // The caller asks once as it parks; this is the first ask
+                // after that one goes unanswered.
+                next_attempt: std::time::Instant::now() + KEY_FIRST_RETRY,
+            });
+
+        let mut dropped = Vec::new();
+        while self
+            .by_origin
+            .get(&origin)
+            .is_some_and(|q| q.len() > self.max_per_origin)
+        {
+            let victim = self
+                .evict_oldest_from(&origin, arrival_is_receipt)
+                .or_else(|| self.take_arrival(&origin, arrival));
+            match victim {
+                Some(event) => dropped.push(self.note_dropped(
+                    event,
+                    arrival,
+                    "this peer's share of the queue",
+                )),
+                None => break,
+            }
+        }
+        while self.total > self.max_total {
+            let victim = self
+                .evict_oldest_anywhere(arrival_is_receipt)
+                .or_else(|| self.take_arrival(&origin, arrival));
+            match victim {
+                Some(event) => {
+                    dropped.push(self.note_dropped(event, arrival, "the queue across every peer"))
+                }
+                None => break,
+            }
+        }
+        self.by_origin.retain(|_, q| !q.is_empty());
+        dropped
+    }
+
+    /// The event that just arrived, taken back out — the last resort when
+    /// nothing already parked may be given up.
+    fn take_arrival(&mut self, origin: &str, arrival: u64) -> Option<ParkedEvent> {
+        let queue = self.by_origin.get_mut(origin)?;
+        let at = queue.iter().position(|e| e.seq == arrival)?;
+        queue.remove(at)
+    }
+
+    /// The oldest event one origin could give up: the first that is not a
+    /// receipt, or — only if `receipts_too` — the oldest event of any kind.
+    /// `None` when the origin holds only receipts and none of them may go.
+    fn evict_oldest_from(&mut self, origin: &str, receipts_too: bool) -> Option<ParkedEvent> {
+        let queue = self.by_origin.get_mut(origin)?;
+        let at = queue
+            .iter()
+            .position(|e| !is_receipt(&e.tags))
+            .or_else(|| receipts_too.then_some(0))?;
+        queue.remove(at)
+    }
+
+    /// The same across every origin. A non-receipt anywhere is preferred to a
+    /// receipt anywhere, so the two passes run in that order rather than one
+    /// pass picking whichever origin happens to hold the oldest event.
+    fn evict_oldest_anywhere(&mut self, receipts_too: bool) -> Option<ParkedEvent> {
+        let origin = self
+            .oldest_origin(false)
+            .or_else(|| receipts_too.then(|| self.oldest_origin(true)).flatten())?;
+        self.evict_oldest_from(&origin, receipts_too)
+    }
+
+    /// Which origin holds the oldest event that may be given up. Each queue is
+    /// in park order, so its own oldest is the first element that qualifies.
+    fn oldest_origin(&self, receipts_too: bool) -> Option<String> {
+        self.by_origin
+            .iter()
+            .filter_map(|(name, q)| {
+                q.iter()
+                    .find(|e| receipts_too || !is_receipt(&e.tags))
+                    .map(|e| (e.seq, name.clone()))
+            })
+            .min()
+            .map(|(_, name)| name)
+    }
+
+    /// Account for one event the queue threw away, loudly, and hand it back.
+    /// An event that goes this way was never delivered and never stored;
+    /// besides this log line, the only trace it can leave is the caller's
+    /// count on the task's row.
+    ///
+    /// Three fates, and an operator needs to tell them apart. An ordinary
+    /// parked event was *evicted* to make room. An arriving non-receipt was
+    /// *refused*, because `full` held nothing but receipts and none of those
+    /// may be given up for it. A parked receipt goes only as a *last resort*:
+    /// `full` held nothing but receipts and what arrived was a receipt too, so
+    /// the choice lay between the oldest ruling and the newest, and the newest
+    /// is the one more likely to still matter. The ceiling holds either way,
+    /// which is what every other bound here rests on.
+    ///
+    /// The fields are the verdict line's, so an operator can follow one event
+    /// from the verdict that parked it to the moment it was thrown away.
+    fn note_dropped(&mut self, event: ParkedEvent, arrival: u64, full: &str) -> ParkedEvent {
+        let (fate, why) = if event.seq == arrival {
+            (
+                "refused",
+                format!("{full} is full and holds nothing that may be evicted for this event"),
+            )
+        } else if is_receipt(&event.tags) {
+            (
+                "evicted-receipt",
+                format!(
+                    "{full} is full and holds nothing but receipts, and the receipt that \
+                     arrived would otherwise have been the one lost"
+                ),
+            )
+        } else {
+            ("evicted", format!("{full} is full"))
+        };
+        self.total -= 1;
+        let key = (
+            event.origin.clone(),
+            event.signer.clone(),
+            event.kid.clone(),
+        );
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.retries.entry(key) {
+            e.get_mut().waiting -= 1;
+            if e.get().waiting == 0 {
+                e.remove();
+            }
+        }
+        tracing::warn!(
+            fate = %fate,
+            reason = %why,
+            event_id = %event.event_id,
+            origin = %event.origin,
+            peer = %event.peer,
+            target = %event.target,
+            max_per_origin = self.max_per_origin,
+            max_total = self.max_total,
+            "Dropped a relayed task event that was waiting for its signer's key — \
+             never delivered, never stored"
+        );
+        event
+    }
+
+    /// Take every parked event this key could settle, oldest first.
+    pub(crate) fn take_for_signer(&mut self, did: &str, kid: &str) -> Vec<ParkedEvent> {
+        let mut taken = Vec::new();
+        for queue in self.by_origin.values_mut() {
+            let mut kept = std::collections::VecDeque::with_capacity(queue.len());
+            while let Some(event) = queue.pop_front() {
+                match event.signer == did && event.kid == kid {
+                    true => taken.push(event),
+                    false => kept.push_back(event),
+                }
+            }
+            *queue = kept;
+        }
+        self.by_origin.retain(|_, q| !q.is_empty());
+        self.total -= taken.len();
+        self.retries
+            .retain(|(_, signer, key_id), _| signer != did || key_id != kid);
+        taken.sort_by_key(|e| e.seq);
+        taken
+    }
+
+    /// The keys it is time to ask for again, and the peer to ask for each.
+    ///
+    /// Asking is the caller's job; the schedule is this queue's, because it is
+    /// the only thing that knows what is still waiting. Each answer moves that
+    /// key on to its next backoff step, so a sweep that runs often does not
+    /// ask often.
+    pub(crate) fn retries_due(&mut self) -> Vec<(String, String, String)> {
+        let now = std::time::Instant::now();
+        let mut due = Vec::new();
+        for ((origin, signer, kid), retry) in self.retries.iter_mut() {
+            // A signature that named no signer or no key can never be settled
+            // by any lookup; those wait to be evicted instead.
+            if signer.is_empty() || kid.is_empty() || retry.next_attempt > now {
+                continue;
+            }
+            due.push((origin.clone(), signer.clone(), kid.clone()));
+            retry.attempts += 1;
+            retry.next_attempt = now + key_retry_backoff(retry.attempts);
+        }
+        due
     }
 }
 
@@ -248,6 +581,322 @@ where
             Err(_) => {
                 RelayVerdict::Invalid("signature does not verify over the coordination document")
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod defer_tests {
+    //! What the queue does with what it is handed. Every drop is read back
+    //! from the list [`DeferQueue::park`] returns rather than from the log
+    //! line beside it: that list is what the receive side turns into the
+    //! count on the task's row, which is the trace the requirement is about,
+    //! and a scoped log-capturing subscriber races with every other test that
+    //! installs one.
+
+    use super::*;
+
+    const SIGNER: &str = "did:plc:parked";
+    const KID: &str = "somekid";
+
+    fn parked(origin: &str, id: &str) -> ParkedEvent {
+        parked_by(origin, id, SIGNER, KID)
+    }
+
+    fn parked_by(origin: &str, id: &str, signer: &str, kid: &str) -> ParkedEvent {
+        ParkedEvent {
+            tags: HashMap::from([("+freeq.at/act-verb".to_string(), "progress".to_string())]),
+            target: "#room".to_string(),
+            from: "someone!s@remote".to_string(),
+            peer_account: Some(signer.to_string()),
+            origin: origin.to_string(),
+            peer: origin.to_string(),
+            peer_declared_act: true,
+            event_id: id.to_string(),
+            signer: signer.to_string(),
+            kid: kid.to_string(),
+            seq: 0,
+        }
+    }
+
+    /// A home server's ruling on somebody's move, on its way to a peer.
+    fn parked_receipt(origin: &str, id: &str) -> ParkedEvent {
+        let mut event = parked(origin, id);
+        event.tags.insert(
+            "+freeq.at/act-verb".to_string(),
+            freeq_sdk::act_transitions::confirmation_verb().to_string(),
+        );
+        event
+    }
+
+    fn ids(events: &[ParkedEvent]) -> Vec<&str> {
+        events.iter().map(|e| e.event_id.as_str()).collect()
+    }
+
+    /// The order events verify in is the order they arrived in — a claim that
+    /// landed before a completion has to be applied before it.
+    #[test]
+    fn parked_events_come_back_in_the_order_they_were_parked() {
+        let mut q = DeferQueue::new(16, 64);
+        for id in ["one", "two", "three"] {
+            assert!(q.park(parked("peer-a", id)).is_empty());
+        }
+        // Interleaved with another origin, to prove the order is the queue's
+        // and not each origin's.
+        assert!(q.park(parked("peer-b", "four")).is_empty());
+        assert_eq!(q.len(), 4);
+
+        let flushed = q.take_for_signer(SIGNER, KID);
+        assert_eq!(ids(&flushed), ["one", "two", "three", "four"]);
+        assert_eq!(q.len(), 0, "a flush empties what it took");
+    }
+
+    /// Only the events the arriving key could settle are taken. Everything
+    /// else keeps waiting for its own.
+    #[test]
+    fn a_key_takes_only_the_events_it_could_settle() {
+        let mut q = DeferQueue::new(16, 64);
+        assert!(q.park(parked_by("peer-a", "mine", SIGNER, KID)).is_empty());
+        assert!(
+            q.park(parked_by("peer-a", "other-signer", "did:plc:someone", KID))
+                .is_empty()
+        );
+        assert!(
+            q.park(parked_by("peer-a", "other-key", SIGNER, "otherkid"))
+                .is_empty()
+        );
+
+        assert_eq!(ids(&q.take_for_signer(SIGNER, KID)), ["mine"]);
+        assert_eq!(q.len(), 2, "the rest are still waiting");
+    }
+
+    /// One peer fills its share and no more. The oldest goes first, and the
+    /// eviction is loud: an event that fell off the back was never delivered.
+    #[test]
+    fn the_two_hundred_and_fifty_seventh_event_from_one_origin_evicts_the_oldest() {
+        let mut q = DeferQueue::new(256, 4096);
+        for i in 0..256 {
+            assert!(q.park(parked("peer-a", &format!("e{i}"))).is_empty());
+        }
+        assert_eq!(q.len(), 256);
+
+        let dropped = q.park(parked("peer-a", "e256"));
+
+        assert_eq!(
+            ids(&dropped),
+            ["e0"],
+            "the evicted event is handed back, for the trace on the task's row"
+        );
+        assert_eq!(q.len(), 256, "the ceiling holds");
+        let held = q.take_for_signer(SIGNER, KID);
+        assert_eq!(
+            ids(&held).first(),
+            Some(&"e1"),
+            "the oldest is what fell off"
+        );
+        assert_eq!(ids(&held).last(), Some(&"e256"));
+    }
+
+    /// And the process has a ceiling of its own: enough peers each within
+    /// their own share still cannot fill memory between them.
+    #[test]
+    fn the_four_thousand_and_ninety_seventh_event_evicts_across_origins() {
+        let mut q = DeferQueue::new(256, 4096);
+        for peer in 0..16 {
+            for i in 0..256 {
+                assert!(
+                    q.park(parked(&format!("peer-{peer}"), &format!("p{peer}-e{i}")))
+                        .is_empty()
+                );
+            }
+        }
+        assert_eq!(q.len(), 4096);
+
+        // A seventeenth peer, well inside its own share, still pushes the
+        // total over — and what goes is the oldest event anywhere.
+        let dropped = q.park(parked("peer-16", "newcomer"));
+
+        assert_eq!(
+            ids(&dropped),
+            ["p0-e0"],
+            "the globally oldest event is the one that fell off"
+        );
+        assert_eq!(q.len(), 4096);
+        let held = q.take_for_signer(SIGNER, KID);
+        assert_eq!(ids(&held).first(), Some(&"p0-e1"));
+        assert_eq!(ids(&held).last(), Some(&"newcomer"));
+    }
+
+    /// A receipt is the home's ruling on somebody's move, and losing one
+    /// leaves the people waiting on it with nothing. So it is never what the
+    /// queue gives up: the oldest *other* event goes instead, however much
+    /// older the receipt is.
+    #[test]
+    fn a_receipt_is_never_the_event_evicted() {
+        let mut q = DeferQueue::new(3, 4096);
+        assert!(q.park(parked_receipt("peer-a", "ruling")).is_empty());
+        assert!(q.park(parked("peer-a", "older")).is_empty());
+        assert!(q.park(parked("peer-a", "newer")).is_empty());
+
+        let dropped = q.park(parked("peer-a", "arrival"));
+        assert_eq!(
+            ids(&dropped),
+            ["older"],
+            "the oldest event that is not a receipt is what goes"
+        );
+
+        let held = q.take_for_signer(SIGNER, KID);
+        assert_eq!(ids(&held), ["ruling", "newer", "arrival"]);
+    }
+
+    /// When there is nothing else left to give up, the ceiling still holds —
+    /// so the arriving event is turned away rather than a parked ruling thrown
+    /// out. This is the ordinary case: what arrives is not a receipt, so no
+    /// ruling is weighed against it.
+    #[test]
+    fn a_bucket_of_receipts_refuses_an_arriving_non_receipt() {
+        let mut q = DeferQueue::new(2, 4096);
+        assert!(q.park(parked_receipt("peer-a", "ruling-one")).is_empty());
+        assert!(q.park(parked_receipt("peer-a", "ruling-two")).is_empty());
+
+        let dropped = q.park(parked("peer-a", "arrival"));
+
+        assert_eq!(ids(&dropped), ["arrival"], "the arrival is what went");
+        assert_eq!(q.len(), 2, "and the ceiling held");
+        assert_eq!(
+            ids(&q.take_for_signer(SIGNER, KID)),
+            ["ruling-one", "ruling-two"],
+            "both rulings are still waiting"
+        );
+    }
+
+    /// The one exception. Two rulings are parked, a third arrives, and the
+    /// ceiling leaves no way to keep all three. Turning the arrival away would
+    /// lose the newest ruling, which is the one most likely to still matter,
+    /// so the oldest goes instead — and catch-up is what brings it back.
+    #[test]
+    fn an_arriving_receipt_evicts_the_oldest_receipt_rather_than_being_turned_away() {
+        let mut q = DeferQueue::new(2, 4096);
+        assert!(q.park(parked_receipt("peer-a", "ruling-one")).is_empty());
+        assert!(q.park(parked_receipt("peer-a", "ruling-two")).is_empty());
+
+        let dropped = q.park(parked_receipt("peer-a", "ruling-three"));
+
+        assert_eq!(
+            ids(&dropped),
+            ["ruling-one"],
+            "the oldest ruling is what went"
+        );
+        assert_eq!(q.len(), 2, "and the ceiling held");
+        assert_eq!(
+            ids(&q.take_for_signer(SIGNER, KID)),
+            ["ruling-two", "ruling-three"],
+            "the two newest rulings are the ones kept"
+        );
+    }
+
+    /// And the same across the whole queue: the total ceiling is held the same
+    /// way, by the oldest ruling anywhere rather than by the arrival.
+    #[test]
+    fn an_arriving_receipt_evicts_the_oldest_receipt_anywhere_when_the_total_is_full() {
+        let mut q = DeferQueue::new(64, 3);
+        assert!(q.park(parked_receipt("peer-a", "oldest")).is_empty());
+        assert!(q.park(parked_receipt("peer-b", "middle")).is_empty());
+        assert!(q.park(parked_receipt("peer-b", "newer")).is_empty());
+
+        let dropped = q.park(parked_receipt("peer-c", "arrival"));
+
+        assert_eq!(ids(&dropped), ["oldest"]);
+        assert_eq!(q.len(), 3);
+        assert_eq!(
+            ids(&q.take_for_signer(SIGNER, KID)),
+            ["middle", "newer", "arrival"]
+        );
+    }
+
+    /// A non-receipt is still preferred to any ruling, wherever it is parked:
+    /// the total ceiling looks for one across every peer before it weighs a
+    /// receipt, rather than taking whichever peer holds the oldest event.
+    #[test]
+    fn the_total_ceiling_gives_up_a_non_receipt_anywhere_before_any_receipt() {
+        let mut q = DeferQueue::new(64, 3);
+        // The oldest event anywhere is a ruling; the only ordinary event is
+        // younger, and parked under a different peer.
+        assert!(q.park(parked_receipt("peer-a", "oldest-ruling")).is_empty());
+        assert!(q.park(parked_receipt("peer-a", "newer-ruling")).is_empty());
+        assert!(q.park(parked("peer-b", "ordinary")).is_empty());
+
+        let dropped = q.park(parked_receipt("peer-c", "arrival"));
+
+        assert_eq!(
+            ids(&dropped),
+            ["ordinary"],
+            "the ordinary event goes, though a ruling is older"
+        );
+        assert_eq!(
+            ids(&q.take_for_signer(SIGNER, KID)),
+            ["oldest-ruling", "newer-ruling", "arrival"]
+        );
+    }
+
+    /// The retry schedule: every distinct signer with events waiting is asked
+    /// for again, once per backoff step rather than once per sweep, and a key
+    /// that arrives stops being asked for.
+    #[test]
+    fn each_waiting_signer_is_asked_for_again_on_its_own_backoff() {
+        let mut q = DeferQueue::new(16, 64);
+        assert!(q.park(parked_by("peer-a", "one", SIGNER, KID)).is_empty());
+        assert!(q.park(parked_by("peer-a", "two", SIGNER, KID)).is_empty());
+        assert!(
+            q.park(parked_by("peer-b", "three", "did:plc:other", "otherkid"))
+                .is_empty()
+        );
+        // A signature naming nobody can never be settled by a lookup.
+        assert!(q.park(parked_by("peer-a", "nameless", "", "")).is_empty());
+
+        assert!(
+            q.retries_due().is_empty(),
+            "the caller asked once as each event parked; the first retry waits"
+        );
+
+        // Wind every schedule back to now, the way thirty seconds passing
+        // would.
+        let due = force_due(&mut q);
+        assert_eq!(due, 2, "one ask per waiting signer, not one per event");
+        assert!(
+            q.retries_due().is_empty(),
+            "and asking moves each key on to its next step"
+        );
+
+        q.take_for_signer(SIGNER, KID);
+        assert_eq!(
+            force_due(&mut q),
+            1,
+            "a key that arrived is no longer asked for"
+        );
+    }
+
+    /// Make every waiting key due now, and return how many were.
+    fn force_due(q: &mut DeferQueue) -> usize {
+        let now = std::time::Instant::now();
+        for retry in q.retries.values_mut() {
+            retry.next_attempt = now;
+        }
+        q.retries_due().len()
+    }
+
+    /// Thirty seconds, doubling, ten minutes at the most.
+    #[test]
+    fn the_backoff_doubles_up_to_its_ceiling() {
+        assert_eq!(key_retry_backoff(0), KEY_FIRST_RETRY);
+        assert_eq!(key_retry_backoff(1), KEY_FIRST_RETRY * 2);
+        assert_eq!(key_retry_backoff(2), KEY_FIRST_RETRY * 4);
+        for attempts in 5..64 {
+            assert_eq!(
+                key_retry_backoff(attempts),
+                KEY_MAX_RETRY,
+                "the wait stops growing rather than overflowing"
+            );
         }
     }
 }

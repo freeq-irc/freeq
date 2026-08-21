@@ -752,6 +752,10 @@ pub struct SharedState {
     /// Active MoQ↔Room bridge handles (one per session).
     #[cfg(feature = "av-native")]
     pub av_bridges: Mutex<std::collections::HashMap<String, crate::av_bridge::BridgeHandle>>,
+    /// Relayed task events waiting for the key that would settle them.
+    /// Bounded and in memory only — a restart drops what is parked, which is
+    /// the same thing an eviction drops: events nobody was shown.
+    pub(crate) act_deferred: Mutex<crate::act_relay::DeferQueue>,
     /// S2S manager (if clustering is active).
     pub s2s_manager: Mutex<Option<Arc<crate::s2s::S2sManager>>>,
     /// CRDT document for cluster state convergence.
@@ -1670,6 +1674,10 @@ impl Server {
             sfu_state: Mutex::new(None),
             #[cfg(feature = "av-native")]
             av_bridges: Mutex::new(std::collections::HashMap::new()),
+            act_deferred: Mutex::new(crate::act_relay::DeferQueue::new(
+                self.config.act_defer_max_per_origin,
+                self.config.act_defer_max_total,
+            )),
             s2s_manager: Mutex::new(None),
             cluster_doc: crate::crdt::ClusterDoc::new(&self.config.server_name),
             db: db.map(Mutex::new),
@@ -2149,6 +2157,7 @@ impl Server {
         }
 
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
+        spawn_act_defer_retry_sweep(Arc::clone(&state));
         spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
 
         // Heartbeat expiry: check agent liveness every 15 seconds.
@@ -2488,6 +2497,7 @@ impl Server {
         // is consistent.
         spawn_phantom_sweeper(Arc::clone(&state));
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
+        spawn_act_defer_retry_sweep(Arc::clone(&state));
         spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
 
         let handle = tokio::spawn(async move {
@@ -2536,6 +2546,7 @@ impl Server {
         // Phantom-session sweeper (defense-in-depth).
         spawn_phantom_sweeper(Arc::clone(&state));
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
+        spawn_act_defer_retry_sweep(Arc::clone(&state));
         spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
 
         let web_state = Arc::clone(&state);
@@ -3514,11 +3525,12 @@ pub(crate) enum TaskEventAction {
     /// Refused: not delivered, not stored. Either a found key over bytes that
     /// do not verify, or an event that claims no origin.
     Drop,
-    /// No verdict is reachable yet. Not delivered and not stored: an outage
-    /// at a key server is not evidence about the sender, and neither is it a
-    /// reason to show an unchecked claim. The signer's key is asked for off
-    /// this path; nothing holds the event while the answer comes back.
-    DropUnchecked,
+    /// No verdict is reachable yet. Not delivered and not stored *while it
+    /// waits*: an outage at a key server is not evidence about the sender,
+    /// and neither is it a reason to show an unchecked claim. The event is
+    /// held in the defer queue and the signer's key is asked for off this
+    /// path; the key's arrival is what judges it again.
+    Park,
 }
 
 /// Reach a verdict about one relayed task event and act on it.
@@ -3526,15 +3538,17 @@ pub(crate) enum TaskEventAction {
 /// The three-way verdict is the whole point, and each answer does something
 /// different. Valid is stored and applied. Invalid — the one case where a key
 /// was found and the bytes still did not verify — is dropped: not delivered,
-/// not stored, logged as the evidence it is. Everything else is never
-/// refused, because an outage at a key server and an old peer are facts about
-/// this server's reach, not about the sender; it is also not carried, because
-/// a claim this server cannot check is not a task it can show.
+/// not stored, logged as the evidence it is. Everything else waits, and is
+/// never refused, because an outage at a key server and an old peer are facts
+/// about this server's reach, not about the sender; while it waits it is also
+/// not carried, because a claim this server cannot check is not a task it can
+/// show.
 ///
 /// One thing is settled ahead of the signature: an event that claims no
 /// origin is refused whatever its bytes say.
 fn judge_relayed_task_event(
     state: &Arc<SharedState>,
+    from: &str,
     target: &str,
     tags: &HashMap<String, String>,
     origin: &str,
@@ -3605,14 +3619,37 @@ fn judge_relayed_task_event(
         crate::act_relay::RelayVerdict::Unverifiable(why) => {
             // A key not held yet is the one unverifiable cause a lookup can
             // fix: ask the relay origin's key server for it, off the delivery
-            // path. Nothing holds the event meanwhile — the queue that waits
-            // for the answer is the next step — so this one goes no further:
-            // not stored, and not shown, because showing it would present an
-            // unchecked claim as a task.
+            // path. The event waits meanwhile — not stored and not shown,
+            // because showing it would present an unchecked claim as a task —
+            // and the key's arrival is what judges it again. An event that can
+            // never verify at all waits too, and ages out by eviction where
+            // somebody can see it.
             if why == crate::connection::messaging::NO_KEY_ON_FILE && !signer.is_empty() {
                 crate::peer_keys::fetch_on_miss(state, origin, signer, sig_tag);
             }
-            TaskEventAction::DropUnchecked
+            let kid = freeq_sdk::sigtag::parse(sig_tag)
+                .map(|(kid, _)| kid.to_string())
+                .unwrap_or_default();
+            let dropped = state
+                .act_deferred
+                .lock()
+                .park(crate::act_relay::ParkedEvent {
+                    tags: tags.clone(),
+                    target: target.to_string(),
+                    from: from.to_string(),
+                    peer_account: peer_account.map(str::to_string),
+                    origin: origin.to_string(),
+                    peer: peer.to_string(),
+                    peer_declared_act,
+                    event_id: event_id.to_string(),
+                    signer: signer.to_string(),
+                    kid,
+                    ..Default::default()
+                });
+            for event in &dropped {
+                note_dropped_unchecked(state, event);
+            }
+            TaskEventAction::Park
         }
     }
 }
@@ -3752,6 +3789,124 @@ fn store_relayed_task_event(
             "Refused a relayed coordination event: that id is already on file"
         );
     }
+}
+
+/// Leave the visible trace of a dropped event: if it belonged to a task on
+/// file, that task's row keeps count, so a reader of the task can see its
+/// record may be incomplete instead of trusting a server log they cannot
+/// read. An event whose task was never stored here — an opening that never
+/// verified, or the stopgap family, which has no task view — leaves only the
+/// queue's own log line.
+fn note_dropped_unchecked(state: &Arc<SharedState>, dropped: &crate::act_relay::ParkedEvent) {
+    let Some(act_id) = dropped_task_id(&dropped.tags, &dropped.event_id) else {
+        return;
+    };
+    let marked = state
+        .with_db(|db| db.bump_act_dropped_unchecked(&act_id))
+        .unwrap_or(false);
+    if marked {
+        tracing::info!(
+            act_id = %act_id,
+            event_id = %dropped.event_id,
+            "The task's record now counts the dropped event"
+        );
+    }
+}
+
+/// The task a parked act event belongs to: an opening names itself, anything
+/// else names its task. `None` for the stopgap family — it has no task view.
+fn dropped_task_id(tags: &HashMap<String, String>, event_id: &str) -> Option<String> {
+    if !crate::connection::act::carries_act_tags(tags) {
+        return None;
+    }
+    let kind = tags
+        .get("+freeq.at/act")
+        .or_else(|| tags.get("freeq.at/act"))
+        .map(String::as_str)
+        .unwrap_or("");
+    let verb = tags
+        .get("+freeq.at/act-verb")
+        .or_else(|| tags.get("act-verb"))
+        .map(String::as_str)
+        .unwrap_or("");
+    match freeq_sdk::act_transitions::opening_verb(kind) == Some(verb) {
+        true => Some(event_id.to_string()),
+        false => tags
+            .get("+freeq.at/act-id")
+            .or_else(|| tags.get("act-id"))
+            .cloned(),
+    }
+}
+
+/// A signing key just landed. Re-check whatever was waiting for it.
+///
+/// The only thing that can change an unverifiable verdict is a key arriving,
+/// and every way one arrives calls here: a local registration, and a fetch
+/// from a peer's key server completing. Events that now verify are applied and
+/// delivered in the order they were parked — a claim that arrived before a
+/// completion is applied before it — and one that still cannot be judged goes
+/// back to waiting.
+pub(crate) fn retry_deferred_task_events(state: &Arc<SharedState>, did: &str, kid: &str) {
+    let waiting = state.act_deferred.lock().take_for_signer(did, kid);
+    if waiting.is_empty() {
+        return;
+    }
+    tracing::info!(
+        did = %did, kid = %kid, count = waiting.len(),
+        "A signing key arrived; re-checking the task events that were waiting for it"
+    );
+    for event in waiting {
+        let action = judge_relayed_task_event(
+            state,
+            &event.from,
+            &event.target,
+            &event.tags,
+            &event.origin,
+            &event.peer,
+            event.peer_account.as_deref(),
+            event.peer_declared_act,
+        );
+        if action == TaskEventAction::Deliver {
+            deliver_relayed_tagmsg(
+                state,
+                &event.from,
+                &event.target,
+                &event.tags,
+                event.peer_account.as_deref(),
+                // A released event verified here before it was delivered, so
+                // the signer's own sessions get it like any checked event.
+                true,
+            );
+        }
+    }
+}
+
+/// How often the defer queue is looked at for keys worth asking for again.
+///
+/// Well below the shortest backoff step, so a key becomes due close to when
+/// its own schedule says rather than at the tick after.
+const DEFER_RETRY_TICK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ask again for the keys parked task events are waiting on.
+///
+/// A key arriving is what releases a parked event, and both paths that notice
+/// one need somebody to have asked. The ask when an event parks covers a
+/// signer who keeps talking; a quiet one's event would otherwise sit until it
+/// was evicted even after its key server came back. So each distinct signer
+/// with events waiting is asked for again on a backoff of its own, until the
+/// key arrives or nothing of theirs is left waiting.
+fn spawn_act_defer_retry_sweep(state: Arc<SharedState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(DEFER_RETRY_TICK);
+        interval.tick().await; // skip first tick
+        loop {
+            interval.tick().await;
+            let due = state.act_deferred.lock().retries_due();
+            for (origin, signer, kid) in due {
+                crate::peer_keys::fetch_again(&state, &origin, &signer, &kid);
+            }
+        }
+    });
 }
 
 /// Check a replayed event's signature against the bytes it travelled with.
@@ -4991,10 +5146,11 @@ pub(crate) async fn process_s2s_message(
             // where each is judged. Valid is stored and applied as far as the
             // task's origin allows, then delivered below. Invalid is dropped
             // here and reaches nobody. Anything else this server cannot check
-            // yet is neither stored nor shown, and never refused — an outage
-            // must not read as a forgery. Read before the tidying below, so
-            // the check sees the tags as they arrived — the signature covers
-            // them.
+            // yet waits in the defer queue — never refused, because an outage
+            // must not read as a forgery, and neither stored nor shown until
+            // the key that settles it arrives. Read before the tidying below,
+            // so the check sees the tags as they arrived — the signature
+            // covers them.
             let is_task_event = crate::connection::act::carries_act_tags(&tags)
                 || tags.contains_key("+freeq.at/event");
             if is_task_event {
@@ -5010,6 +5166,7 @@ pub(crate) async fn process_s2s_message(
                 );
                 if judge_relayed_task_event(
                     state,
+                    &from,
                     &target,
                     &tags,
                     &origin,
@@ -6927,6 +7084,10 @@ mod s2s_adversarial_tests {
             sfu_state: Mutex::new(None),
             #[cfg(feature = "av-native")]
             av_bridges: Mutex::new(std::collections::HashMap::new()),
+            act_deferred: Mutex::new(crate::act_relay::DeferQueue::new(
+                config.act_defer_max_per_origin,
+                config.act_defer_max_total,
+            )),
             s2s_manager: Mutex::new(None),
             cluster_doc: crate::crdt::ClusterDoc::new("test-server-id"),
             db: db.map(Mutex::new),
@@ -13100,8 +13261,9 @@ mod relayed_task_verdict_tests {
     //! reaches its own verdict about every task event a peer relays, and each
     //! verdict leads somewhere different: valid is stored and delivered,
     //! invalid reaches nobody and is written nowhere, and anything it cannot
-    //! judge yet is neither shown nor refused, with the key that would settle
-    //! it asked for off this path.
+    //! judge yet waits in the defer queue — never refused, never shown while
+    //! it waits — with the key that would settle it asked for off this path
+    //! and its arrival what judges the event again.
 
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -13109,7 +13271,10 @@ mod relayed_task_verdict_tests {
     use tokio::sync::mpsc;
 
     use super::s2s_adversarial_tests::{PEER, setup_authenticated_peer, test_manager};
-    use super::{SharedState, process_s2s_message, test_state_with_db};
+    use super::{
+        SharedState, process_s2s_message, retry_deferred_task_events, test_state_with_config,
+        test_state_with_db,
+    };
     use crate::s2s::S2sMessage;
 
     const SIGNER: &str = "did:plc:taskverdict";
@@ -13566,6 +13731,11 @@ mod relayed_task_verdict_tests {
                 .unwrap(),
             "and unstored: the log holds what this server checked"
         );
+        assert_eq!(
+            state.act_deferred.lock().len(),
+            1,
+            "it waits for the key rather than being thrown away"
+        );
 
         let logs = sink.text();
         assert!(
@@ -13680,6 +13850,304 @@ mod relayed_task_verdict_tests {
             (task.state.as_str(), task.assignee.as_deref()),
             ("open", None),
             "and a receipt moves nothing: what it names did the moving"
+        );
+    }
+
+    /// What makes deferring a delay and not a loss: the key turns up, and
+    /// everything that was waiting on it is judged, applied and delivered — in
+    /// the order it was parked, because a claim that arrived before a
+    /// completion has to be applied before it.
+    #[tokio::test]
+    async fn a_key_arriving_releases_what_was_waiting_for_it_in_park_order() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let mut rx = capable_member(&state, "#verdictlate");
+        // No key on file yet, so both events park.
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let opener = "01LATEOFFER0000000000000000";
+        let follow = "01LATEPROGRESS0000000000000";
+
+        relay(
+            &state,
+            &mgr,
+            "#verdictlate",
+            opener,
+            signed_offer_tags("#verdictlate", opener, &key),
+        )
+        .await;
+        relay(
+            &state,
+            &mgr,
+            "#verdictlate",
+            follow,
+            signed_follow_up_tags("#verdictlate", follow, "cancel", opener, SIGNER, &[], &key),
+        )
+        .await;
+        assert_eq!(state.act_deferred.lock().len(), 2, "both are waiting");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "and neither has been shown to anyone"
+        );
+
+        // The key registers — the same call a client's MSGSIG makes.
+        state
+            .with_db(|db| db.save_signing_key(SIGNER, key.verifying_key().as_bytes()))
+            .expect("db present");
+        retry_deferred_task_events(
+            &state,
+            SIGNER,
+            &freeq_sdk::sigtag::derive_kid(&key.verifying_key()),
+        );
+
+        assert_eq!(
+            state.act_deferred.lock().len(),
+            0,
+            "nothing is left waiting"
+        );
+        let first = received(&mut rx).await;
+        assert!(
+            first.contains(opener),
+            "the offer is delivered first, as it was parked first: {first}"
+        );
+        let second = received(&mut rx).await;
+        assert!(second.contains(follow), "then the follow-up: {second}");
+
+        // Both are on file. The offer opened the task and stamped it with the
+        // peer that owns it; the cancellation is filed and goes no further,
+        // because ending a task another server referees is not this server's
+        // call to make.
+        assert!(state.with_db(|db| db.is_act_event(opener)).unwrap());
+        assert!(state.with_db(|db| db.is_act_event(follow)).unwrap());
+        let task = state
+            .with_db(|db| db.act_task(opener))
+            .unwrap()
+            .expect("the peer's task is still live here");
+        assert_eq!(task.origin, PEER);
+        assert_eq!(task.state, "open", "we did not cancel a peer's task");
+    }
+
+    /// A released event reaches the same sessions a live one would, and that
+    /// includes the signer's own other devices here. The live path hands a DM
+    /// to those only when the signature checked out; a released event has just
+    /// checked out, or it would not be delivered at all — so withholding it
+    /// would show a multi-homed signer their own action on one server and not
+    /// the other, for no reason but that their key arrived late.
+    #[tokio::test]
+    async fn a_released_event_reaches_the_signers_own_sessions_too() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        // The person the DM is addressed to, and the signer's own other
+        // device on this server: one identity logged in on two servers.
+        let mut theirs = capable_session_for(&state, RECIPIENT);
+        let mut signers_own = capable_session_for(&state, SIGNER);
+
+        // Signed with a key nothing holds yet, so the event parks.
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let event_id = "01DMRELEASE000000000000000";
+        let venue = freeq_sdk::chatsig::dm_venue(SIGNER, RECIPIENT);
+        let tags = signed_offer_tags_in(&venue, event_id, &key);
+        relay(&state, &mgr, RECIPIENT, event_id, tags).await;
+        assert_eq!(state.act_deferred.lock().len(), 1, "it waits for the key");
+
+        // The key registers, and the wait ends.
+        state
+            .with_db(|db| db.save_signing_key(SIGNER, key.verifying_key().as_bytes()))
+            .expect("db present");
+        retry_deferred_task_events(
+            &state,
+            SIGNER,
+            &freeq_sdk::sigtag::derive_kid(&key.verifying_key()),
+        );
+
+        let to_them = received(&mut theirs).await;
+        assert!(
+            to_them.contains(event_id),
+            "the recipient is told: {to_them}"
+        );
+        let to_signer = received(&mut signers_own).await;
+        assert!(
+            to_signer.contains(event_id),
+            "and so is the signer's own session here, exactly as the live path \
+             would have told it: {to_signer}"
+        );
+    }
+
+    /// The visible trace of a drop: a waiting event thrown out of a full queue
+    /// leaves a count on the task it belonged to, where that task is on file —
+    /// and only there. One whose task was never stored leaves nothing but the
+    /// log, and no row is invented to say so on.
+    #[tokio::test]
+    async fn an_eviction_counts_against_the_task_it_belonged_to() {
+        // A queue of one per peer, so each new unverifiable event evicts the
+        // one before it.
+        let state = test_state_with_config(crate::config::ServerConfig {
+            act_defer_max_per_origin: 1,
+            act_defer_max_total: 4096,
+            ..Default::default()
+        });
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#evict");
+        let key = key_on_file(&state, SIGNER);
+
+        // A task on file: a valid, signed opener from the peer.
+        let opener = "01EVICTOPENER0000000000000";
+        relay(
+            &state,
+            &mgr,
+            "#evict",
+            opener,
+            signed_offer_tags("#evict", opener, &key),
+        )
+        .await;
+        assert!(
+            state.with_db(|db| db.act_task(opener)).flatten().is_some(),
+            "the opener is stored, so there is a row to mark"
+        );
+
+        // Follow-ups signed by an identity whose key is nowhere on file:
+        // every one of them parks.
+        let stranded_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let follow = |event_id: &str, act_id: &str| {
+            signed_follow_up_tags(
+                "#evict",
+                event_id,
+                "progress",
+                act_id,
+                "did:plc:strandedsigner",
+                &[],
+                &stranded_key,
+            )
+        };
+
+        let wait1 = "01EVICTWAIT100000000000000";
+        relay(&state, &mgr, "#evict", wait1, follow(wait1, opener)).await;
+        assert_eq!(state.act_deferred.lock().len(), 1);
+        assert_eq!(
+            state
+                .with_db(|db| db.act_dropped_unchecked(opener))
+                .unwrap(),
+            0,
+            "waiting is not dropped"
+        );
+
+        // The second one evicts the first, and the task's row says so.
+        let wait2 = "01EVICTWAIT200000000000000";
+        relay(&state, &mgr, "#evict", wait2, follow(wait2, opener)).await;
+        assert_eq!(
+            state
+                .with_db(|db| db.act_dropped_unchecked(opener))
+                .unwrap(),
+            1
+        );
+
+        // A follow-up naming a task never stored here parks (evicting the
+        // second, which also counts against the opener's task)…
+        let unknown = "01EVICTNOROW00000000000000";
+        let wait3 = "01EVICTWAIT300000000000000";
+        relay(&state, &mgr, "#evict", wait3, follow(wait3, unknown)).await;
+        assert_eq!(
+            state
+                .with_db(|db| db.act_dropped_unchecked(opener))
+                .unwrap(),
+            2
+        );
+
+        // …and when it is evicted in turn, nothing is invented for its
+        // unknown task: no row, count zero, log only.
+        let wait4 = "01EVICTWAIT400000000000000";
+        relay(&state, &mgr, "#evict", wait4, follow(wait4, opener)).await;
+        assert_eq!(
+            state
+                .with_db(|db| db.act_dropped_unchecked(unknown))
+                .unwrap(),
+            0
+        );
+        assert!(state.with_db(|db| db.act_task(unknown)).flatten().is_none());
+    }
+
+    /// An event that can never verify — no key is named, so no lookup could
+    /// ever settle it — waits like any other rather than being refused, and
+    /// ages out where somebody can see it.
+    #[tokio::test]
+    async fn an_event_that_can_never_verify_still_waits_and_ages_out() {
+        let state = test_state_with_config(crate::config::ServerConfig {
+            act_defer_max_per_origin: 1,
+            act_defer_max_total: 4096,
+            ..Default::default()
+        });
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let mut rx = capable_member(&state, "#nevercheck");
+        let key = key_on_file(&state, SIGNER);
+
+        // A task on file, so an aged-out event about it has a row to mark.
+        let opener = "01NEVEROPENER0000000000000";
+        relay(
+            &state,
+            &mgr,
+            "#nevercheck",
+            opener,
+            signed_offer_tags("#nevercheck", opener, &key),
+        )
+        .await;
+
+        // An algorithm this build does not know: unverifiable forever, since
+        // no key server can answer a question about a key nobody named.
+        let stuck = "01NEVERSTUCK00000000000000";
+        let mut tags =
+            signed_follow_up_tags("#nevercheck", stuck, "progress", opener, SIGNER, &[], &key);
+        tags.insert("+freeq.at/sig".to_string(), "rsa:somekid:AAAA".to_string());
+        relay(&state, &mgr, "#nevercheck", stuck, tags).await;
+
+        assert_eq!(
+            state.act_deferred.lock().len(),
+            1,
+            "it waits rather than being refused"
+        );
+        assert!(
+            !state.with_db(|db| db.is_act_event(stuck)).unwrap(),
+            "and is written nowhere while it waits"
+        );
+
+        // Anything else from that peer pushes it off the back, and the task it
+        // named carries the count.
+        let next = "01NEVERNEXT000000000000000";
+        relay(
+            &state,
+            &mgr,
+            "#nevercheck",
+            next,
+            signed_follow_up_tags(
+                "#nevercheck",
+                next,
+                "progress",
+                opener,
+                "did:plc:someoneelse",
+                &[],
+                &ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+            ),
+        )
+        .await;
+        assert_eq!(
+            state
+                .with_db(|db| db.act_dropped_unchecked(opener))
+                .unwrap(),
+            1,
+            "the ageing-out is visible on the task, not only in the log"
+        );
+        // The opener's own delivery is the only thing that reached the room.
+        let shown = received(&mut rx).await;
+        assert!(shown.contains(opener), "{shown}");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "nothing unchecked was ever shown"
         );
     }
 

@@ -4215,6 +4215,57 @@ mod tests {
         );
     }
 
+    /// The dropped-unchecked count is a receipt on the task's row: it bumps
+    /// only where a row exists, and a task moving does not erase it.
+    #[test]
+    fn the_dropped_unchecked_count_sticks_to_its_task() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T-drop", "#ops", Some(SCHOLAR), 10);
+
+        assert!(db.bump_act_dropped_unchecked("T-drop").unwrap());
+        assert!(
+            !db.bump_act_dropped_unchecked("T-nowhere").unwrap(),
+            "no row, nothing to mark"
+        );
+        assert_eq!(db.act_dropped_unchecked("T-drop").unwrap(), 1);
+        assert_eq!(db.act_dropped_unchecked("T-nowhere").unwrap(), 0);
+
+        // The task moves on — an accept by its offeree — and the count stays.
+        let accept = act_doc(
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "accept"),
+                ("+freeq.at/from", SCHOLAR),
+                ("+freeq.at/act-id", "T-drop"),
+            ],
+            "#ops",
+            "T-drop-accept",
+        );
+        db.apply_act_event(&ActEvent {
+            canonical: &accept,
+            signature: Some("ed25519:kid:sig"),
+            event_id: "T-drop-accept",
+            act_id: "T-drop",
+            opens: false,
+            venue: "#ops",
+            actor: SCHOLAR,
+            from_system: false,
+            origin: None,
+            timestamp: 20,
+        })
+        .unwrap();
+        assert_eq!(
+            db.act_task("T-drop").unwrap().unwrap().state,
+            "assigned",
+            "the follow-up applied"
+        );
+        assert_eq!(
+            db.act_dropped_unchecked("T-drop").unwrap(),
+            1,
+            "and the count survived it"
+        );
+    }
+
     // ── Effective capabilities ────────────────────────────────────────────
     //
     // PHASE-4 says a spawned child gets "the intersection of the parent's caps
@@ -7065,6 +7116,35 @@ impl Db {
         )?;
         tx.commit()?;
         Ok(ActWrite::Filed { was, state: landed })
+    }
+
+    /// Count one more event about this task that the defer queue threw away
+    /// unchecked. Returns whether a task row was there to mark — an event
+    /// whose task is not on file leaves only the eviction log.
+    ///
+    /// A receipt fact, not part of the task's state machine: never relayed,
+    /// never in the signed log, and not reproducible by a rebuild (the
+    /// dropped event is precisely what the log never received).
+    pub fn bump_act_dropped_unchecked(&self, act_id: &str) -> SqlResult<bool> {
+        self.conn.execute(
+            "UPDATE act_actions SET dropped_unchecked = dropped_unchecked + 1
+              WHERE act_id = ?1",
+            params![act_id],
+        )?;
+        Ok(self.conn.changes() > 0)
+    }
+
+    /// How many events about this task the defer queue threw away unchecked.
+    /// Zero for a task with no row — nothing was recorded against it.
+    pub fn act_dropped_unchecked(&self, act_id: &str) -> SqlResult<i64> {
+        self.conn
+            .query_row(
+                "SELECT dropped_unchecked FROM act_actions WHERE act_id = ?1",
+                params![act_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map(|v| v.unwrap_or(0))
     }
 
     /// The receipt facts for a task event's log row: this server checked the

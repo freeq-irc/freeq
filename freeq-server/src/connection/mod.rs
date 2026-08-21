@@ -1318,6 +1318,14 @@ where
                                         state.with_db(|db| {
                                             db.save_signing_key(&did_for_db, &key_bytes)
                                         });
+                                        // Anything a peer relayed under this
+                                        // key was parked for want of it. It
+                                        // can be judged now.
+                                        crate::server::retry_deferred_task_events(
+                                            &state,
+                                            did,
+                                            &freeq_sdk::sigtag::derive_kid(&vk),
+                                        );
                                     }
                                     tracing::info!(
                                         session = %session_id,

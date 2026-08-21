@@ -227,6 +227,16 @@ async fn the_listing_answers_with_open_work_and_its_declared_fields() {
     assert_eq!(row["venue"], "#work");
     assert_eq!(row["caps"], "freeq.at/web-search", "stored and filterable");
     assert_eq!(row["origin"], "", "created here");
+    assert_eq!(
+        row["dropped_unchecked"], 0,
+        "no event about this task was ever dropped unchecked"
+    );
+
+    // The same count on the single-task answer: a reader who opens one task
+    // must be told what a reader of the list is told.
+    let (status, one) = get(web, &format!("/api/v1/actions/{task}"), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(one["task"]["dropped_unchecked"], 0);
 }
 
 #[tokio::test]

@@ -35,11 +35,6 @@ use parking_lot::Mutex;
 
 use crate::server::SharedState;
 
-/// How long a lookup that produced nothing is remembered before another is
-/// attempted, so an unreachable peer is asked once a minute rather than once
-/// per message.
-const RETRY_AFTER: Duration = Duration::from_secs(60);
-
 /// A key server that does not answer promptly is treated as unreachable. This
 /// runs off the delivery path, so the bound is about not accumulating tasks.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -107,15 +102,40 @@ pub fn has_key_source(state: &Arc<SharedState>, origin: &str) -> bool {
 ///
 /// Call when a relayed event was uncheckable for want of a key. Returns
 /// immediately; at most one request per `(did, kid)` is outstanding, and a
-/// lookup that finds nothing is not retried for [`RETRY_AFTER`].
+/// lookup that finds nothing is not asked again for `--peer-key-retry-secs`.
 pub fn fetch_on_miss(state: &Arc<SharedState>, origin: &str, did: &str, sig_tag: &str) {
+    let Ok((kid, _)) = freeq_sdk::sigtag::parse(sig_tag) else {
+        return;
+    };
     match base_for_origin(state, origin) {
-        Some(base) => start_lookup(state, vec![base], did, sig_tag),
+        Some(base) => start_lookup(state, vec![base], did, kid),
         None => tracing::debug!(
             origin = %origin,
             "No key server configured for this peer (--s2s-peer-api); its signatures stay uncheckable"
         ),
     }
+}
+
+/// Ask a peer's key server again for a key that task events are parked on.
+///
+/// **Which governs: the backoff, not the window.** The remembered-miss window
+/// exists so a busy channel does not open a request per message; the defer
+/// queue asks at most once per key per backoff step, which is the same job
+/// done better, and letting the window veto it would leave a quiet signer's
+/// parked events waiting out the queue after their key server came back. So
+/// the remembered miss is forgotten here and the lookup runs. Nothing races:
+/// a fetch gives up after [`FETCH_TIMEOUT`], well inside the shortest step
+/// the backoff ever asks on.
+pub fn fetch_again(state: &Arc<SharedState>, origin: &str, did: &str, kid: &str) {
+    let Some(base) = base_for_origin(state, origin) else {
+        tracing::debug!(
+            origin = %origin,
+            "No key server configured for this peer (--s2s-peer-api); nothing to ask again"
+        );
+        return;
+    };
+    LOOKUPS.lock().remove(&(did.to_string(), kid.to_string()));
+    start_lookup(state, vec![base], did, kid);
 }
 
 /// Look up a key without knowing which peer the signer belongs to.
@@ -127,24 +147,26 @@ pub fn fetch_on_miss(state: &Arc<SharedState>, origin: &str, did: &str, sig_tag:
 /// key id is a hash of the key, so only a server holding the right key can
 /// answer the question at all.
 pub fn fetch_from_any_peer(state: &Arc<SharedState>, did: &str, sig_tag: &str) {
+    let Ok((kid, _)) = freeq_sdk::sigtag::parse(sig_tag) else {
+        return;
+    };
     let bases: Vec<String> = parse_peer_api_config(&state.config.s2s_peer_api)
         .into_values()
         .collect();
     if !bases.is_empty() {
-        start_lookup(state, bases, did, sig_tag);
+        start_lookup(state, bases, did, kid);
     }
 }
 
-/// One lookup for the key `sig_tag` names, tried against `bases` in turn.
-fn start_lookup(state: &Arc<SharedState>, bases: Vec<String>, did: &str, sig_tag: &str) {
-    let Ok((kid, _)) = freeq_sdk::sigtag::parse(sig_tag) else {
-        return;
-    };
-
+/// One lookup for `kid`, tried against `bases` in turn.
+fn start_lookup(state: &Arc<SharedState>, bases: Vec<String>, did: &str, kid: &str) {
     let entry = (did.to_string(), kid.to_string());
     {
+        // How long a fruitless lookup is remembered: an unreachable key server
+        // is asked once a window rather than once per message.
+        let retry_after = Duration::from_secs(state.config.peer_key_retry_secs);
         let mut lookups = LOOKUPS.lock();
-        lookups.retain(|_, at| at.elapsed() < RETRY_AFTER);
+        lookups.retain(|_, at| at.elapsed() < retry_after);
         if lookups.contains_key(&entry) {
             return;
         }
@@ -164,6 +186,11 @@ fn start_lookup(state: &Arc<SharedState>, bases: Vec<String>, did: &str, sig_tag
                     state.with_db(|db| db.save_signing_key(&did, &pubkey));
                     LOOKUPS.lock().remove(&(did.clone(), kid.clone()));
                     tracing::info!(did = %did, kid = %kid, "Fetched a signing key from its home server");
+                    // This lookup was started because something could not be
+                    // checked without the key. Whatever is parked on it can be
+                    // judged now, which is what makes deferring a delay rather
+                    // than a loss.
+                    crate::server::retry_deferred_task_events(&state, &did, &kid);
                     return;
                 }
                 Err(e) => tracing::debug!(

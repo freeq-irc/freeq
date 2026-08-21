@@ -34,6 +34,11 @@
 ## (seconds; 0 = never). Every bidder sees this window, so changing it changes
 ## the terms they bid under:
 # act_review_secs = 1209600
+## How many relayed task events may wait at once for the key that would settle
+## them — per peer, and in total. Parked events are held in memory only; a
+## restart drops them:
+# act_defer_max_per_origin = 256
+# act_defer_max_total = 4096
 
 ## ── Federation (iroh + S2S) ────────────────────────────────────────
 # iroh = true
@@ -43,6 +48,10 @@
 ## Where each peer serves its users' message-signing keys; without an entry a
 ## peer's signatures stay uncheckable here (never reported as forged).
 # s2s_peer_api = ["44f1415c...=https://irc.example.com"]
+## How long a key lookup that found nothing is remembered before a message from
+## the same signer asks again (seconds). It does not govern the defer queue's
+## own retries, which run on their own backoff:
+# peer_key_retry_secs = 60
 # s2s_peer_trust = ["44f1415c...:full"]
 ## Map-shaped keys like the two above may also be written as TOML tables
 ## (tables go at the END of the file — TOML files them after top-level keys):

@@ -188,7 +188,15 @@ impl PeerRef {
 }
 
 /// Spawn one server from its plan, peered to `peer`, resolving `resolver_entries`.
-fn spawn_server(plan: ServerPlan, peer: &PeerRef, resolver_entries: &str) -> TestServer {
+///
+/// `extra` is appended verbatim, for a test that needs one side started with a
+/// setting the other does not have.
+fn spawn_server(
+    plan: ServerPlan,
+    peer: &PeerRef,
+    resolver_entries: &str,
+    extra: &[&str],
+) -> TestServer {
     let db_path = plan
         .dir
         .path()
@@ -227,6 +235,7 @@ fn spawn_server(plan: ServerPlan, peer: &PeerRef, resolver_entries: &str) -> Tes
         &format!("test-fed-{}", plan.seed),
     ]
     .iter()
+    .chain(extra.iter())
     .map(|s| s.to_string())
     .collect();
 
@@ -308,6 +317,18 @@ async fn spawn_pair_with_seeds(
     seed_a: u8,
     seed_b: u8,
 ) -> (TestServer, TestServer) {
+    spawn_pair_with_seeds_and_args(ids, seed_a, seed_b, &[], &[]).await
+}
+
+/// The same again, with extra argv for each server — a setting one side of the
+/// pair needs and the other does not.
+async fn spawn_pair_with_seeds_and_args(
+    ids: &[&TestId],
+    seed_a: u8,
+    seed_b: u8,
+    extra_a: &[&str],
+    extra_b: &[&str],
+) -> (TestServer, TestServer) {
     // A failed test poisons the lock; the next test's servers are unaffected,
     // so take it anyway.
     let serial = ONE_TEST_AT_A_TIME
@@ -325,8 +346,8 @@ async fn spawn_pair_with_seeds(
     // two can cross-reference for peering.
     let a_ref = PeerRef::of(&a_plan);
     let b_ref = PeerRef::of(&b_plan);
-    let mut a = spawn_server(a_plan, &b_ref, &resolver);
-    let b = spawn_server(b_plan, &a_ref, &resolver);
+    let mut a = spawn_server(a_plan, &b_ref, &resolver, extra_a);
+    let b = spawn_server(b_plan, &a_ref, &resolver, extra_b);
     a.serial = Some(serial);
 
     wait_port(&a.irc_addr).await;
@@ -2786,5 +2807,341 @@ async fn a_server_that_was_away_heals_its_task_view() {
     );
 
     ha.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── a task event whose key cannot be fetched yet ──────────────────────────
+//
+// A signature this server cannot check is not a verdict about the sender. A
+// key server that is down, or a key that has not been published yet, is a
+// fact about this server's reach — so the event waits instead of being
+// refused, and nothing about it is shown or filed while it waits. Then the
+// key becomes fetchable and the wait ends by itself: the server asks again on
+// its own backoff, judges the event, applies it and delivers it, without its
+// sender ever saying anything more.
+//
+// The far server's key source is pointed at an address nothing answers on,
+// which is what makes the wait real; the stand-in key server is started only
+// when the test wants the key to become fetchable.
+
+/// A stand-in for a peer's key server, serving one key to anything that asks.
+///
+/// Started late on purpose: until it is, the address in the far server's
+/// `--s2s-peer-api` refuses connections, and every signature by this signer is
+/// honestly uncheckable there.
+async fn serve_signing_key(port: u16, pubkey_b64: String) -> tokio::task::JoinHandle<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .expect("bind the stand-in key server");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let body = format!(
+                r#"{{"algorithm":"ed25519","public_key":"{pubkey_b64}","encoding":"base64url"}}"#
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            // The request is read and discarded: the answer does not depend on
+            // it, and the key id in it is checked by the caller against the
+            // key itself.
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    })
+}
+
+/// Sign and send one act TAGMSG into `channel`; returns the event id it minted.
+async fn send_act_as(
+    handle: &client::ClientHandle,
+    channel: &str,
+    signing: &ed25519_dalek::SigningKey,
+    act_tags: &[(&str, &str)],
+) -> String {
+    let venue = freeq_sdk::chatsig::channel_venue(channel);
+    let id = freeq_sdk::chatsig::new_event_id();
+    let sig = freeq_sdk::act::sign_act(act_tags.iter().copied(), &venue, &id, signing)
+        .expect("act tags present");
+    let wire: Vec<String> = act_tags
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .chain([
+            format!("{}={id}", freeq_sdk::chatsig::EVENT_ID_TAG),
+            format!("+freeq.at/sig={sig}"),
+        ])
+        .collect();
+    handle
+        .raw(&format!("@{} TAGMSG {channel}", wire.join(";")))
+        .await
+        .ok();
+    id
+}
+
+/// Register a session signing key the way a task-sending client does, so the
+/// other server can fetch it when a signature names it.
+async fn register_key(handle: &client::ClientHandle, signing: &ed25519_dalek::SigningKey) {
+    use base64::Engine;
+    let pubkey =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing.verifying_key().as_bytes());
+    handle.raw(&format!("MSGSIG {pubkey}")).await.ok();
+}
+
+/// Ask for the task capability, after registering, and wait for the ACK.
+///
+/// Task messages reach only the connections that negotiated `freeq.at/act` —
+/// everyone else in the room sees the companion prose and none of the machine
+/// half. The Rust SDK does not ask for it (no Rust client consumes task events
+/// yet), so a test that watches for a delivered task event asks in the raw,
+/// the way a task-aware client does.
+async fn request_act_cap(handle: &client::ClientHandle, rx: &mut mpsc::Receiver<Event>) {
+    handle.raw("CAP REQ :freeq.at/act").await.ok();
+    wait_event(
+        rx,
+        |e| matches!(e, Event::RawLine(l) if l.contains(" ACK ") && l.contains("freeq.at/act")),
+        "the task capability ACK",
+    )
+    .await;
+}
+
+/// How many times a session is handed the TAGMSG carrying `event_id`.
+///
+/// Waits up to `within` for the first, then a further `quiet` for a second
+/// that must never come — an event delivered twice is the bug, so the wait
+/// after the first delivery is the assertion.
+async fn tagmsg_deliveries(
+    rx: &mut mpsc::Receiver<Event>,
+    event_id: &str,
+    within: Duration,
+    quiet: Duration,
+) -> usize {
+    let mut seen = 0usize;
+    let matches = |tags: &std::collections::HashMap<String, String>| {
+        tags.get(freeq_sdk::chatsig::EVENT_ID_TAG)
+            .map(String::as_str)
+            == Some(event_id)
+    };
+
+    let deadline = tokio::time::Instant::now() + within;
+    while seen == 0 && tokio::time::Instant::now() < deadline {
+        match timeout(Duration::from_millis(250), rx.recv()).await {
+            Ok(Some(Event::TagMsg { tags, .. })) if matches(&tags) => seen += 1,
+            Ok(Some(_)) => continue,
+            Ok(None) => return seen,
+            Err(_) => continue,
+        }
+    }
+    if seen == 0 {
+        return 0;
+    }
+    let quiet_until = tokio::time::Instant::now() + quiet;
+    while tokio::time::Instant::now() < quiet_until {
+        match timeout(Duration::from_millis(250), rx.recv()).await {
+            Ok(Some(Event::TagMsg { tags, .. })) if matches(&tags) => seen += 1,
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    seen
+}
+
+/// How many rows a server's event log holds under one event id.
+fn event_rows(db_path: &str, event_id: &str) -> i64 {
+    let conn = rusqlite::Connection::open(db_path).expect("open server db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE event_id = ?1",
+        rusqlite::params![event_id],
+        |r| r.get(0),
+    )
+    .expect("count event rows")
+}
+
+/// Every verdict this server logged about one relayed task event, in order.
+fn verdicts_for(server: &TestServer, event_id: &str) -> Vec<String> {
+    server_log(server)
+        .lines()
+        .filter(|l| l.contains(event_id) && l.contains("verdict="))
+        .map(|l| {
+            l.split("verdict=")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// Poll a server's answer for `act_id` for as long as `within`.
+async fn await_act_task_within(
+    web_addr: &str,
+    act_id: &str,
+    within: Duration,
+) -> Option<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + within;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(body) = act_task(web_addr, act_id).await {
+            return Some(body);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    None
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_task_event_waits_for_a_key_it_cannot_fetch_and_applies_when_it_arrives() {
+    const SEED_A: u8 = 216;
+    const SEED_B: u8 = 217;
+    // Long enough for the first backoff step — thirty seconds — plus the
+    // fetch and the judging that follow it.
+    const PAST_THE_FIRST_RETRY: Duration = Duration::from_secs(90);
+    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32])
+        .public()
+        .to_string();
+    let alice = TestId::new("did:plc:alicedefer");
+    let bob = TestId::new("did:plc:bobdefer");
+
+    // Nothing listens here yet. B is told this is where A's users' keys live,
+    // so its lookups fail until the test says otherwise.
+    let key_port = alloc_port();
+    let key_api = format!("{id_a}=http://127.0.0.1:{key_port}");
+    let (srv_a, srv_b) = spawn_pair_with_seeds_and_args(
+        &[&alice, &bob],
+        SEED_A,
+        SEED_B,
+        &[],
+        &["--s2s-peer-api", &key_api],
+    )
+    .await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    request_act_cap(&hb, &mut rxb).await;
+    hb.join("#defer").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#defer").await.unwrap();
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[47u8; 32]);
+    register_key(&ha, &key_a).await;
+    let pubkey = {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_a.verifying_key().as_bytes())
+    };
+
+    // ── the event nobody there can check yet ────────────────────────
+    let parked = send_act_as(
+        &ha,
+        "#defer",
+        &key_a,
+        &[
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "offer"),
+            ("+freeq.at/from", alice.did.as_str()),
+            ("+freeq.at/act-title", "waits-for-a-key"),
+        ],
+    )
+    .await;
+
+    // The home holds it, because the home checked it against a key it has.
+    assert!(
+        await_act_task(&srv_a.web_addr, &parked).await.is_some(),
+        "the server the task was minted on files it"
+    );
+
+    // The far server does not: not shown to anyone, not written down, not
+    // answered for. This is a wait, not a refusal — the difference shows in
+    // the verdict, which says the event could not be checked rather than that
+    // it failed.
+    assert_eq!(
+        tagmsg_deliveries(
+            &mut rxb,
+            &parked,
+            Duration::from_secs(3),
+            Duration::from_millis(500)
+        )
+        .await,
+        0,
+        "an event that cannot be checked is not shown to anyone"
+    );
+    assert_eq!(
+        event_rows(&srv_b.db_path, &parked),
+        0,
+        "nor written into the log"
+    );
+    assert!(
+        act_task(&srv_b.web_addr, &parked).await.is_none(),
+        "nor answered for over REST"
+    );
+    assert_eq!(
+        verdicts_for(&srv_b, &parked),
+        vec!["unverifiable".to_string()],
+        "and the far server says why in the one verdict it has reached: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // ── the key becomes fetchable ───────────────────────────────────
+    //
+    // Nothing else is sent. The far server asks again for the key its parked
+    // event is waiting on, on its own backoff, and that ask is what ends the
+    // wait.
+    let key_server = serve_signing_key(key_port, pubkey).await;
+
+    let body = await_act_task_within(&srv_b.web_addr, &parked, PAST_THE_FIRST_RETRY)
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "a parked event must be judged when its key becomes fetchable, \
+                 without being re-sent; B's verdicts: {}",
+                server_log(&srv_b)
+                    .lines()
+                    .filter(|l| l.contains("verdict=") || l.contains("waiting"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        });
+    assert_eq!(
+        body["task"]["state"].as_str(),
+        Some("open"),
+        "and applied through the rules like any other event: {body}"
+    );
+    assert_eq!(
+        body["task"]["origin"].as_str(),
+        Some(id_a.as_str()),
+        "still owned by the server that minted it: {body}"
+    );
+    assert_eq!(
+        event_rows(&srv_b.db_path, &parked),
+        1,
+        "filed once, under the id its signer minted"
+    );
+    assert_eq!(
+        tagmsg_deliveries(&mut rxb, &parked, S2S_SETTLE, Duration::from_millis(1000)).await,
+        1,
+        "and delivered to the room, once, on release"
+    );
+    assert_eq!(
+        verdicts_for(&srv_b, &parked),
+        vec!["unverifiable".to_string(), "valid".to_string()],
+        "the same event, judged twice: once with no key to check it against, \
+         and once with one"
+    );
+
+    key_server.abort();
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
     drop((srv_a, srv_b));
 }
