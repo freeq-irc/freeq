@@ -191,10 +191,10 @@ fn message_document<'a>(
 ///   kid, an algorithm we don't know, or a legacy-format signature). Attaching
 ///   ours says only what it means: this server vouches that this identity sent
 ///   this.
-/// - **Nothing**, for a guest — and for a signature that *failed* against the
-///   key it named. That is the one case we refuse to paper over: quietly
-///   replacing a failed signature with the server's own would turn a signature
-///   that didn't check into a badge that says it did.
+/// - **Nothing**, for a guest — and for a signature the check found *invalid*
+///   against the key it named. That is the one case we refuse to paper over:
+///   quietly replacing an invalid signature with the server's own would turn a
+///   signature that didn't check into a badge that says it did.
 fn resolve_signature(
     conn: &Connection,
     target: &str,
@@ -211,10 +211,10 @@ fn resolve_signature(
     if let (Some(sig_tag), Some(venue)) = (client_sig, venue.as_deref()) {
         let doc = message_document(did, venue, fields, tags);
         match verify_client_signature(&doc, sig_tag, did, Some(&conn.id), state) {
-            ClientSigOutcome::Verified => {
+            ClientSigVerdict::Valid => {
                 return SettledSignature::Attach(Some(sig_tag.to_string()));
             }
-            ClientSigOutcome::Failed => {
+            ClientSigVerdict::Invalid => {
                 tracing::warn!(
                     session = %conn.id, did = %did, msgid = %fields.msgid,
                     "Client signature did not verify against the key it names — \
@@ -222,7 +222,7 @@ fn resolve_signature(
                 );
                 return SettledSignature::Failed;
             }
-            ClientSigOutcome::Unverifiable(why) => {
+            ClientSigVerdict::Unverifiable(why) => {
                 tracing::debug!(
                     session = %conn.id, did = %did, msgid = %fields.msgid, why = %why,
                     "Client signature not verifiable here — server-signing instead"
@@ -277,16 +277,18 @@ pub(crate) enum SettledSignature {
     Failed,
 }
 
-/// What happened when we checked a client's signature — three outcomes, not
-/// two, because "cannot check" and "does not check out" are different facts.
+/// What this server concluded about a signature from one of its own connected
+/// clients — three verdicts, not two, because "cannot check" and "does not
+/// check out" are different facts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClientSigOutcome {
-    Verified,
+pub(crate) enum ClientSigVerdict {
+    /// The rebuilt document verifies against the key the signature names.
+    Valid,
     /// The named key was found and the signature is wrong: tampering, forgery,
     /// or a client whose canonical disagrees with ours.
-    Failed,
-    /// We cannot reach a verdict, and must not pretend to. Carries the reason
-    /// for the log.
+    Invalid,
+    /// No verdict is reachable, and this server must not pretend to one.
+    /// Carries the reason for the log.
     Unverifiable(&'static str),
 }
 
@@ -333,24 +335,24 @@ pub(super) fn verify_act_signature<'a>(
     did: &str,
     session: &str,
     state: &Arc<SharedState>,
-) -> ClientSigOutcome {
+) -> ClientSigVerdict {
     let Ok((kid, _)) = freeq_sdk::sigtag::parse(sig_tag) else {
-        return ClientSigOutcome::Unverifiable("unparseable or legacy signature format");
+        return ClientSigVerdict::Unverifiable("unparseable or legacy signature format");
     };
     let Some(key) = verifying_key_for(did, kid, Some(session), state) else {
-        return ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE);
+        return ClientSigVerdict::Unverifiable(NO_KEY_ON_FILE);
     };
     match freeq_sdk::act::verify_act(tags, venue, msgid, sig_tag, &key) {
-        Ok(()) => ClientSigOutcome::Verified,
-        Err(freeq_sdk::act::ActSigError::SigInvalid) => ClientSigOutcome::Failed,
+        Ok(()) => ClientSigVerdict::Valid,
+        Err(freeq_sdk::act::ActSigError::SigInvalid) => ClientSigVerdict::Invalid,
         // A mandatory canonical field is absent. Not evidence about the
         // sender — unverifiable, never invalid (thread agreement 2026-08-02).
         Err(freeq_sdk::act::ActSigError::MissingFrom) => {
-            ClientSigOutcome::Unverifiable("missing mandatory field: from")
+            ClientSigVerdict::Unverifiable("missing mandatory field: from")
         }
         // A kid that does not match, a format we cannot read, or no act tags
         // at all: none of these is evidence of forgery.
-        Err(_) => ClientSigOutcome::Unverifiable("unusable signature tag"),
+        Err(_) => ClientSigVerdict::Unverifiable("unusable signature tag"),
     }
 }
 
@@ -366,22 +368,22 @@ fn verify_client_signature(
     did: &str,
     session: Option<&str>,
     state: &Arc<SharedState>,
-) -> ClientSigOutcome {
+) -> ClientSigVerdict {
     // A legacy signature is a bare base64 blob over the retired canonical,
     // which folded a client-minted wall clock this server cannot reproduce.
     // It was never checkable; it is not evidence of anything.
     let Ok((kid, _)) = freeq_sdk::sigtag::parse(sig_tag) else {
-        return ClientSigOutcome::Unverifiable("unparseable or legacy signature format");
+        return ClientSigVerdict::Unverifiable("unparseable or legacy signature format");
     };
 
     let Some(key) = verifying_key_for(did, kid, session, state) else {
-        return ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE);
+        return ClientSigVerdict::Unverifiable(NO_KEY_ON_FILE);
     };
 
     match doc.verify(sig_tag, &key) {
-        Ok(()) => ClientSigOutcome::Verified,
-        Err(e) if e.is_unverifiable() => ClientSigOutcome::Unverifiable("unusable signature tag"),
-        Err(_) => ClientSigOutcome::Failed,
+        Ok(()) => ClientSigVerdict::Valid,
+        Err(e) if e.is_unverifiable() => ClientSigVerdict::Unverifiable("unusable signature tag"),
+        Err(_) => ClientSigVerdict::Invalid,
     }
 }
 
@@ -396,9 +398,9 @@ pub(crate) fn verify_canonical_bytes(
     signer_did: &str,
     canonical: &str,
     sig_tag: &str,
-) -> ClientSigOutcome {
+) -> ClientSigVerdict {
     let Ok((kid, _)) = freeq_sdk::sigtag::parse(sig_tag) else {
-        return ClientSigOutcome::Unverifiable("unparseable or legacy signature format");
+        return ClientSigVerdict::Unverifiable("unparseable or legacy signature format");
     };
     let key = match state
         .with_db(|db| db.get_signing_key_by_kid(signer_did, kid))
@@ -406,12 +408,12 @@ pub(crate) fn verify_canonical_bytes(
         .and_then(|bytes| ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok())
     {
         Some(vk) => vk,
-        None => return ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE),
+        None => return ClientSigVerdict::Unverifiable(NO_KEY_ON_FILE),
     };
     match freeq_sdk::sigtag::verify_canonical(canonical, sig_tag, &key) {
-        Ok(()) => ClientSigOutcome::Verified,
-        Err(e) if e.is_unverifiable() => ClientSigOutcome::Unverifiable("unusable signature tag"),
-        Err(_) => ClientSigOutcome::Failed,
+        Ok(()) => ClientSigVerdict::Valid,
+        Err(e) if e.is_unverifiable() => ClientSigVerdict::Unverifiable("unusable signature tag"),
+        Err(_) => ClientSigVerdict::Invalid,
     }
 }
 
@@ -434,12 +436,12 @@ pub(crate) fn verify_relayed_message(
     fields: &SignedFields<'_>,
     coord_tags: &HashMap<String, String>,
     sig_tag: &str,
-) -> ClientSigOutcome {
+) -> ClientSigVerdict {
     if fields.msgid.is_empty() {
-        return ClientSigOutcome::Unverifiable("relayed message carries no event id");
+        return ClientSigVerdict::Unverifiable("relayed message carries no event id");
     }
     let Some(venue) = signing_venue(state, sender_did, target) else {
-        return ClientSigOutcome::Unverifiable("venue for the relayed target does not resolve");
+        return ClientSigVerdict::Unverifiable("venue for the relayed target does not resolve");
     };
     let doc = message_document(sender_did, &venue, fields, coord_tags);
     verify_client_signature(&doc, sig_tag, sender_did, None, state)
@@ -461,7 +463,7 @@ pub(crate) fn verify_relayed_mutation(
     subject: &str,
     emoji: Option<&str>,
     sig_tag: &str,
-) -> ClientSigOutcome {
+) -> ClientSigVerdict {
     verify_mutation(
         state,
         sender_did,
@@ -496,11 +498,11 @@ pub(crate) fn verify_local_mutation(
     subject: &str,
     emoji: Option<&str>,
     sig_tag: &str,
-) -> ClientSigOutcome {
+) -> ClientSigVerdict {
     let Some(did) = conn.authenticated_did.as_deref() else {
         // A guest has no identity to bind, so there is no document — and
         // nothing for a signature to be evidence of.
-        return ClientSigOutcome::Unverifiable("a guest cannot sign");
+        return ClientSigVerdict::Unverifiable("a guest cannot sign");
     };
     verify_mutation(
         state,
@@ -526,12 +528,12 @@ fn verify_mutation(
     emoji: Option<&str>,
     sig_tag: &str,
     session: Option<&str>,
-) -> ClientSigOutcome {
+) -> ClientSigVerdict {
     if event_msgid.is_empty() {
-        return ClientSigOutcome::Unverifiable("mutation carries no event id");
+        return ClientSigVerdict::Unverifiable("mutation carries no event id");
     }
     let Some(venue) = signing_venue(state, sender_did, target) else {
-        return ClientSigOutcome::Unverifiable("venue for the target does not resolve");
+        return ClientSigVerdict::Unverifiable("venue for the target does not resolve");
     };
     let mut doc =
         freeq_sdk::chatsig::ChatDoc::mutation(kind, sender_did, event_msgid, &venue, subject);
@@ -726,7 +728,7 @@ pub(super) struct CheckedMutation {
     kind: freeq_sdk::chatsig::Mutation,
     /// The subject as the signer named it, before any re-rooting.
     subject: String,
-    outcome: ClientSigOutcome,
+    outcome: ClientSigVerdict,
 }
 
 /// The mutation a TAGMSG's tags describe, if any: the kind, the msgid it acts
@@ -787,7 +789,7 @@ fn coordination_document<'a>(
 /// What this server concluded about an incoming coordination event, and the
 /// bytes it concluded it about.
 struct CheckedCoordination {
-    outcome: ClientSigOutcome,
+    outcome: ClientSigVerdict,
     /// The signed canonical, kept so a verified event is filed as the exact
     /// document a reader will re-check rather than one rebuilt later.
     canonical: String,
@@ -889,7 +891,7 @@ fn keep_signature(checked: Option<&CheckedMutation>, tidied: &HashMap<String, St
         // An unsigned mutation, or one from a guest with nothing to vouch for.
         return false;
     };
-    if checked.outcome != ClientSigOutcome::Verified {
+    if checked.outcome != ClientSigVerdict::Valid {
         return false;
     }
     match mutation_in(tidied) {
@@ -1117,7 +1119,7 @@ pub(super) fn handle_tagmsg(
     let is_mutation = mutation_in(tags).is_some();
     let arrived = mutation_signature(conn, target, tags, state);
     if let Some(ref checked) = arrived
-        && checked.outcome == ClientSigOutcome::Failed
+        && checked.outcome == ClientSigVerdict::Invalid
     {
         tracing::warn!(
             session = %conn.id, did = ?conn.authenticated_did, target = %target,
@@ -1160,7 +1162,7 @@ pub(super) fn handle_tagmsg(
     if is_mutation
         && let Some(did) = conn.authenticated_did.as_deref()
         && signing_venue(state, did, target).is_some()
-        && arrived.as_ref().map(|c| c.outcome) != Some(ClientSigOutcome::Verified)
+        && arrived.as_ref().map(|c| c.outcome) != Some(ClientSigVerdict::Valid)
     {
         tracing::info!(
             session = %conn.id, did = ?conn.authenticated_did, target = %target,
@@ -1312,7 +1314,7 @@ pub(super) fn handle_tagmsg(
         // makes the signed value and the stored value the same value.
         let checked = coordination_signature(conn, target, event_type, tags, state);
         if let Some(ref checked) = checked
-            && checked.outcome == ClientSigOutcome::Failed
+            && checked.outcome == ClientSigVerdict::Invalid
         {
             tracing::warn!(
                 session = %conn.id, did = %did, target = %target,
@@ -1340,14 +1342,14 @@ pub(super) fn handle_tagmsg(
         // under an id of ours while the bytes named the signer's, which made
         // it unverifiable forever. Keep both and record the verdict honestly —
         // the log has a state for exactly this, and the answer improves by
-        // itself once the key is on file. A signature that *failed* never
+        // itself once the key is on file. An *invalid* signature never
         // reaches here; the caller refused the event.
         let signed = checked.map(|c| {
             let state = match c.outcome {
-                ClientSigOutcome::Verified => crate::events::SigState::Valid,
+                ClientSigVerdict::Valid => crate::events::SigState::Valid,
                 _ => crate::events::SigState::Unverifiable,
             };
-            if let ClientSigOutcome::Unverifiable(why) = c.outcome {
+            if let ClientSigVerdict::Unverifiable(why) = c.outcome {
                 tracing::debug!(
                     session = %conn.id, did = %did, why = %why,
                     "Coordination signature not checkable here — filed as unverifiable"
@@ -3422,11 +3424,11 @@ fn handle_edit(
                 let doc = message_document(did, &venue, &signed, tags);
                 verify_client_signature(&doc, sig_tag, did, Some(&conn.id), state)
             }
-            None => ClientSigOutcome::Unverifiable("edit carries no signature"),
+            None => ClientSigVerdict::Unverifiable("edit carries no signature"),
         };
-        if outcome != ClientSigOutcome::Verified {
+        if outcome != ClientSigVerdict::Valid {
             let (code, description) = match outcome {
-                ClientSigOutcome::Failed => (
+                ClientSigVerdict::Invalid => (
                     "SIGNATURE_INVALID",
                     "That signature does not verify against the key it names",
                 ),

@@ -771,8 +771,8 @@ pub(super) fn gate(
     match super::messaging::verify_act_signature(
         pairs, &venue, &msgid, sig_tag, did, &conn.id, state,
     ) {
-        super::messaging::ClientSigOutcome::Verified => {}
-        super::messaging::ClientSigOutcome::Failed => {
+        super::messaging::ClientSigVerdict::Valid => {}
+        super::messaging::ClientSigVerdict::Invalid => {
             tracing::warn!(
                 session = %conn.id, did = %did, target = %target, msgid = %msgid,
                 "Task-message signature did not verify against the key it names — \
@@ -792,7 +792,7 @@ pub(super) fn gate(
         // one server it should not happen at all — a local signer's key is in
         // the local store — but it is the real case once peers are in the
         // picture, so it answers distinctly rather than as a forgery.
-        super::messaging::ClientSigOutcome::Unverifiable(why)
+        super::messaging::ClientSigVerdict::Unverifiable(why)
             if why == super::messaging::NO_KEY_ON_FILE =>
         {
             tracing::warn!(
@@ -816,7 +816,7 @@ pub(super) fn gate(
         // reached a key. Answering SIGNATURE_INVALID here (as this arm did
         // until 2026-08-20) told a sender with a future signature algorithm
         // that its signature was forged.
-        super::messaging::ClientSigOutcome::Unverifiable(why) => {
+        super::messaging::ClientSigVerdict::Unverifiable(why) => {
             tracing::warn!(
                 session = %conn.id, did = %did, target = %target, why = %why,
                 "Task-message signature cannot be checked — refusing the event"

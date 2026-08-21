@@ -3014,11 +3014,11 @@ fn verify_relayed_privmsg(
     replaces_msgid: Option<&str>,
     multiline_lines: Option<&Vec<crate::s2s::MultilineLine>>,
     sig: Option<&str>,
-) -> Option<crate::connection::messaging::ClientSigOutcome> {
-    use crate::connection::messaging::{ClientSigOutcome, SignedFields, verify_relayed_message};
+) -> Option<crate::connection::messaging::ClientSigVerdict> {
+    use crate::connection::messaging::{ClientSigVerdict, SignedFields, verify_relayed_message};
     let sig = sig?;
     let Some(did) = account else {
-        return Some(ClientSigOutcome::Unverifiable(
+        return Some(ClientSigVerdict::Unverifiable(
             "relayed message names no sender DID",
         ));
     };
@@ -3073,20 +3073,20 @@ fn verify_relayed_mutation_tags(
     account: Option<&str>,
     target: &str,
     tags: &HashMap<String, String>,
-) -> Option<crate::connection::messaging::ClientSigOutcome> {
-    use crate::connection::messaging::{ClientSigOutcome, verify_relayed_mutation};
+) -> Option<crate::connection::messaging::ClientSigVerdict> {
+    use crate::connection::messaging::{ClientSigVerdict, verify_relayed_mutation};
 
     let get = |a: &str, b: &str| tags.get(a).or_else(|| tags.get(b)).map(String::as_str);
     let (kind, subject, emoji) = relayed_mutation_in(tags)?;
 
     let sig = tags.get("+freeq.at/sig").map(String::as_str)?;
     let Some(did) = account else {
-        return Some(ClientSigOutcome::Unverifiable(
+        return Some(ClientSigVerdict::Unverifiable(
             "relayed mutation names no actor DID",
         ));
     };
     let Some(subject) = subject else {
-        return Some(ClientSigOutcome::Unverifiable(
+        return Some(ClientSigVerdict::Unverifiable(
             "relayed mutation names no subject",
         ));
     };
@@ -3351,8 +3351,8 @@ pub(crate) fn apply_replayed_event(
     let sig_state = match (ev.signature.as_deref(), ev.canonical.is_empty()) {
         (None, _) => SigState::Unsigned,
         (Some(sig), false) => match replayed_signature_verdict(state, &ev, sig) {
-            crate::connection::messaging::ClientSigOutcome::Verified => SigState::Valid,
-            crate::connection::messaging::ClientSigOutcome::Failed => {
+            crate::connection::messaging::ClientSigVerdict::Valid => SigState::Valid,
+            crate::connection::messaging::ClientSigVerdict::Invalid => {
                 // Evidence of tampering. Refused outright, the same as at
                 // live ingress: a failing signature is never filed.
                 tracing::warn!(
@@ -3361,7 +3361,7 @@ pub(crate) fn apply_replayed_event(
                 );
                 return ReplayOutcome::Unusable;
             }
-            crate::connection::messaging::ClientSigOutcome::Unverifiable(_) => {
+            crate::connection::messaging::ClientSigVerdict::Unverifiable(_) => {
                 SigState::Unverifiable
             }
         },
@@ -3758,16 +3758,16 @@ fn replayed_signature_verdict(
     state: &Arc<SharedState>,
     ev: &crate::s2s::ReplayedEvent,
     sig: &str,
-) -> crate::connection::messaging::ClientSigOutcome {
-    use crate::connection::messaging::{ClientSigOutcome, NO_KEY_ON_FILE};
+) -> crate::connection::messaging::ClientSigVerdict {
+    use crate::connection::messaging::{ClientSigVerdict, NO_KEY_ON_FILE};
     let Some(did) = ev.actor_did.as_deref() else {
-        return ClientSigOutcome::Unverifiable("replayed event names no actor");
+        return ClientSigVerdict::Unverifiable("replayed event names no actor");
     };
     let outcome =
         crate::connection::messaging::verify_canonical_bytes(state, did, &ev.canonical, sig);
     // A signer we hold no key for: ask its home server, off this path, so the
     // next replay of theirs gets a real verdict.
-    if let ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE) = outcome {
+    if let ClientSigVerdict::Unverifiable(NO_KEY_ON_FILE) = outcome {
         crate::peer_keys::fetch_from_any_peer(state, did, sig);
     }
     outcome
@@ -4291,7 +4291,7 @@ pub(crate) async fn process_s2s_message(
                         "Relayed message was altered by our own sanitizer ({v:?} discarded)"
                     );
                     Some(
-                        crate::connection::messaging::ClientSigOutcome::Unverifiable(
+                        crate::connection::messaging::ClientSigVerdict::Unverifiable(
                             "sanitized on receipt",
                         ),
                     )
@@ -4299,27 +4299,27 @@ pub(crate) async fn process_s2s_message(
                 other => other,
             };
             if let Some(verdict) = sig_verdict {
-                use crate::connection::messaging::{ClientSigOutcome, NO_KEY_ON_FILE};
+                use crate::connection::messaging::{ClientSigVerdict, NO_KEY_ON_FILE};
                 // A signer we hold no key for. Ask its home server — off this
                 // path, so nothing waits: the message is already on its way,
                 // labeled honestly, and the answer serves the next one.
-                if let (ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE), Some(did), Some(sig)) =
+                if let (ClientSigVerdict::Unverifiable(NO_KEY_ON_FILE), Some(did), Some(sig)) =
                     (verdict, account.as_deref(), sig.as_deref())
                 {
                     crate::peer_keys::fetch_on_miss(state, &origin, did, sig);
                 }
                 match verdict {
-                    ClientSigOutcome::Verified => tracing::debug!(
+                    ClientSigVerdict::Valid => tracing::debug!(
                         peer = %authenticated_peer_id, target = %target,
                         "Relayed message signature verified against the sender's own key"
                     ),
-                    ClientSigOutcome::Failed => tracing::warn!(
+                    ClientSigVerdict::Invalid => tracing::warn!(
                         peer = %authenticated_peer_id, target = %target, from = %from,
                         account = ?account, msgid = ?msgid,
                         "Relayed message signature did not verify against the key it names — \
                          dropping the message"
                     ),
-                    ClientSigOutcome::Unverifiable(why) => tracing::debug!(
+                    ClientSigVerdict::Unverifiable(why) => tracing::debug!(
                         peer = %authenticated_peer_id, target = %target, why = %why,
                         "Relayed message signature cannot be checked here"
                     ),
@@ -4331,7 +4331,7 @@ pub(crate) async fn process_s2s_message(
             // disagreed — passing on the words alone would put text under the
             // sender's name that the evidence on the wire says is not theirs,
             // and would hide the one fact worth knowing about it.
-            if sig_verdict == Some(crate::connection::messaging::ClientSigOutcome::Failed) {
+            if sig_verdict == Some(crate::connection::messaging::ClientSigVerdict::Invalid) {
                 return;
             }
 
@@ -4395,7 +4395,7 @@ pub(crate) async fn process_s2s_message(
             if edit_of.is_some()
                 && let Some(actor) = account.as_deref()
                 && crate::connection::messaging::signing_venue(state, actor, &target).is_some()
-                && sig_verdict != Some(crate::connection::messaging::ClientSigOutcome::Verified)
+                && sig_verdict != Some(crate::connection::messaging::ClientSigVerdict::Valid)
             {
                 tracing::warn!(
                     peer = %authenticated_peer_id, origin = %origin, target = %target,
@@ -4459,7 +4459,7 @@ pub(crate) async fn process_s2s_message(
             let event_ctx = crate::events::EventContext {
                 sig_state: match (&sig, sig_verdict) {
                     (None, _) => crate::events::SigState::Unsigned,
-                    (Some(_), Some(crate::connection::messaging::ClientSigOutcome::Verified)) => {
+                    (Some(_), Some(crate::connection::messaging::ClientSigVerdict::Valid)) => {
                         crate::events::SigState::Valid
                     }
                     _ => crate::events::SigState::Unverifiable,
@@ -4817,7 +4817,7 @@ pub(crate) async fn process_s2s_message(
                         state,
                         account.as_deref().filter(|_| {
                             sig_verdict
-                                == Some(crate::connection::messaging::ClientSigOutcome::Verified)
+                                == Some(crate::connection::messaging::ClientSigVerdict::Valid)
                         }),
                     ),
                 );
@@ -4957,8 +4957,8 @@ pub(crate) async fn process_s2s_message(
             let sig_verdict =
                 verify_relayed_mutation_tags(state, peer_account.as_deref(), &target, &tags);
             if let Some(verdict) = sig_verdict {
-                use crate::connection::messaging::{ClientSigOutcome, NO_KEY_ON_FILE};
-                if let (ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE), Some(did), Some(sig)) = (
+                use crate::connection::messaging::{ClientSigVerdict, NO_KEY_ON_FILE};
+                if let (ClientSigVerdict::Unverifiable(NO_KEY_ON_FILE), Some(did), Some(sig)) = (
                     verdict,
                     peer_account.as_deref(),
                     tags.get("+freeq.at/sig").map(String::as_str),
@@ -4966,17 +4966,17 @@ pub(crate) async fn process_s2s_message(
                     crate::peer_keys::fetch_on_miss(state, &origin, did, sig);
                 }
                 match verdict {
-                    ClientSigOutcome::Verified => tracing::debug!(
+                    ClientSigVerdict::Valid => tracing::debug!(
                         peer = %authenticated_peer_id, target = %target,
                         "Relayed mutation signature verified against the actor's own key"
                     ),
-                    ClientSigOutcome::Failed => tracing::warn!(
+                    ClientSigVerdict::Invalid => tracing::warn!(
                         peer = %authenticated_peer_id, target = %target, from = %from,
                         account = ?peer_account,
                         "Relayed mutation signature did not verify against the key it names — \
                          stripping it before relay"
                     ),
-                    ClientSigOutcome::Unverifiable(why) => tracing::debug!(
+                    ClientSigVerdict::Unverifiable(why) => tracing::debug!(
                         peer = %authenticated_peer_id, target = %target, why = %why,
                         "Relayed mutation signature cannot be checked here"
                     ),
@@ -5046,7 +5046,7 @@ pub(crate) async fn process_s2s_message(
                 // refuse an event nothing could ever have proven.
                 && relayed_mutation_in(&tags).is_some_and(|(.., subject, _)| subject.is_some())
                 && crate::connection::messaging::signing_venue(state, actor, &target).is_some()
-                && sig_verdict != Some(crate::connection::messaging::ClientSigOutcome::Verified)
+                && sig_verdict != Some(crate::connection::messaging::ClientSigVerdict::Valid)
             {
                 tracing::warn!(
                     peer = %authenticated_peer_id, origin = %origin, target = %target,
@@ -5093,9 +5093,10 @@ pub(crate) async fn process_s2s_message(
             // answered 404 for an act this server had itself applied.
             //
             // The verdict is this server's own. A peer's assurance about a
-            // signature is not evidence, so `Valid` is recorded only where the
-            // check above returned Verified — and a signature that failed was
-            // stripped from `tags` already, so it cannot reach a row at all.
+            // signature is not evidence, so `SigState::Valid` is recorded only
+            // where the check above returned `Valid` — and an invalid
+            // signature was stripped from `tags` already, so it cannot reach a
+            // row at all.
             //
             // The signature rides only when the DID the check ran against is
             // the one the document will bind, and only while the subject is
@@ -5134,7 +5135,7 @@ pub(crate) async fn process_s2s_message(
                 venue: relayed_venue.as_deref(),
                 ctx: crate::events::EventContext {
                     sig_state: if sig_verdict
-                        == Some(crate::connection::messaging::ClientSigOutcome::Verified)
+                        == Some(crate::connection::messaging::ClientSigVerdict::Valid)
                     {
                         crate::events::SigState::Valid
                     } else {
@@ -5277,7 +5278,7 @@ pub(crate) async fn process_s2s_message(
                 // The sender's own other devices here get this only when the
                 // signature checked out: that delivery puts the event in the
                 // named identity's own client as something they did.
-                sig_verdict == Some(crate::connection::messaging::ClientSigOutcome::Verified),
+                sig_verdict == Some(crate::connection::messaging::ClientSigVerdict::Valid),
             );
         }
 
@@ -7003,7 +7004,7 @@ mod s2s_adversarial_tests {
     // the document is rebuilt from the bytes that arrived, and the three
     // answers stay distinct (checks out / does not check out / cannot tell).
 
-    use crate::connection::messaging::ClientSigOutcome;
+    use crate::connection::messaging::ClientSigVerdict;
 
     const SIGNER: &str = "did:plc:relayedsigner";
 
@@ -7055,7 +7056,7 @@ mod s2s_adversarial_tests {
         text: &str,
         tags: &HashMap<String, String>,
         sig: Option<&str>,
-    ) -> Option<crate::connection::messaging::ClientSigOutcome> {
+    ) -> Option<crate::connection::messaging::ClientSigVerdict> {
         verify_relayed_privmsg(state, account, target, msgid, text, tags, None, None, sig)
     }
 
@@ -7075,7 +7076,7 @@ mod s2s_adversarial_tests {
                 &HashMap::new(),
                 Some(&sig),
             ),
-            Some(ClientSigOutcome::Verified)
+            Some(ClientSigVerdict::Valid)
         );
     }
 
@@ -7098,7 +7099,7 @@ mod s2s_adversarial_tests {
                 &HashMap::new(),
                 Some(&sig),
             ),
-            Some(ClientSigOutcome::Failed),
+            Some(ClientSigVerdict::Invalid),
             "a body changed in flight must not verify"
         );
     }
@@ -7121,7 +7122,7 @@ mod s2s_adversarial_tests {
                 &HashMap::new(),
                 Some(&sig),
             ),
-            Some(ClientSigOutcome::Failed),
+            Some(ClientSigVerdict::Invalid),
             "a signed event replayed into another channel must not verify"
         );
     }
@@ -7147,7 +7148,7 @@ mod s2s_adversarial_tests {
                     &HashMap::new(),
                     Some(&sig),
                 ),
-                Some(ClientSigOutcome::Unverifiable(_))
+                Some(ClientSigVerdict::Unverifiable(_))
             ),
             "a relayed message with no event id is uncheckable, not forged"
         );
@@ -7172,7 +7173,7 @@ mod s2s_adversarial_tests {
                 &HashMap::new(),
                 Some(&sig),
             ),
-            Some(ClientSigOutcome::Unverifiable(_))
+            Some(ClientSigVerdict::Unverifiable(_))
         ));
     }
 
@@ -7195,7 +7196,7 @@ mod s2s_adversarial_tests {
                 &HashMap::new(),
                 Some(&sig),
             ),
-            Some(ClientSigOutcome::Unverifiable(_))
+            Some(ClientSigVerdict::Unverifiable(_))
         ));
     }
 
@@ -7255,7 +7256,7 @@ mod s2s_adversarial_tests {
                 Some(&lines),
                 Some(&sig),
             ),
-            Some(ClientSigOutcome::Verified),
+            Some(ClientSigVerdict::Valid),
             "a multiline body must be reassembled before it is hashed"
         );
 
@@ -7273,7 +7274,7 @@ mod s2s_adversarial_tests {
                 None,
                 Some(&sig),
             ),
-            Some(ClientSigOutcome::Verified)
+            Some(ClientSigVerdict::Valid)
         );
     }
 
@@ -7308,7 +7309,7 @@ mod s2s_adversarial_tests {
                 &tags,
                 Some(&sig),
             ),
-            Some(ClientSigOutcome::Verified),
+            Some(ClientSigVerdict::Valid),
             "the reply reference must be part of the rebuilt document"
         );
 
@@ -7699,14 +7700,14 @@ mod s2s_adversarial_tests {
 
         assert_eq!(
             verify_relayed_mutation_tags(&state, Some(SIGNER), "#chat", &tags("01SUBJECTMSGID")),
-            Some(ClientSigOutcome::Verified)
+            Some(ClientSigVerdict::Valid)
         );
 
         // The subject swapped in flight — the reaction moved onto a different
         // message than the one its author reacted to.
         assert_eq!(
             verify_relayed_mutation_tags(&state, Some(SIGNER), "#chat", &tags("01OTHERMESSAGE")),
-            Some(ClientSigOutcome::Failed),
+            Some(ClientSigVerdict::Invalid),
             "a mutation whose subject was swapped must not verify"
         );
     }
@@ -7722,7 +7723,7 @@ mod s2s_adversarial_tests {
         ]);
         assert!(matches!(
             verify_relayed_mutation_tags(&state, Some(SIGNER), "#chat", &tags),
-            Some(ClientSigOutcome::Unverifiable(_))
+            Some(ClientSigVerdict::Unverifiable(_))
         ));
     }
 
@@ -7919,7 +7920,7 @@ mod s2s_adversarial_tests {
                 &HashMap::new(),
                 Some(&sig),
             ),
-            Some(crate::connection::messaging::ClientSigOutcome::Verified),
+            Some(crate::connection::messaging::ClientSigVerdict::Valid),
             "a relayed message signed with a retired key must still verify"
         );
 
@@ -7947,7 +7948,7 @@ mod s2s_adversarial_tests {
                 &canonical,
                 &mutation_sig,
             ),
-            crate::connection::messaging::ClientSigOutcome::Verified,
+            crate::connection::messaging::ClientSigVerdict::Valid,
             "a replayed event signed with a retired key must still verify"
         );
     }
@@ -7989,7 +7990,7 @@ mod s2s_adversarial_tests {
         // Addressed to the recipient's DID: the pair is on the wire already.
         assert_eq!(
             verify_relayed_mutation_tags(&state, Some(SIGNER), recipient, &tags),
-            Some(ClientSigOutcome::Verified),
+            Some(ClientSigVerdict::Valid),
         );
 
         // Addressed to a nick this server can resolve to that same DID — the
@@ -8000,7 +8001,7 @@ mod s2s_adversarial_tests {
             .insert("recipient".to_string(), recipient.to_string());
         assert_eq!(
             verify_relayed_mutation_tags(&state, Some(SIGNER), "recipient", &tags),
-            Some(ClientSigOutcome::Verified),
+            Some(ClientSigVerdict::Valid),
             "a nick and a DID name one conversation, and one venue",
         );
 
@@ -8009,7 +8010,7 @@ mod s2s_adversarial_tests {
         assert!(
             matches!(
                 verify_relayed_mutation_tags(&state, Some(SIGNER), "astranger", &tags),
-                Some(ClientSigOutcome::Unverifiable(_))
+                Some(ClientSigVerdict::Unverifiable(_))
             ),
             "an unresolvable recipient is uncheckable, not forged",
         );
