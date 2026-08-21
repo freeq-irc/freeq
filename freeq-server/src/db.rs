@@ -258,9 +258,16 @@ pub enum ActWrite {
     Recorded,
     /// The rules refused the move.
     Refused(freeq_sdk::act_transitions::Refusal),
-    /// The event names a task this server has never filed — including any
-    /// task belonging to another server, until federation lands.
+    /// The event names a task this server has never filed. A task another
+    /// server opened counts as filed once its opener has crossed — what stays
+    /// unknown is a follow-up to an opener this server never saw. The live
+    /// link is ordered per peer, so on a healthy one the opener arrives first;
+    /// closing a gap left by an unhealthy one is catch-up's job.
     UnknownTask,
+    /// The event belongs to a task another server owns, and it is one that
+    /// would move that task. Filed in the log — it happened — and deliberately
+    /// not applied to the view: the owning server referees its own tasks.
+    StoredNotApplied,
     /// The event was posted outside its task's conversation.
     WrongVenue,
     /// That id is already in the log.
@@ -2788,6 +2795,165 @@ mod tests {
         .unwrap()
     }
 
+    /// The same two moves, arriving from a peer instead of a local client.
+    /// `origin` is what tells the view whose task this is.
+    fn relayed_offer(db: &Db, id: &str, venue: &str, origin: &str, ts: i64) -> ActWrite {
+        let tags = vec![
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "offer"),
+            ("+freeq.at/from", ELIZA),
+        ];
+        let canonical = act_doc(&tags, venue, id);
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: id,
+            act_id: id,
+            opens: true,
+            venue,
+            actor: ELIZA,
+            from_system: false,
+            origin: Some(origin),
+            timestamp: ts,
+        })
+        .unwrap()
+    }
+
+    fn relayed_follow_up(
+        db: &Db,
+        verb: &str,
+        actor: &str,
+        task: &str,
+        id: &str,
+        venue: &str,
+        origin: &str,
+        ts: i64,
+    ) -> ActWrite {
+        let canonical = act_doc(
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", verb),
+                ("+freeq.at/from", actor),
+                ("+freeq.at/act-id", task),
+            ],
+            venue,
+            id,
+        );
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: id,
+            act_id: task,
+            opens: false,
+            venue,
+            actor,
+            from_system: false,
+            origin: Some(origin),
+            timestamp: ts,
+        })
+        .unwrap()
+    }
+
+    // ── whose task is it ──────────────────────────────────────────────────
+
+    /// An offer relayed from a peer creates the task here, stamped with the
+    /// server that owns it. Nothing else can tell later events whose task
+    /// they are addressing.
+    #[test]
+    fn a_task_opened_by_a_peer_is_stamped_with_whose_it_is() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(
+            relayed_offer(&db, "R1", "#ops", "peer-b", 10),
+            ActWrite::Filed {
+                was: None,
+                state: "open".into()
+            }
+        );
+        let task = db.act_task("R1").unwrap().expect("the task is live");
+        assert_eq!(task.origin, "peer-b");
+    }
+
+    /// A move that changes where a peer's task stands is filed and stops
+    /// there. Deciding it here would be this server ruling on work another
+    /// server is refereeing.
+    #[test]
+    fn a_state_transition_on_a_peers_task_is_filed_but_not_applied() {
+        let db = Db::open_memory().unwrap();
+        relayed_offer(&db, "R2", "#ops", "peer-b", 10);
+        assert_eq!(
+            relayed_follow_up(&db, "claim", SCHOLAR, "R2", "E2", "#ops", "peer-b", 20),
+            ActWrite::StoredNotApplied
+        );
+
+        let task = db.act_task("R2").unwrap().expect("still live");
+        assert_eq!(task.state, "open", "the view did not move");
+        assert_eq!(task.assignee, None, "and nobody was assigned here");
+        assert_eq!(task.updated, 10, "the row was not touched at all");
+        assert!(
+            db.is_act_event("E2").unwrap(),
+            "but the log gained the event — it happened, we just did not rule on it"
+        );
+    }
+
+    /// A move that adds to a peer's task without moving it goes through the
+    /// ordinary path: there is no state decision in it to usurp.
+    #[test]
+    fn an_additive_event_on_a_peers_task_reaches_the_view() {
+        let db = Db::open_memory().unwrap();
+        relayed_offer(&db, "R3", "#ops", "peer-b", 10);
+        // The state a claim would have left behind. Reached directly because
+        // this server does not apply the peer's claim — routing events home
+        // is what will close that gap.
+        db.conn
+            .execute(
+                "UPDATE act_actions SET state = 'assigned', assignee = ?2 WHERE act_id = ?1",
+                params!["R3", SCHOLAR],
+            )
+            .unwrap();
+
+        assert_eq!(
+            relayed_follow_up(&db, "progress", SCHOLAR, "R3", "E3", "#ops", "peer-b", 30),
+            ActWrite::Filed {
+                was: Some("assigned".into()),
+                state: "assigned".into()
+            }
+        );
+        let task = db.act_task("R3").unwrap().expect("still live");
+        assert_eq!(task.state, "assigned");
+        assert_eq!(task.updated, 30, "the view saw the report");
+    }
+
+    /// Our own task is ours to decide, whichever link the event came in on.
+    #[test]
+    fn a_task_opened_here_is_decided_here_however_the_event_arrives() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "L1", "#ops", Some(SCHOLAR), 10);
+        assert_eq!(
+            relayed_follow_up(&db, "accept", SCHOLAR, "L1", "E4", "#ops", "peer-b", 20),
+            ActWrite::Filed {
+                was: Some("offered".into()),
+                state: "assigned".into()
+            }
+        );
+        let task = db.act_task("L1").unwrap().expect("still live");
+        assert_eq!(task.state, "assigned");
+        assert_eq!(task.assignee.as_deref(), Some(SCHOLAR));
+    }
+
+    /// A verb the rules file does not list is refused on a peer's task too.
+    /// The table is the shared contract; not refereeing a peer's decisions is
+    /// not the same as carrying anything at all.
+    #[test]
+    fn an_unknown_verb_on_a_peers_task_is_still_refused() {
+        let db = Db::open_memory().unwrap();
+        relayed_offer(&db, "R4", "#ops", "peer-b", 10);
+        assert_eq!(
+            relayed_follow_up(&db, "award", MALLORY, "R4", "E5", "#ops", "peer-b", 20),
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::UnknownVerb)
+        );
+        assert!(!db.is_act_event("E5").unwrap(), "and nothing was filed");
+    }
+
     #[test]
     fn an_offer_creates_the_task_it_opens() {
         let db = Db::open_memory().unwrap();
@@ -3641,6 +3807,14 @@ mod tests {
     /// log, and the log would have stopped being the record.
     #[test]
     fn the_view_rebuilt_from_the_log_equals_the_live_view() {
+        const BID_ONE: &str = "01M16HSB601BD0000000000000";
+        const BID_TWO: &str = "01M16HSB602BD1000000000000";
+        const AWARD: &str = "01M16HSB603AWARD0000000000";
+        const PROGRESS: &str = "01M16HSB604PRGRESS00000000";
+        const SUBMIT: &str = "01M16HSB605SBMT0000000000A";
+        const REVISE: &str = "01M16HSB606REVSE0000000000";
+        const SUBMIT_AGAIN: &str = "01M16HSB607SBMT0000000000B";
+
         let db = Db::open_memory().unwrap();
         offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
         follow_up(&db, "accept", SCHOLAR, "T1", "E1", "#ops", 11);
@@ -3681,15 +3855,18 @@ mod tests {
             "#ops",
             51,
         );
-        bounty_step(&db, "bid", SCHOLAR, "B1", "BID0", None, "#ops", 51);
-        bounty_step(&db, "bid", MALLORY, "B1", "BID1", None, "#ops", 52);
-        bounty_step(&db, "award", ELIZA, "B1", "AW", Some("BID1"), "#ops", 53);
-        bounty_step(&db, "progress", MALLORY, "B1", "PR", None, "#ops", 54);
+        // The ids are mint-ordered, because that is the order a rebuild
+        // replays in: an award names a bid, and a bid it has not reached yet
+        // is a bid it cannot resolve.
+        bounty_step(&db, "bid", SCHOLAR, "B1", BID_ONE, None, "#ops", 51);
+        bounty_step(&db, "bid", MALLORY, "B1", BID_TWO, None, "#ops", 52);
+        bounty_step(&db, "award", ELIZA, "B1", AWARD, Some(BID_TWO), "#ops", 53);
+        bounty_step(&db, "progress", MALLORY, "B1", PROGRESS, None, "#ops", 54);
         // …and into review and back out again, so the rebuild replays the
         // states only a bounty has.
-        bounty_step(&db, "submit", MALLORY, "B1", "SB", None, "#ops", 55);
-        bounty_step(&db, "revise", ELIZA, "B1", "RV", None, "#ops", 56);
-        bounty_step(&db, "submit", MALLORY, "B1", "SB2", None, "#ops", 57);
+        bounty_step(&db, "submit", MALLORY, "B1", SUBMIT, None, "#ops", 55);
+        bounty_step(&db, "revise", ELIZA, "B1", REVISE, None, "#ops", 56);
+        bounty_step(&db, "submit", MALLORY, "B1", SUBMIT_AGAIN, None, "#ops", 57);
 
         let venues = vec!["#ops".to_string(), "#other".to_string()];
         let mut live = db.act_tasks(&venues, None, None, None, 100).unwrap();
@@ -3703,6 +3880,149 @@ mod tests {
             "the declined one left the view; its revival and the bounties did not"
         );
         assert_eq!(rebuilt, live);
+    }
+
+    /// A rebuild replays in **mint** order, which is the event id's order.
+    ///
+    /// The row timestamp is when *this* server took delivery, and it differs
+    /// on every server that took the same events — ordering by it makes the
+    /// rebuilt view a function of who was up when. A signed event id is a
+    /// ULID, so its byte order is the order its signer minted in, and every
+    /// server reads the same order out of it.
+    ///
+    /// Here delivery order and id order disagree. Replayed by timestamp, the
+    /// completion arrives before the acceptance that makes it legal, gets
+    /// dropped, and the task survives in the view; replayed by id, the task
+    /// completes and leaves — which is what the live view shows.
+    #[test]
+    fn a_rebuild_replays_in_mint_order_and_not_delivery_order() {
+        let db = Db::open_memory().unwrap();
+        // The opener's id deliberately sorts *after* both follow-ups: a task's
+        // opener has to be applied first whatever its id, and nothing about
+        // sorting by id guarantees that on its own.
+        const OPENER: &str = "01ZOPENER00000000000000000";
+        offer(&db, OPENER, "#ops", Some(SCHOLAR), 100);
+        assert_eq!(
+            follow_up(&db, "accept", SCHOLAR, OPENER, "01ACCEPT", "#ops", 300),
+            ActWrite::Filed {
+                was: Some("offered".into()),
+                state: "assigned".into()
+            }
+        );
+        assert_eq!(
+            follow_up(&db, "complete", SCHOLAR, OPENER, "01COMPLETE", "#ops", 200),
+            ActWrite::Filed {
+                was: Some("assigned".into()),
+                state: "completed".into()
+            }
+        );
+
+        let live = db
+            .act_tasks(&["#ops".to_string()], None, None, None, 100)
+            .unwrap();
+        assert!(live.is_empty(), "the task completed and left the live view");
+        assert_eq!(
+            db.rebuild_act_actions().unwrap(),
+            live,
+            "the rebuilt view must agree — by id the completion lands, by \
+             delivery time it arrives too early and is dropped"
+        );
+    }
+
+    /// A signed event the rules refuse does not enter a rebuilt view.
+    ///
+    /// The log is not a list of legal moves. A transition on a task another
+    /// server owns is filed here without being ruled on — that server referees
+    /// it — so the log genuinely holds events this server never checked. A
+    /// rebuild that assumed otherwise would let one of them in.
+    #[test]
+    fn a_peers_illegal_event_does_not_enter_the_rebuilt_view() {
+        let db = Db::open_memory().unwrap();
+        relayed_offer(&db, "R1", "#ops", "peer-b", 10);
+        relayed_follow_up(&db, "claim", SCHOLAR, "R1", "R2", "#ops", "peer-b", 11);
+
+        // Filed unruled, both of them: completion by someone who is not the
+        // assignee, and expiry by someone who is not a server.
+        assert_eq!(
+            relayed_follow_up(&db, "complete", MALLORY, "R1", "R3", "#ops", "peer-b", 12),
+            ActWrite::StoredNotApplied
+        );
+        assert_eq!(
+            relayed_follow_up(&db, "expire", MALLORY, "R1", "R4", "#ops", "peer-b", 13),
+            ActWrite::StoredNotApplied
+        );
+        assert_eq!(
+            db.act_task_events("R1").unwrap().len(),
+            4,
+            "all four are in the log, which is what makes this the hard case"
+        );
+
+        let rebuilt = db.rebuild_act_actions().unwrap();
+        let task = rebuilt
+            .iter()
+            .find(|t| t.act_id == "R1")
+            .expect("the task is still live: neither refused event moved it");
+        assert_ne!(
+            task.state, "completed",
+            "a completion by someone who is not the assignee is not a completion"
+        );
+        assert_ne!(
+            task.state, "expired",
+            "and only a server may expire — an actor that is not one never counts \
+             as the system"
+        );
+    }
+
+    /// A server's own expiry still rebuilds, because a server *is* the system.
+    ///
+    /// The counterpart to the test above: deriving `is_system` from the actor
+    /// has to keep saying yes to the one sender the rule was written for.
+    #[test]
+    fn a_servers_own_expiry_rebuilds_as_the_system_event_it_is() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
+        follow_up(&db, "accept", SCHOLAR, "T1", "T2", "#ops", 11);
+        // Filed the way the expiry sweep files its own: signed by the server,
+        // under the server's identity.
+        let server = crate::server::server_did("irc.example");
+        let canonical = act_doc(
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "expire"),
+                ("+freeq.at/from", server.as_str()),
+                ("+freeq.at/act-id", "T1"),
+            ],
+            "#ops",
+            "T3",
+        );
+        assert_eq!(
+            db.apply_act_event(&ActEvent {
+                canonical: &canonical,
+                signature: Some("ed25519:kid:sig"),
+                event_id: "T3",
+                act_id: "T1",
+                opens: false,
+                venue: "#ops",
+                actor: &server,
+                from_system: true,
+                origin: None,
+                timestamp: 12,
+            })
+            .unwrap(),
+            ActWrite::Filed {
+                was: Some("assigned".into()),
+                state: "expired".into()
+            },
+            "the sweep's own event is a system event"
+        );
+
+        assert!(
+            db.rebuild_act_actions()
+                .unwrap()
+                .iter()
+                .all(|t| t.act_id != "T1"),
+            "an expired task is gone from the rebuilt view too"
+        );
     }
 
     #[test]
@@ -3836,14 +4156,47 @@ mod tests {
             "peer.example",
             10,
         );
-        for task in ["B-local", "B-remote"] {
-            let bid = format!("{task}-BID");
-            bounty_step(&db, "bid", SCHOLAR, task, &bid, None, "#ops", 11);
-            let award = format!("{task}-AW");
-            bounty_step(&db, "award", ELIZA, task, &award, Some(&bid), "#ops", 12);
-            let submit = format!("{task}-S");
-            bounty_step(&db, "submit", SCHOLAR, task, &submit, None, "#ops", 13);
-        }
+        bounty_step(
+            &db,
+            "bid",
+            SCHOLAR,
+            "B-local",
+            "B-local-BID",
+            None,
+            "#ops",
+            11,
+        );
+        bounty_step(
+            &db,
+            "award",
+            ELIZA,
+            "B-local",
+            "B-local-AW",
+            Some("B-local-BID"),
+            "#ops",
+            12,
+        );
+        bounty_step(
+            &db,
+            "submit",
+            SCHOLAR,
+            "B-local",
+            "B-local-S",
+            None,
+            "#ops",
+            13,
+        );
+        // The peer's bounty is under review because its own home put it
+        // there. It cannot be driven there from here: a move that changes
+        // where another server's task stands is filed and not applied, so the
+        // row is set to what that server says it is.
+        db.conn
+            .execute(
+                "UPDATE act_actions SET state = 'under_review', assignee = ?2, updated = 13 \
+                 WHERE act_id = ?1",
+                params!["B-remote", SCHOLAR],
+            )
+            .unwrap();
 
         let states = freeq_sdk::act_transitions::review_timeout_states();
         let waiting = db.act_tasks_idle_in_states(&states, 100, 10).unwrap();
@@ -6536,10 +6889,15 @@ impl Db {
             if !ev.from_system {
                 return Ok(ActWrite::Refused(rules::Refusal::ClientConfirm));
             }
+            // The same context every other task event's row gets, so a
+            // receipt relayed from a peer names the link it arrived on. The
+            // row is all it is: whether the peer that carried it is the
+            // task's home, and what the event it names should do, are
+            // questions nothing here asks yet.
             let record = EventRecord {
                 shape: EventShape::Document(ev.canonical),
                 signature: ev.signature,
-                ctx: crate::events::EventContext::verified(),
+                ctx: self.act_context(ev),
                 timestamp: ev.timestamp as u64,
             };
             if !self.insert_event(&record)? {
@@ -6607,6 +6965,28 @@ impl Db {
             if task.venue != ev.venue {
                 return Ok(ActWrite::WrongVenue);
             }
+            // ── whose task is it ──
+            //
+            // A task another server opened is that server's to referee. An
+            // event that would move it is filed here and goes no further:
+            // deciding it would make two servers the authority over one task,
+            // and disagreeing about which. An additive move carries no state
+            // decision to usurp, so it takes the ordinary path below. Which is
+            // which comes out of the rules file, never a list of verbs here.
+            if !task.origin.is_empty() && rules::is_additive(&task.kind, &view.verb) == Some(false)
+            {
+                let record = EventRecord {
+                    shape: EventShape::Document(ev.canonical),
+                    signature: ev.signature,
+                    ctx: self.act_context(ev),
+                    timestamp: ev.timestamp as u64,
+                };
+                if !self.insert_event(&record)? {
+                    return Ok(ActWrite::Duplicate);
+                }
+                tx.commit()?;
+                return Ok(ActWrite::StoredNotApplied);
+            }
             let present: Vec<&str> = view.fields.keys().map(String::as_str).collect();
             // The bid an award takes, resolved before the checker is asked:
             // the checker reads no log, so the lookup is ours. Only a bid
@@ -6624,9 +7004,17 @@ impl Db {
                 accepts,
                 fields: &present,
             };
+            // Whether this event arrived on the link of the server that
+            // referees the task. Our own events carry no origin at all.
+            let from_home = !task.origin.is_empty() && ev.origin == Some(task.origin.as_str());
             let sender = rules::Sender {
                 did: ev.actor,
-                is_system: ev.from_system,
+                // The server itself, and only where a server may be speaking
+                // as one: our own events (no origin), or the home's about its
+                // own task. A peer relaying an event signed under some
+                // `did:web:` name is not thereby the system here — without
+                // this, any peer whose key we hold could expire our tasks.
+                is_system: ev.from_system && (ev.origin.is_none() || from_home),
                 accepted_bid: bid_author
                     .as_deref()
                     .map(|author| rules::AcceptedBid { author }),
@@ -6661,7 +7049,7 @@ impl Db {
         let record = EventRecord {
             shape: EventShape::Document(ev.canonical),
             signature: ev.signature,
-            ctx: crate::events::EventContext::verified(),
+            ctx: self.act_context(ev),
             timestamp: ev.timestamp as u64,
         };
         if !self.insert_event(&record)? {
@@ -6677,6 +7065,16 @@ impl Db {
         )?;
         tx.commit()?;
         Ok(ActWrite::Filed { was, state: landed })
+    }
+
+    /// The receipt facts for a task event's log row: this server checked the
+    /// signature itself before calling, and a relayed event says which link it
+    /// came in on, so a reader can tell a local event from a federated one.
+    fn act_context(&self, ev: &ActEvent<'_>) -> crate::events::EventContext {
+        crate::events::EventContext {
+            sig_state: crate::events::SigState::Valid,
+            origin: ev.origin.map(str::to_string),
+        }
     }
 
     /// Move the view to match an event that was just accepted.
@@ -7129,9 +7527,13 @@ impl Db {
     /// mismatch means some path wrote the view without going through the log,
     /// which is the one thing that would make the log stop being the record.
     pub fn rebuild_act_actions(&self) -> SqlResult<Vec<ActTask>> {
+        // Mint order, not delivery order. `timestamp` is when *this* server
+        // took the event, which differs on every server that took the same
+        // events; a signed event id is a ULID, so its byte order is the order
+        // its signers minted in and every server reads the same one out of it.
         let mut stmt = self.conn.prepare(
             "SELECT event_id, canonical, actor_did, venue, subject, origin, timestamp
-               FROM events WHERE kind = 'act' ORDER BY timestamp, event_id",
+               FROM events WHERE kind = 'act' ORDER BY event_id",
         )?;
         struct Row {
             event_id: String,
@@ -7142,7 +7544,7 @@ impl Db {
             origin: Option<String>,
             timestamp: i64,
         }
-        let rows: Vec<Row> = stmt
+        let mut rows: Vec<Row> = stmt
             .query_map([], |row| {
                 Ok(Row {
                     event_id: row.get(0)?,
@@ -7155,6 +7557,21 @@ impl Db {
                 })
             })?
             .collect::<SqlResult<_>>()?;
+
+        // Each task's opener, ahead of that task's follow-ups. In the field it
+        // already is — an opener's id is minted before the events that name it
+        // — but nothing about sorting by id *guarantees* it, and a follow-up
+        // replayed ahead of its opener names a task that does not exist yet
+        // and is silently dropped. A stable sort, so mint order survives
+        // inside each task; tasks are independent of one another here, so the
+        // grouping this imposes across them changes nothing.
+        rows.sort_by(|a, b| {
+            let key = |r: &Row| {
+                let act_id = r.subject.clone().unwrap_or_else(|| r.event_id.clone());
+                (act_id, r.subject.is_some())
+            };
+            key(a).cmp(&key(b))
+        });
 
         let mut live: std::collections::BTreeMap<String, ActTask> =
             std::collections::BTreeMap::new();
@@ -7227,10 +7644,12 @@ impl Db {
                     },
                     &freeq_sdk::act_transitions::Sender {
                         did: &row.actor,
-                        // The log holds only events this server accepted, and
-                        // it accepted this one — including an expiry it signed
-                        // itself, whose sender check already passed.
-                        is_system: true,
+                        // Read off the actor, never assumed. The log is not a
+                        // list of legal moves: an event on a task another
+                        // server owns is filed here unruled, so a rebuild that
+                        // took every row for pre-checked would let one in. A
+                        // server acts under `did:web:`; a person does not.
+                        is_system: crate::server::is_system_actor(&row.actor),
                         accepted_bid: named
                             .as_deref()
                             .map(|author| freeq_sdk::act_transitions::AcceptedBid { author }),

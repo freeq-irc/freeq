@@ -57,8 +57,7 @@ pub(super) struct Receipt {
 /// spelling of the vendor prefix.
 ///
 /// Reachable from the S2S receive path too: a task message relayed from a peer
-/// is gated on the capability exactly as a local one is, though this server
-/// neither verifies nor stores it until federation lands.
+/// is verified, stored and gated on the capability exactly as a local one is.
 pub(crate) fn carries_act_tags(tags: &HashMap<String, String>) -> bool {
     tags.keys().any(|name| is_act_tag(name))
 }
@@ -998,6 +997,14 @@ pub(super) fn gate(
         // Not reachable from here — a sender's confirm was refused above —
         // but the log's answer for one, and nothing to deliver either way.
         Some(crate::db::ActWrite::Recorded) => {}
+        // A local sender's move on a task another server owns. Filed, carried
+        // to the room, and not decided here — the owning server referees it.
+        // Nothing routes it there yet, so the sender sees their own event and
+        // no answer to it.
+        Some(crate::db::ActWrite::StoredNotApplied) => tracing::debug!(
+            session = %conn.id, did = %did, act_id = %act_id,
+            "Filed a task event without applying it: the task belongs to another server"
+        ),
         Some(crate::db::ActWrite::UnknownTask) => {
             tracing::debug!(
                 session = %conn.id, did = %did, act_id = %act_id,

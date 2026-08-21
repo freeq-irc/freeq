@@ -217,17 +217,32 @@ pub struct Capability {
 }
 
 /// Every capability this build declares. See [`Capability`] for the rules.
-pub const CAPABILITIES: &[Capability] = &[Capability {
-    name: CATCHUP,
-    // Added 2026-08-05. Retire at the next protocol_version bump, once no
-    // peer predates event replay.
-    gates: "CatchupRequest / CatchupEvents — replay of events missed while a link was down",
-}];
+pub const CAPABILITIES: &[Capability] = &[
+    Capability {
+        name: CATCHUP,
+        // Added 2026-08-05. Retire at the next protocol_version bump, once no
+        // peer predates event replay.
+        gates: "CatchupRequest / CatchupEvents — replay of events missed while a link was down",
+    },
+    Capability {
+        name: ACT,
+        // Added 2026-08-17. Retire at the next protocol_version bump, once no
+        // peer predates task events.
+        gates: "Tagmsg carrying task tags — a peer that cannot parse them could strip \
+                them in relay, and a stripped tag map breaks the signature downstream",
+    },
+];
 
 /// Catch-up replay. A peer that does not declare this is never sent
 /// [`S2sMessage::CatchupRequest`] or [`S2sMessage::CatchupEvents`]; it would
 /// warn-and-skip them, which is data loss dressed as compatibility.
 pub const CATCHUP: &str = "catchup";
+
+/// Task events. A peer that does not declare this is never sent a Tagmsg
+/// whose tags form a task document: a relay that strips tags it does not
+/// know would break the signature over them, and downstream that reads as
+/// forgery when the real cause is an old server.
+pub const ACT: &str = "act";
 
 /// The capability list this server advertises.
 pub fn our_capabilities() -> Vec<String> {
@@ -272,6 +287,15 @@ pub struct ReplayedEvent {
     /// A reaction's emoji, for an event with no canonical to carry it.
     #[serde(default)]
     pub emoji: Option<String>,
+    /// The server this event was **minted** at, not whoever is replaying it.
+    ///
+    /// A task's origin names the server that referees it, so an event healed
+    /// through a third party has to arrive still naming its minter. Empty from
+    /// a peer that predates this field, and the peer the link authenticated
+    /// stands in — for an honest peer that is the id it used to stamp the
+    /// whole batch, so an older peer is no worse off than it was.
+    #[serde(default)]
+    pub origin: String,
     pub timestamp: u64,
 }
 
@@ -604,7 +628,10 @@ pub enum S2sMessage {
     /// had to land before replay could.
     #[serde(rename = "catchup_events")]
     CatchupEvents {
-        /// The server that accepted these events.
+        /// The peer replaying this batch. Kept, not retired: it is the
+        /// fallback each event's own [`ReplayedEvent::origin`] falls back to
+        /// when the replying peer predates that field, and dropping it would
+        /// leave an older peer's events with no origin at all.
         origin: String,
         events: Vec<ReplayedEvent>,
         /// True when the answer was cut short by the cap, so the asker can
@@ -998,7 +1025,26 @@ impl S2sManager {
     }
 
     /// Internal: send a message directly to all connected peers (called by broadcast worker).
+    ///
+    /// Task events are the one message with a narrower audience: a Tagmsg
+    /// whose tags form a task document goes only to peers that declared
+    /// [`ACT`] in their Hello. The check lives here, on the one ordered path
+    /// every broadcast takes, so no call site can forget it.
     async fn broadcast_to_peers(&self, msg: S2sMessage) {
+        let act_event_id = match &msg {
+            S2sMessage::Tagmsg { event_id, tags, .. }
+                if crate::connection::act::carries_act_tags(tags) =>
+            {
+                Some(event_id.clone())
+            }
+            _ => None,
+        };
+        // Snapshot before taking the peers lock, never nested inside it.
+        let caps_by_peer = if act_event_id.is_some() {
+            Some(self.peer_capabilities.lock().await.clone())
+        } else {
+            None
+        };
         let peers = self.peers.lock().await;
         if peers.is_empty() {
             return;
@@ -1006,6 +1052,17 @@ impl S2sManager {
         for (peer_id, entry) in peers.iter() {
             if !self.may_relay_to(peer_id, &peers) {
                 continue;
+            }
+            if let (Some(event_id), Some(caps_by_peer)) = (&act_event_id, &caps_by_peer) {
+                let declared = caps_by_peer.get(peer_id).cloned().unwrap_or_default();
+                if !peer_supports(&declared, ACT) {
+                    tracing::info!(
+                        peer = %peer_id,
+                        event = %event_id,
+                        "S2S: task event withheld — peer did not declare the act capability"
+                    );
+                    continue;
+                }
             }
             if entry.tx.send(msg.clone()).await.is_err() {
                 tracing::warn!(peer = %peer_id, "S2S broadcast: failed to send to peer");
@@ -2559,6 +2616,158 @@ mod capability_tests {
         }
     }
 
+    /// Captures what the code under test logs, so a test can assert a skip
+    /// was loud. Cloned handles share one buffer.
+    #[derive(Clone, Default)]
+    struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+        type Writer = LogSink;
+        fn make_writer(&'a self) -> LogSink {
+            self.clone()
+        }
+    }
+
+    /// The act gate itself: a task-tagged Tagmsg reaches only peers that
+    /// declared [`ACT`]; every other message — the companion plain-text line
+    /// included — still reaches every peer, and each withheld send is logged
+    /// naming the peer and the event, so a wrong declaration never fails
+    /// silent.
+    ///
+    /// The federation harness cannot stage the withheld half end to end —
+    /// both of its servers run this build and declare every capability — so
+    /// this is where that half is pinned.
+    #[tokio::test]
+    async fn a_task_event_is_withheld_from_a_peer_that_did_not_declare_act() {
+        let sink = LogSink::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(sink.clone())
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        );
+        let secret = iroh::SecretKey::from_bytes(&rand::random::<[u8; 32]>());
+        let server_id = secret.public().to_string();
+        let (broadcast_tx, _) = mpsc::channel(1);
+        let (event_tx, _) = mpsc::channel(1);
+        let manager = S2sManager {
+            server_id,
+            server_name: "test".to_string(),
+            peers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            peer_names: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            event_tx,
+            event_counter: AtomicU64::new(0),
+            dedup: Arc::new(DedupSet::new()),
+            broadcast_tx,
+            conn_gen: Arc::new(AtomicU64::new(0)),
+            signing_key: Arc::new(secret),
+            trust_config: HashMap::new(),
+            pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            allowed_peers: Vec::new(),
+        };
+
+        let (cap_tx, mut cap_rx) = mpsc::channel(8);
+        let (plain_tx, mut plain_rx) = mpsc::channel(8);
+        {
+            let mut peers = manager.peers.lock().await;
+            peers.insert(
+                "cap-peer".into(),
+                PeerEntry {
+                    tx: cap_tx,
+                    conn_gen: 0,
+                },
+            );
+            peers.insert(
+                "plain-peer".into(),
+                PeerEntry {
+                    tx: plain_tx,
+                    conn_gen: 0,
+                },
+            );
+        }
+        {
+            let mut caps = manager.peer_capabilities.lock().await;
+            caps.insert("cap-peer".into(), vec![ACT.to_string()]);
+            // Declared something, just not `act` — an older build.
+            caps.insert("plain-peer".into(), vec![CATCHUP.to_string()]);
+        }
+
+        let tagmsg = |event_id: &str, tag: (&str, &str)| S2sMessage::Tagmsg {
+            event_id: event_id.to_string(),
+            from: "eliza!e@h".to_string(),
+            target: "#ops".to_string(),
+            tags: HashMap::from([(tag.0.to_string(), tag.1.to_string())]),
+            origin: "srv".to_string(),
+            account: None,
+        };
+
+        manager
+            .broadcast_to_peers(tagmsg("srv:1", ("+freeq.at/act", "handoff")))
+            .await;
+        assert!(
+            matches!(cap_rx.try_recv(), Ok(S2sMessage::Tagmsg { .. })),
+            "a peer that declared act receives the task event"
+        );
+        assert!(
+            plain_rx.try_recv().is_err(),
+            "a peer that did not declare act is not sent the task event"
+        );
+        let logged = String::from_utf8_lossy(&sink.0.lock().unwrap()).to_string();
+        assert!(
+            logged.contains("task event withheld")
+                && logged.contains("plain-peer")
+                && logged.contains("srv:1"),
+            "the skip must be logged naming the peer and the event, got: {logged}"
+        );
+
+        // An ordinary tag message — a reaction — is not narrowed.
+        manager
+            .broadcast_to_peers(tagmsg("srv:2", ("+react", "👍")))
+            .await;
+        assert!(matches!(cap_rx.try_recv(), Ok(S2sMessage::Tagmsg { .. })));
+        assert!(
+            matches!(plain_rx.try_recv(), Ok(S2sMessage::Tagmsg { .. })),
+            "an ordinary tag message still reaches every peer"
+        );
+
+        // The companion plain-text line a task sender posts alongside is an
+        // ordinary message: it reaches the peer the task event was withheld
+        // from.
+        manager
+            .broadcast_to_peers(S2sMessage::Privmsg {
+                event_id: "srv:3".to_string(),
+                from: "eliza!e@h".to_string(),
+                target: "#ops".to_string(),
+                text: "offered: cross-the-hop".to_string(),
+                origin: "srv".to_string(),
+                msgid: Some("M1".to_string()),
+                sig: None,
+                account: None,
+                recipient_did: None,
+                replaces_msgid: None,
+                tags: HashMap::new(),
+                multiline_lines: None,
+            })
+            .await;
+        assert!(matches!(cap_rx.try_recv(), Ok(S2sMessage::Privmsg { .. })));
+        assert!(
+            matches!(plain_rx.try_recv(), Ok(S2sMessage::Privmsg { .. })),
+            "the companion plain-text message still reaches a peer without act"
+        );
+    }
+
     /// A peer that declared nothing supports nothing. This is the rollout
     /// constraint in one line: a frozen peer's Hello has no capability field,
     /// deserializes to empty, and is therefore never sent a new message type.
@@ -2626,6 +2835,7 @@ mod capability_tests {
             actor_did: Some("did:plc:x".to_string()),
             subject: None,
             emoji: None,
+            origin: "minting-server".to_string(),
             timestamp: 42,
         };
         let json = serde_json::to_string(&S2sMessage::CatchupEvents {
@@ -2640,6 +2850,53 @@ mod capability_tests {
         );
         match serde_json::from_str::<S2sMessage>(&json).unwrap() {
             S2sMessage::CatchupEvents { events, .. } => assert_eq!(events, vec![ev]),
+            other => panic!("expected CatchupEvents, got {other:?}"),
+        }
+    }
+
+    /// The per-event origin is additive on the wire in both directions, which
+    /// is what lets it ship without a new capability name.
+    ///
+    /// A peer that predates the field sends a batch without it and reads a
+    /// batch containing it: serde fills the missing field from `default` and
+    /// ignores the unknown one, so neither end sees a parse error. The
+    /// fallback for an absent value is the batch-level origin, which is
+    /// precisely the behaviour that peer already had.
+    #[test]
+    fn a_catchup_batch_from_an_older_peer_still_parses() {
+        // Exactly what a build without the field emits.
+        let older = r##"{"type":"catchup_events","origin":"peer","events":[{
+            "event_id":"01OLD00000000000000000000",
+            "canonical":"",
+            "signature":null,
+            "kind":"message",
+            "venue":"#room",
+            "actor_did":"did:plc:x",
+            "subject":null,
+            "emoji":null,
+            "timestamp":42}],"more":false}"##;
+        match serde_json::from_str::<S2sMessage>(older).unwrap() {
+            S2sMessage::CatchupEvents { origin, events, .. } => {
+                assert_eq!(origin, "peer");
+                assert_eq!(
+                    events[0].origin, "",
+                    "an absent per-event origin reads as unset, not as a claim"
+                );
+            }
+            other => panic!("expected CatchupEvents, got {other:?}"),
+        }
+
+        // And a batch carrying a field an older build never heard of parses
+        // there too — nothing on this type refuses unknown fields.
+        let newer = r##"{"type":"catchup_events","origin":"peer","events":[{
+            "event_id":"01NEW00000000000000000000",
+            "kind":"message","venue":"#room","timestamp":42,
+            "origin":"minting-server",
+            "some_field_from_the_future":"ignored"}],"more":false}"##;
+        match serde_json::from_str::<S2sMessage>(newer).unwrap() {
+            S2sMessage::CatchupEvents { events, .. } => {
+                assert_eq!(events[0].origin, "minting-server");
+            }
             other => panic!("expected CatchupEvents, got {other:?}"),
         }
     }

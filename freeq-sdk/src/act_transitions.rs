@@ -415,6 +415,25 @@ pub fn knows_verb(kind: &str, verb: &str) -> bool {
         .is_some_and(|k| k.transitions.iter().any(|t| t.verb == verb))
 }
 
+/// Whether `verb` only ever lands a task back in the state it moved from.
+///
+/// The distinction the table already draws, asked out loud: an additive move
+/// records something about a task without changing where it stands, while a
+/// transition moves it. A server holding a task another server owns can carry
+/// the first and has no business deciding the second.
+///
+/// `None` when this kind lists no such verb — no row, no answer.
+pub fn is_additive(kind: &str, verb: &str) -> Option<bool> {
+    let kind = spec().kinds.get(kind)?;
+    let mut rows = kind
+        .transitions
+        .iter()
+        .filter(|t| t.verb == verb)
+        .peekable();
+    rows.peek()?;
+    Some(rows.all(|t| t.from.is_exactly(&t.to)))
+}
+
 /// Whether `state` is one this kind never leaves.
 pub fn is_terminal(kind: &str, state: &str) -> bool {
     spec()
@@ -637,6 +656,15 @@ impl FromStates {
             FromStates::One(s) if s == ANY_NONTERMINAL => !kind.terminal.iter().any(|t| t == state),
             FromStates::One(s) => s == state,
             FromStates::Many(states) => states.iter().any(|s| s == state),
+        }
+    }
+
+    /// Whether this `from` names that one state and nothing else. The wildcard
+    /// never qualifies: it covers states the `to` does not.
+    fn is_exactly(&self, state: &str) -> bool {
+        match self {
+            FromStates::One(s) => s != ANY_NONTERMINAL && s == state,
+            FromStates::Many(states) => states.len() == 1 && states[0] == state,
         }
     }
 }
@@ -869,6 +897,41 @@ mod tests {
             );
         }
         assert!(!knows_verb("approval", "request"), "no table, no verbs");
+    }
+
+    /// Which moves change where a task stands and which only add to its
+    /// record. Read out of the table, never restated as a list of verbs — a
+    /// kind added to the file answers this without a code change.
+    #[test]
+    fn the_table_says_which_moves_are_additive() {
+        assert_eq!(is_additive("handoff", "progress"), Some(true));
+        for verb in [
+            "accept", "decline", "claim", "complete", "fail", "cancel", "expire",
+        ] {
+            assert_eq!(is_additive("handoff", verb), Some(false), "{verb}");
+        }
+        assert_eq!(is_additive("handoff", "award"), None, "no row, no answer");
+        // The second kind, whose bids are the reason the distinction matters:
+        // a bid leaves a bounty open, so every server's bids are all visible.
+        assert_eq!(is_additive("bounty", "bid"), Some(true));
+        assert_eq!(is_additive("bounty", "progress"), Some(true));
+        for verb in [
+            "award",
+            "submit",
+            "revise",
+            "accept-work",
+            "forfeit",
+            "auto-accept",
+            "cancel",
+            "expire",
+        ] {
+            assert_eq!(is_additive("bounty", verb), Some(false), "{verb}");
+        }
+        assert_eq!(
+            is_additive("approval", "request"),
+            None,
+            "no table, no answer"
+        );
     }
 
     #[test]

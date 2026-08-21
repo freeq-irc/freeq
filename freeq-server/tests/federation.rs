@@ -77,6 +77,10 @@ struct TestServer {
     irc_addr: String,
     web_addr: String,
     db_path: String,
+    /// Where this server's stderr (its tracing output) is captured, so a test
+    /// can assert on what the server itself concluded — e.g. the observe-only
+    /// verdict it logs for a relayed task event.
+    log_path: String,
     /// The argv this server was spawned with, so it can be stopped and
     /// started again on the same data — which is what "a peer went away and
     /// came back" means.
@@ -94,9 +98,17 @@ impl TestServer {
 
     /// Start it again on the same data, same identity, same ports.
     async fn start_again(&mut self) {
+        let log = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.log_path)
+            .expect("reopen server log");
+        let log_err = log.try_clone().expect("clone server log handle");
         self.child = Command::new(env!("CARGO_BIN_EXE_freeq-server"))
             .args(&self.args)
-            .env("RUST_LOG", "freeq_server=warn")
+            .env("RUST_LOG", HARNESS_RUST_LOG)
+            .stdout(std::process::Stdio::from(log))
+            .stderr(std::process::Stdio::from(log_err))
             .spawn()
             .expect("respawn freeq-server");
         wait_port(&self.irc_addr).await;
@@ -109,6 +121,10 @@ impl Drop for TestServer {
         let _ = self.child.wait();
     }
 }
+
+/// Quiet by default, plus the observe-only task-event verdict lines, which
+/// one test reads back out of the server's captured log.
+const HARNESS_RUST_LOG: &str = "freeq_server=warn,freeq_server::act_relay=info";
 
 /// Bind an ephemeral port, read it, release it. Small reuse race; startup
 /// failure is retried by the caller if it bites.
@@ -214,9 +230,22 @@ fn spawn_server(plan: ServerPlan, peer: &PeerRef, resolver_entries: &str) -> Tes
     .map(|s| s.to_string())
     .collect();
 
+    let log_path = plan
+        .dir
+        .path()
+        .join("server.log")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let log = std::fs::File::create(&log_path).expect("create server log");
+    let log_err = log.try_clone().expect("clone server log handle");
     let child = Command::new(env!("CARGO_BIN_EXE_freeq-server"))
         .args(&args)
-        .env("RUST_LOG", "freeq_server=warn")
+        .env("RUST_LOG", HARNESS_RUST_LOG)
+        // Tracing writes to stdout; panics land on stderr. Both belong in
+        // the capture.
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err))
         .spawn()
         .expect("spawn freeq-server");
 
@@ -226,9 +255,31 @@ fn spawn_server(plan: ServerPlan, peer: &PeerRef, resolver_entries: &str) -> Tes
         irc_addr,
         web_addr,
         db_path,
+        log_path,
         args,
         serial: None,
     }
+}
+
+/// A server's captured tracing output, ANSI stripped so assertions can match
+/// the plain field text.
+fn server_log(server: &TestServer) -> String {
+    let raw = std::fs::read_to_string(&server.log_path).unwrap_or_default();
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // Skip an escape sequence through its final letter.
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Boot two mutually-peered servers, both resolving every `ids` DID offline.
@@ -1045,18 +1096,21 @@ async fn act_tagmsg_crosses_the_hop_with_its_signature() {
     };
     ha.raw(&format!("MSGSIG {pubkey}")).await.ok();
 
-    let venue = freeq_sdk::chatsig::channel_venue("#fact");
-    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
-    let mut crossed: Option<(String, String)> = None;
-    while tokio::time::Instant::now() < deadline {
+    /// Sign and send one fresh handoff offer into #fact; returns (sig, id).
+    async fn send_signed_offer(
+        ha: &client::ClientHandle,
+        from_did: &str,
+        venue: &str,
+        signing: &ed25519_dalek::SigningKey,
+    ) -> (String, String) {
         let id = freeq_sdk::chatsig::new_event_id();
         let act_tags: Vec<(&str, &str)> = vec![
             ("+freeq.at/act", "handoff"),
             ("+freeq.at/act-verb", "offer"),
-            ("+freeq.at/from", alice.did.as_str()),
+            ("+freeq.at/from", from_did),
             ("+freeq.at/act-title", "cross-the-hop"),
         ];
-        let sig = freeq_sdk::act::sign_act(act_tags.clone(), &venue, &id, &signing)
+        let sig = freeq_sdk::act::sign_act(act_tags.clone(), venue, &id, signing)
             .expect("act tags present");
         let wire: Vec<String> = act_tags
             .iter()
@@ -1069,6 +1123,14 @@ async fn act_tagmsg_crosses_the_hop_with_its_signature() {
         ha.raw(&format!("@{} TAGMSG #fact", wire.join(";")))
             .await
             .ok();
+        (sig, id)
+    }
+
+    let venue = freeq_sdk::chatsig::channel_venue("#fact");
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut crossed: Option<(String, String)> = None;
+    while tokio::time::Instant::now() < deadline {
+        let (sig, id) = send_signed_offer(&ha, &alice.did, &venue, &signing).await;
 
         if let Some(line) = watcher.maybe(|l| l.contains("+freeq.at/act="), 2000) {
             assert!(
@@ -1094,6 +1156,80 @@ async fn act_tagmsg_crosses_the_hop_with_its_signature() {
     assert!(
         deaf.maybe(|l| l.contains("+freeq.at/act"), 800).is_none(),
         "a relayed task message must not reach a connection without the capability"
+    );
+
+    // ── the receiving server's own verdict ──────────────────────────
+    //
+    // Server B checks every relayed task event and logs a verdict, observe-
+    // only. The first arrivals can honestly be unverifiable — B holds no key
+    // for this signer until its fetch-on-miss (triggered by exactly that
+    // verdict) fills the store off the delivery path — so keep sending fresh
+    // signed events until one earns B's own VALID. Reaching it proves the
+    // whole receive-side chain against a real hop: key fetched from the
+    // origin, venue and id rebuilt, signature checked by the receiver itself.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut valid_seen = false;
+    while tokio::time::Instant::now() < deadline {
+        let log = server_log(&srv_b);
+        if log
+            .lines()
+            .any(|l| l.contains("verdict=valid") && l.contains("target=#fact"))
+        {
+            valid_seen = true;
+            break;
+        }
+        // Another signed event, in case every earlier one arrived before the
+        // key did.
+        send_signed_offer(&ha, &alice.did, &venue, &signing).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert!(
+        valid_seen,
+        "the receiving server must reach its own VALID verdict for a relayed \
+         task event; its log says: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // ── and a valid verdict is what puts it on file ─────────────────
+    //
+    // The verdict decides: valid means stored, under the id the signer minted
+    // rather than one B made up, so B can answer for a task it did not host
+    // and a later replay recognises the event instead of reading it as a
+    // second claim. B holds A's key by now — that is what the loop above
+    // waited for — so one more offer is judged valid on arrival.
+    let (_, stored_id) = send_signed_offer(&ha, &alice.did, &venue, &signing).await;
+    let url = format!("http://{}/api/v1/actions/{stored_id}", srv_b.web_addr);
+    let client = reqwest::Client::new();
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut stored = serde_json::Value::Null;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(resp) = client.get(&url).send().await
+            && resp.status().is_success()
+            && let Ok(body) = resp.json::<serde_json::Value>().await
+        {
+            stored = body;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        stored["act_id"], stored_id,
+        "the receiving server must hold the crossed task event under the \
+         signer's own id: {stored}"
+    );
+    assert_eq!(
+        stored["task"]["offerer"], alice.did,
+        "filed against the identity that signed it: {stored}"
+    );
+    assert_eq!(stored["task"]["venue"], "#fact", "{stored}");
+    assert_ne!(
+        stored["task"]["origin"], "",
+        "and stamped with the server that owns the task, which is not this \
+         one: {stored}"
     );
 
     ha.quit(None).await.ok();
@@ -2378,5 +2514,277 @@ async fn federated_multiline_edit_stores_the_verified_body() {
 
     ha.quit(None).await.ok();
     hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── a server that was away heals its task view, not just its log ──
+//
+// The end-to-end half of feeding caught-up task events through the same
+// judgment live receiving uses. A server that misses a task's events while it
+// is down has to come back answering for that task the way a server that
+// stayed linked answers — same state, same origin, same events on file. Filing
+// the log row and stopping there left it holding every event of a task while
+// its REST view said there was no such task.
+//
+// Two servers rather than three: the harness peers a *pair*, and a third
+// server would need new peering plumbing and, worse, a signing key it has no
+// link to fetch from — a caught-up event whose signer's key is unknown is
+// skipped by design. The server that goes away has already been handed the
+// signer's key by the live path, so a restart stages the real thing without
+// any of that.
+//
+// The comparison is against the twin task this same server received live,
+// which is the honest reference: server A minted both tasks, so A referees
+// them and B does not — B's view of a task of A's is frozen at the opener
+// whether it arrived live or by replay, and that is precisely what must match.
+
+/// One task as a server answers for it.
+async fn act_task(web_addr: &str, act_id: &str) -> Option<serde_json::Value> {
+    let url = format!("http://{web_addr}/api/v1/actions/{act_id}");
+    let resp = reqwest::get(&url).await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.json::<serde_json::Value>().await.ok()?;
+    body["task"].is_object().then_some(body)
+}
+
+/// Poll until a server answers for `act_id`, or give up.
+async fn await_act_task(web_addr: &str, act_id: &str) -> Option<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(body) = act_task(web_addr, act_id).await {
+            return Some(body);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    None
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_server_that_was_away_heals_its_task_view() {
+    // The server that stays up must keep its outgoing link, which is decided
+    // by comparing endpoint IDs — so the seeds are pinned and the orientation
+    // asserted rather than left to the order tests happen to run in.
+    const SEED_A: u8 = 204;
+    const SEED_B: u8 = 205;
+    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32])
+        .public()
+        .to_string();
+    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32])
+        .public()
+        .to_string();
+    assert!(
+        id_a < id_b,
+        "the server that stays up keeps its outgoing link"
+    );
+
+    let alice = TestId::new("did:plc:aliceheal");
+    let bob = TestId::new("did:plc:bobheal");
+    let (srv_a, mut srv_b) = spawn_pair_with_seeds(&[&alice, &bob], SEED_A, SEED_B).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#heal").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#heal").await.unwrap();
+
+    // A signing key of the test's own, so it builds the act canonical the way
+    // a task-sending client does.
+    let signing = ed25519_dalek::SigningKey::from_bytes(&[17u8; 32]);
+    let pubkey = {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing.verifying_key().as_bytes())
+    };
+    ha.raw(&format!("MSGSIG {pubkey}")).await.ok();
+    let venue = freeq_sdk::chatsig::channel_venue("#heal");
+
+    /// Sign and send one act TAGMSG into #heal; returns its event id.
+    async fn send_act(
+        ha: &client::ClientHandle,
+        venue: &str,
+        signing: &ed25519_dalek::SigningKey,
+        act_tags: &[(&str, &str)],
+    ) -> String {
+        let id = freeq_sdk::chatsig::new_event_id();
+        let sig = freeq_sdk::act::sign_act(act_tags.iter().copied(), venue, &id, signing)
+            .expect("act tags present");
+        let wire: Vec<String> = act_tags
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .chain([
+                format!("{}={id}", freeq_sdk::chatsig::EVENT_ID_TAG),
+                format!("+freeq.at/sig={sig}"),
+            ])
+            .collect();
+        ha.raw(&format!("@{} TAGMSG #heal", wire.join(";")))
+            .await
+            .ok();
+        id
+    }
+
+    /// An open offer, then a claim on it — one task's whole life here.
+    async fn run_lifecycle(
+        ha: &client::ClientHandle,
+        venue: &str,
+        signing: &ed25519_dalek::SigningKey,
+        from: &str,
+        title: &str,
+    ) -> String {
+        let act_id = send_act(
+            ha,
+            venue,
+            signing,
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", from),
+                ("+freeq.at/act-title", title),
+            ],
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        send_act(
+            ha,
+            venue,
+            signing,
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "claim"),
+                ("+freeq.at/from", from),
+                ("+freeq.at/act-id", act_id.as_str()),
+            ],
+        )
+        .await;
+        act_id
+    }
+
+    // ── the reference: a task B takes live ──────────────────────────
+    //
+    // B holds no key for alice until its fetch-on-miss fills the store off the
+    // delivery path, so the first offers can honestly be unverifiable. Keep
+    // running lifecycles until one lands on B; that one is the reference.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut live_id = String::new();
+    while tokio::time::Instant::now() < deadline {
+        let id = run_lifecycle(&ha, &venue, &signing, &alice.did, "taken-live").await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if act_task(&srv_b.web_addr, &id).await.is_some() {
+            live_id = id;
+            break;
+        }
+    }
+    assert!(
+        !live_id.is_empty(),
+        "the link must carry task events before the outage, or the outage \
+         proves nothing; B's log says: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let live_view = act_task(&srv_b.web_addr, &live_id)
+        .await
+        .expect("B answers for the task it took live");
+
+    // ── B goes away, and a whole task happens without it ────────────
+    hb.quit(None).await.ok();
+    srv_b.stop();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let healed_id = run_lifecycle(&ha, &venue, &signing, &alice.did, "healed-later").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        act_task(&srv_a.web_addr, &healed_id).await.is_some(),
+        "the server that stayed up holds the task it minted"
+    );
+
+    // ── B comes back on the same data and the same identity ─────────
+    srv_b.start_again().await;
+
+    let healed = await_act_task(&srv_b.web_addr, &healed_id)
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "a server that healed a task must answer for it, not just hold \
+                 its log; B's log says: {}",
+                server_log(&srv_b)
+                    .lines()
+                    .filter(|l| l.contains("catch-up") || l.contains("catchup"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        });
+
+    // Both events of the task reached the log, in mint order or the follow-up
+    // would have named a task nothing had opened.
+    //
+    // The home's own receipt for the claim may or may not be beside them, and
+    // that is not this test's subject: catch-up skips what it cannot check,
+    // the receipt is signed under the home's `did:web:` identity, and whether
+    // this server has fetched that key by the time the batch lands is a race.
+    // When it does arrive it is filed like any other row and applies nothing.
+    let verbs: Vec<String> = healed["events"]
+        .as_array()
+        .map(|events| {
+            events
+                .iter()
+                .filter_map(|e| {
+                    let doc: serde_json::Value =
+                        serde_json::from_str(e["canonical"].as_str()?).ok()?;
+                    Some(doc["act-verb"].as_str()?.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        verbs.iter().take(2).collect::<Vec<_>>(),
+        ["offer", "claim"],
+        "the opener and the claim are both on file, in that order: {healed}"
+    );
+    assert!(
+        verbs.len() == 2 || verbs == ["offer", "claim", "confirm"],
+        "and nothing else but the home's receipt: {healed}"
+    );
+
+    // The origin names the server that MINTED the task — the one that
+    // referees it — and not merely the peer that replayed it. Here they are
+    // the same server, and the field has to say so.
+    assert_eq!(
+        healed["task"]["origin"].as_str(),
+        Some(id_a.as_str()),
+        "the healed task must name the server that minted it: {healed}"
+    );
+
+    // And the healed view is the view staying connected would have produced:
+    // same kind, same venue, same offerer, same state, same origin. State
+    // included — a task of A's is A's to move, so B's copy sits at the opener
+    // whether it arrived live or by replay.
+    for field in ["kind", "venue", "offerer", "state", "origin", "assignee"] {
+        assert_eq!(
+            healed["task"][field], live_view["task"][field],
+            "healing must land where staying connected lands ({field}): \
+             healed={healed} live={live_view}"
+        );
+    }
+
+    // The two servers differ only where the rule says they must: A minted the
+    // task, so A applied the claim and B did not.
+    let on_a = act_task(&srv_a.web_addr, &healed_id)
+        .await
+        .expect("A answers for its own task");
+    assert_eq!(on_a["task"]["state"].as_str(), Some("assigned"));
+    assert_eq!(
+        healed["task"]["state"].as_str(),
+        Some("open"),
+        "a task another server opened is that server's to move: {healed}"
+    );
+
+    ha.quit(None).await.ok();
     drop((srv_a, srv_b));
 }
