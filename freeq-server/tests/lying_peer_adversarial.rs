@@ -532,3 +532,253 @@ async fn a_peer_whose_actor_is_not_an_op_cannot_set_a_locked_topic() {
 
     assert_link_alive(&mut peer, &mut rxw, "probe-after-forged-topic").await;
 }
+
+// ── a peer that says it is a task's home ──────────────────────────
+
+/// The server the task under test was minted at — the only one whose word
+/// moves it, and not the peer that connects here.
+///
+/// A full-length endpoint id, because that is what the field carries and what
+/// the receive path truncates to.
+const OTHER_HOME: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// Register a signing key the way a client does, so the server can verify what
+/// this test signs. The private half never leaves the test.
+async fn register_key(
+    handle: &freeq_sdk::client::ClientHandle,
+    signing: &ed25519_dalek::SigningKey,
+) {
+    use base64::Engine;
+    let pubkey =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing.verifying_key().as_bytes());
+    handle.raw(&format!("MSGSIG {pubkey}")).await.ok();
+}
+
+/// One signed act event: the id its signer minted, the exact bytes the
+/// signature covers, the signature tag, and the wire tag map that carries all
+/// three.
+fn act_event(
+    signing: &ed25519_dalek::SigningKey,
+    venue: &str,
+    act_tags: &[(&str, &str)],
+) -> (
+    String,
+    String,
+    String,
+    std::collections::HashMap<String, String>,
+) {
+    let id = freeq_sdk::chatsig::new_event_id();
+    let canonical = freeq_sdk::act::act_canonical(act_tags.iter().copied(), venue, &id)
+        .expect("act tags present");
+    let sig = freeq_sdk::act::sign_act(act_tags.iter().copied(), venue, &id, signing)
+        .expect("act tags present");
+    let mut tags: std::collections::HashMap<String, String> = act_tags
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    tags.insert(freeq_sdk::chatsig::EVENT_ID_TAG.to_string(), id.clone());
+    tags.insert("+freeq.at/sig".to_string(), sig.clone());
+    (id, canonical, sig, tags)
+}
+
+/// A task's row as the server holds it: where it says the task lives, what
+/// state it is in, and who holds it.
+fn task_row(db_path: &str, act_id: &str) -> Option<(String, String, Option<String>)> {
+    let conn = rusqlite::Connection::open(db_path).expect("open server db");
+    conn.query_row(
+        "SELECT origin, state, assignee FROM act_actions WHERE act_id = ?1",
+        rusqlite::params![act_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .ok()
+}
+
+/// The link a stored task event arrived on — the peer this server
+/// authenticated, never the origin a payload claimed. The outer `None` says
+/// the event is not on file at all; the inner one says it came from no peer.
+fn event_origin(db_path: &str, event_id: &str) -> Option<Option<String>> {
+    let conn = rusqlite::Connection::open(db_path).expect("open server db");
+    conn.query_row(
+        "SELECT origin FROM events WHERE event_id = ?1",
+        rusqlite::params![event_id],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+/// A task minted somewhere else is refereed there, and a peer does not get to
+/// say it is that somewhere else.
+///
+/// The `origin` on a relayed event is a field in a JSON payload the sender
+/// fills in. The decision it feeds is the one that matters most about a task:
+/// whether this event is the task's home ruling, which is what applies a
+/// transition rather than merely filing it, what flips an event already on
+/// file to confirmed, and what lets a `did:web:` actor speak as the system.
+/// So the field is worth exactly nothing on its own, and the identity the
+/// transport authenticated is what the decision reads.
+///
+/// The setup uses catch-up on purpose: replay is the one path where an event
+/// may legitimately name a server that is not the one handing it over — a
+/// task healed through a third party still has to name the server that
+/// referees it. That is what gives this server a task homed at `OTHER_HOME`
+/// for the live path to then be lied to about.
+#[tokio::test]
+async fn a_peer_claiming_to_be_a_tasks_home_does_not_rule_on_its_task() {
+    let agent = TestId::new("did:plc:lptaskagent");
+    let watcher = TestId::new("did:plc:lptaskwatcher");
+    let (srv, mut peer) = spawn_server_with_peer(&[&agent, &watcher]).await;
+
+    let (ha, mut rxa) = connect(&srv, &agent, "agent");
+    wait_auth_and_register(&mut rxa).await;
+    ha.join("#room").await.unwrap();
+    wait_event(
+        &mut rxa,
+        |e| matches!(e, Event::Joined { .. }),
+        "agent join",
+    )
+    .await;
+
+    let (hw, mut rxw) = connect(&srv, &watcher, "watcher");
+    wait_auth_and_register(&mut rxw).await;
+    hw.join("#room").await.unwrap();
+    wait_event(
+        &mut rxw,
+        |e| matches!(e, Event::Joined { nick, .. } if nick == "watcher"),
+        "watcher join",
+    )
+    .await;
+
+    warm_link(&mut peer, "mallory", "#room", &mut rxw).await;
+
+    let signing = ed25519_dalek::SigningKey::from_bytes(&[61u8; 32]);
+    register_key(&ha, &signing).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while registered_kid(&srv.db_path, &agent.did).is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the agent's signing key must be on file, or nothing this test \
+             signs can be checked here"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let venue = freeq_sdk::chatsig::channel_venue("#room");
+
+    // ── a task this server holds, homed somewhere else ──────────────
+    //
+    // Handed over by catch-up, which is where an event may name a minter
+    // other than the peer replaying it.
+    let (offer_id, offer_canonical, offer_sig, _) = act_event(
+        &signing,
+        &venue,
+        &[
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "offer"),
+            ("+freeq.at/from", agent.did.as_str()),
+            ("+freeq.at/act-title", "minted-somewhere-else"),
+        ],
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    peer.forge(freeq_server::s2s::S2sMessage::CatchupEvents {
+        origin: peer.id.clone(),
+        events: vec![freeq_server::s2s::ReplayedEvent {
+            event_id: offer_id.clone(),
+            canonical: offer_canonical,
+            signature: Some(offer_sig),
+            kind: "act".to_string(),
+            venue: venue.clone(),
+            actor_did: Some(agent.did.clone()),
+            subject: None,
+            emoji: None,
+            // The task's true home, which replay is allowed to name.
+            origin: OTHER_HOME.to_string(),
+            timestamp: now,
+        }],
+        more: false,
+    })
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut row = None;
+    while tokio::time::Instant::now() < deadline {
+        row = task_row(&srv.db_path, &offer_id);
+        if row.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let row = row.expect("the replayed offer opened a task here");
+    assert_eq!(
+        (row.0.as_str(), row.1.as_str()),
+        (OTHER_HOME, "open"),
+        "the task must be on file as open and homed elsewhere, or the lie \
+         below has nothing to claim"
+    );
+
+    // ── the lie: a transition, stamped with the home's id ───────────
+    let (claim_id, _, _, claim_tags) = act_event(
+        &signing,
+        &venue,
+        &[
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "claim"),
+            ("+freeq.at/from", agent.did.as_str()),
+            ("+freeq.at/act-id", offer_id.as_str()),
+        ],
+    );
+    peer.forge(freeq_server::s2s::S2sMessage::Tagmsg {
+        event_id: format!("{}:claim-1", peer.id),
+        from: "mallory".to_string(),
+        target: "#room".to_string(),
+        tags: claim_tags.clone(),
+        // The whole of the attack: a field the sender filled in.
+        origin: OTHER_HOME.to_string(),
+        account: Some(agent.did.clone()),
+    })
+    .await;
+    assert_link_alive(&mut peer, &mut rxw, "probe-after-claimed-home-transition").await;
+
+    assert_eq!(
+        event_origin(&srv.db_path, &claim_id),
+        Some(Some(peer.id.clone())),
+        "a transition on someone else's task is filed, and the row names the \
+         link it came in on rather than the origin the peer stamped"
+    );
+    assert_eq!(
+        task_row(&srv.db_path, &offer_id).map(|r| (r.1, r.2)),
+        Some(("open".to_string(), None)),
+        "and the task it names has not moved"
+    );
+
+    // ── the same lie again, which is how an unconfirmed event flips ──
+    //
+    // The second arrival of an event already on file is what a real home's
+    // ruling looks like, so it is the shape a liar reaches for.
+    peer.forge(freeq_server::s2s::S2sMessage::Tagmsg {
+        event_id: format!("{}:claim-2", peer.id),
+        from: "mallory".to_string(),
+        target: "#room".to_string(),
+        tags: claim_tags,
+        origin: OTHER_HOME.to_string(),
+        account: Some(agent.did.clone()),
+    })
+    .await;
+    assert_link_alive(&mut peer, &mut rxw, "probe-after-repeated-claimed-home").await;
+
+    assert_eq!(
+        event_origin(&srv.db_path, &claim_id),
+        Some(Some(peer.id.clone())),
+        "and saying it twice is not a ruling either"
+    );
+    assert_eq!(
+        task_row(&srv.db_path, &offer_id).map(|r| (r.1, r.2)),
+        Some(("open".to_string(), None)),
+        "so the task is still where its own server left it"
+    );
+
+    ha.quit(None).await.ok();
+    hw.quit(None).await.ok();
+}

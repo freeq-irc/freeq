@@ -752,6 +752,15 @@ pub struct SharedState {
     /// Active MoQ↔Room bridge handles (one per session).
     #[cfg(feature = "av-native")]
     pub av_bridges: Mutex<std::collections::HashMap<String, crate::av_bridge::BridgeHandle>>,
+    /// Relayed task events waiting for the key that would settle them.
+    /// Bounded and in memory only — a restart drops what is parked, which is
+    /// the same thing an eviction drops: events nobody was shown.
+    pub(crate) act_deferred: Mutex<crate::act_relay::DeferQueue>,
+    /// Transitions waiting to reach the server that owns their task. Bounded
+    /// and in memory only, beside the defer queue and for the same reason:
+    /// what is held here is already filed, so a restart costs a prompt ruling
+    /// rather than a record.
+    pub(crate) act_routes: Mutex<crate::act_relay::RouteQueue>,
     /// S2S manager (if clustering is active).
     pub s2s_manager: Mutex<Option<Arc<crate::s2s::S2sManager>>>,
     /// CRDT document for cluster state convergence.
@@ -1670,6 +1679,11 @@ impl Server {
             sfu_state: Mutex::new(None),
             #[cfg(feature = "av-native")]
             av_bridges: Mutex::new(std::collections::HashMap::new()),
+            act_deferred: Mutex::new(crate::act_relay::DeferQueue::new(
+                self.config.act_defer_max_per_origin,
+                self.config.act_defer_max_total,
+            )),
+            act_routes: Mutex::new(crate::act_relay::RouteQueue::new(MAX_PENDING_ROUTES)),
             s2s_manager: Mutex::new(None),
             cluster_doc: crate::crdt::ClusterDoc::new(&self.config.server_name),
             db: db.map(Mutex::new),
@@ -1892,6 +1906,11 @@ impl Server {
                 Ok((manager, mut s2s_rx)) => {
                     // Store manager in shared state so iroh accept loop can route S2S
                     *state.s2s_manager.lock() = Some(Arc::clone(&manager));
+
+                    // Transitions that could not reach the server owning their
+                    // task are retried from here. Only meaningful with
+                    // federation running, which is exactly where this is.
+                    spawn_act_route_retry(Arc::clone(&state));
 
                     // Connect to configured peers with auto-reconnection
                     for peer_id in &self.config.s2s_peers {
@@ -2149,6 +2168,7 @@ impl Server {
         }
 
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
+        spawn_act_defer_retry_sweep(Arc::clone(&state));
         spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
 
         // Heartbeat expiry: check agent liveness every 15 seconds.
@@ -2488,6 +2508,7 @@ impl Server {
         // is consistent.
         spawn_phantom_sweeper(Arc::clone(&state));
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
+        spawn_act_defer_retry_sweep(Arc::clone(&state));
         spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
 
         let handle = tokio::spawn(async move {
@@ -2536,6 +2557,7 @@ impl Server {
         // Phantom-session sweeper (defense-in-depth).
         spawn_phantom_sweeper(Arc::clone(&state));
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
+        spawn_act_defer_retry_sweep(Arc::clone(&state));
         spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
 
         let web_state = Arc::clone(&state);
@@ -3014,11 +3036,11 @@ fn verify_relayed_privmsg(
     replaces_msgid: Option<&str>,
     multiline_lines: Option<&Vec<crate::s2s::MultilineLine>>,
     sig: Option<&str>,
-) -> Option<crate::connection::messaging::ClientSigOutcome> {
-    use crate::connection::messaging::{ClientSigOutcome, SignedFields, verify_relayed_message};
+) -> Option<crate::connection::messaging::ClientSigVerdict> {
+    use crate::connection::messaging::{ClientSigVerdict, SignedFields, verify_relayed_message};
     let sig = sig?;
     let Some(did) = account else {
-        return Some(ClientSigOutcome::Unverifiable(
+        return Some(ClientSigVerdict::Unverifiable(
             "relayed message names no sender DID",
         ));
     };
@@ -3073,20 +3095,20 @@ fn verify_relayed_mutation_tags(
     account: Option<&str>,
     target: &str,
     tags: &HashMap<String, String>,
-) -> Option<crate::connection::messaging::ClientSigOutcome> {
-    use crate::connection::messaging::{ClientSigOutcome, verify_relayed_mutation};
+) -> Option<crate::connection::messaging::ClientSigVerdict> {
+    use crate::connection::messaging::{ClientSigVerdict, verify_relayed_mutation};
 
     let get = |a: &str, b: &str| tags.get(a).or_else(|| tags.get(b)).map(String::as_str);
     let (kind, subject, emoji) = relayed_mutation_in(tags)?;
 
     let sig = tags.get("+freeq.at/sig").map(String::as_str)?;
     let Some(did) = account else {
-        return Some(ClientSigOutcome::Unverifiable(
+        return Some(ClientSigVerdict::Unverifiable(
             "relayed mutation names no actor DID",
         ));
     };
     let Some(subject) = subject else {
-        return Some(ClientSigOutcome::Unverifiable(
+        return Some(ClientSigVerdict::Unverifiable(
             "relayed mutation names no subject",
         ));
     };
@@ -3124,6 +3146,369 @@ pub(crate) enum ReplayOutcome {
     Unusable,
 }
 
+/// The origin a replayed event is filed under: the server that **minted** it,
+/// as this server names things.
+///
+/// Three cases, in order:
+///
+/// - The event names no origin. Only a peer predating the per-event field
+///   sends that, and for such a peer the whole batch came from events it
+///   accepted, so the replying peer is the best answer available — which is
+///   the answer that peer's replays already got.
+/// - The event names us, and `ours_on_file` says our own records bear that
+///   out. It is ours, coming home; a row of ours carries no origin, and
+///   stamping the peer that handed it back would make this server a foreigner
+///   to its own tasks. The corroboration is what keeps that from being a
+///   peer's word: a task event names the server that referees the task, and a
+///   peer naming us as the minter of a task it opened would otherwise hand us
+///   the refereeing of it. Authority comes from the authenticated link and
+///   from our own records, never from a field the sender wrote.
+/// - The event names us and nothing here bears it out. Filed as the peer's,
+///   which is the safe direction: a task whose row this server has entirely
+///   lost heals read-only rather than as one a peer can hand back.
+/// - The event names anyone else. Filed as named, never overwritten with the
+///   replier's id — a task's referee is where it was opened, and a server that
+///   heals through a third party must still be able to say where that is.
+fn replay_origin(own_id: &str, relayed_by: &str, claimed: &str, ours_on_file: bool) -> String {
+    let claimed = claimed.trim();
+    let named = match claimed.is_empty() {
+        true => relayed_by,
+        // A claim that we minted it stands only where our own records bear it
+        // out. Otherwise the answer is the link it came in on.
+        false if claimed == own_id && !ours_on_file => relayed_by,
+        false => claimed,
+    };
+    match named == own_id {
+        true => String::new(),
+        false => sanitize_s2s_str(named, 64),
+    }
+}
+
+/// The order a caught-up batch is applied in, past mint order: a task's
+/// opener, then that task's follow-ups.
+///
+/// An act follow-up names its task, so it sorts under the opener's id; an
+/// opener sorts under its own. The second element puts the opener first
+/// inside the group. Every other kind sorts under its own id and is left
+/// where mint order put it — chat derives no state, so nothing about its
+/// order is load-bearing.
+fn replay_group_key(ev: &crate::s2s::ReplayedEvent) -> (&str, bool) {
+    match ev.kind.as_str() {
+        "act" => match ev.subject.as_deref() {
+            Some(act_id) => (act_id, true),
+            None => (ev.event_id.as_str(), false),
+        },
+        _ => (ev.event_id.as_str(), false),
+    }
+}
+
+/// File a caught-up task event through the same call live receiving files one
+/// through, or `None` when the bytes are not a task event and the ordinary
+/// replay path should take it.
+///
+/// `apply_act_event` is the whole judgment — the rules check, the log write
+/// and the view update in one critical section — so a healed server reaches
+/// the same task state as one that never went away. Whose task it is comes
+/// with it: a transition on a task another server opened is filed and not
+/// applied, here as live.
+///
+/// Two things live receiving does are deliberately absent:
+///
+/// - **No waiting for a key.** An event whose signer's key is not on file is
+///   skipped and logged. A replay has nobody waiting on delivery and a peer
+///   that can simply be asked again on the next link.
+/// - **No delivery.** Catch-up heals state. It does not replay hours-old
+///   conversation at people who have been reading the channel since.
+///
+/// Only the act family lands here. A stopgap coordination event's card cannot
+/// be rebuilt from a replay at all: its canonical carries a *hash* of the
+/// payload, never the payload, so the row a card is made of is not in the
+/// bytes that cross. Its log row still files, by the path below.
+fn file_replayed_task_event(
+    state: &Arc<SharedState>,
+    event_id: &str,
+    origin: &str,
+    relayed_by: &str,
+    ev: &crate::s2s::ReplayedEvent,
+    sig_state: crate::events::SigState,
+) -> Option<ReplayOutcome> {
+    let view = crate::events::derive_act_view(&ev.canonical)?;
+    let facts = crate::events::derive_facts(&ev.canonical)?;
+    let is_receipt = freeq_sdk::act_transitions::is_confirmation(&view.verb);
+
+    // An opener's own id is its task's id; every other event names the task it
+    // belongs to. Derived exactly as the live receive path derives it.
+    let opens = freeq_sdk::act_transitions::opening_verb(&view.kind) == Some(view.verb.as_str());
+    let act_id = match opens {
+        true => event_id.to_string(),
+        false => facts.subject.clone().unwrap_or_default(),
+    };
+    let actor = facts.actor_did.clone().unwrap_or_default();
+
+    // ── whose word this carries, on a path where the origin is written by a
+    //    peer ──
+    //
+    // Every other path reads an origin this server put there itself: live
+    // relay and the addressed copy both overwrite it with the authenticated
+    // peer before anything looks at it. A replay does not, and must not — a
+    // replayed event's origin says which server *minted* it, a peer that heals
+    // us through a third server has to be able to convey that, and it is what
+    // a task's ownership stamp is made of. It is a fact the sender wrote, and
+    // it is fine for ownership because a wrong one only ever hands authority
+    // away from the sender.
+    //
+    // Two events turn it into authority, and for those it will not do: a
+    // receipt, and a transition a server signed under its own `did:web:` name.
+    // Both are the home's word about a task, and on a replay the only thing
+    // tying either to the home is the connection the batch came in on. So both
+    // are judged against that connection, and a peer that is not the task's
+    // own server carries neither, however its batch is stamped.
+    //
+    // The answer for such a peer is to skip rather than to file. A row under
+    // that id — even one marked as applying to nothing — is a row, and the
+    // home's own later replay of the genuine event would then be a duplicate
+    // that changes nothing for ever.
+    //
+    // A task of this server's own has no home link to judge either against:
+    // the home is here, and a row of ours carries no origin. There the name
+    // is the whole of it — see `from_system` below.
+    let task_home = state.with_db(|db| db.act_task_origin(&act_id)).flatten();
+    let owning_peer = match is_receipt || is_system_actor(&actor) {
+        true => task_home.clone().filter(|home| !home.is_empty()),
+        false => None,
+    };
+    if let Some(owner) = owning_peer.as_deref()
+        && owner != relayed_by
+    {
+        tracing::warn!(
+            %event_id, %act_id, peer = %relayed_by, home = %owner, claimed = %origin,
+            verb = %view.verb,
+            "S2S catch-up: skipping a task event that speaks for the task's \
+             home — the peer replaying it is not the server that owns the task"
+        );
+        return Some(ReplayOutcome::Unusable);
+    }
+    // …and where it does carry the home's word, the origin it is judged under
+    // is the connection, so the check the log row records is the one that was
+    // actually made.
+    let origin = match owning_peer.is_some() {
+        true => relayed_by,
+        false => origin,
+    };
+
+    // Whether this server itself signed it. It signs under its own `did:web:`
+    // identity, and on a task of ours that name is what says so: a peer can
+    // stamp a batch with our endpoint id, and one that also signs under some
+    // other `did:web:` name would otherwise be taken for us and could expire
+    // our tasks. Under any other name it goes in as an ordinary
+    // participant's event, and the rules refuse it there.
+    let from_system = match task_home.as_deref() {
+        Some("") => actor == server_did(&state.server_name),
+        _ => is_system_actor(&actor),
+    };
+
+    // The view is written with a valid-signature receipt, so only an event
+    // this server actually verified may write it.
+    if sig_state != crate::events::SigState::Valid {
+        // One replayed event may not be skipped for good. A receipt is what a
+        // transition filed here is waiting on, and a replay is how a server
+        // that was away is meant to hear one — dropping it would leave the
+        // event unconfirmed until somebody asked again, which is the round
+        // trip the replay existed to save. So it waits for the signer's key
+        // exactly as a live one does, and the key's arrival judges it. It
+        // waits under the connection it arrived on, for the reason above.
+        if is_receipt {
+            park_replayed_receipt(state, event_id, relayed_by, ev, &facts);
+            return Some(ReplayOutcome::Unusable);
+        }
+        tracing::warn!(
+            %origin, %event_id, sig_state = ?sig_state,
+            "S2S catch-up: skipping a task event whose signature this server \
+             could not check — the peer can be asked for it again"
+        );
+        return Some(ReplayOutcome::Unusable);
+    }
+
+    let written = state.with_db(|db| {
+        db.apply_act_event(&crate::db::ActEvent {
+            canonical: &ev.canonical,
+            signature: ev.signature.as_deref(),
+            event_id,
+            act_id: &act_id,
+            opens,
+            venue: &facts.venue,
+            actor: &actor,
+            from_system,
+            origin: (!origin.is_empty()).then_some(origin),
+            timestamp: ev.timestamp as i64,
+        })
+    });
+    // A move this server applied to a task it owns is a move it ruled on, and
+    // it owes a receipt for it — replay is a way in like any other. Without
+    // this the only server whose word settles the task says nothing on the one
+    // path nothing else covers: the addressed copy that follows is a duplicate,
+    // and a duplicate moves nothing and confirms nothing.
+    if let Some(written) = written.as_ref() {
+        let receipt = crate::connection::act::receipt_for_applied_move(
+            state,
+            &crate::connection::act::AppliedMove {
+                kind: &view.kind,
+                act_id: &act_id,
+                event_id,
+                venue: &facts.venue,
+                actor: &actor,
+                written,
+            },
+        );
+        if let Some(receipt) = receipt {
+            // A replay reaches no client, so nothing is racing this onto the
+            // wire. The venue is the target for a channel; a direct
+            // conversation has none anyone can address, and a server-authored
+            // line there goes out under `*`, as the sweep's notices do.
+            let target = match facts.venue.starts_with("dm:") {
+                true => "*",
+                false => facts.venue.as_str(),
+            };
+            crate::connection::act::broadcast_receipt(state, &receipt, target);
+        }
+    }
+
+    Some(match written {
+        // No database attached: nothing to file into, and nothing to claim.
+        None => ReplayOutcome::Filed,
+        Some(crate::db::ActWrite::Filed { .. } | crate::db::ActWrite::Confirmed { .. }) => {
+            // And whatever was waiting on precisely this event — a receipt that
+            // outran it — is judged now.
+            release_receipts_waiting_on(state, event_id);
+            ReplayOutcome::Filed
+        }
+        // On file, deliberately unapplied — the task's own server rules on it.
+        Some(crate::db::ActWrite::StoredNotApplied) => {
+            release_receipts_waiting_on(state, event_id);
+            ReplayOutcome::Filed
+        }
+        // Filed, and applied to nothing: a receipt from a peer that does not
+        // own the task, or one the rules here refuse. Both are records, and a
+        // record is what a replay is for.
+        Some(crate::db::ActWrite::ReceiptIgnored | crate::db::ActWrite::ReceiptRefused(_)) => {
+            ReplayOutcome::Filed
+        }
+        // A receipt for a move this server has already settled. The record is
+        // filed and the view stands where it stood: confirming twice must not
+        // move anything twice.
+        Some(crate::db::ActWrite::Recorded) => ReplayOutcome::Filed,
+        // A receipt ahead of the event it confirms. The same wait a live one
+        // gets:
+        // the subject's arrival is what judges it.
+        Some(crate::db::ActWrite::ReceiptBeforeSubject) => {
+            park_replayed_receipt(state, event_id, relayed_by, ev, &facts);
+            ReplayOutcome::Unusable
+        }
+        Some(crate::db::ActWrite::Duplicate) => ReplayOutcome::AlreadyHeld,
+        Some(other) => {
+            tracing::debug!(
+                %origin, %event_id, %act_id, outcome = ?other,
+                "S2S catch-up: a replayed task event was not filed"
+            );
+            ReplayOutcome::Unusable
+        }
+    })
+}
+
+/// Hold one replayed receipt in the defer queue, the way the live path holds
+/// one, and ask for whatever it is waiting on.
+///
+/// A receipt is the one replayed event skipping loses something nobody can get
+/// back cheaply: some server is holding a transition unconfirmed, and this is
+/// the word that would settle it. Two things can be missing — the signer's key,
+/// or the event the receipt names — and the queue waits for either.
+///
+/// The tags are rebuilt from the very bytes the signature covers, so what is
+/// judged on release is what was signed. The target is the venue's, because a
+/// replay carries no wire target of its own: a channel's name, or, for a direct
+/// conversation, one of the two DIDs the venue is made of — the same
+/// addressing this server's own events travel to peers under.
+fn park_replayed_receipt(
+    state: &Arc<SharedState>,
+    event_id: &str,
+    relayed_by: &str,
+    ev: &crate::s2s::ReplayedEvent,
+    facts: &crate::events::EventFacts,
+) {
+    // The connection, never the batch's own stamp: what releases this event
+    // judges it as the live path would, and the live path's origin is the
+    // authenticated peer.
+    let origin = relayed_by;
+    let Some(tags) = crate::connection::act::wire_tags_from_canonical(
+        &ev.canonical,
+        event_id,
+        ev.signature.as_deref(),
+    ) else {
+        return;
+    };
+    let signer = facts.actor_did.clone().unwrap_or_default();
+    let sig_tag = ev.signature.clone().unwrap_or_default();
+    let kid = freeq_sdk::sigtag::parse(&sig_tag)
+        .map(|(kid, _)| kid.to_string())
+        .unwrap_or_default();
+    // Which of the two things it is waiting for. A key we do not hold is asked
+    // for; a subject we do not hold arrives by itself, on this replay or the
+    // next.
+    let have_key = !signer.is_empty()
+        && !kid.is_empty()
+        && state
+            .with_db(|db| db.get_signing_key_by_kid(&signer, &kid))
+            .flatten()
+            .is_some();
+    let subject = match have_key {
+        true => facts.subject.clone(),
+        false => None,
+    };
+    if !have_key && !signer.is_empty() {
+        crate::peer_keys::fetch_on_miss(state, origin, &signer, &sig_tag);
+    }
+    tracing::info!(
+        %origin, %event_id, waiting_on = ?subject,
+        "S2S catch-up: holding a receipt rather than dropping it"
+    );
+    let dropped = state
+        .act_deferred
+        .lock()
+        .park(crate::act_relay::ParkedEvent {
+            target: crate::connection::act::peer_target_for(&facts.venue, &facts.venue),
+            from: signer.clone(),
+            peer_account: Some(signer.clone()),
+            origin: origin.to_string(),
+            peer: relayed_by.to_string(),
+            peer_declared_act: true,
+            event_id: event_id.to_string(),
+            // Whichever it is waiting for, and never both: a key it holds is
+            // one the sweep must not go asking for again.
+            signer: match have_key {
+                true => String::new(),
+                false => signer,
+            },
+            kid: match have_key {
+                true => String::new(),
+                false => kid,
+            },
+            waiting_on: subject,
+            tags,
+            ..Default::default()
+        });
+    for event in &dropped {
+        note_dropped_unchecked(state, event);
+    }
+}
+
+/// Whether an actor is the server itself rather than a person.
+///
+/// A server acts under `did:web:<its name>` — the identity the expiry sweep
+/// signs its own events with — so the method prefix is what separates the two.
+pub(crate) fn is_system_actor(actor: &str) -> bool {
+    actor.starts_with("did:web:")
+}
+
 /// Apply one replayed event.
 ///
 /// The conflict rules, in the terms the plan states them:
@@ -3148,9 +3533,14 @@ pub(crate) enum ReplayOutcome {
 /// The ±120s id clock check deliberately does not run: it is a live-client
 /// ingress check, and a replay is *made* of old events. Signature verification
 /// is what stands in for freshness here, which is why item 1 came first.
+///
+/// `own_id` is this server's endpoint id and `relayed_by` the peer whose reply
+/// this batch arrived in; between them and the event's own claim they decide
+/// the origin it is filed under. See [`replay_origin`].
 pub(crate) fn apply_replayed_event(
     state: &Arc<SharedState>,
-    origin: &str,
+    own_id: &str,
+    relayed_by: &str,
     ev: crate::s2s::ReplayedEvent,
 ) -> ReplayOutcome {
     use crate::events::{EventContext, EventFacts, SigState};
@@ -3159,6 +3549,23 @@ pub(crate) fn apply_replayed_event(
     if event_id.is_empty() {
         return ReplayOutcome::Unusable;
     }
+    // Whether a claim that *we* minted this event is one our own records bear
+    // out. A task event's origin names the server that referees the task, so
+    // the claim is honoured only when the task is already here carrying no
+    // origin — the way a task of ours is stored. An opener names no task, and
+    // one we minted and no longer hold is not something a peer can settle for
+    // us. Any other kind's origin is provenance, decides nothing, and is taken
+    // as sent.
+    let ours_on_file = match ev.kind.as_str() {
+        "act" => ev
+            .subject
+            .as_deref()
+            .and_then(|act_id| state.with_db(|db| db.act_task(act_id)).flatten())
+            .is_some_and(|task| task.origin.is_empty()),
+        _ => true,
+    };
+    let origin = replay_origin(own_id, relayed_by, &ev.origin, ours_on_file);
+    let origin = origin.as_str();
 
     // What we already hold under this id, if anything.
     let existing = state.with_db(|db| db.get_event(&event_id)).flatten();
@@ -3169,7 +3576,8 @@ pub(crate) fn apply_replayed_event(
         let fingerprint = crate::events::fingerprint(&ev.canonical);
         tracing::warn!(
             %origin, event_id = %event_id,
-            "S2S replay: a second claim on this id with different content — dropped,              and a receipt recorded against the copy we keep"
+            "S2S replay: a second claim on this id with different content — \
+             dropped, and a receipt recorded against the copy we keep"
         );
         state.with_db(|db| db.record_event_conflict(&event_id, &fingerprint));
         return ReplayOutcome::Conflicted;
@@ -3181,8 +3589,8 @@ pub(crate) fn apply_replayed_event(
     let sig_state = match (ev.signature.as_deref(), ev.canonical.is_empty()) {
         (None, _) => SigState::Unsigned,
         (Some(sig), false) => match replayed_signature_verdict(state, &ev, sig) {
-            crate::connection::messaging::ClientSigOutcome::Verified => SigState::Valid,
-            crate::connection::messaging::ClientSigOutcome::Failed => {
+            crate::connection::messaging::ClientSigVerdict::Valid => SigState::Valid,
+            crate::connection::messaging::ClientSigVerdict::Invalid => {
                 // Evidence of tampering. Refused outright, the same as at
                 // live ingress: a failing signature is never filed.
                 tracing::warn!(
@@ -3191,7 +3599,7 @@ pub(crate) fn apply_replayed_event(
                 );
                 return ReplayOutcome::Unusable;
             }
-            crate::connection::messaging::ClientSigOutcome::Unverifiable(_) => {
+            crate::connection::messaging::ClientSigVerdict::Unverifiable(_) => {
                 SigState::Unverifiable
             }
         },
@@ -3200,9 +3608,21 @@ pub(crate) fn apply_replayed_event(
         (Some(_), true) => SigState::Unverifiable,
     };
 
+    // A task event goes through the judgment live receiving uses, so a healed
+    // server's task view answers what a server that stayed linked answers.
+    if let Some(outcome) =
+        file_replayed_task_event(state, &event_id, origin, relayed_by, &ev, sig_state)
+    {
+        return outcome;
+    }
+
+    // An empty origin is this server's own event coming home, and a row of
+    // ours is stamped with no origin at all — the same shape local ingress
+    // writes, so a healed event is indistinguishable from one never lost.
     let ctx = EventContext {
         sig_state,
-        origin: Some(sanitize_s2s_str(origin, 64)),
+        origin: (!origin.is_empty()).then(|| origin.to_string()),
+        ..Default::default()
     };
     let signature = ev.signature.as_deref();
     let filed = if ev.canonical.is_empty() {
@@ -3242,21 +3662,879 @@ pub(crate) fn apply_replayed_event(
     }
 }
 
+/// Hand one relayed TAGMSG to the local sessions it is for.
+///
+/// The tail of the receive path, shared with the deferred-task-event flush so
+/// an event that verifies late reaches its readers exactly as one that
+/// verified on arrival does.
+///
+/// The account variant carries the DID the *origin* stamped, never the one a
+/// nick fallback produced: that fallback resolves against our own nick map,
+/// and stamping its answer would present a DID this server inferred as one the
+/// origin attested. Same rule the S2S PRIVMSG path follows.
+///
+/// A task message from a peer is gated on `freeq.at/act` exactly as a local
+/// one is (ruled 2026-08-15).
+fn deliver_relayed_tagmsg(
+    state: &Arc<SharedState>,
+    from: &str,
+    target: &str,
+    tags: &HashMap<String, String>,
+    peer_account: Option<&str>,
+    to_senders_own_sessions: bool,
+) {
+    let build_tagged = |with_account: bool| -> String {
+        let mut t = tags.clone();
+        if with_account && let Some(did) = peer_account {
+            t.insert("account".to_string(), did.to_string());
+        }
+        let tag_msg = crate::irc::Message {
+            tags: t,
+            prefix: Some(from.to_string()),
+            command: "TAGMSG".to_string(),
+            params: vec![target.to_string()],
+        };
+        format!("{tag_msg}\r\n")
+    };
+    let tagged_line = build_tagged(false);
+    let tagged_line_account = peer_account.map(|_| build_tagged(true));
+    let plain_fallback = tags
+        .get("+react")
+        .map(|emoji| format!(":{from} PRIVMSG {target} :\x01ACTION reacted with {emoji}\x01\r\n"));
+
+    // Channel members, or (for a nick / `did:` DM) every local session bound to
+    // that recipient — a federated action addressed to a DID reaches the same
+    // person here.
+    let recipients: Vec<String> = if target.starts_with('#') || target.starts_with('&') {
+        state
+            .channels
+            .lock()
+            .get(&target.to_lowercase())
+            .map(|ch| ch.members.iter().cloned().collect())
+            .unwrap_or_default()
+    } else {
+        let mut sids = crate::connection::routing::local_sessions_for_target(state, target);
+        crate::connection::routing::merge_sessions(
+            &mut sids,
+            crate::connection::routing::sender_sessions_for_account(
+                state,
+                peer_account.filter(|_| to_senders_own_sessions),
+            ),
+        );
+        sids
+    };
+
+    let is_act = crate::connection::act::carries_act_tags(tags);
+    let tag_caps = state.cap_message_tags.lock();
+    let acct_caps = state.cap_account_tag.lock();
+    let act_caps = state.cap_act.lock();
+    let conns = state.connections.lock();
+    for sid in &recipients {
+        if let Some(tx) = conns.get(sid) {
+            if tag_caps.contains(sid) && (!is_act || act_caps.contains(sid)) {
+                let line = if acct_caps.contains(sid) {
+                    tagged_line_account.as_ref().unwrap_or(&tagged_line)
+                } else {
+                    &tagged_line
+                };
+                let _ = tx.try_send(line.clone());
+            } else if !is_act && let Some(ref fallback) = plain_fallback {
+                let _ = tx.try_send(fallback.clone());
+            }
+        }
+    }
+}
+
+/// What the receive side does with one relayed task event, once it has
+/// judged it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskEventAction {
+    /// Stored, applied as far as the origin rules allow, and to be delivered.
+    Deliver,
+    /// Refused: not delivered, not stored. Either a found key over bytes that
+    /// do not verify, or an event that claims no origin.
+    Drop,
+    /// No verdict is reachable yet. Not delivered and not stored *while it
+    /// waits*: an outage at a key server is not evidence about the sender,
+    /// and neither is it a reason to show an unchecked claim. The event is
+    /// held in the defer queue and the signer's key is asked for off this
+    /// path; the key's arrival is what judges it again.
+    Park,
+}
+
+/// Reach a verdict about one relayed task event and act on it.
+///
+/// The three-way verdict is the whole point, and each answer does something
+/// different. Valid is stored and applied. Invalid — the one case where a key
+/// was found and the bytes still did not verify — is dropped: not delivered,
+/// not stored, logged as the evidence it is. Everything else waits, and is
+/// never refused, because an outage at a key server and an old peer are facts
+/// about this server's reach, not about the sender; while it waits it is also
+/// not carried, because a claim this server cannot check is not a task it can
+/// show.
+///
+/// One thing is settled ahead of the signature: an event that claims no
+/// origin is refused whatever its bytes say.
+///
+/// The second half of the answer is the receipt this server owes when the
+/// event was a move on a task it owns. Handed back rather than sent, so a
+/// caller puts it on the wire after the event it confirms — a reader sees the
+/// move before the confirmation of it.
+#[allow(clippy::too_many_arguments)]
+fn judge_relayed_task_event(
+    state: &Arc<SharedState>,
+    from: &str,
+    target: &str,
+    tags: &HashMap<String, String>,
+    origin: &str,
+    peer: &str,
+    peer_account: Option<&str>,
+    peer_declared_act: bool,
+) -> (TaskEventAction, Option<crate::connection::act::Receipt>) {
+    let event_id = tags
+        .get(freeq_sdk::chatsig::EVENT_ID_TAG)
+        .or_else(|| tags.get(freeq_sdk::chatsig::EVENT_ID_TAG_BARE))
+        .map(String::as_str)
+        .unwrap_or("");
+
+    // ── a task event claiming no origin is refused ──
+    //
+    // An empty origin is how this server writes "opened here": it is what the
+    // idle sweep expires, what makes every later move on the task ours to
+    // decide, and what catch-up serves under our own id. A relayed event was
+    // opened somewhere else by definition, so filing one with a blank origin
+    // would make this server the home of another server's task. Every honest
+    // sender stamps its own id.
+    if origin.is_empty() {
+        tracing::warn!(
+            peer = %peer,
+            event_id = %event_id,
+            "Refused a relayed task event that claims no origin — filing it \
+             would make this server the task's home"
+        );
+        return (TaskEventAction::Drop, None);
+    }
+
+    let dm_recipient = (!(target.starts_with('#') || target.starts_with('&')))
+        .then(|| crate::connection::routing::recipient_did_for_target(state, target))
+        .flatten();
+    // The venue of the task this event names, for the one signer whose own
+    // venue is not derivable from the delivery target: the server itself.
+    let task_venue = relayed_task_venue(state, tags, event_id);
+    let verdict = crate::act_relay::relayed_task_verdict(
+        tags,
+        target,
+        peer_account,
+        dm_recipient.as_deref(),
+        task_venue.as_deref(),
+        |did, kid| {
+            state
+                .with_db(|db| db.get_signing_key_by_kid(did, kid))
+                .flatten()
+                .and_then(|bytes| ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok())
+        },
+    );
+    let signer = crate::act_relay::claimed_signer(tags, peer_account).unwrap_or_default();
+    let sig_tag = tags
+        .get("+freeq.at/sig")
+        .or_else(|| tags.get("freeq.at/sig"))
+        .map(String::as_str)
+        .unwrap_or_default();
+    crate::act_relay::log_relayed_verdict(
+        verdict,
+        event_id,
+        origin,
+        peer,
+        target,
+        peer_declared_act,
+    );
+
+    match verdict {
+        crate::act_relay::RelayVerdict::Valid => {
+            match store_relayed_task_event(state, tags, target, origin, peer_account, from) {
+                TaskEventStored::Ruled(receipt) => {
+                    // Whatever this event was, it may be the one a receipt has
+                    // been waiting for.
+                    release_receipts_waiting_on(state, event_id);
+                    (TaskEventAction::Deliver, receipt)
+                }
+                // A receipt that outran the event it confirms. Nothing was
+                // filed and nothing is shown; the subject's arrival is what
+                // judges it again, exactly as a key's arrival judges an event
+                // waiting for one.
+                TaskEventStored::WaitingOn(subject) => {
+                    tracing::info!(
+                        peer = %peer, event_id = %event_id, %subject,
+                        "Holding a receipt until the event it names arrives"
+                    );
+                    let dropped = state
+                        .act_deferred
+                        .lock()
+                        .park(crate::act_relay::ParkedEvent {
+                            tags: tags.clone(),
+                            target: target.to_string(),
+                            from: from.to_string(),
+                            peer_account: peer_account.map(str::to_string),
+                            origin: origin.to_string(),
+                            peer: peer.to_string(),
+                            peer_declared_act,
+                            event_id: event_id.to_string(),
+                            waiting_on: Some(subject),
+                            // No key is owed: this one verified. Naming a
+                            // signer here would put the queue's key sweep on
+                            // asking for a key it already holds.
+                            ..Default::default()
+                        });
+                    for event in &dropped {
+                        note_dropped_unchecked(state, event);
+                    }
+                    (TaskEventAction::Park, None)
+                }
+            }
+        }
+        crate::act_relay::RelayVerdict::Invalid(_) => (TaskEventAction::Drop, None),
+        crate::act_relay::RelayVerdict::Unverifiable(why) => {
+            // A key not held yet is the one unverifiable cause a lookup can
+            // fix: ask the relay origin's key server for it, off the delivery
+            // path. The event waits meanwhile — not stored and not shown,
+            // because showing it would present an unchecked claim as a task —
+            // and the key's arrival is what judges it again. An event that can
+            // never verify at all waits too, and ages out by eviction where
+            // somebody can see it.
+            if why == crate::connection::messaging::NO_KEY_ON_FILE && !signer.is_empty() {
+                crate::peer_keys::fetch_on_miss(state, origin, signer, sig_tag);
+            }
+            let kid = freeq_sdk::sigtag::parse(sig_tag)
+                .map(|(kid, _)| kid.to_string())
+                .unwrap_or_default();
+            let dropped = state
+                .act_deferred
+                .lock()
+                .park(crate::act_relay::ParkedEvent {
+                    tags: tags.clone(),
+                    target: target.to_string(),
+                    from: from.to_string(),
+                    peer_account: peer_account.map(str::to_string),
+                    origin: origin.to_string(),
+                    peer: peer.to_string(),
+                    peer_declared_act,
+                    event_id: event_id.to_string(),
+                    signer: signer.to_string(),
+                    kid,
+                    ..Default::default()
+                });
+            for event in &dropped {
+                note_dropped_unchecked(state, event);
+            }
+            (TaskEventAction::Park, None)
+        }
+    }
+}
+
+/// How many transitions may be waiting for their homes at once.
+///
+/// A ceiling rather than a promise: a home that stays away long enough is
+/// healed by catch-up, which is what the log is for, so the queue exists to
+/// make the common case prompt and not to guarantee delivery.
+const MAX_PENDING_ROUTES: usize = 1024;
+
+/// How often the pending routes are looked at. Coarse on purpose — the backoff
+/// is measured in tens of seconds, so a finer tick would only spin.
+const ROUTE_TICK: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// One task event as it has to travel: the signed tags, and where they were
+/// delivered. Nothing here may be rebuilt or tidied — the signature covers the
+/// tags, and the venue is derived from the target.
+#[derive(Clone)]
+pub(crate) struct TaskEventWire {
+    pub act_id: String,
+    pub event_id: String,
+    pub tags: HashMap<String, String>,
+    pub target: String,
+    pub from: String,
+    pub account: Option<String>,
+}
+
+/// Ask the server that owns a task to rule on a transition it may not have
+/// ruled on yet.
+///
+/// The event has already been filed here, unconfirmed, and already gone out to
+/// every act-capable peer including the home. This is the addressed copy: a
+/// broadcast is best-effort, and a home that was away when it went out has no
+/// second chance at it, while a ruling is not optional.
+pub(crate) fn route_transition_home(state: &Arc<SharedState>, ev: TaskEventWire, home: &str) {
+    if home.is_empty() {
+        return;
+    }
+    let origin = state.server_iroh_id.lock().clone().unwrap_or_default();
+    let message = crate::s2s::S2sMessage::ActRoute {
+        // Stamped fresh at each attempt; see `PendingRoute::message`.
+        event_id: String::new(),
+        act_id: ev.act_id.clone(),
+        act_event_id: ev.event_id.clone(),
+        tags: ev.tags,
+        target: ev.target,
+        from: ev.from,
+        account: ev.account,
+        origin,
+    };
+    state
+        .act_routes
+        .lock()
+        .park(crate::act_relay::PendingRoute {
+            act_id: ev.act_id,
+            event_id: ev.event_id,
+            home: home.to_string(),
+            message,
+            attempts: 0,
+            next_attempt: std::time::Instant::now(),
+            seq: 0,
+        });
+    let state = Arc::clone(state);
+    tokio::spawn(async move { flush_pending_routes(&state).await });
+}
+
+/// Try every route that is due, and put back the ones that are still owed an
+/// answer.
+///
+/// **Every outcome goes back on the list.** None of the three is an answer: a
+/// link accepts a send for as long as it takes to notice it is dead, a peer
+/// that will not take one may be mid-handshake, and an unreachable home may
+/// come back. What ends the asking is the event ceasing to be unconfirmed —
+/// the home's receipt arriving and being applied, or something else being
+/// ruled in that the rules no longer admit this one behind. Failing that, the
+/// queue's own ceiling gives up the oldest ask with a warning
+/// ([`crate::act_relay::RouteQueue::park`]), and the backoff bounds the cost
+/// meanwhile.
+pub(crate) async fn flush_pending_routes(state: &Arc<SharedState>) {
+    let Some(manager) = state.s2s_manager.lock().clone() else {
+        // No federation running: there is nobody to ask, and the routes stay
+        // where they are in case one starts.
+        return;
+    };
+    let due = state.act_routes.lock().take_due(std::time::Instant::now());
+    for mut route in due {
+        // What the route is for, asked before every attempt: is this event
+        // still waiting on its home? Confirmed, superseded, or not on file —
+        // each is an end to the asking.
+        if state.with_db(|db| db.act_event_is_unconfirmed(&route.event_id)) != Some(true) {
+            tracing::debug!(
+                act_id = %route.act_id, event_id = %route.event_id, home = %route.home,
+                "This transition is no longer waiting on a ruling; nothing left to carry"
+            );
+            continue;
+        }
+        // A fresh envelope id per attempt. The receiver's dedup rejects a
+        // counter at or below the high-water mark it already holds from us, so
+        // a retry under the original id would be dropped as a replay of
+        // something that never arrived.
+        if let crate::s2s::S2sMessage::ActRoute { event_id, .. } = &mut route.message {
+            *event_id = manager.next_event_id();
+        }
+        match manager
+            .route_to_home(&route.home, route.message.clone())
+            .await
+        {
+            crate::s2s::RouteOutcome::Sent => tracing::debug!(
+                act_id = %route.act_id, event_id = %route.event_id, home = %route.home,
+                attempts = route.attempts,
+                "Carried a task transition to the server that owns the task"
+            ),
+            crate::s2s::RouteOutcome::Unreachable => tracing::debug!(
+                act_id = %route.act_id, event_id = %route.event_id, home = %route.home,
+                attempts = route.attempts,
+                "The server that owns this task is not reachable; will ask again"
+            ),
+            crate::s2s::RouteOutcome::Refused(why) => tracing::warn!(
+                act_id = %route.act_id, event_id = %route.event_id, home = %route.home,
+                reason = %why,
+                "Cannot carry a task transition to the server that owns the task \
+                 right now; will ask again"
+            ),
+        }
+        route.attempts += 1;
+        route.next_attempt =
+            std::time::Instant::now() + crate::act_relay::retry_backoff(route.attempts);
+        state.act_routes.lock().park(route);
+    }
+}
+
+/// The tick that retries what could not be delivered.
+///
+/// A tick rather than a peer-connect hook: a link coming back is not the only
+/// reason an attempt can newly succeed, and one timer covers every reason
+/// without a second mechanism to keep honest.
+fn spawn_act_route_retry(state: Arc<SharedState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(ROUTE_TICK);
+        interval.tick().await; // skip the immediate first tick
+        loop {
+            interval.tick().await;
+            if state.act_routes.lock().is_empty() {
+                continue;
+            }
+            flush_pending_routes(&state).await;
+        }
+    });
+}
+
+/// Store a task event this server verified itself, under the id its signer
+/// minted.
+///
+/// Never a locally minted id: the log is how a later replay recognises an
+/// event it already holds, and an id of ours makes the same event look like a
+/// second one. A DM files under the canonical two-DID venue rather than the
+/// wire target, which is a nick or a `did:` depending on who addressed whom.
+fn store_relayed_task_event(
+    state: &Arc<SharedState>,
+    tags: &HashMap<String, String>,
+    target: &str,
+    origin: &str,
+    peer_account: Option<&str>,
+    from: &str,
+) -> TaskEventStored {
+    let Some(signer) = crate::act_relay::claimed_signer(tags, peer_account) else {
+        return TaskEventStored::Ruled(None);
+    };
+    let Some(event_id) = tags
+        .get(freeq_sdk::chatsig::EVENT_ID_TAG)
+        .or_else(|| tags.get(freeq_sdk::chatsig::EVENT_ID_TAG_BARE))
+        .cloned()
+    else {
+        return TaskEventStored::Ruled(None);
+    };
+    // The same rule the verdict used, so the bytes are filed under the venue
+    // whose signature was just checked over them.
+    let dm_recipient = (!(target.starts_with('#') || target.starts_with('&')))
+        .then(|| crate::connection::routing::recipient_did_for_target(state, target))
+        .flatten();
+    let Some(venue) = crate::act_relay::venue_for(
+        target,
+        signer,
+        dm_recipient.as_deref(),
+        relayed_task_venue(state, tags, &event_id).as_deref(),
+    ) else {
+        return TaskEventStored::Ruled(None);
+    };
+    let signature = tags
+        .get("+freeq.at/sig")
+        .or_else(|| tags.get("freeq.at/sig"))
+        .cloned();
+    let now = chrono::Utc::now().timestamp();
+
+    if crate::connection::act::carries_act_tags(tags) {
+        let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let Ok(canonical) = freeq_sdk::act::act_canonical(pairs, &venue, &event_id) else {
+            return TaskEventStored::Ruled(None);
+        };
+        let kind = tags
+            .get("+freeq.at/act")
+            .or_else(|| tags.get("freeq.at/act"))
+            .map(String::as_str)
+            .unwrap_or("");
+        let verb = tags
+            .get("+freeq.at/act-verb")
+            .or_else(|| tags.get("act-verb"))
+            .map(String::as_str)
+            .unwrap_or("");
+        // An opener's own event id is the task's id; everything else names the
+        // task it belongs to.
+        let opens = freeq_sdk::act_transitions::opening_verb(kind) == Some(verb);
+        let act_id = match opens {
+            true => event_id.clone(),
+            false => tags
+                .get("+freeq.at/act-id")
+                .or_else(|| tags.get("act-id"))
+                .cloned()
+                .unwrap_or_default(),
+        };
+        let written = state.with_db(|db| {
+            db.apply_act_event(&crate::db::ActEvent {
+                canonical: &canonical,
+                signature: signature.as_deref(),
+                event_id: &event_id,
+                act_id: &act_id,
+                opens,
+                venue: &venue,
+                actor: signer,
+                // Read off the actor, the way catch-up and a rebuild read it:
+                // a server signs under its `did:web:` identity and a person
+                // does not. Hard-coding false here made the same event answer
+                // differently depending on which path it arrived by — this
+                // server's own expiry coming home read as a person's move.
+                from_system: is_system_actor(signer),
+                origin: Some(origin),
+                timestamp: now,
+            })
+        });
+        // A move on a task this server owns, applied here. Our word is what
+        // turns it from a claim into a decision, and the receipt is that word
+        // written down. Handed back rather than sent, so it goes out after the
+        // event it names.
+        if let Some(written) = written.as_ref() {
+            let receipt = crate::connection::act::receipt_for_applied_move(
+                state,
+                &crate::connection::act::AppliedMove {
+                    kind,
+                    act_id: &act_id,
+                    event_id: &event_id,
+                    venue: &venue,
+                    actor: signer,
+                    written,
+                },
+            );
+            if receipt.is_some() {
+                return TaskEventStored::Ruled(receipt);
+            }
+        }
+        match written {
+            None | Some(crate::db::ActWrite::Filed { .. }) => {}
+            // A receipt this server followed: the event it names was re-checked
+            // against the task here and the view moved with it. Nothing is
+            // owed — the receipt was the home's to write, and we are not it.
+            Some(crate::db::ActWrite::Confirmed { ref state }) => tracing::info!(
+                origin = %origin, act_id = %act_id, event_id = %event_id, state = %state,
+                "Followed the receipt of the server that owns this task"
+            ),
+            Some(crate::db::ActWrite::ReceiptIgnored) => tracing::warn!(
+                origin = %origin, act_id = %act_id, event_id = %event_id,
+                "A receipt arrived from a peer that does not own this task — filed \
+                 as the claim it is, and applied to nothing"
+            ),
+            Some(crate::db::ActWrite::ReceiptRefused(refusal)) => tracing::warn!(
+                origin = %origin, act_id = %act_id, event_id = %event_id,
+                reason = %refusal,
+                "The owning server confirmed an event the rules here refuse — the \
+                 receipt is on file and nothing was applied"
+            ),
+            // Not on file yet, so nothing can be judged against it. The caller
+            // holds this one until it is.
+            Some(crate::db::ActWrite::ReceiptBeforeSubject) => {
+                let subject = tags
+                    .get(&format!(
+                        "+freeq.at/{}",
+                        freeq_sdk::act_transitions::confirmation_subject_tag()
+                    ))
+                    .cloned()
+                    .unwrap_or_default();
+                return TaskEventStored::WaitingOn(subject);
+            }
+            Some(crate::db::ActWrite::StoredNotApplied) => {
+                tracing::info!(
+                    origin = %origin, act_id = %act_id, event_id = %event_id, verb = %verb,
+                    "Filed a relayed task event without applying it: the task belongs to \
+                     another server, which is the authority over what it does"
+                );
+                // …and that server is asked for its ruling. A peer that holds
+                // the event unruled carries it too: on a network that is not a
+                // full mesh, that path may be the only one there is, and the
+                // home dedups a copy it already has.
+                let home = state
+                    .with_db(|db| db.act_task_origin(&act_id))
+                    .flatten()
+                    .unwrap_or_default();
+                route_transition_home(
+                    state,
+                    TaskEventWire {
+                        act_id: act_id.clone(),
+                        event_id: event_id.clone(),
+                        tags: tags.clone(),
+                        target: target.to_string(),
+                        from: from.to_string(),
+                        account: Some(signer.to_string()),
+                    },
+                    &home,
+                );
+            }
+            Some(other) => tracing::debug!(
+                origin = %origin, act_id = %act_id, event_id = %event_id,
+                outcome = ?other,
+                "A relayed task event was not filed"
+            ),
+        }
+        return TaskEventStored::Ruled(None);
+    }
+
+    // The stopgap coordination family, filed the way local ingress files one.
+    let Some(event_type) = tags.get("+freeq.at/event").cloned() else {
+        return TaskEventStored::Ruled(None);
+    };
+    let doc =
+        crate::act_relay::coordination_doc_from_tags(tags, signer, &event_id, &venue, &event_type);
+    let canonical = doc.canonical();
+    let payload = match tags.get("+freeq.at/payload") {
+        None => "{}".to_string(),
+        Some(raw) => urlencoding::decode(raw)
+            .unwrap_or_else(|_| raw.as_str().into())
+            .into_owned(),
+    };
+    let event = crate::db::CoordinationEventRow {
+        event_id: event_id.clone(),
+        event_type,
+        actor_did: signer.to_string(),
+        channel: target.to_string(),
+        ref_id: tags
+            .get("+freeq.at/ref")
+            .or_else(|| tags.get("+freeq.at/task-id"))
+            .cloned(),
+        payload_json: payload,
+        signature,
+        timestamp: now,
+    };
+    let stored = state.with_db(|db| {
+        db.store_coordination_event(
+            &event,
+            Some(crate::db::SignedCoordination {
+                canonical: &canonical,
+                state: crate::events::SigState::Valid,
+            }),
+        )
+    });
+    if stored == Some(crate::db::CoordinationWrite::Refused) {
+        tracing::warn!(
+            origin = %origin, event_id = %event_id, channel = %target,
+            "Refused a relayed coordination event: that id is already on file"
+        );
+    }
+    // The stopgap family has no task view and no receipts; there is nothing for
+    // a caller to put on the wire.
+    TaskEventStored::Ruled(None)
+}
+
+/// What the store path did with one relayed task event.
+enum TaskEventStored {
+    /// Filed, as far as this server may file it, together with the receipt it
+    /// owes for the move — `None` when it owes none.
+    Ruled(Option<crate::connection::act::Receipt>),
+    /// A receipt that named an event this server does not hold. Nothing was
+    /// written; it names the event it is waiting for.
+    WaitingOn(String),
+}
+
+/// The venue of the task a relayed event names, read from the log.
+///
+/// Only a server's own event needs it — the venue a `did:web:` signer bound
+/// cannot be rebuilt from the delivery target, because the signer is not one
+/// of a direct conversation's participants. `None` for the stopgap family,
+/// which has no task, and for a task this server has never filed.
+fn relayed_task_venue(
+    state: &Arc<SharedState>,
+    tags: &HashMap<String, String>,
+    event_id: &str,
+) -> Option<String> {
+    let act_id = dropped_task_id(tags, event_id)?;
+    state.with_db(|db| db.act_task_venue(&act_id)).flatten()
+}
+
+/// Leave the visible trace of a dropped event: if it belonged to a task on
+/// file, that task's row keeps count, so a reader of the task can see its
+/// record may be incomplete instead of trusting a server log they cannot
+/// read. An event whose task was never stored here — an opening that never
+/// verified, or the stopgap family, which has no task view — leaves only the
+/// queue's own log line.
+fn note_dropped_unchecked(state: &Arc<SharedState>, dropped: &crate::act_relay::ParkedEvent) {
+    let Some(act_id) = dropped_task_id(&dropped.tags, &dropped.event_id) else {
+        return;
+    };
+    let marked = state
+        .with_db(|db| db.bump_act_dropped_unchecked(&act_id))
+        .unwrap_or(false);
+    if marked {
+        tracing::info!(
+            act_id = %act_id,
+            event_id = %dropped.event_id,
+            "The task's record now counts the dropped event"
+        );
+    }
+}
+
+/// The task a parked act event belongs to: an opening names itself, anything
+/// else names its task. `None` for the stopgap family — it has no task view.
+fn dropped_task_id(tags: &HashMap<String, String>, event_id: &str) -> Option<String> {
+    if !crate::connection::act::carries_act_tags(tags) {
+        return None;
+    }
+    let kind = tags
+        .get("+freeq.at/act")
+        .or_else(|| tags.get("freeq.at/act"))
+        .map(String::as_str)
+        .unwrap_or("");
+    let verb = tags
+        .get("+freeq.at/act-verb")
+        .or_else(|| tags.get("act-verb"))
+        .map(String::as_str)
+        .unwrap_or("");
+    match freeq_sdk::act_transitions::opening_verb(kind) == Some(verb) {
+        true => Some(event_id.to_string()),
+        false => tags
+            .get("+freeq.at/act-id")
+            .or_else(|| tags.get("act-id"))
+            .cloned(),
+    }
+}
+
+/// A signing key just landed. Re-check whatever was waiting for it.
+///
+/// The only thing that can change an unverifiable verdict is a key arriving,
+/// and every way one arrives calls here: a local registration, and a fetch
+/// from a peer's key server completing. Events that now verify are applied and
+/// delivered in the order they were parked — a claim that arrived before a
+/// completion is applied before it — and one that still cannot be judged goes
+/// back to waiting.
+pub(crate) fn retry_deferred_task_events(state: &Arc<SharedState>, did: &str, kid: &str) {
+    let waiting = state.act_deferred.lock().take_for_signer(did, kid);
+    if waiting.is_empty() {
+        return;
+    }
+    tracing::info!(
+        did = %did, kid = %kid, count = waiting.len(),
+        "A signing key arrived; re-checking the task events that were waiting for it"
+    );
+    judge_parked_events(state, waiting);
+}
+
+/// A task event has just been filed. Re-check whatever was waiting for that
+/// event rather than for a key: a receipt that outran the move it names.
+///
+/// The other half of the queue's promise. A receipt is never evicted and never
+/// refused, so the only thing that can be owed to one is its subject, and
+/// every path that files a task event calls here — the live relay, the release
+/// of something that was itself parked, and catch-up.
+pub(crate) fn release_receipts_waiting_on(state: &Arc<SharedState>, subject: &str) {
+    let waiting = state.act_deferred.lock().take_for_subject(subject);
+    if waiting.is_empty() {
+        return;
+    }
+    tracing::info!(
+        %subject, count = waiting.len(),
+        "The event a receipt names is on file; re-checking the receipt"
+    );
+    judge_parked_events(state, waiting);
+}
+
+/// Send back the receipt this server already holds for one event, to the peer
+/// that asked about it again.
+///
+/// Reading, not deciding: the receipt was minted and filed at the moment the
+/// move was applied, and this is that row put back on the wire. A peer that
+/// has since heard it files nothing — its id is already in that peer's log.
+/// Silent when there is no receipt on file, which is the honest answer to
+/// "have you decided?" when we have not.
+async fn answer_with_stored_receipt(
+    state: &Arc<SharedState>,
+    manager: &Arc<crate::s2s::S2sManager>,
+    peer: &str,
+    subject: &str,
+    target: &str,
+) {
+    let Some(stored) = state
+        .with_db(|db| db.act_receipt_for_subject(subject))
+        .flatten()
+    else {
+        return;
+    };
+    let Some(tags) = crate::connection::act::wire_tags_from_canonical(
+        &stored.canonical,
+        &stored.event_id,
+        stored.signature.as_deref(),
+    ) else {
+        return;
+    };
+    let message = crate::s2s::S2sMessage::Tagmsg {
+        event_id: manager.next_event_id(),
+        from: state.server_name.clone(),
+        target: crate::connection::act::peer_target_for(&stored.venue, target),
+        tags,
+        origin: manager.server_id.clone(),
+        account: Some(server_did(&state.server_name)),
+    };
+    match manager.send_act_to_peer(peer, message).await {
+        crate::s2s::RouteOutcome::Sent => tracing::debug!(
+            %peer, %subject, receipt = %stored.event_id,
+            "Answered a peer still asking with the receipt already on file"
+        ),
+        outcome => tracing::debug!(
+            %peer, %subject, receipt = %stored.event_id, ?outcome,
+            "Could not answer a peer still asking about a transition we ruled on"
+        ),
+    }
+}
+
+/// Judge a batch taken out of the defer queue, in the order it was parked — a
+/// claim that arrived before a completion is applied before it.
+fn judge_parked_events(state: &Arc<SharedState>, waiting: Vec<crate::act_relay::ParkedEvent>) {
+    for event in waiting {
+        let (action, receipt) = judge_relayed_task_event(
+            state,
+            &event.from,
+            &event.target,
+            &event.tags,
+            &event.origin,
+            &event.peer,
+            event.peer_account.as_deref(),
+            event.peer_declared_act,
+        );
+        if action == TaskEventAction::Deliver {
+            deliver_relayed_tagmsg(
+                state,
+                &event.from,
+                &event.target,
+                &event.tags,
+                event.peer_account.as_deref(),
+                // A released event verified here before it was delivered, so
+                // the signer's own sessions get it like any checked event.
+                true,
+            );
+        }
+        if let Some(receipt) = receipt {
+            crate::connection::act::broadcast_receipt(state, &receipt, &event.target);
+        }
+    }
+}
+
+/// How often the defer queue is looked at for keys worth asking for again.
+///
+/// Well below the shortest backoff step, so a key becomes due close to when
+/// its own schedule says rather than at the tick after.
+const DEFER_RETRY_TICK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ask again for the keys parked task events are waiting on.
+///
+/// A key arriving is what releases a parked event, and both paths that notice
+/// one need somebody to have asked. The ask when an event parks covers a
+/// signer who keeps talking; a quiet one's event would otherwise sit until it
+/// was evicted even after its key server came back. So each distinct signer
+/// with events waiting is asked for again on a backoff of its own, until the
+/// key arrives or nothing of theirs is left waiting.
+fn spawn_act_defer_retry_sweep(state: Arc<SharedState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(DEFER_RETRY_TICK);
+        interval.tick().await; // skip first tick
+        loop {
+            interval.tick().await;
+            let due = state.act_deferred.lock().retries_due();
+            for (origin, signer, kid) in due {
+                crate::peer_keys::fetch_again(&state, &origin, &signer, &kid);
+            }
+        }
+    });
+}
+
 /// Check a replayed event's signature against the bytes it travelled with.
 fn replayed_signature_verdict(
     state: &Arc<SharedState>,
     ev: &crate::s2s::ReplayedEvent,
     sig: &str,
-) -> crate::connection::messaging::ClientSigOutcome {
-    use crate::connection::messaging::{ClientSigOutcome, NO_KEY_ON_FILE};
+) -> crate::connection::messaging::ClientSigVerdict {
+    use crate::connection::messaging::{ClientSigVerdict, NO_KEY_ON_FILE};
     let Some(did) = ev.actor_did.as_deref() else {
-        return ClientSigOutcome::Unverifiable("replayed event names no actor");
+        return ClientSigVerdict::Unverifiable("replayed event names no actor");
     };
     let outcome =
         crate::connection::messaging::verify_canonical_bytes(state, did, &ev.canonical, sig);
     // A signer we hold no key for: ask its home server, off this path, so the
     // next replay of theirs gets a real verdict.
-    if let ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE) = outcome {
+    if let ClientSigVerdict::Unverifiable(NO_KEY_ON_FILE) = outcome {
         crate::peer_keys::fetch_from_any_peer(state, did, sig);
     }
     outcome
@@ -3471,6 +4749,9 @@ pub(crate) async fn process_s2s_message(
         S2sMessage::AvSessionEnded {
             event_id, origin, ..
         } => (event_id.clone(), origin.clone()),
+        S2sMessage::ActRoute {
+            event_id, origin, ..
+        } => (event_id.clone(), origin.clone()),
         S2sMessage::CrdtSync { origin, .. } => (String::new(), origin.clone()),
         S2sMessage::PeerDisconnected { .. } => (String::new(), String::new()),
         // Catch-up carries no event id of its own: the *replayed* events
@@ -3505,6 +4786,7 @@ pub(crate) async fn process_s2s_message(
         (
             S2sMessage::Privmsg { .. }
             | S2sMessage::Tagmsg { .. }
+            | S2sMessage::ActRoute { .. }
             | S2sMessage::Pin { .. }
             | S2sMessage::Join { .. }
             | S2sMessage::Part { .. }
@@ -3548,6 +4830,36 @@ pub(crate) async fn process_s2s_message(
         }
         _ => {} // Full trust or handshake messages — proceed
     }
+
+    // ── an origin a payload claims carries no authority ──────────────
+    //
+    // `origin` up to here is a field the sender filled in, and everything
+    // below decides things with it: whether an event is the task's home
+    // ruling on its own task (which applies a transition instead of merely
+    // filing it, flips one already on file to confirmed, and lets a
+    // `did:web:` actor speak as the system), and which peer's key server to
+    // ask about a signature. An honest peer stamps its own id, so the two
+    // agree; a mismatch is a peer asserting an authority the transport did
+    // not give it. The authenticated id is what the rest of this function
+    // reads, exactly as the CRDT sync arm below already does.
+    //
+    // Above this line on purpose: the self-origin filter and the dedup key,
+    // which recognize an event rather than trust one. An empty origin claims
+    // nothing and is left alone here — that is a peer predating the field, and
+    // a chat message is none the worse for it. A task event is: an empty
+    // origin is how this server writes "opened here", so the task branch
+    // refuses one rather than reading it (`judge_relayed_task_event`).
+    let origin = if origin.is_empty() || origin == authenticated_peer_id {
+        origin
+    } else {
+        tracing::warn!(
+            authenticated = %authenticated_peer_id,
+            claimed = %origin,
+            "S2S message names an origin other than the peer that sent it — \
+             using the authenticated peer id"
+        );
+        authenticated_peer_id.to_string()
+    };
 
     match msg {
         S2sMessage::Hello {
@@ -3691,7 +5003,6 @@ pub(crate) async fn process_s2s_message(
             from,
             target,
             text,
-            origin,
             msgid,
             sig,
             account,
@@ -3751,7 +5062,7 @@ pub(crate) async fn process_s2s_message(
                         "Relayed message was altered by our own sanitizer ({v:?} discarded)"
                     );
                     Some(
-                        crate::connection::messaging::ClientSigOutcome::Unverifiable(
+                        crate::connection::messaging::ClientSigVerdict::Unverifiable(
                             "sanitized on receipt",
                         ),
                     )
@@ -3759,27 +5070,27 @@ pub(crate) async fn process_s2s_message(
                 other => other,
             };
             if let Some(verdict) = sig_verdict {
-                use crate::connection::messaging::{ClientSigOutcome, NO_KEY_ON_FILE};
+                use crate::connection::messaging::{ClientSigVerdict, NO_KEY_ON_FILE};
                 // A signer we hold no key for. Ask its home server — off this
                 // path, so nothing waits: the message is already on its way,
                 // labeled honestly, and the answer serves the next one.
-                if let (ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE), Some(did), Some(sig)) =
+                if let (ClientSigVerdict::Unverifiable(NO_KEY_ON_FILE), Some(did), Some(sig)) =
                     (verdict, account.as_deref(), sig.as_deref())
                 {
                     crate::peer_keys::fetch_on_miss(state, &origin, did, sig);
                 }
                 match verdict {
-                    ClientSigOutcome::Verified => tracing::debug!(
+                    ClientSigVerdict::Valid => tracing::debug!(
                         peer = %authenticated_peer_id, target = %target,
                         "Relayed message signature verified against the sender's own key"
                     ),
-                    ClientSigOutcome::Failed => tracing::warn!(
+                    ClientSigVerdict::Invalid => tracing::warn!(
                         peer = %authenticated_peer_id, target = %target, from = %from,
                         account = ?account, msgid = ?msgid,
                         "Relayed message signature did not verify against the key it names — \
                          dropping the message"
                     ),
-                    ClientSigOutcome::Unverifiable(why) => tracing::debug!(
+                    ClientSigVerdict::Unverifiable(why) => tracing::debug!(
                         peer = %authenticated_peer_id, target = %target, why = %why,
                         "Relayed message signature cannot be checked here"
                     ),
@@ -3791,7 +5102,7 @@ pub(crate) async fn process_s2s_message(
             // disagreed — passing on the words alone would put text under the
             // sender's name that the evidence on the wire says is not theirs,
             // and would hide the one fact worth knowing about it.
-            if sig_verdict == Some(crate::connection::messaging::ClientSigOutcome::Failed) {
+            if sig_verdict == Some(crate::connection::messaging::ClientSigVerdict::Invalid) {
                 return;
             }
 
@@ -3855,7 +5166,7 @@ pub(crate) async fn process_s2s_message(
             if edit_of.is_some()
                 && let Some(actor) = account.as_deref()
                 && crate::connection::messaging::signing_venue(state, actor, &target).is_some()
-                && sig_verdict != Some(crate::connection::messaging::ClientSigOutcome::Verified)
+                && sig_verdict != Some(crate::connection::messaging::ClientSigVerdict::Valid)
             {
                 tracing::warn!(
                     peer = %authenticated_peer_id, origin = %origin, target = %target,
@@ -3919,12 +5230,13 @@ pub(crate) async fn process_s2s_message(
             let event_ctx = crate::events::EventContext {
                 sig_state: match (&sig, sig_verdict) {
                     (None, _) => crate::events::SigState::Unsigned,
-                    (Some(_), Some(crate::connection::messaging::ClientSigOutcome::Verified)) => {
+                    (Some(_), Some(crate::connection::messaging::ClientSigVerdict::Valid)) => {
                         crate::events::SigState::Valid
                     }
                     _ => crate::events::SigState::Unverifiable,
                 },
                 origin: Some(origin_name.clone()),
+                ..Default::default()
             };
             relay_tags.insert("+freeq.at/origin".to_string(), origin_name);
 
@@ -4277,7 +5589,7 @@ pub(crate) async fn process_s2s_message(
                         state,
                         account.as_deref().filter(|_| {
                             sig_verdict
-                                == Some(crate::connection::messaging::ClientSigOutcome::Verified)
+                                == Some(crate::connection::messaging::ClientSigVerdict::Valid)
                         }),
                     ),
                 );
@@ -4417,8 +5729,8 @@ pub(crate) async fn process_s2s_message(
             let sig_verdict =
                 verify_relayed_mutation_tags(state, peer_account.as_deref(), &target, &tags);
             if let Some(verdict) = sig_verdict {
-                use crate::connection::messaging::{ClientSigOutcome, NO_KEY_ON_FILE};
-                if let (ClientSigOutcome::Unverifiable(NO_KEY_ON_FILE), Some(did), Some(sig)) = (
+                use crate::connection::messaging::{ClientSigVerdict, NO_KEY_ON_FILE};
+                if let (ClientSigVerdict::Unverifiable(NO_KEY_ON_FILE), Some(did), Some(sig)) = (
                     verdict,
                     peer_account.as_deref(),
                     tags.get("+freeq.at/sig").map(String::as_str),
@@ -4426,21 +5738,66 @@ pub(crate) async fn process_s2s_message(
                     crate::peer_keys::fetch_on_miss(state, &origin, did, sig);
                 }
                 match verdict {
-                    ClientSigOutcome::Verified => tracing::debug!(
+                    ClientSigVerdict::Valid => tracing::debug!(
                         peer = %authenticated_peer_id, target = %target,
                         "Relayed mutation signature verified against the actor's own key"
                     ),
-                    ClientSigOutcome::Failed => tracing::warn!(
+                    ClientSigVerdict::Invalid => tracing::warn!(
                         peer = %authenticated_peer_id, target = %target, from = %from,
                         account = ?peer_account,
                         "Relayed mutation signature did not verify against the key it names — \
                          stripping it before relay"
                     ),
-                    ClientSigOutcome::Unverifiable(why) => tracing::debug!(
+                    ClientSigVerdict::Unverifiable(why) => tracing::debug!(
                         peer = %authenticated_peer_id, target = %target, why = %why,
                         "Relayed mutation signature cannot be checked here"
                     ),
                 }
+            }
+
+            // ── the verdict decides what happens to a relayed task event ──
+            //
+            // Both task families — act tags and the stopgap +freeq.at/event
+            // coordination family — cross this branch signed, and this is
+            // where each is judged. Valid is stored and applied as far as the
+            // task's origin allows, then delivered below. Invalid is dropped
+            // here and reaches nobody. Anything else this server cannot check
+            // yet waits in the defer queue — never refused, because an outage
+            // must not read as a forgery, and neither stored nor shown until
+            // the key that settles it arrives. Read before the tidying below,
+            // so the check sees the tags as they arrived — the signature
+            // covers them.
+            let is_task_event = crate::connection::act::carries_act_tags(&tags)
+                || tags.contains_key("+freeq.at/event");
+            // The receipt this server owes if the event turns out to be a move
+            // on a task it owns. Held until after delivery below, so the room
+            // sees the move before the confirmation of it.
+            let mut owed_receipt = None;
+            if is_task_event {
+                let peer_declared_act = crate::s2s::peer_supports(
+                    &manager
+                        .peer_capabilities
+                        .lock()
+                        .await
+                        .get(authenticated_peer_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    crate::s2s::ACT,
+                );
+                let (action, receipt) = judge_relayed_task_event(
+                    state,
+                    &from,
+                    &target,
+                    &tags,
+                    &origin,
+                    authenticated_peer_id,
+                    peer_account.as_deref(),
+                    peer_declared_act,
+                );
+                if action != TaskEventAction::Deliver {
+                    return;
+                }
+                owed_receipt = receipt;
             }
 
             // ── A relayed mutation takes the actor's own proof ──────────
@@ -4468,7 +5825,7 @@ pub(crate) async fn process_s2s_message(
                 // refuse an event nothing could ever have proven.
                 && relayed_mutation_in(&tags).is_some_and(|(.., subject, _)| subject.is_some())
                 && crate::connection::messaging::signing_venue(state, actor, &target).is_some()
-                && sig_verdict != Some(crate::connection::messaging::ClientSigOutcome::Verified)
+                && sig_verdict != Some(crate::connection::messaging::ClientSigVerdict::Valid)
             {
                 tracing::warn!(
                     peer = %authenticated_peer_id, origin = %origin, target = %target,
@@ -4515,9 +5872,10 @@ pub(crate) async fn process_s2s_message(
             // answered 404 for an act this server had itself applied.
             //
             // The verdict is this server's own. A peer's assurance about a
-            // signature is not evidence, so `Valid` is recorded only where the
-            // check above returned Verified — and a signature that failed was
-            // stripped from `tags` already, so it cannot reach a row at all.
+            // signature is not evidence, so `SigState::Valid` is recorded only
+            // where the check above returned `Valid` — and an invalid
+            // signature was stripped from `tags` already, so it cannot reach a
+            // row at all.
             //
             // The signature rides only when the DID the check ran against is
             // the one the document will bind, and only while the subject is
@@ -4556,13 +5914,14 @@ pub(crate) async fn process_s2s_message(
                 venue: relayed_venue.as_deref(),
                 ctx: crate::events::EventContext {
                     sig_state: if sig_verdict
-                        == Some(crate::connection::messaging::ClientSigOutcome::Verified)
+                        == Some(crate::connection::messaging::ClientSigVerdict::Valid)
                     {
                         crate::events::SigState::Valid
                     } else {
                         crate::events::SigState::Unverifiable
                     },
                     origin: Some(sanitize_s2s_str(&origin, 64)),
+                    ..Default::default()
                 },
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -4690,89 +6049,29 @@ pub(crate) async fn process_s2s_message(
                 }
             }
 
-            // Wire forms — identical for channel and DM delivery. The account
-            // variant carries the DID the *origin* stamped, never the one the
-            // nick fallback produced: that fallback resolves against our own
-            // nick map, and stamping its answer would present a DID this
-            // server inferred as one the origin attested. Same rule the S2S
-            // PRIVMSG path follows.
-            let build_tagged = |with_account: bool| -> String {
-                let mut t = tags.clone();
-                if with_account && let Some(ref did) = peer_account {
-                    t.insert("account".to_string(), did.clone());
-                }
-                let tag_msg = crate::irc::Message {
-                    tags: t,
-                    prefix: Some(from.clone()),
-                    command: "TAGMSG".to_string(),
-                    params: vec![target.clone()],
-                };
-                format!("{tag_msg}\r\n")
-            };
-            let tagged_line = build_tagged(false);
-            let tagged_line_account = peer_account.as_ref().map(|_| build_tagged(true));
-            let plain_fallback = tags.get("+react").map(|emoji| {
-                format!(":{from} PRIVMSG {target} :\x01ACTION reacted with {emoji}\x01\r\n")
-            });
+            deliver_relayed_tagmsg(
+                state,
+                &from,
+                &target,
+                &tags,
+                peer_account.as_deref(),
+                // The sender's own other devices here get this only when the
+                // signature checked out: that delivery puts the event in the
+                // named identity's own client as something they did.
+                //
+                // Two checks answer that, one per family. A mutation has the
+                // mutation verdict. A task event never does — it is not a
+                // mutation, so that verdict is absent for every one of them —
+                // and its evidence is the act checker above, which returns
+                // anything but `Deliver` for a signature that did not verify.
+                // Reaching here as a task event therefore means what a valid
+                // mutation verdict means.
+                sig_verdict == Some(crate::connection::messaging::ClientSigVerdict::Valid)
+                    || is_task_event,
+            );
 
-            // Resolve recipients: channel members, or (for a nick / `did:` DM)
-            // every local session bound to that recipient — a federated action
-            // addressed to a DID reaches the same person here.
-            let recipients: Vec<String> = if target.starts_with('#') || target.starts_with('&') {
-                state
-                    .channels
-                    .lock()
-                    .get(&target.to_lowercase())
-                    .map(|ch| ch.members.iter().cloned().collect())
-                    .unwrap_or_default()
-            } else {
-                // Plus the sender's own sessions here — a reaction or delete
-                // they made from another server has to reach their other
-                // devices, the same as the DM PRIVMSG path, and on the same
-                // condition: a signature this server checked, because this
-                // delivery puts the event in the named identity's own client
-                // as something they did.
-                let mut sids =
-                    crate::connection::routing::local_sessions_for_target(state, &target);
-                crate::connection::routing::merge_sessions(
-                    &mut sids,
-                    crate::connection::routing::sender_sessions_for_account(
-                        state,
-                        peer_account.as_deref().filter(|_| {
-                            sig_verdict
-                                == Some(crate::connection::messaging::ClientSigOutcome::Verified)
-                        }),
-                    ),
-                );
-                sids
-            };
-
-            // A task message from a peer is delivered under the same
-            // capability gating as a local one (ruled 2026-08-15). This server
-            // does not verify or store it — that is federation's job, and it
-            // is not built — but relaying it is correct federation behaviour:
-            // a task-aware client can render the remote card, and any attempt
-            // to act on a task this server has never filed draws a clean
-            // refusal. Dropping them at the receive side would instead hide
-            // half of a conversation the companion lines already tell.
-            let is_act = crate::connection::act::carries_act_tags(&tags);
-            let tag_caps = state.cap_message_tags.lock();
-            let acct_caps = state.cap_account_tag.lock();
-            let act_caps = state.cap_act.lock();
-            let conns = state.connections.lock();
-            for sid in &recipients {
-                if let Some(tx) = conns.get(sid) {
-                    if tag_caps.contains(sid) && (!is_act || act_caps.contains(sid)) {
-                        let line = if acct_caps.contains(sid) {
-                            tagged_line_account.as_ref().unwrap_or(&tagged_line)
-                        } else {
-                            &tagged_line
-                        };
-                        let _ = tx.try_send(line.clone());
-                    } else if !is_act && let Some(ref fallback) = plain_fallback {
-                        let _ = tx.try_send(fallback.clone());
-                    }
-                }
+            if let Some(receipt) = owed_receipt {
+                crate::connection::act::broadcast_receipt(state, &receipt, &target);
             }
         }
 
@@ -4783,7 +6082,6 @@ pub(crate) async fn process_s2s_message(
             handle,
             is_op: _, // Intentionally ignored — op status derived locally (C-2)
             actor_class,
-            origin,
             ..
         } => {
             // Sanitize peer-provided strings to prevent IRC protocol injection.
@@ -4970,7 +6268,6 @@ pub(crate) async fn process_s2s_message(
             channel,
             founder_did,
             did_ops,
-            origin,
             ..
         } => {
             let channel = channel.to_lowercase();
@@ -5118,6 +6415,15 @@ pub(crate) async fn process_s2s_message(
                     actor_did: e.actor_did,
                     subject: e.subject,
                     emoji: e.emoji,
+                    // Where the event was minted, which is not necessarily
+                    // here. A blank stored origin means we minted it, so it
+                    // travels named; anything else travels as filed and is
+                    // never overwritten with ours — a task's referee is the
+                    // server that opened it, not the one that replayed it.
+                    origin: match e.origin {
+                        Some(o) if !o.is_empty() => o,
+                        _ => manager.server_id.clone(),
+                    },
                     timestamp: e.timestamp,
                 })
                 .collect();
@@ -5139,16 +6445,118 @@ pub(crate) async fn process_s2s_message(
             }
         }
 
+        // ── a transition carried here because we own the task ──
+        //
+        // Verified exactly as any relayed task event is — the same judge, the
+        // same three-way verdict, the same defer queue when the signer's key
+        // has not arrived yet — and then decided, because deciding is what was
+        // asked for. When the rules take a move on a task of ours, the store
+        // path mints the receipt for it: the same always-emit rule a local
+        // sender's move gets. When the rules refuse it, nothing is filed and
+        // nothing goes out — the claim stays unconfirmed wherever it is held,
+        // which is the true account of a losing one.
+        //
+        // Not delivered to local clients. The event reaches them by the
+        // ordinary relay every task event takes, and delivering the addressed
+        // copy as well would put the same event in the room twice.
+        S2sMessage::ActRoute {
+            act_id,
+            act_event_id,
+            tags,
+            target,
+            from,
+            account,
+            ..
+        } => {
+            let act_id = sanitize_s2s_str(&act_id, 100);
+            let act_event_id = sanitize_s2s_str(&act_event_id, 100);
+            let target = sanitize_s2s_str(&target, 200);
+            let from = sanitize_s2s_str(&from, 512);
+            let peer_account = account.map(|a| sanitize_s2s_str(&a, 512));
+
+            // Ours to rule on, or misrouted. A task we have never seen opened
+            // is not ours either — the store path says so and files nothing.
+            let home = state
+                .with_db(|db| db.act_task_origin(&act_id))
+                .flatten()
+                .unwrap_or_default();
+            if !home.is_empty() {
+                tracing::warn!(
+                    peer = %authenticated_peer_id, act_id = %act_id,
+                    event_id = %act_event_id, home = %home,
+                    "A task transition was carried here for a task another server owns — dropped"
+                );
+                return;
+            }
+
+            let peer_declared_act = crate::s2s::peer_supports(
+                &manager
+                    .peer_capabilities
+                    .lock()
+                    .await
+                    .get(authenticated_peer_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                crate::s2s::ACT,
+            );
+            let (_, receipt) = judge_relayed_task_event(
+                state,
+                &from,
+                &target,
+                &tags,
+                &origin,
+                authenticated_peer_id,
+                peer_account.as_deref(),
+                peer_declared_act,
+            );
+            match receipt {
+                Some(receipt) => {
+                    crate::connection::act::broadcast_receipt(state, &receipt, &target)
+                }
+                // No new receipt, and a peer that is still asking. If this
+                // server confirmed the event before, the receipt was written
+                // down when it was made, so it is read back and sent to the one peer
+                // waiting on it rather than decided a second time. Nothing
+                // else covers this: a catch-up replay carries an event under
+                // the server that minted it, never under the one that ruled
+                // on it, so the ask is the only way back.
+                None => {
+                    answer_with_stored_receipt(
+                        state,
+                        manager,
+                        authenticated_peer_id,
+                        &act_event_id,
+                        &target,
+                    )
+                    .await
+                }
+            }
+        }
+
         S2sMessage::CatchupEvents {
-            origin,
-            events,
+            origin: _,
+            mut events,
             more,
         } => {
             let count = events.len();
             let mut filed = 0usize;
             let mut conflicts = 0usize;
+            // Mint order, not arrival order. An event id is a ULID, so its
+            // byte order is the order its signer minted it in — the one clock
+            // two servers agree on. Without this an opener can arrive behind
+            // the follow-up that names it, and the follow-up names a task
+            // nothing has opened yet.
+            events.sort_by(|a, b| a.event_id.cmp(&b.event_id));
+            // Then each task's opener ahead of that task's follow-ups, the
+            // same regroup a rebuild does and for the same reason: a signer
+            // may mint up to the ingress skew bound in the past, so a
+            // follow-up's id can sort ahead of its opener's, and a follow-up
+            // replayed first names a task nothing has opened. A stable sort,
+            // so mint order survives inside each task, and events of other
+            // kinds keep the id order they already have.
+            events.sort_by(|a, b| replay_group_key(a).cmp(&replay_group_key(b)));
             for ev in events {
-                match apply_replayed_event(state, &origin, ev) {
+                match apply_replayed_event(state, &manager.server_id, authenticated_peer_id, ev) {
                     ReplayOutcome::Filed => filed += 1,
                     ReplayOutcome::AlreadyHeld => {}
                     ReplayOutcome::Conflicted => conflicts += 1,
@@ -6390,6 +7798,11 @@ mod s2s_adversarial_tests {
             sfu_state: Mutex::new(None),
             #[cfg(feature = "av-native")]
             av_bridges: Mutex::new(std::collections::HashMap::new()),
+            act_deferred: Mutex::new(crate::act_relay::DeferQueue::new(
+                config.act_defer_max_per_origin,
+                config.act_defer_max_total,
+            )),
+            act_routes: Mutex::new(crate::act_relay::RouteQueue::new(MAX_PENDING_ROUTES)),
             s2s_manager: Mutex::new(None),
             cluster_doc: crate::crdt::ClusterDoc::new("test-server-id"),
             db: db.map(Mutex::new),
@@ -6444,6 +7857,8 @@ mod s2s_adversarial_tests {
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
+            peer_contact: Arc::new(parking_lot::Mutex::new(crate::s2s::PeerContact::default())),
+            capabilities: crate::s2s::our_capabilities(),
         })
     }
 
@@ -6477,7 +7892,7 @@ mod s2s_adversarial_tests {
     // the document is rebuilt from the bytes that arrived, and the three
     // answers stay distinct (checks out / does not check out / cannot tell).
 
-    use crate::connection::messaging::ClientSigOutcome;
+    use crate::connection::messaging::ClientSigVerdict;
 
     const SIGNER: &str = "did:plc:relayedsigner";
 
@@ -6529,7 +7944,7 @@ mod s2s_adversarial_tests {
         text: &str,
         tags: &HashMap<String, String>,
         sig: Option<&str>,
-    ) -> Option<crate::connection::messaging::ClientSigOutcome> {
+    ) -> Option<crate::connection::messaging::ClientSigVerdict> {
         verify_relayed_privmsg(state, account, target, msgid, text, tags, None, None, sig)
     }
 
@@ -6549,7 +7964,7 @@ mod s2s_adversarial_tests {
                 &HashMap::new(),
                 Some(&sig),
             ),
-            Some(ClientSigOutcome::Verified)
+            Some(ClientSigVerdict::Valid)
         );
     }
 
@@ -6572,7 +7987,7 @@ mod s2s_adversarial_tests {
                 &HashMap::new(),
                 Some(&sig),
             ),
-            Some(ClientSigOutcome::Failed),
+            Some(ClientSigVerdict::Invalid),
             "a body changed in flight must not verify"
         );
     }
@@ -6595,7 +8010,7 @@ mod s2s_adversarial_tests {
                 &HashMap::new(),
                 Some(&sig),
             ),
-            Some(ClientSigOutcome::Failed),
+            Some(ClientSigVerdict::Invalid),
             "a signed event replayed into another channel must not verify"
         );
     }
@@ -6621,7 +8036,7 @@ mod s2s_adversarial_tests {
                     &HashMap::new(),
                     Some(&sig),
                 ),
-                Some(ClientSigOutcome::Unverifiable(_))
+                Some(ClientSigVerdict::Unverifiable(_))
             ),
             "a relayed message with no event id is uncheckable, not forged"
         );
@@ -6646,7 +8061,7 @@ mod s2s_adversarial_tests {
                 &HashMap::new(),
                 Some(&sig),
             ),
-            Some(ClientSigOutcome::Unverifiable(_))
+            Some(ClientSigVerdict::Unverifiable(_))
         ));
     }
 
@@ -6669,7 +8084,7 @@ mod s2s_adversarial_tests {
                 &HashMap::new(),
                 Some(&sig),
             ),
-            Some(ClientSigOutcome::Unverifiable(_))
+            Some(ClientSigVerdict::Unverifiable(_))
         ));
     }
 
@@ -6729,7 +8144,7 @@ mod s2s_adversarial_tests {
                 Some(&lines),
                 Some(&sig),
             ),
-            Some(ClientSigOutcome::Verified),
+            Some(ClientSigVerdict::Valid),
             "a multiline body must be reassembled before it is hashed"
         );
 
@@ -6747,7 +8162,7 @@ mod s2s_adversarial_tests {
                 None,
                 Some(&sig),
             ),
-            Some(ClientSigOutcome::Verified)
+            Some(ClientSigVerdict::Valid)
         );
     }
 
@@ -6782,7 +8197,7 @@ mod s2s_adversarial_tests {
                 &tags,
                 Some(&sig),
             ),
-            Some(ClientSigOutcome::Verified),
+            Some(ClientSigVerdict::Valid),
             "the reply reference must be part of the rebuilt document"
         );
 
@@ -7173,14 +8588,14 @@ mod s2s_adversarial_tests {
 
         assert_eq!(
             verify_relayed_mutation_tags(&state, Some(SIGNER), "#chat", &tags("01SUBJECTMSGID")),
-            Some(ClientSigOutcome::Verified)
+            Some(ClientSigVerdict::Valid)
         );
 
         // The subject swapped in flight — the reaction moved onto a different
         // message than the one its author reacted to.
         assert_eq!(
             verify_relayed_mutation_tags(&state, Some(SIGNER), "#chat", &tags("01OTHERMESSAGE")),
-            Some(ClientSigOutcome::Failed),
+            Some(ClientSigVerdict::Invalid),
             "a mutation whose subject was swapped must not verify"
         );
     }
@@ -7196,7 +8611,7 @@ mod s2s_adversarial_tests {
         ]);
         assert!(matches!(
             verify_relayed_mutation_tags(&state, Some(SIGNER), "#chat", &tags),
-            Some(ClientSigOutcome::Unverifiable(_))
+            Some(ClientSigVerdict::Unverifiable(_))
         ));
     }
 
@@ -7393,7 +8808,7 @@ mod s2s_adversarial_tests {
                 &HashMap::new(),
                 Some(&sig),
             ),
-            Some(crate::connection::messaging::ClientSigOutcome::Verified),
+            Some(crate::connection::messaging::ClientSigVerdict::Valid),
             "a relayed message signed with a retired key must still verify"
         );
 
@@ -7421,7 +8836,7 @@ mod s2s_adversarial_tests {
                 &canonical,
                 &mutation_sig,
             ),
-            crate::connection::messaging::ClientSigOutcome::Verified,
+            crate::connection::messaging::ClientSigVerdict::Valid,
             "a replayed event signed with a retired key must still verify"
         );
     }
@@ -7463,7 +8878,7 @@ mod s2s_adversarial_tests {
         // Addressed to the recipient's DID: the pair is on the wire already.
         assert_eq!(
             verify_relayed_mutation_tags(&state, Some(SIGNER), recipient, &tags),
-            Some(ClientSigOutcome::Verified),
+            Some(ClientSigVerdict::Valid),
         );
 
         // Addressed to a nick this server can resolve to that same DID — the
@@ -7474,7 +8889,7 @@ mod s2s_adversarial_tests {
             .insert("recipient".to_string(), recipient.to_string());
         assert_eq!(
             verify_relayed_mutation_tags(&state, Some(SIGNER), "recipient", &tags),
-            Some(ClientSigOutcome::Verified),
+            Some(ClientSigVerdict::Valid),
             "a nick and a DID name one conversation, and one venue",
         );
 
@@ -7483,7 +8898,7 @@ mod s2s_adversarial_tests {
         assert!(
             matches!(
                 verify_relayed_mutation_tags(&state, Some(SIGNER), "astranger", &tags),
-                Some(ClientSigOutcome::Unverifiable(_))
+                Some(ClientSigVerdict::Unverifiable(_))
             ),
             "an unresolvable recipient is uncheckable, not forged",
         );
@@ -7697,10 +9112,11 @@ mod s2s_adversarial_tests {
             actor_did: Some(SIGNER.to_string()),
             subject: Some("01SUBJECTMSGID".to_string()),
             emoji: Some("👍".to_string()),
+            origin: PEER.to_string(),
             timestamp: filed.timestamp,
         };
         assert_eq!(
-            apply_replayed_event(&state, PEER, replayed),
+            apply_replayed_event(&state, "us", PEER, replayed),
             ReplayOutcome::AlreadyHeld,
             "the same act twice is one event — spent stays spent",
         );
@@ -8487,7 +9903,8 @@ mod s2s_adversarial_tests {
     /// drops the receiver — that's fine when the test only cares
     /// about effects on local state, but we need to inspect the
     /// broadcasted S2sMessage here.
-    fn test_manager_with_broadcast_rx() -> (Arc<S2sManager>, mpsc::Receiver<S2sMessage>) {
+    pub(super) fn test_manager_with_broadcast_rx() -> (Arc<S2sManager>, mpsc::Receiver<S2sMessage>)
+    {
         let (event_tx, _event_rx) = mpsc::channel(1024);
         let (broadcast_tx, broadcast_rx) = mpsc::channel(1024);
         let mut key_bytes = [0u8; 32];
@@ -8509,6 +9926,8 @@ mod s2s_adversarial_tests {
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
+            peer_contact: Arc::new(parking_lot::Mutex::new(crate::s2s::PeerContact::default())),
+            capabilities: crate::s2s::our_capabilities(),
         });
         (manager, broadcast_rx)
     }
@@ -11602,9 +13021,11 @@ mod catchup_tests {
 
     use std::collections::HashMap;
 
+    use super::relayed_task_verdict_tests::capture;
     use super::s2s_adversarial_tests::{setup_authenticated_peer, test_manager};
     use super::{
-        ReplayOutcome, SharedState, apply_replayed_event, process_s2s_message, test_state_with_db,
+        ReplayOutcome, SharedState, apply_replayed_event, process_s2s_message,
+        retry_deferred_task_events, test_state_with_db,
     };
     use crate::events::SigState;
     use crate::s2s::{CATCHUP, ReplayedEvent, S2sMessage, our_capabilities, peer_supports};
@@ -11616,6 +13037,10 @@ mod catchup_tests {
     const ALICE: &str = "did:plc:catchupalice";
     /// The peer id the shared S2S test helpers authenticate.
     use super::s2s_adversarial_tests::PEER;
+    /// This server's own endpoint id — `test_manager`'s `server_id`, so a test
+    /// driving the real handler and one calling `apply_replayed_event` direct
+    /// are talking about the same receiver.
+    const OWN: &str = "test-local-server";
 
     fn state_with_key(key: &SigningKey) -> Arc<SharedState> {
         let state = test_state_with_db();
@@ -11625,7 +13050,13 @@ mod catchup_tests {
         state
     }
 
-    fn signed_event(key: &SigningKey, event_id: &str, body: &str) -> ReplayedEvent {
+    /// One signed event as it travels, minted at `minted_at`.
+    fn minted_event(
+        key: &SigningKey,
+        event_id: &str,
+        body: &str,
+        minted_at: &str,
+    ) -> ReplayedEvent {
         let doc = ChatDoc::message(ALICE, event_id, "#caught", body);
         ReplayedEvent {
             event_id: event_id.to_string(),
@@ -11636,8 +13067,14 @@ mod catchup_tests {
             actor_did: Some(ALICE.to_string()),
             subject: None,
             emoji: None,
+            origin: minted_at.to_string(),
             timestamp: 1000,
         }
+    }
+
+    /// The ordinary case: the peer replaying it is the peer that minted it.
+    fn signed_event(key: &SigningKey, event_id: &str, body: &str) -> ReplayedEvent {
+        minted_event(key, event_id, body, PEER)
     }
 
     /// The receiver checks each replayed event itself and files its own verdict.
@@ -11651,7 +13088,10 @@ mod catchup_tests {
             "01CATCH000000000000000001",
             "missed while you were out",
         );
-        assert_eq!(apply_replayed_event(&state, PEER, ev), ReplayOutcome::Filed);
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, ev),
+            ReplayOutcome::Filed
+        );
 
         let row = state
             .with_db(|db| db.get_event("01CATCH000000000000000001"))
@@ -11665,9 +13105,88 @@ mod catchup_tests {
         assert_eq!(
             row.origin.as_deref(),
             Some(PEER),
-            "and recorded who replayed it"
+            "and recorded where it was minted — which here is the peer that \
+             replayed it, because that peer minted it"
         );
         assert_eq!(row.venue, "#caught");
+    }
+
+    /// Origin names the **minter**, not the messenger.
+    ///
+    /// Three servers: A mints, B files it from A, and C — which was never
+    /// linked to A — heals from B. C must record A. Recording B would make C
+    /// believe B referees a task A owns, and two servers refereeing one task
+    /// is the disagreement the origin field exists to prevent.
+    #[test]
+    fn an_event_healed_through_a_third_party_records_the_server_that_minted_it() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        const MINTER: &str = "server-a";
+
+        // PEER here is B: it is replaying to us, but it is not where this
+        // event came from and its reply says so.
+        let ev = minted_event(&key, "01CATCH000000000000000010", "A said this", MINTER);
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, ev),
+            ReplayOutcome::Filed
+        );
+
+        let row = state
+            .with_db(|db| db.get_event("01CATCH000000000000000010"))
+            .flatten()
+            .expect("the event is on file");
+        assert_eq!(
+            row.origin.as_deref(),
+            Some(MINTER),
+            "the minter, not the messenger"
+        );
+    }
+
+    /// An event of ours, handed back to us, is ours again.
+    ///
+    /// A row this server minted carries no origin. If a replay stamped one on
+    /// it, this server would read its own tasks as another server's and stop
+    /// refereeing them — the exact opposite of what healing is for.
+    #[test]
+    fn an_event_of_ours_that_comes_home_is_filed_as_ours() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+
+        let ev = minted_event(&key, "01CATCH000000000000000011", "we said this", OWN);
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, ev),
+            ReplayOutcome::Filed
+        );
+
+        let row = state
+            .with_db(|db| db.get_event("01CATCH000000000000000011"))
+            .flatten()
+            .expect("the event is on file");
+        assert_eq!(
+            row.origin, None,
+            "an event that came home is not a foreign event"
+        );
+    }
+
+    /// A peer that predates the per-event field sends none, and its replays
+    /// are read exactly as they were before it existed: everything in the
+    /// batch is attributed to the peer that sent the batch.
+    #[test]
+    fn an_older_peers_replay_still_attributes_to_that_peer() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+
+        let ev = minted_event(&key, "01CATCH000000000000000012", "no field", "");
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, ev),
+            ReplayOutcome::Filed
+        );
+
+        let row = state
+            .with_db(|db| db.get_event("01CATCH000000000000000012"))
+            .flatten()
+            .expect("the event is on file");
+        assert_eq!(row.origin.as_deref(), Some(PEER));
     }
 
     /// A replay of what we already hold changes nothing. Links flap; replay has to
@@ -11679,15 +13198,15 @@ mod catchup_tests {
         let ev = signed_event(&key, "01CATCH000000000000000002", "once");
 
         assert_eq!(
-            apply_replayed_event(&state, PEER, ev.clone()),
+            apply_replayed_event(&state, OWN, PEER, ev.clone()),
             ReplayOutcome::Filed
         );
         assert_eq!(
-            apply_replayed_event(&state, PEER, ev.clone()),
+            apply_replayed_event(&state, OWN, PEER, ev.clone()),
             ReplayOutcome::AlreadyHeld
         );
         assert_eq!(
-            apply_replayed_event(&state, PEER, ev),
+            apply_replayed_event(&state, OWN, PEER, ev),
             ReplayOutcome::AlreadyHeld,
             "and again, as many times as the link flaps"
         );
@@ -11713,11 +13232,11 @@ mod catchup_tests {
         assert_ne!(first.canonical, second.canonical);
 
         assert_eq!(
-            apply_replayed_event(&state, PEER, first.clone()),
+            apply_replayed_event(&state, OWN, PEER, first.clone()),
             ReplayOutcome::Filed
         );
         assert_eq!(
-            apply_replayed_event(&state, PEER, second.clone()),
+            apply_replayed_event(&state, OWN, PEER, second.clone()),
             ReplayOutcome::Conflicted
         );
 
@@ -11735,7 +13254,7 @@ mod catchup_tests {
         // Replaying the loser again does not overwrite the receipt, and does not
         // start winning by persistence.
         assert_eq!(
-            apply_replayed_event(&state, PEER, second),
+            apply_replayed_event(&state, OWN, PEER, second),
             ReplayOutcome::Conflicted
         );
         let row2 = state.with_db(|db| db.get_event(id)).flatten().unwrap();
@@ -11763,7 +13282,7 @@ mod catchup_tests {
         .canonical();
 
         assert_eq!(
-            apply_replayed_event(&state, PEER, ev),
+            apply_replayed_event(&state, OWN, PEER, ev),
             ReplayOutcome::Unusable
         );
         assert!(
@@ -11784,7 +13303,10 @@ mod catchup_tests {
         let state = test_state_with_db();
 
         let ev = signed_event(&key, "01CATCH000000000000000005", "who signed this");
-        assert_eq!(apply_replayed_event(&state, PEER, ev), ReplayOutcome::Filed);
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, ev),
+            ReplayOutcome::Filed
+        );
         assert_eq!(
             state
                 .with_db(|db| db.get_event("01CATCH000000000000000005"))
@@ -11810,9 +13332,13 @@ mod catchup_tests {
             actor_did: None,
             subject: None,
             emoji: None,
+            origin: PEER.to_string(),
             timestamp: 1000,
         };
-        assert_eq!(apply_replayed_event(&state, PEER, ev), ReplayOutcome::Filed);
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, ev),
+            ReplayOutcome::Filed
+        );
         assert_eq!(
             state
                 .with_db(|db| db.get_event("01CATCH000000000000000006"))
@@ -11834,7 +13360,7 @@ mod catchup_tests {
         let mut ancient = signed_event(&key, "01CATCH000000000000000007", "from last year");
         ancient.timestamp = 1;
         assert_eq!(
-            apply_replayed_event(&state, PEER, ancient),
+            apply_replayed_event(&state, OWN, PEER, ancient),
             ReplayOutcome::Filed,
             "an old event is exactly what a catch-up is for"
         );
@@ -11924,6 +13450,86 @@ mod catchup_tests {
             "the window is the window: {venues:?}"
         );
         assert!(venues.contains(&"#open"), "{venues:?}");
+    }
+
+    /// Every event in a reply says where it was minted.
+    ///
+    /// One we minted goes out named as ours; one we hold from somewhere else
+    /// goes out named as that somewhere else. Overwriting the second with our
+    /// own id is what would tell an asker we referee a task we do not.
+    #[tokio::test]
+    async fn every_replayed_event_names_the_server_that_minted_it() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        let manager = test_manager();
+        setup_authenticated_peer(&state, &manager).await;
+
+        // One of ours: stored by local ingress, so its origin column is blank.
+        state
+            .with_db(|db| {
+                db.insert_message(
+                    "#caught",
+                    "a!u@h",
+                    "ours",
+                    100,
+                    &HashMap::new(),
+                    Some("01MINT0000000000000000001"),
+                    Some(ALICE),
+                )
+            })
+            .unwrap();
+        // And one we hold from a third server, filed the way a replay files.
+        const ELSEWHERE: &str = "server-elsewhere";
+        assert_eq!(
+            apply_replayed_event(
+                &state,
+                OWN,
+                PEER,
+                minted_event(&key, "01MINT0000000000000000002", "theirs", ELSEWHERE),
+            ),
+            ReplayOutcome::Filed
+        );
+
+        let (tx, mut rx) = mpsc::channel(16);
+        manager
+            .peers
+            .lock()
+            .await
+            .insert(PEER.to_string(), crate::s2s::PeerEntry { tx, conn_gen: 1 });
+        process_s2s_message(
+            &state,
+            &manager,
+            PEER,
+            S2sMessage::CatchupRequest {
+                peer_id: PEER.to_string(),
+                since_ts: 0,
+                limit: 0,
+            },
+        )
+        .await;
+
+        let events = match rx.try_recv().expect("the peer receives an answer") {
+            S2sMessage::CatchupEvents { events, .. } => events,
+            other => panic!("expected CatchupEvents, got {other:?}"),
+        };
+        let origin_of = |id: &str| {
+            events
+                .iter()
+                .find(|e| e.event_id == id)
+                .unwrap_or_else(|| panic!("{id} missing from the reply"))
+                .origin
+                .clone()
+        };
+        assert_eq!(
+            origin_of("01MINT0000000000000000001"),
+            manager.server_id,
+            "an event we minted goes out named as ours, not blank"
+        );
+        assert_eq!(
+            origin_of("01MINT0000000000000000002"),
+            ELSEWHERE,
+            "and one we are only holding keeps the name it arrived under"
+        );
     }
 
     /// …and a peer the live relay path would skip gets no answer either,
@@ -12017,5 +13623,2741 @@ mod catchup_tests {
         let recent = state.with_db(|db| db.events_since(250, 10)).unwrap();
         assert_eq!(recent.len(), 1, "the window is respected");
         assert_eq!(recent[0].event_id, "01WINDOW00000000000000003");
+    }
+
+    // ── healing the task view, not just the log ──────────────────────
+    //
+    // A server that was away has to come back with the *same answers* as one
+    // that stayed. Filing the log row alone leaves it holding the record of a
+    // task while its REST view says the task is not there.
+
+    /// The venue every task event in these tests is posted to.
+    fn caught_venue() -> String {
+        freeq_sdk::chatsig::channel_venue("#caught")
+    }
+
+    /// One signed task event as it travels in a replay, minted at `minted_at`.
+    fn act_event(
+        key: &SigningKey,
+        event_id: &str,
+        minted_at: &str,
+        tags: &[(&str, &str)],
+    ) -> ReplayedEvent {
+        let venue = caught_venue();
+        let canonical = freeq_sdk::act::act_canonical(tags.iter().copied(), &venue, event_id)
+            .expect("act tags present");
+        ReplayedEvent {
+            event_id: event_id.to_string(),
+            signature: Some(freeq_sdk::sigtag::sign_canonical(&canonical, key)),
+            canonical,
+            kind: "act".to_string(),
+            venue,
+            actor_did: Some(ALICE.to_string()),
+            subject: tags
+                .iter()
+                .find(|(k, _)| *k == "+freeq.at/act-id")
+                .map(|(_, v)| v.to_string()),
+            emoji: None,
+            origin: minted_at.to_string(),
+            timestamp: 1000,
+        }
+    }
+
+    /// An offer that opens a claimable task.
+    fn opener(key: &SigningKey, event_id: &str, minted_at: &str) -> ReplayedEvent {
+        act_event(
+            key,
+            event_id,
+            minted_at,
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", ALICE),
+                ("+freeq.at/act-title", "healed"),
+            ],
+        )
+    }
+
+    /// A claim on the task `act_id` opened.
+    fn claim(key: &SigningKey, event_id: &str, act_id: &str, minted_at: &str) -> ReplayedEvent {
+        act_event(
+            key,
+            event_id,
+            minted_at,
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "claim"),
+                ("+freeq.at/from", ALICE),
+                ("+freeq.at/act-id", act_id),
+            ],
+        )
+    }
+
+    /// The ids every receipt on this task names, oldest first.
+    fn receipts_naming(state: &Arc<SharedState>, act_id: &str) -> Vec<String> {
+        let subject_tag = freeq_sdk::act_transitions::confirmation_subject_tag();
+        state
+            .with_db(|db| db.act_task_events(act_id))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|e| {
+                let view = crate::events::derive_act_view(&e.canonical)?;
+                freeq_sdk::act_transitions::is_confirmation(&view.verb)
+                    .then(|| view.fields.get(subject_tag).cloned().unwrap_or_default())
+            })
+            .collect()
+    }
+
+    /// A receipt signed by a home whose key this server may not hold yet.
+    fn receipt(
+        key: &SigningKey,
+        event_id: &str,
+        act_id: &str,
+        subject: &str,
+        home: &str,
+        minted_at: &str,
+    ) -> ReplayedEvent {
+        let subject_tag = format!(
+            "+freeq.at/{}",
+            freeq_sdk::act_transitions::confirmation_subject_tag()
+        );
+        let mut ev = act_event(
+            key,
+            event_id,
+            minted_at,
+            &[
+                ("+freeq.at/act", "handoff"),
+                (
+                    "+freeq.at/act-verb",
+                    freeq_sdk::act_transitions::confirmation_verb(),
+                ),
+                ("+freeq.at/from", home),
+                ("+freeq.at/act-id", act_id),
+                (&subject_tag, subject),
+            ],
+        );
+        ev.actor_did = Some(home.to_string());
+        ev
+    }
+
+    /// A home-signed transition — an expiry — as it travels in a replay.
+    fn system_transition(
+        key: &SigningKey,
+        event_id: &str,
+        act_id: &str,
+        verb: &str,
+        home: &str,
+        minted_at: &str,
+    ) -> ReplayedEvent {
+        let mut ev = act_event(
+            key,
+            event_id,
+            minted_at,
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", verb),
+                ("+freeq.at/from", home),
+                ("+freeq.at/act-id", act_id),
+            ],
+        );
+        ev.actor_did = Some(home.to_string());
+        ev
+    }
+
+    /// Put a signer's key on file, so a replayed event of theirs verifies.
+    fn key_on_file(state: &Arc<SharedState>, did: &str, key: &SigningKey) {
+        state
+            .with_db(|db| db.save_signing_key(did, key.verifying_key().as_bytes()))
+            .expect("test state has a database");
+    }
+
+    /// A task another server owns, with one unruled claim on it — what every
+    /// authority test below starts from. `HOME_LINK` is the endpoint id that
+    /// server is reachable as, and the task is stamped with it.
+    const HOME_LINK: &str = "home-endpoint-id";
+    const HOME_DID: &str = "did:web:home.example";
+    const THIRD_DID: &str = "did:web:third.example";
+
+    fn a_peers_task_with_a_claim_on_it(
+        state: &Arc<SharedState>,
+        key: &SigningKey,
+        act_id: &str,
+        claimed: &str,
+    ) {
+        assert_eq!(
+            apply_replayed_event(state, OWN, HOME_LINK, opener(key, act_id, HOME_LINK)),
+            ReplayOutcome::Filed
+        );
+        assert_eq!(
+            apply_replayed_event(
+                state,
+                OWN,
+                HOME_LINK,
+                claim(key, claimed, act_id, HOME_LINK)
+            ),
+            ReplayOutcome::Filed
+        );
+        assert_eq!(
+            state
+                .with_db(|db| db.act_task(act_id))
+                .flatten()
+                .expect("live")
+                .state,
+            "open",
+            "a transition on a peer's task decides nothing here"
+        );
+    }
+
+    // ── whose word a replayed receipt carries ─────────────────────────────
+    //
+    // A replayed event's origin is what the replaying peer *says* minted it.
+    // That is right for the ownership stamp and wrong for authority: a peer
+    // writes that field. The two events that carry the home's word — its
+    // receipt, and a transition it signed itself — are therefore judged
+    // against the connection the batch arrived on, and a peer that is not the
+    // task's home is not that server however its batch is stamped.
+
+    /// A third server replays a receipt it signed under its own `did:web:`
+    /// name, stamped with the home's endpoint id. The signature checks out —
+    /// it is that server's own key over its own bytes — and the stamp says
+    /// what it likes. The connection says otherwise, and the connection is
+    /// what decides.
+    #[test]
+    fn a_replayed_receipt_from_a_peer_that_is_not_the_home_is_skipped() {
+        const ACT: &str = "01ACT00000000000000000061";
+        const CLAIMED: &str = "01ACT00000000000000000062";
+        const FORGED: &str = "01ACT00000000000000000063";
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        a_peers_task_with_a_claim_on_it(&state, &key, ACT, CLAIMED);
+
+        let third_key = SigningKey::from_bytes(&[113u8; 32]);
+        key_on_file(&state, THIRD_DID, &third_key);
+        let (sink, _guard) = capture();
+        assert_eq!(
+            apply_replayed_event(
+                &state,
+                OWN,
+                PEER,
+                receipt(&third_key, FORGED, ACT, CLAIMED, THIRD_DID, HOME_LINK),
+            ),
+            ReplayOutcome::Unusable
+        );
+
+        assert!(
+            !state.with_db(|db| db.is_act_event(FORGED)).unwrap(),
+            "and it is not filed either: a row under that id would make the \
+             home's own replay of a genuine receipt a duplicate"
+        );
+        assert_eq!(
+            state
+                .with_db(|db| db.act_task(ACT))
+                .flatten()
+                .expect("live")
+                .state,
+            "open",
+            "nothing moved"
+        );
+        assert_eq!(
+            state.act_deferred.lock().len(),
+            0,
+            "nor held: a peer that is not the home never carries the home's word, \
+             so there is nothing about it a key could settle"
+        );
+        let logs = sink.text();
+        assert!(
+            logs.contains(FORGED) && logs.contains("not the server that owns"),
+            "the skip names the event and says why: {logs}"
+        );
+    }
+
+    /// And the home's own replay of its own receipt applies.
+    #[test]
+    fn a_replayed_receipt_from_the_home_itself_applies() {
+        const ACT: &str = "01ACT00000000000000000064";
+        const CLAIMED: &str = "01ACT00000000000000000065";
+        const RECEIPT: &str = "01ACT00000000000000000066";
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        a_peers_task_with_a_claim_on_it(&state, &key, ACT, CLAIMED);
+
+        let home_key = SigningKey::from_bytes(&[127u8; 32]);
+        key_on_file(&state, HOME_DID, &home_key);
+        assert_eq!(
+            apply_replayed_event(
+                &state,
+                OWN,
+                HOME_LINK,
+                receipt(&home_key, RECEIPT, ACT, CLAIMED, HOME_DID, HOME_LINK),
+            ),
+            ReplayOutcome::Filed
+        );
+
+        let task = state
+            .with_db(|db| db.act_task(ACT))
+            .flatten()
+            .expect("live");
+        assert_eq!(
+            (task.state.as_str(), task.assignee.as_deref()),
+            ("assigned", Some(ALICE)),
+            "the home's own replay is the one that carries its word"
+        );
+    }
+
+    /// The same rule for the other event a server signs itself. An expiry
+    /// replayed by anyone but the task's home ends nothing.
+    #[test]
+    fn a_replayed_expiry_from_a_peer_that_is_not_the_home_is_skipped() {
+        const ACT: &str = "01ACT00000000000000000067";
+        const CLAIMED: &str = "01ACT00000000000000000068";
+        const FORGED: &str = "01ACT00000000000000000069";
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        a_peers_task_with_a_claim_on_it(&state, &key, ACT, CLAIMED);
+
+        let third_key = SigningKey::from_bytes(&[131u8; 32]);
+        key_on_file(&state, THIRD_DID, &third_key);
+        assert_eq!(
+            apply_replayed_event(
+                &state,
+                OWN,
+                PEER,
+                system_transition(&third_key, FORGED, ACT, "expire", THIRD_DID, HOME_LINK),
+            ),
+            ReplayOutcome::Unusable
+        );
+        assert!(
+            state.with_db(|db| db.act_task(ACT)).flatten().is_some(),
+            "a peer that does not own the task cannot end it"
+        );
+        assert!(!state.with_db(|db| db.is_act_event(FORGED)).unwrap());
+    }
+
+    /// …and the home's own replay of its own expiry ends it.
+    #[test]
+    fn a_replayed_expiry_from_the_home_itself_ends_the_task() {
+        const ACT: &str = "01ACT00000000000000000070";
+        const CLAIMED: &str = "01ACT00000000000000000071";
+        const EXPIRY: &str = "01ACT00000000000000000072";
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        a_peers_task_with_a_claim_on_it(&state, &key, ACT, CLAIMED);
+
+        let home_key = SigningKey::from_bytes(&[137u8; 32]);
+        key_on_file(&state, HOME_DID, &home_key);
+        assert_eq!(
+            apply_replayed_event(
+                &state,
+                OWN,
+                HOME_LINK,
+                system_transition(&home_key, EXPIRY, ACT, "expire", HOME_DID, HOME_LINK),
+            ),
+            ReplayOutcome::Filed
+        );
+        assert!(
+            state.with_db(|db| db.act_task(ACT)).flatten().is_none(),
+            "the task's own server ended it"
+        );
+    }
+
+    /// And a peer cannot become this server by stamping a batch with our id.
+    ///
+    /// A task of ours carries no origin at all — the home is here — so there
+    /// is no home link to judge a claim to the home's word against. What
+    /// speaks for this server is this server's own `did:web:` name and
+    /// nothing else: under any other name a server-signed event is an
+    /// ordinary participant's, and the rules let no participant expire a
+    /// task. This server's own word, coming home, still ends one:
+    /// `our_own_expiry_coming_home_is_not_confirmed_a_second_time`.
+    #[test]
+    fn a_replayed_expiry_signed_under_another_servers_name_cannot_end_a_task_of_ours() {
+        const ID: &str = "01ACT00000000000000000076";
+        const FORGED: &str = "01ACT00000000000000000077";
+        const OTHER_DID: &str = "did:web:other.example";
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        our_own_task(&state, &key, ID);
+
+        let other_key = SigningKey::from_bytes(&[149u8; 32]);
+        key_on_file(&state, OTHER_DID, &other_key);
+        assert_eq!(
+            apply_replayed_event(
+                &state,
+                OWN,
+                PEER,
+                system_transition(&other_key, FORGED, ID, "expire", OTHER_DID, OWN),
+            ),
+            ReplayOutcome::Unusable
+        );
+        assert_eq!(
+            state
+                .with_db(|db| db.act_task(ID))
+                .flatten()
+                .expect("live")
+                .state,
+            "open",
+            "the task stands: only this server ends a task of this server's"
+        );
+        assert!(
+            !state.with_db(|db| db.is_act_event(FORGED)).unwrap(),
+            "and the rules refused it, so there is no row under that id"
+        );
+    }
+
+    /// A receipt that has to wait for its signer's key waits under the
+    /// connection it arrived on, not under the origin its batch claimed.
+    ///
+    /// The two are made to differ here: the task's own server replays its own
+    /// receipt in a batch entry that names a third server as the minter. The
+    /// connection is what the receipt is judged by, when it parks and again
+    /// when the key releases it — so it applies. Parked under the claim
+    /// instead, it would come back as a stranger's word and move nothing.
+    #[test]
+    fn a_parked_replayed_receipt_is_released_under_the_connection_it_arrived_on() {
+        const ACT: &str = "01ACT00000000000000000073";
+        const CLAIMED: &str = "01ACT00000000000000000074";
+        const RECEIPT: &str = "01ACT00000000000000000075";
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        a_peers_task_with_a_claim_on_it(&state, &key, ACT, CLAIMED);
+
+        // No key for the home yet, so its receipt parks.
+        let home_key = SigningKey::from_bytes(&[139u8; 32]);
+        let mut receipt = receipt(&home_key, RECEIPT, ACT, CLAIMED, HOME_DID, HOME_LINK);
+        receipt.origin = "some-third-server".to_string();
+        let sig = receipt.signature.clone().expect("signed");
+        assert_eq!(
+            apply_replayed_event(&state, OWN, HOME_LINK, receipt),
+            ReplayOutcome::Unusable
+        );
+        assert_eq!(state.act_deferred.lock().len(), 1, "held for its key");
+
+        key_on_file(&state, HOME_DID, &home_key);
+        let kid = freeq_sdk::sigtag::parse(&sig).expect("alg:kid:sig").0;
+        retry_deferred_task_events(&state, HOME_DID, kid);
+
+        let task = state
+            .with_db(|db| db.act_task(ACT))
+            .flatten()
+            .expect("live");
+        assert_eq!(
+            (task.state.as_str(), task.assignee.as_deref()),
+            ("assigned", Some(ALICE)),
+            "the wait ended on the link it began on, which is the task's home"
+        );
+    }
+
+    /// A receipt is the one replayed event that must not be skipped for good.
+    ///
+    /// Skipping is right for an ordinary event whose signer's key has not
+    /// arrived: the peer can be asked for it again. A receipt is what somebody
+    /// else's transition is waiting on, and asking again is the round trip a
+    /// replayed receipt exists to save — so it waits for the key exactly as a
+    /// live one does, and the key's arrival is what applies it.
+    #[test]
+    fn a_replayed_receipt_whose_key_is_missing_waits_instead_of_being_skipped() {
+        const HOME: &str = "did:web:peer-b.example";
+        const ACT: &str = "01ACT00000000000000000051";
+        const CLAIMED: &str = "01ACT00000000000000000052";
+        const RECEIPT: &str = "01ACT00000000000000000053";
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+
+        // A task PEER owns, with a claim on it that decides nothing here.
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, opener(&key, ACT, PEER)),
+            ReplayOutcome::Filed
+        );
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, claim(&key, CLAIMED, ACT, PEER)),
+            ReplayOutcome::Filed
+        );
+        assert_eq!(
+            state
+                .with_db(|db| db.act_task(ACT))
+                .flatten()
+                .unwrap()
+                .state,
+            "open"
+        );
+
+        // The home's receipt, signed with a key nobody here holds.
+        let home_key = SigningKey::from_bytes(&[97u8; 32]);
+        let replayed = receipt(&home_key, RECEIPT, ACT, CLAIMED, HOME, PEER);
+        let sig = replayed.signature.clone().expect("signed");
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, replayed),
+            ReplayOutcome::Unusable
+        );
+        assert_eq!(
+            state.act_deferred.lock().len(),
+            1,
+            "held rather than dropped: this is what the claim is waiting on"
+        );
+
+        // The key turns up.
+        state
+            .with_db(|db| db.save_signing_key(HOME, home_key.verifying_key().as_bytes()))
+            .expect("db present");
+        let kid = freeq_sdk::sigtag::parse(&sig).expect("alg:kid:sig").0;
+        retry_deferred_task_events(&state, HOME, kid);
+
+        let task = state
+            .with_db(|db| db.act_task(ACT))
+            .flatten()
+            .expect("live");
+        assert_eq!(
+            (task.state.as_str(), task.assignee.as_deref()),
+            ("assigned", Some(ALICE)),
+            "and the receipt that was waiting applied the claim it names"
+        );
+    }
+
+    /// A move this server applied to a task it owns is a move it ruled on, and
+    /// it owes a receipt for it however the event reached here.
+    ///
+    /// Replay is a way in like any other: the participant's claim arrives, the
+    /// rules take it, our own task moves — and without this the one server
+    /// whose word settles the task said nothing, on a path nothing else
+    /// covers, because the addressed copy that follows is a duplicate and a
+    /// duplicate mints nothing.
+    #[test]
+    fn a_replayed_move_on_a_task_we_own_leaves_the_receipt_we_owe() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        const ID: &str = "01ACT00000000000000000031";
+        const CLAIMED: &str = "01ACT00000000000000000032";
+        our_own_task(&state, &key, ID);
+
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, claim(&key, CLAIMED, ID, "server-b")),
+            ReplayOutcome::Filed
+        );
+        let task = state.with_db(|db| db.act_task(ID)).flatten().unwrap();
+        assert_eq!(
+            task.state, "assigned",
+            "the rules took the claim, so this server moved its own task"
+        );
+        assert_eq!(
+            receipts_naming(&state, ID),
+            [CLAIMED],
+            "and said so: a receipt naming the event it confirms"
+        );
+
+        // The same claim again, by whatever path. The log knows the id, so
+        // nothing moved and nothing more is owed.
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, claim(&key, CLAIMED, ID, "server-b")),
+            ReplayOutcome::AlreadyHeld
+        );
+        assert_eq!(
+            receipts_naming(&state, ID),
+            [CLAIMED],
+            "a second arrival is not a second move"
+        );
+    }
+
+    /// And this server's own events coming home are not confirmed: they are
+    /// already signed by the server whose word settles the task, which is the
+    /// degenerate case a receipt exists to cover for everybody else.
+    #[test]
+    fn our_own_expiry_coming_home_is_not_confirmed_a_second_time() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        const ID: &str = "01ACT00000000000000000033";
+        our_own_task(&state, &key, ID);
+
+        let server_did = crate::server::server_did(&state.server_name);
+        let server_key = SigningKey::from_bytes(&[9u8; 32]);
+        state
+            .with_db(|db| db.save_signing_key(&server_did, server_key.verifying_key().as_bytes()))
+            .expect("test state has a database");
+        // Built here rather than through `act_event`, which signs as ALICE:
+        // this event's whole point is that the server itself authored it.
+        const EXPIRE: &str = "01ACT00000000000000000034";
+        let venue = caught_venue();
+        let canonical = freeq_sdk::act::act_canonical(
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "expire"),
+                ("+freeq.at/from", server_did.as_str()),
+                ("+freeq.at/act-id", ID),
+            ],
+            &venue,
+            EXPIRE,
+        )
+        .expect("act tags present");
+        let expire = ReplayedEvent {
+            event_id: EXPIRE.to_string(),
+            signature: Some(freeq_sdk::sigtag::sign_canonical(&canonical, &server_key)),
+            canonical,
+            kind: "act".to_string(),
+            venue,
+            actor_did: Some(server_did.clone()),
+            subject: Some(ID.to_string()),
+            emoji: None,
+            origin: OWN.to_string(),
+            timestamp: 1000,
+        };
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, expire),
+            ReplayOutcome::Filed
+        );
+
+        assert!(
+            state.with_db(|db| db.act_task(ID)).flatten().is_none(),
+            "the expiry ended the task"
+        );
+        assert!(
+            receipts_naming(&state, ID).is_empty(),
+            "and this server does not write itself a receipt for its own word"
+        );
+    }
+
+    /// A relayed opener whose `act-replaces` names a task this server has no
+    /// record of is filed, not refused.
+    ///
+    /// A re-offer exists because the original's home went away, and the server
+    /// issuing it need not be one we ever heard the original from — so the
+    /// named task being absent here is the ordinary case, not a suspicious
+    /// one. The link crosses federation as one more act tag inside the signed
+    /// document, and a receiver that dropped it would silently lose the only
+    /// thread tying replacement work back to what it replaces.
+    #[test]
+    fn a_relayed_opener_replacing_a_task_we_never_saw_is_filed() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        const MINTER: &str = "server-a";
+        const ID: &str = "01M16E7TC00000000000000009";
+        const DEAD: &str = "01M16E7TC0NEVERSEEN0000000";
+
+        let event = act_event(
+            &key,
+            ID,
+            MINTER,
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", ALICE),
+                ("+freeq.at/act-title", "re-offered"),
+                ("+freeq.at/act-replaces", DEAD),
+            ],
+        );
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, event),
+            ReplayOutcome::Filed
+        );
+        assert!(
+            state.with_db(|db| db.act_task(ID)).flatten().is_some(),
+            "the replacement task is open here even though the task it names is not"
+        );
+        assert_eq!(
+            state.with_db(|db| db.act_task_is_on_file(DEAD)),
+            Some(false),
+            "and nothing invented a record of the task it replaces"
+        );
+    }
+
+    /// A healed task event moves the task view, not only the log.
+    ///
+    /// Filing the row and stopping there is what left a server that had been
+    /// away answering "no such task" for a task it demonstrably holds the
+    /// events of.
+    #[test]
+    fn a_caught_up_task_event_reaches_the_task_view() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        const MINTER: &str = "server-a";
+        const ID: &str = "01ACT00000000000000000001";
+
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, opener(&key, ID, MINTER)),
+            ReplayOutcome::Filed
+        );
+
+        let task = state
+            .with_db(|db| db.act_task(ID))
+            .flatten()
+            .expect("a healed server answers for the task, not only for its log");
+        assert_eq!(task.state, "open");
+        assert_eq!(task.offerer, ALICE);
+        assert_eq!(task.venue, caught_venue());
+        assert_eq!(task.origin, MINTER, "and knows which server referees it");
+    }
+
+    /// Whose task it is survives healing.
+    ///
+    /// The view is fed through the same call live receiving uses, so the rule
+    /// that a task another server opened is that server's to move applies to a
+    /// replayed event exactly as to a live one: the event is on file, and the
+    /// task has not moved.
+    #[test]
+    fn a_healed_transition_on_another_servers_task_is_filed_but_not_applied() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        const MINTER: &str = "server-a";
+        const ID: &str = "01ACT00000000000000000010";
+
+        apply_replayed_event(&state, OWN, PEER, opener(&key, ID, MINTER));
+        apply_replayed_event(
+            &state,
+            OWN,
+            PEER,
+            claim(&key, "01ACT00000000000000000011", ID, MINTER),
+        );
+
+        let task = state.with_db(|db| db.act_task(ID)).flatten().unwrap();
+        assert_eq!(
+            task.state, "open",
+            "the server that opened a task is the one that decides what it does"
+        );
+        assert_eq!(
+            state.with_db(|db| db.act_task_events(ID)).unwrap().len(),
+            2,
+            "both events are on file — not applying one is not the same as \
+             not recording it"
+        );
+    }
+
+    /// A task this server opened, filed the way local ingress files one —
+    /// with no origin at all, which is how a row of ours is stored.
+    fn our_own_task(state: &Arc<SharedState>, key: &SigningKey, act_id: &str) {
+        let ev = opener(key, act_id, "");
+        let written = state
+            .with_db(|db| {
+                db.apply_act_event(&crate::db::ActEvent {
+                    canonical: &ev.canonical,
+                    signature: ev.signature.as_deref(),
+                    event_id: act_id,
+                    act_id,
+                    opens: true,
+                    venue: &ev.venue,
+                    actor: ALICE,
+                    from_system: false,
+                    origin: None,
+                    timestamp: 1000,
+                })
+            })
+            .expect("db present");
+        assert!(matches!(written, crate::db::ActWrite::Filed { .. }));
+    }
+
+    /// A task event of ours, healed back, is ours to referee again.
+    ///
+    /// The task itself is still here — a server heals the events it missed,
+    /// not rows it never lost — so the replay's claim that we minted the
+    /// follow-up is one our own records bear out, and the move applies.
+    #[test]
+    fn a_healed_task_of_our_own_is_still_ours_to_move() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        const ID: &str = "01ACT00000000000000000020";
+        const CLAIMED: &str = "01ACT00000000000000000021";
+
+        our_own_task(&state, &key, ID);
+        apply_replayed_event(&state, OWN, PEER, claim(&key, CLAIMED, ID, OWN));
+
+        let task = state.with_db(|db| db.act_task(ID)).flatten().unwrap();
+        assert_eq!(
+            task.state, "assigned",
+            "a task that came home is not a foreign task"
+        );
+        assert_eq!(task.assignee.as_deref(), Some(ALICE));
+        let row = state
+            .with_db(|db| db.get_event(CLAIMED))
+            .flatten()
+            .expect("the healed event is on file");
+        assert_eq!(
+            row.origin, None,
+            "and the row is ours, not a foreign server's"
+        );
+    }
+
+    /// A peer cannot hand us a task by naming us as its minter.
+    ///
+    /// Whether this server is a task's home is the one origin claim that is
+    /// about us, and it is settled against our own records rather than taken
+    /// from the payload. Nothing here opened this task, so the peer that
+    /// carried it is what the row records — and a transition on it is filed,
+    /// not refereed. Believing the claim would have this server expiring and
+    /// ordering a task somebody else opened.
+    #[test]
+    fn a_peer_naming_us_as_the_minter_of_a_task_we_never_opened_is_not_believed() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        const ID: &str = "01ACT00000000000000000022";
+
+        apply_replayed_event(&state, OWN, PEER, opener(&key, ID, OWN));
+        let task = state.with_db(|db| db.act_task(ID)).flatten().unwrap();
+        assert_eq!(
+            task.origin, PEER,
+            "the link it arrived on, not the minter it claimed"
+        );
+
+        apply_replayed_event(
+            &state,
+            OWN,
+            PEER,
+            claim(&key, "01ACT00000000000000000023", ID, PEER),
+        );
+        let task = state.with_db(|db| db.act_task(ID)).flatten().unwrap();
+        assert_eq!(
+            task.state, "open",
+            "and it is not ours to move: the transition is on file, unapplied"
+        );
+    }
+
+    /// A task event whose signature cannot be checked is skipped.
+    ///
+    /// It is not filed and it does not open a task: a replay has nobody
+    /// waiting on delivery, and the peer can be asked again on the next
+    /// link.
+    #[test]
+    fn a_caught_up_task_event_that_cannot_be_verified_is_skipped() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        // No key on file for ALICE: the verdict can only be "cannot say".
+        let state = test_state_with_db();
+        const ID: &str = "01ACT00000000000000000030";
+
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, opener(&key, ID, "server-a")),
+            ReplayOutcome::Unusable
+        );
+        assert!(
+            state.with_db(|db| db.get_event(ID)).flatten().is_none(),
+            "an unchecked task event is not filed"
+        );
+        assert!(state.with_db(|db| db.act_task(ID)).flatten().is_none());
+    }
+
+    /// A batch is applied in mint order, whatever order it arrived in.
+    ///
+    /// An event id is a ULID, so its byte order is the order the signers
+    /// minted in — which is the only clock every server agrees on. A follow-up
+    /// ahead of its opener names a task nothing has opened yet and is dropped
+    /// unrecorded; sorted first, both land.
+    #[tokio::test]
+    async fn a_batch_is_applied_in_mint_order_not_arrival_order() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        let manager = test_manager();
+        setup_authenticated_peer(&state, &manager).await;
+        const MINTER: &str = "server-a";
+        const ID: &str = "01ACT00000000000000000040";
+
+        // The opener's id sorts first, as a ULID minted first does. The batch
+        // presents them the other way round.
+        let events = vec![
+            claim(&key, "01ACT00000000000000000041", ID, MINTER),
+            opener(&key, ID, MINTER),
+        ];
+        process_s2s_message(
+            &state,
+            &manager,
+            PEER,
+            S2sMessage::CatchupEvents {
+                origin: PEER.to_string(),
+                events,
+                more: false,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            state.with_db(|db| db.act_task_events(ID)).unwrap().len(),
+            2,
+            "the opener has to be applied before the follow-up that names it"
+        );
+    }
+
+    /// And mint order alone is not enough: a task's opener goes first even
+    /// when its id does not sort first.
+    ///
+    /// A signer may mint up to the ingress skew bound in the past, so two
+    /// signers on two clocks can produce a follow-up whose ULID sorts ahead of
+    /// the opener it names. Sorted by id and no further, that follow-up names
+    /// a task nothing has opened and is dropped unrecorded — the same hole a
+    /// rebuild closes by regrouping.
+    #[tokio::test]
+    async fn a_batch_puts_each_task_opener_ahead_of_its_follow_ups() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        let manager = test_manager();
+        setup_authenticated_peer(&state, &manager).await;
+        const MINTER: &str = "server-a";
+        // The opener's id sorts *after* the claim that names it.
+        const ID: &str = "01ACT00000000000000000051";
+        const CLAIMED: &str = "01ACT00000000000000000050";
+
+        let events = vec![opener(&key, ID, MINTER), claim(&key, CLAIMED, ID, MINTER)];
+        process_s2s_message(
+            &state,
+            &manager,
+            PEER,
+            S2sMessage::CatchupEvents {
+                origin: PEER.to_string(),
+                events,
+                more: false,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            state.with_db(|db| db.act_task_events(ID)).unwrap().len(),
+            2,
+            "the follow-up is recorded, so its opener was applied before it"
+        );
+    }
+
+    /// A batch's own origin field is the sender's; the link's is the peer's.
+    ///
+    /// Where an event names no minter the reply's batch origin used to stand
+    /// in, which let a peer attribute a whole batch to a server it is not.
+    /// What stands in is the peer the transport authenticated.
+    #[tokio::test]
+    async fn a_batch_falls_back_to_the_peer_the_link_authenticated() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        let manager = test_manager();
+        setup_authenticated_peer(&state, &manager).await;
+        const ID: &str = "01ACT00000000000000000060";
+
+        process_s2s_message(
+            &state,
+            &manager,
+            PEER,
+            S2sMessage::CatchupEvents {
+                origin: "server-a".to_string(),
+                events: vec![opener(&key, ID, "")],
+                more: false,
+            },
+        )
+        .await;
+
+        let task = state.with_db(|db| db.act_task(ID)).flatten().unwrap();
+        assert_eq!(
+            task.origin, PEER,
+            "the peer that sent the batch, not the origin it wrote in it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod relayed_task_verdict_tests {
+    //! Verification of relayed task events: the receive path
+    //! reaches its own verdict about every task event a peer relays, and each
+    //! verdict leads somewhere different: valid is stored and delivered,
+    //! invalid reaches nobody and is written nowhere, and anything it cannot
+    //! judge yet waits in the defer queue — never refused, never shown while
+    //! it waits — with the key that would settle it asked for off this path
+    //! and its arrival what judges the event again.
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use tokio::sync::mpsc;
+
+    use super::s2s_adversarial_tests::{
+        PEER, setup_authenticated_peer, test_manager, test_manager_with_broadcast_rx,
+    };
+    use super::{
+        SharedState, flush_pending_routes, process_s2s_message, retry_deferred_task_events,
+        server_did, test_state_with_config, test_state_with_db,
+    };
+    use crate::s2s::S2sMessage;
+
+    const SIGNER: &str = "did:plc:taskverdict";
+
+    /// Captures what the code under test logs — the same shape as the sink in
+    /// s2s.rs's capability tests — so a test can assert the verdict line.
+    #[derive(Clone, Default)]
+    pub(super) struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+        type Writer = LogSink;
+        fn make_writer(&'a self) -> LogSink {
+            self.clone()
+        }
+    }
+
+    impl LogSink {
+        pub(super) fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+        }
+    }
+
+    pub(super) fn capture() -> (LogSink, tracing::subscriber::DefaultGuard) {
+        let sink = LogSink::default();
+        let guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(sink.clone())
+                // No colour codes: the assertions below match substrings.
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        );
+        (sink, guard)
+    }
+
+    /// A key on file for the signer, as a cross-server key fetch would have
+    /// left it.
+    fn key_on_file(state: &Arc<SharedState>, did: &str) -> ed25519_dalek::SigningKey {
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        state
+            .with_db(|db| db.save_signing_key(did, key.verifying_key().as_bytes()))
+            .expect("db present");
+        key
+    }
+
+    /// A local member holding `message-tags` and `freeq.at/act`, so
+    /// delivery-unchanged is assertable.
+    fn capable_member(state: &Arc<SharedState>, channel: &str) -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel(16);
+        let sid = format!("member-of-{channel}");
+        state.connections.lock().insert(sid.clone(), tx);
+        state
+            .channels
+            .lock()
+            .entry(channel.to_string())
+            .or_default()
+            .members
+            .insert(sid.clone());
+        state.cap_message_tags.lock().insert(sid.clone());
+        state.cap_act.lock().insert(sid);
+        rx
+    }
+
+    /// A local session bound to `did`, holding `message-tags` and
+    /// `freeq.at/act` — one of that identity's devices on this server.
+    fn capable_session_for(state: &Arc<SharedState>, did: &str) -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel(16);
+        let sid = format!("session-of-{did}");
+        state.connections.lock().insert(sid.clone(), tx);
+        state
+            .did_sessions
+            .lock()
+            .entry(did.to_string())
+            .or_default()
+            .insert(sid.clone());
+        state.cap_message_tags.lock().insert(sid.clone());
+        state.cap_act.lock().insert(sid);
+        rx
+    }
+
+    /// The wire tags of a handoff offer, signed the way a task-sending client
+    /// signs one: over the act tags, the folded venue, and the id it minted.
+    fn signed_offer_tags(
+        channel: &str,
+        event_id: &str,
+        key: &ed25519_dalek::SigningKey,
+    ) -> HashMap<String, String> {
+        signed_offer_tags_in(&freeq_sdk::chatsig::channel_venue(channel), event_id, key)
+    }
+
+    /// The DID a DM in these tests is addressed to.
+    const RECIPIENT: &str = "did:plc:dmrecipient";
+
+    /// The same, for a venue the caller folded — a DM binds its two DIDs
+    /// rather than the room.
+    fn signed_offer_tags_in(
+        venue: &str,
+        event_id: &str,
+        key: &ed25519_dalek::SigningKey,
+    ) -> HashMap<String, String> {
+        let act: Vec<(&str, &str)> = vec![
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "offer"),
+            ("+freeq.at/from", SIGNER),
+            ("+freeq.at/act-title", "verdict wiring"),
+        ];
+        let sig =
+            freeq_sdk::act::sign_act(act.clone(), venue, event_id, key).expect("act tags present");
+        let mut tags: HashMap<String, String> = act
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        tags.insert(
+            freeq_sdk::chatsig::EVENT_ID_TAG.to_string(),
+            event_id.to_string(),
+        );
+        tags.insert("+freeq.at/sig".to_string(), sig);
+        tags
+    }
+
+    /// The same, for an event that names a task that already exists. `from`
+    /// is spelled out because a server signs its own events under a
+    /// `did:web:` identity and a participant does not, and that difference is
+    /// what the receive path reads.
+    fn signed_follow_up_tags(
+        channel: &str,
+        event_id: &str,
+        verb: &str,
+        act_id: &str,
+        from: &str,
+        extra: &[(&str, &str)],
+        key: &ed25519_dalek::SigningKey,
+    ) -> HashMap<String, String> {
+        let mut act: Vec<(&str, &str)> = vec![
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", verb),
+            ("+freeq.at/from", from),
+            ("+freeq.at/act-id", act_id),
+        ];
+        act.extend_from_slice(extra);
+        let venue = freeq_sdk::chatsig::channel_venue(channel);
+        let sig =
+            freeq_sdk::act::sign_act(act.clone(), &venue, event_id, key).expect("act tags present");
+        let mut tags: HashMap<String, String> = act
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        tags.insert(
+            freeq_sdk::chatsig::EVENT_ID_TAG.to_string(),
+            event_id.to_string(),
+        );
+        tags.insert("+freeq.at/sig".to_string(), sig);
+        tags
+    }
+
+    /// A task this server opened, filed straight into the log so the tests
+    /// below start from one this server owns — a relayed opener is stamped
+    /// with the peer that sent it, and the origin rule would then answer
+    /// before anything else does.
+    fn our_own_task(state: &Arc<SharedState>, channel: &str, act_id: &str) {
+        let venue = freeq_sdk::chatsig::channel_venue(channel);
+        let canonical = freeq_sdk::act::act_canonical(
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", SIGNER),
+            ],
+            &venue,
+            act_id,
+        )
+        .expect("act tags present");
+        let written = state
+            .with_db(|db| {
+                db.apply_act_event(&crate::db::ActEvent {
+                    canonical: &canonical,
+                    signature: None,
+                    event_id: act_id,
+                    act_id,
+                    opens: true,
+                    venue: &venue,
+                    actor: SIGNER,
+                    from_system: false,
+                    origin: None,
+                    timestamp: 10,
+                })
+            })
+            .expect("db present");
+        assert!(matches!(written, crate::db::ActWrite::Filed { .. }));
+    }
+
+    async fn relay(
+        state: &Arc<SharedState>,
+        mgr: &Arc<crate::s2s::S2sManager>,
+        channel: &str,
+        event_id: &str,
+        tags: HashMap<String, String>,
+    ) {
+        process_s2s_message(
+            state,
+            mgr,
+            PEER,
+            S2sMessage::Tagmsg {
+                event_id: format!("{PEER}:{event_id}"),
+                from: "tasker!t@remote".to_string(),
+                target: channel.to_string(),
+                tags,
+                origin: PEER.to_string(),
+                account: Some(SIGNER.to_string()),
+            },
+        )
+        .await;
+    }
+
+    async fn received(rx: &mut mpsc::Receiver<String>) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timeout waiting for delivery")
+            .expect("channel closed")
+    }
+
+    // ── carrying a transition to the server that owns the task ───────────
+    //
+    // A transition on a task this server does not own is filed here and moves
+    // nothing, so the only way it is ever decided is for the server that owns
+    // the task to be asked. The ordinary relay already reaches that server,
+    // but a broadcast is best-effort and has no second try; the addressed copy
+    // is what closes the gap when the home was away.
+
+    /// Put `PEER` on the peers map with a link the test can read, optionally
+    /// declaring the capability that lets a routed transition be handed over.
+    async fn link_peer(
+        mgr: &Arc<crate::s2s::S2sManager>,
+        takes_routes: bool,
+    ) -> mpsc::Receiver<S2sMessage> {
+        let (tx, rx) = mpsc::channel(16);
+        mgr.peers
+            .lock()
+            .await
+            .insert(PEER.to_string(), crate::s2s::PeerEntry { tx, conn_gen: 1 });
+        // Task-aware either way — a peer that can hold a task event is what
+        // makes it a peer at all here — and `takes_routes` is the newer
+        // ability an older build would not have.
+        let mut declared = vec![crate::s2s::ACT.to_string()];
+        if takes_routes {
+            declared.push(crate::s2s::ACT_ROUTE.to_string());
+        }
+        mgr.peer_capabilities
+            .lock()
+            .await
+            .insert(PEER.to_string(), declared);
+        rx
+    }
+
+    /// Make every waiting route due, the way the retry tick eventually does.
+    fn every_route_due_now(state: &Arc<SharedState>) {
+        let ahead = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let due = state.act_routes.lock().take_due(ahead);
+        for mut route in due {
+            route.next_attempt = std::time::Instant::now();
+            state.act_routes.lock().park(route);
+        }
+    }
+
+    /// The tags of a receipt as the server that owns a task signs one.
+    fn signed_receipt_tags(
+        channel: &str,
+        event_id: &str,
+        act_id: &str,
+        subject: &str,
+        home: &str,
+        key: &ed25519_dalek::SigningKey,
+    ) -> HashMap<String, String> {
+        signed_follow_up_tags(
+            channel,
+            event_id,
+            freeq_sdk::act_transitions::confirmation_verb(),
+            act_id,
+            home,
+            &[(
+                &format!(
+                    "+freeq.at/{}",
+                    freeq_sdk::act_transitions::confirmation_subject_tag()
+                ),
+                subject,
+            )],
+            key,
+        )
+    }
+
+    /// Every task event this server put on the wire to its peers, as
+    /// `(verb, tags)`.
+    fn to_peers(
+        broadcasts: &mut mpsc::Receiver<S2sMessage>,
+    ) -> Vec<(String, HashMap<String, String>)> {
+        let mut seen = Vec::new();
+        while let Ok(msg) = broadcasts.try_recv() {
+            if let S2sMessage::Tagmsg { tags, .. } = msg {
+                let verb = tags.get("+freeq.at/act-verb").cloned().unwrap_or_default();
+                seen.push((verb, tags));
+            }
+        }
+        seen
+    }
+
+    /// A task `PEER` owns, with one transition on it filed here unconfirmed
+    /// and a route to `PEER` waiting — the state every route test starts from.
+    ///
+    /// The transition arrives over a third server's link, which is what an
+    /// agent elsewhere claiming `PEER`'s task looks like on the wire.
+    async fn a_transition_waiting_for_its_home(
+        state: &Arc<SharedState>,
+        mgr: &Arc<crate::s2s::S2sManager>,
+        channel: &str,
+        act_id: &str,
+        claim: &str,
+        key: &ed25519_dalek::SigningKey,
+    ) {
+        relay(
+            state,
+            mgr,
+            channel,
+            act_id,
+            signed_offer_tags(channel, act_id, key),
+        )
+        .await;
+
+        const THIRD: &str = "fake-third-peer-id-for-testing";
+        mgr.authenticated_peers
+            .lock()
+            .await
+            .insert(THIRD.to_string());
+        super::S2S_RATE_LIMITS.lock().remove(THIRD);
+
+        process_s2s_message(
+            state,
+            mgr,
+            THIRD,
+            S2sMessage::Tagmsg {
+                event_id: format!("{THIRD}:{claim}"),
+                from: "scholar!s@third".to_string(),
+                target: channel.to_string(),
+                tags: signed_follow_up_tags(channel, claim, "claim", act_id, SIGNER, &[], key),
+                origin: THIRD.to_string(),
+                account: Some(SIGNER.to_string()),
+            },
+        )
+        .await;
+    }
+
+    /// Read every routed transition a peer's link was handed.
+    async fn routed_to_peer(rx: &mut mpsc::Receiver<S2sMessage>) -> Vec<String> {
+        let mut seen = Vec::new();
+        while let Ok(Some(msg)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+        {
+            if let S2sMessage::ActRoute { act_event_id, .. } = msg {
+                seen.push(act_event_id);
+            }
+        }
+        seen
+    }
+
+    /// What the log says about whose word one task event carries. A receipt
+    /// carries no state of its own, and reads as `<a receipt>`.
+    fn confirm_state_of(state: &Arc<SharedState>, act_id: &str, event_id: &str) -> String {
+        state
+            .with_db(|db| db.act_task_events(act_id))
+            .unwrap_or_default()
+            .into_iter()
+            .find(|e| e.event_id == event_id)
+            .map(|e| match e.confirm {
+                Some(confirm) => confirm.as_str().to_string(),
+                None => "<a receipt>".to_string(),
+            })
+            .unwrap_or_else(|| "<not on file>".to_string())
+    }
+
+    /// Carry one transition here as the server holding it unruled would.
+    async fn route_here(
+        state: &Arc<SharedState>,
+        mgr: &Arc<crate::s2s::S2sManager>,
+        channel: &str,
+        act_id: &str,
+        event_id: &str,
+        tags: HashMap<String, String>,
+    ) {
+        process_s2s_message(
+            state,
+            mgr,
+            PEER,
+            S2sMessage::ActRoute {
+                event_id: format!("{PEER}:{event_id}"),
+                act_id: act_id.to_string(),
+                act_event_id: event_id.to_string(),
+                tags,
+                target: channel.to_string(),
+                from: "tasker!t@remote".to_string(),
+                account: Some(SIGNER.to_string()),
+                origin: PEER.to_string(),
+            },
+        )
+        .await;
+    }
+
+    /// A transition this server cannot decide is filed unconfirmed and carried
+    /// to the server that can decide it.
+    #[tokio::test]
+    async fn a_transition_on_a_peers_task_is_carried_to_that_peer() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#routeout");
+        let key = key_on_file(&state, SIGNER);
+
+        let act_id = "01ROUTEOUTOFFER00000000000";
+        let claim = "01ROUTEOUTCLAIM0000000000";
+        a_transition_waiting_for_its_home(&state, &mgr, "#routeout", act_id, claim, &key).await;
+
+        assert_eq!(
+            state
+                .with_db(|db| db.act_task(act_id))
+                .flatten()
+                .expect("still live")
+                .state,
+            "open",
+            "nothing here rules on a task it does not own"
+        );
+        assert_eq!(
+            confirm_state_of(&state, act_id, claim),
+            "unconfirmed",
+            "and the log says the claim is waiting on somebody"
+        );
+        let waiting = state.act_routes.lock().take_due(std::time::Instant::now());
+        assert_eq!(
+            waiting
+                .iter()
+                .map(|r| (r.event_id.as_str(), r.home.as_str()))
+                .collect::<Vec<_>>(),
+            [(claim, PEER)],
+            "the claim is on its way to the server that owns the task"
+        );
+    }
+
+    /// The copy carried to the home is the signed event, byte for byte.
+    ///
+    /// The signature covers every act tag, the venue and the id, so a tag
+    /// added, dropped or tidied on the way out would reach the home as a
+    /// forgery — and the home would refuse the very move it was being asked
+    /// to rule on.
+    #[tokio::test]
+    async fn a_routed_copy_carries_the_signed_tags_verbatim() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#routebytes");
+        let key = key_on_file(&state, SIGNER);
+
+        let act_id = "01ROUTEBYTESOFFER00000000";
+        let claim = "01ROUTEBYTESCLAIM00000000";
+        a_transition_waiting_for_its_home(&state, &mgr, "#routebytes", act_id, claim, &key).await;
+        let signed =
+            signed_follow_up_tags("#routebytes", claim, "claim", act_id, SIGNER, &[], &key);
+
+        let waiting = state.act_routes.lock().take_due(std::time::Instant::now());
+        let [route] = waiting.as_slice() else {
+            panic!("one transition is waiting for its home");
+        };
+        let crate::s2s::S2sMessage::ActRoute { tags, target, .. } = &route.message else {
+            panic!("a route carries an addressed copy");
+        };
+        assert_eq!(tags, &signed, "the tag map travels as the signer wrote it");
+        assert_eq!(
+            tags.get("+freeq.at/sig"),
+            signed.get("+freeq.at/sig"),
+            "the signature among them, unchanged"
+        );
+        assert_eq!(
+            target, "#routebytes",
+            "and the venue it was signed over is recoverable from the target"
+        );
+    }
+
+    /// The addressed copy is for the home to rule on, not for the room to see
+    /// again. The event has already reached every local client by the ordinary
+    /// relay, and delivering the ask as well would put one event in the room
+    /// twice.
+    #[tokio::test]
+    async fn a_routed_copy_is_not_delivered_to_local_clients_again() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let mut rx = capable_member(&state, "#routequiet");
+        let key = key_on_file(&state, SIGNER);
+
+        let act_id = "01ROUTEQUIETOFFER00000000";
+        our_own_task(&state, "#routequiet", act_id);
+
+        let claim = "01ROUTEQUIETCLAIM00000000";
+        let tags = signed_follow_up_tags("#routequiet", claim, "claim", act_id, SIGNER, &[], &key);
+        relay(&state, &mgr, "#routequiet", claim, tags.clone()).await;
+
+        let mut shown = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            shown.push(line);
+        }
+        assert!(
+            shown.iter().any(|line| {
+                line.contains(&format!("{}={claim}", freeq_sdk::chatsig::EVENT_ID_TAG))
+            }),
+            "the ordinary relay is what shows the claim in the room: {shown:?}"
+        );
+
+        route_here(&state, &mgr, "#routequiet", act_id, claim, tags).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "the same event carried here to be ruled on reaches nobody a second time"
+        );
+    }
+
+    /// A link taking a message says nothing about the home having ruled on it,
+    /// so the asking continues. Nothing flips a route's event to confirmed on
+    /// this server, so today that means it is carried without end — which is
+    /// the accepted cost until a home's ruling can cross.
+    #[tokio::test]
+    async fn a_route_the_link_accepted_is_still_waiting_on_a_ruling() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#routelife");
+        let key = key_on_file(&state, SIGNER);
+        let mut to_peer = link_peer(&mgr, true).await;
+
+        let act_id = "01ROUTELIFEOFFER000000000";
+        let claim = "01ROUTELIFECLAIM000000000";
+        a_transition_waiting_for_its_home(&state, &mgr, "#routelife", act_id, claim, &key).await;
+
+        assert_eq!(
+            routed_to_peer(&mut to_peer).await,
+            [claim],
+            "the transition was handed to the home's link"
+        );
+        assert_eq!(
+            confirm_state_of(&state, act_id, claim),
+            "unconfirmed",
+            "and no ruling has come back"
+        );
+        assert_eq!(
+            state.act_routes.lock().len(),
+            1,
+            "so it is still on the list to ask about — a link taking a message \
+             is not the home answering it"
+        );
+    }
+
+    /// A peer that will not take a routed transition right now may be one
+    /// whose Hello has not been processed yet, so that answer does not end the
+    /// asking either.
+    #[tokio::test]
+    async fn a_route_a_peer_would_not_take_is_still_waiting_on_a_ruling() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#routerefused");
+        let key = key_on_file(&state, SIGNER);
+        // Linked, but declaring nothing — the shape of a peer mid-handshake.
+        let mut to_peer = link_peer(&mgr, false).await;
+
+        let act_id = "01ROUTEREFUSEDOFFER000000";
+        let claim = "01ROUTEREFUSEDCLAIM000000";
+        a_transition_waiting_for_its_home(&state, &mgr, "#routerefused", act_id, claim, &key).await;
+
+        assert!(
+            routed_to_peer(&mut to_peer).await.is_empty(),
+            "nothing is handed to a peer that cannot take it"
+        );
+        assert_eq!(
+            state.act_routes.lock().len(),
+            1,
+            "and the transition stays on the list to ask about"
+        );
+    }
+
+    /// The home end: a transition carried here for a task this server owns is
+    /// decided, and the receipt this server owes for the move it just made is
+    /// in the log naming it — the same always-emit rule a local sender's move
+    /// gets at the front door.
+    #[tokio::test]
+    async fn a_routed_transition_applied_here_leaves_a_receipt_naming_it() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#routehome");
+        let key = key_on_file(&state, SIGNER);
+
+        let act_id = "01ROUTEHOMEOFFER0000000000";
+        our_own_task(&state, "#routehome", act_id);
+
+        let claim = "01ROUTEHOMECLAIM0000000000";
+        let tags = signed_follow_up_tags("#routehome", claim, "claim", act_id, SIGNER, &[], &key);
+        route_here(&state, &mgr, "#routehome", act_id, claim, tags).await;
+
+        let task = state
+            .with_db(|db| db.act_task(act_id))
+            .flatten()
+            .expect("our own task is still live");
+        assert_eq!(task.state, "assigned", "the home decided it");
+        assert_eq!(task.assignee.as_deref(), Some(SIGNER));
+        assert_eq!(
+            confirm_state_of(&state, act_id, claim),
+            "confirmed",
+            "an event on a task of ours waits on nobody"
+        );
+
+        let subject_tag = freeq_sdk::act_transitions::confirmation_subject_tag();
+        let receipts: Vec<String> = state
+            .with_db(|db| db.act_task_events(act_id))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|e| {
+                let view = crate::events::derive_act_view(&e.canonical)?;
+                freeq_sdk::act_transitions::is_confirmation(&view.verb)
+                    .then(|| view.fields.get(subject_tag).cloned().unwrap_or_default())
+            })
+            .collect();
+        assert_eq!(
+            receipts,
+            [claim.to_string()],
+            "the home's receipt for the move it applied names the event it confirms"
+        );
+    }
+
+    /// A transition carried here for a task some other server owns is
+    /// misrouted: logged and dropped, never ruled on. Two servers ruling on
+    /// one task is the disagreement this whole design exists to prevent.
+    #[tokio::test]
+    async fn a_transition_routed_here_for_someone_elses_task_is_dropped() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#routewrong");
+        let key = key_on_file(&state, SIGNER);
+
+        // A task PEER opened, which arrived here by ordinary relay.
+        let act_id = "01ROUTEWRONGOFFER000000000";
+        relay(
+            &state,
+            &mgr,
+            "#routewrong",
+            act_id,
+            signed_offer_tags("#routewrong", act_id, &key),
+        )
+        .await;
+        assert_eq!(
+            state
+                .with_db(|db| db.act_task(act_id))
+                .flatten()
+                .expect("on file")
+                .origin,
+            PEER
+        );
+
+        let (sink, _guard) = capture();
+        let claim = "01ROUTEWRONGCLAIM000000000";
+        route_here(
+            &state,
+            &mgr,
+            "#routewrong",
+            act_id,
+            claim,
+            signed_follow_up_tags("#routewrong", claim, "claim", act_id, SIGNER, &[], &key),
+        )
+        .await;
+
+        assert!(
+            !state.with_db(|db| db.is_act_event(claim)).unwrap(),
+            "a misrouted transition is not filed here"
+        );
+        let logs = sink.text();
+        assert!(
+            logs.contains("another server owns") && logs.contains(claim),
+            "the drop names the event: {logs}"
+        );
+    }
+
+    // ── a receipt on the wire ──────────────────────────────────────────────
+    //
+    // What a receipt is for: a transition filed on another server decides
+    // nothing there until the server that owns the task says it won. So the
+    // receipt has to cross, has to count only when it arrives on the owning
+    // server's link, and has to be said again to a peer that never heard it.
+
+    /// A receipt of ours goes to the peers that can read it, not only to the
+    /// room. Without this half the only server whose word settles the task
+    /// speaks it to the people least in need of hearing it.
+    #[tokio::test]
+    async fn a_receipt_of_ours_goes_out_to_peers_as_well_as_to_the_room() {
+        let state = test_state_with_db();
+        let (mgr, mut broadcasts) = test_manager_with_broadcast_rx();
+        setup_authenticated_peer(&state, &mgr).await;
+        let mut rx = capable_member(&state, "#ruleout");
+        let key = key_on_file(&state, SIGNER);
+
+        let act_id = "01RULEOUTOFFER00000000000";
+        our_own_task(&state, "#ruleout", act_id);
+        let claim = "01RULEOUTCLAIM00000000000";
+        relay(
+            &state,
+            &mgr,
+            "#ruleout",
+            claim,
+            signed_follow_up_tags("#ruleout", claim, "claim", act_id, SIGNER, &[], &key),
+        )
+        .await;
+
+        let subject_tag = format!(
+            "+freeq.at/{}",
+            freeq_sdk::act_transitions::confirmation_subject_tag()
+        );
+        let sent = to_peers(&mut broadcasts);
+        let receipt = sent
+            .iter()
+            .find(|(verb, _)| freeq_sdk::act_transitions::is_confirmation(verb))
+            .map(|(_, tags)| tags)
+            .unwrap_or_else(|| panic!("the receipt has to reach the peers: {sent:?}"));
+        assert_eq!(
+            receipt.get(&subject_tag).map(String::as_str),
+            Some(claim),
+            "and it names the event it rules in"
+        );
+        assert_eq!(
+            receipt.get("+freeq.at/from").map(String::as_str),
+            Some(server_did(&state.server_name).as_str()),
+            "signed under the identity that settles this task"
+        );
+        assert!(
+            receipt.contains_key("+freeq.at/sig"),
+            "and signed: a receipt nobody can check is worth nothing"
+        );
+
+        let mut shown = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            shown.push(line);
+        }
+        assert!(
+            shown.iter().any(|line| line.contains("act-verb=confirm")),
+            "the room still hears it too: {shown:?}"
+        );
+    }
+
+    /// The other event only this server can author. An expiry ends a task, and
+    /// a peer that never hears it holds a row that stays live for ever.
+    #[tokio::test]
+    async fn an_expiry_of_ours_goes_out_to_peers() {
+        let state = test_state_with_db();
+        let (mgr, mut broadcasts) = test_manager_with_broadcast_rx();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#expireout");
+
+        let act_id = "01EXPIREOUTOFFER000000000";
+        our_own_task(&state, "#expireout", act_id);
+        let task = state
+            .with_db(|db| db.act_task(act_id))
+            .flatten()
+            .expect("live");
+        assert!(crate::connection::act::expire_task(&state, &task));
+
+        let sent = to_peers(&mut broadcasts);
+        assert!(
+            sent.iter().any(|(verb, _)| verb == "expire"),
+            "the event that ends the task has to reach the servers holding it: {sent:?}"
+        );
+    }
+
+    /// The receiving half: the home rules, and this server follows — because
+    /// the receipt arrived on the link of the server the task was opened on.
+    #[tokio::test]
+    async fn a_receipt_from_the_home_moves_a_task_here() {
+        const HOME: &str = "did:web:peer-b.example";
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#follow");
+        let key = key_on_file(&state, SIGNER);
+        let home_key = key_on_file(&state, HOME);
+
+        let act_id = "01FOLLOWOFFER00000000000";
+        let claim = "01FOLLOWCLAIM00000000000";
+        a_transition_waiting_for_its_home(&state, &mgr, "#follow", act_id, claim, &key).await;
+        assert_eq!(confirm_state_of(&state, act_id, claim), "unconfirmed");
+
+        let receipt = "01FOLLOWRECEIPT000000000";
+        relay(
+            &state,
+            &mgr,
+            "#follow",
+            receipt,
+            signed_receipt_tags("#follow", receipt, act_id, claim, HOME, &home_key),
+        )
+        .await;
+
+        let task = state
+            .with_db(|db| db.act_task(act_id))
+            .flatten()
+            .expect("still live");
+        assert_eq!(
+            (task.state.as_str(), task.assignee.as_deref()),
+            ("assigned", Some(SIGNER)),
+            "the state came from running the claim through the rules here"
+        );
+        assert_eq!(
+            confirm_state_of(&state, act_id, claim),
+            "confirmed",
+            "and the claim is no longer waiting on anybody"
+        );
+        assert_eq!(
+            confirm_state_of(&state, act_id, receipt),
+            "<a receipt>",
+            "the receipt itself carries no state of its own"
+        );
+    }
+
+    /// A receipt can arrive ahead of the event it confirms — an uneven mesh
+    /// makes that ordinary. It waits rather than being dropped, and the
+    /// subject's arrival is what applies it.
+    #[tokio::test]
+    async fn a_receipt_that_outran_its_subject_waits_and_then_applies() {
+        const HOME: &str = "did:web:peer-b.example";
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#outrun");
+        let key = key_on_file(&state, SIGNER);
+        let home_key = key_on_file(&state, HOME);
+
+        let act_id = "01OUTRUNOFFER0000000000";
+        relay(
+            &state,
+            &mgr,
+            "#outrun",
+            act_id,
+            signed_offer_tags("#outrun", act_id, &key),
+        )
+        .await;
+
+        // The receipt first.
+        let claim = "01OUTRUNCLAIM0000000000";
+        let receipt = "01OUTRUNRECEIPT00000000";
+        relay(
+            &state,
+            &mgr,
+            "#outrun",
+            receipt,
+            signed_receipt_tags("#outrun", receipt, act_id, claim, HOME, &home_key),
+        )
+        .await;
+        assert!(
+            !state.with_db(|db| db.is_act_event(receipt)).unwrap(),
+            "a receipt that is waiting is not filed, so the copy it waits for is \
+             not turned into a duplicate"
+        );
+        assert_eq!(state.act_deferred.lock().len(), 1, "it is being held");
+        assert_eq!(
+            state
+                .with_db(|db| db.act_task(act_id))
+                .flatten()
+                .unwrap()
+                .state,
+            "open"
+        );
+
+        // …and then the claim it names.
+        relay(
+            &state,
+            &mgr,
+            "#outrun",
+            claim,
+            signed_follow_up_tags("#outrun", claim, "claim", act_id, SIGNER, &[], &key),
+        )
+        .await;
+
+        assert_eq!(state.act_deferred.lock().len(), 0, "and it was handed back");
+        assert_eq!(
+            state
+                .with_db(|db| db.act_task(act_id))
+                .flatten()
+                .expect("still live")
+                .assignee
+                .as_deref(),
+            Some(SIGNER),
+            "the receipt applied the moment the event it names was on file"
+        );
+        assert_eq!(confirm_state_of(&state, act_id, claim), "confirmed");
+    }
+
+    /// A peer that asks again about a transition already ruled on is answered
+    /// again — with the very receipt on file, read back rather than decided a
+    /// second time. Nothing else covers it: a replay carries an event under
+    /// the server that minted it, never under the one that ruled on it.
+    #[tokio::test]
+    async fn a_repeat_ask_is_answered_with_the_receipt_on_file() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#askagain");
+        let key = key_on_file(&state, SIGNER);
+        let mut to_peer = link_peer(&mgr, true).await;
+
+        let act_id = "01ASKAGAINOFFER00000000";
+        our_own_task(&state, "#askagain", act_id);
+        let claim = "01ASKAGAINCLAIM00000000";
+        let tags = signed_follow_up_tags("#askagain", claim, "claim", act_id, SIGNER, &[], &key);
+        route_here(&state, &mgr, "#askagain", act_id, claim, tags.clone()).await;
+        while to_peer.try_recv().is_ok() {}
+
+        // Asked again, because the peer never heard the answer.
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::ActRoute {
+                event_id: format!("{PEER}:{claim}/2"),
+                act_id: act_id.to_string(),
+                act_event_id: claim.to_string(),
+                tags,
+                target: "#askagain".to_string(),
+                from: "tasker!t@remote".to_string(),
+                account: Some(SIGNER.to_string()),
+                origin: PEER.to_string(),
+            },
+        )
+        .await;
+
+        let subject_tag = format!(
+            "+freeq.at/{}",
+            freeq_sdk::act_transitions::confirmation_subject_tag()
+        );
+        match to_peer.try_recv() {
+            Ok(S2sMessage::Tagmsg { tags: said, .. }) => {
+                assert!(
+                    said.get("+freeq.at/act-verb")
+                        .is_some_and(|verb| freeq_sdk::act_transitions::is_confirmation(verb)),
+                    "the answer is the receipt: {said:?}"
+                );
+                assert_eq!(
+                    said.get(&subject_tag).map(String::as_str),
+                    Some(claim),
+                    "and it names the event still being asked about"
+                );
+            }
+            other => panic!("a peer still asking has to be answered: {other:?}"),
+        }
+
+        let task = state
+            .with_db(|db| db.act_task(act_id))
+            .flatten()
+            .expect("our own task is still live");
+        assert_eq!(
+            (task.state.as_str(), task.assignee.as_deref()),
+            ("assigned", Some(SIGNER)),
+            "said again, not decided again"
+        );
+    }
+
+    /// A route ends when the event it carries stops waiting. The home's receipt
+    /// arriving is one way that happens, and after it there is nothing left to
+    /// ask about.
+    #[tokio::test]
+    async fn a_route_whose_event_has_been_confirmed_is_dropped_without_asking() {
+        const HOME: &str = "did:web:peer-b.example";
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#routeruled");
+        let key = key_on_file(&state, SIGNER);
+        let home_key = key_on_file(&state, HOME);
+        let mut to_peer = link_peer(&mgr, true).await;
+
+        let act_id = "01ROUTERULEDOFFER0000000";
+        let claim = "01ROUTERULEDCLAIM0000000";
+        a_transition_waiting_for_its_home(&state, &mgr, "#routeruled", act_id, claim, &key).await;
+        let _ = routed_to_peer(&mut to_peer).await;
+
+        let receipt = "01ROUTERULEDRECEIPT00000";
+        relay(
+            &state,
+            &mgr,
+            "#routeruled",
+            receipt,
+            signed_receipt_tags("#routeruled", receipt, act_id, claim, HOME, &home_key),
+        )
+        .await;
+        assert_eq!(confirm_state_of(&state, act_id, claim), "confirmed");
+
+        every_route_due_now(&state);
+        flush_pending_routes(&state).await;
+
+        assert!(
+            routed_to_peer(&mut to_peer).await.is_empty(),
+            "a ruled-on event is not asked about again"
+        );
+        assert_eq!(state.act_routes.lock().len(), 0, "and its route is dropped");
+    }
+
+    /// The other way an event stops waiting: something else was ruled in and
+    /// the rules no longer admit this one. A loser is not asked about either.
+    #[tokio::test]
+    async fn a_route_whose_event_was_outrun_is_dropped_without_asking() {
+        const HOME: &str = "did:web:peer-b.example";
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#routeoutrun");
+        let key = key_on_file(&state, SIGNER);
+        let home_key = key_on_file(&state, HOME);
+        let mut to_peer = link_peer(&mgr, true).await;
+
+        let act_id = "01ROUTEOUTRUNOFFER000000";
+        let claim = "01ROUTEOUTRUNCLAIM000000";
+        a_transition_waiting_for_its_home(&state, &mgr, "#routeoutrun", act_id, claim, &key).await;
+        let _ = routed_to_peer(&mut to_peer).await;
+
+        // The task's own server expires it, which it may do under its own
+        // name. The claim that was waiting can never be ruled in now.
+        let expiry = "01ROUTEOUTRUNEXPIRY00000";
+        relay(
+            &state,
+            &mgr,
+            "#routeoutrun",
+            expiry,
+            signed_follow_up_tags(
+                "#routeoutrun",
+                expiry,
+                "expire",
+                act_id,
+                HOME,
+                &[],
+                &home_key,
+            ),
+        )
+        .await;
+        assert_eq!(
+            confirm_state_of(&state, act_id, claim),
+            "superseded",
+            "the claim was outrun by the ending of the task"
+        );
+
+        every_route_due_now(&state);
+        flush_pending_routes(&state).await;
+
+        assert!(
+            routed_to_peer(&mut to_peer).await.is_empty(),
+            "an outrun event is not asked about again"
+        );
+        assert_eq!(state.act_routes.lock().len(), 0, "and its route is dropped");
+    }
+
+    /// Sending to a peer is not hearing from it. The orphan clock reads "last
+    /// heard from", and a message handed to a link that is already gone must
+    /// not refresh it.
+    #[tokio::test]
+    async fn handing_a_transition_to_a_link_is_not_hearing_from_the_peer() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#routecontact");
+        let key = key_on_file(&state, SIGNER);
+        let mut to_peer = link_peer(&mgr, true).await;
+
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+        mgr.peer_contact.lock().touch_at(PEER, long_ago);
+
+        let act_id = "01ROUTECONTACTOFFER0000000";
+        let claim = "01ROUTECONTACTCLAIM0000000";
+        a_transition_waiting_for_its_home(&state, &mgr, "#routecontact", act_id, claim, &key).await;
+        assert_eq!(
+            routed_to_peer(&mut to_peer).await,
+            [claim],
+            "the transition went out over the link"
+        );
+
+        assert_eq!(
+            mgr.peer_contact.lock().last_contact(PEER),
+            long_ago,
+            "and that is not contact: nothing was heard from the peer, so the \
+             clock that says how long a home has been silent must not move"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verifying_relayed_task_event_logs_valid_and_delivers_unchanged() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let mut rx = capable_member(&state, "#verdictvalid");
+        let key = key_on_file(&state, SIGNER);
+        let tags = signed_offer_tags("#verdictvalid", "01VERDICTVALID000000000000", &key);
+        let sig = tags["+freeq.at/sig"].clone();
+
+        let (sink, _guard) = capture();
+        relay(
+            &state,
+            &mgr,
+            "#verdictvalid",
+            "01VERDICTVALID000000000000",
+            tags,
+        )
+        .await;
+
+        let logs = sink.text();
+        assert!(
+            logs.contains("verdict=valid"),
+            "the receiving server's own verdict is logged: {logs}"
+        );
+        assert!(
+            logs.contains("01VERDICTVALID000000000000"),
+            "the verdict line names the event: {logs}"
+        );
+        assert!(
+            logs.contains("peer_declared_act=false"),
+            "the line says whether the peer declared the act capability, so an \
+             operator can tell an old relay from touched tags: {logs}"
+        );
+
+        let line = received(&mut rx).await;
+        assert!(line.contains("TAGMSG"), "delivered: {line}");
+        assert!(
+            line.contains("+freeq.at/act=handoff") && line.contains(&sig),
+            "delivery carries the tags and signature unchanged: {line}"
+        );
+
+        // …and it is on file here, under the id its signer minted — the id a
+        // later replay will name, so the same event is recognised rather than
+        // read as a second claim.
+        assert!(
+            state
+                .with_db(|db| db.is_act_event("01VERDICTVALID000000000000"))
+                .unwrap(),
+            "a verified task event is stored"
+        );
+        let task = state
+            .with_db(|db| db.act_task("01VERDICTVALID000000000000"))
+            .unwrap()
+            .expect("the offer opened a task");
+        assert_eq!(task.origin, PEER, "stamped with the server that owns it");
+        assert_eq!(task.venue, "#verdictvalid");
+        assert_eq!(task.offerer, SIGNER);
+    }
+
+    /// A relayed event belongs to a task some other server opened. An origin
+    /// field left blank says the opposite: an empty origin is how this server
+    /// writes "opened here", so believing one would hand us the refereeing of
+    /// the task and the expiry of work we never took on. It is refused before
+    /// the signature is read — a signature says who signed, never whose task
+    /// it is — and this one verifies, so the blank origin is the only thing
+    /// wrong with the event.
+    /// A task event a peer relayed reaches the signer's own sessions here.
+    ///
+    /// The delivery that puts an event in the named identity's own client is
+    /// gated on this server having checked the signature. For a mutation that
+    /// answer is the mutation verdict; a task event is not a mutation and has
+    /// none, so the gate read absent and a DID logged in here and elsewhere
+    /// saw their own task events on every server but this one. The act
+    /// checker is the answer for this family, and it has already run.
+    #[tokio::test]
+    async fn a_relayed_task_event_reaches_the_signers_own_sessions() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        // The person the DM is addressed to, and the signer's own other
+        // device on this server: one identity logged in on two servers.
+        let mut theirs = capable_session_for(&state, RECIPIENT);
+        let mut signers_own = capable_session_for(&state, SIGNER);
+        let key = key_on_file(&state, SIGNER);
+
+        let event_id = "01DMLIVE0000000000000000AA";
+        let venue = freeq_sdk::chatsig::dm_venue(SIGNER, RECIPIENT);
+        let tags = signed_offer_tags_in(&venue, event_id, &key);
+        relay(&state, &mgr, RECIPIENT, event_id, tags).await;
+
+        let to_them = received(&mut theirs).await;
+        assert!(
+            to_them.contains(event_id),
+            "the recipient is told: {to_them}"
+        );
+        let to_signer = received(&mut signers_own).await;
+        assert!(
+            to_signer.contains(event_id),
+            "and so is the signer's own session here: {to_signer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relayed_task_event_that_names_no_origin_does_not_become_ours() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let mut rx = capable_member(&state, "#noorigin");
+        let key = key_on_file(&state, SIGNER);
+        let event_id = "01NOORIGIN0000000000000000";
+        let tags = signed_offer_tags("#noorigin", event_id, &key);
+
+        let (sink, _guard) = capture();
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Tagmsg {
+                event_id: format!("{PEER}:{event_id}"),
+                from: "tasker!t@remote".to_string(),
+                target: "#noorigin".to_string(),
+                tags,
+                origin: String::new(),
+                account: Some(SIGNER.to_string()),
+            },
+        )
+        .await;
+
+        assert!(
+            state.with_db(|db| db.act_task(event_id)).unwrap().is_none(),
+            "no task of it stands here, least of all one of ours"
+        );
+        assert!(
+            !state.with_db(|db| db.is_act_event(event_id)).unwrap(),
+            "and nothing is filed: the log holds what this server accepted"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "and nobody is shown it"
+        );
+
+        let logs = sink.text();
+        assert!(
+            logs.contains("claims no origin") && logs.contains(event_id),
+            "the refusal says what was wrong and names the event: {logs}"
+        );
+    }
+
+    /// The one verdict that stops an event. This test used to pin the
+    /// opposite — a tampered event still delivered — because the check was
+    /// observe-only and delivery was deliberately untouched by it. Acting on
+    /// the verdict is what reverses it: a found key over altered bytes is
+    /// evidence, and evidence is grounds for showing nobody.
+    #[tokio::test]
+    async fn a_tampered_relayed_task_event_logs_invalid_and_reaches_nobody() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let mut rx = capable_member(&state, "#verdictbad");
+        let key = key_on_file(&state, SIGNER);
+        let event_id = "01VERDICTBAD00000000000000";
+        let mut tags = signed_offer_tags("#verdictbad", event_id, &key);
+        tags.insert(
+            "+freeq.at/act-title".to_string(),
+            "a title nobody signed".to_string(),
+        );
+
+        let (sink, _guard) = capture();
+        relay(&state, &mgr, "#verdictbad", event_id, tags).await;
+
+        let logs = sink.text();
+        assert!(
+            logs.contains("verdict=invalid"),
+            "a found key over altered bytes is evidence, and reads as such: {logs}"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "an event this server can show is forged reaches nobody"
+        );
+        assert!(
+            !state.with_db(|db| db.is_act_event(event_id)).unwrap(),
+            "and it is written nowhere: the log is what this server accepted"
+        );
+        assert!(
+            state.with_db(|db| db.act_task(event_id)).unwrap().is_none(),
+            "so no task of it exists either"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_signers_task_event_logs_unverifiable_never_invalid() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let mut rx = capable_member(&state, "#verdictwho");
+        // Signed with a key this server never sees: nothing on file.
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let tags = signed_offer_tags("#verdictwho", "01VERDICTWHO00000000000000", &key);
+
+        let (sink, _guard) = capture();
+        relay(
+            &state,
+            &mgr,
+            "#verdictwho",
+            "01VERDICTWHO00000000000000",
+            tags,
+        )
+        .await;
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "and goes unseen: showing it would present an unchecked claim as a task"
+        );
+        assert!(
+            !state
+                .with_db(|db| db.is_act_event("01VERDICTWHO00000000000000"))
+                .unwrap(),
+            "and unstored: the log holds what this server checked"
+        );
+        assert_eq!(
+            state.act_deferred.lock().len(),
+            1,
+            "it waits for the key rather than being thrown away"
+        );
+
+        let logs = sink.text();
+        assert!(
+            logs.contains("verdict=unverifiable"),
+            "a key we do not hold is not evidence about the sender: {logs}"
+        );
+        assert!(
+            logs.contains("no key on file"),
+            "the reason names the fixable cause: {logs}"
+        );
+        assert!(
+            !logs.contains("verdict=invalid"),
+            "unverifiable must never be classified as invalid: {logs}"
+        );
+    }
+
+    /// A `did:web:` name in the payload does not make its bearer the system.
+    ///
+    /// The live path reads the actor the way catch-up and a rebuild read it —
+    /// a server signs under `did:web:`, a person does not — so one event no
+    /// longer gets two answers depending on which path it arrived by. But
+    /// reading the name is not believing the claim: `expire` is a verb only
+    /// the system may send, and the system that may send it on a task is the
+    /// server that referees the task. This one is ours, and the event came in
+    /// on a peer's link, so the peer is not it. Without this, any allowlisted
+    /// peer whose key we hold could end work this server owns — which is what
+    /// scoping the expiry sweep to our own tasks was for.
+    #[tokio::test]
+    async fn a_peer_wearing_a_servers_name_cannot_expire_a_task_we_own() {
+        const HOME: &str = "did:web:home.example";
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#syskeeper");
+        let key = key_on_file(&state, HOME);
+
+        let act_id = "01SYSTEMTASK00000000000000";
+        our_own_task(&state, "#syskeeper", act_id);
+
+        let expiry = "01SYSTEMEXPIRE000000000000";
+        relay(
+            &state,
+            &mgr,
+            "#syskeeper",
+            expiry,
+            signed_follow_up_tags("#syskeeper", expiry, "expire", act_id, HOME, &[], &key),
+        )
+        .await;
+
+        let task = state
+            .with_db(|db| db.act_task(act_id))
+            .unwrap()
+            .expect("the task is still standing");
+        assert_eq!(task.state, "open");
+        assert!(
+            !state.with_db(|db| db.is_act_event(expiry)).unwrap(),
+            "and the move is refused, not filed: the rules answered it the \
+             way they answer any sender who may not send that verb"
+        );
+    }
+
+    /// A receipt relayed from a peer is filed like every other task event,
+    /// with the link it arrived on recorded on its row — and here that link
+    /// is what decides it applies to nothing. The task is this server's own,
+    /// so no peer's receipt about it carries any word but its own author's,
+    /// and the record is all it leaves.
+    #[tokio::test]
+    async fn a_relayed_receipt_is_filed_with_the_link_it_arrived_on() {
+        const HOME: &str = "did:web:home.example";
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#receipts");
+        let key = key_on_file(&state, HOME);
+
+        let act_id = "01RECEIPTTASK0000000000000";
+        our_own_task(&state, "#receipts", act_id);
+
+        let receipt = "01RECEIPTEVENT000000000000";
+        relay(
+            &state,
+            &mgr,
+            "#receipts",
+            receipt,
+            signed_follow_up_tags(
+                "#receipts",
+                receipt,
+                freeq_sdk::act_transitions::confirmation_verb(),
+                act_id,
+                HOME,
+                &[("+freeq.at/act-subject", "01RECEIPTSUBJECT0000000000")],
+                &key,
+            ),
+        )
+        .await;
+
+        let row = state
+            .with_db(|db| db.get_event(receipt))
+            .flatten()
+            .expect("the receipt is on file");
+        assert_eq!(
+            row.origin.as_deref(),
+            Some(PEER),
+            "the row names the link the receipt came in on, the way every \
+             other relayed task event's row does"
+        );
+        let task = state
+            .with_db(|db| db.act_task(act_id))
+            .unwrap()
+            .expect("the task is still live");
+        assert_eq!(
+            (task.state.as_str(), task.assignee.as_deref()),
+            ("open", None),
+            "and a receipt moves nothing: what it names did the moving"
+        );
+    }
+
+    /// What makes deferring a delay and not a loss: the key turns up, and
+    /// everything that was waiting on it is judged, applied and delivered — in
+    /// the order it was parked, because a claim that arrived before a
+    /// completion has to be applied before it.
+    #[tokio::test]
+    async fn a_key_arriving_releases_what_was_waiting_for_it_in_park_order() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let mut rx = capable_member(&state, "#verdictlate");
+        // No key on file yet, so both events park.
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let opener = "01LATEOFFER0000000000000000";
+        let follow = "01LATEPROGRESS0000000000000";
+
+        relay(
+            &state,
+            &mgr,
+            "#verdictlate",
+            opener,
+            signed_offer_tags("#verdictlate", opener, &key),
+        )
+        .await;
+        relay(
+            &state,
+            &mgr,
+            "#verdictlate",
+            follow,
+            signed_follow_up_tags("#verdictlate", follow, "cancel", opener, SIGNER, &[], &key),
+        )
+        .await;
+        assert_eq!(state.act_deferred.lock().len(), 2, "both are waiting");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "and neither has been shown to anyone"
+        );
+
+        // The key registers — the same call a client's MSGSIG makes.
+        state
+            .with_db(|db| db.save_signing_key(SIGNER, key.verifying_key().as_bytes()))
+            .expect("db present");
+        retry_deferred_task_events(
+            &state,
+            SIGNER,
+            &freeq_sdk::sigtag::derive_kid(&key.verifying_key()),
+        );
+
+        assert_eq!(
+            state.act_deferred.lock().len(),
+            0,
+            "nothing is left waiting"
+        );
+        let first = received(&mut rx).await;
+        assert!(
+            first.contains(opener),
+            "the offer is delivered first, as it was parked first: {first}"
+        );
+        let second = received(&mut rx).await;
+        assert!(second.contains(follow), "then the follow-up: {second}");
+
+        // Both are on file. The offer opened the task and stamped it with the
+        // peer that owns it; the cancellation is filed and goes no further,
+        // because ending a task another server referees is not this server's
+        // call to make.
+        assert!(state.with_db(|db| db.is_act_event(opener)).unwrap());
+        assert!(state.with_db(|db| db.is_act_event(follow)).unwrap());
+        let task = state
+            .with_db(|db| db.act_task(opener))
+            .unwrap()
+            .expect("the peer's task is still live here");
+        assert_eq!(task.origin, PEER);
+        assert_eq!(task.state, "open", "we did not cancel a peer's task");
+    }
+
+    /// A released event reaches the same sessions a live one would, and that
+    /// includes the signer's own other devices here. The live path hands a DM
+    /// to those only when the signature checked out; a released event has just
+    /// checked out, or it would not be delivered at all — so withholding it
+    /// would show a multi-homed signer their own action on one server and not
+    /// the other, for no reason but that their key arrived late.
+    #[tokio::test]
+    async fn a_released_event_reaches_the_signers_own_sessions_too() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        // The person the DM is addressed to, and the signer's own other
+        // device on this server: one identity logged in on two servers.
+        let mut theirs = capable_session_for(&state, RECIPIENT);
+        let mut signers_own = capable_session_for(&state, SIGNER);
+
+        // Signed with a key nothing holds yet, so the event parks.
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let event_id = "01DMRELEASE000000000000000";
+        let venue = freeq_sdk::chatsig::dm_venue(SIGNER, RECIPIENT);
+        let tags = signed_offer_tags_in(&venue, event_id, &key);
+        relay(&state, &mgr, RECIPIENT, event_id, tags).await;
+        assert_eq!(state.act_deferred.lock().len(), 1, "it waits for the key");
+
+        // The key registers, and the wait ends.
+        state
+            .with_db(|db| db.save_signing_key(SIGNER, key.verifying_key().as_bytes()))
+            .expect("db present");
+        retry_deferred_task_events(
+            &state,
+            SIGNER,
+            &freeq_sdk::sigtag::derive_kid(&key.verifying_key()),
+        );
+
+        let to_them = received(&mut theirs).await;
+        assert!(
+            to_them.contains(event_id),
+            "the recipient is told: {to_them}"
+        );
+        let to_signer = received(&mut signers_own).await;
+        assert!(
+            to_signer.contains(event_id),
+            "and so is the signer's own session here, exactly as the live path \
+             would have told it: {to_signer}"
+        );
+    }
+
+    /// The visible trace of a drop: a waiting event thrown out of a full queue
+    /// leaves a count on the task it belonged to, where that task is on file —
+    /// and only there. One whose task was never stored leaves nothing but the
+    /// log, and no row is invented to say so on.
+    #[tokio::test]
+    async fn an_eviction_counts_against_the_task_it_belonged_to() {
+        // A queue of one per peer, so each new unverifiable event evicts the
+        // one before it.
+        let state = test_state_with_config(crate::config::ServerConfig {
+            act_defer_max_per_origin: 1,
+            act_defer_max_total: 4096,
+            ..Default::default()
+        });
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#evict");
+        let key = key_on_file(&state, SIGNER);
+
+        // A task on file: a valid, signed opener from the peer.
+        let opener = "01EVICTOPENER0000000000000";
+        relay(
+            &state,
+            &mgr,
+            "#evict",
+            opener,
+            signed_offer_tags("#evict", opener, &key),
+        )
+        .await;
+        assert!(
+            state.with_db(|db| db.act_task(opener)).flatten().is_some(),
+            "the opener is stored, so there is a row to mark"
+        );
+
+        // Follow-ups signed by an identity whose key is nowhere on file:
+        // every one of them parks.
+        let stranded_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let follow = |event_id: &str, act_id: &str| {
+            signed_follow_up_tags(
+                "#evict",
+                event_id,
+                "progress",
+                act_id,
+                "did:plc:strandedsigner",
+                &[],
+                &stranded_key,
+            )
+        };
+
+        let wait1 = "01EVICTWAIT100000000000000";
+        relay(&state, &mgr, "#evict", wait1, follow(wait1, opener)).await;
+        assert_eq!(state.act_deferred.lock().len(), 1);
+        assert_eq!(
+            state
+                .with_db(|db| db.act_dropped_unchecked(opener))
+                .unwrap(),
+            0,
+            "waiting is not dropped"
+        );
+
+        // The second one evicts the first, and the task's row says so.
+        let wait2 = "01EVICTWAIT200000000000000";
+        relay(&state, &mgr, "#evict", wait2, follow(wait2, opener)).await;
+        assert_eq!(
+            state
+                .with_db(|db| db.act_dropped_unchecked(opener))
+                .unwrap(),
+            1
+        );
+
+        // A follow-up naming a task never stored here parks (evicting the
+        // second, which also counts against the opener's task)…
+        let unknown = "01EVICTNOROW00000000000000";
+        let wait3 = "01EVICTWAIT300000000000000";
+        relay(&state, &mgr, "#evict", wait3, follow(wait3, unknown)).await;
+        assert_eq!(
+            state
+                .with_db(|db| db.act_dropped_unchecked(opener))
+                .unwrap(),
+            2
+        );
+
+        // …and when it is evicted in turn, nothing is invented for its
+        // unknown task: no row, count zero, log only.
+        let wait4 = "01EVICTWAIT400000000000000";
+        relay(&state, &mgr, "#evict", wait4, follow(wait4, opener)).await;
+        assert_eq!(
+            state
+                .with_db(|db| db.act_dropped_unchecked(unknown))
+                .unwrap(),
+            0
+        );
+        assert!(state.with_db(|db| db.act_task(unknown)).flatten().is_none());
+    }
+
+    /// An event that can never verify — no key is named, so no lookup could
+    /// ever settle it — waits like any other rather than being refused, and
+    /// ages out where somebody can see it.
+    #[tokio::test]
+    async fn an_event_that_can_never_verify_still_waits_and_ages_out() {
+        let state = test_state_with_config(crate::config::ServerConfig {
+            act_defer_max_per_origin: 1,
+            act_defer_max_total: 4096,
+            ..Default::default()
+        });
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let mut rx = capable_member(&state, "#nevercheck");
+        let key = key_on_file(&state, SIGNER);
+
+        // A task on file, so an aged-out event about it has a row to mark.
+        let opener = "01NEVEROPENER0000000000000";
+        relay(
+            &state,
+            &mgr,
+            "#nevercheck",
+            opener,
+            signed_offer_tags("#nevercheck", opener, &key),
+        )
+        .await;
+
+        // An algorithm this build does not know: unverifiable forever, since
+        // no key server can answer a question about a key nobody named.
+        let stuck = "01NEVERSTUCK00000000000000";
+        let mut tags =
+            signed_follow_up_tags("#nevercheck", stuck, "progress", opener, SIGNER, &[], &key);
+        tags.insert("+freeq.at/sig".to_string(), "rsa:somekid:AAAA".to_string());
+        relay(&state, &mgr, "#nevercheck", stuck, tags).await;
+
+        assert_eq!(
+            state.act_deferred.lock().len(),
+            1,
+            "it waits rather than being refused"
+        );
+        assert!(
+            !state.with_db(|db| db.is_act_event(stuck)).unwrap(),
+            "and is written nowhere while it waits"
+        );
+
+        // Anything else from that peer pushes it off the back, and the task it
+        // named carries the count.
+        let next = "01NEVERNEXT000000000000000";
+        relay(
+            &state,
+            &mgr,
+            "#nevercheck",
+            next,
+            signed_follow_up_tags(
+                "#nevercheck",
+                next,
+                "progress",
+                opener,
+                "did:plc:someoneelse",
+                &[],
+                &ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+            ),
+        )
+        .await;
+        assert_eq!(
+            state
+                .with_db(|db| db.act_dropped_unchecked(opener))
+                .unwrap(),
+            1,
+            "the ageing-out is visible on the task, not only in the log"
+        );
+        // The opener's own delivery is the only thing that reached the room.
+        let shown = received(&mut rx).await;
+        assert!(shown.contains(opener), "{shown}");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "nothing unchecked was ever shown"
+        );
+    }
+
+    /// The stopgap coordination family (`+freeq.at/event`) gets a verdict
+    /// too: relayed coordination TAGMSGs were delivered without any check —
+    /// the mutation verifier does not read them — so this wiring is the first
+    /// time the receive side checks one.
+    #[tokio::test]
+    async fn a_relayed_coordination_event_gets_a_verdict_of_its_own() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#verdictcoord");
+        let key = key_on_file(&state, SIGNER);
+
+        let event_id = "01VERDICTCOORD000000000000";
+        let payload = "%7B%22description%22%3A%22ship%20it%22%7D";
+        let sig = freeq_sdk::chatsig::ChatDoc::coordination(
+            SIGNER,
+            event_id,
+            "#verdictcoord",
+            "task_request",
+        )
+        .with_payload(payload)
+        .sign(&key);
+        let mut tags = HashMap::new();
+        tags.insert("+freeq.at/event".to_string(), "task_request".to_string());
+        tags.insert("+freeq.at/payload".to_string(), payload.to_string());
+        tags.insert(
+            freeq_sdk::chatsig::EVENT_ID_TAG.to_string(),
+            event_id.to_string(),
+        );
+        tags.insert("+freeq.at/sig".to_string(), sig);
+
+        let (sink, _guard) = capture();
+        relay(&state, &mgr, "#verdictcoord", event_id, tags).await;
+
+        let logs = sink.text();
+        assert!(
+            logs.contains("verdict=valid") && logs.contains(event_id),
+            "the coordination family verifies under its own document: {logs}"
+        );
+        // …and is filed the same way local ingress files one, under the
+        // signer's own id and with the verdict this server reached.
+        let filed = state
+            .with_db(|db| Ok(db.get_task(event_id)))
+            .flatten()
+            .expect("a verified coordination event is stored");
+        assert_eq!(filed.actor_did, SIGNER);
+        assert_eq!(filed.event_type, "task_request");
+        assert_eq!(
+            filed.payload_json, r#"{"description":"ship it"}"#,
+            "the payload is decoded on the way in, as it is locally"
+        );
     }
 }

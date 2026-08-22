@@ -83,6 +83,14 @@ pub struct ServerConfig {
     #[arg(long, value_delimiter = ',')]
     pub s2s_allowed_peers: Vec<String>,
 
+    /// Capability names this build has but will not declare to peers, so a
+    /// peer treats this server as one that predates them. For tests: it is
+    /// how a two-server run reproduces an older peer without an older build.
+    /// Withholding a capability costs what the capability gates — withhold
+    /// `act` and no peer ever sends this server a task event.
+    #[arg(long, value_delimiter = ',')]
+    pub s2s_undeclared_capabilities: Vec<String>,
+
     /// Where each S2S peer serves its own users' message-signing keys.
     /// Comma-separated `<endpoint-id>=<http(s)://base>` entries — the base URL
     /// of the peer's REST API, e.g. `44f1415c...=https://irc.example.com`.
@@ -92,6 +100,14 @@ pub struct ServerConfig {
     /// peer gets to choose where this server sends requests.
     #[arg(long, value_delimiter = ',')]
     pub s2s_peer_api: Vec<String>,
+
+    /// How long a signing-key lookup that came back with nothing is remembered
+    /// before another is attempted, in seconds. A peer whose key server is
+    /// unreachable is asked once a window rather than once per message. Lower
+    /// only where a deployment needs an unknown signer's next message checked
+    /// sooner than a minute.
+    #[arg(long, default_value = "60")]
+    pub peer_key_retry_secs: u64,
 
     /// S2S peer trust levels. Format: "endpoint_id:level" where level is
     /// "full" (default), "relay" (messages only), or "readonly" (observe only).
@@ -142,6 +158,29 @@ pub struct ServerConfig {
     /// the window before they bid. 0 = never auto-accept.
     #[arg(long, default_value = "1209600")]
     pub act_review_secs: u64,
+
+    /// How many relayed task events may wait at once for the key that would
+    /// settle them, per peer they arrived from. A signature this server cannot
+    /// check yet is never rejected — it is parked until the signer's key
+    /// arrives — so the queue needs a ceiling, and one peer must not be able
+    /// to fill it for everyone. Oldest goes first when the ceiling is reached.
+    #[arg(long, default_value = "256")]
+    pub act_defer_max_per_origin: usize,
+
+    /// The same queue's ceiling across every peer, which is what the process
+    /// actually runs under: enough peers each inside their own share add up to
+    /// more than one server should hold.
+    #[arg(long, default_value = "4096")]
+    pub act_defer_max_total: usize,
+
+    /// How long a task's home server may be out of contact before unfinished
+    /// tasks that server owns read `orphaned` here, in seconds. Purely local:
+    /// the annotation is worked out when a view is read, never stored, never
+    /// relayed, never part of the signed log, and it dissolves the moment the
+    /// home is heard from again. RFC-recommended 24 hours, configurable.
+    /// 0 = never mark.
+    #[arg(long, default_value = "86400")]
+    pub act_orphan_secs: u64,
 
     /// Message of the Day text. If not set, no MOTD is sent.
     #[arg(long)]
@@ -311,7 +350,9 @@ impl Default for ServerConfig {
             iroh_port: None,
             s2s_peers: vec![],
             s2s_allowed_peers: vec![],
+            s2s_undeclared_capabilities: vec![],
             s2s_peer_api: vec![],
+            peer_key_retry_secs: 60,
             s2s_peer_trust: vec![],
             server_did: None,
             data_dir: None,
@@ -319,6 +360,9 @@ impl Default for ServerConfig {
             max_messages_per_channel: 10000,
             act_expiry_secs: 604_800,
             act_review_secs: 1_209_600,
+            act_defer_max_per_origin: 256,
+            act_defer_max_total: 4096,
+            act_orphan_secs: 86_400,
             motd: None,
             motd_file: None,
             web_static_dir: None,
@@ -446,7 +490,9 @@ struct FileConfig {
     iroh_port: Option<u16>,
     s2s_peers: Option<Vec<String>>,
     s2s_allowed_peers: Option<Vec<String>>,
+    s2s_undeclared_capabilities: Option<Vec<String>>,
     s2s_peer_api: Option<MapOrPairs>,
+    peer_key_retry_secs: Option<u64>,
     s2s_peer_trust: Option<MapOrPairs>,
     server_did: Option<String>,
     data_dir: Option<String>,
@@ -454,6 +500,9 @@ struct FileConfig {
     max_messages_per_channel: Option<usize>,
     act_expiry_secs: Option<u64>,
     act_review_secs: Option<u64>,
+    act_defer_max_per_origin: Option<usize>,
+    act_defer_max_total: Option<usize>,
+    act_orphan_secs: Option<u64>,
     motd: Option<String>,
     motd_file: Option<String>,
     web_static_dir: Option<String>,
@@ -569,9 +618,14 @@ fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConf
         iroh,
         s2s_peers,
         s2s_allowed_peers,
+        s2s_undeclared_capabilities,
         max_messages_per_channel,
+        peer_key_retry_secs,
         act_expiry_secs,
         act_review_secs,
+        act_defer_max_per_origin,
+        act_defer_max_total,
+        act_orphan_secs,
         plugins,
         require_did_for_ops,
         oper_dids,
@@ -628,6 +682,10 @@ mod tests {
                 iroh = true
                 act_expiry_secs = 120
                 act_review_secs = 240
+                act_defer_max_per_origin = 7
+                act_defer_max_total = 21
+                act_orphan_secs = 5
+                peer_key_retry_secs = 3
                 s2s_peer_api = ["abcd=https://irc.example.com"]
                 "#,
             ),
@@ -639,6 +697,10 @@ mod tests {
         assert!(c.iroh);
         assert_eq!(c.act_expiry_secs, 120);
         assert_eq!(c.act_review_secs, 240);
+        assert_eq!(c.act_defer_max_per_origin, 7);
+        assert_eq!(c.act_defer_max_total, 21);
+        assert_eq!(c.act_orphan_secs, 5);
+        assert_eq!(c.peer_key_retry_secs, 3);
         assert_eq!(c.s2s_peer_api, vec!["abcd=https://irc.example.com"]);
     }
 
@@ -658,6 +720,9 @@ mod tests {
         assert_eq!(c.listen_addr, "127.0.0.1:6667");
         assert_eq!(c.server_name, "freeq");
         assert_eq!(c.motd.as_deref(), Some("hi"));
+        assert_eq!(c.act_defer_max_per_origin, 256);
+        assert_eq!(c.act_defer_max_total, 4096);
+        assert_eq!(c.peer_key_retry_secs, 60);
     }
 
     #[test]

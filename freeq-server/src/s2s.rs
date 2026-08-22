@@ -217,21 +217,63 @@ pub struct Capability {
 }
 
 /// Every capability this build declares. See [`Capability`] for the rules.
-pub const CAPABILITIES: &[Capability] = &[Capability {
-    name: CATCHUP,
-    // Added 2026-08-05. Retire at the next protocol_version bump, once no
-    // peer predates event replay.
-    gates: "CatchupRequest / CatchupEvents — replay of events missed while a link was down",
-}];
+pub const CAPABILITIES: &[Capability] = &[
+    Capability {
+        name: CATCHUP,
+        // Added 2026-08-05. Retire at the next protocol_version bump, once no
+        // peer predates event replay.
+        gates: "CatchupRequest / CatchupEvents — replay of events missed while a link was down",
+    },
+    Capability {
+        name: ACT,
+        // Added 2026-08-17. Retire at the next protocol_version bump, once no
+        // peer predates task events.
+        gates: "Tagmsg carrying task tags — a peer that cannot parse them could strip \
+                them in relay, and a stripped tag map breaks the signature downstream",
+    },
+    Capability {
+        name: ACT_ROUTE,
+        // Added 2026-08-21. Retire at the next protocol_version bump, once no
+        // peer predates carrying transitions to the server that owns the task.
+        gates: "ActRoute — a transition on a task this server does not own, carried to \
+                the server that does so it can rule on it",
+    },
+];
 
 /// Catch-up replay. A peer that does not declare this is never sent
 /// [`S2sMessage::CatchupRequest`] or [`S2sMessage::CatchupEvents`]; it would
 /// warn-and-skip them, which is data loss dressed as compatibility.
 pub const CATCHUP: &str = "catchup";
 
-/// The capability list this server advertises.
+/// Task events. A peer that does not declare this is never sent a Tagmsg
+/// whose tags form a task document: a relay that strips tags it does not
+/// know would break the signature over them, and downstream that reads as
+/// forgery when the real cause is an old server.
+pub const ACT: &str = "act";
+
+/// Carrying a transition to the server that owns the task. A peer that does
+/// not declare this is never sent [`S2sMessage::ActRoute`]: it would
+/// warn-and-skip a message type it cannot parse, and the transition would stay
+/// undecided while looking delivered.
+pub const ACT_ROUTE: &str = "act_route";
+
+/// Everything this build can receive.
 pub fn our_capabilities() -> Vec<String> {
     CAPABILITIES.iter().map(|c| c.name.to_string()).collect()
+}
+
+/// What this server actually declares: everything it can receive, less
+/// whatever the operator withheld with `--s2s-undeclared-capabilities`.
+///
+/// Withholding is how a two-server test reproduces a peer that predates a
+/// capability without an older build to run. It is not free — a peer sends
+/// nothing a capability gates to a server that did not declare it — which is
+/// exactly the property such a test is there to watch.
+pub fn declared_capabilities(withheld: &[String]) -> Vec<String> {
+    our_capabilities()
+        .into_iter()
+        .filter(|name| !withheld.iter().any(|w| w == name))
+        .collect()
 }
 
 /// Whether `peer_caps` — as declared in that peer's Hello — includes `name`.
@@ -244,6 +286,18 @@ pub fn peer_supports(peer_caps: &[String], name: &str) -> bool {
     peer_caps
         .iter()
         .any(|c| c == name || c.starts_with(&format!("{name}=")))
+}
+
+/// What became of one attempt to carry a transition to a task's home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteOutcome {
+    /// Handed to the link.
+    Sent,
+    /// The home is not reachable right now.
+    Unreachable,
+    /// The home was not sent this: an older build, or a peer this server sends
+    /// no events to.
+    Refused(&'static str),
 }
 
 /// One event, as it travels in a catch-up reply.
@@ -272,6 +326,15 @@ pub struct ReplayedEvent {
     /// A reaction's emoji, for an event with no canonical to carry it.
     #[serde(default)]
     pub emoji: Option<String>,
+    /// The server this event was **minted** at, not whoever is replaying it.
+    ///
+    /// A task's origin names the server that referees it, so an event healed
+    /// through a third party has to arrive still naming its minter. Empty from
+    /// a peer that predates this field, and the peer the link authenticated
+    /// stands in — for an honest peer that is the id it used to stamp the
+    /// whole batch, so an older peer is no worse off than it was.
+    #[serde(default)]
+    pub origin: String,
     pub timestamp: u64,
 }
 
@@ -572,6 +635,44 @@ pub enum S2sMessage {
         origin: String,
     },
 
+    /// A transition on a task this server does not own, carried to the server
+    /// that does.
+    ///
+    /// Every task event is already relayed to every act-capable peer, the home
+    /// included — this is the *addressed* copy, and it exists because a
+    /// broadcast is best-effort while a ruling is not optional. A home that was
+    /// away when the broadcast went out gets asked again; the relay has no
+    /// second try.
+    ///
+    /// The tag map travels exactly as it was signed, signature included:
+    /// rebuilding it or tidying it would break the very document the home has
+    /// to verify. `target` is the delivery target the venue was built from, so
+    /// the home resolves the same venue the signer did.
+    #[serde(rename = "act_route")]
+    ActRoute {
+        #[serde(default)]
+        event_id: String,
+        /// The task the transition moves — and therefore whose server this is
+        /// addressed to.
+        act_id: String,
+        /// The signed event's own id, which is what the log knows it by.
+        act_event_id: String,
+        /// The signed tags, verbatim.
+        tags: HashMap<String, String>,
+        /// The delivery target the venue was built from.
+        target: String,
+        /// The `nick!user@host` prefix the event travelled under.
+        from: String,
+        /// The actor's DID, stamped by the server the actor authenticated to —
+        /// never client-set, the same trust shape as `Tagmsg.account`.
+        #[serde(default)]
+        account: Option<String>,
+        /// The server carrying it, which is not necessarily the one whose user
+        /// authored it: a peer that holds the event unruled carries it too,
+        /// and on a network that is not a full mesh that is how it arrives.
+        origin: String,
+    },
+
     /// Request full state sync (sent on initial link).
     #[serde(rename = "sync_request")]
     SyncRequest,
@@ -604,7 +705,10 @@ pub enum S2sMessage {
     /// had to land before replay could.
     #[serde(rename = "catchup_events")]
     CatchupEvents {
-        /// The server that accepted these events.
+        /// The peer replaying this batch. Kept, not retired: it is the
+        /// fallback each event's own [`ReplayedEvent::origin`] falls back to
+        /// when the replying peer predates that field, and dropping it would
+        /// leave an older peer's events with no origin at all.
         origin: String,
         events: Vec<ReplayedEvent>,
         /// True when the answer was cut short by the cap, so the asker can
@@ -910,6 +1014,70 @@ pub struct PeerEntry {
     pub conn_gen: u64,
 }
 
+/// When this server last had contact with each peer, and when it started.
+///
+/// Deliberately not a field on [`PeerEntry`]: that entry is dropped from the
+/// peers map the moment a link closes, which is exactly the moment "how long
+/// since we heard from that server" starts being worth asking. This record
+/// outlives any one link.
+///
+/// In memory only. A restart forgets every peer and falls back to `started`,
+/// so a server that vanished before the restart takes a full threshold from
+/// *our* start before it reads out of contact again — late rather than early,
+/// which is the safe direction for an annotation that tells a reader somebody
+/// else's work is stranded.
+#[derive(Debug)]
+pub struct PeerContact {
+    started: std::time::Instant,
+    last: HashMap<String, std::time::Instant>,
+}
+
+impl Default for PeerContact {
+    fn default() -> Self {
+        Self::new(std::time::Instant::now())
+    }
+}
+
+impl PeerContact {
+    pub fn new(started: std::time::Instant) -> Self {
+        Self {
+            started,
+            last: HashMap::new(),
+        }
+    }
+
+    /// Record a successful exchange with `peer_id`.
+    pub fn touch(&mut self, peer_id: &str) {
+        self.touch_at(peer_id, std::time::Instant::now());
+    }
+
+    /// The same, at a stated moment.
+    pub fn touch_at(&mut self, peer_id: &str, at: std::time::Instant) {
+        let slot = self.last.entry(peer_id.to_string()).or_insert(at);
+        if at > *slot {
+            *slot = at;
+        }
+    }
+
+    /// When we last heard from `peer_id`, or when we started for one we never
+    /// have.
+    pub fn last_contact(&self, peer_id: &str) -> std::time::Instant {
+        self.last.get(peer_id).copied().unwrap_or(self.started)
+    }
+
+    /// Nothing heard from `peer_id` for longer than `ttl` — the timing half of
+    /// [`S2sManager::peer_out_of_contact`]. A zero `ttl` is the operator
+    /// saying *never*: no peer is ever out of contact by it.
+    pub fn out_of_contact(
+        &self,
+        peer_id: &str,
+        ttl: std::time::Duration,
+        now: std::time::Instant,
+    ) -> bool {
+        !ttl.is_zero() && now.duration_since(self.last_contact(peer_id)) >= ttl
+    }
+}
+
 pub struct S2sManager {
     /// Our server's iroh endpoint ID (cryptographic identity).
     pub server_id: String,
@@ -951,6 +1119,12 @@ pub struct S2sManager {
     /// than read from config at each call site so [`S2sManager::may_relay_to`]
     /// can state the whole rule in one place.
     pub allowed_peers: Vec<String>,
+    /// When each peer was last heard from. Written on every successful
+    /// exchange, never cleared when a link drops — see [`PeerContact`].
+    pub peer_contact: Arc<parking_lot::Mutex<PeerContact>>,
+    /// What this server tells peers it can receive — see
+    /// [`declared_capabilities`].
+    pub capabilities: Vec<String>,
 }
 
 impl S2sManager {
@@ -991,14 +1165,152 @@ impl S2sManager {
         peers.contains_key(peer_id) && self.is_allowlisted(peer_id)
     }
 
+    /// **The** definition of a peer being gone, in one place: no live link
+    /// right now *and* nothing heard from it for longer than `ttl`. Both
+    /// halves are required — a link that is up is contact, however quiet.
+    ///
+    /// Read by the task view, which annotates a foreign task `orphaned` when
+    /// its home answers true here. The link half is the same peers map a
+    /// routed transition is offered to, so what counts as reachable is one
+    /// record read two ways rather than two answers. A zero `ttl` means never.
+    pub async fn peer_out_of_contact(&self, peer_id: &str, ttl: std::time::Duration) -> bool {
+        if ttl.is_zero() || self.peers.lock().await.contains_key(peer_id) {
+            return false;
+        }
+        self.peer_contact
+            .lock()
+            .out_of_contact(peer_id, ttl, std::time::Instant::now())
+    }
+
+    /// Note a successful exchange with `peer_id` — a message read off its
+    /// link, or the link coming up in the first place.
+    pub fn note_contact(&self, peer_id: &str) {
+        self.peer_contact.lock().touch(peer_id);
+    }
+
     /// Whether the operator permits this peer at all. An empty allowlist means
     /// no restriction, matching `--s2s-allowed-peers`.
     fn is_allowlisted(&self, peer_id: &str) -> bool {
         self.allowed_peers.is_empty() || self.allowed_peers.iter().any(|p| p == peer_id)
     }
 
+    /// Carry one transition to the server that owns its task.
+    ///
+    /// Addressed, not broadcast: exactly one server referees a task, and the
+    /// message asks that one for a ruling.
+    ///
+    /// Whether it is worth trying again is the point of the answer: a link
+    /// that is down comes back, an old build does not.
+    pub async fn route_to_home(&self, home: &str, msg: S2sMessage) -> RouteOutcome {
+        // Linked first, and only then what it can parse: a peer we have never
+        // heard from has no declaration for that reason alone, and reading
+        // that as "an old build" would turn a link that is down — worth asking
+        // again — into a refusal that says stop.
+        if !self.is_linked(home).await {
+            return RouteOutcome::Unreachable;
+        }
+        let declared = self.declared_by(home).await;
+        if !peer_supports(&declared, ACT_ROUTE) {
+            return RouteOutcome::Refused("the peer cannot receive routed transitions");
+        }
+        self.send_to_linked_peer(home, msg).await
+    }
+
+    /// Answer one peer with a task event of ours — the receipt a peer that is
+    /// still asking never heard.
+    ///
+    /// Addressed rather than broadcast: everybody else who could act on it got
+    /// it when it was made, and this one peer is the one still waiting. Same
+    /// two gates, and the capability is the ordinary [`ACT`] one, because what
+    /// travels is an ordinary task event.
+    pub async fn send_act_to_peer(&self, peer: &str, msg: S2sMessage) -> RouteOutcome {
+        if !self.is_linked(peer).await {
+            return RouteOutcome::Unreachable;
+        }
+        let declared = self.declared_by(peer).await;
+        if !peer_supports(&declared, ACT) {
+            return RouteOutcome::Refused("the peer did not declare the act capability");
+        }
+        self.send_to_linked_peer(peer, msg).await
+    }
+
+    /// Whether there is a link to this peer at all right now.
+    async fn is_linked(&self, peer: &str) -> bool {
+        self.peers.lock().await.contains_key(peer)
+    }
+
+    /// What one peer said it can parse.
+    ///
+    /// Each of these takes one lock and releases it before the next is taken,
+    /// so nothing here nests the two the way the broadcast path must not.
+    async fn declared_by(&self, peer: &str) -> Vec<String> {
+        self.peer_capabilities
+            .lock()
+            .await
+            .get(peer)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Hand one message to one peer, past the gate every relay passes: we do
+    /// not send to a peer we would not relay messages to
+    /// ([`S2sManager::may_relay_to`]), so trust is decided in one place for
+    /// every kind of traffic. What the peer can parse is its caller's
+    /// question, because the answer differs per message.
+    async fn send_to_linked_peer(&self, peer: &str, msg: S2sMessage) -> RouteOutcome {
+        let peers = self.peers.lock().await;
+        // The link can have gone in the moment since it was looked for.
+        if !peers.contains_key(peer) {
+            return RouteOutcome::Unreachable;
+        }
+        if !self.may_relay_to(peer, &peers) {
+            return RouteOutcome::Refused("this server sends that peer no events");
+        }
+        match peers.get(peer) {
+            // Handed to the link, which is all `Sent` claims. A link that has
+            // just died keeps accepting sends until it notices, so this is not
+            // delivery and deliberately not contact either — the clock that
+            // says how long a home has been silent moves on what is *heard*
+            // from it, on the inbound paths.
+            Some(entry) => match entry.tx.send(msg).await {
+                Ok(()) => RouteOutcome::Sent,
+                // The link died between the check and the send.
+                Err(_) => RouteOutcome::Unreachable,
+            },
+            None => RouteOutcome::Unreachable,
+        }
+    }
+
     /// Internal: send a message directly to all connected peers (called by broadcast worker).
+    ///
+    /// Task events are the one message with a narrower audience: a Tagmsg
+    /// whose tags form a task document goes only to peers that declared
+    /// [`ACT`] in their Hello. The check lives here, on the one ordered path
+    /// every broadcast takes, so no call site can forget it.
     async fn broadcast_to_peers(&self, msg: S2sMessage) {
+        // The id its signer minted, read off the tags — the id the verdict log
+        // and the task's own history are both keyed by, and so the one an
+        // operator can follow a withheld event by. The envelope's id says
+        // which message this was and nothing about which task event. Absent
+        // only for a document that could not have passed ingress or relay,
+        // both of which demand it before anything else.
+        let act_event_id = match &msg {
+            S2sMessage::Tagmsg { tags, .. } if crate::connection::act::carries_act_tags(tags) => {
+                Some(
+                    tags.get(freeq_sdk::chatsig::EVENT_ID_TAG)
+                        .or_else(|| tags.get(freeq_sdk::chatsig::EVENT_ID_TAG_BARE))
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+            }
+            _ => None,
+        };
+        // Snapshot before taking the peers lock, never nested inside it.
+        let caps_by_peer = if act_event_id.is_some() {
+            Some(self.peer_capabilities.lock().await.clone())
+        } else {
+            None
+        };
         let peers = self.peers.lock().await;
         if peers.is_empty() {
             return;
@@ -1006,6 +1318,17 @@ impl S2sManager {
         for (peer_id, entry) in peers.iter() {
             if !self.may_relay_to(peer_id, &peers) {
                 continue;
+            }
+            if let (Some(event_id), Some(caps_by_peer)) = (&act_event_id, &caps_by_peer) {
+                let declared = caps_by_peer.get(peer_id).cloned().unwrap_or_default();
+                if !peer_supports(&declared, ACT) {
+                    tracing::info!(
+                        peer = %peer_id,
+                        event_id = %event_id,
+                        "S2S: task event withheld — peer did not declare the act capability"
+                    );
+                    continue;
+                }
             }
             if entry.tx.send(msg.clone()).await.is_err() {
                 tracing::warn!(peer = %peer_id, "S2S broadcast: failed to send to peer");
@@ -1253,6 +1576,8 @@ pub async fn start(
         authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         allowed_peers: state.config.s2s_allowed_peers.clone(),
+        peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
+        capabilities: declared_capabilities(&state.config.s2s_undeclared_capabilities),
     });
 
     // Spawn the ordered broadcast worker.  All outbound S2S messages flow
@@ -1593,6 +1918,7 @@ async fn handle_s2s_connection(
         );
     }
 
+    manager.note_contact(&peer_id);
     tracing::info!(peer = %peer_id, incoming, "S2S link established");
 
     // Bridge QUIC recv → DuplexStream for BufReader line reading
@@ -1680,6 +2006,9 @@ async fn handle_s2s_connection(
                             }
                         };
 
+                        // Heard from. Counted after the envelope check, so a
+                        // forged or unparseable line is not contact.
+                        read_manager.note_contact(&authenticated_peer_id);
                         let event = AuthenticatedS2sEvent {
                             authenticated_peer_id: authenticated_peer_id.clone(),
                             msg,
@@ -1754,7 +2083,7 @@ async fn handle_s2s_connection(
             server_name: server_name.clone(),
             protocol_version: 2, // v2 = signed envelopes + HelloAck
             trust_level: Some(trust.to_string()),
-            capabilities: our_capabilities(),
+            capabilities: manager.capabilities.clone(),
         };
         if let Some(entry) = peers.lock().await.get(&peer_id) {
             let _ = entry.tx.send(hello).await;
@@ -1828,6 +2157,84 @@ async fn handle_s2s_connection(
 
 #[cfg(test)]
 mod tests {
+
+    // ── last contact with a peer ──────────────────────────────────
+    //
+    // The record the orphan annotation reads. It has to outlive the link,
+    // because "how long since we heard from that server" is only ever asked
+    // about a server whose link is already gone.
+
+    use super::PeerContact;
+    use std::time::{Duration, Instant};
+
+    fn ago(secs: u64) -> Instant {
+        Instant::now()
+            .checked_sub(Duration::from_secs(secs))
+            .expect("this process started long enough ago for the test's clock")
+    }
+
+    #[test]
+    fn a_peer_never_heard_from_counts_from_when_this_server_started() {
+        let contact = PeerContact::new(ago(3600));
+        assert!(
+            contact.out_of_contact("never-seen", Duration::from_secs(600), Instant::now()),
+            "an hour after startup, a peer never heard from is out of contact past ten minutes"
+        );
+        assert!(
+            !contact.out_of_contact("never-seen", Duration::from_secs(7200), Instant::now()),
+            "and not yet past two hours — the seed is our startup, not the epoch"
+        );
+    }
+
+    #[test]
+    fn a_peer_heard_from_recently_is_in_contact() {
+        let mut contact = PeerContact::new(ago(3600));
+        contact.touch_at("home", ago(5));
+        assert!(!contact.out_of_contact("home", Duration::from_secs(600), Instant::now()));
+    }
+
+    #[test]
+    fn a_peer_last_heard_before_the_threshold_is_out_of_contact() {
+        let mut contact = PeerContact::new(ago(3600));
+        contact.touch_at("home", ago(900));
+        assert!(contact.out_of_contact("home", Duration::from_secs(600), Instant::now()));
+    }
+
+    #[test]
+    fn contact_only_ever_moves_forward() {
+        let mut contact = PeerContact::new(ago(3600));
+        contact.touch_at("home", ago(5));
+        // An older reading arriving late must not age the peer backwards.
+        contact.touch_at("home", ago(900));
+        assert!(!contact.out_of_contact("home", Duration::from_secs(600), Instant::now()));
+    }
+
+    #[test]
+    fn a_zero_threshold_never_puts_a_peer_out_of_contact() {
+        let contact = PeerContact::new(ago(86_400));
+        assert!(
+            !contact.out_of_contact("never-seen", Duration::ZERO, Instant::now()),
+            "zero is the operator saying never, not saying immediately"
+        );
+    }
+
+    /// A capability the operator withheld is not declared, and everything
+    /// else still is: a peer must be able to tell one missing ability from a
+    /// server that speaks nothing.
+    #[test]
+    fn a_withheld_capability_is_the_only_one_missing_from_what_we_declare() {
+        let all = super::our_capabilities();
+        let declared = super::declared_capabilities(&[super::ACT.to_string()]);
+        assert!(!declared.iter().any(|c| c == super::ACT));
+        assert_eq!(declared.len(), all.len() - 1);
+        assert!(declared.iter().any(|c| c == super::CATCHUP));
+    }
+
+    #[test]
+    fn withholding_nothing_declares_everything() {
+        assert_eq!(super::declared_capabilities(&[]), super::our_capabilities());
+    }
+
     /// Both sides of a duplicate must choose the same surviving link, or they
     /// trade teardowns until one of them is restarted.
     #[test]
@@ -1956,6 +2363,8 @@ mod tests {
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
+            peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
+            capabilities: our_capabilities(),
         };
 
         // Sign a message
@@ -2020,6 +2429,8 @@ mod tests {
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
+            peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
+            capabilities: our_capabilities(),
         };
 
         let msg = S2sMessage::SyncRequest;
@@ -2063,6 +2474,8 @@ mod tests {
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
+            peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
+            capabilities: our_capabilities(),
         };
 
         let msg = S2sMessage::Privmsg {
@@ -2139,6 +2552,8 @@ mod tests {
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
+            peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
+            capabilities: our_capabilities(),
         };
 
         let rotation = manager.announce_rotation(&new_id);
@@ -2183,6 +2598,8 @@ mod tests {
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
+            peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
+            capabilities: our_capabilities(),
         };
 
         let rotation = manager.announce_rotation(&new_id);
@@ -2226,6 +2643,8 @@ mod tests {
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
+            peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
+            capabilities: our_capabilities(),
         };
 
         // Manually create a rotation with an old timestamp
@@ -2559,6 +2978,287 @@ mod capability_tests {
         }
     }
 
+    /// Captures what the code under test logs, so a test can assert a skip
+    /// was loud. Cloned handles share one buffer.
+    #[derive(Clone, Default)]
+    struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+        type Writer = LogSink;
+        fn make_writer(&'a self) -> LogSink {
+            self.clone()
+        }
+    }
+
+    /// Routing a transition passes the same two gates an ordinary relay
+    /// passes, and says which one stopped it — because one of them is worth
+    /// retrying and the other never will be.
+    #[tokio::test]
+    async fn a_routed_transition_passes_the_capability_and_trust_gates() {
+        let secret = iroh::SecretKey::from_bytes(&rand::random::<[u8; 32]>());
+        let server_id = secret.public().to_string();
+        let (broadcast_tx, _) = mpsc::channel(1);
+        let (event_tx, _) = mpsc::channel(1);
+        let manager = S2sManager {
+            server_id,
+            server_name: "test".to_string(),
+            peers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            peer_names: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            event_tx,
+            event_counter: AtomicU64::new(0),
+            dedup: Arc::new(DedupSet::new()),
+            broadcast_tx,
+            conn_gen: Arc::new(AtomicU64::new(0)),
+            signing_key: Arc::new(secret),
+            trust_config: HashMap::new(),
+            pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            // The trust gate: only these two peers are spoken to at all.
+            allowed_peers: vec!["home".to_string(), "old-home".to_string()],
+            peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
+            capabilities: our_capabilities(),
+        };
+
+        let (home_tx, mut home_rx) = mpsc::channel(8);
+        let (old_tx, mut old_rx) = mpsc::channel(8);
+        let (barred_tx, mut barred_rx) = mpsc::channel(8);
+        {
+            let mut peers = manager.peers.lock().await;
+            peers.insert(
+                "home".into(),
+                PeerEntry {
+                    tx: home_tx,
+                    conn_gen: 0,
+                },
+            );
+            peers.insert(
+                "old-home".into(),
+                PeerEntry {
+                    tx: old_tx,
+                    conn_gen: 0,
+                },
+            );
+            peers.insert(
+                "barred".into(),
+                PeerEntry {
+                    tx: barred_tx,
+                    conn_gen: 0,
+                },
+            );
+        }
+        {
+            let mut caps = manager.peer_capabilities.lock().await;
+            caps.insert("home".into(), vec![ACT.to_string(), ACT_ROUTE.to_string()]);
+            // Task-aware, but predating routed transitions.
+            caps.insert("old-home".into(), vec![ACT.to_string()]);
+            caps.insert(
+                "barred".into(),
+                vec![ACT.to_string(), ACT_ROUTE.to_string()],
+            );
+        }
+
+        let route = |id: &str| S2sMessage::ActRoute {
+            event_id: id.to_string(),
+            act_id: "01TASK".to_string(),
+            act_event_id: "01CLAIM".to_string(),
+            tags: HashMap::from([("+freeq.at/act".to_string(), "handoff".to_string())]),
+            target: "#ops".to_string(),
+            from: "scholar".to_string(),
+            account: Some("did:plc:scholar".to_string()),
+            origin: "us".to_string(),
+        };
+
+        assert_eq!(
+            manager.route_to_home("home", route("srv:1")).await,
+            RouteOutcome::Sent
+        );
+        assert!(matches!(
+            home_rx.try_recv(),
+            Ok(S2sMessage::ActRoute { .. })
+        ));
+
+        assert!(
+            matches!(
+                manager.route_to_home("old-home", route("srv:2")).await,
+                RouteOutcome::Refused(_)
+            ),
+            "an older build never gains the ability by being asked again"
+        );
+        assert!(old_rx.try_recv().is_err());
+
+        assert!(
+            matches!(
+                manager.route_to_home("barred", route("srv:3")).await,
+                RouteOutcome::Refused(_)
+            ),
+            "a peer this server relays nothing to is not handed a transition either"
+        );
+        assert!(barred_rx.try_recv().is_err());
+
+        assert_eq!(
+            manager.route_to_home("away", route("srv:4")).await,
+            RouteOutcome::Unreachable,
+            "a link that is down is worth asking again"
+        );
+    }
+
+    /// The act gate itself: a task-tagged Tagmsg reaches only peers that
+    /// declared [`ACT`]; every other message — the companion plain-text line
+    /// included — still reaches every peer, and each withheld send is logged
+    /// naming the peer and the event, so a wrong declaration never fails
+    /// silent.
+    ///
+    /// The federation harness stages the same thing end to end, with one of
+    /// its two servers started under `--s2s-undeclared-capabilities act`
+    /// (`a_peer_that_never_declared_act_stays_an_onlooker`). This is the unit
+    /// half, and the one that watches the send sites directly.
+    #[tokio::test]
+    async fn a_task_event_is_withheld_from_a_peer_that_did_not_declare_act() {
+        let sink = LogSink::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(sink.clone())
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        );
+        let secret = iroh::SecretKey::from_bytes(&rand::random::<[u8; 32]>());
+        let server_id = secret.public().to_string();
+        let (broadcast_tx, _) = mpsc::channel(1);
+        let (event_tx, _) = mpsc::channel(1);
+        let manager = S2sManager {
+            server_id,
+            server_name: "test".to_string(),
+            peers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            peer_names: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            event_tx,
+            event_counter: AtomicU64::new(0),
+            dedup: Arc::new(DedupSet::new()),
+            broadcast_tx,
+            conn_gen: Arc::new(AtomicU64::new(0)),
+            signing_key: Arc::new(secret),
+            trust_config: HashMap::new(),
+            pending_rotations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            allowed_peers: Vec::new(),
+            peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
+            capabilities: our_capabilities(),
+        };
+
+        let (cap_tx, mut cap_rx) = mpsc::channel(8);
+        let (plain_tx, mut plain_rx) = mpsc::channel(8);
+        {
+            let mut peers = manager.peers.lock().await;
+            peers.insert(
+                "cap-peer".into(),
+                PeerEntry {
+                    tx: cap_tx,
+                    conn_gen: 0,
+                },
+            );
+            peers.insert(
+                "plain-peer".into(),
+                PeerEntry {
+                    tx: plain_tx,
+                    conn_gen: 0,
+                },
+            );
+        }
+        {
+            let mut caps = manager.peer_capabilities.lock().await;
+            caps.insert("cap-peer".into(), vec![ACT.to_string()]);
+            // Declared something, just not `act` — an older build.
+            caps.insert("plain-peer".into(), vec![CATCHUP.to_string()]);
+        }
+
+        let tagmsg = |event_id: &str, tags: &[(&str, &str)]| S2sMessage::Tagmsg {
+            event_id: event_id.to_string(),
+            from: "eliza!e@h".to_string(),
+            target: "#ops".to_string(),
+            tags: tags
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+            origin: "srv".to_string(),
+            account: None,
+        };
+
+        // The id its signer minted rides in the tags, as it does on every act
+        // document that gets this far — ingress and relay both refuse one
+        // without it.
+        const ACT_EVENT: &str = "01ACTWITHHELD0000000000000";
+        manager
+            .broadcast_to_peers(tagmsg(
+                "srv:1",
+                &[
+                    ("+freeq.at/act", "handoff"),
+                    (freeq_sdk::chatsig::EVENT_ID_TAG, ACT_EVENT),
+                ],
+            ))
+            .await;
+        assert!(
+            matches!(cap_rx.try_recv(), Ok(S2sMessage::Tagmsg { .. })),
+            "a peer that declared act receives the task event"
+        );
+        assert!(
+            plain_rx.try_recv().is_err(),
+            "a peer that did not declare act is not sent the task event"
+        );
+        let logged = String::from_utf8_lossy(&sink.0.lock().unwrap()).to_string();
+        assert!(
+            logged.contains("task event withheld")
+                && logged.contains("plain-peer")
+                && logged.contains(ACT_EVENT),
+            "the skip must be logged naming the peer and the task event, got: {logged}"
+        );
+
+        // An ordinary tag message — a reaction — is not narrowed.
+        manager
+            .broadcast_to_peers(tagmsg("srv:2", &[("+react", "👍")]))
+            .await;
+        assert!(matches!(cap_rx.try_recv(), Ok(S2sMessage::Tagmsg { .. })));
+        assert!(
+            matches!(plain_rx.try_recv(), Ok(S2sMessage::Tagmsg { .. })),
+            "an ordinary tag message still reaches every peer"
+        );
+
+        // The companion plain-text line a task sender posts alongside is an
+        // ordinary message: it reaches the peer the task event was withheld
+        // from.
+        manager
+            .broadcast_to_peers(S2sMessage::Privmsg {
+                event_id: "srv:3".to_string(),
+                from: "eliza!e@h".to_string(),
+                target: "#ops".to_string(),
+                text: "offered: cross-the-hop".to_string(),
+                origin: "srv".to_string(),
+                msgid: Some("M1".to_string()),
+                sig: None,
+                account: None,
+                recipient_did: None,
+                replaces_msgid: None,
+                tags: HashMap::new(),
+                multiline_lines: None,
+            })
+            .await;
+        assert!(matches!(cap_rx.try_recv(), Ok(S2sMessage::Privmsg { .. })));
+        assert!(
+            matches!(plain_rx.try_recv(), Ok(S2sMessage::Privmsg { .. })),
+            "the companion plain-text message still reaches a peer without act"
+        );
+    }
+
     /// A peer that declared nothing supports nothing. This is the rollout
     /// constraint in one line: a frozen peer's Hello has no capability field,
     /// deserializes to empty, and is therefore never sent a new message type.
@@ -2626,6 +3326,7 @@ mod capability_tests {
             actor_did: Some("did:plc:x".to_string()),
             subject: None,
             emoji: None,
+            origin: "minting-server".to_string(),
             timestamp: 42,
         };
         let json = serde_json::to_string(&S2sMessage::CatchupEvents {
@@ -2640,6 +3341,53 @@ mod capability_tests {
         );
         match serde_json::from_str::<S2sMessage>(&json).unwrap() {
             S2sMessage::CatchupEvents { events, .. } => assert_eq!(events, vec![ev]),
+            other => panic!("expected CatchupEvents, got {other:?}"),
+        }
+    }
+
+    /// The per-event origin is additive on the wire in both directions, which
+    /// is what lets it ship without a new capability name.
+    ///
+    /// A peer that predates the field sends a batch without it and reads a
+    /// batch containing it: serde fills the missing field from `default` and
+    /// ignores the unknown one, so neither end sees a parse error. The
+    /// fallback for an absent value is the batch-level origin, which is
+    /// precisely the behaviour that peer already had.
+    #[test]
+    fn a_catchup_batch_from_an_older_peer_still_parses() {
+        // Exactly what a build without the field emits.
+        let older = r##"{"type":"catchup_events","origin":"peer","events":[{
+            "event_id":"01OLD00000000000000000000",
+            "canonical":"",
+            "signature":null,
+            "kind":"message",
+            "venue":"#room",
+            "actor_did":"did:plc:x",
+            "subject":null,
+            "emoji":null,
+            "timestamp":42}],"more":false}"##;
+        match serde_json::from_str::<S2sMessage>(older).unwrap() {
+            S2sMessage::CatchupEvents { origin, events, .. } => {
+                assert_eq!(origin, "peer");
+                assert_eq!(
+                    events[0].origin, "",
+                    "an absent per-event origin reads as unset, not as a claim"
+                );
+            }
+            other => panic!("expected CatchupEvents, got {other:?}"),
+        }
+
+        // And a batch carrying a field an older build never heard of parses
+        // there too — nothing on this type refuses unknown fields.
+        let newer = r##"{"type":"catchup_events","origin":"peer","events":[{
+            "event_id":"01NEW00000000000000000000",
+            "kind":"message","venue":"#room","timestamp":42,
+            "origin":"minting-server",
+            "some_field_from_the_future":"ignored"}],"more":false}"##;
+        match serde_json::from_str::<S2sMessage>(newer).unwrap() {
+            S2sMessage::CatchupEvents { events, .. } => {
+                assert_eq!(events[0].origin, "minting-server");
+            }
             other => panic!("expected CatchupEvents, got {other:?}"),
         }
     }

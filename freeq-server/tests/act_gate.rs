@@ -458,8 +458,8 @@ async fn a_task_message_naming_someone_else_as_its_actor_is_refused() {
         let mut a = C::authenticated(addr, "alice", DID_ALICE, k, ACT_CAPS);
         a.msgsig(&signing);
         a.join("#ops");
-        // A correctly signed message whose act-from names somebody else. The
-        // signature proves who sent it; act-from claims who acted, and the
+        // A correctly signed message whose from tag names somebody else. The
+        // signature proves who sent it; the from tag claims who acted, and the
         // two have to be the same person.
         let mut tags = offer_tags();
         tags[2].1 = DID_BOB.into();

@@ -227,6 +227,45 @@ async fn the_listing_answers_with_open_work_and_its_declared_fields() {
     assert_eq!(row["venue"], "#work");
     assert_eq!(row["caps"], "freeq.at/web-search", "stored and filterable");
     assert_eq!(row["origin"], "", "created here");
+    assert_eq!(
+        row["dropped_unchecked"], 0,
+        "no event about this task was ever dropped unchecked"
+    );
+    assert_eq!(
+        row["stored_state"], "open",
+        "the row's own state rides alongside, so a reader can tell the task's \
+         record from this server's reading of it"
+    );
+
+    // The same count on the single-task answer: a reader who opens one task
+    // must be told what a reader of the list is told.
+    let (status, one) = get(web, &format!("/api/v1/actions/{task}"), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(one["task"]["dropped_unchecked"], 0);
+}
+
+/// A task this server minted answers as it stands, whatever any peer is doing:
+/// we are its home, so there is no home to be out of contact with.
+#[tokio::test]
+async fn our_own_task_never_reads_orphaned() {
+    let k = PrivateKey::generate_ed25519();
+    let (irc, web, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
+    let task = tokio::task::spawn_blocking(move || {
+        let signing = SigningKey::from_bytes(&[21u8; 32]);
+        let mut a = C::authenticated(irc, "alice", DID_ALICE, k);
+        a.msgsig(&signing);
+        a.join("#work");
+        a.offer("#work", &channel_venue("#work"), DID_ALICE, &signing)
+    })
+    .await
+    .unwrap();
+
+    let (_, listing) = get(web, "/api/v1/actions", None).await;
+    assert_eq!(listing["tasks"][0]["state"], "open");
+    let (status, one) = get(web, &format!("/api/v1/actions/{task}"), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(one["task"]["state"], "open");
+    assert_eq!(one["task"]["stored_state"], "open");
 }
 
 #[tokio::test]

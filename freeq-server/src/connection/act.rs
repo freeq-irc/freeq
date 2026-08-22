@@ -45,7 +45,7 @@ pub(super) enum Gate {
 /// the log holds one for every move whether or not delivery reaches anybody;
 /// handed back rather than sent, so it goes out *after* the event it names and
 /// a reader sees the move before the confirmation of it.
-pub(super) struct Receipt {
+pub(crate) struct Receipt {
     tags: HashMap<String, String>,
     venue: String,
 }
@@ -57,8 +57,7 @@ pub(super) struct Receipt {
 /// spelling of the vendor prefix.
 ///
 /// Reachable from the S2S receive path too: a task message relayed from a peer
-/// is gated on the capability exactly as a local one is, though this server
-/// neither verifies nor stores it until federation lands.
+/// is verified, stored and gated on the capability exactly as a local one is.
 pub(crate) fn carries_act_tags(tags: &HashMap<String, String>) -> bool {
     tags.keys().any(|name| is_act_tag(name))
 }
@@ -220,11 +219,22 @@ fn file_own_event(
 /// The sweep has no client connection, which is why this is separate from the
 /// gate above — but it is not a separate path.
 ///
+/// **Accepted limitation.** A home decides this on what it has heard, so a
+/// worker whose server is cut off from the home for longer than the
+/// abandonment limit gets the task expired under it, its `progress` never
+/// having arrived. Its signed events stay in the log as the evidence they
+/// are. The only mitigation — never expiring an assigned task while the
+/// assignee's server is out of contact — buys that at the cost of a task
+/// assigned through a server that is gone for good never ending at all, and
+/// is deliberately not built.
+///
 /// Returns whether the task was expired.
 pub(crate) fn expire_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -> bool {
     let written = file_own_event(state, &task.kind, "expire", &task.act_id, &[], &task.venue);
     match written {
-        Some((_, crate::db::ActWrite::Filed { .. })) => {}
+        Some((ref tags, crate::db::ActWrite::Filed { .. })) => {
+            broadcast_own_act_event(state, tags, &task.venue, own_event_target(&task.venue));
+        }
         other => {
             tracing::warn!(
                 act_id = %task.act_id, venue = %task.venue,
@@ -268,7 +278,8 @@ pub(crate) fn expire_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -
 pub(crate) fn auto_accept_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -> bool {
     let verb = freeq_sdk::act_transitions::REVIEW_TIMEOUT_VERB;
     match file_own_event(state, &task.kind, verb, &task.act_id, &[], &task.venue) {
-        Some((_, crate::db::ActWrite::Filed { .. })) => {
+        Some((ref tags, crate::db::ActWrite::Filed { .. })) => {
+            broadcast_own_act_event(state, tags, &task.venue, own_event_target(&task.venue));
             let title = state
                 .with_db(|db| db.act_task_title(&task.act_id))
                 .flatten()
@@ -386,7 +397,7 @@ fn announce_ending(state: &Arc<SharedState>, task: &crate::db::ActTask, title: &
 /// A failure to file is logged and swallowed: the event this would have
 /// confirmed is already on file, and refusing it after the fact would be a
 /// second wrong.
-fn mint_receipt(
+pub(crate) fn mint_receipt(
     state: &Arc<SharedState>,
     kind: &str,
     act_id: &str,
@@ -420,6 +431,65 @@ fn mint_receipt(
     }
 }
 
+/// One task event this server has just written, and what the log said it did.
+///
+/// The arguments [`receipt_for_applied_move`] needs, gathered rather than
+/// listed: every path that files a task event already holds all of them.
+pub(crate) struct AppliedMove<'a> {
+    pub kind: &'a str,
+    pub act_id: &'a str,
+    /// The event's own id — what a receipt for it names.
+    pub event_id: &'a str,
+    pub venue: &'a str,
+    /// Who acted, as the document names them.
+    pub actor: &'a str,
+    /// What the log answered when this event was written.
+    pub written: &'a crate::db::ActWrite,
+}
+
+/// The receipt this server owes for a move it has just applied, or `None`
+/// when it owes none.
+///
+/// The home's rule, in one place because more than one path reaches it: an
+/// event arrives at the front door, over a peer's relay, addressed from the
+/// server holding it unruled, or in a replay of what we were away for, and
+/// every one of those can be the moment a task of ours moves. Which of them it
+/// was is not a property of the move.
+///
+/// Three things have to be true, each ruling out something that is not a move
+/// this server decided:
+///
+/// - the log filed it and the task changed state — an opener is not confirmed
+///   (nothing raced it; opening *is* the action) and a step that left the task
+///   where it stood has nothing to confirm;
+/// - a participant authored it — this server's own events are already signed
+///   by the server whose word settles the task, which is the degenerate case a
+///   receipt exists to cover for everyone else;
+/// - the task was opened here, so the ruling was ours to make.
+pub(crate) fn receipt_for_applied_move(
+    state: &Arc<SharedState>,
+    moved: &AppliedMove<'_>,
+) -> Option<Receipt> {
+    let crate::db::ActWrite::Filed {
+        was: Some(was),
+        state: landed,
+    } = moved.written
+    else {
+        return None;
+    };
+    if was == landed || crate::server::is_system_actor(moved.actor) {
+        return None;
+    }
+    let ours = state
+        .with_db(|db| db.act_task_origin(moved.act_id))
+        .flatten()
+        .is_some_and(|origin| origin.is_empty());
+    if !ours {
+        return None;
+    }
+    mint_receipt(state, moved.kind, moved.act_id, moved.event_id, moved.venue)
+}
+
 /// Put a filed receipt on the wire, to the same people the event it confirms
 /// reached.
 ///
@@ -433,35 +503,145 @@ fn mint_receipt(
 /// target is whatever the sender addressed, which is the known limitation the
 /// expiry notice states too: a server-authored line in a DM names the thread
 /// from the sender's side, and the reader's client has to know that.
-pub(super) fn broadcast_receipt(state: &Arc<SharedState>, receipt: &Receipt, target: &str) {
+pub(crate) fn broadcast_receipt(state: &Arc<SharedState>, receipt: &Receipt, target: &str) {
+    broadcast_own_act_event(state, &receipt.tags, &receipt.venue, target);
+}
+
+/// Put one of this server's own task events on the wire: to the local sessions
+/// in its venue that asked for task events, and to the peers that can read
+/// them.
+///
+/// Gated exactly as every act event is: a connection that did not ask for
+/// `freeq.at/act` gets none of these either, and a peer that did not declare
+/// the capability is not sent one — the gate for that lives on the one ordered
+/// path every broadcast takes.
+///
+/// Peers matter here as much as people do. A transition on this task filed on
+/// another server is a record until this server's word reaches it; the expiry
+/// that ends a task the same way clears a row that would otherwise sit live on
+/// every peer for ever. There is no companion PRIVMSG — the confirmed event's
+/// companion already told the humans, and this half is machine record.
+///
+/// `target` is where the local copy is filed: the one the event this concerns
+/// arrived on, so both lines land in the same place in whatever renders them.
+/// In a direct conversation that target is whatever the sender addressed,
+/// which is the known limitation the expiry notice states too. The copy that
+/// goes to peers is addressed by [`peer_target_for`] instead, because a nick
+/// means nothing on another server.
+fn broadcast_own_act_event(
+    state: &Arc<SharedState>,
+    tags: &HashMap<String, String>,
+    venue: &str,
+    target: &str,
+) {
     let did = crate::server::server_did(&state.server_name);
     let time_tag = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S.000Z")
         .to_string();
     // Spoken by the server under its own name, the way a NOTICE from the
-    // expiry sweep is: the receipt's authorship is the whole point of it.
+    // expiry sweep is: the authorship is the whole point of these.
     let lines = super::messaging::TagmsgLines::build(
-        &receipt.tags,
+        tags,
         &state.server_name,
         target,
         &time_tag,
         Some(&did),
     );
-    let sessions = venue_sessions(state, &receipt.venue);
-    let tag_caps = state.cap_message_tags.lock();
-    let time_caps = state.cap_server_time.lock();
-    let acct_caps = state.cap_account_tag.lock();
-    let act_caps = state.cap_act.lock();
-    let conns = state.connections.lock();
-    for session in &sessions {
-        if !tag_caps.contains(session) || !act_caps.contains(session) {
-            continue;
-        }
-        if let Some(tx) = conns.get(session) {
-            let line = lines.pick(time_caps.contains(session), acct_caps.contains(session));
-            let _ = tx.try_send(line.to_string());
+    let sessions = venue_sessions(state, venue);
+    {
+        let tag_caps = state.cap_message_tags.lock();
+        let time_caps = state.cap_server_time.lock();
+        let acct_caps = state.cap_account_tag.lock();
+        let act_caps = state.cap_act.lock();
+        let conns = state.connections.lock();
+        for session in &sessions {
+            if !tag_caps.contains(session) || !act_caps.contains(session) {
+                continue;
+            }
+            if let Some(tx) = conns.get(session) {
+                let line = lines.pick(time_caps.contains(session), acct_caps.contains(session));
+                let _ = tx.try_send(line.to_string());
+            }
         }
     }
+    super::helpers::s2s_broadcast(
+        state,
+        crate::s2s::S2sMessage::Tagmsg {
+            event_id: super::helpers::s2s_next_event_id(state),
+            from: state.server_name.clone(),
+            target: peer_target_for(venue, target),
+            tags: tags.clone(),
+            origin: state.server_iroh_id.lock().clone().unwrap_or_default(),
+            account: Some(did),
+        },
+    );
+}
+
+/// The delivery target one of this server's own task events travels to peers
+/// under.
+///
+/// A channel keeps its name: every server folds it to the same venue. A direct
+/// conversation has no name another server could resolve — the target a
+/// participant addressed is a nick, which is local — so it travels addressed
+/// to one of the two DIDs its venue is made of. That is the one thing a peer
+/// can resolve, and resolving it is how the peer checks the event was put in
+/// the conversation it belongs to.
+pub(crate) fn peer_target_for(venue: &str, target: &str) -> String {
+    match venue.strip_prefix("dm:") {
+        Some(pair) => pair.split(',').next().unwrap_or(target).to_string(),
+        None => target.to_string(),
+    }
+}
+
+/// Where one of this server's own events about a task is filed locally: the
+/// channel it happened in, or nowhere addressable in a direct conversation,
+/// which is what the ending notices already say by using `*`.
+fn own_event_target(venue: &str) -> &str {
+    match venue.starts_with("dm:") {
+        true => "*",
+        false => venue,
+    }
+}
+
+/// Rebuild the tags a stored task event travelled under, from the very bytes
+/// its signature covers.
+///
+/// The document's keys are the act tag names with the vendor prefix stripped,
+/// so re-prefixing them reproduces what the sender put on the wire — and the
+/// signature that rides alongside verifies against the row's own bytes.
+/// `target` and `id` are the two the canonical's builder injected: they ride
+/// as the message's target and id rather than as act tags.
+///
+/// `None` for bytes that are not a document at all.
+pub(crate) fn wire_tags_from_canonical(
+    canonical: &str,
+    event_id: &str,
+    signature: Option<&str>,
+) -> Option<HashMap<String, String>> {
+    let doc: serde_json::Value = serde_json::from_str(canonical).ok()?;
+    let fields = doc.as_object()?;
+    let mut tags: HashMap<String, String> = HashMap::new();
+    for (key, value) in fields {
+        if key == "target" || key == "id" {
+            continue;
+        }
+        // The signer's envelope tag: same name on the wire and in the
+        // document.
+        if key == "from" {
+            tags.insert("+freeq.at/from".to_string(), value.as_str()?.to_string());
+            continue;
+        }
+        tags.insert(format!("+freeq.at/{key}"), value.as_str()?.to_string());
+    }
+    tags.insert(
+        freeq_sdk::chatsig::EVENT_ID_TAG.to_string(),
+        event_id.to_string(),
+    );
+    tags.insert("msgid".to_string(), event_id.to_string());
+    if let Some(sig) = signature {
+        tags.insert("+freeq.at/sig".to_string(), sig.to_string());
+    }
+    Some(tags)
 }
 
 /// The wire lines for a venue's stored task events within `[from_ts, to_ts]`
@@ -472,10 +652,9 @@ pub(super) fn broadcast_receipt(state: &Arc<SharedState>, receipt: &Receipt, tar
 /// gated exactly as live delivery is, so a client that cannot render a task
 /// card is not sent one it never asked for.
 ///
-/// Each line is rebuilt from the stored canonical: the document's keys are the
-/// act tag names with the vendor prefix stripped, so re-prefixing them
-/// reproduces the tags the sender put on the wire, and the signature that
-/// travels alongside verifies against the very bytes the row holds.
+/// Each line is rebuilt from the stored canonical by
+/// [`wire_tags_from_canonical`], so what a reader gets back is the tags the
+/// sender put on the wire and a signature that verifies against them.
 pub(super) fn replay_lines(
     state: &Arc<SharedState>,
     session_id: &str,
@@ -497,31 +676,8 @@ pub(super) fn replay_lines(
     events
         .into_iter()
         .filter_map(|ev| {
-            let doc: serde_json::Value = serde_json::from_str(&ev.canonical).ok()?;
-            let fields = doc.as_object()?;
-            let mut tags: HashMap<String, String> = HashMap::new();
-            for (key, value) in fields {
-                // `target` and `id` are the two the caller injected; they
-                // ride as the message's own target and id, not as act tags.
-                if key == "target" || key == "id" {
-                    continue;
-                }
-                // The signer's envelope tag: same name on the wire and in
-                // the document.
-                if key == "from" {
-                    tags.insert("+freeq.at/from".to_string(), value.as_str()?.to_string());
-                    continue;
-                }
-                tags.insert(format!("+freeq.at/{key}"), value.as_str()?.to_string());
-            }
-            tags.insert(
-                freeq_sdk::chatsig::EVENT_ID_TAG.to_string(),
-                ev.event_id.clone(),
-            );
-            tags.insert("msgid".to_string(), ev.event_id.clone());
-            if let Some(ref sig) = ev.signature {
-                tags.insert("+freeq.at/sig".to_string(), sig.clone());
-            }
+            let mut tags =
+                wire_tags_from_canonical(&ev.canonical, &ev.event_id, ev.signature.as_deref())?;
             if let Some(ref did) = ev.actor_did {
                 tags.insert("account".to_string(), did.clone());
             }
@@ -772,8 +928,8 @@ pub(super) fn gate(
     match super::messaging::verify_act_signature(
         pairs, &venue, &msgid, sig_tag, did, &conn.id, state,
     ) {
-        super::messaging::ClientSigOutcome::Verified => {}
-        super::messaging::ClientSigOutcome::Failed => {
+        super::messaging::ClientSigVerdict::Valid => {}
+        super::messaging::ClientSigVerdict::Invalid => {
             tracing::warn!(
                 session = %conn.id, did = %did, target = %target, msgid = %msgid,
                 "Task-message signature did not verify against the key it names — \
@@ -793,7 +949,7 @@ pub(super) fn gate(
         // one server it should not happen at all — a local signer's key is in
         // the local store — but it is the real case once peers are in the
         // picture, so it answers distinctly rather than as a forgery.
-        super::messaging::ClientSigOutcome::Unverifiable(why)
+        super::messaging::ClientSigVerdict::Unverifiable(why)
             if why == super::messaging::NO_KEY_ON_FILE =>
         {
             tracing::warn!(
@@ -817,7 +973,7 @@ pub(super) fn gate(
         // reached a key. Answering SIGNATURE_INVALID here (as this arm did
         // until 2026-08-20) told a sender with a future signature algorithm
         // that its signature was forged.
-        super::messaging::ClientSigOutcome::Unverifiable(why) => {
+        super::messaging::ClientSigVerdict::Unverifiable(why) => {
             tracing::warn!(
                 session = %conn.id, did = %did, target = %target, why = %why,
                 "Task-message signature cannot be checked — refusing the event"
@@ -995,9 +1151,42 @@ pub(super) fn gate(
                 receipt = mint_receipt(state, kind, &act_id, &msgid, &venue);
             }
         }
-        // Not reachable from here — a sender's confirm was refused above —
-        // but the log's answer for one, and nothing to deliver either way.
-        Some(crate::db::ActWrite::Recorded) => {}
+        // None of these is reachable from here — a sender's confirm was
+        // refused above, and every one of them is an answer to a receipt —
+        // but they are the log's answers for one, and nothing to deliver
+        // either way.
+        Some(
+            crate::db::ActWrite::Recorded
+            | crate::db::ActWrite::Confirmed { .. }
+            | crate::db::ActWrite::ReceiptIgnored
+            | crate::db::ActWrite::ReceiptBeforeSubject
+            | crate::db::ActWrite::ReceiptRefused(_),
+        ) => {}
+        // A local sender's move on a task another server owns. Filed, carried
+        // to the room, and not decided here — the owning server referees it,
+        // so it is carried there and asked about until that server rules.
+        Some(crate::db::ActWrite::StoredNotApplied) => {
+            tracing::debug!(
+                session = %conn.id, did = %did, act_id = %act_id,
+                "Filed a task event without applying it: the task belongs to another server"
+            );
+            let home = state
+                .with_db(|db| db.act_task_origin(&act_id))
+                .flatten()
+                .unwrap_or_default();
+            crate::server::route_transition_home(
+                state,
+                crate::server::TaskEventWire {
+                    act_id: act_id.clone(),
+                    event_id: msgid.clone(),
+                    tags: tags.clone(),
+                    target: target.to_string(),
+                    from: conn.nick.as_deref().unwrap_or("*").to_string(),
+                    account: Some(did.to_string()),
+                },
+                &home,
+            );
+        }
         Some(crate::db::ActWrite::UnknownTask) => {
             tracing::debug!(
                 session = %conn.id, did = %did, act_id = %act_id,

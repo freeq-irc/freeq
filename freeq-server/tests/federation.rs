@@ -77,6 +77,10 @@ struct TestServer {
     irc_addr: String,
     web_addr: String,
     db_path: String,
+    /// Where this server's stderr (its tracing output) is captured, so a test
+    /// can assert on what the server itself concluded — e.g. the observe-only
+    /// verdict it logs for a relayed task event.
+    log_path: String,
     /// The argv this server was spawned with, so it can be stopped and
     /// started again on the same data — which is what "a peer went away and
     /// came back" means.
@@ -94,9 +98,17 @@ impl TestServer {
 
     /// Start it again on the same data, same identity, same ports.
     async fn start_again(&mut self) {
+        let log = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.log_path)
+            .expect("reopen server log");
+        let log_err = log.try_clone().expect("clone server log handle");
         self.child = Command::new(env!("CARGO_BIN_EXE_freeq-server"))
             .args(&self.args)
-            .env("RUST_LOG", "freeq_server=warn")
+            .env("RUST_LOG", HARNESS_RUST_LOG)
+            .stdout(std::process::Stdio::from(log))
+            .stderr(std::process::Stdio::from(log_err))
             .spawn()
             .expect("respawn freeq-server");
         wait_port(&self.irc_addr).await;
@@ -109,6 +121,10 @@ impl Drop for TestServer {
         let _ = self.child.wait();
     }
 }
+
+/// Quiet by default, plus the observe-only task-event verdict lines, which
+/// one test reads back out of the server's captured log.
+const HARNESS_RUST_LOG: &str = "freeq_server=warn,freeq_server::act_relay=info";
 
 /// Bind an ephemeral port, read it, release it. Small reuse race; startup
 /// failure is retried by the caller if it bites.
@@ -172,7 +188,15 @@ impl PeerRef {
 }
 
 /// Spawn one server from its plan, peered to `peer`, resolving `resolver_entries`.
-fn spawn_server(plan: ServerPlan, peer: &PeerRef, resolver_entries: &str) -> TestServer {
+///
+/// `extra` is appended verbatim, for a test that needs one side started with a
+/// setting the other does not have.
+fn spawn_server(
+    plan: ServerPlan,
+    peer: &PeerRef,
+    resolver_entries: &str,
+    extra: &[&str],
+) -> TestServer {
     let db_path = plan
         .dir
         .path()
@@ -211,12 +235,26 @@ fn spawn_server(plan: ServerPlan, peer: &PeerRef, resolver_entries: &str) -> Tes
         &format!("test-fed-{}", plan.seed),
     ]
     .iter()
+    .chain(extra.iter())
     .map(|s| s.to_string())
     .collect();
 
+    let log_path = plan
+        .dir
+        .path()
+        .join("server.log")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let log = std::fs::File::create(&log_path).expect("create server log");
+    let log_err = log.try_clone().expect("clone server log handle");
     let child = Command::new(env!("CARGO_BIN_EXE_freeq-server"))
         .args(&args)
-        .env("RUST_LOG", "freeq_server=warn")
+        .env("RUST_LOG", HARNESS_RUST_LOG)
+        // Tracing writes to stdout; panics land on stderr. Both belong in
+        // the capture.
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err))
         .spawn()
         .expect("spawn freeq-server");
 
@@ -226,9 +264,31 @@ fn spawn_server(plan: ServerPlan, peer: &PeerRef, resolver_entries: &str) -> Tes
         irc_addr,
         web_addr,
         db_path,
+        log_path,
         args,
         serial: None,
     }
+}
+
+/// A server's captured tracing output, ANSI stripped so assertions can match
+/// the plain field text.
+fn server_log(server: &TestServer) -> String {
+    let raw = std::fs::read_to_string(&server.log_path).unwrap_or_default();
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // Skip an escape sequence through its final letter.
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Boot two mutually-peered servers, both resolving every `ids` DID offline.
@@ -257,6 +317,18 @@ async fn spawn_pair_with_seeds(
     seed_a: u8,
     seed_b: u8,
 ) -> (TestServer, TestServer) {
+    spawn_pair_with_seeds_and_args(ids, seed_a, seed_b, &[], &[]).await
+}
+
+/// The same again, with extra argv for each server — a setting one side of the
+/// pair needs and the other does not.
+async fn spawn_pair_with_seeds_and_args(
+    ids: &[&TestId],
+    seed_a: u8,
+    seed_b: u8,
+    extra_a: &[&str],
+    extra_b: &[&str],
+) -> (TestServer, TestServer) {
     // A failed test poisons the lock; the next test's servers are unaffected,
     // so take it anyway.
     let serial = ONE_TEST_AT_A_TIME
@@ -274,8 +346,8 @@ async fn spawn_pair_with_seeds(
     // two can cross-reference for peering.
     let a_ref = PeerRef::of(&a_plan);
     let b_ref = PeerRef::of(&b_plan);
-    let mut a = spawn_server(a_plan, &b_ref, &resolver);
-    let b = spawn_server(b_plan, &a_ref, &resolver);
+    let mut a = spawn_server(a_plan, &b_ref, &resolver, extra_a);
+    let b = spawn_server(b_plan, &a_ref, &resolver, extra_b);
     a.serial = Some(serial);
 
     wait_port(&a.irc_addr).await;
@@ -1045,18 +1117,21 @@ async fn act_tagmsg_crosses_the_hop_with_its_signature() {
     };
     ha.raw(&format!("MSGSIG {pubkey}")).await.ok();
 
-    let venue = freeq_sdk::chatsig::channel_venue("#fact");
-    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
-    let mut crossed: Option<(String, String)> = None;
-    while tokio::time::Instant::now() < deadline {
+    /// Sign and send one fresh handoff offer into #fact; returns (sig, id).
+    async fn send_signed_offer(
+        ha: &client::ClientHandle,
+        from_did: &str,
+        venue: &str,
+        signing: &ed25519_dalek::SigningKey,
+    ) -> (String, String) {
         let id = freeq_sdk::chatsig::new_event_id();
         let act_tags: Vec<(&str, &str)> = vec![
             ("+freeq.at/act", "handoff"),
             ("+freeq.at/act-verb", "offer"),
-            ("+freeq.at/from", alice.did.as_str()),
+            ("+freeq.at/from", from_did),
             ("+freeq.at/act-title", "cross-the-hop"),
         ];
-        let sig = freeq_sdk::act::sign_act(act_tags.clone(), &venue, &id, &signing)
+        let sig = freeq_sdk::act::sign_act(act_tags.clone(), venue, &id, signing)
             .expect("act tags present");
         let wire: Vec<String> = act_tags
             .iter()
@@ -1069,6 +1144,14 @@ async fn act_tagmsg_crosses_the_hop_with_its_signature() {
         ha.raw(&format!("@{} TAGMSG #fact", wire.join(";")))
             .await
             .ok();
+        (sig, id)
+    }
+
+    let venue = freeq_sdk::chatsig::channel_venue("#fact");
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut crossed: Option<(String, String)> = None;
+    while tokio::time::Instant::now() < deadline {
+        let (sig, id) = send_signed_offer(&ha, &alice.did, &venue, &signing).await;
 
         if let Some(line) = watcher.maybe(|l| l.contains("+freeq.at/act="), 2000) {
             assert!(
@@ -1094,6 +1177,80 @@ async fn act_tagmsg_crosses_the_hop_with_its_signature() {
     assert!(
         deaf.maybe(|l| l.contains("+freeq.at/act"), 800).is_none(),
         "a relayed task message must not reach a connection without the capability"
+    );
+
+    // ── the receiving server's own verdict ──────────────────────────
+    //
+    // Server B checks every relayed task event and logs a verdict, observe-
+    // only. The first arrivals can honestly be unverifiable — B holds no key
+    // for this signer until its fetch-on-miss (triggered by exactly that
+    // verdict) fills the store off the delivery path — so keep sending fresh
+    // signed events until one earns B's own VALID. Reaching it proves the
+    // whole receive-side chain against a real hop: key fetched from the
+    // origin, venue and id rebuilt, signature checked by the receiver itself.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut valid_seen = false;
+    while tokio::time::Instant::now() < deadline {
+        let log = server_log(&srv_b);
+        if log
+            .lines()
+            .any(|l| l.contains("verdict=valid") && l.contains("target=#fact"))
+        {
+            valid_seen = true;
+            break;
+        }
+        // Another signed event, in case every earlier one arrived before the
+        // key did.
+        send_signed_offer(&ha, &alice.did, &venue, &signing).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert!(
+        valid_seen,
+        "the receiving server must reach its own VALID verdict for a relayed \
+         task event; its log says: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // ── and a valid verdict is what puts it on file ─────────────────
+    //
+    // The verdict decides: valid means stored, under the id the signer minted
+    // rather than one B made up, so B can answer for a task it did not host
+    // and a later replay recognises the event instead of reading it as a
+    // second claim. B holds A's key by now — that is what the loop above
+    // waited for — so one more offer is judged valid on arrival.
+    let (_, stored_id) = send_signed_offer(&ha, &alice.did, &venue, &signing).await;
+    let url = format!("http://{}/api/v1/actions/{stored_id}", srv_b.web_addr);
+    let client = reqwest::Client::new();
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut stored = serde_json::Value::Null;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(resp) = client.get(&url).send().await
+            && resp.status().is_success()
+            && let Ok(body) = resp.json::<serde_json::Value>().await
+        {
+            stored = body;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        stored["act_id"], stored_id,
+        "the receiving server must hold the crossed task event under the \
+         signer's own id: {stored}"
+    );
+    assert_eq!(
+        stored["task"]["offerer"], alice.did,
+        "filed against the identity that signed it: {stored}"
+    );
+    assert_eq!(stored["task"]["venue"], "#fact", "{stored}");
+    assert_ne!(
+        stored["task"]["origin"], "",
+        "and stamped with the server that owns the task, which is not this \
+         one: {stored}"
     );
 
     ha.quit(None).await.ok();
@@ -2377,6 +2534,3359 @@ async fn federated_multiline_edit_stores_the_verified_body() {
     );
 
     ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── a server that was away heals its task view, not just its log ──
+//
+// The end-to-end half of feeding caught-up task events through the same
+// judgment live receiving uses. A server that misses a task's events while it
+// is down has to come back answering for that task the way a server that
+// stayed linked answers — same state, same origin, same events on file. Filing
+// the log row and stopping there left it holding every event of a task while
+// its REST view said there was no such task.
+//
+// Two servers rather than three: the harness peers a *pair*, and a third
+// server would need new peering plumbing and, worse, a signing key it has no
+// link to fetch from — a caught-up event whose signer's key is unknown is
+// skipped by design. The server that goes away has already been handed the
+// signer's key by the live path, so a restart stages the real thing without
+// any of that.
+//
+// The comparison is against the twin task this same server received live,
+// which is the honest reference: server A minted both tasks, so A referees
+// them and B does not — B's view of a task of A's is frozen at the opener
+// whether it arrived live or by replay, and that is precisely what must match.
+
+/// One task as a server answers for it.
+async fn act_task(web_addr: &str, act_id: &str) -> Option<serde_json::Value> {
+    let url = format!("http://{web_addr}/api/v1/actions/{act_id}");
+    let resp = reqwest::get(&url).await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.json::<serde_json::Value>().await.ok()?;
+    body["task"].is_object().then_some(body)
+}
+
+/// Poll until a server answers for `act_id`, or give up.
+async fn await_act_task(web_addr: &str, act_id: &str) -> Option<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(body) = act_task(web_addr, act_id).await {
+            return Some(body);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    None
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_server_that_was_away_heals_its_task_view() {
+    // The server that stays up must keep its outgoing link, which is decided
+    // by comparing endpoint IDs — so the seeds are pinned and the orientation
+    // asserted rather than left to the order tests happen to run in.
+    const SEED_A: u8 = 204;
+    const SEED_B: u8 = 205;
+    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32])
+        .public()
+        .to_string();
+    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32])
+        .public()
+        .to_string();
+    assert!(
+        id_a < id_b,
+        "the server that stays up keeps its outgoing link"
+    );
+
+    let alice = TestId::new("did:plc:aliceheal");
+    let bob = TestId::new("did:plc:bobheal");
+    let (srv_a, mut srv_b) = spawn_pair_with_seeds(&[&alice, &bob], SEED_A, SEED_B).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#heal").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#heal").await.unwrap();
+
+    // A signing key of the test's own, so it builds the act canonical the way
+    // a task-sending client does.
+    let signing = ed25519_dalek::SigningKey::from_bytes(&[17u8; 32]);
+    let pubkey = {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing.verifying_key().as_bytes())
+    };
+    ha.raw(&format!("MSGSIG {pubkey}")).await.ok();
+    let venue = freeq_sdk::chatsig::channel_venue("#heal");
+
+    /// Sign and send one act TAGMSG into #heal; returns its event id.
+    async fn send_act(
+        ha: &client::ClientHandle,
+        venue: &str,
+        signing: &ed25519_dalek::SigningKey,
+        act_tags: &[(&str, &str)],
+    ) -> String {
+        let id = freeq_sdk::chatsig::new_event_id();
+        let sig = freeq_sdk::act::sign_act(act_tags.iter().copied(), venue, &id, signing)
+            .expect("act tags present");
+        let wire: Vec<String> = act_tags
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .chain([
+                format!("{}={id}", freeq_sdk::chatsig::EVENT_ID_TAG),
+                format!("+freeq.at/sig={sig}"),
+            ])
+            .collect();
+        ha.raw(&format!("@{} TAGMSG #heal", wire.join(";")))
+            .await
+            .ok();
+        id
+    }
+
+    /// An open offer, then a claim on it — one task's whole life here.
+    async fn run_lifecycle(
+        ha: &client::ClientHandle,
+        venue: &str,
+        signing: &ed25519_dalek::SigningKey,
+        from: &str,
+        title: &str,
+    ) -> String {
+        let act_id = send_act(
+            ha,
+            venue,
+            signing,
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", from),
+                ("+freeq.at/act-title", title),
+            ],
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        send_act(
+            ha,
+            venue,
+            signing,
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "claim"),
+                ("+freeq.at/from", from),
+                ("+freeq.at/act-id", act_id.as_str()),
+            ],
+        )
+        .await;
+        act_id
+    }
+
+    // ── the reference: a task B takes live ──────────────────────────
+    //
+    // B holds no key for alice until its fetch-on-miss fills the store off the
+    // delivery path, so the first offers can honestly be unverifiable. Keep
+    // running lifecycles until one lands on B; that one is the reference.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut live_id = String::new();
+    while tokio::time::Instant::now() < deadline {
+        let id = run_lifecycle(&ha, &venue, &signing, &alice.did, "taken-live").await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if act_task(&srv_b.web_addr, &id).await.is_some() {
+            live_id = id;
+            break;
+        }
+    }
+    assert!(
+        !live_id.is_empty(),
+        "the link must carry task events before the outage, or the outage \
+         proves nothing; B's log says: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    // Settled before it is used as the reference: B follows the home's receipt
+    // on the claim, and comparing a settled view against one still in flight
+    // would be comparing two different moments.
+    await_assignee(&srv_b.web_addr, &live_id, S2S_SETTLE).await;
+    let live_view = act_task(&srv_b.web_addr, &live_id)
+        .await
+        .expect("B answers for the task it took live");
+
+    // ── B goes away, and a whole task happens without it ────────────
+    hb.quit(None).await.ok();
+    srv_b.stop();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let healed_id = run_lifecycle(&ha, &venue, &signing, &alice.did, "healed-later").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        act_task(&srv_a.web_addr, &healed_id).await.is_some(),
+        "the server that stayed up holds the task it minted"
+    );
+
+    // ── B comes back on the same data and the same identity ─────────
+    srv_b.start_again().await;
+
+    let mut healed = await_act_task(&srv_b.web_addr, &healed_id)
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "a server that healed a task must answer for it, not just hold \
+                 its log; B's log says: {}",
+                server_log(&srv_b)
+                    .lines()
+                    .filter(|l| l.contains("catch-up") || l.contains("catchup"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        });
+
+    // Every event of the task reached the log, in mint order or the follow-up
+    // would have named a task nothing had opened — the opener, the claim, and
+    // the home's own receipt for the claim.
+    //
+    // The receipt is signed under the home's `did:web:` identity, whose key
+    // this server may not hold when the batch lands. It is held rather than
+    // skipped, and the key's arrival applies it — which is why this is a poll
+    // and not a single read.
+    let healed_events = |body: &serde_json::Value| -> Vec<String> {
+        body["events"]
+            .as_array()
+            .map(|events| {
+                events
+                    .iter()
+                    .filter_map(|e| {
+                        let doc: serde_json::Value =
+                            serde_json::from_str(e["canonical"].as_str()?).ok()?;
+                        Some(doc["act-verb"].as_str()?.to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        if healed_events(&healed) == ["offer", "claim", "confirm"] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        healed = act_body(&srv_b.web_addr, &healed_id)
+            .await
+            .unwrap_or(healed);
+    }
+    assert_eq!(
+        healed_events(&healed),
+        ["offer", "claim", "confirm"],
+        "the opener, the claim and the home's receipt for it are all on file, in \
+         that order: {healed}"
+    );
+
+    // The origin names the server that MINTED the task — the one that
+    // referees it — and not merely the peer that replayed it. Here they are
+    // the same server, and the field has to say so.
+    assert_eq!(
+        healed["task"]["origin"].as_str(),
+        Some(id_a.as_str()),
+        "the healed task must name the server that minted it: {healed}"
+    );
+
+    // And the healed view is the view staying connected would have produced:
+    // same kind, same venue, same offerer, same state, same assignee, same
+    // origin. State and assignee included — B did not decide either of them,
+    // it followed the home's receipt, and a receipt replays like any other
+    // event.
+    for field in ["kind", "venue", "offerer", "state", "origin", "assignee"] {
+        assert_eq!(
+            healed["task"][field], live_view["task"][field],
+            "healing must land where staying connected lands ({field}): \
+             healed={healed} live={live_view}"
+        );
+    }
+
+    // And where the home stands is where the healed server stands. Nothing
+    // asked A about this task again: what B replayed was the record, receipt
+    // included.
+    let on_a = act_task(&srv_a.web_addr, &healed_id)
+        .await
+        .expect("A answers for its own task");
+    assert_eq!(on_a["task"]["state"].as_str(), Some("assigned"));
+    assert_eq!(
+        healed["task"]["state"].as_str(),
+        Some("assigned"),
+        "a healed server reaches the state its home confirmed the task into: {healed}"
+    );
+
+    ha.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── a task event whose key cannot be fetched yet ──────────────────────────
+//
+// A signature this server cannot check is not a verdict about the sender. A
+// key server that is down, or a key that has not been published yet, is a
+// fact about this server's reach — so the event waits instead of being
+// refused, and nothing about it is shown or filed while it waits. Then the
+// key becomes fetchable and the wait ends by itself: the server asks again on
+// its own backoff, judges the event, applies it and delivers it, without its
+// sender ever saying anything more.
+//
+// The far server's key source is pointed at an address nothing answers on,
+// which is what makes the wait real; the stand-in key server is started only
+// when the test wants the key to become fetchable.
+
+/// A stand-in for a peer's key server, serving one key to anything that asks.
+///
+/// Started late on purpose: until it is, the address in the far server's
+/// `--s2s-peer-api` refuses connections, and every signature by this signer is
+/// honestly uncheckable there.
+async fn serve_signing_key(port: u16, pubkey_b64: String) -> tokio::task::JoinHandle<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .expect("bind the stand-in key server");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let body = format!(
+                r#"{{"algorithm":"ed25519","public_key":"{pubkey_b64}","encoding":"base64url"}}"#
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            // The request is read and discarded: the answer does not depend on
+            // it, and the key id in it is checked by the caller against the
+            // key itself.
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    })
+}
+
+/// Sign and send one act TAGMSG into `channel`; returns the event id it minted.
+async fn send_act_as(
+    handle: &client::ClientHandle,
+    channel: &str,
+    signing: &ed25519_dalek::SigningKey,
+    act_tags: &[(&str, &str)],
+) -> String {
+    let venue = freeq_sdk::chatsig::channel_venue(channel);
+    let id = freeq_sdk::chatsig::new_event_id();
+    let sig = freeq_sdk::act::sign_act(act_tags.iter().copied(), &venue, &id, signing)
+        .expect("act tags present");
+    let wire: Vec<String> = act_tags
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .chain([
+            format!("{}={id}", freeq_sdk::chatsig::EVENT_ID_TAG),
+            format!("+freeq.at/sig={sig}"),
+        ])
+        .collect();
+    handle
+        .raw(&format!("@{} TAGMSG {channel}", wire.join(";")))
+        .await
+        .ok();
+    id
+}
+
+/// Register a session signing key the way a task-sending client does, so the
+/// other server can fetch it when a signature names it.
+async fn register_key(handle: &client::ClientHandle, signing: &ed25519_dalek::SigningKey) {
+    use base64::Engine;
+    let pubkey =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing.verifying_key().as_bytes());
+    handle.raw(&format!("MSGSIG {pubkey}")).await.ok();
+}
+
+/// Ask for the task capability, after registering, and wait for the ACK.
+///
+/// Task messages reach only the connections that negotiated `freeq.at/act` —
+/// everyone else in the room sees the companion prose and none of the machine
+/// half. The Rust SDK does not ask for it (no Rust client consumes task events
+/// yet), so a test that watches for a delivered task event asks in the raw,
+/// the way a task-aware client does.
+async fn request_act_cap(handle: &client::ClientHandle, rx: &mut mpsc::Receiver<Event>) {
+    handle.raw("CAP REQ :freeq.at/act").await.ok();
+    wait_event(
+        rx,
+        |e| matches!(e, Event::RawLine(l) if l.contains(" ACK ") && l.contains("freeq.at/act")),
+        "the task capability ACK",
+    )
+    .await;
+}
+
+/// How many times a session is handed the TAGMSG carrying `event_id`.
+///
+/// Waits up to `within` for the first, then a further `quiet` for a second
+/// that must never come — an event delivered twice is the bug, so the wait
+/// after the first delivery is the assertion.
+async fn tagmsg_deliveries(
+    rx: &mut mpsc::Receiver<Event>,
+    event_id: &str,
+    within: Duration,
+    quiet: Duration,
+) -> usize {
+    let mut seen = 0usize;
+    let matches = |tags: &std::collections::HashMap<String, String>| {
+        tags.get(freeq_sdk::chatsig::EVENT_ID_TAG)
+            .map(String::as_str)
+            == Some(event_id)
+    };
+
+    let deadline = tokio::time::Instant::now() + within;
+    while seen == 0 && tokio::time::Instant::now() < deadline {
+        match timeout(Duration::from_millis(250), rx.recv()).await {
+            Ok(Some(Event::TagMsg { tags, .. })) if matches(&tags) => seen += 1,
+            Ok(Some(_)) => continue,
+            Ok(None) => return seen,
+            Err(_) => continue,
+        }
+    }
+    if seen == 0 {
+        return 0;
+    }
+    let quiet_until = tokio::time::Instant::now() + quiet;
+    while tokio::time::Instant::now() < quiet_until {
+        match timeout(Duration::from_millis(250), rx.recv()).await {
+            Ok(Some(Event::TagMsg { tags, .. })) if matches(&tags) => seen += 1,
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    seen
+}
+
+/// How many rows a server's event log holds under one event id.
+fn event_rows(db_path: &str, event_id: &str) -> i64 {
+    let conn = rusqlite::Connection::open(db_path).expect("open server db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE event_id = ?1",
+        rusqlite::params![event_id],
+        |r| r.get(0),
+    )
+    .expect("count event rows")
+}
+
+/// Every verdict this server logged about one relayed task event, in order.
+fn verdicts_for(server: &TestServer, event_id: &str) -> Vec<String> {
+    server_log(server)
+        .lines()
+        .filter(|l| l.contains(event_id) && l.contains("verdict="))
+        .map(|l| {
+            l.split("verdict=")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// Poll a server's answer for `act_id` for as long as `within`.
+async fn await_act_task_within(
+    web_addr: &str,
+    act_id: &str,
+    within: Duration,
+) -> Option<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + within;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(body) = act_task(web_addr, act_id).await {
+            return Some(body);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    None
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_task_event_waits_for_a_key_it_cannot_fetch_and_applies_when_it_arrives() {
+    const SEED_A: u8 = 216;
+    const SEED_B: u8 = 217;
+    // Long enough for the first backoff step — thirty seconds — plus the
+    // fetch and the judging that follow it.
+    const PAST_THE_FIRST_RETRY: Duration = Duration::from_secs(90);
+    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32])
+        .public()
+        .to_string();
+    let alice = TestId::new("did:plc:alicedefer");
+    let bob = TestId::new("did:plc:bobdefer");
+
+    // Nothing listens here yet. B is told this is where A's users' keys live,
+    // so its lookups fail until the test says otherwise.
+    let key_port = alloc_port();
+    let key_api = format!("{id_a}=http://127.0.0.1:{key_port}");
+    let (srv_a, srv_b) = spawn_pair_with_seeds_and_args(
+        &[&alice, &bob],
+        SEED_A,
+        SEED_B,
+        &[],
+        &["--s2s-peer-api", &key_api],
+    )
+    .await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    request_act_cap(&hb, &mut rxb).await;
+    hb.join("#defer").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#defer").await.unwrap();
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[47u8; 32]);
+    register_key(&ha, &key_a).await;
+    let pubkey = {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_a.verifying_key().as_bytes())
+    };
+
+    // ── the event nobody there can check yet ────────────────────────
+    let parked = send_act_as(
+        &ha,
+        "#defer",
+        &key_a,
+        &[
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "offer"),
+            ("+freeq.at/from", alice.did.as_str()),
+            ("+freeq.at/act-title", "waits-for-a-key"),
+        ],
+    )
+    .await;
+
+    // The home holds it, because the home checked it against a key it has.
+    assert!(
+        await_act_task(&srv_a.web_addr, &parked).await.is_some(),
+        "the server the task was minted on files it"
+    );
+
+    // The far server does not: not shown to anyone, not written down, not
+    // answered for. This is a wait, not a refusal — the difference shows in
+    // the verdict, which says the event could not be checked rather than that
+    // it failed.
+    assert_eq!(
+        tagmsg_deliveries(
+            &mut rxb,
+            &parked,
+            Duration::from_secs(3),
+            Duration::from_millis(500)
+        )
+        .await,
+        0,
+        "an event that cannot be checked is not shown to anyone"
+    );
+    assert_eq!(
+        event_rows(&srv_b.db_path, &parked),
+        0,
+        "nor written into the log"
+    );
+    assert!(
+        act_task(&srv_b.web_addr, &parked).await.is_none(),
+        "nor answered for over REST"
+    );
+    assert_eq!(
+        verdicts_for(&srv_b, &parked),
+        vec!["unverifiable".to_string()],
+        "and the far server says why in the one verdict it has reached: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // ── the key becomes fetchable ───────────────────────────────────
+    //
+    // Nothing else is sent. The far server asks again for the key its parked
+    // event is waiting on, on its own backoff, and that ask is what ends the
+    // wait.
+    let key_server = serve_signing_key(key_port, pubkey).await;
+
+    let body = await_act_task_within(&srv_b.web_addr, &parked, PAST_THE_FIRST_RETRY)
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "a parked event must be judged when its key becomes fetchable, \
+                 without being re-sent; B's verdicts: {}",
+                server_log(&srv_b)
+                    .lines()
+                    .filter(|l| l.contains("verdict=") || l.contains("waiting"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        });
+    assert_eq!(
+        body["task"]["state"].as_str(),
+        Some("open"),
+        "and applied through the rules like any other event: {body}"
+    );
+    assert_eq!(
+        body["task"]["origin"].as_str(),
+        Some(id_a.as_str()),
+        "still owned by the server that minted it: {body}"
+    );
+    assert_eq!(
+        event_rows(&srv_b.db_path, &parked),
+        1,
+        "filed once, under the id its signer minted"
+    );
+    assert_eq!(
+        tagmsg_deliveries(&mut rxb, &parked, S2S_SETTLE, Duration::from_millis(1000)).await,
+        1,
+        "and delivered to the room, once, on release"
+    );
+    assert_eq!(
+        verdicts_for(&srv_b, &parked),
+        vec!["unverifiable".to_string(), "valid".to_string()],
+        "the same event, judged twice: once with no key to check it against, \
+         and once with one"
+    );
+
+    key_server.abort();
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── a transition authored on one server, applied by the task's home ───────
+//
+// A task minted on A is claimed by an agent on B. B files the claim and
+// decides nothing — the task is not B's to decide — and carries it to A. A
+// verifies it exactly as it verifies any relayed task event, runs the rules,
+// applies it, and writes down that it did: the receipt it owes for a move it
+// made. B's copy stays on file, marked as waiting, because nothing has told it
+// otherwise.
+
+/// One task's REST answer, whether the task is live or finished.
+async fn act_body(web_addr: &str, act_id: &str) -> Option<serde_json::Value> {
+    let url = format!("http://{web_addr}/api/v1/actions/{act_id}");
+    let resp = reqwest::get(&url).await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<serde_json::Value>().await.ok()
+}
+
+/// A field of one stored task event's signed document.
+fn doc_field(event: &serde_json::Value, key: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(event["canonical"].as_str().unwrap_or("{}"))
+        .ok()
+        .and_then(|doc| doc.get(key).and_then(|v| v.as_str()).map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Every event of a task as `(verb, confirm_state)`, in the order the log
+/// holds them.
+fn verb_states(body: &serde_json::Value) -> Vec<(String, String)> {
+    body["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|e| {
+            (
+                doc_field(e, "act-verb"),
+                e["confirm_state"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Poll one server until it names an assignee for the task, or give up.
+async fn await_assignee(web_addr: &str, act_id: &str, within: Duration) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut last = None;
+    while tokio::time::Instant::now() < deadline {
+        last = act_task(web_addr, act_id)
+            .await
+            .and_then(|t| t["task"]["assignee"].as_str().map(str::to_string));
+        if last.is_some() {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    last
+}
+
+/// Offer a handoff on A and wait for B to hold it, retrying the offer until
+/// it lands.
+///
+/// The offer is re-sent until the far server holds it: a server has no key for
+/// a stranger until its own fetch fills the store, and an event it cannot
+/// verify yet is not filed. The healing test warms up the same way.
+async fn offer_until_the_peer_holds_it(
+    ha: &client::ClientHandle,
+    channel: &str,
+    key_a: &ed25519_dalek::SigningKey,
+    alice_did: &str,
+    title: &str,
+    peer_web: &str,
+) -> String {
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        let id = send_act_as(
+            ha,
+            channel,
+            key_a,
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", alice_did),
+                ("+freeq.at/act-title", title),
+            ],
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if act_task(peer_web, &id).await.is_some() {
+            return id;
+        }
+    }
+    String::new()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_claim_authored_on_a_peer_is_applied_by_the_task_home() {
+    const SEED_A: u8 = 206;
+    const SEED_B: u8 = 207;
+    let alice = TestId::new("did:plc:aliceroute");
+    let bob = TestId::new("did:plc:bobroute");
+    let (srv_a, srv_b) = spawn_pair_with_seeds(&[&alice, &bob], SEED_A, SEED_B).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#route").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#route").await.unwrap();
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[19u8; 32]);
+    let key_b = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]);
+    register_key(&ha, &key_a).await;
+    register_key(&hb, &key_b).await;
+
+    let act_id = offer_until_the_peer_holds_it(
+        &ha,
+        "#route",
+        &key_a,
+        &alice.did,
+        "cross-server-claim",
+        &srv_b.web_addr,
+    )
+    .await;
+    assert!(
+        !act_id.is_empty(),
+        "the offer must reach B before its agent can claim it; B's log: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // B's agent claims a task B does not own.
+    let claim = send_act_as(
+        &hb,
+        "#route",
+        &key_b,
+        &[
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "claim"),
+            ("+freeq.at/from", bob.did.as_str()),
+            ("+freeq.at/act-id", act_id.as_str()),
+        ],
+    )
+    .await;
+
+    // The home applies it, and that is the only view that moves.
+    let on_a = await_assignee(&srv_a.web_addr, &act_id, S2S_SETTLE).await;
+    assert_eq!(
+        on_a.as_deref(),
+        Some(bob.did.as_str()),
+        "the server that owns the task runs the rules on the claim carried to it; \
+         A's log: {}",
+        server_log(&srv_a)
+            .lines()
+            .filter(|l| l.contains("verdict=") || l.contains(&claim))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // …and B follows it, because the home's receipt reached B. B did not decide
+    // anything: it re-ran the claim its own agent authored through the shared
+    // rules when the receipt naming it arrived.
+    let on_b = await_assignee(&srv_b.web_addr, &act_id, S2S_SETTLE).await;
+    assert_eq!(
+        on_b.as_deref(),
+        Some(bob.did.as_str()),
+        "B follows the receipt of the server that owns the task; B's log: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("receipt") || l.contains(&claim))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let body_a = act_body(&srv_a.web_addr, &act_id)
+        .await
+        .expect("A answers for the task");
+    let body_b = act_body(&srv_b.web_addr, &act_id)
+        .await
+        .expect("B answers for the task");
+
+    // The receipt is in both logs, signed by the server that made it, and it
+    // names the event it rules in.
+    for (name, body) in [("A", &body_a), ("B", &body_b)] {
+        let receipts: Vec<(String, String)> = body["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter(|e| doc_field(e, "act-verb") == "confirm")
+            .map(|e| (doc_field(e, "from"), doc_field(e, "act-subject")))
+            .collect();
+        assert_eq!(
+            receipts,
+            vec![(format!("did:web:test-fed-{SEED_A}"), claim.clone())],
+            "{name} holds the home's receipt, naming the event it confirms: {:?}",
+            verb_states(body)
+        );
+        assert_eq!(
+            body["events"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .find(|e| doc_field(e, "act-verb") == "confirm")
+                .and_then(|e| e["confirm_state"].as_str().map(str::to_string)),
+            None,
+            "and it carries no confirm state of its own on {name}: {:?}",
+            verb_states(body)
+        );
+        assert_eq!(
+            verb_states(body)
+                .iter()
+                .find(|(verb, _)| verb == "claim")
+                .map(|(_, state)| state.as_str()),
+            Some("confirmed"),
+            "{name} shows the claim as confirmed: {:?}",
+            verb_states(body)
+        );
+    }
+
+    // ── and on to the end of the work ───────────────────────────────
+    //
+    // The assignee finishes it from the server that does not own the task.
+    // The home orders that too, so the task leaves both live views on the
+    // same word — a lifecycle carried the whole way across the link, not a
+    // claim and a shrug.
+    send_act_as(
+        &hb,
+        "#route",
+        &key_b,
+        &[
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "complete"),
+            ("+freeq.at/from", bob.did.as_str()),
+            ("+freeq.at/act-id", act_id.as_str()),
+        ],
+    )
+    .await;
+    for (name, addr) in [("A", &srv_a.web_addr), ("B", &srv_b.web_addr)] {
+        assert!(
+            await_task_gone(addr, &act_id, S2S_SETTLE).await,
+            "{name} must end the task on the home's word; {name} says: {:?}",
+            act_body(addr, &act_id).await.map(|b| verb_states(&b))
+        );
+        let body = act_body(addr, &act_id)
+            .await
+            .expect("the log outlives the task");
+        assert_eq!(
+            verb_states(&body)
+                .iter()
+                .find(|(verb, _)| verb == "complete")
+                .map(|(_, state)| state.as_str()),
+            Some("confirmed"),
+            "and {name} shows the completion as ruled on: {:?}",
+            verb_states(&body)
+        );
+    }
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── a claim made while the task's home is away ───────────────────────────
+//
+// The never-lose guarantee, watched end to end. A task minted on one server is
+// claimed by someone on another while the first is down. The claim is a signed
+// record and is treated as one — filed at once, kept, shown — but it decides
+// nothing, because the server that orders this task's moves is not there to
+// order it. The home comes back, is asked again, and applies it.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_claim_made_while_the_home_is_away_reaches_it_when_it_returns() {
+    // B is the server that stays up, so it must be the one that keeps its
+    // outgoing link — the orientation the orphan test pins, for the same
+    // reason: B is what has to reach A again.
+    const SEED_A: u8 = 218;
+    const SEED_B: u8 = 219;
+    // Long enough for the backoff to come round after the home is back: the
+    // attempt that failed while it was down is deliberately not retried at
+    // once.
+    const PAST_THE_BACKOFF: Duration = Duration::from_secs(150);
+    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32])
+        .public()
+        .to_string();
+    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32])
+        .public()
+        .to_string();
+    assert!(
+        id_b < id_a,
+        "the server that stays up keeps its outgoing link"
+    );
+
+    let alice = TestId::new("did:plc:aliceaway");
+    let bob = TestId::new("did:plc:bobaway");
+    let (mut srv_a, srv_b) = spawn_pair_with_seeds(&[&alice, &bob], SEED_A, SEED_B).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#away").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#away").await.unwrap();
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[53u8; 32]);
+    let key_b = ed25519_dalek::SigningKey::from_bytes(&[59u8; 32]);
+    register_key(&ha, &key_a).await;
+    register_key(&hb, &key_b).await;
+
+    let act_id = offer_until_the_peer_holds_it(
+        &ha,
+        "#away",
+        &key_a,
+        &alice.did,
+        "claimed-while-nobody-was-home",
+        &srv_b.web_addr,
+    )
+    .await;
+    assert!(
+        !act_id.is_empty(),
+        "the offer must cross before the outage, or the outage proves nothing; \
+         B's log: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // ── the home goes away, and the task is claimed anyway ──────────
+    ha.quit(None).await.ok();
+    srv_a.stop();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    send_act_as(
+        &hb,
+        "#away",
+        &key_b,
+        &[
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "claim"),
+            ("+freeq.at/from", bob.did.as_str()),
+            ("+freeq.at/act-id", act_id.as_str()),
+        ],
+    )
+    .await;
+
+    // Filed, kept, and deciding nothing: the claim is on the record with its
+    // flag down, and the task still stands where its home left it.
+    let filed = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut away = serde_json::Value::Null;
+    while tokio::time::Instant::now() < filed {
+        away = act_body(&srv_b.web_addr, &act_id).await.unwrap_or_default();
+        if verb_states(&away).iter().any(|(v, _)| v == "claim") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(
+        verb_states(&away)
+            .iter()
+            .find(|(verb, _)| verb == "claim")
+            .map(|(_, state)| state.as_str()),
+        Some("unconfirmed"),
+        "a claim made while the home is away is on file and waiting on it: {:?}",
+        verb_states(&away)
+    );
+    assert_eq!(
+        away["task"]["state"].as_str(),
+        Some("open"),
+        "and changes nothing about the task until the home has ruled: {away}"
+    );
+
+    // ── the home comes back and is asked again ──────────────────────
+    srv_a.start_again().await;
+    let (ha2, mut rxa2) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa2).await;
+    warm_link(&ha2, &bob.did, &mut rxb).await;
+
+    let on_a = await_assignee(&srv_a.web_addr, &act_id, PAST_THE_BACKOFF).await;
+    assert_eq!(
+        on_a.as_deref(),
+        Some(bob.did.as_str()),
+        "a claim made while the home was away has to reach it when it returns; \
+         A says {:?} and B says {:?}",
+        act_body(&srv_a.web_addr, &act_id)
+            .await
+            .map(|b| verb_states(&b)),
+        act_body(&srv_b.web_addr, &act_id)
+            .await
+            .map(|b| verb_states(&b))
+    );
+
+    // …and the receipt comes back to the server that had been holding the
+    // claim. Without that half B would have carried a claim it authored,
+    // watched the home decide it, and never learnt the answer.
+    let on_b = await_assignee(&srv_b.web_addr, &act_id, S2S_SETTLE).await;
+    let body_b = act_body(&srv_b.web_addr, &act_id)
+        .await
+        .expect("B answers for the task");
+    assert_eq!(
+        on_b.as_deref(),
+        Some(bob.did.as_str()),
+        "B follows the receipt once its home is back: {:?}",
+        verb_states(&body_b)
+    );
+    assert_eq!(
+        verb_states(&body_b)
+            .iter()
+            .find(|(verb, _)| verb == "claim")
+            .map(|(_, state)| state.as_str()),
+        Some("confirmed"),
+        "and the claim it was holding is no longer waiting on anybody: {:?}",
+        verb_states(&body_b)
+    );
+
+    ha2.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── the cases a two-server pair is the only place to watch ────────────────
+//
+// Everything below needs two servers with a real link between them: a task
+// whose home is the far side, a race whose outcome depends on which server
+// heard what first, an ending only the home can author, and a bounty whose
+// award has to resolve a bid that was written somewhere else.
+
+/// Poll both servers until each names an assignee for the task, and hand back
+/// the two answers.
+async fn await_assignees(a: &str, b: &str, act_id: &str) -> (Option<String>, Option<String>) {
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut last = (None, None);
+    while tokio::time::Instant::now() < deadline {
+        let on_a = act_task(a, act_id)
+            .await
+            .and_then(|t| t["task"]["assignee"].as_str().map(str::to_string));
+        let on_b = act_task(b, act_id)
+            .await
+            .and_then(|t| t["task"]["assignee"].as_str().map(str::to_string));
+        last = (on_a, on_b);
+        if last.0.is_some() && last.0 == last.1 {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    last
+}
+
+/// The verbs a server has confirmed for a task, in the order it holds them.
+fn confirmed_verbs(body: &serde_json::Value) -> Vec<String> {
+    body["events"]
+        .as_array()
+        .map(|events| {
+            events
+                .iter()
+                .filter(|e| e["confirm_state"].as_str() == Some("confirmed"))
+                .map(|e| doc_field(e, "act-verb"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Poll one server until the task has left the live view, or give up.
+async fn await_task_gone(web_addr: &str, act_id: &str, within: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    while tokio::time::Instant::now() < deadline {
+        if act_task(web_addr, act_id)
+            .await
+            .is_none_or(|body| body["task"].is_null())
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    false
+}
+
+/// Offer a bounty on one server and wait for the far one to hold it, retrying
+/// until it lands — the same key warm-up the handoff offers do.
+async fn bounty_until_the_peer_holds_it(
+    handle: &client::ClientHandle,
+    channel: &str,
+    key: &ed25519_dalek::SigningKey,
+    did: &str,
+    title: &str,
+    peer_web: &str,
+) -> String {
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        let id = send_act_as(
+            handle,
+            channel,
+            key,
+            &[
+                ("+freeq.at/act", "bounty"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", did),
+                ("+freeq.at/act-title", title),
+            ],
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if act_task(peer_web, &id).await.is_some() {
+            return id;
+        }
+    }
+    String::new()
+}
+
+// ── two agents, one task, two servers ─────────────────────────────────────
+//
+// The race the whole ordering design exists for. Exactly one claim wins,
+// both servers name the same winner, and nothing anywhere is left waiting on
+// a decision that has already been made — the loser is refused at the home and
+// marked superseded where it was authored.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn two_claims_on_one_task_leave_both_servers_naming_one_winner() {
+    const SEED_A: u8 = 222;
+    const SEED_B: u8 = 223;
+    let alice = TestId::new("did:plc:aliceraced");
+    let bob = TestId::new("did:plc:bobraced");
+    let (srv_a, srv_b) = spawn_pair_with_seeds(&[&alice, &bob], SEED_A, SEED_B).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#raced").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#raced").await.unwrap();
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[73u8; 32]);
+    let key_b = ed25519_dalek::SigningKey::from_bytes(&[79u8; 32]);
+    register_key(&ha, &key_a).await;
+    register_key(&hb, &key_b).await;
+
+    let mut raced = String::new();
+    let mut both: (Option<String>, Option<String>) = (None, None);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while raced.is_empty() && tokio::time::Instant::now() < deadline {
+        let id = offer_until_the_peer_holds_it(
+            &ha,
+            "#raced",
+            &key_a,
+            &alice.did,
+            "contested",
+            &srv_b.web_addr,
+        )
+        .await;
+        if id.is_empty() {
+            continue;
+        }
+        let claim_a = [
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "claim"),
+            ("+freeq.at/from", alice.did.as_str()),
+            ("+freeq.at/act-id", id.as_str()),
+        ];
+        let claim_b = [
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "claim"),
+            ("+freeq.at/from", bob.did.as_str()),
+            ("+freeq.at/act-id", id.as_str()),
+        ];
+        let (_, _) = tokio::join!(
+            send_act_as(&hb, "#raced", &key_b, &claim_b),
+            send_act_as(&ha, "#raced", &key_a, &claim_a),
+        );
+        both = await_assignees(&srv_a.web_addr, &srv_b.web_addr, &id).await;
+        if both.0.is_some() && both.0 == both.1 {
+            raced = id;
+        }
+    }
+
+    assert!(
+        !raced.is_empty(),
+        "two claims on one task must leave both servers naming one winner; \
+         A said {:?} and B said {:?}",
+        both.0,
+        both.1
+    );
+    let winner = both.0.clone().expect("a winner");
+
+    // Exactly one confirmed claim on each server, and it is the same one — but
+    // what the loser looks like differs by server, which is why both are
+    // asked. The home refused it at its own ingress, and a refused event is
+    // never filed; the server whose agent authored it filed it before anyone
+    // had decided, and dropped it from the pending set when the receipt landed.
+    let mut per_server: Vec<Vec<(String, String)>> = Vec::new();
+    for (name, addr) in [("A", &srv_a.web_addr), ("B", &srv_b.web_addr)] {
+        let body = act_body(addr, &raced)
+            .await
+            .unwrap_or_else(|| panic!("{name} answers for the task"));
+        let claims: Vec<(String, String)> = body["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter(|e| doc_field(e, "act-verb") == "claim")
+            .map(|e| {
+                (
+                    doc_field(e, "from"),
+                    e["confirm_state"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let confirmed: Vec<&String> = claims
+            .iter()
+            .filter(|(_, state)| state == "confirmed")
+            .map(|(did, _)| did)
+            .collect();
+        assert_eq!(
+            confirmed,
+            vec![&winner],
+            "{name} must show exactly one confirmed claim, the winner's: {claims:?}"
+        );
+        assert!(
+            claims.iter().all(|(_, state)| state != "unconfirmed"),
+            "{name} left a claim waiting on a decision that has already been \
+             made: {claims:?}"
+        );
+        per_server.push(claims);
+    }
+    let (on_a, on_b) = (&per_server[0], &per_server[1]);
+    assert_eq!(
+        on_a.len(),
+        1,
+        "the home files nothing for a claim it refuses: {on_a:?}"
+    );
+    // Alice sends on A and bob on B, so a losing bob is the case where the
+    // loser was authored somewhere other than the home — and therefore the
+    // only case where a copy of it exists anywhere to be marked.
+    if winner == alice.did {
+        assert_eq!(
+            on_b.iter()
+                .find(|(did, _)| did == &bob.did)
+                .map(|(_, state)| state.as_str()),
+            Some("superseded"),
+            "B keeps the claim its own agent lost, dropped from the pending \
+             set rather than deleted: {on_b:?}"
+        );
+    }
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── a task whose home is the far server ───────────────────────────────────
+//
+// The mirror of the lifecycle test, and the one that shows this server is not
+// quietly deciding its own answers: every move is authored here and every
+// receipt comes from there.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_task_minted_on_the_far_server_moves_where_that_server_says() {
+    const SEED_A: u8 = 224;
+    const SEED_B: u8 = 225;
+    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32])
+        .public()
+        .to_string();
+
+    // Bob offers the work from B, which makes B the server that referees it.
+    // Alice, on A, is the one who does it.
+    let alice = TestId::new("did:plc:alicemirror");
+    let bob = TestId::new("did:plc:bobmirror");
+    let (srv_a, srv_b) = spawn_pair_with_seeds(&[&alice, &bob], SEED_A, SEED_B).await;
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    ha.join("#mirror").await.unwrap();
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    warm_link(&hb, &alice.did, &mut rxa).await;
+    hb.join("#mirror").await.unwrap();
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[83u8; 32]);
+    let key_b = ed25519_dalek::SigningKey::from_bytes(&[89u8; 32]);
+    register_key(&ha, &key_a).await;
+    register_key(&hb, &key_b).await;
+
+    let act_id = offer_until_the_peer_holds_it(
+        &hb,
+        "#mirror",
+        &key_b,
+        &bob.did,
+        "the-other-direction",
+        &srv_a.web_addr,
+    )
+    .await;
+    assert!(
+        !act_id.is_empty(),
+        "a task offered on B must reach A; A's log says: {}",
+        server_log(&srv_a)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // Which server referees it, said from both ends: B by saying nothing — an
+    // empty origin is "minted here" — and A by naming B.
+    for (name, addr, home) in [
+        ("A", &srv_a.web_addr, id_b.as_str()),
+        ("B", &srv_b.web_addr, ""),
+    ] {
+        let body = act_task(addr, &act_id)
+            .await
+            .unwrap_or_else(|| panic!("{name} answers for the task"));
+        assert_eq!(
+            body["task"]["origin"].as_str(),
+            Some(home),
+            "the far server is the home of this one: {body}"
+        );
+    }
+
+    // Taken by the user on the server that does not own it.
+    send_act_as(
+        &ha,
+        "#mirror",
+        &key_a,
+        &[
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "claim"),
+            ("+freeq.at/from", alice.did.as_str()),
+            ("+freeq.at/act-id", act_id.as_str()),
+        ],
+    )
+    .await;
+
+    let (on_a, on_b) = await_assignees(&srv_a.web_addr, &srv_b.web_addr, &act_id).await;
+    assert_eq!(
+        on_a.as_deref(),
+        Some(alice.did.as_str()),
+        "the home confirmed the claim and both servers followed it; A said \
+         {on_a:?} and B said {on_b:?}. A's log: {}",
+        server_log(&srv_a)
+            .lines()
+            .filter(|l| l.contains("receipt") || l.contains("verdict="))
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(on_b, on_a, "and the server that owns it says the same");
+
+    // A did not decide that — it cannot, the task is not its own. Its copy
+    // reading confirmed is the far server's receipt having arrived.
+    let body_a = act_body(&srv_a.web_addr, &act_id)
+        .await
+        .expect("A answers for the task");
+    assert_eq!(
+        verb_states(&body_a)
+            .iter()
+            .find(|(verb, _)| verb == "claim")
+            .map(|(_, state)| state.as_str()),
+        Some("confirmed"),
+        "the mover follows a receipt it did not make: {:?}",
+        verb_states(&body_a)
+    );
+
+    // ── and on to the end of the work ───────────────────────────────
+    //
+    // The same lifecycle, run the other way: the person who took the work
+    // finishes it here, and the far server — the one that owns the task —
+    // is what ends it on both.
+    send_act_as(
+        &ha,
+        "#mirror",
+        &key_a,
+        &[
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "complete"),
+            ("+freeq.at/from", alice.did.as_str()),
+            ("+freeq.at/act-id", act_id.as_str()),
+        ],
+    )
+    .await;
+    for (name, addr) in [("A", &srv_a.web_addr), ("B", &srv_b.web_addr)] {
+        assert!(
+            await_task_gone(addr, &act_id, S2S_SETTLE).await,
+            "{name} must end the task on the far server's word; {name} says: {:?}",
+            act_body(addr, &act_id).await.map(|b| verb_states(&b))
+        );
+        let body = act_body(addr, &act_id)
+            .await
+            .expect("the log outlives the task");
+        assert_eq!(
+            verb_states(&body)
+                .iter()
+                .find(|(verb, _)| verb == "complete")
+                .map(|(_, state)| state.as_str()),
+            Some("confirmed"),
+            "and {name} shows the completion as ruled on: {:?}",
+            verb_states(&body)
+        );
+    }
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── a cancel and an accept sent at once ───────────────────────────────────
+//
+// The creator's cancel and the offeree's accept, sent together on different
+// servers. The home orders them, and the ordinary result is that the cancel
+// wins: it is filed at the home with no hop to cross while the accept has to
+// travel. When the other order happens anyway the attempt is retried on a
+// fresh task rather than asserted against — that is a different question.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_cancel_and_an_accept_at_once_leave_the_creator_the_winner() {
+    const SEED_A: u8 = 226;
+    const SEED_B: u8 = 227;
+    let alice = TestId::new("did:plc:alicetie");
+    let bob = TestId::new("did:plc:bobtie");
+    let (srv_a, srv_b) = spawn_pair_with_seeds(&[&alice, &bob], SEED_A, SEED_B).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#tie").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#tie").await.unwrap();
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[97u8; 32]);
+    let key_b = ed25519_dalek::SigningKey::from_bytes(&[101u8; 32]);
+    register_key(&ha, &key_a).await;
+    register_key(&hb, &key_b).await;
+
+    let mut settled = String::new();
+    let mut other_order = 0usize;
+    let mut never_filed = 0usize;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while settled.is_empty() && tokio::time::Instant::now() < deadline {
+        // A fresh directed offer, repeated until the far server holds it.
+        let id = send_act_as(
+            &ha,
+            "#tie",
+            &key_a,
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", alice.did.as_str()),
+                ("+freeq.at/act-to", bob.did.as_str()),
+                ("+freeq.at/act-title", "pulled-and-taken-at-once"),
+            ],
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if act_task(&srv_b.web_addr, &id).await.is_none() {
+            continue;
+        }
+
+        // Both moves, together.
+        let cancel_tags = [
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "cancel"),
+            ("+freeq.at/from", alice.did.as_str()),
+            ("+freeq.at/act-id", id.as_str()),
+        ];
+        let accept_tags = [
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "accept"),
+            ("+freeq.at/from", bob.did.as_str()),
+            ("+freeq.at/act-id", id.as_str()),
+        ];
+        let (_, _) = tokio::join!(
+            send_act_as(&ha, "#tie", &key_a, &cancel_tags),
+            send_act_as(&hb, "#tie", &key_b, &accept_tags),
+        );
+
+        // Settled when both servers have confirmed the cancel and neither is
+        // still holding anything on this task waiting to be decided.
+        let settle = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut on_a = serde_json::Value::Null;
+        let mut on_b = serde_json::Value::Null;
+        while tokio::time::Instant::now() < settle {
+            on_a = act_body(&srv_a.web_addr, &id).await.unwrap_or_default();
+            on_b = act_body(&srv_b.web_addr, &id).await.unwrap_or_default();
+            let settled = |body: &serde_json::Value| {
+                confirmed_verbs(body).iter().any(|v| v == "cancel")
+                    && verb_states(body).iter().all(|(_, s)| s != "unconfirmed")
+            };
+            if settled(&on_a) && settled(&on_b) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        // The other arrival order — the accept reached the home first and was
+        // confirmed before the cancel the home had not yet seen. A legal
+        // history, and not the one under test.
+        if verb_states(&on_a).iter().any(|(verb, _)| verb == "accept") {
+            other_order += 1;
+            continue;
+        }
+        // The cancel reached the far server before its own user's accept was
+        // filed, so there is no losing copy anywhere to be marked. Also not
+        // the case under test.
+        if !verb_states(&on_b).iter().any(|(verb, _)| verb == "accept") {
+            never_filed += 1;
+            continue;
+        }
+
+        // The creator's cancel stands, on both servers.
+        for (name, body) in [("A", &on_a), ("B", &on_b)] {
+            assert_eq!(
+                confirmed_verbs(body),
+                vec!["offer".to_string(), "cancel".to_string()],
+                "{name} must end the task on the creator's cancel and nothing \
+                 else: {:?}",
+                verb_states(body)
+            );
+            assert!(
+                body["task"].is_null(),
+                "a cancelled task is out of the live view on {name}: {body}"
+            );
+        }
+        // The home refuses a move on a task that has already finished, and a
+        // refused event is not filed at all — so there is no accept there to
+        // rule in or to mark.
+        assert_eq!(
+            verb_states(&on_a)
+                .iter()
+                .filter(|(verb, _)| verb == "accept")
+                .count(),
+            0,
+            "the home files nothing for the accept it refused: {:?}",
+            verb_states(&on_a)
+        );
+        // The server whose user sent it keeps the record and drops the flag.
+        assert_eq!(
+            verb_states(&on_b)
+                .iter()
+                .find(|(verb, _)| verb == "accept")
+                .map(|(_, state)| state.as_str()),
+            Some("superseded"),
+            "the losing accept stays on file where it was authored, marked as \
+             outrun rather than deleted: {:?}",
+            verb_states(&on_b)
+        );
+        settled = id;
+    }
+
+    assert!(
+        !settled.is_empty(),
+        "no attempt produced the arrival order under test in the time allowed \
+         ({other_order} reached the home accept-first, {never_filed} never \
+         filed an accept at all); B's log says: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("task") || l.contains("verdict="))
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── the ending only the home can author ───────────────────────────────────
+//
+// A task nobody moves is expired by its home's sweep. The peer holding it has
+// no sweep of its own for somebody else's task, so without the home's event
+// crossing, that row stays live on the peer for ever.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn an_expiry_ends_the_task_on_the_peer_holding_it() {
+    const SEED_A: u8 = 228;
+    const SEED_B: u8 = 229;
+    let alice = TestId::new("did:plc:aliceexpire");
+    let bob = TestId::new("did:plc:bobexpire");
+    // A's abandonment limit is one second, so the sweep fires while the test
+    // is watching. B's is left alone — it must not be the one that ends this.
+    let (srv_a, srv_b) = spawn_pair_with_seeds_and_args(
+        &[&alice, &bob],
+        SEED_A,
+        SEED_B,
+        &["--act-expiry-secs", "1"],
+        &[],
+    )
+    .await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#expiry").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#expiry").await.unwrap();
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[103u8; 32]);
+    register_key(&ha, &key_a).await;
+
+    let act_id = offer_until_the_peer_holds_it(
+        &ha,
+        "#expiry",
+        &key_a,
+        &alice.did,
+        "left-to-rot",
+        &srv_b.web_addr,
+    )
+    .await;
+    assert!(
+        !act_id.is_empty(),
+        "the offer must reach B before it can be watched ending there; B's log: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    assert!(
+        await_task_gone(&srv_a.web_addr, &act_id, S2S_SETTLE).await,
+        "the home's own sweep ends the task it opened"
+    );
+    assert!(
+        await_task_gone(&srv_b.web_addr, &act_id, S2S_SETTLE).await,
+        "and the ending crosses, or B holds a live row for a task that is over; \
+         B's log: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("expire") || l.contains(&act_id))
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let body_b = act_body(&srv_b.web_addr, &act_id)
+        .await
+        .expect("B still answers for the finished task");
+    assert_eq!(
+        confirmed_verbs(&body_b),
+        vec!["offer".to_string(), "expire".to_string()],
+        "B holds the whole life of the task, ending included: {:?}",
+        verb_states(&body_b)
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── the relations that ride along ─────────────────────────────────────────
+//
+// Two things a task event can carry that are about something other than the
+// task's own state: the finished action it revives, and, on a bounty, the bid
+// an award takes. Both have to survive a hop.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_revival_relation_crosses_a_link() {
+    const SEED_A: u8 = 230;
+    const SEED_B: u8 = 231;
+    let alice = TestId::new("did:plc:alicerevive");
+    let bob = TestId::new("did:plc:bobrevive");
+    let (srv_a, srv_b) = spawn_pair_with_seeds(&[&alice, &bob], SEED_A, SEED_B).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#revive").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#revive").await.unwrap();
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[107u8; 32]);
+    register_key(&ha, &key_a).await;
+
+    // One task, cancelled — a finished action is what a revival may name.
+    let first = offer_until_the_peer_holds_it(
+        &ha,
+        "#revive",
+        &key_a,
+        &alice.did,
+        "first-attempt",
+        &srv_b.web_addr,
+    )
+    .await;
+    assert!(!first.is_empty(), "the first offer must reach B");
+    send_act_as(
+        &ha,
+        "#revive",
+        &key_a,
+        &[
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "cancel"),
+            ("+freeq.at/from", alice.did.as_str()),
+            ("+freeq.at/act-id", first.as_str()),
+        ],
+    )
+    .await;
+    assert!(
+        await_task_gone(&srv_b.web_addr, &first, S2S_SETTLE).await,
+        "the cancel has to cross before the revival can name a finished action"
+    );
+
+    // And its successor, which names it.
+    let second = send_act_as(
+        &ha,
+        "#revive",
+        &key_a,
+        &[
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "offer"),
+            ("+freeq.at/from", alice.did.as_str()),
+            ("+freeq.at/act-title", "second-attempt"),
+            ("+freeq.at/act-replaces", first.as_str()),
+        ],
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut on_b = None;
+    while tokio::time::Instant::now() < deadline {
+        on_b = act_task(&srv_b.web_addr, &second).await;
+        if on_b.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let on_b = on_b.expect("the successor reaches B");
+    assert_eq!(
+        on_b["task"]["replaces"].as_str(),
+        Some(first.as_str()),
+        "the relation to the action it revives crosses with it: {on_b}"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_bid_from_a_remote_bidder_is_awarded_at_the_home() {
+    const SEED_A: u8 = 232;
+    const SEED_B: u8 = 233;
+    let alice = TestId::new("did:plc:alicebounty");
+    let bob = TestId::new("did:plc:bobbounty");
+    let (srv_a, srv_b) = spawn_pair_with_seeds(&[&alice, &bob], SEED_A, SEED_B).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#bounty").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#bounty").await.unwrap();
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[109u8; 32]);
+    let key_b = ed25519_dalek::SigningKey::from_bytes(&[113u8; 32]);
+    register_key(&ha, &key_a).await;
+    register_key(&hb, &key_b).await;
+
+    let act_id = bounty_until_the_peer_holds_it(
+        &ha,
+        "#bounty",
+        &key_a,
+        &alice.did,
+        "paid-work",
+        &srv_b.web_addr,
+    )
+    .await;
+    assert!(
+        !act_id.is_empty(),
+        "the bounty must reach B before its user can bid; B's log: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // Bob bids from B. A bid is additive — it leaves the bounty open, so it
+    // decides nothing exclusive and is applied wherever it lands. The award
+    // below resolves it from the home's own log, which is exactly why the bid
+    // has to have reached the home first.
+    let mut bid = String::new();
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        let id = send_act_as(
+            &hb,
+            "#bounty",
+            &key_b,
+            &[
+                ("+freeq.at/act", "bounty"),
+                ("+freeq.at/act-verb", "bid"),
+                ("+freeq.at/from", bob.did.as_str()),
+                ("+freeq.at/act-id", act_id.as_str()),
+            ],
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let on_a = act_body(&srv_a.web_addr, &act_id).await.unwrap_or_default();
+        if on_a["events"]
+            .as_array()
+            .is_some_and(|events| events.iter().any(|e| e["event_id"].as_str() == Some(&id)))
+        {
+            bid = id;
+            break;
+        }
+    }
+    assert!(
+        !bid.is_empty(),
+        "the bid has to reach the home, or there is nothing for the award to \
+         take; A's log: {}",
+        server_log(&srv_a)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // Alice awards it from A, naming the bid.
+    send_act_as(
+        &ha,
+        "#bounty",
+        &key_a,
+        &[
+            ("+freeq.at/act", "bounty"),
+            ("+freeq.at/act-verb", "award"),
+            ("+freeq.at/from", alice.did.as_str()),
+            ("+freeq.at/act-id", act_id.as_str()),
+            ("+freeq.at/act-accepts", bid.as_str()),
+        ],
+    )
+    .await;
+
+    let (on_a, on_b) = await_assignees(&srv_a.web_addr, &srv_b.web_addr, &act_id).await;
+    assert_eq!(
+        on_a.as_deref(),
+        Some(bob.did.as_str()),
+        "the award goes to whoever wrote the bid it names, wherever they are; \
+         A said {on_a:?} and B said {on_b:?}"
+    );
+    assert_eq!(
+        on_b, on_a,
+        "and the server the bidder is on follows the home's receipt"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── the review window closing across a hop ────────────────────────────────
+//
+// The other event a server signs itself. Work handed in and never answered is
+// deemed accepted by the server that owns the bounty, under a verb of its own
+// — and a peer that never hears it holds a live row for work that has been
+// accepted, which is the same hole the expiry test closes for abandoned work.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_closed_review_window_accepts_the_work_on_the_peer_holding_it() {
+    const SEED_A: u8 = 234;
+    const SEED_B: u8 = 235;
+    let alice = TestId::new("did:plc:alicereview");
+    let bob = TestId::new("did:plc:bobreview");
+    // A's review window is one second, so the sweep fires while the test is
+    // watching. B's is left alone — it must not be the one that closes this.
+    let (srv_a, srv_b) = spawn_pair_with_seeds_and_args(
+        &[&alice, &bob],
+        SEED_A,
+        SEED_B,
+        &["--act-review-secs", "1"],
+        &[],
+    )
+    .await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#review").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#review").await.unwrap();
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[149u8; 32]);
+    let key_b = ed25519_dalek::SigningKey::from_bytes(&[151u8; 32]);
+    register_key(&ha, &key_a).await;
+    register_key(&hb, &key_b).await;
+
+    let act_id = bounty_until_the_peer_holds_it(
+        &ha,
+        "#review",
+        &key_a,
+        &alice.did,
+        "handed-in-and-ignored",
+        &srv_b.web_addr,
+    )
+    .await;
+    assert!(
+        !act_id.is_empty(),
+        "the bounty must reach B before its user can bid; B's log: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // Bob bids, alice awards it, bob hands the work in — and then nobody says
+    // anything, which is what the window is for.
+    let mut bid = String::new();
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    while bid.is_empty() && tokio::time::Instant::now() < deadline {
+        let id = send_act_as(
+            &hb,
+            "#review",
+            &key_b,
+            &[
+                ("+freeq.at/act", "bounty"),
+                ("+freeq.at/act-verb", "bid"),
+                ("+freeq.at/from", bob.did.as_str()),
+                ("+freeq.at/act-id", act_id.as_str()),
+            ],
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let on_a = act_body(&srv_a.web_addr, &act_id).await.unwrap_or_default();
+        if on_a["events"]
+            .as_array()
+            .is_some_and(|events| events.iter().any(|e| e["event_id"].as_str() == Some(&id)))
+        {
+            bid = id;
+        }
+    }
+    assert!(
+        !bid.is_empty(),
+        "the bid has to reach the home to be awarded"
+    );
+
+    send_act_as(
+        &ha,
+        "#review",
+        &key_a,
+        &[
+            ("+freeq.at/act", "bounty"),
+            ("+freeq.at/act-verb", "award"),
+            ("+freeq.at/from", alice.did.as_str()),
+            ("+freeq.at/act-id", act_id.as_str()),
+            ("+freeq.at/act-accepts", bid.as_str()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        await_assignee(&srv_b.web_addr, &act_id, S2S_SETTLE)
+            .await
+            .as_deref(),
+        Some(bob.did.as_str()),
+        "the award has to be settled on both sides before the work goes in"
+    );
+
+    send_act_as(
+        &hb,
+        "#review",
+        &key_b,
+        &[
+            ("+freeq.at/act", "bounty"),
+            ("+freeq.at/act-verb", "submit"),
+            ("+freeq.at/from", bob.did.as_str()),
+            ("+freeq.at/act-id", act_id.as_str()),
+        ],
+    )
+    .await;
+
+    // The window closes on the server that owns the bounty…
+    assert!(
+        await_task_gone(&srv_a.web_addr, &act_id, S2S_SETTLE).await,
+        "the poster's own server deems unanswered work accepted; A's log: {}",
+        server_log(&srv_a)
+            .lines()
+            .filter(|l| l.contains("review") || l.contains(&act_id))
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    // …and the event that closed it crosses, so the worker's own server stops
+    // showing the work as still under review.
+    assert!(
+        await_task_gone(&srv_b.web_addr, &act_id, S2S_SETTLE).await,
+        "the close has to cross, or B holds a live row for accepted work; \
+         B's log: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("auto-accept") || l.contains(&act_id))
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let body_b = act_body(&srv_b.web_addr, &act_id)
+        .await
+        .expect("B still answers for the finished bounty");
+    assert!(
+        confirmed_verbs(&body_b).last().map(String::as_str) == Some("auto-accept"),
+        "B holds the whole life of the bounty, the close included: {:?}",
+        verb_states(&body_b)
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── the stopgap coordination family across a hop ──────────────────────────
+//
+// The older family, which carries its own signed document and has no task
+// view. It is not part of the act lifecycle and nothing here rules on it —
+// what it owes is that a peer receiving one verifies it and files it, so an
+// agent's activity on one server is readable on the other.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_stopgap_coordination_event_is_stored_on_the_peer_that_receives_it() {
+    const SEED_A: u8 = 236;
+    const SEED_B: u8 = 237;
+    let alice = TestId::new("did:plc:alicestopgap");
+    let bob = TestId::new("did:plc:bobstopgap");
+    let (srv_a, srv_b) = spawn_pair_with_seeds(&[&alice, &bob], SEED_A, SEED_B).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#stopgap").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#stopgap").await.unwrap();
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[157u8; 32]);
+    register_key(&ha, &key_a).await;
+
+    // Repeated until it lands: B holds no key for alice until its own fetch
+    // fills the store, and an event it cannot verify yet is not filed.
+    let mut stored = None;
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    while stored.is_none() && tokio::time::Instant::now() < deadline {
+        let task_id = ha
+            .create_task("#stopgap", "read the far server's copy")
+            .await
+            .expect("the event goes out");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        stored = channel_events(&srv_b.web_addr, "stopgap")
+            .await
+            .into_iter()
+            .find(|e| e["event_id"].as_str() == Some(task_id.as_str()));
+    }
+
+    let stored = stored.unwrap_or_else(|| {
+        panic!(
+            "a coordination event has to reach the peer's store; B's log: {}",
+            server_log(&srv_b)
+                .lines()
+                .filter(|l| l.contains("verdict=") || l.contains("coordination"))
+                .rev()
+                .take(20)
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    });
+    assert_eq!(
+        stored["event_type"].as_str(),
+        Some("task_request"),
+        "filed as what it is: {stored}"
+    );
+    assert_eq!(
+        stored["actor_did"].as_str(),
+        Some(alice.did.as_str()),
+        "under the identity that signed it, not the peer that relayed it: {stored}"
+    );
+    assert!(
+        stored["signature"].as_str().is_some_and(|s| !s.is_empty()),
+        "with the signature it travelled under: {stored}"
+    );
+    assert_eq!(
+        stored["payload"]["description"].as_str(),
+        Some("read the far server's copy"),
+        "and the payload the signature covers: {stored}"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+/// The stopgap coordination events one server holds for a channel.
+async fn channel_events(web_addr: &str, channel: &str) -> Vec<serde_json::Value> {
+    let url = format!("http://{web_addr}/api/v1/channels/{channel}/events");
+    let Ok(resp) = reqwest::get(&url).await else {
+        return Vec::new();
+    };
+    if !resp.status().is_success() {
+        return Vec::new();
+    }
+    let Ok(body) = resp.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
+    body["events"].as_array().cloned().unwrap_or_default()
+}
+
+// ── a task whose home server vanished ─────────────────────────────────────
+//
+// A task is refereed by the server it was created on. While that server is
+// gone nothing can rule on the task, and a peer showing it as fresh open work
+// is lying by omission. So a peer annotates it `orphaned` in its own view —
+// its own reading, never a transition, never relayed, never in the signed log
+// — and the annotation lifts by itself when the home comes back.
+//
+// Read through REST, because that is where the RFC puts the promise: clients
+// see honest liveness rather than a forever-fresh offer.
+
+/// One task's row in a server's task listing — the surface a client's inbox
+/// actually reads.
+async fn listed_task(web_addr: &str, act_id: &str) -> Option<serde_json::Value> {
+    let url = format!("http://{web_addr}/api/v1/actions");
+    let body = reqwest::get(&url)
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    body["tasks"]
+        .as_array()?
+        .iter()
+        .find(|t| t["act_id"].as_str() == Some(act_id))
+        .cloned()
+}
+
+/// Poll a server's answer for `act_id` until its state is `want`, or give up
+/// and return what it last said.
+async fn await_task_state(web_addr: &str, act_id: &str, want: &str, within: Duration) -> String {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut last = String::from("<no answer>");
+    while tokio::time::Instant::now() < deadline {
+        if let Some(body) = act_task(web_addr, act_id).await {
+            last = body["task"]["state"]
+                .as_str()
+                .unwrap_or("<absent>")
+                .to_string();
+            if last == want {
+                return last;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    last
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_task_reads_orphaned_while_its_home_is_away_and_live_again_when_it_returns() {
+    // B is the server that stays up, so it is the one that must keep its
+    // outgoing link — the same orientation rule the away-home test pins, for
+    // the same reason: B is what has to reach A again.
+    const SEED_A: u8 = 208;
+    const SEED_B: u8 = 209;
+    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32])
+        .public()
+        .to_string();
+    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32])
+        .public()
+        .to_string();
+    assert!(
+        id_b < id_a,
+        "the server that stays up keeps its outgoing link"
+    );
+
+    // Seconds rather than the shipped day, which is the whole reason the
+    // threshold is configurable.
+    const ORPHAN_SECS: &str = "5";
+
+    let alice = TestId::new("did:plc:aliceorphan");
+    let bob = TestId::new("did:plc:boborphan");
+    let (mut srv_a, srv_b) = spawn_pair_with_seeds_and_args(
+        &[&alice, &bob],
+        SEED_A,
+        SEED_B,
+        &[],
+        &["--act-orphan-secs", ORPHAN_SECS],
+    )
+    .await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#orphan").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#orphan").await.unwrap();
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[19u8; 32]);
+    register_key(&ha, &key_a).await;
+
+    let act_id = offer_until_the_peer_holds_it(
+        &ha,
+        "#orphan",
+        &key_a,
+        &alice.did,
+        "outlives-its-home",
+        &srv_b.web_addr,
+    )
+    .await;
+    assert!(
+        !act_id.is_empty(),
+        "the link must carry the task before the outage, or the outage proves \
+         nothing; B's log says: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // ── while the home is up, the task reads as it stands ────────────
+    let before = act_task(&srv_b.web_addr, &act_id)
+        .await
+        .expect("B answers for the task it took live");
+    assert_eq!(
+        before["task"]["state"].as_str(),
+        Some("open"),
+        "a task whose home is right there is not orphaned: {before}"
+    );
+    assert_eq!(before["task"]["origin"].as_str(), Some(id_a.as_str()));
+    let events_before = before["events"].as_array().map(Vec::len);
+
+    // ── the home goes away ───────────────────────────────────────────
+    ha.quit(None).await.ok();
+    srv_a.stop();
+
+    let state = await_task_state(
+        &srv_b.web_addr,
+        &act_id,
+        "orphaned",
+        Duration::from_secs(45),
+    )
+    .await;
+    assert_eq!(
+        state,
+        "orphaned",
+        "past the threshold, a task nobody can rule on must say so; B's log \
+         says: {}",
+        server_log(&srv_b)
+            .lines()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // The annotation is this server's reading, not a change to the task.
+    let away = act_task(&srv_b.web_addr, &act_id)
+        .await
+        .expect("B still answers for the task");
+    assert_eq!(
+        away["task"]["stored_state"].as_str(),
+        Some("open"),
+        "the task's own record is untouched: {away}"
+    );
+    assert_eq!(
+        away["events"].as_array().map(Vec::len),
+        events_before,
+        "and nothing was written to the log to say it: {away}"
+    );
+    let listed = listed_task(&srv_b.web_addr, &act_id)
+        .await
+        .expect("the task is still listed while its home is away");
+    assert_eq!(
+        listed["state"].as_str(),
+        Some("orphaned"),
+        "the listing an inbox reads says the same thing: {listed}"
+    );
+    assert_eq!(listed["stored_state"].as_str(), Some("open"));
+
+    // ── the home comes back and speaks ───────────────────────────────
+    srv_a.start_again().await;
+    let (ha2, mut rxa2) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa2).await;
+    warm_link(&ha2, &bob.did, &mut rxb).await;
+
+    let state = await_task_state(&srv_b.web_addr, &act_id, "open", S2S_SETTLE).await;
+    assert_eq!(
+        state, "open",
+        "the annotation lifts by itself when the home is reachable again"
+    );
+
+    // No residue: same record, same log, and the listing back in step.
+    let listed = listed_task(&srv_b.web_addr, &act_id)
+        .await
+        .expect("and it is listed once the home is back");
+    assert_eq!(listed["state"].as_str(), Some("open"));
+    let back = act_task(&srv_b.web_addr, &act_id)
+        .await
+        .expect("B answers for the task once more");
+    assert_eq!(back["task"]["stored_state"].as_str(), Some("open"));
+    assert_eq!(back["events"].as_array().map(Vec::len), events_before);
+    assert_eq!(
+        back["task"]["origin"].as_str(),
+        Some(id_a.as_str()),
+        "and it still names the server that referees it: {back}"
+    );
+
+    // Authority resumed with contact: the home's own ruling on the task now
+    // crosses the link it came back on, and B follows it.
+    ha2.join("#orphan").await.unwrap();
+    register_key(&ha2, &key_a).await;
+    send_act_as(
+        &ha2,
+        "#orphan",
+        &key_a,
+        &[
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "cancel"),
+            ("+freeq.at/from", alice.did.as_str()),
+            ("+freeq.at/act-id", act_id.as_str()),
+        ],
+    )
+    .await;
+    assert!(
+        await_task_gone(&srv_b.web_addr, &act_id, S2S_SETTLE).await,
+        "the home's word ends the task on the peer that was reading it orphaned"
+    );
+
+    ha2.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── a directed task for an identity that is on both servers ───────────────
+//
+// The motivating case for federating tasks at all: one agent, signed in from
+// two places at once, offered work by name. The offer is minted on one server
+// and has to reach every session that identity holds — the one beside the
+// sender and the one a hop away — and reach each of them once. Two servers
+// showing the same task, and one of them showing it twice, is the failure
+// this pins against: an event id is what tells a session it has already been
+// handed this event, and it is the same id on both sides of the link because
+// the signer minted it.
+
+/// How many rows a server's task listing holds for `act_id` — one, or the
+/// server is showing the same task twice.
+async fn listed_rows(web_addr: &str, act_id: &str) -> usize {
+    let url = format!("http://{web_addr}/api/v1/actions");
+    let Ok(resp) = reqwest::get(&url).await else {
+        return 0;
+    };
+    let Ok(body) = resp.json::<serde_json::Value>().await else {
+        return 0;
+    };
+    body["tasks"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter(|t| t["act_id"].as_str() == Some(act_id))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_directed_task_reaches_both_homes_of_one_identity() {
+    const SEED_A: u8 = 212;
+    const SEED_B: u8 = 213;
+    let alice = TestId::new("did:plc:alicedirect");
+    // One identity, two servers, two devices — the same DID signed in on both.
+    let agent = TestId::new("did:plc:agentmultihome");
+    let (srv_a, srv_b) = spawn_pair_with_seeds(&[&alice, &agent], SEED_A, SEED_B).await;
+    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32])
+        .public()
+        .to_string();
+
+    // The agent's far session first, so the link has both ends of the room
+    // before anything is offered.
+    let (h_far, mut rx_far) = connect(&srv_b, &agent, "agentfar");
+    wait_auth_and_register(&mut rx_far).await;
+    request_act_cap(&h_far, &mut rx_far).await;
+    h_far.join("#multi").await.unwrap();
+
+    let (h_near, mut rx_near) = connect(&srv_a, &agent, "agentnear");
+    wait_auth_and_register(&mut rx_near).await;
+    request_act_cap(&h_near, &mut rx_near).await;
+    h_near.join("#multi").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &agent.did, &mut rx_far).await;
+    ha.join("#multi").await.unwrap();
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[37u8; 32]);
+    register_key(&ha, &key_a).await;
+
+    // ── the offer, by name ──────────────────────────────────────────
+    //
+    // Repeated until B holds it, the same key warm-up every act test here
+    // does. Deliveries are counted by event id afterwards, so the warm-up's
+    // earlier offers cannot be mistaken for a second copy of this one.
+    let mut act_id = String::new();
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        let id = send_act_as(
+            &ha,
+            "#multi",
+            &key_a,
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", alice.did.as_str()),
+                ("+freeq.at/act-to", agent.did.as_str()),
+                ("+freeq.at/act-title", "for-an-agent-in-two-places"),
+            ],
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if act_task(&srv_b.web_addr, &id).await.is_some() {
+            act_id = id;
+            break;
+        }
+    }
+    assert!(
+        !act_id.is_empty(),
+        "a directed offer must reach the far server; B's log says: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // ── every session of that identity, once each ───────────────────
+    let near = tagmsg_deliveries(
+        &mut rx_near,
+        &act_id,
+        S2S_SETTLE,
+        Duration::from_millis(1500),
+    )
+    .await;
+    assert_eq!(
+        near, 1,
+        "the session on the offering server is handed the event exactly once"
+    );
+    let far = tagmsg_deliveries(
+        &mut rx_far,
+        &act_id,
+        S2S_SETTLE,
+        Duration::from_millis(1500),
+    )
+    .await;
+    assert_eq!(
+        far, 1,
+        "and so is the session a hop away — one event, one delivery, \
+         recognized by the id its signer minted"
+    );
+
+    // ── one task, one row, one state, on both servers ───────────────
+    //
+    // The home names itself by saying nothing: an empty origin is "minted
+    // here", and only a server that did not mint a task writes down whose it
+    // is.
+    for (name, addr, home) in [
+        ("A", &srv_a.web_addr, ""),
+        ("B", &srv_b.web_addr, id_a.as_str()),
+    ] {
+        let body = act_task(addr, &act_id)
+            .await
+            .unwrap_or_else(|| panic!("{name} answers for the task"));
+        assert_eq!(
+            body["task"]["state"].as_str(),
+            Some("offered"),
+            "a directed offer stands as offered on {name}: {body}"
+        );
+        assert_eq!(
+            body["task"]["offeree"].as_str(),
+            Some(agent.did.as_str()),
+            "and names the identity it was directed at on {name}: {body}"
+        );
+        assert_eq!(
+            body["task"]["origin"].as_str(),
+            Some(home),
+            "both servers agree which one referees the task: {body}"
+        );
+        assert_eq!(
+            body["events"].as_array().map(Vec::len),
+            Some(1),
+            "one offer, filed once, on {name}: {body}"
+        );
+        assert_eq!(
+            listed_rows(addr, &act_id).await,
+            1,
+            "and the listing an inbox reads shows it once on {name}"
+        );
+    }
+
+    ha.quit(None).await.ok();
+    h_near.quit(None).await.ok();
+    h_far.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── a task that lives in a direct conversation ────────────────────────────
+//
+// One task's whole life — offered, accepted, completed — between two people
+// on different servers, held in a DM rather than a channel.
+//
+// What a DM changes is the venue. A signature covers the canonical DM key —
+// the sorted DID pair, which both ends and any peer rebuild identically — and
+// never the wire target, which is whichever name the sender happened to
+// address: a `did:` one way, a nick the other. So the receiving server has to
+// file the event under the two-person key rather than under what it was
+// addressed to, the same re-keying a relayed delete already does. Get that
+// wrong and every peer files a venue no signer signed.
+//
+// The home's receipts are held to the same rule from the other side. A server
+// signs under a `did:web:` name, which is not one of the conversation's two
+// participants, so a venue derived from that signer would be a pair of DIDs
+// the conversation never had: a receipt's venue is the task's own, read from
+// the log.
+//
+// Read through REST as a participant: a DM venue answers to the two people in
+// it and nobody else, so each server is asked with the bearer of the user who
+// is actually on it.
+
+/// Register, keeping the API bearer the server hands out at SASL success.
+///
+/// The bearer is the connection's session id, which the client learns only
+/// from that notice — and it is what authorizes a REST read of a venue that
+/// is not public, a DM above all.
+async fn wait_auth_and_bearer(rx: &mut mpsc::Receiver<Event>) -> String {
+    let mut bearer = String::new();
+    timeout(EVENT_TIMEOUT, async {
+        loop {
+            match rx.recv().await {
+                Some(Event::ServerNotice { text }) => {
+                    if let Some(sid) = text.strip_prefix("API-BEARER ") {
+                        bearer = sid.trim().to_string();
+                    }
+                }
+                Some(Event::Registered { .. }) => return,
+                Some(_) => continue,
+                None => panic!("channel closed before registration"),
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for registration");
+    assert!(
+        !bearer.is_empty(),
+        "the server hands out an API bearer on SASL success"
+    );
+    bearer
+}
+
+/// One task's whole REST answer as a caller the venue admits — the live row,
+/// the event log, or both.
+///
+/// Unlike [`act_task`] this does not require a live row: a finished task
+/// answers `task: null` beside the history that outlives it, and that answer
+/// is exactly what a terminal state looks like here.
+async fn act_body_as(web_addr: &str, act_id: &str, bearer: &str) -> Option<serde_json::Value> {
+    let url = format!("http://{web_addr}/api/v1/actions/{act_id}");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Authorization", format!("Bearer {bearer}"))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<serde_json::Value>().await.ok()
+}
+
+/// Poll a server, as a caller the venue admits, until the task's state is
+/// `want`; return what it last said.
+async fn await_state_as(
+    web_addr: &str,
+    act_id: &str,
+    bearer: &str,
+    want: &str,
+    within: Duration,
+) -> String {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut last = String::from("<no answer>");
+    while tokio::time::Instant::now() < deadline {
+        if let Some(body) = act_body_as(web_addr, act_id, bearer).await {
+            last = match body["task"]["state"].as_str() {
+                Some(state) => state.to_string(),
+                // A finished task drops out of the view and keeps its log.
+                None if body["events"].as_array().is_some_and(|e| !e.is_empty()) => {
+                    "<finished>".to_string()
+                }
+                None => "<absent>".to_string(),
+            };
+            if last == want {
+                return last;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    last
+}
+
+/// Sign one act TAGMSG for a direct conversation and send it.
+///
+/// The signed venue is the canonical DM key built from the two DIDs — never
+/// `target`, which is only how the sender addressed the other person.
+async fn send_act_dm(
+    handle: &client::ClientHandle,
+    sender_did: &str,
+    other_did: &str,
+    target: &str,
+    signing: &ed25519_dalek::SigningKey,
+    act_tags: &[(&str, &str)],
+) -> String {
+    let venue = freeq_sdk::chatsig::dm_venue(sender_did, other_did);
+    let id = freeq_sdk::chatsig::new_event_id();
+    let sig = freeq_sdk::act::sign_act(act_tags.iter().copied(), &venue, &id, signing)
+        .expect("act tags present");
+    let wire: Vec<String> = act_tags
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .chain([
+            format!("{}={id}", freeq_sdk::chatsig::EVENT_ID_TAG),
+            format!("+freeq.at/sig={sig}"),
+        ])
+        .collect();
+    handle
+        .raw(&format!("@{} TAGMSG {target}", wire.join(";")))
+        .await
+        .ok();
+    id
+}
+
+/// One event of a task, by the verb its signed document names.
+fn event_with_verb<'a>(body: &'a serde_json::Value, verb: &str) -> Option<&'a serde_json::Value> {
+    body["events"]
+        .as_array()?
+        .iter()
+        .find(|e| doc_field(e, "act-verb") == verb)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_task_in_a_direct_message_runs_its_whole_life_across_servers() {
+    const SEED_A: u8 = 210;
+    const SEED_B: u8 = 211;
+    let alice = TestId::new("did:plc:alicedmtask");
+    let bob = TestId::new("did:plc:bobdmtask");
+    let (srv_a, srv_b) = spawn_pair_with_seeds(&[&alice, &bob], SEED_A, SEED_B).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    let bearer_b = wait_auth_and_bearer(&mut rxb).await;
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    let bearer_a = wait_auth_and_bearer(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    let _ = &mut rxa;
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[29u8; 32]);
+    let key_b = ed25519_dalek::SigningKey::from_bytes(&[31u8; 32]);
+    register_key(&ha, &key_a).await;
+    register_key(&hb, &key_b).await;
+
+    // The one string both servers must arrive at, from opposite ends and
+    // opposite wire targets.
+    let dm_venue = freeq_sdk::chatsig::dm_venue(&alice.did, &bob.did);
+
+    // ── the offer, directed at the person on the other server ───────
+    //
+    // Repeated until B holds it: B has no key for alice until its own
+    // fetch fills the store off the delivery path, and an event it cannot
+    // check yet is parked rather than filed. The same warm-up every act test
+    // here does.
+    let mut act_id = String::new();
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        let id = send_act_dm(
+            &ha,
+            &alice.did,
+            &bob.did,
+            &bob.did,
+            &key_a,
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", alice.did.as_str()),
+                ("+freeq.at/act-to", bob.did.as_str()),
+                ("+freeq.at/act-title", "a-task-in-a-dm"),
+            ],
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if act_body_as(&srv_b.web_addr, &id, &bearer_b)
+            .await
+            .is_some_and(|b| b["task"].is_object())
+        {
+            act_id = id;
+            break;
+        }
+    }
+    assert!(
+        !act_id.is_empty(),
+        "a task offered in a DM must reach the other person's server; B's log \
+         says: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // Both servers file it under the canonical DM key rather than under the
+    // name it was addressed to — which is what makes the signature check out
+    // on both.
+    for (name, addr, bearer) in [
+        ("A", &srv_a.web_addr, &bearer_a),
+        ("B", &srv_b.web_addr, &bearer_b),
+    ] {
+        let body = act_body_as(addr, &act_id, bearer)
+            .await
+            .unwrap_or_else(|| panic!("{name} answers for the task"));
+        assert_eq!(
+            body["venue"].as_str(),
+            Some(dm_venue.as_str()),
+            "{name} must file a DM task under the two-person key: {body}"
+        );
+        assert_eq!(
+            body["task"]["state"].as_str(),
+            Some("offered"),
+            "a directed offer opens as offered on {name}: {body}"
+        );
+        assert_eq!(body["task"]["offeree"].as_str(), Some(bob.did.as_str()));
+    }
+
+    // ── accepted from the other end of the conversation ─────────────
+    //
+    // Bob answers to a `did:` too, and his server derives the same venue from
+    // the other side of the pair. The task is A's, so B files his accept and
+    // carries it home rather than ruling on it.
+    send_act_dm(
+        &hb,
+        &bob.did,
+        &alice.did,
+        &alice.did,
+        &key_b,
+        &[
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "accept"),
+            ("+freeq.at/from", bob.did.as_str()),
+            ("+freeq.at/act-id", act_id.as_str()),
+        ],
+    )
+    .await;
+
+    for (name, addr, bearer) in [
+        ("A", &srv_a.web_addr, &bearer_a),
+        ("B", &srv_b.web_addr, &bearer_b),
+    ] {
+        let state = await_state_as(addr, &act_id, bearer, "assigned", S2S_SETTLE).await;
+        assert_eq!(
+            state,
+            "assigned",
+            "{name} must follow the home's ruling on the accept; B's log says: {}",
+            server_log(&srv_b)
+                .lines()
+                .filter(|l| l.contains("task") || l.contains("verdict="))
+                .rev()
+                .take(20)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let body = act_body_as(addr, &act_id, bearer).await.expect("an answer");
+        assert_eq!(body["task"]["assignee"].as_str(), Some(bob.did.as_str()));
+    }
+
+    // ── and finished by the person who took it ──────────────────────
+    send_act_dm(
+        &hb,
+        &bob.did,
+        &alice.did,
+        &alice.did,
+        &key_b,
+        &[
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "complete"),
+            ("+freeq.at/from", bob.did.as_str()),
+            ("+freeq.at/act-id", act_id.as_str()),
+        ],
+    )
+    .await;
+
+    for (name, addr, bearer) in [
+        ("A", &srv_a.web_addr, &bearer_a),
+        ("B", &srv_b.web_addr, &bearer_b),
+    ] {
+        // A finished task leaves the live view and keeps its whole log: that
+        // pair — no row, every event still there — is what terminal looks
+        // like here.
+        let state = await_state_as(addr, &act_id, bearer, "<finished>", S2S_SETTLE).await;
+        assert_eq!(
+            state, "<finished>",
+            "{name} must end the task where its home ended it"
+        );
+        let body = act_body_as(addr, &act_id, bearer).await.expect("an answer");
+        assert!(
+            body["task"].is_null(),
+            "a completed task is out of the live view on {name}: {body}"
+        );
+        assert_eq!(
+            body["events"].as_array().map(Vec::len),
+            Some(5),
+            "{name} holds the offer, the accept, the completion and the home's \
+             word about each of the two moves: {body}"
+        );
+        assert_eq!(
+            body["venue"].as_str(),
+            Some(dm_venue.as_str()),
+            "the finished task is still answered for under the DM key on {name}"
+        );
+        let complete = event_with_verb(&body, "complete")
+            .unwrap_or_else(|| panic!("{name} holds the completion"));
+        assert_eq!(
+            complete["confirm_state"].as_str(),
+            Some("confirmed"),
+            "the home ruled on the completion, and {name} says so: {complete}"
+        );
+        // The home signs under a name that is not one of this conversation's
+        // two participants, and its receipt still belongs to the conversation.
+        for receipt in body["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|e| doc_field(e, "act-verb") == "confirm")
+        {
+            assert_eq!(
+                receipt["venue"].as_str(),
+                Some(dm_venue.as_str()),
+                "a receipt takes the task's venue, not one built from its \
+                 signer, on {name}: {receipt}"
+            );
+        }
+    }
+
+    // A DM answers to the two people in it and to nobody else: an
+    // unauthenticated caller is refused outright rather than served a
+    // conversation they are not in.
+    let anon = reqwest::get(&format!(
+        "http://{}/api/v1/actions/{act_id}",
+        srv_b.web_addr
+    ))
+    .await
+    .expect("the endpoint answers");
+    assert_eq!(
+        anon.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a DM task must not be readable without a participant's bearer"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── work finished while the task's home is away ───────────────────────────
+//
+// The never-lose guarantee at the one point where losing would matter most:
+// the event that ends the work. A task assigned across the link is completed
+// by its worker while the server that referees it is down. The completion is
+// signed, so it is filed and kept and shown at once — and it decides nothing,
+// because the only server that can order it is not there. The home comes back
+// and orders it, and both servers end the task on the home's word.
+//
+// Distinct from the claim case above: a claim can be re-offered to somebody
+// else if it is lost, and a completion cannot. Work that was done and whose
+// record went missing is the state this design exists to make impossible.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_completion_signed_while_the_home_is_away_is_ordered_when_it_returns() {
+    // B is the server that stays up, so it must be the one that keeps its
+    // outgoing link: B is what has to reach A again.
+    const SEED_A: u8 = 220;
+    const SEED_B: u8 = 221;
+    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32])
+        .public()
+        .to_string();
+    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32])
+        .public()
+        .to_string();
+    assert!(
+        id_b < id_a,
+        "the server that stays up keeps its outgoing link"
+    );
+
+    let alice = TestId::new("did:plc:alicedone");
+    let bob = TestId::new("did:plc:bobdone");
+    let (mut srv_a, srv_b) = spawn_pair_with_seeds(&[&alice, &bob], SEED_A, SEED_B).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#done").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#done").await.unwrap();
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[61u8; 32]);
+    let key_b = ed25519_dalek::SigningKey::from_bytes(&[67u8; 32]);
+    register_key(&ha, &key_a).await;
+    register_key(&hb, &key_b).await;
+
+    let act_id = offer_until_the_peer_holds_it(
+        &ha,
+        "#done",
+        &key_a,
+        &alice.did,
+        "finished-while-nobody-was-refereeing",
+        &srv_b.web_addr,
+    )
+    .await;
+    assert!(
+        !act_id.is_empty(),
+        "the offer must reach B while the home is still up; B's log: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // ── the work is taken, and the home says so, while it still can ──
+    send_act_as(
+        &hb,
+        "#done",
+        &key_b,
+        &[
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "claim"),
+            ("+freeq.at/from", bob.did.as_str()),
+            ("+freeq.at/act-id", act_id.as_str()),
+        ],
+    )
+    .await;
+    let (on_a, on_b) = await_assignees(&srv_a.web_addr, &srv_b.web_addr, &act_id).await;
+    assert_eq!(
+        (on_a.as_deref(), on_b.as_deref()),
+        (Some(bob.did.as_str()), Some(bob.did.as_str())),
+        "both servers must hold the task assigned before the outage, or the \
+         completion below has nothing to end"
+    );
+
+    // ── the home goes away, and the work is finished anyway ──────────
+    ha.quit(None).await.ok();
+    srv_a.stop();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    send_act_as(
+        &hb,
+        "#done",
+        &key_b,
+        &[
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "complete"),
+            ("+freeq.at/from", bob.did.as_str()),
+            ("+freeq.at/act-id", act_id.as_str()),
+        ],
+    )
+    .await;
+
+    let filed = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut away = serde_json::Value::Null;
+    while tokio::time::Instant::now() < filed {
+        away = act_body(&srv_b.web_addr, &act_id).await.unwrap_or_default();
+        if verb_states(&away).iter().any(|(v, _)| v == "complete") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(
+        verb_states(&away)
+            .iter()
+            .find(|(verb, _)| verb == "complete")
+            .map(|(_, state)| state.as_str()),
+        Some("unconfirmed"),
+        "the finished work is on file at once and waiting on its home: {:?}",
+        verb_states(&away)
+    );
+    assert_eq!(
+        away["task"]["state"].as_str(),
+        Some("assigned"),
+        "and the task is not over until the home says it is: {away}"
+    );
+
+    // ── the home comes back and orders it ────────────────────────────
+    srv_a.start_again().await;
+    let (ha2, mut rxa2) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa2).await;
+    warm_link(&ha2, &bob.did, &mut rxb).await;
+
+    for (name, addr) in [("A", &srv_a.web_addr), ("B", &srv_b.web_addr)] {
+        assert!(
+            await_task_gone(addr, &act_id, Duration::from_secs(150)).await,
+            "{name} must end the task once its home has ordered the \
+             completion; {name} says: {:?}",
+            act_body(addr, &act_id).await.map(|b| verb_states(&b))
+        );
+        let body = act_body(addr, &act_id)
+            .await
+            .expect("the log outlives the task");
+        assert_eq!(
+            verb_states(&body)
+                .iter()
+                .find(|(verb, _)| verb == "complete")
+                .map(|(_, state)| state.as_str()),
+            Some("confirmed"),
+            "and the work that was done while nobody could order it is \
+             ordered now, on {name}: {:?}",
+            verb_states(&body)
+        );
+    }
+
+    ha2.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── a peer that does not speak task events ────────────────────────────────
+//
+// The capability gate, watched between two real servers. A peer that never
+// declared `act` is never sent a task-tagged Tagmsg: a relay that stripped
+// tags it does not understand would break the signature over them, and
+// downstream that reads as forgery when the real cause is an old server. So
+// the events are withheld and the withholding is logged, while everything
+// else — the plain-text companion line a bot posts beside its task events
+// above all — crosses as it always did.
+//
+// The far server is made an onlooker with `--s2s-undeclared-capabilities`,
+// which is how this harness reproduces a peer predating a capability without
+// an older build to run.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_peer_that_never_declared_act_stays_an_onlooker() {
+    const SEED_A: u8 = 214;
+    const SEED_B: u8 = 215;
+    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32])
+        .public()
+        .to_string();
+    let alice = TestId::new("did:plc:aliceonlook");
+    let bob = TestId::new("did:plc:bobonlook");
+    let (srv_a, srv_b) = spawn_pair_with_seeds_and_args(
+        &[&alice, &bob],
+        SEED_A,
+        SEED_B,
+        &[],
+        &["--s2s-undeclared-capabilities", "act"],
+    )
+    .await;
+
+    // Bob asks for the task capability, so that if B held the event at all it
+    // would be handed to him. It never is, and that is the point.
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    request_act_cap(&hb, &mut rxb).await;
+    hb.join("#onlook").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#onlook").await.unwrap();
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[71u8; 32]);
+    register_key(&ha, &key_a).await;
+
+    // The offer is not repeated until the far server holds it, the way every
+    // other test's is: the far server is never going to hold it. It is
+    // repeated until *this* server does, which needs no key it has to fetch.
+    let mut act_id = String::new();
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        let id = send_act_as(
+            &ha,
+            "#onlook",
+            &key_a,
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", alice.did.as_str()),
+                ("+freeq.at/act-title", "not-for-an-old-peer"),
+            ],
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if act_task(&srv_a.web_addr, &id).await.is_some() {
+            act_id = id;
+            break;
+        }
+    }
+    assert!(
+        !act_id.is_empty(),
+        "the offering server must hold its own task; A's log: {}",
+        server_log(&srv_a)
+            .lines()
+            .filter(|l| l.contains("verdict=") || l.contains("act"))
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // The prose a bot posts beside its task events is an ordinary message and
+    // crosses like one. Sent after the task event, so its arrival also says
+    // the link carried everything that went before it.
+    const COMPANION: &str = "alice offers: not-for-an-old-peer";
+    ha.privmsg("#onlook", COMPANION).await.ok();
+    assert_eq!(
+        try_recv_message(&mut rxb, COMPANION, S2S_SETTLE).await,
+        Some("#onlook".to_string()),
+        "an onlooker still reads the human half of what happens in the room"
+    );
+
+    // And never the machine half.
+    assert_eq!(
+        tagmsg_deliveries(
+            &mut rxb,
+            &act_id,
+            Duration::from_millis(1500),
+            Duration::from_millis(500)
+        )
+        .await,
+        0,
+        "a session on a peer that never declared act is handed no task event"
+    );
+    assert!(
+        act_task(&srv_b.web_addr, &act_id).await.is_none(),
+        "and its server files none: {:?}",
+        act_body(&srv_b.web_addr, &act_id).await
+    );
+
+    // A wrong capability declaration must never fail silent, so the server
+    // that withheld the event names both the peer it withheld it from and the
+    // event it withheld, by the id its signer minted.
+    let log_a = server_log(&srv_a);
+    let withheld = log_a
+        .lines()
+        .filter(|l| l.contains("task event withheld"))
+        .any(|l| l.contains(&id_b) && l.contains(&act_id));
+    assert!(
+        withheld,
+        "the withholding is logged, naming the peer and the task event; \
+         A's log: {}",
+        log_a
+            .lines()
+            .filter(|l| l.contains("withheld") || l.contains("capabilit"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
+// ── the addressed route, with nothing else able to carry it ───────────────
+//
+// The away-home test proves a home learns of a transition made while it was
+// down; it does not prove *which* path carried it, because a returning server
+// asks its peers for what it missed within a few seconds and the first route
+// retry is not due for thirty. Here the peer that stays up declares no
+// `catchup`, so the returning home never asks it for anything — and the
+// addressed route is then the only thing left that can carry the claim. The
+// home learning it at all is the proof.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_transition_reaches_an_absent_home_by_the_route_when_nothing_else_can() {
+    // B stays up, so B keeps its outgoing link — B is what has to reach A.
+    const SEED_A: u8 = 238;
+    const SEED_B: u8 = 239;
+    // The first retry is not due for thirty seconds and each failed attempt
+    // pushes the next one further out, so the home's return has to be waited
+    // through rather than watched for.
+    const PAST_THE_BACKOFF: Duration = Duration::from_secs(150);
+    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32])
+        .public()
+        .to_string();
+    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32])
+        .public()
+        .to_string();
+    assert!(
+        id_b < id_a,
+        "the server that stays up keeps its outgoing link"
+    );
+
+    let alice = TestId::new("did:plc:aliceroutealone");
+    let bob = TestId::new("did:plc:bobroutealone");
+    let (mut srv_a, srv_b) = spawn_pair_with_seeds_and_args(
+        &[&alice, &bob],
+        SEED_A,
+        SEED_B,
+        &[],
+        &["--s2s-undeclared-capabilities", "catchup"],
+    )
+    .await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#routealone").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#routealone").await.unwrap();
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[73u8; 32]);
+    let key_b = ed25519_dalek::SigningKey::from_bytes(&[79u8; 32]);
+    register_key(&ha, &key_a).await;
+    register_key(&hb, &key_b).await;
+
+    let act_id = offer_until_the_peer_holds_it(
+        &ha,
+        "#routealone",
+        &key_a,
+        &alice.did,
+        "carried-and-nothing-else",
+        &srv_b.web_addr,
+    )
+    .await;
+    assert!(
+        !act_id.is_empty(),
+        "the offer must reach B before the outage; B's log: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // ── the home goes away, and the task is claimed anyway ───────────
+    ha.quit(None).await.ok();
+    srv_a.stop();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    send_act_as(
+        &hb,
+        "#routealone",
+        &key_b,
+        &[
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "claim"),
+            ("+freeq.at/from", bob.did.as_str()),
+            ("+freeq.at/act-id", act_id.as_str()),
+        ],
+    )
+    .await;
+
+    // ── the home comes back, and asks nobody ─────────────────────────
+    srv_a.start_again().await;
+    let (ha2, mut rxa2) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa2).await;
+    warm_link(&ha2, &bob.did, &mut rxb).await;
+
+    let on_a = await_assignee(&srv_a.web_addr, &act_id, PAST_THE_BACKOFF).await;
+    assert_eq!(
+        on_a.as_deref(),
+        Some(bob.did.as_str()),
+        "with catch-up impossible against this peer, the only thing that can \
+         have carried the claim is the route addressed to the task's home; A \
+         says {:?}",
+        act_body(&srv_a.web_addr, &act_id)
+            .await
+            .map(|b| verb_states(&b))
+    );
+
+    // And the answer still comes back the other way, which is the half a
+    // route exists for: B authored the claim and has to learn it stood.
+    let on_b = await_assignee(&srv_b.web_addr, &act_id, S2S_SETTLE).await;
+    assert_eq!(
+        on_b.as_deref(),
+        Some(bob.did.as_str()),
+        "B follows the home's receipt: {:?}",
+        act_body(&srv_b.web_addr, &act_id)
+            .await
+            .map(|b| verb_states(&b))
+    );
+
+    ha2.quit(None).await.ok();
     hb.quit(None).await.ok();
     drop((srv_a, srv_b));
 }

@@ -844,13 +844,25 @@ fn authorize_venue_read(state: &SharedState, venue: &str, headers: &axum::http::
     }
 }
 
-fn act_task_json(task: &crate::db::ActTask) -> serde_json::Value {
+/// One task as this server answers for it.
+///
+/// `orphaned` is this server's own reading of the task's home — see
+/// [`crate::act_relay::reads_orphaned`]. When it holds, `state` says
+/// `orphaned` so a client sees honest liveness instead of forever-fresh work,
+/// and `stored_state` still carries what the task's own record says, because
+/// the annotation changes nothing about the task itself.
+fn act_task_json(
+    task: &crate::db::ActTask,
+    orphaned: bool,
+    dropped_unchecked: i64,
+) -> serde_json::Value {
     serde_json::json!({
         "act_id": task.act_id,
         "kind": task.kind,
         "venue": task.venue,
         "origin": task.origin,
-        "state": task.state,
+        "state": if orphaned { crate::act_relay::ORPHANED } else { task.state.as_str() },
+        "stored_state": task.state,
         "offerer": task.offerer,
         "offeree": task.offeree,
         "assignee": task.assignee,
@@ -861,7 +873,45 @@ fn act_task_json(task: &crate::db::ActTask) -> serde_json::Value {
         // revives nothing — the same shape `offeree` and `caps` already have.
         "replaces": task.replaces,
         "updated": task.updated,
+        // How many events about this task were dropped from the defer queue
+        // unchecked — this server's own count, never relayed: a reader's
+        // notice that the record here may be incomplete.
+        "dropped_unchecked": dropped_unchecked,
     })
+}
+
+/// Which of these task homes this server has lost contact with, by the
+/// operator's `act_orphan_secs` threshold.
+///
+/// Own tasks (an empty origin) are never asked about — we are their home.
+async fn homes_out_of_contact<'a>(
+    state: &Arc<SharedState>,
+    origins: impl Iterator<Item = &'a str>,
+) -> std::collections::HashSet<String> {
+    let ttl = std::time::Duration::from_secs(state.config.act_orphan_secs);
+    let wanted: std::collections::HashSet<String> = origins
+        .filter(|o| !o.is_empty())
+        .map(str::to_string)
+        .collect();
+    if ttl.is_zero() || wanted.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    let Some(manager) = state.s2s_manager.lock().clone() else {
+        // Federation is switched off, so every one of these homes is
+        // unreachable and will stay that way until an operator says otherwise.
+        // No grace period: the threshold measures how long a link has been
+        // down, and a server with no federation at all has no link to time.
+        // Waiting a day to admit that would be the forever-fresh lie this
+        // annotation exists to stop.
+        return wanted;
+    };
+    let mut gone = std::collections::HashSet::new();
+    for home in wanted {
+        if manager.peer_out_of_contact(&home, ttl).await {
+            gone.insert(home);
+        }
+    }
+    gone
 }
 
 /// GET /api/v1/actions — the live tasks this caller may see.
@@ -886,7 +936,7 @@ async fn api_act_tasks(
         .and_then(|s| s.parse().ok())
         .unwrap_or(100usize)
         .min(500);
-    let tasks: Vec<serde_json::Value> = state
+    let rows = state
         .with_db(|db| {
             db.act_tasks(
                 &venues,
@@ -896,9 +946,26 @@ async fn api_act_tasks(
                 limit,
             )
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // One pass over the homes named here, rather than one lock pair per row:
+    // every task a given server minted has the same answer.
+    let gone = homes_out_of_contact(&state, rows.iter().map(|t| t.origin.as_str())).await;
+    let tasks: Vec<serde_json::Value> = rows
         .iter()
-        .map(act_task_json)
+        .map(|t| {
+            act_task_json(
+                t,
+                crate::act_relay::reads_orphaned(
+                    &t.origin,
+                    &t.kind,
+                    &t.state,
+                    gone.contains(&t.origin),
+                ),
+                state
+                    .with_db(|db| db.act_dropped_unchecked(&t.act_id))
+                    .unwrap_or(0),
+            )
+        })
         .collect();
 
     Ok(Json(serde_json::json!({ "tasks": tasks })))
@@ -925,11 +992,22 @@ async fn api_act_task(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let task = state
-        .with_db(|db| db.act_task(&act_id))
-        .flatten()
-        .as_ref()
-        .map(act_task_json);
+    let row = state.with_db(|db| db.act_task(&act_id)).flatten();
+    let gone = homes_out_of_contact(&state, row.iter().map(|t| t.origin.as_str())).await;
+    let task = row.as_ref().map(|t| {
+        act_task_json(
+            t,
+            crate::act_relay::reads_orphaned(
+                &t.origin,
+                &t.kind,
+                &t.state,
+                gone.contains(&t.origin),
+            ),
+            state
+                .with_db(|db| db.act_dropped_unchecked(&t.act_id))
+                .unwrap_or(0),
+        )
+    });
     let history: Vec<serde_json::Value> = events
         .iter()
         .map(|e| {
@@ -939,6 +1017,13 @@ async fn api_act_task(
                 "signature": e.signature,
                 "actor_did": e.actor_did,
                 "venue": e.venue,
+                // Whose ruling this event carries. A reader has to be able to
+                // tell an event that decided something from one that is on
+                // file and waiting on the server that owns the task:
+                // "confirmed", "unconfirmed", or "superseded" — the last being
+                // a move a confirmed one outran. Absent for a receipt, which
+                // is the answer itself and has no state of its own.
+                "confirm_state": e.confirm.map(crate::events::ConfirmState::as_str),
                 "timestamp": e.timestamp,
             })
         })
@@ -5256,6 +5341,65 @@ mod metrics_tests {
             );
         }
         assert!(out.ends_with('\n'));
+    }
+}
+
+#[cfg(test)]
+mod orphan_view_tests {
+    //! What the view says about a remote task on a server with federation
+    //! switched off — the case where there is no link to the task's home and
+    //! no prospect of one.
+
+    use super::homes_out_of_contact;
+    use crate::act_relay::reads_orphaned;
+    use crate::server::SharedState;
+    use std::sync::Arc;
+
+    /// A peer server's endpoint id, as a foreign task's origin holds it.
+    const HOME: &str = "44f1415cdeadbeef";
+
+    /// A server with no S2S manager — `test_state_with_config` never starts
+    /// one, which is exactly the shape being tested.
+    fn state(act_orphan_secs: u64) -> Arc<SharedState> {
+        crate::server::test_state_with_config(crate::config::ServerConfig {
+            act_orphan_secs,
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn a_remote_task_reads_orphaned_when_federation_is_off() {
+        let state = state(86_400);
+        let gone = homes_out_of_contact(&state, ["", HOME].into_iter()).await;
+        assert!(
+            gone.contains(HOME),
+            "a server that cannot reach any peer is out of contact with this task's home"
+        );
+        assert!(
+            reads_orphaned(HOME, "handoff", "open", gone.contains(HOME)),
+            "so the work it left behind must not read as fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn our_own_task_is_untouched_by_federation_being_off() {
+        let state = state(86_400);
+        let gone = homes_out_of_contact(&state, [""].into_iter()).await;
+        assert!(
+            gone.is_empty(),
+            "an empty origin is our own task — we are its home"
+        );
+        assert!(!reads_orphaned("", "handoff", "open", false));
+    }
+
+    #[tokio::test]
+    async fn the_threshold_at_zero_still_turns_the_annotation_off() {
+        let state = state(0);
+        let gone = homes_out_of_contact(&state, [HOME].into_iter()).await;
+        assert!(
+            gone.is_empty(),
+            "zero is the operator switching the annotation off, federation or no federation"
+        );
     }
 }
 

@@ -219,6 +219,12 @@ pub struct ActLoggedEvent {
     pub signature: Option<String>,
     pub actor_did: Option<String>,
     pub venue: String,
+    /// Whether the server that owns the task has ruled on this event. A reader
+    /// sees an unconfirmed event and knows it decides nothing yet.
+    ///
+    /// `None` for a receipt, which carries no confirm state of its own: it is
+    /// the answer, not something awaiting one.
+    pub confirm: Option<crate::events::ConfirmState>,
     pub timestamp: i64,
 }
 
@@ -252,15 +258,38 @@ pub enum ActWrite {
     /// from one that only reported on it, which is the question a receipt
     /// answers.
     Filed { was: Option<String>, state: String },
-    /// Filed as a record, with the view left where it stood: a receipt. The
-    /// state it names was moved by the event it confirms, and confirming
-    /// something twice must not move anything twice.
+    /// Filed as a record, with the view left where it stood: a receipt whose
+    /// subject this server has already settled. Confirming something twice
+    /// must not move anything twice.
     Recorded,
+    /// A receipt was applied: the event it names was re-checked against the
+    /// task, ruled legal, and the task now stands in `state`.
+    Confirmed { state: String },
+    /// A receipt from a peer that is not the task's home. Filed as evidence —
+    /// a signed claim to authority somebody made is worth keeping — and
+    /// applied to nothing, because authority comes from the link a receipt
+    /// arrived on and never from what its payload says.
+    ReceiptIgnored,
+    /// A receipt naming an event this server does not hold. Nothing is filed:
+    /// the receipt waits for its subject and is offered again when the subject
+    /// lands, the way an event waits for the key that would settle it.
+    ReceiptBeforeSubject,
+    /// The home's receipt for an event the rules here refuse. Filed and
+    /// applied to nothing: a home's receipt that disagrees with the shared
+    /// rules is kept as the signed, comparable evidence it is.
+    ReceiptRefused(freeq_sdk::act_transitions::Refusal),
     /// The rules refused the move.
     Refused(freeq_sdk::act_transitions::Refusal),
-    /// The event names a task this server has never filed — including any
-    /// task belonging to another server, until federation lands.
+    /// The event names a task this server has never filed. A task another
+    /// server opened counts as filed once its opener has crossed — what stays
+    /// unknown is a follow-up to an opener this server never saw. The live
+    /// link is ordered per peer, so on a healthy one the opener arrives first;
+    /// closing a gap left by an unhealthy one is catch-up's job.
     UnknownTask,
+    /// The event belongs to a task another server owns, and it is one that
+    /// would move that task. Filed in the log — it happened — and deliberately
+    /// not applied to the view: the owning server referees its own tasks.
+    StoredNotApplied,
     /// The event was posted outside its task's conversation.
     WrongVenue,
     /// That id is already in the log.
@@ -326,6 +355,17 @@ pub struct StoredEvent {
     /// Fingerprint of a dropped second claim on this id, if there was one.
     pub conflict: Option<String>,
     pub timestamp: u64,
+}
+
+/// Whether a stored task event's bytes are a receipt — the home's word about
+/// another event, rather than a move on a task.
+///
+/// Read from the document instead of a column, because the column a receipt
+/// leaves empty is the same one every event filed before that column existed
+/// leaves empty, and the two mean different things.
+fn is_receipt_document(canonical: &str) -> bool {
+    crate::events::derive_act_view(canonical)
+        .is_some_and(|view| freeq_sdk::act_transitions::is_confirmation(&view.verb))
 }
 
 fn map_stored_event(row: &rusqlite::Row<'_>) -> SqlResult<StoredEvent> {
@@ -1836,8 +1876,9 @@ impl Db {
         self.conn.execute(
             "INSERT OR IGNORE INTO events
                  (event_id, canonical, signature, sig_state, kind, venue,
-                  actor_did, subject, body_hash, emoji, origin, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                  actor_did, subject, body_hash, emoji, origin, confirm_state,
+                  timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 facts.event_id,
                 canonical,
@@ -1850,6 +1891,7 @@ impl Db {
                 facts.body_hash,
                 facts.emoji,
                 rec.ctx.origin,
+                rec.ctx.confirm.map(crate::events::ConfirmState::as_str),
                 rec.timestamp as i64,
             ],
         )?;
@@ -2788,6 +2830,300 @@ mod tests {
         .unwrap()
     }
 
+    /// The same two moves, arriving from a peer instead of a local client.
+    /// `origin` is what tells the view whose task this is.
+    fn relayed_offer(db: &Db, id: &str, venue: &str, origin: &str, ts: i64) -> ActWrite {
+        let tags = vec![
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "offer"),
+            ("+freeq.at/from", ELIZA),
+        ];
+        let canonical = act_doc(&tags, venue, id);
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: id,
+            act_id: id,
+            opens: true,
+            venue,
+            actor: ELIZA,
+            from_system: false,
+            origin: Some(origin),
+            timestamp: ts,
+        })
+        .unwrap()
+    }
+
+    fn relayed_follow_up(
+        db: &Db,
+        verb: &str,
+        actor: &str,
+        task: &str,
+        id: &str,
+        venue: &str,
+        origin: &str,
+        ts: i64,
+    ) -> ActWrite {
+        let canonical = act_doc(
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", verb),
+                ("+freeq.at/from", actor),
+                ("+freeq.at/act-id", task),
+            ],
+            venue,
+            id,
+        );
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: id,
+            act_id: task,
+            opens: false,
+            venue,
+            actor,
+            from_system: false,
+            origin: Some(origin),
+            timestamp: ts,
+        })
+        .unwrap()
+    }
+
+    /// One relayed event of any kind: an opener when `task` is `None`, a
+    /// follow-up on that task otherwise. The pair above covers handoffs, which
+    /// is most of these tests; this one is for the cases that need a second
+    /// kind.
+    #[allow(clippy::too_many_arguments)]
+    fn relayed(
+        db: &Db,
+        id: &str,
+        task: Option<&str>,
+        kind: &str,
+        verb: &str,
+        actor: &str,
+        venue: &str,
+        origin: &str,
+        ts: i64,
+    ) -> ActWrite {
+        let mut tags = vec![
+            ("+freeq.at/act", kind),
+            ("+freeq.at/act-verb", verb),
+            ("+freeq.at/from", actor),
+        ];
+        if let Some(task) = task {
+            tags.push(("+freeq.at/act-id", task));
+        }
+        let canonical = act_doc(&tags, venue, id);
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: id,
+            act_id: task.unwrap_or(id),
+            opens: task.is_none(),
+            venue,
+            actor,
+            from_system: false,
+            origin: Some(origin),
+            timestamp: ts,
+        })
+        .unwrap()
+    }
+
+    // ── whose ruling an event carries ─────────────────────────────────────
+
+    /// What the log says about whose ruling an event carries.
+    fn confirm_of(db: &Db, event_id: &str) -> crate::events::ConfirmState {
+        let raw: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT confirm_state FROM events WHERE event_id = ?1",
+                params![event_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        crate::events::ConfirmState::from_column(raw.as_deref())
+    }
+
+    /// An event this server accepted for a task it owns needs nobody's word
+    /// but its own: it is confirmed the moment it is filed.
+    #[test]
+    fn an_event_on_our_own_task_is_confirmed_at_ingress() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", None, 10);
+        follow_up(&db, "claim", SCHOLAR, "T1", "T2", "#ops", 11);
+
+        for id in ["T1", "T2"] {
+            assert_eq!(
+                confirm_of(&db, id),
+                crate::events::ConfirmState::Confirmed,
+                "{id}: we are the authority over our own tasks"
+            );
+        }
+    }
+
+    /// The rebuild is the proof that the view is derived. It has to agree with
+    /// the live table for a foreign task with unruled events hanging off it,
+    /// which means passing over exactly the events the live path passed over.
+    #[test]
+    fn a_rebuild_matches_the_live_view_with_unconfirmed_events_on_file() {
+        let db = Db::open_memory().unwrap();
+        // Ours, moved by us.
+        offer(&db, "M1", "#ops", None, 10);
+        follow_up(&db, "claim", SCHOLAR, "M1", "M2", "#ops", 11);
+        // A peer's, with a claim from a third server nobody has ruled on.
+        relayed_offer(&db, "M3", "#ops", "peer-b", 12);
+        relayed_follow_up(&db, "claim", MALLORY, "M3", "M4", "#ops", "peer-c", 13);
+        // And a peer's bounty carrying a bid, which is additive — it leaves
+        // the action open, so it decides nothing exclusive and is applied and
+        // confirmed wherever it lands.
+        relayed(
+            &db, "M5", None, "bounty", "offer", ELIZA, "#ops", "peer-b", 14,
+        );
+        relayed(
+            &db,
+            "M6",
+            Some("M5"),
+            "bounty",
+            "bid",
+            MALLORY,
+            "#ops",
+            "peer-c",
+            15,
+        );
+
+        assert_eq!(
+            confirm_of(&db, "M4"),
+            crate::events::ConfirmState::Unconfirmed,
+            "a transition on a peer's task waits on that peer"
+        );
+        assert_eq!(
+            confirm_of(&db, "M6"),
+            crate::events::ConfirmState::Confirmed,
+            "an additive move decides nothing exclusive and waits on nobody"
+        );
+
+        let mut live = db
+            .act_tasks(&["#ops".to_string()], None, None, None, 100)
+            .unwrap();
+        let mut rebuilt = db.rebuild_act_actions().unwrap();
+        live.sort_by(|a, b| a.act_id.cmp(&b.act_id));
+        rebuilt.sort_by(|a, b| a.act_id.cmp(&b.act_id));
+        assert_eq!(
+            rebuilt, live,
+            "the log is the record, and the view is what it derives to"
+        );
+        assert_eq!(
+            rebuilt.iter().find(|t| t.act_id == "M3").unwrap().state,
+            "open",
+            "an unruled claim moves nothing, in the rebuild as in the view"
+        );
+    }
+
+    // ── whose task is it ──────────────────────────────────────────────────
+
+    /// An offer relayed from a peer creates the task here, stamped with the
+    /// server that owns it. Nothing else can tell later events whose task
+    /// they are addressing.
+    #[test]
+    fn a_task_opened_by_a_peer_is_stamped_with_whose_it_is() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(
+            relayed_offer(&db, "R1", "#ops", "peer-b", 10),
+            ActWrite::Filed {
+                was: None,
+                state: "open".into()
+            }
+        );
+        let task = db.act_task("R1").unwrap().expect("the task is live");
+        assert_eq!(task.origin, "peer-b");
+    }
+
+    /// A move that changes where a peer's task stands is filed and stops
+    /// there. Deciding it here would be this server ruling on work another
+    /// server is refereeing.
+    #[test]
+    fn a_state_transition_on_a_peers_task_is_filed_but_not_applied() {
+        let db = Db::open_memory().unwrap();
+        relayed_offer(&db, "R2", "#ops", "peer-b", 10);
+        assert_eq!(
+            relayed_follow_up(&db, "claim", SCHOLAR, "R2", "E2", "#ops", "peer-b", 20),
+            ActWrite::StoredNotApplied
+        );
+        assert_eq!(
+            confirm_of(&db, "E2"),
+            crate::events::ConfirmState::Unconfirmed,
+            "and it is on file as what it is: waiting on peer-b's ruling"
+        );
+
+        let task = db.act_task("R2").unwrap().expect("still live");
+        assert_eq!(task.state, "open", "the view did not move");
+        assert_eq!(task.assignee, None, "and nobody was assigned here");
+        assert_eq!(task.updated, 10, "the row was not touched at all");
+        assert!(
+            db.is_act_event("E2").unwrap(),
+            "but the log gained the event — it happened, we just did not rule on it"
+        );
+    }
+
+    /// A move that adds to a peer's task without moving it goes through the
+    /// ordinary path: there is no state decision in it to usurp.
+    #[test]
+    fn an_additive_event_on_a_peers_task_reaches_the_view() {
+        let db = Db::open_memory().unwrap();
+        relayed_offer(&db, "R3", "#ops", "peer-b", 10);
+        // The state a claim would have left behind. Reached directly because
+        // this server does not apply the peer's claim — routing events home
+        // is what will close that gap.
+        db.conn
+            .execute(
+                "UPDATE act_actions SET state = 'assigned', assignee = ?2 WHERE act_id = ?1",
+                params!["R3", SCHOLAR],
+            )
+            .unwrap();
+
+        assert_eq!(
+            relayed_follow_up(&db, "progress", SCHOLAR, "R3", "E3", "#ops", "peer-b", 30),
+            ActWrite::Filed {
+                was: Some("assigned".into()),
+                state: "assigned".into()
+            }
+        );
+        let task = db.act_task("R3").unwrap().expect("still live");
+        assert_eq!(task.state, "assigned");
+        assert_eq!(task.updated, 30, "the view saw the report");
+    }
+
+    /// Our own task is ours to decide, whichever link the event came in on.
+    #[test]
+    fn a_task_opened_here_is_decided_here_however_the_event_arrives() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "L1", "#ops", Some(SCHOLAR), 10);
+        assert_eq!(
+            relayed_follow_up(&db, "accept", SCHOLAR, "L1", "E4", "#ops", "peer-b", 20),
+            ActWrite::Filed {
+                was: Some("offered".into()),
+                state: "assigned".into()
+            }
+        );
+        let task = db.act_task("L1").unwrap().expect("still live");
+        assert_eq!(task.state, "assigned");
+        assert_eq!(task.assignee.as_deref(), Some(SCHOLAR));
+    }
+
+    /// A verb the rules file does not list is refused on a peer's task too.
+    /// The table is the shared contract; not refereeing a peer's decisions is
+    /// not the same as carrying anything at all.
+    #[test]
+    fn an_unknown_verb_on_a_peers_task_is_still_refused() {
+        let db = Db::open_memory().unwrap();
+        relayed_offer(&db, "R4", "#ops", "peer-b", 10);
+        assert_eq!(
+            relayed_follow_up(&db, "award", MALLORY, "R4", "E5", "#ops", "peer-b", 20),
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::UnknownVerb)
+        );
+        assert!(!db.is_act_event("E5").unwrap(), "and nothing was filed");
+    }
+
     #[test]
     fn an_offer_creates_the_task_it_opens() {
         let db = Db::open_memory().unwrap();
@@ -2931,6 +3267,45 @@ mod tests {
 
     const HOME: &str = "did:web:test";
 
+    /// A receipt as a peer relays one: signed by `home_did`, carried on the
+    /// link `origin` names.
+    #[allow(clippy::too_many_arguments)]
+    fn relayed_receipt(
+        db: &Db,
+        home_did: &str,
+        task: &str,
+        subject: &str,
+        id: &str,
+        venue: &str,
+        origin: &str,
+        ts: i64,
+    ) -> ActWrite {
+        let canonical = act_doc(
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "confirm"),
+                ("+freeq.at/from", home_did),
+                ("+freeq.at/act-id", task),
+                ("+freeq.at/act-subject", subject),
+            ],
+            venue,
+            id,
+        );
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: id,
+            act_id: task,
+            opens: false,
+            venue,
+            actor: home_did,
+            from_system: true,
+            origin: Some(origin),
+            timestamp: ts,
+        })
+        .unwrap()
+    }
+
     /// A receipt, filed the way the home files one: its own event id, the
     /// task in `act-id`, and the confirmed event in `act-subject`.
     fn receipt(
@@ -3035,6 +3410,450 @@ mod tests {
         assert_eq!(
             receipt(&db, "T1", "E1", "R1", "#ops", true, 11),
             ActWrite::Duplicate
+        );
+    }
+
+    /// The receipt row carries no confirm state of its own. The column says
+    /// whether a task's home has answered for an event, and a receipt is that
+    /// answer — a reader seeing "confirmed" on one would be reading the answer
+    /// as the question.
+    #[test]
+    fn a_receipt_carries_no_confirm_state() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
+        follow_up(&db, "accept", SCHOLAR, "T1", "E1", "#ops", 11);
+        receipt(&db, "T1", "E1", "R1", "#ops", true, 11);
+
+        let states: Vec<(String, Option<crate::events::ConfirmState>)> = db
+            .act_task_events("T1")
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.event_id, e.confirm))
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                (
+                    "T1".to_string(),
+                    Some(crate::events::ConfirmState::Confirmed)
+                ),
+                (
+                    "E1".to_string(),
+                    Some(crate::events::ConfirmState::Confirmed)
+                ),
+                ("R1".to_string(), None),
+            ]
+        );
+    }
+
+    // ── a receipt that crossed a link ─────────────────────────────────────
+    //
+    // The receiving half. A transition on a task another server owns is filed
+    // here and moves nothing; the home's receipt naming it is what turns it
+    // into a decision. The receipt carries no state — the state comes from
+    // running the event it names through these very rules — and it counts as
+    // the home's word only because of the link it arrived on.
+
+    const PEER_HOME: &str = "did:web:peer-b.example";
+
+    /// The whole of it: the claim waits, the receipt arrives, the rules take
+    /// the claim, and the view moves.
+    #[test]
+    fn a_receipt_from_the_home_applies_the_event_it_names() {
+        let db = Db::open_memory().unwrap();
+        relayed_offer(&db, "C1", "#ops", "peer-b", 10);
+        assert_eq!(
+            relayed_follow_up(&db, "claim", SCHOLAR, "C1", "C2", "#ops", "peer-c", 11),
+            ActWrite::StoredNotApplied
+        );
+        assert_eq!(
+            db.act_task("C1").unwrap().unwrap().state,
+            "open",
+            "nothing moves on a claim nobody has ruled on"
+        );
+
+        assert_eq!(
+            relayed_receipt(&db, PEER_HOME, "C1", "C2", "R1", "#ops", "peer-b", 12),
+            ActWrite::Confirmed {
+                state: "assigned".into()
+            }
+        );
+        let task = db.act_task("C1").unwrap().expect("still live");
+        assert_eq!(task.state, "assigned");
+        assert_eq!(task.assignee.as_deref(), Some(SCHOLAR));
+        assert_eq!(
+            confirm_of(&db, "C2"),
+            crate::events::ConfirmState::Confirmed
+        );
+    }
+
+    /// And the move is recorded at the time the event itself was filed, not at
+    /// the moment the receipt turned up: a receipt is not a second event.
+    #[test]
+    fn a_receipt_moves_the_view_at_the_time_the_event_was_filed() {
+        let db = Db::open_memory().unwrap();
+        relayed_offer(&db, "C1", "#ops", "peer-b", 10);
+        relayed_follow_up(&db, "claim", SCHOLAR, "C1", "C2", "#ops", "peer-c", 11);
+        relayed_receipt(&db, PEER_HOME, "C1", "C2", "R1", "#ops", "peer-b", 99);
+
+        assert_eq!(
+            db.act_task("C1").unwrap().unwrap().updated,
+            11,
+            "the claim happened at 11; the receipt for it is not when it happened"
+        );
+    }
+
+    /// Authority is the link. A receipt that arrives from anywhere but the
+    /// server the task was opened on is one peer asserting an authority it
+    /// does not have: kept, because a signed claim is evidence, and applied to
+    /// nothing.
+    #[test]
+    fn a_receipt_from_a_peer_that_does_not_own_the_task_applies_nothing() {
+        let db = Db::open_memory().unwrap();
+        relayed_offer(&db, "C1", "#ops", "peer-b", 10);
+        relayed_follow_up(&db, "claim", SCHOLAR, "C1", "C2", "#ops", "peer-c", 11);
+
+        assert_eq!(
+            relayed_receipt(&db, PEER_HOME, "C1", "C2", "R1", "#ops", "peer-c", 12),
+            ActWrite::ReceiptIgnored
+        );
+        assert_eq!(
+            db.act_task("C1").unwrap().unwrap().state,
+            "open",
+            "a peer that does not own the task decides nothing about it"
+        );
+        assert_eq!(
+            confirm_of(&db, "C2"),
+            crate::events::ConfirmState::Unconfirmed,
+            "and the claim is still waiting on the server that does"
+        );
+        assert!(
+            db.is_act_event("R1").unwrap(),
+            "the claim to authority is kept: it is evidence about the peer that made it"
+        );
+    }
+
+    /// Nobody rules on a task of ours but us. A peer's receipt about one is
+    /// the same overreach as a peer's receipt about a third server's task.
+    #[test]
+    fn a_receipt_from_a_peer_about_a_task_of_ours_applies_nothing() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
+
+        assert_eq!(
+            relayed_receipt(&db, PEER_HOME, "T1", "T1", "R1", "#ops", "peer-b", 11),
+            ActWrite::ReceiptIgnored
+        );
+        assert_eq!(db.act_task("T1").unwrap().unwrap().state, "offered");
+    }
+
+    /// A receipt carries no state, so a home whose word the rules refuse gets
+    /// the rules' answer. The receipt stays on file: two servers disagreeing
+    /// about what a shared rules file says is exactly the thing worth keeping
+    /// signed evidence of.
+    #[test]
+    fn a_receipt_the_rules_refuse_applies_nothing_and_is_kept() {
+        let db = Db::open_memory().unwrap();
+        relayed_offer(&db, "C1", "#ops", "peer-b", 10);
+        // Completing work nobody has been assigned is not a legal step from
+        // `open`, whoever says it won.
+        relayed_follow_up(&db, "complete", MALLORY, "C1", "C2", "#ops", "peer-c", 11);
+
+        assert_eq!(
+            relayed_receipt(&db, PEER_HOME, "C1", "C2", "R1", "#ops", "peer-b", 12),
+            ActWrite::ReceiptRefused(freeq_sdk::act_transitions::Refusal::IllegalStep)
+        );
+        assert_eq!(
+            db.act_task("C1").unwrap().unwrap().state,
+            "open",
+            "the rules decide what this view says, not the home"
+        );
+        assert!(
+            db.is_act_event("R1").unwrap(),
+            "and the disagreement is on file, signed"
+        );
+    }
+
+    /// A receipt can outrun the event it names — on a mesh with uneven
+    /// latency that is ordinary. Nothing is filed for it: it is held, and the
+    /// caller offers it again when the subject lands.
+    #[test]
+    fn a_receipt_naming_an_event_we_do_not_hold_waits_for_it() {
+        let db = Db::open_memory().unwrap();
+        relayed_offer(&db, "C1", "#ops", "peer-b", 10);
+
+        assert_eq!(
+            relayed_receipt(&db, PEER_HOME, "C1", "C2", "R1", "#ops", "peer-b", 12),
+            ActWrite::ReceiptBeforeSubject
+        );
+        assert!(
+            !db.is_act_event("R1").unwrap(),
+            "a held receipt is not filed, so the one that arrives later is not a duplicate"
+        );
+
+        // The claim turns up, and now the receipt can be offered again.
+        relayed_follow_up(&db, "claim", SCHOLAR, "C1", "C2", "#ops", "peer-c", 13);
+        assert_eq!(
+            relayed_receipt(&db, PEER_HOME, "C1", "C2", "R1", "#ops", "peer-b", 14),
+            ActWrite::Confirmed {
+                state: "assigned".into()
+            }
+        );
+    }
+
+    /// A receipt for a task whose opener we have never seen names a home we
+    /// cannot check it against — and its subject cannot be on file either. It
+    /// waits, rather than being judged against an origin nobody knows.
+    #[test]
+    fn a_receipt_about_a_task_we_have_never_seen_waits() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(
+            relayed_receipt(&db, PEER_HOME, "C9", "C8", "R1", "#ops", "peer-b", 12),
+            ActWrite::ReceiptBeforeSubject
+        );
+    }
+
+    /// Two agents claim one open task on two different servers. The home rules
+    /// for one; once that lands the rules no longer admit the other, so it
+    /// leaves the pending set. The log row stays — the record is never lost.
+    #[test]
+    fn a_losing_claim_leaves_the_pending_set_when_the_winner_is_confirmed() {
+        let db = Db::open_memory().unwrap();
+        relayed_offer(&db, "W1", "#ops", "peer-b", 10);
+        relayed_follow_up(&db, "claim", SCHOLAR, "W1", "W2", "#ops", "peer-c", 11);
+        relayed_follow_up(&db, "claim", MALLORY, "W1", "W3", "#ops", "peer-d", 12);
+        for id in ["W2", "W3"] {
+            assert_eq!(
+                confirm_of(&db, id),
+                crate::events::ConfirmState::Unconfirmed
+            );
+        }
+
+        relayed_receipt(&db, PEER_HOME, "W1", "W2", "R1", "#ops", "peer-b", 13);
+
+        assert_eq!(
+            confirm_of(&db, "W2"),
+            crate::events::ConfirmState::Confirmed
+        );
+        assert_eq!(
+            confirm_of(&db, "W3"),
+            crate::events::ConfirmState::Superseded,
+            "a claim on a task that is no longer open cannot still be pending"
+        );
+        assert_eq!(
+            db.act_task_events("W1").unwrap().len(),
+            4,
+            "all three moves and the receipt are in the log — the loser's claim happened"
+        );
+        assert_eq!(
+            db.act_task("W1").unwrap().unwrap().assignee.as_deref(),
+            Some(SCHOLAR),
+            "and exactly one of them won"
+        );
+    }
+
+    /// An unconfirmed event that is still a legal move is not a loser. It has
+    /// simply not been ruled on, and dropping it because something else landed
+    /// first would discard a claim its home may still confirm.
+    #[test]
+    fn a_still_legal_unconfirmed_event_keeps_waiting() {
+        let db = Db::open_memory().unwrap();
+        relayed_offer(&db, "P1", "#ops", "peer-b", 10);
+        // A claim and, behind it, the completion of the work it claims. Both
+        // are filed unconfirmed, and the completion is illegal until the claim
+        // is confirmed.
+        relayed_follow_up(&db, "claim", SCHOLAR, "P1", "P2", "#ops", "peer-c", 11);
+        relayed_follow_up(&db, "complete", SCHOLAR, "P1", "P3", "#ops", "peer-c", 12);
+
+        relayed_receipt(&db, PEER_HOME, "P1", "P2", "R1", "#ops", "peer-b", 13);
+
+        assert_eq!(
+            confirm_of(&db, "P3"),
+            crate::events::ConfirmState::Unconfirmed,
+            "still a legal move from where the task now stands, so still pending"
+        );
+    }
+
+    /// The home's own transition needs no receipt: it already carries the
+    /// signature of the server whose word settles the task. That is how a
+    /// peer's view is cleared when the home's sweep ends a task.
+    #[test]
+    fn the_homes_own_expiry_ends_the_task_here_too() {
+        let db = Db::open_memory().unwrap();
+        relayed_offer(&db, "H1", "#ops", "peer-b", 10);
+        relayed_follow_up(&db, "claim", SCHOLAR, "H1", "H2", "#ops", "peer-c", 11);
+
+        let canonical = act_doc(
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "expire"),
+                ("+freeq.at/from", PEER_HOME),
+                ("+freeq.at/act-id", "H1"),
+            ],
+            "#ops",
+            "H3",
+        );
+        let written = db
+            .apply_act_event(&ActEvent {
+                canonical: &canonical,
+                signature: Some("ed25519:kid:sig"),
+                event_id: "H3",
+                act_id: "H1",
+                opens: false,
+                venue: "#ops",
+                actor: PEER_HOME,
+                from_system: true,
+                origin: Some("peer-b"),
+                timestamp: 12,
+            })
+            .unwrap();
+        assert_eq!(
+            written,
+            ActWrite::Filed {
+                was: Some("open".into()),
+                state: "expired".into()
+            }
+        );
+        assert!(
+            db.act_task("H1").unwrap().is_none(),
+            "an expired task leaves the view wherever it is held"
+        );
+        assert_eq!(
+            confirm_of(&db, "H2"),
+            crate::events::ConfirmState::Superseded,
+            "and the claim that was waiting can never be confirmed now"
+        );
+    }
+
+    /// A server is the system only where it may be speaking as one. A peer
+    /// relaying an event signed under some `did:web:` name is not thereby the
+    /// authority over a task of ours.
+    #[test]
+    fn a_peers_system_event_cannot_expire_a_task_of_ours() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T3", "#ops", None, 10);
+        let canonical = act_doc(
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "expire"),
+                ("+freeq.at/from", PEER_HOME),
+                ("+freeq.at/act-id", "T3"),
+            ],
+            "#ops",
+            "T4",
+        );
+        let written = db
+            .apply_act_event(&ActEvent {
+                canonical: &canonical,
+                signature: Some("ed25519:kid:sig"),
+                event_id: "T4",
+                act_id: "T3",
+                opens: false,
+                venue: "#ops",
+                actor: PEER_HOME,
+                from_system: true,
+                origin: Some("peer-b"),
+                timestamp: 11,
+            })
+            .unwrap();
+        assert_eq!(
+            written,
+            ActWrite::Refused(freeq_sdk::act_transitions::Refusal::WrongSender)
+        );
+        assert_eq!(
+            db.act_task("T3").unwrap().expect("still live").state,
+            "open"
+        );
+    }
+
+    /// And it has to agree once a receipt has landed: a foreign task's
+    /// transition applies in the rebuild exactly where the live path applied
+    /// it, which is where a receipt from that task's home is on file for it.
+    #[test]
+    fn a_rebuild_matches_the_live_view_once_a_receipt_has_landed() {
+        let db = Db::open_memory().unwrap();
+        // Ours, moved by us.
+        offer(&db, "M1", "#ops", None, 10);
+        follow_up(&db, "claim", SCHOLAR, "M1", "M2", "#ops", 11);
+        // A peer's, with a claim from a third server the home has confirmed.
+        relayed_offer(&db, "M3", "#ops", "peer-b", 12);
+        relayed_follow_up(&db, "claim", MALLORY, "M3", "M4", "#ops", "peer-c", 13);
+        // A peer's, still carrying only unruled moves.
+        relayed_offer(&db, "M5", "#ops", "peer-b", 14);
+        relayed_follow_up(&db, "claim", MALLORY, "M5", "M6", "#ops", "peer-c", 15);
+
+        relayed_receipt(&db, PEER_HOME, "M3", "M4", "R1", "#ops", "peer-b", 16);
+
+        let mut live = db
+            .act_tasks(&["#ops".to_string()], None, None, None, 100)
+            .unwrap();
+        let mut rebuilt = db.rebuild_act_actions().unwrap();
+        live.sort_by(|a, b| a.act_id.cmp(&b.act_id));
+        rebuilt.sort_by(|a, b| a.act_id.cmp(&b.act_id));
+        assert_eq!(
+            rebuilt, live,
+            "the log is the record, and the view is what it derives to"
+        );
+        assert_eq!(
+            rebuilt.iter().find(|t| t.act_id == "M5").unwrap().state,
+            "open",
+            "an unruled claim moves nothing, in the rebuild as in the view"
+        );
+    }
+
+    /// What the defer queue threw away is a fact about what this server never
+    /// received. Re-materializing a task — which a rebuild does for every one
+    /// of them — must not quietly say the record is whole again.
+    #[test]
+    fn re_materializing_a_task_keeps_the_count_of_what_was_thrown_away() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
+        assert!(db.bump_act_dropped_unchecked("T1").unwrap());
+        assert_eq!(db.act_dropped_unchecked("T1").unwrap(), 1);
+
+        // The opener again, as a replay of the log hands it back.
+        assert_eq!(
+            offer(&db, "T1", "#ops", Some(SCHOLAR), 10),
+            ActWrite::Duplicate
+        );
+        assert_eq!(db.act_dropped_unchecked("T1").unwrap(), 1);
+
+        let venue = "#ops";
+        let canonical = act_doc(
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", ELIZA),
+                ("+freeq.at/act-to", SCHOLAR),
+            ],
+            venue,
+            "T1",
+        );
+        let view = crate::events::derive_act_view(&canonical).unwrap();
+        db.materialize_act(
+            &ActEvent {
+                canonical: &canonical,
+                signature: None,
+                event_id: "T1",
+                act_id: "T1",
+                opens: true,
+                venue,
+                actor: ELIZA,
+                from_system: false,
+                origin: None,
+                timestamp: 10,
+            },
+            &view,
+            "handoff",
+            None,
+            "offered",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.act_dropped_unchecked("T1").unwrap(),
+            1,
+            "the count of what was lost survives the row being written again"
         );
     }
 
@@ -3641,6 +4460,14 @@ mod tests {
     /// log, and the log would have stopped being the record.
     #[test]
     fn the_view_rebuilt_from_the_log_equals_the_live_view() {
+        const BID_ONE: &str = "01M16HSB601BD0000000000000";
+        const BID_TWO: &str = "01M16HSB602BD1000000000000";
+        const AWARD: &str = "01M16HSB603AWARD0000000000";
+        const PROGRESS: &str = "01M16HSB604PRGRESS00000000";
+        const SUBMIT: &str = "01M16HSB605SBMT0000000000A";
+        const REVISE: &str = "01M16HSB606REVSE0000000000";
+        const SUBMIT_AGAIN: &str = "01M16HSB607SBMT0000000000B";
+
         let db = Db::open_memory().unwrap();
         offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
         follow_up(&db, "accept", SCHOLAR, "T1", "E1", "#ops", 11);
@@ -3681,15 +4508,18 @@ mod tests {
             "#ops",
             51,
         );
-        bounty_step(&db, "bid", SCHOLAR, "B1", "BID0", None, "#ops", 51);
-        bounty_step(&db, "bid", MALLORY, "B1", "BID1", None, "#ops", 52);
-        bounty_step(&db, "award", ELIZA, "B1", "AW", Some("BID1"), "#ops", 53);
-        bounty_step(&db, "progress", MALLORY, "B1", "PR", None, "#ops", 54);
+        // The ids are mint-ordered, because that is the order a rebuild
+        // replays in: an award names a bid, and a bid it has not reached yet
+        // is a bid it cannot resolve.
+        bounty_step(&db, "bid", SCHOLAR, "B1", BID_ONE, None, "#ops", 51);
+        bounty_step(&db, "bid", MALLORY, "B1", BID_TWO, None, "#ops", 52);
+        bounty_step(&db, "award", ELIZA, "B1", AWARD, Some(BID_TWO), "#ops", 53);
+        bounty_step(&db, "progress", MALLORY, "B1", PROGRESS, None, "#ops", 54);
         // …and into review and back out again, so the rebuild replays the
         // states only a bounty has.
-        bounty_step(&db, "submit", MALLORY, "B1", "SB", None, "#ops", 55);
-        bounty_step(&db, "revise", ELIZA, "B1", "RV", None, "#ops", 56);
-        bounty_step(&db, "submit", MALLORY, "B1", "SB2", None, "#ops", 57);
+        bounty_step(&db, "submit", MALLORY, "B1", SUBMIT, None, "#ops", 55);
+        bounty_step(&db, "revise", ELIZA, "B1", REVISE, None, "#ops", 56);
+        bounty_step(&db, "submit", MALLORY, "B1", SUBMIT_AGAIN, None, "#ops", 57);
 
         let venues = vec!["#ops".to_string(), "#other".to_string()];
         let mut live = db.act_tasks(&venues, None, None, None, 100).unwrap();
@@ -3703,6 +4533,149 @@ mod tests {
             "the declined one left the view; its revival and the bounties did not"
         );
         assert_eq!(rebuilt, live);
+    }
+
+    /// A rebuild replays in **mint** order, which is the event id's order.
+    ///
+    /// The row timestamp is when *this* server took delivery, and it differs
+    /// on every server that took the same events — ordering by it makes the
+    /// rebuilt view a function of who was up when. A signed event id is a
+    /// ULID, so its byte order is the order its signer minted in, and every
+    /// server reads the same order out of it.
+    ///
+    /// Here delivery order and id order disagree. Replayed by timestamp, the
+    /// completion arrives before the acceptance that makes it legal, gets
+    /// dropped, and the task survives in the view; replayed by id, the task
+    /// completes and leaves — which is what the live view shows.
+    #[test]
+    fn a_rebuild_replays_in_mint_order_and_not_delivery_order() {
+        let db = Db::open_memory().unwrap();
+        // The opener's id deliberately sorts *after* both follow-ups: a task's
+        // opener has to be applied first whatever its id, and nothing about
+        // sorting by id guarantees that on its own.
+        const OPENER: &str = "01ZOPENER00000000000000000";
+        offer(&db, OPENER, "#ops", Some(SCHOLAR), 100);
+        assert_eq!(
+            follow_up(&db, "accept", SCHOLAR, OPENER, "01ACCEPT", "#ops", 300),
+            ActWrite::Filed {
+                was: Some("offered".into()),
+                state: "assigned".into()
+            }
+        );
+        assert_eq!(
+            follow_up(&db, "complete", SCHOLAR, OPENER, "01COMPLETE", "#ops", 200),
+            ActWrite::Filed {
+                was: Some("assigned".into()),
+                state: "completed".into()
+            }
+        );
+
+        let live = db
+            .act_tasks(&["#ops".to_string()], None, None, None, 100)
+            .unwrap();
+        assert!(live.is_empty(), "the task completed and left the live view");
+        assert_eq!(
+            db.rebuild_act_actions().unwrap(),
+            live,
+            "the rebuilt view must agree — by id the completion lands, by \
+             delivery time it arrives too early and is dropped"
+        );
+    }
+
+    /// A signed event the rules refuse does not enter a rebuilt view.
+    ///
+    /// The log is not a list of legal moves. A transition on a task another
+    /// server owns is filed here without being ruled on — that server referees
+    /// it — so the log genuinely holds events this server never checked. A
+    /// rebuild that assumed otherwise would let one of them in.
+    #[test]
+    fn a_peers_illegal_event_does_not_enter_the_rebuilt_view() {
+        let db = Db::open_memory().unwrap();
+        relayed_offer(&db, "R1", "#ops", "peer-b", 10);
+        relayed_follow_up(&db, "claim", SCHOLAR, "R1", "R2", "#ops", "peer-b", 11);
+
+        // Filed unruled, both of them: completion by someone who is not the
+        // assignee, and expiry by someone who is not a server.
+        assert_eq!(
+            relayed_follow_up(&db, "complete", MALLORY, "R1", "R3", "#ops", "peer-b", 12),
+            ActWrite::StoredNotApplied
+        );
+        assert_eq!(
+            relayed_follow_up(&db, "expire", MALLORY, "R1", "R4", "#ops", "peer-b", 13),
+            ActWrite::StoredNotApplied
+        );
+        assert_eq!(
+            db.act_task_events("R1").unwrap().len(),
+            4,
+            "all four are in the log, which is what makes this the hard case"
+        );
+
+        let rebuilt = db.rebuild_act_actions().unwrap();
+        let task = rebuilt
+            .iter()
+            .find(|t| t.act_id == "R1")
+            .expect("the task is still live: neither refused event moved it");
+        assert_ne!(
+            task.state, "completed",
+            "a completion by someone who is not the assignee is not a completion"
+        );
+        assert_ne!(
+            task.state, "expired",
+            "and only a server may expire — an actor that is not one never counts \
+             as the system"
+        );
+    }
+
+    /// A server's own expiry still rebuilds, because a server *is* the system.
+    ///
+    /// The counterpart to the test above: deriving `is_system` from the actor
+    /// has to keep saying yes to the one sender the rule was written for.
+    #[test]
+    fn a_servers_own_expiry_rebuilds_as_the_system_event_it_is() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T1", "#ops", Some(SCHOLAR), 10);
+        follow_up(&db, "accept", SCHOLAR, "T1", "T2", "#ops", 11);
+        // Filed the way the expiry sweep files its own: signed by the server,
+        // under the server's identity.
+        let server = crate::server::server_did("irc.example");
+        let canonical = act_doc(
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "expire"),
+                ("+freeq.at/from", server.as_str()),
+                ("+freeq.at/act-id", "T1"),
+            ],
+            "#ops",
+            "T3",
+        );
+        assert_eq!(
+            db.apply_act_event(&ActEvent {
+                canonical: &canonical,
+                signature: Some("ed25519:kid:sig"),
+                event_id: "T3",
+                act_id: "T1",
+                opens: false,
+                venue: "#ops",
+                actor: &server,
+                from_system: true,
+                origin: None,
+                timestamp: 12,
+            })
+            .unwrap(),
+            ActWrite::Filed {
+                was: Some("assigned".into()),
+                state: "expired".into()
+            },
+            "the sweep's own event is a system event"
+        );
+
+        assert!(
+            db.rebuild_act_actions()
+                .unwrap()
+                .iter()
+                .all(|t| t.act_id != "T1"),
+            "an expired task is gone from the rebuilt view too"
+        );
     }
 
     #[test]
@@ -3751,6 +4724,199 @@ mod tests {
         assert_eq!(public.len(), 1);
         assert_eq!(public[0].act_id, "T1");
         assert!(db.act_tasks(&[], None, None, None, 100).unwrap().is_empty());
+    }
+
+    // ── The sweeps' candidates ────────────────────────────────────────────
+
+    /// An opener filed from a peer's relay. Every other opener in these tests
+    /// leaves `origin` empty, the way a task created here carries it; this one
+    /// names the server the task belongs to.
+    fn remote_offer(
+        db: &Db,
+        tags: &[(&str, &str)],
+        id: &str,
+        venue: &str,
+        home: &str,
+        ts: i64,
+    ) -> ActWrite {
+        let canonical = act_doc(tags, venue, id);
+        db.apply_act_event(&ActEvent {
+            canonical: &canonical,
+            signature: Some("ed25519:kid:sig"),
+            event_id: id,
+            act_id: id,
+            opens: true,
+            venue,
+            actor: ELIZA,
+            from_system: false,
+            origin: Some(home),
+            timestamp: ts,
+        })
+        .unwrap()
+    }
+
+    /// Expiry belongs to the server that created a task: the sweep must not
+    /// offer up a task another server's event opened, however idle it is.
+    #[test]
+    fn the_idle_sweep_names_only_tasks_created_here() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T-local", "#ops", Some(SCHOLAR), 10);
+        remote_offer(
+            &db,
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", ELIZA),
+                ("+freeq.at/act-to", SCHOLAR),
+            ],
+            "T-remote",
+            "#ops",
+            "peer.example",
+            10,
+        );
+
+        let states = freeq_sdk::act_transitions::review_timeout_states();
+        let idle = db.act_tasks_idle_outside_states(&states, 100, 10).unwrap();
+        let ids: Vec<&str> = idle.iter().map(|t| t.act_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["T-local"],
+            "only the task created here is a sweep candidate"
+        );
+    }
+
+    /// The other clock, the same rule: the auto-accept a closed review window
+    /// files is the home server's own signed event, so a bounty another
+    /// server opened is not this one's to accept, however long its poster has
+    /// been silent.
+    #[test]
+    fn the_review_sweep_leaves_another_servers_bounty_under_review() {
+        let db = Db::open_memory().unwrap();
+
+        // Two bounties handed in and never answered: one opened here, one
+        // opened on the server it names.
+        bounty_offer(&db, "B-local", "#ops", 10);
+        remote_offer(
+            &db,
+            &[
+                ("+freeq.at/act", "bounty"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", ELIZA),
+                ("+freeq.at/act-title", "index the archive"),
+            ],
+            "B-remote",
+            "#ops",
+            "peer.example",
+            10,
+        );
+        bounty_step(
+            &db,
+            "bid",
+            SCHOLAR,
+            "B-local",
+            "B-local-BID",
+            None,
+            "#ops",
+            11,
+        );
+        bounty_step(
+            &db,
+            "award",
+            ELIZA,
+            "B-local",
+            "B-local-AW",
+            Some("B-local-BID"),
+            "#ops",
+            12,
+        );
+        bounty_step(
+            &db,
+            "submit",
+            SCHOLAR,
+            "B-local",
+            "B-local-S",
+            None,
+            "#ops",
+            13,
+        );
+        // The peer's bounty is under review because its own home put it
+        // there. It cannot be driven there from here: a move that changes
+        // where another server's task stands is filed and not applied, so the
+        // row is set to what that server says it is.
+        db.conn
+            .execute(
+                "UPDATE act_actions SET state = 'under_review', assignee = ?2, updated = 13 \
+                 WHERE act_id = ?1",
+                params!["B-remote", SCHOLAR],
+            )
+            .unwrap();
+
+        let states = freeq_sdk::act_transitions::review_timeout_states();
+        let waiting = db.act_tasks_idle_in_states(&states, 100, 10).unwrap();
+        let ids: Vec<&str> = waiting.iter().map(|t| t.act_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["B-local"],
+            "only the bounty opened here is up for auto-accept"
+        );
+
+        // The sweep accepts what that query hands it and nothing else, so the
+        // peer's bounty is still on file, still waiting on its own home.
+        assert_eq!(
+            db.act_task("B-remote").unwrap().unwrap().state,
+            "under_review"
+        );
+    }
+
+    /// The dropped-unchecked count is a receipt on the task's row: it bumps
+    /// only where a row exists, and a task moving does not erase it.
+    #[test]
+    fn the_dropped_unchecked_count_sticks_to_its_task() {
+        let db = Db::open_memory().unwrap();
+        offer(&db, "T-drop", "#ops", Some(SCHOLAR), 10);
+
+        assert!(db.bump_act_dropped_unchecked("T-drop").unwrap());
+        assert!(
+            !db.bump_act_dropped_unchecked("T-nowhere").unwrap(),
+            "no row, nothing to mark"
+        );
+        assert_eq!(db.act_dropped_unchecked("T-drop").unwrap(), 1);
+        assert_eq!(db.act_dropped_unchecked("T-nowhere").unwrap(), 0);
+
+        // The task moves on — an accept by its offeree — and the count stays.
+        let accept = act_doc(
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "accept"),
+                ("+freeq.at/from", SCHOLAR),
+                ("+freeq.at/act-id", "T-drop"),
+            ],
+            "#ops",
+            "T-drop-accept",
+        );
+        db.apply_act_event(&ActEvent {
+            canonical: &accept,
+            signature: Some("ed25519:kid:sig"),
+            event_id: "T-drop-accept",
+            act_id: "T-drop",
+            opens: false,
+            venue: "#ops",
+            actor: SCHOLAR,
+            from_system: false,
+            origin: None,
+            timestamp: 20,
+        })
+        .unwrap();
+        assert_eq!(
+            db.act_task("T-drop").unwrap().unwrap().state,
+            "assigned",
+            "the follow-up applied"
+        );
+        assert_eq!(
+            db.act_dropped_unchecked("T-drop").unwrap(),
+            1,
+            "and the count survived it"
+        );
     }
 
     // ── Effective capabilities ────────────────────────────────────────────
@@ -6417,27 +7583,95 @@ impl Db {
 
         // ── A receipt ──
         //
-        // Recognized before the task is read, because it asks nothing of the
-        // task: the home writes it about an event it has already refereed and
-        // filed, and the state that event landed in was set then. Filing a
-        // receipt appends a row and stops. Only the home writes one, so a
-        // sender's confirm is refused here as it is at the gate — this path
-        // is also reachable from a rebuild and from a peer.
+        // Answered before the task's own state machine, because a receipt is
+        // not a move on the task: it is one server's word that an event it
+        // holds is the one that won. A receipt carries no state of its own —
+        // the state comes from running the event it names through the shared
+        // rules here — and it is filed with no confirm column, being the answer
+        // rather than something awaiting one. Only a server writes one, so a
+        // sender's confirm is refused here as it is at the gate; this path is
+        // also reached from a peer and from a replay.
         if rules::is_confirmation(&view.verb) {
             if !ev.from_system {
                 return Ok(ActWrite::Refused(rules::Refusal::ClientConfirm));
             }
+            let subject = view
+                .fields
+                .get(rules::confirmation_subject_tag())
+                .map(String::as_str)
+                .unwrap_or_default();
+
+            // ── authority is the link ──
+            //
+            // A receipt counts as the home's word only when the authenticated
+            // peer it arrived from is the server the task was opened on. Our
+            // own receipts carry no origin at all, and those count for a task
+            // of ours. Anything else is somebody claiming an authority the
+            // link does not give them: kept, because a signed claim is
+            // evidence, and applied to nothing.
+            //
+            // A task whose opener this server has never seen has no home we
+            // can name, and its subject cannot be on file either — so the
+            // receipt waits for the subject rather than being judged against
+            // an origin nobody knows.
+            let Some(home) = self.act_task_origin(ev.act_id)? else {
+                return Ok(ActWrite::ReceiptBeforeSubject);
+            };
+            let from_home = match ev.origin {
+                None => home.is_empty(),
+                Some(peer) => home == peer,
+            };
             let record = EventRecord {
                 shape: EventShape::Document(ev.canonical),
                 signature: ev.signature,
-                ctx: crate::events::EventContext::verified(),
+                ctx: self.act_context(ev, None),
                 timestamp: ev.timestamp as u64,
             };
+            if !from_home {
+                if !self.insert_event(&record)? {
+                    return Ok(ActWrite::Duplicate);
+                }
+                tx.commit()?;
+                return Ok(ActWrite::ReceiptIgnored);
+            }
+
+            // ── the event it names ──
+            //
+            // Not on file: the receipt overtook it, which an uneven mesh
+            // makes ordinary. Nothing is written, and the caller holds it
+            // until the subject lands.
+            let Some(named) = self.get_event(subject)?.filter(|e| e.kind == "act") else {
+                return Ok(ActWrite::ReceiptBeforeSubject);
+            };
+            // Already settled — our own move, or a receipt we have already
+            // followed. Appending the record is the whole of it: confirming
+            // twice must not move anything twice.
+            if !self.act_event_is_unconfirmed(subject)? {
+                if !self.insert_event(&record)? {
+                    return Ok(ActWrite::Duplicate);
+                }
+                tx.commit()?;
+                return Ok(ActWrite::Recorded);
+            }
+
             if !self.insert_event(&record)? {
                 return Ok(ActWrite::Duplicate);
             }
-            tx.commit()?;
-            return Ok(ActWrite::Recorded);
+            return match self.apply_confirmed_event(ev.act_id, &named)? {
+                // The home's word and the shared rules disagree. The rules
+                // decide what this server's view says, and the receipt stays
+                // on file as the signed evidence of the disagreement.
+                Err(refusal) => {
+                    tx.commit()?;
+                    Ok(ActWrite::ReceiptRefused(refusal))
+                }
+                Ok(landed) => {
+                    self.confirm_act_event(subject)?;
+                    self.supersede_refused_act_events(ev.act_id, subject)?;
+                    tx.commit()?;
+                    Ok(ActWrite::Confirmed { state: landed })
+                }
+            };
         }
 
         // ── The revival relation ──
@@ -6498,6 +7732,42 @@ impl Db {
             if task.venue != ev.venue {
                 return Ok(ActWrite::WrongVenue);
             }
+            // Whether this event arrived on the link of the server that
+            // referees the task. Our own events carry no origin at all, and a
+            // task of ours has no home to hear from — we are it — so an empty
+            // origin on either side is never a match.
+            let from_home = !task.origin.is_empty() && ev.origin == Some(task.origin.as_str());
+            // The one transition on a foreign task that needs no receipt: one
+            // the home itself authored — an expiry, a closed review window —
+            // which already carries the signature of the server whose word
+            // settles the task. A participant's move gains that signature
+            // through a receipt; the home's move was born with it.
+            let home_authored = from_home && ev.from_system;
+
+            // ── whose task is it ──
+            //
+            // A task another server opened is that server's to referee. An
+            // event that would move it is filed here and goes no further:
+            // deciding it would make two servers the authority over one task,
+            // and disagreeing about which. An additive move carries no state
+            // decision to usurp, so it takes the ordinary path below. Which is
+            // which comes out of the rules file, never a list of verbs here.
+            if !task.origin.is_empty()
+                && !home_authored
+                && rules::is_additive(&task.kind, &view.verb) == Some(false)
+            {
+                let record = EventRecord {
+                    shape: EventShape::Document(ev.canonical),
+                    signature: ev.signature,
+                    ctx: self.act_context(ev, Some(crate::events::ConfirmState::Unconfirmed)),
+                    timestamp: ev.timestamp as u64,
+                };
+                if !self.insert_event(&record)? {
+                    return Ok(ActWrite::Duplicate);
+                }
+                tx.commit()?;
+                return Ok(ActWrite::StoredNotApplied);
+            }
             let present: Vec<&str> = view.fields.keys().map(String::as_str).collect();
             // The bid an award takes, resolved before the checker is asked:
             // the checker reads no log, so the lookup is ours. Only a bid
@@ -6517,7 +7787,12 @@ impl Db {
             };
             let sender = rules::Sender {
                 did: ev.actor,
-                is_system: ev.from_system,
+                // The server itself, and only where a server may be speaking
+                // as one: our own events (no origin), or the home's about its
+                // own task. A peer relaying an event signed under some
+                // `did:web:` name is not thereby the system here — without
+                // this, any peer whose key we hold could expire our tasks.
+                is_system: ev.from_system && (ev.origin.is_none() || from_home),
                 accepted_bid: bid_author
                     .as_deref()
                     .map(|author| rules::AcceptedBid { author }),
@@ -6552,7 +7827,7 @@ impl Db {
         let record = EventRecord {
             shape: EventShape::Document(ev.canonical),
             signature: ev.signature,
-            ctx: crate::events::EventContext::verified(),
+            ctx: self.act_context(ev, Some(crate::events::ConfirmState::Confirmed)),
             timestamp: ev.timestamp as u64,
         };
         if !self.insert_event(&record)? {
@@ -6566,8 +7841,245 @@ impl Db {
             &landed,
             assignee_named.as_deref(),
         )?;
+        // Whatever else this move did, it may have outrun something. An event
+        // of this task still waiting on its home, which the rules no longer
+        // admit, is a loser: it leaves the pending set here rather than
+        // waiting for a confirmation that can never come.
+        self.supersede_refused_act_events(ev.act_id, ev.event_id)?;
         tx.commit()?;
         Ok(ActWrite::Filed { was, state: landed })
+    }
+
+    /// Re-run one stored event of `act_id` through the rules against where the
+    /// task now stands, and, when the rules take it, move the view to match.
+    ///
+    /// This is what a receipt makes happen: the receipt says which event won,
+    /// and the state comes from running that event through the shared rules
+    /// here — never from the receipt, which carries none. A home whose receipt
+    /// the rules refuse gets the refusal back, and this server's view is left
+    /// exactly where the rules put it.
+    ///
+    /// `named` is the stored subject: its own actor, venue and receipt time,
+    /// so the view records the move as it happened rather than as of the
+    /// moment the receipt arrived.
+    fn apply_confirmed_event(
+        &self,
+        act_id: &str,
+        named: &StoredEvent,
+    ) -> SqlResult<Result<String, freeq_sdk::act_transitions::Refusal>> {
+        use freeq_sdk::act_transitions as rules;
+
+        let Some(view) = crate::events::derive_act_view(&named.canonical) else {
+            return Ok(Err(rules::Refusal::UnknownVerb));
+        };
+        // No live row means the task has finished, and a finished task admits
+        // nothing at all.
+        let Some(task) = self.act_task(act_id)? else {
+            return Ok(Err(rules::Refusal::TerminalTask));
+        };
+        let actor = named.actor_did.clone().unwrap_or_default();
+        let present: Vec<&str> = view.fields.keys().map(String::as_str).collect();
+        let accepts = view.fields.get("act-accepts").map(String::as_str);
+        let bid_author = match accepts {
+            Some(bid) => self.act_bid_author(act_id, bid)?,
+            None => None,
+        };
+        let landed = match rules::check(
+            &rules::Task {
+                kind: &task.kind,
+                state: &task.state,
+                offerer: &task.offerer,
+                offeree: task.offeree.as_deref(),
+                assignee: task.assignee.as_deref(),
+                deadline: task.deadline,
+                bid_deadline: self.act_task_bid_deadline(act_id)?,
+            },
+            &rules::Event {
+                verb: &view.verb,
+                msgid: &named.event_id,
+                accepts,
+                fields: &present,
+            },
+            &rules::Sender {
+                did: &actor,
+                // Read off the actor, the way a rebuild reads it. A server
+                // acts under `did:web:`; a person does not.
+                is_system: crate::server::is_system_actor(&actor),
+                accepted_bid: bid_author
+                    .as_deref()
+                    .map(|author| rules::AcceptedBid { author }),
+            },
+        ) {
+            Ok(state) => state.to_string(),
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        // The event as it was filed, so the view records the move at the time
+        // this server took it rather than at the moment the receipt arrived.
+        let confirmed = ActEvent {
+            canonical: &named.canonical,
+            signature: named.signature.as_deref(),
+            event_id: &named.event_id,
+            act_id,
+            opens: false,
+            venue: &named.venue,
+            actor: &actor,
+            from_system: crate::server::is_system_actor(&actor),
+            origin: named.origin.as_deref(),
+            timestamp: named.timestamp as i64,
+        };
+        self.materialize_act(
+            &confirmed,
+            &view,
+            &task.kind,
+            Some(&task.state),
+            &landed,
+            bid_author.as_deref(),
+        )?;
+        Ok(Ok(landed))
+    }
+
+    /// Mark one task event as ruled on by its task's home.
+    ///
+    /// Returns whether a row moved: `false` when the id is not on file, or
+    /// when it was confirmed already and there is nothing to change.
+    fn confirm_act_event(&self, event_id: &str) -> SqlResult<bool> {
+        self.conn.execute(
+            "UPDATE events SET confirm_state = 'confirmed'
+              WHERE event_id = ?1 AND kind = 'act'
+                AND (confirm_state IS NULL OR confirm_state <> 'confirmed')",
+            params![event_id],
+        )?;
+        Ok(self.conn.changes() > 0)
+    }
+
+    /// Drop from the pending set every unconfirmed event of this task the
+    /// rules no longer admit — the losing half of a race, once the winner has
+    /// been ruled in.
+    ///
+    /// Re-checked rather than swept: an unconfirmed event that is still a
+    /// legal move has simply not been ruled on yet, and calling it a loser
+    /// because something else landed first would drop a claim its home may
+    /// still confirm. The log row is untouched either way; only the flag moves.
+    fn supersede_refused_act_events(&self, act_id: &str, keep: &str) -> SqlResult<usize> {
+        use freeq_sdk::act_transitions as rules;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, canonical, actor_did FROM events
+              WHERE kind = 'act' AND subject = ?1 AND confirm_state = 'unconfirmed'
+                AND event_id <> ?2",
+        )?;
+        let pending: Vec<(String, String, String)> = stmt
+            .query_map(params![act_id, keep], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                ))
+            })?
+            .collect::<SqlResult<_>>()?;
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        // No live row means the task finished, and a finished task admits
+        // nothing at all.
+        let task = self.act_task(act_id)?;
+        let bid_deadline = self.act_task_bid_deadline(act_id)?;
+        let mut dropped = 0usize;
+        for (event_id, canonical, actor) in pending {
+            let Some(view) = crate::events::derive_act_view(&canonical) else {
+                continue;
+            };
+            let present: Vec<&str> = view.fields.keys().map(String::as_str).collect();
+            let accepts = view.fields.get("act-accepts").map(String::as_str);
+            let bid_author = match accepts {
+                Some(bid) => self.act_bid_author(act_id, bid)?,
+                None => None,
+            };
+            let still_legal = task.as_ref().is_some_and(|task| {
+                rules::check(
+                    &rules::Task {
+                        kind: &task.kind,
+                        state: &task.state,
+                        offerer: &task.offerer,
+                        offeree: task.offeree.as_deref(),
+                        assignee: task.assignee.as_deref(),
+                        deadline: task.deadline,
+                        bid_deadline,
+                    },
+                    &rules::Event {
+                        verb: &view.verb,
+                        msgid: &event_id,
+                        accepts,
+                        fields: &present,
+                    },
+                    &rules::Sender {
+                        did: &actor,
+                        is_system: crate::server::is_system_actor(&actor),
+                        accepted_bid: bid_author
+                            .as_deref()
+                            .map(|author| rules::AcceptedBid { author }),
+                    },
+                )
+                .is_ok()
+            });
+            if still_legal {
+                continue;
+            }
+            self.conn.execute(
+                "UPDATE events SET confirm_state = 'superseded' WHERE event_id = ?1",
+                params![event_id],
+            )?;
+            dropped += self.conn.changes() as usize;
+        }
+        Ok(dropped)
+    }
+
+    /// Count one more event about this task that the defer queue threw away
+    /// unchecked. Returns whether a task row was there to mark — an event
+    /// whose task is not on file leaves only the eviction log.
+    ///
+    /// A receipt fact, not part of the task's state machine: never relayed,
+    /// never in the signed log, and not reproducible by a rebuild (the
+    /// dropped event is precisely what the log never received).
+    pub fn bump_act_dropped_unchecked(&self, act_id: &str) -> SqlResult<bool> {
+        self.conn.execute(
+            "UPDATE act_actions SET dropped_unchecked = dropped_unchecked + 1
+              WHERE act_id = ?1",
+            params![act_id],
+        )?;
+        Ok(self.conn.changes() > 0)
+    }
+
+    /// How many events about this task the defer queue threw away unchecked.
+    /// Zero for a task with no row — nothing was recorded against it.
+    pub fn act_dropped_unchecked(&self, act_id: &str) -> SqlResult<i64> {
+        self.conn
+            .query_row(
+                "SELECT dropped_unchecked FROM act_actions WHERE act_id = ?1",
+                params![act_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map(|v| v.unwrap_or(0))
+    }
+
+    /// The receipt facts for a task event's log row: this server checked the
+    /// signature itself before calling, a relayed event says which link it came
+    /// in on, so a reader can tell a local event from a federated one, and
+    /// `confirm` is whether the rules were run on it or it is still waiting on
+    /// its task's home. `None` for a receipt, which is the answer rather than
+    /// something awaiting one.
+    fn act_context(
+        &self,
+        ev: &ActEvent<'_>,
+        confirm: Option<crate::events::ConfirmState>,
+    ) -> crate::events::EventContext {
+        crate::events::EventContext {
+            sig_state: crate::events::SigState::Valid,
+            origin: ev.origin.map(str::to_string),
+            confirm,
+        }
     }
 
     /// Move the view to match an event that was just accepted.
@@ -6599,10 +8111,17 @@ impl Db {
         }
         if ev.opens {
             self.conn.execute(
+                // The count of events the defer queue threw away unchecked
+                // is carried over rather than reset: it is a fact about what
+                // this server never received, and replacing the row — which a
+                // rebuild does for every task — must not quietly say the
+                // record is whole again.
                 "INSERT OR REPLACE INTO act_actions
                      (act_id, kind, venue, origin, state, offerer, offeree, caps, deadline,
-                      replaces, updated)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                      replaces, updated, dropped_unchecked)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                         COALESCE((SELECT dropped_unchecked FROM act_actions
+                                    WHERE act_id = ?1), 0))",
                 params![
                     ev.act_id,
                     kind,
@@ -6680,6 +8199,101 @@ impl Db {
             |r| r.get(0),
         )?;
         Ok(n > 0)
+    }
+
+    /// Where a task was opened, read off the opener's own log row: the empty
+    /// string when this server opened it, and `None` when the log has never
+    /// held that opener at all.
+    ///
+    /// The view answers the same question while a task is live and forgets it
+    /// the moment the task ends — which is precisely when the last move on it
+    /// is the one still needing an answer.
+    pub fn act_task_origin(&self, act_id: &str) -> SqlResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(origin, '') FROM events
+                  WHERE kind = 'act' AND event_id = ?1",
+                params![act_id],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// The conversation a task happens in, read off its opener's own log row.
+    ///
+    /// The venue every one of its events binds, and the one thing that lets a
+    /// receiver rebuild the document a `did:web:` server signed: a home signs
+    /// the task's venue, and a DM venue derived from the *signer* would be a
+    /// pair of DIDs the home is not one of. `None` when the log has never held
+    /// that opener.
+    pub fn act_task_venue(&self, act_id: &str) -> SqlResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT venue FROM events WHERE kind = 'act' AND event_id = ?1",
+                params![act_id],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// The receipt this server holds for one event, or `None` when it holds
+    /// none.
+    ///
+    /// What a peer asking again about a transition is answered with: the
+    /// receipt was written down when it was made, so saying it again is reading
+    /// it back rather than deciding anything a second time.
+    pub fn act_receipt_for_subject(&self, subject: &str) -> SqlResult<Option<ActLoggedEvent>> {
+        let tag = freeq_sdk::act_transitions::confirmation_subject_tag();
+        Ok(self.act_events_naming(subject)?.into_iter().find(|e| {
+            match crate::events::derive_act_view(&e.canonical) {
+                Some(view) => {
+                    freeq_sdk::act_transitions::is_confirmation(&view.verb)
+                        && view.fields.get(tag).map(String::as_str) == Some(subject)
+                }
+                None => false,
+            }
+        }))
+    }
+
+    /// Every task event whose document mentions `subject` in the confirmation
+    /// tag — read as every event of that event's task, because a receipt is
+    /// filed under the task, not under what it names.
+    fn act_events_naming(&self, subject: &str) -> SqlResult<Vec<ActLoggedEvent>> {
+        let act_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(subject, event_id) FROM events
+                  WHERE kind = 'act' AND event_id = ?1",
+                params![subject],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match act_id {
+            Some(act_id) => self.act_task_events(&act_id),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Whether one task event is still waiting on a ruling from its task's
+    /// home.
+    ///
+    /// `false` once the home has confirmed it, once something that outran it
+    /// has superseded it, and for an id that is not on file at all — three
+    /// different histories with one thing in common: nothing is owed on this
+    /// event any more.
+    pub fn act_event_is_unconfirmed(&self, event_id: &str) -> SqlResult<bool> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT confirm_state FROM events WHERE event_id = ?1 AND kind = 'act'",
+                params![event_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw.is_some_and(|column| {
+            crate::events::ConfirmState::from_column(column.as_deref())
+                == crate::events::ConfirmState::Unconfirmed
+        }))
     }
 
     /// One live task by id. `None` once it has finished — the log keeps the
@@ -6770,7 +8384,8 @@ impl Db {
     }
 
     /// Live tasks whose last movement is older than `cutoff` and whose state
-    /// is one of `states` — the review sweep's candidates.
+    /// is one of `states` — the review sweep's candidates, among the tasks
+    /// created here.
     ///
     /// `updated` is what is measured, so a task that anyone touched recently
     /// is not abandoned however old its opener is. On a review window that is
@@ -6786,7 +8401,7 @@ impl Db {
     }
 
     /// Live tasks idle since `cutoff` whose state is **not** one of `states` —
-    /// the expiry sweep's candidates.
+    /// the expiry sweep's candidates, among the tasks created here.
     ///
     /// The complement of the query above, so the two clocks cannot both claim
     /// a task. They pull in opposite directions: a review window favours the
@@ -6802,6 +8417,14 @@ impl Db {
         self.act_tasks_idle(states, false, cutoff, limit)
     }
 
+    /// Both sweeps' candidates, and both are limited to tasks created here.
+    ///
+    /// A sweep files an event of the server's own — an expiry, or a review
+    /// window deemed closed — and that belongs to the server the task was
+    /// created on, which is the one that orders what happens to it. `origin`
+    /// is empty for a task opened here and names the home server otherwise,
+    /// so the filter changes nothing while every stored task is local, and
+    /// starts carrying weight the moment a peer's task is stored.
     fn act_tasks_idle(
         &self,
         states: &[&str],
@@ -6830,7 +8453,7 @@ impl Db {
             "SELECT act_id, kind, venue, origin, state, offerer, offeree, assignee,
                     caps, deadline, replaces, updated
                FROM act_actions
-              WHERE updated < ?1 AND {test}
+              WHERE updated < ?1 AND origin = '' AND {test}
               ORDER BY updated
               LIMIT ?2"
         ))?;
@@ -6938,7 +8561,8 @@ impl Db {
         // events, not the oldest `limit` of them — then oldest first to the
         // caller, which interleaves them with messages in time order.
         let mut stmt = self.conn.prepare(
-            "SELECT event_id, canonical, signature, actor_did, venue, timestamp
+            "SELECT event_id, canonical, signature, actor_did, venue, confirm_state,
+                    timestamp
                FROM events
               WHERE kind = 'act' AND venue = ?1
                 AND timestamp >= ?2 AND timestamp <= ?3
@@ -6946,13 +8570,20 @@ impl Db {
               LIMIT ?4",
         )?;
         let rows = stmt.query_map(params![venue, from_ts, to_ts, limit as i64], |row| {
+            let canonical: String = row.get(1)?;
             Ok(ActLoggedEvent {
                 event_id: row.get(0)?,
-                canonical: row.get(1)?,
+                confirm: match is_receipt_document(&canonical) {
+                    true => None,
+                    false => Some(crate::events::ConfirmState::from_column(
+                        row.get::<_, Option<String>>(5)?.as_deref(),
+                    )),
+                },
+                canonical,
                 signature: row.get(2)?,
                 actor_did: row.get(3)?,
                 venue: row.get(4)?,
-                timestamp: row.get(5)?,
+                timestamp: row.get(6)?,
             })
         })?;
         let mut events: Vec<ActLoggedEvent> = rows.collect::<SqlResult<_>>()?;
@@ -6986,19 +8617,27 @@ impl Db {
     /// follow-up. This is the history a reader gets, and it outlives the view.
     pub fn act_task_events(&self, act_id: &str) -> SqlResult<Vec<ActLoggedEvent>> {
         let mut stmt = self.conn.prepare(
-            "SELECT event_id, canonical, signature, actor_did, venue, timestamp
+            "SELECT event_id, canonical, signature, actor_did, venue, confirm_state,
+                    timestamp
                FROM events
               WHERE kind = 'act' AND (event_id = ?1 OR subject = ?1)
               ORDER BY timestamp, event_id",
         )?;
         let rows = stmt.query_map(params![act_id], |row| {
+            let canonical: String = row.get(1)?;
             Ok(ActLoggedEvent {
                 event_id: row.get(0)?,
-                canonical: row.get(1)?,
+                confirm: match is_receipt_document(&canonical) {
+                    true => None,
+                    false => Some(crate::events::ConfirmState::from_column(
+                        row.get::<_, Option<String>>(5)?.as_deref(),
+                    )),
+                },
+                canonical,
                 signature: row.get(2)?,
                 actor_did: row.get(3)?,
                 venue: row.get(4)?,
-                timestamp: row.get(5)?,
+                timestamp: row.get(6)?,
             })
         })?;
         rows.collect()
@@ -7011,9 +8650,14 @@ impl Db {
     /// mismatch means some path wrote the view without going through the log,
     /// which is the one thing that would make the log stop being the record.
     pub fn rebuild_act_actions(&self) -> SqlResult<Vec<ActTask>> {
+        // Mint order, not delivery order. `timestamp` is when *this* server
+        // took the event, which differs on every server that took the same
+        // events; a signed event id is a ULID, so its byte order is the order
+        // its signers minted in and every server reads the same one out of it.
         let mut stmt = self.conn.prepare(
-            "SELECT event_id, canonical, actor_did, venue, subject, origin, timestamp
-               FROM events WHERE kind = 'act' ORDER BY timestamp, event_id",
+            "SELECT event_id, canonical, actor_did, venue, subject, origin,
+                    confirm_state, timestamp
+               FROM events WHERE kind = 'act' ORDER BY event_id",
         )?;
         struct Row {
             event_id: String,
@@ -7022,9 +8666,10 @@ impl Db {
             venue: String,
             subject: Option<String>,
             origin: Option<String>,
+            confirm: crate::events::ConfirmState,
             timestamp: i64,
         }
-        let rows: Vec<Row> = stmt
+        let mut rows: Vec<Row> = stmt
             .query_map([], |row| {
                 Ok(Row {
                     event_id: row.get(0)?,
@@ -7033,10 +8678,28 @@ impl Db {
                     venue: row.get(3)?,
                     subject: row.get(4)?,
                     origin: row.get(5)?,
-                    timestamp: row.get(6)?,
+                    confirm: crate::events::ConfirmState::from_column(
+                        row.get::<_, Option<String>>(6)?.as_deref(),
+                    ),
+                    timestamp: row.get(7)?,
                 })
             })?
             .collect::<SqlResult<_>>()?;
+
+        // Each task's opener, ahead of that task's follow-ups. In the field it
+        // already is — an opener's id is minted before the events that name it
+        // — but nothing about sorting by id *guarantees* it, and a follow-up
+        // replayed ahead of its opener names a task that does not exist yet
+        // and is silently dropped. A stable sort, so mint order survives
+        // inside each task; tasks are independent of one another here, so the
+        // grouping this imposes across them changes nothing.
+        rows.sort_by(|a, b| {
+            let key = |r: &Row| {
+                let act_id = r.subject.clone().unwrap_or_else(|| r.event_id.clone());
+                (act_id, r.subject.is_some())
+            };
+            key(a).cmp(&key(b))
+        });
 
         let mut live: std::collections::BTreeMap<String, ActTask> =
             std::collections::BTreeMap::new();
@@ -7084,6 +8747,15 @@ impl Db {
                 let Some(task) = live.get(&act_id) else {
                     continue;
                 };
+                // A task another server owns moves on that server's receipts
+                // and on nothing else. An event still waiting on one is on
+                // file and decides nothing, so a rebuild passes over it
+                // exactly as the live path did when it filed it — which is
+                // what makes the two agree about a foreign task.
+                if !task.origin.is_empty() && row.confirm != crate::events::ConfirmState::Confirmed
+                {
+                    continue;
+                }
                 was = Some(task.state.clone());
                 kind = task.kind.clone();
                 let present: Vec<&str> = view.fields.keys().map(String::as_str).collect();
@@ -7109,10 +8781,12 @@ impl Db {
                     },
                     &freeq_sdk::act_transitions::Sender {
                         did: &row.actor,
-                        // The log holds only events this server accepted, and
-                        // it accepted this one — including an expiry it signed
-                        // itself, whose sender check already passed.
-                        is_system: true,
+                        // Read off the actor, never assumed. The log is not a
+                        // list of legal moves: an event on a task another
+                        // server owns is filed here unruled, so a rebuild that
+                        // took every row for pre-checked would let one in. A
+                        // server acts under `did:web:`; a person does not.
+                        is_system: crate::server::is_system_actor(&row.actor),
                         accepted_bid: named
                             .as_deref()
                             .map(|author| freeq_sdk::act_transitions::AcceptedBid { author }),
@@ -8394,6 +10068,7 @@ mod dual_write_tests {
             &EventContext {
                 sig_state: SigState::Unverifiable,
                 origin: Some("peer.example".to_string()),
+                ..Default::default()
             },
         )
         .unwrap();
