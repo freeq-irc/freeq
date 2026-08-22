@@ -320,10 +320,9 @@ async fn run_quic_accept(port: u16, state: Arc<SfuState>) -> anyhow::Result<()> 
 
     while let Some(request) = server.accept().await {
         let id = state.conn_id.fetch_add(1, Ordering::Relaxed);
-        let cluster = state.cluster.clone();
-        let auth = state.auth.clone();
+        let conn_state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_quic_connection(id, request, cluster, auth).await {
+            if let Err(e) = handle_quic_connection(id, request, conn_state).await {
                 tracing::debug!(conn = id, "SFU QUIC session ended: {e}");
             }
         });
@@ -336,11 +335,12 @@ async fn run_quic_accept(port: u16, state: Arc<SfuState>) -> anyhow::Result<()> 
 async fn handle_quic_connection(
     id: u64,
     request: moq_native::Request,
-    cluster: moq_relay::Cluster,
-    auth: moq_relay::Auth,
+    state: Arc<SfuState>,
 ) -> anyhow::Result<()> {
     use moq_relay::AuthParams;
 
+    let cluster = state.cluster.clone();
+    let auth = state.auth.clone();
     let transport = request.transport();
     // Root the connection at the SESSION-SCOPE path derived from the dialed
     // URL, normalized the SAME way the WebSocket entry point normalizes its
@@ -350,6 +350,17 @@ async fn handle_quic_connection(
     // "" (unchanged global behavior for today's clients); `/av/moq/s/{sess}`
     // → per-session isolation (S2). `AuthParams::from_url` still parses any
     // jwt/register query params.
+    // `?inst=` is the client's self-declared AV instance — the media-
+    // revocation key. The WebSocket path has registered it since F6; this
+    // path didn't, so a native (QUIC) client whose roster slot was torn down
+    // kept its media flowing and announcement-driven peers kept hearing the
+    // ghost — F6's fix only reached half the fleet (F10, found by the
+    // harness's blip step against QUIC agents).
+    let inst: Option<String> = request.url().and_then(|url| {
+        url.query_pairs()
+            .find(|(k, _)| k == "inst")
+            .map(|(_, v)| v.into_owned())
+    });
     let params = match request.url() {
         Some(url) => {
             let mut p = AuthParams::from_url(url);
@@ -375,8 +386,25 @@ async fn handle_quic_connection(
     }
     let session = request.ok().await?;
 
-    tracing::info!(conn = id, "SFU: session active");
-    let _ = session.closed().await;
+    tracing::info!(conn = id, inst = ?inst, "SFU: session active");
+    // Park until the client closes — or the roster tears this instance down
+    // and revokes its media, exactly as the WebSocket path has since F6.
+    match inst.as_deref().filter(|i| !i.is_empty()) {
+        Some(instance) => {
+            let notify = state.register_media_conn(instance);
+            tokio::select! {
+                _ = session.closed() => {}
+                _ = notify.notified() => {
+                    tracing::info!(conn = id, instance = %instance,
+                        "SFU: session revoked (roster teardown)");
+                }
+            }
+            state.unregister_media_conn(instance, &notify);
+        }
+        None => {
+            let _ = session.closed().await;
+        }
+    }
     tracing::info!(conn = id, "SFU: session closed");
 
     Ok(())
