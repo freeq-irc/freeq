@@ -1,0 +1,70 @@
+name: AV Harness
+
+# The launch gate for anything that touches AV (docs/AV-MAP.md §7). It builds
+# the server with --features av-native and runs several minutes of real Opus
+# audio between real agents through a real SFU, so it is deliberately NOT on
+# the per-push path — L1 alone already runs there, inside freeq-server's
+# default test suite.
+#
+# On demand before an AV change ships, and weekly so a slow regression in the
+# media stack has a floor on how long it can hide. Its own workflow rather
+# than a job in ci.yml so these triggers don't drag every other job along.
+on:
+  workflow_dispatch:
+  schedule:
+    # Monday 06:17 UTC. Off the hour on purpose — the top of the hour is when
+    # every scheduled workflow on GitHub queues at once.
+    - cron: '17 6 * * 1'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  av-harness:
+    name: L1 (av-native) + L2 tone mesh
+    # macos-26 for the same reason the other AV jobs use it, and because this
+    # is the platform the native clients ship on: the QUIC and WebSocket dial
+    # paths under test here are the ones macOS and iOS actually take.
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # L1 with av-native, so the two feature-gated scenarios — token issuance
+      # and the F6 revocation ordering — actually run instead of skipping.
+      # The per-push job runs the same file without the feature; this is the
+      # other half of it.
+      - name: L1 — AV lifecycle suite (av-native)
+        run: cargo test -p freeq-server --features av-native --test av_lifecycle
+
+      # L2: the tone mesh plus every chaos step. Exit code is the verdict.
+      - name: L2 — tone mesh through the full lifecycle
+        run: ./scripts/avharness.sh --agents 4
+
+      # A gate that cannot fail is not a gate. If a tokenless dial against an
+      # enforcing server ever passes, the harness is measuring nothing — so
+      # prove it fails, on every run, before anyone trusts the run above.
+      - name: Prove the harness can fail (tokenless dial, enforcement on)
+        run: |
+          DATA="$(mktemp -d)"
+          if ./target/release/avharness \
+               --server-bin ./target/release/freeq-server \
+               --data-dir "$DATA" --agents 2 --transport ws \
+               --settle-secs 6 --require-token --break-token; then
+            echo "::error::the harness PASSED with no token against an enforcing server — it is not measuring what it claims to measure"
+            exit 1
+          fi
+          echo "harness correctly reported failure"
+
+      # The server's own log is where a ✗ cell gets explained.
+      - name: Upload server logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: avharness-server-logs
+          path: /tmp/avharness.*/server.log
+          if-no-files-found: ignore

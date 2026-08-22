@@ -51,6 +51,9 @@ freeq-ios/freeq.xcodeproj/
 [Dd]ebug/
 [Rr]elease/
 [Bb]in/
+# …but Rust binaries live in src/bin — the rule above is for build output
+!**/src/bin/
+!**/src/bin/**
 [Oo]bj/
 
 # Android source-set directories whose names collide with the Visual
