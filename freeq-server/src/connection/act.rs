@@ -223,7 +223,9 @@ fn file_own_event(
 pub(crate) fn expire_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -> bool {
     let written = file_own_event(state, &task.kind, "expire", &task.act_id, &[], &task.venue);
     match written {
-        Some((_, crate::db::ActWrite::Filed { .. })) => {}
+        Some((ref tags, crate::db::ActWrite::Filed { .. })) => {
+            broadcast_own_act_event(state, tags, &task.venue, own_event_target(&task.venue));
+        }
         other => {
             tracing::warn!(
                 act_id = %task.act_id, venue = %task.venue,
@@ -267,7 +269,8 @@ pub(crate) fn expire_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -
 pub(crate) fn auto_accept_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -> bool {
     let verb = freeq_sdk::act_transitions::REVIEW_TIMEOUT_VERB;
     match file_own_event(state, &task.kind, verb, &task.act_id, &[], &task.venue) {
-        Some((_, crate::db::ActWrite::Filed { .. })) => {
+        Some((ref tags, crate::db::ActWrite::Filed { .. })) => {
+            broadcast_own_act_event(state, tags, &task.venue, own_event_target(&task.venue));
             let title = state
                 .with_db(|db| db.act_task_title(&task.act_id))
                 .flatten()
@@ -492,34 +495,144 @@ pub(crate) fn receipt_for_applied_move(
 /// expiry notice states too: a server-authored line in a DM names the thread
 /// from the sender's side, and the reader's client has to know that.
 pub(crate) fn broadcast_receipt(state: &Arc<SharedState>, receipt: &Receipt, target: &str) {
+    broadcast_own_act_event(state, &receipt.tags, &receipt.venue, target);
+}
+
+/// Put one of this server's own task events on the wire: to the local sessions
+/// in its venue that asked for task events, and to the peers that can read
+/// them.
+///
+/// Gated exactly as every act event is: a connection that did not ask for
+/// `freeq.at/act` gets none of these either, and a peer that did not declare
+/// the capability is not sent one — the gate for that lives on the one ordered
+/// path every broadcast takes.
+///
+/// Peers matter here as much as people do. A transition on this task filed on
+/// another server is a record until this server's word reaches it; the expiry
+/// that ends a task the same way clears a row that would otherwise sit live on
+/// every peer for ever. There is no companion PRIVMSG — the confirmed event's
+/// companion already told the humans, and this half is machine record.
+///
+/// `target` is where the local copy is filed: the one the event this concerns
+/// arrived on, so both lines land in the same place in whatever renders them.
+/// In a direct conversation that target is whatever the sender addressed,
+/// which is the known limitation the expiry notice states too. The copy that
+/// goes to peers is addressed by [`peer_target_for`] instead, because a nick
+/// means nothing on another server.
+fn broadcast_own_act_event(
+    state: &Arc<SharedState>,
+    tags: &HashMap<String, String>,
+    venue: &str,
+    target: &str,
+) {
     let did = crate::server::server_did(&state.server_name);
     let time_tag = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S.000Z")
         .to_string();
     // Spoken by the server under its own name, the way a NOTICE from the
-    // expiry sweep is: the receipt's authorship is the whole point of it.
+    // expiry sweep is: the authorship is the whole point of these.
     let lines = super::messaging::TagmsgLines::build(
-        &receipt.tags,
+        tags,
         &state.server_name,
         target,
         &time_tag,
         Some(&did),
     );
-    let sessions = venue_sessions(state, &receipt.venue);
-    let tag_caps = state.cap_message_tags.lock();
-    let time_caps = state.cap_server_time.lock();
-    let acct_caps = state.cap_account_tag.lock();
-    let act_caps = state.cap_act.lock();
-    let conns = state.connections.lock();
-    for session in &sessions {
-        if !tag_caps.contains(session) || !act_caps.contains(session) {
-            continue;
-        }
-        if let Some(tx) = conns.get(session) {
-            let line = lines.pick(time_caps.contains(session), acct_caps.contains(session));
-            let _ = tx.try_send(line.to_string());
+    let sessions = venue_sessions(state, venue);
+    {
+        let tag_caps = state.cap_message_tags.lock();
+        let time_caps = state.cap_server_time.lock();
+        let acct_caps = state.cap_account_tag.lock();
+        let act_caps = state.cap_act.lock();
+        let conns = state.connections.lock();
+        for session in &sessions {
+            if !tag_caps.contains(session) || !act_caps.contains(session) {
+                continue;
+            }
+            if let Some(tx) = conns.get(session) {
+                let line = lines.pick(time_caps.contains(session), acct_caps.contains(session));
+                let _ = tx.try_send(line.to_string());
+            }
         }
     }
+    super::helpers::s2s_broadcast(
+        state,
+        crate::s2s::S2sMessage::Tagmsg {
+            event_id: super::helpers::s2s_next_event_id(state),
+            from: state.server_name.clone(),
+            target: peer_target_for(venue, target),
+            tags: tags.clone(),
+            origin: state.server_iroh_id.lock().clone().unwrap_or_default(),
+            account: Some(did),
+        },
+    );
+}
+
+/// The delivery target one of this server's own task events travels to peers
+/// under.
+///
+/// A channel keeps its name: every server folds it to the same venue. A direct
+/// conversation has no name another server could resolve — the target a
+/// participant addressed is a nick, which is local — so it travels addressed
+/// to one of the two DIDs its venue is made of. That is the one thing a peer
+/// can resolve, and resolving it is how the peer checks the event was put in
+/// the conversation it belongs to.
+pub(crate) fn peer_target_for(venue: &str, target: &str) -> String {
+    match venue.strip_prefix("dm:") {
+        Some(pair) => pair.split(',').next().unwrap_or(target).to_string(),
+        None => target.to_string(),
+    }
+}
+
+/// Where one of this server's own events about a task is filed locally: the
+/// channel it happened in, or nowhere addressable in a direct conversation,
+/// which is what the ending notices already say by using `*`.
+fn own_event_target(venue: &str) -> &str {
+    match venue.starts_with("dm:") {
+        true => "*",
+        false => venue,
+    }
+}
+
+/// Rebuild the tags a stored task event travelled under, from the very bytes
+/// its signature covers.
+///
+/// The document's keys are the act tag names with the vendor prefix stripped,
+/// so re-prefixing them reproduces what the sender put on the wire — and the
+/// signature that rides alongside verifies against the row's own bytes.
+/// `target` and `id` are the two the canonical's builder injected: they ride
+/// as the message's target and id rather than as act tags.
+///
+/// `None` for bytes that are not a document at all.
+pub(crate) fn wire_tags_from_canonical(
+    canonical: &str,
+    event_id: &str,
+    signature: Option<&str>,
+) -> Option<HashMap<String, String>> {
+    let doc: serde_json::Value = serde_json::from_str(canonical).ok()?;
+    let fields = doc.as_object()?;
+    let mut tags: HashMap<String, String> = HashMap::new();
+    for (key, value) in fields {
+        if key == "target" || key == "id" {
+            continue;
+        }
+        // The signer's envelope tag: same name on the wire and in the
+        // document.
+        if key == "from" {
+            tags.insert("+freeq.at/from".to_string(), value.as_str()?.to_string());
+            continue;
+        }
+        tags.insert(format!("+freeq.at/{key}"), value.as_str()?.to_string());
+    }
+    tags.insert(
+        freeq_sdk::chatsig::EVENT_ID_TAG.to_string(),
+        event_id.to_string(),
+    );
+    tags.insert("msgid".to_string(), event_id.to_string());
+    if let Some(sig) = signature {
+        tags.insert("+freeq.at/sig".to_string(), sig.to_string());
+    }
+    Some(tags)
 }
 
 /// The wire lines for a venue's stored task events within `[from_ts, to_ts]`
@@ -530,10 +643,9 @@ pub(crate) fn broadcast_receipt(state: &Arc<SharedState>, receipt: &Receipt, tar
 /// gated exactly as live delivery is, so a client that cannot render a task
 /// card is not sent one it never asked for.
 ///
-/// Each line is rebuilt from the stored canonical: the document's keys are the
-/// act tag names with the vendor prefix stripped, so re-prefixing them
-/// reproduces the tags the sender put on the wire, and the signature that
-/// travels alongside verifies against the very bytes the row holds.
+/// Each line is rebuilt from the stored canonical by
+/// [`wire_tags_from_canonical`], so what a reader gets back is the tags the
+/// sender put on the wire and a signature that verifies against them.
 pub(super) fn replay_lines(
     state: &Arc<SharedState>,
     session_id: &str,
@@ -555,31 +667,8 @@ pub(super) fn replay_lines(
     events
         .into_iter()
         .filter_map(|ev| {
-            let doc: serde_json::Value = serde_json::from_str(&ev.canonical).ok()?;
-            let fields = doc.as_object()?;
-            let mut tags: HashMap<String, String> = HashMap::new();
-            for (key, value) in fields {
-                // `target` and `id` are the two the caller injected; they
-                // ride as the message's own target and id, not as act tags.
-                if key == "target" || key == "id" {
-                    continue;
-                }
-                // The signer's envelope tag: same name on the wire and in
-                // the document.
-                if key == "from" {
-                    tags.insert("+freeq.at/from".to_string(), value.as_str()?.to_string());
-                    continue;
-                }
-                tags.insert(format!("+freeq.at/{key}"), value.as_str()?.to_string());
-            }
-            tags.insert(
-                freeq_sdk::chatsig::EVENT_ID_TAG.to_string(),
-                ev.event_id.clone(),
-            );
-            tags.insert("msgid".to_string(), ev.event_id.clone());
-            if let Some(ref sig) = ev.signature {
-                tags.insert("+freeq.at/sig".to_string(), sig.clone());
-            }
+            let mut tags =
+                wire_tags_from_canonical(&ev.canonical, &ev.event_id, ev.signature.as_deref())?;
             if let Some(ref did) = ev.actor_did {
                 tags.insert("account".to_string(), did.clone());
             }
@@ -1053,9 +1142,17 @@ pub(super) fn gate(
                 receipt = mint_receipt(state, kind, &act_id, &msgid, &venue);
             }
         }
-        // Not reachable from here — a sender's confirm was refused above —
-        // but the log's answer for one, and nothing to deliver either way.
-        Some(crate::db::ActWrite::Recorded) => {}
+        // None of these is reachable from here — a sender's confirm was
+        // refused above, and every one of them is an answer to a receipt —
+        // but they are the log's answers for one, and nothing to deliver
+        // either way.
+        Some(
+            crate::db::ActWrite::Recorded
+            | crate::db::ActWrite::Confirmed { .. }
+            | crate::db::ActWrite::ReceiptIgnored
+            | crate::db::ActWrite::ReceiptBeforeSubject
+            | crate::db::ActWrite::ReceiptRefused(_),
+        ) => {}
         // A local sender's move on a task another server owns. Filed, carried
         // to the room, and not decided here — the owning server referees it,
         // so it is carried there and asked about until that server rules.

@@ -136,6 +136,14 @@ pub(crate) struct ParkedEvent {
     /// event that can never verify gets.
     pub signer: String,
     pub kid: String,
+    /// The event this one is waiting for rather than a key: a receipt that
+    /// overtook the transition it confirms. `None` for everything else, which
+    /// waits on a key.
+    ///
+    /// Two different waits, one queue, because both end the same way — the
+    /// thing arrives, the event is judged again, and the ceilings that bound
+    /// one have to bound the other.
+    pub waiting_on: Option<String>,
     /// Park order across every origin. Overwritten by [`DeferQueue::park`].
     pub seq: u64,
 }
@@ -399,13 +407,36 @@ impl DeferQueue {
         event
     }
 
+    /// Take every parked receipt this event would settle, oldest first.
+    ///
+    /// The other half of the release: a receipt that overtook its subject
+    /// waits here, and the subject being filed is what lets it be judged.
+    pub(crate) fn take_for_subject(&mut self, subject: &str) -> Vec<ParkedEvent> {
+        self.take_matching(|event| event.waiting_on.as_deref() == Some(subject))
+    }
+
     /// Take every parked event this key could settle, oldest first.
+    ///
+    /// Never one that is waiting on an event rather than on a key: its
+    /// signature has already been checked, and handing it back now would ask
+    /// the same unanswerable question a second time.
     pub(crate) fn take_for_signer(&mut self, did: &str, kid: &str) -> Vec<ParkedEvent> {
+        let taken = self.take_matching(|event| {
+            event.waiting_on.is_none() && event.signer == did && event.kid == kid
+        });
+        self.retries
+            .retain(|(_, signer, key_id), _| signer != did || key_id != kid);
+        taken
+    }
+
+    /// Take every parked event `wanted` picks out, in park order, and account
+    /// for what left.
+    fn take_matching(&mut self, wanted: impl Fn(&ParkedEvent) -> bool) -> Vec<ParkedEvent> {
         let mut taken = Vec::new();
         for queue in self.by_origin.values_mut() {
             let mut kept = std::collections::VecDeque::with_capacity(queue.len());
             while let Some(event) = queue.pop_front() {
-                match event.signer == did && event.kid == kid {
+                match wanted(&event) {
                     true => taken.push(event),
                     false => kept.push_back(event),
                 }
@@ -414,8 +445,19 @@ impl DeferQueue {
         }
         self.by_origin.retain(|_, q| !q.is_empty());
         self.total -= taken.len();
-        self.retries
-            .retain(|(_, signer, key_id), _| signer != did || key_id != kid);
+        for event in &taken {
+            let key = (
+                event.origin.clone(),
+                event.signer.clone(),
+                event.kid.clone(),
+            );
+            if let std::collections::hash_map::Entry::Occupied(mut e) = self.retries.entry(key) {
+                e.get_mut().waiting -= 1;
+                if e.get().waiting == 0 {
+                    e.remove();
+                }
+            }
+        }
         taken.sort_by_key(|e| e.seq);
         taken
     }
@@ -576,11 +618,37 @@ pub(crate) fn claimed_signer<'a>(
 /// sorted DID pair (`dm_recipient_did` is the caller's resolution of the wire
 /// target — `None` when it does not resolve, which makes the event
 /// unverifiable rather than wrong).
-fn venue_for(target: &str, from_did: &str, dm_recipient_did: Option<&str>) -> Option<String> {
+///
+/// A server is the exception, and has to be. It signs its own events — an
+/// expiry, a closed review window, a receipt — under its `did:web:` name,
+/// which is not one of a direct action's two participants: a venue derived
+/// from that signer would be a pair of DIDs the conversation never had.
+/// `task_venue` is the task's own, read from the log, and it is what a server
+/// signed. The delivery target still has to name somebody in that
+/// conversation, so a home cannot put a task's event into a direct
+/// conversation between two other people.
+pub(crate) fn venue_for(
+    target: &str,
+    from_did: &str,
+    dm_recipient_did: Option<&str>,
+    task_venue: Option<&str>,
+) -> Option<String> {
     if target.starts_with('#') || target.starts_with('&') {
         return Some(freeq_sdk::chatsig::channel_venue(target));
     }
+    if crate::server::is_system_actor(from_did) {
+        let venue = task_venue?;
+        let addressed = dm_recipient_did?;
+        return dm_venue_names(venue, addressed).then(|| venue.to_string());
+    }
     dm_recipient_did.map(|other| freeq_sdk::chatsig::dm_venue(from_did, other))
+}
+
+/// Whether a direct conversation's venue is one of `did`'s.
+fn dm_venue_names(venue: &str, did: &str) -> bool {
+    venue
+        .strip_prefix("dm:")
+        .is_some_and(|pair| pair.split(',').any(|one| one == did))
 }
 
 /// The coordination document a relayed `+freeq.at/event` TAGMSG's signature
@@ -613,14 +681,16 @@ pub(crate) fn coordination_doc_from_tags<'a>(
 ///
 /// `tags` is the tag map as it arrived, `target` the message's delivery
 /// target, `sender_did` the account the origin stamped on the S2S message,
-/// and `dm_recipient_did` the caller's resolution of a non-channel target to
-/// a local DID. `lookup` answers `(did, kid)` with a verifying key when one
-/// is on file.
+/// `dm_recipient_did` the caller's resolution of a non-channel target to a
+/// local DID, and `task_venue` the venue of the task this event names, which
+/// is what a server's own event binds. `lookup` answers `(did, kid)` with a
+/// verifying key when one is on file.
 pub(crate) fn relayed_task_verdict<K>(
     tags: &HashMap<String, String>,
     target: &str,
     sender_did: Option<&str>,
     dm_recipient_did: Option<&str>,
+    task_venue: Option<&str>,
     lookup: K,
 ) -> RelayVerdict
 where
@@ -642,7 +712,7 @@ where
     else {
         return RelayVerdict::Unverifiable("missing id: the event carries no signer-minted id");
     };
-    let Some(venue) = venue_for(target, from, dm_recipient_did) else {
+    let Some(venue) = venue_for(target, from, dm_recipient_did, task_venue) else {
         return RelayVerdict::Unverifiable(
             "missing target: no venue resolves for the delivery target",
         );
@@ -725,6 +795,7 @@ mod defer_tests {
             event_id: id.to_string(),
             signer: signer.to_string(),
             kid: kid.to_string(),
+            waiting_on: None,
             seq: 0,
         }
     }
@@ -952,6 +1023,39 @@ mod defer_tests {
     /// The retry schedule: every distinct signer with events waiting is asked
     /// for again, once per backoff step rather than once per sweep, and a key
     /// that arrives stops being asked for.
+    /// A receipt that outran the event it names waits on that event, and the
+    /// event's arrival is what hands it back.
+    #[test]
+    fn a_receipt_waiting_on_its_subject_is_released_by_that_subject() {
+        let mut q = DeferQueue::new(8, 8);
+        let mut early = parked_receipt("peer-b", "R1");
+        early.signer = String::new();
+        early.kid = String::new();
+        early.waiting_on = Some("C2".to_string());
+        assert!(q.park(early).is_empty());
+
+        assert!(
+            q.take_for_subject("C9").is_empty(),
+            "some other event landing releases nothing"
+        );
+        assert_eq!(ids(&q.take_for_subject("C2")), ["R1"]);
+        assert_eq!(q.len(), 0, "and it is out of the queue once handed back");
+    }
+
+    /// The two waits do not answer each other's questions: a key arriving
+    /// releases what waits on a key, and nothing that waits on an event.
+    #[test]
+    fn a_key_does_not_release_a_receipt_waiting_on_its_subject() {
+        let mut q = DeferQueue::new(8, 8);
+        let mut early = parked_receipt("peer-b", "R1");
+        early.waiting_on = Some("C2".to_string());
+        assert!(q.park(early).is_empty());
+        assert!(q.park(parked("peer-b", "E1")).is_empty());
+
+        assert_eq!(ids(&q.take_for_signer(SIGNER, KID)), ["E1"]);
+        assert_eq!(q.len(), 1, "the receipt is still waiting on its own event");
+    }
+
     #[test]
     fn each_waiting_signer_is_asked_for_again_on_its_own_backoff() {
         let mut q = DeferQueue::new(16, 64);
@@ -1104,6 +1208,22 @@ mod route_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A verdict for an event a *participant* signed, which is every vector
+    /// here: the venue such a signer binds is the one the delivery target
+    /// derives, so no task venue is offered.
+    fn verdict_of<K>(
+        tags: &HashMap<String, String>,
+        target: &str,
+        sender_did: Option<&str>,
+        dm_recipient_did: Option<&str>,
+        lookup: K,
+    ) -> RelayVerdict
+    where
+        K: Fn(&str, &str) -> Option<ed25519_dalek::VerifyingKey>,
+    {
+        relayed_task_verdict(tags, target, sender_did, dm_recipient_did, None, lookup)
+    }
     use base64::Engine;
 
     fn spec(file: &str) -> serde_json::Value {
@@ -1192,7 +1312,7 @@ mod tests {
 
             let from = vector["tags"]["+freeq.at/from"].as_str().unwrap();
             let (target, dm_recipient) = delivery_for(vector, from);
-            let verdict = relayed_task_verdict(
+            let verdict = verdict_of(
                 &tags,
                 &target,
                 // The relay origin's account stamp: irrelevant to an act
@@ -1205,6 +1325,74 @@ mod tests {
         }
     }
 
+    // ── the venue a server's own event binds ──────────────────────────────
+    //
+    // A server signs under `did:web:`, which is not one of a direct action's
+    // two participants: a venue built from that signer would be a pair of DIDs
+    // the conversation never had, and the home's own receipt or expiry would
+    // read as forged. The venue is the task's own instead.
+
+    const A_SERVER: &str = "did:web:home.example";
+    const ALICE: &str = "did:plc:alice";
+    const BOB: &str = "did:plc:bob";
+
+    #[test]
+    fn a_servers_own_event_in_a_channel_takes_the_channel_venue() {
+        assert_eq!(
+            venue_for("#Ops", A_SERVER, None, Some("#ops")),
+            Some("#ops".to_string()),
+            "a channel folds to the same venue on every server, signer or no signer"
+        );
+    }
+
+    #[test]
+    fn a_servers_own_event_in_a_direct_action_takes_the_tasks_venue() {
+        let task = freeq_sdk::chatsig::dm_venue(ALICE, BOB);
+        assert_eq!(
+            venue_for(BOB, A_SERVER, Some(BOB), Some(&task)),
+            Some(task.clone()),
+            "the home signed the conversation the task lives in"
+        );
+        assert_ne!(
+            Some(freeq_sdk::chatsig::dm_venue(A_SERVER, BOB)),
+            Some(task),
+            "which is not the one its own DID would build"
+        );
+    }
+
+    #[test]
+    fn a_servers_event_addressed_outside_its_task_has_no_venue() {
+        let task = freeq_sdk::chatsig::dm_venue(ALICE, BOB);
+        assert_eq!(
+            venue_for(
+                "did:plc:stranger",
+                A_SERVER,
+                Some("did:plc:stranger"),
+                Some(&task)
+            ),
+            None,
+            "a home cannot put a task's event into a conversation it is not in"
+        );
+    }
+
+    #[test]
+    fn a_servers_event_about_a_task_we_do_not_hold_has_no_venue() {
+        assert_eq!(
+            venue_for(BOB, A_SERVER, Some(BOB), None),
+            None,
+            "with no task on file there is nothing to rebuild the document from"
+        );
+    }
+
+    #[test]
+    fn a_participants_direct_event_still_binds_the_pair_it_names() {
+        assert_eq!(
+            venue_for(BOB, ALICE, Some(BOB), Some("dm:someone,else")),
+            Some(freeq_sdk::chatsig::dm_venue(ALICE, BOB)),
+            "a participant's venue comes from the participants, as it always did"
+        );
+    }
+
     #[test]
     fn a_tampered_act_tag_is_invalid() {
         let fixtures = spec("act-signing-vectors.json");
@@ -1215,7 +1403,7 @@ mod tests {
             "Cite 4 sources on X".to_string(),
         );
         let from = vector["tags"]["+freeq.at/from"].as_str().unwrap();
-        let verdict = relayed_task_verdict(
+        let verdict = verdict_of(
             &tags,
             vector["target"].as_str().unwrap(),
             None,
@@ -1233,7 +1421,7 @@ mod tests {
         let fixtures = spec("act-signing-vectors.json");
         let vector = &fixtures["vectors"][0];
         let tags = act_wire_tags(vector);
-        let verdict = relayed_task_verdict(
+        let verdict = verdict_of(
             &tags,
             vector["target"].as_str().unwrap(),
             None,
@@ -1249,7 +1437,7 @@ mod tests {
         let vector = &fixtures["vectors"][0];
         let mut tags = act_wire_tags(vector);
         tags.remove("+freeq.at/from");
-        let verdict = relayed_task_verdict(
+        let verdict = verdict_of(
             &tags,
             vector["target"].as_str().unwrap(),
             // The account stamp does not stand in for an act event's from:
@@ -1270,7 +1458,7 @@ mod tests {
         let vector = &fixtures["vectors"][0];
         let mut tags = act_wire_tags(vector);
         tags.remove(freeq_sdk::chatsig::EVENT_ID_TAG);
-        let verdict = relayed_task_verdict(
+        let verdict = verdict_of(
             &tags,
             vector["target"].as_str().unwrap(),
             None,
@@ -1290,7 +1478,7 @@ mod tests {
         let tags = act_wire_tags(vector);
         // A DM delivery whose recipient this server cannot resolve to a DID:
         // no venue, no document, no verdict about the sender.
-        let verdict = relayed_task_verdict(&tags, "somenick", None, None, |_, _| None);
+        let verdict = verdict_of(&tags, "somenick", None, None, |_, _| None);
         match verdict {
             RelayVerdict::Unverifiable(why) => assert!(why.contains("target"), "{why}"),
             other => panic!("a missing mandatory field is unverifiable: {other:?}"),
@@ -1304,7 +1492,7 @@ mod tests {
         let mut tags = act_wire_tags(vector);
         tags.insert("+freeq.at/sig".to_string(), "rsa:somekid:AAAA".to_string());
         let from = vector["tags"]["+freeq.at/from"].as_str().unwrap();
-        let verdict = relayed_task_verdict(
+        let verdict = verdict_of(
             &tags,
             vector["target"].as_str().unwrap(),
             None,
@@ -1386,7 +1574,7 @@ mod tests {
                 "{name}"
             );
 
-            let verdict = relayed_task_verdict(
+            let verdict = verdict_of(
                 &tags,
                 target,
                 Some(from),
@@ -1405,7 +1593,7 @@ mod tests {
         let mut tags = coordination_wire_tags(vector);
         tags.insert("+freeq.at/payload".to_string(), "%7B%7D".to_string());
         let from = input["from"].as_str().unwrap();
-        let verdict = relayed_task_verdict(
+        let verdict = verdict_of(
             &tags,
             input["target"].as_str().unwrap(),
             Some(from),
@@ -1423,7 +1611,7 @@ mod tests {
         let fixtures = spec("chat-signing-vectors.json");
         let vector = coordination_vectors(&fixtures)[0];
         let input = &vector["input"];
-        let verdict = relayed_task_verdict(
+        let verdict = verdict_of(
             &coordination_wire_tags(vector),
             input["target"].as_str().unwrap(),
             Some(input["from"].as_str().unwrap()),
@@ -1440,7 +1628,7 @@ mod tests {
         let input = &vector["input"];
         // A guest's relay, or an old peer omitting the account field: the
         // document's from is unknowable, so there is nothing to rebuild.
-        let verdict = relayed_task_verdict(
+        let verdict = verdict_of(
             &coordination_wire_tags(vector),
             input["target"].as_str().unwrap(),
             None,
@@ -1460,7 +1648,7 @@ mod tests {
         let input = &vector["input"];
         let mut tags = coordination_wire_tags(vector);
         tags.remove(freeq_sdk::chatsig::EVENT_ID_TAG);
-        let verdict = relayed_task_verdict(
+        let verdict = verdict_of(
             &tags,
             input["target"].as_str().unwrap(),
             Some(input["from"].as_str().unwrap()),
@@ -1481,7 +1669,7 @@ mod tests {
         let mut tags = coordination_wire_tags(vector);
         tags.insert("+freeq.at/sig".to_string(), "rsa:somekid:AAAA".to_string());
         let from = input["from"].as_str().unwrap();
-        let verdict = relayed_task_verdict(
+        let verdict = verdict_of(
             &tags,
             input["target"].as_str().unwrap(),
             Some(from),
@@ -1505,7 +1693,7 @@ mod tests {
         let tags = act_wire_tags(vector);
         let from = vector["tags"]["+freeq.at/from"].as_str().unwrap();
         // The right key, but filed under the account stamp's DID: a miss.
-        let verdict = relayed_task_verdict(
+        let verdict = verdict_of(
             &tags,
             vector["target"].as_str().unwrap(),
             Some("did:plc:relaystamp"),
@@ -1518,7 +1706,7 @@ mod tests {
         );
         assert_eq!(verdict, RelayVerdict::Unverifiable(NO_KEY_ON_FILE));
         // Filed under the document's from: found, and valid.
-        let verdict = relayed_task_verdict(
+        let verdict = verdict_of(
             &tags,
             vector["target"].as_str().unwrap(),
             Some("did:plc:relaystamp"),

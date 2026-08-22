@@ -961,8 +961,9 @@ async fn api_act_task(
                 // tell an event that decided something from one that is on
                 // file and waiting on the server that owns the task:
                 // "confirmed", "unconfirmed", or "superseded" — the last being
-                // a move a confirmed one outran.
-                "confirm_state": e.confirm.as_str(),
+                // a move a confirmed one outran. Absent for a receipt, which
+                // is the answer itself and has no state of its own.
+                "confirm_state": e.confirm.map(crate::events::ConfirmState::as_str),
                 "timestamp": e.timestamp,
             })
         })

@@ -1090,37 +1090,76 @@ impl S2sManager {
     /// Carry one transition to the server that owns its task.
     ///
     /// Addressed, not broadcast: exactly one server referees a task, and the
-    /// message asks that one for a ruling. Two gates, both the ones an
-    /// ordinary relay passes — we do not send to a peer we would not relay
-    /// messages to ([`S2sManager::may_relay_to`], so trust is decided in one
-    /// place for every kind of traffic), and we do not send a message the peer
-    /// has not said it can parse.
+    /// message asks that one for a ruling.
     ///
     /// Whether it is worth trying again is the point of the answer: a link
     /// that is down comes back, an old build does not.
     pub async fn route_to_home(&self, home: &str, msg: S2sMessage) -> RouteOutcome {
-        // Capabilities first, then peers: the same lock order the broadcast
-        // path takes, never nested the other way round.
-        let declared = self
-            .peer_capabilities
-            .lock()
-            .await
-            .get(home)
-            .cloned()
-            .unwrap_or_default();
-        let peers = self.peers.lock().await;
-        // Not linked right now — including a peer we have never heard from,
-        // whose declaration would be missing for that reason alone.
-        if !peers.contains_key(home) {
+        // Linked first, and only then what it can parse: a peer we have never
+        // heard from has no declaration for that reason alone, and reading
+        // that as "an old build" would turn a link that is down — worth asking
+        // again — into a refusal that says stop.
+        if !self.is_linked(home).await {
             return RouteOutcome::Unreachable;
         }
-        if !self.may_relay_to(home, &peers) {
-            return RouteOutcome::Refused("this server sends that peer no events");
-        }
+        let declared = self.declared_by(home).await;
         if !peer_supports(&declared, ACT_ROUTE) {
             return RouteOutcome::Refused("the peer cannot receive routed transitions");
         }
-        match peers.get(home) {
+        self.send_to_linked_peer(home, msg).await
+    }
+
+    /// Answer one peer with a task event of ours — the receipt a peer that is
+    /// still asking never heard.
+    ///
+    /// Addressed rather than broadcast: everybody else who could act on it got
+    /// it when it was made, and this one peer is the one still waiting. Same
+    /// two gates, and the capability is the ordinary [`ACT`] one, because what
+    /// travels is an ordinary task event.
+    pub async fn send_act_to_peer(&self, peer: &str, msg: S2sMessage) -> RouteOutcome {
+        if !self.is_linked(peer).await {
+            return RouteOutcome::Unreachable;
+        }
+        let declared = self.declared_by(peer).await;
+        if !peer_supports(&declared, ACT) {
+            return RouteOutcome::Refused("the peer did not declare the act capability");
+        }
+        self.send_to_linked_peer(peer, msg).await
+    }
+
+    /// Whether there is a link to this peer at all right now.
+    async fn is_linked(&self, peer: &str) -> bool {
+        self.peers.lock().await.contains_key(peer)
+    }
+
+    /// What one peer said it can parse.
+    ///
+    /// Each of these takes one lock and releases it before the next is taken,
+    /// so nothing here nests the two the way the broadcast path must not.
+    async fn declared_by(&self, peer: &str) -> Vec<String> {
+        self.peer_capabilities
+            .lock()
+            .await
+            .get(peer)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Hand one message to one peer, past the gate every relay passes: we do
+    /// not send to a peer we would not relay messages to
+    /// ([`S2sManager::may_relay_to`]), so trust is decided in one place for
+    /// every kind of traffic. What the peer can parse is its caller's
+    /// question, because the answer differs per message.
+    async fn send_to_linked_peer(&self, peer: &str, msg: S2sMessage) -> RouteOutcome {
+        let peers = self.peers.lock().await;
+        // The link can have gone in the moment since it was looked for.
+        if !peers.contains_key(peer) {
+            return RouteOutcome::Unreachable;
+        }
+        if !self.may_relay_to(peer, &peers) {
+            return RouteOutcome::Refused("this server sends that peer no events");
+        }
+        match peers.get(peer) {
             Some(entry) => match entry.tx.send(msg).await {
                 Ok(()) => RouteOutcome::Sent,
                 // The link died between the check and the send.

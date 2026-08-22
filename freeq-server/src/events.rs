@@ -155,9 +155,8 @@ pub enum ConfirmState {
     Unconfirmed,
     /// It was unconfirmed, a confirmed transition landed on the same task, and
     /// the rules no longer admit this one: a losing claim. The log row stays —
-    /// the record is never lost, only the pending flag. Nothing writes this
-    /// yet: a home's ruling reaches only the people on the home, so no peer
-    /// has one to re-check its pending events against.
+    /// the record is never lost, only the pending flag. Written when the
+    /// winner is ruled in, which is when the losers stop being able to win.
     Superseded,
 }
 
