@@ -3269,14 +3269,12 @@ fn file_replayed_task_event(
     // home's own later replay of the genuine event would then be a duplicate
     // that changes nothing for ever.
     //
-    // A task of this server's own is outside all of this: an event of ours
-    // coming home is judged by `replay_origin` against our own records, which
-    // is a corroboration and not a peer's claim.
+    // A task of this server's own has no home link to judge either against:
+    // the home is here, and a row of ours carries no origin. There the name
+    // is the whole of it — see `from_system` below.
+    let task_home = state.with_db(|db| db.act_task_origin(&act_id)).flatten();
     let owning_peer = match is_receipt || is_system_actor(&actor) {
-        true => state
-            .with_db(|db| db.act_task_origin(&act_id))
-            .flatten()
-            .filter(|home| !home.is_empty()),
+        true => task_home.clone().filter(|home| !home.is_empty()),
         false => None,
     };
     if let Some(owner) = owning_peer.as_deref()
@@ -3296,6 +3294,17 @@ fn file_replayed_task_event(
     let origin = match owning_peer.is_some() {
         true => relayed_by,
         false => origin,
+    };
+
+    // Whether this server itself signed it. It signs under its own `did:web:`
+    // identity, and on a task of ours that name is what says so: a peer can
+    // stamp a batch with our endpoint id, and one that also signs under some
+    // other `did:web:` name would otherwise be taken for us and could expire
+    // our tasks. Under any other name it goes in as an ordinary
+    // participant's event, and the rules refuse it there.
+    let from_system = match task_home.as_deref() {
+        Some("") => actor == server_did(&state.server_name),
+        _ => is_system_actor(&actor),
     };
 
     // The view is written with a valid-signature receipt, so only an event
@@ -3329,9 +3338,7 @@ fn file_replayed_task_event(
             opens,
             venue: &facts.venue,
             actor: &actor,
-            // A system event is one the server itself signed, which it does
-            // under its `did:web:` identity.
-            from_system: is_system_actor(&actor),
+            from_system,
             origin: (!origin.is_empty()).then_some(origin),
             timestamp: ev.timestamp as i64,
         })
@@ -13946,6 +13953,50 @@ mod catchup_tests {
         assert!(
             state.with_db(|db| db.act_task(ACT)).flatten().is_none(),
             "the task's own server ended it"
+        );
+    }
+
+    /// And a peer cannot become this server by stamping a batch with our id.
+    ///
+    /// A task of ours carries no origin at all — the home is here — so there
+    /// is no home link to judge a claim to the home's word against. What
+    /// speaks for this server is this server's own `did:web:` name and
+    /// nothing else: under any other name a server-signed event is an
+    /// ordinary participant's, and the rules let no participant expire a
+    /// task. This server's own word, coming home, still ends one:
+    /// `our_own_expiry_coming_home_is_not_confirmed_a_second_time`.
+    #[test]
+    fn a_replayed_expiry_signed_under_another_servers_name_cannot_end_a_task_of_ours() {
+        const ID: &str = "01ACT00000000000000000076";
+        const FORGED: &str = "01ACT00000000000000000077";
+        const OTHER_DID: &str = "did:web:other.example";
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        our_own_task(&state, &key, ID);
+
+        let other_key = SigningKey::from_bytes(&[149u8; 32]);
+        key_on_file(&state, OTHER_DID, &other_key);
+        assert_eq!(
+            apply_replayed_event(
+                &state,
+                OWN,
+                PEER,
+                system_transition(&other_key, FORGED, ID, "expire", OTHER_DID, OWN),
+            ),
+            ReplayOutcome::Unusable
+        );
+        assert_eq!(
+            state
+                .with_db(|db| db.act_task(ID))
+                .flatten()
+                .expect("live")
+                .state,
+            "open",
+            "the task stands: only this server ends a task of this server's"
+        );
+        assert!(
+            !state.with_db(|db| db.is_act_event(FORGED)).unwrap(),
+            "and the rules refused it, so there is no row under that id"
         );
     }
 
