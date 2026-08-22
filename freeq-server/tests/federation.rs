@@ -4624,3 +4624,231 @@ async fn channel_events(web_addr: &str, channel: &str) -> Vec<serde_json::Value>
     };
     body["events"].as_array().cloned().unwrap_or_default()
 }
+
+// ── a task whose home server vanished ─────────────────────────────────────
+//
+// A task is refereed by the server it was created on. While that server is
+// gone nothing can rule on the task, and a peer showing it as fresh open work
+// is lying by omission. So a peer annotates it `orphaned` in its own view —
+// its own reading, never a transition, never relayed, never in the signed log
+// — and the annotation lifts by itself when the home comes back.
+//
+// Read through REST, because that is where the RFC puts the promise: clients
+// see honest liveness rather than a forever-fresh offer.
+
+/// One task's row in a server's task listing — the surface a client's inbox
+/// actually reads.
+async fn listed_task(web_addr: &str, act_id: &str) -> Option<serde_json::Value> {
+    let url = format!("http://{web_addr}/api/v1/actions");
+    let body = reqwest::get(&url)
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    body["tasks"]
+        .as_array()?
+        .iter()
+        .find(|t| t["act_id"].as_str() == Some(act_id))
+        .cloned()
+}
+
+/// Poll a server's answer for `act_id` until its state is `want`, or give up
+/// and return what it last said.
+async fn await_task_state(web_addr: &str, act_id: &str, want: &str, within: Duration) -> String {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut last = String::from("<no answer>");
+    while tokio::time::Instant::now() < deadline {
+        if let Some(body) = act_task(web_addr, act_id).await {
+            last = body["task"]["state"]
+                .as_str()
+                .unwrap_or("<absent>")
+                .to_string();
+            if last == want {
+                return last;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    last
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_task_reads_orphaned_while_its_home_is_away_and_live_again_when_it_returns() {
+    // B is the server that stays up, so it is the one that must keep its
+    // outgoing link — the same orientation rule the away-home test pins, for
+    // the same reason: B is what has to reach A again.
+    const SEED_A: u8 = 208;
+    const SEED_B: u8 = 209;
+    let id_a = iroh::SecretKey::from_bytes(&[SEED_A; 32])
+        .public()
+        .to_string();
+    let id_b = iroh::SecretKey::from_bytes(&[SEED_B; 32])
+        .public()
+        .to_string();
+    assert!(
+        id_b < id_a,
+        "the server that stays up keeps its outgoing link"
+    );
+
+    // Seconds rather than the shipped day, which is the whole reason the
+    // threshold is configurable.
+    const ORPHAN_SECS: &str = "5";
+
+    let alice = TestId::new("did:plc:aliceorphan");
+    let bob = TestId::new("did:plc:boborphan");
+    let (mut srv_a, srv_b) = spawn_pair_with_seeds_and_args(
+        &[&alice, &bob],
+        SEED_A,
+        SEED_B,
+        &[],
+        &["--act-orphan-secs", ORPHAN_SECS],
+    )
+    .await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#orphan").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#orphan").await.unwrap();
+
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&[19u8; 32]);
+    register_key(&ha, &key_a).await;
+
+    let act_id = offer_until_the_peer_holds_it(
+        &ha,
+        "#orphan",
+        &key_a,
+        &alice.did,
+        "outlives-its-home",
+        &srv_b.web_addr,
+    )
+    .await;
+    assert!(
+        !act_id.is_empty(),
+        "the link must carry the task before the outage, or the outage proves \
+         nothing; B's log says: {}",
+        server_log(&srv_b)
+            .lines()
+            .filter(|l| l.contains("verdict="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // ── while the home is up, the task reads as it stands ────────────
+    let before = act_task(&srv_b.web_addr, &act_id)
+        .await
+        .expect("B answers for the task it took live");
+    assert_eq!(
+        before["task"]["state"].as_str(),
+        Some("open"),
+        "a task whose home is right there is not orphaned: {before}"
+    );
+    assert_eq!(before["task"]["origin"].as_str(), Some(id_a.as_str()));
+    let events_before = before["events"].as_array().map(Vec::len);
+
+    // ── the home goes away ───────────────────────────────────────────
+    ha.quit(None).await.ok();
+    srv_a.stop();
+
+    let state = await_task_state(
+        &srv_b.web_addr,
+        &act_id,
+        "orphaned",
+        Duration::from_secs(45),
+    )
+    .await;
+    assert_eq!(
+        state,
+        "orphaned",
+        "past the threshold, a task nobody can rule on must say so; B's log \
+         says: {}",
+        server_log(&srv_b)
+            .lines()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // The annotation is this server's reading, not a change to the task.
+    let away = act_task(&srv_b.web_addr, &act_id)
+        .await
+        .expect("B still answers for the task");
+    assert_eq!(
+        away["task"]["stored_state"].as_str(),
+        Some("open"),
+        "the task's own record is untouched: {away}"
+    );
+    assert_eq!(
+        away["events"].as_array().map(Vec::len),
+        events_before,
+        "and nothing was written to the log to say it: {away}"
+    );
+    let listed = listed_task(&srv_b.web_addr, &act_id)
+        .await
+        .expect("the task is still listed while its home is away");
+    assert_eq!(
+        listed["state"].as_str(),
+        Some("orphaned"),
+        "the listing an inbox reads says the same thing: {listed}"
+    );
+    assert_eq!(listed["stored_state"].as_str(), Some("open"));
+
+    // ── the home comes back and speaks ───────────────────────────────
+    srv_a.start_again().await;
+    let (ha2, mut rxa2) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa2).await;
+    warm_link(&ha2, &bob.did, &mut rxb).await;
+
+    let state = await_task_state(&srv_b.web_addr, &act_id, "open", S2S_SETTLE).await;
+    assert_eq!(
+        state, "open",
+        "the annotation lifts by itself when the home is reachable again"
+    );
+
+    // No residue: same record, same log, and the listing back in step.
+    let listed = listed_task(&srv_b.web_addr, &act_id)
+        .await
+        .expect("and it is listed once the home is back");
+    assert_eq!(listed["state"].as_str(), Some("open"));
+    let back = act_task(&srv_b.web_addr, &act_id)
+        .await
+        .expect("B answers for the task once more");
+    assert_eq!(back["task"]["stored_state"].as_str(), Some("open"));
+    assert_eq!(back["events"].as_array().map(Vec::len), events_before);
+    assert_eq!(
+        back["task"]["origin"].as_str(),
+        Some(id_a.as_str()),
+        "and it still names the server that referees it: {back}"
+    );
+
+    // Authority resumed with contact: the home's own ruling on the task now
+    // crosses the link it came back on, and B follows it.
+    ha2.join("#orphan").await.unwrap();
+    register_key(&ha2, &key_a).await;
+    send_act_as(
+        &ha2,
+        "#orphan",
+        &key_a,
+        &[
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "cancel"),
+            ("+freeq.at/from", alice.did.as_str()),
+            ("+freeq.at/act-id", act_id.as_str()),
+        ],
+    )
+    .await;
+    assert!(
+        await_task_gone(&srv_b.web_addr, &act_id, S2S_SETTLE).await,
+        "the home's word ends the task on the peer that was reading it orphaned"
+    );
+
+    ha2.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}

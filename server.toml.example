@@ -39,6 +39,10 @@
 ## restart drops them:
 # act_defer_max_per_origin = 256
 # act_defer_max_total = 4096
+## How long a task's home server may be out of contact before unfinished tasks
+## it owns read `orphaned` here (seconds; 0 = never). Local view only — never
+## relayed, never in the signed log, and it lifts as soon as the home is back:
+# act_orphan_secs = 86400
 
 ## ── Federation (iroh + S2S) ────────────────────────────────────────
 # iroh = true

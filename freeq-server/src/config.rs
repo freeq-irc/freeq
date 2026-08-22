@@ -165,6 +165,15 @@ pub struct ServerConfig {
     #[arg(long, default_value = "4096")]
     pub act_defer_max_total: usize,
 
+    /// How long a task's home server may be out of contact before unfinished
+    /// tasks that server owns read `orphaned` here, in seconds. Purely local:
+    /// the annotation is worked out when a view is read, never stored, never
+    /// relayed, never part of the signed log, and it dissolves the moment the
+    /// home is heard from again. RFC-recommended 24 hours, configurable.
+    /// 0 = never mark.
+    #[arg(long, default_value = "86400")]
+    pub act_orphan_secs: u64,
+
     /// Message of the Day text. If not set, no MOTD is sent.
     #[arg(long)]
     pub motd: Option<String>,
@@ -344,6 +353,7 @@ impl Default for ServerConfig {
             act_review_secs: 1_209_600,
             act_defer_max_per_origin: 256,
             act_defer_max_total: 4096,
+            act_orphan_secs: 86_400,
             motd: None,
             motd_file: None,
             web_static_dir: None,
@@ -482,6 +492,7 @@ struct FileConfig {
     act_review_secs: Option<u64>,
     act_defer_max_per_origin: Option<usize>,
     act_defer_max_total: Option<usize>,
+    act_orphan_secs: Option<u64>,
     motd: Option<String>,
     motd_file: Option<String>,
     web_static_dir: Option<String>,
@@ -603,6 +614,7 @@ fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConf
         act_review_secs,
         act_defer_max_per_origin,
         act_defer_max_total,
+        act_orphan_secs,
         plugins,
         require_did_for_ops,
         oper_dids,
@@ -661,6 +673,7 @@ mod tests {
                 act_review_secs = 240
                 act_defer_max_per_origin = 7
                 act_defer_max_total = 21
+                act_orphan_secs = 5
                 peer_key_retry_secs = 3
                 s2s_peer_api = ["abcd=https://irc.example.com"]
                 "#,
@@ -675,6 +688,7 @@ mod tests {
         assert_eq!(c.act_review_secs, 240);
         assert_eq!(c.act_defer_max_per_origin, 7);
         assert_eq!(c.act_defer_max_total, 21);
+        assert_eq!(c.act_orphan_secs, 5);
         assert_eq!(c.peer_key_retry_secs, 3);
         assert_eq!(c.s2s_peer_api, vec!["abcd=https://irc.example.com"]);
     }

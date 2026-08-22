@@ -1000,6 +1000,70 @@ pub struct PeerEntry {
     pub conn_gen: u64,
 }
 
+/// When this server last had contact with each peer, and when it started.
+///
+/// Deliberately not a field on [`PeerEntry`]: that entry is dropped from the
+/// peers map the moment a link closes, which is exactly the moment "how long
+/// since we heard from that server" starts being worth asking. This record
+/// outlives any one link.
+///
+/// In memory only. A restart forgets every peer and falls back to `started`,
+/// so a server that vanished before the restart takes a full threshold from
+/// *our* start before it reads out of contact again — late rather than early,
+/// which is the safe direction for an annotation that tells a reader somebody
+/// else's work is stranded.
+#[derive(Debug)]
+pub struct PeerContact {
+    started: std::time::Instant,
+    last: HashMap<String, std::time::Instant>,
+}
+
+impl Default for PeerContact {
+    fn default() -> Self {
+        Self::new(std::time::Instant::now())
+    }
+}
+
+impl PeerContact {
+    pub fn new(started: std::time::Instant) -> Self {
+        Self {
+            started,
+            last: HashMap::new(),
+        }
+    }
+
+    /// Record a successful exchange with `peer_id`.
+    pub fn touch(&mut self, peer_id: &str) {
+        self.touch_at(peer_id, std::time::Instant::now());
+    }
+
+    /// The same, at a stated moment.
+    pub fn touch_at(&mut self, peer_id: &str, at: std::time::Instant) {
+        let slot = self.last.entry(peer_id.to_string()).or_insert(at);
+        if at > *slot {
+            *slot = at;
+        }
+    }
+
+    /// When we last heard from `peer_id`, or when we started for one we never
+    /// have.
+    pub fn last_contact(&self, peer_id: &str) -> std::time::Instant {
+        self.last.get(peer_id).copied().unwrap_or(self.started)
+    }
+
+    /// Nothing heard from `peer_id` for longer than `ttl` — the timing half of
+    /// [`S2sManager::peer_out_of_contact`]. A zero `ttl` is the operator
+    /// saying *never*: no peer is ever out of contact by it.
+    pub fn out_of_contact(
+        &self,
+        peer_id: &str,
+        ttl: std::time::Duration,
+        now: std::time::Instant,
+    ) -> bool {
+        !ttl.is_zero() && now.duration_since(self.last_contact(peer_id)) >= ttl
+    }
+}
+
 pub struct S2sManager {
     /// Our server's iroh endpoint ID (cryptographic identity).
     pub server_id: String,
@@ -1041,6 +1105,9 @@ pub struct S2sManager {
     /// than read from config at each call site so [`S2sManager::may_relay_to`]
     /// can state the whole rule in one place.
     pub allowed_peers: Vec<String>,
+    /// When each peer was last heard from. Written on every successful
+    /// exchange, never cleared when a link drops — see [`PeerContact`].
+    pub peer_contact: Arc<parking_lot::Mutex<PeerContact>>,
 }
 
 impl S2sManager {
@@ -1079,6 +1146,29 @@ impl S2sManager {
     /// rather than locked here: the live path calls this while iterating it.
     pub fn may_relay_to(&self, peer_id: &str, peers: &HashMap<String, PeerEntry>) -> bool {
         peers.contains_key(peer_id) && self.is_allowlisted(peer_id)
+    }
+
+    /// **The** definition of a peer being gone, in one place: no live link
+    /// right now *and* nothing heard from it for longer than `ttl`. Both
+    /// halves are required — a link that is up is contact, however quiet.
+    ///
+    /// Read by the task view, which annotates a foreign task `orphaned` when
+    /// its home answers true here. The link half is the same peers map a
+    /// routed transition is offered to, so what counts as reachable is one
+    /// record read two ways rather than two answers. A zero `ttl` means never.
+    pub async fn peer_out_of_contact(&self, peer_id: &str, ttl: std::time::Duration) -> bool {
+        if ttl.is_zero() || self.peers.lock().await.contains_key(peer_id) {
+            return false;
+        }
+        self.peer_contact
+            .lock()
+            .out_of_contact(peer_id, ttl, std::time::Instant::now())
+    }
+
+    /// Note a successful exchange with `peer_id` — a message read off its
+    /// link, or the link coming up in the first place.
+    pub fn note_contact(&self, peer_id: &str) {
+        self.peer_contact.lock().touch(peer_id);
     }
 
     /// Whether the operator permits this peer at all. An empty allowlist means
@@ -1160,6 +1250,11 @@ impl S2sManager {
             return RouteOutcome::Refused("this server sends that peer no events");
         }
         match peers.get(peer) {
+            // Handed to the link, which is all `Sent` claims. A link that has
+            // just died keeps accepting sends until it notices, so this is not
+            // delivery and deliberately not contact either — the clock that
+            // says how long a home has been silent moves on what is *heard*
+            // from it, on the inbound paths.
             Some(entry) => match entry.tx.send(msg).await {
                 Ok(()) => RouteOutcome::Sent,
                 // The link died between the check and the send.
@@ -1455,6 +1550,7 @@ pub async fn start(
         authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         allowed_peers: state.config.s2s_allowed_peers.clone(),
+        peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
     });
 
     // Spawn the ordered broadcast worker.  All outbound S2S messages flow
@@ -1795,6 +1891,7 @@ async fn handle_s2s_connection(
         );
     }
 
+    manager.note_contact(&peer_id);
     tracing::info!(peer = %peer_id, incoming, "S2S link established");
 
     // Bridge QUIC recv → DuplexStream for BufReader line reading
@@ -1882,6 +1979,9 @@ async fn handle_s2s_connection(
                             }
                         };
 
+                        // Heard from. Counted after the envelope check, so a
+                        // forged or unparseable line is not contact.
+                        read_manager.note_contact(&authenticated_peer_id);
                         let event = AuthenticatedS2sEvent {
                             authenticated_peer_id: authenticated_peer_id.clone(),
                             msg,
@@ -2030,6 +2130,67 @@ async fn handle_s2s_connection(
 
 #[cfg(test)]
 mod tests {
+
+    // ── last contact with a peer ──────────────────────────────────
+    //
+    // The record the orphan annotation reads. It has to outlive the link,
+    // because "how long since we heard from that server" is only ever asked
+    // about a server whose link is already gone.
+
+    use super::PeerContact;
+    use std::time::{Duration, Instant};
+
+    fn ago(secs: u64) -> Instant {
+        Instant::now()
+            .checked_sub(Duration::from_secs(secs))
+            .expect("this process started long enough ago for the test's clock")
+    }
+
+    #[test]
+    fn a_peer_never_heard_from_counts_from_when_this_server_started() {
+        let contact = PeerContact::new(ago(3600));
+        assert!(
+            contact.out_of_contact("never-seen", Duration::from_secs(600), Instant::now()),
+            "an hour after startup, a peer never heard from is out of contact past ten minutes"
+        );
+        assert!(
+            !contact.out_of_contact("never-seen", Duration::from_secs(7200), Instant::now()),
+            "and not yet past two hours — the seed is our startup, not the epoch"
+        );
+    }
+
+    #[test]
+    fn a_peer_heard_from_recently_is_in_contact() {
+        let mut contact = PeerContact::new(ago(3600));
+        contact.touch_at("home", ago(5));
+        assert!(!contact.out_of_contact("home", Duration::from_secs(600), Instant::now()));
+    }
+
+    #[test]
+    fn a_peer_last_heard_before_the_threshold_is_out_of_contact() {
+        let mut contact = PeerContact::new(ago(3600));
+        contact.touch_at("home", ago(900));
+        assert!(contact.out_of_contact("home", Duration::from_secs(600), Instant::now()));
+    }
+
+    #[test]
+    fn contact_only_ever_moves_forward() {
+        let mut contact = PeerContact::new(ago(3600));
+        contact.touch_at("home", ago(5));
+        // An older reading arriving late must not age the peer backwards.
+        contact.touch_at("home", ago(900));
+        assert!(!contact.out_of_contact("home", Duration::from_secs(600), Instant::now()));
+    }
+
+    #[test]
+    fn a_zero_threshold_never_puts_a_peer_out_of_contact() {
+        let contact = PeerContact::new(ago(86_400));
+        assert!(
+            !contact.out_of_contact("never-seen", Duration::ZERO, Instant::now()),
+            "zero is the operator saying never, not saying immediately"
+        );
+    }
+
     /// Both sides of a duplicate must choose the same surviving link, or they
     /// trade teardowns until one of them is restarted.
     #[test]
@@ -2158,6 +2319,7 @@ mod tests {
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
+            peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
         };
 
         // Sign a message
@@ -2222,6 +2384,7 @@ mod tests {
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
+            peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
         };
 
         let msg = S2sMessage::SyncRequest;
@@ -2265,6 +2428,7 @@ mod tests {
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
+            peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
         };
 
         let msg = S2sMessage::Privmsg {
@@ -2341,6 +2505,7 @@ mod tests {
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
+            peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
         };
 
         let rotation = manager.announce_rotation(&new_id);
@@ -2385,6 +2550,7 @@ mod tests {
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
+            peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
         };
 
         let rotation = manager.announce_rotation(&new_id);
@@ -2428,6 +2594,7 @@ mod tests {
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
+            peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
         };
 
         // Manually create a rotation with an old timestamp
@@ -2809,6 +2976,7 @@ mod capability_tests {
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             // The trust gate: only these two peers are spoken to at all.
             allowed_peers: vec!["home".to_string(), "old-home".to_string()],
+            peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
         };
 
         let (home_tx, mut home_rx) = mpsc::channel(8);
@@ -2932,6 +3100,7 @@ mod capability_tests {
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
+            peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
         };
 
         let (cap_tx, mut cap_rx) = mpsc::channel(8);

@@ -32,6 +32,43 @@ use std::collections::HashMap;
 
 use crate::connection::messaging::NO_KEY_ON_FILE;
 
+/// What a task reads as when the server that referees it has gone quiet.
+///
+/// Never a stored state and never a lifecycle event: no task ever transitions
+/// *to* orphaned, nothing signs it, and it is not relayed to anyone. It is
+/// this server's own honest note about work whose authority it cannot reach.
+pub const ORPHANED: &str = "orphaned";
+
+/// Whether a task reads [`ORPHANED`] here.
+///
+/// Three conditions, all local: the task belongs to another server (a
+/// non-empty origin), it has not finished, and that server has been out of
+/// contact past the orphan threshold — which is what
+/// `S2sManager::peer_out_of_contact` answers and the caller passes in.
+///
+/// Computed at read time rather than swept and stored, so the home coming
+/// back reverses the annotation by itself. Nothing is written down, which
+/// means there is nothing to undo and no window where the mark outlives the
+/// outage that earned it.
+///
+/// A task this server minted can never read orphaned: an empty origin means
+/// we are the home, and a server is not out of contact with itself.
+///
+/// **What this does not reconcile.** Seeing a task read orphaned, an
+/// orchestrator may re-offer the work as a fresh task naming the dead one in
+/// `act-replaces`. If the home then comes back and confirms the original
+/// worker's `complete` while the re-offered copy has already run somewhere
+/// else, the work has been done twice under two ids and nothing here notices:
+/// both tasks stand, each correct in its own log. Reconciling the pair is the
+/// orchestrator's, as is the decision not to re-offer work that cannot safely
+/// run twice. The alternative would be a second authority over the original
+/// task, which is the fork the design refuses.
+pub fn reads_orphaned(origin: &str, kind: &str, state: &str, home_out_of_contact: bool) -> bool {
+    !origin.is_empty()
+        && home_out_of_contact
+        && !freeq_sdk::act_transitions::is_terminal(kind, state)
+}
+
 /// What this server concluded about one relayed task event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RelayVerdict {
@@ -1714,5 +1751,45 @@ mod tests {
             one_key(from, vector["kid"].as_str().unwrap(), key_of(vector)),
         );
         assert_eq!(verdict, RelayVerdict::Valid);
+    }
+}
+
+#[cfg(test)]
+mod orphan_tests {
+    //! The annotation is computed on every read and stored nowhere, so a home
+    //! that comes back dissolves it with no timer and nothing to clean up.
+
+    /// A peer server's endpoint id, as a foreign task's origin holds it.
+    const HOME: &str = "44f1415cdeadbeef";
+    /// A live task's kind and state, as the view holds them.
+    const OPEN: (&str, &str) = ("handoff", "open");
+
+    #[test]
+    fn a_foreign_unfinished_task_reads_orphaned_once_its_home_goes_quiet() {
+        let (kind, state) = OPEN;
+        assert!(super::reads_orphaned(HOME, kind, state, true));
+    }
+
+    #[test]
+    fn the_same_task_reads_as_it_stands_while_its_home_is_in_contact() {
+        let (kind, state) = OPEN;
+        assert!(!super::reads_orphaned(HOME, kind, state, false));
+    }
+
+    #[test]
+    fn a_task_this_server_minted_never_reads_orphaned() {
+        let (kind, state) = OPEN;
+        assert!(
+            !super::reads_orphaned("", kind, state, true),
+            "an empty origin is our own task — we are its home"
+        );
+    }
+
+    #[test]
+    fn a_finished_task_never_reads_orphaned() {
+        assert!(
+            !super::reads_orphaned(HOME, "handoff", "completed", true),
+            "nothing is stranded about work that is already done"
+        );
     }
 }

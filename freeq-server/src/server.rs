@@ -7857,6 +7857,7 @@ mod s2s_adversarial_tests {
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
+            peer_contact: Arc::new(parking_lot::Mutex::new(crate::s2s::PeerContact::default())),
         })
     }
 
@@ -9924,6 +9925,7 @@ mod s2s_adversarial_tests {
             authenticated_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
+            peer_contact: Arc::new(parking_lot::Mutex::new(crate::s2s::PeerContact::default())),
         });
         (manager, broadcast_rx)
     }
@@ -14210,6 +14212,50 @@ mod catchup_tests {
         );
     }
 
+    /// A relayed opener whose `act-replaces` names a task this server has no
+    /// record of is filed, not refused.
+    ///
+    /// A re-offer exists because the original's home went away, and the server
+    /// issuing it need not be one we ever heard the original from — so the
+    /// named task being absent here is the ordinary case, not a suspicious
+    /// one. The link crosses federation as one more act tag inside the signed
+    /// document, and a receiver that dropped it would silently lose the only
+    /// thread tying replacement work back to what it replaces.
+    #[test]
+    fn a_relayed_opener_replacing_a_task_we_never_saw_is_filed() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let state = state_with_key(&key);
+        const MINTER: &str = "server-a";
+        const ID: &str = "01M16E7TC00000000000000009";
+        const DEAD: &str = "01M16E7TC0NEVERSEEN0000000";
+
+        let event = act_event(
+            &key,
+            ID,
+            MINTER,
+            &[
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", ALICE),
+                ("+freeq.at/act-title", "re-offered"),
+                ("+freeq.at/act-replaces", DEAD),
+            ],
+        );
+        assert_eq!(
+            apply_replayed_event(&state, OWN, PEER, event),
+            ReplayOutcome::Filed
+        );
+        assert!(
+            state.with_db(|db| db.act_task(ID)).flatten().is_some(),
+            "the replacement task is open here even though the task it names is not"
+        );
+        assert_eq!(
+            state.with_db(|db| db.act_task_is_on_file(DEAD)),
+            Some(false),
+            "and nothing invented a record of the task it replaces"
+        );
+    }
+
     /// A healed task event moves the task view, not only the log.
     ///
     /// Filing the row and stopping there is what left a server that had been
@@ -15580,6 +15626,38 @@ mod relayed_task_verdict_tests {
             "an outrun event is not asked about again"
         );
         assert_eq!(state.act_routes.lock().len(), 0, "and its route is dropped");
+    }
+
+    /// Sending to a peer is not hearing from it. The orphan clock reads "last
+    /// heard from", and a message handed to a link that is already gone must
+    /// not refresh it.
+    #[tokio::test]
+    async fn handing_a_transition_to_a_link_is_not_hearing_from_the_peer() {
+        let state = test_state_with_db();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        let _rx = capable_member(&state, "#routecontact");
+        let key = key_on_file(&state, SIGNER);
+        let mut to_peer = link_peer(&mgr, true).await;
+
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+        mgr.peer_contact.lock().touch_at(PEER, long_ago);
+
+        let act_id = "01ROUTECONTACTOFFER0000000";
+        let claim = "01ROUTECONTACTCLAIM0000000";
+        a_transition_waiting_for_its_home(&state, &mgr, "#routecontact", act_id, claim, &key).await;
+        assert_eq!(
+            routed_to_peer(&mut to_peer).await,
+            [claim],
+            "the transition went out over the link"
+        );
+
+        assert_eq!(
+            mgr.peer_contact.lock().last_contact(PEER),
+            long_ago,
+            "and that is not contact: nothing was heard from the peer, so the \
+             clock that says how long a home has been silent must not move"
+        );
     }
 
     #[tokio::test]

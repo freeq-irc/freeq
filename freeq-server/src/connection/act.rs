@@ -219,6 +219,15 @@ fn file_own_event(
 /// The sweep has no client connection, which is why this is separate from the
 /// gate above — but it is not a separate path.
 ///
+/// **Accepted limitation.** A home decides this on what it has heard, so a
+/// worker whose server is cut off from the home for longer than the
+/// abandonment limit gets the task expired under it, its `progress` never
+/// having arrived. Its signed events stay in the log as the evidence they
+/// are. The only mitigation — never expiring an assigned task while the
+/// assignee's server is out of contact — buys that at the cost of a task
+/// assigned through a server that is gone for good never ending at all, and
+/// is deliberately not built.
+///
 /// Returns whether the task was expired.
 pub(crate) fn expire_task(state: &Arc<SharedState>, task: &crate::db::ActTask) -> bool {
     let written = file_own_event(state, &task.kind, "expire", &task.act_id, &[], &task.venue);
