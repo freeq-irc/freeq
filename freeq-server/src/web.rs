@@ -5008,8 +5008,7 @@ async fn api_session_detail(
         #[cfg(not(feature = "av-native"))]
         {
             body["announced"] = serde_json::Value::Null;
-            body["announced_note"] =
-                serde_json::json!("binary built without --features av-native");
+            body["announced_note"] = serde_json::json!("binary built without --features av-native");
         }
     }
 
