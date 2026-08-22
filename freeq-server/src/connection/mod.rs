@@ -3519,11 +3519,14 @@ where
         ) && !instances.is_empty();
 
         if defer {
-            // Grace period for AV, aligned with the channel-membership grace.
-            const AV_GRACE_SECS: u64 = QUIT_GRACE_SECS;
+            // Grace period for AV. Defaults to the channel-membership grace
+            // (30 s); `--av-grace-secs` / `FREEQ_AV_GRACE_SECS` turns it down
+            // so the lifecycle tests can cross the expiry boundary in a
+            // second instead of sleeping through the production window.
+            let av_grace_secs = state.config.av_grace_secs;
             tracing::info!(
                 did = %did_for_av, instances = instances.len(),
-                "AV: deferring teardown ({}s grace for blip/reconnect)", AV_GRACE_SECS
+                "AV: deferring teardown ({}s grace for blip/reconnect)", av_grace_secs
             );
             // Mark these instances as grace-pending so the join-time orphan
             // reaper leaves their roster slots alone until the grace decides.
@@ -3536,7 +3539,7 @@ where
             let state2 = state.clone();
             let did2 = did_for_av.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(AV_GRACE_SECS)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(av_grace_secs)).await;
                 {
                     let mut pending = state2.av_grace_pending.lock();
                     for inst in &instances {

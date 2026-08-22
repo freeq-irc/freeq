@@ -8,9 +8,19 @@ description = "Native audio client for freeq AV sessions"
 name = "freeq-av"
 path = "src/main.rs"
 
+# The L2 AV harness (docs/AV-MAP.md §7). Lives here because it needs the same
+# MoQ/Opus stack the client does, and it drives a real freeq-server through the
+# full call lifecycle rather than talking to the relay directly.
+[[bin]]
+name = "avharness"
+path = "src/bin/avharness.rs"
+
 [dependencies]
 iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "edd9bcc530a615f3ab3a6919e96790a077905376", default-features = false, features = ["opus", "h264"] }
 freeq-av = { path = "../freeq-av" }
+freeq-sdk = { path = "../freeq-sdk" }
+parking_lot = "0.12"
+serde_json = { workspace = true }
 iroh = { workspace = true }
 moq-native = { git = "https://github.com/Frando/moq", branch = "deps/iroh-main", default-features = false, features = ["noq", "websocket", "aws-lc-rs"] }
 moq-lite = { git = "https://github.com/Frando/moq", branch = "deps/iroh-main" }

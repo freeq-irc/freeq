@@ -1,6 +1,7 @@
 # AV Session Deep-Dive Audit — "some can hear each other and some can't"
 
-**Date:** 2026-07-22 · **Status:** ALL findings F1–F9 fixed + tested (no open items)
+**Date:** 2026-07-22 (F1–F9) · 2026-08-22 (F10–F12, found by the harness)
+**Status:** F1–F9 fixed + tested. **F10–F12 OPEN** — see §6.
 **Symptom under investigation:** multiple people join a call; hearing/seeing is
 split in *random directions*, and which client you're on seems to matter.
 
@@ -224,5 +225,89 @@ Verification at time of writing: server **1084** tests, macOS **434**, iOS
 **105**, sdk-js **219**, web **753** — all green; `--features av-native`
 compiles clean.
 
+---
+
+## 6. Third pass (2026-08-22) — what the harness found
+
+F1–F9 were found by reading code and production logs. F10–F12 were found by
+`scripts/avharness.sh` the first few times it ran, which is the argument for
+having built it: two of the three contradict something this document already
+claimed was closed.
+
+### F10 — HIGH (OPEN): media revocation never happens on the QUIC transport ⇒ class C
+
+F6 above says "Media membership can no longer outlive roster membership."
+That is true for WebSocket clients and false for everyone else.
+
+`av_sfu.rs::handle_ws_moq` reads `?inst=` off the dial URL and registers the
+connection in `SfuState::media_conns`, which is what `revoke_media` closes.
+`handle_quic_connection` does neither — it never parses `inst`, so a
+QUIC-dialed connection is not in the registry and nothing can revoke it. Every
+native client (macOS, iOS, Windows) dials QUIC with `?inst=` (`mediaDialUrl`
+builds `{base}?inst=…&jwt=…`), and they are exactly the announcement-driven
+clients that keep hearing a roster-ghost.
+
+So the F6 fix closed the asymmetry for the half of the fleet that was already
+on the right side of it.
+
+**Reproduced**, not theorised:
+
+    avharness --transport quic --chaos --chaos-steps blip
+
+> C1: a0's media outlived its roster slot — still heard by [1, 2] 11s after
+> grace expiry; announced=true.
+
+with `0` occurrences of `SFU: session revoked` in the server log against `4`
+QUIC connections. The harness reports this as a finding rather than a failure
+today; `--strict-quic-revocation` turns it into a failure, and that flag is
+what the fix should be verified with.
+
+### F11 — MEDIUM (OPEN): a guest's mid-call rename leaves a duplicate slot ⇒ class A
+
+F5's fix — re-send `av-join` with the same instance after a rename — works by
+rejoining the participant slot *in place*. The slot's key is
+`participant_key(did, instance)`, and a guest's DID is `guest:{nick}`. Rename
+the guest and the key changes, so the rejoin inserts a second slot instead of
+updating the first: two roster rows, same instance, different nicks.
+
+Observed directly (2 real participants, `participant_count: 3`):
+
+    {"nick":"gren_b",         "instance_id":"inst-gren_b"}
+    {"nick":"gren_a_renamed", "instance_id":"inst-gren_a"}
+    {"nick":"gren_a",         "instance_id":"inst-gren_a"}   ← ghost
+
+Every roster-driven subscriber then computes two paths for one publisher, one
+of which nobody publishes to — a permanent black tile plus a wasted
+subscription. Authenticated users are unaffected (a DID is stable across a
+rename), which is why `rename_mid_call_updates_roster` in
+`tests/av_lifecycle.rs` pins the DID case and this one is still open.
+
+The fix is presumably to key the slot on instance alone when one is present,
+or to re-key the guest's slot on rename.
+
+### F12 — LOW (OPEN): C2 measured — media-dead / IRC-alive is invisible to everyone
+
+`AV-MAP.md` §5 lists C2 as UNAUDITED. The harness's `media-kill` step now
+measures it, and the answer is the bad one:
+
+> a0 lost its media transport while its IRC connection stayed up. Roster still
+> lists it: **true**. Relay still announces it: false. Nobody hears it.
+
+A client in this state shows itself in-call, shows a tile to every peer, and
+is silent — and nothing in the protocol tells anyone, on either subscription
+model. It self-heals only when the media layer's reconnect backoff succeeds.
+Closing it needs a liveness signal: either the SFU reporting publisher
+presence into the roster (a `publishing` flag on the participant) or the
+client noticing its own transport is down and sending `av-leave`.
+
+### Also worth knowing (not a bug)
+
+The SFU is initialized inside the iroh-endpoint branch of `Server::run`, so a
+server started **without `--iroh` reports `av:false`** and has no relay at all,
+whatever `--features av-native` says. Production always passes `--iroh`, which
+is why this has never bitten; `deploy.sh`'s health check would catch it.
+
+---
+
 **See `docs/AV-TEST-PLAN.md` for the full cross-client matrix that keeps this
-fixed.**
+fixed, and `docs/AV-MAP.md` §7 for the harness that found F10–F12.**

@@ -48,6 +48,16 @@ pub struct ServerConfig {
     #[arg(long)]
     pub db_path: Option<String>,
 
+    /// How long an AV participant's roster slot survives an IRC blip before
+    /// teardown + media revocation, in seconds. This is the class-C boundary
+    /// in `docs/AV-MAP.md` §2: below it a reconnect rejoins in place, at it
+    /// the roster drops the slot and the SFU closes the instance's media.
+    /// 30 s matches the channel-membership grace and is what production runs;
+    /// the lifecycle tests turn it down so asserting the expiry doesn't cost
+    /// half a minute per case.
+    #[arg(long, env = "FREEQ_AV_GRACE_SECS", default_value_t = 30)]
+    pub av_grace_secs: u64,
+
     /// Run the migration ladder to this schema version and exit instead of
     /// starting the server. Requires --db-path. Downgrades run each rung's
     /// down migration; a rung with no down (irreversible) stops with an
@@ -344,6 +354,7 @@ impl Default for ServerConfig {
             server_name: "freeq".to_string(),
             challenge_timeout_secs: 60,
             db_path: None,
+            av_grace_secs: 30,
             migrate_to: None,
             web_addr: None,
             iroh: false,
@@ -485,6 +496,7 @@ struct FileConfig {
     server_name: Option<String>,
     challenge_timeout_secs: Option<u64>,
     db_path: Option<String>,
+    av_grace_secs: Option<u64>,
     web_addr: Option<String>,
     iroh: Option<bool>,
     iroh_port: Option<u16>,
@@ -615,6 +627,7 @@ fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConf
         tls_listen_addr,
         server_name,
         challenge_timeout_secs,
+        av_grace_secs,
         iroh,
         s2s_peers,
         s2s_allowed_peers,
