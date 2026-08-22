@@ -54,7 +54,7 @@ is the bug surface.
 | web roster poll | **1.2 s** | web | subscriptions recomputed; stale roster = wrong mesh until next tick |
 | native roster reconcile | **5 s** | macOS/iOS | display-only strip; media unaffected |
 | native token wait → tokenless dial | **2 s** | FFI callers | dial without `?jwt` against token-less servers; if token arrives late, dial already happened |
-| IRC disconnect grace | **30 s** | server | AV slot survives a blip (`av_grace_pending`); at expiry: roster leave + **media revoked** |
+| IRC disconnect grace | **30 s** (`--av-grace-secs` / `FREEQ_AV_GRACE_SECS`) | server | AV slot survives a blip (`av_grace_pending`); at expiry: roster leave + **media revoked** (WebSocket only — F10). Turned down by the harnesses so a test can cross the boundary in seconds |
 | cleanup sweep | **5 min tick** | server | `should_auto_end`: reaps only sessions with no live-claimed instances |
 | session age arm | **2 h** | server | only for resurrected ghost sessions (F1 fix) — never a live call |
 | AV token expiry | **24 h** | server (JWT) | a day-long call's re-dial after that fails; nobody refreshes tokens |
@@ -115,7 +115,9 @@ client that missed the TAGMSG → next join answers av-error=join-failed (F3)
 ## 5. Failure-class catalog (what "flaky" decomposes into)
 
 Class A — roster ≠ announcements (web-only, one-way loss)
-  A1 stale roster slot (blip reap — F2, fixed)   A2 rename orphan (F5, fixed)
+  A1 stale roster slot (blip reap — F2, fixed)   A2 rename orphan (F5, fixed
+     for DID users; **F11 OPEN** — a guest's rename mints a duplicate slot,
+     because the participant key embeds `guest:{nick}`)
   A3 roster poll lag (1.2 s, inherent)           A4 self-echo edge (F8, fixed)
 
 Class B — session identity split (mutual pairwise silence)
@@ -123,7 +125,11 @@ Class B — session identity split (mutual pairwise silence)
   B3 start collision loser (F4, fixed)           B4 server restart re-join divergence (§5.6, scenario-only)
 
 Class C — media lifecycle ≠ IRC lifecycle
-  C1 IRC-dead/media-alive ghost (F6, fixed)      C2 media-dead/IRC-alive (reconnect backoff; UI shows tile, no audio — UNAUDITED)
+  C1 IRC-dead/media-alive ghost (F6, fixed for WebSocket ONLY — **F10 OPEN**:
+     QUIC connections are never registered for revocation, so every native
+     client's media outlives its roster slot)
+  C2 media-dead/IRC-alive — **measured** by the harness's `media-kill` step
+     (F12): roster keeps the row, nobody hears it, nothing signals it
   C3 token-required rejection ghost (F7, fixed)  C4 token expiry mid-call re-dial (24 h — UNAUDITED)
 
 Class D — environmental (client-local, no protocol bug)
@@ -142,48 +148,83 @@ Class E — deployment/config
 |---|---|---|
 | `av.rs` unit tests (policy: auto-end, reaper, grace) | decisions, not behavior | ✅ yes |
 | `tests/av_error_signal.rs` (real server+SDK) | av-error semantics | ✅ yes |
+| **`tests/av_lifecycle.rs` (L1 — real server+SDK, 8 scenarios)** | **the session state machine's temporal behavior: blip-with-joiner, dead-session join, concurrent start, restart mid-call, rename mid-call, token issuance, revocation ordering** | ✅ **yes** (av-native scenarios skip without the feature; the `av-harness` job runs them with it) |
 | client unit tests (AvStartRace, av-mesh, resolvers) | per-client decisions | ✅ mac/web; iOS in xcode job |
+| **`avharness` + `scripts/avharness.sh` (L2 — tone mesh)** | **I1 as a number, through the full lifecycle, under five kinds of chaos** | ⏳ weekly + `workflow_dispatch` (`av-harness` on macos-26); too heavy for per-push |
 | `av_cross_transport_e2e` (tone matrix, QUIC×WS) | SFU namespace unification | ❌ manual; **bypasses IRC entirely** — blind to classes A and B |
 | Playwright `audio-flow`/`audio-publish`/`av-sessions` | web joins, WS frames flow | ❌ manual; needs local av-native server; asserts flow, not audibility |
 | `av_live_probe` | prod signaling sanity post-deploy | ❌ manual |
-| **CI reality** | — | **every AV crate is `--exclude`d from the workspace test run: zero AV code executes on push** |
+| **CI reality** | — | the AV *crates* are still `--exclude`d from the workspace run, but **freeq-server is not** — L1 executes on every push |
 
-The gap in one sentence: nothing anywhere automatically proves **I1 (X hears
-Y)** through the **full stack** (IRC join → token → dial → publish →
-announce/roster → subscribe → decode), and nothing exercises the two
-subscription models **against each other** under churn — which is precisely
-where every production incident has lived.
+What is still missing, in one sentence: **L3**. Nothing yet puts a real
+browser in the loop, so the two subscription models are still never exercised
+*against each other* — L1 and L2 both observe the roster and the announcements,
+but neither is a client that would actually go deaf when they diverge.
 
-## 7. The harness (see `scripts/avharness/` once built)
+## 7. The harness
 
-Design, layered like the macOS rendering harness (numbers gate CI; states are
-summonable; eyes stay for pixels):
+Layered like the macOS rendering harness (numbers gate CI; states are
+summonable; eyes stay for pixels). **L1 and L2 are built; L3 is not.**
 
-- **L1 — session-layer chaos (CI, headless, no audio).** Real server + N real
-  SDK clients. Drives: start, join, leave, blip-with-joiner, dead-session
-  join, concurrent start, restart mid-call, rename mid-call. Asserts, with
-  timing budgets: I2 (roster exact), I4 (teardown ≤ grace+5 s), I5 (one
-  session id everywhere), av-error delivery, token issuance, media revocation
-  ordering. This automates §5.1–5.7 minus the hearing.
-- **L2 — tone-mesh through the full stack (the one that matters).** Local
-  av-native server; N agents each publish a distinct sine (440·k Hz) **via
-  the real lifecycle** (IRC av-join → token → dial `?jwt&inst`). Every agent
-  Goertzel-detects every other agent's tone: the full I1 matrix as numbers.
-  Then chaos, re-asserting the matrix after each event: kill an agent's IRC
-  (grace), kill its media socket, restart the server, collide two starts,
-  rename mid-call. Exit non-zero names the failing invariant and pair.
-- **L3 — the cross-model probe (web in the loop).** Playwright drives a real
-  web client (fake 440 Hz mic) against the same server with two tone agents;
-  the page asserts *received energy per peer* via an injected AnalyserNode,
-  and the harness blips one agent to prove the roster path converges the way
-  the announcement path does. This is the only layer that can catch class A
-  regressions before users do.
-- **L4 — live probes (post-deploy).** `av_live_probe` (exists) + an
-  `--assert-hears` bot mode for spot-checking production pairs.
+### L1 — session-layer chaos ✅ `freeq-server/tests/av_lifecycle.rs`
 
-Diagnostics to build alongside: `GET /api/v1/sessions/{id}?debug=1` returning
-the SFU's announced paths beside the roster — class A divergence visible in
-one request, in production, during an incident.
+Real server + real SDK clients, no media, no `av-native` needed — so it runs
+in the default CI test job. Eight scenarios, each naming the invariant and the
+test-plan row it automates:
+
+| Test | Automates | Asserts |
+|---|---|---|
+| `start_join_leave_converges` | §5.1 | I2 roster exact, I4 clean-leave ≤2 s, I5 one id, `ended` reaches the channel |
+| `blip_with_joiner_keeps_slot` | §5.2 / F2 | slot survives a joiner's reap inside grace; drops at expiry with `av-state=left` naming the instance |
+| `dead_session_join_answers_error` | §5.3 / F3 | an *ended* session answers `join-failed` with its id echoed |
+| `concurrent_start_converges` | §5.5 / F4 | exactly one session; the loser's `start-collision` names the winner |
+| `restart_mid_call_one_session` | §5.6 / B4 | SIGKILL + restart lands everyone in ONE session (resurrected or new — split is the failure) |
+| `rename_mid_call_updates_roster` | §5.4 / F5 | same instance, new nick, one row (DID users; guests are F11) |
+| `token_minted_on_join` | F7 rail | TAGMSG and REST tokens grant the same session |
+| `media_revocation_ordering` | F6 rail | roster leave and media revocation at one boundary; `?debug=1` agrees |
+
+Run: `cargo test -p freeq-server --test av_lifecycle` (add
+`--features av-native` for the last two). Grace is `--av-grace-secs` so the
+tests cross the expiry boundary in seconds, not the production 30.
+
+### L2 — tone mesh through the full stack ✅ `scripts/avharness.sh`
+
+**The launch gate for anything touching AV.** N agents (`--agents`, default 4)
+join one call through the real lifecycle — IRC connect → JOIN →
+`av-start`/`av-join` → wait for `+freeq.at/av-token` → dial `?jwt&inst` —
+each publishing a sine at 440·(k+1) Hz. Every agent Goertzel-detects every
+other agent's tone: the I1 matrix as numbers, printed with its own
+discrimination margin (currently ~0.44 matched vs ~0.001 mismatched). Then
+chaos, re-asserting the matrix after each: `blip` (IRC dies, media lives),
+`media-kill` (the reverse), `restart`, `collide`, `churn`. Exit code is the
+verdict; a failure names the pair and the direction.
+
+`--require-token` runs the server with `FREEQ_AV_REQUIRE_TOKEN=1` (the E2 flip
+in rehearsal); `--break-token` dials without one, which must fail — that pair
+is how the gate proves it can still fail. Weekly + `workflow_dispatch` as the
+`av-harness` job.
+
+### L3 — the cross-model probe (web in the loop) ☐ NOT BUILT
+
+Playwright drives a real web client (fake 440 Hz mic) against the same server
+with two tone agents; the page asserts *received energy per peer* via an
+injected AnalyserNode, and the harness blips one agent to prove the roster
+path converges the way the announcement path does. **This is still the only
+layer that could catch a class-A regression before users do** — L1 and L2 both
+read the roster and the announcements, but neither is a client that goes deaf
+when they disagree.
+
+### L4 — live probes (post-deploy)
+
+`av_live_probe` (exists) + an `--assert-hears` bot mode for spot-checking
+production pairs.
+
+### Diagnostics ✅
+
+`GET /api/v1/sessions/{id}?debug=1` returns `announced` — the SFU's current
+broadcast paths under the session prefix — beside the roster, so a class-A
+divergence is one request during a live incident. Without `av-native`,
+`announced` is null and `announced_note` says why.
 
 ## 8. Standing rules
 
