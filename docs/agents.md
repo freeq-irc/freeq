@@ -150,7 +150,7 @@ GET /api/v1/channels/mychannel/audit   (chronological audit trail)
 
 The web client renders these as structured cards instead of plain text — task cards with phase progression, evidence cards with expandable payloads, completion cards with result links.
 
-### Task messages: two limitations to plan around
+### Task messages: one limitation to plan around
 
 Alongside the coordination events above, freeq is growing a refereed task family — `act-` tags on a TAGMSG, signed by the sender, checked against a rules file before the server accepts them. One limit is worth knowing before you build on it, and it is not a bug to wait out.
 

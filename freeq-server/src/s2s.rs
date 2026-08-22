@@ -1288,11 +1288,20 @@ impl S2sManager {
     /// [`ACT`] in their Hello. The check lives here, on the one ordered path
     /// every broadcast takes, so no call site can forget it.
     async fn broadcast_to_peers(&self, msg: S2sMessage) {
+        // The id its signer minted, read off the tags — the id the verdict log
+        // and the task's own history are both keyed by, and so the one an
+        // operator can follow a withheld event by. The envelope's id says
+        // which message this was and nothing about which task event. Absent
+        // only for a document that could not have passed ingress or relay,
+        // both of which demand it before anything else.
         let act_event_id = match &msg {
-            S2sMessage::Tagmsg { event_id, tags, .. }
-                if crate::connection::act::carries_act_tags(tags) =>
-            {
-                Some(event_id.clone())
+            S2sMessage::Tagmsg { tags, .. } if crate::connection::act::carries_act_tags(tags) => {
+                Some(
+                    tags.get(freeq_sdk::chatsig::EVENT_ID_TAG)
+                        .or_else(|| tags.get(freeq_sdk::chatsig::EVENT_ID_TAG_BARE))
+                        .cloned()
+                        .unwrap_or_default(),
+                )
             }
             _ => None,
         };
@@ -1315,7 +1324,7 @@ impl S2sManager {
                 if !peer_supports(&declared, ACT) {
                     tracing::info!(
                         peer = %peer_id,
-                        event = %event_id,
+                        event_id = %event_id,
                         "S2S: task event withheld — peer did not declare the act capability"
                     );
                     continue;
@@ -3113,8 +3122,7 @@ mod capability_tests {
     /// The federation harness stages the same thing end to end, with one of
     /// its two servers started under `--s2s-undeclared-capabilities act`
     /// (`a_peer_that_never_declared_act_stays_an_onlooker`). This is the unit
-    /// half: it reads the log line, which that test can only match on the
-    /// peer it names.
+    /// half, and the one that watches the send sites directly.
     #[tokio::test]
     async fn a_task_event_is_withheld_from_a_peer_that_did_not_declare_act() {
         let sink = LogSink::default();
@@ -3174,17 +3182,30 @@ mod capability_tests {
             caps.insert("plain-peer".into(), vec![CATCHUP.to_string()]);
         }
 
-        let tagmsg = |event_id: &str, tag: (&str, &str)| S2sMessage::Tagmsg {
+        let tagmsg = |event_id: &str, tags: &[(&str, &str)]| S2sMessage::Tagmsg {
             event_id: event_id.to_string(),
             from: "eliza!e@h".to_string(),
             target: "#ops".to_string(),
-            tags: HashMap::from([(tag.0.to_string(), tag.1.to_string())]),
+            tags: tags
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
             origin: "srv".to_string(),
             account: None,
         };
 
+        // The id its signer minted rides in the tags, as it does on every act
+        // document that gets this far — ingress and relay both refuse one
+        // without it.
+        const ACT_EVENT: &str = "01ACTWITHHELD0000000000000";
         manager
-            .broadcast_to_peers(tagmsg("srv:1", ("+freeq.at/act", "handoff")))
+            .broadcast_to_peers(tagmsg(
+                "srv:1",
+                &[
+                    ("+freeq.at/act", "handoff"),
+                    (freeq_sdk::chatsig::EVENT_ID_TAG, ACT_EVENT),
+                ],
+            ))
             .await;
         assert!(
             matches!(cap_rx.try_recv(), Ok(S2sMessage::Tagmsg { .. })),
@@ -3198,13 +3219,13 @@ mod capability_tests {
         assert!(
             logged.contains("task event withheld")
                 && logged.contains("plain-peer")
-                && logged.contains("srv:1"),
-            "the skip must be logged naming the peer and the event, got: {logged}"
+                && logged.contains(ACT_EVENT),
+            "the skip must be logged naming the peer and the task event, got: {logged}"
         );
 
         // An ordinary tag message — a reaction — is not narrowed.
         manager
-            .broadcast_to_peers(tagmsg("srv:2", ("+react", "👍")))
+            .broadcast_to_peers(tagmsg("srv:2", &[("+react", "👍")]))
             .await;
         assert!(matches!(cap_rx.try_recv(), Ok(S2sMessage::Tagmsg { .. })));
         assert!(

@@ -5740,17 +5740,16 @@ async fn a_peer_that_never_declared_act_stays_an_onlooker() {
     );
 
     // A wrong capability declaration must never fail silent, so the server
-    // that withheld the event says which peer it withheld it from. The id in
-    // the line is the S2S envelope's, which is what the ordered broadcast
-    // holds — it does not read the task document to name the act event.
+    // that withheld the event names both the peer it withheld it from and the
+    // event it withheld, by the id its signer minted.
     let log_a = server_log(&srv_a);
     let withheld = log_a
         .lines()
         .filter(|l| l.contains("task event withheld"))
-        .any(|l| l.contains(&id_b));
+        .any(|l| l.contains(&id_b) && l.contains(&act_id));
     assert!(
         withheld,
-        "the withholding is logged, naming the peer it was withheld from; \
+        "the withholding is logged, naming the peer and the task event; \
          A's log: {}",
         log_a
             .lines()
