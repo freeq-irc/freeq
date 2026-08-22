@@ -60,6 +60,12 @@
 # oper_dids = ["did:plc:abc..."]
 # reverify_identity_mins = 0
 
+## ── AV ─────────────────────────────────────────────────────────────
+## How long a call participant's roster slot survives an IRC blip before the
+## slot drops and the SFU closes their media. Lower it only in test rigs:
+## below a real reconnect time, every hiccup ejects people from calls.
+# av_grace_secs = 30
+
 ## ── Auth broker / OAuth ────────────────────────────────────────────
 # github_client_id = "Iv1.abc..."
 # github_client_secret = "..."

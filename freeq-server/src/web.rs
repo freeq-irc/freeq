@@ -4964,16 +4964,56 @@ async fn api_sessions_list(State(state): State<Arc<SharedState>>) -> Json<serde_
 }
 
 /// GET /api/v1/sessions/{id} — session details.
+///
+/// `?debug=1` adds `announced`: the broadcast paths the SFU is currently
+/// announcing under this session's prefix, beside the roster. The two are the
+/// call's two sources of truth (web subscribes from the roster, every native
+/// client from the announcements), and every class-A incident has been a
+/// disagreement between them — so this makes that disagreement one request to
+/// see, live, during an incident instead of a log archaeology exercise. A
+/// binary without `av-native` has no SFU to ask: `announced` is null and
+/// `announced_note` says why.
 async fn api_session_detail(
     State(state): State<Arc<SharedState>>,
     Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    let mgr = state.av_sessions.lock();
-    let session = mgr.get(&id).ok_or((
-        axum::http::StatusCode::NOT_FOUND,
-        "Session not found".to_string(),
-    ))?;
-    Ok(Json(session_to_json(session, &mgr)))
+    let mut body = {
+        let mgr = state.av_sessions.lock();
+        let session = mgr.get(&id).ok_or((
+            axum::http::StatusCode::NOT_FOUND,
+            "Session not found".to_string(),
+        ))?;
+        session_to_json(session, &mgr)
+    };
+
+    if params.get("debug").map(String::as_str) == Some("1") {
+        // Taken after the av_sessions guard is dropped — sfu_state is never
+        // acquired while av_sessions is held (the single lock-order rule).
+        #[cfg(feature = "av-native")]
+        {
+            let sfu = state.sfu_state.lock().clone();
+            match sfu {
+                Some(sfu) => {
+                    let paths = sfu.announced_paths(&format!("{id}/"));
+                    body["announced"] = serde_json::json!(paths);
+                }
+                None => {
+                    body["announced"] = serde_json::Value::Null;
+                    body["announced_note"] =
+                        serde_json::json!("SFU not initialized on this server");
+                }
+            }
+        }
+        #[cfg(not(feature = "av-native"))]
+        {
+            body["announced"] = serde_json::Value::Null;
+            body["announced_note"] =
+                serde_json::json!("binary built without --features av-native");
+        }
+    }
+
+    Ok(Json(body))
 }
 
 /// GET /api/v1/sessions/{id}/artifacts — list session artifacts.

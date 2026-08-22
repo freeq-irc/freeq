@@ -120,6 +120,37 @@ impl SfuState {
         }
     }
 
+    /// Every broadcast path the relay is currently announcing under
+    /// `{prefix}` — i.e. exactly what an announcement-driven client (macOS,
+    /// iOS, bots) would subscribe to right now.
+    ///
+    /// This is the other half of the class-A picture. The roster answers "who
+    /// does the server think is in the call"; this answers "who is actually on
+    /// the wire". When they disagree, roster-driven clients (web) silently
+    /// lose whoever the roster misdescribes while announcement-driven clients
+    /// keep hearing them — the asymmetric split that took three production
+    /// incidents to name (see docs/AV-SESSION-AUDIT.md §1).
+    ///
+    /// Snapshot semantics: a fresh consumer is announced every live broadcast
+    /// at subscribe time (`consume_initial`), so draining its non-blocking
+    /// queue yields the current set and nothing else. Closed broadcasts have
+    /// already been removed from the origin tree, so they can't show up here.
+    /// We read `primary` (what local clients publish) rather than `combined`
+    /// because combined is fed by an async shovel task and lags by a tick.
+    pub fn announced_paths(&self, prefix: &str) -> Vec<String> {
+        let mut consumer = self.cluster.primary.consume();
+        let mut live = std::collections::BTreeSet::new();
+        while let Some((path, broadcast)) = consumer.try_announced() {
+            let path = path.to_string();
+            if broadcast.is_some() {
+                live.insert(path);
+            } else {
+                live.remove(&path);
+            }
+        }
+        live.into_iter().filter(|p| p.starts_with(prefix)).collect()
+    }
+
     /// Mint a session-scoped MoQ JWT. The claims grant publish+subscribe
     /// under BOTH namespaces a client may root at — `{sid}/…` (legacy
     /// clients dialing `/av/moq` with absolute broadcast paths) and
