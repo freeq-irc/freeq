@@ -83,6 +83,14 @@ pub struct ServerConfig {
     #[arg(long, value_delimiter = ',')]
     pub s2s_allowed_peers: Vec<String>,
 
+    /// Capability names this build has but will not declare to peers, so a
+    /// peer treats this server as one that predates them. For tests: it is
+    /// how a two-server run reproduces an older peer without an older build.
+    /// Withholding a capability costs what the capability gates — withhold
+    /// `act` and no peer ever sends this server a task event.
+    #[arg(long, value_delimiter = ',')]
+    pub s2s_undeclared_capabilities: Vec<String>,
+
     /// Where each S2S peer serves its own users' message-signing keys.
     /// Comma-separated `<endpoint-id>=<http(s)://base>` entries — the base URL
     /// of the peer's REST API, e.g. `44f1415c...=https://irc.example.com`.
@@ -342,6 +350,7 @@ impl Default for ServerConfig {
             iroh_port: None,
             s2s_peers: vec![],
             s2s_allowed_peers: vec![],
+            s2s_undeclared_capabilities: vec![],
             s2s_peer_api: vec![],
             peer_key_retry_secs: 60,
             s2s_peer_trust: vec![],
@@ -481,6 +490,7 @@ struct FileConfig {
     iroh_port: Option<u16>,
     s2s_peers: Option<Vec<String>>,
     s2s_allowed_peers: Option<Vec<String>>,
+    s2s_undeclared_capabilities: Option<Vec<String>>,
     s2s_peer_api: Option<MapOrPairs>,
     peer_key_retry_secs: Option<u64>,
     s2s_peer_trust: Option<MapOrPairs>,
@@ -608,6 +618,7 @@ fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConf
         iroh,
         s2s_peers,
         s2s_allowed_peers,
+        s2s_undeclared_capabilities,
         max_messages_per_channel,
         peer_key_retry_secs,
         act_expiry_secs,

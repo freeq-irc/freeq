@@ -7858,6 +7858,7 @@ mod s2s_adversarial_tests {
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
             peer_contact: Arc::new(parking_lot::Mutex::new(crate::s2s::PeerContact::default())),
+            capabilities: crate::s2s::our_capabilities(),
         })
     }
 
@@ -9926,6 +9927,7 @@ mod s2s_adversarial_tests {
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
             peer_contact: Arc::new(parking_lot::Mutex::new(crate::s2s::PeerContact::default())),
+            capabilities: crate::s2s::our_capabilities(),
         });
         (manager, broadcast_rx)
     }

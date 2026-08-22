@@ -49,6 +49,10 @@
 # iroh_port = 4433
 # s2s_peers = ["44f1415c..."]
 # s2s_allowed_peers = ["44f1415c..."]
+## Capabilities this build has but will not declare, so peers treat this
+## server as one that predates them. For tests — withholding one costs what it
+## gates, and `act` gates task events entirely:
+# s2s_undeclared_capabilities = ["act"]
 ## Where each peer serves its users' message-signing keys; without an entry a
 ## peer's signatures stay uncheckable here (never reported as forged).
 # s2s_peer_api = ["44f1415c...=https://irc.example.com"]

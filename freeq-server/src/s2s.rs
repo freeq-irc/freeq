@@ -257,9 +257,23 @@ pub const ACT: &str = "act";
 /// undecided while looking delivered.
 pub const ACT_ROUTE: &str = "act_route";
 
-/// The capability list this server advertises.
+/// Everything this build can receive.
 pub fn our_capabilities() -> Vec<String> {
     CAPABILITIES.iter().map(|c| c.name.to_string()).collect()
+}
+
+/// What this server actually declares: everything it can receive, less
+/// whatever the operator withheld with `--s2s-undeclared-capabilities`.
+///
+/// Withholding is how a two-server test reproduces a peer that predates a
+/// capability without an older build to run. It is not free — a peer sends
+/// nothing a capability gates to a server that did not declare it — which is
+/// exactly the property such a test is there to watch.
+pub fn declared_capabilities(withheld: &[String]) -> Vec<String> {
+    our_capabilities()
+        .into_iter()
+        .filter(|name| !withheld.iter().any(|w| w == name))
+        .collect()
 }
 
 /// Whether `peer_caps` — as declared in that peer's Hello — includes `name`.
@@ -1108,6 +1122,9 @@ pub struct S2sManager {
     /// When each peer was last heard from. Written on every successful
     /// exchange, never cleared when a link drops — see [`PeerContact`].
     pub peer_contact: Arc<parking_lot::Mutex<PeerContact>>,
+    /// What this server tells peers it can receive — see
+    /// [`declared_capabilities`].
+    pub capabilities: Vec<String>,
 }
 
 impl S2sManager {
@@ -1551,6 +1568,7 @@ pub async fn start(
         peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         allowed_peers: state.config.s2s_allowed_peers.clone(),
         peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
+        capabilities: declared_capabilities(&state.config.s2s_undeclared_capabilities),
     });
 
     // Spawn the ordered broadcast worker.  All outbound S2S messages flow
@@ -2056,7 +2074,7 @@ async fn handle_s2s_connection(
             server_name: server_name.clone(),
             protocol_version: 2, // v2 = signed envelopes + HelloAck
             trust_level: Some(trust.to_string()),
-            capabilities: our_capabilities(),
+            capabilities: manager.capabilities.clone(),
         };
         if let Some(entry) = peers.lock().await.get(&peer_id) {
             let _ = entry.tx.send(hello).await;
@@ -2191,6 +2209,23 @@ mod tests {
         );
     }
 
+    /// A capability the operator withheld is not declared, and everything
+    /// else still is: a peer must be able to tell one missing ability from a
+    /// server that speaks nothing.
+    #[test]
+    fn a_withheld_capability_is_the_only_one_missing_from_what_we_declare() {
+        let all = super::our_capabilities();
+        let declared = super::declared_capabilities(&[super::ACT.to_string()]);
+        assert!(!declared.iter().any(|c| c == super::ACT));
+        assert_eq!(declared.len(), all.len() - 1);
+        assert!(declared.iter().any(|c| c == super::CATCHUP));
+    }
+
+    #[test]
+    fn withholding_nothing_declares_everything() {
+        assert_eq!(super::declared_capabilities(&[]), super::our_capabilities());
+    }
+
     /// Both sides of a duplicate must choose the same surviving link, or they
     /// trade teardowns until one of them is restarted.
     #[test]
@@ -2320,6 +2355,7 @@ mod tests {
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
             peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
+            capabilities: our_capabilities(),
         };
 
         // Sign a message
@@ -2385,6 +2421,7 @@ mod tests {
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
             peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
+            capabilities: our_capabilities(),
         };
 
         let msg = S2sMessage::SyncRequest;
@@ -2429,6 +2466,7 @@ mod tests {
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
             peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
+            capabilities: our_capabilities(),
         };
 
         let msg = S2sMessage::Privmsg {
@@ -2506,6 +2544,7 @@ mod tests {
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
             peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
+            capabilities: our_capabilities(),
         };
 
         let rotation = manager.announce_rotation(&new_id);
@@ -2551,6 +2590,7 @@ mod tests {
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
             peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
+            capabilities: our_capabilities(),
         };
 
         let rotation = manager.announce_rotation(&new_id);
@@ -2595,6 +2635,7 @@ mod tests {
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
             peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
+            capabilities: our_capabilities(),
         };
 
         // Manually create a rotation with an old timestamp
@@ -2977,6 +3018,7 @@ mod capability_tests {
             // The trust gate: only these two peers are spoken to at all.
             allowed_peers: vec!["home".to_string(), "old-home".to_string()],
             peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
+            capabilities: our_capabilities(),
         };
 
         let (home_tx, mut home_rx) = mpsc::channel(8);
@@ -3068,9 +3110,11 @@ mod capability_tests {
     /// naming the peer and the event, so a wrong declaration never fails
     /// silent.
     ///
-    /// The federation harness cannot stage the withheld half end to end —
-    /// both of its servers run this build and declare every capability — so
-    /// this is where that half is pinned.
+    /// The federation harness stages the same thing end to end, with one of
+    /// its two servers started under `--s2s-undeclared-capabilities act`
+    /// (`a_peer_that_never_declared_act_stays_an_onlooker`). This is the unit
+    /// half: it reads the log line, which that test can only match on the
+    /// peer it names.
     #[tokio::test]
     async fn a_task_event_is_withheld_from_a_peer_that_did_not_declare_act() {
         let sink = LogSink::default();
@@ -3101,6 +3145,7 @@ mod capability_tests {
             peer_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allowed_peers: Vec::new(),
             peer_contact: Arc::new(parking_lot::Mutex::new(PeerContact::default())),
+            capabilities: our_capabilities(),
         };
 
         let (cap_tx, mut cap_rx) = mpsc::channel(8);
