@@ -850,6 +850,16 @@ function wireEvents(c: FreeqClient) {
     }
   });
 
+  c.on('actEvent', (ev) => {
+    // The TAGMSG is the event; its companion prose line arrives separately as
+    // a `message`. The store joins the two and keeps the task they describe.
+    const isChannel = ev.channel.startsWith('#') || ev.channel.startsWith('&');
+    if (!isChannel && !useStore.getState().channels.has(ev.channel.toLowerCase())) {
+      s().addChannel(ev.channel);
+    }
+    s().addActEvent(ev.channel, ev);
+  });
+
   c.on('messageEdited', (channel, originalMsgId, newText, newMsgId, isStreaming, editorNick, editorAccount) => {
     // Ensure DM buffer exists
     const isChannel = channel.startsWith('#') || channel.startsWith('&');
