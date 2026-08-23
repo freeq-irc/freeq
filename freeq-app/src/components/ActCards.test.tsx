@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { render, cleanup } from '@testing-library/react';
-import { ActEventCard } from './ActCards';
+import { ActEventCard, cardNeighbours } from './ActCards';
 import { actHeadline } from '../lib/act-verbs';
 import type { Message, ActTask, ActEvent } from '../store';
 
@@ -101,5 +101,49 @@ describe('what the card carries', () => {
     const ev = event('claim');
     const { container } = render(<ActEventCard msg={msg(ev.msgId!)} task={task([ev])} event={ev} />);
     expect(container.textContent).not.toContain('whatever the sender wrote');
+  });
+});
+
+describe('skipping between a task\'s cards', () => {
+  const lifecycle = [event('offer'), event('claim'), event('progress'), event('complete')];
+
+  it('names the card before and the card after', () => {
+    expect(cardNeighbours(task(lifecycle), lifecycle[1])).toEqual({ prev: 'm-offer', next: 'm-progress' });
+  });
+
+  it('offers nothing before the first card, or after the last', () => {
+    expect(cardNeighbours(task(lifecycle), lifecycle[0])).toEqual({ prev: undefined, next: 'm-claim' });
+    expect(cardNeighbours(task(lifecycle), lifecycle[3])).toEqual({ prev: 'm-progress', next: undefined });
+  });
+
+  it('skips the events the home signs, which are lines and not cards', () => {
+    const confirmed = [
+      lifecycle[0],
+      { eventId: 'e-confirm', verb: 'confirm', from: 'e2e', fields: {} },
+      lifecycle[1],
+    ];
+    expect(cardNeighbours(task(confirmed), lifecycle[0])).toEqual({ prev: undefined, next: 'm-claim' });
+  });
+
+  it('shows a link for each neighbour a card has', () => {
+    const first = render(<ActEventCard msg={msg('m-offer')} task={task(lifecycle)} event={lifecycle[0]} />);
+    expect(first.container.textContent).toContain('next →');
+    expect(first.container.textContent).not.toContain('← prev');
+    cleanup();
+
+    const middle = render(<ActEventCard msg={msg('m-claim')} task={task(lifecycle)} event={lifecycle[1]} />);
+    expect(middle.container.textContent).toContain('← prev');
+    expect(middle.container.textContent).toContain('next →');
+  });
+
+  it('asks the list to jump to the neighbour it names', async () => {
+    const { useStore } = await import('../store');
+    const { getByText } = render(
+      <ActEventCard msg={msg('m-claim')} task={task(lifecycle)} event={lifecycle[1]} />,
+    );
+    getByText('next →').click();
+    expect(useStore.getState().scrollToMsgId).toBe('m-progress');
+    getByText('← prev').click();
+    expect(useStore.getState().scrollToMsgId).toBe('m-offer');
   });
 });

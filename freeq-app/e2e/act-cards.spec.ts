@@ -95,4 +95,19 @@ test.describe('task cards', () => {
       await expect(cards.nth(i)).toContainText(word);
     }
   });
+
+  test('next from the offer card lands on the claim card', async ({ page }) => {
+    const channel = uniqueChannel();
+    await connectGuest(page, uniqueNick(), channel);
+    for (const move of LIFECYCLE) await receiveMove(page, channel, move);
+
+    const cards = page.getByTestId('act-card');
+    await expect(cards).toHaveCount(4);
+    await cards.nth(0).getByText('next →').click();
+
+    // The jump highlights the row it lands on, which is the claim's line.
+    const claim = page.locator(`#msg-m-${LIFECYCLE[1].eventId}`);
+    await expect(claim).toHaveClass(/bg-accent/);
+    await expect(claim.getByTestId('act-card')).toContainText('claimed');
+  });
 });

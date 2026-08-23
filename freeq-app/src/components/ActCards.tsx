@@ -14,14 +14,30 @@ import { TaskTimeline } from './TaskTimeline';
 import { useStore } from '../store';
 import { actHeadline } from '../lib/act-verbs';
 
+/**
+ * The cards either side of this one, by companion msgid.
+ *
+ * A task's cards are its events in the order they were made, minus the two
+ * the home signs for itself: those are system lines, with no card to land on.
+ * Absent at each end, which is what stops the links being offered there.
+ */
+export function cardNeighbours(task: ActTask, event: ActEvent): { prev?: string; next?: string } {
+  const cards = task.events.filter(e => e.msgId);
+  const i = cards.findIndex(e => e.eventId === event.eventId);
+  if (i === -1) return {};
+  return { prev: cards[i - 1]?.msgId, next: cards[i + 1]?.msgId };
+}
+
 export function ActEventCard({ msg, task, event }: {
   msg: Message;
   task: ActTask;
   event: ActEvent;
 }) {
   const [open, setOpen] = useState(false);
+  const setScrollToMsgId = useStore(s => s.setScrollToMsgId);
   const note = event.fields['act-note'];
   const ctx = event.fields['act-ctx'];
+  const { prev, next } = cardNeighbours(task, event);
 
   return (
     <>
@@ -42,6 +58,20 @@ export function ActEventCard({ msg, task, event }: {
             >
               {ctx}
             </a>
+          )}
+          {(prev || next) && (
+            <div className="flex gap-3 mt-1.5 text-[11px]" onClick={e => e.stopPropagation()}>
+              {prev && (
+                <button className="text-fg-dim hover:text-fg-muted" onClick={() => setScrollToMsgId(prev)}>
+                  ← prev
+                </button>
+              )}
+              {next && (
+                <button className="text-fg-dim hover:text-fg-muted" onClick={() => setScrollToMsgId(next)}>
+                  next →
+                </button>
+              )}
+            </div>
           )}
         </CardFrame>
       </div>
