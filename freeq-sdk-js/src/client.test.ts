@@ -1523,6 +1523,88 @@ describe('inbound: actEvent', () => {
     expect(seen).toHaveLength(0);
   });
 
+  it('holds a batched event until the batch that carries its companion lands', async () => {
+    const { client, ws } = await makeRegistered();
+    const order: string[] = [];
+    client.on('actEvent', (e) => order.push(`act:${e.eventId}`));
+    client.on('historyBatch', (buf, msgs) =>
+      order.push(`batch:${buf}:${msgs.map((m) => m.id).join(',')}`),
+    );
+    ws.recv(':server BATCH +h chathistory #foo');
+    // The event line precedes its companion on the wire — the case that
+    // used to hand the app the event with nothing to hang it on.
+    ws.recv(
+      '@batch=h;time=2026-08-22T10:00:00.000Z;+freeq.at/eventid=01OFFER;' +
+        '+freeq.at/act=handoff;+freeq.at/act-verb=offer;+freeq.at/act-title=x;' +
+        '+freeq.at/from=did:plc:eliza :eliza TAGMSG #foo',
+    );
+    ws.recv(
+      '@batch=h;time=2026-08-22T10:00:01.000Z;msgid=01LINE;+freeq.at/ref=01OFFER ' +
+        ':eliza PRIVMSG #foo :offered: x',
+    );
+    ws.recv(':server BATCH -h');
+    // The batched-message path suspends across more microtasks than a plain
+    // PRIVMSG; one flushAsync races the batch close.
+    for (let i = 0; i < 4; i++) await flushAsync();
+    expect(order).toEqual(['batch:#foo:01LINE', 'act:01OFFER']);
+  });
+
+  it('keeps two batched events in wire order behind their batch', async () => {
+    const { client, ws } = await makeRegistered();
+    const order: string[] = [];
+    client.on('actEvent', (e) => order.push(`act:${e.eventId}`));
+    client.on('historyBatch', (buf, msgs) =>
+      order.push(`batch:${msgs.map((m) => m.id).join(',')}`),
+    );
+    ws.recv(':server BATCH +h chathistory #foo');
+    ws.recv(
+      '@batch=h;time=2026-08-22T10:00:00.000Z;+freeq.at/eventid=01OFFER;' +
+        '+freeq.at/act=handoff;+freeq.at/act-verb=offer;+freeq.at/act-title=x;' +
+        '+freeq.at/from=did:plc:eliza :eliza TAGMSG #foo',
+    );
+    ws.recv(
+      '@batch=h;time=2026-08-22T10:00:01.000Z;msgid=01LINE1;+freeq.at/ref=01OFFER ' +
+        ':eliza PRIVMSG #foo :offered: x',
+    );
+    ws.recv(
+      '@batch=h;time=2026-08-22T10:00:02.000Z;+freeq.at/eventid=01CLAIM;' +
+        '+freeq.at/act=handoff;+freeq.at/act-verb=claim;+freeq.at/act-id=01OFFER;' +
+        '+freeq.at/from=did:plc:scholar :scholar TAGMSG #foo',
+    );
+    ws.recv(
+      '@batch=h;time=2026-08-22T10:00:03.000Z;msgid=01LINE2;+freeq.at/ref=01CLAIM ' +
+        ':scholar PRIVMSG #foo :claimed: x',
+    );
+    ws.recv(':server BATCH -h');
+    for (let i = 0; i < 4; i++) await flushAsync();
+    expect(order).toEqual(['batch:01LINE1,01LINE2', 'act:01OFFER', 'act:01CLAIM']);
+  });
+
+  it('fires an unbatched event straight away', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: ActEventPayload[] = [];
+    client.on('actEvent', (e) => seen.push(e));
+    // A batch is open, but this line is not in it.
+    ws.recv(':server BATCH +h chathistory #foo');
+    ws.recv(OFFER);
+    await flushAsync();
+    expect(seen.map((e) => e.eventId)).toEqual(['01OFFER']);
+  });
+
+  it('fires a JOIN-replay event straight away, marked replayed', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: ActEventPayload[] = [];
+    client.on('actEvent', (e) => seen.push(e));
+    ws.recv(
+      '@time=2026-08-22T10:00:00.000Z;+freeq.at/eventid=01JOINED;+freeq.at/act=handoff;' +
+        '+freeq.at/act-verb=offer;+freeq.at/act-title=x;+freeq.at/from=did:plc:eliza :eliza TAGMSG #foo',
+    );
+    await flushAsync();
+    expect(seen).toHaveLength(1);
+    expect(seen[0].eventId).toBe('01JOINED');
+    expect(seen[0].replayed).toBe(true);
+  });
+
   it('leaves the companion prose line to fire message', async () => {
     const { client, ws } = await makeRegistered();
     const acts: ActEventPayload[] = [];

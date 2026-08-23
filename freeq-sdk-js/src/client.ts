@@ -1165,7 +1165,9 @@ export class FreeqClient extends EventEmitter {
    *
    * The TAGMSG *is* the event — the server files it from this line — and this
    * is the one place `actEvent` fires. The companion prose line is an
-   * ordinary message and keeps arriving as `message`.
+   * ordinary message and keeps arriving as `message` — for a history batch,
+   * inside `historyBatch`, which is why the TAGMSG handler holds a batched
+   * event and calls this at batch end instead.
    *
    * Deduped by event id. Three things produce the same id twice: our own echo,
    * the JOIN replay a channel hands a joiner, and the CHATHISTORY that joiner
@@ -2263,7 +2265,19 @@ export class FreeqClient extends EventEmitter {
 
         // Task event (`act-` tags). Same rule as the coordination branch: the
         // TAGMSG is the event, so this is the one place `actEvent` fires.
-        this.emitActEvent(target, from, msg.tags);
+        // Inside a history batch the event is held and fired at batch end,
+        // the way a replayed edit collapses into its batch above.
+        const actBatchId = msg.tags['batch'];
+        const actBatch = actBatchId ? this.batches.get(actBatchId) : undefined;
+        if (
+          actBatch &&
+          actBatch.type !== 'draft/multiline' &&
+          Object.keys(msg.tags).some((n) => signing.isActTag(n))
+        ) {
+          (actBatch.actEvents ??= []).push({ target, from, tags: msg.tags });
+        } else {
+          this.emitActEvent(target, from, msg.tags);
+        }
 
         const avState = msg.tags['+freeq.at/av-state'];
         const avId = msg.tags['+freeq.at/av-id'];
@@ -2502,6 +2516,11 @@ export class FreeqClient extends EventEmitter {
                 }
               }
               this.emit('historyBatch', key, batch.messages);
+            }
+            // Held task events ride out with the batch, in wire order,
+            // after the lines they refer to.
+            for (const held of batch.actEvents ?? []) {
+              this.emitActEvent(held.target, held.from, held.tags);
             }
           }
         }

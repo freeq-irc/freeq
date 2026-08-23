@@ -199,6 +199,11 @@ export interface Batch {
    * `messages` instead of emitted as a top-level `message` event.
    */
   parentBatchId?: string;
+  /**
+   * Act TAGMSGs read inside this batch, in wire order, held so `actEvent`
+   * fires after the batch's companion lines are delivered.
+   */
+  actEvents?: Array<{ target: string; from: string; tags: Record<string, string> }>;
 }
 
 // ── Agent-native types ─────────────────────────────────────────────────────
