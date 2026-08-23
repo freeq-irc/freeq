@@ -3365,14 +3365,26 @@ export class FreeqClient extends EventEmitter {
     return eventId;
   }
 
-  /** Sugar over `emitEvent` for `task_request`. Returns the task ID. */
+  /**
+   * Sugar over `emitEvent` for `task_request`. Returns the task ID.
+   *
+   * Superseded by `sendAct` carrying an `offer` built by `actTags` — the same
+   * work opened as a signed task event the sender then holds by accepting it.
+   * This one keeps sending the older task family until every caller has moved.
+   */
   createTask(channel: string, description: string): string {
     return this.emitEvent(channel, 'task_request', { description }, {
       humanText: `📋 New task: ${description}`,
     });
   }
 
-  /** Sugar for `task_update` — progress update on a task. */
+  /**
+   * Sugar for `task_update` — progress update on a task.
+   *
+   * Superseded by `sendAct` carrying a `progress` built by `actTags`, which
+   * says the same thing on the task's own record. This one keeps sending the
+   * older task family until every caller has moved.
+   */
   updateTask(channel: string, taskId: string, phase: string, summary: string): void {
     this.emitEvent(channel, 'task_update', { phase, summary }, {
       refId: taskId,
@@ -3380,7 +3392,12 @@ export class FreeqClient extends EventEmitter {
     });
   }
 
-  /** Sugar for `task_complete`. */
+  /**
+   * Sugar for `task_complete`.
+   *
+   * Superseded by `sendAct` carrying a `complete` built by `actTags`. This one
+   * keeps sending the older task family until every caller has moved.
+   */
   completeTask(channel: string, taskId: string, summary: string, url?: string): void {
     const payload: Record<string, unknown> = { summary };
     if (url) payload.url = url;
@@ -3391,7 +3408,12 @@ export class FreeqClient extends EventEmitter {
     });
   }
 
-  /** Sugar for `task_failed`. */
+  /**
+   * Sugar for `task_failed`.
+   *
+   * Superseded by `sendAct` carrying a `fail` built by `actTags`. This one
+   * keeps sending the older task family until every caller has moved.
+   */
   failTask(channel: string, taskId: string, error: string): void {
     this.emitEvent(channel, 'task_failed', { error }, {
       refId: taskId,
@@ -3399,7 +3421,14 @@ export class FreeqClient extends EventEmitter {
     });
   }
 
-  /** Sugar for `evidence_attach` — attach evidence to a task. */
+  /**
+   * Sugar for `evidence_attach` — attach evidence to a task.
+   *
+   * Superseded by `sendAct` carrying a `progress` built by `actTags` with
+   * `ctx` and `ctx-h` fields — the materials and a hash of them, so what is
+   * fetched later is checkable against what was signed. This one keeps sending
+   * the older task family until every caller has moved.
+   */
   attachEvidence(
     channel: string,
     taskId: string,

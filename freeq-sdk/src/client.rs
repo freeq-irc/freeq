@@ -1079,6 +1079,11 @@ impl ClientHandle {
     }
 
     /// Create a new task and return its ID.
+    ///
+    /// Superseded by [`ClientHandle::send_act`] carrying an `offer` built by
+    /// [`crate::act::act_tags`] — the same work opened as a signed task event
+    /// the sender then holds by accepting it. This one keeps sending the older
+    /// task family until every caller has moved.
     pub async fn create_task(&self, channel: &str, description: &str) -> Result<String> {
         let payload = serde_json::json!({"description": description}).to_string();
         self.emit_event(
@@ -1092,6 +1097,11 @@ impl ClientHandle {
     }
 
     /// Update a task's status.
+    ///
+    /// Superseded by [`ClientHandle::send_act`] carrying a `progress` built by
+    /// [`crate::act::act_tags`], which says the same thing on the task's own
+    /// record. This one keeps sending the older task family until every caller
+    /// has moved.
     pub async fn update_task(
         &self,
         channel: &str,
@@ -1112,6 +1122,10 @@ impl ClientHandle {
     }
 
     /// Complete a task.
+    ///
+    /// Superseded by [`ClientHandle::send_act`] carrying a `complete` built by
+    /// [`crate::act::act_tags`]. This one keeps sending the older task family
+    /// until every caller has moved.
     pub async fn complete_task(
         &self,
         channel: &str,
@@ -1136,6 +1150,10 @@ impl ClientHandle {
     }
 
     /// Fail a task.
+    ///
+    /// Superseded by [`ClientHandle::send_act`] carrying a `fail` built by
+    /// [`crate::act::act_tags`]. This one keeps sending the older task family
+    /// until every caller has moved.
     pub async fn fail_task(&self, channel: &str, task_id: &str, error: &str) -> Result<()> {
         let payload = serde_json::json!({"error": error}).to_string();
         self.emit_event(
@@ -1150,6 +1168,12 @@ impl ClientHandle {
     }
 
     /// Attach evidence to a task.
+    ///
+    /// Superseded by [`ClientHandle::send_act`] carrying a `progress` built by
+    /// [`crate::act::act_tags`] with `ctx` and `ctx-h` fields — the materials
+    /// and a hash of them, so what is fetched later is checkable against what
+    /// was signed. This one keeps sending the older task family until every
+    /// caller has moved.
     pub async fn attach_evidence(
         &self,
         channel: &str,
