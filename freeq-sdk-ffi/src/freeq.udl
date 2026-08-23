@@ -93,6 +93,20 @@ dictionary CoordinationEvent {
     string? payload;
 };
 
+dictionary ActEvent {
+    string from;
+    string target;
+    string kind;
+    string verb;
+    string? did;
+    string event_id;
+    string task_id;
+    sequence<TagEntry> fields;
+    string? sig_tag;
+    boolean replayed;
+    string? dm_key;
+};
+
 dictionary ReactionTally {
     string emoji;
     sequence<string> nicks;
@@ -135,6 +149,7 @@ interface FreeqEvent {
     AwayChanged(string nick, string? away_msg);
     Message(IrcMessage msg);
     TagMsg(TagMessage msg);
+    Act(ActEvent event);
     Names(string channel, sequence<IrcMember> members);
     TopicChanged(string channel, ChannelTopic topic);
     ModeChanged(string channel, string mode, string? arg, string set_by);

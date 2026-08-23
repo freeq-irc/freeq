@@ -291,6 +291,12 @@ pub fn convert_event(event: &freeq_sdk::event::Event) -> DomainEvent {
         Event::MemberDid { .. } => DomainEvent::Notice {
             text: String::new(),
         },
+        // A task event is the parse of a TAGMSG that also arrives raw, and
+        // nothing here draws task cards yet — inert until it does, the same
+        // answer the binding above gets.
+        Event::Act { .. } => DomainEvent::Notice {
+            text: String::new(),
+        },
     }
 }
 

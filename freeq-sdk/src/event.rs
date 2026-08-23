@@ -61,6 +61,42 @@ pub enum Event {
         dm_key: Option<String>,
     },
 
+    /// A task event: a TAGMSG carrying `act` tags, already read.
+    ///
+    /// The line still arrives as [`Event::TagMsg`] too, the way a coordination
+    /// TAGMSG does — this variant is the parse, not a replacement for the
+    /// message. A consumer that renders task cards listens here; one that
+    /// wants the raw tags has them either way.
+    ///
+    /// Emitted once per event id. The same event arrives up to three times —
+    /// our own echo, the replay a channel hands a joiner, and the history that
+    /// joiner asks for next — and the second and third sightings are dropped.
+    Act {
+        from: String,
+        target: String,
+        /// The task kind — the `act` tag's value, e.g. `handoff`.
+        kind: String,
+        /// The move: `offer`, `claim`, `progress`, `confirm`, …
+        verb: String,
+        /// The acting identity: the `from` tag, else the server's `account`.
+        did: Option<String>,
+        /// The signer-minted id of this event.
+        event_id: String,
+        /// The action this event is about — the one it names, or its own id
+        /// when it names none, because an opener's id *is* the action's.
+        task_id: String,
+        /// Every act tag, keyed by its name with the vendor prefix stripped.
+        /// Exactly what the signature covers.
+        fields: std::collections::BTreeMap<String, String>,
+        /// The signature over the act document, if the line carried one.
+        sig_tag: Option<String>,
+        /// True when this arrived from history rather than live.
+        replayed: bool,
+        /// Same as [`Event::Message::dm_key`]: the DM conversation key,
+        /// `None` for channels.
+        dm_key: Option<String>,
+    },
+
     /// BATCH start (e.g., chathistory)
     BatchStart {
         id: String,

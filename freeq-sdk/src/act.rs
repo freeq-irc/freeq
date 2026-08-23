@@ -239,6 +239,169 @@ where
     ))
 }
 
+/// The wire tags of a task event.
+///
+/// `kind` and `verb` are what the event is and what it does; `task` names the
+/// action it is about, and is `None` exactly for an opener, whose own event id
+/// becomes the action's id for the rest of its life. `from` is the actor.
+/// Every `(name, value)` in `fields` rides as `act-<name>`, so `("note", …)`
+/// is `act-note` and `("ctx-h", …)` is `act-ctx-h`.
+///
+/// Nothing here knows a verb. Which verbs a kind allows, and from which state,
+/// is the rules file's business ([`crate::act_transitions`]) — this builds the
+/// document a sender wants to sign, whatever it says.
+pub fn act_tags(
+    kind: &str,
+    verb: &str,
+    task: Option<&str>,
+    from: &str,
+    fields: &[(&str, &str)],
+) -> std::collections::HashMap<String, String> {
+    let mut t = std::collections::HashMap::new();
+    t.insert("+freeq.at/act".into(), kind.to_string());
+    t.insert("+freeq.at/act-verb".into(), verb.to_string());
+    t.insert("+freeq.at/from".into(), from.to_string());
+    if let Some(task) = task {
+        t.insert("+freeq.at/act-id".into(), task.to_string());
+    }
+    for (name, value) in fields {
+        t.insert(format!("+freeq.at/act-{name}"), value.to_string());
+    }
+    t
+}
+
+/// The line people read beside a task event, when the sender writes none.
+///
+/// The companion is prose for a room, so it is the one place a verb has to be
+/// spelled out. Kept to a single function, with one arm per verb and the verb
+/// itself as the answer for anything it has not been taught: a kind may add a
+/// verb without touching this, and the room gets the verb's name until someone
+/// writes it a sentence.
+pub fn act_line(kind: &str, verb: &str, fields: &[(&str, &str)]) -> String {
+    let field = |name: &str| {
+        fields
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| *v)
+            .filter(|v| !v.is_empty())
+    };
+    // What a room calls the thing being acted on. A handoff is a task in
+    // prose — it always has been in these lines — and every other kind is
+    // called by its own name.
+    let named = if kind == "handoff" { "task" } else { kind };
+    match verb {
+        "offer" => format!("offered: {}", field("title").unwrap_or_default()),
+        "accept" => format!("accepted the {named}"),
+        "decline" => format!("declined the {named}"),
+        "claim" => format!("claimed the {named}"),
+        "progress" => match field("note") {
+            Some(note) => format!("progress: {note}"),
+            None => "made progress".to_string(),
+        },
+        "complete" => format!("completed the {named}"),
+        "fail" => format!("failed the {named}"),
+        "cancel" => format!("cancelled the {named}"),
+        "bid" => match field("note") {
+            Some(note) => format!("bid: {note}"),
+            None => "bid on the bounty".to_string(),
+        },
+        "award" => "awarded the bounty".to_string(),
+        "submit" => "submitted the work".to_string(),
+        "revise" => "asked for revisions".to_string(),
+        "accept-work" => "accepted the work".to_string(),
+        "forfeit" => "forfeited the bounty".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// A task event as it arrived: what the tags say, read once so a consumer does
+/// not have to know the tag names.
+///
+/// The same fields the TypeScript SDK's `ActEventPayload` carries, under the
+/// same rules — most of all that `task` is never empty. An opener names no
+/// other action because its own id is the action's for the rest of its life,
+/// so it names itself here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActEvent {
+    /// The task kind — the `act` tag's value, e.g. `handoff`.
+    pub kind: String,
+    /// The move: `offer`, `claim`, `progress`, `confirm`, …
+    pub verb: String,
+    /// The acting identity: the `from` tag, else the server's `account`.
+    pub did: Option<String>,
+    /// The signer-minted id of this event.
+    pub event_id: String,
+    /// The action this event is about — `act-id`, or this event's own id when
+    /// it opens one.
+    pub task_id: String,
+    /// Every act tag, keyed by its name with the vendor prefix stripped:
+    /// `act-note` reads as `act-note`, `+freeq.at/act` as `act`. Exactly what
+    /// the signature covers, so a reader drawing from these draws from what
+    /// was signed.
+    pub fields: BTreeMap<String, String>,
+    /// The signature over the act document, if the line carried one.
+    pub sig_tag: Option<String>,
+    /// True when this arrived from history rather than live — a replayed line
+    /// carries the server's `time` tag.
+    pub replayed: bool,
+}
+
+/// Read a task event off a message's tags, or `None` when the message is not
+/// one.
+///
+/// Not a task event: no act tag at all, or no id to file it under. Both are
+/// silence rather than an error — an ordinary TAGMSG carries neither, and the
+/// caller is asking "is this one?", not "is this valid?". Whether the
+/// signature holds is [`verify_act`]'s question, asked separately and against
+/// a venue only the receiver knows.
+pub fn parse_event<'a, I>(tags: I) -> Option<ActEvent>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let mut fields = BTreeMap::new();
+    let mut did = None;
+    let mut account = None;
+    let mut event_id = None;
+    let mut sig_tag = None;
+    let mut replayed = false;
+    for (name, value) in tags {
+        let stripped = stripped_name(name);
+        match stripped {
+            "from" => did = Some(value.to_string()),
+            "account" => account = Some(value.to_string()),
+            "eventid" => event_id = Some(value.to_string()),
+            "sig" => sig_tag = Some(value.to_string()),
+            "time" => replayed = true,
+            // The id a signed event carries once an adopting server has taken
+            // it: the server files the signed id under `msgid` and drops the
+            // tag it arrived in.
+            "msgid" if event_id.is_none() => event_id = Some(value.to_string()),
+            _ if is_act_tag(name) => {
+                fields.insert(stripped.to_string(), value.to_string());
+            }
+            _ => {}
+        }
+    }
+    if fields.is_empty() {
+        return None;
+    }
+    let event_id = event_id?;
+    let task_id = fields
+        .get("act-id")
+        .cloned()
+        .unwrap_or_else(|| event_id.clone());
+    Some(ActEvent {
+        kind: fields.get("act").cloned().unwrap_or_default(),
+        verb: fields.get("act-verb").cloned().unwrap_or_default(),
+        did: did.or(account),
+        event_id,
+        task_id,
+        fields,
+        sig_tag,
+        replayed,
+    })
+}
+
 /// Parse a sig tag value into (kid, signature bytes).
 pub fn parse_sig_tag(sig_tag: &str) -> Result<(&str, [u8; 64]), ActSigError> {
     crate::sigtag::parse(sig_tag).map_err(ActSigError::from)
@@ -727,8 +890,8 @@ mod tests {
         id: &'static str,
     }
 
-    /// The four shared vectors. Kept in one place so the generator and the
-    /// checker can't drift.
+    /// The shared vectors, one per shape worth freezing. Kept in one place so
+    /// the generator and the checker can't drift.
     fn fixture_cases() -> Vec<Case> {
         vec![
             Case {
@@ -865,6 +1028,165 @@ mod tests {
                 ],
                 target: OFFER_VENUE,
                 id: "01JACCEPTEVENTID0000000000",
+            },
+            Case {
+                // Taking an offer nobody was named for. The leanest follow-up
+                // there is — kind, verb, actor, task — which is what makes it
+                // worth freezing: if two implementations disagree about a
+                // document this small, they disagree about all of them.
+                name: "claim-on-an-open-handoff",
+                seed: 9,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "claim"),
+                    ("+freeq.at/from", "did:plc:scholar"),
+                    ("+freeq.at/act-id", OFFER_ID),
+                ],
+                target: OFFER_VENUE,
+                id: "01JCLAIMEVENTID00000000000",
+            },
+            Case {
+                // A step carrying context: where the materials are and a hash
+                // of what was there when this was signed. Both are ordinary
+                // act tags, so the sweep covers them without knowing what
+                // either means — which is how evidence rides a step at all.
+                name: "progress-with-context",
+                seed: 10,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "progress"),
+                    ("+freeq.at/from", "did:plc:scholar"),
+                    ("+freeq.at/act-id", OFFER_ID),
+                    ("+freeq.at/act-note", "2 of 3 sources read"),
+                    ("+freeq.at/act-ctx", "https://example.com/checks/abc"),
+                    ("+freeq.at/act-ctx-h", "sha256:9f86d"),
+                ],
+                target: OFFER_VENUE,
+                id: "01JPROGRESSEVENTID00000000",
+            },
+            Case {
+                // A completion whose result rides `act-ctx` with no hash: the
+                // sender had a link and not the bytes. Honest and allowed —
+                // and the reason the hash is a separate tag rather than part
+                // of the link.
+                name: "complete-with-a-result-link",
+                seed: 11,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "complete"),
+                    ("+freeq.at/from", "did:plc:scholar"),
+                    ("+freeq.at/act-id", OFFER_ID),
+                    ("+freeq.at/act-note", "filed"),
+                    ("+freeq.at/act-ctx", "https://example.com/article"),
+                ],
+                target: OFFER_VENUE,
+                id: "01JCOMPLETEEVENTID00000000",
+            },
+            Case {
+                // Giving up work you hold. Terminal, and the note is the only
+                // account anyone gets of why.
+                name: "fail-with-a-reason",
+                seed: 12,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "fail"),
+                    ("+freeq.at/from", "did:plc:scholar"),
+                    ("+freeq.at/act-id", OFFER_ID),
+                    ("+freeq.at/act-note", "the source is paywalled"),
+                ],
+                target: OFFER_VENUE,
+                id: "01JFAILEVENTID000000000000",
+            },
+            Case {
+                // The poster withdrawing their own task. Same document as any
+                // participant step; who may send it is the rules file's
+                // business, not the canonical's.
+                name: "cancel-by-the-offerer",
+                seed: 13,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "cancel"),
+                    ("+freeq.at/from", "did:plc:eliza"),
+                    ("+freeq.at/act-id", OFFER_ID),
+                    ("+freeq.at/act-note", "no longer needed"),
+                ],
+                target: OFFER_VENUE,
+                id: "01JCANCELEVENTID0000000000",
+            },
+            Case {
+                // Turning down an offer that named you.
+                name: "decline-by-the-offeree",
+                seed: 14,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "decline"),
+                    ("+freeq.at/from", "did:plc:scholar"),
+                    ("+freeq.at/act-id", OFFER_ID),
+                    ("+freeq.at/act-note", "no capacity today"),
+                ],
+                target: OFFER_VENUE,
+                id: "01JDECLINEEVENTID000000000",
+            },
+            Case {
+                // Handing work in on a bounty. Nothing about a submission
+                // says the work is done — only that it is in — so the
+                // document says no more than that.
+                name: "bounty-submit",
+                seed: 15,
+                tags: vec![
+                    ("+freeq.at/act", "bounty"),
+                    ("+freeq.at/act-verb", "submit"),
+                    ("+freeq.at/from", "did:plc:scholar"),
+                    ("+freeq.at/act-id", BOUNTY_ID),
+                    ("+freeq.at/act-note", "branch pushed"),
+                ],
+                target: "#swarm",
+                id: "01JSUBMITEVENTID0000000000",
+            },
+            Case {
+                // The poster sending submitted work back for another pass.
+                name: "bounty-revise",
+                seed: 16,
+                tags: vec![
+                    ("+freeq.at/act", "bounty"),
+                    ("+freeq.at/act-verb", "revise"),
+                    ("+freeq.at/from", "did:plc:eliza"),
+                    ("+freeq.at/act-id", BOUNTY_ID),
+                    ("+freeq.at/act-note", "tests missing"),
+                ],
+                target: "#swarm",
+                id: "01JREVISEEVENTID0000000000",
+            },
+            Case {
+                // The poster accepting the work, with a payment reference
+                // along for the record. Opaque like the bid's terms: covered
+                // because it is present, never because anything reads it.
+                name: "bounty-accept-work-with-a-payment-reference",
+                seed: 17,
+                tags: vec![
+                    ("+freeq.at/act", "bounty"),
+                    ("+freeq.at/act-verb", "accept-work"),
+                    ("+freeq.at/from", "did:plc:eliza"),
+                    ("+freeq.at/act-id", BOUNTY_ID),
+                    ("+freeq.at/act-tx", "lightning:abc123"),
+                ],
+                target: "#swarm",
+                id: "01JACCEPTWORKEVENTID000000",
+            },
+            Case {
+                // Walking away from a bounty you hold. Terminal: re-listing
+                // it is a new bounty naming this one in the revival relation.
+                name: "bounty-forfeit",
+                seed: 18,
+                tags: vec![
+                    ("+freeq.at/act", "bounty"),
+                    ("+freeq.at/act-verb", "forfeit"),
+                    ("+freeq.at/from", "did:plc:scholar"),
+                    ("+freeq.at/act-id", BOUNTY_ID),
+                    ("+freeq.at/act-note", "out of time"),
+                ],
+                target: "#swarm",
+                id: "01JFORFEITEVENTID000000000",
             },
         ]
     }
@@ -1076,6 +1398,58 @@ mod tests {
         std::fs::write(fixtures_path(), json + "\n").unwrap();
     }
 
+    /// Every vector's tags are what the builder makes of that vector's own
+    /// inputs.
+    ///
+    /// The sending half of the contract: the signing half above proves the
+    /// canonical and the signature reproduce, and this proves the tags a
+    /// sender writes are the tags that were frozen. It walks the whole file
+    /// rather than a list, so a vector cannot be added without being covered
+    /// — including the two nothing here sends, the approval kind's opener and
+    /// the home's receipt, because the builder knows no verb and does not
+    /// care which of them it is spelling.
+    #[test]
+    fn every_vector_is_what_the_builder_makes_of_its_own_inputs() {
+        for case in fixture_cases() {
+            let by_name: BTreeMap<&str, &str> = case
+                .tags
+                .iter()
+                .map(|(name, value)| (stripped_name(name), *value))
+                .collect();
+            // `verb` and `id` are the builder's own parameters; everything
+            // else under the prefix is a field.
+            let fields: Vec<(&str, &str)> = by_name
+                .iter()
+                .filter_map(|(name, value)| {
+                    name.strip_prefix("act-")
+                        .filter(|f| *f != "verb" && *f != "id")
+                        .map(|f| (f, *value))
+                })
+                .collect();
+            let built = act_tags(
+                by_name.get("act").copied().unwrap_or_default(),
+                by_name.get("act-verb").copied().unwrap_or_default(),
+                by_name.get("act-id").copied(),
+                by_name.get("from").copied().unwrap_or_default(),
+                &fields,
+            );
+            // The vector carries tags no sender writes — the signature, the
+            // event id, and two that are there to prove they are not covered.
+            let expected: std::collections::HashMap<String, String> = case
+                .tags
+                .iter()
+                .filter(|(name, _)| {
+                    !matches!(
+                        *name,
+                        "+freeq.at/sig" | "+freeq.at/eventid" | "+freeq.at/actor-class" | "msgid"
+                    )
+                })
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            assert_eq!(built, expected, "vector {}", case.name);
+        }
+    }
+
     /// The committed fixture file must exactly match what this implementation
     /// produces — this is the cross-language byte-compatibility contract.
     #[test]
@@ -1130,6 +1504,281 @@ mod tests {
                 other => panic!("negative {} names unknown verdict {other}", n.name),
             }
         }
+    }
+
+    /// An opener names no action, because its own event id becomes the
+    /// action's — so `act-id` is the one tag it must not carry.
+    #[test]
+    fn act_tags_leaves_an_opener_naming_no_action() {
+        let tags = act_tags(
+            "handoff",
+            "offer",
+            None,
+            "did:plc:eliza",
+            &[
+                ("title", "Cite 3 sources on X"),
+                ("caps", "freeq.at/web-search"),
+            ],
+        );
+        assert_eq!(
+            tags,
+            std::collections::HashMap::from([
+                ("+freeq.at/act".to_string(), "handoff".to_string()),
+                ("+freeq.at/act-verb".to_string(), "offer".to_string()),
+                ("+freeq.at/from".to_string(), "did:plc:eliza".to_string()),
+                (
+                    "+freeq.at/act-title".to_string(),
+                    "Cite 3 sources on X".to_string()
+                ),
+                (
+                    "+freeq.at/act-caps".to_string(),
+                    "freeq.at/web-search".to_string()
+                ),
+            ])
+        );
+    }
+
+    /// A follow-up names the action it is about, and nothing else changes.
+    #[test]
+    fn act_tags_makes_a_follow_up_name_its_action() {
+        let tags = act_tags("handoff", "claim", Some(OFFER_ID), "did:plc:scholar", &[]);
+        assert_eq!(
+            tags,
+            std::collections::HashMap::from([
+                ("+freeq.at/act".to_string(), "handoff".to_string()),
+                ("+freeq.at/act-verb".to_string(), "claim".to_string()),
+                ("+freeq.at/from".to_string(), "did:plc:scholar".to_string()),
+                ("+freeq.at/act-id".to_string(), OFFER_ID.to_string()),
+            ])
+        );
+    }
+
+    /// A field name with a hyphen in it keeps the hyphen: the prefix goes on
+    /// the front and nothing else is touched.
+    #[test]
+    fn act_tags_prefixes_a_hyphenated_field_whole() {
+        let tags = act_tags(
+            "handoff",
+            "progress",
+            Some(OFFER_ID),
+            "did:plc:scholar",
+            &[("ctx", "https://example.com/x"), ("ctx-h", "sha256:9f00")],
+        );
+        assert_eq!(
+            tags.get("+freeq.at/act-ctx-h").map(String::as_str),
+            Some("sha256:9f00")
+        );
+        assert_eq!(
+            tags.get("+freeq.at/act-ctx").map(String::as_str),
+            Some("https://example.com/x")
+        );
+    }
+
+    /// The document a kind nobody has heard of produces: the builder writes
+    /// what it is told, because which verbs a kind allows is not its question.
+    #[test]
+    fn act_tags_builds_a_kind_and_verb_it_has_never_heard_of() {
+        let tags = act_tags(
+            "lease",
+            "renew",
+            Some(OFFER_ID),
+            "did:plc:eliza",
+            &[("term", "30d")],
+        );
+        assert_eq!(tags.get("+freeq.at/act").map(String::as_str), Some("lease"));
+        assert_eq!(
+            tags.get("+freeq.at/act-verb").map(String::as_str),
+            Some("renew")
+        );
+        assert_eq!(
+            tags.get("+freeq.at/act-term").map(String::as_str),
+            Some("30d")
+        );
+    }
+
+    /// Every verb's default line, as the room reads it. A handoff is a task in
+    /// prose; every other kind is called by its own name.
+    #[test]
+    fn act_line_says_what_each_verb_did() {
+        let none: &[(&str, &str)] = &[];
+        assert_eq!(
+            act_line("handoff", "offer", &[("title", "Cite 3 sources on X")]),
+            "offered: Cite 3 sources on X"
+        );
+        assert_eq!(act_line("handoff", "accept", none), "accepted the task");
+        assert_eq!(act_line("handoff", "decline", none), "declined the task");
+        assert_eq!(act_line("handoff", "claim", none), "claimed the task");
+        assert_eq!(act_line("handoff", "complete", none), "completed the task");
+        assert_eq!(act_line("handoff", "fail", none), "failed the task");
+        assert_eq!(act_line("handoff", "cancel", none), "cancelled the task");
+        assert_eq!(act_line("bounty", "cancel", none), "cancelled the bounty");
+        assert_eq!(act_line("bounty", "award", none), "awarded the bounty");
+        assert_eq!(act_line("bounty", "submit", none), "submitted the work");
+        assert_eq!(act_line("bounty", "revise", none), "asked for revisions");
+        assert_eq!(act_line("bounty", "accept-work", none), "accepted the work");
+        assert_eq!(act_line("bounty", "forfeit", none), "forfeited the bounty");
+    }
+
+    /// Two verbs read their note when there is one and stand on their own when
+    /// there is not.
+    #[test]
+    fn act_line_uses_a_note_only_when_one_was_written() {
+        let none: &[(&str, &str)] = &[];
+        assert_eq!(act_line("handoff", "progress", none), "made progress");
+        assert_eq!(
+            act_line("handoff", "progress", &[("note", "halfway")]),
+            "progress: halfway"
+        );
+        assert_eq!(act_line("bounty", "bid", none), "bid on the bounty");
+        assert_eq!(
+            act_line("bounty", "bid", &[("note", "two days")]),
+            "bid: two days"
+        );
+    }
+
+    /// A verb this has not been taught is named rather than described: a kind
+    /// may add one without editing prose, and the room still sees what it was.
+    #[test]
+    fn act_line_names_a_verb_it_has_no_sentence_for() {
+        assert_eq!(act_line("lease", "renew", &[]), "renew");
+    }
+
+    /// A follow-up names the action it is about, and that value is the task's
+    /// id for a reader.
+    #[test]
+    fn a_follow_up_reads_the_task_it_names() {
+        let event = parse_event(vec![
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "claim"),
+            ("+freeq.at/act-id", OFFER_ID),
+            ("+freeq.at/from", "did:plc:scholar"),
+            ("+freeq.at/eventid", "01JCLAIMEVENTID00000000000"),
+            ("+freeq.at/sig", "ed25519:kid:sig"),
+        ])
+        .expect("a task event");
+        assert_eq!(event.kind, "handoff");
+        assert_eq!(event.verb, "claim");
+        assert_eq!(event.did.as_deref(), Some("did:plc:scholar"));
+        assert_eq!(event.event_id, "01JCLAIMEVENTID00000000000");
+        assert_eq!(event.task_id, OFFER_ID);
+        assert_eq!(event.sig_tag.as_deref(), Some("ed25519:kid:sig"));
+        assert!(!event.replayed);
+    }
+
+    /// An opener names no action, so it is the action: its own id is what
+    /// every later event will name.
+    #[test]
+    fn an_opener_reads_as_its_own_task() {
+        let event = parse_event(offer_tags()).expect("a task event");
+        assert_eq!(event.verb, "offer");
+        assert_eq!(event.task_id, OFFER_ID);
+        assert_eq!(event.event_id, OFFER_ID);
+        // Only the covered tags are read back; the rest of the line is not
+        // the document.
+        assert_eq!(
+            event.fields.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "act",
+                "act-caps",
+                "act-ctx-h",
+                "act-deadline",
+                "act-title",
+                "act-to",
+                "act-verb"
+            ]
+        );
+    }
+
+    /// Reading an opener's task from the absence of `act-id` is the rules
+    /// file's own answer, checked against it rather than assumed: for every
+    /// kind, the verb that opens it is the verb that carries no `act-id`.
+    #[test]
+    fn the_opening_verb_is_the_one_that_names_no_task() {
+        for kind in ["handoff", "bounty"] {
+            let opens = crate::act_transitions::opening_verb(kind).expect("a known kind");
+            let event = parse_event(vec![
+                ("+freeq.at/act", kind),
+                ("+freeq.at/act-verb", opens),
+                ("+freeq.at/act-title", "anything"),
+                ("+freeq.at/from", "did:plc:eliza"),
+                ("+freeq.at/eventid", OFFER_ID),
+            ])
+            .expect("a task event");
+            assert_eq!(
+                event.task_id, event.event_id,
+                "{kind}'s opener names itself"
+            );
+        }
+    }
+
+    /// The server's `account` names the actor when the sender wrote no `from`
+    /// tag — which a well-formed event always does, but a reader should not
+    /// need the event to be well-formed to say who sent it.
+    #[test]
+    fn the_account_tag_names_the_actor_when_from_is_absent() {
+        let event = parse_event(vec![
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "progress"),
+            ("+freeq.at/act-id", OFFER_ID),
+            ("account", "did:plc:scholar"),
+            ("msgid", "01JPROGRESSEVENTID00000000"),
+        ])
+        .expect("a task event");
+        assert_eq!(event.did.as_deref(), Some("did:plc:scholar"));
+        assert_eq!(event.event_id, "01JPROGRESSEVENTID00000000");
+    }
+
+    /// The signed id wins over the server's `msgid` whichever order the tags
+    /// arrive in — a map hands them up unordered.
+    #[test]
+    fn the_signed_id_wins_over_the_servers_msgid() {
+        for tags in [
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", "did:plc:eliza"),
+                ("msgid", "01JSERVERMINTED0000000000"),
+                ("+freeq.at/eventid", OFFER_ID),
+            ],
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", "did:plc:eliza"),
+                ("+freeq.at/eventid", OFFER_ID),
+                ("msgid", "01JSERVERMINTED0000000000"),
+            ],
+        ] {
+            assert_eq!(parse_event(tags).expect("a task event").event_id, OFFER_ID);
+        }
+    }
+
+    /// A replayed line carries the server's time tag; a live one does not.
+    #[test]
+    fn a_replayed_line_says_so() {
+        let mut tags = offer_tags();
+        tags.push(("time", "2026-08-22T10:00:00.000Z"));
+        assert!(parse_event(tags).expect("a task event").replayed);
+    }
+
+    /// Two silences, not errors: an ordinary TAGMSG is not a task event, and
+    /// neither is one nothing can be filed under.
+    #[test]
+    fn a_line_that_is_not_a_task_event_reads_as_none() {
+        // No act tag at all — a reaction.
+        assert!(parse_event(vec![("+react", "👍"), ("+reply", "01ABC")]).is_none());
+        // `actor-class` is not an act tag; the coverage rule says so.
+        assert!(
+            parse_event(vec![("+freeq.at/actor-class", "agent"), ("msgid", "01ABC")]).is_none()
+        );
+        // Act tags but no id: nothing to file it under, and nothing to dedupe.
+        assert!(
+            parse_event(vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", "did:plc:eliza"),
+            ])
+            .is_none()
+        );
     }
 
     #[test]

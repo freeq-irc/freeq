@@ -156,11 +156,26 @@ export function newEventId(): string {
   return out;
 }
 
-/** Strip the client-tag vendor prefix from a tag name, if present. */
-function strippedName(name: string): string {
+/**
+ * A tag name with the client-tag vendor prefix taken off, if it had one.
+ */
+export function strippedTagName(name: string): string {
   if (name.startsWith('+freeq.at/')) return name.slice('+freeq.at/'.length);
   if (name.startsWith('freeq.at/')) return name.slice('freeq.at/'.length);
   return name;
+}
+
+/**
+ * Whether a tag name is one a task event's signature covers.
+ *
+ * Exported, and written once, because the two sides have to agree: what the
+ * signature covers and what a reader draws a card from are the same set, and
+ * a reader drawing from a tag the signer did not cover would be drawing from
+ * something nobody signed. The same rule as `freeq_sdk::act::is_act_tag`.
+ */
+export function isActTag(name: string): boolean {
+  const stripped = strippedTagName(name);
+  return stripped === 'act' || stripped.startsWith('act-');
 }
 
 /** The fields of a chat message that its signature covers. */
@@ -193,7 +208,7 @@ export async function messageCanonical(fields: MessageDocFields): Promise<string
   if (fields.edit) doc.edit = fields.edit;
   const coord: Record<string, string> = {};
   for (const [name, value] of Object.entries(fields.tags ?? {})) {
-    const key = strippedName(name);
+    const key = strippedTagName(name);
     if ((COVERED_COORD_TAGS as readonly string[]).includes(key)) coord[key] = value;
   }
   if (Object.keys(coord).length > 0) doc.coord = coord;
@@ -280,13 +295,9 @@ export function actCanonical(
   const covered: Record<string, string> = {};
   let from: string | null = null;
   for (const [name, value] of Object.entries(tags)) {
-    const stripped = name.startsWith('+freeq.at/')
-      ? name.slice('+freeq.at/'.length)
-      : name.startsWith('freeq.at/')
-        ? name.slice('freeq.at/'.length)
-        : name;
+    const stripped = strippedTagName(name);
     if (stripped === 'from') from = value;
-    else if (stripped === 'act' || stripped.startsWith('act-')) covered[stripped] = value;
+    else if (isActTag(name)) covered[stripped] = value;
   }
   if (Object.keys(covered).length === 0) return null;
   if (from === null) return null;
@@ -294,6 +305,98 @@ export function actCanonical(
   covered.id = id;
   covered.target = target;
   return canonicalize(covered);
+}
+
+/**
+ * The wire tags of a task event.
+ *
+ * `kind` and `verb` are what the event is and what it does; `task` names the
+ * action it is about, and is left out exactly for an opener, whose own event
+ * id becomes the action's id for the rest of its life. `from` is the actor.
+ * Every entry in `fields` rides as `act-<name>`, so `note` is `act-note` and
+ * `ctx-h` is `act-ctx-h`.
+ *
+ * Nothing here knows a verb. Which verbs a kind allows, and from which state,
+ * is the rules file's business — this builds the document a sender wants to
+ * sign, whatever it says. Byte-identical to `freeq_sdk::act::act_tags`.
+ */
+export function actTags(
+  kind: string,
+  verb: string,
+  task: string | undefined,
+  from: string,
+  fields: Record<string, string>,
+): Record<string, string> {
+  const tags: Record<string, string> = {
+    '+freeq.at/act': kind,
+    '+freeq.at/act-verb': verb,
+    '+freeq.at/from': from,
+  };
+  if (task !== undefined) tags['+freeq.at/act-id'] = task;
+  for (const [name, value] of Object.entries(fields)) {
+    tags[`+freeq.at/act-${name}`] = value;
+  }
+  return tags;
+}
+
+/**
+ * The line people read beside a task event, when the sender writes none.
+ *
+ * The companion is prose for a room, so it is the one place a verb has to be
+ * spelled out. Kept to a single function, with one arm per verb and the verb
+ * itself as the answer for anything it has not been taught: a kind may add a
+ * verb without touching this, and the room gets the verb's name until someone
+ * writes it a sentence.
+ *
+ * Byte-identical to `freeq_sdk::act::act_line`; the cross-language check
+ * compares both.
+ */
+export function actLine(
+  kind: string,
+  verb: string,
+  fields: Record<string, string>,
+): string {
+  const field = (name: string): string | undefined => fields[name] || undefined;
+  // What a room calls the thing being acted on. A handoff is a task in prose —
+  // it always has been in these lines — and every other kind is called by its
+  // own name.
+  const named = kind === 'handoff' ? 'task' : kind;
+  switch (verb) {
+    case 'offer':
+      return `offered: ${field('title') ?? ''}`;
+    case 'accept':
+      return `accepted the ${named}`;
+    case 'decline':
+      return `declined the ${named}`;
+    case 'claim':
+      return `claimed the ${named}`;
+    case 'progress': {
+      const note = field('note');
+      return note ? `progress: ${note}` : 'made progress';
+    }
+    case 'complete':
+      return `completed the ${named}`;
+    case 'fail':
+      return `failed the ${named}`;
+    case 'cancel':
+      return `cancelled the ${named}`;
+    case 'bid': {
+      const note = field('note');
+      return note ? `bid: ${note}` : 'bid on the bounty';
+    }
+    case 'award':
+      return 'awarded the bounty';
+    case 'submit':
+      return 'submitted the work';
+    case 'revise':
+      return 'asked for revisions';
+    case 'accept-work':
+      return 'accepted the work';
+    case 'forfeit':
+      return 'forfeited the bounty';
+    default:
+      return verb;
+  }
 }
 
 export async function deriveKid(rawPublicKey: Uint8Array): Promise<string> {

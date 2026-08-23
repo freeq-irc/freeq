@@ -171,6 +171,22 @@ pub enum Command {
         evidence_type: Option<String>,
         human_text: String,
     },
+    /// A task event: the signed TAGMSG that *is* the event, and the companion
+    /// line that renders it for the people in the room.
+    ///
+    /// Structured, and one command for the pair, because the two halves are
+    /// two documents that have to agree. `event_id` arrives already minted —
+    /// the caller was handed it before this reached the wire, and the
+    /// signature covers exactly that id. `done` carries back the one answer a
+    /// caller must not miss: a task event is never sent unsigned, so a session
+    /// that cannot sign is an error rather than a quieter send.
+    Act {
+        target: String,
+        event_id: String,
+        tags: std::collections::HashMap<String, String>,
+        human_text: String,
+        done: tokio::sync::oneshot::Sender<Result<()>>,
+    },
     Raw(String),
     Quit(Option<String>),
 }
@@ -636,6 +652,68 @@ impl ClientHandle {
         Ok(())
     }
 
+    /// Send a task event: the signed TAGMSG that *is* the event, then the
+    /// plain-text companion that renders it for people. Returns the event's
+    /// id — which, for an opener, is the task's id for the rest of its life.
+    ///
+    /// `tags` is the whole document, built by [`crate::act::act_tags`] or by
+    /// hand. Nothing here reads it: this sends whatever act tags it is given,
+    /// under any kind and any verb, and which verbs a kind allows is the rules
+    /// file's business, not this method's.
+    ///
+    /// `human_text` follows [`ClientHandle::quit`]'s shape: `None` for the
+    /// line [`crate::act::act_line`] writes for these tags, `Some("")` for no
+    /// companion at all, `Some(line)` for the caller's own words.
+    ///
+    /// The one place this differs from every other send here: **it never falls
+    /// back to unsigned**. A message sent without a signature is still a
+    /// message, but an unsigned task event is refused at the server's door and
+    /// asserts nothing — so no key, no account, or a bare-nick DM with no
+    /// venue a verifier could rebuild is an error the caller is handed.
+    pub async fn send_act(
+        &self,
+        target: &str,
+        tags: std::collections::HashMap<String, String>,
+        human_text: Option<&str>,
+    ) -> Result<String> {
+        let event_id = crate::chatsig::new_event_id();
+        let human_text = match human_text {
+            Some(line) => line.to_string(),
+            None => {
+                let kind = tags
+                    .get("+freeq.at/act")
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                let verb = tags
+                    .get("+freeq.at/act-verb")
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                let fields: Vec<(&str, &str)> = tags
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        name.strip_prefix("+freeq.at/act-")
+                            .map(|field| (field, value.as_str()))
+                    })
+                    .collect();
+                crate::act::act_line(kind, verb, &fields)
+            }
+        };
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(Command::Act {
+                target: self.resolve_wire_target(target),
+                event_id: event_id.clone(),
+                tags,
+                human_text,
+                done,
+            })
+            .await?;
+        answer.await.map_err(|_| {
+            anyhow::anyhow!("the connection ended before the task event was sent")
+        })??;
+        Ok(event_id)
+    }
+
     /// Start a new AV (voice/video) call in `channel`. The server
     /// replies with an `av-state` TAGMSG carrying the session id —
     /// watch for it with [`crate::av::parse_av_state`] applied to
@@ -1001,6 +1079,11 @@ impl ClientHandle {
     }
 
     /// Create a new task and return its ID.
+    ///
+    /// Superseded by [`ClientHandle::send_act`] carrying an `offer` built by
+    /// [`crate::act::act_tags`] — the same work opened as a signed task event
+    /// the sender then holds by accepting it. This one keeps sending the older
+    /// task family until every caller has moved.
     pub async fn create_task(&self, channel: &str, description: &str) -> Result<String> {
         let payload = serde_json::json!({"description": description}).to_string();
         self.emit_event(
@@ -1014,6 +1097,11 @@ impl ClientHandle {
     }
 
     /// Update a task's status.
+    ///
+    /// Superseded by [`ClientHandle::send_act`] carrying a `progress` built by
+    /// [`crate::act::act_tags`], which says the same thing on the task's own
+    /// record. This one keeps sending the older task family until every caller
+    /// has moved.
     pub async fn update_task(
         &self,
         channel: &str,
@@ -1034,6 +1122,10 @@ impl ClientHandle {
     }
 
     /// Complete a task.
+    ///
+    /// Superseded by [`ClientHandle::send_act`] carrying a `complete` built by
+    /// [`crate::act::act_tags`]. This one keeps sending the older task family
+    /// until every caller has moved.
     pub async fn complete_task(
         &self,
         channel: &str,
@@ -1058,6 +1150,10 @@ impl ClientHandle {
     }
 
     /// Fail a task.
+    ///
+    /// Superseded by [`ClientHandle::send_act`] carrying a `fail` built by
+    /// [`crate::act::act_tags`]. This one keeps sending the older task family
+    /// until every caller has moved.
     pub async fn fail_task(&self, channel: &str, task_id: &str, error: &str) -> Result<()> {
         let payload = serde_json::json!({"error": error}).to_string();
         self.emit_event(
@@ -1072,6 +1168,12 @@ impl ClientHandle {
     }
 
     /// Attach evidence to a task.
+    ///
+    /// Superseded by [`ClientHandle::send_act`] carrying a `progress` built by
+    /// [`crate::act::act_tags`] with `ctx` and `ctx-h` fields — the materials
+    /// and a hash of them, so what is fetched later is checkable against what
+    /// was signed. This one keeps sending the older task family until every
+    /// caller has moved.
     pub async fn attach_evidence(
         &self,
         channel: &str,
@@ -1936,6 +2038,10 @@ where
     let mut web_token = config.web_token.clone();
     let mut authenticated_did: Option<String> = None;
     let mut pending_commands: Vec<Command> = Vec::new();
+    // Task event ids already handed up. The same event arrives up to three
+    // times — our own echo, the replay a channel hands a joiner, and the
+    // history that joiner asks for next — and only the first is an event.
+    let mut seen_act_events: SeenActEvents = SeenActEvents::default();
     // Session message-signing keypair (generated after SASL success)
     let mut msg_signing_key: Option<ed25519_dalek::SigningKey> = None;
     let mut msg_signing_did: Option<String> = None;
@@ -2524,6 +2630,29 @@ where
                                         .await;
                                 }
                                 let dm_key = dm_key_for(&did_maps, &own_nick, &from, &target);
+                                // A task event is handed up as its own event
+                                // as well as the raw TAGMSG, the way a
+                                // coordination TAGMSG is — once per event id.
+                                if let Some(act) = crate::act::parse_event(
+                                    msg.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+                                ) && seen_act_events.first_sighting(&act.event_id)
+                                {
+                                    let _ = event_tx
+                                        .send(Event::Act {
+                                            from: from.clone(),
+                                            target: target.clone(),
+                                            kind: act.kind,
+                                            verb: act.verb,
+                                            did: act.did,
+                                            event_id: act.event_id,
+                                            task_id: act.task_id,
+                                            fields: act.fields,
+                                            sig_tag: act.sig_tag,
+                                            replayed: act.replayed,
+                                            dm_key: dm_key.clone(),
+                                        })
+                                        .await;
+                                }
                                 let _ = event_tx.send(Event::TagMsg { from, target, tags: msg.tags.clone(), dm_key }).await;
                             }
                         }
@@ -2655,6 +2784,39 @@ async fn dispatch_assembled_multiline(
     // Nested-batch parent (e.g. multiline inside CHATHISTORY) is
     // exposed to the consumer via the `batch` tag so UI layers can
     // attach the assembled message to the outer batch.
+}
+
+/// How long a task event's id is remembered so the same event is not handed up
+/// twice.
+///
+/// Generous on purpose: the duplicate this exists to swallow is a joiner's
+/// replay followed by the history it asks for, and a catch-up over a slow link
+/// can put minutes between the two sightings of one event.
+const ACT_EVENT_DEDUPE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The task event ids this connection has already handed up, and when.
+#[derive(Default)]
+struct SeenActEvents {
+    seen: HashMap<String, std::time::Instant>,
+}
+
+impl SeenActEvents {
+    /// Whether this id is new, recording it if so. Old entries are swept when
+    /// the map grows rather than on a timer: nothing here is worth a task.
+    fn first_sighting(&mut self, event_id: &str) -> bool {
+        let now = std::time::Instant::now();
+        if let Some(seen) = self.seen.get(event_id)
+            && now.duration_since(*seen) < ACT_EVENT_DEDUPE
+        {
+            return false;
+        }
+        self.seen.insert(event_id.to_string(), now);
+        if self.seen.len() > 4096 {
+            self.seen
+                .retain(|_, t| now.duration_since(*t) < ACT_EVENT_DEDUPE);
+        }
+        true
+    }
 }
 
 /// The capability a server advertises to say it verifies the chat signing
@@ -2856,6 +3018,96 @@ fn sign_coordination_outgoing(
         doc = doc.with_evidence(evidence_type);
     }
     Some(doc.sign(key))
+}
+
+/// What a caller is told when a task event cannot be signed.
+///
+/// One sentence for all three causes — no key, no DID, no venue a verifier
+/// could rebuild — because the answer is the same in each case and the
+/// TypeScript SDK's `sendAct` already words it this way.
+const ACT_UNSIGNABLE: &str = "a task event must be signed: authenticate, register a signing key, \
+                              and address a channel or a DID";
+
+/// Put a task event on the wire: the signed TAGMSG that *is* the event, then
+/// the plain-text companion that renders it for people.
+///
+/// The same paired send the coordination emitter does, and for the same reason
+/// — two documents, each signing its own id. The companion links back with
+/// `+freeq.at/ref`, which is on chat's covered list; an `act-` name there would
+/// sit outside every signature, because those belong to task messages alone.
+/// It names the action, which for an opener is the opener itself.
+///
+/// Never falls back to unsigned: the refusal goes to the caller instead. The
+/// outer `Result` is the wire's; the inner one is the caller's.
+#[allow(clippy::too_many_arguments)]
+async fn send_act_event<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    target: &str,
+    event_id: &str,
+    mut tags: std::collections::HashMap<String, String>,
+    human_text: &str,
+    signing_key: &Option<ed25519_dalek::SigningKey>,
+    signing_did: &Option<String>,
+    server_verifies_documents: bool,
+) -> Result<Result<()>> {
+    let (Some(key), Some(did)) = (signing_key, signing_did) else {
+        return Ok(Err(anyhow::anyhow!(ACT_UNSIGNABLE)));
+    };
+    let Some(venue) = crate::chatsig::venue_for_target(target, did) else {
+        return Ok(Err(anyhow::anyhow!(ACT_UNSIGNABLE)));
+    };
+    let sig = match crate::act::sign_act(
+        tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        &venue,
+        event_id,
+        key,
+    ) {
+        Ok(sig) => sig,
+        Err(e) => return Ok(Err(anyhow::Error::new(e))),
+    };
+    // The action this event is about: the one it names, or itself when it
+    // names none — an opener's own id is the action's for the rest of its life.
+    let task = tags
+        .get("+freeq.at/act-id")
+        .cloned()
+        .unwrap_or_else(|| event_id.to_string());
+    tags.insert(
+        crate::chatsig::EVENT_ID_TAG.to_string(),
+        event_id.to_string(),
+    );
+    tags.insert(crate::sigtag::SIG_TAG.to_string(), sig);
+    let tagmsg = crate::irc::Message {
+        tags,
+        prefix: None,
+        command: "TAGMSG".to_string(),
+        params: vec![target.to_string()],
+    };
+    writer.write_all(format!("{tagmsg}\r\n").as_bytes()).await?;
+
+    // The companion is an ordinary message signing its own id, carrying only
+    // the reference that joins it to the action. A caller who asked for no
+    // line gets none: the event is already on the wire.
+    if !human_text.is_empty() {
+        let mut companion = std::collections::HashMap::from([("+freeq.at/ref".to_string(), task)]);
+        sign_outgoing(
+            &mut companion,
+            signing_key,
+            signing_did,
+            target,
+            human_text,
+            server_verifies_documents,
+        );
+        let privmsg = crate::irc::Message {
+            tags: companion,
+            prefix: None,
+            command: "PRIVMSG".to_string(),
+            params: vec![target.to_string(), human_text.to_string()],
+        };
+        writer
+            .write_all(format!("{privmsg}\r\n").as_bytes())
+            .await?;
+    }
+    Ok(Ok(()))
 }
 
 /// Execute a single IRC command on the wire.
@@ -3081,6 +3333,35 @@ async fn execute_command<W: AsyncWrite + Unpin>(
             writer
                 .write_all(format!("{privmsg}\r\n").as_bytes())
                 .await?;
+        }
+        Command::Act {
+            target,
+            event_id,
+            tags,
+            human_text,
+            done,
+        } => {
+            let sent = send_act_event(
+                writer,
+                &target,
+                &event_id,
+                tags,
+                &human_text,
+                signing_key,
+                signing_did,
+                server_verifies_documents,
+            )
+            .await;
+            // A refusal is the caller's answer, not the connection's problem:
+            // the session stays up and the next send is unaffected. A write
+            // that failed is the connection's problem, so it still propagates
+            // — and dropping `done` unsent is what tells the caller so.
+            match sent {
+                Ok(refusal) => {
+                    let _ = done.send(refusal);
+                }
+                Err(e) => return Err(e),
+            }
         }
         Command::Raw(line) => {
             // Strip CRLF/NUL to prevent protocol injection via raw commands
@@ -6095,6 +6376,179 @@ mod irc_loop_tests {
         assert_eq!(tags.get("+react").map(|s| s.as_str()), Some("👍"));
     }
 
+    /// A task event arrives as `Event::Act` beside the raw TAGMSG, read once
+    /// so a consumer does not have to know the tag names.
+    #[tokio::test]
+    async fn server_act_tagmsg_emits_an_act_event_beside_the_tagmsg() {
+        let (mut server, mut events, _cmd) = start_run_irc("host30").await;
+
+        server
+            .write_all(
+                b"@+freeq.at/act=handoff;+freeq.at/act-verb=offer;\
++freeq.at/act-title=Cite\\s3\\ssources;+freeq.at/from=did:plc:eliza;\
++freeq.at/eventid=01OFFER :eliza!u@h TAGMSG #room\r\n",
+            )
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+
+        let (mut act, mut raw) = (None, None);
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(400), async {
+            while let Some(ev) = events.recv().await {
+                match ev {
+                    Event::Act { .. } => act = Some(ev),
+                    Event::TagMsg { tags, .. } => raw = Some(tags),
+                    _ => {}
+                }
+                if act.is_some() && raw.is_some() {
+                    return;
+                }
+            }
+        })
+        .await;
+
+        let Some(Event::Act {
+            from,
+            target,
+            kind,
+            verb,
+            did,
+            task_id,
+            fields,
+            ..
+        }) = act
+        else {
+            panic!("expected an Act event");
+        };
+        assert_eq!(from, "eliza");
+        assert_eq!(target, "#room");
+        assert_eq!(verb, "offer");
+        assert_eq!(kind, "handoff");
+        assert_eq!(did.as_deref(), Some("did:plc:eliza"));
+        // An opener names no other action, so it names itself.
+        assert_eq!(task_id, "01OFFER");
+        assert_eq!(
+            fields.get("act-title").map(String::as_str),
+            Some("Cite 3 sources")
+        );
+        // The raw line still arrives, the way a coordination TAGMSG does.
+        let raw = raw.expect("the TAGMSG must still arrive");
+        assert_eq!(
+            raw.get("+freeq.at/act-verb").map(|s| s.as_str()),
+            Some("offer")
+        );
+    }
+
+    /// Our own event, echoed back by a server that acked `echo-message`, is
+    /// one event. Same id, no `time` tag — the live case, where the replay
+    /// test below is the history one. Both reach the same sighting check;
+    /// this pins the one a sender meets first.
+    #[tokio::test]
+    async fn our_own_echoed_task_event_is_handed_up_once() {
+        let (mut server, mut events, _cmd) = start_run_irc("host32").await;
+
+        let line: &[u8] = b"@+freeq.at/act=handoff;+freeq.at/act-verb=offer;\
++freeq.at/act-title=ship\\sit;+freeq.at/from=did:plc:eliza;\
++freeq.at/eventid=01ECHO :eliza!u@h TAGMSG #room\r\n";
+        server.write_all(line).await.unwrap();
+        server.write_all(line).await.unwrap();
+        // A different event after it, so an empty second sighting cannot be
+        // mistaken for one that simply had not arrived yet.
+        server
+            .write_all(
+                b"@+freeq.at/act=handoff;+freeq.at/act-verb=claim;\
++freeq.at/act-id=01ECHO;+freeq.at/from=did:plc:scholar;\
++freeq.at/eventid=01AFTER :scholar!u@h TAGMSG #room\r\n",
+            )
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+
+        let mut seen: Vec<(String, bool)> = Vec::new();
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(400), async {
+            while let Some(ev) = events.recv().await {
+                if let Event::Act {
+                    event_id, replayed, ..
+                } = ev
+                {
+                    let last = event_id == "01AFTER";
+                    seen.push((event_id, replayed));
+                    if last {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            seen.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["01ECHO", "01AFTER"],
+            "the echo must be handed up once"
+        );
+        assert!(
+            seen.iter().all(|(_, replayed)| !replayed),
+            "a line with no time tag is live, not a replay"
+        );
+    }
+
+    /// The same event twice — a joiner's replay and the history it asks for
+    /// next — is one event. The TAGMSG still arrives both times: it is the
+    /// line, not the event.
+    #[tokio::test]
+    async fn an_act_event_seen_twice_is_handed_up_once() {
+        let (mut server, mut events, _cmd) = start_run_irc("host31").await;
+
+        let line: &[u8] = b"@time=2026-08-22T10:00:00.000Z;+freeq.at/act=handoff;\
++freeq.at/act-verb=claim;+freeq.at/act-id=01OFFER;+freeq.at/from=did:plc:scholar;\
++freeq.at/eventid=01CLAIM :scholar!u@h TAGMSG #room\r\n";
+        server.write_all(line).await.unwrap();
+        server.write_all(line).await.unwrap();
+        // A second, different event: it must still come through, and it is
+        // also what tells us the first one's duplicate was really dropped
+        // rather than merely slow.
+        server
+            .write_all(
+                b"@+freeq.at/act=handoff;+freeq.at/act-verb=progress;\
++freeq.at/act-id=01OFFER;+freeq.at/from=did:plc:scholar;\
++freeq.at/eventid=01PROGRESS :scholar!u@h TAGMSG #room\r\n",
+            )
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+
+        let mut seen: Vec<(String, String, bool)> = Vec::new();
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(400), async {
+            while let Some(ev) = events.recv().await {
+                if let Event::Act {
+                    event_id,
+                    task_id,
+                    replayed,
+                    ..
+                } = ev
+                {
+                    let last = event_id == "01PROGRESS";
+                    seen.push((event_id, task_id, replayed));
+                    if last {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            seen.iter()
+                .map(|(id, _, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["01CLAIM", "01PROGRESS"],
+            "the replayed claim must be handed up once"
+        );
+        assert!(seen[0].2, "a line carrying a time tag is a replay");
+        assert!(!seen[1].2);
+        assert_eq!(seen[1].1, "01OFFER", "a follow-up names its task");
+    }
+
     // ── legacy +freeq.at/multiline \\n normalization ──────────────────────────
 
     /// PRIVMSG bearing the legacy `+freeq.at/multiline` tag must have its
@@ -6281,6 +6735,262 @@ mod did_maps_tests {
         assert_eq!(m.dm_key(BOB), BOB);
         assert_eq!(m.dm_key("Guest7"), "Guest7"); // no mangling
         assert_eq!(m.wire_target(BOB), BOB);
+    }
+
+    // ── task events ──────────────────────────────────────────────────────────
+
+    /// A handle wired to a channel nothing reads from until the test does.
+    fn task_handle() -> (ClientHandle, mpsc::Receiver<Command>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        (
+            ClientHandle {
+                cmd_tx,
+                echo_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                caps_acked: Arc::new(parking_lot::Mutex::new(CapsState::default())),
+                did_maps: Arc::new(parking_lot::Mutex::new(DidMapsState::default())),
+            },
+            cmd_rx,
+        )
+    }
+
+    /// Run one `send_act` against a signing session and return the id it
+    /// handed back with the lines it put on the wire.
+    async fn sent_act(
+        tags: std::collections::HashMap<String, String>,
+        human_text: Option<&'static str>,
+    ) -> (Result<String>, String) {
+        use ed25519_dalek::SigningKey;
+
+        let (handle, mut cmd_rx) = task_handle();
+        let sending = tokio::spawn(async move { handle.send_act("#room", tags, human_text).await });
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(
+            &mut buf,
+            cmd_rx.recv().await.unwrap(),
+            &Some(SigningKey::from_bytes(&[7u8; 32])),
+            &Some("did:plc:eliza".to_string()),
+            true,
+        )
+        .await
+        .expect("the connection survives whatever the caller is told");
+        (sending.await.unwrap(), String::from_utf8(buf).unwrap())
+    }
+
+    /// A kind and a verb this SDK has never heard of go out signed. Nothing in
+    /// the send path reads either one — which verbs a kind allows is the rules
+    /// file's business, and a new kind needs no code here at all.
+    #[tokio::test]
+    async fn a_kind_and_verb_the_sdk_never_heard_of_go_out_signed() {
+        use ed25519_dalek::SigningKey;
+
+        let tags = crate::act::act_tags(
+            "lease",
+            "renew",
+            Some("01LEASE"),
+            "did:plc:eliza",
+            &[("term", "30d")],
+        );
+        let (id, wire) = sent_act(tags, None).await;
+        let event_id = id.expect("the event was sent");
+
+        let mut lines = wire.lines();
+        let event = crate::irc::Message::parse(lines.next().unwrap()).expect("parses");
+        assert_eq!(event.command, "TAGMSG");
+        assert_eq!(
+            event.tags.get("+freeq.at/act-verb").map(String::as_str),
+            Some("renew")
+        );
+        assert_eq!(
+            event.tags.get("+freeq.at/act-term").map(String::as_str),
+            Some("30d")
+        );
+        let sig = event
+            .tags
+            .get(crate::sigtag::SIG_TAG)
+            .unwrap_or_else(|| panic!("a task event is never sent unsigned: {wire}"));
+        crate::act::verify_act(
+            event.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            &crate::chatsig::channel_venue("#room"),
+            &event_id,
+            sig,
+            &SigningKey::from_bytes(&[7u8; 32]).verifying_key(),
+        )
+        .expect("the signature verifies over the venue and the id a receiver rebuilds");
+
+        // A verb with no sentence written for it is named, not described.
+        let companion = crate::irc::Message::parse(lines.next().unwrap()).expect("parses");
+        assert_eq!(
+            companion.params,
+            vec!["#room".to_string(), "renew".to_string()],
+            "{wire}"
+        );
+    }
+
+    /// With no line asked for, the companion is the one `act_line` writes for
+    /// these tags, and it names the action the event is about.
+    #[tokio::test]
+    async fn no_line_asked_for_sends_the_one_the_tags_deserve() {
+        let tags = crate::act::act_tags(
+            "handoff",
+            "progress",
+            Some("01OFFER"),
+            "did:plc:eliza",
+            &[("note", "halfway")],
+        );
+        let (id, wire) = sent_act(tags, None).await;
+        id.expect("the event was sent");
+
+        let companion = crate::irc::Message::parse(wire.lines().nth(1).unwrap()).expect("parses");
+        assert_eq!(companion.command, "PRIVMSG");
+        assert_eq!(
+            companion.params,
+            vec!["#room".to_string(), "progress: halfway".to_string()],
+            "{wire}"
+        );
+        assert_eq!(
+            companion.tags.get("+freeq.at/ref").map(String::as_str),
+            Some("01OFFER"),
+            "a follow-up's companion names the action, not this event: {wire}"
+        );
+    }
+
+    /// An opener names no action, so its companion names the event itself —
+    /// the id every later move will carry.
+    #[tokio::test]
+    async fn an_openers_companion_names_the_event_it_opened() {
+        let tags = crate::act::act_tags(
+            "handoff",
+            "offer",
+            None,
+            "did:plc:eliza",
+            &[("title", "Cite 3 sources")],
+        );
+        let (id, wire) = sent_act(tags, None).await;
+        let event_id = id.expect("the event was sent");
+
+        let companion = crate::irc::Message::parse(wire.lines().nth(1).unwrap()).expect("parses");
+        assert_eq!(
+            companion.params,
+            vec!["#room".to_string(), "offered: Cite 3 sources".to_string()]
+        );
+        assert_eq!(
+            companion.tags.get("+freeq.at/ref").map(String::as_str),
+            Some(event_id.as_str()),
+            "{wire}"
+        );
+    }
+
+    /// A caller who asks for no line gets the event and nothing else; one who
+    /// writes their own gets exactly what they wrote.
+    #[tokio::test]
+    async fn the_caller_decides_whether_a_line_goes_with_it() {
+        let tags =
+            || crate::act::act_tags("handoff", "accept", Some("01OFFER"), "did:plc:eliza", &[]);
+
+        let (id, silent) = sent_act(tags(), Some("")).await;
+        id.expect("the event was sent");
+        assert_eq!(silent.lines().count(), 1, "no companion at all: {silent}");
+        assert!(silent.starts_with('@'), "{silent}");
+
+        let (id, written) = sent_act(tags(), Some("on it")).await;
+        id.expect("the event was sent");
+        let companion =
+            crate::irc::Message::parse(written.lines().nth(1).unwrap()).expect("parses");
+        assert_eq!(
+            companion.params,
+            vec!["#room".to_string(), "on it".to_string()],
+            "{written}"
+        );
+    }
+
+    /// No key, no event. Every other send here falls back to unsigned; a task
+    /// event asserts nothing without a signature, so the caller is told instead.
+    #[tokio::test]
+    async fn a_task_event_without_a_key_is_refused_and_nothing_is_written() {
+        let (handle, mut cmd_rx) = task_handle();
+        let sending = tokio::spawn(async move {
+            handle
+                .send_act(
+                    "#room",
+                    crate::act::act_tags("handoff", "claim", Some("01OFFER"), "did:plc:x", &[]),
+                    None,
+                )
+                .await
+        });
+
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(&mut buf, cmd_rx.recv().await.unwrap(), &None, &None, true)
+            .await
+            .expect("the connection survives a refusal");
+        let refused = sending.await.unwrap().expect_err("no key, no event");
+        assert_eq!(refused.to_string(), ACT_UNSIGNABLE);
+        assert!(buf.is_empty(), "nothing may reach the wire unsigned");
+    }
+
+    /// A session with a key but no account is refused too. The guard names
+    /// three cases — no key, no DID, or neither — and a single tuple pattern
+    /// answers all three, so this is the arm the two tests either side of it
+    /// leave unexercised.
+    #[tokio::test]
+    async fn a_task_event_from_a_session_with_no_account_is_refused() {
+        use ed25519_dalek::SigningKey;
+
+        let (handle, mut cmd_rx) = task_handle();
+        let sending = tokio::spawn(async move {
+            handle
+                .send_act(
+                    "#room",
+                    crate::act::act_tags("handoff", "claim", Some("01OFFER"), "did:plc:x", &[]),
+                    None,
+                )
+                .await
+        });
+
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(
+            &mut buf,
+            cmd_rx.recv().await.unwrap(),
+            &Some(SigningKey::from_bytes(&[3u8; 32])),
+            &None,
+            true,
+        )
+        .await
+        .expect("the connection survives a refusal");
+        let refused = sending.await.unwrap().expect_err("no account, no event");
+        assert_eq!(refused.to_string(), ACT_UNSIGNABLE);
+        assert!(buf.is_empty(), "nothing may reach the wire unsigned");
+    }
+
+    /// A bare nick has no venue any verifier could rebuild, so it has no task
+    /// event either — the same refusal, for the same reason.
+    #[tokio::test]
+    async fn a_task_event_to_a_nick_we_hold_no_did_for_is_refused() {
+        use ed25519_dalek::SigningKey;
+
+        let (handle, mut cmd_rx) = task_handle();
+        let sending = tokio::spawn(async move {
+            handle
+                .send_act(
+                    "stranger",
+                    crate::act::act_tags("handoff", "claim", Some("01OFFER"), "did:plc:x", &[]),
+                    None,
+                )
+                .await
+        });
+
+        let mut buf: Vec<u8> = Vec::new();
+        execute_command(
+            &mut buf,
+            cmd_rx.recv().await.unwrap(),
+            &Some(SigningKey::from_bytes(&[9u8; 32])),
+            &Some("did:plc:sender".to_string()),
+            true,
+        )
+        .await
+        .expect("the connection survives a refusal");
+        let refused = sending.await.unwrap().expect_err("no venue, no event");
+        assert_eq!(refused.to_string(), ACT_UNSIGNABLE);
+        assert!(buf.is_empty(), "nothing may reach the wire unsigned");
     }
 
     #[test]

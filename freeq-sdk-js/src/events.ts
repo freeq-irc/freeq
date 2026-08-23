@@ -10,7 +10,7 @@
 import type {
   Message, Member, Channel, WhoisInfo, ChannelListEntry,
   AvSession, TransportState, PinnedMessage,
-  GovernancePayload, PresencePayload, CoordinationEventPayload,
+  GovernancePayload, PresencePayload, CoordinationEventPayload, ActEventPayload,
   SpendPayload, BudgetSnapshot, AgentSpawnedPayload, AgentDespawnedPayload,
 } from './types.js';
 
@@ -205,6 +205,12 @@ export interface FreeqEvents {
    *  channel we're in (TAGMSG or its companion PRIVMSG). Handlers
    *  dispatch on `payload.eventType`. */
   coordinationEvent: (payload: CoordinationEventPayload) => void;
+
+  /** Fired when a task event — a TAGMSG carrying `act-` tags — arrives in a
+   *  channel or DM we're in, live or replayed. Handlers dispatch on
+   *  `payload.verb` and key their state by `payload.taskId`. The companion
+   *  prose line arrives separately as `message`. */
+  actEvent: (payload: ActEventPayload) => void;
 
   /** Fired when a SPEND wire command is broadcast to a channel we're in. */
   spend: (payload: SpendPayload) => void;

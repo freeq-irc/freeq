@@ -269,6 +269,37 @@ export interface CoordinationEventPayload {
   tags: Record<string, string>;
 }
 
+/** Payload of the `actEvent` event — parsed `act-` tagged TAGMSG. */
+export interface ActEventPayload {
+  /** Channel (or DM target) the event was sent to. */
+  channel: string;
+  /** Sender's nick. */
+  from: string;
+  /** The acting identity: the `+freeq.at/from` tag, else the account tag. */
+  did?: string;
+  /** The task kind — the `+freeq.at/act` value, e.g. `handoff`, `bounty`. */
+  kind: string;
+  /** The move — `offer`, `claim`, `progress`, `confirm`, … */
+  verb: string;
+  /** The signer-minted id of this event. */
+  eventId: string;
+  /** The task this event is about. An opener names no other, so its own id
+   *  is the task's — which is why this is never empty. */
+  taskId: string;
+  /** Every `act-` tag on the line, keyed by its name with the vendor prefix
+   *  stripped — so `+freeq.at/act-note` reads as `act-note`, and the kind
+   *  itself as `act`. The signature covers exactly these, so a reader that
+   *  draws a card from them draws from what was signed. */
+  fields: Record<string, string>;
+  /** Raw IRCv3 tags from the wire (for advanced consumers). */
+  tags: Record<string, string>;
+  /** The signature over the act document, if the line carried one. */
+  sigTag?: string;
+  /** True when this arrived from history rather than live — a replayed line
+   *  carries the server's `time` tag. */
+  replayed: boolean;
+}
+
 /** Payload of the `spend` event — SPEND wire command relayed by the server. */
 export interface SpendPayload {
   channel: string;

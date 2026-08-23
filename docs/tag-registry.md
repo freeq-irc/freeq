@@ -58,6 +58,13 @@ across the Rust and TypeScript SDKs with shared test vectors
 | `+freeq.at/act-id` | The action a follow-up belongs to — the opener's own event id. Openers carry none. |
 | `+freeq.at/act-verb` | What is being asked/done. |
 | `+freeq.at/act-title` | Human-readable title. |
+| `+freeq.at/act-to` | The recipient an offer is directed at, by DID. Absent means open: anyone may claim it. |
+| `+freeq.at/act-caps` | A self-declared hint about what the work needs. Stored and filterable, never a gate — nothing checks it. |
+| `+freeq.at/act-note` | A sentence for the record on any step. Prose, covered by the signature like every other act tag. |
+| `+freeq.at/act-ctx` | Where the action's materials are. |
+| `+freeq.at/act-ctx-h` | A hash of what `act-ctx` points at, so what is fetched later is checkable against what was signed. |
+| `+freeq.at/act-replaces` | The finished action this one revives — a failed handoff re-offered, a forfeited bounty re-listed. Openers only. |
+| `+freeq.at/act-subject` | The event a receipt confirms. Written by the action's home server, never by a participant. |
 | `+freeq.at/from` | The signer/actor (envelope tag; the document key is `from`). |
 | `+freeq.at/eventid` | The event id the signer minted; the server adopts it (shared with chat). |
 | `+freeq.at/act-accepts` | The bid an award takes — that bid's own event id. The assignee is its author. |
@@ -67,6 +74,7 @@ across the Rust and TypeScript SDKs with shared test vectors
 | `+freeq.at/act-bid` | What a bidder asks for. Opaque. |
 | `+freeq.at/act-pay-to` | Where a bidder wants paying. Opaque. |
 | `+freeq.at/act-tx` | A payment reference on the acceptance. Opaque — a claim on the record, never a confirmation. |
+| `+freeq.at/act-scope` | What an `approval` action covers. A kind's own field: the signature covers every `act-` tag, so a kind adds one without any canonical changing. |
 
 ## Governance & budgets
 
