@@ -211,6 +211,178 @@
         "+freeq.at/from": "did:plc:scholar"
       },
       "target": "#ops"
+    },
+    {
+      "canonical": "{\"act\":\"handoff\",\"act-id\":\"01JABCDEF000000000000000EF\",\"act-verb\":\"claim\",\"from\":\"did:plc:scholar\",\"id\":\"01JCLAIMEVENTID00000000000\",\"target\":\"#ops\"}",
+      "id": "01JCLAIMEVENTID00000000000",
+      "kid": "28KYJRxRMhtyZueNHBUcKw",
+      "name": "claim-on-an-open-handoff",
+      "publicKey": "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg",
+      "seed": "0909090909090909090909090909090909090909090909090909090909090909",
+      "sigTag": "ed25519:28KYJRxRMhtyZueNHBUcKw:6C16K8GoStyMFlWsqa-6JqJRco60TOVtvXvEDzlPiqNqN2RCzne3dwfoKWOk3xh8eIA3oasm7BrWtFNSCp_-BQ",
+      "tags": {
+        "+freeq.at/act": "handoff",
+        "+freeq.at/act-id": "01JABCDEF000000000000000EF",
+        "+freeq.at/act-verb": "claim",
+        "+freeq.at/from": "did:plc:scholar"
+      },
+      "target": "#ops"
+    },
+    {
+      "canonical": "{\"act\":\"handoff\",\"act-ctx\":\"https://example.com/checks/abc\",\"act-ctx-h\":\"sha256:9f86d\",\"act-id\":\"01JABCDEF000000000000000EF\",\"act-note\":\"2 of 3 sources read\",\"act-verb\":\"progress\",\"from\":\"did:plc:scholar\",\"id\":\"01JPROGRESSEVENTID00000000\",\"target\":\"#ops\"}",
+      "id": "01JPROGRESSEVENTID00000000",
+      "kid": "UG7xh510jOBxOw3QHaMq0g",
+      "name": "progress-with-context",
+      "publicKey": "Q6cucUQBdi32a2jCbfvfJoKq7J8kdOykYT5CSg-6_Tw",
+      "seed": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "sigTag": "ed25519:UG7xh510jOBxOw3QHaMq0g:6C5GkIjkqCpJuBtKvOic_7-b52aZF_V5A1a9egYTStBRL7eSSKZxtWJ6K8n7ekfOdL8sRB7JyONlFGJaSicKCw",
+      "tags": {
+        "+freeq.at/act": "handoff",
+        "+freeq.at/act-ctx": "https://example.com/checks/abc",
+        "+freeq.at/act-ctx-h": "sha256:9f86d",
+        "+freeq.at/act-id": "01JABCDEF000000000000000EF",
+        "+freeq.at/act-note": "2 of 3 sources read",
+        "+freeq.at/act-verb": "progress",
+        "+freeq.at/from": "did:plc:scholar"
+      },
+      "target": "#ops"
+    },
+    {
+      "canonical": "{\"act\":\"handoff\",\"act-ctx\":\"https://example.com/article\",\"act-id\":\"01JABCDEF000000000000000EF\",\"act-note\":\"filed\",\"act-verb\":\"complete\",\"from\":\"did:plc:scholar\",\"id\":\"01JCOMPLETEEVENTID00000000\",\"target\":\"#ops\"}",
+      "id": "01JCOMPLETEEVENTID00000000",
+      "kid": "_fcqCI8Y9zmejFK85EhEFQ",
+      "name": "complete-with-a-result-link",
+      "publicKey": "Zr5-Myx6RTMyvZ0Kf32wVfXF7xoGraZtmLOftoEMRzo",
+      "seed": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "sigTag": "ed25519:_fcqCI8Y9zmejFK85EhEFQ:4L5wBh7lsvneuitr2FY6weq7S9uRm1aiEcgQtmDQ5FRri5IM_llJt9R384zh1BAA5upsIAeWwiEP3a-FdaVnAg",
+      "tags": {
+        "+freeq.at/act": "handoff",
+        "+freeq.at/act-ctx": "https://example.com/article",
+        "+freeq.at/act-id": "01JABCDEF000000000000000EF",
+        "+freeq.at/act-note": "filed",
+        "+freeq.at/act-verb": "complete",
+        "+freeq.at/from": "did:plc:scholar"
+      },
+      "target": "#ops"
+    },
+    {
+      "canonical": "{\"act\":\"handoff\",\"act-id\":\"01JABCDEF000000000000000EF\",\"act-note\":\"the source is paywalled\",\"act-verb\":\"fail\",\"from\":\"did:plc:scholar\",\"id\":\"01JFAILEVENTID000000000000\",\"target\":\"#ops\"}",
+      "id": "01JFAILEVENTID000000000000",
+      "kid": "7SPYUxJaOs_yeC3d-E4Bjg",
+      "name": "fail-with-a-reason",
+      "publicKey": "C1E62bSSQBXKCQLtB5BE06xdvsIwbwaUjBDajrbjny0",
+      "seed": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "sigTag": "ed25519:7SPYUxJaOs_yeC3d-E4Bjg:XTSEiEIlRLEOoBM5C5CRPg1dLjKE9aHJ7tiL9BgQox9d3muQeKVHtStbKg-4trqQ9lwxooLbxcNIMDa7pFGdCQ",
+      "tags": {
+        "+freeq.at/act": "handoff",
+        "+freeq.at/act-id": "01JABCDEF000000000000000EF",
+        "+freeq.at/act-note": "the source is paywalled",
+        "+freeq.at/act-verb": "fail",
+        "+freeq.at/from": "did:plc:scholar"
+      },
+      "target": "#ops"
+    },
+    {
+      "canonical": "{\"act\":\"handoff\",\"act-id\":\"01JABCDEF000000000000000EF\",\"act-note\":\"no longer needed\",\"act-verb\":\"cancel\",\"from\":\"did:plc:eliza\",\"id\":\"01JCANCELEVENTID0000000000\",\"target\":\"#ops\"}",
+      "id": "01JCANCELEVENTID0000000000",
+      "kid": "3v5jMPePzBHv0PsoYU8NKQ",
+      "name": "cancel-by-the-offerer",
+      "publicKey": "kaKKC3Q4FZOk2UaVeSCJJq_IrYLIg5t2RDWbnrqaSzo",
+      "seed": "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+      "sigTag": "ed25519:3v5jMPePzBHv0PsoYU8NKQ:1QOdCgM2kDeJ46bJUXpS-V4d4UBIFb7e6Lk0c43gOnpqzefKDohEQnyGT1Y89dW-YLHaUDKIsghX4BfzMVvrDw",
+      "tags": {
+        "+freeq.at/act": "handoff",
+        "+freeq.at/act-id": "01JABCDEF000000000000000EF",
+        "+freeq.at/act-note": "no longer needed",
+        "+freeq.at/act-verb": "cancel",
+        "+freeq.at/from": "did:plc:eliza"
+      },
+      "target": "#ops"
+    },
+    {
+      "canonical": "{\"act\":\"handoff\",\"act-id\":\"01JABCDEF000000000000000EF\",\"act-note\":\"no capacity today\",\"act-verb\":\"decline\",\"from\":\"did:plc:scholar\",\"id\":\"01JDECLINEEVENTID000000000\",\"target\":\"#ops\"}",
+      "id": "01JDECLINEEVENTID000000000",
+      "kid": "UhaKnBksbRU6Lwsc5PQUTA",
+      "name": "decline-by-the-offeree",
+      "publicKey": "C-71qeZ55qPhNP4ng3v_MsfLX11E6gm8sOVCutakwMw",
+      "seed": "0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e",
+      "sigTag": "ed25519:UhaKnBksbRU6Lwsc5PQUTA:Q9K0UW7UfMjUQWbhhjTe2FbI78Od0vv9COqocSm5uILo0n3KUhA_XRIbOFNVFyNRPsHiD3mQIFFBAcklUOGXBA",
+      "tags": {
+        "+freeq.at/act": "handoff",
+        "+freeq.at/act-id": "01JABCDEF000000000000000EF",
+        "+freeq.at/act-note": "no capacity today",
+        "+freeq.at/act-verb": "decline",
+        "+freeq.at/from": "did:plc:scholar"
+      },
+      "target": "#ops"
+    },
+    {
+      "canonical": "{\"act\":\"bounty\",\"act-id\":\"01JBOUNTYEVENTID00000000B\",\"act-note\":\"branch pushed\",\"act-verb\":\"submit\",\"from\":\"did:plc:scholar\",\"id\":\"01JSUBMITEVENTID0000000000\",\"target\":\"#swarm\"}",
+      "id": "01JSUBMITEVENTID0000000000",
+      "kid": "eV7V_-kDm_VtIk3BnRnDPg",
+      "name": "bounty-submit",
+      "publicKey": "2b8hSHSKhcidparY7gsPwtEF_TnUGkx5ZTY1TwrikAw",
+      "seed": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+      "sigTag": "ed25519:eV7V_-kDm_VtIk3BnRnDPg:7dD9YPUjSPKd1LZHrmfkFyBENaK4bFQxqLiYZ00biiSOzDcIfC7ruMfe3tDEP5JaHgpRHteVotFWfGaW-vc7Bg",
+      "tags": {
+        "+freeq.at/act": "bounty",
+        "+freeq.at/act-id": "01JBOUNTYEVENTID00000000B",
+        "+freeq.at/act-note": "branch pushed",
+        "+freeq.at/act-verb": "submit",
+        "+freeq.at/from": "did:plc:scholar"
+      },
+      "target": "#swarm"
+    },
+    {
+      "canonical": "{\"act\":\"bounty\",\"act-id\":\"01JBOUNTYEVENTID00000000B\",\"act-note\":\"tests missing\",\"act-verb\":\"revise\",\"from\":\"did:plc:eliza\",\"id\":\"01JREVISEEVENTID0000000000\",\"target\":\"#swarm\"}",
+      "id": "01JREVISEEVENTID0000000000",
+      "kid": "efs470FOvtV_LzpbqBeZ7Q",
+      "name": "bounty-revise",
+      "publicKey": "XJxt8mHJy4QEdXdqrvzZRLQFMo-rKPmzqV70BJDT3oQ",
+      "seed": "1010101010101010101010101010101010101010101010101010101010101010",
+      "sigTag": "ed25519:efs470FOvtV_LzpbqBeZ7Q:F3c4ovu8sDHv8OHRIMrg-TTUj72F7E9_E62Fd3m-ejIHUkMrlKNekRQEJcWyCshXddm25DXVsohZ25q5FOIZAA",
+      "tags": {
+        "+freeq.at/act": "bounty",
+        "+freeq.at/act-id": "01JBOUNTYEVENTID00000000B",
+        "+freeq.at/act-note": "tests missing",
+        "+freeq.at/act-verb": "revise",
+        "+freeq.at/from": "did:plc:eliza"
+      },
+      "target": "#swarm"
+    },
+    {
+      "canonical": "{\"act\":\"bounty\",\"act-id\":\"01JBOUNTYEVENTID00000000B\",\"act-tx\":\"lightning:abc123\",\"act-verb\":\"accept-work\",\"from\":\"did:plc:eliza\",\"id\":\"01JACCEPTWORKEVENTID000000\",\"target\":\"#swarm\"}",
+      "id": "01JACCEPTWORKEVENTID000000",
+      "kid": "ELpoLIrRNROXHotWiBqriw",
+      "name": "bounty-accept-work-with-a-payment-reference",
+      "publicKey": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc",
+      "seed": "1111111111111111111111111111111111111111111111111111111111111111",
+      "sigTag": "ed25519:ELpoLIrRNROXHotWiBqriw:ZE8sxwk1DZa8KYP4QWHXCFbLaQXg17slzEhhtFBYUOnE_wWWkeNuP6cDa-v4Pqd2xN6FWmD1XRi9LDtxPYmKCQ",
+      "tags": {
+        "+freeq.at/act": "bounty",
+        "+freeq.at/act-id": "01JBOUNTYEVENTID00000000B",
+        "+freeq.at/act-tx": "lightning:abc123",
+        "+freeq.at/act-verb": "accept-work",
+        "+freeq.at/from": "did:plc:eliza"
+      },
+      "target": "#swarm"
+    },
+    {
+      "canonical": "{\"act\":\"bounty\",\"act-id\":\"01JBOUNTYEVENTID00000000B\",\"act-note\":\"out of time\",\"act-verb\":\"forfeit\",\"from\":\"did:plc:scholar\",\"id\":\"01JFORFEITEVENTID000000000\",\"target\":\"#swarm\"}",
+      "id": "01JFORFEITEVENTID000000000",
+      "kid": "sAZjWdZPl-snmUf-6wg6lg",
+      "name": "bounty-forfeit",
+      "publicKey": "IEBA42TBDyvsnB_lAKHNTCR8idZQoB7X6CyrqGeHfCE",
+      "seed": "1212121212121212121212121212121212121212121212121212121212121212",
+      "sigTag": "ed25519:sAZjWdZPl-snmUf-6wg6lg:kGTKidnZWuf01SyFFtrLa_YSFP20SJuw-9g-UOFdgedWD-B9Z7Uma_Ha-xqHBDPJZ0q0_Dfwe4qu_qlqzWrHBA",
+      "tags": {
+        "+freeq.at/act": "bounty",
+        "+freeq.at/act-id": "01JBOUNTYEVENTID00000000B",
+        "+freeq.at/act-note": "out of time",
+        "+freeq.at/act-verb": "forfeit",
+        "+freeq.at/from": "did:plc:scholar"
+      },
+      "target": "#swarm"
     }
   ],
   "venueRule": "target is the normalized venue, never the wire target: a channel lowercased, or `dm:<did_a>,<did_b>` with the two DIDs sorted ascending."

@@ -890,8 +890,8 @@ mod tests {
         id: &'static str,
     }
 
-    /// The four shared vectors. Kept in one place so the generator and the
-    /// checker can't drift.
+    /// The shared vectors, one per shape worth freezing. Kept in one place so
+    /// the generator and the checker can't drift.
     fn fixture_cases() -> Vec<Case> {
         vec![
             Case {
@@ -1028,6 +1028,165 @@ mod tests {
                 ],
                 target: OFFER_VENUE,
                 id: "01JACCEPTEVENTID0000000000",
+            },
+            Case {
+                // Taking an offer nobody was named for. The leanest follow-up
+                // there is — kind, verb, actor, task — which is what makes it
+                // worth freezing: if two implementations disagree about a
+                // document this small, they disagree about all of them.
+                name: "claim-on-an-open-handoff",
+                seed: 9,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "claim"),
+                    ("+freeq.at/from", "did:plc:scholar"),
+                    ("+freeq.at/act-id", OFFER_ID),
+                ],
+                target: OFFER_VENUE,
+                id: "01JCLAIMEVENTID00000000000",
+            },
+            Case {
+                // A step carrying context: where the materials are and a hash
+                // of what was there when this was signed. Both are ordinary
+                // act tags, so the sweep covers them without knowing what
+                // either means — which is how evidence rides a step at all.
+                name: "progress-with-context",
+                seed: 10,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "progress"),
+                    ("+freeq.at/from", "did:plc:scholar"),
+                    ("+freeq.at/act-id", OFFER_ID),
+                    ("+freeq.at/act-note", "2 of 3 sources read"),
+                    ("+freeq.at/act-ctx", "https://example.com/checks/abc"),
+                    ("+freeq.at/act-ctx-h", "sha256:9f86d"),
+                ],
+                target: OFFER_VENUE,
+                id: "01JPROGRESSEVENTID00000000",
+            },
+            Case {
+                // A completion whose result rides `act-ctx` with no hash: the
+                // sender had a link and not the bytes. Honest and allowed —
+                // and the reason the hash is a separate tag rather than part
+                // of the link.
+                name: "complete-with-a-result-link",
+                seed: 11,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "complete"),
+                    ("+freeq.at/from", "did:plc:scholar"),
+                    ("+freeq.at/act-id", OFFER_ID),
+                    ("+freeq.at/act-note", "filed"),
+                    ("+freeq.at/act-ctx", "https://example.com/article"),
+                ],
+                target: OFFER_VENUE,
+                id: "01JCOMPLETEEVENTID00000000",
+            },
+            Case {
+                // Giving up work you hold. Terminal, and the note is the only
+                // account anyone gets of why.
+                name: "fail-with-a-reason",
+                seed: 12,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "fail"),
+                    ("+freeq.at/from", "did:plc:scholar"),
+                    ("+freeq.at/act-id", OFFER_ID),
+                    ("+freeq.at/act-note", "the source is paywalled"),
+                ],
+                target: OFFER_VENUE,
+                id: "01JFAILEVENTID000000000000",
+            },
+            Case {
+                // The poster withdrawing their own task. Same document as any
+                // participant step; who may send it is the rules file's
+                // business, not the canonical's.
+                name: "cancel-by-the-offerer",
+                seed: 13,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "cancel"),
+                    ("+freeq.at/from", "did:plc:eliza"),
+                    ("+freeq.at/act-id", OFFER_ID),
+                    ("+freeq.at/act-note", "no longer needed"),
+                ],
+                target: OFFER_VENUE,
+                id: "01JCANCELEVENTID0000000000",
+            },
+            Case {
+                // Turning down an offer that named you.
+                name: "decline-by-the-offeree",
+                seed: 14,
+                tags: vec![
+                    ("+freeq.at/act", "handoff"),
+                    ("+freeq.at/act-verb", "decline"),
+                    ("+freeq.at/from", "did:plc:scholar"),
+                    ("+freeq.at/act-id", OFFER_ID),
+                    ("+freeq.at/act-note", "no capacity today"),
+                ],
+                target: OFFER_VENUE,
+                id: "01JDECLINEEVENTID000000000",
+            },
+            Case {
+                // Handing work in on a bounty. Nothing about a submission
+                // says the work is done — only that it is in — so the
+                // document says no more than that.
+                name: "bounty-submit",
+                seed: 15,
+                tags: vec![
+                    ("+freeq.at/act", "bounty"),
+                    ("+freeq.at/act-verb", "submit"),
+                    ("+freeq.at/from", "did:plc:scholar"),
+                    ("+freeq.at/act-id", BOUNTY_ID),
+                    ("+freeq.at/act-note", "branch pushed"),
+                ],
+                target: "#swarm",
+                id: "01JSUBMITEVENTID0000000000",
+            },
+            Case {
+                // The poster sending submitted work back for another pass.
+                name: "bounty-revise",
+                seed: 16,
+                tags: vec![
+                    ("+freeq.at/act", "bounty"),
+                    ("+freeq.at/act-verb", "revise"),
+                    ("+freeq.at/from", "did:plc:eliza"),
+                    ("+freeq.at/act-id", BOUNTY_ID),
+                    ("+freeq.at/act-note", "tests missing"),
+                ],
+                target: "#swarm",
+                id: "01JREVISEEVENTID0000000000",
+            },
+            Case {
+                // The poster accepting the work, with a payment reference
+                // along for the record. Opaque like the bid's terms: covered
+                // because it is present, never because anything reads it.
+                name: "bounty-accept-work-with-a-payment-reference",
+                seed: 17,
+                tags: vec![
+                    ("+freeq.at/act", "bounty"),
+                    ("+freeq.at/act-verb", "accept-work"),
+                    ("+freeq.at/from", "did:plc:eliza"),
+                    ("+freeq.at/act-id", BOUNTY_ID),
+                    ("+freeq.at/act-tx", "lightning:abc123"),
+                ],
+                target: "#swarm",
+                id: "01JACCEPTWORKEVENTID000000",
+            },
+            Case {
+                // Walking away from a bounty you hold. Terminal: re-listing
+                // it is a new bounty naming this one in the revival relation.
+                name: "bounty-forfeit",
+                seed: 18,
+                tags: vec![
+                    ("+freeq.at/act", "bounty"),
+                    ("+freeq.at/act-verb", "forfeit"),
+                    ("+freeq.at/from", "did:plc:scholar"),
+                    ("+freeq.at/act-id", BOUNTY_ID),
+                    ("+freeq.at/act-note", "out of time"),
+                ],
+                target: "#swarm",
+                id: "01JFORFEITEVENTID000000000",
             },
         ]
     }
@@ -1237,6 +1396,58 @@ mod tests {
         let json = serde_json::to_string_pretty(&build_fixtures_json()).unwrap();
         std::fs::create_dir_all(fixtures_path().parent().unwrap()).unwrap();
         std::fs::write(fixtures_path(), json + "\n").unwrap();
+    }
+
+    /// Every vector's tags are what the builder makes of that vector's own
+    /// inputs.
+    ///
+    /// The sending half of the contract: the signing half above proves the
+    /// canonical and the signature reproduce, and this proves the tags a
+    /// sender writes are the tags that were frozen. It walks the whole file
+    /// rather than a list, so a vector cannot be added without being covered
+    /// — including the two nothing here sends, the approval kind's opener and
+    /// the home's receipt, because the builder knows no verb and does not
+    /// care which of them it is spelling.
+    #[test]
+    fn every_vector_is_what_the_builder_makes_of_its_own_inputs() {
+        for case in fixture_cases() {
+            let by_name: BTreeMap<&str, &str> = case
+                .tags
+                .iter()
+                .map(|(name, value)| (stripped_name(name), *value))
+                .collect();
+            // `verb` and `id` are the builder's own parameters; everything
+            // else under the prefix is a field.
+            let fields: Vec<(&str, &str)> = by_name
+                .iter()
+                .filter_map(|(name, value)| {
+                    name.strip_prefix("act-")
+                        .filter(|f| *f != "verb" && *f != "id")
+                        .map(|f| (f, *value))
+                })
+                .collect();
+            let built = act_tags(
+                by_name.get("act").copied().unwrap_or_default(),
+                by_name.get("act-verb").copied().unwrap_or_default(),
+                by_name.get("act-id").copied(),
+                by_name.get("from").copied().unwrap_or_default(),
+                &fields,
+            );
+            // The vector carries tags no sender writes — the signature, the
+            // event id, and two that are there to prove they are not covered.
+            let expected: std::collections::HashMap<String, String> = case
+                .tags
+                .iter()
+                .filter(|(name, _)| {
+                    !matches!(
+                        *name,
+                        "+freeq.at/sig" | "+freeq.at/eventid" | "+freeq.at/actor-class" | "msgid"
+                    )
+                })
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            assert_eq!(built, expected, "vector {}", case.name);
+        }
     }
 
     /// The committed fixture file must exactly match what this implementation
