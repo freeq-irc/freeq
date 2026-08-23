@@ -239,6 +239,81 @@ where
     ))
 }
 
+/// The wire tags of a task event.
+///
+/// `kind` and `verb` are what the event is and what it does; `task` names the
+/// action it is about, and is `None` exactly for an opener, whose own event id
+/// becomes the action's id for the rest of its life. `from` is the actor.
+/// Every `(name, value)` in `fields` rides as `act-<name>`, so `("note", …)`
+/// is `act-note` and `("ctx-h", …)` is `act-ctx-h`.
+///
+/// Nothing here knows a verb. Which verbs a kind allows, and from which state,
+/// is the rules file's business ([`crate::act_transitions`]) — this builds the
+/// document a sender wants to sign, whatever it says.
+pub fn act_tags(
+    kind: &str,
+    verb: &str,
+    task: Option<&str>,
+    from: &str,
+    fields: &[(&str, &str)],
+) -> std::collections::HashMap<String, String> {
+    let mut t = std::collections::HashMap::new();
+    t.insert("+freeq.at/act".into(), kind.to_string());
+    t.insert("+freeq.at/act-verb".into(), verb.to_string());
+    t.insert("+freeq.at/from".into(), from.to_string());
+    if let Some(task) = task {
+        t.insert("+freeq.at/act-id".into(), task.to_string());
+    }
+    for (name, value) in fields {
+        t.insert(format!("+freeq.at/act-{name}"), value.to_string());
+    }
+    t
+}
+
+/// The line people read beside a task event, when the sender writes none.
+///
+/// The companion is prose for a room, so it is the one place a verb has to be
+/// spelled out. Kept to a single function, with one arm per verb and the verb
+/// itself as the answer for anything it has not been taught: a kind may add a
+/// verb without touching this, and the room gets the verb's name until someone
+/// writes it a sentence.
+pub fn act_line(kind: &str, verb: &str, fields: &[(&str, &str)]) -> String {
+    let field = |name: &str| {
+        fields
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| *v)
+            .filter(|v| !v.is_empty())
+    };
+    // What a room calls the thing being acted on. A handoff is a task in
+    // prose — it always has been in these lines — and every other kind is
+    // called by its own name.
+    let named = if kind == "handoff" { "task" } else { kind };
+    match verb {
+        "offer" => format!("offered: {}", field("title").unwrap_or_default()),
+        "accept" => format!("accepted the {named}"),
+        "decline" => format!("declined the {named}"),
+        "claim" => format!("claimed the {named}"),
+        "progress" => match field("note") {
+            Some(note) => format!("progress: {note}"),
+            None => "made progress".to_string(),
+        },
+        "complete" => format!("completed the {named}"),
+        "fail" => format!("failed the {named}"),
+        "cancel" => format!("cancelled the {named}"),
+        "bid" => match field("note") {
+            Some(note) => format!("bid: {note}"),
+            None => "bid on the bounty".to_string(),
+        },
+        "award" => "awarded the bounty".to_string(),
+        "submit" => "submitted the work".to_string(),
+        "revise" => "asked for revisions".to_string(),
+        "accept-work" => "accepted the work".to_string(),
+        "forfeit" => "forfeited the bounty".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Parse a sig tag value into (kid, signature bytes).
 pub fn parse_sig_tag(sig_tag: &str) -> Result<(&str, [u8; 64]), ActSigError> {
     crate::sigtag::parse(sig_tag).map_err(ActSigError::from)
@@ -1130,6 +1205,143 @@ mod tests {
                 other => panic!("negative {} names unknown verdict {other}", n.name),
             }
         }
+    }
+
+    /// An opener names no action, because its own event id becomes the
+    /// action's — so `act-id` is the one tag it must not carry.
+    #[test]
+    fn act_tags_leaves_an_opener_naming_no_action() {
+        let tags = act_tags(
+            "handoff",
+            "offer",
+            None,
+            "did:plc:eliza",
+            &[
+                ("title", "Cite 3 sources on X"),
+                ("caps", "freeq.at/web-search"),
+            ],
+        );
+        assert_eq!(
+            tags,
+            std::collections::HashMap::from([
+                ("+freeq.at/act".to_string(), "handoff".to_string()),
+                ("+freeq.at/act-verb".to_string(), "offer".to_string()),
+                ("+freeq.at/from".to_string(), "did:plc:eliza".to_string()),
+                (
+                    "+freeq.at/act-title".to_string(),
+                    "Cite 3 sources on X".to_string()
+                ),
+                (
+                    "+freeq.at/act-caps".to_string(),
+                    "freeq.at/web-search".to_string()
+                ),
+            ])
+        );
+    }
+
+    /// A follow-up names the action it is about, and nothing else changes.
+    #[test]
+    fn act_tags_makes_a_follow_up_name_its_action() {
+        let tags = act_tags("handoff", "claim", Some(OFFER_ID), "did:plc:scholar", &[]);
+        assert_eq!(
+            tags,
+            std::collections::HashMap::from([
+                ("+freeq.at/act".to_string(), "handoff".to_string()),
+                ("+freeq.at/act-verb".to_string(), "claim".to_string()),
+                ("+freeq.at/from".to_string(), "did:plc:scholar".to_string()),
+                ("+freeq.at/act-id".to_string(), OFFER_ID.to_string()),
+            ])
+        );
+    }
+
+    /// A field name with a hyphen in it keeps the hyphen: the prefix goes on
+    /// the front and nothing else is touched.
+    #[test]
+    fn act_tags_prefixes_a_hyphenated_field_whole() {
+        let tags = act_tags(
+            "handoff",
+            "progress",
+            Some(OFFER_ID),
+            "did:plc:scholar",
+            &[("ctx", "https://example.com/x"), ("ctx-h", "sha256:9f00")],
+        );
+        assert_eq!(
+            tags.get("+freeq.at/act-ctx-h").map(String::as_str),
+            Some("sha256:9f00")
+        );
+        assert_eq!(
+            tags.get("+freeq.at/act-ctx").map(String::as_str),
+            Some("https://example.com/x")
+        );
+    }
+
+    /// The document a kind nobody has heard of produces: the builder writes
+    /// what it is told, because which verbs a kind allows is not its question.
+    #[test]
+    fn act_tags_builds_a_kind_and_verb_it_has_never_heard_of() {
+        let tags = act_tags(
+            "lease",
+            "renew",
+            Some(OFFER_ID),
+            "did:plc:eliza",
+            &[("term", "30d")],
+        );
+        assert_eq!(tags.get("+freeq.at/act").map(String::as_str), Some("lease"));
+        assert_eq!(
+            tags.get("+freeq.at/act-verb").map(String::as_str),
+            Some("renew")
+        );
+        assert_eq!(
+            tags.get("+freeq.at/act-term").map(String::as_str),
+            Some("30d")
+        );
+    }
+
+    /// Every verb's default line, as the room reads it. A handoff is a task in
+    /// prose; every other kind is called by its own name.
+    #[test]
+    fn act_line_says_what_each_verb_did() {
+        let none: &[(&str, &str)] = &[];
+        assert_eq!(
+            act_line("handoff", "offer", &[("title", "Cite 3 sources on X")]),
+            "offered: Cite 3 sources on X"
+        );
+        assert_eq!(act_line("handoff", "accept", none), "accepted the task");
+        assert_eq!(act_line("handoff", "decline", none), "declined the task");
+        assert_eq!(act_line("handoff", "claim", none), "claimed the task");
+        assert_eq!(act_line("handoff", "complete", none), "completed the task");
+        assert_eq!(act_line("handoff", "fail", none), "failed the task");
+        assert_eq!(act_line("handoff", "cancel", none), "cancelled the task");
+        assert_eq!(act_line("bounty", "cancel", none), "cancelled the bounty");
+        assert_eq!(act_line("bounty", "award", none), "awarded the bounty");
+        assert_eq!(act_line("bounty", "submit", none), "submitted the work");
+        assert_eq!(act_line("bounty", "revise", none), "asked for revisions");
+        assert_eq!(act_line("bounty", "accept-work", none), "accepted the work");
+        assert_eq!(act_line("bounty", "forfeit", none), "forfeited the bounty");
+    }
+
+    /// Two verbs read their note when there is one and stand on their own when
+    /// there is not.
+    #[test]
+    fn act_line_uses_a_note_only_when_one_was_written() {
+        let none: &[(&str, &str)] = &[];
+        assert_eq!(act_line("handoff", "progress", none), "made progress");
+        assert_eq!(
+            act_line("handoff", "progress", &[("note", "halfway")]),
+            "progress: halfway"
+        );
+        assert_eq!(act_line("bounty", "bid", none), "bid on the bounty");
+        assert_eq!(
+            act_line("bounty", "bid", &[("note", "two days")]),
+            "bid: two days"
+        );
+    }
+
+    /// A verb this has not been taught is named rather than described: a kind
+    /// may add one without editing prose, and the room still sees what it was.
+    #[test]
+    fn act_line_names_a_verb_it_has_no_sentence_for() {
+        assert_eq!(act_line("lease", "renew", &[]), "renew");
     }
 
     #[test]
