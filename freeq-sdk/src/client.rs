@@ -2014,6 +2014,10 @@ where
     let mut web_token = config.web_token.clone();
     let mut authenticated_did: Option<String> = None;
     let mut pending_commands: Vec<Command> = Vec::new();
+    // Task event ids already handed up. The same event arrives up to three
+    // times — our own echo, the replay a channel hands a joiner, and the
+    // history that joiner asks for next — and only the first is an event.
+    let mut seen_act_events: SeenActEvents = SeenActEvents::default();
     // Session message-signing keypair (generated after SASL success)
     let mut msg_signing_key: Option<ed25519_dalek::SigningKey> = None;
     let mut msg_signing_did: Option<String> = None;
@@ -2602,6 +2606,29 @@ where
                                         .await;
                                 }
                                 let dm_key = dm_key_for(&did_maps, &own_nick, &from, &target);
+                                // A task event is handed up as its own event
+                                // as well as the raw TAGMSG, the way a
+                                // coordination TAGMSG is — once per event id.
+                                if let Some(act) = crate::act::parse_event(
+                                    msg.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+                                ) && seen_act_events.first_sighting(&act.event_id)
+                                {
+                                    let _ = event_tx
+                                        .send(Event::Act {
+                                            from: from.clone(),
+                                            target: target.clone(),
+                                            kind: act.kind,
+                                            verb: act.verb,
+                                            did: act.did,
+                                            event_id: act.event_id,
+                                            task_id: act.task_id,
+                                            fields: act.fields,
+                                            sig_tag: act.sig_tag,
+                                            replayed: act.replayed,
+                                            dm_key: dm_key.clone(),
+                                        })
+                                        .await;
+                                }
                                 let _ = event_tx.send(Event::TagMsg { from, target, tags: msg.tags.clone(), dm_key }).await;
                             }
                         }
@@ -2733,6 +2760,39 @@ async fn dispatch_assembled_multiline(
     // Nested-batch parent (e.g. multiline inside CHATHISTORY) is
     // exposed to the consumer via the `batch` tag so UI layers can
     // attach the assembled message to the outer batch.
+}
+
+/// How long a task event's id is remembered so the same event is not handed up
+/// twice.
+///
+/// Generous on purpose: the duplicate this exists to swallow is a joiner's
+/// replay followed by the history it asks for, and a catch-up over a slow link
+/// can put minutes between the two sightings of one event.
+const ACT_EVENT_DEDUPE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The task event ids this connection has already handed up, and when.
+#[derive(Default)]
+struct SeenActEvents {
+    seen: HashMap<String, std::time::Instant>,
+}
+
+impl SeenActEvents {
+    /// Whether this id is new, recording it if so. Old entries are swept when
+    /// the map grows rather than on a timer: nothing here is worth a task.
+    fn first_sighting(&mut self, event_id: &str) -> bool {
+        let now = std::time::Instant::now();
+        if let Some(seen) = self.seen.get(event_id)
+            && now.duration_since(*seen) < ACT_EVENT_DEDUPE
+        {
+            return false;
+        }
+        self.seen.insert(event_id.to_string(), now);
+        if self.seen.len() > 4096 {
+            self.seen
+                .retain(|_, t| now.duration_since(*t) < ACT_EVENT_DEDUPE);
+        }
+        true
+    }
 }
 
 /// The capability a server advertises to say it verifies the chat signing
@@ -6290,6 +6350,179 @@ mod irc_loop_tests {
         assert_eq!(from, "alice");
         assert_eq!(target, "#room");
         assert_eq!(tags.get("+react").map(|s| s.as_str()), Some("👍"));
+    }
+
+    /// A task event arrives as `Event::Act` beside the raw TAGMSG, read once
+    /// so a consumer does not have to know the tag names.
+    #[tokio::test]
+    async fn server_act_tagmsg_emits_an_act_event_beside_the_tagmsg() {
+        let (mut server, mut events, _cmd) = start_run_irc("host30").await;
+
+        server
+            .write_all(
+                b"@+freeq.at/act=handoff;+freeq.at/act-verb=offer;\
++freeq.at/act-title=Cite\\s3\\ssources;+freeq.at/from=did:plc:eliza;\
++freeq.at/eventid=01OFFER :eliza!u@h TAGMSG #room\r\n",
+            )
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+
+        let (mut act, mut raw) = (None, None);
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(400), async {
+            while let Some(ev) = events.recv().await {
+                match ev {
+                    Event::Act { .. } => act = Some(ev),
+                    Event::TagMsg { tags, .. } => raw = Some(tags),
+                    _ => {}
+                }
+                if act.is_some() && raw.is_some() {
+                    return;
+                }
+            }
+        })
+        .await;
+
+        let Some(Event::Act {
+            from,
+            target,
+            kind,
+            verb,
+            did,
+            task_id,
+            fields,
+            ..
+        }) = act
+        else {
+            panic!("expected an Act event");
+        };
+        assert_eq!(from, "eliza");
+        assert_eq!(target, "#room");
+        assert_eq!(verb, "offer");
+        assert_eq!(kind, "handoff");
+        assert_eq!(did.as_deref(), Some("did:plc:eliza"));
+        // An opener names no other action, so it names itself.
+        assert_eq!(task_id, "01OFFER");
+        assert_eq!(
+            fields.get("act-title").map(String::as_str),
+            Some("Cite 3 sources")
+        );
+        // The raw line still arrives, the way a coordination TAGMSG does.
+        let raw = raw.expect("the TAGMSG must still arrive");
+        assert_eq!(
+            raw.get("+freeq.at/act-verb").map(|s| s.as_str()),
+            Some("offer")
+        );
+    }
+
+    /// Our own event, echoed back by a server that acked `echo-message`, is
+    /// one event. Same id, no `time` tag — the live case, where the replay
+    /// test below is the history one. Both reach the same sighting check;
+    /// this pins the one a sender meets first.
+    #[tokio::test]
+    async fn our_own_echoed_task_event_is_handed_up_once() {
+        let (mut server, mut events, _cmd) = start_run_irc("host32").await;
+
+        let line: &[u8] = b"@+freeq.at/act=handoff;+freeq.at/act-verb=offer;\
++freeq.at/act-title=ship\\sit;+freeq.at/from=did:plc:eliza;\
++freeq.at/eventid=01ECHO :eliza!u@h TAGMSG #room\r\n";
+        server.write_all(line).await.unwrap();
+        server.write_all(line).await.unwrap();
+        // A different event after it, so an empty second sighting cannot be
+        // mistaken for one that simply had not arrived yet.
+        server
+            .write_all(
+                b"@+freeq.at/act=handoff;+freeq.at/act-verb=claim;\
++freeq.at/act-id=01ECHO;+freeq.at/from=did:plc:scholar;\
++freeq.at/eventid=01AFTER :scholar!u@h TAGMSG #room\r\n",
+            )
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+
+        let mut seen: Vec<(String, bool)> = Vec::new();
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(400), async {
+            while let Some(ev) = events.recv().await {
+                if let Event::Act {
+                    event_id, replayed, ..
+                } = ev
+                {
+                    let last = event_id == "01AFTER";
+                    seen.push((event_id, replayed));
+                    if last {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            seen.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["01ECHO", "01AFTER"],
+            "the echo must be handed up once"
+        );
+        assert!(
+            seen.iter().all(|(_, replayed)| !replayed),
+            "a line with no time tag is live, not a replay"
+        );
+    }
+
+    /// The same event twice — a joiner's replay and the history it asks for
+    /// next — is one event. The TAGMSG still arrives both times: it is the
+    /// line, not the event.
+    #[tokio::test]
+    async fn an_act_event_seen_twice_is_handed_up_once() {
+        let (mut server, mut events, _cmd) = start_run_irc("host31").await;
+
+        let line: &[u8] = b"@time=2026-08-22T10:00:00.000Z;+freeq.at/act=handoff;\
++freeq.at/act-verb=claim;+freeq.at/act-id=01OFFER;+freeq.at/from=did:plc:scholar;\
++freeq.at/eventid=01CLAIM :scholar!u@h TAGMSG #room\r\n";
+        server.write_all(line).await.unwrap();
+        server.write_all(line).await.unwrap();
+        // A second, different event: it must still come through, and it is
+        // also what tells us the first one's duplicate was really dropped
+        // rather than merely slow.
+        server
+            .write_all(
+                b"@+freeq.at/act=handoff;+freeq.at/act-verb=progress;\
++freeq.at/act-id=01OFFER;+freeq.at/from=did:plc:scholar;\
++freeq.at/eventid=01PROGRESS :scholar!u@h TAGMSG #room\r\n",
+            )
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+
+        let mut seen: Vec<(String, String, bool)> = Vec::new();
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(400), async {
+            while let Some(ev) = events.recv().await {
+                if let Event::Act {
+                    event_id,
+                    task_id,
+                    replayed,
+                    ..
+                } = ev
+                {
+                    let last = event_id == "01PROGRESS";
+                    seen.push((event_id, task_id, replayed));
+                    if last {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            seen.iter()
+                .map(|(id, _, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["01CLAIM", "01PROGRESS"],
+            "the replayed claim must be handed up once"
+        );
+        assert!(seen[0].2, "a line carrying a time tag is a replay");
+        assert!(!seen[1].2);
+        assert_eq!(seen[1].1, "01OFFER", "a follow-up names its task");
     }
 
     // ── legacy +freeq.at/multiline \\n normalization ──────────────────────────

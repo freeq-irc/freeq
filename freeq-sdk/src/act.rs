@@ -314,6 +314,94 @@ pub fn act_line(kind: &str, verb: &str, fields: &[(&str, &str)]) -> String {
     }
 }
 
+/// A task event as it arrived: what the tags say, read once so a consumer does
+/// not have to know the tag names.
+///
+/// The same fields the TypeScript SDK's `ActEventPayload` carries, under the
+/// same rules — most of all that `task` is never empty. An opener names no
+/// other action because its own id is the action's for the rest of its life,
+/// so it names itself here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActEvent {
+    /// The task kind — the `act` tag's value, e.g. `handoff`.
+    pub kind: String,
+    /// The move: `offer`, `claim`, `progress`, `confirm`, …
+    pub verb: String,
+    /// The acting identity: the `from` tag, else the server's `account`.
+    pub did: Option<String>,
+    /// The signer-minted id of this event.
+    pub event_id: String,
+    /// The action this event is about — `act-id`, or this event's own id when
+    /// it opens one.
+    pub task_id: String,
+    /// Every act tag, keyed by its name with the vendor prefix stripped:
+    /// `act-note` reads as `act-note`, `+freeq.at/act` as `act`. Exactly what
+    /// the signature covers, so a reader drawing from these draws from what
+    /// was signed.
+    pub fields: BTreeMap<String, String>,
+    /// The signature over the act document, if the line carried one.
+    pub sig_tag: Option<String>,
+    /// True when this arrived from history rather than live — a replayed line
+    /// carries the server's `time` tag.
+    pub replayed: bool,
+}
+
+/// Read a task event off a message's tags, or `None` when the message is not
+/// one.
+///
+/// Not a task event: no act tag at all, or no id to file it under. Both are
+/// silence rather than an error — an ordinary TAGMSG carries neither, and the
+/// caller is asking "is this one?", not "is this valid?". Whether the
+/// signature holds is [`verify_act`]'s question, asked separately and against
+/// a venue only the receiver knows.
+pub fn parse_event<'a, I>(tags: I) -> Option<ActEvent>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let mut fields = BTreeMap::new();
+    let mut did = None;
+    let mut account = None;
+    let mut event_id = None;
+    let mut sig_tag = None;
+    let mut replayed = false;
+    for (name, value) in tags {
+        let stripped = stripped_name(name);
+        match stripped {
+            "from" => did = Some(value.to_string()),
+            "account" => account = Some(value.to_string()),
+            "eventid" => event_id = Some(value.to_string()),
+            "sig" => sig_tag = Some(value.to_string()),
+            "time" => replayed = true,
+            // The id a signed event carries once an adopting server has taken
+            // it: the server files the signed id under `msgid` and drops the
+            // tag it arrived in.
+            "msgid" if event_id.is_none() => event_id = Some(value.to_string()),
+            _ if is_act_tag(name) => {
+                fields.insert(stripped.to_string(), value.to_string());
+            }
+            _ => {}
+        }
+    }
+    if fields.is_empty() {
+        return None;
+    }
+    let event_id = event_id?;
+    let task_id = fields
+        .get("act-id")
+        .cloned()
+        .unwrap_or_else(|| event_id.clone());
+    Some(ActEvent {
+        kind: fields.get("act").cloned().unwrap_or_default(),
+        verb: fields.get("act-verb").cloned().unwrap_or_default(),
+        did: did.or(account),
+        event_id,
+        task_id,
+        fields,
+        sig_tag,
+        replayed,
+    })
+}
+
 /// Parse a sig tag value into (kid, signature bytes).
 pub fn parse_sig_tag(sig_tag: &str) -> Result<(&str, [u8; 64]), ActSigError> {
     crate::sigtag::parse(sig_tag).map_err(ActSigError::from)
@@ -1342,6 +1430,144 @@ mod tests {
     #[test]
     fn act_line_names_a_verb_it_has_no_sentence_for() {
         assert_eq!(act_line("lease", "renew", &[]), "renew");
+    }
+
+    /// A follow-up names the action it is about, and that value is the task's
+    /// id for a reader.
+    #[test]
+    fn a_follow_up_reads_the_task_it_names() {
+        let event = parse_event(vec![
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "claim"),
+            ("+freeq.at/act-id", OFFER_ID),
+            ("+freeq.at/from", "did:plc:scholar"),
+            ("+freeq.at/eventid", "01JCLAIMEVENTID00000000000"),
+            ("+freeq.at/sig", "ed25519:kid:sig"),
+        ])
+        .expect("a task event");
+        assert_eq!(event.kind, "handoff");
+        assert_eq!(event.verb, "claim");
+        assert_eq!(event.did.as_deref(), Some("did:plc:scholar"));
+        assert_eq!(event.event_id, "01JCLAIMEVENTID00000000000");
+        assert_eq!(event.task_id, OFFER_ID);
+        assert_eq!(event.sig_tag.as_deref(), Some("ed25519:kid:sig"));
+        assert!(!event.replayed);
+    }
+
+    /// An opener names no action, so it is the action: its own id is what
+    /// every later event will name.
+    #[test]
+    fn an_opener_reads_as_its_own_task() {
+        let event = parse_event(offer_tags()).expect("a task event");
+        assert_eq!(event.verb, "offer");
+        assert_eq!(event.task_id, OFFER_ID);
+        assert_eq!(event.event_id, OFFER_ID);
+        // Only the covered tags are read back; the rest of the line is not
+        // the document.
+        assert_eq!(
+            event.fields.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "act",
+                "act-caps",
+                "act-ctx-h",
+                "act-deadline",
+                "act-title",
+                "act-to",
+                "act-verb"
+            ]
+        );
+    }
+
+    /// Reading an opener's task from the absence of `act-id` is the rules
+    /// file's own answer, checked against it rather than assumed: for every
+    /// kind, the verb that opens it is the verb that carries no `act-id`.
+    #[test]
+    fn the_opening_verb_is_the_one_that_names_no_task() {
+        for kind in ["handoff", "bounty"] {
+            let opens = crate::act_transitions::opening_verb(kind).expect("a known kind");
+            let event = parse_event(vec![
+                ("+freeq.at/act", kind),
+                ("+freeq.at/act-verb", opens),
+                ("+freeq.at/act-title", "anything"),
+                ("+freeq.at/from", "did:plc:eliza"),
+                ("+freeq.at/eventid", OFFER_ID),
+            ])
+            .expect("a task event");
+            assert_eq!(
+                event.task_id, event.event_id,
+                "{kind}'s opener names itself"
+            );
+        }
+    }
+
+    /// The server's `account` names the actor when the sender wrote no `from`
+    /// tag — which a well-formed event always does, but a reader should not
+    /// need the event to be well-formed to say who sent it.
+    #[test]
+    fn the_account_tag_names_the_actor_when_from_is_absent() {
+        let event = parse_event(vec![
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "progress"),
+            ("+freeq.at/act-id", OFFER_ID),
+            ("account", "did:plc:scholar"),
+            ("msgid", "01JPROGRESSEVENTID00000000"),
+        ])
+        .expect("a task event");
+        assert_eq!(event.did.as_deref(), Some("did:plc:scholar"));
+        assert_eq!(event.event_id, "01JPROGRESSEVENTID00000000");
+    }
+
+    /// The signed id wins over the server's `msgid` whichever order the tags
+    /// arrive in — a map hands them up unordered.
+    #[test]
+    fn the_signed_id_wins_over_the_servers_msgid() {
+        for tags in [
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", "did:plc:eliza"),
+                ("msgid", "01JSERVERMINTED0000000000"),
+                ("+freeq.at/eventid", OFFER_ID),
+            ],
+            vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", "did:plc:eliza"),
+                ("+freeq.at/eventid", OFFER_ID),
+                ("msgid", "01JSERVERMINTED0000000000"),
+            ],
+        ] {
+            assert_eq!(parse_event(tags).expect("a task event").event_id, OFFER_ID);
+        }
+    }
+
+    /// A replayed line carries the server's time tag; a live one does not.
+    #[test]
+    fn a_replayed_line_says_so() {
+        let mut tags = offer_tags();
+        tags.push(("time", "2026-08-22T10:00:00.000Z"));
+        assert!(parse_event(tags).expect("a task event").replayed);
+    }
+
+    /// Two silences, not errors: an ordinary TAGMSG is not a task event, and
+    /// neither is one nothing can be filed under.
+    #[test]
+    fn a_line_that_is_not_a_task_event_reads_as_none() {
+        // No act tag at all — a reaction.
+        assert!(parse_event(vec![("+react", "👍"), ("+reply", "01ABC")]).is_none());
+        // `actor-class` is not an act tag; the coverage rule says so.
+        assert!(
+            parse_event(vec![("+freeq.at/actor-class", "agent"), ("msgid", "01ABC")]).is_none()
+        );
+        // Act tags but no id: nothing to file it under, and nothing to dedupe.
+        assert!(
+            parse_event(vec![
+                ("+freeq.at/act", "handoff"),
+                ("+freeq.at/act-verb", "offer"),
+                ("+freeq.at/from", "did:plc:eliza"),
+            ])
+            .is_none()
+        );
     }
 
     #[test]

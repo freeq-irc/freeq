@@ -1,6 +1,7 @@
 /** Unit tests for FreeqClient. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import type { ActEventPayload } from './types';
 
 // ── WebSocket mock ────────────────────────────────────────────────
 
@@ -1305,6 +1306,120 @@ describe('inbound: coordinationEvent', () => {
     ws.recv('@+react=🎉 :alice TAGMSG #foo');
     await flushAsync();
     expect(seen).toHaveLength(0);
+  });
+});
+
+describe('inbound: actEvent', () => {
+  const OFFER =
+    '@+freeq.at/eventid=01OFFER;+freeq.at/act=handoff;+freeq.at/act-verb=offer;' +
+    '+freeq.at/act-title=Cite\\s3\\ssources;+freeq.at/from=did:plc:eliza;' +
+    '+freeq.at/sig=ed25519:kid:sig :eliza TAGMSG #foo';
+
+  it('emits the parsed task event from a TAGMSG', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: ActEventPayload[] = [];
+    client.on('actEvent', (e) => seen.push(e));
+    ws.recv(OFFER);
+    await flushAsync();
+    expect(seen).toHaveLength(1);
+    const e = seen[0];
+    expect(e.channel).toBe('#foo');
+    expect(e.from).toBe('eliza');
+    expect(e.did).toBe('did:plc:eliza');
+    expect(e.kind).toBe('handoff');
+    expect(e.verb).toBe('offer');
+    expect(e.eventId).toBe('01OFFER');
+    // Every act tag, keyed by its stripped name — and nothing else.
+    expect(e.fields).toEqual({
+      act: 'handoff',
+      'act-verb': 'offer',
+      'act-title': 'Cite 3 sources',
+    });
+    expect(e.sigTag).toBe('ed25519:kid:sig');
+    expect(e.replayed).toBe(false);
+  });
+
+  it('falls back to the account tag when the sender wrote no from tag', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: ActEventPayload[] = [];
+    client.on('actEvent', (e) => seen.push(e));
+    ws.recv(
+      '@msgid=01NOFROM;account=did:plc:scholar;+freeq.at/act=handoff;' +
+        '+freeq.at/act-verb=claim;+freeq.at/act-id=01OFFER :scholar TAGMSG #foo',
+    );
+    await flushAsync();
+    expect(seen[0].did).toBe('did:plc:scholar');
+  });
+
+  it("an opener's task is itself; a follow-up names the task it is about", async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: ActEventPayload[] = [];
+    client.on('actEvent', (e) => seen.push(e));
+    ws.recv(OFFER);
+    ws.recv(
+      '@+freeq.at/eventid=01CLAIM;+freeq.at/act=handoff;+freeq.at/act-verb=claim;' +
+        '+freeq.at/act-id=01OFFER;+freeq.at/from=did:plc:scholar :scholar TAGMSG #foo',
+    );
+    await flushAsync();
+    expect(seen.map((e) => [e.eventId, e.taskId])).toEqual([
+      ['01OFFER', '01OFFER'],
+      ['01CLAIM', '01OFFER'],
+    ]);
+  });
+
+  it('de-dupes our own echo by event id', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: ActEventPayload[] = [];
+    client.on('actEvent', (e) => seen.push(e));
+    ws.recv(OFFER);
+    ws.recv(OFFER);
+    await flushAsync();
+    expect(seen).toHaveLength(1);
+  });
+
+  it('de-dupes an event a joiner gets from JOIN replay and again from CHATHISTORY', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: ActEventPayload[] = [];
+    client.on('actEvent', (e) => seen.push(e));
+    // JOIN replay: the server stamps the original time on the line.
+    ws.recv(
+      '@time=2026-08-22T10:00:00.000Z;+freeq.at/eventid=01REPLAY;+freeq.at/act=handoff;' +
+        '+freeq.at/act-verb=offer;+freeq.at/act-title=x;+freeq.at/from=did:plc:eliza :eliza TAGMSG #foo',
+    );
+    // The same event again, inside the CHATHISTORY batch the joiner asks for.
+    ws.recv(':server BATCH +h chathistory #foo');
+    ws.recv(
+      '@batch=h;time=2026-08-22T10:00:00.000Z;+freeq.at/eventid=01REPLAY;+freeq.at/act=handoff;' +
+        '+freeq.at/act-verb=offer;+freeq.at/act-title=x;+freeq.at/from=did:plc:eliza :eliza TAGMSG #foo',
+    );
+    ws.recv(':server BATCH -h');
+    await flushAsync();
+    expect(seen).toHaveLength(1);
+    expect(seen[0].replayed).toBe(true);
+  });
+
+  it('ignores a TAGMSG carrying no act tag', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: ActEventPayload[] = [];
+    client.on('actEvent', (e) => seen.push(e));
+    ws.recv('@+react=🎉;+reply=01ABC :alice TAGMSG #foo');
+    // `actor-class` is not an act tag, and the coverage rule says so.
+    ws.recv('@msgid=01X;+freeq.at/actor-class=agent :alice TAGMSG #foo');
+    await flushAsync();
+    expect(seen).toHaveLength(0);
+  });
+
+  it('leaves the companion prose line to fire message', async () => {
+    const { client, ws } = await makeRegistered();
+    const acts: ActEventPayload[] = [];
+    const msgs: unknown[] = [];
+    client.on('actEvent', (e) => acts.push(e));
+    client.on('message', (m) => msgs.push(m));
+    ws.recv(OFFER);
+    ws.recv('@msgid=01LINE;+freeq.at/ref=01OFFER :eliza PRIVMSG #foo :offered: Cite 3 sources');
+    await flushAsync();
+    expect(acts).toHaveLength(1);
+    expect(msgs).toHaveLength(1);
   });
 });
 

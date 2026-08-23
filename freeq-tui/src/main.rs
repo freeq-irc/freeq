@@ -1196,6 +1196,9 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
         Event::BatchEnd { id } => {
             app.end_batch(&id);
         }
+        // A task event is the parse of a TAGMSG that arrives raw below too,
+        // and the TUI draws no task cards yet — ignored until it does.
+        Event::Act { .. } => {}
         Event::TagMsg {
             from,
             target,

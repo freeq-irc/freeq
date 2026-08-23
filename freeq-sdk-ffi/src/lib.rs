@@ -252,6 +252,26 @@ pub struct TagEntry {
     pub value: String,
 }
 
+/// A task event, read off an `act`-tagged TAGMSG.
+///
+/// The same fields `freeq_sdk::act::ActEvent` carries, with the tag map turned
+/// into the sequence shape the bridge uses everywhere else. `task_id` is never
+/// empty: an opener names no other action, so it names itself.
+pub struct ActEvent {
+    pub from: String,
+    pub target: String,
+    pub kind: String,
+    pub verb: String,
+    pub did: Option<String>,
+    pub event_id: String,
+    pub task_id: String,
+    /// Every act tag, keyed by its name with the vendor prefix stripped.
+    pub fields: Vec<TagEntry>,
+    pub sig_tag: Option<String>,
+    pub replayed: bool,
+    pub dm_key: Option<String>,
+}
+
 pub struct TagMessage {
     pub from: String,
     pub target: String,
@@ -304,6 +324,9 @@ pub enum FreeqEvent {
     },
     TagMsg {
         msg: TagMessage,
+    },
+    Act {
+        event: ActEvent,
     },
     Names {
         channel: String,
@@ -841,6 +864,39 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
                 },
             }
         }
+        Event::Act {
+            from,
+            target,
+            kind,
+            verb,
+            did,
+            event_id,
+            task_id,
+            fields,
+            sig_tag,
+            replayed,
+            dm_key,
+        } => FreeqEvent::Act {
+            event: ActEvent {
+                from: from.clone(),
+                target: target.clone(),
+                kind: kind.clone(),
+                verb: verb.clone(),
+                did: did.clone(),
+                event_id: event_id.clone(),
+                task_id: task_id.clone(),
+                fields: fields
+                    .iter()
+                    .map(|(k, v)| TagEntry {
+                        key: k.clone(),
+                        value: v.clone(),
+                    })
+                    .collect(),
+                sig_tag: sig_tag.clone(),
+                replayed: *replayed,
+                dm_key: dm_key.clone(),
+            },
+        },
         Event::Names { channel, nicks } => {
             let members = nicks
                 .iter()
@@ -2787,6 +2843,56 @@ mod tests {
             .reactions
             .iter()
             .any(|r| r.emoji == "🎉" && r.nicks == vec!["carol".to_string()]));
+    }
+
+    /// A task event crosses the bridge with the fields a card is drawn from,
+    /// the way a coordination event does — read once here so each native app
+    /// does not read the tags again.
+    #[test]
+    fn convert_event_exposes_an_act_event() {
+        let event = freeq_sdk::act::parse_event(vec![
+            ("+freeq.at/act", "handoff"),
+            ("+freeq.at/act-verb", "progress"),
+            ("+freeq.at/act-id", "01OFFER"),
+            ("+freeq.at/act-note", "two of three sources read"),
+            ("+freeq.at/from", "did:plc:scholar"),
+            ("+freeq.at/eventid", "01PROGRESS"),
+            ("+freeq.at/sig", "ed25519:kid:sig"),
+        ])
+        .expect("a task event");
+        let ev = freeq_sdk::event::Event::Act {
+            from: "scholar".to_string(),
+            target: "#ship-it".to_string(),
+            kind: event.kind,
+            verb: event.verb,
+            did: event.did,
+            event_id: event.event_id,
+            task_id: event.task_id,
+            fields: event.fields,
+            sig_tag: event.sig_tag,
+            replayed: event.replayed,
+            dm_key: None,
+        };
+        let FreeqEvent::Act { event } = convert_event(&ev).expect("exposed event") else {
+            panic!("expected Act variant");
+        };
+        assert_eq!(event.from, "scholar");
+        assert_eq!(event.target, "#ship-it");
+        assert_eq!(event.kind, "handoff");
+        assert_eq!(event.verb, "progress");
+        assert_eq!(event.did.as_deref(), Some("did:plc:scholar"));
+        assert_eq!(event.event_id, "01PROGRESS");
+        assert_eq!(event.task_id, "01OFFER");
+        assert_eq!(event.sig_tag.as_deref(), Some("ed25519:kid:sig"));
+        assert!(!event.replayed);
+        assert_eq!(
+            event
+                .fields
+                .iter()
+                .find(|t| t.key == "act-note")
+                .map(|t| t.value.as_str()),
+            Some("two of three sources read")
+        );
     }
 
     #[test]

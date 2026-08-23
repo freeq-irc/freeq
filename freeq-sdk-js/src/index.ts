@@ -56,6 +56,7 @@ export type {
   GovernancePayload,
   PresencePayload,
   CoordinationEventPayload,
+  ActEventPayload,
   SpendPayload,
   BudgetSnapshot,
   AgentSpawnedPayload,

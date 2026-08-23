@@ -18,7 +18,7 @@ import type {
   IRCMessage, Message, Member, AvSession, AvParticipant,
   FreeqClientOptions, SaslCredentials, Batch, TransportState,
   PinnedMessage, WhoisInfo, HistoryOptions, EmitEventOptions,
-  HeartbeatHandle, GovernanceSignal, CoordinationEventPayload,
+  HeartbeatHandle, GovernanceSignal, CoordinationEventPayload, ActEventPayload,
 } from './types.js';
 
 /**
@@ -33,6 +33,16 @@ import type {
  * deploy lockstep, no flag day.
  */
 export const SIGNING_CAP = 'freeq.at/msgsig';
+
+/**
+ * How long a task event's id is remembered so the same event is not emitted
+ * twice.
+ *
+ * Generous on purpose: the duplicate this exists to swallow is a joiner's
+ * JOIN replay followed by the CHATHISTORY it asks for, and a catch-up over a
+ * slow link can put minutes between the two sightings of one event.
+ */
+const ACT_EVENT_DEDUPE_MS = 10 * 60_000;
 
 export class FreeqClient extends EventEmitter {
   private transport: Transport | null = null;
@@ -121,6 +131,12 @@ export class FreeqClient extends EventEmitter {
   /** Recently-seen coordination event IDs (TAGMSG + companion PRIVMSG carry
    *  the same eventId; we fire `coordinationEvent` only once per pair). */
   private _seenCoordinationEvents = new Map<string, number>();
+  /** Task event ids already emitted, and when. Longer-lived than the
+   *  coordination map because the duplicates it exists to swallow are further
+   *  apart: an echo arrives in the same breath, but a joiner gets every event
+   *  twice — once in JOIN replay and once in the CHATHISTORY it asks for
+   *  next. */
+  private _seenActEvents = new Map<string, number>();
 
   constructor(opts: FreeqClientOptions) {
     super();
@@ -244,6 +260,7 @@ export class FreeqClient extends EventEmitter {
     }
     this._pendingWhois.clear();
     this._seenCoordinationEvents.clear();
+    this._seenActEvents.clear();
     this._nickCollisionRetries = 0;
     if (this._agentHeartbeatTimer) {
       clearInterval(this._agentHeartbeatTimer);
@@ -1141,6 +1158,59 @@ export class FreeqClient extends EventEmitter {
       tags,
     };
     this.emit('coordinationEvent', eventPayload);
+  }
+
+  /**
+   * Emit `actEvent` for a TAGMSG carrying act tags.
+   *
+   * The TAGMSG *is* the event — the server files it from this line — and this
+   * is the one place `actEvent` fires. The companion prose line is an
+   * ordinary message and keeps arriving as `message`.
+   *
+   * Deduped by event id. Three things produce the same id twice: our own echo,
+   * the JOIN replay a channel hands a joiner, and the CHATHISTORY that joiner
+   * asks for next. The last two are the ledger item
+   * `act-events-replay-twice-to-a-joiner`, and dropping the second sighting
+   * here is where it closes.
+   */
+  private emitActEvent(channel: string, from: string, tags: Record<string, string>): void {
+    const fields: Record<string, string> = {};
+    for (const [name, value] of Object.entries(tags)) {
+      if (signing.isActTag(name)) fields[signing.strippedTagName(name)] = value;
+    }
+    if (Object.keys(fields).length === 0) return;
+
+    // A signed event through an adopting server arrives with the id in
+    // `msgid` (the server adopts the signed id and strips the eventid tag);
+    // through one that predates adoption, in `+freeq.at/eventid` verbatim.
+    const eventId = tags[signing.EVENT_ID_TAG] || tags['msgid'] || '';
+    if (!eventId) return;
+    const now = Date.now();
+    const seen = this._seenActEvents.get(eventId);
+    if (seen !== undefined && now - seen < ACT_EVENT_DEDUPE_MS) return;
+    this._seenActEvents.set(eventId, now);
+    if (this._seenActEvents.size > 4096) {
+      const cutoff = now - ACT_EVENT_DEDUPE_MS;
+      for (const [k, t] of this._seenActEvents) {
+        if (t < cutoff) this._seenActEvents.delete(k);
+      }
+    }
+
+    // An opener carries no `act-id`: its own event id is the task's, for the
+    // rest of the task's life. Every later move names that id.
+    this.emit('actEvent', {
+      channel,
+      from,
+      did: tags['+freeq.at/from'] || tags['account'] || undefined,
+      kind: fields['act'] || '',
+      verb: fields['act-verb'] || '',
+      eventId,
+      taskId: fields['act-id'] || eventId,
+      fields,
+      tags,
+      sigTag: tags[signing.SIG_TAG] || undefined,
+      replayed: tags['time'] !== undefined,
+    } satisfies ActEventPayload);
   }
 
   /**
@@ -2190,6 +2260,10 @@ export class FreeqClient extends EventEmitter {
         if (eventType) {
           this.emitCoordinationEvent(target, from, msg.tags);
         }
+
+        // Task event (`act-` tags). Same rule as the coordination branch: the
+        // TAGMSG is the event, so this is the one place `actEvent` fires.
+        this.emitActEvent(target, from, msg.tags);
 
         const avState = msg.tags['+freeq.at/av-state'];
         const avId = msg.tags['+freeq.at/av-id'];

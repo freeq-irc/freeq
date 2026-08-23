@@ -156,11 +156,26 @@ export function newEventId(): string {
   return out;
 }
 
-/** Strip the client-tag vendor prefix from a tag name, if present. */
-function strippedName(name: string): string {
+/**
+ * A tag name with the client-tag vendor prefix taken off, if it had one.
+ */
+export function strippedTagName(name: string): string {
   if (name.startsWith('+freeq.at/')) return name.slice('+freeq.at/'.length);
   if (name.startsWith('freeq.at/')) return name.slice('freeq.at/'.length);
   return name;
+}
+
+/**
+ * Whether a tag name is one a task event's signature covers.
+ *
+ * Exported, and written once, because the two sides have to agree: what the
+ * signature covers and what a reader draws a card from are the same set, and
+ * a reader drawing from a tag the signer did not cover would be drawing from
+ * something nobody signed. The same rule as `freeq_sdk::act::is_act_tag`.
+ */
+export function isActTag(name: string): boolean {
+  const stripped = strippedTagName(name);
+  return stripped === 'act' || stripped.startsWith('act-');
 }
 
 /** The fields of a chat message that its signature covers. */
@@ -193,7 +208,7 @@ export async function messageCanonical(fields: MessageDocFields): Promise<string
   if (fields.edit) doc.edit = fields.edit;
   const coord: Record<string, string> = {};
   for (const [name, value] of Object.entries(fields.tags ?? {})) {
-    const key = strippedName(name);
+    const key = strippedTagName(name);
     if ((COVERED_COORD_TAGS as readonly string[]).includes(key)) coord[key] = value;
   }
   if (Object.keys(coord).length > 0) doc.coord = coord;
@@ -280,13 +295,9 @@ export function actCanonical(
   const covered: Record<string, string> = {};
   let from: string | null = null;
   for (const [name, value] of Object.entries(tags)) {
-    const stripped = name.startsWith('+freeq.at/')
-      ? name.slice('+freeq.at/'.length)
-      : name.startsWith('freeq.at/')
-        ? name.slice('freeq.at/'.length)
-        : name;
+    const stripped = strippedTagName(name);
     if (stripped === 'from') from = value;
-    else if (stripped === 'act' || stripped.startsWith('act-')) covered[stripped] = value;
+    else if (isActTag(name)) covered[stripped] = value;
   }
   if (Object.keys(covered).length === 0) return null;
   if (from === null) return null;
