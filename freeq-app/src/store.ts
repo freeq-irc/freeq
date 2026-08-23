@@ -553,6 +553,35 @@ function pairActCompanions(ch: Channel): void {
   if (changed) ch.actTasks = tasks;
 }
 
+/**
+ * What the room is told about an event that wrote no line of its own.
+ *
+ * The home signs `confirm` and `expire` itself and sends no companion, so
+ * these two are the only events the reader hears about as a system line
+ * rather than a card.
+ */
+function actSystemLine(task: ActTask, ev: ActEventInput): string | undefined {
+  // Both lines name the task by its title, which only the opener carries, and
+  // the opener falls out of the replay window before the events that follow
+  // it do — so with no title held there is nothing to name, and nothing said.
+  const title = task.title;
+  if (!title) return undefined;
+  switch (ev.verb) {
+    case 'confirm': {
+      // The receipt carries only the id of the move it confirms, so the move's
+      // sender and its raw verb are read off that event — and with no such
+      // event held there is nothing to name, and nothing to say.
+      const subject = task.events.find((e) => e.eventId === ev.fields['act-subject']);
+      if (!subject) return undefined;
+      return `confirmed: ${subject.from}'s ${subject.verb} on ${title}`;
+    }
+    case 'expire':
+      return `${title} expired`;
+    default:
+      return undefined;
+  }
+}
+
 /** Who holds the task after this move: named outright on a directed offer,
  *  taken by whoever claims or accepts it, and on an award the bidder whose
  *  bid was chosen — `act-accepts` names the bid, not the bidder. */
@@ -1592,6 +1621,29 @@ export const useStore = create<Store>((set, get) => ({
 
     const ch: Channel = { ...base, actTasks };
     pairActCompanions(ch);
+
+    const line = actSystemLine(actTasks.get(ev.taskId)!, ev);
+    if (line) {
+      // When the home moved, off the id it minted the event under — a receipt
+      // handed back on join is old news, and saying "now" would date it wrong
+      // and file it under the newest thing said.
+      const at = actEventTime(ev.eventId);
+      const said = at === undefined ? new Date() : new Date(at);
+      // Keyed by the event id, so the repeat a joiner is handed lands on the
+      // dedup above rather than printing the line twice.
+      const row: Message = {
+        id: ev.eventId,
+        from: '',
+        text: line,
+        timestamp: said,
+        tags: {},
+        isSystem: true,
+      };
+      let i = ch.messages.length;
+      while (i > 0 && (ch.messages[i - 1].timestamp?.getTime?.() ?? 0) > said.getTime()) i--;
+      ch.messages = [...ch.messages.slice(0, i), row, ...ch.messages.slice(i)].slice(-1000);
+    }
+
     const channels = new Map(s.channels);
     channels.set(key, ch);
     return { channels };

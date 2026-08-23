@@ -268,3 +268,83 @@ describe('companion lines', () => {
     expect(events[1].msgId).toBeUndefined();
   });
 });
+
+describe('the events that write no line of their own', () => {
+  it('tells the room what the home confirmed', () => {
+    const st = useStore.getState();
+    st.addActEvent(CH, ev());
+    st.addActEvent(CH, move('claim', 'e2'));
+    st.addActEvent(CH, move('confirm', 'e3', { 'act-subject': 'e2' }, 'acceptance'));
+
+    const lines = useStore.getState().channels.get(CH)!.messages.filter((m) => m.isSystem);
+    expect(lines.map((m) => m.text)).toEqual([
+      "confirmed: worker's claim on ship the release",
+    ]);
+  });
+
+  it('says nothing about a move it does not hold', () => {
+    const st = useStore.getState();
+    st.addActEvent(CH, ev());
+    st.addActEvent(CH, move('confirm', 'e3', { 'act-subject': 'e2' }, 'acceptance'));
+
+    expect(useStore.getState().channels.get(CH)!.messages.filter((m) => m.isSystem)).toHaveLength(0);
+  });
+
+  it('says nothing about a task whose opener it never held', () => {
+    // The events replay in a window of their own, so a task's later moves
+    // arrive without the opener that carries its title.
+    const st = useStore.getState();
+    st.addActEvent(CH, move('expire', 'e2', {}, 'acceptance'));
+
+    expect(useStore.getState().channels.get(CH)!.messages.filter((m) => m.isSystem)).toHaveLength(0);
+  });
+
+  it('tells the room when a task expired', () => {
+    const st = useStore.getState();
+    st.addActEvent(CH, ev());
+    st.addActEvent(CH, move('expire', 'e2', {}, 'acceptance'));
+
+    const lines = useStore.getState().channels.get(CH)!.messages.filter((m) => m.isSystem);
+    expect(lines.map((m) => m.text)).toEqual(['ship the release expired']);
+  });
+
+  it('says when the home moved, not when the line reached us', () => {
+    // A receipt handed back on join is old news: it carries its own time in
+    // the id it was minted under.
+    const at = Date.UTC(2026, 7, 22, 9, 15, 0);
+    const st = useStore.getState();
+    st.addActEvent(CH, ev());
+    st.addActEvent(CH, move('expire', idAt(at), {}, 'acceptance'));
+
+    const line = useStore.getState().channels.get(CH)!.messages.find((m) => m.isSystem)!;
+    expect(line.timestamp.getTime()).toBe(at);
+  });
+
+  it('puts a replayed move among the lines it belongs between', () => {
+    const at = Date.UTC(2026, 7, 22, 9, 15, 0);
+    const st = useStore.getState();
+    st.addActEvent(CH, ev());
+    st.addMessage(CH, { ...msg('m-later', 'poster', 'said later', OPENER), timestamp: new Date(at + 60_000) } as any);
+    st.addActEvent(CH, move('expire', idAt(at), {}, 'acceptance'));
+
+    const rows = useStore.getState().channels.get(CH)!.messages.filter((m) => m.isSystem || m.id === 'm-later');
+    expect(rows.map((m) => m.id)).toEqual([idAt(at), 'm-later']);
+  });
+
+  it('says it once when the event is replayed', () => {
+    const st = useStore.getState();
+    st.addActEvent(CH, ev());
+    st.addActEvent(CH, move('expire', 'e2', {}, 'acceptance'));
+    st.addActEvent(CH, move('expire', 'e2', {}, 'acceptance'));
+
+    expect(useStore.getState().channels.get(CH)!.messages.filter((m) => m.isSystem)).toHaveLength(1);
+  });
+
+  it('leaves every other verb to its card', () => {
+    const st = useStore.getState();
+    st.addActEvent(CH, ev());
+    st.addActEvent(CH, move('progress', 'e2', { 'act-note': 'tagged the build' }));
+
+    expect(useStore.getState().channels.get(CH)!.messages.filter((m) => m.isSystem)).toHaveLength(0);
+  });
+});

@@ -13,6 +13,7 @@ import { LinkPreview } from './LinkPreview';
 import { MessageContextMenu } from './MessageContextMenu';
 import { MarkdownMessage } from './MarkdownRenderer';
 import { CoordinationEventCard, isCoordinationEvent } from './CoordinationCards';
+import { ActEventCard, useActCompanion } from './ActCards';
 import { jumbomojiSize } from '../lib/jumbomoji';
 import { buildTranscript } from '../lib/transcript';
 import { useCachedVerdict, VERIFY_LABELS } from '../lib/verify-signature';
@@ -421,6 +422,7 @@ function MessageContentImpl({ msg, channel, onNickClick }: {
   onNickClick?: (nick: string, did: string | undefined, origin: string | undefined, e: React.MouseEvent, evidence?: RowEvidence) => void;
 }) {
   const setLightbox = useStore((s) => s.setLightboxUrl);
+  const actCompanion = useActCompanion(msg, channel);
   const linkCtx: RenderCtx = { channel, onNickClick };
 
   if (msg.isAction) {
@@ -430,6 +432,11 @@ function MessageContentImpl({ msg, channel, onNickClick }: {
         <span style={{ color }} className="font-semibold not-italic">{'* '}{displayNameForKey(msg.from)}</span>{' '}{msg.text}
       </div>
     );
+  }
+
+  // A task event's companion line is that event's card, and stays one.
+  if (actCompanion) {
+    return <ActEventCard msg={msg} task={actCompanion.task} event={actCompanion.event} />;
   }
 
   // Coordination event cards (Phase 3)
