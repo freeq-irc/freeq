@@ -307,6 +307,98 @@ export function actCanonical(
   return canonicalize(covered);
 }
 
+/**
+ * The wire tags of a task event.
+ *
+ * `kind` and `verb` are what the event is and what it does; `task` names the
+ * action it is about, and is left out exactly for an opener, whose own event
+ * id becomes the action's id for the rest of its life. `from` is the actor.
+ * Every entry in `fields` rides as `act-<name>`, so `note` is `act-note` and
+ * `ctx-h` is `act-ctx-h`.
+ *
+ * Nothing here knows a verb. Which verbs a kind allows, and from which state,
+ * is the rules file's business — this builds the document a sender wants to
+ * sign, whatever it says. Byte-identical to `freeq_sdk::act::act_tags`.
+ */
+export function actTags(
+  kind: string,
+  verb: string,
+  task: string | undefined,
+  from: string,
+  fields: Record<string, string>,
+): Record<string, string> {
+  const tags: Record<string, string> = {
+    '+freeq.at/act': kind,
+    '+freeq.at/act-verb': verb,
+    '+freeq.at/from': from,
+  };
+  if (task !== undefined) tags['+freeq.at/act-id'] = task;
+  for (const [name, value] of Object.entries(fields)) {
+    tags[`+freeq.at/act-${name}`] = value;
+  }
+  return tags;
+}
+
+/**
+ * The line people read beside a task event, when the sender writes none.
+ *
+ * The companion is prose for a room, so it is the one place a verb has to be
+ * spelled out. Kept to a single function, with one arm per verb and the verb
+ * itself as the answer for anything it has not been taught: a kind may add a
+ * verb without touching this, and the room gets the verb's name until someone
+ * writes it a sentence.
+ *
+ * Byte-identical to `freeq_sdk::act::act_line`; the cross-language check
+ * compares both.
+ */
+export function actLine(
+  kind: string,
+  verb: string,
+  fields: Record<string, string>,
+): string {
+  const field = (name: string): string | undefined => fields[name] || undefined;
+  // What a room calls the thing being acted on. A handoff is a task in prose —
+  // it always has been in these lines — and every other kind is called by its
+  // own name.
+  const named = kind === 'handoff' ? 'task' : kind;
+  switch (verb) {
+    case 'offer':
+      return `offered: ${field('title') ?? ''}`;
+    case 'accept':
+      return `accepted the ${named}`;
+    case 'decline':
+      return `declined the ${named}`;
+    case 'claim':
+      return `claimed the ${named}`;
+    case 'progress': {
+      const note = field('note');
+      return note ? `progress: ${note}` : 'made progress';
+    }
+    case 'complete':
+      return `completed the ${named}`;
+    case 'fail':
+      return `failed the ${named}`;
+    case 'cancel':
+      return `cancelled the ${named}`;
+    case 'bid': {
+      const note = field('note');
+      return note ? `bid: ${note}` : 'bid on the bounty';
+    }
+    case 'award':
+      return 'awarded the bounty';
+    case 'submit':
+      return 'submitted the work';
+    case 'revise':
+      return 'asked for revisions';
+    case 'accept-work':
+      return 'accepted the work';
+    case 'forfeit':
+      return 'forfeited the bounty';
+    default:
+      return verb;
+  }
+}
+
 export async function deriveKid(rawPublicKey: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', rawPublicKey as unknown as ArrayBuffer);
   return b64url(new Uint8Array(digest).slice(0, 16));

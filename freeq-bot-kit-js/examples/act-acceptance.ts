@@ -18,8 +18,14 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FreeqBot } from '../src/index.js';
-import * as act from '../src/act-verbs.js';
+import { actTags } from '@freeq/sdk';
 import { verifyActTags } from '../src/act.js';
+
+/** Send a task event as `ctx`'s bot, with the line these tags deserve. */
+const send = (ctx, kind, verb, task, fields = {}) =>
+  ctx.client.sendAct(ctx.target, actTags(kind, verb, task, ctx.did, fields), {
+    taskId: task,
+  });
 
 const SERVER = process.env.FREEQ_SERVER_BIN ?? 'target/debug/freeq-server';
 const CHANNEL = '#acceptance';
@@ -120,7 +126,7 @@ async function main() {
 
     // ── a task that gets turned down ──
     step('decline', 'a directed offer the worker turns down');
-    const declined = await act.offer(poster.ctx, {
+    const declined = await send(poster.ctx, 'handoff', 'offer', undefined, {
       title: 'rewrite the changelog',
       to: worker.ctx.did,
     });
@@ -129,7 +135,7 @@ async function main() {
       (await openWork()).some((t) => t.act_id === declined && t.state === 'offered'),
       `offered — the API shows it as offered (${declined})`,
     );
-    await act.decline(worker.ctx, declined);
+    await send(worker.ctx, 'handoff', 'decline', declined);
     await sleep(700);
     check(!(await openWork()).some((t) => t.act_id === declined), 'declined — gone from open work');
     const declinedHistory = await api(`/api/v1/actions/${declined}`);
@@ -141,7 +147,7 @@ async function main() {
 
     // ── the full run ──
     step('offer', 'a second task, offered to the worker');
-    const task = await act.offer(poster.ctx, {
+    const task = await send(poster.ctx, 'handoff', 'offer', undefined, {
       title: 'ship the release',
       to: worker.ctx.did,
     });
@@ -150,7 +156,7 @@ async function main() {
 
     step('wrong sender', 'the poster tries to accept its own directed offer');
     poster.seen.fails.length = 0;
-    await act.accept(poster.ctx, task).catch(() => {});
+    await send(poster.ctx, 'handoff', 'accept', task).catch(() => {});
     await sleep(700);
     check(
       poster.seen.fails.some((l) => l.includes('WRONG_SENDER')),
@@ -162,7 +168,7 @@ async function main() {
     );
 
     step('accept', 'the worker takes it');
-    const acceptId = await act.accept(worker.ctx, task);
+    const acceptId = await send(worker.ctx, 'handoff', 'accept', task);
     await sleep(700);
     let row = (await openWork()).find((t) => t.act_id === task);
     check(row?.state === 'assigned', 'assigned');
@@ -170,7 +176,7 @@ async function main() {
 
     step('illegal step', 'the worker accepts a second time');
     worker.seen.fails.length = 0;
-    await act.accept(worker.ctx, task).catch(() => {});
+    await send(worker.ctx, 'handoff', 'accept', task).catch(() => {});
     await sleep(700);
     check(
       worker.seen.fails.some((l) => l.includes('ILLEGAL_STEP')),
@@ -178,7 +184,7 @@ async function main() {
     );
 
     step('progress', 'the worker reports in');
-    await act.progress(worker.ctx, task, { note: 'tagged the build' });
+    await send(worker.ctx, 'handoff', 'progress', task, { note: 'tagged the build' });
     await sleep(700);
     check(
       (await openWork()).find((t) => t.act_id === task)?.state === 'assigned',
@@ -186,7 +192,7 @@ async function main() {
     );
 
     step('complete', 'the worker finishes');
-    const completeId = await act.complete(worker.ctx, task);
+    const completeId = await send(worker.ctx, 'handoff', 'complete', task);
     await sleep(700);
     check(!(await openWork()).some((t) => t.act_id === task), 'completed — gone from open work');
     const full = await api(`/api/v1/actions/${task}`);
@@ -222,7 +228,7 @@ async function main() {
 
     // ── the revival relation ──
     step('replaces', 'the finished task is re-offered, naming what it revives');
-    const revived = await act.offer(poster.ctx, {
+    const revived = await send(poster.ctx, 'handoff', 'offer', undefined, {
       title: 'ship the release, again',
       to: worker.ctx.did,
       replaces: task,
@@ -239,7 +245,10 @@ async function main() {
 
     step('replaces refused', 'a re-offer naming a task that has not finished');
     poster.seen.fails.length = 0;
-    await act.offer(poster.ctx, { title: 'too soon', replaces: revived }).catch(() => {});
+    await send(poster.ctx, 'handoff', 'offer', undefined, {
+      title: 'too soon',
+      replaces: revived,
+    }).catch(() => {});
     await sleep(700);
     check(
       poster.seen.fails.some((l) => l.includes('REPLACES_NOT_TERMINAL')),
@@ -261,9 +270,8 @@ async function main() {
     step('bounty', 'a bounty two bots bid on, awarded to one of them');
     const rival = await spawnBot('acceptance-rival');
     await sleep(1500);
-    const bounty = await act.offer(poster.ctx, {
+    const bounty = await send(poster.ctx, 'bounty', 'offer', undefined, {
       title: 'index the archive',
-      kind: 'bounty',
     });
     await sleep(700);
     check(
@@ -271,8 +279,8 @@ async function main() {
       `open (${bounty})`,
     );
 
-    const workerBid = await act.bid(worker.ctx, bounty, { note: 'two days' });
-    await act.bid(rival.ctx, bounty, { note: 'one day, no sources' });
+    const workerBid = await send(worker.ctx, 'bounty', 'bid', bounty, { note: 'two days' });
+    await send(rival.ctx, 'bounty', 'bid', bounty, { note: 'one day, no sources' });
     await sleep(900);
     check(
       (await openWork()).find((t) => t.act_id === bounty)?.state === 'open',
@@ -285,7 +293,9 @@ async function main() {
     );
 
     step('award', 'the poster takes one of the bids');
-    const awardId = await act.award(poster.ctx, bounty, workerBid);
+    const awardId = await send(poster.ctx, 'bounty', 'award', bounty, {
+      accepts: workerBid,
+    });
     await sleep(700);
     const awarded = (await openWork()).find((t) => t.act_id === bounty);
     check(awarded?.state === 'assigned', 'assigned');
@@ -300,7 +310,7 @@ async function main() {
 
     step('the loser', 'the bot whose bid was not taken tries to hand work in');
     rival.seen.fails.length = 0;
-    await act.submit(rival.ctx, bounty).catch(() => {});
+    await send(rival.ctx, 'bounty', 'submit', bounty).catch(() => {});
     await sleep(700);
     check(
       rival.seen.fails.some((l) => l.includes('WRONG_SENDER')),
@@ -308,20 +318,20 @@ async function main() {
     );
 
     step('review', 'the winner hands the work in, and the poster sends it back');
-    await act.submit(worker.ctx, bounty);
+    await send(worker.ctx, 'bounty', 'submit', bounty);
     await sleep(700);
     check(
       (await openWork()).find((t) => t.act_id === bounty)?.state === 'under_review',
       'under review — handed in, not finished',
     );
     poster.seen.fails.length = 0;
-    await act.cancel(poster.ctx, bounty, { kind: 'bounty' }).catch(() => {});
+    await send(poster.ctx, 'bounty', 'cancel', bounty).catch(() => {});
     await sleep(700);
     check(
       poster.seen.fails.some((l) => l.includes('ILLEGAL_STEP')),
       'and delivered work is not the poster\'s to withdraw: ILLEGAL_STEP',
     );
-    await act.revise(poster.ctx, bounty);
+    await send(poster.ctx, 'bounty', 'revise', bounty);
     await sleep(700);
     check(
       (await openWork()).find((t) => t.act_id === bounty)?.state === 'assigned',
@@ -329,9 +339,9 @@ async function main() {
     );
 
     step('the poster accepts', 'the offerer\'s word is what ends a bounty');
-    await act.submit(worker.ctx, bounty);
+    await send(worker.ctx, 'bounty', 'submit', bounty);
     await sleep(700);
-    const bountyDone = await act.acceptWork(poster.ctx, bounty);
+    const bountyDone = await send(poster.ctx, 'bounty', 'accept-work', bounty);
     await sleep(700);
     check(!(await openWork()).some((t) => t.act_id === bounty), 'accepted — gone from open work');
     check(
@@ -342,7 +352,9 @@ async function main() {
     // ── expiry ──
     step('expiry', `a task nobody touches, swept after ${EXPIRY_SECS}s`);
     poster.seen.notices.length = 0;
-    const abandoned = await act.offer(poster.ctx, { title: 'nobody wants this' });
+    const abandoned = await send(poster.ctx, 'handoff', 'offer', undefined, {
+      title: 'nobody wants this',
+    });
     await sleep((EXPIRY_SECS + 5) * 1000);
     check(
       !(await openWork()).some((t) => t.act_id === abandoned),

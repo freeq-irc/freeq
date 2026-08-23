@@ -2,6 +2,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { ActEventPayload } from './types';
+import { actTags } from './signing';
 
 // ── WebSocket mock ────────────────────────────────────────────────
 
@@ -1306,6 +1307,119 @@ describe('inbound: coordinationEvent', () => {
     ws.recv('@+react=🎉 :alice TAGMSG #foo');
     await flushAsync();
     expect(seen).toHaveLength(0);
+  });
+});
+
+describe('outbound: sendAct', () => {
+  /** A registered client with a real session key, so a task event can be
+   *  signed and put on the wire. */
+  async function signingClient(): Promise<{
+    client: import('./client.js').FreeqClient;
+    ws: MockWebSocket;
+  }> {
+    const { FreeqClient } = await import('./client.js');
+    const client = new FreeqClient({
+      url: 'wss://test/irc',
+      nick: 'eliza',
+      skipInitialBrokerRefresh: true,
+    });
+    client.signing.setSigningDid('did:plc:eliza');
+    await client.signing.generateSigningKey();
+    client.connect();
+    await flushAsync();
+    const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    ws.recv(':srv CAP * LS :message-tags freeq.at/msgsig');
+    await flushAsync();
+    ws.recv(':srv CAP * ACK :message-tags freeq.at/msgsig');
+    await flushAsync();
+    ws.recv(':srv 001 eliza :Welcome');
+    await flushAsync();
+    ws.sent.length = 0;
+    return { client, ws };
+  }
+
+  async function settled(ws: MockWebSocket, match: string): Promise<void> {
+    for (let i = 0; i < 100; i++) {
+      if (ws.sent.some((l) => l.includes(match))) return;
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  }
+
+  const TASK = '01JABCDEF000000000000000EF';
+  const lines = (ws: MockWebSocket) => ws.sent.filter((l) => l.includes('PRIVMSG'));
+
+  it('asked for no line, sends the one the tags deserve', async () => {
+    const { client, ws } = await signingClient();
+    const id = await client.sendAct(
+      '#ops',
+      actTags('handoff', 'progress', TASK, 'did:plc:eliza', { note: 'halfway' }),
+    );
+    await settled(ws, 'PRIVMSG');
+    expect(id).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+    const companion = lines(ws)[0]!;
+    expect(companion).toContain(':progress: halfway');
+    // A follow-up's companion names the action, not this event.
+    expect(companion).toContain(`+freeq.at/ref=${TASK}`);
+  });
+
+  it("an opener's companion names the event it opened", async () => {
+    const { client, ws } = await signingClient();
+    const id = await client.sendAct(
+      '#ops',
+      actTags('handoff', 'offer', undefined, 'did:plc:eliza', { title: 'Cite 3 sources' }),
+    );
+    await settled(ws, 'PRIVMSG');
+    const companion = lines(ws)[0]!;
+    expect(companion).toContain(':offered: Cite 3 sources');
+    expect(companion).toContain(`+freeq.at/ref=${id}`);
+  });
+
+  it('an empty line sends the event and nothing else', async () => {
+    const { client, ws } = await signingClient();
+    await client.sendAct(
+      '#ops',
+      actTags('handoff', 'accept', TASK, 'did:plc:eliza', {}),
+      { humanText: '' },
+    );
+    await settled(ws, 'TAGMSG');
+    expect(ws.sent.some((l) => l.includes('TAGMSG'))).toBe(true);
+    expect(lines(ws)).toHaveLength(0);
+  });
+
+  it("a caller's own words are what the room reads", async () => {
+    const { client, ws } = await signingClient();
+    await client.sendAct(
+      '#ops',
+      actTags('handoff', 'accept', TASK, 'did:plc:eliza', {}),
+      { humanText: 'on it' },
+    );
+    await settled(ws, 'PRIVMSG');
+    expect(lines(ws)[0]!).toContain(':on it');
+  });
+
+  it('sends a kind and verb it has never heard of, signed', async () => {
+    // Which verbs a kind allows is the rules file's business; nothing in the
+    // send path reads either one.
+    const { client, ws } = await signingClient();
+    await client.sendAct(
+      '#ops',
+      actTags('lease', 'renew', TASK, 'did:plc:eliza', { term: '30d' }),
+    );
+    await settled(ws, 'PRIVMSG');
+    const event = ws.sent.find((l) => l.includes('TAGMSG'))!;
+    expect(event).toContain('+freeq.at/act=lease');
+    expect(event).toContain('+freeq.at/act-verb=renew');
+    expect(event).toContain('+freeq.at/sig=ed25519:');
+    // A verb with no sentence written for it is named, not described. A
+    // one-word body carries no leading colon on the wire.
+    expect(lines(ws)[0]!).toMatch(/PRIVMSG #ops renew$/);
+  });
+
+  it('refuses to send a task event it cannot sign', async () => {
+    const { client } = await makeRegistered();
+    await expect(
+      client.sendAct('#ops', actTags('handoff', 'claim', TASK, 'did:plc:eliza', {})),
+    ).rejects.toThrow('a task event must be signed');
   });
 });
 

@@ -66,33 +66,11 @@ export {
 } from "./act.js";
 export type { ActVerifyResult } from "./act.js";
 
-// The moves a bot can make on a task — one function per verb, each doing the
-// paired send (the signed task event, plus the line people read). A handoff's
-// first, then the ones only a bounty has. `expire` and `auto-accept` are
-// absent on purpose: only the server makes those moves.
-export {
-  offer,
-  accept,
-  decline,
-  claim,
-  progress,
-  complete,
-  fail,
-  cancel,
-  bid,
-  award,
-  submit,
-  revise,
-  acceptWork,
-  forfeit,
-} from "./act-verbs.js";
-export type {
-  ActContext,
-  OfferOptions,
-  StepOptions,
-  BidOptions,
-  AcceptWorkOptions,
-} from "./act-verbs.js";
+// Task sending is the SDK's, not bot-kit's: `client.sendAct` puts the event
+// on the wire and `actTags` from `@freeq/sdk` spells its tags. Which verbs a
+// kind allows is the rules file's business, read by the checker below — a
+// function per verb here would be a second copy of it, growing with every
+// kind.
 
 // The task lifecycle rules — which move is legal, from which state, by whom.
 // The rules are data (spec/act-transitions.json, copied into src/); this is

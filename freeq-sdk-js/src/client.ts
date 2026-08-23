@@ -3321,7 +3321,7 @@ export class FreeqClient extends EventEmitter {
   async sendAct(
     target: string,
     actTags: Record<string, string>,
-    opts: { humanText: string; taskId?: string } = { humanText: '' },
+    opts: { humanText?: string; taskId?: string } = {},
   ): Promise<string> {
     const eventId = signing.newEventId();
     const signed = await this.signing.signAct(target, actTags, eventId);
@@ -3337,11 +3337,29 @@ export class FreeqClient extends EventEmitter {
       [signing.SIG_TAG]: signed.sigTag,
     };
     this.raw(format('TAGMSG', [target], wireTags));
-    if (opts.humanText) {
+    // Three answers, not two: no `humanText` asks for the line these tags
+    // deserve, `''` asks for no companion at all, and anything else is the
+    // caller's own words.
+    const humanText =
+      opts.humanText ??
+      signing.actLine(
+        actTags['+freeq.at/act'] ?? '',
+        actTags['+freeq.at/act-verb'] ?? '',
+        Object.fromEntries(
+          Object.entries(actTags).flatMap(([name, value]) => {
+            const field = name.startsWith('+freeq.at/act-')
+              ? name.slice('+freeq.at/act-'.length)
+              : null;
+            return field === null ? [] : [[field, value] as [string, string]];
+          }),
+        ),
+      );
+    if (humanText) {
       // The companion is an ordinary message signing its own id, carrying
-      // only the reference that joins it to the task.
-      await this.writeSignedMessage('PRIVMSG', target, opts.humanText, {
-        '+freeq.at/ref': opts.taskId ?? eventId,
+      // only the reference that joins it to the action — the one it names,
+      // or itself when it names none.
+      await this.writeSignedMessage('PRIVMSG', target, humanText, {
+        '+freeq.at/ref': opts.taskId ?? actTags['+freeq.at/act-id'] ?? eventId,
       });
     }
     return eventId;
