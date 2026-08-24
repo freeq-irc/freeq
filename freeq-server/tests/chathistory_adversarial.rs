@@ -993,6 +993,224 @@ async fn chathistory_before_returns_older_messages() {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// CHATHISTORY msgid ANCHORS
+// ═══════════════════════════════════════════════════════════════
+
+/// The `time=` tag of a replayed line, truncated to the second the server
+/// stored it at — which is all the resolution a timestamp anchor has.
+fn second_of(line: &str) -> String {
+    let tags = line
+        .strip_prefix('@')
+        .and_then(|s| s.split_once(' ').map(|(t, _)| t))
+        .unwrap_or("");
+    for tag in tags.split(';') {
+        if let Some(val) = tag.strip_prefix("time=") {
+            return val.split('.').next().unwrap_or(val).to_string();
+        }
+    }
+    String::new()
+}
+
+/// Fill `channel` with `senders * 5` messages sent as fast as the wire
+/// carries them — 5 each is one session's flood budget, and the point is a
+/// burst dense enough that most of it shares a single stored second.
+fn burst(addr: SocketAddr, channel: &str, senders: usize) -> usize {
+    let mut clients: Vec<C> = (0..senders)
+        .map(|i| {
+            let mut c = C::with_caps(addr, &format!("bst{i}"));
+            c.reg();
+            c.tx(&format!("JOIN {channel}"));
+            c.num("366");
+            c.drain();
+            c
+        })
+        .collect();
+    for round in 0..5 {
+        for (i, c) in clients.iter_mut().enumerate() {
+            c.tx(&format!("PRIVMSG {channel} :burst {i} {round}"));
+        }
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    for c in &mut clients {
+        c.tx("QUIT :seeded");
+    }
+    drop(clients);
+    senders * 5
+}
+
+#[tokio::test]
+async fn chathistory_before_msgid_pages_a_same_second_burst_exactly_once() {
+    let r = resolver(vec![]);
+    let (addr, _h) = start(r).await;
+    run(addr, |addr| {
+        let sent = burst(addr, "#msgburst", 4);
+
+        let mut rdr = C::with_caps(addr, "mb_rdr");
+        rdr.reg();
+        rdr.drain();
+        rdr.tx("JOIN #msgburst");
+        rdr.num("366");
+        rdr.drain();
+
+        // The order the server itself serves, and the ids in it.
+        rdr.tx("CHATHISTORY LATEST #msgburst * 500");
+        let latest = rdr.collect_batch_messages();
+        assert_eq!(latest.len(), sent, "the burst should all be stored");
+        let ids: Vec<String> = latest.iter().map(|l| C::extract_msgid(l)).collect();
+        assert!(ids.iter().all(|id| !id.is_empty()), "every row has a msgid");
+
+        // The premise: rows really do share a second, so a timestamp anchor
+        // could not separate them.
+        let seconds: Vec<String> = latest.iter().map(|l| second_of(l)).collect();
+        let shared = seconds
+            .iter()
+            .filter(|s| seconds.iter().filter(|o| o == s).count() > 1)
+            .count();
+        assert!(
+            shared >= 2,
+            "burst should share a stored second: {seconds:?}"
+        );
+
+        // Walk back a page at a time, anchoring each request on the oldest
+        // row of the page before it.
+        let mut anchor = ids.last().unwrap().clone();
+        let mut walked: Vec<String> = vec![anchor.clone()];
+        for _ in 0..sent {
+            rdr.tx(&format!("CHATHISTORY BEFORE #msgburst msgid={anchor} 5"));
+            let page = rdr.collect_batch_messages();
+            if page.is_empty() {
+                break;
+            }
+            let page_ids: Vec<String> = page.iter().map(|l| C::extract_msgid(l)).collect();
+            for id in page_ids.iter().rev() {
+                walked.push(id.clone());
+            }
+            anchor = page_ids[0].clone();
+        }
+        walked.reverse();
+
+        assert_eq!(walked, ids, "no skipped rows, no repeated rows");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn chathistory_after_msgid_walks_forward_through_a_burst() {
+    let r = resolver(vec![]);
+    let (addr, _h) = start(r).await;
+    run(addr, |addr| {
+        let sent = burst(addr, "#msgfwd", 3);
+
+        let mut rdr = C::with_caps(addr, "mf_rdr");
+        rdr.reg();
+        rdr.drain();
+        rdr.tx("JOIN #msgfwd");
+        rdr.num("366");
+        rdr.drain();
+
+        rdr.tx("CHATHISTORY LATEST #msgfwd * 500");
+        let ids: Vec<String> = rdr
+            .collect_batch_messages()
+            .iter()
+            .map(|l| C::extract_msgid(l))
+            .collect();
+        assert_eq!(ids.len(), sent);
+
+        let mut anchor = ids.first().unwrap().clone();
+        let mut walked: Vec<String> = vec![anchor.clone()];
+        for _ in 0..sent {
+            rdr.tx(&format!("CHATHISTORY AFTER #msgfwd msgid={anchor} 4"));
+            let page = rdr.collect_batch_messages();
+            if page.is_empty() {
+                break;
+            }
+            let page_ids: Vec<String> = page.iter().map(|l| C::extract_msgid(l)).collect();
+            walked.extend(page_ids.iter().cloned());
+            anchor = page_ids.last().unwrap().clone();
+        }
+
+        assert_eq!(walked, ids);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn chathistory_unknown_msgid_fails_with_message_error() {
+    let r = resolver(vec![]);
+    let (addr, _h) = start(r).await;
+    run(addr, |addr| {
+        let mut alice = C::with_caps(addr, "unk_a");
+        alice.reg();
+        alice.drain();
+        alice.tx("JOIN #unknownid");
+        alice.num("366");
+        alice.drain();
+        alice.tx("PRIVMSG #unknownid :one");
+        std::thread::sleep(Duration::from_millis(200));
+        alice.drain();
+
+        for sub in ["BEFORE", "AFTER"] {
+            alice.tx(&format!(
+                "CHATHISTORY {sub} #unknownid msgid=01NOSUCHMESSAGE0000000000 50"
+            ));
+            let line = alice
+                .maybe(|l| l.contains("FAIL") || l.contains("BATCH"), 2000)
+                .unwrap_or_else(|| panic!("{sub} with an unknown msgid should answer"));
+            assert!(
+                line.contains("FAIL CHATHISTORY MESSAGE_ERROR")
+                    && line.contains(sub)
+                    && line.contains("#unknownid"),
+                "{sub}: {line}"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn chathistory_before_timestamp_still_pages_older_messages() {
+    let r = resolver(vec![]);
+    let (addr, _h) = start(r).await;
+    run(addr, |addr| {
+        let mut alice = C::with_caps(addr, "ts_a");
+        alice.reg();
+        alice.drain();
+        alice.tx("JOIN #tsanchor");
+        alice.num("366");
+        alice.drain();
+
+        // Two seconds apart, so a second-resolution anchor can separate them.
+        alice.tx("PRIVMSG #tsanchor :older");
+        std::thread::sleep(Duration::from_millis(2100));
+        alice.tx("PRIVMSG #tsanchor :newer");
+        std::thread::sleep(Duration::from_millis(300));
+        alice.drain();
+
+        alice.tx("CHATHISTORY LATEST #tsanchor * 50");
+        let latest = alice.collect_batch_messages();
+        assert_eq!(latest.len(), 2, "{latest:?}");
+        let newest_time = latest
+            .last()
+            .unwrap()
+            .strip_prefix('@')
+            .and_then(|s| s.split_once(' ').map(|(t, _)| t))
+            .and_then(|tags| {
+                tags.split(';')
+                    .find_map(|t| t.strip_prefix("time=").map(str::to_string))
+            })
+            .expect("server-time tag");
+
+        alice.tx(&format!(
+            "CHATHISTORY BEFORE #tsanchor timestamp={newest_time} 50"
+        ));
+        let page = alice.collect_batch_messages();
+        assert_eq!(page.len(), 1, "{page:?}");
+        assert!(page[0].ends_with("older"), "{}", page[0]);
+    })
+    .await;
+}
+
+// ═══════════════════════════════════════════════════════════════
 // CHATHISTORY AFTER KICK
 // ═══════════════════════════════════════════════════════════════
 

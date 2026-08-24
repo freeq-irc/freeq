@@ -2504,6 +2504,48 @@ fn parse_chathistory_ts(s: &str) -> Option<u64> {
         .map(|dt| dt.timestamp() as u64)
 }
 
+/// A CHATHISTORY selection parameter: `timestamp=<rfc3339>` or `msgid=<id>`.
+///
+/// Timestamps are stored at second resolution, so a timestamp anchor cannot
+/// separate two messages sent in the same second — paging by one either
+/// repeats that second's rows or steps over them. A msgid names one row.
+enum HistoryAnchor {
+    Timestamp(u64),
+    Msgid(String),
+}
+
+fn parse_chathistory_anchor(s: &str) -> Option<HistoryAnchor> {
+    if let Some(id) = s.strip_prefix("msgid=") {
+        return (!id.is_empty()).then(|| HistoryAnchor::Msgid(id.to_string()));
+    }
+    parse_chathistory_ts(s).map(HistoryAnchor::Timestamp)
+}
+
+/// `FAIL CHATHISTORY MESSAGE_ERROR <subcommand> <target> :…` — the reply the
+/// IRCv3 chathistory spec directs when no history can be returned because of
+/// an error, which is the case a msgid naming no stored row falls under.
+fn fail_message_error(
+    subcmd: &str,
+    target: &str,
+    state: &Arc<SharedState>,
+    server_name: &str,
+    session_id: &str,
+    send: &dyn Fn(&Arc<SharedState>, &str, String),
+) {
+    let reply = Message::from_server(
+        server_name,
+        "FAIL",
+        vec![
+            "CHATHISTORY",
+            "MESSAGE_ERROR",
+            subcmd,
+            target,
+            "Messages could not be retrieved",
+        ],
+    );
+    send(state, session_id, format!("{reply}\r\n"));
+}
+
 /// Resolve a CHATHISTORY/SEARCH target and authorize access.
 /// For channels: membership check. For DMs: auth check + canonical key.
 /// Returns (db_key, display_target); None means a FAIL was already sent.
@@ -2654,24 +2696,80 @@ pub(super) fn handle_chathistory(
                 if msg.params.len() < 4 {
                     (vec![], None)
                 } else {
-                    let ts = parse_chathistory_ts(&msg.params[2]).unwrap_or(u64::MAX);
                     let limit = msg.params[3].parse::<usize>().unwrap_or(50).min(500);
-                    let rows = state
-                        .with_db(|db| db.get_messages(&db_key, limit, Some(ts)))
-                        .unwrap_or_default();
-                    (rows, Some((0, secs(ts), limit)))
+                    match parse_chathistory_anchor(&msg.params[2]) {
+                        Some(HistoryAnchor::Msgid(id)) => {
+                            let Some(Some((ts, row_id))) =
+                                state.with_db(|db| db.history_cursor(&db_key, &id))
+                            else {
+                                fail_message_error(
+                                    &subcmd,
+                                    &target,
+                                    state,
+                                    server_name,
+                                    session_id,
+                                    send,
+                                );
+                                return;
+                            };
+                            let rows = state
+                                .with_db(|db| {
+                                    db.get_messages_before_cursor(&db_key, ts, row_id, limit)
+                                })
+                                .unwrap_or_default();
+                            (rows, Some((0, secs(ts), limit)))
+                        }
+                        anchor => {
+                            let ts = match anchor {
+                                Some(HistoryAnchor::Timestamp(ts)) => ts,
+                                _ => u64::MAX,
+                            };
+                            let rows = state
+                                .with_db(|db| db.get_messages(&db_key, limit, Some(ts)))
+                                .unwrap_or_default();
+                            (rows, Some((0, secs(ts), limit)))
+                        }
+                    }
                 }
             }
             "AFTER" => {
                 if msg.params.len() < 4 {
                     (vec![], None)
                 } else {
-                    let ts = parse_chathistory_ts(&msg.params[2]).unwrap_or(0);
                     let limit = msg.params[3].parse::<usize>().unwrap_or(50).min(500);
-                    let rows = state
-                        .with_db(|db| db.get_messages_after(&db_key, ts, limit))
-                        .unwrap_or_default();
-                    (rows, Some((secs(ts), i64::MAX, limit)))
+                    match parse_chathistory_anchor(&msg.params[2]) {
+                        Some(HistoryAnchor::Msgid(id)) => {
+                            let Some(Some((ts, row_id))) =
+                                state.with_db(|db| db.history_cursor(&db_key, &id))
+                            else {
+                                fail_message_error(
+                                    &subcmd,
+                                    &target,
+                                    state,
+                                    server_name,
+                                    session_id,
+                                    send,
+                                );
+                                return;
+                            };
+                            let rows = state
+                                .with_db(|db| {
+                                    db.get_messages_after_cursor(&db_key, ts, row_id, limit)
+                                })
+                                .unwrap_or_default();
+                            (rows, Some((secs(ts), i64::MAX, limit)))
+                        }
+                        anchor => {
+                            let ts = match anchor {
+                                Some(HistoryAnchor::Timestamp(ts)) => ts,
+                                _ => 0,
+                            };
+                            let rows = state
+                                .with_db(|db| db.get_messages_after(&db_key, ts, limit))
+                                .unwrap_or_default();
+                            (rows, Some((secs(ts), i64::MAX, limit)))
+                        }
+                    }
                 }
             }
             "LATEST" => {
