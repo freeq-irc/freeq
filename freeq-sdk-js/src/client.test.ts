@@ -955,6 +955,32 @@ describe('requestHistory', () => {
     expect(ws.sent).toContain('CHATHISTORY AFTER #foo msgid=xyz 50');
   });
 
+  it('opts.mode=before falls back to the timestamp anchor', async () => {
+    const { client, ws } = await makeRegistered();
+    client.requestHistory({
+      target: '#foo', mode: 'before', timestamp: '2026-08-24T12:00:00.000Z', count: 30,
+    });
+    expect(ws.sent).toContain('CHATHISTORY BEFORE #foo timestamp=2026-08-24T12:00:00.000Z 30');
+  });
+
+  it('opts.mode=after falls back to the timestamp anchor', async () => {
+    const { client, ws } = await makeRegistered();
+    client.requestHistory({
+      target: '#foo', mode: 'after', timestamp: '2026-08-24T12:00:00.000Z',
+    });
+    expect(ws.sent).toContain('CHATHISTORY AFTER #foo timestamp=2026-08-24T12:00:00.000Z 50');
+  });
+
+  it('prefers the msgid anchor when both are given', async () => {
+    const { client, ws } = await makeRegistered();
+    client.requestHistory({
+      target: '#foo', mode: 'before', msgid: 'abc',
+      timestamp: '2026-08-24T12:00:00.000Z', count: 10,
+    });
+    expect(ws.sent).toContain('CHATHISTORY BEFORE #foo msgid=abc 10');
+    expect(ws.sent.some((l: string) => l.includes('timestamp='))).toBe(false);
+  });
+
   it('opts.mode=before throws if msgid missing', async () => {
     const { client } = await makeRegistered();
     expect(() => client.requestHistory({ target: '#foo', mode: 'before' })).toThrow(/msgid/);

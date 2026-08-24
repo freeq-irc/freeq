@@ -352,10 +352,12 @@ export interface AgentDespawnedPayload {
 export interface HistoryOptions {
   target: string;
   mode: 'latest' | 'before' | 'after';
-  /** Required for mode='before' or 'after' unless `timestamp` is given. */
+  /** Required for mode='before' or 'after' unless `timestamp` is given.
+   *  Preferred over `timestamp` when both are supplied. */
   msgid?: string;
-  /** ISO 8601 timestamp. Alternative to `msgid` for 'before'/'after' modes
-   *  (CHATHISTORY supports either; some clients paginate by timestamp). */
+  /** ISO 8601 timestamp. The anchor used for 'before'/'after' when no
+   *  `msgid` is given. Second-resolution on the server, so it cannot
+   *  separate messages sent in the same second. */
   timestamp?: string;
   /** Default: 50. */
   count?: number;

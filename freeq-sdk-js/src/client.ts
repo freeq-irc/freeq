@@ -753,8 +753,13 @@ export class FreeqClient extends EventEmitter {
    *
    *  `opts.mode` selects:
    *    - 'latest' — most recent N messages
-   *    - 'before' — N messages before `opts.msgid`
-   *    - 'after'  — N messages after `opts.msgid`
+   *    - 'before' — N messages before the anchor
+   *    - 'after'  — N messages after the anchor
+   *
+   *  'before' and 'after' need an anchor: `opts.msgid` or `opts.timestamp`.
+   *  A msgid is preferred when both are given — it names one stored row,
+   *  where a timestamp is second-resolution and cannot separate messages
+   *  sent in the same second.
    */
   requestHistory(opts: HistoryOptions): void;
   /** @deprecated Use the `HistoryOptions` form. The two-arg form is kept
