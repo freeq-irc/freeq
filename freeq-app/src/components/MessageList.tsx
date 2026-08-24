@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback, useState, useMemo, memo } from 'react';
-import { useStore, uniqueMemberCount, type Message, type PinnedMessage } from '../store';
+import { useStore, uniqueMemberCount, MESSAGE_WINDOW, type Message, type PinnedMessage } from '../store';
 import { getNick, getClient, requestHistory, sendReaction, sendUnreact, joinChannel } from '../irc/client';
 import { fetchProfile, getCachedProfile, type ATProfile } from '../lib/profiles';
 import { isDid, isPeerBlocked } from '../lib/identity';
@@ -1255,14 +1255,20 @@ export function MessageList() {
   const [popover, setPopover] = useState<{ nick: string; did?: string; origin?: string; evidence?: RowEvidence; pos: { x: number; y: number } } | null>(null);
 
   // Track whether user has scrolled up (unstick from bottom)
+  const trimMessageWindow = useStore((s) => s.trimMessageWindow);
   const handleScroll = useCallback(() => {
     const el = ref.current;
     if (!el) return;
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
     stickToBottomRef.current = atBottom;
     setShowScrollBtn(!atBottom);
-    if (atBottom) setNewMsgCount(0);
-  }, []);
+    if (atBottom) {
+      setNewMsgCount(0);
+      // Scrolling up grows the held window past MESSAGE_WINDOW; back at the
+      // bottom those rows are out of reach again, so give them back.
+      if (rawMessages.length > MESSAGE_WINDOW) trimMessageWindow(activeChannel);
+    }
+  }, [activeChannel, rawMessages.length, trimMessageWindow]);
 
   // Scroll to bottom when messages change (if stuck to bottom), or count new messages
   const prevLenRef = useRef(messages.length);

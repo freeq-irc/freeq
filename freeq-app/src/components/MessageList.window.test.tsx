@@ -1,0 +1,132 @@
+// @vitest-environment jsdom
+/**
+ * Who gives the scrollback window back.
+ *
+ * Paging back grows a channel's held rows past the resting window, and the
+ * store keeps them until it is told to trim. MessageList owns the scroll
+ * position, so it is what tells the store — and only once the reader is
+ * back at the bottom, never while they are still reading above it.
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, cleanup, fireEvent } from '@testing-library/react';
+
+vi.mock('../irc/client', () => ({
+  getNick: () => 'me',
+  getClient: () => null,
+  requestHistory: vi.fn(),
+  sendReaction: vi.fn(),
+  sendUnreact: vi.fn(),
+  joinChannel: vi.fn(),
+}));
+
+const { MessageList } = await import('./MessageList');
+const { useStore, MESSAGE_WINDOW } = await import('../store');
+const client = await import('../irc/client');
+
+const s = () => useStore.getState();
+const held = (ch: string) => s().channels.get(ch.toLowerCase())!.messages;
+
+const LIVE_BASE = 10_000_000;
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  s().reset();
+});
+afterEach(cleanup);
+
+/** A channel holding `live` rows with an older page of `history` merged on
+ *  top of them — the state a reader reaches by scrolling up. */
+function channelWith(name: string, live: number, history: number) {
+  for (let i = 0; i < live; i++) {
+    s().addMessage(name, {
+      id: `live-${String(i).padStart(5, '0')}`, from: 'alice',
+      text: `row ${i}`, timestamp: new Date(LIVE_BASE + i), tags: {},
+    });
+  }
+  if (history > 0) {
+    s().mergeHistory(name, Array.from({ length: history }, (_, i) => ({
+      id: `page-${String(i).padStart(5, '0')}`, from: 'bob',
+      text: `old ${i}`, timestamp: new Date(LIVE_BASE - history + i), tags: {},
+    })));
+  }
+  s().setActiveChannel(name);
+}
+
+/** jsdom has no layout, so the scroll geometry is stated outright. */
+function scrollTo(el: HTMLElement, pos: 'top' | 'middle' | 'bottom') {
+  const scrollHeight = 20_000;
+  const clientHeight = 500;
+  const scrollTop = pos === 'top' ? 0 : pos === 'middle' ? 8_000 : scrollHeight - clientHeight;
+  for (const [prop, value] of [
+    ['scrollHeight', scrollHeight], ['clientHeight', clientHeight], ['scrollTop', scrollTop],
+  ] as const) {
+    Object.defineProperty(el, prop, { value, configurable: true, writable: true });
+  }
+  fireEvent.scroll(el);
+}
+
+function list() {
+  const { getByTestId } = render(<MessageList />);
+  return getByTestId('message-list');
+}
+
+describe('trimming the grown window', () => {
+  it('does not trim while the reader is scrolled back', () => {
+    channelWith('#read', MESSAGE_WINDOW, 50);
+    const el = list();
+    expect(held('#read').length).toBe(MESSAGE_WINDOW + 50);
+
+    scrollTo(el, 'middle');
+
+    expect(held('#read').length).toBe(MESSAGE_WINDOW + 50);
+    expect(held('#read')[0].id).toBe('page-00000');
+  });
+
+  it('does not trim at the top, where the next page is asked for', () => {
+    channelWith('#top', MESSAGE_WINDOW, 50);
+    const el = list();
+
+    scrollTo(el, 'top');
+
+    expect(held('#top').length).toBe(MESSAGE_WINDOW + 50);
+    expect(client.requestHistory).toHaveBeenCalledWith(
+      '#top', new Date(LIVE_BASE - 50).toISOString(),
+    );
+  });
+
+  it('trims to the newest rows once the reader is back at the bottom', () => {
+    channelWith('#back', MESSAGE_WINDOW, 50);
+    const el = list();
+    scrollTo(el, 'middle');
+    expect(held('#back').length).toBe(MESSAGE_WINDOW + 50);
+
+    scrollTo(el, 'bottom');
+
+    const rows = held('#back');
+    expect(rows.length).toBe(MESSAGE_WINDOW);
+    expect(rows.some((m) => m.id.startsWith('page-'))).toBe(false);
+  });
+
+  it('keeps the newest row through the trim', () => {
+    channelWith('#newest', MESSAGE_WINDOW, 50);
+    const el = list();
+    const newest = held('#newest')[MESSAGE_WINDOW + 49].id;
+
+    scrollTo(el, 'bottom');
+
+    const rows = held('#newest');
+    expect(rows.length).toBe(MESSAGE_WINDOW);
+    expect(rows[rows.length - 1].id).toBe(newest);
+    expect(el.querySelector(`#msg-${newest}`)).not.toBeNull();
+  });
+
+  it('leaves a channel below the window untouched', () => {
+    channelWith('#small', 100, 20);
+    const el = list();
+    const before = held('#small');
+
+    scrollTo(el, 'bottom');
+
+    expect(held('#small')).toBe(before);
+  });
+});
