@@ -8,6 +8,20 @@ import { setLastReadMsgId } from './lib/db';
  *  seconds, so this only expires someone who stopped without saying so. */
 export const TYPING_TIMEOUT_MS = 10_000;
 
+/** Rows a channel holds at rest — what a reader sitting at the bottom needs. */
+export const MESSAGE_WINDOW = 1000;
+/** Ceiling while a reader pages back: past it the oldest rows go first. */
+export const MESSAGE_WINDOW_MAX = 5000;
+
+/**
+ * The cap an append must respect. A window grown by scrolling back stays
+ * grown — trimming it belongs to `trimMessageWindow`, which runs when the
+ * reader returns to the bottom, not to whatever message arrives next.
+ */
+function appendCap(held: number): number {
+  return held > MESSAGE_WINDOW ? MESSAGE_WINDOW_MAX : MESSAGE_WINDOW;
+}
+
 export interface Message {
   id: string;
   from: string;
@@ -244,6 +258,9 @@ export interface Store {
   // Actions — messages
   addMessage: (channel: string, msg: Message) => void;
   mergeHistory: (channel: string, messages: Message[]) => void;
+  /** Drop back to the newest MESSAGE_WINDOW rows. Called when the reader
+   *  returns to the bottom, never while they are scrolled back. */
+  trimMessageWindow: (channel: string) => void;
   addSystemMessage: (channel: string, text: string) => void;
   editMessage: (channel: string, originalMsgId: string, newText: string, newMsgId?: string, isStreaming?: boolean, editorNick?: string, editorAccount?: string) => void;
   deleteMessage: (channel: string, msgId: string, deleterNick?: string, deleterAccount?: string) => void;
@@ -779,7 +796,7 @@ export const useStore = create<Store>((set, get) => ({
     // memoized components and shallow selectors.
     const ch: typeof base = {
       ...base,
-      messages: [...base.messages, msg].slice(-1000),
+      messages: [...base.messages, msg].slice(-appendCap(base.messages.length)),
       isJoined: base.isJoined || isDMBuf,
       unreadCount:
         !msg.isSystem && s.activeChannel.toLowerCase() !== key
@@ -859,8 +876,20 @@ export const useStore = create<Store>((set, get) => ({
       if (ta !== tb) return ta - tb;
       return (a.id || '').localeCompare(b.id || '');
     });
-    ch.messages = merged.slice(-1000);
+    // A history page is older than everything held, so capping at
+    // MESSAGE_WINDOW would drop the page that was just fetched. The window
+    // grows to hold it and only the total cap bounds it.
+    ch.messages = merged.slice(-MESSAGE_WINDOW_MAX);
     channels.set(channel.toLowerCase(), ch);
+    return { channels };
+  }),
+
+  trimMessageWindow: (channel) => set((s) => {
+    const key = channel.toLowerCase();
+    const ch = s.channels.get(key);
+    if (!ch || ch.messages.length <= MESSAGE_WINDOW) return {};
+    const channels = new Map(s.channels);
+    channels.set(key, { ...ch, messages: ch.messages.slice(-MESSAGE_WINDOW) });
     return { channels };
   }),
 
@@ -1051,8 +1080,9 @@ export const useStore = create<Store>((set, get) => ({
       return (a.id || '').localeCompare(b.id || '');
     });
 
-    // Batch messages go at the beginning (history)
-    ch.messages = [...newMsgs, ...ch.messages].slice(-1000);
+    // Batch messages go at the beginning (history) — same window rule as
+    // mergeHistory: keep the fetched page, bound only by the total cap.
+    ch.messages = [...newMsgs, ...ch.messages].slice(-MESSAGE_WINDOW_MAX);
     channels.set(batch.target.toLowerCase(), ch);
     return { channels, batches };
   }),

@@ -291,13 +291,14 @@ describe('message cap', () => {
     expect(ch.messages[ch.messages.length - 1].text).toBe('msg1000');
   });
 
-  it('batch merge with overflow drops oldest correctly', () => {
+  it('batch merge past the window keeps the fetched page', () => {
     ensureChannel('#batchbig');
     // Add 900 messages
     for (let i = 0; i < 900; i++) {
       useStore.getState().addMessage('#batchbig', mkMsg({ id: `exist-${i}`, text: `e${i}` }));
     }
-    // Start batch with 200 messages (total would be 1100)
+    // Start batch with 200 messages (total 1100 — past the resting window,
+    // which the reader grew by paging back; the page must not be discarded)
     useStore.getState().startBatch('big', 'chathistory', '#batchbig');
     for (let i = 0; i < 200; i++) {
       useStore.getState().addBatchMessage('big', mkMsg({
@@ -308,7 +309,8 @@ describe('message cap', () => {
     }
     useStore.getState().endBatch('big');
     const ch = useStore.getState().channels.get('#batchbig')!;
-    expect(ch.messages.length).toBeLessThanOrEqual(1000);
+    expect(ch.messages.length).toBe(1101); // 900 live + 200 history + the init row
+    expect(ch.messages.filter((m) => m.id.startsWith('batch-')).length).toBe(200);
   });
 });
 
@@ -455,7 +457,7 @@ describe('history batch merge ordering (FIXED)', () => {
       .toEqual(['mA', 'mB', 'mC']);
   });
 
-  it('caps merged result to 1000 most recent messages', () => {
+  it('grows the window past 1000 rather than dropping the merged history', () => {
     const s = () => useStore.getState();
     const ch = '#freeq';
     ensureChannel(ch);
@@ -479,10 +481,17 @@ describe('history batch merge ordering (FIXED)', () => {
     (s() as any).mergeHistory(ch, history);
 
     const msgs = s().channels.get(ch)!.messages;
-    expect(msgs.length).toBe(1000);
-    // Should retain the 1000 most recent (all 600 live + last 400 history).
+    // All 1200 are held: the window grew for the reader paging back, and
+    // only trimMessageWindow (on return to the bottom) drops rows again.
+    expect(msgs.length).toBe(1200);
     expect(msgs[msgs.length - 1].id).toBe('live-0599');
-    expect(msgs[0].id).toBe('hist-0200');
+    expect(msgs[0].id).toBe('hist-0000');
+
+    s().trimMessageWindow(ch);
+    const trimmed = s().channels.get(ch)!.messages;
+    expect(trimmed.length).toBe(1000);
+    expect(trimmed[trimmed.length - 1].id).toBe('live-0599');
+    expect(trimmed[0].id).toBe('hist-0200');
   });
 });
 
