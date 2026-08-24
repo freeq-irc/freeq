@@ -626,7 +626,7 @@ describe('requestWhois', () => {
     expect(ws.sent).toContain('WHOIS bob');
     ws.recv(':srv 311 alice bob ~user host.example * :Bob');
     ws.recv(':srv 330 alice bob did:plc:bob123 :is authenticated as');
-    ws.recv(':srv 671 alice bob bob.bsky.social :is using a registered handle');
+    ws.recv(':srv 671 alice bob :AT Protocol handle: bob.bsky.social');
     ws.recv(':srv 318 alice bob :End of WHOIS list');
     await flushAsync();
     const info = await promise;
@@ -636,6 +636,30 @@ describe('requestWhois', () => {
     expect(info.did).toBe('did:plc:bob123');
     expect(info.handle).toBe('bob.bsky.social');
     expect(typeof info.fetchedAt).toBe('number');
+  });
+
+  it('does not treat a "client:" 671 info line as the handle', async () => {
+    const { client, ws } = await makeRegistered();
+    const promise = client.requestWhois('guest1');
+    await flushAsync();
+    ws.recv(':srv 311 alice guest1 ~user host.example * :Guest');
+    ws.recv(':srv 671 alice guest1 :client: Hermes');
+    ws.recv(':srv 318 alice guest1 :End of WHOIS list');
+    await flushAsync();
+    const info = await promise;
+    expect(info.handle).toBeUndefined();
+  });
+
+  it('does not treat a "linked" 671 info line as the handle', async () => {
+    const { client, ws } = await makeRegistered();
+    const promise = client.requestWhois('bob');
+    await flushAsync();
+    ws.recv(':srv 311 alice bob ~user host.example * :Bob');
+    ws.recv(':srv 671 alice bob :linked github: bobdev');
+    ws.recv(':srv 318 alice bob :End of WHOIS list');
+    await flushAsync();
+    const info = await promise;
+    expect(info.handle).toBeUndefined();
   });
 
   it('rejects on timeout', async () => {
