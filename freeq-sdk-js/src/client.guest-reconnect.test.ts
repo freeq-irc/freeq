@@ -141,3 +141,133 @@ describe('guest auto-reconnect: channels', () => {
     expect(joins).toContain('JOIN #news');
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// Nick resume
+// ═══════════════════════════════════════════════════════════════════
+
+/** Registration lines the client sends on a fresh connection. */
+function nickLines(ws: MockWebSocket, nick: string): string[] {
+  return ws.sent.filter((l) => l === `NICK ${nick}`);
+}
+
+describe('guest auto-reconnect: nick', () => {
+  it('reclaims the same nick when 433 is the previous session still holding it', async () => {
+    vi.useFakeTimers();
+    const { FreeqClient } = await import('./client.js');
+    const client = new FreeqClient({ url: 'wss://test/irc', nick: 'visitor' });
+
+    client.connect();
+    const ws1 = MockWebSocket.instances[0];
+    await registerAsGuest(ws1, 'visitor');
+    expect(client.nick).toBe('visitor');
+
+    const ws2 = await autoReconnect(ws1);
+    expect(nickLines(ws2, 'visitor')).toHaveLength(1);
+
+    // The server hasn't reaped the dead session yet.
+    ws2.recv(':srv 433 * visitor :Nickname is already in use');
+    await flushAsync();
+    expect(
+      ws2.sent.find((l) => l.startsWith('NICK visitor_')),
+      'must not rename itself while the ghost may still clear',
+    ).toBeUndefined();
+    expect(nickLines(ws2, 'visitor'), 'the retry is on a backoff, not immediate').toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(600);
+    expect(nickLines(ws2, 'visitor'), 'the original nick is asked for again').toHaveLength(2);
+
+    // Ghost reaped: registration completes under the original nick.
+    ws2.recv(':srv CAP * LS :message-tags server-time');
+    await flushAsync();
+    ws2.recv(':srv 001 visitor :Welcome to freeq, visitor (guest)');
+    await flushAsync();
+
+    expect(client.nick).toBe('visitor');
+    expect(ws2.sent.some((l) => l.startsWith('NICK visitor_'))).toBe(false);
+  });
+
+  it('falls back to the suffix policy once the retry budget is spent', async () => {
+    vi.useFakeTimers();
+    const { FreeqClient } = await import('./client.js');
+    const client = new FreeqClient({ url: 'wss://test/irc', nick: 'visitor' });
+
+    client.connect();
+    const ws1 = MockWebSocket.instances[0];
+    await registerAsGuest(ws1, 'visitor');
+
+    const ws2 = await autoReconnect(ws1);
+
+    // Someone else genuinely holds the nick: every retry is refused.
+    for (const delay of [600, 1100, 2100]) {
+      ws2.recv(':srv 433 * visitor :Nickname is already in use');
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(delay);
+    }
+    expect(nickLines(ws2, 'visitor'), 'registration + three retries').toHaveLength(4);
+    expect(ws2.sent.some((l) => l.startsWith('NICK visitor_'))).toBe(false);
+
+    ws2.recv(':srv 433 * visitor :Nickname is already in use');
+    await flushAsync();
+    expect(
+      ws2.sent.find((l) => l === 'NICK visitor_'),
+      'budget spent — the existing collision policy takes over',
+    ).toBeDefined();
+
+    ws2.recv(':srv 001 visitor_ :Welcome to freeq, visitor_ (guest)');
+    await flushAsync();
+    expect(client.nick).toBe('visitor_');
+  });
+
+  it('a collision on a first connect renames immediately, as before', async () => {
+    vi.useFakeTimers();
+    const { FreeqClient } = await import('./client.js');
+    const client = new FreeqClient({ url: 'wss://test/irc', nick: 'visitor' });
+
+    client.connect();
+    const ws = MockWebSocket.instances[0];
+    await flushAsync();
+
+    ws.recv(':srv 433 * visitor :Nickname is already in use');
+    await flushAsync();
+
+    expect(
+      ws.sent.find((l) => l === 'NICK visitor_'),
+      'no session to resume: the nick belongs to someone else',
+    ).toBeDefined();
+  });
+
+  it('an authenticated session does not take the guest resume path', async () => {
+    // Its identity is the DID, and its resume path is SASL. The 433 handling
+    // it had before this stays exactly as it was.
+    vi.useFakeTimers();
+    const { FreeqClient } = await import('./client.js');
+    const client = new FreeqClient({
+      url: 'wss://test/irc',
+      nick: 'chad',
+      skipInitialBrokerRefresh: true,
+    });
+    client.setSaslCredentials({
+      token: 'tok',
+      did: 'did:plc:chad',
+      pdsUrl: 'https://pds.example',
+      method: 'pds-session',
+    });
+
+    client.connect();
+    const ws1 = MockWebSocket.instances[0];
+    await flushAsync();
+    // Server offers no sasl cap, so registration completes without a SASL
+    // exchange and we get a session to (not) resume.
+    ws1.recv(':srv CAP * LS :message-tags server-time');
+    await flushAsync();
+    ws1.recv(':srv 001 chad :Welcome to freeq, chad');
+    await flushAsync();
+
+    const ws2 = await autoReconnect(ws1);
+    ws2.recv(':srv 433 * chad :Nickname is already in use');
+    await flushAsync();
+
+    expect(ws2.sent.find((l) => l === 'NICK chad_')).toBeDefined();
+  });
+});

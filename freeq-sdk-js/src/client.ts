@@ -44,6 +44,14 @@ export const SIGNING_CAP = 'freeq.at/msgsig';
  */
 const ACT_EVENT_DEDUPE_MS = 10 * 60_000;
 
+/**
+ * Backoff for re-sending a guest's own nick after 433 on an automatic
+ * reconnect. A guest's nick is their whole identity, and the reconnect can
+ * arrive before the server has reaped the previous session holding it —
+ * a few seconds of retries outlast that race without stalling the reconnect.
+ */
+const GUEST_NICK_RESUME_DELAYS_MS = [500, 1000, 2000];
+
 export class FreeqClient extends EventEmitter {
   private transport: Transport | null = null;
   private _nick = '';
@@ -126,6 +134,15 @@ export class FreeqClient extends EventEmitter {
   }>>();
   /** Random-suffix nick collision retry counter. */
   private _nickCollisionRetries = 0;
+  /** Set on the first completed registration: a later connection on this
+   *  client is a reconnect, not a first connect. */
+  private _hadSession = false;
+  /** True between sending registration and 001 on the current connection. */
+  private _awaitingWelcome = false;
+  /** How many times the current connection has re-sent its own nick after
+   *  433, and the pending retry's timer. */
+  private _nickResumeAttempts = 0;
+  private _nickResumeTimer: ReturnType<typeof setTimeout> | null = null;
   /** Background heartbeat loop handle (set by startHeartbeat()). */
   private _agentHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   /** Recently-seen coordination event IDs (TAGMSG + companion PRIVMSG carry
@@ -202,6 +219,7 @@ export class FreeqClient extends EventEmitter {
       this.transport = null;
     }
     this._saslFailed = false;
+    this.clearNickResume();
 
     let lineQueue: Promise<void> = Promise.resolve();
     const serializedHandleLine = (line: string) => {
@@ -262,6 +280,9 @@ export class FreeqClient extends EventEmitter {
     this._seenCoordinationEvents.clear();
     this._seenActEvents.clear();
     this._nickCollisionRetries = 0;
+    this.clearNickResume();
+    this._hadSession = false;
+    this._awaitingWelcome = false;
     if (this._agentHeartbeatTimer) {
       clearInterval(this._agentHeartbeatTimer);
       this._agentHeartbeatTimer = null;
@@ -861,6 +882,25 @@ export class FreeqClient extends EventEmitter {
 
   // ── Internals ──
 
+  /** Whether a 433 should be answered by asking for the same nick again:
+   *  a guest registering on a reconnect, with retries left and none in
+   *  flight. A collision on a first connect is someone else's nick. */
+  private shouldResumeNick(): boolean {
+    return this._hadSession
+      && this._awaitingWelcome
+      && !this.sasl?.did
+      && this._nickResumeTimer === null
+      && this._nickResumeAttempts < GUEST_NICK_RESUME_DELAYS_MS.length;
+  }
+
+  private clearNickResume(): void {
+    if (this._nickResumeTimer) {
+      clearTimeout(this._nickResumeTimer);
+      this._nickResumeTimer = null;
+    }
+    this._nickResumeAttempts = 0;
+  }
+
   /**
    * A reconnect could not re-establish the authenticated identity *before any
    * SASL attempt* — the broker session refresh timed out or failed and we have
@@ -902,6 +942,7 @@ export class FreeqClient extends EventEmitter {
 
     if (state === 'connected') {
       this.ackedCaps.clear();
+      this.clearNickResume();
       let registrationSent = false;
 
       const sendRegistration = (token?: string) => {
@@ -910,6 +951,7 @@ export class FreeqClient extends EventEmitter {
         // onto a dead/replaced transport.
         if (registrationSent || !this.transport) return;
         registrationSent = true;
+        this._awaitingWelcome = true;
         if (token && this.sasl) this.sasl.token = token;
         this.raw('CAP LS 302');
         this.raw(`NICK ${this._nick}`);
@@ -1780,6 +1822,9 @@ export class FreeqClient extends EventEmitter {
         this.guestFallbackCount = 0;
         this._nick = serverNick;
         this._registered = true;
+        this._hadSession = true;
+        this._awaitingWelcome = false;
+        this.clearNickResume();
         this.emit('registered', this._nick);
         this.emit('nickChanged', this._nick);
 
@@ -1819,7 +1864,21 @@ export class FreeqClient extends EventEmitter {
       }
 
       case '433': {
-        // 433 ERR_NICKNAMEINUSE — apply onNickCollision policy.
+        // 433 ERR_NICKNAMEINUSE.
+        // On an automatic reconnect the nick in use is usually our own,
+        // still held by the previous session the server hasn't reaped yet.
+        // Ask for it again on a short backoff before renaming ourselves —
+        // for a guest, a rename is a change of identity.
+        if (this.shouldResumeNick()) {
+          const delay = GUEST_NICK_RESUME_DELAYS_MS[this._nickResumeAttempts];
+          this._nickResumeAttempts++;
+          this._nickResumeTimer = setTimeout(() => {
+            this._nickResumeTimer = null;
+            this.raw(`NICK ${this._nick}`);
+          }, delay);
+          break;
+        }
+        // Retries exhausted (or not a reconnect): apply onNickCollision policy.
         const policy = this.opts.onNickCollision ?? 'auto-suffix';
         if (policy === 'refuse') {
           this.emit('authError', `nick '${this._nick}' is already taken`);
