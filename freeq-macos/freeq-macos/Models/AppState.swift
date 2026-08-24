@@ -1727,6 +1727,11 @@ extension AppState {
 
     func handleEvent(_ event: FreeqEvent) {
         switch event {
+        case .act:
+            // A task event; the native card for it is upcoming work, so the
+            // event is deliberately ignored rather than unhandled.
+            break
+
         case .readMarker(let target, let timestamp):
             // draft/read-marker (S1) — cross-device read state. The unread
             // "New" line UI that consumes this is a later phase (§6.3);

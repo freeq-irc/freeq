@@ -2600,6 +2600,11 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
         guard let state = appState else { return }
 
         switch event {
+        case .act:
+            // A task event; the native card for it is upcoming work, so the
+            // event is deliberately ignored rather than unhandled.
+            break
+
         case .connected:
             print("[freeq.event] .connected")
             state.connectionState = .connected
