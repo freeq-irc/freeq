@@ -1,6 +1,6 @@
 import { useEffect, useRef, useCallback, useState, useMemo, memo } from 'react';
 import { useStore, uniqueMemberCount, MESSAGE_WINDOW, type Message, type PinnedMessage } from '../store';
-import { getNick, getClient, requestHistory, sendReaction, sendUnreact, joinChannel } from '../irc/client';
+import { getNick, getClient, requestHistory, sendReaction, sendUnreact, joinChannel, type HistoryAnchor } from '../irc/client';
 import { fetchProfile, getCachedProfile, type ATProfile } from '../lib/profiles';
 import { isDid, isPeerBlocked } from '../lib/identity';
 import { claimForMessage } from '@freeq/sdk';
@@ -1205,6 +1205,28 @@ function PinnedBar({ pins, messages }: { pins: PinnedMessage[]; messages: Messag
   );
 }
 
+/** Distance from the top at which the next page is worth asking for. */
+const NEAR_TOP_PX = 120;
+
+/** A server message id is a ULID. Anything else is a row the server sent no
+ *  msgid for (or one this client minted), which can only be anchored by
+ *  time. */
+const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/i;
+
+/** How to ask for the page older than everything in `msgs`.
+ *
+ *  The oldest row that came from someone — join/part notices carry no server
+ *  id — names the boundary. A msgid anchors it exactly; a timestamp is
+ *  second-resolution and is the fallback. */
+function historyAnchor(msgs: Message[]): HistoryAnchor | null {
+  for (const m of msgs) {
+    if (m.isSystem) continue;
+    if (m.id && ULID_RE.test(m.id)) return { msgid: m.id };
+    return { timestamp: m.timestamp.toISOString() };
+  }
+  return null;
+}
+
 export function MessageList() {
   const activeChannel = useStore((s) => s.activeChannel);
   const rawMessages = useStore((s) => {
@@ -1250,6 +1272,9 @@ export function MessageList() {
   const density = useStore((s) => s.messageDensity);
   const ref = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
+  const [atTop, setAtTop] = useState(false);
+  const historyEdge = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.historyEdge ?? 'unknown');
+  const historyFetching = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.historyFetching ?? false);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const [newMsgCount, setNewMsgCount] = useState(0);
   const [popover, setPopover] = useState<{ nick: string; did?: string; origin?: string; evidence?: RowEvidence; pos: { x: number; y: number } } | null>(null);
@@ -1262,6 +1287,7 @@ export function MessageList() {
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
     stickToBottomRef.current = atBottom;
     setShowScrollBtn(!atBottom);
+    setAtTop(el.scrollTop <= NEAR_TOP_PX);
     if (atBottom) {
       setNewMsgCount(0);
       // Scrolling up grows the held window past MESSAGE_WINDOW; back at the
@@ -1325,18 +1351,28 @@ export function MessageList() {
     return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); clearTimeout(t4); };
   }, [activeChannel]);
 
-  // Combined scroll handler: track stick-to-bottom + load history on scroll-to-top
-  const onScroll = useCallback(() => {
-    handleScroll();
+  // Ask for the page older than everything held. The boundary row's button
+  // and the auto-fetch below are the same request.
+  const loadOlder = useCallback(() => {
+    if (activeChannel === 'server') return;
+    const ch = useStore.getState().channels.get(activeChannel.toLowerCase());
+    if (!ch || ch.historyFetching || ch.historyEdge === 'start') return;
+    const anchor = historyAnchor(rawMessages);
+    if (!anchor) return;
+    requestHistory(activeChannel, anchor);
+  }, [activeChannel, rawMessages]);
+
+  // While the reader is at the top and older history may exist, keep asking.
+  //
+  // The condition is re-read after every change to the list, not only inside
+  // a scroll handler: a page prepending can leave the reader sitting at the
+  // top with no further scroll event to fire, which is what made the old
+  // trigger need a scroll down and back up to re-arm.
+  useEffect(() => {
     const el = ref.current;
-    if (!el || el.scrollTop > 50) return;
-    if (activeChannel !== 'server' && messages.length > 0) {
-      const oldest = messages[0];
-      if (!oldest.isSystem) {
-        requestHistory(activeChannel, oldest.timestamp.toISOString());
-      }
-    }
-  }, [activeChannel, messages, handleScroll]);
+    if (!el || el.scrollTop > NEAR_TOP_PX) return;
+    loadOlder();
+  }, [atTop, historyEdge, historyFetching, rawMessages, loadOlder]);
 
   // Clean block-copy: when a selection spans ≥2 message rows, rewrite the
   // clipboard to a tidy `Name: message` transcript instead of the raw DOM
@@ -1390,7 +1426,7 @@ export function MessageList() {
     <div key={activeChannel} ref={ref} data-testid="message-list" role="log" aria-label={`Messages in ${activeChannel}`} aria-live="polite" className={`flex-1 overflow-y-auto relative ${
       density === 'compact' ? 'text-[14px] [&_.msg-full]:pt-1.5 [&_.msg-full]:pb-0' :
       density === 'cozy' ? 'text-[16px] [&_.msg-full]:pt-4 [&_.msg-full]:pb-2' : ''
-    }`} onScroll={onScroll} onCopy={handleCleanCopy}>
+    }`} onScroll={handleScroll} onCopy={handleCleanCopy}>
       {activeChannel.startsWith('#') && pins.length > 0 && (
         <div className="sticky top-0 z-10">
           <PinnedBar pins={pins} messages={messages} />
@@ -1453,6 +1489,22 @@ export function MessageList() {
                 Direct messages are private between you and <span className="text-fg-muted">{displayNameForKey(activeChannel)}</span>.
               </div>
             </>
+          )}
+        </div>
+      )}
+      {activeChannel !== 'server' && messages.length > 0 && (
+        <div className="px-4 py-3 flex items-center justify-center" data-testid="history-boundary">
+          {historyFetching ? (
+            <span className="text-xs text-fg-dim">Loading older messages…</span>
+          ) : historyEdge === 'start' ? (
+            <span className="text-xs text-fg-dim">This is the beginning of the channel.</span>
+          ) : (
+            <button
+              className="text-xs text-accent hover:underline"
+              onClick={loadOlder}
+            >
+              Load older messages
+            </button>
           )}
         </div>
       )}

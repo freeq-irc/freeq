@@ -90,7 +90,7 @@ describe('trimming the grown window', () => {
 
     expect(held('#top').length).toBe(MESSAGE_WINDOW + 50);
     expect(client.requestHistory).toHaveBeenCalledWith(
-      '#top', new Date(LIVE_BASE - 50).toISOString(),
+      '#top', { timestamp: new Date(LIVE_BASE - 50).toISOString() },
     );
   });
 

@@ -340,13 +340,51 @@ export function sendWhois(userNick: string) {
   useStore.getState().markWhoisPending(userNick);
 }
 
-export function requestHistory(channel: string, beforeTimestamp?: string) {
-  if (!client) return;
-  if (beforeTimestamp) {
-    client.requestHistory({ target: channel, mode: 'before', timestamp: beforeTimestamp });
-  } else {
-    client.requestHistory({ target: channel, mode: 'latest' });
+/** Rows one page of history asks for. */
+export const HISTORY_PAGE = 50;
+
+/** How long a page has to arrive before the request is written off. A FAIL
+ *  (an anchor naming no stored row) or a dropped connection would otherwise
+ *  leave the channel loading forever. */
+const HISTORY_TIMEOUT_MS = 10_000;
+
+const historyTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function clearHistoryTimer(key: string) {
+  const t = historyTimers.get(key);
+  if (t !== undefined) {
+    clearTimeout(t);
+    historyTimers.delete(key);
   }
+}
+
+/** An anchor for the page of history older than what is already held. */
+export interface HistoryAnchor {
+  msgid?: string;
+  timestamp?: string;
+}
+
+/** Ask for history in `channel`. With an anchor, the page older than it;
+ *  without one, the most recent page. */
+export function requestHistory(channel: string, anchor?: HistoryAnchor) {
+  if (!client) return;
+  if (!anchor || (!anchor.msgid && !anchor.timestamp)) {
+    client.requestHistory({ target: channel, mode: 'latest', count: HISTORY_PAGE });
+    return;
+  }
+  const key = channel.toLowerCase();
+  useStore.getState().historyFetchStarted(channel);
+  clearHistoryTimer(key);
+  historyTimers.set(key, setTimeout(() => {
+    historyTimers.delete(key);
+    useStore.getState().historyFetchFailed(channel);
+  }, HISTORY_TIMEOUT_MS));
+  client.requestHistory({
+    target: channel,
+    mode: 'before',
+    count: HISTORY_PAGE,
+    ...anchor,
+  });
 }
 
 export function requestDmTargets(limit = 50) {
@@ -797,6 +835,12 @@ function wireEvents(c: FreeqClient) {
     // Prefetch avatars by DID for history messages
     const dids = messages.map((m: any) => m.tags?.account).filter(Boolean);
     if (dids.length) prefetchProfiles(dids);
+
+    // The count off the wire, before the store dedups it against what is
+    // already held — a short page is the only thing that means there is no
+    // more history. A no-op unless this channel had a page in flight.
+    clearHistoryTimer(channel.toLowerCase());
+    useStore.getState().historyPageReceived(channel, messages.length, HISTORY_PAGE);
 
     useStore.getState().mergeHistory(
       channel,
