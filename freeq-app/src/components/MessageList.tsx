@@ -1271,20 +1271,30 @@ export function MessageList() {
   }, [activeChannel, rawMessages.length, trimMessageWindow]);
 
   // Scroll to bottom when messages change (if stuck to bottom), or count new messages
-  const prevLenRef = useRef(messages.length);
+  const prevNewestRef = useRef({ channel: activeChannel, id: messages[messages.length - 1]?.id });
   useEffect(() => {
-    const added = messages.length - prevLenRef.current;
-    prevLenRef.current = messages.length;
-    if (!stickToBottomRef.current) {
-      if (added > 0) setNewMsgCount((c) => c + added);
+    const prev = prevNewestRef.current;
+    prevNewestRef.current = { channel: activeChannel, id: messages[messages.length - 1]?.id };
+    if (!stickToBottomRef.current && prev.channel === activeChannel) {
+      // Only rows below the row that was newest are new to this reader — a
+      // history page merged while they scroll back lands above them.
+      let added = 0;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].id === prev.id) break;
+        added++;
+      }
+      // Counting the whole list means that row is no longer held (or there
+      // was none): no baseline, so nothing to announce.
+      if (added > 0 && added < messages.length) setNewMsgCount((c) => c + added);
       return;
     }
+    if (!stickToBottomRef.current) return;
     const scrollBottom = () => {
       if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
     };
     // Double RAF ensures layout is complete after React render
     requestAnimationFrame(() => requestAnimationFrame(scrollBottom));
-  }, [messages.length, messages]);
+  }, [messages.length, messages, activeChannel]);
 
   // Always scroll to bottom on channel switch
   // Multiple timers to catch: initial render, layout, CHATHISTORY load
@@ -1292,7 +1302,6 @@ export function MessageList() {
     stickToBottomRef.current = true;
     setShowScrollBtn(false);
     setNewMsgCount(0);
-    prevLenRef.current = 0;
     const scrollBottom = () => {
       if (ref.current) {
         ref.current.scrollTop = ref.current.scrollHeight;

@@ -8,7 +8,7 @@
  * back at the bottom, never while they are still reading above it.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, cleanup, fireEvent } from '@testing-library/react';
+import { render, cleanup, fireEvent, act, screen } from '@testing-library/react';
 
 vi.mock('../irc/client', () => ({
   getNick: () => 'me',
@@ -128,5 +128,84 @@ describe('trimming the grown window', () => {
     scrollTo(el, 'bottom');
 
     expect(held('#small')).toBe(before);
+  });
+});
+
+describe('the new-message pill while the reader is scrolled back', () => {
+  /** Scroll away from the bottom and read the pill/jump button's label. */
+  function scrolledBack(name: string, live: number) {
+    channelWith(name, live, 0);
+    const el = list();
+    scrollTo(el, 'middle');
+    return el;
+  }
+
+  /** The jump/pill button, which only exists while the reader is away from
+   *  the bottom; its label is the count. */
+  const pillButton = () =>
+    screen.queryByRole('button', { name: /new message|Jump to bottom/ });
+  const pill = () => pillButton()?.textContent;
+
+  function liveMessage(name: string, id: string, offset: number) {
+    act(() => {
+      s().addMessage(name, {
+        id, from: 'carol', text: id, timestamp: new Date(LIVE_BASE + offset), tags: {},
+      });
+    });
+  }
+
+  function historyPage(name: string, n: number) {
+    act(() => {
+      s().mergeHistory(name, Array.from({ length: n }, (_, i) => ({
+        id: `older-${String(i).padStart(5, '0')}`, from: 'bob',
+        text: `older ${i}`, timestamp: new Date(LIVE_BASE - 10_000 + i), tags: {},
+      })));
+    });
+  }
+
+  it('offers the jump button with no count until something arrives', () => {
+    scrolledBack('#pill0', 10);
+    expect(pill()).toBe('Jump to bottom');
+  });
+
+  it('counts a live message', () => {
+    scrolledBack('#pill1', 10);
+    liveMessage('#pill1', 'new-1', 1_000);
+    expect(pill()).toBe('1 new message');
+    liveMessage('#pill1', 'new-2', 1_001);
+    expect(pill()).toBe('2 new messages');
+  });
+
+  it('does not count a merged history page', () => {
+    scrolledBack('#pill2', 10);
+    historyPage('#pill2', 50);
+    expect(pill()).toBe('Jump to bottom');
+  });
+
+  it('does not count a history page merged past the window', () => {
+    channelWith('#pill3', MESSAGE_WINDOW, 0);
+    const el = list();
+    scrollTo(el, 'middle');
+    historyPage('#pill3', 50);
+    expect(held('#pill3').length).toBe(MESSAGE_WINDOW + 50);
+    expect(pill()).toBe('Jump to bottom');
+  });
+
+  it('keeps counting live messages across a merged history page', () => {
+    scrolledBack('#pill4', 10);
+    liveMessage('#pill4', 'new-1', 1_000);
+    historyPage('#pill4', 50);
+    liveMessage('#pill4', 'new-2', 1_001);
+    expect(pill()).toBe('2 new messages');
+  });
+
+  it('clears the count when the reader returns to the bottom', () => {
+    const el = scrolledBack('#pill5', 10);
+    liveMessage('#pill5', 'new-1', 1_000);
+    expect(pill()).toBe('1 new message');
+
+    act(() => { scrollTo(el, 'bottom'); });
+
+    expect(pillButton()).toBeNull();
   });
 });
