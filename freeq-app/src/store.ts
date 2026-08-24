@@ -92,7 +92,21 @@ export interface Channel {
   /** Who is composing here, keyed by lowercased nick. A DM peer is on no
    *  member roster, so this cannot hang off {@link Member}. */
   typingUsers: Map<string, TypingUser>;
+  /** Whether anything older than the oldest held row still exists. */
+  historyEdge: HistoryEdge;
+  /** Whether a page of older history is on the wire right now. */
+  historyFetching: boolean;
 }
+
+/**
+ * What is above the oldest row a channel holds.
+ *
+ *  - `unknown` — nothing has been asked for yet, so the top of the loaded
+ *    list is indistinguishable from the start of the channel.
+ *  - `more` — the last page came back full, so there is more behind it.
+ *  - `start` — the last page came back short: that is the whole channel.
+ */
+export type HistoryEdge = 'unknown' | 'more' | 'start';
 
 /** One typer: the nick as it came off the wire, and when we last heard it. */
 export interface TypingUser {
@@ -261,6 +275,14 @@ export interface Store {
   /** Drop back to the newest MESSAGE_WINDOW rows. Called when the reader
    *  returns to the bottom, never while they are scrolled back. */
   trimMessageWindow: (channel: string) => void;
+  /** A page of older history has been asked for. */
+  historyFetchStarted: (channel: string) => void;
+  /** A page of older history came back: `received` rows against the
+   *  `limit` that was asked for. A no-op unless a fetch was in flight, so
+   *  history arriving for any other reason leaves the edge alone. */
+  historyPageReceived: (channel: string, received: number, limit: number) => void;
+  /** The page never came. The edge is left where it was. */
+  historyFetchFailed: (channel: string) => void;
   addSystemMessage: (channel: string, text: string) => void;
   editMessage: (channel: string, originalMsgId: string, newText: string, newMsgId?: string, isStreaming?: boolean, editorNick?: string, editorAccount?: string) => void;
   deleteMessage: (channel: string, msgId: string, deleterNick?: string, deleterAccount?: string) => void;
@@ -362,6 +384,8 @@ function getOrCreateChannel(channels: Map<string, Channel>, name: string): Chann
       isJoined: false,
       pins: [],
       typingUsers: new Map(),
+      historyEdge: 'unknown',
+      historyFetching: false,
     };
     channels.set(key, ch);
   }
@@ -789,6 +813,8 @@ export const useStore = create<Store>((set, get) => ({
       isJoined: false,
       pins: [],
       typingUsers: new Map(),
+      historyEdge: 'unknown',
+      historyFetching: false,
     };
     // Always produce a fresh Channel object so subscribers comparing
     // channel identity (Sidebar, MessageList children, etc.) see a new
@@ -890,6 +916,39 @@ export const useStore = create<Store>((set, get) => ({
     if (!ch || ch.messages.length <= MESSAGE_WINDOW) return {};
     const channels = new Map(s.channels);
     channels.set(key, { ...ch, messages: ch.messages.slice(-MESSAGE_WINDOW) });
+    return { channels };
+  }),
+
+  historyFetchStarted: (channel) => set((s) => {
+    const channels = new Map(s.channels);
+    const ch = getOrCreateChannel(channels, channel);
+    if (ch.historyFetching) return {};
+    channels.set(channel.toLowerCase(), { ...ch, historyFetching: true });
+    return { channels };
+  }),
+
+  historyPageReceived: (channel, received, limit) => set((s) => {
+    const key = channel.toLowerCase();
+    const ch = s.channels.get(key);
+    if (!ch || !ch.historyFetching) return {};
+    // The count off the wire, not the rows the store kept: a page that
+    // overlaps what is already held dedups down to nothing while more
+    // history still sits behind it.
+    const channels = new Map(s.channels);
+    channels.set(key, {
+      ...ch,
+      historyFetching: false,
+      historyEdge: received < limit ? 'start' : 'more',
+    });
+    return { channels };
+  }),
+
+  historyFetchFailed: (channel) => set((s) => {
+    const key = channel.toLowerCase();
+    const ch = s.channels.get(key);
+    if (!ch || !ch.historyFetching) return {};
+    const channels = new Map(s.channels);
+    channels.set(key, { ...ch, historyFetching: false });
     return { channels };
   }),
 
