@@ -1501,7 +1501,12 @@ export function MessageList() {
           ))}
         </div>
       )}
-      {messages.length === 0 && !showSkeleton && (
+      {/* The empty state owns the beginning line, so it has to render for a
+          channel whose only rows are join and part notices — the boundary row
+          is suppressed there precisely because it can do nothing. The server
+          tab keeps its own test: its rows are system rows by nature, and
+          `hasSenderRows` would be false over a full log. */}
+      {(activeChannel === 'server' ? messages.length === 0 : !hasSenderRows) && !showSkeleton && (
         <div className="flex flex-col items-center justify-center h-full text-fg-dim px-8">
           <img src="/freeq.png" alt="freeq" className="w-14 h-14 mb-4 opacity-20" />
           {activeChannel === 'server' ? (

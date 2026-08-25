@@ -13,7 +13,7 @@
  * scroll walks the whole channel.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, cleanup, fireEvent, act, screen } from '@testing-library/react';
+import { render, cleanup, fireEvent, act, screen, waitFor } from '@testing-library/react';
 
 vi.mock('../irc/client', () => ({
   getNick: () => 'me',
@@ -192,6 +192,43 @@ describe('the boundary row', () => {
 
     expect(s().channels.get('bob')!.historyEdge).toBe('start');
     expect(boundary().textContent).toBe('This is the beginning of the conversation.');
+  });
+
+  it('leaves the beginning line to the empty state in a notices-only channel', async () => {
+    // The row is suppressed there because it can do nothing, so something
+    // else has to say where the channel begins.
+    s().addSystemMessage('#nobody', 'alice joined');
+    s().addSystemMessage('#nobody', 'alice left');
+    s().setActiveChannel('#nobody');
+    const el = list();
+    scrollTo(el, 'middle');
+    act(() => { s().historyOpeningPage('#nobody', 0, PAGE); });
+
+    // Activation shows a skeleton for the first moments; the empty state is
+    // what stands once it clears.
+    await waitFor(() => expect(el.textContent).toContain('This is the beginning of'));
+
+    expect(screen.queryByTestId('history-boundary')).toBeNull();
+    expect(el.textContent).toContain('#nobody');
+    expect(el.textContent, 'the notices are still there').toContain('alice joined');
+  });
+
+  it('keeps the empty state away from a channel that holds messages', () => {
+    channelWith('#full', 3);
+    const el = list();
+
+    expect(el.textContent).not.toContain('This is the beginning of');
+  });
+
+  it('leaves the server buffer to its own rows, which are all system rows', () => {
+    // Every line on the server tab is a system row, so the sender test would
+    // put the welcome over a full log.
+    s().addSystemMessage('server', 'MOTD line');
+    act(() => { s().setActiveChannel('server'); });
+    const { container } = render(<MessageList />);
+
+    expect(container.textContent).toContain('MOTD line');
+    expect(container.textContent).not.toContain('Welcome to freeq');
   });
 
   it('is not rendered once a channel of only notices is known to be empty', () => {
