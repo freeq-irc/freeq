@@ -157,6 +157,24 @@ describe('a page of history the bridge asked for', () => {
     expect(ch('#other')!.historyFetching).toBe(true);
   });
 
+  it('ends a DM with a guest peer at the button', () => {
+    // A signed-in reader's conversation with a guest has no canonical key —
+    // it is built from two DIDs and the guest has none — so the server
+    // answers INVALID_TARGET. The row has to end there rather than load on.
+    const client = connected();
+    seed('gp_guest');
+    bridge.requestHistory('gp_guest', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    client.emit(
+      'serverFail',
+      'CHATHISTORY INVALID_TARGET gp_guest Unknown target',
+    );
+
+    expect(ch('gp_guest')!.historyFetching).toBe(false);
+    expect(ch('gp_guest')!.historyAutoPaused).toBe(true);
+    expect(ch('gp_guest')!.historyEdge, 'nothing was learned about the history').toBe('unknown');
+  });
+
   it('matches the target however the server cased it', () => {
     const client = connected();
     seed('#Cased');

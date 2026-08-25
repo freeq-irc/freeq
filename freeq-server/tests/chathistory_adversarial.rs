@@ -884,6 +884,52 @@ async fn dm_chathistory_between_authenticated_users() {
 }
 
 #[tokio::test]
+async fn dm_chathistory_with_a_guest_peer_answers_invalid_target() {
+    let key_a = PrivateKey::generate_ed25519();
+    let r = resolver(vec![(DID_A, &key_a)]);
+    let (addr, _h) = start(r).await;
+    run(addr, move |addr| {
+        // A signed-in user asking about a conversation with a guest. There is
+        // no canonical key for it — the key is built from two DIDs and the
+        // guest has none — so there is no history to serve and no way to
+        // serve it. This test states what the server answers today.
+        let mut alice = C::with_sasl(addr, "gp_alice", DID_A, key_a);
+        alice.reg();
+        alice.drain();
+
+        let mut guest = C::with_caps(addr, "gp_guest");
+        guest.reg();
+        guest.drain();
+        std::thread::sleep(Duration::from_millis(200));
+
+        alice.tx("CHATHISTORY LATEST gp_guest * 50");
+        let line = alice
+            .maybe(|l| l.contains("FAIL") || l.contains("BATCH"), 2000)
+            .expect("the request should be answered");
+        assert!(
+            line.contains("FAIL CHATHISTORY INVALID_TARGET") && line.contains("gp_guest"),
+            "{line}"
+        );
+
+        // And the same for the paging subcommands a client's boundary row
+        // sends, so nothing about it is left hanging.
+        for sub in ["BEFORE", "AFTER"] {
+            alice.tx(&format!(
+                "CHATHISTORY {sub} gp_guest timestamp=2026-08-24T12:00:00.000Z 50"
+            ));
+            let line = alice
+                .maybe(|l| l.contains("FAIL") || l.contains("BATCH"), 2000)
+                .unwrap_or_else(|| panic!("{sub} should be answered"));
+            assert!(
+                line.contains("FAIL CHATHISTORY INVALID_TARGET"),
+                "{sub}: {line}"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn dm_chathistory_third_party_cannot_read() {
     let key_a = PrivateKey::generate_ed25519();
     let key_b = PrivateKey::generate_ed25519();
