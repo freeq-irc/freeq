@@ -1,0 +1,233 @@
+// @vitest-environment jsdom
+/**
+ * How the bridge resolves a page of history it asked for.
+ *
+ * A request is armed as it goes out and has to end somewhere: the batch, a
+ * refusal from the server, or — only when nothing comes back at all — the
+ * timer. What must never happen is that it ends nowhere, because the row
+ * above the oldest message reads "Loading older messages…" until it does.
+ */
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+// jsdom supplies window, document and localStorage; only randomUUID is missing.
+Object.defineProperty(globalThis, 'crypto', {
+  value: { randomUUID: () => 'uuid-' + Math.random().toString(36).slice(2), subtle: {} },
+  writable: true, configurable: true,
+});
+
+type Handler = (...args: any[]) => void;
+
+/** Enough of FreeqClient for the bridge to wire itself to, plus a way to
+ *  push events back at it and to read what it put on the wire. */
+class MockFreeqClient {
+  static latest: MockFreeqClient | null = null;
+  handlers = new Map<string, Handler[]>();
+  history: Array<Record<string, unknown>> = [];
+  nick = 'me';
+  joinedChannels = new Set<string>();
+  nickToDid: unknown = null;
+  constructor(public opts: any) { MockFreeqClient.latest = this; }
+  on(event: string, fn: Handler) {
+    const list = this.handlers.get(event) ?? [];
+    list.push(fn);
+    this.handlers.set(event, list);
+  }
+  emit(event: string, ...args: any[]) {
+    for (const fn of this.handlers.get(event) ?? []) fn(...args);
+  }
+  requestHistory(opts: Record<string, unknown>) { this.history.push(opts); }
+  requestHistoryTargets() { /* not under test */ }
+  setSaslCredentials() { /* not under test */ }
+  connect() { /* no-op */ }
+  disconnect() { /* no-op */ }
+  getNickForDid() { return undefined; }
+}
+
+vi.mock('@freeq/sdk', () => ({
+  FreeqClient: MockFreeqClient,
+  format: {},
+  prefetchProfiles: () => {},
+  claimForMessage: () => undefined,
+}));
+
+const bridge = await import('./client');
+const { useStore } = await import('../store');
+
+const s = () => useStore.getState();
+const ch = (name: string) => s().channels.get(name.toLowerCase());
+
+/** A connected bridge, with the mock client it wired itself to. */
+function connected(): MockFreeqClient {
+  bridge.connect('wss://test/irc', 'me', []);
+  return MockFreeqClient.latest!;
+}
+
+/** One row, so the channel exists and has something to anchor on. */
+function seed(channel: string) {
+  s().addMessage(channel, {
+    id: '01M0AAAAAAAAAAAAAAAAAAAA01', from: 'alice',
+    text: 'hi', timestamp: new Date(1_700_000_000_000), tags: {},
+  });
+}
+
+beforeEach(() => {
+  vi.useFakeTimers();
+  localStorage.clear();
+  s().reset();
+  MockFreeqClient.latest = null;
+});
+afterEach(() => {
+  vi.runOnlyPendingTimers();
+  vi.useRealTimers();
+});
+
+describe('a page of history the bridge asked for', () => {
+  it('is armed as the request goes out', () => {
+    const client = connected();
+    seed('#armed');
+    bridge.requestHistory('#armed', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    expect(ch('#armed')!.historyFetching).toBe(true);
+    expect(client.history.at(-1)).toMatchObject({
+      target: '#armed', mode: 'before', msgid: '01M0AAAAAAAAAAAAAAAAAAAA01',
+    });
+  });
+
+  it('ends on the batch, and the timer does not fire afterwards', () => {
+    const client = connected();
+    seed('#batch');
+    bridge.requestHistory('#batch', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    client.emit('historyBatch', '#batch', []);
+
+    expect(ch('#batch')!.historyFetching).toBe(false);
+    expect(ch('#batch')!.historyEdge).toBe('start');
+
+    vi.advanceTimersByTime(60_000);
+    expect(ch('#batch')!.historyFetching).toBe(false);
+    expect(ch('#batch')!.historyEdge).toBe('start');
+  });
+
+  it('ends at once on a CHATHISTORY refusal, without waiting for the timer', () => {
+    const client = connected();
+    seed('#refused');
+    bridge.requestHistory('#refused', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    client.emit(
+      'serverFail',
+      'CHATHISTORY ACCOUNT_REQUIRED #refused You must be authenticated to access DM history',
+    );
+
+    expect(ch('#refused')!.historyFetching).toBe(false);
+    expect(ch('#refused')!.historyAutoPaused).toBe(true);
+    expect(ch('#refused')!.historyEdge).toBe('unknown');
+  });
+
+  it('ends at once on MESSAGE_ERROR, whose target sits after the subcommand', () => {
+    const client = connected();
+    seed('#unknownid');
+    bridge.requestHistory('#unknownid', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    client.emit(
+      'serverFail',
+      'CHATHISTORY MESSAGE_ERROR BEFORE #unknownid Messages could not be retrieved',
+    );
+
+    expect(ch('#unknownid')!.historyFetching).toBe(false);
+    expect(ch('#unknownid')!.historyAutoPaused).toBe(true);
+  });
+
+  it('leaves a channel alone when the refusal names a different one', () => {
+    const client = connected();
+    seed('#mine');
+    bridge.requestHistory('#mine', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    client.emit('serverFail', 'CHATHISTORY INVALID_TARGET #someone-elses No such channel');
+
+    expect(ch('#mine')!.historyFetching, 'still waiting on our own page').toBe(true);
+  });
+
+  it('leaves a channel alone for a FAIL that is not about history', () => {
+    const client = connected();
+    seed('#other');
+    bridge.requestHistory('#other', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    client.emit('serverFail', 'JOIN INVALID_TARGET #other Bad channel');
+
+    expect(ch('#other')!.historyFetching).toBe(true);
+  });
+
+  it('matches the target however the server cased it', () => {
+    const client = connected();
+    seed('#Cased');
+    bridge.requestHistory('#Cased', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    client.emit('serverFail', 'CHATHISTORY ACCOUNT_REQUIRED #CASED nope');
+
+    expect(ch('#cased')!.historyFetching).toBe(false);
+  });
+});
+
+describe('a page that never comes back', () => {
+  it('is written off by the timer, and leaves the button', () => {
+    connected();
+    seed('#silent');
+    bridge.requestHistory('#silent', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+    expect(ch('#silent')!.historyFetching).toBe(true);
+
+    vi.advanceTimersByTime(10_000);
+
+    expect(ch('#silent')!.historyFetching).toBe(false);
+    expect(ch('#silent')!.historyAutoPaused).toBe(true);
+  });
+
+  it('survives the reader leaving the channel and coming back', () => {
+    // Switching away does not cancel the request, and nothing else will
+    // answer it — so the buffer has to end somewhere by itself.
+    connected();
+    seed('#away');
+    seed('#elsewhere');
+    s().setActiveChannel('#away');
+    bridge.requestHistory('#away', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    s().setActiveChannel('#elsewhere');
+    vi.advanceTimersByTime(10_000);
+    s().setActiveChannel('#away');
+
+    expect(ch('#away')!.historyFetching).toBe(false);
+    expect(ch('#away')!.historyAutoPaused).toBe(true);
+  });
+
+  it('ends at the button when the connection drops mid-flight', () => {
+    // The drop itself resolves nothing — there is no handler that cancels a
+    // page in flight — so this is the timer's job, and the ten seconds are
+    // the cost. What matters for the row is that it does end.
+    const client = connected();
+    seed('#dropped');
+    bridge.requestHistory('#dropped', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    client.emit('connectionStateChanged', 'disconnected');
+    expect(ch('#dropped')!.historyFetching, 'the drop alone does not answer it').toBe(true);
+
+    vi.advanceTimersByTime(10_000);
+
+    expect(ch('#dropped')!.historyFetching).toBe(false);
+    expect(ch('#dropped')!.historyAutoPaused).toBe(true);
+  });
+
+  it('does not write off a page that already landed', () => {
+    const client = connected();
+    seed('#landed');
+    bridge.requestHistory('#landed', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+    client.emit('historyBatch', '#landed', Array.from({ length: 50 }, (_, i) => ({
+      id: `01M0BBBBBBBBBBBBBBBBBBBB${String(i).padStart(2, '0')}`, from: 'bob',
+      text: `old ${i}`, timestamp: new Date(1_600_000_000_000 + i), tags: {},
+    })));
+    expect(ch('#landed')!.historyEdge).toBe('more');
+    expect(ch('#landed')!.historyAutoPaused).toBe(false);
+
+    vi.advanceTimersByTime(60_000);
+
+    expect(ch('#landed')!.historyAutoPaused, 'the timer was cancelled with the batch').toBe(false);
+  });
+});

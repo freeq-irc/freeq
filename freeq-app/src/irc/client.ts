@@ -358,6 +358,20 @@ function clearHistoryTimer(key: string) {
   }
 }
 
+/** The channel a `FAIL CHATHISTORY …` answers, if we are waiting on a page
+ *  for it.
+ *
+ *  The parameter that names the target sits in a different position per
+ *  error code, so rather than parse by code this matches the targets we
+ *  actually have a page out for. A FAIL for anything else is not ours to
+ *  act on. */
+function pendingHistoryTargetIn(text: string): string | null {
+  if (!text.startsWith('CHATHISTORY ')) return null;
+  const tokens = new Set(text.toLowerCase().split(/\s+/));
+  for (const key of historyTimers.keys()) if (tokens.has(key)) return key;
+  return null;
+}
+
 /** An anchor for the page of history older than what is already held. */
 export interface HistoryAnchor {
   msgid?: string;
@@ -807,6 +821,15 @@ function wireEvents(c: FreeqClient) {
   });
 
   c.on('serverFail', (text) => {
+    // A refusal is an answer. Resolving it here rather than waiting out the
+    // timer is what turns an old server's ACCOUNT_REQUIRED, or an anchor it
+    // does not know, into the button at once instead of ten seconds of
+    // spinner. The timer stays as the backstop for silence.
+    const pending = pendingHistoryTargetIn(text);
+    if (pending) {
+      clearHistoryTimer(pending);
+      useStore.getState().historyFetchFailed(pending);
+    }
     // Server rejected an action (FAIL <cmd> <code> <desc>). Show it where
     // the user is looking — silent rejections are undebuggable. Exception:
     // background history probes (speculative CHATHISTORY on opening a
