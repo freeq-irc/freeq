@@ -2729,7 +2729,7 @@ pub(super) fn handle_chathistory(
                     let limit = msg.params[3].parse::<usize>().unwrap_or(50).min(500);
                     match parse_chathistory_anchor(&msg.params[2]) {
                         Some(HistoryAnchor::Msgid(id)) => {
-                            let Some(Some((ts, row_id))) =
+                            let Some(Some((ts, cursor_id))) =
                                 state.with_db(|db| db.history_cursor(&db_key, &id))
                             else {
                                 fail_message_error(
@@ -2744,7 +2744,7 @@ pub(super) fn handle_chathistory(
                             };
                             let rows = state
                                 .with_db(|db| {
-                                    db.get_messages_before_cursor(&db_key, ts, row_id, limit)
+                                    db.get_messages_before_cursor(&db_key, ts, &cursor_id, limit)
                                 })
                                 .unwrap_or_default();
                             (rows, Some((0, secs(ts), limit)))
@@ -2769,7 +2769,7 @@ pub(super) fn handle_chathistory(
                     let limit = msg.params[3].parse::<usize>().unwrap_or(50).min(500);
                     match parse_chathistory_anchor(&msg.params[2]) {
                         Some(HistoryAnchor::Msgid(id)) => {
-                            let Some(Some((ts, row_id))) =
+                            let Some(Some((ts, cursor_id))) =
                                 state.with_db(|db| db.history_cursor(&db_key, &id))
                             else {
                                 fail_message_error(
@@ -2784,7 +2784,7 @@ pub(super) fn handle_chathistory(
                             };
                             let rows = state
                                 .with_db(|db| {
-                                    db.get_messages_after_cursor(&db_key, ts, row_id, limit)
+                                    db.get_messages_after_cursor(&db_key, ts, &cursor_id, limit)
                                 })
                                 .unwrap_or_default();
                             (rows, Some((secs(ts), i64::MAX, limit)))

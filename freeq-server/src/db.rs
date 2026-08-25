@@ -1154,50 +1154,62 @@ impl Db {
         Ok(result)
     }
 
-    /// Where `msgid` sits in `channel`'s stored order: its `(timestamp, id)`.
+    /// Where `msgid` sits in the order a page is cut on: `(timestamp, msgid)`.
     ///
-    /// Stored order is `(timestamp, id)` — the second component is what
-    /// determinately orders two rows that share a second, which is the whole
-    /// point of anchoring a page by msgid rather than by time.
+    /// The second component is what determinately orders two rows sharing a
+    /// second, which is the whole point of anchoring a page by msgid rather
+    /// than by time. It is the msgid and not the row id because a client sorts
+    /// its held messages by `(timestamp, msgid)`: concurrent senders land in
+    /// the table in an order that has nothing to do with their msgids, so a
+    /// page cut on row id can hand back only rows the client files above its
+    /// anchor — the anchor never moves and the reader is stuck there.
     ///
     /// A soft-deleted row still anchors: the reader asked for the page around
     /// an id they hold, and a message deleted after they fetched it is still a
     /// valid place in the order. An edit's root id resolves too, since that is
     /// the id a client holds an edited message under.
-    pub fn history_cursor(&self, channel: &str, msgid: &str) -> SqlResult<Option<(u64, i64)>> {
+    pub fn history_cursor(&self, channel: &str, msgid: &str) -> SqlResult<Option<(u64, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT timestamp, id FROM messages
+            "SELECT timestamp FROM messages
              WHERE channel = ?1 AND (msgid = ?2 OR root_msgid = ?2)
              ORDER BY msgid = ?2 DESC, timestamp ASC, id ASC
              LIMIT 1",
         )?;
         let mut rows = stmt.query_map(params![channel, msgid], |row| {
-            Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)?))
+            Ok(row.get::<_, i64>(0)? as u64)
         })?;
         match rows.next() {
-            Some(row) => Ok(Some(row?)),
+            // The second half of the cursor is the id that was ASKED for, not
+            // the one on the row it found. They differ only when the ask names
+            // an edit's root, and the root is the id the client holds that
+            // message under — so it is the id the client sorts it by, which is
+            // what the cursor has to agree with.
+            Some(ts) => Ok(Some((ts?, msgid.to_string()))),
             None => Ok(None),
         }
     }
 
-    /// Messages strictly before the `(timestamp, id)` cursor, oldest first.
+    /// Messages strictly before the `(timestamp, msgid)` cursor, oldest first.
+    ///
+    /// A row with no msgid at all — old enough to predate them — orders as the
+    /// empty string, which is where a client puts it too.
     pub fn get_messages_before_cursor(
         &self,
         channel: &str,
         ts: u64,
-        id: i64,
+        msgid: &str,
         limit: usize,
     ) -> SqlResult<Vec<MessageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did, root_msgid
              FROM messages
              WHERE channel = ?1 AND deleted_at IS NULL
-               AND (timestamp < ?2 OR (timestamp = ?2 AND id < ?3))
-             ORDER BY timestamp DESC, id DESC
+               AND (timestamp < ?2 OR (timestamp = ?2 AND COALESCE(msgid, '') < ?3))
+             ORDER BY timestamp DESC, COALESCE(msgid, '') DESC
              LIMIT ?4"
         )?;
         let rows = stmt.query_map(
-            params![channel, ts as i64, id, limit as i64],
+            params![channel, ts as i64, msgid, limit as i64],
             map_message_row,
         )?;
         let mut result = rows.collect::<SqlResult<Vec<_>>>()?;
@@ -1210,24 +1222,24 @@ impl Db {
         Ok(result)
     }
 
-    /// Messages strictly after the `(timestamp, id)` cursor, oldest first.
+    /// Messages strictly after the `(timestamp, msgid)` cursor, oldest first.
     pub fn get_messages_after_cursor(
         &self,
         channel: &str,
         ts: u64,
-        id: i64,
+        msgid: &str,
         limit: usize,
     ) -> SqlResult<Vec<MessageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did, root_msgid
              FROM messages
              WHERE channel = ?1 AND deleted_at IS NULL
-               AND (timestamp > ?2 OR (timestamp = ?2 AND id > ?3))
-             ORDER BY timestamp ASC, id ASC
+               AND (timestamp > ?2 OR (timestamp = ?2 AND COALESCE(msgid, '') > ?3))
+             ORDER BY timestamp ASC, COALESCE(msgid, '') ASC
              LIMIT ?4"
         )?;
         let rows = stmt.query_map(
-            params![channel, ts as i64, id, limit as i64],
+            params![channel, ts as i64, msgid, limit as i64],
             map_message_row,
         )?;
         let mut result = rows.collect::<SqlResult<Vec<_>>>()?;
@@ -6543,7 +6555,7 @@ mod tests {
         let mut seen: Vec<String> = vec![anchor.clone()];
         loop {
             let (ts, id) = db.history_cursor("#burst", &anchor).unwrap().unwrap();
-            let page = db.get_messages_before_cursor("#burst", ts, id, 5).unwrap();
+            let page = db.get_messages_before_cursor("#burst", ts, &id, 5).unwrap();
             if page.is_empty() {
                 break;
             }
@@ -6568,7 +6580,7 @@ mod tests {
         let mut seen: Vec<String> = vec![anchor.clone()];
         loop {
             let (ts, id) = db.history_cursor("#fwd", &anchor).unwrap().unwrap();
-            let page = db.get_messages_after_cursor("#fwd", ts, id, 5).unwrap();
+            let page = db.get_messages_after_cursor("#fwd", ts, &id, 5).unwrap();
             if page.is_empty() {
                 break;
             }
@@ -6610,9 +6622,92 @@ mod tests {
             .history_cursor("#mix", "01MIX0000000000000000000003")
             .unwrap()
             .unwrap();
-        let page = db.get_messages_before_cursor("#mix", ts, id, 10).unwrap();
+        let page = db.get_messages_before_cursor("#mix", ts, &id, 10).unwrap();
         let texts: Vec<&str> = page.iter().map(|r| r.text.as_str()).collect();
         assert_eq!(texts, vec!["older", "same a"]);
+    }
+
+    /// Insert one row with a chosen msgid at a chosen second, so a test can
+    /// make insert order and msgid order disagree the way concurrent senders
+    /// do.
+    fn msg_at(db: &Db, channel: &str, msgid: &str, ts: u64) {
+        msg(db, channel, &format!("text for {msgid}"), ts, msgid);
+    }
+
+    /// Walk a channel backwards the way a client does: anchor on the OLDEST
+    /// row it holds in ITS order — `(timestamp, msgid)` — ask for the page
+    /// before that, merge, and re-anchor. Returns the ids it ends up holding,
+    /// oldest first, and stops if the anchor ever fails to move.
+    fn walk_like_a_client(db: &Db, channel: &str, limit: usize) -> Vec<String> {
+        let mut held: Vec<(u64, String)> = db
+            .get_messages(channel, limit, None)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.timestamp, r.msgid.unwrap()))
+            .collect();
+        held.sort();
+        for _ in 0..50 {
+            let (ts, anchor) = held
+                .first()
+                .cloned()
+                .expect("the opening page is not empty");
+            let (cts, cid) = match db.history_cursor(channel, &anchor).unwrap() {
+                Some(c) => c,
+                None => break,
+            };
+            let page = db
+                .get_messages_before_cursor(channel, cts, &cid, limit)
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            for row in page {
+                let key = (row.timestamp, row.msgid.unwrap());
+                if !held.contains(&key) {
+                    held.push(key);
+                }
+            }
+            held.sort();
+            // The client re-anchors on its own oldest row. If the page did not
+            // move it, asking again sends the identical request — the walk is
+            // jammed and the reader cannot get past this boundary.
+            if held.first().map(|(t, m)| (*t, m.clone())) == Some((ts, anchor)) {
+                break;
+            }
+        }
+        held.into_iter().map(|(_, m)| m).collect()
+    }
+
+    #[test]
+    fn paging_survives_a_burst_whose_msgid_order_fights_its_insert_order() {
+        // Concurrent senders in one second get their rows written in an order
+        // that has nothing to do with their msgids — verified in production
+        // data. A client sorts by `(timestamp, msgid)`, so a page boundary on
+        // one of those disagreements can hand back only rows the client files
+        // ABOVE its anchor: the anchor does not move, the next request is
+        // identical, and the reader is stuck at that boundary for good.
+        let db = Db::open_memory().unwrap();
+        const T: u64 = 1_700_100_000;
+        // Insert order is the rowid order; the msgids deliberately are not.
+        let inserts = [
+            "01CLASH00000000000000000M10",
+            "01CLASH00000000000000000M20",
+            "01CLASH00000000000000000M30",
+            "01CLASH00000000000000000M05", // sorts first, written fourth
+            "01CLASH00000000000000000M40",
+            "01CLASH00000000000000000M50",
+        ];
+        for id in inserts {
+            msg_at(&db, "#clash", id, T);
+        }
+
+        let mut expected: Vec<String> = inserts.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+
+        // Two at a time, so a boundary lands on the disagreement.
+        let walked = walk_like_a_client(&db, "#clash", 2);
+
+        assert_eq!(walked, expected, "the whole channel, in the client's order");
     }
 
     #[test]
@@ -6678,7 +6773,7 @@ mod tests {
             .history_cursor("#del", "01DEL0000000000000000000002")
             .unwrap()
             .expect("a deleted row still names a place in the order");
-        let page = db.get_messages_before_cursor("#del", ts, id, 10).unwrap();
+        let page = db.get_messages_before_cursor("#del", ts, &id, 10).unwrap();
         let texts: Vec<&str> = page.iter().map(|r| r.text.as_str()).collect();
         assert_eq!(texts, vec!["keep"]);
 
@@ -6686,7 +6781,7 @@ mod tests {
             .history_cursor("#del", "01DEL0000000000000000000001")
             .unwrap()
             .unwrap();
-        let page = db.get_messages_after_cursor("#del", ts, id, 10).unwrap();
+        let page = db.get_messages_after_cursor("#del", ts, &id, 10).unwrap();
         let texts: Vec<&str> = page.iter().map(|r| r.text.as_str()).collect();
         assert_eq!(texts, vec!["newest"], "the deleted row is not served");
     }
