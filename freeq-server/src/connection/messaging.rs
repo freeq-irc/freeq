@@ -2669,9 +2669,44 @@ pub(super) fn handle_chathistory(
         return;
     }
 
+    let has_tags = state.cap_message_tags.lock().contains(session_id);
+    let has_time = state.cap_server_time.lock().contains(session_id);
+    let has_batch = state.cap_batch.lock().contains(session_id);
+    let has_multiline = state.cap_draft_multiline.lock().contains(session_id);
+
+    // A guest asking about a DM gets an ordinary empty answer, not a refusal.
+    //
+    // DM rows are filed under a key built from two DIDs, so a session with no
+    // DID has no DM history to withhold — the empty answer is the true one,
+    // and it is the answer a client can page against. `ACCOUNT_REQUIRED` here
+    // sent an error per request that every client then had to hide.
+    //
+    // Only this case. An authenticated user asking about a conversation they
+    // are not in is a different question with a different answer, and SEARCH
+    // keeps its own.
+    let raw_target = &msg.params[1];
+    let is_channel = raw_target.starts_with('#') || raw_target.starts_with('&');
+    if !is_channel && conn.authenticated_did.is_none() {
+        replay_rows_as_batch(
+            vec![],
+            None,
+            raw_target,
+            "chathistory",
+            state,
+            server_name,
+            session_id,
+            send,
+            has_tags,
+            has_time,
+            has_batch,
+            has_multiline,
+        );
+        return;
+    }
+
     let Some((db_key, target)) = resolve_history_target(
         conn,
-        &msg.params[1],
+        raw_target,
         "CHATHISTORY",
         state,
         server_name,
@@ -2680,11 +2715,6 @@ pub(super) fn handle_chathistory(
     ) else {
         return;
     };
-
-    let has_tags = state.cap_message_tags.lock().contains(session_id);
-    let has_time = state.cap_server_time.lock().contains(session_id);
-    let has_batch = state.cap_batch.lock().contains(session_id);
-    let has_multiline = state.cap_draft_multiline.lock().contains(session_id);
 
     // Fetch messages from DB based on subcommand. The task events served
     // alongside them answer to the same request bounds — the subcommand's

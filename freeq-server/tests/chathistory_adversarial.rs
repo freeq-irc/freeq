@@ -742,19 +742,96 @@ async fn chathistory_after_part_denied() {
 // ═══════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn dm_chathistory_requires_auth() {
+async fn dm_chathistory_for_a_guest_answers_empty() {
     let r = resolver(vec![]);
     let (addr, _h) = start(r).await;
     run(addr, |addr| {
-        // Guest (no DID) tries CHATHISTORY for a DM
+        // A session with no DID has no DM history to withhold: DM rows are
+        // filed under a key built from two DIDs. So the answer is an ordinary
+        // empty batch, which a client can page against, rather than an error
+        // it has to hide.
         let mut guest = C::with_caps(addr, "dm_guest");
         guest.reg();
         guest.drain();
         guest.tx("CHATHISTORY LATEST some_nick * 50");
-        let fail = guest.rx(|l| l.contains("FAIL"), "DM history denied");
+
+        let open = guest.rx(
+            |l| l.contains("BATCH +") || l.contains("FAIL"),
+            "DM history answer",
+        );
         assert!(
-            fail.contains("ACCOUNT_REQUIRED") || fail.contains("FAIL"),
-            "Guest should be denied DM CHATHISTORY: {fail}"
+            !open.contains("FAIL"),
+            "a guest's DM history request should not fail: {open}"
+        );
+        assert!(open.contains("chathistory some_nick"), "{open}");
+
+        let close = guest.rx(
+            |l| l.contains("BATCH") || l.contains("PRIVMSG"),
+            "batch end",
+        );
+        assert!(
+            close.contains("BATCH -"),
+            "the batch should hold no rows: {close}"
+        );
+
+        // Same for the paging subcommands, which is what the boundary row in
+        // a client actually sends.
+        for sub in ["BEFORE", "AFTER"] {
+            guest.tx(&format!(
+                "CHATHISTORY {sub} some_nick timestamp=2026-08-24T12:00:00.000Z 50"
+            ));
+            let open = guest.rx(
+                |l| l.contains("BATCH +") || l.contains("FAIL"),
+                "paged DM history answer",
+            );
+            assert!(!open.contains("FAIL"), "{sub}: {open}");
+            let close = guest.rx(
+                |l| l.contains("BATCH") || l.contains("PRIVMSG"),
+                "batch end",
+            );
+            assert!(close.contains("BATCH -"), "{sub}: {close}");
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn channel_chathistory_for_a_guest_outside_the_channel_still_fails() {
+    let r = resolver(vec![]);
+    let (addr, _h) = start(r).await;
+    run(addr, |addr| {
+        // The empty answer is for DM targets only. A channel the asker is not
+        // in is still a refusal, guest or not.
+        let mut guest = C::with_caps(addr, "ch_guest");
+        guest.reg();
+        guest.drain();
+        guest.tx("CHATHISTORY LATEST #not_mine * 50");
+        let fail = guest.rx(|l| l.contains("FAIL") || l.contains("BATCH"), "answer");
+        assert!(
+            fail.contains("FAIL") && fail.contains("INVALID_TARGET"),
+            "{fail}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn dm_search_for_a_guest_still_requires_an_account() {
+    let r = resolver(vec![]);
+    let (addr, _h) = start(r).await;
+    run(addr, |addr| {
+        // SEARCH keeps its own answer: only CHATHISTORY changed.
+        let mut guest = C::with_caps(addr, "se_guest");
+        guest.reg();
+        guest.drain();
+        guest.tx("SEARCH some_nick :hello");
+        let fail = guest.rx(
+            |l| l.contains("FAIL") || l.contains("BATCH"),
+            "search answer",
+        );
+        assert!(
+            fail.contains("FAIL") && fail.contains("ACCOUNT_REQUIRED"),
+            "{fail}"
         );
     })
     .await;

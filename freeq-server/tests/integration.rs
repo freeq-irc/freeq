@@ -4685,10 +4685,10 @@ async fn join_history_includes_account_tag() {
     server_handle.abort();
 }
 
-// ── Test: Guest cannot access DM history ─────────────────────────────
+// ── Test: a guest's DM history request answers empty ─────────────────
 
 #[tokio::test]
-async fn dm_history_rejected_for_guest() {
+async fn dm_history_for_a_guest_answers_empty() {
     let key_alice = PrivateKey::generate_secp256k1();
     let did_alice = "did:plc:dmguest";
     let doc_alice = did::make_test_did_document(did_alice, &key_alice.public_key_multibase());
@@ -4742,20 +4742,37 @@ async fn dm_history_rejected_for_guest() {
     )
     .await;
 
-    // Guest requests DM history — should fail with ACCOUNT_REQUIRED
+    // A session with no DID has no DM history — DM rows are filed under a
+    // key built from two DIDs — so the answer is an ordinary empty batch
+    // rather than an error the client has to hide.
     handle_guest
         .raw("CHATHISTORY LATEST dmauth * 50")
         .await
         .unwrap();
 
-    // Should get a FAIL notice about authentication
     expect_event(
         &mut events_guest,
         2000,
-        |e| matches!(e, Event::ServerNotice { text } if text.contains("authenticated")),
-        "Guest gets auth error",
+        |e| matches!(e, Event::BatchStart { batch_type, .. } if batch_type == "chathistory"),
+        "Guest gets a chathistory batch start",
     )
     .await;
+
+    // Nothing between the batch's ends, and no complaint on the way.
+    loop {
+        let event = timeout(Duration::from_millis(2000), events_guest.recv())
+            .await
+            .expect("Guest gets batch end")
+            .expect("event stream stayed open");
+        match event {
+            Event::BatchEnd { .. } => break,
+            Event::Message { text, .. } => panic!("guest DM history should be empty: {text}"),
+            Event::ServerNotice { text } if text.contains("authenticated") => {
+                panic!("guest DM history should not complain: {text}")
+            }
+            _ => {}
+        }
+    }
 
     handle_alice.quit(None).await.unwrap();
     handle_guest.quit(None).await.unwrap();
