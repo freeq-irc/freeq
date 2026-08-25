@@ -223,6 +223,55 @@ describe('a page of history the bridge asked for', () => {
   });
 });
 
+describe('what a CHATHISTORY refusal shows the reader', () => {
+  /** Rows the buffer holds that are not messages — the app renders a server
+   *  rejection as one of these. */
+  const noticesIn = (channel: string) =>
+    (ch(channel)?.messages ?? []).filter((m) => m.isSystem).map((m) => m.text);
+
+  it('says nothing about a DM with a guest peer', () => {
+    // A signed-in reader's DM with a guest has no canonical key, so the
+    // server refuses the history request the app sends on every activation.
+    // There is nothing the reader can do about it and the row already ends
+    // at the button, so the refusal is not worth a line in the conversation.
+    const client = connected();
+    seed('gp_guest');
+    s().setActiveChannel('gp_guest');
+    bridge.requestHistory('gp_guest', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    client.emit('serverFail', 'CHATHISTORY INVALID_TARGET gp_guest Unknown target');
+
+    expect(noticesIn('gp_guest')).toEqual([]);
+    expect(ch('gp_guest')!.historyFetching, 'the row still ends').toBe(false);
+  });
+
+  it('says nothing when an older server refuses a guest outright', () => {
+    // Servers before the empty answer refuse every guest DM history request.
+    const client = connected();
+    seed('peer');
+    s().setActiveChannel('peer');
+    bridge.requestHistory('peer', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    client.emit(
+      'serverFail',
+      'CHATHISTORY ACCOUNT_REQUIRED peer You must be authenticated to access DM history',
+    );
+
+    expect(noticesIn('peer')).toEqual([]);
+    expect(ch('peer')!.historyFetching).toBe(false);
+  });
+
+  it('still shows a rejection the reader can act on', () => {
+    const client = connected();
+    seed('#room');
+    s().setActiveChannel('#room');
+
+    client.emit('serverFail', 'JOIN INVITEONLYCHAN #room Cannot join channel');
+
+    expect(noticesIn('#room')).toEqual(['Server error: JOIN INVITEONLYCHAN #room Cannot join channel']);
+  });
+});
+
 describe('a page that never comes back', () => {
   it('is written off by the timer, and leaves the button', () => {
     connected();
