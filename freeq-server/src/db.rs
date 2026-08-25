@@ -1086,6 +1086,12 @@ impl Db {
     /// Fetch recent messages for a channel, ordered oldest-first.
     /// `limit`: max number of messages to return.
     /// `before`: if Some, only return messages with timestamp < this value (for pagination).
+    ///
+    /// Ordered by `(timestamp, msgid)`, the same order the msgid cursor cuts
+    /// on and the same one a client sorts by. Cutting the opening page on the
+    /// row id instead put its boundary in a different place inside a second:
+    /// the rows left out sorted newer than anything the client then held, so
+    /// paging backwards could never reach them.
     pub fn get_messages(
         &self,
         channel: &str,
@@ -1097,7 +1103,7 @@ impl Db {
                 "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did, root_msgid
                  FROM messages
                  WHERE channel = ?1 AND deleted_at IS NULL AND timestamp < ?2
-                 ORDER BY timestamp DESC, id DESC
+                 ORDER BY timestamp DESC, COALESCE(msgid, '') DESC
                  LIMIT ?3"
             )?;
             let rows = stmt.query_map(
@@ -1110,7 +1116,7 @@ impl Db {
                 "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did, root_msgid
                  FROM messages
                  WHERE channel = ?1 AND deleted_at IS NULL
-                 ORDER BY timestamp DESC, id DESC
+                 ORDER BY timestamp DESC, COALESCE(msgid, '') DESC
                  LIMIT ?2"
             )?;
             let rows = stmt.query_map(params![channel, limit as i64], map_message_row)?;
@@ -1138,7 +1144,7 @@ impl Db {
             "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did, root_msgid
              FROM messages
              WHERE channel = ?1 AND deleted_at IS NULL AND timestamp > ?2
-             ORDER BY timestamp ASC, id ASC
+             ORDER BY timestamp ASC, COALESCE(msgid, '') ASC
              LIMIT ?3"
         )?;
         let rows = stmt.query_map(
@@ -1263,7 +1269,7 @@ impl Db {
             "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did, root_msgid
              FROM messages
              WHERE channel = ?1 AND deleted_at IS NULL AND timestamp > ?2 AND timestamp < ?3
-             ORDER BY timestamp ASC, id ASC
+             ORDER BY timestamp ASC, COALESCE(msgid, '') ASC
              LIMIT ?4"
         )?;
         let rows = stmt.query_map(
@@ -6708,6 +6714,36 @@ mod tests {
         let walked = walk_like_a_client(&db, "#clash", 2);
 
         assert_eq!(walked, expected, "the whole channel, in the client's order");
+    }
+
+    #[test]
+    fn the_opening_page_and_the_pages_after_it_cut_on_one_order() {
+        // The opening page a client gets is `get_messages`, and everything
+        // after it is the msgid cursor. If those two are cut on different
+        // orders, a boundary inside a second leaves rows on the far side that
+        // the client sorts NEWER than anything it holds — so paging backwards
+        // can never reach them and they are lost for the session.
+        let db = Db::open_memory().unwrap();
+        const T: u64 = 1_700_200_000;
+        // Three seconds, twelve rows each, msgids interleaved across the
+        // second the way concurrent senders interleave them.
+        let mut all: Vec<String> = Vec::new();
+        for second in 0..3u64 {
+            for sender in 0..4u64 {
+                for i in 0..3u64 {
+                    // Insert grouped by sender, but number the msgids so that
+                    // the two orders disagree inside every second.
+                    let id = format!("01OPEN{:021}", second * 100 + i * 10 + sender);
+                    msg_at(&db, "#opening", &id, T + second);
+                    all.push(id);
+                }
+            }
+        }
+        all.sort();
+
+        let walked = walk_like_a_client(&db, "#opening", 10);
+
+        assert_eq!(walked, all, "every row, however the opening page was cut");
     }
 
     #[test]
