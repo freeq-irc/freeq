@@ -378,27 +378,29 @@ export interface HistoryAnchor {
   timestamp?: string;
 }
 
-/** Ask for history in `channel`. With an anchor, the page older than it;
- *  without one, the most recent page. */
+/** Ask for history in `channel`: with an anchor, the page older than it;
+ *  without one, the most recent page.
+ *
+ *  Either way the request is tracked, so its answer teaches the channel
+ *  what is above the oldest row it holds. An untracked request tells the
+ *  app nothing — which is how a channel with no row to anchor on, and a
+ *  channel shorter than one page, both ended up showing a button over
+ *  history that was already complete. */
 export function requestHistory(channel: string, anchor?: HistoryAnchor) {
   if (!client) return;
-  if (!anchor || (!anchor.msgid && !anchor.timestamp)) {
-    client.requestHistory({ target: channel, mode: 'latest', count: HISTORY_PAGE });
-    return;
-  }
+  const anchored = !!anchor && (!!anchor.msgid || !!anchor.timestamp);
   const key = channel.toLowerCase();
-  useStore.getState().historyFetchStarted(channel);
+  useStore.getState().historyFetchStarted(channel, anchored);
   clearHistoryTimer(key);
   historyTimers.set(key, setTimeout(() => {
     historyTimers.delete(key);
     useStore.getState().historyFetchFailed(channel);
   }, HISTORY_TIMEOUT_MS));
-  client.requestHistory({
-    target: channel,
-    mode: 'before',
-    count: HISTORY_PAGE,
-    ...anchor,
-  });
+  client.requestHistory(
+    anchored
+      ? { target: channel, mode: 'before', count: HISTORY_PAGE, ...anchor }
+      : { target: channel, mode: 'latest', count: HISTORY_PAGE },
+  );
 }
 
 export function requestDmTargets(limit = 50) {
@@ -854,27 +856,38 @@ function wireEvents(c: FreeqClient) {
     s().addSystemMessage(target, text);
   });
 
-  c.on('historyBatch', (channel, messages) => {
+  c.on('historyBatch', (channel, messages, info) => {
     // Prefetch avatars by DID for history messages
     const dids = messages.map((m: any) => m.tags?.account).filter(Boolean);
     if (dids.length) prefetchProfiles(dids);
 
-    clearHistoryTimer(channel.toLowerCase());
+    const key = channel.toLowerCase();
+    const held = () => useStore.getState().channels.get(key)?.messages.length ?? 0;
 
     // Merge first, then report both counts: the size off the wire, which is
     // the only thing that says whether more history exists, and how many
     // rows actually reached the held list, which is what says whether
     // asking again on the same anchor would get anywhere.
-    const held = () =>
-      useStore.getState().channels.get(channel.toLowerCase())?.messages.length ?? 0;
     const before = held();
     useStore.getState().mergeHistory(
       channel,
       messages as import('../store').Message[],
     );
-    useStore.getState().historyPageReceived(
-      channel, messages.length, HISTORY_PAGE, held() - before,
-    );
+    const added = held() - before;
+
+    const ch = useStore.getState().channels.get(key);
+    const expected = ch?.historyFetchAnchored ? 'before' : 'latest';
+    if (ch?.historyFetching && (!info || info.mode === expected)) {
+      clearHistoryTimer(key);
+      useStore.getState().historyPageReceived(
+        channel, messages.length, info?.count ?? HISTORY_PAGE, added,
+      );
+    } else if (info?.mode === 'latest') {
+      // The opening page, which the SDK asks for on join without telling the
+      // app. Its size is what lets a channel shorter than one page know its
+      // history is complete before anyone scrolls.
+      useStore.getState().historyOpeningPage(channel, messages.length, info.count);
+    }
   });
 
   c.on('dmTarget', (nick) => {

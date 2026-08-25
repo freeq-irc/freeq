@@ -12,6 +12,7 @@ import type {
   AvSession, TransportState, PinnedMessage,
   GovernancePayload, PresencePayload, CoordinationEventPayload, ActEventPayload,
   SpendPayload, BudgetSnapshot, AgentSpawnedPayload, AgentDespawnedPayload,
+  HistoryBatchInfo,
 } from './types.js';
 
 /** Map of event names to their handler signatures. */
@@ -118,8 +119,12 @@ export interface FreeqEvents {
   /** Fired when a system/server message should be displayed. */
   systemMessage: (target: string, text: string) => void;
 
-  /** Fired when a CHATHISTORY batch completes. */
-  historyBatch: (channel: string, messages: Message[]) => void;
+  /** Fired when a CHATHISTORY batch completes. `info` describes the request
+   *  it answers — the mode and the page size asked for — so a caller can
+   *  tell an answer to its own paging request from the opening page, and
+   *  can compare the rows returned against the size requested. Absent when
+   *  no request for that target is on record. */
+  historyBatch: (channel: string, messages: Message[], info?: HistoryBatchInfo) => void;
 
   /** Fired when a DM target is discovered (CHATHISTORY TARGETS). */
   dmTarget: (nick: string) => void;

@@ -1004,6 +1004,80 @@ describe('requestHistory', () => {
   });
 });
 
+describe('what a history batch answers', () => {
+  /** Open and close a chathistory batch for `target`, with `n` rows. */
+  function batch(ws: any, id: string, target: string, n: number) {
+    ws.recv(`:srv BATCH +${id} chathistory ${target}`);
+    for (let i = 0; i < n; i++) {
+      ws.recv(`@batch=${id};msgid=m${id}${i} :bob!b@h PRIVMSG ${target} :row ${i}`);
+    }
+    ws.recv(`:srv BATCH -${id}`);
+  }
+
+  it('reports the mode and size the request asked for', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: Array<unknown> = [];
+    client.on('historyBatch', (_c, _m, info) => seen.push(info));
+
+    client.requestHistory({ target: '#foo', mode: 'latest', count: 30 });
+    batch(ws, 'b1', '#foo', 2);
+    for (let i = 0; i < 4; i++) await flushAsync();
+
+    expect(seen).toEqual([{ mode: 'latest', count: 30 }]);
+  });
+
+  it('answers a target\'s requests in the order they were asked', async () => {
+    // Two requests can be out for one target at once — the opening page and
+    // a page the reader asked for. Labelling the first answer with the
+    // second request tells the caller its paging request came back when it
+    // has not.
+    const { client, ws } = await makeRegistered();
+    const seen: Array<unknown> = [];
+    client.on('historyBatch', (_c, _m, info) => seen.push(info));
+
+    client.requestHistory({ target: '#foo', mode: 'latest', count: 50 });
+    client.requestHistory({ target: '#foo', mode: 'before', msgid: 'abc', count: 50 });
+    batch(ws, 'b1', '#foo', 0);
+    for (let i = 0; i < 4; i++) await flushAsync();
+    batch(ws, 'b2', '#foo', 0);
+    for (let i = 0; i < 4; i++) await flushAsync();
+
+    expect(seen).toEqual([
+      { mode: 'latest', count: 50 },
+      { mode: 'before', count: 50 },
+    ]);
+  });
+
+  it('reports nothing for a batch no request is on record for', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: Array<unknown> = [];
+    client.on('historyBatch', (_c, _m, info) => seen.push(info));
+
+    batch(ws, 'b1', '#unasked', 3);
+    for (let i = 0; i < 4; i++) await flushAsync();
+
+    expect(seen).toEqual([undefined]);
+  });
+
+  it('keeps each target\'s requests apart', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: Array<[string, unknown]> = [];
+    client.on('historyBatch', (c, _m, info) => seen.push([c, info]));
+
+    client.requestHistory({ target: '#a', mode: 'latest', count: 50 });
+    client.requestHistory({ target: '#b', mode: 'before', msgid: 'x', count: 20 });
+    batch(ws, 'b2', '#b', 0);
+    for (let i = 0; i < 4; i++) await flushAsync();
+    batch(ws, 'b1', '#a', 0);
+    for (let i = 0; i < 4; i++) await flushAsync();
+
+    expect(seen).toEqual([
+      ['#b', { mode: 'before', count: 20 }],
+      ['#a', { mode: 'latest', count: 50 }],
+    ]);
+  });
+});
+
 describe('history targets', () => {
   it('requestHistoryTargets() sends CHATHISTORY TARGETS', async () => {
     const { client, ws } = await makeRegistered();

@@ -41,8 +41,10 @@ const requestHistory = client.requestHistory as unknown as ReturnType<typeof vi.
 beforeEach(() => {
   vi.clearAllMocks();
   s().reset();
+  // The bridge arms every request it sends, anchored or not, and the guards
+  // under test read that flag.
   requestHistory.mockImplementation((channel: string, anchor?: unknown) => {
-    if (anchor) s().historyFetchStarted(channel);
+    s().historyFetchStarted(channel, !!anchor);
   });
 });
 afterEach(cleanup);
@@ -50,15 +52,30 @@ afterEach(cleanup);
 /** A 26-character Crockford id, the shape a server msgid has. */
 const ulid = (n: number) => `01M0${String(n).padStart(22, '0')}`;
 
-/** A channel holding `n` rows, ids ordered from `first`. */
-function channelWith(name: string, n: number, first = 1000) {
+/** A channel holding `n` rows, ids ordered from `first`.
+ *
+ *  `taught` answers the channel's opening request up front, the way the
+ *  activation fetch does, so a test about paging back starts where a reader
+ *  actually starts. Pass false to keep the edge unknown. */
+function channelWith(name: string, n: number, first = 1000, taught = true) {
   for (let i = 0; i < n; i++) {
     s().addMessage(name, {
       id: ulid(first + i), from: 'alice',
       text: `row ${first + i}`, timestamp: new Date(BASE + (first + i) * 1000), tags: {},
     });
   }
+  if (taught) {
+    s().historyFetchStarted(name, false);
+    s().historyPageReceived(name, PAGE, PAGE, PAGE);
+  }
   s().setActiveChannel(name);
+}
+
+/** Answer a channel's opening request up front, so a test about paging back
+ *  does not spend it on the activation fetch. */
+function taught(name: string) {
+  s().historyFetchStarted(name, false);
+  s().historyPageReceived(name, PAGE, PAGE, PAGE);
 }
 
 /** jsdom has no layout, so the scroll geometry is stated outright. */
@@ -77,6 +94,13 @@ function scrollTo(el: HTMLElement, pos: 'top' | 'middle' | 'bottom') {
 function list() {
   const { getByTestId } = render(<MessageList />);
   return getByTestId('message-list');
+}
+
+/** Like `list()`, but keeping the handle needed to re-render across a
+ *  channel switch. */
+function renderList() {
+  const r = render(<MessageList />);
+  return { ...r, rerender: () => r.rerender(<MessageList />) };
 }
 
 /** Answer the page in flight: `received` rows against a page of `limit`,
@@ -121,7 +145,7 @@ describe('the boundary row', () => {
     // Nothing has answered yet, so the top of the loaded list may or may not
     // be the start of the channel. That is reason to offer the page, not to
     // declare the start.
-    channelWith('#fresh', 5);
+    channelWith('#fresh', 5, 1000, false);
     const el = list();
     scrollTo(el, 'middle');
     act(() => { s().historyFetchFailed('#fresh'); });
@@ -170,6 +194,32 @@ describe('the boundary row', () => {
     expect(boundary().textContent).toBe('This is the beginning of the conversation.');
   });
 
+  it('is not rendered once a channel of only notices is known to be empty', () => {
+    // Nothing came from a sender and the server holds nothing either, so
+    // there is no history boundary to mark — the empty-state welcome is
+    // already saying where the channel begins.
+    s().addSystemMessage('#notices', 'alice joined');
+    s().addSystemMessage('#notices', 'alice left');
+    s().setActiveChannel('#notices');
+    const el = list();
+    scrollTo(el, 'middle');
+    // The opening page the SDK asks for on join, answering empty.
+    act(() => { s().historyOpeningPage('#notices', 0, PAGE); });
+
+    expect(s().channels.get('#notices')!.historyEdge).toBe('start');
+    expect(screen.queryByTestId('history-boundary')).toBeNull();
+  });
+
+  it('still offers the affordance in a channel of only notices until it knows', () => {
+    s().addSystemMessage('#asking', 'alice joined');
+    s().setActiveChannel('#asking');
+    const el = list();
+    scrollTo(el, 'middle');
+    act(() => { s().historyFetchFailed('#asking'); });
+
+    expect(boundary().textContent).toBe('Load older messages');
+  });
+
   it('is not rendered on the server buffer', () => {
     channelWith('#some', 3);
     act(() => { s().setActiveChannel('server'); });
@@ -212,6 +262,7 @@ describe('the auto-fetch condition', () => {
       id: 'local-echo-1', from: 'me',
       text: 'mine', timestamp: new Date(BASE + 5_000), tags: {},
     });
+    taught('#noid');
     s().setActiveChannel('#noid');
     list();
 
@@ -370,7 +421,7 @@ describe('the auto-fetch condition', () => {
     answerWith('#deep', PAGE, 4000);
     scrollTo(el, 'middle');
     act(() => {
-      s().historyFetchStarted('#deep');
+      s().historyFetchStarted('#deep', true);
       s().historyPageReceived('#deep', 4, PAGE, 4);
     });
     expect(boundary().textContent).toBe('This is the beginning of the channel.');
@@ -396,11 +447,66 @@ describe('the auto-fetch condition', () => {
     expect(loadButton()).not.toBeNull();
   }, 20_000); // renders past the 1000-row window; well clear of the 5s default
 
-  it('does not ask on a channel holding nothing to anchor on', () => {
+  it('asks for the newest page when there is no row to anchor on', () => {
+    // A channel holding only join and part notices used to make the click a
+    // no-op and the auto-fetch silent. The question it can still ask is
+    // whether the server holds anything at all.
     s().addSystemMessage('#quiet', 'alice joined');
+    taught('#quiet');
     s().setActiveChannel('#quiet');
     list();
 
-    expect(requestHistory).not.toHaveBeenCalled();
+    expect(requestHistory).toHaveBeenCalledWith('#quiet', undefined);
+  });
+
+  it('learns the start of a channel of only notices from that answer', () => {
+    s().addSystemMessage('#learns', 'alice joined');
+    taught('#learns');
+    s().setActiveChannel('#learns');
+    list();
+    expect(requestHistory).toHaveBeenCalledWith('#learns', undefined);
+
+    act(() => { s().historyPageReceived('#learns', 0, PAGE, 0); });
+
+    expect(s().channels.get('#learns')!.historyEdge).toBe('start');
+  });
+
+  it('takes the rows when an anchorless ask turns some up', () => {
+    s().addSystemMessage('#turnsup', 'alice joined');
+    taught('#turnsup');
+    s().setActiveChannel('#turnsup');
+    list();
+
+    answerWith('#turnsup', 12, 200);
+
+    expect(s().channels.get('#turnsup')!.messages.length).toBeGreaterThan(1);
+    expect(s().channels.get('#turnsup')!.historyEdge).toBe('start');
+  });
+
+  it('does not leave a fetch behind when the reader switches away', () => {
+    // The request is still out when the reader leaves, and nothing on the
+    // new channel will answer it. Coming back must not find a spinner that
+    // belongs to a request nobody is waiting on any more.
+    channelWith('#leave', 5);
+    channelWith('#other2', 3, 8000);
+    s().setActiveChannel('#leave');
+    const { rerender } = renderList();
+    expect(s().channels.get('#leave')!.historyFetching).toBe(true);
+
+    act(() => { s().setActiveChannel('#other2'); });
+    rerender();
+    act(() => { s().historyFetchFailed('#leave'); }); // the bridge's timer
+    expect(s().channels.get('#leave')!.historyFetching).toBe(false);
+    expect(s().channels.get('#leave')!.historyAutoPaused).toBe(true);
+
+    const before = requestHistory.mock.calls.length;
+    act(() => { s().setActiveChannel('#leave'); });
+    rerender();
+
+    // Back at the top of a channel that says more exists, so the row is
+    // loading again — but on a request that just went out, not the one left
+    // behind. Either way it is not stuck.
+    expect(s().channels.get('#leave')!.historyAutoPaused, 'coming back re-arms').toBe(false);
+    expect(requestHistory.mock.calls.length).toBeGreaterThan(before);
   });
 });

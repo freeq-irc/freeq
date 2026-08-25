@@ -99,6 +99,11 @@ export interface Channel {
   /** Whether the automatic fetch is held off after a page never arrived.
    *  Asking by hand, or re-activating the buffer, starts it again. */
   historyAutoPaused: boolean;
+  /** Whether the page in flight was anchored on a held row. An opening
+   *  request is not, and its answer is expected to repeat rows already
+   *  held — so it says nothing about whether paging back is getting
+   *  anywhere. */
+  historyFetchAnchored: boolean;
 }
 
 /**
@@ -278,8 +283,10 @@ export interface Store {
   /** Drop back to the newest MESSAGE_WINDOW rows. Called when the reader
    *  returns to the bottom, never while they are scrolled back. */
   trimMessageWindow: (channel: string) => void;
-  /** A page of older history has been asked for. */
-  historyFetchStarted: (channel: string) => void;
+  /** A page of history has been asked for. `anchored` says whether it was
+   *  anchored on a held row, which is what makes its answer worth reading
+   *  for whether paging back is getting anywhere. */
+  historyFetchStarted: (channel: string, anchored: boolean) => void;
   /** A page of older history came back: `received` rows against the
    *  `limit` that was asked for, of which `added` reached the held list.
    *  A no-op unless a fetch was in flight, so history arriving for any
@@ -290,6 +297,11 @@ export interface Store {
   historyFetchFailed: (channel: string) => void;
   /** Start the automatic fetch again after it was held off. */
   historyAutoResumed: (channel: string) => void;
+  /** The opening page of a channel's history, which the SDK asks for on
+   *  join. Teaches the edge while nothing is known, so a channel shorter
+   *  than one page says so without anyone clicking. Never overrides what a
+   *  page the app asked for has already established. */
+  historyOpeningPage: (channel: string, received: number, limit: number) => void;
   addSystemMessage: (channel: string, text: string) => void;
   editMessage: (channel: string, originalMsgId: string, newText: string, newMsgId?: string, isStreaming?: boolean, editorNick?: string, editorAccount?: string) => void;
   deleteMessage: (channel: string, msgId: string, deleterNick?: string, deleterAccount?: string) => void;
@@ -394,6 +406,7 @@ function getOrCreateChannel(channels: Map<string, Channel>, name: string): Chann
       historyEdge: 'unknown',
       historyFetching: false,
       historyAutoPaused: false,
+      historyFetchAnchored: false,
     };
     channels.set(key, ch);
   }
@@ -824,6 +837,7 @@ export const useStore = create<Store>((set, get) => ({
       historyEdge: 'unknown',
       historyFetching: false,
       historyAutoPaused: false,
+      historyFetchAnchored: false,
     };
     // Always produce a fresh Channel object so subscribers comparing
     // channel identity (Sidebar, MessageList children, etc.) see a new
@@ -938,11 +952,15 @@ export const useStore = create<Store>((set, get) => ({
     return { channels };
   }),
 
-  historyFetchStarted: (channel) => set((s) => {
+  historyFetchStarted: (channel, anchored) => set((s) => {
     const channels = new Map(s.channels);
     const ch = getOrCreateChannel(channels, channel);
     if (ch.historyFetching) return {};
-    channels.set(channel.toLowerCase(), { ...ch, historyFetching: true });
+    channels.set(channel.toLowerCase(), {
+      ...ch,
+      historyFetching: true,
+      historyFetchAnchored: anchored,
+    });
     return { channels };
   }),
 
@@ -954,18 +972,22 @@ export const useStore = create<Store>((set, get) => ({
     // page that overlaps what is already held dedups down to nothing while
     // more history still sits behind it.
     //
-    // What the store kept answers a different question. A page that reached
-    // the held list not at all — every row a duplicate, or the whole page
-    // discarded by the absolute cap — would be asked for again on the same
-    // anchor, and again. Whatever it was, asking once more is not what to
-    // do about it; hold the automatic fetching off and leave the reader a
-    // button.
+    // What the store kept answers a different question. An anchored page
+    // that reached the held list not at all — every row a duplicate, or the
+    // whole page discarded by the absolute cap — would be asked for again
+    // on the same anchor, and again. Whatever it was, asking once more is
+    // not what to do about it; hold the automatic fetching off and leave the
+    // reader a button.
+    //
+    // Only an anchored page. An opening request repeats rows the channel
+    // already holds by design — that is what makes it safe to send — and it
+    // is not the same question the next fetch would ask.
     const channels = new Map(s.channels);
     channels.set(key, {
       ...ch,
       historyFetching: false,
       historyEdge: received < limit ? 'start' : 'more',
-      historyAutoPaused: received > 0 && added === 0,
+      historyAutoPaused: ch.historyFetchAnchored === true && received > 0 && added === 0,
     });
     return { channels };
   }),
@@ -980,6 +1002,15 @@ export const useStore = create<Store>((set, get) => ({
     // decide.
     const channels = new Map(s.channels);
     channels.set(key, { ...ch, historyFetching: false, historyAutoPaused: true });
+    return { channels };
+  }),
+
+  historyOpeningPage: (channel, received, limit) => set((s) => {
+    const key = channel.toLowerCase();
+    const ch = s.channels.get(key);
+    if (!ch || ch.historyFetching || ch.historyEdge !== 'unknown') return {};
+    const channels = new Map(s.channels);
+    channels.set(key, { ...ch, historyEdge: received < limit ? 'start' : 'more' });
     return { channels };
   }),
 

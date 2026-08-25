@@ -17,7 +17,7 @@ import { prefetchProfiles } from './profiles.js';
 import type {
   IRCMessage, Message, Member, AvSession, AvParticipant,
   FreeqClientOptions, SaslCredentials, Batch, TransportState,
-  PinnedMessage, WhoisInfo, HistoryOptions, EmitEventOptions,
+  PinnedMessage, WhoisInfo, HistoryOptions, HistoryBatchInfo, EmitEventOptions,
   HeartbeatHandle, GovernanceSignal, CoordinationEventPayload, ActEventPayload,
 } from './types.js';
 
@@ -100,6 +100,11 @@ export class FreeqClient extends EventEmitter {
   private backgroundWhois = new Set<string>();
   private echoPlaintextCache = new Map<string, { plaintext: string; ts: number }>();
   private batches = new Map<string, Batch>();
+  /** History requests sent per lowercased target, oldest first. The server
+   *  answers a target's requests in the order they were asked, so the batch
+   *  that closes takes the front of the queue — a single slot would label an
+   *  earlier answer with a later request. */
+  private historyRequests = new Map<string, Array<{ mode: 'latest' | 'before' | 'after'; count: number }>>();
   /** Server-advertised `draft/multiline` policy (parsed from CAP LS). */
   private multilineMaxBytes = 40000;
   private multilineMaxLines = 100;
@@ -260,6 +265,7 @@ export class FreeqClient extends EventEmitter {
     this.backgroundWhois.clear();
     this.echoPlaintextCache.clear();
     this.batches.clear();
+    this.historyRequests.clear();
     this._avSessions.clear();
     this._activeAvSession = null;
     this._avTokens.clear();
@@ -772,8 +778,10 @@ export class FreeqClient extends EventEmitter {
       // Legacy positional form: (channel, before?). `before` is treated
       // as a timestamp marker for CHATHISTORY BEFORE (existing behavior).
       if (before) {
+        this.noteHistoryRequest(channelOrOpts, 'before', count);
         this.raw(`CHATHISTORY BEFORE ${channelOrOpts} timestamp=${before} ${count}`);
       } else {
+        this.noteHistoryRequest(channelOrOpts, 'latest', count);
         this.raw(`CHATHISTORY LATEST ${channelOrOpts} * ${count}`);
       }
       return;
@@ -787,17 +795,38 @@ export class FreeqClient extends EventEmitter {
         : null;
     switch (opts.mode) {
       case 'latest':
+        this.noteHistoryRequest(opts.target, 'latest', c);
         this.raw(`CHATHISTORY LATEST ${opts.target} * ${c}`);
         break;
       case 'before':
         if (!marker) throw new Error("requestHistory mode='before' requires opts.msgid or opts.timestamp");
+        this.noteHistoryRequest(opts.target, 'before', c);
         this.raw(`CHATHISTORY BEFORE ${opts.target} ${marker} ${c}`);
         break;
       case 'after':
         if (!marker) throw new Error("requestHistory mode='after' requires opts.msgid or opts.timestamp");
+        this.noteHistoryRequest(opts.target, 'after', c);
         this.raw(`CHATHISTORY AFTER ${opts.target} ${marker} ${c}`);
         break;
     }
+  }
+
+  /** Remember what was asked for, keyed by the target as it goes on the
+   *  wire — which is the target the server echoes on the answering batch. */
+  private noteHistoryRequest(target: string, mode: 'latest' | 'before' | 'after', count: number): void {
+    const key = target.toLowerCase();
+    const queue = this.historyRequests.get(key) ?? [];
+    queue.push({ mode, count });
+    this.historyRequests.set(key, queue);
+  }
+
+  /** What the closing batch for `target` answers, consuming it. */
+  private takeHistoryRequest(target: string): HistoryBatchInfo | undefined {
+    const key = target.toLowerCase();
+    const queue = this.historyRequests.get(key);
+    const info = queue?.shift();
+    if (queue && queue.length === 0) this.historyRequests.delete(key);
+    return info;
   }
 
   /** Request CHATHISTORY TARGETS — list of recent conversation targets
@@ -2567,7 +2596,10 @@ export class FreeqClient extends EventEmitter {
                   }
                 }
               }
-              this.emit('historyBatch', key, batch.messages);
+              this.emit(
+                'historyBatch', key, batch.messages,
+                this.takeHistoryRequest(batch.target),
+              );
             }
             // Held task events ride out with the batch, in wire order,
             // after the lines they refer to.

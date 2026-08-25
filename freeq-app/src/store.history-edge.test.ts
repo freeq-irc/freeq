@@ -61,14 +61,14 @@ describe('the history edge', () => {
   });
 
   it('is unknown on a channel that has only ever been asked', () => {
-    s().historyFetchStarted('#armed');
+    s().historyFetchStarted('#armed', true);
     expect(ch('#armed').historyEdge).toBe('unknown');
     expect(ch('#armed').historyFetching).toBe(true);
   });
 
   it('goes unknown → more on a full page', () => {
     s().addMessage('#full', page(1, 500)[0]);
-    s().historyFetchStarted('#full');
+    s().historyFetchStarted('#full', true);
     s().mergeHistory('#full', page(PAGE, 100));
     s().historyPageReceived('#full', PAGE, PAGE, PAGE);
 
@@ -78,11 +78,11 @@ describe('the history edge', () => {
 
   it('goes more → start on a short page', () => {
     s().addMessage('#short', page(1, 500)[0]);
-    s().historyFetchStarted('#short');
+    s().historyFetchStarted('#short', true);
     s().historyPageReceived('#short', PAGE, PAGE, PAGE);
     expect(ch('#short').historyEdge).toBe('more');
 
-    s().historyFetchStarted('#short');
+    s().historyFetchStarted('#short', true);
     s().mergeHistory('#short', page(12, 50));
     s().historyPageReceived('#short', 12, PAGE, 12);
 
@@ -92,7 +92,7 @@ describe('the history edge', () => {
 
   it('marks the start on an empty page', () => {
     s().addMessage('#empty', page(1, 500)[0]);
-    s().historyFetchStarted('#empty');
+    s().historyFetchStarted('#empty', true);
     s().historyPageReceived('#empty', 0, PAGE, 0);
 
     expect(ch('#empty').historyEdge).toBe('start');
@@ -106,7 +106,7 @@ describe('the history edge', () => {
     s().mergeHistory('#overlap', overlap);
     const before = ch('#overlap').messages.length;
 
-    s().historyFetchStarted('#overlap');
+    s().historyFetchStarted('#overlap', true);
     s().mergeHistory('#overlap', overlap);
     s().historyPageReceived('#overlap', PAGE, PAGE, 0);
 
@@ -125,18 +125,18 @@ describe('the history edge', () => {
 
   it('does not re-arm a fetch that is already in flight', () => {
     s().addMessage('#once', page(1, 500)[0]);
-    s().historyFetchStarted('#once');
+    s().historyFetchStarted('#once', true);
     const armed = ch('#once');
-    s().historyFetchStarted('#once');
+    s().historyFetchStarted('#once', true);
 
     expect(ch('#once')).toBe(armed);
   });
 
   it('clears the in-flight flag when a fetch goes unanswered, leaving the edge', () => {
     s().addMessage('#lost', page(1, 500)[0]);
-    s().historyFetchStarted('#lost');
+    s().historyFetchStarted('#lost', true);
     s().historyPageReceived('#lost', PAGE, PAGE, PAGE);
-    s().historyFetchStarted('#lost');
+    s().historyFetchStarted('#lost', true);
     s().historyFetchFailed('#lost');
 
     expect(ch('#lost').historyFetching).toBe(false);
@@ -147,7 +147,7 @@ describe('the history edge', () => {
     s().addMessage('#held', page(1, 500)[0]);
     expect(ch('#held').historyAutoPaused).toBe(false);
 
-    s().historyFetchStarted('#held');
+    s().historyFetchStarted('#held', true);
     s().historyFetchFailed('#held');
 
     expect(ch('#held').historyAutoPaused).toBe(true);
@@ -155,7 +155,7 @@ describe('the history edge', () => {
 
   it('starts the automatic fetch again on request', () => {
     s().addMessage('#again', page(1, 500)[0]);
-    s().historyFetchStarted('#again');
+    s().historyFetchStarted('#again', true);
     s().historyFetchFailed('#again');
 
     s().historyAutoResumed('#again');
@@ -174,7 +174,7 @@ describe('the history edge', () => {
 
   it('does not hold off a page that arrived', () => {
     s().addMessage('#fine', page(1, 500)[0]);
-    s().historyFetchStarted('#fine');
+    s().historyFetchStarted('#fine', true);
     s().historyPageReceived('#fine', PAGE, PAGE, PAGE);
 
     expect(ch('#fine').historyAutoPaused).toBe(false);
@@ -193,7 +193,7 @@ describe('the history edge', () => {
     // The trim discards the oldest rows, so history above the oldest held
     // row exists by construction — whatever the edge said a moment ago.
     const WINDOW = grownPastTheWindow('#trim');
-    s().historyFetchStarted('#trim');
+    s().historyFetchStarted('#trim', true);
     s().historyPageReceived('#trim', 2, PAGE, 2);
     expect(ch('#trim').historyEdge).toBe('start');
     expect(ch('#trim').messages.length).toBeGreaterThan(WINDOW);
@@ -206,7 +206,7 @@ describe('the history edge', () => {
 
   it('starts the automatic fetch again after the window is trimmed', () => {
     grownPastTheWindow('#trimpause');
-    s().historyFetchStarted('#trimpause');
+    s().historyFetchStarted('#trimpause', true);
     s().historyFetchFailed('#trimpause');
     expect(ch('#trimpause').historyAutoPaused).toBe(true);
 
@@ -217,7 +217,7 @@ describe('the history edge', () => {
 
   it('leaves the edge alone when there is nothing to trim', () => {
     s().addMessage('#small', page(1, 500)[0]);
-    s().historyFetchStarted('#small');
+    s().historyFetchStarted('#small', true);
     s().historyPageReceived('#small', 2, PAGE, 2);
     const before = ch('#small');
 
@@ -239,7 +239,7 @@ describe('the history edge', () => {
 
     const heldBefore = ch('#cap').messages.length;
     const oldestBefore = ch('#cap').messages[0].id;
-    s().historyFetchStarted('#cap');
+    s().historyFetchStarted('#cap', true);
     s().mergeHistory('#cap', page(PAGE, 1_000)); // older than everything held
     const added = ch('#cap').messages.length - heldBefore;
 
@@ -252,9 +252,28 @@ describe('the history edge', () => {
     expect(ch('#cap').historyAutoPaused, 'but asking again would repeat it forever').toBe(true);
   });
 
+  it('does not stop on an opening page that only repeats what is held', () => {
+    // The request a channel opens with is not anchored on anything and its
+    // answer is expected to repeat rows already held — that is what makes it
+    // safe to send. Reading that as "asking again gets nowhere" would stop
+    // the reader before their first scroll.
+    for (const msg of page(20, 900)) s().addMessage('#opening', msg);
+    const heldBefore = ch('#opening').messages.length;
+
+    s().historyFetchStarted('#opening', false);
+    s().mergeHistory('#opening', page(20, 900)); // every row a duplicate
+    const added = ch('#opening').messages.length - heldBefore;
+    expect(added).toBe(0);
+
+    s().historyPageReceived('#opening', 20, PAGE, added);
+
+    expect(ch('#opening').historyAutoPaused).toBe(false);
+    expect(ch('#opening').historyEdge, 'a short page still means the start').toBe('start');
+  });
+
   it('keeps fetching when a page does add rows', () => {
     s().addMessage('#adds', page(1, 500)[0]);
-    s().historyFetchStarted('#adds');
+    s().historyFetchStarted('#adds', true);
     s().mergeHistory('#adds', page(PAGE, 100));
     s().historyPageReceived('#adds', PAGE, PAGE, PAGE);
 
@@ -263,9 +282,9 @@ describe('the history edge', () => {
   });
 
   it('keeps the edge per channel', () => {
-    s().historyFetchStarted('#a');
+    s().historyFetchStarted('#a', true);
     s().historyPageReceived('#a', 3, PAGE, 3);
-    s().historyFetchStarted('#b');
+    s().historyFetchStarted('#b', true);
     s().historyPageReceived('#b', PAGE, PAGE, PAGE);
 
     expect(ch('#a').historyEdge).toBe('start');
@@ -273,7 +292,7 @@ describe('the history edge', () => {
   });
 
   it('keys the channel case-insensitively', () => {
-    s().historyFetchStarted('#Mixed');
+    s().historyFetchStarted('#Mixed', true);
     s().historyPageReceived('#mIXED', 2, PAGE, 2);
 
     expect(ch('#mixed').historyEdge).toBe('start');

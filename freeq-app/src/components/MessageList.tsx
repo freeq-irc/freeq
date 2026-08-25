@@ -1208,6 +1208,12 @@ function PinnedBar({ pins, messages }: { pins: PinnedMessage[]; messages: Messag
 /** Distance from the top at which the next page is worth asking for. */
 const NEAR_TOP_PX = 120;
 
+/** Whether `msgs` holds anything from a sender, as opposed to join and part
+ *  notices. */
+function messagesHaveASender(msgs: Message[]): boolean {
+  return msgs.some((m) => !m.isSystem);
+}
+
 /** A server message id is a ULID. Anything else is a row the server sent no
  *  msgid for (or one this client minted), which can only be anchored by
  *  time. */
@@ -1257,6 +1263,11 @@ export function MessageList() {
     if (showJoinPart) return msgs;
     return msgs.filter((m) => !m.isSystem || !JOIN_PART_RE.test(m.text));
   }, [rawMessages, showJoinPart, blockedDids, blockedNicks, activeMembers]);
+
+  /** Whether anything on screen came from a sender, as opposed to join and
+   *  part notices. A channel with none has nothing for the boundary row to
+   *  sit above once its history is known to be empty. */
+  const hasSenderRows = useMemo(() => messagesHaveASender(messages), [messages]);
 
   // In-thread blocked indicator: a blocked peer's thread is hidden from the
   // sidebar but still reachable (quick switcher), and their messages are
@@ -1349,7 +1360,8 @@ export function MessageList() {
     useStore.getState().historyAutoResumed(activeChannel);
 
     // DM buffers don't get NAMES/366 so history isn't auto-fetched.
-    // Always request on activation (dedup handles duplicates).
+    // Always request on activation (dedup handles duplicates). Channels get
+    // theirs from the SDK on join, and its batch teaches the edge.
     if (isDM) {
       requestHistory(activeChannel);
     }
@@ -1363,9 +1375,14 @@ export function MessageList() {
     if (activeChannel === 'server') return;
     const ch = useStore.getState().channels.get(activeChannel.toLowerCase());
     if (!ch || ch.historyFetching || ch.historyEdge === 'start') return;
+    // A channel with nothing to anchor on — one holding only join and part
+    // notices — can still ask for the newest page, and its answer says
+    // whether the server holds anything at all. Not while the edge is
+    // unknown, though: the opening page is on its way and asking for it
+    // twice is a second request for the same thing.
     const anchor = historyAnchor(rawMessages);
-    if (!anchor) return;
-    requestHistory(activeChannel, anchor);
+    if (!anchor && ch.historyEdge === 'unknown') return;
+    requestHistory(activeChannel, anchor ?? undefined);
   }, [activeChannel, rawMessages]);
 
   // The button. Asking by hand is also what starts the automatic path again
@@ -1510,7 +1527,7 @@ export function MessageList() {
           )}
         </div>
       )}
-      {activeChannel !== 'server' && messages.length > 0 && (
+      {activeChannel !== 'server' && messages.length > 0 && !(historyEdge === 'start' && !hasSenderRows) && (
         <div className="px-4 py-3 flex items-center justify-center" data-testid="history-boundary">
           {historyFetching ? (
             <span className="text-xs text-fg-dim">Loading older messages…</span>

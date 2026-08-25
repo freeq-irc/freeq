@@ -348,6 +348,14 @@ export interface AgentDespawnedPayload {
   reason?: string;
 }
 
+/** What a `historyBatch` answers: the request the client sent for that
+ *  target. A batch with no matching request reports none. */
+export interface HistoryBatchInfo {
+  mode: 'latest' | 'before' | 'after';
+  /** The page size that was asked for. */
+  count: number;
+}
+
 /** Options for `requestHistory`. */
 export interface HistoryOptions {
   target: string;
