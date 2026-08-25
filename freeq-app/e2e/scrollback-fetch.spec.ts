@@ -7,11 +7,12 @@
  * gesture is toward the top, and the marker has to appear without a single
  * scroll back down to re-arm anything.
  *
- * The seeding is deliberately dense — as fast as the wire carries it, with
- * no pacing against wall-clock seconds. Pages anchored on a `msgid` step
- * through rows sharing a stored second one at a time, which a
- * second-resolution `timestamp` anchor cannot do; a channel seeded this way
- * is only walkable at all because of that.
+ * The seeding is deliberately dense. Every sender fires a burst at once, so
+ * each burst lands inside one stored second with their msgids interleaved;
+ * the only pacing is the server's flood window between bursts. Pages
+ * anchored on a `msgid` step through rows sharing a second one at a time,
+ * which a second-resolution `timestamp` anchor cannot do; a channel seeded
+ * this way is only walkable at all because of that.
  */
 import { test, expect, type Page, type Locator } from '@playwright/test';
 import net from 'node:net';
@@ -20,22 +21,62 @@ import { uniqueNick, uniqueChannel, connectGuest } from './helpers';
 const IRC_HOST = process.env.FREEQ_IRC_HOST || '127.0.0.1';
 const IRC_PORT = Number(process.env.FREEQ_IRC_PORT || 16799);
 
-/** Messages one session may send before the server's flood limit bites. */
-const PER_SESSION = 5;
-/** Sockets open at once — the server caps connections per IP at 20. */
-const MAX_PARALLEL = 10;
-/** Sessions to seed with, so `SESSIONS * PER_SESSION` messages in all. */
-const SESSIONS = 60;
+/** The server's flood window: five messages per two seconds per connection. */
+const BURST = 5;
+const BURST_WINDOW_MS = 2_250;
+/** Sessions that stay up for the whole seeding.
+ *
+ *  Kept low on purpose. These are held open for the length of the seeding,
+ *  so they overlap whatever the rest of the suite is doing on the same
+ *  address, and the server caps connections per IP at 20 — ten of them was
+ *  enough to push the spec that runs next over that cap and reject its
+ *  first wave. Six leaves room for a neighbour's ten and the readers. */
+const SESSIONS = 6;
+/** Messages each of them sends, in bursts of `BURST`. */
+const PER_SESSION = 50;
 const SEEDED = SESSIONS * PER_SESSION;
 
-/** Fill one session's flood budget into `channel` and leave. */
+/**
+ * One session that stays connected and sends its whole share, pausing
+ * between bursts to stay inside the flood window.
+ *
+ * Sixty short-lived sessions seeding this channel is what made the walk
+ * unreliable under suite load: sixty connects, joins and quits against a
+ * server the rest of the suite is also using, any one of which timing out
+ * fails the test for a reason that has nothing to do with paging. A
+ * handful of connections held open cost the same messages and almost none of
+ * that.
+ */
 function seedSession(channel: string, nick: string, first: number, count: number): Promise<void> {
   return new Promise((resolve, reject) => {
     const sock = net.connect(IRC_PORT, IRC_HOST);
     sock.setNoDelay(true);
     let buf = '';
     let joined = false;
-    const timer = setTimeout(() => { sock.destroy(); reject(new Error(`seed session ${nick} timed out`)); }, 15_000);
+    let sent = 0;
+    const timer = setTimeout(
+      () => { sock.destroy(); reject(new Error(`seed session ${nick} timed out`)); },
+      30_000 + (count / BURST) * BURST_WINDOW_MS,
+    );
+    const done = () => {
+      clearTimeout(timer);
+      sock.write('QUIT :seeded\r\n');
+      // Resolve once the server has actually let go, so the connection is off
+      // its per-IP count before whatever runs next starts connecting. The
+      // socket is not ended until the last burst has had a moment to flush.
+      sock.on('close', () => resolve());
+      setTimeout(() => sock.end(), 100);
+      setTimeout(() => resolve(), 2_000);
+    };
+    const sendBurst = () => {
+      let out = '';
+      for (let i = 0; i < BURST && sent < count; i++, sent++) {
+        out += `PRIVMSG ${channel} :seed ${String(first + sent).padStart(5, '0')}\r\n`;
+      }
+      sock.write(out);
+      if (sent >= count) done();
+      else setTimeout(sendBurst, BURST_WINDOW_MS);
+    };
     sock.on('error', (err) => { clearTimeout(timer); reject(err); });
     sock.on('data', (chunk) => {
       buf += chunk.toString();
@@ -46,12 +87,7 @@ function seedSession(channel: string, nick: string, first: number, count: number
         if (/ 001 /.test(line)) sock.write(`JOIN ${channel}\r\n`);
         if (!joined && / 366 /.test(line)) {
           joined = true;
-          let out = '';
-          for (let i = 0; i < count; i++) {
-            out += `PRIVMSG ${channel} :seed ${String(first + i).padStart(5, '0')}\r\n`;
-          }
-          sock.write(`${out}QUIT :seeded\r\n`);
-          setTimeout(() => { clearTimeout(timer); sock.end(); resolve(); }, 50);
+          sendBurst();
         }
       }
     });
@@ -59,13 +95,10 @@ function seedSession(channel: string, nick: string, first: number, count: number
   });
 }
 
-/** Seed `SEEDED` messages as fast as the connection cap allows. */
+/** Seed `SEEDED` messages through `SESSIONS` connections held open. */
 async function seedDensely(channel: string): Promise<void> {
-  for (let wave = 0; wave < SESSIONS; wave += MAX_PARALLEL) {
-    const size = Math.min(MAX_PARALLEL, SESSIONS - wave);
-    await Promise.all(Array.from({ length: size }, (_, k) =>
-      seedSession(channel, `df${wave}k${k}`, (wave + k) * PER_SESSION, PER_SESSION)));
-  }
+  await Promise.all(Array.from({ length: SESSIONS }, (_, k) =>
+    seedSession(channel, `df${k}`, k * PER_SESSION, PER_SESSION)));
 }
 
 /** How many message rows the transcript is holding. */
@@ -83,8 +116,8 @@ function boundary(page: Page): Locator {
 }
 
 test.describe('walking a channel to its start', () => {
-  // Seeding 300 messages over 60 short-lived sessions, then a walk of
-  // several pages, runs long by construction.
+  // Seeding paces against the flood window, and a walk of several pages
+  // follows it, so this one runs long by construction.
   test.setTimeout(300_000);
 
   test('one continuous scroll up reaches the start-of-channel marker', async ({ page }) => {
