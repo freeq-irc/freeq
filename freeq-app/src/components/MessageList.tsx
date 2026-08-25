@@ -1237,6 +1237,8 @@ export function MessageList() {
   const blockedDids = useStore((s) => s.blockedDids);
   const blockedNicks = useStore((s) => s.blockedNicks);
   const activeMembers = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.members);
+  /** A DM buffer: not the server tab, and not a channel name. */
+  const isDM = activeChannel !== 'server' && !activeChannel.startsWith('#') && !activeChannel.startsWith('&');
 
   // Filter out join/part/quit noise unless the user opted in.
   // Keep moderation actions (kicks, bans, mode changes) always visible.
@@ -1343,13 +1345,12 @@ export function MessageList() {
 
     // DM buffers don't get NAMES/366 so history isn't auto-fetched.
     // Always request on activation (dedup handles duplicates).
-    const isDM = activeChannel !== 'server' && !activeChannel.startsWith('#') && !activeChannel.startsWith('&');
     if (isDM) {
       requestHistory(activeChannel);
     }
 
     return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); clearTimeout(t4); };
-  }, [activeChannel]);
+  }, [activeChannel, isDM]);
 
   // Ask for the page older than everything held. The boundary row's button
   // and the auto-fetch below are the same request.
@@ -1497,7 +1498,9 @@ export function MessageList() {
           {historyFetching ? (
             <span className="text-xs text-fg-dim">Loading older messages…</span>
           ) : historyEdge === 'start' ? (
-            <span className="text-xs text-fg-dim">This is the beginning of the channel.</span>
+            <span className="text-xs text-fg-dim">
+              {isDM ? 'This is the beginning of the conversation.' : 'This is the beginning of the channel.'}
+            </span>
           ) : (
             <button
               className="text-xs text-accent hover:underline"

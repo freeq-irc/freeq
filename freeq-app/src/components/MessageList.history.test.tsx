@@ -137,6 +137,36 @@ describe('the boundary row', () => {
     expect(loadButton()).toBeNull();
   });
 
+  it('names the conversation, not the channel, at the start of a DM', () => {
+    s().addMessage('alice', {
+      id: ulid(1000), from: 'alice',
+      text: 'hi', timestamp: new Date(BASE + 1_000_000), tags: {},
+    });
+    s().setActiveChannel('alice');
+    const el = list();
+    scrollTo(el, 'middle');
+    answerWith('alice', 3, 100);
+
+    expect(boundary().textContent).toBe('This is the beginning of the conversation.');
+  });
+
+  it('reaches the start of a guest DM on an empty answer', () => {
+    // A session with no DID has no DM history, and the server answers that
+    // with an empty page rather than an error. Nothing in the app has to
+    // know that: an empty page is a short page.
+    s().addMessage('bob', {
+      id: ulid(2000), from: 'bob',
+      text: 'hello', timestamp: new Date(BASE + 2_000_000), tags: {},
+    });
+    s().setActiveChannel('bob');
+    const el = list();
+    scrollTo(el, 'middle');
+    answerWith('bob', 0, 0);
+
+    expect(s().channels.get('bob')!.historyEdge).toBe('start');
+    expect(boundary().textContent).toBe('This is the beginning of the conversation.');
+  });
+
   it('is not rendered on the server buffer', () => {
     channelWith('#some', 3);
     act(() => { s().setActiveChannel('server'); });
