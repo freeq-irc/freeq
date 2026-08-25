@@ -175,6 +175,43 @@ describe('a page of history the bridge asked for', () => {
     expect(ch('gp_guest')!.historyEdge, 'nothing was learned about the history').toBe('unknown');
   });
 
+  it('does not resolve a DM whose peer is nicked like a subcommand', () => {
+    // `before` is a legal nick and sits where the subcommand does. A refusal
+    // about another target must not end this one's page.
+    const client = connected();
+    seed('before');
+    bridge.requestHistory('before', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    client.emit(
+      'serverFail',
+      'CHATHISTORY MESSAGE_ERROR BEFORE #elsewhere Messages could not be retrieved',
+    );
+
+    expect(ch('before')!.historyFetching, 'still waiting on its own page').toBe(true);
+  });
+
+  it('resolves that peer when the refusal is about them', () => {
+    const client = connected();
+    seed('before');
+    bridge.requestHistory('before', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    client.emit('serverFail', 'CHATHISTORY ACCOUNT_REQUIRED before You must be authenticated');
+
+    expect(ch('before')!.historyFetching).toBe(false);
+  });
+
+  it('ignores a pending target named inside the description', () => {
+    // The description is prose; a channel named in it is not what the
+    // refusal is about.
+    const client = connected();
+    seed('#foo');
+    bridge.requestHistory('#foo', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    client.emit('serverFail', 'CHATHISTORY INVALID_TARGET #other No such channel #foo');
+
+    expect(ch('#foo')!.historyFetching).toBe(true);
+  });
+
   it('matches the target however the server cased it', () => {
     const client = connected();
     seed('#Cased');

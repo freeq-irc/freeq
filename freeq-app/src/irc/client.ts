@@ -358,17 +358,44 @@ function clearHistoryTimer(key: string) {
   }
 }
 
+/** CHATHISTORY subcommands, which sit where a target could and are all legal
+ *  nicks. */
+const HISTORY_SUBCOMMANDS = new Set([
+  'latest', 'before', 'after', 'around', 'between', 'targets',
+]);
+
+/** Which word of `CHATHISTORY <code> …` names the target, by code, counting
+ *  the command word as 0. Codes not listed have no fixed position. */
+const HISTORY_FAIL_TARGET_AT: Record<string, number> = {
+  message_error: 3,      // <subcommand> <target>
+  invalid_target: 2,
+  account_required: 2,
+};
+
 /** The channel a `FAIL CHATHISTORY …` answers, if we are waiting on a page
  *  for it.
  *
- *  The parameter that names the target sits in a different position per
- *  error code, so rather than parse by code this matches the targets we
- *  actually have a page out for. A FAIL for anything else is not ours to
- *  act on. */
+ *  The parameter that names the target sits in a different position per error
+ *  code, so rather than parse by code this matches the ones that could hold a
+ *  target against the targets we actually have a page out for. A FAIL for
+ *  anything else is not ours to act on.
+ *
+ *  For the codes whose shape is known the target is read from its own
+ *  position and nowhere else: the subcommand sits where a target could and
+ *  every subcommand is a legal nick, and the description that follows is
+ *  prose in which a channel name means nothing. Codes with no known shape
+ *  fall back to scanning what is left, skipping the words that can only be
+ *  subcommands. */
 function pendingHistoryTargetIn(text: string): string | null {
   if (!text.startsWith('CHATHISTORY ')) return null;
-  const tokens = new Set(text.toLowerCase().split(/\s+/));
-  for (const key of historyTimers.keys()) if (tokens.has(key)) return key;
+  const words = text.toLowerCase().split(/\s+/);
+  const at = HISTORY_FAIL_TARGET_AT[words[1] ?? ''];
+  const candidates = at !== undefined
+    ? [words[at]]
+    : words.slice(2).filter((w) => !HISTORY_SUBCOMMANDS.has(w));
+  for (const candidate of candidates) {
+    if (candidate && historyTimers.has(candidate)) return candidate;
+  }
   return null;
 }
 

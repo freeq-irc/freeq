@@ -52,6 +52,21 @@ const ACT_EVENT_DEDUPE_MS = 10 * 60_000;
  */
 const GUEST_NICK_RESUME_DELAYS_MS = [500, 1000, 2000];
 
+/** CHATHISTORY subcommands, which sit where a target could and are all legal
+ *  nicks. */
+const HISTORY_SUBCOMMANDS = new Set([
+  'latest', 'before', 'after', 'around', 'between', 'targets',
+]);
+
+/** Which parameter of `FAIL CHATHISTORY <code> …` names the target, by code.
+ *  Counted from the start of the FAIL parameters, so `CHATHISTORY` is 0 and
+ *  the code is 1. Codes not listed have no fixed position and are scanned. */
+const HISTORY_FAIL_TARGET_AT: Record<string, number> = {
+  message_error: 3,      // <subcommand> <target>
+  invalid_target: 2,
+  account_required: 2,
+};
+
 export class FreeqClient extends EventEmitter {
   private transport: Transport | null = null;
   private _nick = '';
@@ -824,12 +839,23 @@ export class FreeqClient extends EventEmitter {
    *  CHATHISTORY names.
    *
    *  The parameter holding the target sits in a different position per error
-   *  code, so rather than parse by code this matches the parameters against
-   *  the targets that have a request outstanding. A FAIL naming none of them
-   *  is not about a request this client is waiting on. */
+   *  code, so rather than parse by code this matches the remaining
+   *  parameters against the targets that have a request outstanding. A FAIL
+   *  naming none of them is not about a request this client is waiting on.
+   *
+   *  For the codes whose shape is known the target is read from its own
+   *  position and nowhere else, so a refusal about one target cannot drain a
+   *  DM whose peer happens to be nicked `before` — the subcommand sits where
+   *  a target could and every subcommand is a legal nick. Codes with no known
+   *  shape fall back to scanning, skipping the words that can only be
+   *  subcommands. */
   private dropRefusedHistoryRequest(params: string[]): void {
-    for (const param of params) {
-      const key = param.toLowerCase();
+    const at = HISTORY_FAIL_TARGET_AT[(params[1] ?? '').toLowerCase()];
+    const candidates = at !== undefined
+      ? [params[at]]
+      : params.slice(2).filter((p) => !HISTORY_SUBCOMMANDS.has(p.toLowerCase()));
+    for (const candidate of candidates) {
+      const key = (candidate ?? '').toLowerCase();
       if (this.historyRequests.has(key)) {
         this.takeHistoryRequest(key);
         return;

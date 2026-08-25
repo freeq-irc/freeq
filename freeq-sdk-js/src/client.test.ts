@@ -1068,6 +1068,40 @@ describe('what a history batch answers', () => {
     expect(seen).toEqual([{ mode: 'latest', count: 20 }]);
   });
 
+  it('does not drain a DM whose peer is nicked like a subcommand', async () => {
+    // The subcommand sits where a target could, and `before` is a legal nick.
+    // A refusal about one target must not drain another's request.
+    const { client, ws } = await makeRegistered();
+    const seen: Array<unknown> = [];
+    client.on('historyBatch', (_c, _m, info) => seen.push(info));
+
+    client.requestHistory({ target: 'before', mode: 'latest', count: 44 });
+    ws.recv(':srv FAIL CHATHISTORY MESSAGE_ERROR BEFORE #elsewhere :Messages could not be retrieved');
+    await flushAsync();
+    batch(ws, 'b1', 'before', 0);
+    for (let i = 0; i < 4; i++) await flushAsync();
+
+    expect(seen).toEqual([{ mode: 'latest', count: 44 }]);
+  });
+
+  it('still finds that peer when the refusal is about them', async () => {
+    // The subcommand is only skipped when something follows it, so a refusal
+    // whose one remaining parameter is that peer resolves to them.
+    const { client, ws } = await makeRegistered();
+    const seen: Array<unknown> = [];
+    client.on('historyBatch', (_c, _m, info) => seen.push(info));
+
+    client.requestHistory({ target: 'before', mode: 'before', msgid: 'x', count: 44 });
+    ws.recv(':srv FAIL CHATHISTORY ACCOUNT_REQUIRED before :You must be authenticated');
+    await flushAsync();
+
+    client.requestHistory({ target: 'before', mode: 'latest', count: 12 });
+    batch(ws, 'b1', 'before', 0);
+    for (let i = 0; i < 4; i++) await flushAsync();
+
+    expect(seen).toEqual([{ mode: 'latest', count: 12 }]);
+  });
+
   it('leaves the queue alone for a refusal naming no pending target', async () => {
     const { client, ws } = await makeRegistered();
     const seen: Array<unknown> = [];
