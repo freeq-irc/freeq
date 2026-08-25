@@ -213,6 +213,73 @@ describe('the boundary row', () => {
     expect(el.textContent, 'the notices are still there').toContain('alice joined');
   });
 
+  it('does not claim the beginning of a channel whose opening page is still out', async () => {
+    // The ordinary join: the server sends a notice for your own JOIN, so the
+    // buffer holds one row and nothing from a sender while the opening page
+    // is in flight. Claiming the beginning there tells the reader a channel
+    // about to show fifty messages starts here.
+    s().addSystemMessage('#busy', 'me joined');
+    s().setActiveChannel('#busy');
+    const el = list();
+    act(() => { s().historyFetchStarted('#busy', false); });
+
+    expect(boundary().textContent).toBe('Loading older messages…');
+    expect(el.textContent).not.toContain('This is the beginning of');
+
+    // Still not once the activation skeleton has cleared — the page decides
+    // this, not a timer.
+    await new Promise((r) => setTimeout(r, 700));
+    expect(boundary().textContent).toBe('Loading older messages…');
+    expect(el.textContent).not.toContain('This is the beginning of');
+
+    // The page lands full: fifty messages, and nothing ever said otherwise.
+    answerWith('#busy', PAGE, 100);
+    expect(el.textContent).not.toContain('This is the beginning of');
+    expect(s().channels.get('#busy')!.historyEdge).toBe('more');
+  });
+
+  it('does not claim the beginning beside a live button', async () => {
+    // A full opening page that holds nothing from a sender settles the edge
+    // on `more`. Waiting out the activation skeleton is the point: without
+    // it the empty state is hidden anyway and the assertion proves nothing.
+    s().addSystemMessage('#quietfull', 'me joined');
+    s().setActiveChannel('#quietfull');
+    const el = list();
+    act(() => { s().historyOpeningPage('#quietfull', PAGE, PAGE); });
+    await new Promise((r) => setTimeout(r, 700));
+
+    expect(s().channels.get('#quietfull')!.historyEdge).toBe('more');
+    // The row is there and is not the start marker — with no row to anchor
+    // on it goes on to ask for the newest page, so it reads as loading.
+    expect(boundary().textContent).not.toBe('This is the beginning of the channel.');
+    expect(el.textContent).not.toContain('This is the beginning of');
+  });
+
+  it('keeps naming the peer in a DM that holds nothing', async () => {
+    // A DM's empty state says who the conversation is with and nothing about
+    // where it begins, and until a message arrives it is the only thing that
+    // does. It holds exactly while there is no boundary row beside it, so it
+    // never claims anything a page in flight could contradict.
+    s().addDmTarget('bob');
+    act(() => { s().setActiveChannel('bob'); });
+    const el = list();
+    await new Promise((r) => setTimeout(r, 700));
+
+    expect(el.textContent).toContain('Conversation with');
+    expect(screen.queryByTestId('history-boundary')).toBeNull();
+  });
+
+  it('drops that naming once the DM holds a notice, and the row takes over', async () => {
+    s().addDmTarget('carol');
+    s().addSystemMessage('carol', 'carol is offline');
+    act(() => { s().setActiveChannel('carol'); });
+    const el = list();
+    await new Promise((r) => setTimeout(r, 700));
+
+    expect(screen.queryByTestId('history-boundary')).not.toBeNull();
+    expect(el.textContent).not.toContain('Conversation with');
+  });
+
   it('keeps the empty state away from a channel that holds messages', () => {
     channelWith('#full', 3);
     const el = list();

@@ -1503,10 +1503,22 @@ export function MessageList() {
       )}
       {/* The empty state owns the beginning line, so it has to render for a
           channel whose only rows are join and part notices — the boundary row
-          is suppressed there precisely because it can do nothing. The server
-          tab keeps its own test: its rows are system rows by nature, and
-          `hasSenderRows` would be false over a full log. */}
-      {(activeChannel === 'server' ? messages.length === 0 : !hasSenderRows) && !showSkeleton && (
+          is suppressed there precisely because it can do nothing. The two are
+          complements: the same edge the row is suppressed on is the one the
+          empty state claims, so neither can say the channel begins here while
+          a page that may fill it is still out.
+
+          Only channels state a beginning, so only channels wait for the edge.
+          A DM's empty state names the conversation and its privacy rule and
+          says nothing about where it begins, and it is the only thing naming
+          the peer before a message arrives — it keeps the old test, which
+          holds exactly while there is no boundary row to sit beside. The
+          server tab keeps it too: its rows are system rows by nature, so
+          `hasSenderRows` would be false over a full log, and it has no
+          history to page through for an edge to be learned from. */}
+      {(activeChannel === 'server' || isDM
+        ? messages.length === 0
+        : !hasSenderRows && historyEdge === 'start') && !showSkeleton && (
         <div className="flex flex-col items-center justify-center h-full text-fg-dim px-8">
           <img src="/freeq.png" alt="freeq" className="w-14 h-14 mb-4 opacity-20" />
           {activeChannel === 'server' ? (
