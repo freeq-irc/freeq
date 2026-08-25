@@ -293,8 +293,7 @@ describe('messaging methods', () => {
     // target, fetch history by it (the reply batch then arrives DID-keyed),
     // and learn the display binding so the DID renders as a name at once.
     const { client, ws } = await makeRegistered();
-    // TARGETS only ever arrive on an authenticated session; the client now
-    // skips DM-history fetches as a guest, so simulate the authed state.
+    // TARGETS only ever arrive on an authenticated session.
     (client as any)._authDid = 'did:plc:alice';
     const targets: string[] = [];
     client.on('historyTarget', (t) => targets.push(t));
@@ -984,6 +983,18 @@ describe('requestHistory', () => {
   it('opts.mode=before throws if msgid missing', async () => {
     const { client } = await makeRegistered();
     expect(() => client.requestHistory({ target: '#foo', mode: 'before' })).toThrow(/msgid/);
+  });
+
+  it('a guest asking for DM history reaches the wire', async () => {
+    // The client used to drop this request: the server always answered
+    // ACCOUNT_REQUIRED, so asking was noise. A current server answers an
+    // empty result instead, which is what lets a guest's DM buffer reach
+    // the start of the conversation.
+    const { client, ws } = await makeRegistered();
+    client.requestHistory({ target: 'somebody', mode: 'latest' });
+    client.requestHistory({ target: 'somebody', mode: 'before', msgid: 'abc', count: 50 });
+    expect(ws.sent).toContain('CHATHISTORY LATEST somebody * 50');
+    expect(ws.sent).toContain('CHATHISTORY BEFORE somebody msgid=abc 50');
   });
 
   it('legacy two-arg form still works', async () => {

@@ -1277,6 +1277,7 @@ export function MessageList() {
   const [atTop, setAtTop] = useState(false);
   const historyEdge = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.historyEdge ?? 'unknown');
   const historyFetching = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.historyFetching ?? false);
+  const historyAutoPaused = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.historyAutoPaused ?? false);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const [newMsgCount, setNewMsgCount] = useState(0);
   const [popover, setPopover] = useState<{ nick: string; did?: string; origin?: string; evidence?: RowEvidence; pos: { x: number; y: number } } | null>(null);
@@ -1343,6 +1344,10 @@ export function MessageList() {
     const t3 = setTimeout(scrollBottom, 600); // after CHATHISTORY arrives
     const t4 = setTimeout(scrollBottom, 1200); // slow networks
 
+    // Coming back to a buffer is the reader asking for it again, so a fetch
+    // that was held off after failing gets another go.
+    useStore.getState().historyAutoResumed(activeChannel);
+
     // DM buffers don't get NAMES/366 so history isn't auto-fetched.
     // Always request on activation (dedup handles duplicates).
     if (isDM) {
@@ -1353,8 +1358,8 @@ export function MessageList() {
   }, [activeChannel, isDM]);
 
   // Ask for the page older than everything held. The boundary row's button
-  // and the auto-fetch below are the same request.
-  const loadOlder = useCallback(() => {
+  // and the auto-fetch below send the same request.
+  const fetchOlder = useCallback(() => {
     if (activeChannel === 'server') return;
     const ch = useStore.getState().channels.get(activeChannel.toLowerCase());
     if (!ch || ch.historyFetching || ch.historyEdge === 'start') return;
@@ -1363,17 +1368,29 @@ export function MessageList() {
     requestHistory(activeChannel, anchor);
   }, [activeChannel, rawMessages]);
 
+  // The button. Asking by hand is also what starts the automatic path again
+  // after a page went unanswered, so the reader is never stuck with a row
+  // that only they can advance.
+  const onLoadOlder = useCallback(() => {
+    useStore.getState().historyAutoResumed(activeChannel);
+    fetchOlder();
+  }, [activeChannel, fetchOlder]);
+
   // While the reader is at the top and older history may exist, keep asking.
   //
   // The condition is re-read after every change to the list, not only inside
   // a scroll handler: a page prepending can leave the reader sitting at the
   // top with no further scroll event to fire, which is what made the old
   // trigger need a scroll down and back up to re-arm.
+  //
+  // A page that never arrived holds this off — otherwise a request that
+  // always fails is asked again the instant the in-flight flag clears.
   useEffect(() => {
     const el = ref.current;
     if (!el || el.scrollTop > NEAR_TOP_PX) return;
-    loadOlder();
-  }, [atTop, historyEdge, historyFetching, rawMessages, loadOlder]);
+    if (useStore.getState().channels.get(activeChannel.toLowerCase())?.historyAutoPaused) return;
+    fetchOlder();
+  }, [activeChannel, atTop, historyEdge, historyFetching, historyAutoPaused, rawMessages, fetchOlder]);
 
   // Clean block-copy: when a selection spans ≥2 message rows, rewrite the
   // clipboard to a tidy `Name: message` transcript instead of the raw DOM
@@ -1504,7 +1521,7 @@ export function MessageList() {
           ) : (
             <button
               className="text-xs text-accent hover:underline"
-              onClick={loadOlder}
+              onClick={onLoadOlder}
             >
               Load older messages
             </button>

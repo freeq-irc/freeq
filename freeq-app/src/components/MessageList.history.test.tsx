@@ -289,15 +289,62 @@ describe('the auto-fetch condition', () => {
     expect(requestHistory).toHaveBeenCalledTimes(1);
   });
 
-  it('asks again after a fetch goes unanswered', () => {
-    channelWith('#retry', 5);
+  it('stops asking on its own after a page goes unanswered', () => {
+    // Whatever swallowed the page will swallow the next one, and the reader
+    // would otherwise watch a spinner forever.
+    channelWith('#lost', 5);
     const el = list();
     expect(requestHistory).toHaveBeenCalledTimes(1);
 
-    act(() => { s().historyFetchFailed('#retry'); });
-    scrollTo(el, 'top');
+    act(() => { s().historyFetchFailed('#lost'); });
 
+    expect(boundary().textContent).toBe('Load older messages');
+
+    scrollTo(el, 'top');
+    scrollTo(el, 'top');
+    act(() => {
+      s().addMessage('#lost', {
+        id: ulid(5000), from: 'carol', text: 'live', timestamp: new Date(BASE + 5_000_000), tags: {},
+      });
+    });
+
+    expect(requestHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it('asks again, and keeps asking, when the reader clicks', () => {
+    channelWith('#byhand', 5, 1000);
+    list();
+    act(() => { s().historyFetchFailed('#byhand'); });
+    expect(requestHistory).toHaveBeenCalledTimes(1);
+
+    act(() => { fireEvent.click(loadButton()!); });
     expect(requestHistory).toHaveBeenCalledTimes(2);
+
+    // And the automatic path is running again: the next page prepending
+    // leads into the one after it with no further click.
+    answerWith('#byhand', PAGE, 900);
+    expect(requestHistory).toHaveBeenCalledTimes(3);
+    expect(requestHistory).toHaveBeenLastCalledWith('#byhand', { msgid: ulid(900) });
+  });
+
+  it('asks again when the reader comes back to the buffer', () => {
+    channelWith('#return', 5);
+    list();
+    act(() => { s().historyFetchFailed('#return'); });
+    expect(requestHistory).toHaveBeenCalledTimes(1);
+
+    // setActiveChannel only moves to a buffer that exists.
+    act(() => {
+      s().addMessage('#elsewhere', {
+        id: ulid(6000), from: 'dave', text: 'over here', timestamp: new Date(BASE + 6_000_000), tags: {},
+      });
+      s().setActiveChannel('#elsewhere');
+    });
+    act(() => { s().setActiveChannel('#return'); });
+
+    expect(s().channels.get('#return')!.historyAutoPaused).toBe(false);
+    expect(requestHistory.mock.calls.filter((c) => c[0] === '#return').length)
+      .toBeGreaterThan(1);
   });
 
   it('does not ask on a channel holding nothing to anchor on', () => {

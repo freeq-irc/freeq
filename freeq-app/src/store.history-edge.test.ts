@@ -142,6 +142,43 @@ describe('the history edge', () => {
     expect(ch('#lost').historyEdge).toBe('more');
   });
 
+  it('holds the automatic fetch off when a page goes unanswered', () => {
+    s().addMessage('#held', page(1, 500)[0]);
+    expect(ch('#held').historyAutoPaused).toBe(false);
+
+    s().historyFetchStarted('#held');
+    s().historyFetchFailed('#held');
+
+    expect(ch('#held').historyAutoPaused).toBe(true);
+  });
+
+  it('starts the automatic fetch again on request', () => {
+    s().addMessage('#again', page(1, 500)[0]);
+    s().historyFetchStarted('#again');
+    s().historyFetchFailed('#again');
+
+    s().historyAutoResumed('#again');
+
+    expect(ch('#again').historyAutoPaused).toBe(false);
+  });
+
+  it('leaves a channel alone when nothing was held off', () => {
+    s().addMessage('#noop', page(1, 500)[0]);
+    const before = ch('#noop');
+
+    s().historyAutoResumed('#noop');
+
+    expect(ch('#noop')).toBe(before);
+  });
+
+  it('does not hold off a page that arrived', () => {
+    s().addMessage('#fine', page(1, 500)[0]);
+    s().historyFetchStarted('#fine');
+    s().historyPageReceived('#fine', PAGE, PAGE);
+
+    expect(ch('#fine').historyAutoPaused).toBe(false);
+  });
+
   it('keeps the edge per channel', () => {
     s().historyFetchStarted('#a');
     s().historyPageReceived('#a', 3, PAGE);

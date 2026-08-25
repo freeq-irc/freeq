@@ -96,6 +96,9 @@ export interface Channel {
   historyEdge: HistoryEdge;
   /** Whether a page of older history is on the wire right now. */
   historyFetching: boolean;
+  /** Whether the automatic fetch is held off after a page never arrived.
+   *  Asking by hand, or re-activating the buffer, starts it again. */
+  historyAutoPaused: boolean;
 }
 
 /**
@@ -281,8 +284,11 @@ export interface Store {
    *  `limit` that was asked for. A no-op unless a fetch was in flight, so
    *  history arriving for any other reason leaves the edge alone. */
   historyPageReceived: (channel: string, received: number, limit: number) => void;
-  /** The page never came. The edge is left where it was. */
+  /** The page never came. The edge is left where it was, and the automatic
+   *  fetch is held off so a request that always fails cannot loop. */
   historyFetchFailed: (channel: string) => void;
+  /** Start the automatic fetch again after it was held off. */
+  historyAutoResumed: (channel: string) => void;
   addSystemMessage: (channel: string, text: string) => void;
   editMessage: (channel: string, originalMsgId: string, newText: string, newMsgId?: string, isStreaming?: boolean, editorNick?: string, editorAccount?: string) => void;
   deleteMessage: (channel: string, msgId: string, deleterNick?: string, deleterAccount?: string) => void;
@@ -386,6 +392,7 @@ function getOrCreateChannel(channels: Map<string, Channel>, name: string): Chann
       typingUsers: new Map(),
       historyEdge: 'unknown',
       historyFetching: false,
+      historyAutoPaused: false,
     };
     channels.set(key, ch);
   }
@@ -815,6 +822,7 @@ export const useStore = create<Store>((set, get) => ({
       typingUsers: new Map(),
       historyEdge: 'unknown',
       historyFetching: false,
+      historyAutoPaused: false,
     };
     // Always produce a fresh Channel object so subscribers comparing
     // channel identity (Sidebar, MessageList children, etc.) see a new
@@ -947,8 +955,21 @@ export const useStore = create<Store>((set, get) => ({
     const key = channel.toLowerCase();
     const ch = s.channels.get(key);
     if (!ch || !ch.historyFetching) return {};
+    // Whatever swallowed this page — an old server refusing, a dropped
+    // connection — will swallow the next one too, and the auto-fetch would
+    // ask again the moment the flag clears. Hold it off and let the reader
+    // decide.
     const channels = new Map(s.channels);
-    channels.set(key, { ...ch, historyFetching: false });
+    channels.set(key, { ...ch, historyFetching: false, historyAutoPaused: true });
+    return { channels };
+  }),
+
+  historyAutoResumed: (channel) => set((s) => {
+    const key = channel.toLowerCase();
+    const ch = s.channels.get(key);
+    if (!ch || !ch.historyAutoPaused) return {};
+    const channels = new Map(s.channels);
+    channels.set(key, { ...ch, historyAutoPaused: false });
     return { channels };
   }),
 

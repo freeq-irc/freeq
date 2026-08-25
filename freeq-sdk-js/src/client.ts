@@ -767,18 +767,6 @@ export class FreeqClient extends EventEmitter {
   requestHistory(channel: string, before?: string): void;
   requestHistory(channelOrOpts: string | HistoryOptions, before?: string): void {
     const count = 50;
-    // Guests can never fetch DM history (the server always answers
-    // ACCOUNT_REQUIRED, which the app now renders — so an unauthenticated
-    // session opening a DM spammed a red error line per request). Skip the
-    // structurally-impossible request; channels stay untouched, and
-    // authenticated sessions keep full behavior incl. nick targets on
-    // older servers.
-    const targetOf = (x: string | HistoryOptions) =>
-      typeof x === 'string' ? x : x.target;
-    const t = targetOf(channelOrOpts);
-    if (t && !t.startsWith('#') && !t.startsWith('&') && !this._authDid) {
-      return;
-    }
     let opts: HistoryOptions;
     if (typeof channelOrOpts === 'string') {
       // Legacy positional form: (channel, before?). `before` is treated
