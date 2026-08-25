@@ -324,6 +324,50 @@ describe('the boundary row', () => {
     expect(boundary().textContent).toBe('Load older messages');
   });
 
+  it('states the beginning itself when a topic has taken the empty state\'s slot', async () => {
+    // The empty state renders the topic where it would otherwise say where
+    // the channel begins, so the row is what is left to say it.
+    s().addSystemMessage('#topical', 'alice joined');
+    s().setTopic('#topical', 'Weekly sync notes');
+    s().setActiveChannel('#topical');
+    const el = list();
+    scrollTo(el, 'middle');
+    act(() => { s().historyOpeningPage('#topical', 0, PAGE); });
+    await new Promise((r) => setTimeout(r, 700));
+
+    expect(boundary().textContent).toBe('This is the beginning of the channel.');
+    expect(el.textContent).toContain('Weekly sync notes');
+    // Exactly one of the two says it.
+    expect(el.textContent).not.toContain('This is the beginning of #topical');
+  });
+
+  it('leaves it to the empty state when there is no topic', async () => {
+    s().addSystemMessage('#topicless', 'alice joined');
+    s().setActiveChannel('#topicless');
+    const el = list();
+    scrollTo(el, 'middle');
+    act(() => { s().historyOpeningPage('#topicless', 0, PAGE); });
+    await new Promise((r) => setTimeout(r, 700));
+
+    expect(screen.queryByTestId('history-boundary')).toBeNull();
+    expect(el.textContent).toContain('This is the beginning of');
+  });
+
+  it('never lets both say it, topic or not', async () => {
+    for (const [name, topic] of [['#both1', 'a topic'], ['#both2', '']] as const) {
+      s().addSystemMessage(name, 'alice joined');
+      if (topic) s().setTopic(name, topic);
+      act(() => { s().setActiveChannel(name); });
+      const { container, unmount } = render(<MessageList />);
+      act(() => { s().historyOpeningPage(name, 0, PAGE); });
+      await new Promise((r) => setTimeout(r, 700));
+
+      const said = (container.textContent ?? '').split('This is the beginning of').length - 1;
+      expect(said, `${name} should have exactly one beginning line`).toBe(1);
+      unmount();
+    }
+  });
+
   it('is not rendered on the server buffer', () => {
     channelWith('#some', 3);
     act(() => { s().setActiveChannel('server'); });

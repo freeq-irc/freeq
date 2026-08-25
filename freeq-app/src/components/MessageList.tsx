@@ -1269,6 +1269,14 @@ export function MessageList() {
    *  sit above once its history is known to be empty. */
   const hasSenderRows = useMemo(() => messagesHaveASender(messages), [messages]);
 
+  /** Whether the empty state, where it renders, is the thing that says where
+   *  this buffer begins. `ChannelEmptyState` puts the topic in that slot when
+   *  the channel has one, and a DM's empty state never says it at all — in
+   *  either case the boundary row's marker is what is left to say it. */
+  const activeTopic = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.topic);
+  const emptyStateSaysBeginning =
+    activeChannel !== 'server' && !isDM && !activeTopic;
+
   // In-thread blocked indicator: a blocked peer's thread is hidden from the
   // sidebar but still reachable (quick switcher), and their messages are
   // filtered — without a banner the history just looks silently one-sided.
@@ -1544,7 +1552,12 @@ export function MessageList() {
           )}
         </div>
       )}
-      {activeChannel !== 'server' && messages.length > 0 && !(historyEdge === 'start' && !hasSenderRows) && (
+      {/* Suppressed only where the empty state is about to say the same thing.
+          Exactly one of the two states the beginning of a channel that has
+          reached its start: the empty state when it carries that sentence,
+          this row when a topic has taken that slot. */}
+      {activeChannel !== 'server' && messages.length > 0
+        && !(historyEdge === 'start' && !hasSenderRows && emptyStateSaysBeginning) && (
         <div className="px-4 py-3 flex items-center justify-center" data-testid="history-boundary">
           {historyFetching ? (
             <span className="text-xs text-fg-dim">Loading older messages…</span>
