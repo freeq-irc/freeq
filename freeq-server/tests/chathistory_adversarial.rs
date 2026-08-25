@@ -1186,12 +1186,23 @@ async fn chathistory_after_msgid_walks_forward_through_a_burst() {
         rdr.drain();
 
         rdr.tx("CHATHISTORY LATEST #msgfwd * 500");
-        let ids: Vec<String> = rdr
-            .collect_batch_messages()
-            .iter()
-            .map(|l| C::extract_msgid(l))
-            .collect();
+        let latest = rdr.collect_batch_messages();
+        let ids: Vec<String> = latest.iter().map(|l| C::extract_msgid(l)).collect();
         assert_eq!(ids.len(), sent);
+
+        // The premise, as in the backward walk: rows really do share a stored
+        // second, so a timestamp anchor could not separate them. Without this
+        // a slow enough machine spreads the burst out and the walk proves
+        // nothing about the case it exists for.
+        let seconds: Vec<String> = latest.iter().map(|l| second_of(l)).collect();
+        let shared = seconds
+            .iter()
+            .filter(|s| seconds.iter().filter(|o| o == s).count() > 1)
+            .count();
+        assert!(
+            shared >= 2,
+            "burst should share a stored second: {seconds:?}"
+        );
 
         let mut anchor = ids.first().unwrap().clone();
         let mut walked: Vec<String> = vec![anchor.clone()];

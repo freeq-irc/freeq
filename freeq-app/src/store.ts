@@ -923,7 +923,17 @@ export const useStore = create<Store>((set, get) => ({
     const ch = s.channels.get(key);
     if (!ch || ch.messages.length <= MESSAGE_WINDOW) return {};
     const channels = new Map(s.channels);
-    channels.set(key, { ...ch, messages: ch.messages.slice(-MESSAGE_WINDOW) });
+    // Rows just went out of reach, so whatever the edge said before, there
+    // is history above the oldest held row now — by construction, since
+    // these are the rows that were discarded. A channel walked to its start
+    // and then trimmed would otherwise keep saying "start" over rows that
+    // are not it, with the button hidden and the fetch refusing.
+    channels.set(key, {
+      ...ch,
+      messages: ch.messages.slice(-MESSAGE_WINDOW),
+      historyEdge: 'more',
+      historyAutoPaused: false,
+    });
     return { channels };
   }),
 

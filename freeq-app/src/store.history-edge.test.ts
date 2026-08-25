@@ -28,7 +28,8 @@ Object.defineProperty(globalThis, 'crypto', {
 // @ts-expect-error mock
 globalThis.window = { localStorage: globalThis.localStorage, location: { hash: '' }, addEventListener: () => {} };
 
-const { useStore } = await import('./store');
+const storeModule = await import('./store');
+const { useStore } = storeModule;
 type Message = Parameters<ReturnType<typeof useStore.getState>['addMessage']>[1];
 
 const s = () => useStore.getState();
@@ -177,6 +178,53 @@ describe('the history edge', () => {
     s().historyPageReceived('#fine', PAGE, PAGE);
 
     expect(ch('#fine').historyAutoPaused).toBe(false);
+  });
+
+  /** A channel grown past the resting window the only way it can be: live
+   *  rows to the cap, then older pages merged on top by scrolling back. */
+  function grownPastTheWindow(name: string) {
+    const { MESSAGE_WINDOW } = storeModule;
+    for (const m of page(MESSAGE_WINDOW, 5_000)) s().addMessage(name, m);
+    s().mergeHistory(name, page(200, 4_000));
+    return MESSAGE_WINDOW;
+  }
+
+  it('says there is more again after the window is trimmed', () => {
+    // The trim discards the oldest rows, so history above the oldest held
+    // row exists by construction — whatever the edge said a moment ago.
+    const WINDOW = grownPastTheWindow('#trim');
+    s().historyFetchStarted('#trim');
+    s().historyPageReceived('#trim', 2, PAGE);
+    expect(ch('#trim').historyEdge).toBe('start');
+    expect(ch('#trim').messages.length).toBeGreaterThan(WINDOW);
+
+    s().trimMessageWindow('#trim');
+
+    expect(ch('#trim').messages.length).toBe(WINDOW);
+    expect(ch('#trim').historyEdge).toBe('more');
+  });
+
+  it('starts the automatic fetch again after the window is trimmed', () => {
+    grownPastTheWindow('#trimpause');
+    s().historyFetchStarted('#trimpause');
+    s().historyFetchFailed('#trimpause');
+    expect(ch('#trimpause').historyAutoPaused).toBe(true);
+
+    s().trimMessageWindow('#trimpause');
+
+    expect(ch('#trimpause').historyAutoPaused).toBe(false);
+  });
+
+  it('leaves the edge alone when there is nothing to trim', () => {
+    s().addMessage('#small', page(1, 500)[0]);
+    s().historyFetchStarted('#small');
+    s().historyPageReceived('#small', 2, PAGE);
+    const before = ch('#small');
+
+    s().trimMessageWindow('#small');
+
+    expect(ch('#small')).toBe(before);
+    expect(ch('#small').historyEdge).toBe('start');
   });
 
   it('keeps the edge per channel', () => {

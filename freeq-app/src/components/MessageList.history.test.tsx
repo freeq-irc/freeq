@@ -25,7 +25,8 @@ vi.mock('../irc/client', () => ({
 }));
 
 const { MessageList } = await import('./MessageList');
-const { useStore } = await import('../store');
+const storeModule = await import('../store');
+const { useStore } = storeModule;
 const client = await import('../irc/client');
 
 const s = () => useStore.getState();
@@ -346,6 +347,52 @@ describe('the auto-fetch condition', () => {
     expect(requestHistory.mock.calls.filter((c) => c[0] === '#return').length)
       .toBeGreaterThan(1);
   });
+
+  it('recovers from the start marker after the window is trimmed', () => {
+    // The scenario the review named: a channel past the resting window is
+    // walked to its true start, the reader returns to the bottom and the
+    // trim discards the rows that made it the start, and they scroll up
+    // again. The marker must not still be claiming the start over rows that
+    // are not it, with the button hidden and the fetch refusing.
+    const { MESSAGE_WINDOW } = storeModule;
+    for (let i = 0; i < MESSAGE_WINDOW; i++) {
+      s().addMessage('#deep', {
+        id: ulid(5000 + i), from: 'alice',
+        text: `live ${i}`, timestamp: new Date(BASE + (5000 + i) * 1000), tags: {},
+      });
+    }
+    s().setActiveChannel('#deep');
+    const el = list();
+
+    // Walked back past the cap, and the last page came up short.
+    answerWith('#deep', PAGE, 4000);
+    scrollTo(el, 'middle');
+    act(() => {
+      s().historyFetchStarted('#deep');
+      s().historyPageReceived('#deep', 4, PAGE);
+    });
+    expect(boundary().textContent).toBe('This is the beginning of the channel.');
+    expect(s().channels.get('#deep')!.messages.length).toBeGreaterThan(MESSAGE_WINDOW);
+
+    // Back to the bottom: MessageList hands the grown rows back.
+    scrollTo(el, 'bottom');
+    expect(s().channels.get('#deep')!.messages.length).toBe(MESSAGE_WINDOW);
+
+    // Up again. The rows that were the start are gone, so the marker is
+    // gone with them and the fetch is no longer refused.
+    requestHistory.mockClear();
+    scrollTo(el, 'top');
+
+    expect(boundary().textContent).not.toBe('This is the beginning of the channel.');
+    expect(requestHistory).toHaveBeenCalledTimes(1);
+    expect(boundary().textContent).toBe('Loading older messages…');
+
+    // And the button is reachable again, rather than hidden behind a marker
+    // that cannot be cleared.
+    scrollTo(el, 'middle');
+    answerWith('#deep', PAGE, 3000);
+    expect(loadButton()).not.toBeNull();
+  }, 20_000); // renders past the 1000-row window; well clear of the 5s default
 
   it('does not ask on a channel holding nothing to anchor on', () => {
     s().addSystemMessage('#quiet', 'alice joined');
