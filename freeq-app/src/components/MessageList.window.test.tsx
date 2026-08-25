@@ -189,7 +189,7 @@ describe('the new-message pill while the reader is scrolled back', () => {
     historyPage('#pill3', 50);
     expect(held('#pill3').length).toBe(MESSAGE_WINDOW + 50);
     expect(pill()).toBe('Jump to bottom');
-  });
+  }, 30_000); // renders past the 1000-row window; 15.6s seen under load
 
   it('keeps counting live messages across a merged history page', () => {
     scrolledBack('#pill4', 10);
