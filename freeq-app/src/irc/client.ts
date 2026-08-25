@@ -668,6 +668,20 @@ function wireEvents(c: FreeqClient) {
 
   c.on('connectionStateChanged', (state) => {
     s().setConnectionState(state);
+    if (state !== 'connected') {
+      // Nothing is going to arrive over a socket that is gone, so the pages
+      // waiting on one end here rather than ten seconds from now. Held off
+      // as well as ended: asking again while there is no transport would
+      // just queue another dead request.
+      for (const key of [...historyTimers.keys()]) {
+        clearHistoryTimer(key);
+        useStore.getState().historyFetchFailed(key);
+      }
+    } else {
+      // Back again, so the reason for holding off is gone. Other buffers
+      // re-arm when the reader returns to them, which they already do.
+      useStore.getState().historyAutoResumed(useStore.getState().activeChannel);
+    }
     // Left 'connected' while in a call: capture the call identity so the
     // reconnect can rejoin the SAME session with the SAME instance within
     // the server's AV grace window (mirrors macOS

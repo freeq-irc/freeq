@@ -253,21 +253,56 @@ describe('a page that never comes back', () => {
     expect(ch('#away')!.historyAutoPaused).toBe(true);
   });
 
-  it('ends at the button when the connection drops mid-flight', () => {
-    // The drop itself resolves nothing — there is no handler that cancels a
-    // page in flight — so this is the timer's job, and the ten seconds are
-    // the cost. What matters for the row is that it does end.
+  it('ends at the button the moment the connection drops', () => {
     const client = connected();
     seed('#dropped');
     bridge.requestHistory('#dropped', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
 
     client.emit('connectionStateChanged', 'disconnected');
-    expect(ch('#dropped')!.historyFetching, 'the drop alone does not answer it').toBe(true);
 
-    vi.advanceTimersByTime(10_000);
-
-    expect(ch('#dropped')!.historyFetching).toBe(false);
+    expect(ch('#dropped')!.historyFetching, 'without waiting out the timer').toBe(false);
     expect(ch('#dropped')!.historyAutoPaused).toBe(true);
+  });
+
+  it('ends every buffer waiting on that socket, not just the active one', () => {
+    const client = connected();
+    seed('#one');
+    seed('#two');
+    bridge.requestHistory('#one', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+    bridge.requestHistory('#two', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    client.emit('connectionStateChanged', 'disconnected');
+
+    expect(ch('#one')!.historyFetching).toBe(false);
+    expect(ch('#two')!.historyFetching).toBe(false);
+  });
+
+  it('arms the automatic fetching again for the buffer in front of the reader', () => {
+    const client = connected();
+    seed('#back');
+    s().setActiveChannel('#back');
+    bridge.requestHistory('#back', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+    client.emit('connectionStateChanged', 'disconnected');
+    expect(ch('#back')!.historyAutoPaused).toBe(true);
+
+    client.emit('connectionStateChanged', 'connected');
+
+    expect(ch('#back')!.historyAutoPaused, 'so a scroll to the top asks again').toBe(false);
+  });
+
+  it('leaves the timer alone as the answer to silence', () => {
+    // A socket that is still up and simply says nothing is the case the
+    // timer is for, and it still is.
+    connected();
+    seed('#quiet');
+    bridge.requestHistory('#quiet', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    vi.advanceTimersByTime(9_000);
+    expect(ch('#quiet')!.historyFetching).toBe(true);
+    vi.advanceTimersByTime(1_500);
+
+    expect(ch('#quiet')!.historyFetching).toBe(false);
+    expect(ch('#quiet')!.historyAutoPaused).toBe(true);
   });
 
   it('does not write off a page that already landed', () => {
