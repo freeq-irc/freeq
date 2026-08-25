@@ -83,13 +83,15 @@ function list() {
  *  merged the way the bridge merges them. */
 function answerWith(channel: string, rows: number, first: number, limit = PAGE) {
   act(() => {
-    s().historyPageReceived(channel, rows, limit);
+    const held = () => s().channels.get(channel.toLowerCase())?.messages.length ?? 0;
+    const before = held();
     if (rows > 0) {
       s().mergeHistory(channel, Array.from({ length: rows }, (_, i) => ({
         id: ulid(first + i), from: 'bob',
         text: `old ${first + i}`, timestamp: new Date(BASE + (first + i) * 1000), tags: {},
       })));
     }
+    s().historyPageReceived(channel, rows, limit, held() - before);
   });
 }
 
@@ -369,7 +371,7 @@ describe('the auto-fetch condition', () => {
     scrollTo(el, 'middle');
     act(() => {
       s().historyFetchStarted('#deep');
-      s().historyPageReceived('#deep', 4, PAGE);
+      s().historyPageReceived('#deep', 4, PAGE, 4);
     });
     expect(boundary().textContent).toBe('This is the beginning of the channel.');
     expect(s().channels.get('#deep')!.messages.length).toBeGreaterThan(MESSAGE_WINDOW);

@@ -836,15 +836,21 @@ function wireEvents(c: FreeqClient) {
     const dids = messages.map((m: any) => m.tags?.account).filter(Boolean);
     if (dids.length) prefetchProfiles(dids);
 
-    // The count off the wire, before the store dedups it against what is
-    // already held — a short page is the only thing that means there is no
-    // more history. A no-op unless this channel had a page in flight.
     clearHistoryTimer(channel.toLowerCase());
-    useStore.getState().historyPageReceived(channel, messages.length, HISTORY_PAGE);
 
+    // Merge first, then report both counts: the size off the wire, which is
+    // the only thing that says whether more history exists, and how many
+    // rows actually reached the held list, which is what says whether
+    // asking again on the same anchor would get anywhere.
+    const held = () =>
+      useStore.getState().channels.get(channel.toLowerCase())?.messages.length ?? 0;
+    const before = held();
     useStore.getState().mergeHistory(
       channel,
       messages as import('../store').Message[],
+    );
+    useStore.getState().historyPageReceived(
+      channel, messages.length, HISTORY_PAGE, held() - before,
     );
   });
 

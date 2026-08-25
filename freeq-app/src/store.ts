@@ -281,9 +281,10 @@ export interface Store {
   /** A page of older history has been asked for. */
   historyFetchStarted: (channel: string) => void;
   /** A page of older history came back: `received` rows against the
-   *  `limit` that was asked for. A no-op unless a fetch was in flight, so
-   *  history arriving for any other reason leaves the edge alone. */
-  historyPageReceived: (channel: string, received: number, limit: number) => void;
+   *  `limit` that was asked for, of which `added` reached the held list.
+   *  A no-op unless a fetch was in flight, so history arriving for any
+   *  other reason leaves the edge alone. */
+  historyPageReceived: (channel: string, received: number, limit: number, added: number) => void;
   /** The page never came. The edge is left where it was, and the automatic
    *  fetch is held off so a request that always fails cannot loop. */
   historyFetchFailed: (channel: string) => void;
@@ -945,18 +946,26 @@ export const useStore = create<Store>((set, get) => ({
     return { channels };
   }),
 
-  historyPageReceived: (channel, received, limit) => set((s) => {
+  historyPageReceived: (channel, received, limit, added) => set((s) => {
     const key = channel.toLowerCase();
     const ch = s.channels.get(key);
     if (!ch || !ch.historyFetching) return {};
-    // The count off the wire, not the rows the store kept: a page that
-    // overlaps what is already held dedups down to nothing while more
-    // history still sits behind it.
+    // The edge reads the count off the wire, not the rows the store kept: a
+    // page that overlaps what is already held dedups down to nothing while
+    // more history still sits behind it.
+    //
+    // What the store kept answers a different question. A page that reached
+    // the held list not at all — every row a duplicate, or the whole page
+    // discarded by the absolute cap — would be asked for again on the same
+    // anchor, and again. Whatever it was, asking once more is not what to
+    // do about it; hold the automatic fetching off and leave the reader a
+    // button.
     const channels = new Map(s.channels);
     channels.set(key, {
       ...ch,
       historyFetching: false,
       historyEdge: received < limit ? 'start' : 'more',
+      historyAutoPaused: received > 0 && added === 0,
     });
     return { channels };
   }),
