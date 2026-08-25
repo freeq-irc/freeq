@@ -416,7 +416,9 @@ pub(super) fn handle_who(
         // note in channel.rs::handle_names.
         let dids_snapshot = state.session_dids.lock().clone();
         let channels = state.channels.lock();
-        if let Some(ch) = channels.get(&channel) {
+        if let Some(ch) = channels.get(&channel).filter(|ch| {
+            state.channel_is_discoverable(&channel, ch) || ch.members.contains(session_id)
+        }) {
             let n2s = state.nick_to_session.lock();
             let away = state.session_away.lock();
 

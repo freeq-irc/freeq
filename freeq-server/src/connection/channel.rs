@@ -2089,13 +2089,18 @@ pub(super) fn handle_names(
     let nick_list: Vec<String> = {
         let channels = state.channels.lock();
         let (member_sessions, remote_members, ops, voiced) = match channels.get(channel) {
-            Some(ch) => (
-                ch.members.clone(),
-                ch.remote_members.clone(),
-                ch.ops.clone(),
-                ch.voiced.clone(),
-            ),
-            None => Default::default(),
+            Some(ch)
+                if state.channel_is_discoverable(channel, ch)
+                    || ch.members.contains(session_id) =>
+            {
+                (
+                    ch.members.clone(),
+                    ch.remote_members.clone(),
+                    ch.ops.clone(),
+                    ch.voiced.clone(),
+                )
+            }
+            _ => Default::default(),
         };
         // Read from the guard already held; re-locking here deadlocks
         // (parking_lot mutexes are not reentrant).
