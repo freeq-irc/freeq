@@ -820,6 +820,23 @@ export class FreeqClient extends EventEmitter {
     this.historyRequests.set(key, queue);
   }
 
+  /** Drop the oldest pending request for whichever target a refused
+   *  CHATHISTORY names.
+   *
+   *  The parameter holding the target sits in a different position per error
+   *  code, so rather than parse by code this matches the parameters against
+   *  the targets that have a request outstanding. A FAIL naming none of them
+   *  is not about a request this client is waiting on. */
+  private dropRefusedHistoryRequest(params: string[]): void {
+    for (const param of params) {
+      const key = param.toLowerCase();
+      if (this.historyRequests.has(key)) {
+        this.takeHistoryRequest(key);
+        return;
+      }
+    }
+  }
+
   /** What the closing batch for `target` answers, consuming it. */
   private takeHistoryRequest(target: string): HistoryBatchInfo | undefined {
     const key = target.toLowerCase();
@@ -2226,6 +2243,11 @@ export class FreeqClient extends EventEmitter {
       }
 
       case 'FAIL': {
+        // A refused CHATHISTORY is answered by this line and by no batch, so
+        // the request it refuses has to leave the queue here or the queue for
+        // that target stays one behind for the rest of the connection and
+        // every later batch is labelled with the request before it.
+        if (msg.params[0] === 'CHATHISTORY') this.dropRefusedHistoryRequest(msg.params);
         // IRCv3 FAIL — surface to the app. A silent server rejection is
         // indistinguishable from a client bug at the UI (and has cost
         // real debugging time); the app renders these as system messages.

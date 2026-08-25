@@ -1048,6 +1048,40 @@ describe('what a history batch answers', () => {
     ]);
   });
 
+  it('keeps the queue straight when a request is refused instead of answered', async () => {
+    // A refused CHATHISTORY is answered by the FAIL and by no batch. If the
+    // request it refuses stays queued, the next batch is labelled with it and
+    // the caller does not recognise the answer to the request it is waiting
+    // on — which sends that page to a timeout rather than to the reader.
+    const { client, ws } = await makeRegistered();
+    const seen: Array<unknown> = [];
+    client.on('historyBatch', (_c, _m, info) => seen.push(info));
+
+    client.requestHistory({ target: '#foo', mode: 'before', msgid: 'gone', count: 50 });
+    ws.recv(':srv FAIL CHATHISTORY MESSAGE_ERROR BEFORE #foo :Messages could not be retrieved');
+    await flushAsync();
+
+    client.requestHistory({ target: '#foo', mode: 'latest', count: 20 });
+    batch(ws, 'b1', '#foo', 0);
+    for (let i = 0; i < 4; i++) await flushAsync();
+
+    expect(seen).toEqual([{ mode: 'latest', count: 20 }]);
+  });
+
+  it('leaves the queue alone for a refusal naming no pending target', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: Array<unknown> = [];
+    client.on('historyBatch', (_c, _m, info) => seen.push(info));
+
+    client.requestHistory({ target: '#foo', mode: 'before', msgid: 'abc', count: 50 });
+    ws.recv(':srv FAIL CHATHISTORY INVALID_TARGET #somewhere-else :No such channel');
+    await flushAsync();
+    batch(ws, 'b1', '#foo', 0);
+    for (let i = 0; i < 4; i++) await flushAsync();
+
+    expect(seen).toEqual([{ mode: 'before', count: 50 }]);
+  });
+
   it('reports nothing for a batch no request is on record for', async () => {
     const { client, ws } = await makeRegistered();
     const seen: Array<unknown> = [];
