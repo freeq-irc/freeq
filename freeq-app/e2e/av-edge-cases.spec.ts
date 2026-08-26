@@ -84,9 +84,12 @@ test.describe('AV Session Edge Cases', () => {
     await startAvSessionRaw(page, channel);
     await page.waitForTimeout(2000);
 
-    // startAvSession on a channel that already has a session should join
-    // and show a system message
+    // Calls require a signed-in identity (ea2cc262: "startAvSession now checks
+    // authDid before sending, shows error if guest"), so stand one up. What is
+    // under test is the join, which runs for real from there.
     await page.evaluate(async ([ch]) => {
+      const { useStore } = await import('/src/store.ts');
+      useStore.getState().setAuth('did:plc:e2eavjoin', 'e2e');
       const { startAvSession } = await import('/src/irc/client.ts');
       await startAvSession(ch);
     }, [channel]);
