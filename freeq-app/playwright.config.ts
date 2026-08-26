@@ -12,6 +12,10 @@ import { defineConfig, devices } from '@playwright/test';
  */
 export default defineConfig({
   testDir: './e2e',
+  // The deep scrollback walk seeds thousands of rows against the server's
+  // flood limits, so it costs minutes by construction. Excluded from the
+  // default run; `npm run test:e2e:deep` runs it deliberately.
+  testIgnore: process.env.FREEQ_E2E_DEEP ? [] : ['**/scrollback-deep.spec.ts'],
   timeout: 30_000,
   expect: { timeout: 10_000 },
   fullyParallel: false, // tests share one server, run sequentially
