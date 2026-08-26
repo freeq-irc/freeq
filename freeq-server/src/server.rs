@@ -74,6 +74,8 @@ pub struct ChannelState {
     pub key: Option<String>,
     /// Pinned message IDs (msgid strings), most recent first.
     pub pins: Vec<PinnedMessage>,
+    /// Key for this channel's private-media space.
+    pub media_space_key: Option<String>,
 }
 
 /// A pinned message reference.
@@ -626,6 +628,8 @@ pub struct SharedState {
     pub server_name: String,
     pub challenge_store: ChallengeStore,
     pub did_resolver: DidResolver,
+    /// Private-media spaces. None = feature off.
+    pub media_space: Option<std::sync::Arc<crate::media_space::MediaSpaceManager>>,
     /// session_id -> sender for writing lines to that client
     pub connections: Mutex<HashMap<String, mpsc::Sender<String>>>,
     /// nick -> session_id (case-insensitive: keys are always lowercase)
@@ -1579,6 +1583,7 @@ impl Server {
                     && !ch.moderated
                     && ch.key.is_none()
                     && ch.bans.is_empty()
+                    && ch.media_space_key.is_none()
                 {
                     // Don't prune if channel has policy (check later)
                     let _ = db.delete_channel(name);
@@ -1628,10 +1633,36 @@ impl Server {
             bundles
         };
 
+        // Docker compose's `${VAR:-}` passes SET-BUT-EMPTY env vars, which
+        // clap surfaces as Some(""). Empty means unset here.
+        fn non_empty(v: &Option<String>) -> Option<&str> {
+            v.as_deref().filter(|s| !s.is_empty())
+        }
+        let media_space = match (
+            non_empty(&self.config.media_space_did),
+            non_empty(&self.config.media_space_password),
+        ) {
+            (Some(did), Some(password)) => Some(std::sync::Arc::new(
+                crate::media_space::MediaSpaceManager::new(
+                    did.to_string(),
+                    password.to_string(),
+                    non_empty(&self.config.media_space_pds).map(str::to_string),
+                    self.config.server_name.clone(),
+                ),
+            )),
+            (Some(_), None) => {
+                tracing::warn!(
+                    "media_space_did set without media_space_password; private media disabled"
+                );
+                None
+            }
+            _ => None,
+        };
         let state = Arc::new(SharedState {
             server_name: self.config.server_name.clone(),
             challenge_store: ChallengeStore::new(self.config.challenge_timeout_secs),
             did_resolver: self.resolver.clone(),
+            media_space,
             connections: Mutex::new(HashMap::new()),
             nick_to_session: Mutex::new(NickMap::new()),
             session_dids: Mutex::new(HashMap::new()),
@@ -7751,6 +7782,7 @@ mod s2s_adversarial_tests {
             server_name: config.server_name.clone(),
             challenge_store: crate::sasl::ChallengeStore::new(60),
             did_resolver: freeq_sdk::did::DidResolver::static_map(HashMap::new()),
+            media_space: None,
             connections: Mutex::new(HashMap::new()),
             nick_to_session: Mutex::new(NickMap::new()),
             session_dids: Mutex::new(HashMap::new()),

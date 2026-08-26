@@ -193,6 +193,13 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .route("/api/v1/openapi.json", get(crate::openapi::openapi_json))
         .route("/api/v1/openapi.yaml", get(crate::openapi::openapi_yaml))
         .route("/llms.txt", get(crate::openapi::llms_txt))
+        // Private media spaces. Returns a 404 if the feature is unconfigured.
+        .route("/.well-known/did.json", get(media_space_did_doc))
+        .route(
+            "/xrpc/com.atproto.simplespace.checkUserAccess",
+            get(xrpc_check_user_access),
+        )
+        .route("/api/v1/media-space", get(api_media_space))
         // REST API (read-only, v1)
         .route("/api/v1/health", get(api_health))
         // The mediated, metered model path: the server holds the provider
@@ -2276,6 +2283,176 @@ fn authorize_channel_read(
     } else {
         Err(StatusCode::FORBIDDEN)
     }
+}
+
+// ── Private media spaces ───────────────────────────────────────────────
+
+/// GET /.well-known/did.json — the did:web document for this server's
+/// managing-app identity. The spaces PDS resolves `did:web:{server_name}`
+/// here to find the checkUserAccess endpoint.
+async fn media_space_did_doc(
+    State(state): State<Arc<SharedState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if state.media_space.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(serde_json::json!({
+        "@context": ["https://www.w3.org/ns/did/v1"],
+        "id": format!("did:web:{}", state.server_name),
+        "service": [{
+            "id": format!("#{}", crate::media_space::MANAGING_APP_FRAGMENT),
+            "type": "FreeqMediaManagingApp",
+            "serviceEndpoint": format!("https://{}", state.server_name),
+        }],
+    })))
+}
+
+#[derive(serde::Deserialize)]
+struct CheckUserAccessParams {
+    space: String,
+    user: String,
+    #[serde(rename = "clientId")]
+    #[allow(dead_code)]
+    client_id: Option<String>,
+}
+
+/// GET /xrpc/com.atproto.simplespace.checkUserAccess — the managing-app
+/// callback the spaces PDS invokes when minting a space credential. The
+/// answer comes from the live channel roster: current member DID, founder,
+/// or DID-op of the channel owning the space.
+async fn xrpc_check_user_access(
+    State(state): State<Arc<SharedState>>,
+    Query(q): Query<CheckUserAccessParams>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(mgr) = state.media_space.clone() else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "MethodNotImplemented"})),
+        ));
+    };
+    let jwt = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "AuthMissing"})),
+        ))?;
+    if let Err(err) = crate::media_space::verify_service_auth(
+        &state.did_resolver,
+        jwt,
+        &mgr.authority_did,
+        &mgr.managing_app(),
+        "com.atproto.simplespace.checkUserAccess",
+    )
+    .await
+    {
+        tracing::warn!(error = %err, space = %q.space, "rejected checkUserAccess service auth");
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "AuthenticationRequired"})),
+        ));
+    }
+    let authorized = media_space_member(&state, &mgr, &q.space, &q.user);
+    Ok(Json(serde_json::json!({ "authorized": authorized })))
+}
+
+/// Whether `user_did` may access `space`: the space must be one this server
+/// is the authority for, and the DID must currently hold the owning channel
+/// (member session, founder, or DID-op). Guests have no DID and never match.
+fn media_space_member(
+    state: &SharedState,
+    mgr: &crate::media_space::MediaSpaceManager,
+    space: &str,
+    user_did: &str,
+) -> bool {
+    let Some(key) = mgr.parse_space_key(space) else {
+        return false;
+    };
+    // Snapshot under the channels lock, resolve sessions under session_dids
+    // (same lock order as authorize_channel_read).
+    let (members, founder, did_ops) = {
+        let channels = state.channels.lock();
+        let Some(ch) = channels
+            .values()
+            .find(|c| c.media_space_key.as_deref() == Some(key))
+        else {
+            return false;
+        };
+        (
+            ch.members.clone(),
+            ch.founder_did.clone(),
+            ch.did_ops.clone(),
+        )
+    };
+    if founder.as_deref() == Some(user_did) || did_ops.contains(user_did) {
+        return true;
+    }
+    let session_dids = state.session_dids.lock();
+    members.iter().any(|sid| {
+        session_dids
+            .get(sid)
+            .map(|d| d == user_did)
+            .unwrap_or(false)
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct MediaSpaceParams {
+    channel: String,
+}
+
+/// GET /api/v1/media-space?channel=… — the channel's space ref, creating the
+/// space on first use. Authorization mirrors channel history reads.
+async fn api_media_space(
+    State(state): State<Arc<SharedState>>,
+    Query(q): Query<MediaSpaceParams>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let Some(mgr) = state.media_space.clone() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let channel = authorize_channel_read(&state, &q.channel, &headers)?;
+    let key = channel.to_lowercase();
+
+    let space_body = |space_key: &str| {
+        serde_json::json!({
+            "space": mgr.space_ref(space_key),
+            "type": crate::media_space::SPACE_TYPE,
+        })
+    };
+    let stored = |state: &SharedState, key: &str| {
+        state
+            .channels
+            .lock()
+            .get(key)
+            .and_then(|c| c.media_space_key.clone())
+    };
+    if let Some(k) = stored(&state, &key) {
+        return Ok(Json(space_body(&k)));
+    }
+
+    // First use: create exactly one space, even under concurrent requests.
+    let _creating = mgr.create_lock.lock().await;
+    if let Some(k) = stored(&state, &key) {
+        return Ok(Json(space_body(&k)));
+    }
+    let new_key = ulid::Ulid::new().to_string();
+    if let Err(err) = mgr.create_space(&state.did_resolver, &new_key).await {
+        tracing::error!(error = %err, channel = %channel, "media space creation failed");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    let snapshot = {
+        let mut channels = state.channels.lock();
+        let Some(ch) = channels.get_mut(&key) else {
+            return Err(StatusCode::NOT_FOUND);
+        };
+        ch.media_space_key = Some(new_key.clone());
+        ch.clone()
+    };
+    state.with_db(|db| db.save_channel(&key, &snapshot));
+    Ok(Json(space_body(&new_key)))
 }
 
 /// GET /api/v1/messages/{msgid} — permalink resolution. Returns the message
