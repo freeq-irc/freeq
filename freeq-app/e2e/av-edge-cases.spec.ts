@@ -203,11 +203,11 @@ test.describe('AV Session Edge Cases', () => {
     const sessionId = data.active.id;
 
     // Activate audio (this creates moq-publish)
-    await page.evaluate(() => {
-      const { useStore } = require('/src/store.ts');
-      useStore.getState().setActiveAvSession(arguments[0]);
+    await page.evaluate(async (id) => {
+      const { useStore } = await import('/src/store.ts');
+      useStore.getState().setActiveAvSession(id);
       useStore.getState().setAvAudioActive(true);
-    });
+    }, sessionId);
     await page.waitForTimeout(3000);
 
     // Check that the SFU session was established
@@ -228,16 +228,23 @@ test.describe('AV Session Edge Cases', () => {
     }, [channel]);
     await page.waitForTimeout(2000);
 
-    // End the session
-    await page.evaluate(async ([ch]) => {
+    // End it the way the app does: av-end carries the session id, and a
+    // TAGMSG without one names no session to end.
+    const sessionId = await page.evaluate(async () => {
+      const { useStore } = await import('/src/store.ts');
+      for (const s of useStore.getState().avSessions.values()) return s.id;
+      return null;
+    });
+    expect(sessionId, 'av-start created a session').not.toBeNull();
+    await page.evaluate(async ([ch, id]) => {
       const mod = await import('/src/irc/client.ts');
-      mod.rawCommand(`@+freeq.at/av-end TAGMSG ${ch}`);
-    }, [channel]);
+      mod.endAvSession(ch, id as string);
+    }, [channel, sessionId]);
     await page.waitForTimeout(1000);
 
     // Session should be in 'ended' state briefly
-    const sessionState = await page.evaluate(() => {
-      const { useStore } = require('/src/store.ts');
+    const sessionState = await page.evaluate(async () => {
+      const { useStore } = await import('/src/store.ts');
       const sessions = useStore.getState().avSessions;
       for (const s of sessions.values()) {
         return s.state;
@@ -249,8 +256,8 @@ test.describe('AV Session Edge Cases', () => {
 
     // After 6 seconds, should be fully removed
     await page.waitForTimeout(6000);
-    const remainingSessions = await page.evaluate(() => {
-      const { useStore } = require('/src/store.ts');
+    const remainingSessions = await page.evaluate(async () => {
+      const { useStore } = await import('/src/store.ts');
       return useStore.getState().avSessions.size;
     });
     expect(remainingSessions).toBe(0);
