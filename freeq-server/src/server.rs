@@ -13021,7 +13021,6 @@ mod catchup_tests {
 
     use std::collections::HashMap;
 
-    use super::relayed_task_verdict_tests::capture;
     use super::s2s_adversarial_tests::{setup_authenticated_peer, test_manager};
     use super::{
         ReplayOutcome, SharedState, apply_replayed_event, process_s2s_message,
@@ -14590,47 +14589,6 @@ mod relayed_task_verdict_tests {
     use crate::s2s::S2sMessage;
 
     const SIGNER: &str = "did:plc:taskverdict";
-
-    /// Captures what the code under test logs — the same shape as the sink in
-    /// s2s.rs's capability tests — so a test can assert the verdict line.
-    #[derive(Clone, Default)]
-    pub(super) struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogSink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
-        type Writer = LogSink;
-        fn make_writer(&'a self) -> LogSink {
-            self.clone()
-        }
-    }
-
-    impl LogSink {
-        pub(super) fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
-        }
-    }
-
-    pub(super) fn capture() -> (LogSink, tracing::subscriber::DefaultGuard) {
-        let sink = LogSink::default();
-        let guard = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_writer(sink.clone())
-                // No colour codes: the assertions below match substrings.
-                .with_ansi(false)
-                .with_max_level(tracing::Level::INFO)
-                .finish(),
-        );
-        (sink, guard)
-    }
 
     /// A key on file for the signer, as a cross-server key fetch would have
     /// left it.
