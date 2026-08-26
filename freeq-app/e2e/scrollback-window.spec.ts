@@ -17,16 +17,31 @@ const IRC_PORT = Number(process.env.FREEQ_IRC_PORT || 16799);
 const WINDOW = 1000;
 /** Rows per CHATHISTORY page the app asks for. */
 const PAGE = 50;
-/** Messages one session may send before the server's flood limit bites. */
-const PER_SESSION = 5;
-/** Sockets open at once — the server caps connections per IP at 20. */
-const MAX_PARALLEL = 10;
+/** The server's flood window: five messages per two seconds per connection. */
+const BURST = 5;
+const BURST_WINDOW_MS = 2_100;
+/** Sessions held open for the whole seeding. With the talker and the reader
+ *  this stays well under the 20-per-IP cap, and a held-open connection
+ *  overlaps whatever the rest of the suite is doing on the same address. */
+const SESSIONS = 10;
+/** Messages each of them sends, in bursts of `BURST`.
+ *
+ *  The total is the one this channel always held. It is not slack: paging is
+ *  continuous now, so holding at the top drains the channel rather than
+ *  taking one page, and the assertions after the growth loop need history
+ *  still to be arriving. A channel that can be drained inside the loop has
+ *  none left for them. */
+const PER_SESSION = 264;
 
 /**
- * Fill one session's flood budget into `channel` and leave.
+ * One session that stays connected and sends its whole share, pausing
+ * between bursts to stay inside the flood window.
  *
- * A fresh session gets a fresh budget, so seeding at any volume means many
- * short-lived ones rather than one chatty connection.
+ * This used to be one short-lived session per five messages — over five
+ * hundred connects, joins and quits for a channel this size, against a
+ * server the rest of the suite is also using. Any one of them failing to
+ * connect fails the test for a reason that has nothing to do with the
+ * window.
  */
 function seedSession(channel: string, nick: string, first: number, count: number): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -34,7 +49,33 @@ function seedSession(channel: string, nick: string, first: number, count: number
     sock.setNoDelay(true);
     let buf = '';
     let joined = false;
-    const timer = setTimeout(() => { sock.destroy(); reject(new Error(`seed session ${nick} timed out`)); }, 15_000);
+    let sent = 0;
+    // Twice the time the bursts need, plus a minute. Seeding shares an event
+    // loop with the browser driver, and a budget that merely covers the
+    // bursts back to back is one this fails under suite load rather than for
+    // anything about the window.
+    const timer = setTimeout(
+      () => { sock.destroy(); reject(new Error(`seed session ${nick} timed out`)); },
+      60_000 + (count / BURST) * BURST_WINDOW_MS * 2,
+    );
+    const done = () => {
+      clearTimeout(timer);
+      sock.write('QUIT :seeded\r\n');
+      // Resolve once the server has let go, so the connection is off its
+      // per-IP count before whatever runs next starts connecting.
+      sock.on('close', () => resolve());
+      setTimeout(() => sock.end(), 100);
+      setTimeout(() => resolve(), 2_000);
+    };
+    const sendBurst = () => {
+      let out = '';
+      for (let i = 0; i < BURST && sent < count; i++, sent++) {
+        out += `PRIVMSG ${channel} :seed ${String(first + sent).padStart(5, '0')}\r\n`;
+      }
+      sock.write(out);
+      if (sent >= count) done();
+      else setTimeout(sendBurst, BURST_WINDOW_MS);
+    };
     sock.on('error', (err) => { clearTimeout(timer); reject(err); });
     sock.on('data', (chunk) => {
       buf += chunk.toString();
@@ -45,12 +86,7 @@ function seedSession(channel: string, nick: string, first: number, count: number
         if (/ 001 /.test(line)) sock.write(`JOIN ${channel}\r\n`);
         if (!joined && / 366 /.test(line)) {
           joined = true;
-          let out = '';
-          for (let i = 0; i < count; i++) {
-            out += `PRIVMSG ${channel} :seed ${String(first + i).padStart(5, '0')}\r\n`;
-          }
-          sock.write(`${out}QUIT :seeded\r\n`);
-          setTimeout(() => { clearTimeout(timer); sock.end(); resolve(); }, 50);
+          sendBurst();
         }
       }
     });
@@ -59,29 +95,26 @@ function seedSession(channel: string, nick: string, first: number, count: number
 }
 
 /**
- * Seed `buckets` wall-clock seconds' worth of messages, `perBucket` each.
+ * Seed `SESSIONS * PER_SESSION` messages through connections held open.
  *
- * The bucketing is not decoration. Stored timestamps are second-resolution
- * and CHATHISTORY pages with `timestamp < marker`, so rows sharing the page
- * boundary's second are stepped over — a channel seeded all at once is one
- * page deep however many rows it holds. One bucket per second is what makes
- * the channel walkable a page at a time.
+ * The old seeding paced one bucket of messages per wall-clock second, and
+ * the reason was that CHATHISTORY paged with `timestamp < marker`: rows
+ * sharing a page boundary's second were stepped over, so a channel seeded
+ * all at once was one page deep however many rows it held. Pages are cut on
+ * `(timestamp, msgid)` now and step through a shared second one row at a
+ * time, so the channel is walkable however its rows fall across seconds and
+ * the bucketing has nothing left to do.
  */
-async function seedChannel(channel: string, buckets: number, perBucket: number): Promise<number> {
-  const sessions = Math.ceil(perBucket / PER_SESSION);
-  let sent = 0;
-  for (let bucket = 0; bucket < buckets; bucket++) {
-    const startedAt = Date.now();
-    for (let wave = 0; wave < sessions; wave += MAX_PARALLEL) {
-      const size = Math.min(MAX_PARALLEL, sessions - wave);
-      await Promise.all(Array.from({ length: size }, (_, k) =>
-        seedSession(channel, `sd${bucket}w${wave}k${k}`, sent + (wave + k) * PER_SESSION, PER_SESSION)));
-    }
-    sent += sessions * PER_SESSION;
-    const spent = Date.now() - startedAt;
-    if (spent < 1000) await new Promise((r) => setTimeout(r, 1000 - spent));
-  }
-  return sent;
+async function seedChannel(channel: string): Promise<number> {
+  // One retry each. The server caps connections per IP and this spec's
+  // senders go up while a neighbouring spec's may still be coming down, so a
+  // refused connect is a transient the fixture should ride out rather than
+  // report as a failure of the window.
+  await Promise.all(Array.from({ length: SESSIONS }, (_, k) =>
+    seedSession(channel, `sd${k}`, k * PER_SESSION, PER_SESSION)
+      .catch(() => new Promise((r) => setTimeout(r, 2_000))
+        .then(() => seedSession(channel, `sdr${k}`, k * PER_SESSION, PER_SESSION)))));
+  return SESSIONS * PER_SESSION;
 }
 
 /**
@@ -154,15 +187,17 @@ function jumpButton(page: Page): Locator {
 }
 
 test.describe('scrollback window', () => {
-  // Seeding is paced against wall-clock seconds, and ~19 pages of scroll-back
-  // follow it, so this one runs long by construction.
-  test.setTimeout(300_000);
+  // The flood window is per connection, so seeding this much through
+  // connections that stay open takes minutes rather than the seconds a crowd
+  // of disposable ones took, and ~19 pages of scroll-back follow it.
+  test.setTimeout(600_000);
 
   test('paging back grows the window; returning to the bottom trims it without moving the view', async ({ page }) => {
     const channel = uniqueChannel();
-    // 24 buckets ≈ 24 walkable pages: one is spent on the rows the JOIN
-    // already replayed, ~19 carry the held list past 1000, the rest is slack.
-    const seeded = await seedChannel(channel, 24, 110);
+    // Ten senders, 264 each: one page is spent on the rows the JOIN
+    // already replayed, ~19 carry the held list past 1000, the rest is what
+    // keeps arriving while the assertions after the loop run.
+    const seeded = await seedChannel(channel);
     expect(seeded).toBeGreaterThan(WINDOW);
     const live = await talker(channel, uniqueNick('live'));
 
