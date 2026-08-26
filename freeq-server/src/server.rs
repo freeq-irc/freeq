@@ -13833,7 +13833,20 @@ mod catchup_tests {
 
         let third_key = SigningKey::from_bytes(&[113u8; 32]);
         key_on_file(&state, THIRD_DID, &third_key);
-        let (sink, _guard) = capture();
+
+        // What a receipt would move if it were usable: the claim it names
+        // stops being unconfirmed, and the task view follows. Both are read
+        // before and after, because "ignored" is exactly the two of them not
+        // moving.
+        let claim_unconfirmed_before = state
+            .with_db(|db| db.act_event_is_unconfirmed(CLAIMED))
+            .expect("the claim is on file");
+        assert!(claim_unconfirmed_before, "nothing has confirmed it yet");
+        let task_before = state
+            .with_db(|db| db.act_task(ACT))
+            .flatten()
+            .expect("live");
+
         assert_eq!(
             apply_replayed_event(
                 &state,
@@ -13842,6 +13855,21 @@ mod catchup_tests {
                 receipt(&third_key, FORGED, ACT, CLAIMED, THIRD_DID, HOME_LINK),
             ),
             ReplayOutcome::Unusable
+        );
+
+        assert!(
+            state
+                .with_db(|db| db.act_event_is_unconfirmed(CLAIMED))
+                .expect("still on file"),
+            "the claim it named is still unconfirmed: the receipt confirmed nothing"
+        );
+        assert_eq!(
+            state
+                .with_db(|db| db.act_task(ACT))
+                .flatten()
+                .expect("live"),
+            task_before,
+            "and the task view is the one it was before the receipt arrived"
         );
 
         assert!(
@@ -13863,11 +13891,6 @@ mod catchup_tests {
             0,
             "nor held: a peer that is not the home never carries the home's word, \
              so there is nothing about it a key could settle"
-        );
-        let logs = sink.text();
-        assert!(
-            logs.contains(FORGED) && logs.contains("not the server that owns"),
-            "the skip names the event and says why: {logs}"
         );
     }
 
