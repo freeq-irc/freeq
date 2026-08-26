@@ -7,19 +7,22 @@ everything about it may change.
 
 ## Why
 
-Media shared through freeq is public. Attachments are uploaded to the
-sender's PDS as public blobs, so anyone with the link can fetch them,
-forever, no matter how locked down the channel is. An image posted in an
-invite-only channel is exactly as public as one posted in #freeq, and
-deleting the message does not delete the file.
+freeq can already put your public media on your own PDS ("save a public
+copy to my PDS"). This feature is the other side of that: your private
+media on your own PDS too, under your control, following AT Protocol
+concepts.
 
-With this feature on, media shared in a channel is visible to exactly the
-people who are in that channel. Joining grants access, being kicked or
-banned removes it, and the uploader can genuinely delete their files. The
-freeq server never stores or even sees the media itself: files live on
-each uploader's own PDS, and clients fetch them from there directly.
+Today, private attachments are held by the freeq server instead. It stores
+the files, holds the key, and access rides on possession of a link. That
+works, but the files are not yours in any atproto sense: you cannot take
+them with you, truly delete them, or keep the server operator out of them.
 
-## How it works, briefly
+With spaces, a private file stays in your own repo on your PDS. The
+channel decides who may read it (joining grants access, a kick or ban
+removes it), the freeq server never stores or even sees the bytes, and
+deleting your file is a real deletion.
+
+## How it works
 
 The server gets its own AT Protocol account, which acts as the gatekeeper
 for one private "space" per channel. Members' clients put media into the
@@ -42,6 +45,17 @@ media_space_password = "..."
 (Or use the matching CLI flags / `FREEQ_MEDIA_SPACE_*` environment
 variables.) Leave these unset and the feature is completely off; media
 works exactly as before.
+
+To enable it under docker compose, ensure the variables are set in your
+`.env` and add these to the freeq service:
+
+```yaml
+environment:
+  - FREEQ_MEDIA_SPACE_DID=${FREEQ_MEDIA_SPACE_DID:-}
+  - FREEQ_MEDIA_SPACE_PASSWORD=${FREEQ_MEDIA_SPACE_PASSWORD:-}
+```
+
+and set the values in your `.env`.
 
 Two things to know when enabling it:
 

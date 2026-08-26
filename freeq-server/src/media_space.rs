@@ -18,6 +18,12 @@ pub const SPACE_TYPE: &str = "at.freeq.media";
 /// this server's `did:web` document.
 pub const MANAGING_APP_FRAGMENT: &str = "freeq_media";
 
+/// The OAuth scope token granting full access to this server's media spaces.
+/// Explicit `collection=*` spares the PDS resolving the space type's lexicon.
+pub fn space_scope(authority_did: &str) -> String {
+    format!("space:{SPACE_TYPE}?authority={authority_did}&collection=*")
+}
+
 /// Client for the spaces PDS plus the identity this server manages spaces as.
 pub struct MediaSpaceManager {
     pub authority_did: String,

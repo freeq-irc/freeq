@@ -199,8 +199,9 @@ fn requested_scopes_are_narrow_not_transition_generic() {
         OauthPurpose::Login,
         OauthPurpose::BlobUpload,
         OauthPurpose::BlueskyPost,
+        OauthPurpose::MediaSpace,
     ] {
-        let s = p.requested_scope();
+        let s = p.requested_scope(Some("did:plc:testauthority"));
         assert!(
             !s.contains("transition:generic"),
             "purpose {:?} requests legacy scope: {s}",
@@ -387,7 +388,7 @@ async fn metadata_scope_contains_every_requested_purpose_scope() {
         OauthPurpose::BlobUpload,
         OauthPurpose::BlueskyPost,
     ] {
-        for token in p.requested_scope().split_whitespace() {
+        for token in p.requested_scope(None).split_whitespace() {
             assert!(
                 metadata_scope.contains(token),
                 "client-metadata.json scope ({:?}) is missing token `{token}` requested by purpose {:?}; \

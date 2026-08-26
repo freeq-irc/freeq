@@ -3038,10 +3038,19 @@ fn verify_broker_signature_raw(
 
 /// Serves the AT Protocol OAuth client-metadata.json document.
 /// The client_id for non-localhost origins is `{origin}/client-metadata.json`.
-async fn client_metadata(headers: axum::http::HeaderMap) -> Json<serde_json::Value> {
+async fn client_metadata(
+    State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
+) -> Json<serde_json::Value> {
     let (web_origin, _) = derive_web_origin(&headers);
     let redirect_uri = format!("{web_origin}/auth/callback");
     let client_id = build_client_id(&web_origin, &redirect_uri);
+    // Advertise every scope any flow may request in the metadata.
+    let mut scope = "atproto blob:image/* repo:blue.irc.media?action=create repo:app.bsky.feed.post transition:generic".to_string();
+    if let Some(ref mgr) = state.media_space {
+        scope.push(' ');
+        scope.push_str(&crate::media_space::space_scope(&mgr.authority_did));
+    }
 
     Json(serde_json::json!({
         "client_id": client_id,
@@ -3064,7 +3073,7 @@ async fn client_metadata(headers: axum::http::HeaderMap) -> Json<serde_json::Val
         // remains permitted by the current client metadata. We never ask
         // for it on a fresh /authorize. Remove this entry once the PDS
         // ecosystem has fully sunset transitional scopes.
-        "scope": "atproto blob:image/* repo:blue.irc.media?action=create repo:app.bsky.feed.post transition:generic",
+        "scope": scope,
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
@@ -3346,7 +3355,7 @@ async fn auth_login(
     // request additional scopes there.
     let redirect_uri = format!("{web_origin}/auth/callback");
     let purpose = crate::server::OauthPurpose::Login;
-    let scope = purpose.requested_scope();
+    let scope = purpose.requested_scope(None);
     let client_id = build_client_id(&web_origin, &redirect_uri);
 
     // Generate PKCE + DPoP key + state
@@ -3365,7 +3374,7 @@ async fn auth_login(
         &code_challenge,
         &oauth_state,
         &handle,
-        scope,
+        &scope,
         &dpop_key,
     )
     .await
@@ -3410,7 +3419,8 @@ async fn auth_login(
 
 #[derive(Deserialize)]
 struct AuthStepUpQuery {
-    /// `blob_upload` or `bluesky_post` — see [`crate::server::OauthPurpose`].
+    /// `blob_upload`, `bluesky_post`, or `media_space` — see
+    /// [`crate::server::OauthPurpose`].
     purpose: String,
     /// DID to step up. Must match an active Login session on this server,
     /// otherwise the step-up is refused (we'd have nothing to "upgrade").
@@ -3440,6 +3450,12 @@ async fn auth_step_up(
         StatusCode::BAD_REQUEST,
         format!("Unknown purpose: {}", q.purpose),
     ))?;
+    if matches!(purpose, crate::server::OauthPurpose::MediaSpace) && state.media_space.is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Private media is not enabled on this server".to_string(),
+        ));
+    }
     if matches!(purpose, crate::server::OauthPurpose::Login) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -3511,7 +3527,8 @@ async fn auth_step_up(
     .map_err(map_outbound_err)?;
 
     let redirect_uri = format!("{web_origin}/auth/callback");
-    let scope = purpose.requested_scope();
+    let scope =
+        purpose.requested_scope(state.media_space.as_ref().map(|m| m.authority_did.as_str()));
     let client_id = build_client_id(&web_origin, &redirect_uri);
 
     let dpop_key = freeq_sdk::oauth::DpopKey::generate();
@@ -3529,7 +3546,7 @@ async fn auth_step_up(
         &code_challenge,
         &oauth_state,
         &login_session.handle,
-        scope,
+        &scope,
         &dpop_key,
     )
     .await

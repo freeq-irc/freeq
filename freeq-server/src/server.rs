@@ -259,6 +259,10 @@ pub enum OauthPurpose {
     /// Cross-posting messages to Bluesky. Scope: adds `repo:app.bsky.feed.post`.
     /// Triggered the first time a user enables Bluesky mirroring on a channel.
     BlueskyPost,
+    /// Writing private media into this server's channel spaces. Scope: adds
+    /// `space:at.freeq.media` for this server's space authority. Triggered
+    /// the first time a user makes a private upload.
+    MediaSpace,
 }
 
 impl OauthPurpose {
@@ -268,6 +272,7 @@ impl OauthPurpose {
             "login" => Some(Self::Login),
             "blob_upload" => Some(Self::BlobUpload),
             "bluesky_post" => Some(Self::BlueskyPost),
+            "media_space" => Some(Self::MediaSpace),
             _ => None,
         }
     }
@@ -278,16 +283,19 @@ impl OauthPurpose {
             Self::Login => "login",
             Self::BlobUpload => "blob_upload",
             Self::BlueskyPost => "bluesky_post",
+            Self::MediaSpace => "media_space",
         }
     }
 
     /// The OAuth scope string we *request* for this purpose. The PDS may
     /// grant a different one — store that in [`WebSession::granted_scope`]
     /// and check it at use time via [`scope_satisfies_purpose`].
-    pub fn requested_scope(self) -> &'static str {
+    ///
+    /// `media_space_authority` is the server's space authority DID.
+    pub fn requested_scope(self, media_space_authority: Option<&str>) -> String {
         match self {
             // Identity-only. Same as a vanilla "Login with Bluesky" button.
-            Self::Login => "atproto",
+            Self::Login => "atproto".to_string(),
             // Upload images to the user's repo. Narrow MIME on purpose so
             // the consent screen says "upload images" instead of "upload
             // anything". Also requests `repo:blue.irc.media?action=create`
@@ -296,10 +304,17 @@ impl OauthPurpose {
             // alongside the blob — without this scope the PDS rejects
             // record creation with ScopeMissingError even though the blob
             // upload itself succeeds.
-            Self::BlobUpload => "atproto blob:image/* repo:blue.irc.media?action=create",
+            Self::BlobUpload => {
+                "atproto blob:image/* repo:blue.irc.media?action=create".to_string()
+            }
             // Cross-post to Bluesky's feed. Repo write narrowed to a single
             // collection.
-            Self::BlueskyPost => "atproto repo:app.bsky.feed.post",
+            Self::BlueskyPost => "atproto repo:app.bsky.feed.post".to_string(),
+            // Read and write this server's channel media spaces.
+            Self::MediaSpace => format!(
+                "atproto {}",
+                crate::media_space::space_scope(media_space_authority.unwrap_or("*")),
+            ),
         }
     }
 }
@@ -340,6 +355,12 @@ pub fn scope_satisfies_purpose(granted: &str, purpose: OauthPurpose) -> bool {
         OauthPurpose::BlueskyPost => granted
             .split_whitespace()
             .any(|s| s == "repo:app.bsky.feed.post" || s == "repo:*"),
+        OauthPurpose::MediaSpace => {
+            let prefix = format!("space:{}", crate::media_space::SPACE_TYPE);
+            granted.split_whitespace().any(|s| {
+                s == prefix || s.starts_with(&format!("{prefix}?")) || s.starts_with("space:*")
+            })
+        }
     }
 }
 

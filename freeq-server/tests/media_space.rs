@@ -250,6 +250,45 @@ async fn did_web_document_names_the_managing_app_service() {
     fx.server.abort();
 }
 
+// ── OAuth scope surface ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn client_metadata_advertises_the_space_scope_only_when_enabled() {
+    let fx = fixture_with_ids(&[]).await;
+    let (s, meta) = get(fx.web, "/client-metadata.json").await;
+    assert_eq!(s, 200);
+    let scope = meta["scope"].as_str().unwrap();
+    let expected = format!("space:at.freeq.media?authority={AUTHORITY_DID}&collection=*");
+    assert!(
+        scope.split_whitespace().any(|t| t == expected),
+        "feature-on metadata must advertise the space scope; got: {scope}"
+    );
+    fx.server.abort();
+
+    let config = freeq_server::config::ServerConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        web_addr: Some("127.0.0.1:0".to_string()),
+        server_name: "test-media-off".to_string(),
+        challenge_timeout_secs: 60,
+        db_path: Some(":memory:".to_string()),
+        ..Default::default()
+    };
+    let (_irc, web, server) = freeq_server::server::Server::with_resolver(
+        config,
+        DidResolver::static_map(HashMap::new()),
+    )
+    .start_with_web()
+    .await
+    .unwrap();
+    let (s, meta) = get(web, "/client-metadata.json").await;
+    assert_eq!(s, 200);
+    assert!(
+        !meta["scope"].as_str().unwrap().contains("space:"),
+        "feature-off metadata must not advertise any space scope"
+    );
+    server.abort();
+}
+
 // ── Lazy creation via the space-ref API ────────────────────────────────
 
 #[tokio::test]
