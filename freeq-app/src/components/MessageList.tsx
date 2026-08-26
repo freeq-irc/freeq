@@ -1465,8 +1465,14 @@ export function MessageList() {
     setPopover({ nick, did, origin, evidence, pos: { x: e.clientX, y: e.clientY } });
   }, []);
 
+  // The pane, and the chrome that sits over it. Anything anchored to what the
+  // reader can see hangs off the wrapper rather than off the scroller: inside
+  // a scroll container an absolutely positioned box is placed against the
+  // whole scrollable content, not against the part of it on screen, so it
+  // rides away with the content and is only in view at the very bottom.
   return (
-    <div key={activeChannel} ref={ref} data-testid="message-list" role="log" aria-label={`Messages in ${activeChannel}`} aria-live="polite" className={`flex-1 overflow-y-auto relative ${
+    <div className="flex-1 min-h-0 flex flex-col relative">
+      <div key={activeChannel} ref={ref} data-testid="message-list" role="log" aria-label={`Messages in ${activeChannel}`} aria-live="polite" className={`flex-1 min-h-0 overflow-y-auto relative ${
       density === 'compact' ? 'text-[14px] [&_.msg-full]:pt-1.5 [&_.msg-full]:pb-0' :
       density === 'cozy' ? 'text-[16px] [&_.msg-full]:pt-4 [&_.msg-full]:pb-2' : ''
     }`} onScroll={handleScroll} onCopy={handleCleanCopy}>
@@ -1633,7 +1639,9 @@ export function MessageList() {
         })}
       </div>
 
-      {/* Scroll to bottom button */}
+      </div>
+
+      {/* Pinned to the pane the reader is looking at, not to the content. */}
       {showScrollBtn && (
         <button
           onClick={() => {
