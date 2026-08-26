@@ -15,8 +15,12 @@ test.describe('Channels', () => {
 
     // Wait a moment for ops to be assigned
     await page.waitForTimeout(500);
-    await sendMessage(page, `/topic ${channel} E2E test topic`);
-    await expect(page.getByText('E2E test topic')).toBeVisible({ timeout: 8_000 });
+    // `/topic` takes the text only — it always targets the open channel — and
+    // the topic then reads back in exactly one place, the header.
+    await sendMessage(page, '/topic E2E test topic');
+    await expect(
+      page.locator('header').getByText('E2E test topic'),
+    ).toBeVisible({ timeout: 8_000 });
   });
 
   test('can switch between channels', async ({ page }) => {

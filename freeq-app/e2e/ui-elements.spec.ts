@@ -99,8 +99,10 @@ test.describe('Slash commands', () => {
     const channel = uniqueChannel();
     await connectGuest(page, nick, channel);
 
-    await sendMessage(page, `/topic ${channel} My cool topic`);
-    await expect(page.getByText('My cool topic')).toBeVisible({ timeout: 5_000 });
+    await sendMessage(page, '/topic My cool topic');
+    await expect(
+      page.locator('header').getByText('My cool topic'),
+    ).toBeVisible({ timeout: 5_000 });
   });
 });
 
