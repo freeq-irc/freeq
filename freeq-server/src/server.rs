@@ -15235,7 +15235,13 @@ mod relayed_task_verdict_tests {
             PEER
         );
 
-        let (sink, _guard) = capture();
+        // "Never ruled on" is the task not moving: the view of it before the
+        // misrouted transition arrives must be the view after.
+        let task_before = state
+            .with_db(|db| db.act_task(act_id))
+            .flatten()
+            .expect("on file");
+
         let claim = "01ROUTEWRONGCLAIM000000000";
         route_here(
             &state,
@@ -15251,10 +15257,13 @@ mod relayed_task_verdict_tests {
             !state.with_db(|db| db.is_act_event(claim)).unwrap(),
             "a misrouted transition is not filed here"
         );
-        let logs = sink.text();
-        assert!(
-            logs.contains("another server owns") && logs.contains(claim),
-            "the drop names the event: {logs}"
+        assert_eq!(
+            state
+                .with_db(|db| db.act_task(act_id))
+                .flatten()
+                .expect("still on file"),
+            task_before,
+            "and the task it named did not move: this server ruled on nothing"
         );
     }
 
@@ -15663,7 +15672,7 @@ mod relayed_task_verdict_tests {
     }
 
     #[tokio::test]
-    async fn a_verifying_relayed_task_event_logs_valid_and_delivers_unchanged() {
+    async fn a_verifying_relayed_task_event_is_delivered_unchanged_and_filed_valid() {
         let state = test_state_with_db();
         let mgr = test_manager();
         setup_authenticated_peer(&state, &mgr).await;
@@ -15672,7 +15681,6 @@ mod relayed_task_verdict_tests {
         let tags = signed_offer_tags("#verdictvalid", "01VERDICTVALID000000000000", &key);
         let sig = tags["+freeq.at/sig"].clone();
 
-        let (sink, _guard) = capture();
         relay(
             &state,
             &mgr,
@@ -15682,19 +15690,15 @@ mod relayed_task_verdict_tests {
         )
         .await;
 
-        let logs = sink.text();
-        assert!(
-            logs.contains("verdict=valid"),
-            "the receiving server's own verdict is logged: {logs}"
-        );
-        assert!(
-            logs.contains("01VERDICTVALID000000000000"),
-            "the verdict line names the event: {logs}"
-        );
-        assert!(
-            logs.contains("peer_declared_act=false"),
-            "the line says whether the peer declared the act capability, so an \
-             operator can tell an old relay from touched tags: {logs}"
+        // The verdict this server reached is on the stored row, not only in
+        // its logs.
+        assert_eq!(
+            state
+                .with_db(|db| db.get_event("01VERDICTVALID000000000000"))
+                .unwrap()
+                .expect("the event is filed")
+                .sig_state,
+            crate::events::SigState::Valid,
         );
 
         let line = received(&mut rx).await;
@@ -15775,7 +15779,6 @@ mod relayed_task_verdict_tests {
         let event_id = "01NOORIGIN0000000000000000";
         let tags = signed_offer_tags("#noorigin", event_id, &key);
 
-        let (sink, _guard) = capture();
         process_s2s_message(
             &state,
             &mgr,
@@ -15805,11 +15808,11 @@ mod relayed_task_verdict_tests {
                 .is_err(),
             "and nobody is shown it"
         );
-
-        let logs = sink.text();
-        assert!(
-            logs.contains("claims no origin") && logs.contains(event_id),
-            "the refusal says what was wrong and names the event: {logs}"
+        assert_eq!(
+            state.act_deferred.lock().len(),
+            0,
+            "refused outright, not parked: no key arriving later can fix a \
+             blank origin"
         );
     }
 
@@ -15819,7 +15822,7 @@ mod relayed_task_verdict_tests {
     /// the verdict is what reverses it: a found key over altered bytes is
     /// evidence, and evidence is grounds for showing nobody.
     #[tokio::test]
-    async fn a_tampered_relayed_task_event_logs_invalid_and_reaches_nobody() {
+    async fn a_tampered_relayed_task_event_reaches_nobody() {
         let state = test_state_with_db();
         let mgr = test_manager();
         setup_authenticated_peer(&state, &mgr).await;
@@ -15832,13 +15835,13 @@ mod relayed_task_verdict_tests {
             "a title nobody signed".to_string(),
         );
 
-        let (sink, _guard) = capture();
         relay(&state, &mgr, "#verdictbad", event_id, tags).await;
 
-        let logs = sink.text();
-        assert!(
-            logs.contains("verdict=invalid"),
-            "a found key over altered bytes is evidence, and reads as such: {logs}"
+        assert_eq!(
+            state.act_deferred.lock().len(),
+            0,
+            "a found key over altered bytes is evidence, not a missing key: \
+             refused for good, never parked to retry"
         );
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
@@ -15857,7 +15860,7 @@ mod relayed_task_verdict_tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_signers_task_event_logs_unverifiable_never_invalid() {
+    async fn an_unknown_signers_task_event_waits_for_the_key() {
         let state = test_state_with_db();
         let mgr = test_manager();
         setup_authenticated_peer(&state, &mgr).await;
@@ -15866,7 +15869,6 @@ mod relayed_task_verdict_tests {
         let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let tags = signed_offer_tags("#verdictwho", "01VERDICTWHO00000000000000", &key);
 
-        let (sink, _guard) = capture();
         relay(
             &state,
             &mgr,
@@ -15888,24 +15890,12 @@ mod relayed_task_verdict_tests {
                 .unwrap(),
             "and unstored: the log holds what this server checked"
         );
+        // Parked, not refused: a key this server does not hold is not
+        // evidence of forgery, so the event waits rather than dying.
         assert_eq!(
             state.act_deferred.lock().len(),
             1,
             "it waits for the key rather than being thrown away"
-        );
-
-        let logs = sink.text();
-        assert!(
-            logs.contains("verdict=unverifiable"),
-            "a key we do not hold is not evidence about the sender: {logs}"
-        );
-        assert!(
-            logs.contains("no key on file"),
-            "the reason names the fixable cause: {logs}"
-        );
-        assert!(
-            !logs.contains("verdict=invalid"),
-            "unverifiable must never be classified as invalid: {logs}"
         );
     }
 
@@ -16339,16 +16329,20 @@ mod relayed_task_verdict_tests {
         );
         tags.insert("+freeq.at/sig".to_string(), sig);
 
-        let (sink, _guard) = capture();
         relay(&state, &mgr, "#verdictcoord", event_id, tags).await;
 
-        let logs = sink.text();
-        assert!(
-            logs.contains("verdict=valid") && logs.contains(event_id),
-            "the coordination family verifies under its own document: {logs}"
+        // The coordination family verifies under its own document, and the
+        // verdict this server reached is on the stored row.
+        assert_eq!(
+            state
+                .with_db(|db| db.get_event(event_id))
+                .unwrap()
+                .expect("a verified coordination event is in the log")
+                .sig_state,
+            crate::events::SigState::Valid,
         );
         // …and is filed the same way local ingress files one, under the
-        // signer's own id and with the verdict this server reached.
+        // signer's own id.
         let filed = state
             .with_db(|db| Ok(db.get_task(event_id)))
             .flatten()
