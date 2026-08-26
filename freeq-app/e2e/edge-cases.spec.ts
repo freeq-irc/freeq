@@ -213,7 +213,9 @@ test.describe('Multi-tab / nick collision', () => {
 test.describe('Layout limits', () => {
   test('very long channel name does not break layout', async ({ page }) => {
     const nick = uniqueNick();
-    const longName = '#pw-' + 'a'.repeat(80);
+    // 64 characters is the server's limit; past it the JOIN is refused with
+    // numeric 479 and there is no channel to lay out.
+    const longName = ('#pw-' + 'a'.repeat(80)).slice(0, 64);
     await connectGuest(page, nick, longName);
 
     // No horizontal overflow
