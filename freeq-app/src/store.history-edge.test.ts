@@ -227,29 +227,50 @@ describe('the history edge', () => {
     expect(ch('#small').historyEdge).toBe('start');
   });
 
+  it('keeps fetching past where the old ceiling stood', () => {
+    // A channel used to hold 5000 rows at most, and at that number an older
+    // page merged and was discarded whole — the no-progress stop was what
+    // caught it. Nothing bounds the window now, so a page arriving up there
+    // lands like any other and the reader walks straight past the old wall.
+    const WALL = 5000;
+    for (const msg of page(1_000, 100_000)) s().addMessage('#deep', msg);
+    s().mergeHistory('#deep', page(WALL + 200, 10_000)); // paged back past the wall
+    expect(ch('#deep').messages.length).toBe(WALL + 1_200);
+
+    const heldBefore = ch('#deep').messages.length;
+    s().historyFetchStarted('#deep', true);
+    s().mergeHistory('#deep', page(PAGE, 1_000)); // older than everything held
+    const added = ch('#deep').messages.length - heldBefore;
+
+    expect(added, 'the page was kept whole').toBe(PAGE);
+    expect(ch('#deep').messages[0].id).toBe('row-01000');
+    expect(ch('#deep').messages.length).toBeGreaterThan(WALL);
+
+    s().historyPageReceived('#deep', PAGE, PAGE, added);
+
+    expect(ch('#deep').historyEdge).toBe('more');
+    expect(ch('#deep').historyAutoPaused, 'nothing stops the walk up here').toBe(false);
+  });
+
   it('stops the automatic fetching when a fetched page adds no rows', () => {
-    // The absolute cap, reached: a channel holding MESSAGE_WINDOW_MAX rows
-    // keeps the newest ones, so an older page merges and is discarded whole.
-    // Nothing about the answer says "stop" — it is a full page, so the edge
-    // reads `more` — and the auto-fetch would ask for the same page forever.
-    const { MESSAGE_WINDOW_MAX } = storeModule;
-    for (const msg of page(MESSAGE_WINDOW_MAX, 100_000)) s().addMessage('#cap', msg);
-    s().mergeHistory('#cap', page(MESSAGE_WINDOW_MAX, 100_000));
-    expect(ch('#cap').messages.length).toBe(MESSAGE_WINDOW_MAX);
+    // What is left for the no-progress stop: a page whose every row the
+    // channel already holds. It is a full page, so the edge reads `more`,
+    // and asking again on the same anchor would fetch it forever.
+    for (const msg of page(PAGE, 1_000)) s().addMessage('#dup', msg);
+    const heldBefore = ch('#dup').messages.length;
+    const oldestBefore = ch('#dup').messages[0].id;
 
-    const heldBefore = ch('#cap').messages.length;
-    const oldestBefore = ch('#cap').messages[0].id;
-    s().historyFetchStarted('#cap', true);
-    s().mergeHistory('#cap', page(PAGE, 1_000)); // older than everything held
-    const added = ch('#cap').messages.length - heldBefore;
+    s().historyFetchStarted('#dup', true);
+    s().mergeHistory('#dup', page(PAGE, 1_000)); // the rows already held
+    const added = ch('#dup').messages.length - heldBefore;
 
-    expect(added, 'the cap discarded the whole page').toBe(0);
-    expect(ch('#cap').messages[0].id, 'the held list did not move').toBe(oldestBefore);
+    expect(added, 'every row was a duplicate').toBe(0);
+    expect(ch('#dup').messages[0].id, 'the held list did not move').toBe(oldestBefore);
 
-    s().historyPageReceived('#cap', PAGE, PAGE, added);
+    s().historyPageReceived('#dup', PAGE, PAGE, added);
 
-    expect(ch('#cap').historyEdge, 'a full page still means more exists').toBe('more');
-    expect(ch('#cap').historyAutoPaused, 'but asking again would repeat it forever').toBe(true);
+    expect(ch('#dup').historyEdge, 'a full page still means more exists').toBe('more');
+    expect(ch('#dup').historyAutoPaused, 'but asking again would repeat it forever').toBe(true);
   });
 
   it('does not stop on an opening page that only repeats what is held', () => {

@@ -10,17 +10,6 @@ export const TYPING_TIMEOUT_MS = 10_000;
 
 /** Rows a channel holds at rest — what a reader sitting at the bottom needs. */
 export const MESSAGE_WINDOW = 1000;
-/** Ceiling while a reader pages back: past it the oldest rows go first. */
-export const MESSAGE_WINDOW_MAX = 5000;
-
-/**
- * The cap an append must respect. A window grown by scrolling back stays
- * grown — trimming it belongs to `trimMessageWindow`, which runs when the
- * reader returns to the bottom, not to whatever message arrives next.
- */
-function appendCap(held: number): number {
-  return held > MESSAGE_WINDOW ? MESSAGE_WINDOW_MAX : MESSAGE_WINDOW;
-}
 
 export interface Message {
   id: string;
@@ -845,7 +834,13 @@ export const useStore = create<Store>((set, get) => ({
     // memoized components and shallow selectors.
     const ch: typeof base = {
       ...base,
-      messages: [...base.messages, msg].slice(-appendCap(base.messages.length)),
+      // A channel sitting at its resting window keeps the newest 1000. One
+      // grown by paging back is never shrunk by an arriving message —
+      // giving those rows up belongs to `trimMessageWindow`, which runs
+      // when the reader returns to the bottom.
+      messages: base.messages.length > MESSAGE_WINDOW
+        ? [...base.messages, msg]
+        : [...base.messages, msg].slice(-MESSAGE_WINDOW),
       isJoined: base.isJoined || isDMBuf,
       unreadCount:
         !msg.isSystem && s.activeChannel.toLowerCase() !== key
@@ -927,8 +922,8 @@ export const useStore = create<Store>((set, get) => ({
     });
     // A history page is older than everything held, so capping at
     // MESSAGE_WINDOW would drop the page that was just fetched. The window
-    // grows to hold it and only the total cap bounds it.
-    ch.messages = merged.slice(-MESSAGE_WINDOW_MAX);
+    // grows to hold whatever comes back, with no ceiling above it.
+    ch.messages = merged;
     channels.set(channel.toLowerCase(), ch);
     return { channels };
   }),
@@ -973,11 +968,9 @@ export const useStore = create<Store>((set, get) => ({
     // more history still sits behind it.
     //
     // What the store kept answers a different question. An anchored page
-    // that reached the held list not at all — every row a duplicate, or the
-    // whole page discarded by the absolute cap — would be asked for again
-    // on the same anchor, and again. Whatever it was, asking once more is
-    // not what to do about it; hold the automatic fetching off and leave the
-    // reader a button.
+    // whose rows the held list took none of is a page of duplicates, and
+    // asking on the same anchor would fetch it again, and again. Hold the
+    // automatic fetching off and leave the reader a button.
     //
     // Only an anchored page. An opening request repeats rows the channel
     // already holds by design — that is what makes it safe to send — and it
@@ -1211,8 +1204,8 @@ export const useStore = create<Store>((set, get) => ({
     });
 
     // Batch messages go at the beginning (history) — same window rule as
-    // mergeHistory: keep the fetched page, bound only by the total cap.
-    ch.messages = [...newMsgs, ...ch.messages].slice(-MESSAGE_WINDOW_MAX);
+    // mergeHistory: keep the fetched page, with no ceiling above it.
+    ch.messages = [...newMsgs, ...ch.messages];
     channels.set(batch.target.toLowerCase(), ch);
     return { channels, batches };
   }),

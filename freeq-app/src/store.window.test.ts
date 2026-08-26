@@ -3,10 +3,10 @@
  *
  * A channel held at most the newest 1000 rows, so once it was full every
  * CHATHISTORY page fetched by scrolling up was merged and immediately
- * discarded — the scrollback above the cap was unreachable. The window now
- * grows past 1000 while older pages arrive (bounded by a per-channel total
- * cap) and is trimmed back to the newest 1000 only when the reader returns
- * to the bottom.
+ * discarded — the scrollback above that was unreachable. The window now
+ * grows past 1000 for as long as older pages keep arriving, with no ceiling
+ * above it, and is trimmed back to the newest 1000 only when the reader
+ * returns to the bottom.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 
@@ -28,7 +28,7 @@ Object.defineProperty(globalThis, 'crypto', {
 // @ts-expect-error mock
 globalThis.window = { localStorage: globalThis.localStorage, location: { hash: '' }, addEventListener: () => {} };
 
-const { useStore, MESSAGE_WINDOW, MESSAGE_WINDOW_MAX } = await import('./store');
+const { useStore, MESSAGE_WINDOW } = await import('./store');
 type Message = Parameters<ReturnType<typeof useStore.getState>['addMessage']>[1];
 
 const s = () => useStore.getState();
@@ -66,10 +66,9 @@ function deliverBatch(channel: string, page: Message[], id = 'b1') {
   s().endBatch(id);
 }
 
-describe('window caps', () => {
-  it('holds the newest 1000 at rest and never more than the total cap', () => {
+describe('the resting window', () => {
+  it('holds the newest 1000 rows', () => {
     expect(MESSAGE_WINDOW).toBe(1000);
-    expect(MESSAGE_WINDOW_MAX).toBeGreaterThan(MESSAGE_WINDOW);
   });
 });
 
@@ -199,45 +198,69 @@ describe('trimMessageWindow', () => {
   });
 });
 
-// (d) The total cap drops oldest rows first.
+// (d) Nothing above the resting window bounds a channel a reader keeps
+// paging back: every page fetched is a page kept.
 
-describe('the total cap', () => {
-  it('drops the oldest rows first when history merges pass it', () => {
+describe('a window grown well past the resting one', () => {
+  it('keeps every page, however many arrive', () => {
     fillLive('#cap', MESSAGE_WINDOW);
-    // Six pages of 1000 older rows, each older than the last.
+    // Six pages of 1000 older rows, each older than the last — past where
+    // the old 5000-row ceiling stood, and nothing is dropped.
     for (let p = 0; p < 6; p++) {
       s().mergeHistory('#cap', olderPage(1000, LIVE_BASE - p * 1000, `p${p}`));
     }
 
     const rows = held('#cap');
-    expect(rows.length).toBe(MESSAGE_WINDOW_MAX);
-    // Newest is untouched; the oldest pages are what went.
+    expect(rows.length).toBe(MESSAGE_WINDOW + 6000);
     expect(rows[rows.length - 1].id).toBe(`live-${String(MESSAGE_WINDOW - 1).padStart(5, '0')}`);
-    expect(rows.some((r) => r.id.startsWith('p5-'))).toBe(false);
-    expect(rows.some((r) => r.id.startsWith('p4-'))).toBe(false);
-    expect(rows[0].id).toBe('p3-00000');
+    expect(rows[0].id).toBe('p5-00000');
+    expect(rows.some((r) => r.id.startsWith('p4-'))).toBe(true);
   });
 
-  it('drops the oldest rows first when live messages pass it', () => {
+  it('keeps every page delivered as a batch too', () => {
+    fillLive('#capb', MESSAGE_WINDOW);
+    for (let p = 0; p < 6; p++) {
+      deliverBatch('#capb', olderPage(1000, LIVE_BASE - p * 1000, `p${p}`), `b${p}`);
+    }
+
+    const rows = held('#capb');
+    expect(rows.length).toBe(MESSAGE_WINDOW + 6000);
+    expect(rows[0].id).toBe('p5-00000');
+  });
+
+  it('evicts nothing when a live message arrives', () => {
     fillLive('#capl', MESSAGE_WINDOW);
-    s().mergeHistory('#capl', olderPage(MESSAGE_WINDOW_MAX - MESSAGE_WINDOW, LIVE_BASE, 'page'));
-    expect(held('#capl').length).toBe(MESSAGE_WINDOW_MAX);
+    s().mergeHistory('#capl', olderPage(6000, LIVE_BASE, 'page'));
+    expect(held('#capl').length).toBe(MESSAGE_WINDOW + 6000);
+    const oldest = held('#capl')[0].id;
 
     s().addMessage('#capl', msg('fresh-1', LIVE_BASE + MESSAGE_WINDOW));
 
     const rows = held('#capl');
-    expect(rows.length).toBe(MESSAGE_WINDOW_MAX);
+    expect(rows.length).toBe(MESSAGE_WINDOW + 6001);
     expect(rows[rows.length - 1].id).toBe('fresh-1');
-    expect(rows[0].id).toBe('page-00001');
+    expect(rows[0].id).toBe(oldest);
   });
 
-  it('caps a single oversized page at the total cap', () => {
+  it('keeps a single oversized page whole', () => {
     fillLive('#huge', 10);
-    s().mergeHistory('#huge', olderPage(MESSAGE_WINDOW_MAX + 500, LIVE_BASE, 'page'));
+    s().mergeHistory('#huge', olderPage(6000, LIVE_BASE, 'page'));
 
     const rows = held('#huge');
-    expect(rows.length).toBe(MESSAGE_WINDOW_MAX);
+    expect(rows.length).toBe(6010);
+    expect(rows[0].id).toBe('page-00000');
     expect(rows[rows.length - 1].id).toBe('live-00009');
+  });
+
+  it('the trim still restores the newest 1000 from a window this size', () => {
+    fillLive('#trimbig', MESSAGE_WINDOW);
+    s().mergeHistory('#trimbig', olderPage(6000, LIVE_BASE, 'page'));
+
+    s().trimMessageWindow('#trimbig');
+
+    const rows = held('#trimbig');
+    expect(rows.length).toBe(MESSAGE_WINDOW);
+    expect(rows[0].id).toBe('live-00000');
   });
 });
 
