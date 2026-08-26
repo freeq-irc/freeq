@@ -518,7 +518,8 @@ test.describe('Edge cases', () => {
     await sidebar.getByText('Server').click();
     await page.waitForTimeout(300);
 
-    // Server tab should show connection info
-    await expect(page.getByText(/connected|welcome/i)).toBeVisible({ timeout: 5000 });
+    // The server tab carries the registration replies; RPL_YOURHOST is the
+    // one that is always there, MOTD or no MOTD.
+    await expect(page.getByText(/your host is/i)).toBeVisible({ timeout: 5000 });
   });
 });
