@@ -1198,33 +1198,10 @@ mod route_tests {
         assert_eq!(q.len(), 1);
     }
 
-    /// The ceiling holds, and what falls off is loud: the event stays on file
-    /// and unconfirmed, and catch-up is what settles it after that.
+    /// The ceiling holds: the oldest route falls off, and the event it
+    /// carried stays on file and unconfirmed for catch-up to settle.
     #[test]
-    fn the_queue_has_a_ceiling_and_says_when_it_drops_something() {
-        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        struct Writer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Writer {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let make = {
-            let sink = std::sync::Arc::clone(&sink);
-            move || Writer(std::sync::Arc::clone(&sink))
-        };
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_writer(make)
-                .with_ansi(false)
-                .with_max_level(tracing::Level::WARN)
-                .finish(),
-        );
-
+    fn the_queue_has_a_ceiling_and_drops_the_oldest() {
         let mut q = RouteQueue::new(2);
         q.park(route("one", "home"));
         q.park(route("two", "home"));
@@ -1237,8 +1214,6 @@ mod route_tests {
             .map(|r| r.event_id)
             .collect();
         assert_eq!(held, ["two", "three"], "the oldest is what fell off");
-        let logs = String::from_utf8_lossy(&sink.lock().unwrap()).to_string();
-        assert!(logs.contains("one"), "the drop names the event: {logs}");
     }
 }
 

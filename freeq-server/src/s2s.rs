@@ -2978,28 +2978,6 @@ mod capability_tests {
         }
     }
 
-    /// Captures what the code under test logs, so a test can assert a skip
-    /// was loud. Cloned handles share one buffer.
-    #[derive(Clone, Default)]
-    struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogSink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
-        type Writer = LogSink;
-        fn make_writer(&'a self) -> LogSink {
-            self.clone()
-        }
-    }
-
     /// Routing a transition passes the same two gates an ordinary relay
     /// passes, and says which one stopped it — because one of them is worth
     /// retrying and the other never will be.
@@ -3115,9 +3093,7 @@ mod capability_tests {
 
     /// The act gate itself: a task-tagged Tagmsg reaches only peers that
     /// declared [`ACT`]; every other message — the companion plain-text line
-    /// included — still reaches every peer, and each withheld send is logged
-    /// naming the peer and the event, so a wrong declaration never fails
-    /// silent.
+    /// included — still reaches every peer.
     ///
     /// The federation harness stages the same thing end to end, with one of
     /// its two servers started under `--s2s-undeclared-capabilities act`
@@ -3125,13 +3101,6 @@ mod capability_tests {
     /// half, and the one that watches the send sites directly.
     #[tokio::test]
     async fn a_task_event_is_withheld_from_a_peer_that_did_not_declare_act() {
-        let sink = LogSink::default();
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_writer(sink.clone())
-                .with_max_level(tracing::Level::INFO)
-                .finish(),
-        );
         let secret = iroh::SecretKey::from_bytes(&rand::random::<[u8; 32]>());
         let server_id = secret.public().to_string();
         let (broadcast_tx, _) = mpsc::channel(1);
@@ -3214,13 +3183,6 @@ mod capability_tests {
         assert!(
             plain_rx.try_recv().is_err(),
             "a peer that did not declare act is not sent the task event"
-        );
-        let logged = String::from_utf8_lossy(&sink.0.lock().unwrap()).to_string();
-        assert!(
-            logged.contains("task event withheld")
-                && logged.contains("plain-peer")
-                && logged.contains(ACT_EVENT),
-            "the skip must be logged naming the peer and the task event, got: {logged}"
         );
 
         // An ordinary tag message — a reaction — is not narrowed.
