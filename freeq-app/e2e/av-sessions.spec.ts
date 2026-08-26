@@ -11,7 +11,7 @@
  * state management that the call UI depends on.
  */
 import { test, expect } from '@playwright/test';
-import { uniqueNick, uniqueChannel, connectGuest, connectSecondUser, expectSystemMessage } from './helpers';
+import { uniqueNick, uniqueChannel, connectGuest, connectSecondUser, expectSystemMessage, startAvSessionRaw } from './helpers';
 
 const API_BASE = 'http://127.0.0.1:8080';
 
@@ -39,8 +39,11 @@ async function sendTagmsg(page: import('@playwright/test').Page, channel: string
 
 test.describe('AV Session REST API', () => {
 
-  test('sessions list is initially empty for a new channel', async ({ request }) => {
+  test('sessions list is initially empty for a new channel', async ({ page, request }) => {
     const channel = uniqueChannel();
+    // The endpoint fails closed on a channel it has never heard of, so the
+    // channel has to exist before "no call in it yet" is answerable.
+    await connectGuest(page, uniqueNick('av'), channel);
     const resp = await request.get(`${API_BASE}/api/v1/channels/${encodeURIComponent(channel)}/sessions`);
     expect(resp.ok()).toBe(true);
     const data = await resp.json();
@@ -68,23 +71,7 @@ test.describe('AV Session Lifecycle via IRC', () => {
 
     await connectGuest(page, nick, channel);
 
-    // Send av-start TAGMSG via raw WebSocket (since there's no /raw command)
-    await page.evaluate(([ch]) => {
-      // Find the WebSocket connection
-      const wsList = (performance as unknown as { __ws?: WebSocket[] }).__ws;
-      // Try a different approach — dispatch through the compose box
-    }, [channel]);
-
-    // Actually, use the network directly — the compose box handles /msg etc.
-    // The simplest approach: use fetch to send a raw IRC command via the client's transport
-    // But we don't have access. Let's use a different approach:
-    // The web app calls startAvSession() which sends the TAGMSG.
-    // Let's call that function directly.
-    await page.evaluate(async ([ch]) => {
-      // Access the IRC client module
-      const mod = await import('/src/irc/client.ts');
-      mod.rawCommand(`@+freeq.at/av-start TAGMSG ${ch}`);
-    }, [channel]);
+    await startAvSessionRaw(page, channel);
 
     // Wait for session to be created
     await page.waitForTimeout(2000);
@@ -104,10 +91,7 @@ test.describe('AV Session Lifecycle via IRC', () => {
 
     await connectGuest(page, nick, channel);
 
-    await page.evaluate(async ([ch]) => {
-      const mod = await import('/src/irc/client.ts');
-      mod.rawCommand(`@+freeq.at/av-start TAGMSG ${ch}`);
-    }, [channel]);
+    await startAvSessionRaw(page, channel);
 
     await page.waitForTimeout(2000);
 
@@ -126,18 +110,19 @@ test.describe('AV Session Lifecycle via IRC', () => {
 
     // User 1 starts session
     await connectGuest(page, nick1, channel);
-    await page.evaluate(async ([ch]) => {
-      const mod = await import('/src/irc/client.ts');
-      mod.rawCommand(`@+freeq.at/av-start TAGMSG ${ch}`);
-    }, [channel]);
+    await startAvSessionRaw(page, channel);
     await page.waitForTimeout(2000);
 
     // User 2 connects and joins
+    // av-join has to name the session it joins; a bare TAGMSG routes nowhere,
+    // which is why the client refuses to send one.
+    const started = await request.get(`${API_BASE}/api/v1/channels/${encodeURIComponent(channel)}/sessions`);
+    const sessionId = (await started.json()).active.id;
     const { page: page2, ctx } = await connectSecondUser(browser, nick2, channel);
-    await page2.evaluate(async ([ch]) => {
+    await page2.evaluate(async ([ch, id]) => {
       const mod = await import('/src/irc/client.ts');
-      mod.rawCommand(`@+freeq.at/av-join TAGMSG ${ch}`);
-    }, [channel]);
+      mod.joinAvSession(ch, id as string);
+    }, [channel, sessionId]);
     await page2.waitForTimeout(2000);
 
     // Check API
@@ -157,17 +142,18 @@ test.describe('AV Session Lifecycle via IRC', () => {
     const channel = uniqueChannel();
 
     await connectGuest(page, nick1, channel);
-    await page.evaluate(async ([ch]) => {
-      const mod = await import('/src/irc/client.ts');
-      mod.rawCommand(`@+freeq.at/av-start TAGMSG ${ch}`);
-    }, [channel]);
+    await startAvSessionRaw(page, channel);
     await page.waitForTimeout(2000);
 
+    // av-join has to name the session it joins; a bare TAGMSG routes nowhere,
+    // which is why the client refuses to send one.
+    const started = await request.get(`${API_BASE}/api/v1/channels/${encodeURIComponent(channel)}/sessions`);
+    const sessionId = (await started.json()).active.id;
     const { page: page2, ctx } = await connectSecondUser(browser, nick2, channel);
-    await page2.evaluate(async ([ch]) => {
+    await page2.evaluate(async ([ch, id]) => {
       const mod = await import('/src/irc/client.ts');
-      mod.rawCommand(`@+freeq.at/av-join TAGMSG ${ch}`);
-    }, [channel]);
+      mod.joinAvSession(ch, id as string);
+    }, [channel, sessionId]);
     await page2.waitForTimeout(2000);
 
     // Verify 2 participants
@@ -193,10 +179,7 @@ test.describe('AV Session Lifecycle via IRC', () => {
     const channel = uniqueChannel();
 
     await connectGuest(page, nick, channel);
-    await page.evaluate(async ([ch]) => {
-      const mod = await import('/src/irc/client.ts');
-      mod.rawCommand(`@+freeq.at/av-start TAGMSG ${ch}`);
-    }, [channel]);
+    await startAvSessionRaw(page, channel);
     await page.waitForTimeout(2000);
 
     // Get session ID

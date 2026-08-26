@@ -16,6 +16,22 @@ export function uniqueChannel(): string {
   return `#pw-${TS}-${counter++}`;
 }
 
+/** Start a call with a bare av-start TAGMSG.
+ *
+ * `+freeq.at/av-instance` is deliberately not sent. The server documents a
+ * one-slot-per-DID fallback for clients that omit it, and that fallback does
+ * not hold — the live set the reaper checks holds only (did, Some(instance))
+ * pairs, so an instance-less creator is swept by the next participant's
+ * av-join. Sending the tag from here would turn the specs that catch that
+ * green without the server changing.
+ */
+export async function startAvSessionRaw(page: Page, channel: string) {
+  await page.evaluate(async ([ch]) => {
+    const mod = await import('/src/irc/client.ts');
+    mod.rawCommand(`@+freeq.at/av-start TAGMSG ${ch}`);
+  }, [channel]);
+}
+
 /** Set up localStorage before page load to skip onboarding */
 export async function prepPage(page: Page) {
   await page.addInitScript(() => {

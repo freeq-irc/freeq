@@ -8,7 +8,7 @@
  * 4. Stale sessions block new session creation
  */
 import { test, expect } from '@playwright/test';
-import { uniqueNick, uniqueChannel, connectGuest, connectSecondUser, expectSystemMessage } from './helpers';
+import { uniqueNick, uniqueChannel, connectGuest, connectSecondUser, expectSystemMessage, startAvSessionRaw } from './helpers';
 
 const API_BASE = 'http://127.0.0.1:8080';
 
@@ -21,10 +21,7 @@ test.describe('AV Session Edge Cases', () => {
 
     // User 1 starts session
     await connectGuest(page, nick1, channel);
-    await page.evaluate(async ([ch]) => {
-      const mod = await import('/src/irc/client.ts');
-      mod.rawCommand(`@+freeq.at/av-start TAGMSG ${ch}`);
-    }, [channel]);
+    await startAvSessionRaw(page, channel);
     await page.waitForTimeout(2000);
 
     // Verify session exists
@@ -43,10 +40,7 @@ test.describe('AV Session Edge Cases', () => {
       nick2,
       channel,
     );
-    await page2.evaluate(async ([ch]) => {
-      const mod = await import('/src/irc/client.ts');
-      mod.rawCommand(`@+freeq.at/av-start TAGMSG ${ch}`);
-    }, [channel]);
+    await startAvSessionRaw(page2, channel);
     await page2.waitForTimeout(2000);
 
     // New session should exist (old one auto-ended)
@@ -66,10 +60,7 @@ test.describe('AV Session Edge Cases', () => {
 
     // User 1 starts session before User 2 is in the channel
     await connectGuest(page, nick1, channel);
-    await page.evaluate(async ([ch]) => {
-      const mod = await import('/src/irc/client.ts');
-      mod.rawCommand(`@+freeq.at/av-start TAGMSG ${ch}`);
-    }, [channel]);
+    await startAvSessionRaw(page, channel);
     await page.waitForTimeout(2000);
 
     // User 2 joins the channel AFTER session started
@@ -90,10 +81,7 @@ test.describe('AV Session Edge Cases', () => {
     const channel = uniqueChannel();
 
     await connectGuest(page, nick, channel);
-    await page.evaluate(async ([ch]) => {
-      const mod = await import('/src/irc/client.ts');
-      mod.rawCommand(`@+freeq.at/av-start TAGMSG ${ch}`);
-    }, [channel]);
+    await startAvSessionRaw(page, channel);
     await page.waitForTimeout(2000);
 
     // startAvSession on a channel that already has a session should join
@@ -114,10 +102,7 @@ test.describe('AV Session Edge Cases', () => {
     const channel = uniqueChannel();
 
     await connectGuest(page, nick1, channel);
-    await page.evaluate(async ([ch]) => {
-      const mod = await import('/src/irc/client.ts');
-      mod.rawCommand(`@+freeq.at/av-start TAGMSG ${ch}`);
-    }, [channel]);
+    await startAvSessionRaw(page, channel);
     await page.waitForTimeout(2000);
 
     // Check: 1 participant
@@ -156,10 +141,7 @@ test.describe('AV Session Edge Cases', () => {
 
     // Creator starts session
     await connectGuest(page, nick1, channel);
-    await page.evaluate(async ([ch]) => {
-      const mod = await import('/src/irc/client.ts');
-      mod.rawCommand(`@+freeq.at/av-start TAGMSG ${ch}`);
-    }, [channel]);
+    await startAvSessionRaw(page, channel);
     await page.waitForTimeout(2000);
 
     // Joiner joins
@@ -191,10 +173,7 @@ test.describe('AV Session Edge Cases', () => {
     const channel = uniqueChannel();
 
     await connectGuest(page, nick, channel);
-    await page.evaluate(async ([ch]) => {
-      const mod = await import('/src/irc/client.ts');
-      mod.rawCommand(`@+freeq.at/av-start TAGMSG ${ch}`);
-    }, [channel]);
+    await startAvSessionRaw(page, channel);
     await page.waitForTimeout(2000);
 
     // Get session ID
@@ -222,10 +201,7 @@ test.describe('AV Session Edge Cases', () => {
     const channel = uniqueChannel();
 
     await connectGuest(page, nick, channel);
-    await page.evaluate(async ([ch]) => {
-      const mod = await import('/src/irc/client.ts');
-      mod.rawCommand(`@+freeq.at/av-start TAGMSG ${ch}`);
-    }, [channel]);
+    await startAvSessionRaw(page, channel);
     await page.waitForTimeout(2000);
 
     // End it the way the app does: av-end carries the session id, and a
