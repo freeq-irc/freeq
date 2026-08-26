@@ -12,6 +12,9 @@
  */
 import { test, expect, type Page } from '@playwright/test';
 import { uniqueNick, uniqueChannel, connectGuest, sendMessage, expectMessage } from './helpers';
+// The verdict wording lives in one table every client shares. Assert from
+// that table, not from a copy of it: rewording a verdict is not a regression.
+import { VERIFY_LABELS } from '../src/lib/verify-signature';
 
 /**
  * Put a signed message into the open conversation, as if it had arrived.
@@ -97,7 +100,7 @@ test.describe('signature verification', () => {
     // Nothing on this server ever signed that id, so the honest answer is
     // that it cannot be checked — and it must not read as verified.
     await expect(panel).toHaveAttribute('data-verdict', 'unverifiable');
-    await expect(page.getByText('Could not be checked')).toBeVisible();
+    await expect(panel.getByText(VERIFY_LABELS.unverifiable.heading)).toBeVisible();
     await panel.getByRole('button', { name: 'Dismiss' }).click();
     await expect(page.getByTestId('verify-panel')).toHaveCount(0);
   });
@@ -187,7 +190,7 @@ test.describe('signature verification', () => {
     await requestVerify(page, 'a signature that will not hold up');
     const panel = page.getByTestId('verify-panel');
     await expect(panel).toHaveAttribute('data-verdict', 'invalid', { timeout: 10_000 });
-    await expect(page.getByText('Does not match its signing key')).toBeVisible();
+    await expect(panel.getByText(VERIFY_LABELS.invalid.heading)).toBeVisible();
     await panel.getByRole('button', { name: 'Dismiss' }).click();
 
     await expect(
