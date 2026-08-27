@@ -300,10 +300,13 @@ export function stopTyping(target: string) {
   client?.stopTyping(target);
 }
 
-export function joinChannel(channel: string) {
-  client?.join(channel);
-  useStore.getState().addChannel(channel);
-  useStore.getState().setActiveChannel(channel);
+export function joinChannel(channel: string, key?: string) {
+  // Text is sent with channel and key as one string ("#secretchat hunter2").
+  const [name, inlineKey] = channel.trim().split(/\s+/);
+  if (!name) return;
+  client?.join(name, key ?? inlineKey);
+  useStore.getState().addChannel(name);
+  useStore.getState().setActiveChannel(name);
 }
 
 export function partChannel(channel: string) {
