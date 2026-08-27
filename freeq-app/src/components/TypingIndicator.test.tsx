@@ -91,6 +91,44 @@ describe('who is typing', () => {
   });
 });
 
+describe('the space the typing line takes', () => {
+  // A line that appears and goes takes its height with it, and everything
+  // above it — the transcript, and the affordance pinned to the bottom of the
+  // pane — moves by that much, twice, every time someone starts and stops.
+  // The strip is always there; only its contents come and go.
+  function strip() {
+    const { container } = render(<TypingIndicatorBar />);
+    return container.querySelector('[data-testid="typing-bar"]');
+  }
+
+  it('is there when nobody is typing', () => {
+    s().addChannel('#quiet');
+    s().setActiveChannel('#quiet');
+
+    expect(strip()).not.toBeNull();
+  });
+
+  it('is the same box whether or not anyone is typing', () => {
+    s().addChannel('#same');
+    s().addMember('#same', { nick: 'bob' });
+    s().setActiveChannel('#same');
+    const quiet = strip()!.className;
+    cleanup();
+
+    s().setTyping('#same', 'bob', true);
+    const typing = strip()!;
+
+    expect(typing.className).toBe(quiet);
+    expect(typing.textContent).toContain('bob is typing');
+  });
+
+  it('is there on a buffer that has no typing at all', () => {
+    s().setActiveChannel('server');
+
+    expect(strip()).not.toBeNull();
+  });
+});
+
 describe('where the typing line lives', () => {
   it('sits outside the scrolling transcript, not below its last message', () => {
     // Appended inside the scroll container, the line lands below the fold for

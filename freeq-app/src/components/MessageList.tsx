@@ -1078,28 +1078,46 @@ function Reactions({ msg, channel }: { msg: Message; channel: string }) {
  * last message, off the bottom of a reader's view, which is exactly where it
  * used to be.
  */
+/**
+ * The typing line, floating over the bottom of the transcript.
+ *
+ * The mount point has no height, so the layout is identical whether or not
+ * anyone is typing: nothing is reserved when the line is empty, and nothing
+ * moves when it appears. A line that took part in the layout either moved
+ * the transcript twice a turn or held a permanently empty band under it.
+ */
 export function TypingIndicatorBar() {
   const activeChannel = useStore((s) => s.activeChannel);
   const ch = useStore((s) => s.channels.get(s.activeChannel.toLowerCase()));
-  if (!ch || activeChannel === 'server') return null;
+  const typers = ch && activeChannel !== 'server'
+    ? [...ch.typingUsers.values()].map((t) => t.nick)
+    : [];
 
-  const typers = [...ch.typingUsers.values()].map((t) => t.nick);
-  if (typers.length === 0) return null;
-
-  const text = typers.length === 1
+  const text = typers.length === 0
+    ? null
+    : typers.length === 1
     ? `${typers[0]} is typing`
     : typers.length === 2
     ? `${typers[0]} and ${typers[1]} are typing`
     : `${typers[0]} and ${typers.length - 1} others are typing`;
 
   return (
-    <div className="px-4 py-1.5 flex items-center gap-2 text-xs text-fg-dim animate-fadeIn" aria-live="polite" aria-atomic="true">
-      <span className="flex gap-0.5">
-        <span className="w-1.5 h-1.5 rounded-full bg-accent animate-bounce" style={{ animationDelay: '0ms' }} />
-        <span className="w-1.5 h-1.5 rounded-full bg-accent animate-bounce" style={{ animationDelay: '150ms' }} />
-        <span className="w-1.5 h-1.5 rounded-full bg-accent animate-bounce" style={{ animationDelay: '300ms' }} />
-      </span>
-      <span className="text-fg-muted">{text}</span>
+    <div
+      className="relative h-0 z-10"
+      data-testid="typing-bar"
+      aria-live="polite"
+      aria-atomic="true"
+    >
+      {text && (
+        <div className="absolute bottom-0 left-0 right-0 h-7 px-4 flex items-center gap-2 text-xs text-fg-dim bg-bg-secondary/90 animate-fadeIn">
+          <span className="flex gap-0.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-accent animate-bounce" style={{ animationDelay: '0ms' }} />
+            <span className="w-1.5 h-1.5 rounded-full bg-accent animate-bounce" style={{ animationDelay: '150ms' }} />
+            <span className="w-1.5 h-1.5 rounded-full bg-accent animate-bounce" style={{ animationDelay: '300ms' }} />
+          </span>
+          <span className="text-fg-muted">{text}</span>
+        </div>
+      )}
     </div>
   );
 }
