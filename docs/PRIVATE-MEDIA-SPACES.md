@@ -19,8 +19,8 @@ them with you, truly delete them, or keep the server operator out of them.
 
 With spaces, a private file stays in your own repo on your PDS. The
 channel decides who may read it (joining grants access, a kick or ban
-removes it), the freeq server never stores or even sees the bytes, and
-deleting your file is a real deletion.
+removes it), the freeq server stores nothing, and deleting your file from
+your own repo is a real deletion.
 
 ## How it works
 
@@ -79,5 +79,10 @@ public one.
   PDS, readable by anyone the gatekeeper authorizes. Encrypted (+E)
   channels are not supported yet.
 - Someone kicked from a channel may keep access for up to about two hours,
-  until their last-issued credential expires.
-- DMs and federated (S2S) members are not supported yet.
+  until the read credential in play expires.
+- Private media spaces are per channel: DMs and federated (S2S) members are
+  not currently supported.
+- The server can read the media it serves, since it fetches on each
+  viewer's behalf. The difference from server-side storage is custody: the
+  file is in your repo, portable and deletable by you, and access is
+  decided by live channel membership rather than by whoever holds a link.

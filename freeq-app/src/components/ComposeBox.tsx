@@ -54,6 +54,10 @@ export function ComposeBox() {
   // and/or also post it to their Bluesky feed (which implies the PDS copy).
   const [sharePds, setSharePds] = useState(false);
   const [shareBluesky, setShareBluesky] = useState(false);
+  // Store the file in the user's own repo inside this channel's media space.
+  // Offered only when the server has the feature configured.
+  const [spaceMedia, setSpaceMedia] = useState(false);
+  const [spacesAvailable, setSpacesAvailable] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const emojiRef = useRef<HTMLButtonElement>(null);
@@ -191,7 +195,18 @@ export function ComposeBox() {
     setPendingUpload(null);
     setSharePds(false);
     setShareBluesky(false);
+    setSpaceMedia(false);
   };
+
+  // Does this server offer private media spaces?
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/v1/health')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((h) => { if (!cancelled && h?.media_spaces) setSpacesAvailable(true); })
+      .catch(() => { /* keep option hidden */ });
+    return () => { cancelled = true; };
+  }, []);
 
   const doUpload = useCallback(async () => {
     if (!pendingUpload || !authDid) return;
@@ -207,6 +222,7 @@ export function ComposeBox() {
         // share_bluesky implies share_pds (feed embed references the PDS blob).
         if (sharePds || shareBluesky) f.append('share_pds', 'true');
         if (shareBluesky) f.append('share_bluesky', 'true');
+        if (spaceMedia) f.append('space_media', 'true');
         return f;
       };
 
@@ -217,19 +233,20 @@ export function ComposeBox() {
       // once with a fresh form. This is the Phase 2 incremental-auth
       // path — we never asked for blob upload at sign-in time.
       const purpose = await detectStepUpRequired(resp);
-      if (purpose === 'blob_upload') {
-        const outcome = await requestStepUp('blob_upload', authDid);
+      if (purpose === 'blob_upload' || purpose === 'media_space') {
+        const outcome = await requestStepUp(purpose, authDid);
         if (outcome.ok) {
           resp = await fetch('/api/v1/upload', { method: 'POST', body: buildForm() });
         } else {
           // Tailor the message to *why* it failed so the user knows
           // whether to allow popups, retry, or wait less next time.
+          const what = purpose === 'media_space' ? 'private media' : 'a public copy';
           const msg =
             outcome.reason === 'popup_blocked'
-              ? 'Allow popups for this site so freeq can request the image-upload permission, then retry.'
+              ? `Allow popups for this site so freeq can ask your PDS for permission to save ${what}, then retry.`
               : outcome.reason === 'timeout'
-                ? 'The Bluesky permission popup timed out. Try the upload again.'
-                : 'Image upload needs one extra Bluesky permission. Try again and complete the popup.';
+                ? 'The permission popup timed out. Try the upload again.'
+                : `Saving ${what} to your PDS needs one extra permission. Try again and complete the popup.`;
           throw new Error(msg);
         }
       }
@@ -287,10 +304,11 @@ export function ComposeBox() {
       setText('');
       setSharePds(false);
       setShareBluesky(false);
+      setSpaceMedia(false);
     } catch (e: any) {
       setPendingUpload((p) => p ? { ...p, uploading: false, error: e.message || 'Upload failed' } : null);
     }
-  }, [pendingUpload, authDid, activeChannel, text, ch, sharePds, shareBluesky]);
+  }, [pendingUpload, authDid, activeChannel, text, ch, sharePds, shareBluesky, spaceMedia]);
 
   // ── Drag & drop ──
 
@@ -612,6 +630,17 @@ export function ComposeBox() {
                   <span>🔒</span>
                   <span>Private to {ch?.name || activeChannel} by default</span>
                 </div>
+                {spacesAvailable && activeChannel.startsWith('#') && (
+                  <label className="flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={spaceMedia}
+                      onChange={(e) => setSpaceMedia(e.target.checked)}
+                      className="w-3 h-3 rounded accent-blue"
+                    />
+                    <span className="text-sm text-fg-dim">Keep it on my PDS (private to this channel)</span>
+                  </label>
+                )}
                 <label className="flex items-center gap-1.5 cursor-pointer">
                   <input
                     type="checkbox"

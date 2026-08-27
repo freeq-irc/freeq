@@ -9,7 +9,7 @@
  * "ok" signal from the callback page, and resolves so the caller can
  * retry the original action.
  */
-export type StepUpPurpose = 'blob_upload' | 'bluesky_post';
+export type StepUpPurpose = 'blob_upload' | 'bluesky_post' | 'media_space';
 
 /**
  * Returns the base URL of the freeq HTTP server. The web app is normally
@@ -111,7 +111,7 @@ export async function detectStepUpRequired(
     const body = await resp.clone().json();
     if (body?.error === 'step_up_required' && body?.purpose) {
       const p = body.purpose as string;
-      if (p === 'blob_upload' || p === 'bluesky_post') return p;
+      if (p === 'blob_upload' || p === 'bluesky_post' || p === 'media_space') return p;
     }
   } catch {
     // Not JSON, or wrong shape. Treat as a regular 403.

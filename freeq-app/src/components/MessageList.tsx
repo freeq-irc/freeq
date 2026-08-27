@@ -273,7 +273,10 @@ function isTrustedImageUrl(url: string): boolean {
     const u = new URL(url, window.location.origin);
     // Private freeq media served from our own origin is always first-party —
     // never gate it behind the "load external media" setting.
-    if (u.origin === window.location.origin && u.pathname.startsWith('/api/v1/media/')) {
+    if (
+      u.origin === window.location.origin &&
+      (u.pathname.startsWith('/api/v1/media/') || u.pathname.startsWith('/api/v1/space-media/'))
+    ) {
       return true;
     }
     const h = u.hostname;

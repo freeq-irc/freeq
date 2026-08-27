@@ -258,7 +258,7 @@ async fn client_metadata_advertises_the_space_scope_only_when_enabled() {
     let (s, meta) = get(fx.web, "/client-metadata.json").await;
     assert_eq!(s, 200);
     let scope = meta["scope"].as_str().unwrap();
-    let expected = format!("space:at.freeq.media?authority={AUTHORITY_DID}&collection=*");
+    let expected = format!("space:*?authority={AUTHORITY_DID}&collection=*");
     assert!(
         scope.split_whitespace().any(|t| t == expected),
         "feature-on metadata must advertise the space scope; got: {scope}"
@@ -286,6 +286,126 @@ async fn client_metadata_advertises_the_space_scope_only_when_enabled() {
         !meta["scope"].as_str().unwrap().contains("space:"),
         "feature-off metadata must not advertise any space scope"
     );
+    server.abort();
+}
+
+// ── Serving space media ────────────────────────────────────────────────
+
+/// base64url-encode a record URI the way the serve route expects it.
+fn encode_ref(uri: &str) -> String {
+    URL_SAFE_NO_PAD.encode(uri.as_bytes())
+}
+
+#[tokio::test]
+async fn space_media_route_rejects_refs_that_are_not_ours() {
+    let fx = fixture_with_ids(&[]).await;
+    for uri in [
+        "at://did:plc:someoneelse/space/at.freeq.media/K1/did:plc:a/at.freeq.media.item/3k",
+        "at://did:plc:mediaauthority/space/com.example.other/K1/did:plc:a/c/3k",
+        "at://did:plc:mediaauthority/space/at.freeq.media/K1",
+    ] {
+        let (status, _) = get(
+            fx.web,
+            &format!("/api/v1/space-media/{}/x.png", encode_ref(uri)),
+        )
+        .await;
+        assert_eq!(status, 400, "must refuse a ref that is not ours: {uri}");
+    }
+    // Not base64 at all.
+    let (status, _) = get(fx.web, "/api/v1/space-media/!!!not-base64!!!/x.png").await;
+    assert_eq!(status, 400);
+    fx.server.abort();
+}
+
+#[tokio::test]
+async fn space_media_route_404s_for_an_unknown_space() {
+    let fx = fixture_with_ids(&[]).await;
+    // Well-formed and ours, but no channel owns this space key.
+    let uri = format!(
+        "at://{AUTHORITY_DID}/space/at.freeq.media/NOSUCHKEY/did:plc:a/at.freeq.media.item/3k"
+    );
+    let (status, _) = get(
+        fx.web,
+        &format!("/api/v1/space-media/{}/x.png", encode_ref(&uri)),
+    )
+    .await;
+    assert_eq!(status, 404);
+    fx.server.abort();
+}
+
+#[tokio::test]
+async fn space_media_route_refuses_anonymous_reads_of_a_restricted_channel() {
+    let fx = fixture_with_ids(&[]).await;
+    let config = ConnectConfig {
+        server_addr: fx.irc.to_string(),
+        nick: "own".to_string(),
+        user: "own".to_string(),
+        realname: "test".to_string(),
+        ..Default::default()
+    };
+    let (h, mut events) = client::connect(config, None);
+    expect_event(
+        &mut events,
+        |e| matches!(e, Event::Registered { .. }),
+        "registered",
+    )
+    .await;
+    h.join("#priv").await.unwrap();
+    expect_event(&mut events, |e| matches!(e, Event::Joined { .. }), "joined").await;
+
+    // Mint the space while the channel is still public, then lock it.
+    let (s, body) = get(fx.web, "/api/v1/media-space?channel=%23priv").await;
+    assert_eq!(s, 200);
+    let space = body["space"].as_str().unwrap().to_string();
+    let key = space.rsplit('/').next().unwrap().to_string();
+    h.mode("#priv", "+k", Some("sekrit")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let uri =
+        format!("at://{AUTHORITY_DID}/space/at.freeq.media/{key}/did:plc:a/at.freeq.media.item/3k");
+    let (status, _) = get(
+        fx.web,
+        &format!("/api/v1/space-media/{}/x.png", encode_ref(&uri)),
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "an anonymous caller must not read a restricted channel's media"
+    );
+
+    h.quit(None).await.ok();
+    fx.server.abort();
+}
+
+#[tokio::test]
+async fn health_reports_whether_media_spaces_are_configured() {
+    let fx = fixture_with_ids(&[]).await;
+    let (s, body) = get(fx.web, "/api/v1/health").await;
+    assert_eq!(s, 200);
+    assert_eq!(body["media_spaces"], true);
+    fx.server.abort();
+
+    let config = freeq_server::config::ServerConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        web_addr: Some("127.0.0.1:0".to_string()),
+        server_name: "test-media-off".to_string(),
+        challenge_timeout_secs: 60,
+        db_path: Some(":memory:".to_string()),
+        ..Default::default()
+    };
+    let (_irc, web, server) = freeq_server::server::Server::with_resolver(
+        config,
+        DidResolver::static_map(HashMap::new()),
+    )
+    .start_with_web()
+    .await
+    .unwrap();
+    let (s, body) = get(web, "/api/v1/health").await;
+    assert_eq!(s, 200);
+    assert_eq!(body["media_spaces"], false);
+    // And the serve route is gone entirely.
+    let (status, _) = get(web, "/api/v1/space-media/abc/x.png").await;
+    assert_eq!(status, 404);
     server.abort();
 }
 

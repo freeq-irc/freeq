@@ -200,6 +200,7 @@ pub fn router(state: Arc<SharedState>) -> Router {
             get(xrpc_check_user_access),
         )
         .route("/api/v1/media-space", get(api_media_space))
+        .route("/api/v1/space-media/{ref}/{filename}", get(api_space_media))
         // REST API (read-only, v1)
         .route("/api/v1/health", get(api_health))
         // The mediated, metered model path: the server holds the provider
@@ -571,6 +572,8 @@ struct HealthResponse {
     /// and the web client all work — while every AV endpoint answers 503. That
     /// shipped to production once, and the only signal was a user trying a call.
     av: bool,
+    /// Whether private media spaces are configured.
+    media_spaces: bool,
 }
 
 #[derive(Serialize)]
@@ -1949,6 +1952,7 @@ async fn api_health(State(state): State<Arc<SharedState>>) -> Json<HealthRespons
         channels,
         uptime_secs: uptime,
         av: av_available(&state),
+        media_spaces: state.media_space.is_some(),
     })
 }
 
@@ -2370,6 +2374,11 @@ fn media_space_member(
     let Some(key) = mgr.parse_space_key(space) else {
         return false;
     };
+    // This server reads its own spaces to serve media to members it has
+    // already authorized.
+    if user_did == mgr.authority_did {
+        return true;
+    }
     // Snapshot under the channels lock, resolve sessions under session_dids
     // (same lock order as authorize_channel_read).
     let (members, founder, did_ops) = {
@@ -2414,29 +2423,35 @@ async fn api_media_space(
         return Err(StatusCode::NOT_FOUND);
     };
     let channel = authorize_channel_read(&state, &q.channel, &headers)?;
-    let key = channel.to_lowercase();
+    let key = channel_space_key(&state, &mgr, &channel).await?;
+    Ok(Json(serde_json::json!({
+        "space": mgr.space_ref(&key),
+        "type": crate::media_space::SPACE_TYPE,
+    })))
+}
 
-    let space_body = |space_key: &str| {
-        serde_json::json!({
-            "space": mgr.space_ref(space_key),
-            "type": crate::media_space::SPACE_TYPE,
-        })
-    };
-    let stored = |state: &SharedState, key: &str| {
+/// The channel's media space key.
+/// The space is created the first time media is uploaded.
+async fn channel_space_key(
+    state: &Arc<SharedState>,
+    mgr: &crate::media_space::MediaSpaceManager,
+    channel: &str,
+) -> Result<String, StatusCode> {
+    let key = channel.to_lowercase();
+    let stored = |key: &str| {
         state
             .channels
             .lock()
             .get(key)
             .and_then(|c| c.media_space_key.clone())
     };
-    if let Some(k) = stored(&state, &key) {
-        return Ok(Json(space_body(&k)));
+    if let Some(k) = stored(&key) {
+        return Ok(k);
     }
 
-    // First use: create exactly one space, even under concurrent requests.
     let _creating = mgr.create_lock.lock().await;
-    if let Some(k) = stored(&state, &key) {
-        return Ok(Json(space_body(&k)));
+    if let Some(k) = stored(&key) {
+        return Ok(k);
     }
     let new_key = ulid::Ulid::new().to_string();
     if let Err(err) = mgr.create_space(&state.did_resolver, &new_key).await {
@@ -2452,7 +2467,64 @@ async fn api_media_space(
         ch.clone()
     };
     state.with_db(|db| db.save_channel(&key, &snapshot));
-    Ok(Json(space_body(&new_key)))
+    Ok(new_key)
+}
+
+/// GET /api/v1/space-media/{ref}/{filename} — serve a private space media
+/// file to a member of the channel that owns the space.
+///
+/// `ref` is the record's `at://` URI, base64url-encoded so it survives a path
+/// segment; the trailing filename gives clients the extension they use to
+/// decide how to render, exactly like the private-store capability URLs.
+async fn api_space_media(
+    State(state): State<Arc<SharedState>>,
+    Path((encoded_ref, _filename)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, StatusCode> {
+    let Some(mgr) = state.media_space.clone() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    use base64::Engine;
+    let uri = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded_ref.as_bytes())
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let Some(rec) = mgr.parse_record_uri(&uri) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    // Which channel owns this space, and may the caller read it? Reuse the
+    // channel-history rule so restricted channels stay restricted.
+    let channel = {
+        let channels = state.channels.lock();
+        channels
+            .iter()
+            .find(|(_, c)| c.media_space_key.as_deref() == Some(rec.space_key.as_str()))
+            .map(|(name, _)| name.clone())
+    };
+    let Some(channel) = channel else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    authorize_channel_read(&state, &channel, &headers)?;
+
+    let (bytes, mime) = mgr
+        .fetch_media(&state.did_resolver, &rec)
+        .await
+        .map_err(|err| {
+            tracing::warn!(error = %err, uri = %uri, "space media fetch failed");
+            StatusCode::BAD_GATEWAY
+        })?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, mime),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "private, max-age=300".to_string(),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 /// GET /api/v1/messages/{msgid} — permalink resolution. Returns the message
@@ -4088,6 +4160,9 @@ async fn api_upload(
     // `share_bluesky` (feed post) implies `share_pds` since the feed embed
     // references the PDS blob. `cross_post` is the legacy alias for it.
     let mut share_pds = false;
+    // Store the file in the user's own repo inside this channel's media
+    // space instead of the server's private store.
+    let mut space_media = false;
     let mut share_bluesky = false;
 
     while let Some(field) = multipart
@@ -4144,6 +4219,10 @@ async fn api_upload(
                 let val = field.text().await.unwrap_or_default();
                 share_bluesky = val == "true" || val == "1";
             }
+            "space_media" => {
+                let val = field.text().await.unwrap_or_default();
+                space_media = val == "true" || val == "1";
+            }
             _ => {}
         }
     }
@@ -4181,6 +4260,104 @@ async fn api_upload(
             StatusCode::UNAUTHORIZED,
             "Upload requires an active connection for this DID".into(),
         ));
+    }
+
+    // ── Private media space ─────────────────────────────────────────────
+    // The file goes into the uploader's own repo inside the channel's space.
+    // Nothing is stored here, so this returns before the private store.
+    if space_media {
+        let Some(mgr) = state.media_space.clone() else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "Private media spaces are not enabled on this server".into(),
+            ));
+        };
+        let Some(channel) = channel.clone().filter(|c| c.starts_with('#')) else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Private media spaces are per-channel; no channel given".into(),
+            ));
+        };
+        let session = {
+            let sessions = state.web_sessions.lock();
+            let purpose = crate::server::OauthPurpose::MediaSpace;
+            sessions
+                .get(&(did.clone(), purpose))
+                .or_else(|| sessions.get(&(did.clone(), crate::server::OauthPurpose::Login)))
+                .filter(|s| crate::server::scope_satisfies_purpose(&s.granted_scope, purpose))
+                .cloned()
+        };
+        let Some(session) = session else {
+            let has_login = state
+                .web_sessions
+                .lock()
+                .contains_key(&(did.clone(), crate::server::OauthPurpose::Login));
+            let body = if has_login {
+                serde_json::json!({
+                    "error": "step_up_required",
+                    "purpose": "media_space",
+                    "step_up_url": "/auth/step-up?purpose=media_space",
+                    "message": "Storing this file privately on your PDS needs an \
+                                additional permission. Authorize once and we'll proceed.",
+                })
+            } else {
+                serde_json::json!({
+                    "error": "not_authenticated",
+                    "message": "No active session for this DID — please log in.",
+                })
+            };
+            return Err((
+                if has_login {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::UNAUTHORIZED
+                },
+                body.to_string(),
+            ));
+        };
+
+        let space_key = channel_space_key(&state, &mgr, &channel)
+            .await
+            .map_err(|s| {
+                (
+                    s,
+                    "Could not resolve this channel's media space".to_string(),
+                )
+            })?;
+        let dpop_key = freeq_sdk::oauth::DpopKey::from_base64url(&session.dpop_key_b64)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DPoP key: {e}")))?;
+        let result = freeq_sdk::media::upload_media_to_space(
+            &session.pds_url,
+            &session.did,
+            &session.access_token,
+            Some(&dpop_key),
+            session.dpop_nonce.as_deref(),
+            &mgr.space_ref(&space_key),
+            crate::media_space::MEDIA_COLLECTION,
+            &content_type,
+            &file_data,
+            alt.as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            tracing::warn!(did = %did, channel = %channel, error = %e, "space media upload failed");
+            (StatusCode::BAD_GATEWAY, format!("{e}"))
+        })?;
+
+        tracing::info!(did = %did, channel = %channel, uri = %result.uri, "Space media stored");
+        let (origin, _) = derive_web_origin(&headers);
+        use base64::Engine;
+        let encoded =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(result.uri.as_bytes());
+        let name = pick_media_filename(filename.as_deref(), &content_type);
+        return Ok(Json(serde_json::json!({
+            "url": format!("{origin}/api/v1/space-media/{encoded}/{name}"),
+            "uri": result.uri,
+            "private": true,
+            "space": true,
+            "mime": result.mime_type,
+            "size": result.size,
+        })));
     }
 
     // ── Opt-in PDS authorization ────────────────────────────────────────

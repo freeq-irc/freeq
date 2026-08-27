@@ -18,10 +18,15 @@ pub const SPACE_TYPE: &str = "at.freeq.media";
 /// this server's `did:web` document.
 pub const MANAGING_APP_FRAGMENT: &str = "freeq_media";
 
-/// The OAuth scope token granting full access to this server's media spaces.
-/// Explicit `collection=*` spares the PDS resolving the space type's lexicon.
+/// Collection holding one media item per record inside a media space.
+pub const MEDIA_COLLECTION: &str = "at.freeq.media.item";
+
+/// The OAuth scope token granting access to this server's media spaces.
+///
+/// The type is `*` because a named one must resolve to a published lexicon
+/// and [`SPACE_TYPE`] is not published.
 pub fn space_scope(authority_did: &str) -> String {
-    format!("space:{SPACE_TYPE}?authority={authority_did}&collection=*")
+    format!("space:*?authority={authority_did}&collection=*")
 }
 
 /// Client for the spaces PDS plus the identity this server manages spaces as.
@@ -33,6 +38,7 @@ pub struct MediaSpaceManager {
     pds_url: tokio::sync::Mutex<Option<String>>,
     session: tokio::sync::Mutex<Option<String>>,
     pub create_lock: tokio::sync::Mutex<()>,
+    credentials: tokio::sync::Mutex<std::collections::HashMap<String, CachedCredential>>,
     http: reqwest::Client,
     server_name: String,
 }
@@ -51,6 +57,7 @@ impl MediaSpaceManager {
             pds_url: tokio::sync::Mutex::new(None),
             session: tokio::sync::Mutex::new(None),
             create_lock: tokio::sync::Mutex::new(()),
+            credentials: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             http: reqwest::Client::new(),
             server_name,
         }
@@ -175,6 +182,262 @@ impl MediaSpaceManager {
         }
         unreachable!("createSpace retry loop always returns or bails");
     }
+
+    /// Parse a record URI naming a record in one of this server's spaces:
+    /// `at://{authority}/space/{type}/{skey}/{author}/{collection}/{rkey}`.
+    pub fn parse_record_uri(&self, uri: &str) -> Option<SpaceRecordRef> {
+        let rest = uri.strip_prefix("at://")?;
+        let parts: Vec<&str> = rest.split('/').collect();
+        let [did, marker, space_type, skey, author, collection, rkey] = parts[..] else {
+            return None;
+        };
+        if did != self.authority_did
+            || marker != "space"
+            || space_type != SPACE_TYPE
+            || skey.is_empty()
+            || !author.starts_with("did:")
+            || collection.is_empty()
+            || rkey.is_empty()
+        {
+            return None;
+        }
+        Some(SpaceRecordRef {
+            space: self.space_ref(skey),
+            space_key: skey.to_string(),
+            author_did: author.to_string(),
+            collection: collection.to_string(),
+            rkey: rkey.to_string(),
+        })
+    }
+
+    /// A space credential for reading `space`, minted for this server's own
+    /// authority identity and bound to a DPoP key.
+    ///
+    /// The server reads on behalf of members it has already authorized.
+    async fn space_credential(
+        &self,
+        resolver: &DidResolver,
+        space: &str,
+    ) -> Result<(String, freeq_sdk::oauth::DpopKey)> {
+        {
+            let cache = self.credentials.lock().await;
+            if let Some(entry) = cache.get(space)
+                && entry.good_until > now_secs()
+            {
+                return Ok((
+                    entry.credential.clone(),
+                    freeq_sdk::oauth::DpopKey::from_base64url(&entry.dpop_key_b64)?,
+                ));
+            }
+        }
+
+        let pds = self.pds_url(resolver).await?;
+        let token = self.session_token(resolver).await?;
+        // Step 1: our own PDS mints a delegation token for the space.
+        let res = self
+            .http
+            .get(format!("{pds}/xrpc/com.atproto.space.getDelegationToken"))
+            .query(&[("space", space)])
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("getDelegationToken request")?;
+        if !res.status().is_success() {
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
+            bail!("getDelegationToken failed: {status} {body}");
+        }
+        let delegation = res.json::<serde_json::Value>().await?["token"]
+            .as_str()
+            .context("getDelegationToken response missing token")?
+            .to_string();
+
+        // Step 2: the authority exchanges it for a credential bound to our
+        // DPoP key. Presenting the proof here is what sets that binding.
+        let dpop_key = freeq_sdk::oauth::DpopKey::generate();
+        let url = format!("{pds}/xrpc/com.atproto.space.getSpaceCredential");
+        let mut nonce: Option<String> = None;
+        let mut credential = None;
+        for attempt in 0..3 {
+            let proof = dpop_key.proof("POST", &url, nonce.as_deref(), Some(&delegation))?;
+            let res = self
+                .http
+                .post(&url)
+                .header("Authorization", format!("DPoP {delegation}"))
+                .header("DPoP", proof)
+                .json(&serde_json::json!({ "space": space }))
+                .send()
+                .await
+                .context("getSpaceCredential request")?;
+            if let Some(n) = res
+                .headers()
+                .get("dpop-nonce")
+                .and_then(|v| v.to_str().ok())
+            {
+                nonce = Some(n.to_string());
+            }
+            let status = res.status();
+            if status.is_success() {
+                credential = res.json::<serde_json::Value>().await?["credential"]
+                    .as_str()
+                    .map(str::to_string);
+                break;
+            }
+            let body = res.text().await.unwrap_or_default();
+            // The first call to a host has no nonce yet and is expected to
+            // fail once with the nonce we then use.
+            if (status == 401 || status == 400) && attempt < 2 {
+                continue;
+            }
+            bail!("getSpaceCredential failed: {status} {body}");
+        }
+        let credential = credential.context("getSpaceCredential returned no credential")?;
+
+        self.credentials.lock().await.insert(
+            space.to_string(),
+            CachedCredential {
+                credential: credential.clone(),
+                dpop_key_b64: dpop_key.to_base64url(),
+                good_until: now_secs() + 1800,
+            },
+        );
+        Ok((credential, dpop_key))
+    }
+
+    /// Fetch a media record and its blob from the author's PDS. Returns the
+    /// bytes and the MIME type the record declares.
+    pub async fn fetch_media(
+        &self,
+        resolver: &DidResolver,
+        rec: &SpaceRecordRef,
+    ) -> Result<(Vec<u8>, String)> {
+        let (credential, dpop_key) = self.space_credential(resolver, &rec.space).await?;
+        let author_doc = resolver
+            .resolve(&rec.author_did)
+            .await
+            .context("resolving media author's DID")?;
+        let repo_host = author_doc
+            .service
+            .iter()
+            .find(|s| s.id.ends_with("#atproto_pds"))
+            .map(|s| s.service_endpoint.trim_end_matches('/').to_string())
+            .context("media author's DID document has no PDS")?;
+
+        let record = self
+            .space_get_json(
+                &format!("{repo_host}/xrpc/com.atproto.space.getRecord"),
+                &[
+                    ("space", rec.space.as_str()),
+                    ("repo", rec.author_did.as_str()),
+                    ("collection", rec.collection.as_str()),
+                    ("rkey", rec.rkey.as_str()),
+                ],
+                &credential,
+                &dpop_key,
+            )
+            .await
+            .context("fetching space media record")?;
+        let value = &record["value"];
+        let cid = value["blob"]["ref"]["$link"]
+            .as_str()
+            .context("media record has no blob reference")?;
+        let mime = value["mimeType"]
+            .as_str()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+
+        let bytes = self
+            .space_get_bytes(
+                &format!("{repo_host}/xrpc/com.atproto.space.getBlob"),
+                &[
+                    ("space", rec.space.as_str()),
+                    ("repo", rec.author_did.as_str()),
+                    ("cid", cid),
+                ],
+                &credential,
+                &dpop_key,
+            )
+            .await
+            .context("fetching space media blob")?;
+        Ok((bytes, mime))
+    }
+
+    async fn space_get_json(
+        &self,
+        url: &str,
+        params: &[(&str, &str)],
+        credential: &str,
+        dpop_key: &freeq_sdk::oauth::DpopKey,
+    ) -> Result<serde_json::Value> {
+        let bytes = self
+            .space_get_bytes(url, params, credential, dpop_key)
+            .await?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// A credential-authenticated XRPC GET, with the DPoP nonce handshake the
+    /// first call to a host always needs.
+    async fn space_get_bytes(
+        &self,
+        url: &str,
+        params: &[(&str, &str)],
+        credential: &str,
+        dpop_key: &freeq_sdk::oauth::DpopKey,
+    ) -> Result<Vec<u8>> {
+        let mut nonce: Option<String> = None;
+        for attempt in 0..3 {
+            let proof = dpop_key.proof("GET", url, nonce.as_deref(), Some(credential))?;
+            let res = self
+                .http
+                .get(url)
+                .query(params)
+                .header("Authorization", format!("DPoP {credential}"))
+                .header("DPoP", proof)
+                .send()
+                .await?;
+            if let Some(n) = res
+                .headers()
+                .get("dpop-nonce")
+                .and_then(|v| v.to_str().ok())
+            {
+                nonce = Some(n.to_string());
+            }
+            let status = res.status();
+            if status.is_success() {
+                return Ok(res.bytes().await?.to_vec());
+            }
+            if (status == 401 || status == 400) && attempt < 2 {
+                continue;
+            }
+            let body = res.text().await.unwrap_or_default();
+            bail!("{status}: {body}");
+        }
+        bail!("space request failed after retries")
+    }
+}
+
+/// A record inside one of this server's spaces, as named by an `at://` URI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceRecordRef {
+    /// The space the record lives in, without the record tail.
+    pub space: String,
+    pub space_key: String,
+    pub author_did: String,
+    pub collection: String,
+    pub rkey: String,
+}
+
+struct CachedCredential {
+    credential: String,
+    dpop_key_b64: String,
+    good_until: u64,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 pub async fn verify_service_auth(
@@ -300,6 +563,52 @@ mod tests {
         );
         assert_eq!(m.parse_space_key("not-a-uri"), None);
         assert_eq!(m.parse_space_key("at://did:plc:authority123"), None);
+    }
+
+    #[test]
+    fn parses_a_record_uri_in_one_of_our_spaces() {
+        let m = mgr();
+        let rec = m
+            .parse_record_uri(
+                "at://did:plc:authority123/space/at.freeq.media/K1/did:plc:alice/at.freeq.media.item/3kx",
+            )
+            .expect("well-formed record uri");
+        assert_eq!(rec.space_key, "K1");
+        assert_eq!(rec.author_did, "did:plc:alice");
+        assert_eq!(rec.collection, "at.freeq.media.item");
+        assert_eq!(rec.rkey, "3kx");
+        assert_eq!(rec.space, m.space_ref("K1"));
+    }
+
+    #[test]
+    fn record_uri_parsing_rejects_anything_not_ours() {
+        let m = mgr();
+        for uri in [
+            // Someone else's authority.
+            "at://did:plc:other/space/at.freeq.media/K1/did:plc:alice/at.freeq.media.item/3kx",
+            // A different space type.
+            "at://did:plc:authority123/space/com.example.other/K1/did:plc:alice/c/3kx",
+            // A bare space ref carries no record.
+            "at://did:plc:authority123/space/at.freeq.media/K1",
+            // The author must be a DID.
+            "at://did:plc:authority123/space/at.freeq.media/K1/alice/at.freeq.media.item/3kx",
+            // Trailing junk beyond the record tail.
+            "at://did:plc:authority123/space/at.freeq.media/K1/did:plc:alice/c/3kx/extra",
+            "not-a-uri",
+        ] {
+            assert!(
+                m.parse_record_uri(uri).is_none(),
+                "must not parse as one of our records: {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn space_scope_names_this_authority() {
+        assert_eq!(
+            space_scope("did:plc:authority123"),
+            "space:*?authority=did:plc:authority123&collection=*"
+        );
     }
 
     #[test]
