@@ -1236,6 +1236,7 @@ function PinnedBar({ pins, messages }: { pins: PinnedMessage[]; messages: Messag
 /** Distance from the top at which the next page is worth asking for. */
 const NEAR_TOP_PX = 120;
 
+
 /** One entry in the rendered list: a message, or a run of join/part notices
  *  collapsed into a single line. The virtualizer counts these, so the list it
  *  is handed has to be the list that renders — a row skipped inside the map
@@ -1398,7 +1399,10 @@ export function MessageList() {
    *  bottom of the conversation. */
   const newerEdge = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.newerEdge ?? 'tip');
   const [showScrollBtn, setShowScrollBtn] = useState(false);
-  const [newMsgCount, setNewMsgCount] = useState(0);
+  /** Messages that have arrived below the reader since they left the live
+   *  end. Kept by the store, because a window away from the live end does
+   *  not hold them and the list has nothing to count. */
+  const newMsgCount = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.unseenBelow ?? 0);
   const [popover, setPopover] = useState<{ nick: string; did?: string; origin?: string; evidence?: RowEvidence; pos: { x: number; y: number } } | null>(null);
 
   /** Put the view on the newest row.
@@ -1440,6 +1444,7 @@ export function MessageList() {
 
   // Track whether user has scrolled up (unstick from bottom)
   const trimMessageWindow = useStore((s) => s.trimMessageWindow);
+  const setReaderAtBottom = useStore((s) => s.setReaderAtBottom);
   const handleScroll = useCallback(() => {
     const el = ref.current;
     if (!el) return;
@@ -1453,21 +1458,20 @@ export function MessageList() {
     setShowScrollBtn(!atPresent);
     setAtTop(atTopNow);
     setAtNewerEnd(atBottom);
+    // What the store needs to know before the next message lands: whether
+    // there is a reader holding a position an arrival must not disturb.
+    setReaderAtBottom(activeChannel, atPresent);
     if (atPresent) {
-      setNewMsgCount(0);
       // Scrolling up grows the held window past MESSAGE_WINDOW; back at the
       // bottom those rows are out of reach again, so give them back.
       if (rawMessages.length > MESSAGE_WINDOW) trimMessageWindow(activeChannel);
     }
-  }, [activeChannel, rawMessages.length, trimMessageWindow, newerEdge]);
+  }, [activeChannel, rawMessages.length, trimMessageWindow, setReaderAtBottom, newerEdge]);
 
-  // Scroll to bottom when messages change (if stuck to bottom), or count new messages
-  const prevNewestRef = useRef({ channel: activeChannel, id: messages[messages.length - 1]?.id });
+  // Scroll to bottom when messages change, if the reader is at the bottom.
   /** Whether the reader has asked for the present and the page is still out. */
   const returningToPresent = useRef(false);
   useEffect(() => {
-    const prev = prevNewestRef.current;
-    prevNewestRef.current = { channel: activeChannel, id: messages[messages.length - 1]?.id };
     // A window away from the live end has no bottom to be stuck to: the rows
     // below it were never fetched. Following a link into one lands the reader
     // where the link pointed, and re-pinning to the end of the window would
@@ -1479,31 +1483,18 @@ export function MessageList() {
       returningToPresent.current = false;
       stickToBottomRef.current = true;
       setShowScrollBtn(false);
-      setNewMsgCount(0);
-    }
-    if (!stickToBottomRef.current && prev.channel === activeChannel) {
-      // Only rows below the row that was newest are new to this reader — a
-      // history page merged while they scroll back lands above them.
-      let added = 0;
-      for (let i = messages.length - 1; i >= 0; i--) {
-        if (messages[i].id === prev.id) break;
-        added++;
-      }
-      // Counting the whole list means that row is no longer held (or there
-      // was none): no baseline, so nothing to announce.
-      if (added > 0 && added < messages.length) setNewMsgCount((c) => c + added);
-      return;
+      setReaderAtBottom(activeChannel, true);
     }
     if (!stickToBottomRef.current) return;
     requestAnimationFrame(pinToBottom);
-  }, [messages.length, messages, activeChannel, newerEdge, pinToBottom]);
+  }, [messages.length, messages, activeChannel, newerEdge, pinToBottom, setReaderAtBottom]);
 
   // Always scroll to bottom on channel switch
   // Multiple timers to catch: initial render, layout, CHATHISTORY load
   useEffect(() => {
     stickToBottomRef.current = true;
     setShowScrollBtn(false);
-    setNewMsgCount(0);
+    setReaderAtBottom(activeChannel, true);
     const scrollBottom = () => {
       stickToBottomRef.current = true;
       pinToBottom();
@@ -1525,8 +1516,13 @@ export function MessageList() {
       requestHistory(activeChannel);
     }
 
-    return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); clearTimeout(t4); };
-  }, [activeChannel, isDM, pinToBottom]);
+    // A buffer the reader walks away from is left with no reader holding a
+    // position in it, so an arrival there is free to keep it at its ceiling.
+    return () => {
+      clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); clearTimeout(t4);
+      useStore.getState().setReaderAtBottom(activeChannel, true);
+    };
+  }, [activeChannel, isDM, pinToBottom, setReaderAtBottom]);
 
   // Ask for the page older than everything held. The boundary row's button
   // and the auto-fetch below send the same request.
@@ -1733,6 +1729,11 @@ export function MessageList() {
     setStartMargin(chrome.current?.offsetHeight ?? 0);
   }, [activeChannel, pins.length, peerBlocked, showSkeleton, historyEdge, historyFetching, hasSenderRows, isEmpty]);
 
+  // Scroll anchoring off: the browser's own is a second thing moving the
+  // scroll position when the content above the reader changes, and the
+  // virtualizer is already doing that on its own terms. The two together
+  // fight over a list whose rows are mounted and unmounted as it moves.
+  //
   // The pane, and the chrome that sits over it. Anything anchored to what the
   // reader can see hangs off the wrapper rather than off the scroller: inside
   // a scroll container an absolutely positioned box is placed against the
@@ -1743,7 +1744,7 @@ export function MessageList() {
       <div key={activeChannel} ref={ref} data-testid="message-list" role="log" aria-label={`Messages in ${activeChannel}`} aria-live="polite" className={`flex-1 min-h-0 overflow-y-auto relative ${
       density === 'compact' ? 'text-[14px] [&_.msg-full]:pt-1.5 [&_.msg-full]:pb-0' :
       density === 'cozy' ? 'text-[16px] [&_.msg-full]:pt-4 [&_.msg-full]:pb-2' : ''
-    }`} onScroll={handleScroll} onCopy={handleCleanCopy}>
+    }`} style={{ overflowAnchor: 'none' }} onScroll={handleScroll} onCopy={handleCleanCopy}>
       <div ref={chrome}>
       {activeChannel.startsWith('#') && pins.length > 0 && (
         <div className="sticky top-0 z-10">
@@ -1901,15 +1902,16 @@ export function MessageList() {
       {(showScrollBtn || newerEdge === 'more') && (
         <button
           onClick={() => {
-            setNewMsgCount(0);
             // Below an anchored window the rest of the conversation has not
             // been fetched, so there is nothing to scroll to. The newest page
-            // is asked for, and its answer becomes the window.
+            // is asked for, and its answer becomes the window — and reaching
+            // it, not asking for it, is what clears the count.
             if (newerEdge === 'more') {
               returningToPresent.current = true;
               requestHistory(activeChannel);
               return;
             }
+            setReaderAtBottom(activeChannel, true);
             stickToBottomRef.current = true;
             setShowScrollBtn(false);
             pinToBottom();

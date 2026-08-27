@@ -85,6 +85,14 @@ export interface Channel {
   historyEdge: HistoryEdge;
   /** Whether anything newer than the newest held row still exists. */
   newerEdge: NewerEdge;
+  /** Whether the reader is sitting at the live end of this buffer. False
+   *  while they hold a position above it, which is what stops an arriving
+   *  message taking a row out from under them. True for a buffer nobody is
+   *  looking at: there is no position to hold. */
+  readerAtBottom: boolean;
+  /** Messages that have arrived below the reader since they left the live
+   *  end, held or not. What the jump affordance counts. */
+  unseenBelow: number;
   /** Whether a page of older history is on the wire right now. */
   historyFetching: boolean;
   /** Whether the automatic fetch is held off after a page never arrived.
@@ -290,6 +298,12 @@ export interface Store {
   // Actions — messages
   addMessage: (channel: string, msg: Message) => void;
   mergeHistory: (channel: string, messages: Message[]) => void;
+  /** Where the reader is in `channel`: at its live end, or holding a
+   *  position above it. `true` is the app's stick-to-bottom state, which is
+   *  the bottom of a window that reaches the live end and nothing else.
+   *  Saying so is also saying the messages that arrived below them have been
+   *  reached, so it clears that count. */
+  setReaderAtBottom: (channel: string, atBottom: boolean) => void;
   /** Drop back to the newest MESSAGE_WINDOW rows — eviction from the old
    *  end. Called when the reader returns to the bottom, never while they
    *  are scrolled back. */
@@ -427,6 +441,8 @@ function getOrCreateChannel(channels: Map<string, Channel>, name: string): Chann
       typingUsers: new Map(),
       historyEdge: 'unknown',
       newerEdge: 'tip',
+      readerAtBottom: true,
+      unseenBelow: 0,
       historyFetching: false,
       historyAutoPaused: false,
       newerAutoPaused: false,
@@ -830,12 +846,19 @@ export const useStore = create<Store>((set, get) => ({
   }),
 
   // Messages
-  addMessage: (channel, msg) => set((s) => {
+  addMessage: (channel, msg) => {
+    const key = channel.toLowerCase();
+    // Whether the cap is this channel's to apply at all. A window grown past
+    // the ceiling by paging back is not shrunk by an arriving message —
+    // giving those rows up belongs to `trimMessageWindow`, which runs when
+    // the reader returns to the bottom.
+    const wasAtRest = (get().channels.get(key)?.messages.length ?? 0) <= MESSAGE_WINDOW;
+
+    set((s) => {
     if (channel === 'server' || channel.toLowerCase() === 'server') {
       return { serverMessages: [...s.serverMessages, msg].slice(-500) };
     }
 
-    const key = channel.toLowerCase();
     const oldCh = s.channels.get(key);
 
     // Dedup by msgid — CHATHISTORY can return messages already shown live.
@@ -860,29 +883,45 @@ export const useStore = create<Store>((set, get) => ({
       typingUsers: new Map(),
       historyEdge: 'unknown',
       newerEdge: 'tip',
+      readerAtBottom: true,
+      unseenBelow: 0,
       historyFetching: false,
       historyAutoPaused: false,
       newerAutoPaused: false,
       historyFetchMode: 'latest',
     };
+    // A window that does not reach the live end does not hold this message
+    // either: it belongs after the run of rows the window is, on the far
+    // side of history nobody has fetched. Holding it would put a gap inside
+    // the held list with nothing to say it was there. The reader is told the
+    // ordinary way — the count below them — and the message arrives with the
+    // page that closes the gap.
+    const holds = base.newerEdge === 'tip';
     // Always produce a fresh Channel object so subscribers comparing
     // channel identity (Sidebar, MessageList children, etc.) see a new
     // reference and re-render. Mutating in place can hide updates from
     // memoized components and shallow selectors.
     const ch: typeof base = {
       ...base,
-      // A channel sitting at its resting window keeps the newest 1000. One
-      // grown by paging back is never shrunk by an arriving message —
-      // giving those rows up belongs to `trimMessageWindow`, which runs
-      // when the reader returns to the bottom.
-      messages: base.messages.length > MESSAGE_WINDOW
-        ? [...base.messages, msg]
-        : [...base.messages, msg].slice(-MESSAGE_WINDOW),
+      // Only ever an add. The cap that follows it is its own update: one
+      // that dropped a row at the start while adding at the end would move
+      // every row's index in a single commit, under a reader looking at the
+      // middle of them.
+      messages: holds ? [...base.messages, msg] : base.messages,
       isJoined: base.isJoined || isDMBuf,
       unreadCount:
         !msg.isSystem && s.activeChannel.toLowerCase() !== key
           ? base.unreadCount + 1
           : base.unreadCount,
+      // Below the reader and not yet reached, whether or not it is held. A
+      // reader is only at the live end when they are at the bottom of a
+      // window that reaches it; below an older window everything newer is
+      // below them by construction. A notice is not a message anyone is
+      // waiting for.
+      unseenBelow:
+        !msg.isSystem && !(base.readerAtBottom && base.newerEdge === 'tip')
+          ? base.unseenBelow + 1
+          : base.unseenBelow,
     };
 
     const channels = new Map(s.channels);
@@ -897,7 +936,20 @@ export const useStore = create<Store>((set, get) => ({
     }
 
     return { channels };
-  }),
+    });
+
+    // The cap, on its own, after the add.
+    if (!wasAtRest) return;
+    const grown = get().channels.get(key);
+    if (!grown || !grown.readerAtBottom || grown.messages.length <= MESSAGE_WINDOW) return;
+    set((s) => {
+      const ch = s.channels.get(key);
+      if (!ch) return {};
+      const channels = new Map(s.channels);
+      channels.set(key, { ...ch, messages: ch.messages.slice(-MESSAGE_WINDOW) });
+      return { channels };
+    });
+  },
 
   mergeHistory: (channel, incoming) => set((s) => {
     if (!incoming || incoming.length === 0) return {};
@@ -962,6 +1014,20 @@ export const useStore = create<Store>((set, get) => ({
     // grows to hold whatever comes back, with no ceiling above it.
     ch.messages = merged;
     channels.set(channel.toLowerCase(), ch);
+    return { channels };
+  }),
+
+  setReaderAtBottom: (channel, atBottom) => set((s) => {
+    const key = channel.toLowerCase();
+    const ch = s.channels.get(key);
+    if (!ch) return {};
+    if (ch.readerAtBottom === atBottom && (!atBottom || ch.unseenBelow === 0)) return {};
+    const channels = new Map(s.channels);
+    channels.set(key, {
+      ...ch,
+      readerAtBottom: atBottom,
+      unseenBelow: atBottom ? 0 : ch.unseenBelow,
+    });
     return { channels };
   }),
 

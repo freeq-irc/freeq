@@ -203,6 +203,42 @@ describe('paging back inside an anchored window', () => {
   });
 });
 
+describe('where the list says the reader is', () => {
+  it('says they have left the live end when they scroll up', () => {
+    anchoredWindow('#left', 20);
+    act(() => { s().openWindow('#left', s().channels.get('#left')!.messages, true); });
+    const el = list();
+    act(() => { scrollTo(el, 'bottom'); });
+    expect(s().channels.get('#left')!.readerAtBottom).toBe(true);
+
+    act(() => { scrollTo(el, 'top'); });
+
+    expect(s().channels.get('#left')!.readerAtBottom).toBe(false);
+  });
+
+  it('says they are back at it when they return', () => {
+    anchoredWindow('#backat', 20);
+    act(() => { s().openWindow('#backat', s().channels.get('#backat')!.messages, true); });
+    const el = list();
+    act(() => { scrollTo(el, 'top'); });
+    expect(s().channels.get('#backat')!.readerAtBottom).toBe(false);
+
+    act(() => { scrollTo(el, 'bottom'); });
+
+    expect(s().channels.get('#backat')!.readerAtBottom).toBe(true);
+  });
+
+  it('does not say they are at the live end of a window that is not', () => {
+    // The bottom of an old window is not the bottom of the conversation.
+    anchoredWindow('#notlive', 20);
+    const el = list();
+
+    act(() => { scrollTo(el, 'bottom'); });
+
+    expect(s().channels.get('#notlive')!.readerAtBottom).toBe(false);
+  });
+});
+
 describe('reaching the newer end of a window', () => {
   it('asks for the page after its newest row', () => {
     anchoredWindow('#forward', 20);
