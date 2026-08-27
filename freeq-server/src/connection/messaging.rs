@@ -2832,18 +2832,29 @@ pub(super) fn handle_chathistory(
                             // whole span, capped by the same limit.
                             (rows, Some((0, i64::MAX, limit)))
                         }
-                        // `*`, or anything unparseable, degrades to the newest
-                        // page the way BEFORE's does: the older half is the end
-                        // of the channel and there is nothing newer.
-                        anchor => {
-                            let at = match anchor {
-                                Some(HistoryAnchor::Timestamp(ts)) => ts,
-                                _ => u64::MAX,
-                            };
+                        Some(HistoryAnchor::Timestamp(at)) => {
                             let rows = state
                                 .with_db(|db| db.get_messages_around(&db_key, at, limit))
                                 .unwrap_or_default();
                             (rows, Some((0, i64::MAX, limit)))
+                        }
+                        // A page about a place in the channel, asked for
+                        // without a place. `*` names none, and neither does a
+                        // word that parses as nothing — so this answers the
+                        // way a msgid naming no stored row does, rather than
+                        // handing back a stretch of the channel nobody asked
+                        // about. BEFORE and AFTER have a newest and an oldest
+                        // page to fall back on; there is no such page here.
+                        None => {
+                            fail_message_error(
+                                &subcmd,
+                                &target,
+                                state,
+                                server_name,
+                                session_id,
+                                send,
+                            );
+                            return;
                         }
                     }
                 }

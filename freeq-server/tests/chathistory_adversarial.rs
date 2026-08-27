@@ -1385,7 +1385,7 @@ async fn chathistory_unknown_msgid_fails_with_message_error() {
         std::thread::sleep(Duration::from_millis(200));
         alice.drain();
 
-        for sub in ["BEFORE", "AFTER"] {
+        for sub in ["BEFORE", "AFTER", "AROUND"] {
             alice.tx(&format!(
                 "CHATHISTORY {sub} #unknownid msgid=01NOSUCHMESSAGE0000000000 50"
             ));
@@ -1397,6 +1397,43 @@ async fn chathistory_unknown_msgid_fails_with_message_error() {
                     && line.contains(sub)
                     && line.contains("#unknownid"),
                 "{sub}: {line}"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn chathistory_around_without_an_anchor_fails_with_message_error() {
+    let r = resolver(vec![]);
+    let (addr, _h) = start(r).await;
+    run(addr, |addr| {
+        let mut alice = C::with_caps(addr, "noanc_a");
+        alice.reg();
+        alice.drain();
+        alice.tx("JOIN #noanchor");
+        alice.num("366");
+        alice.drain();
+        for i in 0..3 {
+            alice.tx(&format!("PRIVMSG #noanchor :row {i}"));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        alice.drain();
+
+        // AROUND is a page about a place in the channel. `*` names no place,
+        // and neither does a word that parses as nothing — there is no
+        // sensible page to serve, and serving one anyway hands the reader a
+        // stretch of the channel they did not ask about.
+        for anchor in ["*", "notatimestamp", "timestamp=", "msgid="] {
+            alice.tx(&format!("CHATHISTORY AROUND #noanchor {anchor} 50"));
+            let line = alice
+                .maybe(|l| l.contains("FAIL") || l.contains("BATCH"), 2000)
+                .unwrap_or_else(|| panic!("AROUND {anchor} should answer"));
+            assert!(
+                line.contains("FAIL CHATHISTORY MESSAGE_ERROR")
+                    && line.contains("AROUND")
+                    && line.contains("#noanchor"),
+                "{anchor}: {line}"
             );
         }
     })
