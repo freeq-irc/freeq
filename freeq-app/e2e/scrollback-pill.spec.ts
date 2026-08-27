@@ -14,7 +14,7 @@
  */
 import { test, expect, type Locator } from '@playwright/test';
 import net from 'node:net';
-import { uniqueNick, uniqueChannel, connectGuest } from './helpers';
+import { uniqueNick, uniqueChannel, connectGuest, heldRowCount } from './helpers';
 
 const IRC_HOST = process.env.FREEQ_IRC_HOST || '127.0.0.1';
 const IRC_PORT = Number(process.env.FREEQ_IRC_PORT || 16799);
@@ -104,7 +104,7 @@ test.describe('the jump-to-bottom pill', () => {
 
     await connectGuest(page, uniqueNick('pil'), channel);
     const list = page.getByTestId('message-list');
-    await expect.poll(() => list.evaluate((el) => el.querySelectorAll('[id^="msg-"]').length),
+    await expect.poll(() => heldRowCount(page, channel),
       { timeout: 20_000 }).toBeGreaterThan(20);
     // Activating a channel re-pins the view to the bottom on a timer.
     await page.waitForTimeout(1_500);

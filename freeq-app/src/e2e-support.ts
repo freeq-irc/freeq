@@ -25,3 +25,31 @@ export function heldRowCount(channel: string): number {
   if (channel.toLowerCase() === 'server') return s.serverMessages.length;
   return s.channels.get(channel.toLowerCase())?.messages.length ?? 0;
 }
+
+/** The msgid of the newest row the store holds for `channel`, or null.
+ *
+ *  The newest row is not always mounted — a reader scrolled back is looking
+ *  at rows a long way from it — so a spec cannot read it off the last
+ *  `msg-` node in the document. */
+export function newestHeldMsgId(channel: string): string | null {
+  const s = useStore.getState();
+  const rows = channel.toLowerCase() === 'server'
+    ? s.serverMessages
+    : (s.channels.get(channel.toLowerCase())?.messages ?? []);
+  return rows.length > 0 ? rows[rows.length - 1].id : null;
+}
+
+/** The msgid of the oldest row the store holds for `channel`, or null. */
+export function oldestHeldMsgId(channel: string): string | null {
+  const s = useStore.getState();
+  const rows = channel.toLowerCase() === 'server'
+    ? s.serverMessages
+    : (s.channels.get(channel.toLowerCase())?.messages ?? []);
+  return rows.length > 0 ? rows[0].id : null;
+}
+
+/** Ask the message list to go to `msgid`, the way a search result or a reply
+ *  reference does. */
+export function jumpToMessage(msgid: string): void {
+  useStore.getState().setScrollToMsgId(msgid);
+}

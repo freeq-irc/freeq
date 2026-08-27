@@ -32,6 +32,45 @@ export async function startAvSessionRaw(page: Page, channel: string) {
   }, [channel]);
 }
 
+/** How many message rows the app's store holds for `channel`.
+ *
+ *  Not the rows on screen. The message list mounts a window of what it holds,
+ *  so counting `msg-` nodes in the document counts the window and not the
+ *  list — a count that shrinks when the reader scrolls, and that says nothing
+ *  about what a page of history added. `src/e2e-support.ts` reads the held
+ *  list itself; `e2e/store-count.spec.ts` is what proves it reads the store
+ *  the running app is using. */
+export function heldRowCount(page: Page, channel: string): Promise<number> {
+  return page.evaluate(async (ch) => {
+    const mod = await import('/src/e2e-support.ts');
+    return mod.heldRowCount(ch);
+  }, channel);
+}
+
+/** The msgid of the newest row the store holds for `channel`. */
+export function newestHeldMsgId(page: Page, channel: string): Promise<string | null> {
+  return page.evaluate(async (ch) => {
+    const mod = await import('/src/e2e-support.ts');
+    return mod.newestHeldMsgId(ch);
+  }, channel);
+}
+
+/** The msgid of the oldest row the store holds for `channel`. */
+export function oldestHeldMsgId(page: Page, channel: string): Promise<string | null> {
+  return page.evaluate(async (ch) => {
+    const mod = await import('/src/e2e-support.ts');
+    return mod.oldestHeldMsgId(ch);
+  }, channel);
+}
+
+/** Go to a message the way a search result or a reply reference does. */
+export function jumpToMessage(page: Page, msgid: string): Promise<void> {
+  return page.evaluate(async (id) => {
+    const mod = await import('/src/e2e-support.ts');
+    mod.jumpToMessage(id);
+  }, msgid);
+}
+
 /** Set up localStorage before page load to skip onboarding */
 export async function prepPage(page: Page) {
   await page.addInitScript(() => {

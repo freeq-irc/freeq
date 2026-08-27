@@ -16,7 +16,7 @@
  */
 import { test, expect, type Page, type Locator } from '@playwright/test';
 import net from 'node:net';
-import { uniqueNick, uniqueChannel, connectGuest } from './helpers';
+import { uniqueNick, uniqueChannel, connectGuest, heldRowCount } from './helpers';
 
 const IRC_HOST = process.env.FREEQ_IRC_HOST || '127.0.0.1';
 const IRC_PORT = Number(process.env.FREEQ_IRC_PORT || 16799);
@@ -101,11 +101,6 @@ async function seedDensely(channel: string): Promise<void> {
     seedSession(channel, `df${k}`, k * PER_SESSION, PER_SESSION)));
 }
 
-/** How many message rows the transcript is holding. */
-function heldRows(list: Locator): Promise<number> {
-  return list.evaluate((el) => el.querySelectorAll('[id^="msg-"]').length);
-}
-
 /** Where the reader is: distance from the bottom, in pixels. */
 function distanceFromBottom(list: Locator): Promise<number> {
   return list.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
@@ -126,7 +121,7 @@ test.describe('walking a channel to its start', () => {
 
     await connectGuest(page, uniqueNick('rdr'), channel);
     const list = page.getByTestId('message-list');
-    await expect.poll(() => heldRows(list), { timeout: 20_000 }).toBeGreaterThan(10);
+    await expect.poll(() => heldRowCount(page, channel), { timeout: 20_000 }).toBeGreaterThan(10);
     // Activating a channel re-pins the view to the bottom on a timer for the
     // next 1.2s; scrolling up inside that window is undone.
     await page.waitForTimeout(1_500);
@@ -158,6 +153,6 @@ test.describe('walking a channel to its start', () => {
     // The whole channel came back on the way there. A page anchored by
     // timestamp would have stepped over the rows sharing each page
     // boundary's second and arrived short.
-    expect(await heldRows(list)).toBeGreaterThanOrEqual(SEEDED);
+    expect(await heldRowCount(page, channel)).toBeGreaterThanOrEqual(SEEDED);
   });
 });

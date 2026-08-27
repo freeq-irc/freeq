@@ -13,7 +13,7 @@
  */
 import { test, expect, type Page, type Locator } from '@playwright/test';
 import net from 'node:net';
-import { uniqueNick, uniqueChannel, connectGuest } from './helpers';
+import { uniqueNick, uniqueChannel, connectGuest, heldRowCount } from './helpers';
 
 const IRC_HOST = process.env.FREEQ_IRC_HOST || '127.0.0.1';
 const IRC_PORT = Number(process.env.FREEQ_IRC_PORT || 16799);
@@ -119,18 +119,13 @@ async function seedChannel(channel: string): Promise<number> {
   return SEEDED;
 }
 
-/** How many message rows the transcript is holding. */
-function heldRows(list: Locator): Promise<number> {
-  return list.evaluate((el) => el.querySelectorAll('[id^="msg-"]').length);
-}
-
 function boundary(page: Page): Locator {
   return page.getByTestId('history-boundary');
 }
 
 test.describe('walking a channel past the old ceiling', () => {
-  // Seeding paces against the flood window and the walk is a hundred pages
-  // of a list nothing virtualises, so this one runs long by construction.
+  // Seeding paces against the flood window and the walk is a hundred pages,
+  // so this one runs long by construction.
   test.setTimeout(1_800_000);
 
   test('a channel of more than 5000 messages walks all the way to its start', async ({ page }) => {
@@ -140,7 +135,7 @@ test.describe('walking a channel past the old ceiling', () => {
 
     await connectGuest(page, uniqueNick('rdr'), channel);
     const list = page.getByTestId('message-list');
-    await expect.poll(() => heldRows(list), { timeout: 20_000 }).toBeGreaterThan(10);
+    await expect.poll(() => heldRowCount(page, channel), { timeout: 20_000 }).toBeGreaterThan(10);
     // Activating a channel re-pins the view to the bottom on a timer for the
     // next 1.2s; scrolling up inside that window is undone.
     await page.waitForTimeout(1_500);
@@ -156,13 +151,13 @@ test.describe('walking a channel past the old ceiling', () => {
     const marker = page.getByText('This is the beginning of the channel.');
     const deadline = Date.now() + 1_200_000;
     let reached = false;
-    let held = await heldRows(list);
+    let held = await heldRowCount(page, channel);
     let stalled = 0;
     while (Date.now() < deadline) {
       if (await marker.count() > 0) { reached = true; break; }
       await list.evaluate((el) => { el.scrollTop = 0; });
       await page.waitForTimeout(250);
-      const now = await heldRows(list);
+      const now = await heldRowCount(page, channel);
       // Pages land as fast as the server answers, but a list this long takes
       // a while to render each one, so the growth is uneven: only a long run
       // of no growth at all — a minute of gestures — says the walk stopped.
@@ -177,7 +172,7 @@ test.describe('walking a channel past the old ceiling', () => {
 
     // The whole channel is held, past where the old ceiling would have
     // discarded every further page.
-    const finalRows = await heldRows(list);
+    const finalRows = await heldRowCount(page, channel);
     expect(finalRows, 'the held list should be past the old ceiling').toBeGreaterThan(WALL);
     expect(finalRows).toBeGreaterThanOrEqual(SEEDED);
   });

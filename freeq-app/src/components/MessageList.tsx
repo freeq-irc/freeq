@@ -1319,6 +1319,8 @@ export function MessageList() {
    *  whether or not it is on screen. */
   const { rows, indexOfId } = useMemo(() => buildRenderRows(messages), [messages]);
   const virtualizer = useRef<VirtualizerHandle>(null);
+  const rowCount = useRef(0);
+  rowCount.current = rows.length;
 
   /** Whether the empty state, where it renders, is the thing that says where
    *  this buffer begins. `ChannelEmptyState` puts the topic in that slot when
@@ -1356,6 +1358,25 @@ export function MessageList() {
   const [newMsgCount, setNewMsgCount] = useState(0);
   const [popover, setPopover] = useState<{ nick: string; did?: string; origin?: string; evidence?: RowEvidence; pos: { x: number; y: number } } | null>(null);
 
+  /** Put the view on the newest row.
+   *
+   *  Setting the scroll to its full height alone is not enough over a
+   *  virtualized list: the rows near the bottom have not been measured, so
+   *  the height it is set against is an estimate that grows as they are, and
+   *  the reader is left short of the end. Asking the virtualizer for the last
+   *  row mounts and measures that stretch first; the frames after it settle
+   *  the remainder. */
+  const pinToBottom = useCallback(() => {
+    const toEnd = () => {
+      if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
+    };
+    if (rowCount.current > 0) {
+      virtualizer.current?.scrollToIndex(rowCount.current - 1, { align: 'end' });
+    }
+    toEnd();
+    requestAnimationFrame(() => { toEnd(); requestAnimationFrame(toEnd); });
+  }, []);
+
   // Track whether user has scrolled up (unstick from bottom)
   const trimMessageWindow = useStore((s) => s.trimMessageWindow);
   const evictNewerRows = useStore((s) => s.evictNewerRows);
@@ -1387,9 +1408,24 @@ export function MessageList() {
 
   // Scroll to bottom when messages change (if stuck to bottom), or count new messages
   const prevNewestRef = useRef({ channel: activeChannel, id: messages[messages.length - 1]?.id });
+  /** Whether the reader has asked for the present and the page is still out. */
+  const returningToPresent = useRef(false);
   useEffect(() => {
     const prev = prevNewestRef.current;
     prevNewestRef.current = { channel: activeChannel, id: messages[messages.length - 1]?.id };
+    // A window away from the live end has no bottom to be stuck to: the rows
+    // below it were never fetched. Following a link into one lands the reader
+    // where the link pointed, and re-pinning to the end of the window would
+    // take them straight off it again. When the page they asked for arrives
+    // at the live end, that is where they land.
+    if (newerEdge !== 'tip') {
+      stickToBottomRef.current = false;
+    } else if (returningToPresent.current) {
+      returningToPresent.current = false;
+      stickToBottomRef.current = true;
+      setShowScrollBtn(false);
+      setNewMsgCount(0);
+    }
     if (!stickToBottomRef.current && prev.channel === activeChannel) {
       // Only rows below the row that was newest are new to this reader — a
       // history page merged while they scroll back lands above them.
@@ -1404,12 +1440,8 @@ export function MessageList() {
       return;
     }
     if (!stickToBottomRef.current) return;
-    const scrollBottom = () => {
-      if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
-    };
-    // Double RAF ensures layout is complete after React render
-    requestAnimationFrame(() => requestAnimationFrame(scrollBottom));
-  }, [messages.length, messages, activeChannel]);
+    requestAnimationFrame(pinToBottom);
+  }, [messages.length, messages, activeChannel, newerEdge, pinToBottom]);
 
   // Always scroll to bottom on channel switch
   // Multiple timers to catch: initial render, layout, CHATHISTORY load
@@ -1418,13 +1450,10 @@ export function MessageList() {
     setShowScrollBtn(false);
     setNewMsgCount(0);
     const scrollBottom = () => {
-      if (ref.current) {
-        ref.current.scrollTop = ref.current.scrollHeight;
-        stickToBottomRef.current = true;
-      }
+      stickToBottomRef.current = true;
+      pinToBottom();
     };
     scrollBottom();
-    requestAnimationFrame(() => requestAnimationFrame(scrollBottom));
     const t1 = setTimeout(scrollBottom, 100);
     const t2 = setTimeout(scrollBottom, 300);
     const t3 = setTimeout(scrollBottom, 600); // after CHATHISTORY arrives
@@ -1442,7 +1471,7 @@ export function MessageList() {
     }
 
     return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); clearTimeout(t4); };
-  }, [activeChannel, isDM]);
+  }, [activeChannel, isDM, pinToBottom]);
 
   // Ask for the page older than everything held. The boundary row's button
   // and the auto-fetch below send the same request.
@@ -1753,8 +1782,11 @@ export function MessageList() {
 
       </div>
 
-      {/* Pinned to the pane the reader is looking at, not to the content. */}
-      {showScrollBtn && (
+      {/* Pinned to the pane the reader is looking at, not to the content.
+          Offered wherever the window does not reach the live end, without
+          waiting for a scroll to say so: a window opened around a link is
+          away from the present the moment it lands. */}
+      {(showScrollBtn || newerEdge === 'more') && (
         <button
           onClick={() => {
             setNewMsgCount(0);
@@ -1762,15 +1794,13 @@ export function MessageList() {
             // been fetched, so there is nothing to scroll to. The newest page
             // is asked for, and its answer becomes the window.
             if (newerEdge === 'more') {
+              returningToPresent.current = true;
               requestHistory(activeChannel);
-              stickToBottomRef.current = true;
               return;
             }
-            if (ref.current) {
-              ref.current.scrollTop = ref.current.scrollHeight;
-              stickToBottomRef.current = true;
-              setShowScrollBtn(false);
-            }
+            stickToBottomRef.current = true;
+            setShowScrollBtn(false);
+            pinToBottom();
           }}
           className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-bg-secondary border border-border rounded-full px-4 py-2 shadow-xl flex items-center gap-2 text-sm text-fg-muted hover:text-fg hover:border-accent transition-all z-10 animate-fadeIn"
         >

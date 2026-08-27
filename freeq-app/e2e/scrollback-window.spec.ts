@@ -8,7 +8,7 @@
  */
 import { test, expect, type Page, type Locator } from '@playwright/test';
 import net from 'node:net';
-import { uniqueNick, uniqueChannel, connectGuest } from './helpers';
+import { uniqueNick, uniqueChannel, connectGuest, heldRowCount, newestHeldMsgId } from './helpers';
 
 const IRC_HOST = process.env.FREEQ_IRC_HOST || '127.0.0.1';
 const IRC_PORT = Number(process.env.FREEQ_IRC_PORT || 16799);
@@ -150,11 +150,6 @@ async function talker(channel: string, nick: string) {
   };
 }
 
-/** How many message rows the transcript is holding. */
-function heldRows(list: Locator): Promise<number> {
-  return list.evaluate((el) => el.querySelectorAll('[id^="msg-"]').length);
-}
-
 /** Where the reader is: distance from the bottom, in pixels. */
 function distanceFromBottom(list: Locator): Promise<number> {
   return list.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
@@ -170,11 +165,11 @@ async function pageBack(list: Locator): Promise<void> {
 }
 
 /** Wait for a scroll-up fetch to land, without failing if this one did not. */
-async function grewWithin(list: Locator, before: number, ms: number): Promise<number> {
+async function grewWithin(list: Locator, channel: string, before: number, ms: number): Promise<number> {
   const deadline = Date.now() + ms;
   let rows = before;
   while (Date.now() < deadline) {
-    rows = await heldRows(list);
+    rows = await heldRowCount(list.page(), channel);
     if (rows > before) return rows;
     await list.page().waitForTimeout(100);
   }
@@ -203,19 +198,19 @@ test.describe('scrollback window', () => {
 
     await connectGuest(page, uniqueNick('rdr'), channel);
     const list = page.getByTestId('message-list');
-    await expect.poll(() => heldRows(list), { timeout: 20_000 }).toBeGreaterThan(PAGE);
+    await expect.poll(() => heldRowCount(page, channel), { timeout: 20_000 }).toBeGreaterThan(PAGE);
     // Activating a channel re-pins the view to the bottom on a timer for the
     // next 1.2s; scrolling up inside that window is undone before the handler
     // reads it.
     await page.waitForTimeout(1_500);
 
     // ── page back until the held list is past the resting window ──
-    let held = await heldRows(list);
+    let held = await heldRowCount(page, channel);
     let stalled = 0;
     for (let attempt = 0; attempt < 60 && held <= WINDOW; attempt++) {
       const before = held;
       await pageBack(list);
-      held = await grewWithin(list, before, 8_000);
+      held = await grewWithin(list, channel, before, 8_000);
       stalled = held > before ? 0 : stalled + 1;
       expect(stalled, 'four scroll-up fetches in a row added no rows').toBeLessThan(4);
     }
@@ -228,22 +223,23 @@ test.describe('scrollback window', () => {
     live.say('a live line while the reader is up the page');
     await expect(jumpButton(page)).toHaveText('1 new message');
 
-    const heldBeforePage = await heldRows(list);
+    const heldBeforePage = await heldRowCount(page, channel);
     await pageBack(list);
-    expect(await grewWithin(list, heldBeforePage, 8_000)).toBeGreaterThan(heldBeforePage);
+    expect(await grewWithin(list, channel, heldBeforePage, 8_000)).toBeGreaterThan(heldBeforePage);
     await expect(jumpButton(page), 'a fetched history page is not new to the reader')
       .toHaveText('1 new message');
 
     // ── returning to the bottom trims, and the view stays put ──
-    const newestRow = list.locator('[id^="msg-"]').last();
-    const newestId = await newestRow.getAttribute('id');
+    // Read off the held list rather than the document: the reader is a long
+    // way from the newest row, so it is not one of the rows on screen.
+    const newestId = await newestHeldMsgId(page, channel);
     await jumpButton(page).click();
 
-    await expect.poll(() => heldRows(list), { timeout: 15_000 }).toBeLessThanOrEqual(WINDOW);
-    expect(await heldRows(list)).toBe(WINDOW);
+    await expect.poll(() => heldRowCount(page, channel), { timeout: 15_000 }).toBeLessThanOrEqual(WINDOW);
+    expect(await heldRowCount(page, channel)).toBe(WINDOW);
 
     // The newest row survived the trim and is the one the reader is looking at.
-    const newest = list.locator(`[id="${newestId}"]`);
+    const newest = list.locator(`[id="msg-${newestId}"]`);
     await expect(newest).toBeInViewport();
     expect(await distanceFromBottom(list)).toBeLessThan(4);
 
