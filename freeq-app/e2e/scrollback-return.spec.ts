@@ -25,6 +25,13 @@ const BURST_WINDOW_MS = 2_250;
 /** Sessions held open for the whole seeding, kept low so the per-IP cap
  *  leaves room for the readers and for whatever else is running. */
 const SESSIONS = 6;
+/** Seeding connects from a second loopback address, as the deep walk does.
+ *  The server counts connections per IP and refuses the 21st, and these are
+ *  held open for the length of the seeding while the rest of the suite is
+ *  using the same address — enough, on the run this spec first joined, to
+ *  cost two neighbouring specs their connection. Where the address is not
+ *  usable the sessions fall back to the default source. */
+const SEED_SRC = '127.0.0.2';
 const PER_SESSION = 50;
 const SEEDED = SESSIONS * PER_SESSION;
 /** The opening page the SDK asks for on join. */
@@ -32,9 +39,11 @@ const PAGE = 50;
 
 /** One session that stays connected and sends its whole share, pausing
  *  between bursts to stay inside the flood window. */
-function seedSession(channel: string, nick: string, first: number, count: number): Promise<void> {
+function seedSession(
+  channel: string, nick: string, first: number, count: number, src: string | undefined,
+): Promise<void> {
   return new Promise((resolve, reject) => {
-    const sock = net.connect(IRC_PORT, IRC_HOST);
+    const sock = net.connect({ port: IRC_PORT, host: IRC_HOST, localAddress: src });
     sock.setNoDelay(true);
     let buf = '';
     let joined = false;
@@ -74,9 +83,19 @@ function seedSession(channel: string, nick: string, first: number, count: number
   });
 }
 
-function seedChannel(channel: string): Promise<void[]> {
-  return Promise.all(Array.from({ length: SESSIONS }, (_, k) =>
-    seedSession(channel, `rt${k}`, k * PER_SESSION, PER_SESSION)));
+/** Whether the server accepts a connection from `SEED_SRC`. */
+function seedSourceUsable(): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    const probe = net.connect({ port: IRC_PORT, host: IRC_HOST, localAddress: SEED_SRC });
+    probe.on('connect', () => { probe.destroy(); resolve(SEED_SRC); });
+    probe.on('error', () => resolve(undefined));
+  });
+}
+
+async function seedChannel(channel: string): Promise<void> {
+  const src = await seedSourceUsable();
+  await Promise.all(Array.from({ length: SESSIONS }, (_, k) =>
+    seedSession(channel, `rt${k}`, k * PER_SESSION, PER_SESSION, src)));
 }
 
 /** Where the reader is: distance from the bottom, in pixels. */
