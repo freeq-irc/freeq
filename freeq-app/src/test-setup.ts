@@ -37,13 +37,39 @@ for (const name of ['localStorage', 'sessionStorage'] as const) {
 }
 
 // jsdom implements no ResizeObserver, and the message list's virtualizer
-// constructs one to measure rows. Without it every render of that component
-// throws. jsdom also lays nothing out, so a real implementation would only
-// ever report zeroes: this observes nothing and reports nothing, which is
-// what a zero-height document has to say anyway.
+// constructs one to measure the pane and the rows in it. Without one, every
+// render of that component throws; with one that reports what jsdom knows —
+// nothing has a size, and nothing has an offsetParent — the virtualizer has
+// no window to compute and mounts no rows at all, and a component test could
+// not see a message.
+//
+// So this reports a nominal size for every box it is asked about, which is
+// enough for a window to exist. The number is arbitrary and means nothing:
+// jsdom has no layout, and a test that depends on how many rows fall inside
+// a viewport is testing this constant rather than the component.
+const NOMINAL_BOX_PX = 20;
+
 if (typeof (globalThis as Record<string, unknown>).ResizeObserver !== 'function') {
   (globalThis as Record<string, unknown>).ResizeObserver = class {
-    observe() {}
+    cb: (entries: unknown[]) => void;
+    constructor(cb: (entries: unknown[]) => void) {
+      this.cb = cb;
+    }
+    observe(el: Element) {
+      // A virtualizer ignores a box that is not laid out, which in jsdom is
+      // every box.
+      if (!(el as HTMLElement).offsetParent) {
+        Object.defineProperty(el, 'offsetParent', {
+          value: document.body, configurable: true,
+        });
+      }
+      // A real one reports after layout, never inside `observe`. Reporting
+      // synchronously here lands inside React's own render and the
+      // measurement is dropped.
+      queueMicrotask(() => {
+        this.cb([{ target: el, contentRect: { width: NOMINAL_BOX_PX, height: NOMINAL_BOX_PX } }]);
+      });
+    }
     unobserve() {}
     disconnect() {}
   };

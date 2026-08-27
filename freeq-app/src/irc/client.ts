@@ -909,16 +909,35 @@ function wireEvents(c: FreeqClient) {
     const key = channel.toLowerCase();
     const held = () => useStore.getState().channels.get(key)?.messages.length ?? 0;
 
+    // A page that lands where the window has not reached becomes the window
+    // rather than merging into it: an around page is somewhere the reader
+    // jumped to, and a newest page asked for from a window away from the
+    // live end is the reader coming back to the present. Merging either one
+    // would leave a run of the conversation missing in the middle of the
+    // held list with nothing to say it was.
+    const waiting = useStore.getState().channels.get(key);
+    const replaces = waiting?.historyFetching && (!info || info.mode === waiting.historyFetchMode)
+      && (waiting.historyFetchMode === 'around'
+        || (waiting.historyFetchMode === 'latest' && waiting.newerEdge === 'more'));
+
     // Merge first, then report both counts: the size off the wire, which is
     // the only thing that says whether more history exists, and how many
     // rows actually reached the held list, which is what says whether
     // asking again on the same anchor would get anywhere.
     const before = held();
-    useStore.getState().mergeHistory(
-      channel,
-      messages as import('../store').Message[],
-    );
-    const added = held() - before;
+    if (replaces) {
+      useStore.getState().openWindow(
+        channel,
+        messages as import('../store').Message[],
+        waiting!.historyFetchMode === 'latest',
+      );
+    } else {
+      useStore.getState().mergeHistory(
+        channel,
+        messages as import('../store').Message[],
+      );
+    }
+    const added = replaces ? held() : held() - before;
 
     const ch = useStore.getState().channels.get(key);
     // The channel is waiting on one particular page. An answer the bridge

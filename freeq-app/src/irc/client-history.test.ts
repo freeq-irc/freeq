@@ -131,6 +131,53 @@ describe('a page of history the bridge asked for', () => {
     expect(ch('#aroundend')!.historyFetching).toBe(false);
   });
 
+  it('makes an around answer the window rather than merging it in', () => {
+    const client = connected();
+    seed('#swap');
+    bridge.requestHistory('#swap', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' }, 'around');
+
+    client.emit('historyBatch', '#swap', [{
+      id: '01M0BBBBBBBBBBBBBBBBBBBB01', from: 'bob', text: 'far back',
+      timestamp: new Date(1_600_000_000_000), tags: {},
+    }], { mode: 'around', count: 50 });
+
+    const rows = ch('#swap')!.messages;
+    expect(rows.map((m) => m.id)).toEqual(['01M0BBBBBBBBBBBBBBBBBBBB01']);
+    expect(ch('#swap')!.newerEdge).toBe('more');
+  });
+
+  it('makes the newest page the window again when the reader comes back', () => {
+    const client = connected();
+    seed('#back');
+    bridge.requestHistory('#back', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' }, 'around');
+    client.emit('historyBatch', '#back', [{
+      id: '01M0BBBBBBBBBBBBBBBBBBBB01', from: 'bob', text: 'far back',
+      timestamp: new Date(1_600_000_000_000), tags: {},
+    }], { mode: 'around', count: 50 });
+
+    bridge.requestHistory('#back');
+    client.emit('historyBatch', '#back', [{
+      id: '01M0CCCCCCCCCCCCCCCCCCCC01', from: 'carol', text: 'now',
+      timestamp: new Date(1_700_000_000_000), tags: {},
+    }], { mode: 'latest', count: 50 });
+
+    expect(ch('#back')!.messages.map((m) => m.id)).toEqual(['01M0CCCCCCCCCCCCCCCCCCCC01']);
+    expect(ch('#back')!.newerEdge).toBe('tip');
+  });
+
+  it('merges an ordinary older page into the window it already has', () => {
+    const client = connected();
+    seed('#merge');
+    bridge.requestHistory('#merge', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    client.emit('historyBatch', '#merge', [{
+      id: '01M09999999999999999999901', from: 'bob', text: 'older',
+      timestamp: new Date(1_600_000_000_000), tags: {},
+    }], { mode: 'before', count: 50 });
+
+    expect(ch('#merge')!.messages.length).toBe(2);
+  });
+
   it('ends at once on a CHATHISTORY refusal, without waiting for the timer', () => {
     const client = connected();
     seed('#refused');

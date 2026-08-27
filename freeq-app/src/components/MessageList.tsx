@@ -15,7 +15,7 @@ import { MessageContextMenu } from './MessageContextMenu';
 import { MarkdownMessage } from './MarkdownRenderer';
 import { CoordinationEventCard, isCoordinationEvent } from './CoordinationCards';
 import { jumbomojiSize } from '../lib/jumbomoji';
-import { buildTranscript } from '../lib/transcript';
+import { buildTranscript, rowsInSelection } from '../lib/transcript';
 import { useCachedVerdict, VERIFY_LABELS } from '../lib/verify-signature';
 import { VerifySignaturePanel } from './VerifySignaturePanel';
 
@@ -1209,11 +1209,6 @@ function PinnedBar({ pins, messages }: { pins: PinnedMessage[]; messages: Messag
 /** Distance from the top at which the next page is worth asking for. */
 const NEAR_TOP_PX = 120;
 
-/** Rows mounted before the pane has been measured. A pane measures itself on
- *  mount, so this is what stands for the first render and no longer — enough
- *  that the list is never briefly empty. */
-const ROWS_BEFORE_MEASURE = 40;
-
 /** One entry in the rendered list: a message, or a run of join/part notices
  *  collapsed into a single line. The virtualizer counts these, so the list it
  *  is handed has to be the list that renders — a row skipped inside the map
@@ -1223,13 +1218,6 @@ type RenderRow =
   | { kind: 'notices'; key: string; text: string };
 
 const IS_JOIN_PART = /^.+ (joined|left)$/;
-
-/** The msgid of the row `node` sits in, or null if it is in none. */
-function rowIdAt(node: Node | null): string | null {
-  const el = node instanceof Element ? node : (node?.parentElement ?? null);
-  const row = el?.closest<HTMLElement>('[id^="msg-"]');
-  return row ? row.id.slice(4) : null;
-}
 
 /** Collapse consecutive join/part notices, and index what is left by msgid. */
 function buildRenderRows(messages: Message[]): {
@@ -1360,26 +1348,42 @@ export function MessageList() {
   const historyEdge = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.historyEdge ?? 'unknown');
   const historyFetching = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.historyFetching ?? false);
   const historyAutoPaused = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.historyAutoPaused ?? false);
+  /** Whether the newest held row is the live end of the channel. A window
+   *  opened around an older message is not, and its bottom is not the
+   *  bottom of the conversation. */
+  const newerEdge = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.newerEdge ?? 'tip');
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const [newMsgCount, setNewMsgCount] = useState(0);
   const [popover, setPopover] = useState<{ nick: string; did?: string; origin?: string; evidence?: RowEvidence; pos: { x: number; y: number } } | null>(null);
 
   // Track whether user has scrolled up (unstick from bottom)
   const trimMessageWindow = useStore((s) => s.trimMessageWindow);
+  const evictNewerRows = useStore((s) => s.evictNewerRows);
   const handleScroll = useCallback(() => {
     const el = ref.current;
     if (!el) return;
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-    stickToBottomRef.current = atBottom;
-    setShowScrollBtn(!atBottom);
-    setAtTop(el.scrollTop <= NEAR_TOP_PX);
-    if (atBottom) {
+    // The bottom of the window is the present only when the window ends at
+    // the live end. Below an anchored window there is more conversation, so
+    // the reader is still away from it however far down they have scrolled.
+    const atPresent = atBottom && newerEdge === 'tip';
+    const atTopNow = el.scrollTop <= NEAR_TOP_PX;
+    stickToBottomRef.current = atPresent;
+    setShowScrollBtn(!atPresent);
+    setAtTop(atTopNow);
+    if (atPresent) {
       setNewMsgCount(0);
       // Scrolling up grows the held window past MESSAGE_WINDOW; back at the
       // bottom those rows are out of reach again, so give them back.
       if (rawMessages.length > MESSAGE_WINDOW) trimMessageWindow(activeChannel);
+    } else if (atTopNow && newerEdge === 'more' && rawMessages.length > MESSAGE_WINDOW) {
+      // Paging back inside a window that is already away from the live end:
+      // the rows at its new end are the ones out of reach now, and the jump
+      // to the present fetches them back. Only away from the live end —
+      // there, the newest rows are where the next message lands.
+      evictNewerRows(activeChannel);
     }
-  }, [activeChannel, rawMessages.length, trimMessageWindow]);
+  }, [activeChannel, rawMessages.length, trimMessageWindow, evictNewerRows, newerEdge]);
 
   // Scroll to bottom when messages change (if stuck to bottom), or count new messages
   const prevNewestRef = useRef({ channel: activeChannel, id: messages[messages.length - 1]?.id });
@@ -1487,16 +1491,8 @@ export function MessageList() {
   const handleCleanCopy = useCallback((e: React.ClipboardEvent) => {
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed || !ref.current) return;
-    // The two rows the selection runs between, and then every held row
-    // between them. Collecting the mounted rows the selection touches would
-    // collect only the part of it that is on screen.
-    const first = rowIdAt(sel.anchorNode);
-    const last = rowIdAt(sel.focusNode);
-    if (!first || !last || first === last) return; // inside one row → native copy
-    const a = messages.findIndex((m) => m.id === first);
-    const b = messages.findIndex((m) => m.id === last);
-    if (a < 0 || b < 0) return;
-    const selected = messages.slice(Math.min(a, b), Math.max(a, b) + 1);
+    const selected = rowsInSelection(messages, sel);
+    if (!selected) return; // inside one row, or not rows → native copy
     const transcript = buildTranscript(selected, (nick) => displayNameForKey(nick));
     if (!transcript) return;
     e.clipboardData.setData('text/plain', transcript);
@@ -1506,20 +1502,39 @@ export function MessageList() {
   // Scroll to a specific message (from search, reply click, etc.)
   const scrollToMsgId = useStore((s) => s.scrollToMsgId);
   const [highlightId, setHighlightId] = useState<string | null>(null);
+  const [pendingJump, setPendingJump] = useState<string | null>(null);
   useEffect(() => {
     if (!scrollToMsgId) return;
     useStore.getState().setScrollToMsgId(null);
-    // A row out of the mounted window has no element to scroll into view, so
-    // the scroll is asked for by index and the virtualizer mounts what it
-    // lands on.
-    const at = indexOfId.get(scrollToMsgId);
-    if (at === undefined) return;
-    setHighlightId(scrollToMsgId);
+    setPendingJump(scrollToMsgId);
+  }, [scrollToMsgId]);
+
+  /** A row the channel holds is scrolled to by index — out of the mounted
+   *  window there is no element to scroll into view. A row it does not hold
+   *  is somewhere the window has never reached, so the window around it is
+   *  fetched and this runs again over what comes back. Asked for once: a
+   *  page that comes back without the row is the answer that there is none
+   *  to be had. */
+  const askedAround = useRef<string | null>(null);
+  useEffect(() => {
+    if (!pendingJump) return;
+    const at = indexOfId.get(pendingJump);
+    if (at === undefined) {
+      if (askedAround.current === pendingJump || !ULID_RE.test(pendingJump)) {
+        setPendingJump(null);
+        return;
+      }
+      askedAround.current = pendingJump;
+      requestHistory(activeChannel, { msgid: pendingJump }, 'around');
+      return;
+    }
+    setPendingJump(null);
+    setHighlightId(pendingJump);
     requestAnimationFrame(() => {
       virtualizer.current?.scrollToIndex(at, { align: 'center', smooth: true });
       setTimeout(() => setHighlightId(null), 2000);
     });
-  }, [scrollToMsgId, indexOfId]);
+  }, [pendingJump, indexOfId, activeChannel]);
 
   // Show brief skeleton on channel switch while CHATHISTORY loads
   const [showSkeleton, setShowSkeleton] = useState(false);
@@ -1701,7 +1716,6 @@ export function MessageList() {
           scrollRef={ref}
           shift={shiftOnPrepend}
           startMargin={startMargin}
-          ssrCount={Math.min(ROWS_BEFORE_MEASURE, rows.length)}
           keepMounted={keepMounted}
         >
           {rows.map((row) => (
@@ -1743,6 +1757,15 @@ export function MessageList() {
       {showScrollBtn && (
         <button
           onClick={() => {
+            setNewMsgCount(0);
+            // Below an anchored window the rest of the conversation has not
+            // been fetched, so there is nothing to scroll to. The newest page
+            // is asked for, and its answer becomes the window.
+            if (newerEdge === 'more') {
+              requestHistory(activeChannel);
+              stickToBottomRef.current = true;
+              return;
+            }
             if (ref.current) {
               ref.current.scrollTop = ref.current.scrollHeight;
               stickToBottomRef.current = true;
