@@ -1,4 +1,5 @@
-import { useEffect, useRef, useCallback, useState, useMemo, memo } from 'react';
+import { useEffect, useRef, useCallback, useState, useMemo, useLayoutEffect, memo } from 'react';
+import { Virtualizer, type VirtualizerHandle } from 'virtua';
 import { useStore, uniqueMemberCount, MESSAGE_WINDOW, type Message, type PinnedMessage } from '../store';
 import { getNick, getClient, requestHistory, sendReaction, sendUnreact, joinChannel, type HistoryAnchor } from '../irc/client';
 import { fetchProfile, getCachedProfile, type ATProfile } from '../lib/profiles';
@@ -1208,6 +1209,62 @@ function PinnedBar({ pins, messages }: { pins: PinnedMessage[]; messages: Messag
 /** Distance from the top at which the next page is worth asking for. */
 const NEAR_TOP_PX = 120;
 
+/** Rows mounted before the pane has been measured. A pane measures itself on
+ *  mount, so this is what stands for the first render and no longer — enough
+ *  that the list is never briefly empty. */
+const ROWS_BEFORE_MEASURE = 40;
+
+/** One entry in the rendered list: a message, or a run of join/part notices
+ *  collapsed into a single line. The virtualizer counts these, so the list it
+ *  is handed has to be the list that renders — a row skipped inside the map
+ *  would leave a hole in its index space. */
+type RenderRow =
+  | { kind: 'message'; key: string; msg: Message; at: number }
+  | { kind: 'notices'; key: string; text: string };
+
+const IS_JOIN_PART = /^.+ (joined|left)$/;
+
+/** The msgid of the row `node` sits in, or null if it is in none. */
+function rowIdAt(node: Node | null): string | null {
+  const el = node instanceof Element ? node : (node?.parentElement ?? null);
+  const row = el?.closest<HTMLElement>('[id^="msg-"]');
+  return row ? row.id.slice(4) : null;
+}
+
+/** Collapse consecutive join/part notices, and index what is left by msgid. */
+function buildRenderRows(messages: Message[]): {
+  rows: RenderRow[];
+  indexOfId: Map<string, number>;
+} {
+  const rows: RenderRow[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg.isSystem && IS_JOIN_PART.test(msg.text)) {
+      const prev = i > 0 ? messages[i - 1] : null;
+      if (prev?.isSystem && IS_JOIN_PART.test(prev.text)) continue; // in a run
+      const group: Message[] = [msg];
+      for (let j = i + 1; j < messages.length; j++) {
+        const m = messages[j];
+        if (m.isSystem && IS_JOIN_PART.test(m.text)) group.push(m);
+        else break;
+      }
+      if (group.length > 1) {
+        const joins = group.filter((m) => m.text.endsWith(' joined')).map((m) => m.text.replace(' joined', ''));
+        const parts = group.filter((m) => m.text.endsWith(' left')).map((m) => m.text.replace(' left', ''));
+        const said: string[] = [];
+        if (joins.length > 0) said.push(`${joins.slice(0, 3).join(', ')}${joins.length > 3 ? ` and ${joins.length - 3} more` : ''} joined`);
+        if (parts.length > 0) said.push(`${parts.slice(0, 3).join(', ')}${parts.length > 3 ? ` and ${parts.length - 3} more` : ''} left`);
+        rows.push({ kind: 'notices', key: msg.id, text: `— ${said.join('; ')}` });
+        continue;
+      }
+    }
+    rows.push({ kind: 'message', key: msg.id, msg, at: i });
+  }
+  const indexOfId = new Map<string, number>();
+  rows.forEach((r, i) => indexOfId.set(r.key, i));
+  return { rows, indexOfId };
+}
+
 /** Whether `msgs` holds anything from a sender, as opposed to join and part
  *  notices. */
 function messagesHaveASender(msgs: Message[]): boolean {
@@ -1268,6 +1325,12 @@ export function MessageList() {
    *  part notices. A channel with none has nothing for the boundary row to
    *  sit above once its history is known to be empty. */
   const hasSenderRows = useMemo(() => messagesHaveASender(messages), [messages]);
+
+  /** The rendered list, and where each row sits in it. Only a window of these
+   *  is mounted at a time, so an index is the only handle on a row that works
+   *  whether or not it is on screen. */
+  const { rows, indexOfId } = useMemo(() => buildRenderRows(messages), [messages]);
+  const virtualizer = useRef<VirtualizerHandle>(null);
 
   /** Whether the empty state, where it renders, is the thing that says where
    *  this buffer begins. `ChannelEmptyState` puts the topic in that slot when
@@ -1424,11 +1487,16 @@ export function MessageList() {
   const handleCleanCopy = useCallback((e: React.ClipboardEvent) => {
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed || !ref.current) return;
-    const rows = Array.from(ref.current.querySelectorAll<HTMLElement>('[id^="msg-"]'))
-      .filter((n) => sel.containsNode(n, true));
-    if (rows.length < 2) return; // single/partial selection → native copy
-    const ids = new Set(rows.map((n) => n.id.slice(4))); // strip "msg-"
-    const selected = messages.filter((m) => ids.has(m.id));
+    // The two rows the selection runs between, and then every held row
+    // between them. Collecting the mounted rows the selection touches would
+    // collect only the part of it that is on screen.
+    const first = rowIdAt(sel.anchorNode);
+    const last = rowIdAt(sel.focusNode);
+    if (!first || !last || first === last) return; // inside one row → native copy
+    const a = messages.findIndex((m) => m.id === first);
+    const b = messages.findIndex((m) => m.id === last);
+    if (a < 0 || b < 0) return;
+    const selected = messages.slice(Math.min(a, b), Math.max(a, b) + 1);
     const transcript = buildTranscript(selected, (nick) => displayNameForKey(nick));
     if (!transcript) return;
     e.clipboardData.setData('text/plain', transcript);
@@ -1441,16 +1509,17 @@ export function MessageList() {
   useEffect(() => {
     if (!scrollToMsgId) return;
     useStore.getState().setScrollToMsgId(null);
-    // Wait for render, then scroll
+    // A row out of the mounted window has no element to scroll into view, so
+    // the scroll is asked for by index and the virtualizer mounts what it
+    // lands on.
+    const at = indexOfId.get(scrollToMsgId);
+    if (at === undefined) return;
+    setHighlightId(scrollToMsgId);
     requestAnimationFrame(() => {
-      const el = document.getElementById(`msg-${scrollToMsgId}`);
-      if (el) {
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        setHighlightId(scrollToMsgId);
-        setTimeout(() => setHighlightId(null), 2000);
-      }
+      virtualizer.current?.scrollToIndex(at, { align: 'center', smooth: true });
+      setTimeout(() => setHighlightId(null), 2000);
     });
-  }, [scrollToMsgId]);
+  }, [scrollToMsgId, indexOfId]);
 
   // Show brief skeleton on channel switch while CHATHISTORY loads
   const [showSkeleton, setShowSkeleton] = useState(false);
@@ -1465,6 +1534,49 @@ export function MessageList() {
     setPopover({ nick, did, origin, evidence, pos: { x: e.clientX, y: e.clientY } });
   }, []);
 
+  /** Whether the change that just landed added rows above the ones held,
+   *  which is what makes the view hold its place rather than jump when the
+   *  list in front of the reader gets longer at the top.
+   *
+   *  Read during render, because the virtualizer reads it in the same render
+   *  the row count changes in. Recomputed only when the ends move, so a
+   *  render repeated over the same rows answers what the first one did. */
+  const ends = useRef({ first: '', last: '', prepended: false });
+  const firstKey = rows[0]?.key ?? '';
+  const lastKey = rows[rows.length - 1]?.key ?? '';
+  if (firstKey !== ends.current.first || lastKey !== ends.current.last) {
+    ends.current = {
+      first: firstKey,
+      last: lastKey,
+      prepended: !!ends.current.last && lastKey === ends.current.last,
+    };
+  }
+  const shiftOnPrepend = ends.current.prepended;
+
+  /** Rows that stay mounted wherever the reader is: the newest one while
+   *  they are sitting at the live end, so a message arriving is on screen
+   *  the moment it lands, and a row being pointed at by a jump. */
+  const keepMounted = useMemo(() => {
+    const idx: number[] = [];
+    if (!showScrollBtn && rows.length > 0) idx.push(rows.length - 1);
+    if (highlightId !== null) {
+      const at = indexOfId.get(highlightId);
+      if (at !== undefined) idx.push(at);
+    }
+    return idx;
+  }, [showScrollBtn, rows.length, highlightId, indexOfId]);
+
+  /** How much of the pane sits above the rows — the pinned bar, the blocked
+   *  banner, the boundary row. The virtualizer places rows against the
+   *  scroller, so without this its idea of where a row sits is out by
+   *  whatever stands over the list. */
+  const chrome = useRef<HTMLDivElement>(null);
+  const [startMargin, setStartMargin] = useState(0);
+  const isEmpty = rows.length === 0;
+  useLayoutEffect(() => {
+    setStartMargin(chrome.current?.offsetHeight ?? 0);
+  }, [activeChannel, pins.length, peerBlocked, showSkeleton, historyEdge, historyFetching, hasSenderRows, isEmpty]);
+
   // The pane, and the chrome that sits over it. Anything anchored to what the
   // reader can see hangs off the wrapper rather than off the scroller: inside
   // a scroll container an absolutely positioned box is placed against the
@@ -1476,6 +1588,7 @@ export function MessageList() {
       density === 'compact' ? 'text-[14px] [&_.msg-full]:pt-1.5 [&_.msg-full]:pb-0' :
       density === 'cozy' ? 'text-[16px] [&_.msg-full]:pt-4 [&_.msg-full]:pb-2' : ''
     }`} onScroll={handleScroll} onCopy={handleCleanCopy}>
+      <div ref={chrome}>
       {activeChannel.startsWith('#') && pins.length > 0 && (
         <div className="sticky top-0 z-10">
           <PinnedBar pins={pins} messages={messages} />
@@ -1581,62 +1694,47 @@ export function MessageList() {
           )}
         </div>
       )}
+      </div>
       <div className="pb-2">
-        {messages.map((msg, i) => {
-          // Collapse consecutive join/part/quit system messages
-          const isJoinPart = msg.isSystem && /^.+ (joined|left)$/.test(msg.text);
-          if (isJoinPart) {
-            // Skip if the previous message was also a join/part (we'll render them as a group)
-            const prev = i > 0 ? messages[i - 1] : null;
-            const prevIsJP = prev?.isSystem && /^.+ (joined|left)$/.test(prev.text);
-            const next = i < messages.length - 1 ? messages[i + 1] : null;
-            const nextIsJP = next?.isSystem && /^.+ (joined|left)$/.test(next.text);
-            if (prevIsJP) return null; // skip — rendered by the first in the group
-            if (nextIsJP) {
-              // First in a group — collect all consecutive
-              const group: Message[] = [msg];
-              for (let j = i + 1; j < messages.length; j++) {
-                const m = messages[j];
-                if (m.isSystem && /^.+ (joined|left)$/.test(m.text)) group.push(m);
-                else break;
-              }
-              const joins = group.filter(m => m.text.endsWith(' joined')).map(m => m.text.replace(' joined', ''));
-              const parts = group.filter(m => m.text.endsWith(' left')).map(m => m.text.replace(' left', ''));
-              const parts_list: string[] = [];
-              if (joins.length > 0) parts_list.push(`${joins.slice(0, 3).join(', ')}${joins.length > 3 ? ` and ${joins.length - 3} more` : ''} joined`);
-              if (parts.length > 0) parts_list.push(`${parts.slice(0, 3).join(', ')}${parts.length > 3 ? ` and ${parts.length - 3} more` : ''} left`);
-              return (
-                <div key={msg.id} id={`msg-${msg.id}`} className="px-4 py-0.5 flex items-start gap-3">
-                  <span className="w-10 shrink-0" />
-                  <span className="text-fg-dim text-xs opacity-60">— {parts_list.join('; ')}</span>
-                </div>
-              );
-            }
-          }
-          return (
-          <div key={msg.id} id={`msg-${msg.id}`} className={highlightId === msg.id ? 'bg-accent/10 transition-colors duration-1000' : ''}>
-            {lastReadMsgId && i > 0 && messages[i - 1].id === lastReadMsgId && !msg.isSelf && (
-              <div className="flex items-center gap-3 px-4 my-3" id="unread-marker">
-                <div className="flex-1 h-px bg-danger/40" />
-                <span className="text-xs font-bold text-danger/70 uppercase tracking-wider">New</span>
-                <div className="flex-1 h-px bg-danger/40" />
+        <Virtualizer
+          ref={virtualizer}
+          scrollRef={ref}
+          shift={shiftOnPrepend}
+          startMargin={startMargin}
+          ssrCount={Math.min(ROWS_BEFORE_MEASURE, rows.length)}
+          keepMounted={keepMounted}
+        >
+          {rows.map((row) => (
+            row.kind === 'notices' ? (
+              <div key={row.key} id={`msg-${row.key}`} className="px-4 py-0.5 flex items-start gap-3">
+                <span className="w-10 shrink-0" />
+                <span className="text-fg-dim text-xs opacity-60">{row.text}</span>
               </div>
-            )}
-            {shouldShowDateSep(messages, i) && <DateSeparator date={msg.timestamp} />}
-            {msg.deleted ? (
-              <div className="px-4 py-0.5 text-xs italic text-[var(--text-muted)] opacity-50">
-                Message from {displayNameForKey(msg.from)} deleted
-              </div>
-            ) : msg.isSystem ? (
-              <SystemMessage msg={msg} />
-            ) : isGrouped(messages, i) ? (
-              <GroupedMessage msg={msg} channel={activeChannel} onNickClick={onNickClick} />
             ) : (
-              <FullMessage msg={msg} channel={activeChannel} onNickClick={onNickClick} />
-            )}
-          </div>
-          );
-        })}
+            <div key={row.key} id={`msg-${row.key}`} className={highlightId === row.key ? 'bg-accent/10 transition-colors duration-1000' : ''}>
+              {lastReadMsgId && row.at > 0 && messages[row.at - 1].id === lastReadMsgId && !row.msg.isSelf && (
+                <div className="flex items-center gap-3 px-4 my-3" id="unread-marker">
+                  <div className="flex-1 h-px bg-danger/40" />
+                  <span className="text-xs font-bold text-danger/70 uppercase tracking-wider">New</span>
+                  <div className="flex-1 h-px bg-danger/40" />
+                </div>
+              )}
+              {shouldShowDateSep(messages, row.at) && <DateSeparator date={row.msg.timestamp} />}
+              {row.msg.deleted ? (
+                <div className="px-4 py-0.5 text-xs italic text-[var(--text-muted)] opacity-50">
+                  Message from {displayNameForKey(row.msg.from)} deleted
+                </div>
+              ) : row.msg.isSystem ? (
+                <SystemMessage msg={row.msg} />
+              ) : isGrouped(messages, row.at) ? (
+                <GroupedMessage msg={row.msg} channel={activeChannel} onNickClick={onNickClick} />
+              ) : (
+                <FullMessage msg={row.msg} channel={activeChannel} onNickClick={onNickClick} />
+              )}
+            </div>
+            )
+          ))}
+        </Virtualizer>
       </div>
 
       </div>

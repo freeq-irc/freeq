@@ -35,3 +35,16 @@ for (const name of ['localStorage', 'sessionStorage'] as const) {
     });
   }
 }
+
+// jsdom implements no ResizeObserver, and the message list's virtualizer
+// constructs one to measure rows. Without it every render of that component
+// throws. jsdom also lays nothing out, so a real implementation would only
+// ever report zeroes: this observes nothing and reports nothing, which is
+// what a zero-height document has to say anyway.
+if (typeof (globalThis as Record<string, unknown>).ResizeObserver !== 'function') {
+  (globalThis as Record<string, unknown>).ResizeObserver = class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  };
+}
