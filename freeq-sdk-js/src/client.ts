@@ -119,7 +119,7 @@ export class FreeqClient extends EventEmitter {
    *  answers a target's requests in the order they were asked, so the batch
    *  that closes takes the front of the queue — a single slot would label an
    *  earlier answer with a later request. */
-  private historyRequests = new Map<string, Array<{ mode: 'latest' | 'before' | 'after'; count: number }>>();
+  private historyRequests = new Map<string, Array<HistoryBatchInfo>>();
   /** Server-advertised `draft/multiline` policy (parsed from CAP LS). */
   private multilineMaxBytes = 40000;
   private multilineMaxLines = 100;
@@ -776,8 +776,10 @@ export class FreeqClient extends EventEmitter {
    *    - 'latest' — most recent N messages
    *    - 'before' — N messages before the anchor
    *    - 'after'  — N messages after the anchor
+   *    - 'around' — N messages surrounding the anchor, split across it
    *
-   *  'before' and 'after' need an anchor: `opts.msgid` or `opts.timestamp`.
+   *  'before', 'after' and 'around' need an anchor: `opts.msgid` or
+   *  `opts.timestamp`.
    *  A msgid is preferred when both are given — it names one stored row,
    *  where a timestamp is second-resolution and cannot separate messages
    *  sent in the same second.
@@ -823,12 +825,17 @@ export class FreeqClient extends EventEmitter {
         this.noteHistoryRequest(opts.target, 'after', c);
         this.raw(`CHATHISTORY AFTER ${opts.target} ${marker} ${c}`);
         break;
+      case 'around':
+        if (!marker) throw new Error("requestHistory mode='around' requires opts.msgid or opts.timestamp");
+        this.noteHistoryRequest(opts.target, 'around', c);
+        this.raw(`CHATHISTORY AROUND ${opts.target} ${marker} ${c}`);
+        break;
     }
   }
 
   /** Remember what was asked for, keyed by the target as it goes on the
    *  wire — which is the target the server echoes on the answering batch. */
-  private noteHistoryRequest(target: string, mode: 'latest' | 'before' | 'after', count: number): void {
+  private noteHistoryRequest(target: string, mode: HistoryBatchInfo['mode'], count: number): void {
     const key = target.toLowerCase();
     const queue = this.historyRequests.get(key) ?? [];
     queue.push({ mode, count });

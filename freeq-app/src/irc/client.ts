@@ -405,15 +405,19 @@ export interface HistoryAnchor {
   timestamp?: string;
 }
 
-/** Ask for history in `channel`: with an anchor, the page older than it;
- *  without one, the most recent page.
+/** Ask for history in `channel`: with an anchor, the page around or older
+ *  than it; without one, the most recent page.
  *
  *  Either way the request is tracked, so its answer teaches the channel
  *  what is above the oldest row it holds. An untracked request tells the
  *  app nothing — which is how a channel with no row to anchor on, and a
  *  channel shorter than one page, both ended up showing a button over
  *  history that was already complete. */
-export function requestHistory(channel: string, anchor?: HistoryAnchor) {
+export function requestHistory(
+  channel: string,
+  anchor?: HistoryAnchor,
+  mode: 'before' | 'around' = 'before',
+) {
   if (!client) return;
   const anchored = !!anchor && (!!anchor.msgid || !!anchor.timestamp);
   const key = channel.toLowerCase();
@@ -425,7 +429,7 @@ export function requestHistory(channel: string, anchor?: HistoryAnchor) {
   }, HISTORY_TIMEOUT_MS));
   client.requestHistory(
     anchored
-      ? { target: channel, mode: 'before', count: HISTORY_PAGE, ...anchor }
+      ? { target: channel, mode, count: HISTORY_PAGE, ...anchor }
       : { target: channel, mode: 'latest', count: HISTORY_PAGE },
   );
 }
@@ -917,8 +921,11 @@ function wireEvents(c: FreeqClient) {
     const added = held() - before;
 
     const ch = useStore.getState().channels.get(key);
-    const expected = ch?.historyFetchAnchored ? 'before' : 'latest';
-    if (ch?.historyFetching && (!info || info.mode === expected)) {
+    // An anchored request is either a page older than a held row or a page
+    // around one, and both answer it. An answer the bridge cannot place
+    // leaves the channel reading as still loading until the timer runs out.
+    const expected = ch?.historyFetchAnchored ? ['before', 'around'] : ['latest'];
+    if (ch?.historyFetching && (!info || expected.includes(info.mode))) {
       clearHistoryTimer(key);
       useStore.getState().historyPageReceived(
         channel, messages.length, info?.count ?? HISTORY_PAGE, added,

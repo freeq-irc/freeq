@@ -351,7 +351,7 @@ export interface AgentDespawnedPayload {
 /** What a `historyBatch` answers: the request the client sent for that
  *  target. A batch with no matching request reports none. */
 export interface HistoryBatchInfo {
-  mode: 'latest' | 'before' | 'after';
+  mode: 'latest' | 'before' | 'after' | 'around';
   /** The page size that was asked for. */
   count: number;
 }
@@ -359,12 +359,12 @@ export interface HistoryBatchInfo {
 /** Options for `requestHistory`. */
 export interface HistoryOptions {
   target: string;
-  mode: 'latest' | 'before' | 'after';
-  /** Required for mode='before' or 'after' unless `timestamp` is given.
-   *  Preferred over `timestamp` when both are supplied. */
+  mode: 'latest' | 'before' | 'after' | 'around';
+  /** Required for mode='before', 'after' or 'around' unless `timestamp` is
+   *  given. Preferred over `timestamp` when both are supplied. */
   msgid?: string;
-  /** ISO 8601 timestamp. The anchor used for 'before'/'after' when no
-   *  `msgid` is given. Second-resolution on the server, so it cannot
+  /** ISO 8601 timestamp. The anchor used for 'before'/'after'/'around' when
+   *  no `msgid` is given. Second-resolution on the server, so it cannot
    *  separate messages sent in the same second. */
   timestamp?: string;
   /** Default: 50. */

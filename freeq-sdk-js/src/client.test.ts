@@ -980,6 +980,25 @@ describe('requestHistory', () => {
     expect(ws.sent.some((l: string) => l.includes('timestamp='))).toBe(false);
   });
 
+  it('opts.mode=around sends CHATHISTORY AROUND with msgid', async () => {
+    const { client, ws } = await makeRegistered();
+    client.requestHistory({ target: '#foo', mode: 'around', msgid: 'abc', count: 40 });
+    expect(ws.sent).toContain('CHATHISTORY AROUND #foo msgid=abc 40');
+  });
+
+  it('opts.mode=around falls back to the timestamp anchor', async () => {
+    const { client, ws } = await makeRegistered();
+    client.requestHistory({
+      target: '#foo', mode: 'around', timestamp: '2026-08-24T12:00:00.000Z',
+    });
+    expect(ws.sent).toContain('CHATHISTORY AROUND #foo timestamp=2026-08-24T12:00:00.000Z 50');
+  });
+
+  it('opts.mode=around throws if no anchor is given', async () => {
+    const { client } = await makeRegistered();
+    expect(() => client.requestHistory({ target: '#foo', mode: 'around' })).toThrow(/msgid/);
+  });
+
   it('opts.mode=before throws if msgid missing', async () => {
     const { client } = await makeRegistered();
     expect(() => client.requestHistory({ target: '#foo', mode: 'before' })).toThrow(/msgid/);
@@ -1046,6 +1065,20 @@ describe('what a history batch answers', () => {
       { mode: 'latest', count: 50 },
       { mode: 'before', count: 50 },
     ]);
+  });
+
+  it('labels an around answer as one', async () => {
+    // A caller that cannot tell an around answer from the opening page
+    // leaves the channel waiting on a page that already arrived.
+    const { client, ws } = await makeRegistered();
+    const seen: Array<unknown> = [];
+    client.on('historyBatch', (_c, _m, info) => seen.push(info));
+
+    client.requestHistory({ target: '#foo', mode: 'around', msgid: 'abc', count: 60 });
+    batch(ws, 'b1', '#foo', 3);
+    for (let i = 0; i < 4; i++) await flushAsync();
+
+    expect(seen).toEqual([{ mode: 'around', count: 60 }]);
   });
 
   it('keeps the queue straight when a request is refused instead of answered', async () => {

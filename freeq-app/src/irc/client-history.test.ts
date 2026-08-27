@@ -108,6 +108,29 @@ describe('a page of history the bridge asked for', () => {
     expect(ch('#batch')!.historyEdge).toBe('start');
   });
 
+  it('goes out as an around request when one is asked for', () => {
+    const client = connected();
+    seed('#around');
+    bridge.requestHistory('#around', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' }, 'around');
+
+    expect(client.history).toEqual([
+      { target: '#around', mode: 'around', count: 50, msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' },
+    ]);
+    expect(ch('#around')!.historyFetching).toBe(true);
+  });
+
+  it('ends on an around answer, which is not the answer to an opening page', () => {
+    // An around answer that the bridge does not recognise leaves the channel
+    // reading "Loading older messages…" until the timer writes it off.
+    const client = connected();
+    seed('#aroundend');
+    bridge.requestHistory('#aroundend', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' }, 'around');
+
+    client.emit('historyBatch', '#aroundend', [], { mode: 'around', count: 50 });
+
+    expect(ch('#aroundend')!.historyFetching).toBe(false);
+  });
+
   it('ends at once on a CHATHISTORY refusal, without waiting for the timer', () => {
     const client = connected();
     seed('#refused');
