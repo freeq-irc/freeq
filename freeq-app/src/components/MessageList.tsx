@@ -1417,8 +1417,13 @@ export function MessageList() {
     // of a pane it is already inside keeps the list moving for several frames
     // — under the reader's pointer, and under anything anchored to a row.
     if (el.scrollHeight <= el.clientHeight) return;
+    // The later frames are for a view that is still meant to be at the end.
+    // A jump taken between them puts the reader somewhere else, and a frame
+    // scheduled before it must not take them back.
     const toEnd = () => {
-      if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
+      if (ref.current && stickToBottomRef.current) {
+        ref.current.scrollTop = ref.current.scrollHeight;
+      }
     };
     if (rowCount.current > 0) {
       virtualizer.current?.scrollToIndex(rowCount.current - 1, { align: 'end' });
@@ -1647,9 +1652,21 @@ export function MessageList() {
     // The row was reached, so this link is not the one that went unanswered:
     // following it again later is a fresh question and asks again.
     askedAround.current = null;
+    // Wherever the row is, it is not the end of the list, and a pin to the
+    // end scheduled before this would land on top of the scroll below.
+    stickToBottomRef.current = false;
     setHighlightId(pendingJump);
+    // Asked for again as the rows around it are measured. The first ask is
+    // answered against estimated row heights — for a window that was just
+    // fetched, every row in it is an estimate — and lands near the row
+    // rather than on it. Instant rather than smooth for the same reason:
+    // there is nothing to travel past, and an animation that starts from an
+    // estimate finishes somewhere else.
+    const land = () => virtualizer.current?.scrollToIndex(at, { align: 'center' });
     requestAnimationFrame(() => {
-      virtualizer.current?.scrollToIndex(at, { align: 'center', smooth: true });
+      land();
+      requestAnimationFrame(land);
+      setTimeout(land, 120);
       setTimeout(() => setHighlightId(null), 2000);
     });
   }, [pendingJump, indexOfId, activeChannel]);
