@@ -421,7 +421,7 @@ export function requestHistory(
   if (!client) return;
   const anchored = !!anchor && (!!anchor.msgid || !!anchor.timestamp);
   const key = channel.toLowerCase();
-  useStore.getState().historyFetchStarted(channel, anchored);
+  useStore.getState().historyFetchStarted(channel, anchored, mode);
   clearHistoryTimer(key);
   historyTimers.set(key, setTimeout(() => {
     historyTimers.delete(key);
@@ -921,11 +921,11 @@ function wireEvents(c: FreeqClient) {
     const added = held() - before;
 
     const ch = useStore.getState().channels.get(key);
-    // An anchored request is either a page older than a held row or a page
-    // around one, and both answer it. An answer the bridge cannot place
-    // leaves the channel reading as still loading until the timer runs out.
-    const expected = ch?.historyFetchAnchored ? ['before', 'around'] : ['latest'];
-    if (ch?.historyFetching && (!info || expected.includes(info.mode))) {
+    // The channel is waiting on one particular page. An answer the bridge
+    // cannot place against it leaves the channel reading as still loading
+    // until the timer runs out.
+    const expected = ch?.historyFetchMode ?? 'latest';
+    if (ch?.historyFetching && (!info || info.mode === expected)) {
       clearHistoryTimer(key);
       useStore.getState().historyPageReceived(
         channel, messages.length, info?.count ?? HISTORY_PAGE, added,

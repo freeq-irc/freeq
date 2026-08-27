@@ -83,16 +83,19 @@ export interface Channel {
   typingUsers: Map<string, TypingUser>;
   /** Whether anything older than the oldest held row still exists. */
   historyEdge: HistoryEdge;
+  /** Whether anything newer than the newest held row still exists. */
+  newerEdge: NewerEdge;
   /** Whether a page of older history is on the wire right now. */
   historyFetching: boolean;
   /** Whether the automatic fetch is held off after a page never arrived.
    *  Asking by hand, or re-activating the buffer, starts it again. */
   historyAutoPaused: boolean;
-  /** Whether the page in flight was anchored on a held row. An opening
-   *  request is not, and its answer is expected to repeat rows already
-   *  held — so it says nothing about whether paging back is getting
-   *  anywhere. */
-  historyFetchAnchored: boolean;
+  /** What the page in flight asked for. An opening request ('latest') is
+   *  not anchored on a held row, and its answer is expected to repeat rows
+   *  already held — so it says nothing about whether paging back is getting
+   *  anywhere. An 'around' answer splits across its anchor, so its size says
+   *  nothing about where the channel starts. */
+  historyFetchMode: HistoryFetchMode;
 }
 
 /**
@@ -104,6 +107,20 @@ export interface Channel {
  *  - `start` — the last page came back short: that is the whole channel.
  */
 export type HistoryEdge = 'unknown' | 'more' | 'start';
+
+/**
+ * What is below the newest row a channel holds.
+ *
+ *  - `tip` — nothing: the newest held row is the live end of the channel, and
+ *    a message sent now lands right after it.
+ *  - `more` — the window sits away from the live end, because it was opened
+ *    around an older message or because its newest rows were evicted. What is
+ *    between it and now has to be fetched.
+ */
+export type NewerEdge = 'tip' | 'more';
+
+/** What a history request in flight asked the server for. */
+export type HistoryFetchMode = 'latest' | 'before' | 'around';
 
 /** One typer: the nick as it came off the wire, and when we last heard it. */
 export interface TypingUser {
@@ -269,13 +286,25 @@ export interface Store {
   // Actions — messages
   addMessage: (channel: string, msg: Message) => void;
   mergeHistory: (channel: string, messages: Message[]) => void;
-  /** Drop back to the newest MESSAGE_WINDOW rows. Called when the reader
-   *  returns to the bottom, never while they are scrolled back. */
+  /** Drop back to the newest MESSAGE_WINDOW rows — eviction from the old
+   *  end. Called when the reader returns to the bottom, never while they
+   *  are scrolled back. */
   trimMessageWindow: (channel: string) => void;
+  /** Drop back to the oldest MESSAGE_WINDOW rows — eviction from the new
+   *  end, for a reader who has paged away from it. What goes is fetchable
+   *  again: the newer edge is left saying there is more. */
+  evictNewerRows: (channel: string) => void;
+  /** Install `messages` as the whole window for `channel`, discarding what
+   *  was held. The answer to a fetch that lands somewhere the old window did
+   *  not reach — an anchored open around a deep link, or a fresh page at the
+   *  live end — where merging would leave a silent gap in the middle of the
+   *  list. `atTip` says whether the new window ends at the live end. */
+  openWindow: (channel: string, messages: Message[], atTip: boolean) => void;
   /** A page of history has been asked for. `anchored` says whether it was
    *  anchored on a held row, which is what makes its answer worth reading
-   *  for whether paging back is getting anywhere. */
-  historyFetchStarted: (channel: string, anchored: boolean) => void;
+   *  for whether paging back is getting anywhere; `mode` says which anchored
+   *  page it is. */
+  historyFetchStarted: (channel: string, anchored: boolean, mode?: HistoryFetchMode) => void;
   /** A page of older history came back: `received` rows against the
    *  `limit` that was asked for, of which `added` reached the held list.
    *  A no-op unless a fetch was in flight, so history arriving for any
@@ -393,9 +422,10 @@ function getOrCreateChannel(channels: Map<string, Channel>, name: string): Chann
       pins: [],
       typingUsers: new Map(),
       historyEdge: 'unknown',
+      newerEdge: 'tip',
       historyFetching: false,
       historyAutoPaused: false,
-      historyFetchAnchored: false,
+      historyFetchMode: 'latest',
     };
     channels.set(key, ch);
   }
@@ -824,9 +854,10 @@ export const useStore = create<Store>((set, get) => ({
       pins: [],
       typingUsers: new Map(),
       historyEdge: 'unknown',
+      newerEdge: 'tip',
       historyFetching: false,
       historyAutoPaused: false,
-      historyFetchAnchored: false,
+      historyFetchMode: 'latest',
     };
     // Always produce a fresh Channel object so subscribers comparing
     // channel identity (Sidebar, MessageList children, etc.) see a new
@@ -947,14 +978,49 @@ export const useStore = create<Store>((set, get) => ({
     return { channels };
   }),
 
-  historyFetchStarted: (channel, anchored) => set((s) => {
+  evictNewerRows: (channel) => set((s) => {
+    const key = channel.toLowerCase();
+    const ch = s.channels.get(key);
+    if (!ch || ch.messages.length <= MESSAGE_WINDOW) return {};
+    const channels = new Map(s.channels);
+    // The mirror of `trimMessageWindow`: rows the reader has paged away from
+    // go back, and the newer edge says so, by construction — these are the
+    // rows that were discarded. Fetching them again is a page at the newer
+    // end, or the fresh latest page a jump to the present asks for.
+    channels.set(key, {
+      ...ch,
+      messages: ch.messages.slice(0, MESSAGE_WINDOW),
+      newerEdge: 'more',
+    });
+    return { channels };
+  }),
+
+  openWindow: (channel, messages, atTip) => set((s) => {
+    if (channel === 'server' || channel.toLowerCase() === 'server') return {};
+    const channels = new Map(s.channels);
+    const ch = getOrCreateChannel(channels, channel);
+    const rows = [...messages].sort((a, b) => {
+      const ta = a.timestamp?.getTime?.() ?? 0;
+      const tb = b.timestamp?.getTime?.() ?? 0;
+      if (ta !== tb) return ta - tb;
+      return (a.id || '').localeCompare(b.id || '');
+    });
+    channels.set(channel.toLowerCase(), {
+      ...ch,
+      messages: rows,
+      newerEdge: atTip ? 'tip' : 'more',
+    });
+    return { channels };
+  }),
+
+  historyFetchStarted: (channel, anchored, mode = 'before') => set((s) => {
     const channels = new Map(s.channels);
     const ch = getOrCreateChannel(channels, channel);
     if (ch.historyFetching) return {};
     channels.set(channel.toLowerCase(), {
       ...ch,
       historyFetching: true,
-      historyFetchAnchored: anchored,
+      historyFetchMode: anchored ? mode : 'latest',
     });
     return { channels };
   }),
@@ -975,12 +1041,19 @@ export const useStore = create<Store>((set, get) => ({
     // Only an anchored page. An opening request repeats rows the channel
     // already holds by design — that is what makes it safe to send — and it
     // is not the same question the next fetch would ask.
+    //
+    // An around page is the exception to the short-page reading. It splits
+    // across its anchor, so half a limit's worth of rows is the ordinary
+    // answer at either end of a long channel — reading it as the start of
+    // the channel hides the button over history that is really there.
     const channels = new Map(s.channels);
+    const isAround = ch.historyFetchMode === 'around';
     channels.set(key, {
       ...ch,
       historyFetching: false,
-      historyEdge: received < limit ? 'start' : 'more',
-      historyAutoPaused: ch.historyFetchAnchored === true && received > 0 && added === 0,
+      historyEdge: !isAround && received < limit ? 'start' : 'more',
+      historyAutoPaused:
+        ch.historyFetchMode !== 'latest' && received > 0 && added === 0,
     });
     return { channels };
   }),
