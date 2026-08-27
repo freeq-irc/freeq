@@ -181,6 +181,29 @@ test.describe('a reader moving through a channel', () => {
       expect(await heldRowCount(linked, channel)).toBeLessThanOrEqual(PAGE * 2);
       expect(await oldestHeldMsgId(linked, channel)).not.toBe(oldest);
 
+      // ── or to the present by walking there ──
+      //
+      // The same window again, left the other way: forward a page at a time,
+      // on nothing but the scroll. Everything between an old window and the
+      // present is reachable without taking the affordance.
+      await jumpToMessage(linked, oldest!);
+      await expect(linkedList.locator(`[id="msg-${oldest}"]`))
+        .toBeInViewport({ timeout: 15_000 });
+      await expect(jumpButton(linked)).toBeVisible();
+      const heldAtTheLink = await heldRowCount(linked, channel);
+
+      const walkDeadline = Date.now() + 120_000;
+      while (Date.now() < walkDeadline && await jumpButton(linked).count() > 0) {
+        await linkedList.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+        await linked.waitForTimeout(250);
+      }
+
+      await expect(jumpButton(linked),
+        'scrolling forward should reach the present').toHaveCount(0);
+      expect(await heldRowCount(linked, channel),
+        'the walk forward should have brought pages with it')
+        .toBeGreaterThan(heldAtTheLink);
+
       await linked.close();
     });
 });

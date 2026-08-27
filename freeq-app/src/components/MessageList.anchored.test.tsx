@@ -103,6 +103,36 @@ describe('a jump to a message', () => {
       .filter((c) => c[2] === 'around');
     expect(asks.length).toBe(1);
   });
+
+  it('asks again when the same link is followed a second time', () => {
+    // The refusal to ask twice is about one jump that went unanswered, not
+    // about the link: a reader who comes back to it later, from a window
+    // that no longer holds the row, is asking a fresh question.
+    anchoredWindow('#twice', 20);
+    list();
+    act(() => { s().setScrollToMsgId(id(9999)); });
+    // The page lands, with the row in it, and the reader is taken there.
+    act(() => {
+      s().openWindow('#twice', [{
+        id: id(9999), from: 'alice', text: 'linked',
+        timestamp: new Date(OLD_BASE + 9999), tags: {},
+      }], false);
+    });
+    // ...and later the window is somewhere else again.
+    act(() => {
+      s().openWindow('#twice', [{
+        id: id(40), from: 'alice', text: 'elsewhere',
+        timestamp: new Date(OLD_BASE + 40), tags: {},
+      }], true);
+    });
+    vi.clearAllMocks();
+
+    act(() => { s().setScrollToMsgId(id(9999)); });
+
+    expect(client.requestHistory).toHaveBeenCalledWith(
+      '#twice', { msgid: id(9999) }, 'around',
+    );
+  });
 });
 
 describe('the bottom of an anchored window', () => {

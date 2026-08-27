@@ -1644,6 +1644,9 @@ export function MessageList() {
       return;
     }
     setPendingJump(null);
+    // The row was reached, so this link is not the one that went unanswered:
+    // following it again later is a fresh question and asks again.
+    askedAround.current = null;
     setHighlightId(pendingJump);
     requestAnimationFrame(() => {
       virtualizer.current?.scrollToIndex(at, { align: 'center', smooth: true });
