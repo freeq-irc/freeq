@@ -405,8 +405,8 @@ export interface HistoryAnchor {
   timestamp?: string;
 }
 
-/** Ask for history in `channel`: with an anchor, the page around or older
- *  than it; without one, the most recent page.
+/** Ask for history in `channel`: with an anchor, the page around, older or
+ *  newer than it; without one, the most recent page.
  *
  *  Either way the request is tracked, so its answer teaches the channel
  *  what is above the oldest row it holds. An untracked request tells the
@@ -416,7 +416,7 @@ export interface HistoryAnchor {
 export function requestHistory(
   channel: string,
   anchor?: HistoryAnchor,
-  mode: 'before' | 'around' = 'before',
+  mode: 'before' | 'around' | 'after' = 'before',
 ) {
   if (!client) return;
   const anchored = !!anchor && (!!anchor.msgid || !!anchor.timestamp);

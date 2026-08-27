@@ -90,6 +90,10 @@ export interface Channel {
   /** Whether the automatic fetch is held off after a page never arrived.
    *  Asking by hand, or re-activating the buffer, starts it again. */
   historyAutoPaused: boolean;
+  /** The same, for the page after the newest held row. The two ends hold
+   *  themselves off separately: a forward page that never came says nothing
+   *  about whether paging back still works. */
+  newerAutoPaused: boolean;
   /** What the page in flight asked for. An opening request ('latest') is
    *  not anchored on a held row, and its answer is expected to repeat rows
    *  already held — so it says nothing about whether paging back is getting
@@ -120,7 +124,7 @@ export type HistoryEdge = 'unknown' | 'more' | 'start';
 export type NewerEdge = 'tip' | 'more';
 
 /** What a history request in flight asked the server for. */
-export type HistoryFetchMode = 'latest' | 'before' | 'around';
+export type HistoryFetchMode = 'latest' | 'before' | 'around' | 'after';
 
 /** One typer: the nick as it came off the wire, and when we last heard it. */
 export interface TypingUser {
@@ -313,7 +317,7 @@ export interface Store {
   /** The page never came. The edge is left where it was, and the automatic
    *  fetch is held off so a request that always fails cannot loop. */
   historyFetchFailed: (channel: string) => void;
-  /** Start the automatic fetch again after it was held off. */
+  /** Start the automatic fetch again, at both ends, after it was held off. */
   historyAutoResumed: (channel: string) => void;
   /** The opening page of a channel's history, which the SDK asks for on
    *  join. Teaches the edge while nothing is known, so a channel shorter
@@ -425,6 +429,7 @@ function getOrCreateChannel(channels: Map<string, Channel>, name: string): Chann
       newerEdge: 'tip',
       historyFetching: false,
       historyAutoPaused: false,
+      newerAutoPaused: false,
       historyFetchMode: 'latest',
     };
     channels.set(key, ch);
@@ -857,6 +862,7 @@ export const useStore = create<Store>((set, get) => ({
       newerEdge: 'tip',
       historyFetching: false,
       historyAutoPaused: false,
+      newerAutoPaused: false,
       historyFetchMode: 'latest',
     };
     // Always produce a fresh Channel object so subscribers comparing
@@ -1046,14 +1052,27 @@ export const useStore = create<Store>((set, get) => ({
     // across its anchor, so half a limit's worth of rows is the ordinary
     // answer at either end of a long channel — reading it as the start of
     // the channel hides the button over history that is really there.
+    //
+    // A page forward answers the other end's question and only that one: the
+    // window's newest row is where it stops, and how far the channel goes
+    // back is not something it was asked.
     const channels = new Map(s.channels);
     const isAround = ch.historyFetchMode === 'around';
+    const stuck = ch.historyFetchMode !== 'latest' && received > 0 && added === 0;
+    if (ch.historyFetchMode === 'after') {
+      channels.set(key, {
+        ...ch,
+        historyFetching: false,
+        newerEdge: received < limit ? 'tip' : 'more',
+        newerAutoPaused: stuck,
+      });
+      return { channels };
+    }
     channels.set(key, {
       ...ch,
       historyFetching: false,
       historyEdge: !isAround && received < limit ? 'start' : 'more',
-      historyAutoPaused:
-        ch.historyFetchMode !== 'latest' && received > 0 && added === 0,
+      historyAutoPaused: stuck,
     });
     return { channels };
   }),
@@ -1067,7 +1086,13 @@ export const useStore = create<Store>((set, get) => ({
     // ask again the moment the flag clears. Hold it off and let the reader
     // decide.
     const channels = new Map(s.channels);
-    channels.set(key, { ...ch, historyFetching: false, historyAutoPaused: true });
+    const forward = ch.historyFetchMode === 'after';
+    channels.set(key, {
+      ...ch,
+      historyFetching: false,
+      historyAutoPaused: forward ? ch.historyAutoPaused : true,
+      newerAutoPaused: forward ? true : ch.newerAutoPaused,
+    });
     return { channels };
   }),
 
@@ -1083,9 +1108,11 @@ export const useStore = create<Store>((set, get) => ({
   historyAutoResumed: (channel) => set((s) => {
     const key = channel.toLowerCase();
     const ch = s.channels.get(key);
-    if (!ch || !ch.historyAutoPaused) return {};
+    if (!ch || (!ch.historyAutoPaused && !ch.newerAutoPaused)) return {};
+    // Both ends. Coming back to a buffer, or asking by hand, is the reader
+    // saying to try again, and they cannot say which end they meant.
     const channels = new Map(s.channels);
-    channels.set(key, { ...ch, historyAutoPaused: false });
+    channels.set(key, { ...ch, historyAutoPaused: false, newerAutoPaused: false });
     return { channels };
   }),
 

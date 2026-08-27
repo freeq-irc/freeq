@@ -131,6 +131,38 @@ describe('a page of history the bridge asked for', () => {
     expect(ch('#aroundend')!.historyFetching).toBe(false);
   });
 
+  it('goes out as a page after a row when one is asked for', () => {
+    const client = connected();
+    seed('#forward');
+    bridge.requestHistory('#forward', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' }, 'after');
+
+    expect(client.history).toEqual([
+      { target: '#forward', mode: 'after', count: 50, msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' },
+    ]);
+  });
+
+  it('merges an after answer into the window, and teaches the newer end', () => {
+    const client = connected();
+    // A window away from the live end, so reaching it is a change and not
+    // the state the channel started in.
+    s().openWindow('#fwdmerge', [{
+      id: '01M0AAAAAAAAAAAAAAAAAAAA01', from: 'alice', text: 'old',
+      timestamp: new Date(1_700_000_000_000), tags: {},
+    }], false);
+    expect(ch('#fwdmerge')!.newerEdge).toBe('more');
+    bridge.requestHistory('#fwdmerge', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' }, 'after');
+
+    client.emit('historyBatch', '#fwdmerge', [{
+      id: '01M0ZZZZZZZZZZZZZZZZZZZZ01', from: 'carol', text: 'newer',
+      timestamp: new Date(1_800_000_000_000), tags: {},
+    }], { mode: 'after', count: 50 });
+
+    expect(ch('#fwdmerge')!.messages.map((m) => m.id))
+      .toEqual(['01M0AAAAAAAAAAAAAAAAAAAA01', '01M0ZZZZZZZZZZZZZZZZZZZZ01']);
+    expect(ch('#fwdmerge')!.newerEdge).toBe('tip');
+    expect(ch('#fwdmerge')!.historyFetching).toBe(false);
+  });
+
   it('makes an around answer the window rather than merging it in', () => {
     const client = connected();
     seed('#swap');
