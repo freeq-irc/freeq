@@ -1,25 +1,31 @@
 /**
- * E2E: the walk does not stop where the old ceiling stood.
+ * E2E: a channel far deeper than the window walks to its start, and the
+ * window stays the size it is meant to be the whole way.
  *
- * A channel used to hold 5000 rows at most. At that number an older page was
- * merged and discarded whole, the automatic fetching stopped itself to avoid
- * asking for the same page forever, and the reader was left at a button that
- * could never reach the start — the original page-discard bug at a larger
- * number. Nothing bounds the held list now, so this seeds past 5000 and walks
- * the whole channel to its start marker.
+ * The two halves are one statement. A walk that reaches the start by holding
+ * every page it was ever handed proves nothing about a reader who keeps
+ * reading: it is the same unbounded list under another name. A window that
+ * holds its ceiling but stops moving is a reader stuck at a button. This
+ * seeds past five thousand rows, walks the whole channel to its start marker,
+ * and requires the held list never to pass its ceiling on the way.
  *
- * Nothing below 5000 rows can see that, which is why this spec seeds so much
- * and runs so long.
+ * Nothing below a few thousand rows can see either half, which is why this
+ * spec seeds so much and runs so long.
  */
 import { test, expect, type Page, type Locator } from '@playwright/test';
 import net from 'node:net';
-import { uniqueNick, uniqueChannel, connectGuest, heldRowCount } from './helpers';
+import { uniqueNick, uniqueChannel, connectGuest, heldRowCount, oldestHeldMsgId } from './helpers';
 
 const IRC_HOST = process.env.FREEQ_IRC_HOST || '127.0.0.1';
 const IRC_PORT = Number(process.env.FREEQ_IRC_PORT || 16799);
 
-/** Where the old ceiling stood. */
+/** A depth far past anything the window holds, so the walk is hundreds of
+ *  pages rather than a handful. */
 const WALL = 5000;
+/** Rows the app holds at rest (`MESSAGE_WINDOW` in the store). */
+const WINDOW = 1000;
+/** Rows per CHATHISTORY page the app asks for. */
+const PAGE = 50;
 /** The server's flood window: five messages per two seconds per connection. */
 const BURST = 5;
 const BURST_WINDOW_MS = 2_250;
@@ -38,7 +44,7 @@ const SESSIONS = 8;
 const SEED_SRC = '127.0.0.2';
 /** Messages each of them sends, in bursts of `BURST`. */
 const PER_SESSION = 640;
-const SEEDED = SESSIONS * PER_SESSION; // 5120 — past the wall
+const SEEDED = SESSIONS * PER_SESSION; // 5120 — five times the window
 
 /**
  * One session that stays connected and sends its whole share, pausing
@@ -123,7 +129,7 @@ function boundary(page: Page): Locator {
   return page.getByTestId('history-boundary');
 }
 
-test.describe('walking a channel past the old ceiling', () => {
+test.describe('walking a channel far deeper than the window', () => {
   // Seeding paces against the flood window and the walk is a hundred pages,
   // so this one runs long by construction.
   test.setTimeout(1_800_000);
@@ -146,34 +152,43 @@ test.describe('walking a channel past the old ceiling', () => {
     // ── the walk ──
     //
     // Every gesture sets scrollTop to 0, all the way from the newest row to
-    // the oldest. Under the old ceiling this stalled with the held list at
-    // 5000 and the button showing, whatever the reader did next.
+    // the oldest.
     const marker = page.getByText('This is the beginning of the channel.');
     const deadline = Date.now() + 1_200_000;
     let reached = false;
-    let held = await heldRowCount(page, channel);
+    let oldest = await oldestHeldMsgId(page, channel);
     let stalled = 0;
+    let deepest = 0;
     while (Date.now() < deadline) {
       if (await marker.count() > 0) { reached = true; break; }
       await list.evaluate((el) => { el.scrollTop = 0; });
       await page.waitForTimeout(250);
-      const now = await heldRowCount(page, channel);
-      // Pages land as fast as the server answers, but a list this long takes
-      // a while to render each one, so the growth is uneven: only a long run
-      // of no growth at all — a minute of gestures — says the walk stopped.
-      stalled = now > held ? 0 : stalled + 1;
-      held = now;
-      expect(stalled, `the walk stopped growing at ${held} rows`).toBeLessThan(240);
+      // What says a page landed is the oldest row in the window changing, not
+      // the count: at its ceiling the window moves rather than grows. Pages
+      // land as fast as the server answers and a list this long takes a while
+      // to render each one, so the movement is uneven — only a long run of
+      // none at all, a minute of gestures, says the walk stopped.
+      const now = await oldestHeldMsgId(page, channel);
+      stalled = now !== oldest ? 0 : stalled + 1;
+      oldest = now;
+      expect(stalled, `the walk stopped moving, ${oldest} at the top`).toBeLessThan(240);
+
+      const held = await heldRowCount(page, channel);
+      deepest = Math.max(deepest, held);
+      expect(held, `the window grew past its ceiling, to ${held} rows`)
+        .toBeLessThanOrEqual(WINDOW + PAGE);
     }
 
-    expect(reached, `scrolling up should reach the start; held ${held} rows`).toBe(true);
+    expect(reached, `scrolling up should reach the start; ${oldest} at the top`).toBe(true);
     await expect(boundary(page)).toHaveText('This is the beginning of the channel.');
     await expect(page.getByRole('button', { name: 'Load older messages' })).toHaveCount(0);
 
-    // The whole channel is held, past where the old ceiling would have
-    // discarded every further page.
+    // Thousands of rows went past the reader and the window carried its
+    // ceiling and no more — which is the whole of it: the pages it gave up at
+    // the far end are what let it keep taking new ones at this one.
+    expect(deepest, 'the window should have filled to its ceiling on the way')
+      .toBeGreaterThanOrEqual(WINDOW);
     const finalRows = await heldRowCount(page, channel);
-    expect(finalRows, 'the held list should be past the old ceiling').toBeGreaterThan(WALL);
-    expect(finalRows).toBeGreaterThanOrEqual(SEEDED);
+    expect(finalRows).toBeLessThanOrEqual(WINDOW + PAGE);
   });
 });

@@ -1,14 +1,22 @@
 /**
- * E2E: the scrollback window — grow while paging back, trim on return.
+ * E2E: the scrollback window — moves while paging back, and the way back to
+ * the present is a fetch.
  *
- * The store keeps a channel's newest 1000 rows at rest, grows past that
- * while the reader pages back, and gives the rows up when they return to
- * the bottom. Everything about that behaviour is scroll geometry, which
- * jsdom does not have: this is the only place it can be seen for real.
+ * The store keeps a channel's newest 1000 rows at rest. Paging back fills
+ * that window and then moves it: each page arriving at the older end costs a
+ * page at the newer one, so the reader walks the channel without the list
+ * growing under them. Nothing below the window is held once they have walked
+ * off it, so returning to the bottom asks the server for the newest page
+ * rather than scrolling to rows that are no longer there. Everything about
+ * that behaviour is scroll geometry, which jsdom does not have: this is the
+ * only place it can be seen for real.
  */
 import { test, expect, type Page, type Locator } from '@playwright/test';
 import net from 'node:net';
-import { uniqueNick, uniqueChannel, connectGuest, heldRowCount, newestHeldMsgId } from './helpers';
+import {
+  uniqueNick, uniqueChannel, connectGuest,
+  heldRowCount, newestHeldMsgId, oldestHeldMsgId,
+} from './helpers';
 
 const IRC_HOST = process.env.FREEQ_IRC_HOST || '127.0.0.1';
 const IRC_PORT = Number(process.env.FREEQ_IRC_PORT || 16799);
@@ -164,16 +172,21 @@ async function pageBack(list: Locator): Promise<void> {
   await list.evaluate((el) => { el.scrollTop = 0; });
 }
 
-/** Wait for a scroll-up fetch to land, without failing if this one did not. */
-async function grewWithin(list: Locator, channel: string, before: number, ms: number): Promise<number> {
+/** Wait for a scroll-up fetch to land, without failing if this one did not.
+ *
+ *  What says a page arrived is the oldest row in the window changing. The
+ *  count does not: at its ceiling the window moves rather than grows. */
+async function movedWithin(
+  list: Locator, channel: string, before: string | null, ms: number,
+): Promise<string | null> {
   const deadline = Date.now() + ms;
-  let rows = before;
+  let oldest = before;
   while (Date.now() < deadline) {
-    rows = await heldRowCount(list.page(), channel);
-    if (rows > before) return rows;
+    oldest = await oldestHeldMsgId(list.page(), channel);
+    if (oldest !== before) return oldest;
     await list.page().waitForTimeout(100);
   }
-  return rows;
+  return oldest;
 }
 
 /** The jump/pill button, whose label carries the unread count. */
@@ -187,11 +200,11 @@ test.describe('scrollback window', () => {
   // of disposable ones took, and ~19 pages of scroll-back follow it.
   test.setTimeout(600_000);
 
-  test('paging back grows the window; returning to the bottom trims it without moving the view', async ({ page }) => {
+  test('paging back holds the ceiling; returning to the bottom lands at the live tip', async ({ page }) => {
     const channel = uniqueChannel();
-    // Ten senders, 264 each: one page is spent on the rows the JOIN
-    // already replayed, ~19 carry the held list past 1000, the rest is what
-    // keeps arriving while the assertions after the loop run.
+    // Ten senders, 264 each: one page is spent on the rows the JOIN already
+    // replayed, ~19 fill the window to its ceiling, and the rest is what the
+    // window moves over once it is there.
     const seeded = await seedChannel(channel);
     expect(seeded).toBeGreaterThan(WINDOW);
     const live = await talker(channel, uniqueNick('live'));
@@ -204,17 +217,30 @@ test.describe('scrollback window', () => {
     // reads it.
     await page.waitForTimeout(1_500);
 
-    // ── page back until the held list is past the resting window ──
+    // ── page back until the window is full ──
+    let oldest = await oldestHeldMsgId(page, channel);
     let held = await heldRowCount(page, channel);
     let stalled = 0;
-    for (let attempt = 0; attempt < 60 && held <= WINDOW; attempt++) {
-      const before = held;
+    for (let attempt = 0; attempt < 60 && held < WINDOW; attempt++) {
+      const before = oldest;
       await pageBack(list);
-      held = await grewWithin(list, channel, before, 8_000);
-      stalled = held > before ? 0 : stalled + 1;
-      expect(stalled, 'four scroll-up fetches in a row added no rows').toBeLessThan(4);
+      oldest = await movedWithin(list, channel, before, 8_000);
+      stalled = oldest !== before ? 0 : stalled + 1;
+      expect(stalled, 'four scroll-up fetches in a row moved the window nowhere').toBeLessThan(4);
+      held = await heldRowCount(page, channel);
     }
-    expect(held, 'paging back should grow the held list past the resting window').toBeGreaterThan(WINDOW);
+    expect(held, 'paging back should fill the window to its ceiling').toBeGreaterThanOrEqual(WINDOW);
+
+    // ── and then keep paging: the window moves, it does not grow ──
+    for (let more = 0; more < 5; more++) {
+      const before = oldest;
+      await pageBack(list);
+      oldest = await movedWithin(list, channel, before, 8_000);
+      expect(oldest, 'the window should keep moving over the channel').not.toBe(before);
+      const now = await heldRowCount(page, channel);
+      expect(now, `the window grew past its ceiling, to ${now} rows`)
+        .toBeLessThanOrEqual(WINDOW + PAGE);
+    }
     expect(await distanceFromBottom(list)).toBeGreaterThan(0);
 
     // ── the pill counts live messages, and a history page does not move it ──
@@ -223,27 +249,36 @@ test.describe('scrollback window', () => {
     live.say('a live line while the reader is up the page');
     await expect(jumpButton(page)).toHaveText('1 new message');
 
-    const heldBeforePage = await heldRowCount(page, channel);
+    const beforePage = oldest;
     await pageBack(list);
-    expect(await grewWithin(list, channel, heldBeforePage, 8_000)).toBeGreaterThan(heldBeforePage);
+    expect(await movedWithin(list, channel, beforePage, 8_000)).not.toBe(beforePage);
     await expect(jumpButton(page), 'a fetched history page is not new to the reader')
       .toHaveText('1 new message');
 
-    // ── returning to the bottom trims, and the view stays put ──
-    // Read off the held list rather than the document: the reader is a long
-    // way from the newest row, so it is not one of the rows on screen.
-    const newestId = await newestHeldMsgId(page, channel);
+    // ── returning to the bottom lands at the live tip ──
+    //
+    // The rows between here and the present were given back on the way, so
+    // there is nothing below this window to scroll to: taking the affordance
+    // asks the server for the newest page, and what arrives is a page rather
+    // than the ceiling.
     await jumpButton(page).click();
+    await expect(jumpButton(page), 'the affordance has nothing left to offer at the tip')
+      .toHaveCount(0, { timeout: 15_000 });
+    expect(await heldRowCount(page, channel)).toBeLessThanOrEqual(PAGE * 2);
 
-    await expect.poll(() => heldRowCount(page, channel), { timeout: 15_000 }).toBeLessThanOrEqual(WINDOW);
-    expect(await heldRowCount(page, channel)).toBe(WINDOW);
-
-    // The newest row survived the trim and is the one the reader is looking at.
+    // It is the live end: the line sent while the reader was up the page is
+    // in it, and the newest row is the one they are looking at.
+    await expect(list.getByText('a live line while the reader is up the page')).toBeVisible();
+    const newestId = await newestHeldMsgId(page, channel);
     const newest = list.locator(`[id="msg-${newestId}"]`);
     await expect(newest).toBeInViewport();
-    expect(await distanceFromBottom(list)).toBeLessThan(4);
+    // Polled, not read once: the page that just arrived is a window of rows
+    // nothing has measured yet, so the height the view is put against is an
+    // estimate for a frame or two after it lands.
+    await expect.poll(() => distanceFromBottom(list), { timeout: 5_000 })
+      .toBeLessThan(4);
 
-    // ...and stays there: the trim must not yank the view a frame later.
+    // ...and stays there: the page arriving must not yank the view a frame later.
     await page.waitForTimeout(500);
     await expect(newest).toBeInViewport();
     expect(await distanceFromBottom(list)).toBeLessThan(4);

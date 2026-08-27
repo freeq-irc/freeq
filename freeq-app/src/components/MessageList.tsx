@@ -1429,7 +1429,13 @@ export function MessageList() {
       virtualizer.current?.scrollToIndex(rowCount.current - 1, { align: 'end' });
     }
     toEnd();
+    // Last, and after the virtualizer has settled. Asking it for the last row
+    // brings the rows near the end into range to be measured, but it stops
+    // with that row's end against the end of the pane — the space under the
+    // list is still below the reader, and its own correction lands after the
+    // frames above.
     requestAnimationFrame(() => { toEnd(); requestAnimationFrame(toEnd); });
+    setTimeout(toEnd, 150);
   }, []);
 
   // Track whether user has scrolled up (unstick from bottom)
