@@ -173,6 +173,73 @@ describe('paging back inside an anchored window', () => {
   });
 });
 
+describe('reaching the newer end of a window', () => {
+  it('asks for the page after its newest row', () => {
+    anchoredWindow('#forward', 20);
+    const el = list();
+
+    act(() => { scrollTo(el, 'bottom'); });
+
+    expect(client.requestHistory).toHaveBeenCalledWith(
+      '#forward', { msgid: id(19) }, 'after',
+    );
+  });
+
+  it('asks for nothing at the newer end of a window that reaches the present', () => {
+    anchoredWindow('#attip', 20);
+    act(() => { s().openWindow('#attip', s().channels.get('#attip')!.messages, true); });
+    const el = list();
+
+    act(() => { scrollTo(el, 'bottom'); });
+
+    expect(client.requestHistory).not.toHaveBeenCalledWith(
+      '#attip', expect.anything(), 'after',
+    );
+  });
+
+  it('gives back the rows at the older end once it is over the ceiling', async () => {
+    const { MESSAGE_WINDOW } = await import('../store');
+    anchoredWindow('#fwdceiling', MESSAGE_WINDOW + 200);
+
+    const el = list();
+    act(() => { scrollTo(el, 'bottom'); });
+
+    const held = s().channels.get('#fwdceiling')!.messages;
+    expect(held.length).toBe(MESSAGE_WINDOW);
+    expect(held[held.length - 1].id, 'the end the reader is at is the end that stays')
+      .toBe(id(MESSAGE_WINDOW + 199));
+    expect(s().channels.get('#fwdceiling')!.historyEdge).toBe('more');
+  });
+
+  it('asks again once for each time the reader arrives there', () => {
+    // Not on a loop: a page forward lands below the reader, so the next one
+    // is asked for when they scroll down to it.
+    anchoredWindow('#once', 20);
+    const el = list();
+
+    act(() => { scrollTo(el, 'bottom'); });
+    act(() => { scrollTo(el, 'bottom'); });
+
+    const forward = (client.requestHistory as ReturnType<typeof vi.fn>).mock.calls
+      .filter((c) => c[2] === 'after');
+    expect(forward.length).toBe(1);
+  });
+
+  it('leaves it alone while the reader is on their way to the present', () => {
+    anchoredWindow('#jumping', 20);
+    const el = list();
+    act(() => { scrollTo(el, 'bottom'); });
+    vi.clearAllMocks();
+
+    act(() => { jumpButton()!.click(); });
+    act(() => { scrollTo(el, 'bottom'); });
+
+    expect(client.requestHistory).not.toHaveBeenCalledWith(
+      '#jumping', expect.anything(), 'after',
+    );
+  });
+});
+
 describe('a live message arriving while the reader is parked back', () => {
   it('does not stop the reader paging further back', () => {
     anchoredWindow('#parked', 20);

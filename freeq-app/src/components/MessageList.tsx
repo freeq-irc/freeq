@@ -1305,6 +1305,21 @@ function historyAnchor(msgs: Message[]): HistoryAnchor | null {
   return null;
 }
 
+/** How to ask for the page newer than everything in `msgs`.
+ *
+ *  The mirror of {@link historyAnchor}: the newest row that came from
+ *  someone names the boundary, by msgid where there is one and by time
+ *  otherwise. */
+function newerHistoryAnchor(msgs: Message[]): HistoryAnchor | null {
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m.isSystem) continue;
+    if (m.id && ULID_RE.test(m.id)) return { msgid: m.id };
+    return { timestamp: m.timestamp.toISOString() };
+  }
+  return null;
+}
+
 export function MessageList() {
   const activeChannel = useStore((s) => s.activeChannel);
   const rawMessages = useStore((s) => {
@@ -1374,6 +1389,7 @@ export function MessageList() {
   const ref = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
   const [atTop, setAtTop] = useState(false);
+  const [atNewerEnd, setAtNewerEnd] = useState(false);
   const historyEdge = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.historyEdge ?? 'unknown');
   const historyFetching = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.historyFetching ?? false);
   const historyAutoPaused = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.historyAutoPaused ?? false);
@@ -1425,6 +1441,7 @@ export function MessageList() {
     stickToBottomRef.current = atPresent;
     setShowScrollBtn(!atPresent);
     setAtTop(atTopNow);
+    setAtNewerEnd(atBottom);
     if (atPresent) {
       setNewMsgCount(0);
       // Scrolling up grows the held window past MESSAGE_WINDOW; back at the
@@ -1551,6 +1568,36 @@ export function MessageList() {
     if (!atBottom && rawMessages.length > MESSAGE_WINDOW) evictNewerRows(activeChannel);
     fetchOlder();
   }, [activeChannel, atTop, historyEdge, historyFetching, historyAutoPaused, rawMessages, fetchOlder, evictNewerRows]);
+
+  // Ask for the page newer than everything held — the mirror of `fetchOlder`,
+  // for a window that has been walked away from the live end.
+  const newerAutoPaused = useStore((s) => s.channels.get(s.activeChannel.toLowerCase())?.newerAutoPaused ?? false);
+  const fetchNewer = useCallback(() => {
+    if (activeChannel === 'server') return;
+    const ch = useStore.getState().channels.get(activeChannel.toLowerCase());
+    if (!ch || ch.historyFetching || ch.newerEdge === 'tip' || ch.newerAutoPaused) return;
+    const anchor = newerHistoryAnchor(rawMessages);
+    if (!anchor) return;
+    requestHistory(activeChannel, anchor, 'after');
+  }, [activeChannel, rawMessages]);
+
+  // At the newer end of a window that does not reach the live end, the next
+  // page forward is what is under the reader. Asked for once per arrival
+  // rather than on a loop: a page forward lands below them, so the one after
+  // it is asked for when they scroll down to it.
+  //
+  // Paying for it at the other end, as the walk back does: the rows the
+  // reader has left go back, and the older edge says they can be fetched
+  // again.
+  useEffect(() => {
+    if (!atNewerEnd || newerEdge === 'tip') return;
+    // Not while the reader has asked for the present and that page is still
+    // out: they are leaving this window, not walking it.
+    if (returningToPresent.current) return;
+    if (rawMessages.length > MESSAGE_WINDOW) trimMessageWindow(activeChannel);
+    fetchNewer();
+  }, [activeChannel, atNewerEnd, newerEdge, historyFetching, newerAutoPaused,
+      rawMessages, fetchNewer, trimMessageWindow]);
 
   // Clean block-copy: when a selection spans ≥2 message rows, rewrite the
   // clipboard to a tidy `Name: message` transcript instead of the raw DOM
