@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use axum::response::IntoResponse;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use freeq_sdk::auth::{ChallengeSigner, KeySigner};
@@ -31,8 +32,19 @@ fn managing_app() -> String {
 /// A mock spaces PDS: createSession always succeeds, createSpace succeeds and
 /// counts its calls.
 async fn mock_pds() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    mock_pds_inner(false).await
+}
+
+/// Same as above, but the first createSpace fails the way an aged-out session
+/// does: a 400 carrying `ExpiredToken`.
+async fn mock_pds_expiring_session() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    mock_pds_inner(true).await
+}
+
+async fn mock_pds_inner(expire_first: bool) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
     let created = Arc::new(AtomicUsize::new(0));
     let counter = created.clone();
+    let expired_once = Arc::new(AtomicUsize::new(0));
     let app = axum::Router::new()
         .route(
             "/xrpc/com.atproto.server.createSession",
@@ -49,9 +61,20 @@ async fn mock_pds() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
             "/xrpc/com.atproto.simplespace.createSpace",
             axum::routing::post(move || {
                 let counter = counter.clone();
+                let expired_once = expired_once.clone();
                 async move {
+                    if expire_first && expired_once.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            axum::Json(serde_json::json!({
+                                "error": "ExpiredToken",
+                                "message": "Token has expired",
+                            })),
+                        )
+                            .into_response();
+                    }
                     counter.fetch_add(1, Ordering::SeqCst);
-                    axum::Json(serde_json::json!({ "uri": "at://created" }))
+                    axum::Json(serde_json::json!({ "uri": "at://created" })).into_response()
                 }
             }),
         );
@@ -290,6 +313,73 @@ async fn client_metadata_advertises_the_space_scope_only_when_enabled() {
 }
 
 // ── Serving space media ────────────────────────────────────────────────
+
+/// The PDS reports an aged-out session as a 400 carrying `ExpiredToken`.
+/// The stale token is dropped and the request made again.
+#[tokio::test]
+async fn an_expired_authority_session_is_renewed_and_the_space_still_created() {
+    let (pds_addr, created) = mock_pds_expiring_session().await;
+    let authority_key = PrivateKey::generate_secp256k1();
+    let mut docs: HashMap<String, DidDocument> = HashMap::new();
+    docs.insert(
+        AUTHORITY_DID.to_string(),
+        make_test_did_document(AUTHORITY_DID, &authority_key.public_key_multibase()),
+    );
+    let config = freeq_server::config::ServerConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        web_addr: Some("127.0.0.1:0".to_string()),
+        server_name: SERVER_NAME.to_string(),
+        challenge_timeout_secs: 60,
+        db_path: Some(":memory:".to_string()),
+        media_space_did: Some(AUTHORITY_DID.to_string()),
+        media_space_password: Some("hunter2".to_string()),
+        media_space_pds: Some(format!("http://{pds_addr}")),
+        ..Default::default()
+    };
+    let (irc, web, server) =
+        freeq_server::server::Server::with_resolver(config, DidResolver::static_map(docs))
+            .start_with_web()
+            .await
+            .unwrap();
+
+    let cfg = ConnectConfig {
+        server_addr: irc.to_string(),
+        nick: "guest1".to_string(),
+        user: "guest1".to_string(),
+        realname: "test".to_string(),
+        ..Default::default()
+    };
+    let (h, mut events) = client::connect(cfg, None);
+    expect_event(
+        &mut events,
+        |e| matches!(e, Event::Registered { .. }),
+        "registered",
+    )
+    .await;
+    h.join("#open").await.unwrap();
+    expect_event(&mut events, |e| matches!(e, Event::Joined { .. }), "joined").await;
+
+    let (status, body) = get(web, "/api/v1/media-space?channel=%23open").await;
+    assert_eq!(
+        status, 200,
+        "an expired session must not fail the request: {body}"
+    );
+    assert!(body["space"].as_str().unwrap().contains("at.freeq.media"));
+    assert_eq!(created.load(Ordering::SeqCst), 1, "created after the retry");
+
+    h.quit(None).await.ok();
+    server.abort();
+}
+
+#[tokio::test]
+async fn space_media_urls_carry_no_spaces() {
+    let name = freeq_server::media_store::sanitize_filename("Image filename with spaces.png");
+    assert!(
+        !name.contains(' '),
+        "sanitized filename kept a space: {name}"
+    );
+    assert!(name.ends_with(".png"), "extension must survive: {name}");
+}
 
 /// base64url-encode a record URI the way the serve route expects it.
 fn encode_ref(uri: &str) -> String {

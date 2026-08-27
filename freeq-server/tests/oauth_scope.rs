@@ -193,6 +193,27 @@ fn purpose_round_trips_through_string() {
     assert_eq!(OauthPurpose::parse("nonsense"), None);
 }
 
+/// An upload is two PDS calls, uploadBlob then createRecord, so it takes the
+/// blob scope and the space scope together. Holding one without the other is
+/// insufficient, and the client re-prompts.
+#[test]
+fn media_space_needs_both_the_space_and_blob_halves() {
+    let full = "atproto blob:*/* space:*?authority=did:plc:a&collection=*";
+    assert!(scope_satisfies_purpose(full, OauthPurpose::MediaSpace));
+
+    let space_only = "atproto space:*?authority=did:plc:a&collection=*";
+    assert!(
+        !scope_satisfies_purpose(space_only, OauthPurpose::MediaSpace),
+        "a space grant without blob access cannot upload"
+    );
+
+    let blob_only = "atproto blob:*/*";
+    assert!(!scope_satisfies_purpose(
+        blob_only,
+        OauthPurpose::MediaSpace
+    ));
+}
+
 #[test]
 fn requested_scopes_are_narrow_not_transition_generic() {
     for p in [

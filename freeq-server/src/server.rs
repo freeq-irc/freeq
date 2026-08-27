@@ -356,10 +356,16 @@ pub fn scope_satisfies_purpose(granted: &str, purpose: OauthPurpose) -> bool {
             .split_whitespace()
             .any(|s| s == "repo:app.bsky.feed.post" || s == "repo:*"),
         OauthPurpose::MediaSpace => {
+            // An upload is two PDS calls: uploadBlob for the bytes, then
+            // createRecord to file them in the space.
             let prefix = format!("space:{}", crate::media_space::SPACE_TYPE);
-            granted.split_whitespace().any(|s| {
+            let has_space = granted.split_whitespace().any(|s| {
                 s == prefix || s.starts_with(&format!("{prefix}?")) || s.starts_with("space:*")
-            })
+            });
+            let has_blob = granted
+                .split_whitespace()
+                .any(|s| s == "blob:*/*" || s.starts_with("blob:*"));
+            has_space && has_blob
         }
     }
 }

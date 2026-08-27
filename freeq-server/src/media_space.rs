@@ -21,12 +21,19 @@ pub const MANAGING_APP_FRAGMENT: &str = "freeq_media";
 /// Collection holding one media item per record inside a media space.
 pub const MEDIA_COLLECTION: &str = "at.freeq.media.item";
 
-/// The OAuth scope token granting access to this server's media spaces.
+/// The OAuth scopes an upload to this server's media spaces takes:
+/// `blob:*/*` for the bytes, which go up through the ordinary uploadBlob,
+/// and the space scope for the record that pins them.
 ///
-/// The type is `*` because a named one must resolve to a published lexicon
+/// The type is `*` because a named one must resolve to a published lexicon,
 /// and [`SPACE_TYPE`] is not published.
 pub fn space_scope(authority_did: &str) -> String {
-    format!("space:*?authority={authority_did}&collection=*")
+    format!("blob:*/* space:*?authority={authority_did}&collection=*")
+}
+
+/// Check for a stale cached session token is stale.
+fn session_expired(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED || body.contains("ExpiredToken")
 }
 
 /// Client for the spaces PDS plus the identity this server manages spaces as.
@@ -175,7 +182,7 @@ impl MediaSpaceManager {
             if body.contains("SpaceAlreadyExists") {
                 return Ok(());
             }
-            if status.as_u16() == 401 && attempt == 0 {
+            if session_expired(status, &body) && attempt == 0 {
                 continue;
             }
             bail!("createSpace failed: {status} {body}");
@@ -232,25 +239,35 @@ impl MediaSpaceManager {
         }
 
         let pds = self.pds_url(resolver).await?;
-        let token = self.session_token(resolver).await?;
-        // Step 1: our own PDS mints a delegation token for the space.
-        let res = self
-            .http
-            .get(format!("{pds}/xrpc/com.atproto.space.getDelegationToken"))
-            .query(&[("space", space)])
-            .bearer_auth(&token)
-            .send()
-            .await
-            .context("getDelegationToken request")?;
-        if !res.status().is_success() {
+        // Step 1: our PDS creates a delegation token for the space.
+        let mut delegation = None;
+        for attempt in 0..2 {
+            if attempt > 0 {
+                *self.session.lock().await = None;
+            }
+            let token = self.session_token(resolver).await?;
+            let res = self
+                .http
+                .get(format!("{pds}/xrpc/com.atproto.space.getDelegationToken"))
+                .query(&[("space", space)])
+                .bearer_auth(&token)
+                .send()
+                .await
+                .context("getDelegationToken request")?;
             let status = res.status();
+            if status.is_success() {
+                delegation = res.json::<serde_json::Value>().await?["token"]
+                    .as_str()
+                    .map(str::to_string);
+                break;
+            }
             let body = res.text().await.unwrap_or_default();
+            if session_expired(status, &body) && attempt == 0 {
+                continue;
+            }
             bail!("getDelegationToken failed: {status} {body}");
         }
-        let delegation = res.json::<serde_json::Value>().await?["token"]
-            .as_str()
-            .context("getDelegationToken response missing token")?
-            .to_string();
+        let delegation = delegation.context("getDelegationToken returned no token")?;
 
         // Step 2: the authority exchanges it for a credential bound to our
         // DPoP key. Presenting the proof here is what sets that binding.
@@ -259,11 +276,11 @@ impl MediaSpaceManager {
         let mut nonce: Option<String> = None;
         let mut credential = None;
         for attempt in 0..3 {
-            let proof = dpop_key.proof("POST", &url, nonce.as_deref(), Some(&delegation))?;
+            let proof = dpop_key.proof("POST", &url, nonce.as_deref(), None)?;
             let res = self
                 .http
                 .post(&url)
-                .header("Authorization", format!("DPoP {delegation}"))
+                .header("Authorization", format!("Bearer {delegation}"))
                 .header("DPoP", proof)
                 .json(&serde_json::json!({ "space": space }))
                 .send()
@@ -607,7 +624,7 @@ mod tests {
     fn space_scope_names_this_authority() {
         assert_eq!(
             space_scope("did:plc:authority123"),
-            "space:*?authority=did:plc:authority123&collection=*"
+            "blob:*/* space:*?authority=did:plc:authority123&collection=*"
         );
     }
 

@@ -27,7 +27,9 @@ use crate::server::SharedState;
 // is re-exported because `crate::web::generate_random_string` is referenced from
 // connection::login; `urlencod` is the local alias for the engine's `urlencode`.
 pub use freeq_oauth::generate_random_string;
-use freeq_oauth::{ClientProvider, build_client_id, generate_pkce, urlencode as urlencod};
+use freeq_oauth::{
+    ClientProvider, build_client_id_with_scopes, generate_pkce, urlencode as urlencod,
+};
 
 // ── WebSocket ↔ IRC bridge ─────────────────────────────────────────────
 
@@ -3108,6 +3110,14 @@ fn verify_broker_signature_raw(
 
 // ── OAuth client metadata ──────────────────────────────────────────────
 
+/// The media-space scope this server can request.
+fn media_space_scope(state: &SharedState) -> Option<String> {
+    state
+        .media_space
+        .as_ref()
+        .map(|m| crate::media_space::space_scope(&m.authority_did))
+}
+
 /// Serves the AT Protocol OAuth client-metadata.json document.
 /// The client_id for non-localhost origins is `{origin}/client-metadata.json`.
 async fn client_metadata(
@@ -3116,7 +3126,11 @@ async fn client_metadata(
 ) -> Json<serde_json::Value> {
     let (web_origin, _) = derive_web_origin(&headers);
     let redirect_uri = format!("{web_origin}/auth/callback");
-    let client_id = build_client_id(&web_origin, &redirect_uri);
+    let client_id = build_client_id_with_scopes(
+        &web_origin,
+        &redirect_uri,
+        media_space_scope(&state).as_deref(),
+    );
     // Advertise every scope any flow may request in the metadata.
     let mut scope = "atproto blob:image/* repo:blue.irc.media?action=create repo:app.bsky.feed.post transition:generic".to_string();
     if let Some(ref mgr) = state.media_space {
@@ -3428,7 +3442,11 @@ async fn auth_login(
     let redirect_uri = format!("{web_origin}/auth/callback");
     let purpose = crate::server::OauthPurpose::Login;
     let scope = purpose.requested_scope(None);
-    let client_id = build_client_id(&web_origin, &redirect_uri);
+    let client_id = build_client_id_with_scopes(
+        &web_origin,
+        &redirect_uri,
+        media_space_scope(&state).as_deref(),
+    );
 
     // Generate PKCE + DPoP key + state
     let dpop_key = freeq_sdk::oauth::DpopKey::generate();
@@ -3601,7 +3619,11 @@ async fn auth_step_up(
     let redirect_uri = format!("{web_origin}/auth/callback");
     let scope =
         purpose.requested_scope(state.media_space.as_ref().map(|m| m.authority_did.as_str()));
-    let client_id = build_client_id(&web_origin, &redirect_uri);
+    let client_id = build_client_id_with_scopes(
+        &web_origin,
+        &redirect_uri,
+        media_space_scope(&state).as_deref(),
+    );
 
     let dpop_key = freeq_sdk::oauth::DpopKey::generate();
     let (code_verifier, code_challenge) = generate_pkce();
@@ -4349,7 +4371,11 @@ async fn api_upload(
         use base64::Engine;
         let encoded =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(result.uri.as_bytes());
-        let name = pick_media_filename(filename.as_deref(), &content_type);
+        // Strip spaces, .., etc.
+        let name = crate::media_store::sanitize_filename(&pick_media_filename(
+            filename.as_deref(),
+            &content_type,
+        ));
         return Ok(Json(serde_json::json!({
             "url": format!("{origin}/api/v1/space-media/{encoded}/{name}"),
             "uri": result.uri,

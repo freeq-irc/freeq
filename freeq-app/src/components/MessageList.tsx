@@ -8,6 +8,7 @@ import { isDid, isPeerBlocked } from '../lib/identity';
 import { claimForMessage } from '@freeq/sdk';
 import type { RowEvidence } from './UserPopover';
 import { displayNameForKey } from '../lib/display-name';
+import { apiFetch } from '../lib/api';
 import { EmojiPicker } from './EmojiPicker';
 import { UserPopover } from './UserPopover';
 import { BlueskyEmbed } from './BlueskyEmbed';
@@ -287,17 +288,91 @@ function isTrustedImageUrl(url: string): boolean {
   }
 }
 
+
+/** Why space media could not be shown: the viewer is not a member, or the
+ *  fetch itself broke. */
+type MediaFailure = 'refused' | 'error' | null;
+
+/** Is this one of our authenticated space-media URLs? */
+function isSpaceMediaUrl(url: string): boolean {
+  try {
+    const u = new URL(url, window.location.origin);
+    return u.origin === window.location.origin && u.pathname.startsWith('/api/v1/space-media/');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Space media is served only to channel members, and membership is proven by
+ * the session bearer, which an `<img src>` cannot send. Fetch those URLs with
+ * the header and hand back an object URL; everything else passes through.
+ */
+function useAuthedMedia(url: string): { src: string | null; failure: MediaFailure } {
+  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [failure, setFailure] = useState<MediaFailure>(null);
+
+  useEffect(() => {
+    if (!isSpaceMediaUrl(url)) return;
+    let revoked = false;
+    let made: string | null = null;
+    setFailure(null);
+    apiFetch(url)
+      .then((r) => {
+        if (r.ok) return r.blob();
+        // Being refused is a different thing to tell someone than a fetch
+        // that broke: one is about who they are, the other about the server.
+        throw new Error(r.status === 403 || r.status === 404 ? 'refused' : 'error');
+      })
+      .then((b) => {
+        if (revoked) return;
+        made = URL.createObjectURL(b);
+        setObjectUrl(made);
+      })
+      .catch((e) => {
+        if (!revoked) setFailure(e?.message === 'refused' ? 'refused' : 'error');
+      });
+    return () => {
+      revoked = true;
+      if (made) URL.revokeObjectURL(made);
+      setObjectUrl(null);
+    };
+  }, [url]);
+
+  if (!isSpaceMediaUrl(url)) return { src: url, failure: null };
+  return { src: objectUrl, failure };
+}
+
 /** Image that respects the "Load external media" setting. */
 function GatedImage({ url, onOpen }: { url: string; onOpen: () => void }) {
   const loadMedia = useStore((s) => s.loadExternalMedia);
   const [revealed, setRevealed] = useState(false);
   const trusted = isTrustedImageUrl(url);
+  const { src, failure } = useAuthedMedia(url);
+
+  if (failure) {
+    return (
+      <div className="flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-bg-tertiary text-fg-dim text-sm">
+        <span className="text-lg">🔒</span>
+        <span>
+          {failure === 'refused'
+            ? 'Private media, only visible to members of this channel'
+            : 'Private media could not be loaded'}
+        </span>
+      </div>
+    );
+  }
 
   if (trusted || loadMedia || revealed) {
+    if (!src) {
+      return (
+        <div className="w-40 h-24 rounded-lg border border-border bg-bg-tertiary animate-pulse" />
+      );
+    }
     return (
       <button onClick={onOpen} className="block cursor-zoom-in">
         <img
-          src={url}
+          src={src}
           alt=""
           className="max-w-sm max-h-80 rounded-lg border border-border object-contain bg-bg-tertiary hover:opacity-90 transition-opacity"
           loading="lazy"
@@ -323,7 +398,7 @@ function GatedImage({ url, onOpen }: { url: string; onOpen: () => void }) {
 
 // Bluesky post URL pattern
 const BSKY_POST_RE = /https?:\/\/bsky\.app\/profile\/([^/]+)\/post\/([a-zA-Z0-9]+)/;
-// YouTube URL pattern  
+// YouTube URL pattern
 const YT_RE = /(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/;
 
 /** Inline audio player for voice messages and audio files */
@@ -408,10 +483,22 @@ function InlineAudioPlayer({ url, label }: { url: string; label?: string }) {
 
 /** Inline video player */
 function InlineVideoPlayer({ url }: { url: string }) {
+  const { src, failure } = useAuthedMedia(url);
+  if (failure || !src) {
+    return (
+      <div className="mt-1.5 max-w-sm px-3 py-2 rounded-lg border border-border bg-bg-tertiary text-fg-dim text-sm">
+        {failure === 'refused'
+          ? 'Private video, only visible to members of this channel'
+          : failure
+            ? 'Private video could not be loaded'
+            : 'Loading...'}
+      </div>
+    );
+  }
   return (
     <div className="mt-1.5 max-w-sm">
       <video
-        src={url}
+        src={src}
         controls
         preload="metadata"
         className="rounded-lg border border-border max-h-72 bg-black"

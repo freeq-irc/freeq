@@ -68,20 +68,19 @@ Two things to know when enabling it:
   web users who were already logged in must log out and back in once to
   grant the extra permission. Everyone else just keeps using public media.
 
-Uploads are a per-message choice in the client: private is the default in
-invite-only or keyed channels, public elsewhere, and either can be picked
-explicitly. A private upload that fails is never quietly turned into a
-public one.
+Uploads are a per-message choice in the client, opt-in per file.
 
 ## Limitations
 
 - Access control, not encryption: files sit unencrypted on the uploader's
   PDS, readable by anyone the gatekeeper authorizes. Encrypted (+E)
   channels are not supported yet.
-- Someone kicked from a channel may keep access for up to about two hours,
-  until the read credential in play expires.
+- Access is checked per request against live channel membership, so losing
+  the channel simultaneously stops media access.
 - Private media spaces are per channel: DMs and federated (S2S) members are
   not currently supported.
+- In a public channel, media is readable by anyone who can read the channel,
+  including anonymous readers.
 - The server can read the media it serves, since it fetches on each
   viewer's behalf. The difference from server-side storage is custody: the
   file is in your repo, portable and deletable by you, and access is
