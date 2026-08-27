@@ -1413,7 +1413,6 @@ export function MessageList() {
 
   // Track whether user has scrolled up (unstick from bottom)
   const trimMessageWindow = useStore((s) => s.trimMessageWindow);
-  const evictNewerRows = useStore((s) => s.evictNewerRows);
   const handleScroll = useCallback(() => {
     const el = ref.current;
     if (!el) return;
@@ -1431,14 +1430,8 @@ export function MessageList() {
       // Scrolling up grows the held window past MESSAGE_WINDOW; back at the
       // bottom those rows are out of reach again, so give them back.
       if (rawMessages.length > MESSAGE_WINDOW) trimMessageWindow(activeChannel);
-    } else if (atTopNow && newerEdge === 'more' && rawMessages.length > MESSAGE_WINDOW) {
-      // Paging back inside a window that is already away from the live end:
-      // the rows at its new end are the ones out of reach now, and the jump
-      // to the present fetches them back. Only away from the live end —
-      // there, the newest rows are where the next message lands.
-      evictNewerRows(activeChannel);
     }
-  }, [activeChannel, rawMessages.length, trimMessageWindow, evictNewerRows, newerEdge]);
+  }, [activeChannel, rawMessages.length, trimMessageWindow, newerEdge]);
 
   // Scroll to bottom when messages change (if stuck to bottom), or count new messages
   const prevNewestRef = useRef({ channel: activeChannel, id: messages[messages.length - 1]?.id });
@@ -1540,12 +1533,24 @@ export function MessageList() {
   //
   // A page that never arrived holds this off — otherwise a request that
   // always fails is asked again the instant the in-flight flag clears.
+  const evictNewerRows = useStore((s) => s.evictNewerRows);
   useEffect(() => {
     const el = ref.current;
     if (!el || el.scrollTop > NEAR_TOP_PX) return;
     if (useStore.getState().channels.get(activeChannel.toLowerCase())?.historyAutoPaused) return;
+    // The walk moves the window rather than growing it. Each page that lands
+    // on a window already at its ceiling costs the same at the end the reader
+    // has left — which is where eviction belongs, beside the fetch that
+    // caused the growth: a reader parked at the top is served page after page
+    // without touching the scroll again.
+    //
+    // Not in a pane whose top is also its bottom. There is no end the reader
+    // has left there, and the rows at the live end are the ones in front of
+    // them.
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    if (!atBottom && rawMessages.length > MESSAGE_WINDOW) evictNewerRows(activeChannel);
     fetchOlder();
-  }, [activeChannel, atTop, historyEdge, historyFetching, historyAutoPaused, rawMessages, fetchOlder]);
+  }, [activeChannel, atTop, historyEdge, historyFetching, historyAutoPaused, rawMessages, fetchOlder, evictNewerRows]);
 
   // Clean block-copy: when a selection spans ≥2 message rows, rewrite the
   // clipboard to a tidy `Name: message` transcript instead of the raw DOM

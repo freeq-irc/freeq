@@ -156,15 +156,20 @@ describe('paging back inside an anchored window', () => {
     expect(held[0].id, 'the end the reader is at is the end that stays').toBe(id(0));
   });
 
-  it('leaves the live end alone in a window that reaches it', async () => {
+  it('gives them back in a window that reaches the live end too', async () => {
+    // The walk costs the same wherever it started. A window that still
+    // reaches the live end is not a reason to keep rows the reader has paged
+    // away from — the edge says they are fetchable, forwards or by the jump.
     const { MESSAGE_WINDOW } = await import('../store');
     anchoredWindow('#attipceiling', MESSAGE_WINDOW + 200);
     act(() => { s().openWindow('#attipceiling', s().channels.get('#attipceiling')!.messages, true); });
     const el = list();
+    expect(s().channels.get('#attipceiling')!.newerEdge).toBe('tip');
 
     act(() => { scrollTo(el, 'top'); });
 
-    expect(s().channels.get('#attipceiling')!.messages.length).toBe(MESSAGE_WINDOW + 200);
+    expect(s().channels.get('#attipceiling')!.messages.length).toBe(MESSAGE_WINDOW);
+    expect(s().channels.get('#attipceiling')!.newerEdge).toBe('more');
   });
 });
 

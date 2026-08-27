@@ -82,16 +82,44 @@ describe('trimming the grown window', () => {
     expect(held('#read')[0].id).toBe('page-00000');
   });
 
-  it('does not trim at the top, where the next page is asked for', () => {
+  it('gives back the rows at the live end at the top, and asks for the next page', () => {
+    // The walk moves the window rather than growing it. The rows at the end
+    // the reader has left are the ones out of reach now, and the edge says
+    // they can be fetched again — by paging forward, or by the jump.
     channelWith('#top', MESSAGE_WINDOW, 50);
     const el = list();
 
     scrollTo(el, 'top');
 
-    expect(held('#top').length).toBe(MESSAGE_WINDOW + 50);
+    const rows = held('#top');
+    expect(rows.length).toBe(MESSAGE_WINDOW);
+    expect(rows[0].id, 'the end the reader is at is the end that stays').toBe('page-00000');
+    expect(s().channels.get('#top')!.newerEdge).toBe('more');
     expect(client.requestHistory).toHaveBeenCalledWith(
       '#top', { timestamp: new Date(LIVE_BASE - 50).toISOString() },
     );
+  });
+
+  it('stays at the ceiling across the pages that keep arriving at the top', () => {
+    // Parked at the top, the reader is served page after page without
+    // touching the scroll again. Each one lands on a window already at its
+    // ceiling, so each one has to cost the same at the other end.
+    channelWith('#walk', MESSAGE_WINDOW, 0);
+    const el = list();
+    scrollTo(el, 'top');
+
+    for (let p = 0; p < 4; p++) {
+      act(() => {
+        s().mergeHistory('#walk', Array.from({ length: 50 }, (_, i) => ({
+          id: `p${p}-${String(i).padStart(5, '0')}`, from: 'bob',
+          text: `older ${p}.${i}`, timestamp: new Date(LIVE_BASE - (p + 1) * 50 + i), tags: {},
+        })));
+      });
+      expect(held('#walk').length,
+        `the window grew past its ceiling on page ${p}`).toBeLessThanOrEqual(MESSAGE_WINDOW);
+    }
+
+    expect(held('#walk')[0].id).toBe('p3-00000');
   });
 
   it('trims to the newest rows once the reader is back at the bottom', () => {
