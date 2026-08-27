@@ -120,6 +120,7 @@ function answerWith(channel: string, rows: number, first: number, limit = PAGE) 
 }
 
 const boundary = () => screen.getByTestId('history-boundary');
+const noBoundary = () => screen.queryByTestId('history-boundary');
 const loadButton = () => screen.queryByRole('button', { name: 'Load older messages' });
 
 describe('the boundary row', () => {
@@ -131,14 +132,14 @@ describe('the boundary row', () => {
     expect(loadButton()).toBeNull();
   });
 
-  it('offers the affordance once a page has landed and more exists', () => {
+  it('shows nothing once a page has landed and the walk can continue on its own', () => {
     channelWith('#offer', 5);
     const el = list();
     scrollTo(el, 'middle');
     answerWith('#offer', PAGE, 100);
 
-    expect(boundary().textContent).toBe('Load older messages');
-    expect(loadButton()).not.toBeNull();
+    expect(noBoundary()).toBeNull();
+    expect(loadButton()).toBeNull();
   });
 
   it('offers the affordance while the edge is still unknown', () => {
@@ -314,12 +315,15 @@ describe('the boundary row', () => {
     expect(screen.queryByTestId('history-boundary')).toBeNull();
   });
 
-  it('still offers the affordance in a channel of only notices until it knows', () => {
+  it('offers the retry in a channel of only notices after a fetch fails', () => {
     s().addSystemMessage('#asking', 'alice joined');
     s().setActiveChannel('#asking');
     const el = list();
     scrollTo(el, 'middle');
-    act(() => { s().historyFetchFailed('#asking'); });
+    act(() => {
+      s().historyFetchStarted('#asking', false);
+      s().historyFetchFailed('#asking');
+    });
 
     expect(boundary().textContent).toBe('Load older messages');
   });
@@ -376,11 +380,15 @@ describe('the boundary row', () => {
     expect(screen.queryByTestId('history-boundary')).toBeNull();
   });
 
-  it('asks for a page when the affordance is clicked', () => {
+  it('asks for a page when the retry is clicked', () => {
     channelWith('#click', 5);
     const el = list();
     scrollTo(el, 'middle');
     answerWith('#click', PAGE, 100);
+    act(() => {
+      s().historyFetchStarted('#click', true);
+      s().historyFetchFailed('#click');
+    });
     requestHistory.mockClear();
 
     act(() => { fireEvent.click(loadButton()!); });
@@ -588,11 +596,11 @@ describe('the auto-fetch condition', () => {
     expect(requestHistory).toHaveBeenCalledTimes(1);
     expect(boundary().textContent).toBe('Loading older messages…');
 
-    // And the button is reachable again, rather than hidden behind a marker
-    // that cannot be cleared.
+    // And once the page lands the walk stands ready again with no chrome:
+    // the marker stays gone and nothing floats over the list.
     scrollTo(el, 'middle');
     answerWith('#deep', PAGE, 3000);
-    expect(loadButton()).not.toBeNull();
+    expect(noBoundary()).toBeNull();
   }, 20_000); // renders past the 1000-row window; well clear of the 5s default
 
   it('asks for the newest page when there is no row to anchor on', () => {

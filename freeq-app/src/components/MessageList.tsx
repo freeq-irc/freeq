@@ -1722,6 +1722,10 @@ export function MessageList() {
    *  banner, the boundary row. The virtualizer places rows against the
    *  scroller, so without this its idea of where a row sits is out by
    *  whatever stands over the list. */
+  /** Whether the boundary above the oldest held row has anything to say. */
+  const boundaryShown = activeChannel !== 'server' && messages.length > 0
+    && !(historyEdge === 'start' && !hasSenderRows && emptyStateSaysBeginning);
+
   const chrome = useRef<HTMLDivElement>(null);
   const [startMargin, setStartMargin] = useState(0);
   const isEmpty = rows.length === 0;
@@ -1828,27 +1832,19 @@ export function MessageList() {
           )}
         </div>
       )}
-      {/* Suppressed only where the empty state is about to say the same thing.
+      {/* Where the channel begins — the one boundary state that belongs to the
+          conversation rather than to the fetching, so the one that sits in the
+          list. It arrives once, at the end of the walk, and stays.
+
+          Suppressed only where the empty state is about to say the same thing.
           Exactly one of the two states the beginning of a channel that has
           reached its start: the empty state when it carries that sentence,
           this row when a topic has taken that slot. */}
-      {activeChannel !== 'server' && messages.length > 0
-        && !(historyEdge === 'start' && !hasSenderRows && emptyStateSaysBeginning) && (
+      {boundaryShown && !historyFetching && historyEdge === 'start' && (
         <div className="px-4 py-3 flex items-center justify-center" data-testid="history-boundary">
-          {historyFetching ? (
-            <span className="text-xs text-fg-dim">Loading older messages…</span>
-          ) : historyEdge === 'start' ? (
-            <span className="text-xs text-fg-dim">
-              {isDM ? 'This is the beginning of the conversation.' : 'This is the beginning of the channel.'}
-            </span>
-          ) : (
-            <button
-              className="text-xs text-accent hover:underline"
-              onClick={onLoadOlder}
-            >
-              Load older messages
-            </button>
-          )}
+          <span className="text-xs text-fg-dim">
+            {isDM ? 'This is the beginning of the conversation.' : 'This is the beginning of the channel.'}
+          </span>
         </div>
       )}
       </div>
@@ -1894,6 +1890,30 @@ export function MessageList() {
       </div>
 
       </div>
+
+      {/* The states that belong to the fetching rather than to the
+          conversation: a page on the wire, and the retry left after one that
+          never came. Above the pane and out of the layout — as a row in the
+          list, each appearance and disappearance moved every row under it.
+          Nothing is shown while fetching is neither running nor stuck: the
+          walk is automatic, so a standing button is chrome with no job. */}
+      {boundaryShown && (historyFetching || historyAutoPaused) && (
+        <div
+          className="absolute top-0 left-1/2 -translate-x-1/2 mt-2 px-3 py-1 rounded-full bg-bg-secondary/95 border border-border shadow-lg flex items-center justify-center z-10 animate-fadeIn"
+          data-testid="history-boundary"
+        >
+          {historyFetching ? (
+            <span className="text-xs text-fg-dim">Loading older messages…</span>
+          ) : (
+            <button
+              className="text-xs text-accent hover:underline"
+              onClick={onLoadOlder}
+            >
+              Load older messages
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Pinned to the pane the reader is looking at, not to the content.
           Offered wherever the window does not reach the live end, without
