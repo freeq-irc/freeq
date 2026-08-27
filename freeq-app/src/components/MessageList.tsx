@@ -1,4 +1,5 @@
 import { useEffect, useRef, useCallback, useState, useMemo, useLayoutEffect, memo } from 'react';
+import { createPortal } from 'react-dom';
 import { Virtualizer, type VirtualizerHandle } from 'virtua';
 import { useStore, uniqueMemberCount, MESSAGE_WINDOW, type Message, type PinnedMessage } from '../store';
 import { getNick, getClient, requestHistory, sendReaction, sendUnreact, joinChannel, type HistoryAnchor } from '../irc/client';
@@ -577,6 +578,20 @@ function MessageContentImpl({ msg, channel, onNickClick }: {
 }
 
 /** Inline reply badge showing the original message */
+/**
+ * An overlay a row opens — a menu, a picker, a panel — placed against the
+ * viewport rather than against the row.
+ *
+ * The rows are laid out by a virtualizer, which contains each of them
+ * (`contain: layout style`). A contained element is the containing block for
+ * anything `position: fixed` inside it, so an overlay left in the row's own
+ * tree is positioned against that row: a menu opened on a message near the
+ * top of the pane lands halfway down the window, under the compose box.
+ */
+function RowOverlay({ children }: { children: React.ReactNode }) {
+  return createPortal(children, document.body);
+}
+
 function ReplyBadge({ msgId }: { msgId: string }) {
   const channels = useStore((s) => s.channels);
   const activeChannel = useStore((s) => s.activeChannel);
@@ -792,18 +807,21 @@ function FullMessageImpl({ msg, channel, onNickClick }: MessageProps) {
       </div>
 
       {showEmojiPicker && pickerPos && (
-        <div className="fixed z-50" style={{ left: pickerPos.x - 140, top: pickerPos.y - 280 }}>
-          <EmojiPicker
-            onSelect={(emoji) => {
-              sendReaction(channel, emoji, msg.id);
-              setShowEmojiPicker(false);
-            }}
-            onClose={() => setShowEmojiPicker(false)}
-          />
-        </div>
+        <RowOverlay>
+          <div className="fixed z-50" style={{ left: pickerPos.x - 140, top: pickerPos.y - 280 }}>
+            <EmojiPicker
+              onSelect={(emoji) => {
+                sendReaction(channel, emoji, msg.id);
+                setShowEmojiPicker(false);
+              }}
+              onClose={() => setShowEmojiPicker(false)}
+            />
+          </div>
+        </RowOverlay>
       )}
 
       {ctxMenu && (
+        <RowOverlay>
         <MessageContextMenu
           msg={msg}
           channel={channel}
@@ -815,15 +833,18 @@ function FullMessageImpl({ msg, channel, onNickClick }: MessageProps) {
           onReact={openEmojiPicker}
           onVerify={() => setVerifyPanel(ctxMenu)}
         />
+        </RowOverlay>
       )}
 
       {verifyPanel && (
-        <VerifySignaturePanel
-          msgid={msg.id}
-          signed={!!msg.tags['+freeq.at/sig']}
-          position={verifyPanel}
-          onClose={() => setVerifyPanel(null)}
-        />
+        <RowOverlay>
+          <VerifySignaturePanel
+            msgid={msg.id}
+            signed={!!msg.tags['+freeq.at/sig']}
+            position={verifyPanel}
+            onClose={() => setVerifyPanel(null)}
+          />
+        </RowOverlay>
       )}
     </div>
   );
@@ -883,18 +904,21 @@ function GroupedMessageImpl({ msg, channel, onNickClick }: MessageProps) {
       </div>
 
       {showEmojiPicker && pickerPos && (
-        <div className="fixed z-50" style={{ left: pickerPos.x - 140, top: pickerPos.y - 280 }}>
-          <EmojiPicker
-            onSelect={(emoji) => {
-              sendReaction(channel, emoji, msg.id);
-              setShowEmojiPicker(false);
-            }}
-            onClose={() => setShowEmojiPicker(false)}
-          />
-        </div>
+        <RowOverlay>
+          <div className="fixed z-50" style={{ left: pickerPos.x - 140, top: pickerPos.y - 280 }}>
+            <EmojiPicker
+              onSelect={(emoji) => {
+                sendReaction(channel, emoji, msg.id);
+                setShowEmojiPicker(false);
+              }}
+              onClose={() => setShowEmojiPicker(false)}
+            />
+          </div>
+        </RowOverlay>
       )}
 
       {ctxMenu && (
+        <RowOverlay>
         <MessageContextMenu
           msg={msg}
           channel={channel}
@@ -906,15 +930,18 @@ function GroupedMessageImpl({ msg, channel, onNickClick }: MessageProps) {
           onReact={(e: React.MouseEvent) => { setPickerPos({ x: e.clientX, y: e.clientY }); setShowEmojiPicker(true); }}
           onVerify={() => setVerifyPanel(ctxMenu)}
         />
+        </RowOverlay>
       )}
 
       {verifyPanel && (
-        <VerifySignaturePanel
-          msgid={msg.id}
-          signed={!!msg.tags?.['+freeq.at/sig']}
-          position={verifyPanel}
-          onClose={() => setVerifyPanel(null)}
-        />
+        <RowOverlay>
+          <VerifySignaturePanel
+            msgid={msg.id}
+            signed={!!msg.tags?.['+freeq.at/sig']}
+            position={verifyPanel}
+            onClose={() => setVerifyPanel(null)}
+          />
+        </RowOverlay>
       )}
     </div>
   );
@@ -1367,6 +1394,13 @@ export function MessageList() {
    *  row mounts and measures that stretch first; the frames after it settle
    *  the remainder. */
   const pinToBottom = useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    // A pane the whole list fits inside has no scroll position to put
+    // anywhere, and asking the virtualizer to bring the last row to the end
+    // of a pane it is already inside keeps the list moving for several frames
+    // — under the reader's pointer, and under anything anchored to a row.
+    if (el.scrollHeight <= el.clientHeight) return;
     const toEnd = () => {
       if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
     };
