@@ -2802,6 +2802,52 @@ pub(super) fn handle_chathistory(
                     }
                 }
             }
+            "AROUND" => {
+                if msg.params.len() < 4 {
+                    (vec![], None)
+                } else {
+                    let limit = msg.params[3].parse::<usize>().unwrap_or(50).min(500);
+                    match parse_chathistory_anchor(&msg.params[2]) {
+                        Some(HistoryAnchor::Msgid(id)) => {
+                            let Some(Some((ts, cursor_id))) =
+                                state.with_db(|db| db.history_cursor(&db_key, &id))
+                            else {
+                                fail_message_error(
+                                    &subcmd,
+                                    &target,
+                                    state,
+                                    server_name,
+                                    session_id,
+                                    send,
+                                );
+                                return;
+                            };
+                            let rows = state
+                                .with_db(|db| {
+                                    db.get_messages_around_cursor(&db_key, ts, &cursor_id, limit)
+                                })
+                                .unwrap_or_default();
+                            // The page reaches to both sides of the anchor, so
+                            // the task events it answers to are the venue's
+                            // whole span, capped by the same limit.
+                            (rows, Some((0, i64::MAX, limit)))
+                        }
+                        // `*`, or anything unparseable, degrades to the newest
+                        // page the way BEFORE's does: the older half is the end
+                        // of the channel and there is nothing newer.
+                        anchor => {
+                            let at = match anchor {
+                                Some(HistoryAnchor::Timestamp(ts)) => ts,
+                                _ => u64::MAX,
+                            };
+                            let rows = state
+                                .with_db(|db| db.get_messages_around(&db_key, at, limit))
+                                .unwrap_or_default();
+                            (rows, Some((0, i64::MAX, limit)))
+                        }
+                    }
+                }
+            }
             "LATEST" => {
                 if msg.params.len() < 4 {
                     (vec![], None)

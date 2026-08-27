@@ -1257,6 +1257,101 @@ impl Db {
         Ok(result)
     }
 
+    /// Messages at or after the `(timestamp, msgid)` cursor, oldest first.
+    ///
+    /// The inclusive sibling of {@link get_messages_after_cursor}: the row the
+    /// cursor names is served. Only `AROUND` wants that — a reader who asked
+    /// for the page surrounding a message wants the message in it.
+    fn get_messages_from_cursor(
+        &self,
+        channel: &str,
+        ts: u64,
+        msgid: &str,
+        limit: usize,
+    ) -> SqlResult<Vec<MessageRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did, root_msgid
+             FROM messages
+             WHERE channel = ?1 AND deleted_at IS NULL
+               AND (timestamp > ?2 OR (timestamp = ?2 AND COALESCE(msgid, '') >= ?3))
+             ORDER BY timestamp ASC, COALESCE(msgid, '') ASC
+             LIMIT ?4"
+        )?;
+        let rows = stmt.query_map(
+            params![channel, ts as i64, msgid, limit as i64],
+            map_message_row,
+        )?;
+        let mut result = rows.collect::<SqlResult<Vec<_>>>()?;
+        if let Some(ref key) = self.encryption_key {
+            for row in &mut result {
+                row.text = decrypt_at_rest(key, &row.text);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Messages at or after a timestamp (oldest first).
+    fn get_messages_from(
+        &self,
+        channel: &str,
+        from: u64,
+        limit: usize,
+    ) -> SqlResult<Vec<MessageRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, channel, sender, text, timestamp, tags_json, msgid, replaces_msgid, deleted_at, sender_did, root_msgid
+             FROM messages
+             WHERE channel = ?1 AND deleted_at IS NULL AND timestamp >= ?2
+             ORDER BY timestamp ASC, COALESCE(msgid, '') ASC
+             LIMIT ?3"
+        )?;
+        let rows = stmt.query_map(params![channel, from as i64, limit as i64], map_message_row)?;
+        let mut result = rows.collect::<SqlResult<Vec<_>>>()?;
+        if let Some(ref key) = self.encryption_key {
+            for row in &mut result {
+                row.text = decrypt_at_rest(key, &row.text);
+            }
+        }
+        Ok(result)
+    }
+
+    /// The page surrounding the `(timestamp, msgid)` cursor, oldest first.
+    ///
+    /// Half the limit from older than the cursor, the rest from the cursor
+    /// forward — the anchored row included, since it is the row the reader
+    /// asked to be shown. Both halves cut on `(timestamp, msgid)`, so the
+    /// page's two edges are ordinary cursors to page out of. A short half is
+    /// not padded from the other side: the answer says what is there.
+    pub fn get_messages_around_cursor(
+        &self,
+        channel: &str,
+        ts: u64,
+        msgid: &str,
+        limit: usize,
+    ) -> SqlResult<Vec<MessageRow>> {
+        let older_limit = limit / 2;
+        let mut rows = self.get_messages_before_cursor(channel, ts, msgid, older_limit)?;
+        rows.extend(self.get_messages_from_cursor(channel, ts, msgid, limit - older_limit)?);
+        Ok(rows)
+    }
+
+    /// The page surrounding a timestamp, oldest first.
+    ///
+    /// The timestamp-anchored sibling of {@link get_messages_around_cursor},
+    /// cutting on plain timestamp the way the timestamp-anchored one-sided
+    /// pages do. A row stamped exactly `at` belongs to the newer half, so no
+    /// row falls between the halves.
+    pub fn get_messages_around(
+        &self,
+        channel: &str,
+        at: u64,
+        limit: usize,
+    ) -> SqlResult<Vec<MessageRow>> {
+        let older_limit = limit / 2;
+        let mut rows = self.get_messages(channel, older_limit, Some(at))?;
+        rows.extend(self.get_messages_from(channel, at, limit - older_limit)?);
+        Ok(rows)
+    }
+
     /// Get messages between two timestamps (oldest first).
     pub fn get_messages_between(
         &self,
@@ -6744,6 +6839,145 @@ mod tests {
         let walked = walk_like_a_client(&db, "#opening", 10);
 
         assert_eq!(walked, all, "every row, however the opening page was cut");
+    }
+
+    #[test]
+    fn around_cursor_splits_the_page_across_the_anchor() {
+        let db = Db::open_memory().unwrap();
+        let ids = same_second_burst(&db, "#around", 20, 1_700_000_500);
+
+        // Anchored on the middle row, with an even limit: half the page is
+        // older than the anchor, and the rest starts at the anchor itself.
+        let (ts, id) = db.history_cursor("#around", &ids[10]).unwrap().unwrap();
+        let page = db
+            .get_messages_around_cursor("#around", ts, &id, 10)
+            .unwrap();
+        let got: Vec<String> = page.iter().map(|r| r.msgid.clone().unwrap()).collect();
+        assert_eq!(
+            got,
+            ids[5..15],
+            "five older, then the anchor and four newer"
+        );
+    }
+
+    #[test]
+    fn around_cursor_at_an_end_returns_what_there_is() {
+        let db = Db::open_memory().unwrap();
+        let ids = same_second_burst(&db, "#aroundend", 6, 1_700_000_600);
+
+        // Oldest row: nothing older to serve, so only the newer half comes
+        // back. The page is short, not padded from the other side.
+        let (ts, id) = db.history_cursor("#aroundend", &ids[0]).unwrap().unwrap();
+        let page = db
+            .get_messages_around_cursor("#aroundend", ts, &id, 6)
+            .unwrap();
+        let got: Vec<String> = page.iter().map(|r| r.msgid.clone().unwrap()).collect();
+        assert_eq!(got, ids[0..3]);
+
+        // Newest row: the older half is served in full, and the newer half
+        // is the anchor alone. The short half is not padded from the other.
+        let (ts, id) = db
+            .history_cursor("#aroundend", ids.last().unwrap())
+            .unwrap()
+            .unwrap();
+        let page = db
+            .get_messages_around_cursor("#aroundend", ts, &id, 6)
+            .unwrap();
+        let got: Vec<String> = page.iter().map(|r| r.msgid.clone().unwrap()).collect();
+        assert_eq!(got, ids[2..6]);
+    }
+
+    #[test]
+    fn around_cursor_page_skips_deleted_rows_but_a_deleted_row_still_anchors() {
+        let db = Db::open_memory().unwrap();
+        for i in 0..5 {
+            msg(
+                &db,
+                "#arounddel",
+                &format!("row {i}"),
+                1_700_000_700 + i as u64,
+                &format!("01ARDEL{:019}", i),
+            );
+        }
+        db.soft_delete_message("#arounddel", "01ARDEL0000000000000000002")
+            .unwrap();
+
+        let (ts, id) = db
+            .history_cursor("#arounddel", "01ARDEL0000000000000000002")
+            .unwrap()
+            .expect("a deleted row still names a place in the order");
+        let page = db
+            .get_messages_around_cursor("#arounddel", ts, &id, 4)
+            .unwrap();
+        let texts: Vec<&str> = page.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["row 0", "row 1", "row 3", "row 4"],
+            "the deleted anchor is not served, the rows around it are"
+        );
+    }
+
+    #[test]
+    fn around_timestamp_splits_on_plain_time() {
+        let db = Db::open_memory().unwrap();
+        for i in 0..8 {
+            msg(
+                &db,
+                "#aroundts",
+                &format!("row {i}"),
+                1_700_000_800 + i as u64,
+                &format!("01ARTS{:020}", i),
+            );
+        }
+
+        // A time that is a row's own second: that row belongs to the newer
+        // half, so no row falls between the two halves.
+        let page = db
+            .get_messages_around("#aroundts", 1_700_000_804, 4)
+            .unwrap();
+        let texts: Vec<&str> = page.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, vec!["row 2", "row 3", "row 4", "row 5"]);
+
+        // A time no row carries splits between neighbours.
+        let page = db
+            .get_messages_around("#aroundts", 1_700_000_850, 4)
+            .unwrap();
+        let texts: Vec<&str> = page.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, vec!["row 6", "row 7"]);
+    }
+
+    #[test]
+    fn around_pages_are_contiguous_with_what_a_walk_from_them_reaches() {
+        let db = Db::open_memory().unwrap();
+        let ids = same_second_burst(&db, "#aroundwalk", 30, 1_700_000_900);
+
+        let (ts, id) = db.history_cursor("#aroundwalk", &ids[15]).unwrap().unwrap();
+        let page = db
+            .get_messages_around_cursor("#aroundwalk", ts, &id, 8)
+            .unwrap();
+        let mut walked: Vec<String> = page.iter().map(|r| r.msgid.clone().unwrap()).collect();
+
+        // Paging out of an around page in both directions reaches every row
+        // exactly once: the two edges of the page are ordinary cursors.
+        let (ts, id) = db
+            .history_cursor("#aroundwalk", walked.first().unwrap())
+            .unwrap()
+            .unwrap();
+        let older = db
+            .get_messages_before_cursor("#aroundwalk", ts, &id, 100)
+            .unwrap();
+        let (ts, id) = db
+            .history_cursor("#aroundwalk", walked.last().unwrap())
+            .unwrap()
+            .unwrap();
+        let newer = db
+            .get_messages_after_cursor("#aroundwalk", ts, &id, 100)
+            .unwrap();
+
+        let mut all: Vec<String> = older.iter().map(|r| r.msgid.clone().unwrap()).collect();
+        all.append(&mut walked);
+        all.extend(newer.iter().map(|r| r.msgid.clone().unwrap()));
+        assert_eq!(all, ids, "every row exactly once, in stored order");
     }
 
     #[test]

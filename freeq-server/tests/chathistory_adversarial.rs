@@ -776,7 +776,7 @@ async fn dm_chathistory_for_a_guest_answers_empty() {
 
         // Same for the paging subcommands, which is what the boundary row in
         // a client actually sends.
-        for sub in ["BEFORE", "AFTER"] {
+        for sub in ["BEFORE", "AFTER", "AROUND"] {
             guest.tx(&format!(
                 "CHATHISTORY {sub} some_nick timestamp=2026-08-24T12:00:00.000Z 50"
             ));
@@ -1264,6 +1264,108 @@ async fn chathistory_after_msgid_walks_forward_through_a_burst() {
         }
 
         assert_eq!(walked, ids);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn chathistory_around_msgid_serves_both_sides_of_the_anchor() {
+    let r = resolver(vec![]);
+    let (addr, _h) = start(r).await;
+    run(addr, |addr| {
+        let sent = burst(addr, "#msground", 4);
+
+        let mut rdr = C::with_caps(addr, "ma_rdr");
+        rdr.reg();
+        rdr.drain();
+        rdr.tx("JOIN #msground");
+        rdr.num("366");
+        rdr.drain();
+
+        rdr.tx("CHATHISTORY LATEST #msground * 500");
+        let latest = rdr.collect_batch_messages();
+        assert_eq!(latest.len(), sent, "the burst should all be stored");
+        let ids: Vec<String> = latest.iter().map(|l| C::extract_msgid(l)).collect();
+
+        // The premise, as in the one-sided walks: rows really do share a
+        // stored second, so a timestamp anchor could not separate them.
+        let seconds: Vec<String> = latest.iter().map(|l| second_of(l)).collect();
+        let shared = seconds
+            .iter()
+            .filter(|s| seconds.iter().filter(|o| o == s).count() > 1)
+            .count();
+        assert!(
+            shared >= 2,
+            "burst should share a stored second: {seconds:?}"
+        );
+
+        let middle = ids.len() / 2;
+        rdr.tx(&format!(
+            "CHATHISTORY AROUND #msground msgid={} 8",
+            ids[middle]
+        ));
+        let page = rdr.collect_batch_messages();
+        let page_ids: Vec<String> = page.iter().map(|l| C::extract_msgid(l)).collect();
+
+        assert!(
+            page_ids.contains(&ids[middle]),
+            "the anchored row is in its own page: {page_ids:?}"
+        );
+        let at = page_ids.iter().position(|id| id == &ids[middle]).unwrap();
+        assert!(at > 0, "rows older than the anchor came back: {page_ids:?}");
+        assert!(
+            at < page_ids.len() - 1,
+            "rows newer than the anchor came back: {page_ids:?}"
+        );
+
+        // The page is a contiguous run of the channel's own order, in it.
+        let start = ids.iter().position(|id| id == &page_ids[0]).unwrap();
+        assert_eq!(page_ids, ids[start..start + page_ids.len()]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn chathistory_around_timestamp_serves_both_sides_of_the_time() {
+    let r = resolver(vec![]);
+    let (addr, _h) = start(r).await;
+    run(addr, |addr| {
+        let mut alice = C::with_caps(addr, "ats_a");
+        alice.reg();
+        alice.drain();
+        alice.tx("JOIN #tsaround");
+        alice.num("366");
+        alice.drain();
+
+        // Three seconds apart, so a second-resolution anchor separates them.
+        alice.tx("PRIVMSG #tsaround :older");
+        std::thread::sleep(Duration::from_millis(2100));
+        alice.tx("PRIVMSG #tsaround :middle");
+        std::thread::sleep(Duration::from_millis(2100));
+        alice.tx("PRIVMSG #tsaround :newer");
+        std::thread::sleep(Duration::from_millis(300));
+        alice.drain();
+
+        alice.tx("CHATHISTORY LATEST #tsaround * 50");
+        let latest = alice.collect_batch_messages();
+        assert_eq!(latest.len(), 3, "{latest:?}");
+        let middle_time = latest[1]
+            .strip_prefix('@')
+            .and_then(|s| s.split_once(' ').map(|(t, _)| t))
+            .and_then(|tags| {
+                tags.split(';')
+                    .find_map(|t| t.strip_prefix("time=").map(str::to_string))
+            })
+            .expect("server-time tag");
+
+        alice.tx(&format!(
+            "CHATHISTORY AROUND #tsaround timestamp={middle_time} 3"
+        ));
+        let page = alice.collect_batch_messages();
+        assert_eq!(page.len(), 3, "{page:?}");
+        assert!(page[0].ends_with("older"), "{}", page[0]);
+        assert!(page[1].ends_with("middle"), "{}", page[1]);
+        assert!(page[2].ends_with("newer"), "{}", page[2]);
     })
     .await;
 }
