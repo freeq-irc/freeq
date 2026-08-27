@@ -1,9 +1,15 @@
 /**
- * TaskTimeline — focused view for a single task.
- * Fetches from GET /api/v1/tasks/{taskId}
+ * TaskTimeline — focused view for a single task, of either family.
+ *
+ * A coordination task is fetched from `/api/v1/tasks/{id}` and shown as the
+ * phase-and-evidence view it has always had; a task event's action is fetched
+ * from `/api/v1/actions/{id}` and shown as what it is — the moves made on it,
+ * each under the word for the verb it carried.
  */
 import { useEffect, useState } from 'react';
 import { VerifySignaturePanel } from './VerifySignaturePanel';
+import { displayNameForKey } from '../lib/display-name';
+import { actHeadline } from '../lib/act-verbs';
 
 interface TaskEvent {
   event_id: string;
@@ -23,7 +29,94 @@ interface TaskData {
 
 const phaseOrder = ['specifying', 'designing', 'building', 'reviewing', 'testing', 'deploying'];
 
-export function TaskTimeline({ taskId, onClose }: { taskId: string; onClose: () => void }) {
+export function TaskTimeline(props: { taskId?: string; actId?: string; onClose: () => void }) {
+  return props.actId
+    ? <ActionTimeline actId={props.actId} onClose={props.onClose} />
+    : <CoordinationTimeline taskId={props.taskId ?? ''} onClose={props.onClose} />;
+}
+
+/** One event of an action, as `/api/v1/actions/{id}` serves it. */
+interface ActionEvent {
+  event_id: string;
+  canonical: string;
+  signature?: string;
+  actor_did?: string;
+  confirm_state?: string;
+  timestamp: number;
+}
+
+function ActionTimeline({ actId, onClose }: { actId: string; onClose: () => void }) {
+  const [data, setData] = useState<{ task: any; events: ActionEvent[] } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [verify, setVerify] = useState<{ id: string; signed: boolean; pos: { x: number; y: number } } | null>(null);
+
+  useEffect(() => {
+    fetch(`/api/v1/actions/${encodeURIComponent(actId)}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { setData(d); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, [actId]);
+
+  if (loading) return <div className="p-4 text-fg-dim text-sm">Loading task...</div>;
+  if (!data?.events?.length) return <div className="p-4 text-fg-dim text-sm">Task not found.</div>;
+
+  // The document each event signed is where its verb and title live, so the
+  // view reads the same bytes the signature covers.
+  const docs = data.events.map(e => {
+    let doc: Record<string, string> = {};
+    try { doc = JSON.parse(e.canonical); } catch { /* an unreadable event still lists */ }
+    return { event: e, doc };
+  });
+  // Only the opener signs a title, so a reader holding no opener is shown
+  // none: the id beside it is a handle, not a name for the work.
+  const title = docs.find(d => d.doc['act-title'])?.doc['act-title'];
+
+  return (
+    <div className="rounded-lg border border-border overflow-hidden bg-bg-secondary max-w-md">
+      <div className="flex items-center justify-between px-3 py-2 bg-surface/50 border-b border-border/50">
+        <div className="flex items-center gap-2">
+          <span>📋</span>
+          {title && <span className="font-semibold text-sm text-fg">{title}</span>}
+          <span className="text-[10px] font-mono text-fg-dim/60">{actId.slice(0, 12)}</span>
+        </div>
+        <button onClick={onClose} className="text-fg-dim hover:text-fg text-sm">✕</button>
+      </div>
+
+      <div className="px-3 py-2">
+        {docs.map(({ event, doc }) => (
+          <div key={event.event_id} className="flex items-center gap-2 text-xs py-1">
+            <span className="font-semibold text-fg-muted">{actHeadline(doc['act-verb'] ?? '')}</span>
+            <span className="text-fg-dim truncate">
+              {event.actor_did ? displayNameForKey(event.actor_did) : ''}
+            </span>
+            <span className="ml-auto text-[10px] text-fg-dim/50">
+              {new Date(event.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+            </span>
+            <button
+              className="text-[10px] text-fg-dim/60 hover:text-fg-muted underline decoration-dotted"
+              title="Check this event's signature"
+              onClick={ev => setVerify({ id: event.event_id, signed: !!event.signature, pos: { x: ev.clientX, y: ev.clientY } })}
+            >
+              verify
+            </button>
+          </div>
+        ))}
+      </div>
+
+      {verify && (
+        <VerifySignaturePanel
+          msgid={verify.id}
+          signed={verify.signed}
+          position={verify.pos}
+          noun="event"
+          onClose={() => setVerify(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function CoordinationTimeline({ taskId, onClose }: { taskId: string; onClose: () => void }) {
   const [data, setData] = useState<TaskData | null>(null);
   const [loading, setLoading] = useState(true);
   const [verify, setVerify] = useState<{ id: string; signed: boolean; pos: { x: number; y: number } } | null>(null);

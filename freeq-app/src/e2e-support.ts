@@ -7,4 +7,4 @@
  * paths the dev server already serves. This module is such a path. Nothing in
  * the app imports it, so it never reaches a production bundle.
  */
-export { FreeqClient, generateDidKey } from '@freeq/sdk';
+export { FreeqClient, generateDidKey, actTags } from '@freeq/sdk';

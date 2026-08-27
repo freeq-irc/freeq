@@ -65,6 +65,53 @@ export interface PinnedMessage {
   pinned_at: number;
 }
 
+/** A link an event carried as context, with the hash its signature covers. */
+export interface ActCtxLink {
+  url: string;
+  hash?: string;
+}
+
+/** One move on a task, in the order it arrived. */
+export interface ActEvent {
+  eventId: string;
+  verb: string;
+  from: string;
+  did?: string;
+  /** Every `act-` tag of the event, keyed as the SDK hands them over — so a
+   *  note reads as `act-note` and the kind itself as `act`. */
+  fields: Record<string, string>;
+  /** The companion line's msgid, once it has arrived. The home's own
+   *  `confirm` and `expire` send no companion and keep none. */
+  msgId?: string;
+}
+
+/** A task as this channel has seen it, keyed by its opener's event id. */
+export interface ActTask {
+  taskId: string;
+  kind: string;
+  title: string;
+  /** Who opened it, and who holds it — `act-to` on a directed offer, else
+   *  whoever claimed it or was awarded it. */
+  offerer?: string;
+  assignee?: string;
+  /** The latest move made on it, and the latest note anyone attached. */
+  verb: string;
+  note?: string;
+  ctx: ActCtxLink[];
+  events: ActEvent[];
+}
+
+/** What the bridge hands over from the SDK's `actEvent`. */
+export interface ActEventInput {
+  from: string;
+  did?: string;
+  kind: string;
+  verb: string;
+  eventId: string;
+  taskId: string;
+  fields: Record<string, string>;
+}
+
 export interface Channel {
   name: string;
   topic: string;
@@ -93,6 +140,8 @@ export interface Channel {
    *  held — so it says nothing about whether paging back is getting
    *  anywhere. */
   historyFetchAnchored: boolean;
+  /** The tasks this channel has seen, keyed by the opener's event id. */
+  actTasks: Map<string, ActTask>;
 }
 
 /**
@@ -339,6 +388,7 @@ export interface Store {
   setPins: (channel: string, pins: PinnedMessage[]) => void;
   addPin: (channel: string, msgid: string, pinnedBy: string) => void;
   removePin: (channel: string, msgid: string) => void;
+  addActEvent: (channel: string, ev: ActEventInput) => void;
   setSearchQuery: (query: string) => void;
   setChannelListOpen: (open: boolean) => void;
   setChannelList: (list: ChannelListEntry[]) => void;
@@ -396,10 +446,163 @@ function getOrCreateChannel(channels: Map<string, Channel>, name: string): Chann
       historyFetching: false,
       historyAutoPaused: false,
       historyFetchAnchored: false,
+      actTasks: new Map(),
     };
     channels.set(key, ch);
   }
   return ch;
+}
+
+/** Crockford base32, as ULIDs use it. */
+const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+
+/**
+ * When an event was minted, off the ULID it is named by — the only time an
+ * event carries. Undefined for an id that is not a ULID, so ids the server
+ * never minted (a test's, a peer's own spelling) fall back to arrival order.
+ */
+function actEventTime(eventId: string): number | undefined {
+  if (eventId.length !== 26) return undefined;
+  let ms = 0;
+  for (const c of eventId.slice(0, 10)) {
+    const digit = CROCKFORD.indexOf(c);
+    if (digit < 0) return undefined;
+    ms = ms * 32 + digit;
+  }
+  return ms;
+}
+
+/**
+ * Whether a line was written by the sender an event names: the DID when both
+ * sides carry one, the nick otherwise — case aside, since replay hands back
+ * the event under the lowercased nick the server holds and the line under the
+ * nick as it was sent.
+ */
+function actSameSender(ev: ActEvent, m: Message): boolean {
+  const lineDid = m.tags?.['account'];
+  if (ev.did && lineDid) return ev.did === lineDid;
+  return ev.from.toLowerCase() === m.from.toLowerCase();
+}
+
+/**
+ * Join each task event to the companion line carrying its prose.
+ *
+ * The companion names only the task (`+freeq.at/ref`), never the event, so
+ * the two are matched by their sender and then by how close in time they are:
+ * a joiner is handed the lines and the task events as two windows that
+ * truncate independently, so a line missing from its window must leave its
+ * event unpaired rather than shift every later line onto the wrong event.
+ * Either side can land first, so this runs from both, and never re-pairs what
+ * it has already paired: the message list is capped, and an evicted companion
+ * must not shift its successors.
+ */
+function pairActCompanions(ch: Channel): void {
+  if (ch.actTasks.size === 0) return;
+  const claimed = new Set<string>();
+  for (const task of ch.actTasks.values()) {
+    for (const ev of task.events) if (ev.msgId) claimed.add(ev.msgId);
+  }
+  const free = new Map<string, Message[]>();
+  for (const m of ch.messages) {
+    const ref = m.tags?.['+freeq.at/ref'];
+    if (!ref || claimed.has(m.id) || !ch.actTasks.has(ref)) continue;
+    const list = free.get(ref);
+    if (list) list.push(m);
+    else free.set(ref, [m]);
+  }
+  if (free.size === 0) return;
+  let changed = false;
+  const tasks = new Map(ch.actTasks);
+  for (const [id, task] of tasks) {
+    const lines = free.get(id);
+    if (!lines) continue;
+    // Every line each unpaired event could take, nearest in time first, and
+    // in arrival order where neither side dates itself.
+    const near: { ev: number; line: number; gap: number }[] = [];
+    task.events.forEach((ev, evIdx) => {
+      if (ev.msgId) return;
+      const at = actEventTime(ev.eventId);
+      lines.forEach((m, lineIdx) => {
+        if (!actSameSender(ev, m)) return;
+        const wrote = m.timestamp?.getTime?.();
+        const gap =
+          at !== undefined && wrote !== undefined && !Number.isNaN(wrote)
+            ? Math.abs(wrote - at)
+            : Infinity;
+        near.push({ ev: evIdx, line: lineIdx, gap });
+      });
+    });
+    near.sort((a, b) => (a.gap === b.gap ? a.ev - b.ev || a.line - b.line : a.gap - b.gap));
+    const pairedTo = new Map<number, string>();
+    const used = new Set<number>();
+    for (const { ev, line } of near) {
+      if (pairedTo.has(ev) || used.has(line)) continue;
+      pairedTo.set(ev, lines[line].id);
+      used.add(line);
+    }
+    if (pairedTo.size === 0) continue;
+    tasks.set(id, {
+      ...task,
+      events: task.events.map((ev, evIdx) => {
+        const msgId = pairedTo.get(evIdx);
+        return msgId ? { ...ev, msgId } : ev;
+      }),
+    });
+    changed = true;
+  }
+  if (changed) ch.actTasks = tasks;
+}
+
+/**
+ * What the room is told about an event that wrote no line of its own.
+ *
+ * The home signs `confirm` and `expire` itself and sends no companion, so
+ * these two are the only events the reader hears about as a system line
+ * rather than a card.
+ */
+function actSystemLine(task: ActTask, ev: ActEventInput): string | undefined {
+  // Both lines name the task by its title, which only the opener carries, and
+  // the opener falls out of the replay window before the events that follow
+  // it do — so with no title held there is nothing to name, and nothing said.
+  const title = task.title;
+  if (!title) return undefined;
+  switch (ev.verb) {
+    case 'confirm': {
+      // The receipt carries only the id of the move it confirms, so the move's
+      // sender and its raw verb are read off that event — and with no such
+      // event held there is nothing to name, and nothing to say.
+      const subject = task.events.find((e) => e.eventId === ev.fields['act-subject']);
+      if (!subject) return undefined;
+      return `confirmed: ${subject.from}'s ${subject.verb} on ${title}`;
+    }
+    case 'expire':
+      return `${title} expired`;
+    default:
+      return undefined;
+  }
+}
+
+/** Who holds the task after this move: named outright on a directed offer,
+ *  taken by whoever claims or accepts it, and on an award the bidder whose
+ *  bid was chosen — `act-accepts` names the bid, not the bidder. */
+function actAssignee(
+  prior: ActTask | undefined,
+  ev: ActEventInput,
+  events: ActEvent[],
+): string | undefined {
+  switch (ev.verb) {
+    case 'offer':
+      return ev.fields['act-to'] ?? prior?.assignee;
+    case 'claim':
+    case 'accept':
+      return ev.did ?? ev.from;
+    case 'award': {
+      const bid = events.find((e) => e.eventId === ev.fields['act-accepts']);
+      return bid ? bid.did ?? bid.from : prior?.assignee;
+    }
+    default:
+      return prior?.assignee;
+  }
 }
 
 export const useStore = create<Store>((set, get) => ({
@@ -827,6 +1030,7 @@ export const useStore = create<Store>((set, get) => ({
       historyFetching: false,
       historyAutoPaused: false,
       historyFetchAnchored: false,
+      actTasks: new Map(),
     };
     // Always produce a fresh Channel object so subscribers comparing
     // channel identity (Sidebar, MessageList children, etc.) see a new
@@ -847,6 +1051,10 @@ export const useStore = create<Store>((set, get) => ({
           ? base.unreadCount + 1
           : base.unreadCount,
     };
+
+    // A companion line is the row that becomes a task's card, so joining it
+    // to its event has to happen wherever it lands — live or in replay.
+    if (msg.tags?.['+freeq.at/ref']) pairActCompanions(ch);
 
     const channels = new Map(s.channels);
     channels.set(key, ch);
@@ -924,6 +1132,9 @@ export const useStore = create<Store>((set, get) => ({
     // MESSAGE_WINDOW would drop the page that was just fetched. The window
     // grows to hold whatever comes back, with no ceiling above it.
     ch.messages = merged;
+    // A joiner's replay caps lines and task events separately, so a line
+    // whose event is already here arrives by history, and pairs here.
+    if (novel.some((m) => m.tags?.['+freeq.at/ref'])) pairActCompanions(ch);
     channels.set(channel.toLowerCase(), ch);
     return { channels };
   }),
@@ -1206,6 +1417,9 @@ export const useStore = create<Store>((set, get) => ({
     // Batch messages go at the beginning (history) — same window rule as
     // mergeHistory: keep the fetched page, with no ceiling above it.
     ch.messages = [...newMsgs, ...ch.messages];
+    // The batch is where a line lands, so it is where a line is joined to
+    // the event it belongs to — the same as live and as a history merge.
+    if (newMsgs.some((m) => m.tags?.['+freeq.at/ref'])) pairActCompanions(ch);
     channels.set(batch.target.toLowerCase(), ch);
     return { channels, batches };
   }),
@@ -1355,6 +1569,83 @@ export const useStore = create<Store>((set, get) => ({
       ch.pins = ch.pins.filter(p => p.msgid !== msgid);
       channels.set(channel.toLowerCase(), { ...ch });
     }
+    return { channels };
+  }),
+  addActEvent: (channel, ev) => set((s) => {
+    const key = channel.toLowerCase();
+    const base: Channel = s.channels.get(key) ?? {
+      name: channel,
+      topic: '',
+      members: new Map(),
+      messages: [],
+      modes: new Set<string>(),
+      isEncrypted: false,
+      unreadCount: 0,
+      mentionCount: 0,
+      isJoined: false,
+      pins: [],
+      typingUsers: new Map(),
+      historyEdge: 'unknown',
+      historyFetching: false,
+      historyAutoPaused: false,
+      historyFetchAnchored: false,
+      actTasks: new Map(),
+    };
+
+    const prior = base.actTasks.get(ev.taskId);
+    // Dedup by event id — a joiner is handed the same events twice, once by
+    // the JOIN replay and once by the CHATHISTORY it asks for next.
+    if (prior?.events.some((e) => e.eventId === ev.eventId)) return {};
+
+    const events: ActEvent[] = [
+      ...(prior?.events ?? []),
+      { eventId: ev.eventId, verb: ev.verb, from: ev.from, did: ev.did, fields: ev.fields },
+    ];
+    const ctx = ev.fields['act-ctx'];
+    const actTasks = new Map(base.actTasks);
+    actTasks.set(ev.taskId, {
+      taskId: ev.taskId,
+      kind: ev.kind || prior?.kind || '',
+      title: ev.fields['act-title'] ?? prior?.title ?? '',
+      // An opener names no other task, so its own id is the task's — which
+      // is what makes it the opener, and its sender the offerer.
+      offerer: ev.eventId === ev.taskId ? ev.did ?? ev.from : prior?.offerer,
+      assignee: actAssignee(prior, ev, events),
+      verb: ev.verb,
+      note: ev.fields['act-note'] ?? prior?.note,
+      ctx: ctx
+        ? [...(prior?.ctx ?? []), { url: ctx, hash: ev.fields['act-ctx-h'] }]
+        : prior?.ctx ?? [],
+      events,
+    });
+
+    const ch: Channel = { ...base, actTasks };
+    pairActCompanions(ch);
+
+    const line = actSystemLine(actTasks.get(ev.taskId)!, ev);
+    if (line) {
+      // When the home moved, off the id it minted the event under — a receipt
+      // handed back on join is old news, and saying "now" would date it wrong
+      // and file it under the newest thing said.
+      const at = actEventTime(ev.eventId);
+      const said = at === undefined ? new Date() : new Date(at);
+      // Keyed by the event id, so the repeat a joiner is handed lands on the
+      // dedup above rather than printing the line twice.
+      const row: Message = {
+        id: ev.eventId,
+        from: '',
+        text: line,
+        timestamp: said,
+        tags: {},
+        isSystem: true,
+      };
+      let i = ch.messages.length;
+      while (i > 0 && (ch.messages[i - 1].timestamp?.getTime?.() ?? 0) > said.getTime()) i--;
+      ch.messages = [...ch.messages.slice(0, i), row, ...ch.messages.slice(i)].slice(-1000);
+    }
+
+    const channels = new Map(s.channels);
+    channels.set(key, ch);
     return { channels };
   }),
   setSearchQuery: (query) => set({ searchQuery: query }),

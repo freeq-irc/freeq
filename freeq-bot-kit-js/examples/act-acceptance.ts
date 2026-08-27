@@ -260,7 +260,20 @@ async function main() {
     const late = await spawnBot('acceptance-latecomer');
     await sleep(2000);
     const replayed = late.seen.raw.filter((l) => l.includes('+freeq.at/act='));
-    check(replayed.length > 0, `task events replayed on join (${replayed.length} lines)`);
+    // Every stored event reaches a joiner twice: the channel replays history
+    // at JOIN, and sdk-js then asks for CHATHISTORY, which answers with the
+    // same rows. Counted exactly, so either half changing is visible here
+    // rather than passing as "some lines arrived".
+    const stored = (
+      await Promise.all(
+        [declined, task, revived].map(async (id) =>
+          (await api(`/api/v1/actions/${id}`)).events.length),
+      )
+    ).reduce((a, b) => a + b, 0);
+    check(
+      replayed.length === stored * 2,
+      `every stored task event replayed on join, twice over (${replayed.length} lines, ${stored} events)`,
+    );
     check(
       replayed.some((l) => l.includes('+freeq.at/sig=')),
       'with their signatures, so a late arrival can check them',
