@@ -1510,10 +1510,20 @@ export function MessageList() {
   // Always scroll to bottom on channel switch
   // Multiple timers to catch: initial render, layout, CHATHISTORY load
   useEffect(() => {
-    stickToBottomRef.current = true;
-    setShowScrollBtn(false);
-    setReaderAtBottom(activeChannel, true);
+    // Opening a buffer puts the reader at its live end, unless they arrived
+    // asking for one particular row — a bookmark, a search result, a link.
+    // Then the end is not where they are going, and the cascade below would
+    // take them there anyway, several times over, as the window they asked
+    // for arrives.
+    const jumped = () =>
+      !!pendingJumpRef.current || jumpHoldsView.current === activeChannel;
+    if (!jumped()) {
+      stickToBottomRef.current = true;
+      setShowScrollBtn(false);
+      setReaderAtBottom(activeChannel, true);
+    }
     const scrollBottom = () => {
+      if (jumped()) return;
       stickToBottomRef.current = true;
       pinToBottom();
     };
@@ -1538,6 +1548,7 @@ export function MessageList() {
     // position in it, so an arrival there is free to keep it at its ceiling.
     return () => {
       clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); clearTimeout(t4);
+      jumpHoldsView.current = null;
       useStore.getState().setReaderAtBottom(activeChannel, true);
     };
   }, [activeChannel, isDM, pinToBottom, setReaderAtBottom]);
@@ -1643,9 +1654,19 @@ export function MessageList() {
   const scrollToMsgId = useStore((s) => s.scrollToMsgId);
   const [highlightId, setHighlightId] = useState<string | null>(null);
   const [pendingJump, setPendingJump] = useState<string | null>(null);
+  /** The same, for the activation timers to read: they fire after the render
+   *  that set it and would otherwise close over the value from before. */
+  const pendingJumpRef = useRef<string | null>(null);
+  /** The buffer whose view a jump has taken, if any. Opening a buffer pins it
+   *  to its live end on a cascade of timers running for over a second, and a
+   *  jump resolves long before the last of them — so it is not enough for the
+   *  cascade to stand down only while the jump is still pending. Cleared when
+   *  the reader leaves the buffer, so opening it again pins as usual. */
+  const jumpHoldsView = useRef<string | null>(null);
   useEffect(() => {
     if (!scrollToMsgId) return;
     useStore.getState().setScrollToMsgId(null);
+    pendingJumpRef.current = scrollToMsgId;
     setPendingJump(scrollToMsgId);
   }, [scrollToMsgId]);
 
@@ -1661,13 +1682,17 @@ export function MessageList() {
     const at = indexOfId.get(pendingJump);
     if (at === undefined) {
       if (askedAround.current === pendingJump || !ULID_RE.test(pendingJump)) {
+        pendingJumpRef.current = null;
         setPendingJump(null);
         return;
       }
       askedAround.current = pendingJump;
+      jumpHoldsView.current = activeChannel;
       requestHistory(activeChannel, { msgid: pendingJump }, 'around');
       return;
     }
+    pendingJumpRef.current = null;
+    jumpHoldsView.current = activeChannel;
     setPendingJump(null);
     // The row was reached, so this link is not the one that went unanswered:
     // following it again later is a fresh question and asks again.

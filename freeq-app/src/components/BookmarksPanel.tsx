@@ -5,6 +5,7 @@ export function BookmarksPanel() {
   const bookmarks = useStore((s) => s.bookmarks);
   const removeBookmark = useStore((s) => s.removeBookmark);
   const setActive = useStore((s) => s.setActiveChannel);
+  const setScrollToMsgId = useStore((s) => s.setScrollToMsgId);
   const setOpen = useStore((s) => s.setBookmarksPanelOpen);
 
   if (!open) return null;
@@ -40,10 +41,17 @@ export function BookmarksPanel() {
                 <div className="text-sm text-fg-muted line-clamp-3">{bm.text}</div>
                 <div className="flex gap-2 mt-2">
                   <button
-                    onClick={() => { setActive(bm.channel); setOpen(false); }}
+                    onClick={() => {
+                      // The channel first, then the row: the list mounts for
+                      // the new buffer with the row already asked for, and
+                      // fetches the window around it if it holds neither.
+                      setActive(bm.channel);
+                      setScrollToMsgId(bm.msgId);
+                      setOpen(false);
+                    }}
                     className="text-[11px] text-accent hover:underline"
                   >
-                    Go to channel
+                    Go to message
                   </button>
                   <button
                     onClick={() => removeBookmark(bm.msgId)}

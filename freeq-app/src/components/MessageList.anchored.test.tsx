@@ -135,6 +135,24 @@ describe('a jump to a message', () => {
   });
 });
 
+describe('a jump asked for as the channel opens', () => {
+  it('survives the activation that follows it', () => {
+    // Opening a buffer pins it to its live end on a cascade of timers. A
+    // reader who arrived by asking for one particular row did not ask for
+    // the end, and the request for the window around that row has to still
+    // go out once those timers have run.
+    anchoredWindow('#opened', 20);
+    act(() => { s().openWindow('#opened', s().channels.get('#opened')!.messages, true); });
+    list();
+
+    act(() => { s().setScrollToMsgId(id(9999)); });
+
+    expect(client.requestHistory).toHaveBeenCalledWith(
+      '#opened', { msgid: id(9999) }, 'around',
+    );
+  });
+});
+
 describe('the bottom of an anchored window', () => {
   it('is not the present, so the jump affordance stands there', () => {
     anchoredWindow('#bottom', 20);
