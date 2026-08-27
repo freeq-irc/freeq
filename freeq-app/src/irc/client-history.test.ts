@@ -325,6 +325,98 @@ describe('a page of history the bridge asked for', () => {
   });
 });
 
+describe('a request that replaces the window', () => {
+  /** A window sitting away from the live end, as a deep jump leaves one. */
+  function detached(channel: string) {
+    s().openWindow(channel, [{
+      id: '01M0AAAAAAAAAAAAAAAAAAAA01', from: 'alice', text: 'old',
+      timestamp: new Date(1_700_000_000_000), tags: {},
+    }], false);
+  }
+
+  it('cannot be sent twice over, however many times the reader asks', () => {
+    // Two jumps to the present make two windows out of two answers, and the
+    // second lands on whatever the first installed.
+    const client = connected();
+    detached('#twice');
+
+    bridge.requestHistory('#twice');
+    bridge.requestHistory('#twice');
+    bridge.requestHistory('#twice');
+
+    expect(client.history.length).toBe(1);
+  });
+
+  it('holds off an ordinary page while it is out, too', () => {
+    const client = connected();
+    detached('#hold');
+    bridge.requestHistory('#hold');
+
+    bridge.requestHistory('#hold', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    expect(client.history.length).toBe(1);
+    expect(client.history[0]).toMatchObject({ mode: 'latest' });
+  });
+
+  it('takes the slot from an ordinary page that is still out', () => {
+    // The other way round: a reader who asks to leave the window while a
+    // page into it is loading is leaving, and the jump is what they get.
+    const client = connected();
+    detached('#take');
+    bridge.requestHistory('#take', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    bridge.requestHistory('#take');
+
+    expect(client.history.length).toBe(2);
+    expect(ch('#take')!.historyFetchMode).toBe('latest');
+  });
+
+  it('drops an answer that comes back after its request is gone', () => {
+    // The page timed out and the reader moved; the answer arrives anyway.
+    // Merging it puts rows in the window that do not adjoin the ones in it.
+    const client = connected();
+    detached('#late');
+    bridge.requestHistory('#late');
+    vi.advanceTimersByTime(60_000);
+    expect(ch('#late')!.historyFetching).toBe(false);
+    const held = ch('#late')!.messages.map((m) => m.id);
+
+    client.emit('historyBatch', '#late', [{
+      id: '01M0ZZZZZZZZZZZZZZZZZZZZ01', from: 'carol', text: 'much later',
+      timestamp: new Date(1_800_000_000_000), tags: {},
+    }], { mode: 'latest', count: 50 });
+
+    expect(ch('#late')!.messages.map((m) => m.id)).toEqual(held);
+  });
+
+  it('drops an unasked-for page at a detached window', () => {
+    // The opening page a server sends on its own account is safe at the live
+    // end and a hole in the middle anywhere else.
+    const client = connected();
+    detached('#unasked');
+    const held = ch('#unasked')!.messages.map((m) => m.id);
+
+    client.emit('historyBatch', '#unasked', [{
+      id: '01M0YYYYYYYYYYYYYYYYYYYY01', from: 'carol', text: 'elsewhere',
+      timestamp: new Date(1_900_000_000_000), tags: {},
+    }], { mode: 'latest', count: 50 });
+
+    expect(ch('#unasked')!.messages.map((m) => m.id)).toEqual(held);
+  });
+
+  it('still takes an unasked-for page at the live end', () => {
+    const client = connected();
+    seed('#opening');
+
+    client.emit('historyBatch', '#opening', [{
+      id: '01M0BBBBBBBBBBBBBBBBBBBB01', from: 'bob', text: 'older',
+      timestamp: new Date(1_600_000_000_000), tags: {},
+    }], { mode: 'latest', count: 50 });
+
+    expect(ch('#opening')!.messages.length).toBe(2);
+  });
+});
+
 describe('what a CHATHISTORY refusal shows the reader', () => {
   /** Rows the buffer holds that are not messages — the app renders a server
    *  rejection as one of these. */

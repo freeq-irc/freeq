@@ -102,6 +102,11 @@ export interface Channel {
    *  themselves off separately: a forward page that never came says nothing
    *  about whether paging back still works. */
   newerAutoPaused: boolean;
+  /** Whether the page in flight will be installed as the whole window when
+   *  it lands, rather than merged into what is held. Decided when the
+   *  request goes out, because what makes it a replacement — the window
+   *  sitting away from the live end — is what its own answer changes. */
+  historyFetchReplaces: boolean;
   /** What the page in flight asked for. An opening request ('latest') is
    *  not anchored on a held row, and its answer is expected to repeat rows
    *  already held — so it says nothing about whether paging back is getting
@@ -321,7 +326,12 @@ export interface Store {
   /** A page of history has been asked for. `anchored` says whether it was
    *  anchored on a held row, which is what makes its answer worth reading
    *  for whether paging back is getting anywhere; `mode` says which anchored
-   *  page it is. */
+   *  page it is.
+   *
+   *  One page is in flight at a time. A request whose answer will replace the
+   *  window takes the slot from one that would only have merged into it — the
+   *  reader is leaving, and what they asked for last is what they meant. A
+   *  replacement already in flight keeps it. */
   historyFetchStarted: (channel: string, anchored: boolean, mode?: HistoryFetchMode) => void;
   /** A page of older history came back: `received` rows against the
    *  `limit` that was asked for, of which `added` reached the held list.
@@ -447,6 +457,7 @@ function getOrCreateChannel(channels: Map<string, Channel>, name: string): Chann
       historyAutoPaused: false,
       newerAutoPaused: false,
       historyFetchMode: 'latest',
+      historyFetchReplaces: false,
     };
     channels.set(key, ch);
   }
@@ -889,6 +900,7 @@ export const useStore = create<Store>((set, get) => ({
       historyAutoPaused: false,
       newerAutoPaused: false,
       historyFetchMode: 'latest',
+      historyFetchReplaces: false,
     };
     // A window that does not reach the live end does not hold this message
     // either: it belongs after the run of rows the window is, on the far
@@ -1088,11 +1100,14 @@ export const useStore = create<Store>((set, get) => ({
   historyFetchStarted: (channel, anchored, mode = 'before') => set((s) => {
     const channels = new Map(s.channels);
     const ch = getOrCreateChannel(channels, channel);
-    if (ch.historyFetching) return {};
+    const asked: HistoryFetchMode = anchored ? mode : 'latest';
+    const replaces = asked === 'around' || (asked === 'latest' && ch.newerEdge === 'more');
+    if (ch.historyFetching && (ch.historyFetchReplaces || !replaces)) return {};
     channels.set(channel.toLowerCase(), {
       ...ch,
       historyFetching: true,
-      historyFetchMode: anchored ? mode : 'latest',
+      historyFetchMode: asked,
+      historyFetchReplaces: replaces,
     });
     return { channels };
   }),
