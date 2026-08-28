@@ -2831,6 +2831,12 @@ impl SeenActEvents {
 /// flag day.
 pub const MSGSIG_CAP: &str = "freeq.at/msgsig";
 
+/// The capability a client must ack to be sent task events.
+///
+/// The server delivers an act TAGMSG only to sessions that asked for it, so a
+/// client that renders task cards and never asks receives nothing at all.
+pub const ACT_CAP: &str = "freeq.at/act";
+
 /// Put a chat signature (and the event id it covers) on an outgoing message's
 /// tags, when this session has a signing key and the venue is knowable.
 ///
@@ -3416,6 +3422,9 @@ async fn handle_cap_response<W: AsyncWrite + Unpin>(
                 "draft/chathistory",
                 "draft/multiline",
                 "draft/read-marker",
+                // Task events are delivered only to a session that asked for
+                // them, so a consumer rendering task cards has to ask.
+                ACT_CAP,
                 // Requested rather than merely read off the LS line: the ACK
                 // is the server's own confirmation that it verifies chat
                 // documents, and signing is gated on it (see `MSGSIG_CAP`).
@@ -4768,6 +4777,76 @@ mod multiline_tests {
         assert!(
             legacy.contains("CAP REQ"),
             "the rest of registration is unchanged: {legacy:?}"
+        );
+    }
+
+    /// A task event is only delivered to a session that asked for it: the
+    /// server gates act TAGMSGs on the `freeq.at/act` cap being acked. A
+    /// client that renders task cards but never asks receives nothing at all.
+    #[tokio::test]
+    async fn a_client_asks_for_the_task_events_it_renders() {
+        async fn requested_caps(advertised: &str) -> String {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+
+            let (client_side, mut server_side) = tokio::io::duplex(8192);
+            let (event_tx, _event_rx) = mpsc::channel::<Event>(64);
+            let (_cmd_tx, cmd_rx) = mpsc::channel::<Command>(16);
+            let config = ConnectConfig {
+                server_addr: "test".to_string(),
+                nick: "tester".to_string(),
+                user: "tester".to_string(),
+                realname: "tester".to_string(),
+                tls: false,
+                tls_insecure: false,
+                web_token: None,
+                websocket_url: None,
+            };
+            let (reader, writer) = tokio::io::split(client_side);
+            tokio::spawn(async move {
+                let _ = run_irc(
+                    BufReader::new(reader),
+                    writer,
+                    &config,
+                    None,
+                    event_tx,
+                    cmd_rx,
+                    Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                    Arc::new(parking_lot::Mutex::new(CapsState::default())),
+                    Arc::new(parking_lot::Mutex::new(DidMapsState::default())),
+                )
+                .await;
+            });
+
+            server_side
+                .write_all(format!(":srv CAP * LS :{advertised}\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut wire = Vec::new();
+            let mut chunk = vec![0u8; 4096];
+            while let Ok(Ok(n)) = tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                server_side.read(&mut chunk),
+            )
+            .await
+            {
+                if n == 0 {
+                    break;
+                }
+                wire.extend_from_slice(&chunk[..n]);
+            }
+            String::from_utf8_lossy(&wire).into_owned()
+        }
+
+        let offered = requested_caps("message-tags server-time batch freeq.at/act").await;
+        assert!(
+            offered.contains("freeq.at/act"),
+            "a server offering task events is asked for them: {offered:?}"
+        );
+
+        let absent = requested_caps("message-tags server-time batch").await;
+        assert!(
+            !absent.contains("freeq.at/act"),
+            "a server that never offered it is not asked: {absent:?}"
         );
     }
 
