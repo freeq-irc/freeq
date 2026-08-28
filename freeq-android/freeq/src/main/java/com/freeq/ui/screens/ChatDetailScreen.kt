@@ -53,6 +53,7 @@ fun ChatDetailScreen(
     LaunchedEffect(channelName) {
         appState.activeChannel.value = channelName
         appState.markRead(channelName)
+        appState.noteThreadOpened(channelName)
     }
 
     // Clear active channel when leaving (back button or tab navigation)

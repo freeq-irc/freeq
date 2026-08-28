@@ -892,6 +892,10 @@ class AppState(application: Application) : AndroidViewModel(application) {
         } catch (_: Exception) {}
     }
 
+    /** DM threads whose history this session has asked for. A restored thread
+     *  asks when it is opened; see [DmHistoryOnOpen]. */
+    private val dmHistoryAsked = mutableSetOf<String>()
+
     fun requestHistory(channel: String) {
         // Channel history is served to any member, guests included —
         // membership is the server's only check. DM history requires an
@@ -899,7 +903,19 @@ class AppState(application: Application) : AndroidViewModel(application) {
         // notice handler then has to swallow. Gate only the DM case.
         val isChannel = channel.startsWith("#") || channel.startsWith("&")
         if (!isChannel && authenticatedDID.value == null) return
+        if (!isChannel) dmHistoryAsked.add(channel.lowercase())
         sendRaw("CHATHISTORY LATEST $channel * 100")
+    }
+
+    /**
+     * A thread was opened. A DM whose history this session never got asks for
+     * it now — the page carries the thread's task events, which a DM has no
+     * join to replay and which a restored buffer would otherwise never see.
+     */
+    fun noteThreadOpened(name: String) {
+        if (DmHistoryOnOpen.shouldFetch(name, authenticatedDID.value != null, dmHistoryAsked)) {
+            requestHistory(name)
+        }
     }
 
     fun pinMessage(channel: String, msgId: String) {
