@@ -12,6 +12,8 @@ Design: `docs/PI-FREEQ-MULTIPLAYER.md`. Pitch: `docs/PI-FREEQ-PITCH.md`.
 | M2 — tool + tiered inbound | **DONE** ✅ | cross-agent ask verified; tier gate holds |
 | M3 — humans in the room | **DONE** ✅ | Demo 2 verified: human → agent → answer in room |
 | M4 — handoffs | **DONE** ✅ | offer→accept→complete survives BOTH sides offline |
+| M5 — open tasks | **DONE** ✅ | post/claim, first claim wins, race-tested |
+| M6 — signature verification | **DONE** ✅ | three-way: valid / invalid / unverifiable |
 
 ## Reading list — done
 
@@ -443,7 +445,13 @@ handler needs.
       persisted view. 117 unit tests; acceptance verified on production.
 - [x] **Re-verify M4 locally** — done; full `npm run verify` green against a
       freshly built local server
-- [ ] Optional next: claimable/open handoffs (`act-caps`, no `act-to`) —
-      substrate already supports them; only the tool surface is missing
-- [ ] Optional next: verify inbound act signatures (needs per-DID key
-      history; the RFC flags this as unbuilt)
+- [x] Claimable/open handoffs (`post` / `claim`) — race-tested against a real
+      server: exactly one winner, all views agree, loser cannot complete
+- [x] Verify inbound act signatures — three-way (valid / invalid /
+      unverifiable), using the per-kid key-history endpoint
+- [x] Unit tests for `connection.ts` (34) — the file where the churn bug lived
+- [ ] **Record the two-person demo** — still the only blocked item
+- [ ] Optional: bounded defer-and-retry queue for unverifiable events (the RFC
+      specifies one; we apply-and-flag instead)
+- [ ] Optional: cross-server claim ordering (relies on the RFC's
+      minting-server serialization; untested here)
