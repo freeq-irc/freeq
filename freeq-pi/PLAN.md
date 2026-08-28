@@ -289,6 +289,44 @@ all four live harnesses (peers / ask / room / handoff). Production is no
 longer needed for any part of the test suite; keep it for the recorded demo
 only.
 
+## Post-release fixes (found in real use on production)
+
+### Agents flapped: connect / disconnect / re-register loop
+
+Reported as "my agents keep disconnecting and reconnecting". Server logs
+showed session ids in the **600s**, four concurrent sessions on one DID,
+repeated `AGENT REGISTER`, ghost-mode churn, and a hello storm.
+
+Two compounding bugs, both ours:
+
+1. **Duplicate reconnect loops.** The SDK transport already auto-reconnects
+   ("WebSocket IRC transport with auto-reconnect and heartbeat"), and bot-kit
+   re-runs its announce sequence on every `ready`. `FreeqConnection` ALSO tore
+   the bot down and built a fresh one on every `disconnected`, racing the
+   transport's own retry and leaving several live sessions per DID. Removed:
+   the transport owns reconnection; we only retry the *initial* connect.
+2. **Dead state branches.** `TransportState` is only
+   `disconnected | connecting | connected`, but the handler tested for
+   `"ready"` and `"closed"` — branches that could never fire — while
+   treating every `disconnected` as fatal. Also added a re-entrancy guard so
+   two `start()` calls cannot build two bots.
+
+Verified by `spike/churn-check.ts`, which forces the socket down mid-session:
+**2 connections total** (initial + one transport reconnect), no
+"other sessions remain for DID". Before the fix, a single blip multiplied.
+
+### Every pi window fought over one identity
+
+Opening a second pi window connected a second session as the SAME did:key and
+nick. Legal server-side (multi-device siblings) but incoherent: presence is
+last-writer-wins, so an idle window overwrote the working window's
+`executing` status, and one mention was answered by every window.
+
+`src/lock.ts` — a pid-file lock in the agent dir, so one session holds the
+connection and the rest go passive (surfaced in `/freeq status`, moved with
+`/freeq takeover`). A lock from a crashed session is reclaimed via a liveness
+check rather than locking the machine out. 10 unit tests.
+
 ## Parked ideas (NOT scheduled — do not build)
 
 ### Summoning an AV agent into a call

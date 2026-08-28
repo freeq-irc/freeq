@@ -97,6 +97,8 @@ export class FreeqConnection {
   #opts: ConnectionOptions;
   #meta: SessionMeta;
   #stopped = false;
+  /** Guards against two concurrent start() calls building two bots. */
+  #starting = false;
   #retry = RECONNECT_INITIAL_MS;
   #timer: NodeJS.Timeout | undefined;
   /** Notices are deduped: a flapping connection must not spam the TUI. */
@@ -145,6 +147,11 @@ export class FreeqConnection {
    */
   async start(): Promise<void> {
     if (this.#stopped) return;
+    // One bot, one socket, one server session per installation. Re-entering
+    // start() (a retry firing while a connect is in flight, session_start
+    // racing /freeq login) used to build a second bot and leave both live.
+    if (this.#starting || this.#bot) return;
+    this.#starting = true;
     this.#state = "connecting";
     try {
       const bot = await FreeqBot.create({
@@ -210,13 +217,28 @@ export class FreeqConnection {
         this.#announce(channel, PI_HELLO);
       });
 
+      // Transport state is only 'connected' | 'connecting' | 'disconnected'.
+      //
+      // IMPORTANT: the SDK transport auto-reconnects, and bot-kit re-runs its
+      // announce sequence on every 'ready'. So a dropped socket is ALREADY
+      // being handled one layer down, and this handler must not start a
+      // competing recovery. It previously tore the bot down and built a fresh
+      // one on every 'disconnected', which raced the transport's own retry and
+      // left several live sessions on one DID — the server logged endless
+      // ghost-mode churn and re-registration, and peers saw a hello storm.
       bot.on("connectionStateChanged", (s: string) => {
-        if (s === "connected" || s === "ready") {
+        if (s === "connected") {
           this.#state = "online";
-          this.#retry = RECONNECT_INITIAL_MS;
           this.#noticed.delete("offline");
-        } else if (s === "disconnected" || s === "closed") {
-          if (!this.#stopped) this.#degrade("connection lost");
+        } else if (s === "connecting") {
+          if (this.#state === "online") this.#state = "connecting";
+        } else if (s === "disconnected" && !this.#stopped) {
+          this.#state = "connecting";
+          this.#notice(
+            "freeq: connection dropped — the transport is reconnecting; pi continues normally",
+            "warning",
+            "offline",
+          );
         }
       });
 
@@ -229,38 +251,45 @@ export class FreeqConnection {
       this.#state = "online";
       this.#retry = RECONNECT_INITIAL_MS;
     } catch (err) {
-      this.#degrade((err as Error).message);
+      // Only the INITIAL connect is retried here. Once a bot exists, the
+      // transport owns reconnection (see connectionStateChanged above).
+      this.#state = "error";
+      this.#lastError = (err as Error).message;
+      this.#notice(
+        `freeq: could not connect (${this.#lastError}) — pi continues normally`,
+        "warning",
+        "offline",
+      );
+      await this.#discardBot();
+      this.#scheduleInitialRetry();
+    } finally {
+      this.#starting = false;
     }
   }
 
-  #degrade(reason: string): void {
-    this.#state = "error";
-    this.#lastError = reason;
-    this.#notice(`freeq: offline (${reason}) — pi continues normally`, "warning", "offline");
-    this.#scheduleRetry();
+  /** Tear down a half-built bot so a retry cannot leave two sessions live. */
+  async #discardBot(): Promise<void> {
+    const bot = this.#bot;
+    this.#bot = undefined;
+    if (!bot) return;
+    try {
+      await bot.stop("discarded");
+    } catch {
+      /* already gone */
+    }
   }
 
-  #scheduleRetry(): void {
-    if (this.#stopped || this.#timer) return;
+  #scheduleInitialRetry(): void {
+    if (this.#stopped || this.#timer || this.#bot) return;
     const delay = this.#retry;
     this.#retry = Math.min(this.#retry * 2, RECONNECT_MAX_MS);
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
-      if (this.#stopped) return;
-      void this.#reconnect();
+      if (this.#stopped || this.#bot) return;
+      void this.start();
     }, delay);
     // Don't hold the process open just to retry a chat connection.
     this.#timer.unref?.();
-  }
-
-  async #reconnect(): Promise<void> {
-    try {
-      await this.#bot?.stop("reconnect");
-    } catch {
-      /* ignore */
-    }
-    this.#bot = undefined;
-    await this.start();
   }
 
   #onPresence(p: PresencePayload): void {

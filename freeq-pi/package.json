@@ -29,8 +29,9 @@
     "verify:peers": "tsx spike/peers-check.ts",
     "verify:ask": "tsx spike/ask-check.ts",
     "verify:room": "tsx spike/room-check.ts",
-    "verify": "npm run test && npm run verify:peers && npm run verify:ask && npm run verify:room && npm run verify:handoff",
-    "verify:handoff": "tsx spike/handoff-check.ts"
+    "verify": "npm run test && npm run verify:peers && npm run verify:ask && npm run verify:room && npm run verify:handoff && npm run verify:churn",
+    "verify:handoff": "tsx spike/handoff-check.ts",
+    "verify:churn": "tsx spike/churn-check.ts"
   },
   "dependencies": {
     "@freeq/bot-kit": "file:../freeq-bot-kit-js",

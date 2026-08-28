@@ -110,6 +110,23 @@ npx tsx spike/ask-check.ts   --server ws://127.0.0.1:18080/irc   # cross-agent a
 
 `spike/` holds test harnesses, not product code.
 
+## One connection per installation
+
+Identity is per-installation, so every pi window would otherwise connect as
+the same DID and nick. The server allows that (multi-device siblings) but the
+result is incoherent: presence becomes last-writer-wins, so an idle window
+overwrites the "executing" status of the window actually working, and a single
+channel mention gets answered by every window at once.
+
+So exactly one pi session holds the connection; the rest stay passive and say
+so in `/freeq status`. Use `/freeq takeover` to move it to the window you're
+working in. The slot is released on shutdown, and a lock left by a crashed
+session is reclaimed automatically.
+
+Reconnection belongs to the SDK transport, not to this package — running a
+second recovery loop on top of it produced duplicate sessions and endless
+ghost churn on the server. `npm run verify:churn` guards that.
+
 ## Outbound redaction
 
 Everything this agent sends is redacted for secrets (tokens, keys, PEM blocks,

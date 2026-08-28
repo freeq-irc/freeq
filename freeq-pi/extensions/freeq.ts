@@ -31,6 +31,7 @@ import {
 import { deriveInstallSlug, defaultNick, isDid } from "../src/identity.js";
 import { collectSessionMeta, describeMeta } from "../src/presence.js";
 import { FreeqConnection, type InboundAsk } from "../src/connection.js";
+import { ConnectionLock } from "../src/lock.js";
 import {
   HandoffStore,
   hashBrief,
@@ -51,6 +52,14 @@ export default function (pi: ExtensionAPI): void {
   let sources: string[] = [];
   let conn: FreeqConnection | undefined;
   let agentDir = getAgentDir();
+  /**
+   * Only one pi session per installation talks to freeq. Identity is
+   * per-installation, so without this every window connects as the same DID
+   * and nick: presence becomes last-writer-wins and a single mention gets
+   * answered by every window at once.
+   */
+  let lock: ConnectionLock | undefined;
+  let passive = false;
 
   /**
    * Things this session owes a reply to, in arrival order: peer asks, and
@@ -211,6 +220,20 @@ export default function (pi: ExtensionAPI): void {
     if (!isDid(cfg.ownerDid)) return "freeq: not logged in — run `/freeq login <did:plc:…>`";
     if (conn && conn.state !== "offline") return `freeq: already ${conn.state}`;
 
+    // Claim the installation's single connection slot.
+    lock ??= new ConnectionLock(ConnectionLock.pathFor(agentDir));
+    const claim = await lock.acquire(ctx.cwd);
+    if (!claim.held) {
+      passive = true;
+      return (
+        `freeq: another pi session on this installation holds the connection` +
+        (claim.holder?.label ? ` (${claim.holder.label})` : "") +
+        `. This window stays passive — one agent identity, one presence. ` +
+        `Close that session, or run /freeq takeover here.`
+      );
+    }
+    passive = false;
+
     const meta = await collectSessionMeta({ cwd: ctx.cwd, model: ctx.model?.id });
 
     conn = new FreeqConnection({
@@ -332,6 +355,9 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_shutdown", async () => {
     await conn?.stop("pi session ended");
     conn = undefined;
+    // Hand the slot to the next window rather than making it wait for a
+    // liveness check to notice we're gone.
+    await lock?.release();
   });
 
   // Report "working" for the whole run, and go quiet again when it settles.
@@ -745,7 +771,13 @@ export default function (pi: ExtensionAPI): void {
             [
               `owner:    ${cfg.ownerDid ?? "(not logged in — /freeq login <did>)"}`,
               `server:   ${cfg.server}`,
-              `state:    ${conn ? conn.describe() : "offline (not connected)"}`,
+              `state:    ${
+                passive
+                  ? "passive — another pi session holds this installation's connection"
+                  : conn
+                    ? conn.describe()
+                    : "offline (not connected)"
+              }`,
               `muted:    ${cfg.muted ? "YES — silent everywhere (/freeq unmute)" : "no"}`,
               `channels: ${cfg.channels.length ? cfg.channels.join(", ") : "(none)"}`,
               `trusted:  ${Object.keys(cfg.trust).length} peer(s)`,
@@ -753,6 +785,29 @@ export default function (pi: ExtensionAPI): void {
             ].join("\n"),
             "info",
           );
+          return;
+        }
+
+        case "takeover": {
+          // Deliberate, explicit, and destructive to the other window's
+          // connection: it will find the slot gone and go passive.
+          const holder = await (lock ??= new ConnectionLock(
+            ConnectionLock.pathFor(agentDir),
+          )).read();
+          const ok = await ctx.ui.confirm(
+            "freeq: take over the connection",
+            `The connection is held by${holder?.label ? ` ${holder.label}` : " another pi session"}` +
+              ` (pid ${holder?.pid ?? "?"}).\n\n` +
+              `Take it over for this window? The other session will go passive.`,
+          );
+          if (!ok) return;
+          await lock.release();
+          // Force a fresh claim by clearing any stale in-memory state.
+          lock = new ConnectionLock(ConnectionLock.pathFor(agentDir));
+          await conn?.stop("takeover");
+          conn = undefined;
+          const message = await connect(ctx);
+          ctx.ui.notify(message, conn ? "info" : "warning");
           return;
         }
 
@@ -899,7 +954,7 @@ export default function (pi: ExtensionAPI): void {
           ctx.ui.notify(
             "/freeq [status | login <did> | join #c | leave #c | peers | " +
               "handoffs | mode #c <silent|addressed|participant> | " +
-              "trust <did> <tier> | mute | unmute | on | off]",
+              "trust <did> <tier> | mute | unmute | takeover | on | off]",
             "info",
           );
       }
