@@ -63,6 +63,15 @@ let client: FreeqClient | null = null;
  */
 const DM_PEER_WHOIS_TIMEOUT_MS = 2000;
 
+/**
+ * Actor class (human / agent / external_agent) is only carried on an
+ * extended-join tag and on WHOIS numeric 673 — never in NAMES. So for anyone
+ * already in a channel when we arrive, we have to ask. Bounded per roster
+ * sync, and remembered per session, so a busy channel cannot become a flood.
+ */
+const ACTOR_CLASS_PROBE_BUDGET = 25;
+const actorClassProbed = new Set<string>();
+
 /** Rebuilt per connection: what a peer resolved to dies with the session. */
 let dmSendGate: ((target: string, send: () => void) => void) | null = null;
 
@@ -789,6 +798,11 @@ function wireEvents(c: FreeqClient) {
 
   c.on('memberJoined', (channel, member) => {
     if (channel) s().addMember(channel, member);
+    // A WHOIS answer arrives as a channel-less "join": it is how we learn the
+    // actor class of somebody who was already in the room when we got here
+    // (NAMES never carries it). Dropping these is what left agents rendered
+    // as humans.
+    else if (member.actorClass) s().updateMemberActorClass(member.nick, member.actorClass);
     if (member.did) prefetchProfiles([member.did]);
   });
 
@@ -833,11 +847,38 @@ function wireEvents(c: FreeqClient) {
   c.on('membersSync', (channel, members) => {
     s().setMembers(channel, members);
     for (const m of members) if (m.did) prefetchProfiles([m.did]);
+    probeActorClasses(members);
   });
 
   c.on('memberDid', (nick, did) => {
     s().updateMemberDid(nick, did);
   });
+
+  /**
+   * Ask who is an agent, for members the roster could not tell us about.
+   *
+   * Only nicks whose class is still unknown, only once per nick per session,
+   * and capped per sync so joining a busy channel cannot turn into a WHOIS
+   * flood. The answer comes back as numeric 673 and lands via the
+   * channel-less `memberJoined` above.
+   */
+  function probeActorClasses(members: Array<{ nick: string; actorClass?: string }>): void {
+    let budget = ACTOR_CLASS_PROBE_BUDGET;
+    for (const m of members) {
+      if (budget <= 0) break;
+      if (!m.nick || m.actorClass) continue;
+      const key = m.nick.toLowerCase();
+      if (key === c.nick.toLowerCase()) continue;
+      if (actorClassProbed.has(key)) continue;
+      actorClassProbed.add(key);
+      budget--;
+      // requestWhois returns a promise that REJECTS on timeout; swallow it.
+      // A probe that fails just means no badge, and an unhandled rejection
+      // here would be noise in every busy channel. Not optional-called: if
+      // the method ever goes away we want a type error, not a silent no-op.
+      void c.requestWhois(m.nick).catch(() => undefined);
+    }
+  }
 
   c.on('message', (channel, message) => {
     // Prefetch avatar by DID if available (from account-tag)

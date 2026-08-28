@@ -347,6 +347,15 @@ export interface Store {
   setUserAway: (nick: string, reason: string | null) => void;
   setTyping: (channel: string, nick: string, typing: boolean) => void;
   updateMemberDid: (nick: string, did: string) => void;
+  /**
+   * Apply an actor class learned after the roster arrived.
+   *
+   * NAMES carries only nicks and prefixes, so a client joining a channel an
+   * agent is already in cannot tell it is an agent. WHOIS (numeric 673) is
+   * the only after-the-fact source, and it names no channel — hence a
+   * nick-keyed update across every channel in view, like `updateMemberDid`.
+   */
+  updateMemberActorClass: (nick: string, actorClass: Member['actorClass']) => void;
   handleMode: (channel: string, mode: string, arg: string | undefined, setBy: string) => void;
 
   // Actions — messages
@@ -1025,6 +1034,21 @@ export const useStore = create<Store>((set, get) => ({
       }
     }
     return { channels };
+  }),
+
+  updateMemberActorClass: (nick, actorClass) => set((s) => {
+    if (!nick || !actorClass) return {};
+    const key = nick.toLowerCase();
+    const channels = new Map(s.channels);
+    let touched = false;
+    for (const [chKey, ch] of channels) {
+      const member = ch.members.get(key);
+      if (!member || member.actorClass === actorClass) continue;
+      ch.members.set(key, { ...member, actorClass });
+      channels.set(chKey, { ...ch });
+      touched = true;
+    }
+    return touched ? { channels } : {};
   }),
 
   handleMode: (channel, mode, arg, _setBy) => set((s) => {

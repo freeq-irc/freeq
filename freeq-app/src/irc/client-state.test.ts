@@ -548,3 +548,49 @@ describe('setMembers — end-of-NAMES roster replace (vanishing-members fix)', (
     expect(alice.isOp).toBe(true);
   });
 });
+
+describe('updateMemberActorClass — agent badge for members who joined before us', () => {
+  // NAMES (353) carries only nicks and prefixes, so a client that joins a
+  // channel an agent is already in never learns the agent is an agent, and
+  // renders it as a human. WHOIS (numeric 673) is the only way to find out
+  // after the fact, and the SDK reports it with an EMPTY channel — which the
+  // client used to drop on the floor.
+  it('applies an actor class learned after the roster arrived', () => {
+    s().setMembers('#ops', [{ nick: 'pi-reth' }, { nick: 'chad' }]);
+    expect(s().channels.get('#ops')!.members.get('pi-reth')!.actorClass).toBeUndefined();
+
+    s().updateMemberActorClass('pi-reth', 'agent');
+    expect(s().channels.get('#ops')!.members.get('pi-reth')!.actorClass).toBe('agent');
+    // Humans are left alone.
+    expect(s().channels.get('#ops')!.members.get('chad')!.actorClass).toBeUndefined();
+  });
+
+  it('applies it in every channel the member shares with us', () => {
+    s().setMembers('#a', [{ nick: 'pi-bot' }]);
+    s().setMembers('#b', [{ nick: 'pi-bot' }]);
+    s().updateMemberActorClass('pi-bot', 'external_agent');
+    expect(s().channels.get('#a')!.members.get('pi-bot')!.actorClass).toBe('external_agent');
+    expect(s().channels.get('#b')!.members.get('pi-bot')!.actorClass).toBe('external_agent');
+  });
+
+  it('is case-insensitive about the nick', () => {
+    s().setMembers('#c', [{ nick: 'Pi-Agent' }]);
+    s().updateMemberActorClass('pi-agent', 'agent');
+    expect(s().channels.get('#c')!.members.get('pi-agent')!.actorClass).toBe('agent');
+  });
+
+  it('survives a later NAMES sync that carries no actor class', () => {
+    s().setMembers('#d', [{ nick: 'pi-x' }]);
+    s().updateMemberActorClass('pi-x', 'agent');
+    s().setMembers('#d', [{ nick: 'pi-x', isOp: true }]); // fresh NAMES, no class
+    const m = s().channels.get('#d')!.members.get('pi-x')!;
+    expect(m.actorClass).toBe('agent');
+    expect(m.isOp).toBe(true);
+  });
+
+  it('ignores a nick nobody in view holds', () => {
+    s().setMembers('#e', [{ nick: 'alice' }]);
+    expect(() => s().updateMemberActorClass('ghost', 'agent')).not.toThrow();
+    expect(s().channels.get('#e')!.members.has('ghost')).toBe(false);
+  });
+});
