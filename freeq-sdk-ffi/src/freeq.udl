@@ -82,7 +82,7 @@ dictionary IrcMessage {
     boolean edited;
     string? dm_key;
     CoordinationEvent? coordination;
-    sequence<TagEntry> tags;
+    sequence<TagEntry> tags = [];
 };
 
 dictionary CoordinationEvent {

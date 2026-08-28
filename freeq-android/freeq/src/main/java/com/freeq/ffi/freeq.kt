@@ -3781,7 +3781,7 @@ data class IrcMessage (
     var `edited`: kotlin.Boolean, 
     var `dmKey`: kotlin.String?, 
     var `coordination`: CoordinationEvent?, 
-    var `tags`: List<TagEntry>
+    var `tags`: List<TagEntry> = listOf()
 ) {
     
     companion object
