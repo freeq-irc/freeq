@@ -1833,7 +1833,15 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                 // offline peer never emits one, so a leftover nick-keyed
                 // thread would otherwise duplicate the DID-keyed row.
                 event.partnerDid?.let { state.adoptDmBinding(event.nick, it) }
-                state.getOrCreateDM(key).seedActivityFromTarget(event.timestamp)
+                val dm = state.getOrCreateDM(key)
+                dm.seedActivityFromTarget(event.timestamp)
+                // The server has just named this conversation. Holding nothing
+                // for it means either a thread restored empty or one never
+                // fetched — and getOrCreateDM only asks for a thread it had to
+                // create, so a restored one would never ask at all. A thread
+                // with no messages is also hidden from the chat list, so this
+                // is what makes it visible again.
+                if (dm.messages.isEmpty()) state.requestHistory(key)
             }
 
             is FreeqEvent.MemberDid -> {
