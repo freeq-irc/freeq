@@ -479,9 +479,39 @@ export default function (pi: ExtensionAPI): void {
   ): Promise<void> {
     const me = conn?.did;
 
+    // We just became the assignee — by claiming an open task, or by our own
+    // accept echoing back. Either way the work is now ours, so start it.
+    // (An accept we initiated via the confirm dialog already injected; guard
+    // on the verb so we do not do it twice.)
+    if (!created && ev.verb === "claim" && rec.assignee === me) {
+      startAssignedWork(ctx, cfg, rec, ev.from);
+      return;
+    }
+
     // Something we offered moved.
     if (rec.offerer === me && !created) {
-      notify(ctx, `freeq handoff ${rec.id.slice(0, 10)} → ${rec.state} (${rec.title})`, "info");
+      const who = rec.assignee ? ` by ${rec.assignee.slice(0, 22)}…` : "";
+      notify(
+        ctx,
+        `freeq handoff ${rec.id.slice(0, 10)} → ${rec.state}${who} (${rec.title})`,
+        "info",
+      );
+      return;
+    }
+
+    // A new OPEN task: nobody is obliged to take it, so never prompt. Surface
+    // it and let the operator or the model decide via the 'claim' action.
+    // Prompting here would turn a public work queue into a dialog generator.
+    if (created && !rec.offeree) {
+      const tier = tierFor(cfg, rec.offerer);
+      if (!tierAtLeast(tier, "handoff")) return; // untrusted poster: ignore entirely
+      notify(
+        ctx,
+        `freeq: open task ${rec.id.slice(0, 10)} in ${rec.channel} — ${rec.title}` +
+          (rec.caps ? `\n  caps: ${rec.caps}` : "") +
+          `\n  claim it with the freeq tool (action 'claim').`,
+        "info",
+      );
       return;
     }
 
@@ -529,29 +559,44 @@ export default function (pi: ExtensionAPI): void {
 
     await conn?.sendAct(rec.channel, "accept", rec.id, {}, undefined);
     notify(ctx, `freeq: accepted handoff ${rec.id.slice(0, 10)} — ${rec.title}`, "info");
+    startAssignedWork(ctx, cfg, rec, ev.from);
+  }
 
+  /**
+   * Begin work that is now assigned to this session.
+   *
+   * Shared by the directed path (offer → confirm → accept) and the open path
+   * (post → claim), so both report presence identically and both enter the
+   * model through the same tier-gated pipeline.
+   */
+  function startAssignedWork(
+    ctx: ExtensionContext,
+    cfg: FreeqConfig,
+    rec: HandoffRecord,
+    fromNick: string,
+  ): void {
     // Tie presence to the task, so the room can see who is on what.
     workLabel = `handoff: ${rec.title}`.slice(0, 80);
     workTask = rec.id;
     pushStatus("executing", workLabel, workTask, true);
 
-    // Hand the work to the model as untrusted input, through the same gate
-    // everything else uses.
     deliver(ctx, {
       kind: "chat",
       channel: rec.channel,
-      from: ev.from,
+      from: fromNick,
       did: rec.offerer,
       text:
-        `You have accepted a handoff over freeq.\n\n` +
+        `You have taken on a task handed off over freeq.\n\n` +
         `Task: ${rec.title}\n` +
         `Task id: ${rec.id}\n` +
+        (rec.caps ? `Declared capabilities: ${rec.caps}\n` : "") +
         (rec.note ? `\nBrief:\n${rec.note}\n` : "") +
-        `\nWork on this in THIS environment. When you are done, report what you did. ` +
-        `Do not send secrets or absolute paths back.`,
+        `\nWork on this in THIS environment. When you are done, report what you ` +
+        `did and mark it complete with the freeq tool (action 'complete', ` +
+        `taskId '${rec.id}'). Do not send secrets or absolute paths back.`,
       addressed: true,
       mode: cfg.muted ? "silent" : "addressed",
-      tier,
+      tier: tierFor(cfg, rec.offerer),
     });
   }
 
@@ -571,7 +616,9 @@ export default function (pi: ExtensionAPI): void {
       "'handoff' DELEGATES a unit of work to a peer: use it when the work must " +
       "happen in their environment, when it is too big for one question, or when " +
       "they may be offline — the offer waits for them and they must explicitly " +
-      "accept. 'handoffs' lists tasks you owe or are owed; 'complete' finishes " +
+      "accept. 'post' offers work to a CHANNEL without naming anyone, so whoever " +
+      "is capable and available can take it; 'claim' takes such a task. " +
+      "'handoffs' lists tasks you owe or are owed; 'complete' finishes " +
       "one assigned to you. Never send secrets, credentials, or absolute " +
       "filesystem paths.",
     parameters: Type.Object({
@@ -584,6 +631,8 @@ export default function (pi: ExtensionAPI): void {
           Type.Literal("handoff"),
           Type.Literal("handoffs"),
           Type.Literal("complete"),
+          Type.Literal("post"),
+          Type.Literal("claim"),
         ],
         { description: "What to do" },
       ),
@@ -599,7 +648,14 @@ export default function (pi: ExtensionAPI): void {
       brief: Type.Optional(
         Type.String({ description: "Full context the other agent needs, for handoff" }),
       ),
-      taskId: Type.Optional(Type.String({ description: "Task id, for complete" })),
+      taskId: Type.Optional(Type.String({ description: "Task id, for complete/claim" })),
+      caps: Type.Optional(
+        Type.String({
+          description:
+            "Capabilities a claimer should have, for 'post' — space-separated hints " +
+            "like 'pi/lang:rust pi/repo:github.com/o/r'. Advisory only.",
+        }),
+      ),
     }),
     async execute(_id, params, _signal, _onUpdate, _ctx) {
       const text = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: {} });
@@ -723,6 +779,91 @@ export default function (pi: ExtensionAPI): void {
               `They must explicitly accept. If their agent is offline the offer ` +
               `waits and is replayed when they reconnect — you do not need to ` +
               `keep this session open.`,
+          );
+        }
+
+        case "post": {
+          // An OPEN handoff: no act-to, so it starts unassigned and the
+          // channel is the queue. Whoever is capable claims it; the minting
+          // server serialises competing claims (first valid wins).
+          const title = params.title ?? params.message;
+          if (!title) return text("post requires 'title' (what needs doing).");
+          const cfg2 = config ?? (await ensureConfig(_ctx));
+          const channel = params.channel ?? cfg2.channels[0];
+          if (!channel) {
+            return text("post needs a channel — the room is the work queue. Try /freeq join #x.");
+          }
+
+          const brief = params.brief ?? "";
+          const fields: Record<string, string> = { title };
+          if (params.caps) fields.caps = params.caps;
+          if (brief) fields["ctx-h"] = hashBrief(brief);
+
+          const taskId = await conn.sendAct(channel, "offer", undefined, fields);
+          if (!taskId) return text("Could not post the task (offline, or not signed in).");
+
+          const store = await ensureHandoffs();
+          if (brief) {
+            localBriefs.set(taskId, brief);
+            conn.send(channel, `[task ${taskId.slice(0, 10)} brief] ${brief}`);
+          }
+          store.put({
+            id: taskId,
+            kind: HANDOFF_KIND,
+            state: "open",
+            offerer: conn.did ?? "",
+            // No offeree: that is what makes it claimable.
+            title,
+            note: brief || undefined,
+            ctxHash: brief ? hashBrief(brief) : undefined,
+            caps: params.caps,
+            channel,
+            fromReplay: false,
+            signed: true,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            log: [{ verb: "offer", by: conn.did ?? "", at: Date.now() }],
+          });
+          await store.save();
+
+          return text(
+            `Posted an open task: ${taskId}\nin ${channel}` +
+              (params.caps ? `\ncaps: ${params.caps}` : "") +
+              `\n\nAnyone capable in that room can claim it. It stays open until ` +
+              `someone does, so it survives everyone being offline.`,
+          );
+        }
+
+        case "claim": {
+          const store = await ensureHandoffs();
+          const me = conn.did;
+          if (!params.taskId) {
+            // Be useful: show what is claimable rather than just erroring.
+            const open = store
+              .all()
+              .filter((r) => r.state === "open" && r.offerer !== me);
+            if (!open.length) return text("No open tasks to claim.");
+            return text(
+              `claim requires 'taskId'. Open tasks:\n` +
+                open.map((r) => `  ${describeHandoff(r, me)}${r.caps ? `  caps: ${r.caps}` : ""}`).join("\n"),
+            );
+          }
+          const rec =
+            store.get(params.taskId) ?? store.all().find((r) => r.id.startsWith(params.taskId!));
+          if (!rec) return text(`No task known with id ${params.taskId}.`);
+          if (rec.state !== "open") {
+            return text(
+              `Task ${rec.id.slice(0, 10)} is '${rec.state}', not open — nothing to claim.`,
+            );
+          }
+          if (rec.offerer === me) return text("You posted that task; you cannot claim it.");
+
+          const ok = await conn.sendAct(rec.channel, "claim", rec.id, {});
+          return text(
+            ok
+              ? `Claimed ${rec.id.slice(0, 10)} — "${rec.title}". If another agent claimed it ` +
+                `first the server will reject this; check 'handoffs' to confirm you hold it.`
+              : "Could not send the claim.",
           );
         }
 

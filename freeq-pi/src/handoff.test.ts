@@ -290,3 +290,106 @@ describe("routine wire traffic is not reported as failure", () => {
     if (!r.ok) expect(r.benign).toBeFalsy();
   });
 });
+
+describe("open (claimable) tasks", () => {
+  /** An offer with no act-to is open: the channel is the queue. */
+  function postOpen(store: HandoffStore, caps?: string): string {
+    const fields: Record<string, string> = { act: "handoff", "act-title": "Summarize the S2S logs" };
+    if (caps) fields["act-caps"] = caps;
+    const e = ev({ fields, taskId: "01OPEN00000000000000000000", eventId: "01OPEN00000000000000000000" });
+    const r = store.apply(e);
+    expect(r.ok, r.ok ? "" : r.reason).toBe(true);
+    if (r.ok) expect(r.record.state).toBe("open");
+    return e.taskId;
+  }
+
+  it("starts in 'open' with no assignee when nobody is named", () => {
+    const id = postOpen(store);
+    const rec = store.get(id)!;
+    expect(rec.state).toBe("open");
+    expect(rec.offeree).toBeUndefined();
+    expect(rec.assignee).toBeUndefined();
+  });
+
+  it("keeps the declared capabilities as an advisory hint", () => {
+    const id = postOpen(store, "pi/lang:rust pi/repo:github.com/o/r");
+    expect(store.get(id)!.caps).toBe("pi/lang:rust pi/repo:github.com/o/r");
+  });
+
+  it("lets ANY did claim it — that is the difference from a directed offer", () => {
+    const id = postOpen(store);
+    expect(move(store, "claim", id, MALLORY).ok).toBe(true);
+    expect(store.get(id)!.state).toBe("assigned");
+    expect(store.get(id)!.assignee).toBe(MALLORY);
+  });
+
+  it("first claim wins; a second is refused", () => {
+    // The minting server serialises competing claims. Locally we must reach
+    // the same verdict: once assigned, it is no longer claimable.
+    const id = postOpen(store);
+    expect(move(store, "claim", id, BOB).ok).toBe(true);
+    const second = move(store, "claim", id, MALLORY);
+    expect(second.ok).toBe(false);
+    expect(store.get(id)!.assignee).toBe(BOB);
+  });
+
+  it("cannot be 'accepted' — accept is only for a directed offer", () => {
+    const id = postOpen(store);
+    expect(move(store, "accept", id, BOB).ok).toBe(false);
+    expect(store.get(id)!.state).toBe("open");
+  });
+
+  it("a directed offer cannot be claimed — claim is only for an open task", () => {
+    const id = offer(store); // directed at BOB
+    expect(move(store, "claim", id, MALLORY).ok).toBe(false);
+    expect(store.get(id)!.state).toBe("offered");
+  });
+
+  it("only the claimer may complete it", () => {
+    const id = postOpen(store);
+    move(store, "claim", id, BOB);
+    expect(move(store, "complete", id, MALLORY).ok).toBe(false);
+    expect(move(store, "complete", id, BOB).ok).toBe(true);
+    expect(store.get(id)!.state).toBe("completed");
+  });
+
+  it("the poster can still cancel it while unclaimed", () => {
+    const id = postOpen(store);
+    expect(move(store, "cancel", id, ALICE).ok).toBe(true);
+    expect(store.get(id)!.state).toBe("cancelled");
+    // And a late claim is then refused.
+    expect(move(store, "claim", id, BOB).ok).toBe(false);
+  });
+
+  it("shows in the claimable list for everyone, not just one recipient", () => {
+    const id = postOpen(store);
+    // inboxFor includes open tasks, since anyone may take them.
+    for (const did of [BOB, MALLORY]) {
+      expect(store.inboxFor(did).map((r) => r.id)).toContain(id);
+    }
+    // And it is the poster's outstanding work too.
+    expect(store.outboxFor(ALICE).map((r) => r.id)).toContain(id);
+  });
+
+  it("drops out of the claimable list once taken", () => {
+    const id = postOpen(store);
+    move(store, "claim", id, BOB);
+    expect(store.inboxFor(MALLORY).map((r) => r.id)).not.toContain(id);
+    expect(store.inboxFor(BOB).map((r) => r.id)).toContain(id); // now the assignee
+  });
+
+  it("survives a restart as an open task", async () => {
+    const { mkdtemp } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const dir2 = await mkdtemp(join(tmpdir(), "handoff-open-"));
+    const p = join(dir2, "h.json");
+    const a = new HandoffStore(p);
+    const id = postOpen(a, "pi/lang:ts");
+    await a.save();
+    const b = new HandoffStore(p);
+    await b.load();
+    expect(b.get(id)!.state).toBe("open");
+    expect(b.get(id)!.caps).toBe("pi/lang:ts");
+    expect(b.get(id)!.offeree).toBeUndefined();
+  });
+});

@@ -36,6 +36,8 @@ npm run verify
 | `verify:ask` (M2) | one agent asks another across the network; the tier gate refuses before trust and permits after | `ALL CHECKS PASSED` |
 | `verify:room` (M3) | a human in a channel gets an answer from an agent's own environment; unaddressed and untrusted messages are ignored | `ALL CHECKS PASSED` |
 | `verify:handoff` (M4) | a handoff offered to an **offline** recipient is delivered by replay, accepted, completed, and rebuilt from history by the offerer | `ALL CHECKS PASSED — handoffs survive offline` |
+| `verify:claim` | an open task posted to a channel is claimed by exactly one of two agents racing for it, all views agree, and the loser cannot complete it | `ALL CHECKS PASSED — claim race is safe` |
+| `verify:churn` | a socket dropped mid-session is recovered by the transport without spawning duplicate sessions | `ALL CHECKS PASSED — no duplicate sessions` |
 
 Each harness plants a fact **only the responding side can see** (a file in its
 working directory) and asserts that exact string comes back — so a pass means
@@ -228,7 +230,9 @@ your terminal, let alone queue you work.
   verifying them needs per-DID key history that the RFC itself flags as
   unbuilt (origin-server lookup now, DID-document anchoring later). Treat the
   `signed` flag as "was signed", not "signature checked".
-- **Claimable/open handoffs are not exposed.** The substrate supports them
-  (`act-caps`, no `act-to`); the tool only offers directed handoffs.
+- **Claim ordering is single-server.** Two agents racing on one server
+  converge correctly (`verify:claim`). Across federated servers the RFC's
+  minting-server serialization is what guarantees it, and that path is
+  untested here.
 - **Handoffs need a shared channel.** The room is the audit log and the
   replay mechanism; DM-only handoffs are not wired up.
