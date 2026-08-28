@@ -379,6 +379,31 @@ export class FreeqConnection {
   }
 
   /**
+   * Report what this agent is doing right now.
+   *
+   * States are freeq's agent presence vocabulary (snake_case on the wire):
+   * `active` when idle-but-available, `executing` while running a turn,
+   * `waiting_for_input` when blocked on its human, `paused`, `degraded`, …
+   *
+   * Note the asymmetry documented in freeq-irc/freeq#70: the server relays
+   * the status STRING for away-ish states (`executing` included) but drops it
+   * for `online`/`active`/`idle`, because it rides the parameterless "back
+   * from away" AWAY. So "what I'm working on" propagates while working —
+   * which is exactly when it matters — and goes quiet when idle.
+   *
+   * `task` is an act task id, so a channel can tie a working agent to the
+   * handoff it accepted.
+   */
+  setWorkState(state: string, status?: string, task?: string): void {
+    if (!this.#bot || this.#state !== "online") return;
+    try {
+      this.#bot.setState(state, status, task);
+    } catch {
+      /* presence is best-effort and must never break a turn */
+    }
+  }
+
+  /**
    * Push updated session metadata.
    *
    * Sets presence (liveness, and status for any client that can read it) AND

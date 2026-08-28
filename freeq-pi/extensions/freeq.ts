@@ -92,6 +92,27 @@ export default function (pi: ExtensionAPI): void {
   /** Channel replies are chat, not essays. */
   const MAX_CHANNEL_REPLY = 1200;
 
+  // ── live work status ────────────────────────────────────────────────────
+  //
+  // A watching human should be able to tell, from a freeq client, whether
+  // this agent is idle, thinking, or grinding on a specific task. Without
+  // this the member list says "available" while the console is clearly busy.
+
+  /** What we're doing, for presence. Set by the turn lifecycle below. */
+  let workLabel: string | undefined;
+  /** Task id we're working, if this turn came from a handoff. */
+  let workTask: string | undefined;
+  /** Coalesce rapid tool-call updates — presence is not a debug log. */
+  let lastStatusPush = 0;
+
+  function pushStatus(state: string, label?: string, task?: string, force = false): void {
+    if (!conn || conn.state !== "online") return;
+    const now = Date.now();
+    if (!force && now - lastStatusPush < 2500) return;
+    lastStatusPush = now;
+    conn.setWorkState(state, label, task);
+  }
+
   /** Durable view of handoffs. Loaded once per session. */
   let handoffs: HandoffStore | undefined;
   /** Briefs we authored, kept locally so we can show what we sent. */
@@ -162,6 +183,13 @@ export default function (pi: ExtensionAPI): void {
       pendingReplies.push({ kind: "ask", ask });
     } else if (opts?.replyToChannel) {
       pendingReplies.push({ kind: "channel", channel: ev.channel, from: ev.from });
+    }
+
+    // Attribute the coming turn to whoever caused it, so a watcher sees
+    // "answering chad" rather than an unexplained busy agent.
+    if (expectsReply) {
+      workLabel = `answering ${ev.from}`;
+      pushStatus("executing", workLabel, workTask, true);
     }
     const framed = frameInbound(ev, { expectsReply });
 
@@ -306,6 +334,18 @@ export default function (pi: ExtensionAPI): void {
     conn = undefined;
   });
 
+  // Report "working" for the whole run, and go quiet again when it settles.
+  pi.on("agent_start", async () => {
+    pushStatus("executing", workLabel ?? "working", workTask, true);
+  });
+
+  // Name the current tool so a watcher sees movement, not just a spinner.
+  pi.on("tool_call", async (event) => {
+    const tool = (event as { toolName?: string }).toolName;
+    if (!tool) return;
+    pushStatus("executing", workLabel ? `${workLabel} · ${tool}` : tool, workTask);
+  });
+
   // Capture assistant text so an inbound ask can be answered with it.
   pi.on("turn_end", async (event) => {
     const content = (event as { message?: { content?: unknown } }).message?.content;
@@ -352,6 +392,13 @@ export default function (pi: ExtensionAPI): void {
     lastAssistantText = "";
 
     if (!conn || conn.state !== "online") return;
+
+    // Back to available. Clearing the label matters: a stale "working on X"
+    // is worse than no status at all.
+    workLabel = undefined;
+    workTask = undefined;
+    pushStatus("active", undefined, undefined, true);
+
     const model = ctx.model?.id;
     if (model === lastModel) return;
     lastModel = model;
@@ -404,6 +451,8 @@ export default function (pi: ExtensionAPI): void {
     const auto = cfg.autoAccept?.includes(rec.offerer);
 
     if (!auto) {
+      // Blocked on a human decision — say so, rather than looking idle or busy.
+      pushStatus("waiting_for_input", `handoff offer: ${rec.title}`.slice(0, 80), rec.id, true);
       const ok = await ctx.ui.confirm(
         "freeq: incoming handoff",
         `${rec.title}${age}\n\n` +
@@ -422,6 +471,11 @@ export default function (pi: ExtensionAPI): void {
 
     await conn?.sendAct(rec.channel, "accept", rec.id, {}, undefined);
     notify(ctx, `freeq: accepted handoff ${rec.id.slice(0, 10)} — ${rec.title}`, "info");
+
+    // Tie presence to the task, so the room can see who is on what.
+    workLabel = `handoff: ${rec.title}`.slice(0, 80);
+    workTask = rec.id;
+    pushStatus("executing", workLabel, workTask, true);
 
     // Hand the work to the model as untrusted input, through the same gate
     // everything else uses.

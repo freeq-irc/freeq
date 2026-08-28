@@ -62,6 +62,10 @@ client.on("serverFail", (t) => console.error(`[human] server: ${t}`));
 let said = false;
 client.on("channelJoined", (channel) => {
   console.error(`[human] joined ${channel} as ${client.nick}`);
+  // Only the channel we were asked about: the server auto-rejoins a DID to
+  // every channel it was previously in, so the first join event is often an
+  // old room and sending there would go unnoticed.
+  if (channel.toLowerCase() !== values.channel!.toLowerCase()) return;
   if (said || !values.say) return;
   said = true;
   setTimeout(() => {

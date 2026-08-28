@@ -97,6 +97,7 @@ const conn: FreeqConnection = new FreeqConnection({
       console.error(`[responder] <${msg.from}> tier=${ev.tier} → ${decision.action}`);
       if (!reachesModel(decision.action) || busy) return;
       busy = true;
+      conn.setWorkState("executing", `answering ${msg.from}`);
       try {
         buf = "";
         await session.prompt(frameInbound(ev, { expectsReply: true }));
@@ -104,6 +105,7 @@ const conn: FreeqConnection = new FreeqConnection({
         if (answer) conn.send(channel, `${msg.from}: ${answer.slice(0, 1200)}`);
       } finally {
         busy = false;
+        conn.setWorkState("active");
       }
     })();
   },
@@ -135,6 +137,9 @@ async function handleAsk(ask: InboundAsk): Promise<void> {
     return;
   }
   busy = true;
+  // Tell the room what we're doing — an agent that looks "available" while
+  // grinding is worse than no presence at all.
+  conn.setWorkState("executing", `answering ${ask.from}`);
   try {
     buf = "";
     await session.prompt(frameInbound(ev, { expectsReply: true }));
@@ -143,6 +148,7 @@ async function handleAsk(ask: InboundAsk): Promise<void> {
     console.error(`[responder]   → replied (${answer.length} chars): ${answer.slice(0, 160)}`);
   } finally {
     busy = false;
+    conn.setWorkState("active");
   }
 }
 
