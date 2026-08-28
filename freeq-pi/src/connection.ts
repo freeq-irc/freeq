@@ -37,6 +37,51 @@ import {
 
 export type ConnState = "offline" | "connecting" | "online" | "error";
 
+/**
+ * The slice of bot-kit this class actually uses.
+ *
+ * Declared so the connection can be driven by a fake in tests. This file owns
+ * the reconnect/announce/ask state machine — the part that broke in
+ * production — and none of that logic needs a real socket to exercise.
+ */
+export interface BotLike {
+  on(event: string, handler: (...args: never[]) => void): unknown;
+  start(): Promise<unknown>;
+  stop(reason?: string): Promise<unknown>;
+  setState(state: string, status?: string, task?: string): void;
+  checkMention(channel: string, text: string): { kind: string; stripped?: string };
+  resolveSenderDid(msg: { from: string; tags?: Record<string, string> }): Promise<string | null>;
+  readonly identity: { did: string };
+  readonly client: {
+    readonly nick: string | null;
+    join(channel: string): void;
+    raw(line: string): void;
+    sendMessage(target: string, text: string): void;
+    sendTagmsg(target: string, tags: Record<string, string>): void;
+    sendAct(
+      target: string,
+      tags: Record<string, string>,
+      opts?: { humanText?: string; taskId?: string },
+    ): Promise<string>;
+    readonly signing: { getPublicKey(): string | null };
+  };
+}
+
+/** How a bot gets built. Overridden in tests. */
+export type BotFactory = (opts: {
+  name: string;
+  ownerDid: string;
+  nick: string;
+  url: string;
+  root?: string;
+  channels?: string[];
+  actorClass: "agent";
+  initialState: string;
+  initialStatus: string;
+  onNickCollision: "auto-suffix";
+  mention: { matcher: (text: string, nick: string) => string | null };
+}) => Promise<BotLike>;
+
 export interface Peer {
   nick: string;
   /**
@@ -69,6 +114,10 @@ export interface ConnectionOptions {
   onScrub?: (hits: string[], target: string) => void;
   /** Inbound channel/DM messages (routed through the tier pipeline). */
   onMessage?: (channel: string, msg: Message) => void;
+  /** Override how the bot is created. Tests inject a fake; production omits it. */
+  botFactory?: BotFactory;
+  /** How long to wait for the session signing key. Shortened in tests. */
+  signingKeyTimeoutMs?: number;
   /**
    * An inbound `ask` from a peer. The host decides (via the tier pipeline)
    * whether to answer; it must call `replyToAsk` exactly once either way.
@@ -90,7 +139,7 @@ const RECONNECT_INITIAL_MS = 2_000;
 const RECONNECT_MAX_MS = 60_000;
 
 export class FreeqConnection {
-  #bot: FreeqBot | undefined;
+  #bot: BotLike | undefined;
   #state: ConnState = "offline";
   #lastError: string | undefined;
   #peers = new Map<string, Peer>();
@@ -125,7 +174,7 @@ export class FreeqConnection {
   get meta(): SessionMeta {
     return this.#meta;
   }
-  get bot(): FreeqBot | undefined {
+  get bot(): BotLike | undefined {
     return this.#bot;
   }
 
@@ -154,7 +203,9 @@ export class FreeqConnection {
     this.#starting = true;
     this.#state = "connecting";
     try {
-      const bot = await FreeqBot.create({
+      const create: BotFactory =
+        this.#opts.botFactory ?? ((o) => FreeqBot.create(o) as unknown as Promise<BotLike>);
+      const bot = await create({
         name: botName(this.#opts.slug),
         ownerDid: this.#opts.ownerDid,
         nick: this.#opts.nick ?? defaultNick(this.#opts.slug),
@@ -319,7 +370,7 @@ export class FreeqConnection {
   }
 
   /** Poll until this session can sign act documents, or give up. */
-  async #awaitSigningKey(timeoutMs = 15_000): Promise<boolean> {
+  async #awaitSigningKey(timeoutMs = this.#opts.signingKeyTimeoutMs ?? 15_000): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       if (this.#bot?.client.signing.getPublicKey()) return true;
@@ -533,7 +584,11 @@ export class FreeqConnection {
   checkMention(channel: string, text: string): { addressed: boolean; stripped: string; cooling: boolean } {
     const r = this.#bot?.checkMention(channel, text);
     if (!r) return { addressed: false, stripped: text, cooling: false };
-    if (r.kind === "respond") return { addressed: true, stripped: r.stripped, cooling: false };
+    // `stripped` is only meaningful on a 'respond'; fall back to the raw text
+    // rather than trusting the shape (a fake or a future bot-kit may omit it).
+    if (r.kind === "respond") {
+      return { addressed: true, stripped: r.stripped ?? text, cooling: false };
+    }
     if (r.kind === "cooldown") return { addressed: true, stripped: text, cooling: true };
     return { addressed: false, stripped: text, cooling: false };
   }
