@@ -29,7 +29,12 @@
  * and in no client.
  */
 
-import spec from './identity-claims.json';
+// `with { type: 'json' }` is not decoration: Node's ESM loader has required a
+// type attribute on JSON imports since v22, so without it every consumer that
+// runs this package as plain ESM (`node dist/index.js`) dies at import time
+// with ERR_IMPORT_ATTRIBUTE_MISSING. Bundlers tolerated its absence, which is
+// why it went unnoticed.
+import spec from './identity-claims.json' with { type: 'json' };
 
 export type IdentityClaimState =
   | 'atProtocol'

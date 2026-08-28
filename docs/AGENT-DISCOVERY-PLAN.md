@@ -8,7 +8,7 @@
 |---|---|---|
 | 1. OpenAPI spec + drift test | **done** | `spec/openapi.yaml` (82 paths, 3.1.0) served at `/api/v1/openapi.{json,yaml}`; 7 unit + 4 acceptance tests |
 | 2. llms.txt | **done** | `/llms.txt` on server + freeq.at, `/llms-full.txt`, `/docs/<slug>.md` raw markdown, repo-root `llms.txt`; 11 pytest |
-| 3a. `@freeq/mcp` stdio | todo | |
+| 3a. `@freeq/mcp` stdio | **done** | `freeq-mcp/` — 17 tools, 3 resources, 87 vitest; verified against production over stdio |
 | 3b. remote MCP `/mcp` | todo | |
 | 4. `skills/` | todo | |
 | 5. tie-together + deploy | todo | |
@@ -70,6 +70,53 @@
   and the repo-root file's in-repo links exist.
 - CI gained a `site` job running the freeq-site pytest suite; it had no CI
   coverage at all, which is how a curated index would have rotted silently.
+
+### Phase 3a as built
+
+`freeq-mcp/` (`@freeq/mcp`), stdio MCP server on `@modelcontextprotocol/sdk`,
+wrapping `@freeq/sdk` for IRC and the REST API for reads.
+
+- **17 tools.** Reads (`channels`, `history`, `search`, `message`, `verify`,
+  `pins`, `topic`, `whois`, `diagnose`, `whoami`) need no connection — making
+  an agent open a WebSocket to read a public channel is a tax. Writes
+  (`connect`, `disconnect`, `join`, `say`, `ask`, `inbox`, `answer`) connect on
+  demand.
+- **Three resources**: `freeq://server/openapi.json`, `freeq://server/llms.txt`,
+  `freeq://server/health` — the Phase 1/2 surfaces, reachable as context
+  rather than as a decision to call something.
+- **`freeq_verify` explains itself.** It distinguishes an author-signed message
+  (non-repudiable) from a server-relayed one (proof of relay only). Returning
+  `verified: true` alone invites exactly the over-claim freeq exists to prevent.
+- **Two identity modes** (open question 2, resolved as proposed): with
+  `FREEQ_OWNER_DID` set, a persistent bot-kit `did:key` identity plus a
+  delegation certificate naming the owner; without it, a guest connection, and
+  every write result says plainly that nothing is attributable.
+- **`freeq_ask` is wire-compatible with `@freeq/pi`'s `ask`** — caller-minted
+  request id on the `+freeq.at/event` channel, exactly one reply, replies from
+  anyone but the peer asked are rejected. Answers carry an explicit
+  untrusted-input caveat.
+- **`freeq_inbox` exists because MCP calls are stateless and IRC is not.** A
+  bounded per-target buffer (200 messages) holds what arrived between calls;
+  without it "what did people say to me" could only ever return messages that
+  landed during the call.
+- **Errors are actionable.** REST failures are translated: 403 says invite-only
+  or key-protected and to join over IRC, 503 says the server may run without
+  persistence, 401 says where a bearer comes from.
+- Tests: 87 vitest — config/env parsing, REST URL construction and error
+  translation, the session state machine (ask contract, buffer bounds,
+  reconnect/teardown), and the MCP surface itself driven by a real MCP client
+  over an in-memory transport (tool list, schemas, required args, read-only
+  refusals, resources).
+- CI gained an `mcp` job: install, build, test, plus a smoke step that imports
+  the built entry point as plain ESM.
+
+**Bug found and fixed along the way:** `@freeq/sdk`'s
+`import spec from './identity-claims.json'` had no `with { type: 'json' }`.
+Bundlers tolerate that; Node's ESM loader has required the attribute since v22,
+so *any* consumer running the SDK as plain ESM died at import time with
+`ERR_IMPORT_ATTRIBUTE_MISSING`. Fixed in the SDK (and its `module` set to
+`esnext` so TypeScript will emit the attribute); all 465 SDK and 366 bot-kit
+tests still pass.
 
 ## Goal
 

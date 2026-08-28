@@ -87,6 +87,37 @@ jobs:
         working-directory: freeq-sdk-js
         run: npm audit --omit=dev --audit-level=high
 
+  mcp:
+    name: MCP Server (vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # `npm install` rather than `npm ci`: the package depends on the sibling
+      # SDK and bot-kit via file: paths, and its prebuild builds them both.
+      - name: Install
+        working-directory: freeq-mcp
+        run: npm install
+
+      - name: Build
+        working-directory: freeq-mcp
+        run: npm run build
+
+      - name: Test
+        working-directory: freeq-mcp
+        run: npm test
+
+      # The published entry point must survive being run as plain ESM by node.
+      # A JSON import missing its type attribute passes every bundler and dies
+      # only here, which is exactly how it got shipped once.
+      - name: Smoke (stdio handshake)
+        working-directory: freeq-mcp
+        run: node --input-type=module -e "import('./dist/index.js').then(m => { if (typeof m.createFreeqMcpServer !== 'function') { throw new Error('entry point did not export createFreeqMcpServer'); } })"
+
   site:
     name: Docs Site (pytest)
     runs-on: ubuntu-latest

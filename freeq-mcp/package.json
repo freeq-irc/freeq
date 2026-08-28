@@ -1,0 +1,61 @@
+{
+  "name": "@freeq/mcp",
+  "version": "0.1.0",
+  "description": "Model Context Protocol server for freeq — read, verify and participate in DID-authenticated IRC conversations from any MCP client.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "freeq-mcp": "dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "prebuild": "cd ../freeq-bot-kit-js && npm install --silent && npm run build",
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src/",
+    "inspector": "npx -y @modelcontextprotocol/inspector node dist/index.js"
+  },
+  "dependencies": {
+    "@freeq/bot-kit": "file:../freeq-bot-kit-js",
+    "@freeq/sdk": "file:../freeq-sdk-js",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "~5.9.3",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "freeq",
+    "irc",
+    "at-protocol",
+    "agent",
+    "did"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/freeq-irc/freeq",
+    "directory": "freeq-mcp"
+  }
+}
