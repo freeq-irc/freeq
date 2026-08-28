@@ -79,6 +79,8 @@ internal fun parseServerTimeMillis(raw: String?): Long? {
 class ChannelState(val name: String) {
     val messages = mutableStateListOf<ChatMessage>()
     val members = mutableStateListOf<MemberInfo>()
+    /** The tasks this channel has seen, keyed by each opener's event id. */
+    val actTasks = ActTaskStore()
     var topic = mutableStateOf("")
     val typingUsers = mutableStateMapOf<String, Date>()
     var lastActivityTime = mutableStateOf(0L)
@@ -1688,6 +1690,31 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                     if (addEmoji != null) buf?.addReaction(replyId, addEmoji, from)
                     if (removeEmoji != null) buf?.removeReaction(replyId, removeEmoji, from)
                 }
+            }
+
+            is FreeqEvent.Act -> {
+                // A task event rides as a TAGMSG, so it routes the way every
+                // other TAGMSG does. The SDK has already read the tags and
+                // dropped the repeats a joiner is handed.
+                val act = event.event
+                val bufferName =
+                    TagMsgRouter.routeTo(act.target, act.from, state.nick.value, act.dmKey)
+                val buf = if (bufferName.startsWith("#")) {
+                    state.getOrCreateChannel(bufferName)
+                } else {
+                    state.getOrCreateDM(bufferName)
+                }
+                buf.actTasks.record(
+                    ActEventInput(
+                        from = act.from,
+                        did = act.did,
+                        kind = act.kind,
+                        verb = act.verb,
+                        eventId = act.eventId,
+                        taskId = act.taskId,
+                        fields = act.fields.associate { it.key to it.value },
+                    )
+                )
             }
 
             is FreeqEvent.NickChanged -> {
