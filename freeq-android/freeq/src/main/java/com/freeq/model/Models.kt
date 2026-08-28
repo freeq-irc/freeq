@@ -1704,7 +1704,7 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                 } else {
                     state.getOrCreateDM(bufferName)
                 }
-                buf.actTasks.record(
+                val line = buf.actTasks.record(
                     ActEventInput(
                         from = act.from,
                         did = act.did,
@@ -1715,6 +1715,24 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                         fields = act.fields.associate { it.key to it.value },
                     )
                 )
+                // The home signs confirm and expire itself and sends no line
+                // beside them, so the room hears about those two here. Dated
+                // by the id the home minted the event under — a receipt handed
+                // back on join is old news, and saying "now" would date it
+                // wrong and file it under the newest thing said. Keyed by that
+                // id too, so a replayed receipt lands on the dedup rather than
+                // printing twice.
+                if (line != null) {
+                    buf.appendIfNew(
+                        ChatMessage(
+                            id = act.eventId,
+                            from = "",
+                            text = line,
+                            isAction = false,
+                            timestamp = actEventTimeMs(act.eventId)?.let { Date(it) } ?: Date(),
+                        )
+                    )
+                }
             }
 
             is FreeqEvent.NickChanged -> {

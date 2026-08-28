@@ -250,6 +250,20 @@ class ActTaskStoreTest {
         assertNull(store.record(move("expire", "e2", who = "acceptance", did = null)))
     }
 
+    // ── When an event was made ──
+
+    @Test fun an_event_carries_the_moment_it_was_minted() {
+        // The system lines are dated by this: a receipt handed back on join is
+        // old news, and saying "now" would file it under the newest thing said.
+        val at = 1_755_000_000_000L
+        assertEquals(at, actEventTimeMs(idAt(at)))
+    }
+
+    @Test fun an_id_the_server_never_minted_carries_no_time() {
+        assertNull(actEventTimeMs("e2"))
+        assertNull(actEventTimeMs("UUUUUUUUUU" + "ZZZZZZZZZZZZZZZZ"))
+    }
+
     @Test fun every_other_verb_is_left_to_its_card() {
         val store = ActTaskStore()
         store.record(ev())

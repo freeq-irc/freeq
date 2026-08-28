@@ -143,7 +143,7 @@ class ActTaskStore {
             val near = mutableListOf<Triple<Int, Int, Double>>()
             task.events.forEachIndexed events@{ evIdx, ev ->
                 if (ev.msgId != null) return@events
-                val at = eventTimeMs(ev.eventId)
+                val at = actEventTimeMs(ev.eventId)
                 candidates.forEachIndexed lines@{ lineIdx, line ->
                     if (!sameSender(ev, line)) return@lines
                     val gap = if (at != null) {
@@ -225,25 +225,22 @@ class ActTaskStore {
             ?.let { it.did ?: it.from } ?: prior?.assignee
         else -> prior?.assignee
     }
+}
 
-    private companion object {
-        const val CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+private const val CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
-        /**
-         * When an event was minted, off the ULID it is named by — the only
-         * time an event carries. Null for an id that is not a ULID, so ids
-         * the server never minted (a test's, a peer's own spelling) fall back
-         * to arrival order.
-         */
-        fun eventTimeMs(eventId: String): Long? {
-            if (eventId.length != 26) return null
-            var ms = 0L
-            for (c in eventId.take(10)) {
-                val digit = CROCKFORD.indexOf(c)
-                if (digit < 0) return null
-                ms = ms * 32 + digit
-            }
-            return ms
-        }
+/**
+ * When an event was minted, off the ULID it is named by — the only time an
+ * event carries. Null for an id that is not a ULID, so ids the server never
+ * minted (a test's, a peer's own spelling) fall back to arrival order.
+ */
+fun actEventTimeMs(eventId: String): Long? {
+    if (eventId.length != 26) return null
+    var ms = 0L
+    for (c in eventId.take(10)) {
+        val digit = CROCKFORD.indexOf(c)
+        if (digit < 0) return null
+        ms = ms * 32 + digit
     }
+    return ms
 }
