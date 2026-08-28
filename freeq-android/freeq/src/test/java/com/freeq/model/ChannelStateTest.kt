@@ -48,6 +48,31 @@ class ChannelStateTest {
         assertEquals("m1", ch.actTasks.task(opener)!!.events[0].msgId)
     }
 
+    @Test fun a_paired_line_draws_a_card_of_its_own_event() {
+        val ch = ChannelState("#work")
+        offer(ch)
+        ch.appendIfNew(msg(id = "m1", from = "poster").copy(actRef = opener))
+        ch.recordActEvent(
+            ActEventInput(
+                from = "worker", did = "did:plc:worker", kind = "handoff", verb = "progress",
+                eventId = "e2", taskId = opener, fields = mapOf("act-note" to "halfway"),
+            )
+        )
+        ch.appendIfNew(msg(id = "m2", from = "worker").copy(actRef = opener))
+
+        // One card per event, each headed by the verb its own event carried.
+        assertEquals("offer", ch.actCards["m1"]!!.event.verb)
+        assertEquals("progress", ch.actCards["m2"]!!.event.verb)
+        assertEquals("ship the release", ch.actCards["m2"]!!.task.title)
+    }
+
+    @Test fun an_event_with_no_line_draws_no_card() {
+        val ch = ChannelState("#work")
+        offer(ch)
+
+        assertTrue(ch.actCards.isEmpty())
+    }
+
     @Test fun an_ordinary_line_joins_nothing() {
         val ch = ChannelState("#work")
         offer(ch)

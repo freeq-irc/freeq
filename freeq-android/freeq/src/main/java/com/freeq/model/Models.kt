@@ -85,6 +85,10 @@ class ChannelState(val name: String) {
     val members = mutableStateListOf<MemberInfo>()
     /** The tasks this channel has seen, keyed by each opener's event id. */
     val actTasks = ActTaskStore()
+    /** The card each companion line draws, keyed by that line's id. Compose
+     *  state, so a line already on screen becomes its card the moment its
+     *  event lands. */
+    val actCards = mutableStateMapOf<String, ActCard>()
     var topic = mutableStateOf("")
     val typingUsers = mutableStateMapOf<String, Date>()
     var lastActivityTime = mutableStateOf(0L)
@@ -132,6 +136,24 @@ class ChannelState(val name: String) {
                 m.actRef?.let { ActLine(m.id, m.from, m.account, m.timestamp.time, it) }
             }
         )
+        refreshActCards()
+    }
+
+    /** File one task event, and hand back the line the room is told, if any. */
+    fun recordActEvent(ev: ActEventInput): String? {
+        val line = actTasks.record(ev)
+        refreshActCards()
+        return line
+    }
+
+    private fun refreshActCards() {
+        for (task in actTasks.tasks.values) {
+            for (ev in task.events) {
+                val id = ev.msgId ?: continue
+                val card = ActCard(task, ev)
+                if (actCards[id] != card) actCards[id] = card
+            }
+        }
     }
 
     /**
@@ -1725,7 +1747,7 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                 } else {
                     state.getOrCreateDM(bufferName)
                 }
-                val line = buf.actTasks.record(
+                val line = buf.recordActEvent(
                     ActEventInput(
                         from = act.from,
                         did = act.did,

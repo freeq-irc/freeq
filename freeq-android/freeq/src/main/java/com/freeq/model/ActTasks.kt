@@ -33,6 +33,9 @@ data class ActTask(
     val events: List<ActTaskEvent> = emptyList(),
 )
 
+/** A task event and the task it belongs to, as one card draws them. */
+data class ActCard(val task: ActTask, val event: ActTaskEvent)
+
 /** What the bridge hands over from `FreeqEvent.Act`. */
 data class ActEventInput(
     val from: String,

@@ -654,13 +654,20 @@ private fun MessageBubble(
                     }
                 }
 
-                // Message text + inline embeds
-                MessageContent(
-                    text = msg.text,
-                    isAction = msg.isAction,
-                    fromNick = msg.from,
-                    onImageClick = onImageClick
-                )
+                // A task event's companion line is that event's card, and
+                // stays one: every event keeps a card of its own.
+                val actCard = channelState.actCards[msg.id]
+                if (actCard != null) {
+                    ActEventCard(actCard)
+                } else {
+                    // Message text + inline embeds
+                    MessageContent(
+                        text = msg.text,
+                        isAction = msg.isAction,
+                        fromNick = msg.from,
+                        onImageClick = onImageClick
+                    )
+                }
 
                 // Reactions
                 if (msg.reactions.isNotEmpty()) {
