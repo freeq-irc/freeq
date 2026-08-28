@@ -2054,6 +2054,12 @@ where
     let mut multiline_batches: std::collections::HashMap<String, InboundMultilineBatch> =
         std::collections::HashMap::new();
     let mut line_buf = String::new();
+    // The task event awaiting the server's answer, and the sends queued behind
+    // it. One at a time: a refusal names no event id, so the only thing that
+    // makes a `FAIL TAGMSG` attributable is there being exactly one send it
+    // could belong to.
+    let mut awaiting_act: Option<AwaitingAct> = None;
+    let mut act_queue: std::collections::VecDeque<Command> = std::collections::VecDeque::new();
     let mut last_activity = tokio::time::Instant::now();
     let ping_interval = tokio::time::Duration::from_secs(60);
     let ping_timeout = tokio::time::Duration::from_secs(120);
@@ -2078,6 +2084,32 @@ where
                 let _ = event_tx.send(Event::RawLine(raw.clone())).await;
 
                 if let Some(msg) = Message::parse(&line_buf) {
+                    // Does this line answer a task event whose line is held?
+                    // The echo of the event itself says the server took it; a
+                    // `FAIL TAGMSG` says it did not. Read before the ordinary
+                    // handling below, which still sees the line as it always
+                    // did.
+                    if let Some(held) = awaiting_act.as_ref() {
+                        let accepted = msg.command == "TAGMSG"
+                            && msg.tags.get(crate::chatsig::EVENT_ID_TAG)
+                                == Some(&held.event_id);
+                        let refused = msg.command == "FAIL"
+                            && msg.params.first().map(String::as_str) == Some("TAGMSG");
+                        if accepted || refused {
+                            let held = awaiting_act.take().expect("checked");
+                            let verdict = if accepted {
+                                Ok(())
+                            } else {
+                                Err(anyhow::anyhow!("{}", msg.params[1..].join(" ")))
+                            };
+                            let verifies = caps_acked.lock().acked.contains(MSGSIG_CAP);
+                            finish_act(&mut writer, held, verdict, &msg_signing_key, &msg_signing_did, verifies).await?;
+                            awaiting_act = next_act(
+                                &mut writer, &mut act_queue, &msg_signing_key, &msg_signing_did, verifies,
+                            )
+                            .await?;
+                        }
+                    }
                     match msg.command.as_str() {
                         // ERR_NICKNAMEINUSE
                         "433" => {
@@ -2264,7 +2296,20 @@ where
                             // Flush any commands that were queued before registration
                             let verifies = caps_acked.lock().acked.contains(MSGSIG_CAP);
                             for cmd in pending_commands.drain(..) {
-                                execute_command(&mut writer, cmd, &msg_signing_key, &msg_signing_did, verifies).await?;
+                                // A task event held back before registration
+                                // waits like any other: it queues here and the
+                                // line follows the server's answer.
+                                if defers_companion(&cmd, &caps_acked) {
+                                    act_queue.push_back(cmd);
+                                } else {
+                                    execute_command(&mut writer, cmd, &msg_signing_key, &msg_signing_did, verifies).await?;
+                                }
+                            }
+                            if awaiting_act.is_none() {
+                                awaiting_act = next_act(
+                                    &mut writer, &mut act_queue, &msg_signing_key, &msg_signing_did, verifies,
+                                )
+                                .await?;
                             }
                         }
                         "353" => {
@@ -2727,7 +2772,21 @@ where
             Some(cmd) = cmd_rx.recv() => {
                 if registered || matches!(cmd, Command::Quit(_)) {
                     let verifies = caps_acked.lock().acked.contains(MSGSIG_CAP);
-                    execute_command(&mut writer, cmd, &msg_signing_key, &msg_signing_did, verifies).await?;
+                    // A task event whose line waits for the answer is started
+                    // here, not in `execute_command`: the answer arrives on the
+                    // read side, which only this loop can see.
+                    if defers_companion(&cmd, &caps_acked) {
+                        if awaiting_act.is_some() {
+                            act_queue.push_back(cmd);
+                        } else {
+                            awaiting_act = begin_act(
+                                &mut writer, cmd, &msg_signing_key, &msg_signing_did, verifies,
+                            )
+                            .await?;
+                        }
+                    } else {
+                        execute_command(&mut writer, cmd, &msg_signing_key, &msg_signing_did, verifies).await?;
+                    }
                     if !registered {
                         break; // Quit before registration
                     }
@@ -2735,6 +2794,18 @@ where
                     // Queue until registered — commands silently wait
                     pending_commands.push(cmd);
                 }
+            }
+            // The line of a task event nobody answered for goes out anyway.
+            _ = tokio::time::sleep_until(
+                awaiting_act.as_ref().map(|a| a.deadline).unwrap_or_else(|| tokio::time::Instant::now() + ACT_ANSWER_WINDOW),
+            ), if awaiting_act.is_some() => {
+                let held = awaiting_act.take().expect("guarded");
+                let verifies = caps_acked.lock().acked.contains(MSGSIG_CAP);
+                finish_act(&mut writer, held, Ok(()), &msg_signing_key, &msg_signing_did, verifies).await?;
+                awaiting_act = next_act(
+                    &mut writer, &mut act_queue, &msg_signing_key, &msg_signing_did, verifies,
+                )
+                .await?;
             }
             // Periodic client-to-server PING and timeout detection
             _ = tokio::time::sleep_until(next_ping) => {
@@ -3034,6 +3105,14 @@ fn sign_coordination_outgoing(
 const ACT_UNSIGNABLE: &str = "a task event must be signed: authenticate, register a signing key, \
                               and address a channel or a DID";
 
+/// How long a task event waits for the server's answer before its line is
+/// sent anyway.
+///
+/// Fail-open on purpose: the companion is what a reader sees, so an accepted
+/// step whose line never went out is invisible to everyone — a worse failure
+/// than the rare late line beside a step that was refused.
+const ACT_ANSWER_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Put a task event on the wire: the signed TAGMSG that *is* the event, then
 /// the plain-text companion that renders it for people.
 ///
@@ -3055,7 +3134,8 @@ async fn send_act_event<W: AsyncWrite + Unpin>(
     signing_key: &Option<ed25519_dalek::SigningKey>,
     signing_did: &Option<String>,
     server_verifies_documents: bool,
-) -> Result<Result<()>> {
+    companion_mode: Companion,
+) -> Result<Result<String>> {
     let (Some(key), Some(did)) = (signing_key, signing_did) else {
         return Ok(Err(anyhow::anyhow!(ACT_UNSIGNABLE)));
     };
@@ -3077,6 +3157,8 @@ async fn send_act_event<W: AsyncWrite + Unpin>(
         .get("+freeq.at/act-id")
         .cloned()
         .unwrap_or_else(|| event_id.to_string());
+    // Handed back so a deferred line can carry the same reference later.
+    let joins = task.clone();
     tags.insert(
         crate::chatsig::EVENT_ID_TAG.to_string(),
         event_id.to_string(),
@@ -3093,7 +3175,7 @@ async fn send_act_event<W: AsyncWrite + Unpin>(
     // The companion is an ordinary message signing its own id, carrying only
     // the reference that joins it to the action. A caller who asked for no
     // line gets none: the event is already on the wire.
-    if !human_text.is_empty() {
+    if !human_text.is_empty() && companion_mode == Companion::Now {
         let mut companion = std::collections::HashMap::from([("+freeq.at/ref".to_string(), task)]);
         sign_outgoing(
             &mut companion,
@@ -3113,7 +3195,180 @@ async fn send_act_event<W: AsyncWrite + Unpin>(
             .write_all(format!("{privmsg}\r\n").as_bytes())
             .await?;
     }
-    Ok(Ok(()))
+    Ok(Ok(joins))
+}
+
+/// A task event on the wire with its line still held back.
+///
+/// Kept by the read loop, which is the only place the answer arrives: the
+/// sender's own echo of the event means it was accepted, and a `FAIL TAGMSG`
+/// means it was not.
+struct AwaitingAct {
+    event_id: String,
+    target: String,
+    /// The action the held line references.
+    joins: String,
+    human_text: String,
+    done: tokio::sync::oneshot::Sender<Result<()>>,
+    deadline: tokio::time::Instant,
+}
+
+/// Whether a task event's companion line goes out with it, or waits for the
+/// server's answer and is sent by the loop that hears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Companion {
+    Now,
+    Deferred,
+}
+
+/// Whether this command is a task event whose line must wait for the answer.
+///
+/// Only when the session holds `echo-message`: without it the server sends no
+/// echo, so there is nothing to wait for and today's behaviour stands. A
+/// caller who asked for no line has nothing to hold back either.
+fn defers_companion(cmd: &Command, caps_acked: &CapsAcked) -> bool {
+    match cmd {
+        Command::Act { human_text, .. } => {
+            !human_text.is_empty() && caps_acked.lock().acked.contains("echo-message")
+        }
+        _ => false,
+    }
+}
+
+/// Put a task event on the wire with its line held back, and return what is
+/// now waiting for the server's answer.
+///
+/// `None` when there is nothing to wait for: a send that could not be signed
+/// is refused here and its caller told, exactly as before.
+async fn begin_act<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    cmd: Command,
+    signing_key: &Option<ed25519_dalek::SigningKey>,
+    signing_did: &Option<String>,
+    server_verifies_documents: bool,
+) -> Result<Option<AwaitingAct>> {
+    let Command::Act {
+        target,
+        event_id,
+        tags,
+        human_text,
+        done,
+    } = cmd
+    else {
+        return Ok(None);
+    };
+    match send_act_event(
+        writer,
+        &target,
+        &event_id,
+        tags,
+        &human_text,
+        signing_key,
+        signing_did,
+        server_verifies_documents,
+        Companion::Deferred,
+    )
+    .await?
+    {
+        Ok(joins) => Ok(Some(AwaitingAct {
+            event_id,
+            target,
+            joins,
+            human_text,
+            done,
+            deadline: tokio::time::Instant::now() + ACT_ANSWER_WINDOW,
+        })),
+        Err(refusal) => {
+            let _ = done.send(Err(refusal));
+            Ok(None)
+        }
+    }
+}
+
+/// Settle a task event that was waiting: on acceptance its line goes out, on
+/// refusal it never does, and either way its caller is told.
+async fn finish_act<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    held: AwaitingAct,
+    verdict: Result<()>,
+    signing_key: &Option<ed25519_dalek::SigningKey>,
+    signing_did: &Option<String>,
+    server_verifies_documents: bool,
+) -> Result<()> {
+    if verdict.is_ok() {
+        write_act_companion(
+            writer,
+            &held.target,
+            &held.joins,
+            &held.human_text,
+            signing_key,
+            signing_did,
+            server_verifies_documents,
+        )
+        .await?;
+    }
+    let _ = held.done.send(verdict);
+    Ok(())
+}
+
+/// Start the next task event queued behind the one that just settled.
+///
+/// Loops past any that cannot be signed, since those settle without waiting.
+async fn next_act<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    queue: &mut std::collections::VecDeque<Command>,
+    signing_key: &Option<ed25519_dalek::SigningKey>,
+    signing_did: &Option<String>,
+    server_verifies_documents: bool,
+) -> Result<Option<AwaitingAct>> {
+    while let Some(cmd) = queue.pop_front() {
+        if let Some(waiting) = begin_act(
+            writer,
+            cmd,
+            signing_key,
+            signing_did,
+            server_verifies_documents,
+        )
+        .await?
+        {
+            return Ok(Some(waiting));
+        }
+    }
+    Ok(None)
+}
+
+/// Write the line that renders a task event, once the event is known to have
+/// been accepted. `joins` is the action the line references, as
+/// [`send_act_event`] handed it back.
+async fn write_act_companion<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    target: &str,
+    joins: &str,
+    human_text: &str,
+    signing_key: &Option<ed25519_dalek::SigningKey>,
+    signing_did: &Option<String>,
+    server_verifies_documents: bool,
+) -> Result<()> {
+    let mut tags =
+        std::collections::HashMap::from([("+freeq.at/ref".to_string(), joins.to_string())]);
+    sign_outgoing(
+        &mut tags,
+        signing_key,
+        signing_did,
+        target,
+        human_text,
+        server_verifies_documents,
+    );
+    let privmsg = crate::irc::Message {
+        tags,
+        prefix: None,
+        command: "PRIVMSG".to_string(),
+        params: vec![target.to_string(), human_text.to_string()],
+    };
+    writer
+        .write_all(format!("{privmsg}\r\n").as_bytes())
+        .await?;
+    Ok(())
 }
 
 /// Execute a single IRC command on the wire.
@@ -3356,6 +3611,7 @@ async fn execute_command<W: AsyncWrite + Unpin>(
                 signing_key,
                 signing_did,
                 server_verifies_documents,
+                Companion::Now,
             )
             .await;
             // A refusal is the caller's answer, not the connection's problem:
@@ -3364,7 +3620,7 @@ async fn execute_command<W: AsyncWrite + Unpin>(
             // — and dropping `done` unsent is what tells the caller so.
             match sent {
                 Ok(refusal) => {
-                    let _ = done.send(refusal);
+                    let _ = done.send(refusal.map(|_| ()));
                 }
                 Err(e) => return Err(e),
             }
@@ -6853,6 +7109,326 @@ mod did_maps_tests {
         .await
         .expect("the connection survives whatever the caller is told");
         (sending.await.unwrap(), String::from_utf8(buf).unwrap())
+    }
+
+    /// A whole session driven through `run_irc`, so a send can be answered.
+    ///
+    /// Returns the handle to send with, the socket end the "server" writes to
+    /// and reads from, and the caps the session negotiated.
+    async fn answering_session(
+        caps: &str,
+    ) -> (ClientHandle, tokio::io::DuplexStream) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let (client_side, mut server_side) = tokio::io::duplex(8192);
+        let (event_tx, _event_rx) = mpsc::channel::<Event>(64);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(16);
+        let echo_registry: EchoRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let caps_acked: CapsAcked = Arc::new(parking_lot::Mutex::new(CapsState::default()));
+        let did_maps: DidMaps = Arc::new(parking_lot::Mutex::new(DidMapsState::default()));
+        let handle = ClientHandle {
+            cmd_tx,
+            echo_registry: echo_registry.clone(),
+            caps_acked: caps_acked.clone(),
+            did_maps: did_maps.clone(),
+        };
+        let config = ConnectConfig {
+            server_addr: "test".to_string(),
+            nick: "tester".to_string(),
+            user: "tester".to_string(),
+            realname: "tester".to_string(),
+            tls: false,
+            tls_insecure: false,
+            web_token: None,
+            websocket_url: None,
+        };
+        let (reader, writer) = tokio::io::split(client_side);
+        tokio::spawn(async move {
+            let _ = run_irc(
+                BufReader::new(reader),
+                writer,
+                &config,
+                None,
+                event_tx,
+                cmd_rx,
+                echo_registry,
+                caps_acked,
+                did_maps,
+            )
+            .await;
+        });
+
+        for line in [
+            format!(":srv CAP * LS :{caps}"),
+            format!(":srv CAP * ACK :{caps}"),
+            ":srv 900 tester :You are now logged in as did:plc:tester".to_string(),
+            // The session key is minted here, so a signing session needs it.
+            ":srv 903 tester :SASL authentication successful".to_string(),
+            ":srv 001 tester :Welcome".to_string(),
+        ] {
+            server_side
+                .write_all(format!("{line}\r\n").as_bytes())
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Drain registration chatter so the duplex does not fill.
+        let mut drain = vec![0u8; 8192];
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            server_side.read(&mut drain),
+        )
+        .await;
+        (handle, server_side)
+    }
+
+    /// Everything the client has written since the last read, as text.
+    async fn wire_since(server_side: &mut tokio::io::DuplexStream, ms: u64) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut out = Vec::new();
+        let mut chunk = vec![0u8; 4096];
+        while let Ok(Ok(n)) = tokio::time::timeout(
+            std::time::Duration::from_millis(ms),
+            server_side.read(&mut chunk),
+        )
+        .await
+        {
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// The tags of a task event, for a session that signs.
+    fn probe_act_tags() -> std::collections::HashMap<String, String> {
+        crate::act::act_tags(
+            "handoff",
+            "progress",
+            Some("01OFFER"),
+            "did:plc:tester",
+            &[("note", "halfway")],
+        )
+    }
+
+    const ACT_CAPS: &str = "message-tags server-time echo-message freeq.at/act freeq.at/msgsig";
+
+    /// The line beside a task event says the step happened, so it waits until
+    /// the server has said the step is allowed.
+    #[tokio::test]
+    async fn the_companion_waits_for_the_event_to_be_accepted() {
+        use tokio::io::AsyncWriteExt;
+
+        let (handle, mut server) = answering_session(ACT_CAPS).await;
+        let sending =
+            tokio::spawn(async move { handle.send_act("#room", probe_act_tags(), Some("halfway")).await });
+
+        let first = wire_since(&mut server, 400).await;
+        assert!(
+            first.contains("TAGMSG"),
+            "the event goes out at once: {first:?}"
+        );
+        assert!(
+            !first.contains("PRIVMSG"),
+            "but its line waits for the answer: {first:?}"
+        );
+
+        // The server accepts it: our own echo of the event comes back.
+        let event = crate::irc::Message::parse(first.lines().next().unwrap()).expect("parses");
+        let event_id = event.tags.get(crate::chatsig::EVENT_ID_TAG).unwrap().clone();
+        server
+            .write_all(
+                format!(
+                    "@{}={event_id} :tester!u@h TAGMSG #room\r\n",
+                    crate::chatsig::EVENT_ID_TAG
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let after = wire_since(&mut server, 300).await;
+        assert!(
+            after.contains("PRIVMSG") && after.contains("halfway"),
+            "and follows once the event is accepted: {after:?}"
+        );
+        sending.await.unwrap().expect("the send succeeded");
+    }
+
+    /// A step the server refuses never gets a line: the prose would say a
+    /// thing happened that did not, and no card could ever attach to it.
+    #[tokio::test]
+    async fn a_refused_event_never_writes_its_line() {
+        use tokio::io::AsyncWriteExt;
+
+        let (handle, mut server) = answering_session(ACT_CAPS).await;
+        let sending =
+            tokio::spawn(async move { handle.send_act("#room", probe_act_tags(), Some("halfway")).await });
+        let first = wire_since(&mut server, 200).await;
+        assert!(first.contains("TAGMSG") && !first.contains("PRIVMSG"), "{first:?}");
+
+        server
+            .write_all(
+                b":srv FAIL TAGMSG ILLEGAL_STEP :That step cannot be taken from the task's current state\r\n",
+            )
+            .await
+            .unwrap();
+
+        let refusal = sending
+            .await
+            .unwrap()
+            .expect_err("the caller is told the step was refused");
+        let said = refusal.to_string();
+        assert!(
+            said.contains("ILLEGAL_STEP"),
+            "carrying the server's own code: {said}"
+        );
+        assert!(
+            said.contains("cannot be taken"),
+            "and its own sentence: {said}"
+        );
+        let after = wire_since(&mut server, 200).await;
+        assert!(
+            !after.contains("PRIVMSG"),
+            "and no line is ever written: {after:?}"
+        );
+    }
+
+    /// A refusal names no event, so the only thing that makes one attributable
+    /// is there being a single send it could belong to. A second send waits:
+    /// its event stays off the wire until the first is answered, and each line
+    /// follows its own event's answer.
+    #[tokio::test]
+    async fn a_second_send_waits_for_the_first_to_be_answered() {
+        use tokio::io::AsyncWriteExt;
+
+        let (handle, mut server) = answering_session(ACT_CAPS).await;
+        let first_handle = handle.clone();
+        let first =
+            tokio::spawn(async move { first_handle.send_act("#room", probe_act_tags(), Some("first")).await });
+        let opened = wire_since(&mut server, 200).await;
+        let first_event = crate::irc::Message::parse(opened.lines().next().unwrap()).expect("parses");
+        let first_id = first_event.tags.get(crate::chatsig::EVENT_ID_TAG).unwrap().clone();
+
+        // The second is issued while the first still awaits its answer.
+        let second =
+            tokio::spawn(async move { handle.send_act("#room", probe_act_tags(), Some("second")).await });
+        let while_waiting = wire_since(&mut server, 250).await;
+        assert!(
+            while_waiting.is_empty(),
+            "the second event stays off the wire until the first is settled: {while_waiting:?}"
+        );
+
+        // The first is accepted: its line goes out, and the second event follows.
+        server
+            .write_all(
+                format!(
+                    "@{}={first_id} :tester!u@h TAGMSG #room\r\n",
+                    crate::chatsig::EVENT_ID_TAG
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let released = wire_since(&mut server, 300).await;
+        assert!(
+            released.contains("PRIVMSG") && released.contains("first"),
+            "the first line follows its own answer: {released:?}"
+        );
+        assert!(
+            released.contains("TAGMSG"),
+            "and the second event goes out behind it: {released:?}"
+        );
+        assert!(
+            !released.contains("second"),
+            "while the second line still waits for its own answer: {released:?}"
+        );
+        first.await.unwrap().expect("the first send succeeded");
+
+        let second_event = crate::irc::Message::parse(
+            released
+                .lines()
+                .find(|l| l.contains("TAGMSG"))
+                .expect("the second event"),
+        )
+        .expect("parses");
+        let second_id = second_event.tags.get(crate::chatsig::EVENT_ID_TAG).unwrap().clone();
+        assert_ne!(second_id, first_id, "a send of its own: {released:?}");
+
+        server
+            .write_all(
+                format!(
+                    "@{}={second_id} :tester!u@h TAGMSG #room\r\n",
+                    crate::chatsig::EVENT_ID_TAG
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let after = wire_since(&mut server, 300).await;
+        assert!(
+            after.contains("PRIVMSG") && after.contains("second"),
+            "and the second line follows its own answer: {after:?}"
+        );
+        second.await.unwrap().expect("the second send succeeded");
+    }
+
+    /// A server that answers neither way must not cost the room the line: an
+    /// accepted step nobody can see is worse than a late one beside a refusal.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_event_writes_its_line_anyway() {
+        let (handle, mut server) = answering_session(ACT_CAPS).await;
+        let sending =
+            tokio::spawn(async move { handle.send_act("#room", probe_act_tags(), Some("halfway")).await });
+        let first = wire_since(&mut server, 200).await;
+        assert!(first.contains("TAGMSG") && !first.contains("PRIVMSG"), "{first:?}");
+
+        tokio::time::advance(ACT_ANSWER_WINDOW + std::time::Duration::from_secs(1)).await;
+
+        let after = wire_since(&mut server, 200).await;
+        assert!(
+            after.contains("PRIVMSG") && after.contains("halfway"),
+            "the line goes out once the window has passed: {after:?}"
+        );
+        sending.await.unwrap().expect("and the caller is not told of a failure");
+    }
+
+    /// Without `echo-message` there is no answer to wait for, so both halves
+    /// go out together, exactly as they always did.
+    #[tokio::test]
+    async fn without_the_echo_capability_both_halves_go_out_at_once() {
+        let (handle, mut server) =
+            answering_session("message-tags server-time freeq.at/act freeq.at/msgsig").await;
+        let sending =
+            tokio::spawn(async move { handle.send_act("#room", probe_act_tags(), Some("halfway")).await });
+
+        let wire = wire_since(&mut server, 300).await;
+        assert!(wire.contains("TAGMSG"), "{wire:?}");
+        assert!(
+            wire.contains("PRIVMSG") && wire.contains("halfway"),
+            "the line does not wait for an echo that will never come: {wire:?}"
+        );
+        sending.await.unwrap().expect("the send succeeded");
+    }
+
+    /// A caller who asked for no line waits for nothing: the event is the
+    /// whole send, and the call returns as soon as it is on the wire.
+    #[tokio::test]
+    async fn a_send_with_no_line_asked_for_waits_for_nothing() {
+        let (handle, mut server) = answering_session(ACT_CAPS).await;
+        let sent = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            handle.send_act("#room", probe_act_tags(), Some("")),
+        )
+        .await
+        .expect("the call does not wait on an answer")
+        .expect("the event was sent");
+        assert!(!sent.is_empty(), "and its id came back");
+
+        let wire = wire_since(&mut server, 200).await;
+        assert!(wire.contains("TAGMSG"), "{wire:?}");
+        assert!(!wire.contains("PRIVMSG"), "with no line beside it: {wire:?}");
     }
 
     /// A kind and a verb this SDK has never heard of go out signed. Nothing in
