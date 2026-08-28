@@ -73,6 +73,39 @@ class ChannelStateTest {
         assertTrue(ch.actCards.isEmpty())
     }
 
+    @Test fun a_wire_message_becomes_a_card_through_the_mapper() {
+        // The whole path a companion takes: the FFI message with the tags the
+        // server put on the wire, through the mapper, into the channel, joined
+        // to an event carrying the fields the SDK hands over.
+        val ch = ChannelState("#work")
+        ch.recordActEvent(
+            ActEventInput(
+                from = "actposter", did = "did:key:zPoster", kind = "handoff", verb = "offer",
+                eventId = opener, taskId = opener,
+                fields = mapOf(
+                    "act" to "handoff",
+                    "act-title" to "update the release notes",
+                    "act-verb" to "offer",
+                ),
+            )
+        )
+        val wire = com.freeq.ffi.IrcMessage(
+            fromNick = "actposter", target = "#work",
+            text = "offered: update the release notes", msgid = "m1",
+            replyTo = null, replacesMsgid = null, editOf = null, batchId = null,
+            pinMsgid = null, unpinMsgid = null, isAction = false, isSigned = true,
+            timestampMs = 1_700_000_000_000L, account = "did:key:zPoster", origin = null,
+            reactions = emptyList(), edited = false, dmKey = null, coordination = null,
+            tags = listOf(com.freeq.ffi.TagEntry("+freeq.at/ref", opener)),
+        )
+        ch.appendIfNew(MessageMapper.fromIrc(wire))
+
+        val card = ch.actCards["m1"]
+        assertNotNull("the companion line must draw a card", card)
+        assertEquals("offered", ActVerbs.headline(card!!.event.verb))
+        assertEquals("update the release notes", card.task.title)
+    }
+
     @Test fun an_ordinary_line_joins_nothing() {
         val ch = ChannelState("#work")
         offer(ch)
