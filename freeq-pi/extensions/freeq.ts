@@ -219,6 +219,14 @@ export default function (pi: ExtensionAPI): void {
     if (!cfg.enabled) return "freeq is disabled (`/freeq on` to enable)";
     if (!isDid(cfg.ownerDid)) return "freeq: not logged in — run `/freeq login <did:plc:…>`";
     if (conn && conn.state !== "offline") return `freeq: already ${conn.state}`;
+    // An existing-but-offline connection still owns a bot and possibly a
+    // socket the transport is retrying. Replacing it without stopping it
+    // leaks a session, which is how one pi process ended up holding three
+    // connections and answering every mention three times.
+    if (conn) {
+      await conn.stop("replaced");
+      conn = undefined;
+    }
 
     // Claim the installation's single connection slot.
     lock ??= new ConnectionLock(ConnectionLock.pathFor(agentDir));
