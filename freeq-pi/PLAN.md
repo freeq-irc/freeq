@@ -11,7 +11,7 @@ Design: `docs/PI-FREEQ-MULTIPLAYER.md`. Pitch: `docs/PI-FREEQ-PITCH.md`.
 | M1 — package skeleton | **DONE** ✅ | two installs mutually visible w/ metadata + DIDs |
 | M2 — tool + tiered inbound | **DONE** ✅ | cross-agent ask verified; tier gate holds |
 | M3 — humans in the room | **DONE** ✅ | Demo 2 verified: human → agent → answer in room |
-| M4 — handoffs | not started | **the product**; only after the recorded 2-laptop demo |
+| M4 — handoffs | not started | **the product**; unblocked — cross-machine demo done |
 
 ## Reading list — done
 
@@ -335,6 +335,10 @@ handler needs.
       second person**; record it (this is the deliverable to show the pi team)
 - [x] **M3**: humans in the room (Demo 2), outbound scrubber, `/freeq mute`,
       batched notifications, DEMO.md — **v0.1 feature-complete**
-- [ ] **Record the two-laptop demo** (needs a second person) — the deliverable
+- [x] **Two-MACHINE demo** — laptop ↔ reth, production server, full arc
+      (refused → trust → answered → humans in the room). See `DEMO-RESULTS.md`.
+      Everything mechanical in the v0.1 criterion is proven.
+- [ ] **Re-run with a real second person** — the only remaining gap; both
+      identities in tonight's run were Chad's. Then record it.
 - [ ] **M4**: handoffs — durable delegation. `ask` was the wedge; this is the
       product, and the thing local multiplayer extensions cannot do.
