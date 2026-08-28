@@ -1121,6 +1121,52 @@ async fn replay_carries_the_receipts_to_capability_holders_only() {
     .await;
 }
 
+/// History is the only way a task event reaches a direct conversation twice:
+/// a DM has no join to replay it. A client that comes back to a thread asks
+/// for its history, so the events it holds must come back with the messages.
+#[tokio::test]
+async fn history_carries_a_direct_conversation_s_task_events() {
+    let ka = key();
+    // Bob connects twice — once to receive the event live, once to come back
+    // and ask for it — so his key is built from fixed bytes rather than
+    // generated, since a generated one cannot be handed to two clients.
+    let kb = PrivateKey::ed25519_from_bytes(&[11u8; 32]).unwrap();
+    let kb_again = PrivateKey::ed25519_from_bytes(&[11u8; 32]).unwrap();
+    let (addr, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    run(addr, move |addr| {
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut b = C::authenticated(addr, "bob", DID_BOB, kb, ACT_CAPS);
+        let mut a = C::authenticated(addr, "alice", DID_ALICE, ka, ACT_CAPS);
+        a.msgsig(&alice_key);
+
+        let venue = freeq_sdk::chatsig::dm_venue(DID_ALICE, DID_BOB);
+        let id = fresh_id();
+        let tags = offer_tags();
+        let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let sig = freeq_sdk::act::sign_act(pairs, &venue, &id, &alice_key).unwrap();
+        let mut wire: Vec<String> = tags.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        wire.push(format!("{EVENT_ID_TAG}={id}"));
+        wire.push(format!("+freeq.at/sig={sig}"));
+        a.tx(&format!("@{} TAGMSG {DID_BOB}", wire.join(";")));
+        b.rx(|l| l.contains("+freeq.at/act="), "the task reaches bob live");
+        // A message too, so the batch has one of each to interleave.
+        a.tx(&format!("PRIVMSG {DID_BOB} :a line about it"));
+        b.rx(|l| l.contains("a line about it"), "and so does the line");
+
+        // Bob comes back to the thread and asks for it.
+        let mut back = C::authenticated(addr, "bob2", DID_BOB, kb_again, ACT_CAPS);
+        back.tx(&format!("CHATHISTORY LATEST {DID_ALICE} * 50"));
+        let replayed = back
+            .maybe(|l| l.contains("+freeq.at/act="), 3_000)
+            .expect("the conversation's task events come back with its history");
+        assert!(
+            replayed.contains(&id),
+            "and it is the event that was sent: {replayed}"
+        );
+    })
+    .await;
+}
+
 // ── bounty: the second kind, and no code of its own ─────────────────────────
 
 /// A bounty step, signed. `accepts` is the bid an award takes.

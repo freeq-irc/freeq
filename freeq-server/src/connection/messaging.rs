@@ -160,6 +160,20 @@ pub(crate) fn signing_venue(
     Some(freeq_sdk::chatsig::dm_venue(sender_did, &recipient))
 }
 
+/// The venue whose task events answer a history request for `target`.
+///
+/// The same venue the write path signs into: a channel's own, and for a direct
+/// conversation the pair of DIDs. `venue_of` cannot serve here — for a DM it
+/// returns the bare target, which is half of the venue and matches nothing.
+/// Falls back to the target's own venue when the asker has no DID, which is a
+/// connection that cannot hold DM history anyway.
+fn act_replay_venue(state: &Arc<SharedState>, conn: &Connection, target: &str) -> String {
+    conn.authenticated_did
+        .as_deref()
+        .and_then(|did| signing_venue(state, did, target))
+        .unwrap_or_else(|| crate::events::venue_of(target))
+}
+
 /// Build the document a chat message's signature covers.
 fn message_document<'a>(
     did: &'a str,
@@ -2691,6 +2705,7 @@ pub(super) fn handle_chathistory(
             vec![],
             None,
             raw_target,
+            raw_target,
             "chathistory",
             state,
             server_name,
@@ -2897,6 +2912,11 @@ pub(super) fn handle_chathistory(
     replay_rows_as_batch(
         messages,
         act_window,
+        // A task event is filed under the venue it was signed for, which for a
+        // direct conversation is both DIDs — not the one the asker addressed.
+        // Reading it back by the target alone matched nothing, so a DM's task
+        // events never replayed at all.
+        &act_replay_venue(state, conn, &target),
         &target,
         "chathistory",
         state,
@@ -2976,6 +2996,7 @@ pub(super) fn handle_search(
         messages,
         None,
         &target,
+        &target,
         "freeq.at/search",
         state,
         server_name,
@@ -3000,6 +3021,7 @@ pub(super) fn handle_search(
 fn replay_rows_as_batch(
     messages: Vec<crate::db::MessageRow>,
     act_window: Option<(i64, i64, usize)>,
+    act_venue: &str,
     target: &str,
     batch_type: &str,
     state: &Arc<SharedState>,
@@ -3035,7 +3057,7 @@ fn replay_rows_as_batch(
         Some((from_ts, to_ts, limit)) => super::act::replay_lines(
             state,
             session_id,
-            &crate::events::venue_of(&target),
+            act_venue,
             &target,
             from_ts,
             to_ts,
