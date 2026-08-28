@@ -16,10 +16,11 @@
     "extensions",
     "skills",
     "dist",
-    "README.md"
+    "README.md",
+    "scripts"
   ],
   "scripts": {
-    "prebuild": "cd ../freeq-bot-kit-js && npm install --silent && npm run build",
+    "prebuild": "node scripts/build-deps.mjs",
     "build": "tsc",
     "dev": "tsc --watch",
     "test": "vitest run",
@@ -33,7 +34,8 @@
     "verify:handoff": "tsx spike/handoff-check.ts",
     "verify:churn": "tsx spike/churn-check.ts",
     "verify:claim": "tsx spike/claim-check.ts",
-    "verify:sig": "tsx spike/verify-check.ts"
+    "verify:sig": "tsx spike/verify-check.ts",
+    "prepare": "node scripts/build-deps.mjs"
   },
   "dependencies": {
     "@freeq/bot-kit": "file:../freeq-bot-kit-js",

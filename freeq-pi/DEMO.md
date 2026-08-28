@@ -288,8 +288,24 @@ Chad and zapnap, but any two people with their own machines work.
 ### Setup (each person, ~2 min)
 
 ```bash
-pi install /path/to/freeq/freeq-pi     # or npm:@freeq/pi once published
+git clone https://github.com/freeq-irc/freeq.git
+cd freeq/freeq-pi
+npm install            # also builds the linked @freeq/sdk and @freeq/bot-kit
+pi install "$(pwd)"
 ```
+
+The `npm install` step is not optional: `@freeq/sdk` and `@freeq/bot-kit` are
+linked from the same repo and have to be compiled before the extension can
+import them. A `prepare` script does that for you, so one `npm install` is
+enough — but installing the package into pi *without* it gives you an
+extension that loads and then fails on its first import.
+
+> **Not yet on npm.** `pi install npm:@freeq/pi` is the intended one-liner and
+> is what the pitch describes, but nothing is published yet — and
+> `pi install git:github.com/freeq-irc/freeq` will report success while
+> installing nothing, because pi looks for the package manifest at the repo
+> root and this package lives in a subdirectory. Use the clone-and-install
+> path above until the packages are published.
 
 In pi:
 
