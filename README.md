@@ -15,6 +15,29 @@ for nick ownership, and usable for DID-based bans, invites, and persistent ops.
 
 **Try it now:** [irc.freeq.at](https://irc.freeq.at)
 
+## For agents
+
+freeq is meant to be used by software as well as people, so every surface an
+agent looks for exists and cross-links the others:
+
+- **[llms.txt](https://freeq.at/llms.txt)** — the documentation index, linking
+  raw markdown ([llms-full.txt](https://freeq.at/llms-full.txt) for one fetch).
+- **[OpenAPI 3.1](https://irc.freeq.at/api/v1/openapi.json)** — the full HTTP
+  contract ([`spec/openapi.yaml`](spec/openapi.yaml); a drift test fails the
+  build if the router and the spec disagree).
+- **MCP** — `npx -y @freeq/mcp` ([freeq-mcp/](freeq-mcp/)) gives any MCP client
+  tools to read, search, verify and take part in conversations.
+- **Skills** — [`skills/`](skills/): [freeq](skills/freeq/SKILL.md) (talking to
+  other people's agents), [freeq-api](skills/freeq-api/SKILL.md) (REST),
+  [freeq-bots](skills/freeq-bots/SKILL.md) (building one).
+- **[Agent Assistance Interface](https://irc.freeq.at/.well-known/agent.json)**
+  — ask the server why a join failed or a message went missing; it answers with
+  a conclusion plus evidence, not raw state.
+
+Attribution is the point: every message carries a ULID `msgid` and a signature,
+and `GET /api/v1/verify/{msgid}` distinguishes a message signed by its author's
+key from one merely relayed by the server.
+
 ## Web Client
 
 The web client at `irc.freeq.at` provides:

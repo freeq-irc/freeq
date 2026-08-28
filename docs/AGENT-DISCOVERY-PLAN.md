@@ -9,9 +9,9 @@
 | 1. OpenAPI spec + drift test | **done** | `spec/openapi.yaml` (82 paths, 3.1.0) served at `/api/v1/openapi.{json,yaml}`; 7 unit + 4 acceptance tests |
 | 2. llms.txt | **done** | `/llms.txt` on server + freeq.at, `/llms-full.txt`, `/docs/<slug>.md` raw markdown, repo-root `llms.txt`; 11 pytest |
 | 3a. `@freeq/mcp` stdio | **done** | `freeq-mcp/` — 17 tools, 3 resources, 87 vitest; verified against production over stdio |
-| 3b. remote MCP `/mcp` | todo | |
-| 4. `skills/` | todo | |
-| 5. tie-together + deploy | todo | |
+| 3b. remote MCP `/mcp` | todo | the one phase left |
+| 4. `skills/` | **done** | `skills/{freeq,freeq-api,freeq-bots}`; 6 pytest keep them valid |
+| 5. tie-together | **done** | `agent.json` surfaces, README "For agents", `/agents` page, llms.txt entries. Deploy not run — needs a human. |
 
 ### Deviations from the original plan
 
@@ -109,6 +109,38 @@ wrapping `@freeq/sdk` for IRC and the REST API for reads.
   refusals, resources).
 - CI gained an `mcp` job: install, build, test, plus a smoke step that imports
   the built entry point as plain ESM.
+
+### Phases 4 & 5 as built
+
+- `skills/freeq` — the pi skill generalized: a capability table mapping each
+  action to MCP tools, the pi extension, or raw HTTP, so it is useful whatever
+  the host provides. Keeps the untrusted-input and never-send rules verbatim,
+  and adds the attribution section (verify before you quote; guest mode means
+  nothing you send is attributable).
+- `skills/freeq-api` — REST recipes, the `%23` gotcha, what 403/503 actually
+  mean, how to read a verify result, and where a bearer token comes from.
+- `skills/freeq-bots` — shortest working bot, the two-DIDs distinction
+  (agent key vs owner) that causes most bad bot designs, channel etiquette,
+  and "ask the server" rather than guessing.
+- Kept in the repo rather than copied into `@freeq/mcp`. The plan floated
+  bundling them in the npm package; a physical copy is exactly the divergence
+  the plan itself warned about, and MCP clients read SKILL.md from a checkout,
+  not from `node_modules`. `freeq-pi` keeps its own pi-specific copy, which is
+  a different document (it speaks in `freeq({action:…})` calls), not a stale
+  duplicate.
+- 6 pytest in `freeq-site/tests/test_skills.py`: frontmatter parses, `name`
+  matches the directory, the description is long enough to route on and says
+  when to use the skill, cross-references resolve, and every
+  `freeq.at/docs/<slug>.md` link names a mapped doc. They live in the site
+  suite because it is the only CI pytest that sees the repo root — and a
+  malformed SKILL.md fails *silently* in every consumer, which is the worst
+  kind of broken.
+- Tie-together: `/.well-known/agent.json` `surfaces` now includes `skills`;
+  README gained a "For agents" section; the site's `/agents` page gained a
+  "Four ways in" table; both llms.txt files list the skills.
+- **Not done: deploy.** `./deploy/deploy.sh` (server) and `freeq-site/deploy.sh`
+  (site, needs `MIREN_CLUSTER`) are human-run. `@freeq/mcp` is unpublished —
+  `npm publish` needs credentials.
 
 **Bug found and fixed along the way:** `@freeq/sdk`'s
 `import spec from './identity-claims.json'` had no `with { type: 'json' }`.

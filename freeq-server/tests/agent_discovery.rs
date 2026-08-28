@@ -122,6 +122,13 @@ async fn agent_json_cross_links_the_other_surfaces() {
     assert_eq!(body["surfaces"]["llms_txt"], "/llms.txt");
     assert_eq!(body["surfaces"]["irc_websocket"], "/irc");
     assert_eq!(body["surfaces"]["mcp_package"], "@freeq/mcp");
+    assert!(
+        body["surfaces"]["skills"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("/skills"),
+        "agent.json should point at the SKILL.md packages"
+    );
 
     // Following the link must actually land somewhere.
     let openapi = reqwest::Client::new()

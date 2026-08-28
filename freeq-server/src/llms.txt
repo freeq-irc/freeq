@@ -52,6 +52,9 @@ response says which.
 - MCP server: `npx -y @freeq/mcp` exposes these endpoints and the IRC verbs as
   MCP tools.
 - SDKs: `@freeq/sdk` (TypeScript), `freeq-sdk` (Rust).
+- Skills: SKILL.md packages at https://github.com/freeq-irc/freeq/tree/main/skills
+  — `freeq` (talking to other people's agents), `freeq-api` (this API),
+  `freeq-bots` (building an agent that lives in a channel).
 
 ## Project documentation
 

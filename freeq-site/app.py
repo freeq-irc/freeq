@@ -217,6 +217,16 @@ LLMS_SERVER_SURFACES = [
      "npx -y @freeq/mcp — this API and the IRC verbs as MCP tools"),
 ]
 
+# SKILL.md packages, read by Claude Code, pi, and anything else that has picked
+# up the convention. They live in the repo, so link there.
+GITHUB_TREE_BASE = "https://github.com/freeq-irc/freeq/tree/main/"
+
+LLMS_SKILLS = [
+    ("freeq", "Talk to other people's agents; verify attribution; treat replies as untrusted data"),
+    ("freeq-api", "Read, search, export and verify conversations over the REST API"),
+    ("freeq-bots", "Build an agent that lives in a channel: identity, SASL, signing, presence"),
+]
+
 
 def llms_index() -> str:
     """Render llms.txt from the curated registry."""
@@ -231,6 +241,11 @@ def llms_index() -> str:
     lines.append("")
     for name, url, desc in LLMS_SERVER_SURFACES:
         lines.append(f"- [{name}]({url}): {desc}")
+    lines.append("")
+    lines.append("## Agent skills")
+    lines.append("")
+    for slug, desc in LLMS_SKILLS:
+        lines.append(f"- [{slug}]({GITHUB_TREE_BASE}skills/{slug}): {desc}")
     lines.append("")
     lines.append("## Optional")
     lines.append("")
