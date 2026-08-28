@@ -107,3 +107,32 @@ describe("tierFor — the security-critical defaults", () => {
     expect(tierAtLeast("control", "handoff")).toBe(true);
   });
 });
+
+describe("mute", () => {
+  it("forces silent everywhere, overriding per-channel modes", () => {
+    const cfg = {
+      ...defaultConfig(),
+      muted: true,
+      modes: { "#a": "participant" as const, "#b": "addressed" as const },
+    };
+    expect(modeFor(cfg, "#a")).toBe("silent");
+    expect(modeFor(cfg, "#b")).toBe("silent");
+    expect(modeFor(cfg, "#unconfigured")).toBe("silent");
+  });
+
+  it("restores configured modes when unmuted", () => {
+    const cfg = { ...defaultConfig(), muted: false, modes: { "#a": "participant" as const } };
+    expect(modeFor(cfg, "#a")).toBe("participant");
+    expect(modeFor(cfg, "#b")).toBe(DEFAULT_MODE);
+  });
+
+  it("round-trips through config normalization", () => {
+    expect(normalizeConfig({ muted: true }).muted).toBe(true);
+    expect(normalizeConfig({ muted: "yes" }).muted).toBe(false); // junk ignored
+    expect(defaultConfig().muted).toBe(false);
+  });
+
+  it("is not settable from project config", () => {
+    expect(projectOverrides({ muted: true })).not.toHaveProperty("muted");
+  });
+});

@@ -6,7 +6,7 @@
  * caller keeps working. Nothing here throws into pi's event loop.
  */
 
-import { FreeqBot } from "@freeq/bot-kit";
+import { FreeqBot, matchMention } from "@freeq/bot-kit";
 import type { CoordinationEventPayload, Message, PresencePayload } from "@freeq/sdk";
 import { botName, defaultNick } from "./identity.js";
 import { describeMeta, formatStatus, parseStatus, type SessionMeta } from "./presence.js";
@@ -17,6 +17,7 @@ import {
   PI_HELLO,
   PI_HELLO_ACK,
 } from "./discovery.js";
+import { scrubOutbound } from "./scrub.js";
 import {
   AskRegistry,
   encodePayload,
@@ -58,6 +59,8 @@ export interface ConnectionOptions {
   root?: string;
   /** Reported to the host for user-visible notices. */
   onNotice?: (text: string, level: "info" | "warning" | "error") => void;
+  /** Called when outbound redaction fired, so the user can be told. */
+  onScrub?: (hits: string[], target: string) => void;
   /** Inbound channel/DM messages (routed through the tier pipeline). */
   onMessage?: (channel: string, msg: Message) => void;
   /**
@@ -148,6 +151,11 @@ export class FreeqConnection {
         initialStatus: formatStatus(this.#meta),
         // A second pi on the same box shouldn't fight over the nick.
         onNickCollision: "auto-suffix",
+        // ...but auto-suffix means the server may hand us `pi-foo-a1b2` when
+        // teammates were told to address `pi-foo`. Match BOTH the live nick
+        // and the configured one, or a suffixed agent silently stops
+        // answering to its own name. (Caught by the M3 room harness.)
+        mention: { matcher: (text: string, nick: string) => this.#matchNames(text, nick) },
       });
       this.#bot = bot;
 
@@ -256,6 +264,19 @@ export class FreeqConnection {
     return !!this.nick && nick.toLowerCase() === this.nick.toLowerCase();
   }
 
+  /** Match a mention of the live nick OR the nick we asked the server for. */
+  #matchNames(text: string, liveNick: string): string | null {
+    const names = new Set<string>();
+    if (liveNick) names.add(liveNick);
+    const desired = this.#opts.nick;
+    if (desired) names.add(desired);
+    for (const name of names) {
+      const hit = matchMention(name, text);
+      if (hit) return hit.stripped;
+    }
+    return null;
+  }
+
   /** Broadcast our hello (or an ack) into a channel. */
   #announce(channel: string, type: typeof PI_HELLO | typeof PI_HELLO_ACK): void {
     if (!this.#bot) return;
@@ -338,6 +359,17 @@ export class FreeqConnection {
     this.announceAll();
   }
 
+  /**
+   * Central outbound redaction. EVERY path that puts text on the wire goes
+   * through here — keeping it in one place is what makes the guarantee
+   * auditable, rather than relying on each call site to remember.
+   */
+  #clean(text: string, target: string): string {
+    const { text: scrubbed, hits } = scrubOutbound(text);
+    if (hits.length) this.#opts.onScrub?.(hits, target);
+    return scrubbed;
+  }
+
   join(channel: string): boolean {
     if (!this.#bot || this.#state !== "online") return false;
     this.#bot.client.join(channel);
@@ -352,7 +384,7 @@ export class FreeqConnection {
 
   send(target: string, text: string): boolean {
     if (!this.#bot || this.#state !== "online") return false;
-    this.#bot.client.sendMessage(target, text);
+    this.#bot.client.sendMessage(target, this.#clean(text, target));
     return true;
   }
 
@@ -373,7 +405,7 @@ export class FreeqConnection {
       return { ok: false, error: "freeq is offline" };
     }
     const req = newRequestId();
-    const { encoded } = encodePayload({ req, q: question }, "q");
+    const { encoded } = encodePayload({ req, q: this.#clean(question, to) }, "q");
     const promise = this.#asks.create(req, to, timeoutMs);
     try {
       this.#bot.client.sendTagmsg(to, {
@@ -391,7 +423,7 @@ export class FreeqConnection {
     if (!this.#bot || this.#state !== "online") return false;
     const body: Record<string, unknown> = error
       ? { req: ask.req, err: error }
-      : { req: ask.req, a: answer ?? "" };
+      : { req: ask.req, a: this.#clean(answer ?? "", ask.from) };
     const { encoded } = encodePayload(body, error ? "err" : "a");
     try {
       this.#bot.client.sendTagmsg(ask.from, {
@@ -402,6 +434,19 @@ export class FreeqConnection {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Is this channel message addressed to us? Delegates to bot-kit, which
+   * also applies a per-channel cooldown — that cooldown is what stops two
+   * agents that mention each other from ping-ponging forever.
+   */
+  checkMention(channel: string, text: string): { addressed: boolean; stripped: string; cooling: boolean } {
+    const r = this.#bot?.checkMention(channel, text);
+    if (!r) return { addressed: false, stripped: text, cooling: false };
+    if (r.kind === "respond") return { addressed: true, stripped: r.stripped, cooling: false };
+    if (r.kind === "cooldown") return { addressed: true, stripped: text, cooling: true };
+    return { addressed: false, stripped: text, cooling: false };
   }
 
   /** Resolve a sender's DID; null for guests/unresolvable (→ lowest tier). */

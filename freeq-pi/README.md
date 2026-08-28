@@ -54,7 +54,8 @@ Other actions: `peers`, `send`, `say`. See `skills/freeq/SKILL.md`.
 | `/freeq join #c` / `/freeq leave #c` | channel membership |
 | `/freeq mode #c <silent\|addressed\|participant>` | how the agent behaves in a channel |
 | `/freeq trust <did> <tier>` | grant a peer authority (confirmation required) |
-| `/freeq on` / `/freeq off` | master switch |
+| `/freeq mute` / `/freeq unmute` | stay connected but say nothing anywhere |
+| `/freeq on` / `/freeq off` | master switch (disconnects) |
 
 ## Security model
 
@@ -95,7 +96,8 @@ engages when spoken to or handed work), `silent`, `participant`.
 ## Development
 
 ```bash
-npm install && npm test          # 65+ unit tests
+npm install && npm test          # 90 unit tests
+npm run verify                   # tests + 3 live harnesses (needs a local server)
 npm run build
 
 # Live checks against a local server (do NOT develop against production):
@@ -108,8 +110,24 @@ npx tsx spike/ask-check.ts   --server ws://127.0.0.1:18080/irc   # cross-agent a
 
 `spike/` holds test harnesses, not product code.
 
-## Status
+## Outbound redaction
 
-M0–M2 complete: identity, discovery, presence, the `freeq` tool, and the
-tiered inbound pipeline with `ask`. Handoffs (durable delegation that survives
-the recipient being offline) are M4 — see `PLAN.md`.
+Everything this agent sends is redacted for secrets (tokens, keys, PEM blocks,
+credentials in URLs) **and absolute filesystem paths**, centrally in the
+connection layer so no code path can bypass it. Paths matter because freeq
+history is durable and often public: during development an agent answered
+"which repo are you in?" with a full home-directory path, and that message is
+still in public channel history. You'll get a notice naming what was removed.
+
+## Status — v0.1
+
+Complete: installation identity, peer discovery, presence, the `freeq` tool
+(`peers`/`ask`/`send`/`say`), the tiered inbound pipeline, channel
+participation with humans, and outbound redaction.
+
+**Not yet built: handoffs** — durable delegation that survives the recipient
+being offline. `ask` is the wedge; handoff is the product, and it's the thing
+local (same-filesystem) multiplayer extensions fundamentally cannot provide.
+See `PLAN.md` (M4).
+
+To demo or test this, read `DEMO.md`.

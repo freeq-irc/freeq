@@ -44,10 +44,45 @@ export default function (pi: ExtensionAPI): void {
   let conn: FreeqConnection | undefined;
   let agentDir = getAgentDir();
 
-  /** Inbound asks awaiting this session's answer, in arrival order. */
-  const pendingAsks: InboundAsk[] = [];
-  /** Text of the most recent assistant turn, used to answer an ask. */
+  /**
+   * Things this session owes a reply to, in arrival order: peer asks, and
+   * channel messages that addressed us (Demo 2 — humans in the room).
+   */
+  type PendingReply =
+    | { kind: "ask"; ask: InboundAsk }
+    | { kind: "channel"; channel: string; from: string };
+  const pendingReplies: PendingReply[] = [];
+  /** Text of the most recent assistant turn, used to form replies. */
   let lastAssistantText = "";
+
+  /**
+   * OBSERVE-tier traffic is surfaced, not injected — but one notification per
+   * message would drown the TUI in a busy channel, so they're batched.
+   */
+  const observed: string[] = [];
+  let observeTimer: NodeJS.Timeout | undefined;
+  function surface(ctx: ExtensionContext, line: string): void {
+    observed.push(line);
+    if (observeTimer) return;
+    observeTimer = setTimeout(() => {
+      observeTimer = undefined;
+      const batch = observed.splice(0, observed.length);
+      if (!batch.length) return;
+      const head = batch.slice(0, 8);
+      const more = batch.length - head.length;
+      notify(
+        ctx,
+        `freeq (${batch.length} message${batch.length === 1 ? "" : "s"}):\n` +
+          head.join("\n") +
+          (more > 0 ? `\n…and ${more} more` : ""),
+        "info",
+      );
+    }, 4000);
+    observeTimer.unref?.();
+  }
+
+  /** Channel replies are chat, not essays. */
+  const MAX_CHANNEL_REPLY = 1200;
 
   const notify = (
     ctx: ExtensionContext | undefined,
@@ -83,11 +118,16 @@ export default function (pi: ExtensionAPI): void {
    * that may call `pi.sendUserMessage`, and it refuses to do so unless
    * `decideInbound` said so.
    */
-  function deliver(ctx: ExtensionContext, ev: InboundEvent, ask?: InboundAsk): void {
+  function deliver(
+    ctx: ExtensionContext,
+    ev: InboundEvent,
+    opts?: { ask?: InboundAsk; replyToChannel?: boolean },
+  ): void {
+    const ask = opts?.ask;
     const decision = decideInbound(ev);
 
     if (!reachesModel(decision.action)) {
-      if (decision.action === "surface") notify(ctx, summarize(ev, decision), "info");
+      if (decision.action === "surface") surface(ctx, summarize(ev, decision));
       // An unanswerable ask still gets a reply — silence is indistinguishable
       // from a broken agent on the far side.
       if (ask && conn) {
@@ -96,14 +136,19 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
-    if (ask) pendingAsks.push(ask);
-    const framed = frameInbound(ev, { expectsReply: !!ask });
+    const expectsReply = !!ask || !!opts?.replyToChannel;
+    if (ask) {
+      pendingReplies.push({ kind: "ask", ask });
+    } else if (opts?.replyToChannel) {
+      pendingReplies.push({ kind: "channel", channel: ev.channel, from: ev.from });
+    }
+    const framed = frameInbound(ev, { expectsReply });
 
     // deliverAs is REQUIRED while streaming; omitting it throws. When idle,
     // pi sends immediately and triggers a turn.
-    const opts = ctx.isIdle() ? undefined : ({ deliverAs: "followUp" } as const);
+    const deliveryOpts = ctx.isIdle() ? undefined : ({ deliverAs: "followUp" } as const);
     try {
-      void pi.sendUserMessage(framed, opts);
+      void pi.sendUserMessage(framed, deliveryOpts);
       notify(ctx, summarize(ev, decision), "info");
     } catch (err) {
       if (ask && conn) conn.replyToAsk(ask, undefined, `local delivery failed`);
@@ -128,23 +173,40 @@ export default function (pi: ExtensionAPI): void {
       meta,
       onNotice: (text, level) => notify(ctx, text, level),
 
+      onScrub: (hits, target) =>
+        notify(ctx, `freeq: redacted ${hits.join(", ")} from a message to ${target}`, "warning"),
+
       onMessage: (channel, msg) => {
         void (async () => {
           const did = await conn!.resolveSenderDid(msg);
-          const nick = conn!.nick ?? "";
-          const addressed =
-            !channel.startsWith("#") ||
-            (!!nick && new RegExp(`(^|\\W)${escapeRe(nick)}(\\W|$)`, "i").test(msg.text));
-          deliver(ctx, {
-            kind: "chat",
-            channel,
-            from: msg.from,
-            did,
-            text: msg.text,
-            addressed,
-            mode: modeFor(cfg, channel),
-            tier: tierFor(cfg, did),
-          });
+          const isChannel = channel.startsWith("#");
+          // bot-kit's mention check also enforces a per-channel cooldown,
+          // which is what stops two agents that mention each other from
+          // ping-ponging forever.
+          const mention = isChannel
+            ? conn!.checkMention(channel, msg.text)
+            : { addressed: true, stripped: msg.text, cooling: false };
+
+          if (mention.cooling) {
+            surface(ctx, `freeq [${channel}] <${msg.from}> (rate-limited, not answered)`);
+            return;
+          }
+
+          deliver(
+            ctx,
+            {
+              kind: "chat",
+              channel,
+              from: msg.from,
+              did,
+              text: mention.addressed ? mention.stripped : msg.text,
+              addressed: mention.addressed,
+              mode: modeFor(cfg, channel),
+              tier: tierFor(cfg, did),
+            },
+            // Someone addressed us in a room: answer in the room.
+            { replyToChannel: mention.addressed },
+          );
         })();
       },
 
@@ -158,10 +220,13 @@ export default function (pi: ExtensionAPI): void {
             did: ask.did,
             text: ask.question,
             addressed: true, // an ask is addressed by construction
-            mode: modeFor(cfg, ask.channel),
+            // An ask is a direct request, not room chatter: it is governed by
+            // the tier gate, not by the venue's presentation mode. Mute still
+            // wins, since mute means "say nothing anywhere".
+            mode: cfg.muted ? "silent" : "addressed",
             tier: tierFor(cfg, ask.did),
           },
-          ask,
+          { ask },
         );
       },
     });
@@ -200,19 +265,32 @@ export default function (pi: ExtensionAPI): void {
 
   let lastModel: string | undefined;
   pi.on("agent_settled", async (_event, ctx) => {
-    // Answer any asks this run was triggered by.
-    while (pendingAsks.length) {
-      const ask = pendingAsks.shift()!;
+    // Pay back whatever this run was triggered by.
+    while (pendingReplies.length) {
+      const item = pendingReplies.shift()!;
       if (!conn) continue;
-      if (lastAssistantText) {
-        conn.replyToAsk(ask, lastAssistantText);
-        notify(ctx, `freeq: answered ${ask.from} (${lastAssistantText.length} chars)`, "info");
-      } else {
-        // M0 finding: an empty answer is a real state — report it, never
-        // leave the asker hanging until timeout.
-        conn.replyToAsk(ask, undefined, "no answer produced");
-        notify(ctx, `freeq: no answer produced for ${ask.from}`, "warning");
+
+      if (item.kind === "ask") {
+        if (lastAssistantText) {
+          conn.replyToAsk(item.ask, lastAssistantText);
+          notify(ctx, `freeq: answered ${item.ask.from} (${lastAssistantText.length} chars)`, "info");
+        } else {
+          // M0 finding: an empty answer is a real state — report it, never
+          // leave the asker hanging until timeout.
+          conn.replyToAsk(item.ask, undefined, "no answer produced");
+          notify(ctx, `freeq: no answer produced for ${item.ask.from}`, "warning");
+        }
+        continue;
       }
+
+      // Channel reply (Demo 2). Keep it chat-sized.
+      if (!lastAssistantText) continue;
+      const body =
+        lastAssistantText.length > MAX_CHANNEL_REPLY
+          ? `${lastAssistantText.slice(0, MAX_CHANNEL_REPLY)}\n…(truncated)`
+          : lastAssistantText;
+      conn.send(item.channel, `${item.from}: ${body}`);
+      notify(ctx, `freeq: replied in ${item.channel} to ${item.from}`, "info");
     }
     lastAssistantText = "";
 
@@ -347,10 +425,25 @@ export default function (pi: ExtensionAPI): void {
               `owner:    ${cfg.ownerDid ?? "(not logged in — /freeq login <did>)"}`,
               `server:   ${cfg.server}`,
               `state:    ${conn ? conn.describe() : "offline (not connected)"}`,
+              `muted:    ${cfg.muted ? "YES — silent everywhere (/freeq unmute)" : "no"}`,
               `channels: ${cfg.channels.length ? cfg.channels.join(", ") : "(none)"}`,
               `trusted:  ${Object.keys(cfg.trust).length} peer(s)`,
               `config:   ${sources.length ? sources.join(", ") : "(defaults only)"}`,
             ].join("\n"),
+            "info",
+          );
+          return;
+        }
+
+        case "mute":
+        case "unmute": {
+          cfg.muted = sub === "mute";
+          await saveConfig(agentDir, cfg);
+          ctx.ui.notify(
+            cfg.muted
+              ? "freeq: muted — still connected and reachable, but will not " +
+                "answer or inject anything until /freeq unmute"
+              : "freeq: unmuted",
             "info",
           );
           return;
@@ -459,7 +552,9 @@ export default function (pi: ExtensionAPI): void {
 
         default:
           ctx.ui.notify(
-            "/freeq [status|login <did>|join #c|leave #c|peers|mode #c <m>|trust <did> <tier>|on|off]",
+            "/freeq [status | login <did> | join #c | leave #c | peers | " +
+              "mode #c <silent|addressed|participant> | trust <did> <tier> | " +
+              "mute | unmute | on | off]",
             "info",
           );
       }

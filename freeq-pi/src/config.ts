@@ -51,6 +51,11 @@ export interface FreeqConfig {
   trust: Record<string, Tier>;
   /** Master switch — `/freeq off` sets false without discarding config. */
   enabled: boolean;
+  /**
+   * `/freeq mute` — stay connected but behave as `silent` everywhere.
+   * Distinct from `enabled: false`, which disconnects entirely.
+   */
+  muted: boolean;
 }
 
 export const DEFAULT_SERVER = "wss://irc.freeq.at/irc";
@@ -62,6 +67,7 @@ export function defaultConfig(): FreeqConfig {
     modes: {},
     trust: {},
     enabled: true,
+    muted: false,
   };
 }
 
@@ -97,6 +103,7 @@ export function normalizeConfig(raw: unknown): FreeqConfig {
   if (typeof o.nick === "string" && o.nick) base.nick = o.nick;
   if (typeof o.install === "string" && o.install) base.install = o.install;
   if (typeof o.enabled === "boolean") base.enabled = o.enabled;
+  if (typeof o.muted === "boolean") base.muted = o.muted;
   base.channels = normalizeChannels(o.channels);
 
   if (o.modes && typeof o.modes === "object") {
@@ -186,8 +193,9 @@ export async function saveConfig(agentDir: string, config: FreeqConfig): Promise
   await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
 }
 
-/** Effective mode for a channel. */
+/** Effective mode for a channel. Mute forces `silent` everywhere. */
 export function modeFor(config: FreeqConfig, channel: string): Mode {
+  if (config.muted) return "silent";
   return config.modes[channel.toLowerCase()] ?? DEFAULT_MODE;
 }
 

@@ -10,8 +10,8 @@ Design: `docs/PI-FREEQ-MULTIPLAYER.md`. Pitch: `docs/PI-FREEQ-PITCH.md`.
 | M0 — headless spike bot | **DONE** ✅ | proved live on `#playground` — see evidence below |
 | M1 — package skeleton | **DONE** ✅ | two installs mutually visible w/ metadata + DIDs |
 | M2 — tool + tiered inbound | **DONE** ✅ | cross-agent ask verified; tier gate holds |
-| M3 — humans in the room | **next** | addressed mode, scrubber, docs |
-| M4 — handoffs | not started | only after M3 demoed |
+| M3 — humans in the room | **DONE** ✅ | Demo 2 verified: human → agent → answer in room |
+| M4 — handoffs | not started | **the product**; only after the recorded 2-laptop demo |
 
 ## Reading list — done
 
@@ -193,6 +193,76 @@ prove the human/organisational half.
   new persistence code. Behaviour (one owner-bound `did:key` per
   installation, 0600) is unchanged. Revert if you want the distinct path.
 
+## M3 evidence (first release complete)
+
+Harness `spike/room-check.ts` — a DID-authenticated **human** on a plain freeq
+client (no pi) in a channel with an agent:
+
+```
+TEST 1 — unaddressed chatter        → surface        ✓ agent stayed quiet
+TEST 2 — addressed, untrusted human → surface        ✓ declined to answer
+TEST 3 — addressed, 'message' tier  → inject
+  ✓ answered in the room: "Staging build tag: PELICAN-4402"
+  ✓ contains PELICAN-4402 — from its own environment
+```
+
+90 unit tests. All three live harnesses pass (`npm run verify`).
+
+### Bug found by the M3 harness (product fix, not a test fix)
+
+The server auto-suffixes nicks on collision (`pi-agent` → `pi-agent-z6mkher4`).
+A human addressing the **configured** nick then failed to match, so the agent
+silently stopped answering to the name its teammates were told. Fixed with a
+custom mention matcher that matches the live nick **and** the configured one.
+This would have been a confusing intermittent failure in a live demo.
+
+### M3 scope delivered
+
+- `src/scrub.ts` — central outbound redaction for secrets **and absolute
+  paths** (the M0 leak class), enforced in `FreeqConnection` so no send path
+  can bypass it. Regression test uses the verbatim M0 leak.
+- Channel replies (Demo 2): addressed messages get answered in the room,
+  truncated to chat size, with bot-kit's per-channel cooldown preventing
+  two agents from ping-ponging.
+- `/freeq mute` / `unmute` — stay connected and reachable but say nothing.
+- Batched OBSERVE notifications (one grouped notice per 4s, not one per line).
+- `DEMO.md` — solo verification + the two-laptop demo script + recording
+  checklist.
+
+## Parked ideas (NOT scheduled — do not build)
+
+### Summoning an AV agent into a call
+
+*Raised by Chad, 2026-04. Captured only; no work planned.*
+
+"Ask your pi to join a call" — i.e. a pi agent brings voice/video presence
+into a freeq call.
+
+The important architectural point: **pi would not join the call itself.** The
+AV stack is Rust (`freeq_sdk::av` for signaling, `freeq-av` for the MoQ/SFU
+media session, `freeq-agent-kit` for VAD/utterance helpers; Eliza is the
+reference implementation). `@freeq/pi` is TypeScript. So the shape is
+*summoning*: pi asks a separate AV-capable agent process to join on its
+behalf, and talks to it over freeq like any other peer.
+
+Why that's the right shape anyway, independent of the language split:
+- keeps media out of the pi extension entirely (no realtime audio in the
+  agent's event loop, no new failure mode for a coding session)
+- the AV agent is a normal owned freeq bot, so identity, governance
+  (pause/revoke) and provenance already apply to it
+- it's a natural `handoff`/`act` consumer (M4): "summon" is a directed action
+  to a known AV agent, or an open capability-matched offer
+  (`act-caps=freeq.at/av`) that any AV-capable agent can claim
+
+This is also already anticipated by the design doc: the HANDOFF RFC calls out
+escalating an async action "into a live channel or voice room" as something a
+pure HTTP inbox can't do. Summoning is that escalation, made concrete.
+
+Open questions if it's ever picked up: who pays for / hosts the AV agent
+process; whether the pi session gets the transcript back as inbound events
+(tier-gated like everything else); and whether "summon" should be a distinct
+verb or just a handoff with an AV capability.
+
 ## Open questions carried from the design doc (mine to resolve)
 
 - **Tool shape** — starting with one `freeq({action})` tool; will report on
@@ -263,6 +333,8 @@ handler needs.
       mechanism verified by `spike/ask-check.ts`
 - [ ] **M2 demo**: two people, two laptops, across the internet — **needs a
       second person**; record it (this is the deliverable to show the pi team)
-- [ ] **M3**: humans in the room (Demo 2), outbound scrubber (secrets **and
-      absolute paths** — see the M0 leak), `/freeq mute`, batched OBSERVE
-      notifications
+- [x] **M3**: humans in the room (Demo 2), outbound scrubber, `/freeq mute`,
+      batched notifications, DEMO.md — **v0.1 feature-complete**
+- [ ] **Record the two-laptop demo** (needs a second person) — the deliverable
+- [ ] **M4**: handoffs — durable delegation. `ask` was the wedge; this is the
+      product, and the thing local multiplayer extensions cannot do.
