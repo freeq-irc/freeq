@@ -7,7 +7,7 @@
 | Phase | Status | Notes |
 |---|---|---|
 | 1. OpenAPI spec + drift test | **done** | `spec/openapi.yaml` (82 paths, 3.1.0) served at `/api/v1/openapi.{json,yaml}`; 7 unit + 4 acceptance tests |
-| 2. llms.txt | in progress | server-side `/llms.txt` done; freeq.at site routes + repo-root file remain |
+| 2. llms.txt | **done** | `/llms.txt` on server + freeq.at, `/llms-full.txt`, `/docs/<slug>.md` raw markdown, repo-root `llms.txt`; 11 pytest |
 | 3a. `@freeq/mcp` stdio | todo | |
 | 3b. remote MCP `/mcp` | todo | |
 | 4. `skills/` | todo | |
@@ -49,6 +49,27 @@
 - Drift test verified to fail on a deliberately unregistered probe route, so
   it is not vacuous. `cargo test --workspace` in CI covers it; no CI change
   needed.
+
+### Phase 2 as built
+
+- `freeq-site/app.py` gained a curated registry (`LLMS_SECTIONS`,
+  `LLMS_SERVER_SURFACES`) and three routes: `/llms.txt` (generated index),
+  `/llms-full.txt` (curated docs concatenated), and `/docs/<slug>.md` (raw
+  markdown source — llms.txt links here, not at the rendered page).
+- Section titles come from each doc's own H1, so the index can't drift from
+  the docs' own naming.
+- `_doc_path()` now falls back between the site's `docs/` copy and the repo's
+  `docs/`. The copy is only refreshed by `deploy.sh`, so without the fallback
+  a newly added doc looked broken locally and worked in production.
+- Repo-root `llms.txt`: hand-written, points at the hosted indexes and the
+  in-repo docs (GitHub is itself a discovery surface).
+- Tests: 11 new pytest in `freeq-site/tests/test_llms_txt.py` — every curated
+  slug resolves to a real doc, every on-site link in the generated index
+  returns 200, the `.md` route serves source rather than HTML and doesn't
+  shadow the rendered page, `llms-full.txt` stays bounded to the curated set,
+  and the repo-root file's in-repo links exist.
+- CI gained a `site` job running the freeq-site pytest suite; it had no CI
+  coverage at all, which is how a curated index would have rotted silently.
 
 ## Goal
 

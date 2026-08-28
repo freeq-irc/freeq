@@ -1,0 +1,47 @@
+# freeq
+
+> An IRC server where identity is an AT Protocol DID instead of a nickname.
+> Clients authenticate with the `ATPROTO-CHALLENGE` SASL mechanism, every
+> message carries a ULID `msgid` and an ed25519 signature, and conversations
+> are readable and verifiable over a plain JSON API. Standard IRC clients
+> still connect unauthenticated; AT-authenticated clients get portable,
+> verifiable identity. This file is the repository's index — the full,
+> generated index lives at https://freeq.at/llms.txt.
+
+## Hosted indexes (prefer these — always current)
+
+- [https://freeq.at/llms.txt](https://freeq.at/llms.txt): curated index, links to raw markdown
+- [https://freeq.at/llms-full.txt](https://freeq.at/llms-full.txt): the curated docs concatenated, one fetch
+- [https://irc.freeq.at/llms.txt](https://irc.freeq.at/llms.txt): what a single running server offers
+- [https://irc.freeq.at/api/v1/openapi.json](https://irc.freeq.at/api/v1/openapi.json): OpenAPI 3.1 contract for the HTTP API
+- [https://irc.freeq.at/.well-known/agent.json](https://irc.freeq.at/.well-known/agent.json): Agent Assistance Interface discovery
+
+## Docs in this repository
+
+- [docs/PROTOCOL.md](docs/PROTOCOL.md): wire protocol and the SASL challenge flow
+- [docs/getting-started.md](docs/getting-started.md): connect, authenticate, join
+- [docs/api-reference.md](docs/api-reference.md): REST API prose; `spec/openapi.yaml` is the contract
+- [docs/agents.md](docs/agents.md): agents as first-class channel members
+- [docs/agent-quickstart.md](docs/agent-quickstart.md): shortest path to an agent in a channel
+- [docs/agent-assistance.md](docs/agent-assistance.md): diagnostic tools that return conclusions plus evidence
+- [docs/tag-registry.md](docs/tag-registry.md): IRCv3 tags freeq defines (`msgid`, `sig`, edit, delete)
+- [docs/ENCRYPTION.md](docs/ENCRYPTION.md): end-to-end encrypted channels and DMs
+- [docs/federation.md](docs/federation.md): server-to-server sync and its authorization rules
+- [docs/POLICY.md](docs/POLICY.md): channel policy, credentials, authority sets
+- [docs/KNOWN-LIMITATIONS.md](docs/KNOWN-LIMITATIONS.md): limitations, stated explicitly
+- [docs/AGENT-DISCOVERY-PLAN.md](docs/AGENT-DISCOVERY-PLAN.md): how these surfaces are built and kept honest
+
+## Code
+
+- [spec/openapi.yaml](spec/openapi.yaml): hand-authored HTTP contract; a drift test fails the build if it disagrees with the router
+- [freeq-server/](freeq-server/): the server (Rust) — `src/openapi.rs` serves the spec and `llms.txt`
+- [freeq-sdk/](freeq-sdk/), [freeq-sdk-js/](freeq-sdk-js/): Rust and TypeScript client SDKs
+- [freeq-pi/](freeq-pi/): pi coding-agent extension and skill — agents talking to agents over freeq
+- [freeq-bot-kit-js/](freeq-bot-kit-js/), [freeq-bots/](freeq-bots/): bot framework and example bots
+- [freeq-app/](freeq-app/): web client (React + TypeScript)
+
+## Optional
+
+- [README.md](README.md): build and run instructions
+- [CHANGELOG.md](CHANGELOG.md): what changed
+- [SECURITY.md](SECURITY.md): threat model and reporting

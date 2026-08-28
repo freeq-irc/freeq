@@ -141,6 +141,160 @@ SLUG_MAP = {
 }
 
 
+# ── llms.txt: the curated index agents read first ─────────────────────
+#
+# The convention (llmstxt.org): an H1, a blockquote summary, then sections of
+# links to *markdown* — agents want the source, not the rendered page. So each
+# entry points at /docs/<slug>.md, served raw by `docs_page_markdown` below.
+#
+# This is a curated list, deliberately much smaller than SLUG_MAP. An index
+# containing all 100+ docs is a directory listing, not an index: it burns the
+# reader's context before they reach anything useful. Entries here are the
+# docs someone needs to understand freeq and build against it. Every slug is
+# checked against SLUG_MAP by the tests, so a rename can't rot the index.
+
+SITE_URL = "https://freeq.at"
+
+LLMS_SUMMARY = (
+    "freeq is an IRC server where identity is an AT Protocol DID instead of a "
+    "nickname. Clients authenticate with the ATPROTO-CHALLENGE SASL mechanism, "
+    "every message carries a ULID msgid and an ed25519 signature, and "
+    "conversations are readable and verifiable over a plain JSON API. It treats "
+    "IRC as infrastructure: standard clients still connect, unauthenticated, "
+    "while AT-authenticated clients get portable, verifiable identity."
+)
+
+# [(section, [(slug, one-line description)])]
+LLMS_SECTIONS = [
+    ("Start here", [
+        ("what-is-freeq", "What freeq is and why DID-backed identity on IRC"),
+        ("getting-started", "Connect, authenticate, join a channel"),
+        ("features", "What the server and clients actually support today"),
+    ]),
+    ("Protocol", [
+        ("protocol", "Wire protocol, including the ATPROTO-CHALLENGE SASL flow"),
+        ("authentication", "Identity, DIDs, handles, OAuth and app passwords"),
+        ("tag-registry", "IRCv3 message tags freeq defines (msgid, sig, edit, delete)"),
+        ("encryption", "End-to-end encrypted channels and DMs"),
+        ("federation", "Server-to-server sync and its authorization rules"),
+        ("limitations", "Known limitations, stated explicitly"),
+    ]),
+    ("Agent surfaces", [
+        ("agents", "How agents participate as first-class members"),
+        ("agent-quickstart", "Shortest path from nothing to an agent in a channel"),
+        ("agent-assistance", "Diagnostic tools that return conclusions plus evidence"),
+        ("well-known-agent", "The /.well-known/agent.json discovery document"),
+        ("watch-your-agent", "Observing and auditing what an agent did"),
+    ]),
+    ("Building on freeq", [
+        ("api-reference", "REST API reference prose; the contract itself is the OpenAPI spec"),
+        ("typescript-sdk", "@freeq/sdk — the TypeScript client"),
+        ("bot-quickstart", "Build a bot: identity, SASL, signing, event loop"),
+        ("bots", "Bot patterns and the bot kit"),
+        ("self-hosting", "Run your own server"),
+    ]),
+    ("Governance", [
+        ("policy-system", "Channel policy: rules, credentials, authority sets"),
+        ("verifiers", "Credential verifiers (e.g. GitHub linkage)"),
+        ("moderation", "Moderation model and audit trail"),
+    ]),
+]
+
+# Machine-readable endpoints on a running server. Absolute, because an agent
+# reading llms.txt needs somewhere it can actually issue a request.
+LLMS_SERVER_SURFACES = [
+    ("OpenAPI 3.1 contract", "https://irc.freeq.at/api/v1/openapi.json",
+     "Every HTTP endpoint, its parameters and its responses"),
+    ("Agent Assistance Interface", "https://irc.freeq.at/.well-known/agent.json",
+     "Discovery document for the diagnostic tools"),
+    ("Server llms.txt", "https://irc.freeq.at/llms.txt",
+     "The same index, scoped to one running server"),
+    ("Channel list", "https://irc.freeq.at/api/v1/channels",
+     "Live public channels, no auth required"),
+    ("IRC over WebSocket", "wss://irc.freeq.at/irc",
+     "The IRC line protocol, including SASL ATPROTO-CHALLENGE"),
+    ("MCP server", "https://www.npmjs.com/package/@freeq/mcp",
+     "npx -y @freeq/mcp — this API and the IRC verbs as MCP tools"),
+]
+
+
+def llms_index() -> str:
+    """Render llms.txt from the curated registry."""
+    lines = ["# freeq", "", f"> {LLMS_SUMMARY}", ""]
+    for section, entries in LLMS_SECTIONS:
+        lines.append(f"## {section}")
+        lines.append("")
+        for slug, desc in entries:
+            lines.append(f"- [{_doc_title(slug)}]({SITE_URL}/docs/{slug}.md): {desc}")
+        lines.append("")
+    lines.append("## Machine-readable surfaces")
+    lines.append("")
+    for name, url, desc in LLMS_SERVER_SURFACES:
+        lines.append(f"- [{name}]({url}): {desc}")
+    lines.append("")
+    lines.append("## Optional")
+    lines.append("")
+    lines.append(f"- [Everything above, concatenated]({SITE_URL}/llms-full.txt): "
+                 "one document, for a single fetch")
+    lines.append("- [Source](https://github.com/freeq-irc/freeq): the implementation is the "
+                 "specification of last resort")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _doc_path(slug: str):
+    """Filesystem path for a slug, or None if it isn't mapped.
+
+    Falls back from the site's docs/ copy to the repo's docs/. deploy.sh
+    refreshes the copy on every deploy, so in a working tree it is usually
+    stale — without the fallback, a doc added to the repo appears broken
+    locally and works in production, which is the worst way round.
+    """
+    entry = SLUG_MAP.get(slug)
+    if not entry:
+        return None
+    source, filename = entry
+    primary = (SITE_DOCS_DIR if source == "site" else REPO_DOCS_DIR) / filename
+    if primary.exists():
+        return primary
+    fallback = (REPO_DOCS_DIR if source == "site" else SITE_DOCS_DIR) / filename
+    return fallback if fallback.exists() else primary
+
+
+def _doc_title(slug: str) -> str:
+    """First H1 of a doc, falling back to a humanized slug."""
+    path = _doc_path(slug)
+    if path and path.exists():
+        for line in path.read_text().splitlines():
+            if line.startswith("# "):
+                return line[2:].strip()
+    return slug.replace("-", " ").capitalize()
+
+
+def llms_full() -> str:
+    """Concatenate the curated docs into one markdown document."""
+    parts = [
+        "# freeq — full documentation",
+        "",
+        f"> {LLMS_SUMMARY}",
+        "",
+        f"Generated from {SITE_URL}/llms.txt. Curated docs only, in index order.",
+        "",
+    ]
+    for section, entries in LLMS_SECTIONS:
+        parts.append(f"# {section}")
+        parts.append("")
+        for slug, _desc in entries:
+            path = _doc_path(slug)
+            if not path or not path.exists():
+                continue
+            parts.append(f"<!-- source: docs/{path.name} · {SITE_URL}/docs/{slug}/ -->")
+            parts.append("")
+            parts.append(path.read_text().rstrip())
+            parts.append("")
+    return "\n".join(parts)
+
+
 # ── Relative .md link rewriting ──────────────────────────────────────
 #
 # Docs are written for the repo (GitHub), where relative links like
@@ -343,6 +497,29 @@ def docs_index():
     return render_template("docs_index.html")
 
 
+@app.route("/llms.txt")
+def llms_txt():
+    return llms_index(), 200, {"Content-Type": "text/markdown; charset=utf-8"}
+
+
+@app.route("/llms-full.txt")
+def llms_full_txt():
+    return llms_full(), 200, {"Content-Type": "text/markdown; charset=utf-8"}
+
+
+@app.route("/docs/<path:slug>.md")
+def docs_page_markdown(slug):
+    """Serve a doc's raw markdown source.
+
+    llms.txt links here rather than to the rendered page: an agent that
+    fetches HTML pays for the chrome and then has to strip it back out.
+    """
+    path = _doc_path(slug)
+    if not path or not path.exists():
+        abort(404)
+    return path.read_text(), 200, {"Content-Type": "text/markdown; charset=utf-8"}
+
+
 @app.route("/docs/<path:slug>/")
 def docs_page(slug):
     """Render a doc page from either site or repo docs."""
@@ -350,11 +527,8 @@ def docs_page(slug):
     if not entry:
         abort(404)
     source, filename = entry
-    if source == "site":
-        filepath = SITE_DOCS_DIR / filename
-    else:
-        filepath = REPO_DOCS_DIR / filename
-    if not filepath.exists():
+    filepath = _doc_path(slug)
+    if filepath is None or not filepath.exists():
         # Return helpful 404 with debug info
         import json
         info = {

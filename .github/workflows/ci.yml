@@ -87,6 +87,27 @@ jobs:
         working-directory: freeq-sdk-js
         run: npm audit --omit=dev --audit-level=high
 
+  site:
+    name: Docs Site (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The site renders the repo's docs/ and generates llms.txt from a curated
+      # slug registry, so a doc rename can break the agent entry point without
+      # touching a line of Python. These tests follow every generated link.
+      - name: Install
+        working-directory: freeq-site
+        run: pip install -r requirements.txt pytest
+
+      - name: Test
+        working-directory: freeq-site
+        run: python -m pytest tests -q
+
   web:
     name: Web Client
     runs-on: ubuntu-latest
