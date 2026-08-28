@@ -661,7 +661,7 @@ private fun MessageBubble(
                 // stays one: every event keeps a card of its own.
                 val actCard = channelState.actCards[msg.id]
                 if (actCard != null) {
-                    ActEventCard(actCard, onJumpToMessage)
+                    ActEventCard(actCard, msg.timestamp, onJumpToMessage)
                 } else {
                     // Message text + inline embeds
                     MessageContent(
