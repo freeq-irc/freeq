@@ -1587,7 +1587,15 @@ export function MessageList() {
   // A page that never arrived holds this off — otherwise a request that
   // always fails is asked again the instant the in-flight flag clears.
   const evictNewerRows = useStore((s) => s.evictNewerRows);
-  useEffect(() => {
+  /** The effect above still misses one case: trackpad momentum crossing a
+   *  prepend's position correction can end with the reader at the top and
+   *  the final DOM scroll event swallowed, so nothing re-reads the condition
+   *  (measured live: scrollTop 0, nothing in flight, nothing paused, no
+   *  fetch). The virtualizer reports scrolling through its own pipeline —
+   *  its onScroll/onScrollEnd see the positions its corrections produce —
+   *  so the tick is driven from those as well. */
+  const autoFetchTick = useRef<() => void>(() => {});
+  const autoFetchOlder = useCallback(() => {
     const el = ref.current;
     if (!el || el.scrollTop > NEAR_TOP_PX) return;
     if (useStore.getState().channels.get(activeChannel.toLowerCase())?.historyAutoPaused) return;
@@ -1603,7 +1611,11 @@ export function MessageList() {
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
     if (!atBottom && rawMessages.length > MESSAGE_WINDOW) evictNewerRows(activeChannel);
     fetchOlder();
-  }, [activeChannel, atTop, historyEdge, historyFetching, historyAutoPaused, rawMessages, fetchOlder, evictNewerRows]);
+  }, [activeChannel, rawMessages, fetchOlder, evictNewerRows]);
+  autoFetchTick.current = autoFetchOlder;
+  useEffect(() => {
+    autoFetchOlder();
+  }, [activeChannel, atTop, historyEdge, historyFetching, historyAutoPaused, rawMessages, autoFetchOlder]);
 
   // Ask for the page newer than everything held — the mirror of `fetchOlder`,
   // for a window that has been walked away from the live end.
@@ -1898,6 +1910,8 @@ export function MessageList() {
           shift={shiftOnPrepend}
           startMargin={startMargin}
           keepMounted={keepMounted}
+          onScroll={(offset) => { if (offset <= NEAR_TOP_PX) autoFetchTick.current(); }}
+          onScrollEnd={() => autoFetchTick.current()}
         >
           {rows.map((row) => (
             row.kind === 'notices' ? (
