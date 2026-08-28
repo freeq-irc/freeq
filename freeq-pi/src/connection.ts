@@ -17,6 +17,16 @@ import {
   PI_HELLO,
   PI_HELLO_ACK,
 } from "./discovery.js";
+import {
+  AskRegistry,
+  encodePayload,
+  newRequestId,
+  parseAskReply,
+  parseAskRequest,
+  PI_ASK,
+  PI_ASK_REPLY,
+  type AskResult,
+} from "./ask.js";
 
 export type ConnState = "offline" | "connecting" | "online" | "error";
 
@@ -48,8 +58,21 @@ export interface ConnectionOptions {
   root?: string;
   /** Reported to the host for user-visible notices. */
   onNotice?: (text: string, level: "info" | "warning" | "error") => void;
-  /** Inbound channel/DM messages (M2 wires the tiered pipeline here). */
+  /** Inbound channel/DM messages (routed through the tier pipeline). */
   onMessage?: (channel: string, msg: Message) => void;
+  /**
+   * An inbound `ask` from a peer. The host decides (via the tier pipeline)
+   * whether to answer; it must call `replyToAsk` exactly once either way.
+   */
+  onAsk?: (ask: InboundAsk) => void;
+}
+
+export interface InboundAsk {
+  req: string;
+  from: string;
+  did: string | null;
+  channel: string;
+  question: string;
 }
 
 const RECONNECT_INITIAL_MS = 2_000;
@@ -67,6 +90,7 @@ export class FreeqConnection {
   #timer: NodeJS.Timeout | undefined;
   /** Notices are deduped: a flapping connection must not spam the TUI. */
   #noticed = new Set<string>();
+  #asks = new AskRegistry((reason) => this.#opts.onNotice?.(`freeq ask: ${reason}`, "warning"));
 
   constructor(opts: ConnectionOptions) {
     this.#opts = opts;
@@ -248,8 +272,29 @@ export class FreeqConnection {
   }
 
   async #onCoordinationEvent(e: CoordinationEventPayload): Promise<void> {
-    if (e.eventType !== PI_HELLO && e.eventType !== PI_HELLO_ACK) return;
     if (this.#isSelf(e.from)) return;
+
+    if (e.eventType === PI_ASK) {
+      const req = parseAskRequest(e.payload);
+      if (!req) return;
+      const did = e.did ?? (await this.resolveSenderDid({ from: e.from, tags: e.tags }));
+      this.#opts.onAsk?.({
+        req: req.req,
+        from: e.from,
+        did,
+        channel: e.channel,
+        question: req.q,
+      });
+      return;
+    }
+
+    if (e.eventType === PI_ASK_REPLY) {
+      const reply = parseAskReply(e.payload);
+      if (reply) this.#asks.deliver(reply, e.from);
+      return;
+    }
+
+    if (e.eventType !== PI_HELLO && e.eventType !== PI_HELLO_ACK) return;
 
     const hello = parseHello(e.payload);
     if (!hello) return;
@@ -317,6 +362,48 @@ export class FreeqConnection {
     return true;
   }
 
+  /**
+   * Ask a peer a question and wait for exactly one reply.
+   *
+   * The request id is minted here and carried in the payload — correctness
+   * never depends on IRC reply tags.
+   */
+  async ask(to: string, question: string, timeoutMs?: number): Promise<AskResult> {
+    if (!this.#bot || this.#state !== "online") {
+      return { ok: false, error: "freeq is offline" };
+    }
+    const req = newRequestId();
+    const { encoded } = encodePayload({ req, q: question }, "q");
+    const promise = this.#asks.create(req, to, timeoutMs);
+    try {
+      this.#bot.client.sendTagmsg(to, {
+        "+freeq.at/event": PI_ASK,
+        "+freeq.at/payload": encoded,
+      });
+    } catch (err) {
+      this.#asks.deliver({ req, err: `send failed: ${(err as Error).message}` }, to);
+    }
+    return promise;
+  }
+
+  /** Answer an inbound ask. Safe to call once per ask. */
+  replyToAsk(ask: InboundAsk, answer: string | undefined, error?: string): boolean {
+    if (!this.#bot || this.#state !== "online") return false;
+    const body: Record<string, unknown> = error
+      ? { req: ask.req, err: error }
+      : { req: ask.req, a: answer ?? "" };
+    const { encoded } = encodePayload(body, error ? "err" : "a");
+    try {
+      this.#bot.client.sendTagmsg(ask.from, {
+        "+freeq.at/event": PI_ASK_REPLY,
+        "+freeq.at/payload": encoded,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** Resolve a sender's DID; null for guests/unresolvable (→ lowest tier). */
   async resolveSenderDid(msg: { from: string; tags?: Record<string, string> }): Promise<string | null> {
     try {
@@ -335,6 +422,7 @@ export class FreeqConnection {
 
   async stop(reason = "session end"): Promise<void> {
     this.#stopped = true;
+    this.#asks.cancelAll("freeq connection closed");
     if (this.#timer) {
       clearTimeout(this.#timer);
       this.#timer = undefined;

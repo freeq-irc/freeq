@@ -9,8 +9,8 @@ Design: `docs/PI-FREEQ-MULTIPLAYER.md`. Pitch: `docs/PI-FREEQ-PITCH.md`.
 |---|---|---|
 | M0 — headless spike bot | **DONE** ✅ | proved live on `#playground` — see evidence below |
 | M1 — package skeleton | **DONE** ✅ | two installs mutually visible w/ metadata + DIDs |
-| M2 — tool + tiered inbound | **next** | **the core**; v0.1 acceptance |
-| M3 — humans in the room | not started | addressed mode, scrubber, docs |
+| M2 — tool + tiered inbound | **DONE** ✅ | cross-agent ask verified; tier gate holds |
+| M3 — humans in the room | **next** | addressed mode, scrubber, docs |
 | M4 — handoffs | not started | only after M3 demoed |
 
 ## Reading list — done
@@ -134,6 +134,57 @@ target/release/freeq-server --listen-addr 127.0.0.1:16667 \
 
 Dev stays local from here; prod is reserved for the recorded demo.
 
+## M2 evidence (core capability proven)
+
+Harness `spike/ask-check.ts` stands up **two independent pi sessions**, each
+with its own installation identity, own freeq connection, and own working
+directory. The responder's cwd contains a fact the asker cannot see.
+
+```
+[m2] TEST 1 — ask from an UNTRUSTED peer (must be declined)
+[responder] ask from pi-asker tier=observe → surface (needs 'request')
+[m2] ✓ declined as expected
+
+[m2] TEST 2 — same ask after granting 'request' tier
+[responder] ask from pi-asker tier=request → answer
+[m2] ✓ answer: SHIPPING-VALVE-7731
+[m2] ✓ contains SHIPPING-VALVE-7731 — knowledge crossed the network
+```
+
+The same question is **refused before trust and answered after** — the tier
+gate is load-bearing, not decorative. 65 unit tests pass, including the
+mandatory invariant across all 24 kind×mode×addressed×DID combinations.
+
+Tool registration verified in a real pi session (`--mode rpc`): the model
+discovered `freeq`, called it with `{action:"peers"}`, and got the graceful
+unconfigured message.
+
+**Still outstanding for the real v0.1 criterion:** two people, two laptops,
+across the internet, recorded. The harness proves the mechanism; it cannot
+prove the human/organisational half.
+
+## M2 design decisions
+
+1. **`ask` rides coordination events**, like discovery — `pi_ask` /
+   `pi_ask_reply` with a caller-minted request id in the payload. No
+   dependence on IRC reply tags, per the design doc's Decided section.
+2. **Payload sizing measures the encoded form.** The server line limit is 8192
+   incl. tags and percent-encoding can triple non-ASCII text, so `encodePayload`
+   shrinks until the *encoded* string fits (raw-length budgeting would
+   overshoot; unit-tested with emoji).
+3. **Answer hijacking is blocked**: a reply is only accepted from the peer we
+   asked. A third party answering someone else's question is dropped and
+   reported.
+4. **Declines are explicit.** An ask that fails the tier gate gets a
+   `declined: <reason>` reply rather than silence — silence is
+   indistinguishable from a broken agent, and would burn the asker's timeout.
+5. **One injection point.** `deliver()` in the extension is the only function
+   that calls `pi.sendUserMessage`, and it refuses unless `decideInbound`
+   returned `inject`/`answer`. `src/inbound.ts` is pure, so the policy is
+   testable without any I/O.
+6. **`/freeq trust` requires confirmation** and spells out that `request`+
+   lets a peer trigger turns in your session.
+
 ## Deviations from spec (flagged for review)
 
 - **Identity storage path**: using bot-kit's `~/.freeq/bots/pi-<slug>/`
@@ -207,7 +258,11 @@ handler needs.
 - [x] **M1**: `src/{config,identity,presence,connection,discovery}.ts`,
       `extensions/freeq.ts` with `/freeq login|status|join|leave|peers|mode|
       trust|on|off`; acceptance verified via `spike/peers-check.ts`
-- [ ] **M2**: `src/ask.ts` (request id + timeout + exactly-one-response),
-      `src/inbound.ts` (tier pipeline → `pi.sendUserMessage`), the `freeq`
-      tool (`peers|send|say|ask`), mandatory OBSERVE-never-reaches-model test;
-      acceptance = the two-laptop cross-internet ask, recorded
+- [x] **M2**: `src/ask.ts`, `src/inbound.ts`, the `freeq` tool
+      (`peers|ask|send|say`), skill + README, mandatory invariant test;
+      mechanism verified by `spike/ask-check.ts`
+- [ ] **M2 demo**: two people, two laptops, across the internet — **needs a
+      second person**; record it (this is the deliverable to show the pi team)
+- [ ] **M3**: humans in the room (Demo 2), outbound scrubber (secrets **and
+      absolute paths** — see the M0 leak), `/freeq mute`, batched OBSERVE
+      notifications
