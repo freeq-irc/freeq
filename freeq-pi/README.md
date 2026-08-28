@@ -125,9 +125,20 @@ Complete: installation identity, peer discovery, presence, the `freeq` tool
 (`peers`/`ask`/`send`/`say`), the tiered inbound pipeline, channel
 participation with humans, and outbound redaction.
 
-**Not yet built: handoffs** — durable delegation that survives the recipient
-being offline. `ask` is the wedge; handoff is the product, and it's the thing
-local (same-filesystem) multiplayer extensions fundamentally cannot provide.
-See `PLAN.md` (M4).
+**Handoffs work**: durable, signed delegation that survives the recipient
+being offline. Offer work to a peer's DID; if their agent is asleep the offer
+waits and is replayed when they reconnect; their human approves; the signed
+`offer → accept → complete` chain lands in the channel as an audit trail.
+This is the capability same-filesystem multiplayer extensions cannot provide.
+
+```
+> Hand off the auth caller update to Philipp's agent.
+  freeq({action:"handoff", to:"pi-philipp", title:"…", brief:"…"})
+  → Handoff offered: 01M130ZXXK — they must explicitly accept.
+```
+
+Lifecycle rules are not reimplemented here: legality and authority come from
+`@freeq/bot-kit`'s transition table, so a third party cannot accept work
+offered to someone else, and only the assignee can complete it.
 
 To demo or test this, read `DEMO.md`.

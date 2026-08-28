@@ -7,7 +7,13 @@
  */
 
 import { FreeqBot, matchMention } from "@freeq/bot-kit";
-import type { CoordinationEventPayload, Message, PresencePayload } from "@freeq/sdk";
+import type {
+  ActEventPayload,
+  CoordinationEventPayload,
+  Message,
+  PresencePayload,
+} from "@freeq/sdk";
+import { actTags } from "@freeq/sdk";
 import { botName, defaultNick } from "./identity.js";
 import { describeMeta, formatStatus, parseStatus, type SessionMeta } from "./presence.js";
 import {
@@ -68,6 +74,8 @@ export interface ConnectionOptions {
    * whether to answer; it must call `replyToAsk` exactly once either way.
    */
   onAsk?: (ask: InboundAsk) => void;
+  /** A `freeq.at/act` task event (handoffs). */
+  onActEvent?: (ev: ActEventPayload) => void;
 }
 
 export interface InboundAsk {
@@ -174,6 +182,23 @@ export class FreeqConnection {
 
       bot.on("presence", (p: PresencePayload) => this.#onPresence(p));
 
+      // Task events (handoffs). Replayed events arrive here too, which is
+      // how an offer made while we were offline reaches us.
+      //
+      // Unlike chat, our OWN act events are NOT filtered out. Two reasons,
+      // both found the hard way: (1) the echo of our own `accept` is what
+      // advances our local state — drop it and the assignee can never reach
+      // `complete`; (2) after a lost or fresh view, history replay of our own
+      // offers is how we rebuild them. Re-applying is safe: the store treats
+      // a repeat offer as a duplicate and a repeat move as an illegal step.
+      bot.on("actEvent", (ev: ActEventPayload) => {
+        try {
+          this.#opts.onActEvent?.(ev);
+        } catch (err) {
+          this.#opts.onNotice?.(`freeq: task handler error: ${(err as Error).message}`, "error");
+        }
+      });
+
       // Peer discovery rides coordination events, not presence — the server
       // drops presence status for active agents (see discovery.ts).
       bot.on("coordinationEvent", (e: CoordinationEventPayload) => {
@@ -262,6 +287,16 @@ export class FreeqConnection {
 
   #isSelf(nick: string): boolean {
     return !!this.nick && nick.toLowerCase() === this.nick.toLowerCase();
+  }
+
+  /** Poll until this session can sign act documents, or give up. */
+  async #awaitSigningKey(timeoutMs = 15_000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.#bot?.client.signing.getPublicKey()) return true;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return !!this.#bot?.client.signing.getPublicKey();
   }
 
   /** Match a mention of the live nick OR the nick we asked the server for. */
@@ -447,6 +482,60 @@ export class FreeqConnection {
     if (r.kind === "respond") return { addressed: true, stripped: r.stripped, cooling: false };
     if (r.kind === "cooldown") return { addressed: true, stripped: text, cooling: true };
     return { addressed: false, stripped: text, cooling: false };
+  }
+
+  /**
+   * Emit a signed task event.
+   *
+   * The SDK signs the act document and posts the TAGMSG plus a
+   * human-readable companion line, so a plain IRC client in the room sees
+   * prose while agents see the structured event.
+   *
+   * `fields` are act field names WITHOUT the `+freeq.at/act-` prefix
+   * (`title`, `to`, `ctx-h`, `note`, …). Returns the event id, which for an
+   * opener IS the task id.
+   */
+  async sendAct(
+    channel: string,
+    verb: string,
+    taskId: string | undefined,
+    fields: Record<string, string>,
+    humanText?: string,
+  ): Promise<string | undefined> {
+    if (!this.#bot || this.#state !== "online") return undefined;
+    const from = this.did;
+    if (!from) return undefined;
+
+    // The session signing key is minted during SASL and registered on 001,
+    // and `sendAct` signs directly rather than going through the SDK's gated
+    // send queue — so an act event emitted immediately after connect can
+    // race the key and fail with "a task event must be signed". Wait for the
+    // key rather than surfacing a spurious error to the user.
+    if (!(await this.#awaitSigningKey())) {
+      this.#opts.onNotice?.(
+        "freeq: no signing key available — task events must be signed, so this was not sent",
+        "error",
+      );
+      return undefined;
+    }
+
+    // Redact free text before it is signed — a signature over a leaked
+    // secret would make the leak permanent AND non-repudiable.
+    const clean: Record<string, string> = {};
+    for (const [k, v] of Object.entries(fields)) {
+      clean[k] = k === "title" || k === "note" ? this.#clean(v, channel) : v;
+    }
+
+    const tags = actTags("handoff", verb, taskId, from, clean);
+    try {
+      return await this.#bot.client.sendAct(channel, tags, {
+        humanText: humanText === undefined ? undefined : this.#clean(humanText, channel),
+        taskId,
+      });
+    } catch (err) {
+      this.#opts.onNotice?.(`freeq: could not send task event: ${(err as Error).message}`, "error");
+      return undefined;
+    }
   }
 
   /** Resolve a sender's DID; null for guests/unresolvable (→ lowest tier). */

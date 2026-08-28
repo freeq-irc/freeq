@@ -11,7 +11,7 @@ Design: `docs/PI-FREEQ-MULTIPLAYER.md`. Pitch: `docs/PI-FREEQ-PITCH.md`.
 | M1 — package skeleton | **DONE** ✅ | two installs mutually visible w/ metadata + DIDs |
 | M2 — tool + tiered inbound | **DONE** ✅ | cross-agent ask verified; tier gate holds |
 | M3 — humans in the room | **DONE** ✅ | Demo 2 verified: human → agent → answer in room |
-| M4 — handoffs | not started | **the product**; unblocked — cross-machine demo done |
+| M4 — handoffs | **DONE** ✅ | offer→accept→complete survives BOTH sides offline |
 
 ## Reading list — done
 
@@ -229,6 +229,65 @@ This would have been a confusing intermittent failure in a live demo.
 - `DEMO.md` — solo verification + the two-laptop demo script + recording
   checklist.
 
+## M4 evidence — handoffs survive offline
+
+`spike/handoff-check.ts`, run against **production** (see note on the local
+server below). The test is deliberately harsh: nobody is online to relay
+anything.
+
+```
+STEP 1  bob is offline (never started)
+        ✓ alice offered task 01M130ZXXK to an OFFLINE recipient
+STEP 2  alice disconnects — nothing is running anywhere
+STEP 3  bob starts for the first time
+        ✓ bob learned about the offer from replay (fromReplay=true)
+        ✓ it shows in bob's inbox
+STEP 4  bob accepts and completes
+STEP 5  alice reconnects with an EMPTY view
+        ✓ alice sees the task COMPLETED
+        ✓ signed lifecycle replayed: offer → accept → complete
+        ✓ every event in the chain carried a signature
+```
+
+Alice's final view was rebuilt entirely from channel history — the RFC's
+"signed log is the source of truth, the view is rebuildable" property, working.
+
+### What was reused rather than rebuilt
+
+Per the RFC's build discipline: `sendAct()`/`actTags()` (SDK) sign and emit;
+`checkTransition()`/`initialState()` (bot-kit, driven by
+`act-transitions.json`) own legality and authority. This package restates
+none of those rules — which is why "a third party cannot accept work offered
+to someone else" and "only the assignee may complete" passed on the first
+run. New here: a persisted local view, and the policy for what a pi session
+*does* about an offer.
+
+### Two real bugs found by the M4 harness
+
+1. **Own act events were filtered out.** Chat filters self-echo; act events
+   must not. The echo of your own `accept` is what advances your local state
+   — with it dropped, an assignee could never reach `complete` — and replay
+   of your own offers is how a lost view is rebuilt. Both broken, both fixed.
+2. **`sendAct` raced the signing key.** The session key is minted during SASL
+   and registered on 001, and `sendAct` signs directly instead of going
+   through the SDK's gated send queue, so an offer sent right after connect
+   failed with "a task event must be signed". Now waits for the key.
+
+Also: server `confirm` receipts are expected wire traffic, not rejected
+transitions. `ApplyResult.benign` distinguishes routine (receipts, duplicate
+echoes) from genuine refusals, so the TUI stays quiet about the former.
+
+### Environment findings (for the morning)
+
+- **The checked-in `target/release/freeq-server` binary is from Jun 19** and
+  predates the `freeq.at/msgsig` / `freeq.at/act` caps, so act signing fails
+  against it — M4 could not be verified locally.
+- **The local Rust toolchain is broken**: `rustc` "not applicable to the
+  stable-aarch64-apple-darwin toolchain", so I could not rebuild it. Worth a
+  `rustup` repair; until then local act testing needs a fresh binary.
+- M4 was therefore verified against production `irc.freeq.at` in a
+  throwaway channel. M1–M3 harnesses still run locally.
+
 ## Parked ideas (NOT scheduled — do not build)
 
 ### Summoning an AV agent into a call
@@ -340,5 +399,11 @@ handler needs.
       Everything mechanical in the v0.1 criterion is proven.
 - [ ] **Re-run with a real second person** — the only remaining gap; both
       identities in tonight's run were Chad's. Then record it.
-- [ ] **M4**: handoffs — durable delegation. `ask` was the wedge; this is the
-      product, and the thing local multiplayer extensions cannot do.
+- [x] **M4**: handoffs — offer/accept/decline/progress/complete/cancel via the
+      act substrate, human-gated accept, offline replay, `/freeq handoffs`,
+      persisted view. 117 unit tests; acceptance verified on production.
+- [ ] **Re-verify M4 locally** once `freeq-server` is rebuilt (see findings)
+- [ ] Optional next: claimable/open handoffs (`act-caps`, no `act-to`) —
+      substrate already supports them; only the tool surface is missing
+- [ ] Optional next: verify inbound act signatures (needs per-DID key
+      history; the RFC flags this as unbuilt)

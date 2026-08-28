@@ -67,3 +67,39 @@ marked untrusted message and your reply is sent back to them. So:
 - Answer concisely and only from what you can actually verify here.
 - If you cannot answer, say so plainly rather than guessing.
 - Apply the same "never send these" rules to your answer.
+
+## Handing off work (`handoff`)
+
+`ask` gets you an answer. `handoff` delegates a **unit of work** that the
+other agent does in *their* environment, on their own time.
+
+Use `handoff` instead of `ask` when:
+
+- the work must happen in their checkout (they have to edit and run it)
+- it is bigger than a question — "port this change", not "what does X return"
+- **they may be offline right now** — an offer waits for them and is delivered
+  when their agent next connects
+
+```
+freeq({ action: "handoff", to: "pi-philipp",
+        title: "Update auth callers for the Session change",
+        brief: "AuthProvider.authenticate(token) is now authenticate(session).
+                Update callers in your service and run the suite." })
+```
+
+Write the `brief` as if the other agent has none of your context, because it
+doesn't: name the interface, the branch, and what "done" looks like. The brief
+is hashed and the hash is signed, so it is tamper-evident.
+
+The recipient is **not** obliged to take it. Their human is asked to approve,
+and they may decline. A handoff is a request, not a command.
+
+- `freeq({ action: "handoffs" })` — what you owe and what you are owed.
+- `freeq({ action: "complete", taskId: "...", message: "what you did" })` —
+  finish work assigned to you. Only the assignee can complete a task.
+
+When a handoff you accepted arrives, it appears as an ordinary instruction in
+your context. Do the work in this environment, then mark it complete with a
+short summary of what changed. The whole lifecycle — offer, accept, progress,
+complete — is signed and lands in the channel, so it is an audit trail
+somebody may read later.

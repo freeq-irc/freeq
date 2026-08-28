@@ -21,6 +21,7 @@ import {
   saveConfig,
   modeFor,
   tierFor,
+  tierAtLeast,
   MODES,
   TIER_RANK,
   type FreeqConfig,
@@ -30,6 +31,13 @@ import {
 import { deriveInstallSlug, defaultNick, isDid } from "../src/identity.js";
 import { collectSessionMeta, describeMeta } from "../src/presence.js";
 import { FreeqConnection, type InboundAsk } from "../src/connection.js";
+import {
+  HandoffStore,
+  hashBrief,
+  describeHandoff,
+  HANDOFF_KIND,
+  type HandoffRecord,
+} from "../src/handoff.js";
 import {
   decideInbound,
   frameInbound,
@@ -83,6 +91,19 @@ export default function (pi: ExtensionAPI): void {
 
   /** Channel replies are chat, not essays. */
   const MAX_CHANNEL_REPLY = 1200;
+
+  /** Durable view of handoffs. Loaded once per session. */
+  let handoffs: HandoffStore | undefined;
+  /** Briefs we authored, kept locally so we can show what we sent. */
+  const localBriefs = new Map<string, string>();
+
+  async function ensureHandoffs(): Promise<HandoffStore> {
+    if (handoffs) return handoffs;
+    const store = new HandoffStore(HandoffStore.pathFor(agentDir));
+    await store.load();
+    handoffs = store;
+    return store;
+  }
 
   const notify = (
     ctx: ExtensionContext | undefined,
@@ -210,6 +231,24 @@ export default function (pi: ExtensionAPI): void {
         })();
       },
 
+      onActEvent: (ev) => {
+        void (async () => {
+          const store = await ensureHandoffs();
+          const result = store.apply(ev);
+          if (!result.ok) {
+            // Illegal or unattributable moves are logged, never applied.
+            // Server receipts, duplicate echoes, and replayed moves for tasks
+            // we never saw are all routine — say nothing about those.
+            if (!result.benign && !ev.replayed) {
+              notify(ctx, `freeq: rejected ${ev.verb} — ${result.reason}`, "warning");
+            }
+            return;
+          }
+          await store.save();
+          await onHandoffEvent(ctx, cfg, ev, result.record, result.created);
+        })();
+      },
+
       onAsk: (ask) => {
         deliver(
           ctx,
@@ -242,6 +281,24 @@ export default function (pi: ExtensionAPI): void {
     if (!cfg.enabled || !isDid(cfg.ownerDid)) return; // silent when not set up
     const msg = await connect(ctx);
     if (conn?.state !== "online") notify(ctx, msg, "warning");
+
+    // Surface work that arrived while this installation was offline. The
+    // server replays channel history on join, so offers made overnight land
+    // as replayed act events; anything still open is reported once here.
+    const store = await ensureHandoffs();
+    setTimeout(() => {
+      const me = conn?.did;
+      const waiting = store.inboxFor(me);
+      if (waiting.length) {
+        notify(
+          ctx,
+          `freeq: ${waiting.length} handoff(s) waiting for you:\n` +
+            waiting.map((r) => `  ${describeHandoff(r, me)}`).join("\n") +
+            `\nUse the freeq tool (action 'handoffs') to review.`,
+          "warning",
+        );
+      }
+    }, 12_000).unref?.();
   });
 
   pi.on("session_shutdown", async () => {
@@ -301,6 +358,91 @@ export default function (pi: ExtensionAPI): void {
     conn.updateMeta({ ...conn.meta, model });
   });
 
+  /**
+   * What a pi session does when a handoff moves.
+   *
+   * The only branch with teeth is an inbound offer: accepting it means
+   * agreeing to do someone else's work, so it is HUMAN-GATED by default.
+   * Auto-accept must be opted into per-DID.
+   */
+  async function onHandoffEvent(
+    ctx: ExtensionContext,
+    cfg: FreeqConfig,
+    ev: { verb: string; replayed: boolean; from: string },
+    rec: HandoffRecord,
+    created: boolean,
+  ): Promise<void> {
+    const me = conn?.did;
+
+    // Something we offered moved.
+    if (rec.offerer === me && !created) {
+      notify(ctx, `freeq handoff ${rec.id.slice(0, 10)} → ${rec.state} (${rec.title})`, "info");
+      return;
+    }
+
+    // A new offer addressed to us.
+    const forMe = created && rec.offeree && rec.offeree === me;
+    if (!forMe) {
+      notify(ctx, `freeq handoff ${rec.id.slice(0, 10)}: ${rec.state} — ${rec.title}`, "info");
+      return;
+    }
+
+    const tier = tierFor(cfg, rec.offerer);
+    if (!tierAtLeast(tier, "handoff")) {
+      // Below handoff tier we do not even prompt — an unknown DID must not be
+      // able to raise a dialog in your terminal, let alone queue you work.
+      notify(
+        ctx,
+        `freeq: ignoring handoff from ${rec.offerer} (tier '${tier}', needs 'handoff'). ` +
+          `/freeq handoffs to review, /freeq trust <did> handoff to allow.`,
+        "warning",
+      );
+      return;
+    }
+
+    const age = rec.fromReplay || ev.replayed ? " (offered while you were offline)" : "";
+    const auto = cfg.autoAccept?.includes(rec.offerer);
+
+    if (!auto) {
+      const ok = await ctx.ui.confirm(
+        "freeq: incoming handoff",
+        `${rec.title}${age}\n\n` +
+          `from:     ${rec.offerer}\n` +
+          `task:     ${rec.id}\n` +
+          `context:  ${rec.ctxHash ?? "(none)"}\n` +
+          `deadline: ${rec.deadline ? new Date(rec.deadline * 1000).toISOString() : "(none)"}\n\n` +
+          `Accepting means this session takes on the work.`,
+      );
+      if (!ok) {
+        await conn?.sendAct(rec.channel, "decline", rec.id, {}, undefined);
+        notify(ctx, `freeq: declined handoff ${rec.id.slice(0, 10)}`, "info");
+        return;
+      }
+    }
+
+    await conn?.sendAct(rec.channel, "accept", rec.id, {}, undefined);
+    notify(ctx, `freeq: accepted handoff ${rec.id.slice(0, 10)} — ${rec.title}`, "info");
+
+    // Hand the work to the model as untrusted input, through the same gate
+    // everything else uses.
+    deliver(ctx, {
+      kind: "chat",
+      channel: rec.channel,
+      from: ev.from,
+      did: rec.offerer,
+      text:
+        `You have accepted a handoff over freeq.\n\n` +
+        `Task: ${rec.title}\n` +
+        `Task id: ${rec.id}\n` +
+        (rec.note ? `\nBrief:\n${rec.note}\n` : "") +
+        `\nWork on this in THIS environment. When you are done, report what you did. ` +
+        `Do not send secrets or absolute paths back.`,
+      addressed: true,
+      mode: cfg.muted ? "silent" : "addressed",
+      tier,
+    });
+  }
+
   // ── the tool ────────────────────────────────────────────────────────────
 
   pi.registerTool({
@@ -313,7 +455,12 @@ export default function (pi: ExtensionAPI): void {
       "'peers' lists reachable agents; 'ask' sends a question to one peer and waits " +
       "for its answer (use this when another agent knows something about its own " +
       "environment that you cannot see); 'send' messages a peer without waiting; " +
-      "'say' posts to a channel. Never send secrets, credentials, or absolute " +
+      "'say' posts to a channel. " +
+      "'handoff' DELEGATES a unit of work to a peer: use it when the work must " +
+      "happen in their environment, when it is too big for one question, or when " +
+      "they may be offline — the offer waits for them and they must explicitly " +
+      "accept. 'handoffs' lists tasks you owe or are owed; 'complete' finishes " +
+      "one assigned to you. Never send secrets, credentials, or absolute " +
       "filesystem paths.",
     parameters: Type.Object({
       action: Type.Union(
@@ -322,15 +469,25 @@ export default function (pi: ExtensionAPI): void {
           Type.Literal("ask"),
           Type.Literal("send"),
           Type.Literal("say"),
+          Type.Literal("handoff"),
+          Type.Literal("handoffs"),
+          Type.Literal("complete"),
         ],
         { description: "What to do" },
       ),
-      to: Type.Optional(Type.String({ description: "Peer nick, for ask/send" })),
-      channel: Type.Optional(Type.String({ description: "Channel like #dev, for say" })),
-      message: Type.Optional(Type.String({ description: "Message or question text" })),
+      to: Type.Optional(
+        Type.String({ description: "Peer nick for ask/send; peer DID or nick for handoff" }),
+      ),
+      channel: Type.Optional(Type.String({ description: "Channel like #dev, for say/handoff" })),
+      message: Type.Optional(Type.String({ description: "Message, question, or completion note" })),
       timeoutSec: Type.Optional(
         Type.Number({ description: "Seconds to wait for an ask reply (default 120)" }),
       ),
+      title: Type.Optional(Type.String({ description: "Short title of the work, for handoff" })),
+      brief: Type.Optional(
+        Type.String({ description: "Full context the other agent needs, for handoff" }),
+      ),
+      taskId: Type.Optional(Type.String({ description: "Task id, for complete" })),
     }),
     async execute(_id, params, _signal, _onUpdate, _ctx) {
       const text = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: {} });
@@ -386,6 +543,116 @@ export default function (pi: ExtensionAPI): void {
             conn.send(params.channel, params.message)
               ? `Posted to ${params.channel}.`
               : `Could not post to ${params.channel}.`,
+          );
+        }
+
+        case "handoff": {
+          const title = params.title ?? params.message;
+          if (!params.to || !title) {
+            return text("handoff requires 'to' (peer DID or nick) and 'title'.");
+          }
+          const cfg2 = config ?? (await ensureConfig(_ctx));
+          const channel = params.channel ?? cfg2.channels[0];
+          if (!channel) {
+            return text(
+              "handoff needs a channel to post in (the room is the audit log). " +
+                "Join one with /freeq join #x, or pass 'channel'.",
+            );
+          }
+
+          // Resolve a nick to a DID: an action is addressed to an identity,
+          // never a nick (nicks are per-server and can be reassigned).
+          let toDid = params.to;
+          if (!toDid.startsWith("did:")) {
+            const peer = conn.peers().find((p) => p.nick.toLowerCase() === params.to!.toLowerCase());
+            if (!peer?.did) {
+              return text(
+                `Cannot resolve '${params.to}' to a DID. Run action 'peers' first; ` +
+                  `a handoff is addressed to an identity, not a nick.`,
+              );
+            }
+            toDid = peer.did;
+          }
+
+          const brief = params.brief ?? "";
+          const fields: Record<string, string> = { to: toDid, title };
+          if (brief) fields["ctx-h"] = hashBrief(brief);
+
+          const taskId = await conn.sendAct(channel, "offer", undefined, fields);
+          if (!taskId) return text("Could not send the handoff (offline, or not signed in).");
+
+          const store = await ensureHandoffs();
+          if (brief) {
+            localBriefs.set(taskId, brief);
+            // The brief travels as an ordinary message so the assignee can
+            // read it; the signed hash on the offer makes it tamper-evident.
+            conn.send(channel, `[handoff ${taskId.slice(0, 10)} brief] ${brief}`);
+          }
+          store.put({
+            id: taskId,
+            kind: HANDOFF_KIND,
+            state: "offered",
+            offerer: conn.did ?? "",
+            offeree: toDid,
+            title,
+            note: brief || undefined,
+            ctxHash: brief ? hashBrief(brief) : undefined,
+            channel,
+            fromReplay: false,
+            signed: true,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            log: [{ verb: "offer", by: conn.did ?? "", at: Date.now() }],
+          });
+          await store.save();
+
+          return text(
+            `Handoff offered: ${taskId}\nto ${toDid} in ${channel}\n\n` +
+              `They must explicitly accept. If their agent is offline the offer ` +
+              `waits and is replayed when they reconnect — you do not need to ` +
+              `keep this session open.`,
+          );
+        }
+
+        case "handoffs": {
+          const store = await ensureHandoffs();
+          const me = conn.did;
+          const inbox = store.inboxFor(me);
+          const outbox = store.outboxFor(me);
+          if (!inbox.length && !outbox.length) return text("No open handoffs.");
+          const fmt = (rs: HandoffRecord[]) =>
+            rs.map((r) => `  ${describeHandoff(r, me)}`).join("\n");
+          return text(
+            [
+              inbox.length ? `Offered to / assigned to you:\n${fmt(inbox)}` : "",
+              outbox.length ? `You offered:\n${fmt(outbox)}` : "",
+            ]
+              .filter(Boolean)
+              .join("\n\n"),
+          );
+        }
+
+        case "complete": {
+          if (!params.taskId) return text("complete requires 'taskId'.");
+          const store = await ensureHandoffs();
+          const rec =
+            store.get(params.taskId) ?? store.all().find((r) => r.id.startsWith(params.taskId!));
+          if (!rec) return text(`No handoff known with id ${params.taskId}.`);
+          if (rec.assignee !== conn.did) {
+            return text(
+              `You are not the assignee of ${rec.id} — only the assignee can complete it.`,
+            );
+          }
+          const ok = await conn.sendAct(
+            rec.channel,
+            "complete",
+            rec.id,
+            params.message ? { note: params.message } : {},
+          );
+          return text(
+            ok
+              ? `Marked ${rec.id.slice(0, 10)} complete. The signed lifecycle is in ${rec.channel}.`
+              : "Could not send the completion event.",
           );
         }
 
@@ -491,6 +758,30 @@ export default function (pi: ExtensionAPI): void {
           return;
         }
 
+        case "handoffs": {
+          const store = await ensureHandoffs();
+          const me = conn?.did;
+          const inbox = store.inboxFor(me);
+          const outbox = store.outboxFor(me);
+          const all = store.all();
+          if (!all.length) {
+            ctx.ui.notify("freeq: no handoffs on record", "info");
+            return;
+          }
+          const fmt = (rs: HandoffRecord[]) => rs.map((r) => `  ${describeHandoff(r, me)}`).join("\n");
+          ctx.ui.notify(
+            [
+              inbox.length ? `Offered to / assigned to you:\n${fmt(inbox)}` : "",
+              outbox.length ? `You offered:\n${fmt(outbox)}` : "",
+              `\n(${all.length} total on record, including finished)`,
+            ]
+              .filter(Boolean)
+              .join("\n\n"),
+            "info",
+          );
+          return;
+        }
+
         case "peers": {
           const peers = conn?.peers() ?? [];
           if (!peers.length) {
@@ -553,8 +844,8 @@ export default function (pi: ExtensionAPI): void {
         default:
           ctx.ui.notify(
             "/freeq [status | login <did> | join #c | leave #c | peers | " +
-              "mode #c <silent|addressed|participant> | trust <did> <tier> | " +
-              "mute | unmute | on | off]",
+              "handoffs | mode #c <silent|addressed|participant> | " +
+              "trust <did> <tier> | mute | unmute | on | off]",
             "info",
           );
       }

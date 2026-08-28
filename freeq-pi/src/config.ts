@@ -56,6 +56,11 @@ export interface FreeqConfig {
    * Distinct from `enabled: false`, which disconnects entirely.
    */
   muted: boolean;
+  /**
+   * DIDs whose handoff offers are accepted without a confirmation prompt.
+   * Opt-in only, and only meaningful at `handoff` tier or above.
+   */
+  autoAccept?: string[];
 }
 
 export const DEFAULT_SERVER = "wss://irc.freeq.at/irc";
@@ -68,6 +73,7 @@ export function defaultConfig(): FreeqConfig {
     trust: {},
     enabled: true,
     muted: false,
+    autoAccept: [],
   };
 }
 
@@ -104,6 +110,11 @@ export function normalizeConfig(raw: unknown): FreeqConfig {
   if (typeof o.install === "string" && o.install) base.install = o.install;
   if (typeof o.enabled === "boolean") base.enabled = o.enabled;
   if (typeof o.muted === "boolean") base.muted = o.muted;
+  if (Array.isArray(o.autoAccept)) {
+    base.autoAccept = o.autoAccept.filter(
+      (d): d is string => typeof d === "string" && d.startsWith("did:"),
+    );
+  }
   base.channels = normalizeChannels(o.channels);
 
   if (o.modes && typeof o.modes === "object") {
