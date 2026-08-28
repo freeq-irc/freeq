@@ -38,6 +38,19 @@ class BufferCacheTest {
         return ch
     }
 
+    @Test fun a_cached_companion_keeps_the_task_it_names() {
+        // Dedup on replay is by id, so a cached line shadows the copy history
+        // sends back: whatever it lost on the way to disk it never gets back,
+        // and a companion that lost its task can never draw its card.
+        val line = msg(id = "01LINE", text = "offered: ship the release")
+            .copy(actRef = "01JOPENER00000000000000000")
+        val back = BufferCache.decode(
+            BufferCache.encode(listOf(CachedBuffer("#work", isDM = false, topic = null, messages = listOf(line))))
+        )!!
+
+        assertEquals("01JOPENER00000000000000000", back[0].messages[0].actRef)
+    }
+
     // ── snapshot ──
 
     @Test fun snapshot_marks_channels_and_dms_by_name() {

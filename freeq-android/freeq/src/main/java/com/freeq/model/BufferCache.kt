@@ -30,7 +30,10 @@ internal data class CachedBuffer(
  * keeps the whole thing unit-testable.
  */
 internal object BufferCache {
-    const val VERSION = 2
+    // 3: a companion line's task reference joined the cached fields. A cache
+    //    written without it can never draw its cards, and dedup on replay
+    //    keeps the cached copy, so the old shape is discarded rather than read.
+    const val VERSION = 3
     const val MAX_MESSAGES_PER_BUFFER = 50
     const val FILE_NAME = "buffers.json"
 
@@ -91,6 +94,7 @@ internal object BufferCache {
                         .put("isSigned", m.isSigned)
                         .put("account", m.account)
                         .put("origin", m.origin)
+                        .put("actRef", m.actRef)
                         .put("reactions", reactions)
                 )
             }
@@ -152,6 +156,7 @@ internal object BufferCache {
             isSigned = obj.optBoolean("isSigned"),
             account = obj.optString("account").takeIf { it.isNotEmpty() },
             origin = obj.optString("origin").takeIf { it.isNotEmpty() },
+            actRef = obj.optString("actRef").takeIf { it.isNotEmpty() },
             reactions = reactions,
         )
     }
