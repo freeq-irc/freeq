@@ -39,6 +39,10 @@ data class ChatMessage(
     // null = locally-originated. Drives "via {origin}" + suppresses the local
     // verified/signed badges, which would overstate trust for a peer-vouched msg.
     val origin: String? = null,
+    // The task this line was written beside (+freeq.at/ref), for a companion
+    // line. The only thing joining a line to the work it is about; null on an
+    // ordinary message.
+    val actRef: String? = null,
     val reactions: MutableMap<String, MutableSet<String>> = mutableMapOf()
 )
 
@@ -111,6 +115,23 @@ class ChannelState(val name: String) {
         if (msg.from.isNotEmpty() && msg.timestamp.time > lastActivityTime.value) {
             lastActivityTime.value = msg.timestamp.time
         }
+        // Either side can land first, so joining runs from both.
+        if (msg.actRef != null) pairActCompanions()
+    }
+
+    /**
+     * Join the task events this channel holds to the companion lines it holds.
+     *
+     * Cheap to repeat: already-joined pairs are left alone, and a line whose
+     * event has not arrived waits for it.
+     */
+    fun pairActCompanions() {
+        if (actTasks.tasks.isEmpty()) return
+        actTasks.pair(
+            messages.mapNotNull { m ->
+                m.actRef?.let { ActLine(m.id, m.from, m.account, m.timestamp.time, it) }
+            }
+        )
     }
 
     /**
@@ -1715,6 +1736,7 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                         fields = act.fields.associate { it.key to it.value },
                     )
                 )
+                buf.pairActCompanions()
                 // The home signs confirm and expire itself and sends no line
                 // beside them, so the room hears about those two here. Dated
                 // by the id the home minted the event under — a receipt handed

@@ -73,6 +73,18 @@ class MessageMapperTest {
         assertEquals(1_700_000_000_000L, out.timestamp.time)
     }
 
+    @Test fun surfaces_the_reference_a_companion_line_carries() {
+        // The only thing joining a line to the work it is about.
+        val out = MessageMapper.fromIrc(ircMsg(
+            tags = listOf(TagEntry("+freeq.at/ref", "01JOPENER00000000000000000")),
+        ))
+        assertEquals("01JOPENER00000000000000000", out.actRef)
+    }
+
+    @Test fun an_ordinary_line_references_no_task() {
+        assertNull(MessageMapper.fromIrc(ircMsg(text = "hello")).actRef)
+    }
+
     @Test fun preserves_msgid_when_present() {
         val out = MessageMapper.fromIrc(ircMsg(msgid = "01HXABC123"))
         assertEquals("01HXABC123", out.id)

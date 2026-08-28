@@ -18,6 +18,44 @@ import java.util.Date
  */
 class ChannelStateTest {
 
+    // ── Task events and the lines beside them ──
+
+    private val opener = "01JOPENER00000000000000000"
+
+    private fun offer(ch: ChannelState) = ch.actTasks.record(
+        ActEventInput(
+            from = "poster", did = "did:plc:poster", kind = "handoff", verb = "offer",
+            eventId = opener, taskId = opener,
+            fields = mapOf("act-title" to "ship the release"),
+        )
+    )
+
+    @Test fun a_companion_line_joins_the_event_it_was_written_beside() {
+        val ch = ChannelState("#work")
+        offer(ch)
+        ch.appendIfNew(msg(id = "m1", from = "poster", text = "offered: ship the release")
+            .copy(actRef = opener))
+
+        assertEquals("m1", ch.actTasks.task(opener)!!.events[0].msgId)
+    }
+
+    @Test fun a_line_that_landed_first_joins_when_its_event_arrives() {
+        val ch = ChannelState("#work")
+        ch.appendIfNew(msg(id = "m1", from = "poster").copy(actRef = opener))
+        offer(ch)
+        ch.pairActCompanions()
+
+        assertEquals("m1", ch.actTasks.task(opener)!!.events[0].msgId)
+    }
+
+    @Test fun an_ordinary_line_joins_nothing() {
+        val ch = ChannelState("#work")
+        offer(ch)
+        ch.appendIfNew(msg(id = "m1", from = "poster", text = "unrelated"))
+
+        assertNull(ch.actTasks.task(opener)!!.events[0].msgId)
+    }
+
     private fun msg(
         id: String = "m-${idCounter++}",
         from: String = "alice",

@@ -37,6 +37,9 @@ internal object MessageMapper {
             account = ircMsg.account,
             origin = ircMsg.origin,
             reactions = reactions,
+            // What makes this a companion line, if it is one: the task it was
+            // written beside. No named FFI field carries it.
+            actRef = ircMsg.tags.firstOrNull { it.key == "+freeq.at/ref" }?.value,
         )
     }
 }
