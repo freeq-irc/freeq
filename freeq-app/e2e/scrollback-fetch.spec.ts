@@ -129,8 +129,10 @@ test.describe('walking a channel to its start', () => {
 
     // The row is there from the start, and it is not claiming the channel
     // begins where the loaded list happens to.
-    await expect(boundary(page)).toBeVisible();
-    await expect(boundary(page)).not.toHaveText('This is the beginning of the channel.');
+    // At rest nothing floats over the list and the start marker does not
+    // exist yet: the fetching states render only while a page is on the wire
+    // or after one failed.
+    await expect(boundary(page)).toHaveCount(0);
 
     // ── the walk ──
     //

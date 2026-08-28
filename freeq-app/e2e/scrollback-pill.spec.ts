@@ -32,7 +32,9 @@ const SESSIONS = 2;
 const PER_SESSION = 40;
 
 /** The inset the pill is given from the bottom of the pane (`bottom-4`). */
-const INSET_PX = 16;
+// One lane above the typing strip's floating row, so the two can never
+// overlap: bottom-12 = 48px.
+const INSET_PX = 48;
 
 /** One session that stays connected and sends its share inside the flood
  *  window. */

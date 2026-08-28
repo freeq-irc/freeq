@@ -146,8 +146,10 @@ test.describe('walking a channel far deeper than the window', () => {
     // next 1.2s; scrolling up inside that window is undone.
     await page.waitForTimeout(1_500);
 
-    await expect(boundary(page)).toBeVisible();
-    await expect(boundary(page)).not.toHaveText('This is the beginning of the channel.');
+    // At rest nothing floats over the list and the start marker does not
+    // exist yet: the fetching states render only while a page is on the wire
+    // or after one failed.
+    await expect(boundary(page)).toHaveCount(0);
 
     // ── the walk ──
     //
