@@ -37,6 +37,7 @@ npm run verify
 | `verify:room` (M3) | a human in a channel gets an answer from an agent's own environment; unaddressed and untrusted messages are ignored | `ALL CHECKS PASSED` |
 | `verify:handoff` (M4) | a handoff offered to an **offline** recipient is delivered by replay, accepted, completed, and rebuilt from history by the offerer | `ALL CHECKS PASSED — handoffs survive offline` |
 | `verify:claim` | an open task posted to a channel is claimed by exactly one of two agents racing for it, all views agree, and the loser cannot complete it | `ALL CHECKS PASSED — claim race is safe` |
+| `verify:sig` | a real signature verifies against the real key store; tampering with a covered tag is INVALID; an unreachable key store is UNVERIFIABLE, not invalid | `ALL CHECKS PASSED` |
 | `verify:churn` | a socket dropped mid-session is recovered by the transport without spawning duplicate sessions | `ALL CHECKS PASSED — no duplicate sessions` |
 
 Each harness plants a fact **only the responding side can see** (a file in its
@@ -225,11 +226,19 @@ your terminal, let alone queue you work.
   trusted.
 - **No provenance mirroring yet** — the signed decision log described in the
   design doc is a later phase.
-- **Inbound act signatures are recorded, not verified.** Events carry
-  signatures and we track whether every event in a chain had one, but
-  verifying them needs per-DID key history that the RFC itself flags as
-  unbuilt (origin-server lookup now, DID-document anchoring later). Treat the
-  `signed` flag as "was signed", not "signature checked".
+- **Signature verification holds against an honest server, not a malicious
+  one.** Inbound task events ARE now verified: a forged or tampered event is
+  rejected and never applied, and an unreachable key store yields
+  "unverifiable" rather than a false accusation. But the DID↔key binding is
+  published by the server, so a malicious server could still publish its own
+  key as yours. The hash-derived `kid` stops retroactive key substitution; it
+  cannot attest the original binding. Real end-to-end non-repudiation needs
+  the key anchored in the DID document — the RFC's own open item.
+- **Unverifiable events are applied and flagged, not queued for retry.** The
+  RFC specifies a bounded defer queue that retries the key lookup; we apply
+  the event to the local view and mark the chain `⚠unverified` instead. No
+  work is lost, and the server remains the authority on ordering, but a chain
+  that went unverified does not later flip to verified on its own.
 - **Claim ordering is single-server.** Two agents racing on one server
   converge correctly (`verify:claim`). Across federated servers the RFC's
   minting-server serialization is what guarantees it, and that path is

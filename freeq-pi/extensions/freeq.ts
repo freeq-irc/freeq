@@ -36,9 +36,11 @@ import {
   HandoffStore,
   hashBrief,
   describeHandoff,
+  noteVerification,
   HANDOFF_KIND,
   type HandoffRecord,
 } from "../src/handoff.js";
+import { serverKeyFetcher, verifyActEvent, type KeyFetcher } from "../src/verify.js";
 import {
   decideInbound,
   frameInbound,
@@ -126,6 +128,8 @@ export default function (pi: ExtensionAPI): void {
 
   /** Durable view of handoffs. Loaded once per session. */
   let handoffs: HandoffStore | undefined;
+  /** Resolves the exact key a signature names, from the server's key store. */
+  let keyFetcher: KeyFetcher | undefined;
   /** Briefs we authored, kept locally so we can show what we sent. */
   const localBriefs = new Map<string, string>();
 
@@ -313,6 +317,34 @@ export default function (pi: ExtensionAPI): void {
       onActEvent: (ev) => {
         void (async () => {
           const store = await ensureHandoffs();
+
+          // Check the signature BEFORE applying. Three-way outcome per the
+          // RFC: a forgery is rejected, but an unreachable key store is an
+          // outage — deferring beats destroying someone's completed work.
+          keyFetcher ??= serverKeyFetcher(httpOriginFor(cfg.server));
+          const verdict = await verifyActEvent(
+            {
+              channel: ev.channel,
+              did: ev.did,
+              eventId: ev.eventId,
+              tags: ev.tags,
+              sigTag: ev.sigTag,
+            },
+            { fetchKey: keyFetcher, selfDid: conn?.did ?? "" },
+          );
+
+          if (verdict.outcome === "invalid") {
+            // Do not apply, and say so loudly: this is tampering or forgery,
+            // not a transient problem.
+            notify(
+              ctx,
+              `freeq: REJECTED a task event from ${ev.from} — bad signature ` +
+                `(${verdict.reason}). Task ${ev.taskId.slice(0, 10)} was NOT updated.`,
+              "error",
+            );
+            return;
+          }
+
           const result = store.apply(ev);
           if (!result.ok) {
             // Illegal or unattributable moves are logged, never applied.
@@ -323,7 +355,19 @@ export default function (pi: ExtensionAPI): void {
             }
             return;
           }
+          noteVerification(
+            result.record,
+            verdict.outcome === "valid" ? "valid" : "unverifiable",
+          );
           await store.save();
+          if (verdict.outcome === "unverifiable" && !ev.replayed) {
+            notify(
+              ctx,
+              `freeq: could not verify the signature on ${ev.verb} for ` +
+                `${ev.taskId.slice(0, 10)} (${verdict.reason}) — applied, but unproven.`,
+              "warning",
+            );
+          }
           await onHandoffEvent(ctx, cfg, ev, result.record, result.created);
         })();
       },
@@ -1137,4 +1181,20 @@ export default function (pi: ExtensionAPI): void {
 
 function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * The HTTP origin that serves the key store, derived from the IRC websocket
+ * URL (`wss://host/irc` → `https://host`).
+ */
+function httpOriginFor(wsUrl: string): string {
+  try {
+    const u = new URL(wsUrl);
+    u.protocol = u.protocol === "ws:" ? "http:" : "https:";
+    u.pathname = "";
+    u.search = "";
+    return u.origin;
+  } catch {
+    return "https://irc.freeq.at";
+  }
 }

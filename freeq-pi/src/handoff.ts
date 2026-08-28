@@ -73,6 +73,16 @@ export interface HandoffRecord {
   fromReplay: boolean;
   /** True when every event we applied carried a signature. */
   signed: boolean;
+  /**
+   * Worst verification outcome across the events we applied.
+   *
+   * `valid` means every event's signature was checked against the key it
+   * named. `unverifiable` means at least one could not be checked (no key on
+   * record, or the key origin was unreachable) — the work is NOT discarded,
+   * per the RFC, but the chain is not proven either. Events that verify as
+   * INVALID are never applied, so they never appear here.
+   */
+  verification?: "valid" | "unverifiable";
   createdAt: number;
   updatedAt: number;
   /** Append-only local log of applied events, for `/freeq handoffs <id>`. */
@@ -307,6 +317,8 @@ function normalizeRecord(raw: unknown): HandoffRecord | undefined {
     lastActor: typeof o.lastActor === "string" ? o.lastActor : undefined,
     fromReplay: o.fromReplay === true,
     signed: o.signed !== false,
+    verification:
+      o.verification === "valid" || o.verification === "unverifiable" ? o.verification : undefined,
     createdAt: typeof o.createdAt === "number" ? o.createdAt : Date.now(),
     updatedAt: typeof o.updatedAt === "number" ? o.updatedAt : Date.now(),
     log: Array.isArray(o.log)
@@ -327,13 +339,30 @@ function normalizeRecord(raw: unknown): HandoffRecord | undefined {
   };
 }
 
+/** Fold a new verification outcome into a record, keeping the worst. */
+export function noteVerification(
+  rec: HandoffRecord,
+  outcome: "valid" | "unverifiable",
+): void {
+  if (outcome === "unverifiable" || rec.verification === "unverifiable") {
+    rec.verification = "unverifiable";
+    return;
+  }
+  rec.verification = "valid";
+}
+
 /** One-line human summary of a handoff. */
 export function describeHandoff(r: HandoffRecord, selfDid?: string): string {
   const who =
     r.offerer === selfDid
       ? `→ ${short(r.offeree) ?? "open"}`
       : `← ${short(r.offerer)}`;
-  const flags = [r.signed ? "" : " unsigned", r.fromReplay ? " (replayed)" : ""].join("");
+  const flags = [
+    r.signed ? "" : " unsigned",
+    r.verification === "valid" ? " ✓verified" : "",
+    r.verification === "unverifiable" ? " ⚠unverified" : "",
+    r.fromReplay ? " (replayed)" : "",
+  ].join("");
   return `${r.id.slice(0, 10)}  ${r.state.padEnd(9)} ${who}  ${r.title}${flags}`;
 }
 
