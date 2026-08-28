@@ -3780,7 +3780,8 @@ data class IrcMessage (
     var `reactions`: List<ReactionTally>, 
     var `edited`: kotlin.Boolean, 
     var `dmKey`: kotlin.String?, 
-    var `coordination`: CoordinationEvent?
+    var `coordination`: CoordinationEvent?, 
+    var `tags`: List<TagEntry>
 ) {
     
     companion object
@@ -3811,6 +3812,7 @@ public object FfiConverterTypeIrcMessage: FfiConverterRustBuffer<IrcMessage> {
             FfiConverterBoolean.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalTypeCoordinationEvent.read(buf),
+            FfiConverterSequenceTypeTagEntry.read(buf),
         )
     }
 
@@ -3833,7 +3835,8 @@ public object FfiConverterTypeIrcMessage: FfiConverterRustBuffer<IrcMessage> {
             FfiConverterSequenceTypeReactionTally.allocationSize(value.`reactions`) +
             FfiConverterBoolean.allocationSize(value.`edited`) +
             FfiConverterOptionalString.allocationSize(value.`dmKey`) +
-            FfiConverterOptionalTypeCoordinationEvent.allocationSize(value.`coordination`)
+            FfiConverterOptionalTypeCoordinationEvent.allocationSize(value.`coordination`) +
+            FfiConverterSequenceTypeTagEntry.allocationSize(value.`tags`)
     )
 
     override fun write(value: IrcMessage, buf: ByteBuffer) {
@@ -3856,6 +3859,7 @@ public object FfiConverterTypeIrcMessage: FfiConverterRustBuffer<IrcMessage> {
             FfiConverterBoolean.write(value.`edited`, buf)
             FfiConverterOptionalString.write(value.`dmKey`, buf)
             FfiConverterOptionalTypeCoordinationEvent.write(value.`coordination`, buf)
+            FfiConverterSequenceTypeTagEntry.write(value.`tags`, buf)
     }
 }
 

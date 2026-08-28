@@ -202,6 +202,15 @@ pub struct IrcMessage {
     /// task/evidence card instead of plain text (parity with the web
     /// `CoordinationCards`); a tag-unaware view still shows `text`.
     pub coordination: Option<CoordinationEvent>,
+    /// Every tag the message arrived with.
+    ///
+    /// The fields above name the tags a client was known to need; this is the
+    /// rest, so a tag a client learns to read later needs no change here. A
+    /// task event's companion line is why it exists: it is joined to its task
+    /// by `+freeq.at/ref` alone, which no named field carries — the web reads
+    /// it straight off the line, and without this a native client cannot tell
+    /// a companion from any other message.
+    pub tags: Vec<TagEntry>,
 }
 
 /// A parsed agent coordination event (the `+freeq.at/*` task tag family).
@@ -839,6 +848,13 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
                     edited: is_edited,
                     dm_key: dm_key.clone(),
                     coordination,
+                    tags: tags
+                        .iter()
+                        .map(|(k, v)| TagEntry {
+                            key: k.clone(),
+                            value: v.clone(),
+                        })
+                        .collect(),
                 },
             }
         }
@@ -2918,6 +2934,41 @@ mod tests {
         assert_eq!(coord.task_id.as_deref(), Some("T4821"));
         assert_eq!(coord.phase.as_deref(), Some("testing"));
         assert_eq!(coord.payload.as_deref(), Some("{\"step\":3}"));
+    }
+
+    #[test]
+    fn convert_event_message_carries_its_tags() {
+        // A task event's companion line carries only `+freeq.at/ref` to join
+        // it to the work it is about — no `+freeq.at/event`, so the
+        // coordination field above is empty for it. A native client draws its
+        // card off that reference, so the tags travel whole.
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("msgid".to_string(), "01LINE".to_string());
+        tags.insert(
+            "+freeq.at/ref".to_string(),
+            "01KYVT2BBB0000000000000000".to_string(),
+        );
+        let ev = freeq_sdk::event::Event::Message {
+            from: "taskbot".to_string(),
+            target: "#work".to_string(),
+            text: "offered: ship the release".to_string(),
+            tags,
+            dm_key: None,
+        };
+        let FreeqEvent::Message { msg } = convert_event(&ev).expect("event") else {
+            panic!("expected Message");
+        };
+        assert!(msg.coordination.is_none());
+        let carried = msg
+            .tags
+            .iter()
+            .map(|t| (t.key.as_str(), t.value.as_str()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            carried.get("+freeq.at/ref").copied(),
+            Some("01KYVT2BBB0000000000000000")
+        );
+        assert_eq!(carried.get("msgid").copied(), Some("01LINE"));
     }
 
     #[test]

@@ -2,6 +2,7 @@ package com.freeq.model
 
 import com.freeq.ffi.IrcMessage
 import com.freeq.ffi.ReactionTally
+import com.freeq.ffi.TagEntry
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -37,6 +38,7 @@ class MessageMapperTest {
         origin: String? = null,
         reactions: List<ReactionTally> = emptyList(),
         edited: Boolean = false,
+        tags: List<TagEntry> = emptyList(),
     ) = IrcMessage(
         fromNick = fromNick,
         target = target,
@@ -57,6 +59,7 @@ class MessageMapperTest {
         edited = edited,
         dmKey = null,
         coordination = null,
+        tags = tags,
     )
 
     @Test fun preserves_basic_fields() {
