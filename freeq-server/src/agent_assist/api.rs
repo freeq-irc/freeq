@@ -72,7 +72,7 @@ pub fn routes() -> Router<Arc<SharedState>> {
 
 /// Capabilities advertised by the discovery endpoint. Kept in lock-step
 /// with the tool routes above so agents can rely on this as truth.
-const CAPABILITIES: &[&str] = &[
+pub(crate) const CAPABILITIES: &[&str] = &[
     "validate_client_config",
     "diagnose_message_ordering",
     "diagnose_sync",
@@ -121,6 +121,7 @@ async fn get_discovery() -> impl IntoResponse {
             required: false,
             methods: vec!["bearer"],
         },
+        surfaces: Default::default(),
     })
 }
 

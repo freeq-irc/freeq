@@ -346,6 +346,36 @@ pub struct AgentDiscovery {
     pub assistance_endpoint: &'static str,
     pub capabilities: Vec<&'static str>,
     pub auth: AgentDiscoveryAuth,
+    /// The other machine-readable surfaces on this host. An agent that finds
+    /// this document should not have to guess at the rest.
+    pub surfaces: AgentSurfaces,
+}
+
+/// Cross-links to the sibling discovery surfaces (OpenAPI, llms.txt, MCP).
+#[derive(Debug, Serialize)]
+pub struct AgentSurfaces {
+    /// OpenAPI 3.1 contract for every HTTP endpoint on this server.
+    pub openapi: &'static str,
+    /// YAML source of the same document.
+    pub openapi_yaml: &'static str,
+    /// Markdown index for LLM agents.
+    pub llms_txt: &'static str,
+    /// IRC-over-WebSocket transport (relative; scheme follows the request).
+    pub irc_websocket: &'static str,
+    /// npm package name of the MCP server that wraps this API.
+    pub mcp_package: &'static str,
+}
+
+impl Default for AgentSurfaces {
+    fn default() -> Self {
+        Self {
+            openapi: "/api/v1/openapi.json",
+            openapi_yaml: "/api/v1/openapi.yaml",
+            llms_txt: "/llms.txt",
+            irc_websocket: "/irc",
+            mcp_package: "@freeq/mcp",
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

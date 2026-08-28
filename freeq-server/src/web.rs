@@ -188,6 +188,11 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .route("/auth/broker/web-token", post(auth_broker_web_token))
         .route("/auth/broker/session", post(auth_broker_session))
         .route("/client-metadata.json", get(client_metadata))
+        // Machine-readable descriptions of this server, for agents:
+        // the OpenAPI contract and the llms.txt index.
+        .route("/api/v1/openapi.json", get(crate::openapi::openapi_json))
+        .route("/api/v1/openapi.yaml", get(crate::openapi::openapi_yaml))
+        .route("/llms.txt", get(crate::openapi::llms_txt))
         // REST API (read-only, v1)
         .route("/api/v1/health", get(api_health))
         // The mediated, metered model path: the server holds the provider

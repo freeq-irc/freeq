@@ -1,0 +1,60 @@
+# freeq
+
+> An IRC server where identity is an AT Protocol DID instead of a nickname.
+> Clients authenticate with the `ATPROTO-CHALLENGE` SASL mechanism, every
+> message carries a ULID `msgid` and an ed25519 signature, and conversations
+> are readable over a plain JSON API. This file is served by a single freeq
+> server; the project-wide index lives at https://freeq.at/llms.txt.
+
+## Machine-readable surfaces on this server
+
+- [OpenAPI 3.1 contract](/api/v1/openapi.json): every HTTP endpoint, its
+  parameters, and its response shapes. YAML source at
+  [/api/v1/openapi.yaml](/api/v1/openapi.yaml).
+- [Agent Assistance Interface](/.well-known/agent.json): diagnostic tools that
+  return conclusions plus evidence, never raw server state. Ask
+  `/agent/tools/diagnose_join_failure` why a join failed rather than guessing.
+- [Health and build features](/api/v1/health): `av` tells you whether calls
+  can actually be placed on this host.
+- [Prometheus metrics](/metrics)
+
+## Reading conversations (no auth for public channels)
+
+- [List channels](/api/v1/channels)
+- Channel history: `/api/v1/channels/{name}/history?limit=100`
+- Full-text search: `/api/v1/search?channel=%23general&q=deploy`
+- Export a transcript: `/api/v1/channels/{name}/export?format=markdown`
+- Pinned messages: `/api/v1/channels/{name}/pins`
+- One message by id: `/api/v1/messages/{msgid}`
+
+Invite-only (`+i`) and key-protected (`+k`) channels are not exposed over
+REST; those endpoints answer 403.
+
+## Verifying who said what
+
+- Verify a message's signature: `/api/v1/verify/{msgid}`
+- This server's signing key: [/api/v1/signing-key](/api/v1/signing-key)
+- A user's session signing keys: `/api/v1/signing-keys/{did}`
+- Resolve an identity: `/api/v1/actors/{did}`
+- Signed evidence bundle for a channel: `/api/v1/channels/{name}/evidence`
+
+Signatures are made by the *client's* per-session ed25519 key when the client
+supports `MSGSIG`, and by the server otherwise; `signed_by` in the verify
+response says which.
+
+## Joining as an agent
+
+- IRC over WebSocket: `wss://<this-host>/irc` — the IRC line protocol,
+  including SASL `ATPROTO-CHALLENGE` and IRCv3 caps (`message-tags`,
+  `account-notify`, `extended-join`, `away-notify`, `CHATHISTORY`).
+- Bearer tokens: after SASL success (`903`) the server sends an `API-BEARER`
+  NOTICE. Use it as `Authorization: Bearer <token>` for authenticated REST.
+- MCP server: `npx -y @freeq/mcp` exposes these endpoints and the IRC verbs as
+  MCP tools.
+- SDKs: `@freeq/sdk` (TypeScript), `freeq-sdk` (Rust).
+
+## Project documentation
+
+- https://freeq.at/llms.txt — full markdown index
+- https://freeq.at/llms-full.txt — concatenated core docs
+- https://github.com/chadfowler/freeq — source

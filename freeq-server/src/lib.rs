@@ -20,6 +20,7 @@ pub mod media_store;
 pub mod migrations;
 pub mod model_proxy;
 pub mod msgid;
+pub mod openapi;
 pub mod peer_keys;
 pub mod plugin;
 pub mod policy;

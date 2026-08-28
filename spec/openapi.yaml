@@ -1,0 +1,1793 @@
+# freeq HTTP API — OpenAPI 3.1
+#
+# Canonical, hand-authored contract for everything freeq-server speaks over
+# HTTP: the `/api/v1/*` REST surface, the Agent Assistance Interface
+# (`/.well-known/agent.json` + `/agent/*`), the policy/credential endpoints,
+# and the non-JSON transport routes (`/irc`, `/av/*`, OAuth) documented for
+# completeness.
+#
+# Served by the server itself at:
+#   GET /api/v1/openapi.yaml   (this file, verbatim)
+#   GET /api/v1/openapi.json   (same document, transcoded at startup)
+#
+# A route-coverage drift test (freeq-server/src/openapi.rs tests) fails the
+# build if a `/api/v1/*`, `/agent*` or `/.well-known/agent.json` route exists
+# in the router but not here, or vice-versa. Add routes here in the same
+# commit that adds them to the router.
+openapi: 3.1.0
+info:
+  title: freeq
+  version: 0.1.0
+  summary: AT Protocol-authenticated IRC server with a JSON API for agents.
+  description: |
+    freeq is an IRC server where identity is an AT Protocol DID (via the
+    `ATPROTO-CHALLENGE` SASL mechanism) rather than a nickname, plus a REST
+    surface so agents can read and verify conversations without speaking IRC.
+
+    **Agent entry points**
+
+    - `GET /api/v1/openapi.json` — this contract
+    - `GET /.well-known/agent.json` — Agent Assistance Interface discovery
+    - `GET /llms.txt` — markdown index for LLM agents
+    - `@freeq/mcp` — MCP server wrapping this API and the IRC protocol
+    - `@freeq/sdk` (TypeScript), `freeq-sdk` (Rust) — client SDKs
+
+    **Reading conventions**
+
+    - Timestamps are Unix seconds (integers) unless noted.
+    - Message ids (`msgid`) are ULIDs, stable across federation.
+    - Most read endpoints are unauthenticated for public channels; channels
+      with `+i` (invite-only) or `+k` (key) are excluded or return 403.
+    - Anything that acts as a user takes a bearer token (see `security`).
+  license:
+    name: MIT
+    url: https://github.com/chadfowler/freeq/blob/main/LICENSE
+  contact:
+    name: freeq
+    url: https://freeq.at
+servers:
+  - url: https://irc.freeq.at
+    description: Production
+  - url: http://127.0.0.1:6668
+    description: Local development (default HTTP/WS port)
+externalDocs:
+  description: Docs, protocol notes, and agent surfaces
+  url: https://freeq.at/llms.txt
+tags:
+  - name: discovery
+    description: Machine-readable descriptions of this server.
+  - name: server
+    description: Health, metrics, signing keys.
+  - name: channels
+    description: Channel listing, history, topic, pins, export, search.
+  - name: messages
+    description: Single-message lookup and signature verification.
+  - name: users
+    description: User and WHOIS lookups.
+  - name: identity
+    description: DIDs, signing keys, E2EE pre-key bundles.
+  - name: media
+    description: Upload, blob proxy, signed media, link previews.
+  - name: agent-assistance
+    description: |
+      Conclusion-returning diagnostic tools for agents and bot developers.
+      Every tool answers with an evidence bundle, never raw server state.
+  - name: coordination
+    description: Agent tasks, ACT actions, manifests, budgets, audit log.
+  - name: sessions
+    description: AV/collaboration sessions and their artifacts.
+  - name: policy
+    description: |
+      Channel policy, credentials, and verifiers. Mounted only when the
+      server runs with a policy engine configured.
+  - name: auth
+    description: AT Protocol OAuth and broker token exchange.
+  - name: transport
+    description: Non-JSON endpoints (IRC over WebSocket, AV media, web pages).
+
+security:
+  - {}
+  - bearerAuth: []
+
+paths:
+  # ── discovery ────────────────────────────────────────────────────────
+  /api/v1/openapi.json:
+    get:
+      tags: [discovery]
+      operationId: getOpenApiJson
+      summary: This OpenAPI document, as JSON.
+      security: [{}]
+      responses:
+        "200":
+          description: OpenAPI 3.1 document.
+          content:
+            application/json:
+              schema:
+                type: object
+  /api/v1/openapi.yaml:
+    get:
+      tags: [discovery]
+      operationId: getOpenApiYaml
+      summary: This OpenAPI document, as YAML (canonical source).
+      security: [{}]
+      responses:
+        "200":
+          description: OpenAPI 3.1 document.
+          content:
+            application/yaml:
+              schema:
+                type: string
+  /.well-known/agent.json:
+    get:
+      tags: [discovery, agent-assistance]
+      operationId: getAgentDiscovery
+      summary: Agent Assistance Interface discovery document.
+      description: |
+        Lists the assistance tools this server actually has mounted.
+        `capabilities` is kept in lock-step with the `/agent/tools/*` routes;
+        `free_form_session` only appears when an LLM provider is configured.
+      security: [{}]
+      responses:
+        "200":
+          description: Discovery document.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentDiscovery"
+  /llms.txt:
+    get:
+      tags: [discovery]
+      operationId: getLlmsTxt
+      summary: Markdown index of this server's agent surfaces.
+      security: [{}]
+      responses:
+        "200":
+          description: llms.txt document.
+          content:
+            text/markdown:
+              schema:
+                type: string
+
+  # ── server ───────────────────────────────────────────────────────────
+  /api/v1/health:
+    get:
+      tags: [server]
+      operationId: getHealth
+      summary: Liveness and build/feature report.
+      description: |
+        `av` reports whether calls can actually be placed — the binary was
+        built with `--features av-native` *and* the SFU came up. A server
+        built without it looks entirely healthy while every AV endpoint
+        answers 503, so deploys gate on this field.
+      security: [{}]
+      responses:
+        "200":
+          description: Server status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+  /metrics:
+    get:
+      tags: [server]
+      operationId: getMetrics
+      summary: Prometheus text-format metrics.
+      security: [{}]
+      responses:
+        "200":
+          description: Metrics exposition.
+          content:
+            text/plain:
+              schema:
+                type: string
+  /api/v1/signing-key:
+    get:
+      tags: [server, identity]
+      operationId: getServerSigningKey
+      summary: This server's ed25519 message-signing public key.
+      description: |
+        Used to verify `+freeq.at/sig` tags on messages the server signed on
+        a client's behalf (the fallback path when a client does not sign its
+        own messages).
+      security: [{}]
+      responses:
+        "200":
+          description: Public key.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SigningKey"
+
+  # ── channels ─────────────────────────────────────────────────────────
+  /api/v1/channels:
+    get:
+      tags: [channels]
+      operationId: listChannels
+      summary: List visible channels.
+      security: [{}]
+      responses:
+        "200":
+          description: Channels with member counts and topics.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ChannelInfo"
+  /api/v1/channels/{name}/history:
+    get:
+      tags: [channels]
+      operationId: getChannelHistory
+      summary: Stored messages for a channel, newest-last.
+      description: |
+        Deleted messages are excluded; edited messages are returned in their
+        edited form (`replaces_msgid` links the edit to the original).
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Before"
+      security: [{}]
+      responses:
+        "200":
+          description: Messages.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Message"
+        "403": { $ref: "#/components/responses/RestrictedChannel" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/NoDatabase" }
+  /api/v1/channels/{name}/export:
+    get:
+      tags: [channels]
+      operationId: exportChannel
+      summary: Bulk export of a public channel's history, oldest-first.
+      description: '"The conversation is the commit" — transcripts must be extractable.'
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+        - name: format
+          in: query
+          description: '`json` (default) or `markdown`.'
+          schema:
+            type: string
+            enum: [json, markdown]
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Before"
+      security: [{}]
+      responses:
+        "200":
+          description: Transcript.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Message"
+            text/markdown:
+              schema:
+                type: string
+        "403": { $ref: "#/components/responses/RestrictedChannel" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/channels/{name}/topic:
+    get:
+      tags: [channels]
+      operationId: getChannelTopic
+      summary: Current topic, with who set it and when.
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+      security: [{}]
+      responses:
+        "200":
+          description: Topic.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChannelTopic"
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/channels/{name}/pins:
+    get:
+      tags: [channels]
+      operationId: getChannelPins
+      summary: Pinned messages for a channel.
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+      security: [{}]
+      responses:
+        "200":
+          description: Pins, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pins:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Pin"
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/search:
+    get:
+      tags: [channels]
+      operationId: search
+      summary: Full-text search within one channel.
+      description: |
+        SQLite FTS5 over stored messages (encrypted databases fall back to a
+        bounded decrypt-and-scan). Channels with `+i` or `+k` return 403 —
+        the same authorization CHATHISTORY applies.
+      parameters:
+        - name: channel
+          in: query
+          required: true
+          schema: { type: string }
+          example: "#general"
+        - name: q
+          in: query
+          required: true
+          description: FTS5 query string.
+          schema: { type: string }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Before"
+      security: [{}]
+      responses:
+        "200":
+          description: Matching messages.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Message"
+        "403": { $ref: "#/components/responses/RestrictedChannel" }
+        "503": { $ref: "#/components/responses/NoDatabase" }
+  /api/v1/channels/{name}/evidence:
+    get:
+      tags: [channels, messages]
+      operationId: getChannelEvidence
+      summary: Signed evidence bundle for a channel's recent messages.
+      description: |
+        Returns each message together with the canonical bytes the server
+        signed, so a third party can verify without reconstructing the
+        canonicalization itself.
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Before"
+      security: [{}]
+      responses:
+        "200":
+          description: Evidence bundle.
+          content:
+            application/json:
+              schema:
+                type: object
+        "403": { $ref: "#/components/responses/RestrictedChannel" }
+  /api/v1/favorites:
+    get:
+      tags: [channels]
+      operationId: getFavorites
+      summary: The caller's favorite channels.
+      security: [bearerAuth: []]
+      responses:
+        "200":
+          description: Favorites.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  favorites:
+                    type: array
+                    items: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    put:
+      tags: [channels]
+      operationId: setFavorites
+      summary: Replace the caller's favorite channels.
+      security: [bearerAuth: []]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                favorites:
+                  type: array
+                  items: { type: string }
+      responses:
+        "200": { description: Stored. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # ── messages ─────────────────────────────────────────────────────────
+  /api/v1/messages/{msgid}:
+    get:
+      tags: [messages]
+      operationId: getMessage
+      summary: Fetch a single message by ULID msgid.
+      parameters:
+        - $ref: "#/components/parameters/MsgId"
+      security: [{}]
+      responses:
+        "200":
+          description: Message with channel and sender DID.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StoredMessage"
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/NoDatabase" }
+  /api/v1/verify/{msgid}:
+    get:
+      tags: [messages]
+      operationId: verifyMessage
+      summary: Verify a message's signature.
+      description: |
+        Re-canonicalizes the stored message, resolves the signing key (client
+        session key or server key) and reports whether the signature holds.
+      parameters:
+        - $ref: "#/components/parameters/MsgId"
+      security: [{}]
+      responses:
+        "200":
+          description: Verification result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VerifyResult"
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ── users ────────────────────────────────────────────────────────────
+  /api/v1/users/{nick}:
+    get:
+      tags: [users]
+      operationId: getUser
+      summary: Look up a user by nick.
+      parameters:
+        - $ref: "#/components/parameters/Nick"
+      security: [{}]
+      responses:
+        "200":
+          description: User.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/users/{nick}/whois:
+    get:
+      tags: [users]
+      operationId: whois
+      summary: WHOIS a user, including shared channels.
+      parameters:
+        - $ref: "#/components/parameters/Nick"
+      security: [{}]
+      responses:
+        "200":
+          description: WHOIS record.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Whois"
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ── identity ─────────────────────────────────────────────────────────
+  /api/v1/actors/{did}:
+    get:
+      tags: [identity]
+      operationId: getActorIdentity
+      summary: Resolved identity for a DID (handle, PDS, verification keys).
+      parameters:
+        - $ref: "#/components/parameters/Did"
+      security: [{}]
+      responses:
+        "200":
+          description: Actor identity.
+          content:
+            application/json:
+              schema:
+                type: object
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/signing-keys/{did}:
+    get:
+      tags: [identity]
+      operationId: getDidSigningKeys
+      summary: Registered client session signing keys for a DID.
+      parameters:
+        - $ref: "#/components/parameters/Did"
+      security: [{}]
+      responses:
+        "200":
+          description: Keys.
+          content:
+            application/json:
+              schema:
+                type: object
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/signing-keys/{did}/{kid}:
+    get:
+      tags: [identity]
+      operationId: getDidSigningKeyByKid
+      summary: One session signing key by key id.
+      parameters:
+        - $ref: "#/components/parameters/Did"
+        - name: kid
+          in: path
+          required: true
+          schema: { type: string }
+      security: [{}]
+      responses:
+        "200":
+          description: Key.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SigningKey"
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/keys/{did}:
+    get:
+      tags: [identity]
+      operationId: getPreKeyBundle
+      summary: E2EE pre-key bundle for a DID.
+      parameters:
+        - $ref: "#/components/parameters/Did"
+      security: [{}]
+      responses:
+        "200":
+          description: Bundle.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bundle: { type: object }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/keys:
+    post:
+      tags: [identity]
+      operationId: putPreKeyBundle
+      summary: Publish an E2EE pre-key bundle.
+      description: Requires bearer auth as the named DID.
+      security: [bearerAuth: []]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [did, bundle]
+              properties:
+                did: { type: string }
+                bundle: { type: object }
+      responses:
+        "200": { description: Stored. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/channels/{name}/groupkeys:
+    get:
+      tags: [identity]
+      operationId: getGroupKeys
+      summary: Wrapped group keys for an encrypted channel.
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+      security: [bearerAuth: []]
+      responses:
+        "200":
+          description: Group key material.
+          content:
+            application/json:
+              schema:
+                type: object
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [identity]
+      operationId: putGroupKeys
+      summary: Publish wrapped group keys for an encrypted channel.
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+      security: [bearerAuth: []]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200": { description: Stored. }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  # ── media ────────────────────────────────────────────────────────────
+  /api/v1/upload:
+    post:
+      tags: [media]
+      operationId: upload
+      summary: Upload an image or file (multipart), returning a media URL.
+      description: |
+        Body limit 12 MB. Public uploads return a plain URL; private uploads
+        are encrypted at rest and return a signed capability URL under
+        `/api/v1/media/{id}/{sig}/{filename}`.
+      security: [bearerAuth: []]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "200":
+          description: Upload result.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413": { description: Body too large. }
+  /api/v1/media/{id}/{sig}/{filename}:
+    get:
+      tags: [media]
+      operationId: getMedia
+      summary: Fetch an encrypted-at-rest blob via a signed capability URL.
+      description: |
+        Only `id` and `sig` are authoritative; `filename` is cosmetic so
+        clients see the right extension.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: sig
+          in: path
+          required: true
+          schema: { type: string }
+        - name: filename
+          in: path
+          required: true
+          schema: { type: string }
+      security: [{}]
+      responses:
+        "200":
+          description: Blob bytes.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/blob:
+    get:
+      tags: [media]
+      operationId: proxyBlob
+      summary: SSRF-guarded proxy for an AT Protocol blob URL.
+      parameters:
+        - name: url
+          in: query
+          required: true
+          schema: { type: string, format: uri }
+      security: [{}]
+      responses:
+        "200":
+          description: Blob bytes.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v1/og:
+    get:
+      tags: [media]
+      operationId: getLinkPreview
+      summary: OpenGraph link preview for a URL.
+      parameters:
+        - name: url
+          in: query
+          required: true
+          schema: { type: string, format: uri }
+      security: [{}]
+      responses:
+        "200":
+          description: Preview metadata.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  # ── agent assistance ─────────────────────────────────────────────────
+  /agent/tools/validate_client_config:
+    post:
+      tags: [agent-assistance]
+      operationId: validateClientConfig
+      summary: Check a client configuration against what this server accepts.
+      requestBody: { $ref: "#/components/requestBodies/AgentTool" }
+      responses:
+        "200": { $ref: "#/components/responses/AgentTool" }
+  /agent/tools/diagnose_message_ordering:
+    post:
+      tags: [agent-assistance]
+      operationId: diagnoseMessageOrdering
+      summary: Explain an observed message-ordering anomaly.
+      requestBody: { $ref: "#/components/requestBodies/AgentTool" }
+      responses:
+        "200": { $ref: "#/components/responses/AgentTool" }
+  /agent/tools/diagnose_sync:
+    post:
+      tags: [agent-assistance]
+      operationId: diagnoseSync
+      summary: Diagnose server-to-server state divergence.
+      requestBody: { $ref: "#/components/requestBodies/AgentTool" }
+      responses:
+        "200": { $ref: "#/components/responses/AgentTool" }
+  /agent/tools/inspect_my_session:
+    post:
+      tags: [agent-assistance]
+      operationId: inspectMySession
+      summary: Report what the server believes about the caller's session.
+      requestBody: { $ref: "#/components/requestBodies/AgentTool" }
+      responses:
+        "200": { $ref: "#/components/responses/AgentTool" }
+  /agent/tools/diagnose_join_failure:
+    post:
+      tags: [agent-assistance]
+      operationId: diagnoseJoinFailure
+      summary: Explain why a JOIN was rejected (bans, +i, +k, policy).
+      requestBody: { $ref: "#/components/requestBodies/AgentTool" }
+      responses:
+        "200": { $ref: "#/components/responses/AgentTool" }
+  /agent/tools/diagnose_disconnect:
+    post:
+      tags: [agent-assistance]
+      operationId: diagnoseDisconnect
+      summary: Explain a disconnect (limits, timeouts, auth failures).
+      requestBody: { $ref: "#/components/requestBodies/AgentTool" }
+      responses:
+        "200": { $ref: "#/components/responses/AgentTool" }
+  /agent/tools/replay_missed_messages:
+    post:
+      tags: [agent-assistance]
+      operationId: replayMissedMessages
+      summary: Return messages a client missed while disconnected.
+      requestBody: { $ref: "#/components/requestBodies/AgentTool" }
+      responses:
+        "200": { $ref: "#/components/responses/AgentTool" }
+  /agent/tools/predict_message_outcome:
+    post:
+      tags: [agent-assistance]
+      operationId: predictMessageOutcome
+      summary: Predict what would happen if a given message were sent.
+      requestBody: { $ref: "#/components/requestBodies/AgentTool" }
+      responses:
+        "200": { $ref: "#/components/responses/AgentTool" }
+  /agent/tools/explain_message_routing:
+    post:
+      tags: [agent-assistance]
+      operationId: explainMessageRouting
+      summary: Explain who received a message and why.
+      requestBody: { $ref: "#/components/requestBodies/AgentTool" }
+      responses:
+        "200": { $ref: "#/components/responses/AgentTool" }
+  /agent/tools/diagnose_av_session:
+    post:
+      tags: [agent-assistance]
+      operationId: diagnoseAvSession
+      summary: Diagnose an audio/video session (SFU state, tracks, tokens).
+      requestBody: { $ref: "#/components/requestBodies/AgentTool" }
+      responses:
+        "200": { $ref: "#/components/responses/AgentTool" }
+  /agent/session:
+    post:
+      tags: [agent-assistance]
+      operationId: agentSession
+      summary: Free-form assistance request, routed to a tool by an LLM.
+      description: |
+        Returns `LLM_NOT_CONFIGURED` when no provider is installed; in that
+        case call a structured `/agent/tools/*` endpoint directly.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message: { type: string }
+                context:
+                  type: object
+                  description: Reserved for future structured context.
+      responses:
+        "200": { $ref: "#/components/responses/AgentTool" }
+
+  # ── coordination ─────────────────────────────────────────────────────
+  /api/v1/actions:
+    get:
+      tags: [coordination]
+      operationId: listActions
+      summary: List ACT actions.
+      parameters:
+        - name: kind
+          in: query
+          schema: { type: string }
+        - name: assignee
+          in: query
+          schema: { type: string }
+        - name: state
+          in: query
+          schema: { type: string }
+        - $ref: "#/components/parameters/Limit"
+      security: [{}]
+      responses:
+        "200":
+          description: Actions.
+          content:
+            application/json:
+              schema: { type: object }
+  /api/v1/actions/{act_id}:
+    get:
+      tags: [coordination]
+      operationId: getAction
+      summary: One ACT action, with its transition history.
+      parameters:
+        - name: act_id
+          in: path
+          required: true
+          schema: { type: string }
+      security: [{}]
+      responses:
+        "200":
+          description: Action.
+          content:
+            application/json:
+              schema: { type: object }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/tasks/{task_id}:
+    get:
+      tags: [coordination]
+      operationId: getTask
+      summary: Status of a delegated task.
+      parameters:
+        - name: task_id
+          in: path
+          required: true
+          schema: { type: string }
+      security: [{}]
+      responses:
+        "200":
+          description: Task.
+          content:
+            application/json:
+              schema: { type: object }
+  /api/v1/agents/manifests:
+    get:
+      tags: [coordination]
+      operationId: listAgentManifests
+      summary: Manifests published by agents on this server.
+      security: [{}]
+      responses:
+        "200":
+          description: Manifests.
+          content:
+            application/json:
+              schema: { type: object }
+  /api/v1/agents/manifests/{did}:
+    get:
+      tags: [coordination]
+      operationId: getAgentManifest
+      summary: One agent's manifest.
+      parameters:
+        - $ref: "#/components/parameters/Did"
+      security: [{}]
+      responses:
+        "200":
+          description: Manifest.
+          content:
+            application/json:
+              schema: { type: object }
+  /api/v1/agents/spawned:
+    get:
+      tags: [coordination]
+      operationId: listSpawnedAgents
+      summary: Agents spawned by this server.
+      security: [{}]
+      responses:
+        "200":
+          description: Spawned agents.
+          content:
+            application/json:
+              schema: { type: object }
+  /api/v1/channels/{name}/agent-capabilities:
+    get:
+      tags: [coordination]
+      operationId: getChannelAgentCapabilities
+      summary: Capabilities agents have been granted in a channel.
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+      security: [{}]
+      responses:
+        "200":
+          description: Capabilities.
+          content:
+            application/json:
+              schema: { type: object }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/channels/{name}/approvals:
+    get:
+      tags: [coordination]
+      operationId: getPendingApprovals
+      summary: Actions awaiting human approval in a channel.
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+      security: [{}]
+      responses:
+        "200":
+          description: Pending approvals.
+          content:
+            application/json:
+              schema: { type: object }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/channels/{name}/events:
+    get:
+      tags: [coordination]
+      operationId: getChannelEvents
+      summary: Coordination event log for a channel.
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+        - name: type
+          in: query
+          schema: { type: string }
+        - name: ref_id
+          in: query
+          schema: { type: string }
+        - name: actor
+          in: query
+          schema: { type: string }
+        - $ref: "#/components/parameters/Since"
+        - $ref: "#/components/parameters/Limit"
+      security: [{}]
+      responses:
+        "200":
+          description: Events.
+          content:
+            application/json:
+              schema: { type: object }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/channels/{name}/audit:
+    get:
+      tags: [coordination]
+      operationId: getChannelAudit
+      summary: Governance/audit log for a channel.
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+        - name: actor
+          in: query
+          schema: { type: string }
+        - $ref: "#/components/parameters/Since"
+        - $ref: "#/components/parameters/Limit"
+      security: [{}]
+      responses:
+        "200":
+          description: Audit entries.
+          content:
+            application/json:
+              schema: { type: object }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/channels/{name}/budget:
+    get:
+      tags: [coordination]
+      operationId: getChannelBudget
+      summary: Model-spend budget configured for a channel.
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+      security: [{}]
+      responses:
+        "200":
+          description: Budget.
+          content:
+            application/json:
+              schema: { type: object }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/channels/{name}/spend:
+    get:
+      tags: [coordination]
+      operationId: getChannelSpend
+      summary: Recorded model spend for a channel.
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+        - name: agent
+          in: query
+          schema: { type: string }
+        - $ref: "#/components/parameters/Since"
+        - $ref: "#/components/parameters/Limit"
+      security: [{}]
+      responses:
+        "200":
+          description: Spend records.
+          content:
+            application/json:
+              schema: { type: object }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/model/chat/completions:
+    post:
+      tags: [coordination]
+      operationId: modelChatCompletions
+      summary: Mediated, metered model call (OpenAI-compatible shape).
+      description: |
+        The server holds the provider credential; the caller holds only an
+        identity and a budget. Spend is metered against the channel budget.
+      security: [bearerAuth: []]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Completion.
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "402": { description: Budget exhausted. }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  # ── sessions ─────────────────────────────────────────────────────────
+  /api/v1/sessions:
+    get:
+      tags: [sessions]
+      operationId: listSessions
+      summary: Active sessions on this server.
+      security: [{}]
+      responses:
+        "200":
+          description: Sessions.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items: { type: object }
+  /api/v1/sessions/{id}:
+    get:
+      tags: [sessions]
+      operationId: getSession
+      summary: One session's detail.
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+        - name: debug
+          in: query
+          description: Set to `1` to include SFU announcement debug fields.
+          schema: { type: string, enum: ["1"] }
+      security: [{}]
+      responses:
+        "200":
+          description: Session.
+          content:
+            application/json:
+              schema: { type: object }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/sessions/{id}/artifacts:
+    get:
+      tags: [sessions]
+      operationId: listSessionArtifacts
+      summary: Artifacts attached to a session.
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      security: [{}]
+      responses:
+        "200":
+          description: Artifacts.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  artifacts:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Artifact"
+    post:
+      tags: [sessions]
+      operationId: createSessionArtifact
+      summary: Attach an artifact to a session.
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      security: [bearerAuth: []]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Artifact"
+      responses:
+        "200": { description: Created. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/channels/{name}/sessions:
+    get:
+      tags: [sessions]
+      operationId: getChannelSessions
+      summary: Active and recent sessions for a channel.
+      parameters:
+        - $ref: "#/components/parameters/ChannelName"
+      security: [{}]
+      responses:
+        "200":
+          description: Sessions.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  active: { type: array, items: { type: object } }
+                  recent: { type: array, items: { type: object } }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/av/sessions/{id}/token:
+    get:
+      tags: [sessions, transport]
+      operationId: getAvSessionToken
+      summary: Short-lived token authorizing this caller to join an AV session.
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      security: [bearerAuth: []]
+      responses:
+        "200":
+          description: Token.
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { description: Built without `--features av-native`. }
+
+  # ── policy (mounted only with a policy engine) ───────────────────────
+  /api/v1/policy/{channel}:
+    get:
+      tags: [policy]
+      operationId: getPolicy
+      summary: Effective join policy for a channel.
+      parameters:
+        - $ref: "#/components/parameters/PolicyChannel"
+      security: [{}]
+      responses:
+        "200":
+          description: Policy.
+          content:
+            application/json:
+              schema: { type: object }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/policy/{channel}/rules:
+    get:
+      tags: [policy]
+      operationId: getPolicyRules
+      summary: Individual rules making up a channel's policy.
+      parameters:
+        - $ref: "#/components/parameters/PolicyChannel"
+      security: [{}]
+      responses:
+        "200":
+          description: Rules.
+          content:
+            application/json:
+              schema: { type: object }
+  /api/v1/policy/{channel}/history:
+    get:
+      tags: [policy]
+      operationId: getPolicyHistory
+      summary: Hash-chained history of policy changes.
+      parameters:
+        - $ref: "#/components/parameters/PolicyChannel"
+      security: [{}]
+      responses:
+        "200":
+          description: Policy chain.
+          content:
+            application/json:
+              schema: { type: object }
+  /api/v1/policy/{channel}/join:
+    post:
+      tags: [policy]
+      operationId: policyJoin
+      summary: Attempt a policy-gated join, presenting credentials.
+      parameters:
+        - $ref: "#/components/parameters/PolicyChannel"
+      security: [bearerAuth: []]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Join decision.
+          content:
+            application/json:
+              schema: { type: object }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/policy/{channel}/check:
+    post:
+      tags: [policy]
+      operationId: checkPolicyRequirements
+      summary: Dry-run a policy check without joining.
+      parameters:
+        - $ref: "#/components/parameters/PolicyChannel"
+      security: [{}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Requirement report.
+          content:
+            application/json:
+              schema: { type: object }
+  /api/v1/policy/{channel}/membership/{did}:
+    get:
+      tags: [policy]
+      operationId: getPolicyMembership
+      summary: Whether a DID satisfies a channel's policy.
+      parameters:
+        - $ref: "#/components/parameters/PolicyChannel"
+        - $ref: "#/components/parameters/Did"
+      security: [{}]
+      responses:
+        "200":
+          description: Membership status.
+          content:
+            application/json:
+              schema: { type: object }
+  /api/v1/policy/{channel}/transparency:
+    get:
+      tags: [policy]
+      operationId: getPolicyTransparency
+      summary: Transparency record for policy decisions in a channel.
+      parameters:
+        - $ref: "#/components/parameters/PolicyChannel"
+      security: [{}]
+      responses:
+        "200":
+          description: Transparency log.
+          content:
+            application/json:
+              schema: { type: object }
+  /api/v1/authority/{hash}:
+    get:
+      tags: [policy]
+      operationId: getAuthoritySet
+      summary: Authority set by content hash.
+      parameters:
+        - name: hash
+          in: path
+          required: true
+          schema: { type: string }
+      security: [{}]
+      responses:
+        "200":
+          description: Authority set.
+          content:
+            application/json:
+              schema: { type: object }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/credentials/{did}:
+    get:
+      tags: [policy]
+      operationId: getCredentials
+      summary: Credentials issued to a DID.
+      parameters:
+        - $ref: "#/components/parameters/Did"
+      security: [{}]
+      responses:
+        "200":
+          description: Credentials.
+          content:
+            application/json:
+              schema: { type: object }
+  /api/v1/credentials/present:
+    post:
+      tags: [policy]
+      operationId: presentCredential
+      summary: Present a credential for verification.
+      security: [{}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Verification result.
+          content:
+            application/json:
+              schema: { type: object }
+  /api/v1/verify/github:
+    post:
+      tags: [policy]
+      operationId: verifyGithub
+      summary: Issue a GitHub-linkage credential.
+      description: Requires `GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET`; otherwise 503.
+      security: [{}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Credential.
+          content:
+            application/json:
+              schema: { type: object }
+        "503": { description: GitHub verifier not configured. }
+
+  # ── auth ─────────────────────────────────────────────────────────────
+  /auth/login:
+    get:
+      tags: [auth]
+      operationId: authLogin
+      summary: Start the AT Protocol OAuth flow for a handle.
+      parameters:
+        - name: handle
+          in: query
+          required: true
+          schema: { type: string }
+          example: alice.bsky.social
+        - name: mobile
+          in: query
+          description: '`1` to redirect to the `freeq://` scheme.'
+          schema: { type: string, enum: ["1"] }
+        - name: irc_state
+          in: query
+          description: Set when the flow came from the IRC `/login` command.
+          schema: { type: string }
+      security: [{}]
+      responses:
+        "302": { description: Redirect to the authorization server. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /auth/callback:
+    get:
+      tags: [auth]
+      operationId: authCallback
+      summary: OAuth redirect target; completes the flow.
+      security: [{}]
+      responses:
+        "200": { description: HTML that hands the session to the client. }
+        "302": { description: Redirect to the client. }
+  /auth/step-up:
+    get:
+      tags: [auth]
+      operationId: authStepUp
+      summary: Incremental authorization for a specific scope.
+      description: |
+        Drives a second OAuth flow (image upload, Bluesky cross-post) without
+        replacing the user's primary login session.
+      security: [{}]
+      responses:
+        "302": { description: Redirect to the authorization server. }
+  /auth/mobile:
+    get:
+      tags: [auth]
+      operationId: authMobileRedirect
+      summary: Hash-fragment bridge that redirects into the `freeq://` scheme.
+      security: [{}]
+      responses:
+        "200": { description: HTML redirector. }
+  /auth/broker/web-token:
+    post:
+      tags: [auth]
+      operationId: brokerWebToken
+      summary: Exchange a broker-signed request for a web session token.
+      description: Authenticated by `X-Broker-Signature` over the raw body.
+      security: [brokerSignature: []]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [did, handle]
+              properties:
+                did: { type: string }
+                handle: { type: string }
+      responses:
+        "200":
+          description: Session token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BrokerToken"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { description: Broker auth not configured or bad signature. }
+  /auth/broker/session:
+    post:
+      tags: [auth]
+      operationId: brokerSession
+      summary: Hand a broker-held OAuth session to this server.
+      security: [brokerSignature: []]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Accepted.
+          content:
+            application/json:
+              schema: { type: object }
+        "403": { description: Broker auth not configured or bad signature. }
+  /client-metadata.json:
+    get:
+      tags: [auth, discovery]
+      operationId: getClientMetadata
+      summary: AT Protocol OAuth client metadata document.
+      security: [{}]
+      responses:
+        "200":
+          description: Client metadata.
+          content:
+            application/json:
+              schema: { type: object }
+
+  # ── transport ────────────────────────────────────────────────────────
+  /irc:
+    get:
+      tags: [transport]
+      operationId: ircWebSocket
+      summary: IRC over WebSocket.
+      description: |
+        Upgrade to a WebSocket carrying the IRC line protocol, including the
+        `ATPROTO-CHALLENGE` SASL mechanism. Per-IP connection limits apply.
+      security: [{}]
+      responses:
+        "101": { description: Switching protocols. }
+        "429": { description: Per-IP connection limit reached. }
+  /av/moq:
+    get:
+      tags: [transport]
+      operationId: avMoqWebSocket
+      summary: MoQ-over-WebSocket media transport (SFU).
+      security: [{}]
+      responses:
+        "101": { description: Switching protocols. }
+        "503": { description: Built without `--features av-native`. }
+  /av/call:
+    get:
+      tags: [transport]
+      operationId: avCallPage
+      summary: Standalone AV call page.
+      security: [{}]
+      responses:
+        "200":
+          description: HTML page.
+          content:
+            text/html:
+              schema: { type: string }
+  /av/call.html:
+    get:
+      tags: [transport]
+      operationId: avCallPageHtml
+      summary: Alias of `/av/call`.
+      security: [{}]
+      responses:
+        "200":
+          description: HTML page.
+          content:
+            text/html:
+              schema: { type: string }
+  /av/assets/{filename}:
+    get:
+      tags: [transport]
+      operationId: avAsset
+      summary: Static asset for the AV call page.
+      parameters:
+        - name: filename
+          in: path
+          required: true
+          schema: { type: string }
+      security: [{}]
+      responses:
+        "200": { description: Asset bytes. }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /join/{channel}:
+    get:
+      tags: [transport]
+      operationId: channelInvitePage
+      summary: Shareable channel invite landing page.
+      parameters:
+        - name: channel
+          in: path
+          required: true
+          schema: { type: string }
+      security: [{}]
+      responses:
+        "200":
+          description: HTML page.
+          content:
+            text/html:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        A freeq API bearer token. Obtained either from the `API-BEARER`
+        NOTICE the server sends after a successful SASL `903`, or from
+        `POST /auth/broker/web-token`. Identifies the caller by DID.
+    brokerSignature:
+      type: apiKey
+      in: header
+      name: X-Broker-Signature
+      description: HMAC over the raw request body, using the broker shared secret.
+
+  parameters:
+    ChannelName:
+      name: name
+      in: path
+      required: true
+      description: Channel name, with or without the leading `#` (case-insensitive).
+      schema: { type: string }
+      example: "#general"
+    PolicyChannel:
+      name: channel
+      in: path
+      required: true
+      schema: { type: string }
+      example: "#general"
+    Nick:
+      name: nick
+      in: path
+      required: true
+      schema: { type: string }
+    Did:
+      name: did
+      in: path
+      required: true
+      schema: { type: string }
+      example: did:plc:4qsyxmnsblo4luuycm3572bq
+    MsgId:
+      name: msgid
+      in: path
+      required: true
+      description: ULID message id.
+      schema: { type: string }
+    SessionId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      description: Maximum rows to return.
+      schema: { type: integer, minimum: 1 }
+    Before:
+      name: before
+      in: query
+      description: Return only rows older than this Unix-seconds timestamp.
+      schema: { type: integer, format: int64 }
+    Since:
+      name: since
+      in: query
+      description: Return only rows newer than this Unix-seconds timestamp.
+      schema: { type: integer, format: int64 }
+
+  requestBodies:
+    AgentTool:
+      required: true
+      description: Tool-specific input object; see `/.well-known/agent.json`.
+      content:
+        application/json:
+          schema:
+            type: object
+
+  responses:
+    AgentTool:
+      description: |
+        Evidence bundle envelope: a conclusion plus the evidence behind it,
+        with a `request_id` for audit correlation.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AgentToolEnvelope"
+    BadRequest:
+      description: Malformed request.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Authenticated, but not permitted.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: No such resource.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RestrictedChannel:
+      description: |
+        Channel is invite-only (`+i`) or key-protected (`+k`); its contents
+        are not exposed over REST.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RateLimited:
+      description: Rate limit exceeded.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NoDatabase:
+      description: This server runs without persistence, so history is unavailable.
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+    Health:
+      type: object
+      required: [server_name, version, connections, channels, uptime_secs, av]
+      properties:
+        server_name: { type: string }
+        version: { type: string }
+        git_commit: { type: string }
+        connections: { type: integer }
+        channels: { type: integer }
+        uptime_secs: { type: integer, format: int64 }
+        av:
+          type: boolean
+          description: AV built in (`--features av-native`) *and* SFU up.
+    ChannelInfo:
+      type: object
+      required: [name, members]
+      properties:
+        name: { type: string }
+        members: { type: integer }
+        topic: { type: [string, "null"] }
+    ChannelTopic:
+      type: object
+      required: [channel]
+      properties:
+        channel: { type: string }
+        topic: { type: [string, "null"] }
+        set_by: { type: [string, "null"] }
+        set_at: { type: [integer, "null"], format: int64 }
+    Message:
+      type: object
+      required: [id, sender, text, timestamp, tags]
+      properties:
+        id: { type: integer, format: int64 }
+        sender:
+          type: string
+          description: IRC prefix (`nick!user@host`) or nick.
+        text: { type: string }
+        timestamp: { type: integer, format: int64 }
+        tags:
+          type: object
+          additionalProperties: { type: string }
+          description: IRCv3 message tags, including `+freeq.at/sig`.
+        msgid: { type: string, description: ULID. }
+    StoredMessage:
+      allOf:
+        - $ref: "#/components/schemas/Message"
+        - type: object
+          properties:
+            channel: { type: string }
+            sender_did: { type: [string, "null"] }
+            replaces_msgid:
+              type: [string, "null"]
+              description: Set when this message is an edit of another.
+    Pin:
+      type: object
+      properties:
+        msgid: { type: string }
+        pinned_by: { type: string }
+        pinned_at: { type: integer, format: int64 }
+        text: { type: string }
+    User:
+      type: object
+      required: [nick, online]
+      properties:
+        nick: { type: string }
+        online: { type: boolean }
+        did: { type: [string, "null"] }
+        handle: { type: [string, "null"] }
+    Whois:
+      allOf:
+        - $ref: "#/components/schemas/User"
+        - type: object
+          properties:
+            channels:
+              type: array
+              items: { type: string }
+    SigningKey:
+      type: object
+      properties:
+        did: { type: string }
+        kid: { type: string }
+        alg: { type: string, examples: [ed25519] }
+        public_key:
+          type: string
+          description: base64url (unpadded) raw public key bytes.
+    VerifyResult:
+      type: object
+      properties:
+        msgid: { type: string }
+        verified: { type: boolean }
+        signer: { type: string, description: DID or server name. }
+        signed_by:
+          type: string
+          description: '`client` (session key) or `server` (fallback).'
+        reason:
+          type: string
+          description: Why verification failed, when it did.
+    Artifact:
+      type: object
+      properties:
+        id: { type: string }
+        session_id: { type: string }
+        kind: { type: string }
+        created_at: { type: integer, format: int64 }
+        created_by: { type: string }
+        content_ref: { type: string }
+        content_type: { type: string }
+        visibility: { type: string }
+        title: { type: string }
+    BrokerToken:
+      type: object
+      required: [token, nick, did, handle]
+      properties:
+        token: { type: string }
+        nick: { type: string }
+        did: { type: string }
+        handle: { type: string }
+    AgentDiscovery:
+      type: object
+      required: [service, version, assistance_endpoint, capabilities, auth]
+      properties:
+        service: { type: string, examples: [Freeq] }
+        version: { type: string }
+        description: { type: string }
+        assistance_endpoint: { type: string, examples: ["/agent/tools"] }
+        capabilities:
+          type: array
+          items: { type: string }
+        auth:
+          type: object
+          properties:
+            required: { type: boolean }
+            methods:
+              type: array
+              items: { type: string }
+    AgentToolEnvelope:
+      type: object
+      properties:
+        request_id: { type: string }
+        conclusion: { type: string }
+        evidence: { type: object }
+        caller: { type: object }

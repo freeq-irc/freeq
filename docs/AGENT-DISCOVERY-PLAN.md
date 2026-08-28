@@ -1,6 +1,54 @@
 # Agent Discovery Plan — OpenAPI, MCP, Skills, llms.txt
 
-**Branch:** `agent-discovery` · **Status:** planning · **Updated:** 2026-05-24
+**Branch:** `agent-discovery` · **Status:** in progress · **Updated:** 2026-05-25
+
+## Progress log
+
+| Phase | Status | Notes |
+|---|---|---|
+| 1. OpenAPI spec + drift test | **done** | `spec/openapi.yaml` (82 paths, 3.1.0) served at `/api/v1/openapi.{json,yaml}`; 7 unit + 4 acceptance tests |
+| 2. llms.txt | in progress | server-side `/llms.txt` done; freeq.at site routes + repo-root file remain |
+| 3a. `@freeq/mcp` stdio | todo | |
+| 3b. remote MCP `/mcp` | todo | |
+| 4. `skills/` | todo | |
+| 5. tie-together + deploy | todo | |
+
+### Deviations from the original plan
+
+- **YAML is canonical, JSON is derived at startup.** `serde_yaml_ng` added to
+  `freeq-server` (no yaml crate existed in the tree) so the hand-authored
+  `spec/openapi.yaml` can be `include_str!`'d and transcoded once into JSON
+  behind a `OnceLock`. Authoring in JSON was rejected as unmaintainable by hand.
+- **Drift test reads router *source*, not the live `Router`.** axum 0.8 exposes
+  no route introspection, so the test `include_str!`s `web.rs`,
+  `agent_assist/api.rs` and `policy/api.rs` and regex-extracts `.route("…")`
+  literals. Same guarantee (paths can't silently rot), no reflection needed.
+- **Scalar/Swagger UI at `/api/docs` not built.** The spec is for agents; a
+  human-facing renderer is cosmetic and adds a vendored JS bundle. Revisit if
+  asked.
+
+### Phase 1 as built
+
+- `spec/openapi.yaml` — hand-authored 3.1.0 contract covering all 82 router
+  paths: `/api/v1/*`, `/agent*`, `/.well-known/agent.json`, policy endpoints
+  (flagged as conditionally mounted), OAuth/broker, and the transport routes
+  (`/irc`, `/av/*`). Shared `components` for the error envelope, bearer +
+  broker-signature schemes, and the `limit`/`before`/`since` parameters.
+- `freeq-server/src/openapi.rs` — `include_str!` the YAML, serve it verbatim,
+  transcode to JSON once behind a `OnceLock`, and serve `/llms.txt`.
+- `freeq-server/src/llms.txt` — the server-side index (what this host is,
+  where the machine-readable surfaces are, how to read/verify conversations).
+- `/.well-known/agent.json` gained a `surfaces` block cross-linking OpenAPI,
+  llms.txt, `/irc`, and `@freeq/mcp` (`AgentSurfaces` in `agent_assist/types.rs`).
+- Tests: 7 unit tests in `openapi.rs` (YAML/JSON validity, both drift
+  directions, capability↔spec agreement, unique `operationId`s, a guard
+  against the path extractor matching nothing) and 4 acceptance tests in
+  `freeq-server/tests/agent_discovery.rs` (spec fetchable as JSON + YAML,
+  llms.txt markdown, `agent.json` cross-links resolve, and every documented
+  parameterless GET endpoint answers something other than 404).
+- Drift test verified to fail on a deliberately unregistered probe route, so
+  it is not vacuous. `cargo test --workspace` in CI covers it; no CI change
+  needed.
 
 ## Goal
 
