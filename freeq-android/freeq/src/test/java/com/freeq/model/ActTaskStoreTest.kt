@@ -250,6 +250,84 @@ class ActTaskStoreTest {
         assertNull(store.record(move("expire", "e2", who = "acceptance", did = null)))
     }
 
+    // ── The cards either side of one ──
+
+    private fun paired(store: ActTaskStore, verbs: List<String>) {
+        // An opener and its follow-ups, each with the line its sender wrote.
+        store.record(ev())
+        verbs.forEachIndexed { i, verb -> store.record(move(verb, "e${i + 2}")) }
+        store.pair(
+            listOf(line("m1", "poster", opener, account = poster)) +
+                verbs.mapIndexed { i, _ -> line("m${i + 2}", "worker", opener, account = worker) }
+        )
+    }
+
+    @Test fun the_first_card_has_no_card_before_it() {
+        val store = ActTaskStore()
+        paired(store, listOf("claim", "complete"))
+        val task = store.task(opener)!!
+
+        val ends = actCardNeighbours(task, task.events[0])
+        assertNull(ends.prev)
+        assertEquals("m2", ends.next)
+    }
+
+    @Test fun a_card_in_the_middle_has_one_either_side() {
+        val store = ActTaskStore()
+        paired(store, listOf("claim", "complete"))
+        val task = store.task(opener)!!
+
+        val ends = actCardNeighbours(task, task.events[1])
+        assertEquals("m1", ends.prev)
+        assertEquals("m3", ends.next)
+    }
+
+    @Test fun the_last_card_has_no_card_after_it() {
+        val store = ActTaskStore()
+        paired(store, listOf("claim", "complete"))
+        val task = store.task(opener)!!
+
+        val ends = actCardNeighbours(task, task.events[2])
+        assertEquals("m2", ends.prev)
+        assertNull(ends.next)
+    }
+
+    @Test fun the_two_the_home_signs_are_not_neighbours() {
+        // They write no companion line, so there is no card to land on: a
+        // confirm between two moves must not be offered as either one's
+        // neighbour, and has no neighbours of its own.
+        val store = ActTaskStore()
+        store.record(ev())
+        store.record(move("claim", "e2"))
+        store.record(move("confirm", "e3", mapOf("act-subject" to "e2"), who = "acceptance", did = null))
+        store.record(move("complete", "e4"))
+        store.pair(
+            listOf(
+                line("m1", "poster", opener, account = poster),
+                line("m2", "worker", opener, account = worker),
+                line("m4", "worker", opener, account = worker),
+            )
+        )
+        val task = store.task(opener)!!
+
+        assertEquals("m4", actCardNeighbours(task, task.events[1]).next)
+        val receipt = actCardNeighbours(task, task.events[2])
+        assertNull(receipt.prev)
+        assertNull(receipt.next)
+    }
+
+    @Test fun an_event_whose_line_has_not_arrived_offers_nothing() {
+        val store = ActTaskStore()
+        store.record(ev())
+        store.record(move("claim", "e2"))
+        store.pair(listOf(line("m1", "poster", opener, account = poster)))
+        val task = store.task(opener)!!
+
+        val unpaired = actCardNeighbours(task, task.events[1])
+        assertNull(unpaired.prev)
+        assertNull(unpaired.next)
+    }
+
     // ── When an event was made ──
 
     @Test fun an_event_carries_the_moment_it_was_minted() {

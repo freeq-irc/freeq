@@ -33,6 +33,25 @@ data class ActTask(
     val events: List<ActTaskEvent> = emptyList(),
 )
 
+/** The cards either side of one, by the msgid of the line each is drawn on. */
+data class ActNeighbours(val prev: String? = null, val next: String? = null)
+
+/**
+ * The cards either side of this one.
+ *
+ * A task's cards are its events in the order they were made, minus the two
+ * the home signs for itself: those write no companion line, so there is no
+ * card to land on. Absent at each end, which is what stops a link being
+ * offered there — and absent entirely for an event whose own line has not
+ * arrived, since it has no card of its own to navigate from.
+ */
+fun actCardNeighbours(task: ActTask, event: ActTaskEvent): ActNeighbours {
+    val cards = task.events.filter { it.msgId != null }
+    val i = cards.indexOfFirst { it.eventId == event.eventId }
+    if (i == -1) return ActNeighbours()
+    return ActNeighbours(cards.getOrNull(i - 1)?.msgId, cards.getOrNull(i + 1)?.msgId)
+}
+
 /** A task event and the task it belongs to, as one card draws them. */
 data class ActCard(val task: ActTask, val event: ActTaskEvent)
 

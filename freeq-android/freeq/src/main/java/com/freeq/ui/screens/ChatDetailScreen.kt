@@ -181,6 +181,7 @@ fun ChatDetailScreen(
                     channelState = channelState,
                     onProfileClick = { nick, origin, anchor -> profileTarget = Triple(nick, origin, anchor) },
                     scrollToMessageId = scrollToMessageId,
+                    onJumpToMessage = { msgId -> scrollToMessageId = msgId },
                     modifier = Modifier.weight(1f)
                 )
 

@@ -69,6 +69,7 @@ fun MessageList(
     channelState: ChannelState,
     onProfileClick: ((String, String?, ChatMessage?) -> Unit)? = null,
     scrollToMessageId: String? = null,
+    onJumpToMessage: ((String) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     // Safety: hide blocked users' messages at render time. Messages stay in
@@ -282,7 +283,8 @@ fun MessageList(
                     clipboardManager = clipboardManager,
                     onNickClick = onProfileClick,
                     onImageClick = { url -> lightboxUrl = url },
-                    onThreadClick = { threadMsg -> threadMessage = threadMsg }
+                    onThreadClick = { threadMsg -> threadMessage = threadMsg },
+                    onJumpToMessage = onJumpToMessage
                 )
             }
 
@@ -411,7 +413,8 @@ private fun MessageBubble(
     clipboardManager: androidx.compose.ui.platform.ClipboardManager,
     onNickClick: ((String, String?, ChatMessage?) -> Unit)? = null,
     onImageClick: ((String) -> Unit)? = null,
-    onThreadClick: ((ChatMessage) -> Unit)? = null
+    onThreadClick: ((ChatMessage) -> Unit)? = null,
+    onJumpToMessage: ((String) -> Unit)? = null
 ) {
     var showMenu by remember { mutableStateOf(false) }
     var showEmojiPicker by remember { mutableStateOf(false) }
@@ -658,7 +661,7 @@ private fun MessageBubble(
                 // stays one: every event keeps a card of its own.
                 val actCard = channelState.actCards[msg.id]
                 if (actCard != null) {
-                    ActEventCard(actCard)
+                    ActEventCard(actCard, onJumpToMessage)
                 } else {
                     // Message text + inline embeds
                     MessageContent(

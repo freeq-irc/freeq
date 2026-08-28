@@ -20,6 +20,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.freeq.model.ActCard
 import com.freeq.model.ActVerbs
+import com.freeq.model.actCardNeighbours
 
 /**
  * One task event, as the line its sender wrote beside it.
@@ -31,8 +32,9 @@ import com.freeq.model.ActVerbs
  * never reads as a claim.
  */
 @Composable
-fun ActEventCard(card: ActCard) {
+fun ActEventCard(card: ActCard, onJumpToMessage: ((String) -> Unit)? = null) {
     val uriHandler = LocalUriHandler.current
+    val neighbours = actCardNeighbours(card.task, card.event)
     val note = card.event.fields["act-note"]
     val ctx = card.event.fields["act-ctx"]
     val ctxHash = card.event.fields["act-ctx-h"]
@@ -82,6 +84,30 @@ fun ActEventCard(card: ActCard) {
                 fontSize = 14.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+
+        // The cards either side of this one on the same task, absent at each
+        // end. Nothing is offered for a move the home signed: it wrote no
+        // line, so there is no card to land on.
+        if (onJumpToMessage != null && (neighbours.prev != null || neighbours.next != null)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                neighbours.prev?.let { prev ->
+                    Text(
+                        text = "← prev",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.clickable { onJumpToMessage(prev) },
+                    )
+                }
+                neighbours.next?.let { next ->
+                    Text(
+                        text = "next →",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.clickable { onJumpToMessage(next) },
+                    )
+                }
+            }
         }
 
         if (!ctx.isNullOrEmpty()) {
