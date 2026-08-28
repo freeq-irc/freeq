@@ -10,7 +10,7 @@
  */
 import { useStore } from './store';
 
-export { FreeqClient, generateDidKey } from '@freeq/sdk';
+export { FreeqClient, generateDidKey, actTags } from '@freeq/sdk';
 
 /**
  * How many message rows the store holds for `channel` right now.

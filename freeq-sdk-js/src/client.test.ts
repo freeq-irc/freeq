@@ -367,6 +367,23 @@ describe('messaging methods', () => {
     expect(client.getNickForDid('did:plc:bob')).toBe('bob'); // binding learned
   });
 
+  it('a replayed line whose batch was never opened arrives as history', async () => {
+    // The envelope can be missed — a reconnect mid-replay, an open lost to
+    // the login burst — and the line inside it still says it is a replay.
+    // Handing it over as live filed day-old rows under the newest thing said.
+    const { client, ws } = await makeRegistered();
+    const live: string[] = [];
+    const history: Array<[string, number]> = [];
+    client.on('message', (channel) => live.push(channel));
+    client.on('historyBatch', (channel, msgs) => history.push([channel, msgs.length]));
+
+    ws.recv('@batch=gone;time=2026-08-22T10:00:00.000Z;msgid=m1 :bob!b@h PRIVMSG #room :old news');
+    for (let i = 0; i < 4; i++) await flushAsync();
+
+    expect(live).toEqual([]);
+    expect(history).toEqual([['#room', 1]]);
+  });
+
   it('sendMarkdown() resolves the DM target like sendMessage', async () => {
     const { client, ws } = await makeRegistered();
     client.nickToDid = (n) => (n.toLowerCase() === 'bob' ? 'did:plc:bob' : undefined);

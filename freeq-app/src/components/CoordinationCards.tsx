@@ -42,7 +42,7 @@ function TaskIdBadge({ taskId }: { taskId?: string }) {
 
 // ─── Card Wrapper ───────────────────────────────────
 
-function CardFrame({ icon, label, children, msg, className }: {
+export function CardFrame({ icon, label, children, msg, className }: {
   icon: string;
   label: string;
   children: React.ReactNode;

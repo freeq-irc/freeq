@@ -2258,8 +2258,16 @@ export class FreeqClient extends EventEmitter {
 
         // Check if this message belongs to a batch
         const batchId = msg.tags['batch'];
-        if (batchId && this.batches.has(batchId)) {
-          this.batches.get(batchId)!.messages.push(message);
+        if (batchId) {
+          const batch = this.batches.get(batchId);
+          if (batch) {
+            batch.messages.push(message);
+            break;
+          }
+          // A line naming a batch we never saw opened is still a replay: the
+          // envelope was missed, not the line. It goes over as history, which
+          // the app files by time, rather than as something just said.
+          this.emit('historyBatch', bufName, [message]);
           break;
         }
 
