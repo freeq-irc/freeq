@@ -201,64 +201,69 @@ async fn verify_org_membership(
     org: &str,
     pending: &PendingVerification,
 ) -> axum::response::Response {
-    // Authenticated membership endpoint (sees private memberships).
-    // Single request: 200 → inspect the record's state; 404 → no record.
-    let membership = match get_status_and_json(
-        http,
-        &format!("https://api.github.com/user/memberships/orgs/{org}"),
-        access_token,
-    )
-    .await
-    {
-        Ok((status, Some(body))) if status.is_success() => parse_membership_state(&body),
-        Ok((status, _)) => classify_yes_no_status(status),
-        Err(e) => ApiCheck::Error(e.to_string()),
-    };
+    let answer = authenticated_membership(http, access_token, org).await;
 
-    let is_member = match membership {
-        ApiCheck::Yes => true,
-        ApiCheck::Error(e) => {
+    match &answer {
+        MembershipAnswer::Transient(e) => {
+            tracing::warn!(org = %org, error = %e, "GitHub org membership check failed");
+            return retry_page(e);
+        }
+        MembershipAnswer::Failed(e) => {
             tracing::warn!(org = %org, error = %e, "GitHub org membership check failed");
             return error_page(&format!(
-                "GitHub is having trouble answering right now ({e}).\n\n\
-                 This is temporary — please go back and try the verification again."
+                "GitHub could not answer whether {username} belongs to {org} ({e}).\n\n\
+                 Start the verification again from the beginning so GitHub can \
+                 re-authorize this app."
             ));
         }
-        ApiCheck::No => {
-            // Fall back to the public membership check (covers members who
-            // flaunt their membership publicly but lack read:org scope).
-            // NOTE: unauthenticated — 60 req/hr per server IP. A 403 here is
-            // almost certainly rate limiting, so surface it as an Error.
-            match get_status_with_retries(
-                http,
-                &format!("https://api.github.com/orgs/{org}/public_members/{username}"),
-                None,
-            )
-            .await
-            {
-                Ok(status) => match classify_yes_no_status(status) {
-                    ApiCheck::Yes => true,
-                    ApiCheck::No => false,
-                    ApiCheck::Error(e) => {
-                        tracing::warn!(org = %org, error = %e, "GitHub public membership check failed");
-                        return error_page(&format!(
-                            "GitHub is having trouble answering right now ({e}).\n\n\
-                             This is temporary — please go back and try the verification again."
-                        ));
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(org = %org, error = %e, "GitHub public membership check failed");
-                    return error_page(&format!(
-                        "GitHub is having trouble answering right now ({e}).\n\n\
-                         This is temporary — please go back and try the verification again."
-                    ));
+        _ => {}
+    }
+
+    // A refusal is not a "no" — the token simply isn't allowed to answer for
+    // this org, and the public roster still settles it for members who show
+    // their membership publicly.
+    let mut is_member = matches!(answer, MembershipAnswer::Member);
+    if !is_member {
+        // Unauthenticated — 60 req/hr per server IP. A 403 here is almost
+        // certainly rate limiting, so surface it as an error, not a denial.
+        let public = get_status_with_retries(
+            http,
+            &format!("https://api.github.com/orgs/{org}/public_members/{username}"),
+            None,
+        )
+        .await
+        .map_or_else(|e| ApiCheck::Error(e.to_string()), classify_yes_no_status);
+
+        match public {
+            ApiCheck::Yes => is_member = true,
+            ApiCheck::No => {}
+            ApiCheck::Error(e) => {
+                tracing::warn!(org = %org, error = %e, "GitHub public membership check failed");
+                // With a refusal in hand, fall through to it instead.
+                if !matches!(answer, MembershipAnswer::Refused(_)) {
+                    return retry_page(&e);
                 }
             }
         }
-    };
+    }
 
     if !is_member {
+        if let MembershipAnswer::Refused(detail) = &answer {
+            tracing::warn!(
+                org = %org, github = %username, detail = %detail,
+                "GitHub refused to answer the org membership check"
+            );
+            return error_page(&format!(
+                "GitHub would not confirm whether {username} belongs to {org}.\n\n\
+                 GitHub said: {detail}\n\n\
+                 This usually means {org} restricts OAuth app access and this app is \
+                 not approved. An org owner can approve it at\n\
+                 https://github.com/orgs/{org}/settings/oauth_application_policy\n\n\
+                 Failing that, make your membership public at\n\
+                 https://github.com/orgs/{org}/people\n\
+                 and run the verification again."
+            ));
+        }
         return error_page(&format!(
             "{username} is not a member of the {org} organization.\n\n\
              Options:\n\
@@ -283,6 +288,76 @@ async fn verify_org_membership(
         &format!("{org} (org)"),
     )
     .await
+}
+
+/// What the authenticated membership endpoint said about a user and an org.
+#[derive(Debug, Clone, PartialEq)]
+enum MembershipAnswer {
+    Member,
+    NotMember,
+    /// GitHub has the answer but won't give it to this token — the org
+    /// restricts OAuth apps, or a SAML session hasn't been authorized.
+    /// Carries GitHub's own explanation.
+    Refused(String),
+    /// Rate limit, 5xx, or a network failure. Never a denial.
+    Transient(String),
+    /// A revoked token or a malformed request. Never a denial, and no use retrying.
+    Failed(String),
+}
+
+/// Ask the authenticated membership endpoint about `org`. This sees private
+/// memberships because the token carries `read:org`.
+async fn authenticated_membership(
+    http: &reqwest::Client,
+    access_token: &str,
+    org: &str,
+) -> MembershipAnswer {
+    let url = format!("https://api.github.com/user/memberships/orgs/{org}");
+    match get_status_and_body(http, &url, access_token).await {
+        Ok((status, body)) => classify_membership(status, &body),
+        Err(e) => MembershipAnswer::Transient(e.to_string()),
+    }
+}
+
+/// Turn a response from `/user/memberships/orgs/{org}` into an answer.
+fn classify_membership(status: reqwest::StatusCode, body: &str) -> MembershipAnswer {
+    if status.is_success() {
+        // A 200 carrying something other than JSON is a proxy or captive portal
+        // talking, not GitHub. `parse_membership_state` reads an empty record as
+        // a member, so it must never see one we invented.
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) else {
+            return MembershipAnswer::Transient("membership response was not JSON".into());
+        };
+        return match parse_membership_state(&parsed) {
+            ApiCheck::Yes => MembershipAnswer::Member,
+            _ => MembershipAnswer::NotMember,
+        };
+    }
+
+    // 429 and 5xx never reach here: `get_status_and_body` retries those and
+    // reports them as `Err`. What's left is permanent.
+    match status.as_u16() {
+        403 => MembershipAnswer::Refused(github_message(body)),
+        404 => MembershipAnswer::NotMember,
+        _ => MembershipAnswer::Failed(format!("HTTP {status} — {}", github_message(body))),
+    }
+}
+
+/// Pull the human-readable `message` out of a GitHub error body.
+fn github_message(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["message"].as_str().map(String::from))
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "no explanation given".into())
+}
+
+/// The page for a failure that really might succeed on a retry.
+fn retry_page(err: &str) -> axum::response::Response {
+    error_page(&format!(
+        "GitHub is having trouble answering right now ({err}).\n\n\
+         This is temporary — please go back and try the verification again."
+    ))
 }
 
 /// Verify repo collaborator access. The user's token must have access to the repo.
@@ -324,6 +399,8 @@ async fn verify_repo_collaborator(
                                 ApiCheck::No
                             }
                         }
+                        // A token that can't see the repo has answered the question.
+                        Err(FetchError::Permanent(_)) => ApiCheck::No,
                         Err(e) => ApiCheck::Error(e.to_string()),
                     }
                 }
@@ -436,6 +513,16 @@ async fn issue_credential(
         )
     };
 
+    // The DID and repo arrive on the query string that starts the flow and are
+    // never validated, so treat everything interpolated here as hostile.
+    let nonce = super::script_nonce();
+    let username_html = super::html_escape(username);
+    let verified_msg_html = super::html_escape(verified_msg);
+    let did_html = super::html_escape(&pending.subject_did);
+    let vc_json_html = super::html_escape(&vc_json);
+    let credential_type_js =
+        serde_json::to_string(credential_type).unwrap_or_else(|_| "\"\"".into());
+
     let html = format!(
         r#"<!DOCTYPE html><html><head><title>freeq — Verified</title>
 <style>
@@ -446,27 +533,32 @@ pre {{ background: #1a1a2e; color: #0f0; padding: 16px; border-radius: 8px; over
 button {{ background: #333; color: #fff; border: 1px solid #555; padding: 8px 16px; border-radius: 4px; cursor: pointer; }}
 button:hover {{ background: #444; }}
 </style>
-<script>
-if (window.opener) {{
-    window.opener.postMessage({{ type: 'freeq-credential', status: 'verified', credential_type: '{credential_type}' }}, '*');
-    // Auto-close popup after a brief delay if credential was auto-delivered
-    {auto_close_js}
-}}
-</script>
 </head><body>
 <h1>✓ Verified</h1>
-<p><span class="badge">{username}</span> — {verified_msg}</p>
-<p>Credential issued for: <code>{did}</code></p>
+<p><span class="badge">{username_html}</span> — {verified_msg_html}</p>
+<p>Credential issued for: <code>{did_html}</code></p>
 {callback_status}
 <details><summary>Credential JSON</summary>
-<pre id="vc">{vc_json}</pre>
-<button onclick="navigator.clipboard.writeText(document.getElementById('vc').textContent)">📋 Copy</button>
+<pre id="vc">{vc_json_html}</pre>
+<button id="copy">📋 Copy</button>
 </details>
+<script nonce="{nonce}">
+(function () {{
+    var vc = document.getElementById('vc');
+    document.getElementById('copy').addEventListener('click', function () {{
+        navigator.clipboard.writeText(vc.textContent);
+    }});
+    if (window.opener) {{
+        window.opener.postMessage({{ type: 'freeq-credential', status: 'verified', credential_type: {credential_type_js} }}, '*');
+        // Auto-close popup after a brief delay if credential was auto-delivered
+        {auto_close_js}
+    }}
+}})();
+</script>
 </body></html>"#,
-        did = pending.subject_did,
     );
 
-    axum::response::Html(html).into_response()
+    super::result_page(html, &nonce)
 }
 
 /// The result of a GitHub API yes/no check.
@@ -508,8 +600,8 @@ fn parse_membership_state(body: &serde_json::Value) -> ApiCheck {
 }
 
 /// GET a GitHub API endpoint, returning the final status code, with bounded
-/// retries on 429/5xx/network errors. Err(_) means the request could not be
-/// completed at all — callers must surface that as a retryable error.
+/// retries on 429/5xx/network errors. A 4xx comes back as `Ok` for the caller
+/// to interpret; `Err(_)` means the request never completed.
 async fn get_status_with_retries(
     http: &reqwest::Client,
     url: &str,
@@ -525,10 +617,11 @@ async fn get_status_with_retries(
                 .send()
                 .await
                 .map_err(|e| FetchError::Transient(format!("request failed: {e}")))?;
-            if let Some(err) = FetchError::from_status(resp.status()) {
+            let status = resp.status();
+            if let Some(err @ FetchError::Transient(_)) = FetchError::from_status(status) {
                 return Err(err);
             }
-            Ok(resp.status())
+            Ok(status)
         },
         2,
         std::time::Duration::from_millis(400),
@@ -564,14 +657,15 @@ async fn get_json_checked(
     .await
 }
 
-/// GET a GitHub API endpoint, returning the final status and (on success)
-/// the parsed JSON body, with bounded retries on 429/5xx/network errors.
-/// Non-2xx statuses (e.g. 404) are returned, not treated as errors.
-async fn get_status_and_json(
+/// GET a GitHub API endpoint, returning the final status and the raw body,
+/// with bounded retries on 429/5xx/network errors. 4xx bodies are handed back
+/// rather than discarded — GitHub explains its refusals there, and the caller
+/// needs that text to tell the user what to do about it.
+async fn get_status_and_body(
     http: &reqwest::Client,
     url: &str,
     access_token: &str,
-) -> Result<(reqwest::StatusCode, Option<serde_json::Value>), FetchError> {
+) -> Result<(reqwest::StatusCode, String), FetchError> {
     retry_loop(
         || async {
             let resp = http
@@ -581,18 +675,15 @@ async fn get_status_and_json(
                 .send()
                 .await
                 .map_err(|e| FetchError::Transient(format!("request failed: {e}")))?;
-            if let Some(err) = FetchError::from_status(resp.status()) {
+            let status = resp.status();
+            if let Some(err @ FetchError::Transient(_)) = FetchError::from_status(status) {
                 return Err(err);
             }
-            let status = resp.status();
-            if !status.is_success() {
-                return Ok((status, None));
-            }
             let body = resp
-                .json::<serde_json::Value>()
+                .text()
                 .await
-                .map_err(|e| FetchError::Permanent(format!("invalid JSON: {e}")))?;
-            Ok((status, Some(body)))
+                .map_err(|e| FetchError::Permanent(format!("unreadable body: {e}")))?;
+            Ok((status, body))
         },
         2,
         std::time::Duration::from_millis(400),
@@ -601,11 +692,7 @@ async fn get_status_and_json(
 }
 
 fn error_page(msg: &str) -> axum::response::Response {
-    let safe_msg = msg
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;");
+    let safe_msg = super::html_escape(msg);
     let html = format!(
         r#"<!DOCTYPE html><html><head><title>freeq — Error</title>
 <style>
@@ -623,6 +710,105 @@ p {{ white-space: pre-wrap; text-align: left; }}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What GitHub actually returns when an org gates OAuth apps.
+    const OAUTH_RESTRICTED: &str = r#"{"message":"Although you appear to have the correct authorization credentials, the `Z-Space-Society` organization has enabled OAuth App access restrictions, meaning that data access to third-parties is limited.","documentation_url":"https://docs.github.com/articles/restricting-access-to-your-organization-s-data/"}"#;
+
+    #[test]
+    fn active_membership_record_is_a_member() {
+        assert_eq!(
+            classify_membership(reqwest::StatusCode::OK, r#"{"state":"active"}"#),
+            MembershipAnswer::Member
+        );
+    }
+
+    #[test]
+    fn pending_invitation_is_not_a_member() {
+        assert_eq!(
+            classify_membership(reqwest::StatusCode::OK, r#"{"state":"pending"}"#),
+            MembershipAnswer::NotMember
+        );
+    }
+
+    #[test]
+    fn missing_membership_record_is_not_a_member() {
+        assert_eq!(
+            classify_membership(reqwest::StatusCode::NOT_FOUND, r#"{"message":"Not Found"}"#),
+            MembershipAnswer::NotMember
+        );
+    }
+
+    #[test]
+    fn oauth_app_restriction_is_a_refusal_carrying_githubs_reason() {
+        match classify_membership(reqwest::StatusCode::FORBIDDEN, OAUTH_RESTRICTED) {
+            MembershipAnswer::Refused(detail) => {
+                assert!(detail.contains("OAuth App access restrictions"), "{detail}")
+            }
+            other => panic!("403 must be a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_never_reported_as_not_a_member() {
+        let answer = classify_membership(reqwest::StatusCode::FORBIDDEN, OAUTH_RESTRICTED);
+        assert_ne!(answer, MembershipAnswer::NotMember);
+        assert_ne!(answer, MembershipAnswer::Member);
+    }
+
+    #[test]
+    fn a_rate_limit_is_retried_upstream_not_classified_here() {
+        // Why `classify_membership` has no 429/5xx arm: the fetch helper retries
+        // those and hands the caller an `Err`, so only permanent statuses arrive.
+        assert!(matches!(
+            FetchError::from_status(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            Some(FetchError::Transient(_))
+        ));
+        assert!(matches!(
+            FetchError::from_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+            Some(FetchError::Transient(_))
+        ));
+    }
+
+    #[test]
+    fn a_200_that_is_not_json_is_never_a_member() {
+        // A captive portal or proxy page must not read as a membership record.
+        match classify_membership(reqwest::StatusCode::OK, "<html>captive portal</html>") {
+            MembershipAnswer::Transient(_) => {}
+            other => panic!("an unparseable 200 must not grant membership, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_revoked_token_is_a_permanent_failure_not_a_retry() {
+        match classify_membership(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"message":"Bad credentials"}"#,
+        ) {
+            MembershipAnswer::Failed(detail) => {
+                assert!(detail.contains("Bad credentials"), "{detail}")
+            }
+            other => panic!("401 must be a permanent failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_public_roster_miss_is_an_answer_not_an_error() {
+        // GitHub answers "not a public member" with 404.
+        assert_eq!(
+            classify_yes_no_status(reqwest::StatusCode::NOT_FOUND),
+            ApiCheck::No
+        );
+    }
+
+    #[test]
+    fn github_message_falls_back_when_the_body_is_unhelpful() {
+        assert_eq!(
+            github_message(r#"{"message":"Bad credentials"}"#),
+            "Bad credentials"
+        );
+        assert_eq!(github_message("not json at all"), "no explanation given");
+        assert_eq!(github_message(r#"{"message":""}"#), "no explanation given");
+    }
 
     #[test]
     fn classify_collaborator_status() {
