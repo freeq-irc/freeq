@@ -277,16 +277,17 @@ Also: server `confirm` receipts are expected wire traffic, not rejected
 transitions. `ApplyResult.benign` distinguishes routine (receipts, duplicate
 echoes) from genuine refusals, so the TUI stays quiet about the former.
 
-### Environment findings (for the morning)
+### Environment findings — RESOLVED
 
-- **The checked-in `target/release/freeq-server` binary is from Jun 19** and
-  predates the `freeq.at/msgsig` / `freeq.at/act` caps, so act signing fails
-  against it — M4 could not be verified locally.
-- **The local Rust toolchain is broken**: `rustc` "not applicable to the
-  stable-aarch64-apple-darwin toolchain", so I could not rebuild it. Worth a
-  `rustup` repair; until then local act testing needs a fresh binary.
-- M4 was therefore verified against production `irc.freeq.at` in a
-  throwaway channel. M1–M3 harnesses still run locally.
+The stale `freeq-server` binary (Jun 19, predating the `freeq.at/msgsig` /
+`freeq.at/act` caps) meant M4 initially had to be verified against
+production. Chad repaired the Rust toolchain; `cargo build --release -p
+freeq-server` now succeeds (1m47s) and the fresh binary advertises both caps.
+
+**`npm run verify` now passes entirely locally, exit 0** — 117 unit tests plus
+all four live harnesses (peers / ask / room / handoff). Production is no
+longer needed for any part of the test suite; keep it for the recorded demo
+only.
 
 ## Parked ideas (NOT scheduled — do not build)
 
@@ -402,7 +403,8 @@ handler needs.
 - [x] **M4**: handoffs — offer/accept/decline/progress/complete/cancel via the
       act substrate, human-gated accept, offline replay, `/freeq handoffs`,
       persisted view. 117 unit tests; acceptance verified on production.
-- [ ] **Re-verify M4 locally** once `freeq-server` is rebuilt (see findings)
+- [x] **Re-verify M4 locally** — done; full `npm run verify` green against a
+      freshly built local server
 - [ ] Optional next: claimable/open handoffs (`act-caps`, no `act-to`) —
       substrate already supports them; only the tool surface is missing
 - [ ] Optional next: verify inbound act signatures (needs per-DID key
