@@ -89,3 +89,43 @@ describe("one connection per installation", () => {
     expect(JSON.parse(await readFile(path, "utf8")).label).toBe("successor");
   });
 });
+
+describe("refresh — surviving a vanished lock file", () => {
+  it("recreates the file if it disappears while we hold it", async () => {
+    const a = new ConnectionLock(path);
+    await a.acquire("A");
+    const { unlink } = await import("node:fs/promises");
+    await unlink(path); // tmp cleaner, or a human tidying up a "stale" lock
+    expect(await a.refresh("A")).toBe(true);
+    expect(JSON.parse(await readFile(path, "utf8")).pid).toBe(process.pid);
+  });
+
+  it("keeps holding when the file is already ours", async () => {
+    const a = new ConnectionLock(path);
+    await a.acquire("A");
+    expect(await a.refresh("A")).toBe(true);
+  });
+
+  it("concedes if a live process legitimately took over", async () => {
+    const a = new ConnectionLock(path);
+    await a.acquire("A");
+    await writeFile(path, JSON.stringify({ pid: 1, at: Date.now(), label: "takeover" }));
+    expect(await a.refresh("A")).toBe(false);
+    expect(a.held).toBe(false);
+    // We must not have stomped the new holder.
+    expect(JSON.parse(await readFile(path, "utf8")).label).toBe("takeover");
+  });
+
+  it("reclaims when the file names a dead process", async () => {
+    const a = new ConnectionLock(path);
+    await a.acquire("A");
+    await writeFile(path, JSON.stringify({ pid: 2 ** 30, at: 1, label: "ghost" }));
+    expect(await a.refresh("A")).toBe(true);
+    expect(JSON.parse(await readFile(path, "utf8")).pid).toBe(process.pid);
+  });
+
+  it("does nothing if we never held it", async () => {
+    const b = new ConnectionLock(path);
+    expect(await b.refresh()).toBe(false);
+  });
+});

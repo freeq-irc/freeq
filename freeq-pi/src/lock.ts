@@ -97,6 +97,34 @@ export class ConnectionLock {
     return { held: true };
   }
 
+  /**
+   * Re-assert a lock we believe we hold.
+   *
+   * The file can vanish under us — a tmp-dir cleaner, an operator tidying up,
+   * or (as happened during development) someone deleting what looked like a
+   * stale lock while its owner was very much alive. Without this, the slot
+   * silently becomes free and the next window connects alongside us, which is
+   * exactly the duplicate-session state the lock exists to prevent.
+   *
+   * Returns false if somebody else now legitimately holds it, in which case
+   * the caller should stand down rather than fight.
+   */
+  async refresh(label?: string): Promise<boolean> {
+    if (!this.#held) return false;
+    const current = await this.read();
+    if (current && current.pid !== process.pid && pidAlive(current.pid)) {
+      // Someone took over while we weren't looking. Concede.
+      this.#held = false;
+      return false;
+    }
+    if (current && current.pid === process.pid) return true;
+    // Missing or stale-but-not-ours: rewrite it.
+    const info: LockInfo = { pid: process.pid, at: Date.now(), label };
+    await mkdir(dirname(this.#path), { recursive: true });
+    await writeFile(this.#path, `${JSON.stringify(info)}\n`, { mode: 0o600 });
+    return true;
+  }
+
   /** Release only if we still own it — never stomp a successor. */
   async release(): Promise<void> {
     if (!this.#held) return;

@@ -60,6 +60,8 @@ export default function (pi: ExtensionAPI): void {
    */
   let lock: ConnectionLock | undefined;
   let passive = false;
+  /** Keeps the lock file alive if something deletes it under us. */
+  let lockTimer: NodeJS.Timeout | undefined;
 
   /**
    * Things this session owes a reply to, in arrival order: peer asks, and
@@ -242,6 +244,24 @@ export default function (pi: ExtensionAPI): void {
     }
     passive = false;
 
+    // Re-assert the lock periodically: if the file vanishes the slot would
+    // silently free up and the next window would connect alongside us.
+    if (!lockTimer) {
+      lockTimer = setInterval(() => {
+        void (async () => {
+          const stillOurs = await lock?.refresh(ctx.cwd);
+          if (stillOurs === false && conn) {
+            // Somebody took over deliberately. Stand down rather than fight.
+            passive = true;
+            await conn.stop("another session took over");
+            conn = undefined;
+            notify(ctx, "freeq: another pi session took over the connection", "warning");
+          }
+        })();
+      }, 60_000);
+      lockTimer.unref?.();
+    }
+
     const meta = await collectSessionMeta({ cwd: ctx.cwd, model: ctx.model?.id });
 
     conn = new FreeqConnection({
@@ -363,6 +383,10 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_shutdown", async () => {
     await conn?.stop("pi session ended");
     conn = undefined;
+    if (lockTimer) {
+      clearInterval(lockTimer);
+      lockTimer = undefined;
+    }
     // Hand the slot to the next window rather than making it wait for a
     // liveness check to notice we're gone.
     await lock?.release();
