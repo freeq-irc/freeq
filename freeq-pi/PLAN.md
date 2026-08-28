@@ -8,8 +8,8 @@ Design: `docs/PI-FREEQ-MULTIPLAYER.md`. Pitch: `docs/PI-FREEQ-PITCH.md`.
 | milestone | state | notes |
 |---|---|---|
 | M0 — headless spike bot | **DONE** ✅ | proved live on `#playground` — see evidence below |
-| M1 — package skeleton | **next** | identity, connection, presence, commands |
-| M2 — tool + tiered inbound | not started | **the core**; v0.1 acceptance |
+| M1 — package skeleton | **DONE** ✅ | two installs mutually visible w/ metadata + DIDs |
+| M2 — tool + tiered inbound | **next** | **the core**; v0.1 acceptance |
 | M3 — humans in the room | not started | addressed mode, scrubber, docs |
 | M4 — handoffs | not started | only after M3 demoed |
 
@@ -63,6 +63,77 @@ Design: `docs/PI-FREEQ-MULTIPLAYER.md`. Pitch: `docs/PI-FREEQ-PITCH.md`.
    inventing `~/.freeq/pi/`. (Spec said `~/.freeq/pi/identity/`; this is the
    same intent with less new code — flagged as a deviation, see below.)
 
+## M1 evidence (acceptance met)
+
+Acceptance: *"two machines run pi with the package; `/freeq peers` on each
+shows the other with live session metadata."* Verified against a **local**
+freeq-server (see "prod hygiene" below) with two independent installation
+identities and separate state roots — the same shape as two laptops:
+
+```
+alice: online: pi-alice-z6mkkzxf (did:key:z6MkkZXFr1Tz…)
+bob:   online: pi-bob-z6mkhx5r  (did:key:z6Mkhx5r2Cs7…)
+alice → pi-bob-z6mkhx5r   [did:key:z6Mkhx5r…] online freeq @main (github.com/…) · test-model
+bob   → pi-alice-z6mkkzxf [did:key:z6MkkZXF…] online freeq @main (github.com/…) · test-model
+```
+
+Harness: `spike/peers-check.ts` (exit 0 = acceptance). 32 unit tests pass.
+Extension verified to load in real pi (`pi -e … --mode rpc`) without
+disturbing a normal session.
+
+## ⚠️ Finding: presence cannot carry metadata (design change, no server change)
+
+First M1 run showed peers as `no metadata`. Root cause is in the **server**,
+not our code — `freeq-server/src/connection/mod.rs` relays PRESENCE to peers
+over the IRC `AWAY` back-compat mechanism, and "back from away" is
+parameterless by IRC semantics:
+
+```rust
+let is_clear = ps == Online || ps == Active || ps == Idle;
+let line = if is_clear { ":{hostmask} AWAY" }          // status DROPPED
+           else        { ":{hostmask} AWAY :{away_text}" };
+```
+
+So an **active** agent can never advertise session metadata via PRESENCE
+status — status only propagates for away-ish states. Options were (a) lie
+about liveness to smuggle status, (b) change the server, (c) move discovery
+to an application-level announcement. Took **(c)**:
+
+- `src/discovery.ts` — `pi_hello` / `pi_hello_ack` over the existing
+  `+freeq.at/event=*` coordination-event channel (TAGMSG). The SDK already
+  parses it, de-dupes by event id, and annotates the sender's DID.
+- No server change; richer structured JSON instead of a squeezed status line;
+  and it's the same TAGMSG substrate M2's `ask` needs anyway.
+- Ack storms avoided: we reply to `hello`, never to `hello_ack`.
+- **Security:** the `did` inside a hello is self-asserted and is never used
+  for authorization — peer DIDs come from the SDK's server-backed resolution.
+  Unit-tested; M2's tier decisions depend on this distinction.
+
+Presence is still sent (liveness + any client that can read status); hellos
+are what peers actually learn metadata from.
+
+**Recommend filing a freeq-server issue** (not doing it under this contract):
+relaying presence status for active agents needs a real mechanism rather than
+the AWAY back-compat path. Not blocking — discovery no longer depends on it.
+
+## Prod hygiene (changed after M0)
+
+M0 ran against **production** `irc.freeq.at` and left two permanent messages
+in public `#playground` history — including an agent answer containing an
+absolute local path (`/Users/chad/src/freeq`). Presence is now hardened
+against path leaks (`looksLikePath`, unit-tested), but the **answer** path
+isn't yet — M3's scrubber must redact absolute paths, not just secrets.
+Scope updated below.
+
+All M1 work ran against a **local** server:
+
+```
+target/release/freeq-server --listen-addr 127.0.0.1:16667 \
+  --web-addr 127.0.0.1:18080 --db-path /tmp/freeq-local/test.db
+```
+
+Dev stays local from here; prod is reserved for the recorded demo.
+
 ## Deviations from spec (flagged for review)
 
 - **Identity storage path**: using bot-kit's `~/.freeq/bots/pi-<slug>/`
@@ -77,6 +148,15 @@ Design: `docs/PI-FREEQ-MULTIPLAYER.md`. Pitch: `docs/PI-FREEQ-PITCH.md`.
   model reliability after M2 and switch to `freeq_*` tools if it misfires.
 - **Context export format** for handoffs — deferred to M4, markdown brief first.
 - **Human-in-pi channel pane** — not building; freeq client in another pane.
+- **Peer discovery mechanism** — resolved: application-level hello over
+  coordination events (see finding above), not presence status.
+
+## M3 scope addition (from the M0 leak)
+
+The scrubber must redact **absolute filesystem paths** in outbound
+`say`/`send`/reply text, in addition to secrets. Home directories and repo
+roots identify the user and machine, and an agent answering "which repo are
+you in?" will volunteer them unprompted.
 
 ## M0 evidence (acceptance met)
 
@@ -124,6 +204,10 @@ handler needs.
 - [x] Plan file
 - [x] M0 spike: `freeq-pi/spike/spike-bot.ts` + live run against `#playground`
 - [x] M0 driver/harness: `freeq-pi/spike/send.ts`
-- [ ] **M1**: `src/identity.ts`, `src/connection.ts`, `src/presence.ts`,
-      `src/config.ts`, `extensions/freeq.ts` with `/freeq login|status|join|
-      leave|peers`; acceptance = two installs see each other in `/freeq peers`
+- [x] **M1**: `src/{config,identity,presence,connection,discovery}.ts`,
+      `extensions/freeq.ts` with `/freeq login|status|join|leave|peers|mode|
+      trust|on|off`; acceptance verified via `spike/peers-check.ts`
+- [ ] **M2**: `src/ask.ts` (request id + timeout + exactly-one-response),
+      `src/inbound.ts` (tier pipeline → `pi.sendUserMessage`), the `freeq`
+      tool (`peers|send|say|ask`), mandatory OBSERVE-never-reaches-model test;
+      acceptance = the two-laptop cross-internet ask, recorded
