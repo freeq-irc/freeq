@@ -2149,12 +2149,14 @@ extension AppState {
                 NAMES channel=\(channel, privacy: .public)                 incoming=\(memberList.count)                 pendingBefore=\(self.pendingNames[key]?.count ?? -1)                 nicks=\(memberList.prefix(8).map { ($0.isOp ? "@" : "") + $0.nick }.joined(separator: ","), privacy: .public)
                 """)
             var existing = pendingNames[key] ?? []
+            // NAMES carries no actor class, so keep whatever we already knew
+            // for this nick — otherwise every roster refresh un-badges the
+            // agents in the room. The buffer may not exist yet (first NAMES
+            // after JOIN), in which case there is nothing to carry over.
+            let priorMembers = allBuffers.first { $0.name.lowercased() == key }?.members ?? []
             existing.append(contentsOf: memberList.map { m in
                 {
-                    // NAMES carries no actor class, so keep whatever we
-                    // already knew for this nick — otherwise every roster
-                    // refresh un-badges the agents in the room.
-                    let prior = ch.members.first { $0.nick.lowercased() == m.nick.lowercased() }
+                    let prior = priorMembers.first { $0.nick.lowercased() == m.nick.lowercased() }
                     return MemberInfo(
                         nick: m.nick, isOp: m.isOp, isHalfop: m.isHalfop,
                         isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: prior?.did,
