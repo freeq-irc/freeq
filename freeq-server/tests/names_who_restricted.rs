@@ -1,7 +1,8 @@
 //! Non-members must not be able to enumerate the roster of a restricted
-//! (+i/+k/+E) channel via NAMES or WHO. Both answer exactly as they would
-//! for a channel that does not exist, so the reply also does not reveal
-//! whether the name is in use.
+//! (+i/+k/+E) channel via NAMES or WHO, nor reach the same names from the
+//! other side with WHOIS. NAMES and WHO answer exactly as they would for a
+//! channel that does not exist, so the reply also does not reveal whether
+//! the name is in use.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -178,6 +179,92 @@ async fn names_on_restricted_channel_matches_nonexistent_channel() {
             strip(restricted_rows),
             strip(missing_rows),
             "restricted channel is distinguishable from a nonexistent one"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn names_on_encrypted_channel_hides_members_from_non_members() {
+    run(|addr| {
+        let _alice = restricted_channel(addr, "#enc", "+E");
+        let mut bob = C::connect(addr, "bob");
+        bob.reg();
+        bob.send("NAMES #enc");
+        let rows = bob.collect_until("353", "366");
+        for row in rows {
+            assert!(
+                !row.contains("alice"),
+                "non-member NAMES leaked roster: {row}"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn who_on_encrypted_channel_hides_members_from_non_members() {
+    run(|addr| {
+        let _alice = restricted_channel(addr, "#enc", "+E");
+        let mut bob = C::connect(addr, "bob");
+        bob.reg();
+        bob.send("WHO #enc");
+        let rows = bob.collect_until("352", "315");
+        assert!(rows.is_empty(), "non-member WHO leaked roster: {rows:?}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn whois_hides_restricted_channel_from_non_members() {
+    run(|addr| {
+        let _alice = restricted_channel(addr, "#priv", "+k sekrit");
+        let mut bob = C::connect(addr, "bob");
+        bob.reg();
+        bob.send("WHOIS alice");
+        let rows = bob.collect_until("319", "318");
+        assert!(
+            rows.iter().all(|r| !r.contains("#priv")),
+            "non-member WHOIS leaked the channel: {rows:?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn whois_still_shows_shared_restricted_channel_to_a_member() {
+    run(|addr| {
+        let _alice = restricted_channel(addr, "#priv", "+k sekrit");
+        let mut bob = C::connect(addr, "bob");
+        bob.reg();
+        bob.send("JOIN #priv sekrit");
+        bob.num("366");
+
+        bob.send("WHOIS alice");
+        let rows = bob.collect_until("319", "318");
+        assert!(
+            rows.iter().any(|r| r.contains("#priv")),
+            "member WHOIS lost the shared channel: {rows:?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn whois_still_shows_public_channels_to_non_members() {
+    run(|addr| {
+        let mut alice = C::connect(addr, "alice");
+        alice.reg();
+        alice.send("JOIN #open");
+        alice.num("366");
+
+        let mut bob = C::connect(addr, "bob");
+        bob.reg();
+        bob.send("WHOIS alice");
+        let rows = bob.collect_until("319", "318");
+        assert!(
+            rows.iter().any(|r| r.contains("#open")),
+            "public WHOIS broke for non-members: {rows:?}"
         );
     })
     .await;

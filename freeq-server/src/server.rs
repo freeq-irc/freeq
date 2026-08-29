@@ -902,7 +902,7 @@ impl SharedState {
     /// keyed (`+k`), not encrypted-only (`+E`), and not gated by a join policy.
     /// Any restriction means it is effectively private, and advertising its
     /// name/topic to strangers or other tenants only leaks it. Members always
-    /// see their own channels regardless (the callers OR-in membership).
+    /// see their own channels regardless (see `channel_visible_to`).
     pub fn channel_is_discoverable(&self, name: &str, ch: &ChannelState) -> bool {
         if ch.is_mode_restricted() {
             return false;
@@ -913,6 +913,23 @@ impl SharedState {
             return false;
         }
         true
+    }
+
+    /// Can this session see the channel? Shared by LIST, NAMES, WHO, and WHOIS.
+    pub fn channel_visible_to(&self, name: &str, ch: &ChannelState, session_id: &str) -> bool {
+        self.channel_is_discoverable(name, ch) || ch.members.contains(session_id)
+    }
+
+    /// Same, for an HTTP caller who may have several sessions open.
+    /// Empty means anonymous.
+    pub fn channel_visible_to_sessions(
+        &self,
+        name: &str,
+        ch: &ChannelState,
+        viewer_sessions: &[String],
+    ) -> bool {
+        self.channel_is_discoverable(name, ch)
+            || viewer_sessions.iter().any(|s| ch.members.contains(s))
     }
 
     /// Connect-time allowlist (Phase 3.2, opt-in). Returns whether a DID may
