@@ -45,6 +45,16 @@ export const SIGNING_CAP = 'freeq.at/msgsig';
 const ACT_EVENT_DEDUPE_MS = 10 * 60_000;
 
 /**
+ * How long a task event waits for the server's word before its companion
+ * line is sent anyway.
+ *
+ * Fail-open on purpose: the line is what clients render as the card, so an
+ * accepted step whose line never went out is invisible to everyone — a worse
+ * failure than the rare late line beside a step that was refused.
+ */
+const ACT_ANSWER_WINDOW_MS = 5_000;
+
+/**
  * Backoff for re-sending a guest's own nick after 433 on an automatic
  * reconnect. A guest's nick is their whole identity, and the reconnect can
  * arrive before the server has reaped the previous session holding it —
@@ -1419,6 +1429,18 @@ export class FreeqClient extends EventEmitter {
    * directly.
    */
   private sendChain: Promise<unknown> = Promise.resolve();
+
+  /**
+   * Task events whose companion line is waiting on the server's word, one at
+   * a time.
+   *
+   * Its own chain, not `sendChain`: a send waiting here holds the wire for as
+   * long as the server takes to answer, and ordinary messages must not queue
+   * behind that. One at a time because a `FAIL TAGMSG` names no event id —
+   * the only thing that makes a refusal attributable is there being exactly
+   * one send it could belong to.
+   */
+  private actAnswerChain: Promise<unknown> = Promise.resolve();
 
   /**
    * Resolves once this session's key registration has reached the wire.
@@ -3507,7 +3529,6 @@ export class FreeqClient extends EventEmitter {
       [signing.EVENT_ID_TAG]: eventId,
       [signing.SIG_TAG]: signed.sigTag,
     };
-    this.raw(format('TAGMSG', [target], wireTags));
     // Three answers, not two: no `humanText` asks for the line these tags
     // deserve, `''` asks for no companion at all, and anything else is the
     // caller's own words.
@@ -3525,15 +3546,88 @@ export class FreeqClient extends EventEmitter {
           }),
         ),
       );
-    if (humanText) {
-      // The companion is an ordinary message signing its own id, carrying
-      // only the reference that joins it to the action — the one it names,
-      // or itself when it names none.
-      await this.writeSignedMessage('PRIVMSG', target, humanText, {
-        '+freeq.at/ref': opts.taskId ?? actTags['+freeq.at/act-id'] ?? eventId,
-      });
+    // The companion is an ordinary message signing its own id, carrying only
+    // the reference that joins it to the action — the one it names, or itself
+    // when it names none.
+    const ref = opts.taskId ?? actTags['+freeq.at/act-id'] ?? eventId;
+
+    // Nothing to wait for: a session without `echo-message` is never told its
+    // own event was taken, and a caller who asked for no line has none to
+    // hold back. Both halves go out as they always did.
+    if (!humanText || !this.ackedCaps.has('echo-message')) {
+      this.raw(format('TAGMSG', [target], wireTags));
+      if (humanText) await this.writeActCompanion(target, humanText, ref);
+      return eventId;
     }
+
+    const settled = this.actAnswerChain.then(
+      () => this.writeActAwaitingAnswer(target, wireTags, humanText, ref, eventId),
+      () => this.writeActAwaitingAnswer(target, wireTags, humanText, ref, eventId),
+    );
+    // A refused send must not wedge every act send after it.
+    this.actAnswerChain = settled.catch(() => undefined);
+    await settled;
     return eventId;
+  }
+
+  /** The line beside a task event, signed as the ordinary message it is. */
+  private writeActCompanion(target: string, humanText: string, ref: string): Promise<void> {
+    return this.writeSignedMessage('PRIVMSG', target, humanText, { '+freeq.at/ref': ref });
+  }
+
+  /**
+   * Put a task event on the wire and hold its line until the server has
+   * answered for the event.
+   *
+   * The server gates the event and not the line, so a line sent beside a
+   * refused step is prose about something that never happened — and no card
+   * can ever attach to it. Throws the refusal, so the caller of `sendAct`
+   * hears what the server said.
+   */
+  private async writeActAwaitingAnswer(
+    target: string,
+    wireTags: Record<string, string>,
+    humanText: string,
+    ref: string,
+    eventId: string,
+  ): Promise<void> {
+    // Armed before the event goes out: the answer is a line off the same
+    // socket, and the listener has to be there when it lands.
+    const answer = this.actAnswer(eventId);
+    this.raw(format('TAGMSG', [target], wireTags));
+    const refusal = await answer;
+    if (refusal) throw new Error(refusal);
+    await this.writeActCompanion(target, humanText, ref);
+  }
+
+  /**
+   * The server's word on a task event just sent: the refusal's words when it
+   * was refused, and nothing when it was taken.
+   *
+   * Acceptance is our own echo of the event — matched by the id we minted,
+   * either as the sender's tag or, through a server that adopts it, as the
+   * msgid it was filed under. A `FAIL TAGMSG` is the refusal; it names no
+   * event id, which is why only one send waits here at a time. Silence for
+   * the whole window reads as taken, deliberately (see `ACT_ANSWER_WINDOW_MS`).
+   */
+  private actAnswer(eventId: string): Promise<string | undefined> {
+    return new Promise<string | undefined>((resolve) => {
+      const settle = (refusal?: string): void => {
+        clearTimeout(timer);
+        this.off('raw', onRaw);
+        resolve(refusal);
+      };
+      const timer = setTimeout(() => settle(), ACT_ANSWER_WINDOW_MS);
+      const onRaw = (_line: string, parsed: IRCMessage): void => {
+        if (parsed.command === 'TAGMSG') {
+          const id = parsed.tags?.[signing.EVENT_ID_TAG] ?? parsed.tags?.['msgid'];
+          if (id === eventId) settle();
+        } else if (parsed.command === 'FAIL' && parsed.params[0] === 'TAGMSG') {
+          settle(parsed.params.slice(1).join(' ') || 'the server refused the task event');
+        }
+      };
+      this.on('raw', onRaw);
+    });
   }
 
   /**

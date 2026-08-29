@@ -1542,7 +1542,7 @@ describe('inbound: coordinationEvent', () => {
 describe('outbound: sendAct', () => {
   /** A registered client with a real session key, so a task event can be
    *  signed and put on the wire. */
-  async function signingClient(): Promise<{
+  async function signingClient(caps = 'message-tags freeq.at/msgsig'): Promise<{
     client: import('./client.js').FreeqClient;
     ws: MockWebSocket;
   }> {
@@ -1557,9 +1557,9 @@ describe('outbound: sendAct', () => {
     client.connect();
     await flushAsync();
     const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
-    ws.recv(':srv CAP * LS :message-tags freeq.at/msgsig');
+    ws.recv(`:srv CAP * LS :${caps}`);
     await flushAsync();
-    ws.recv(':srv CAP * ACK :message-tags freeq.at/msgsig');
+    ws.recv(`:srv CAP * ACK :${caps}`);
     await flushAsync();
     ws.recv(':srv 001 eliza :Welcome');
     await flushAsync();
@@ -1649,6 +1649,137 @@ describe('outbound: sendAct', () => {
     await expect(
       client.sendAct('#ops', actTags('handoff', 'claim', TASK, 'did:plc:eliza', {})),
     ).rejects.toThrow('a task event must be signed');
+  });
+
+  // ── The line waits for the server to take the event ──
+  //
+  // The server gates only the TAGMSG, so a line sent beside it unconditionally
+  // is prose about a step that may never have happened.
+
+  const ECHOING = 'message-tags freeq.at/msgsig echo-message';
+  const events = (ws: MockWebSocket) => ws.sent.filter((l) => l.includes('TAGMSG'));
+  const eventIdOf = (line: string) => /\+freeq\.at\/eventid=([^;\s]+)/.exec(line)![1];
+
+  /** The server's echo of a task event we sent, which is what says it took it. */
+  function echoOf(line: string): string {
+    return (
+      `@+freeq.at/eventid=${eventIdOf(line)};+freeq.at/act=handoff;` +
+      '+freeq.at/act-verb=progress;+freeq.at/from=did:plc:eliza :eliza TAGMSG #ops'
+    );
+  }
+
+  const REFUSAL =
+    ":srv FAIL TAGMSG ILLEGAL_STEP :That step cannot be taken from the task's current state";
+
+  it('holds the line until our own echo of the event comes back', async () => {
+    const { client, ws } = await signingClient(ECHOING);
+    const sent = client.sendAct(
+      '#ops',
+      actTags('handoff', 'progress', TASK, 'did:plc:eliza', { note: 'halfway' }),
+    );
+    await settled(ws, 'TAGMSG');
+    // The event alone so far — the line is what the server has not spoken for.
+    expect(events(ws)).toHaveLength(1);
+    expect(lines(ws)).toHaveLength(0);
+
+    ws.recv(echoOf(events(ws)[0]!));
+    expect(await sent).toBe(eventIdOf(events(ws)[0]!));
+    await settled(ws, 'PRIVMSG');
+    expect(lines(ws)[0]!).toContain(':progress: halfway');
+  });
+
+  it('never writes the line for an event the server refused', async () => {
+    const { client, ws } = await signingClient(ECHOING);
+    const sent = client.sendAct(
+      '#ops',
+      actTags('handoff', 'progress', TASK, 'did:plc:eliza', { note: 'halfway' }),
+    );
+    await settled(ws, 'TAGMSG');
+    ws.recv(REFUSAL);
+    // The caller hears the server's own words, code first.
+    await expect(sent).rejects.toThrow(
+      "ILLEGAL_STEP That step cannot be taken from the task's current state",
+    );
+    await settled(ws, 'PRIVMSG');
+    expect(lines(ws)).toHaveLength(0);
+  });
+
+  it('writes the line anyway when nobody answers inside the window', async () => {
+    const { client, ws } = await signingClient(ECHOING);
+    // Only the window's own timer is faked: signing resolves off the
+    // platform's work queue, and a fake clock over all of it never lets go.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const sent = client.sendAct(
+        '#ops',
+        actTags('handoff', 'progress', TASK, 'did:plc:eliza', { note: 'halfway' }),
+      );
+      // `setImmediate` is not faked, so this pumps the real work queue the
+      // signature resolves on without moving the window's clock.
+      const tick = (): Promise<void> => new Promise((r) => setImmediate(r));
+      for (let i = 0; i < 200 && events(ws).length === 0; i++) await tick();
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(lines(ws)).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(1);
+      await sent;
+      expect(lines(ws)[0]!).toContain(':progress: halfway');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('sends both halves at once on a session with no echo to wait for', async () => {
+    const { client, ws } = await signingClient();
+    const sent = client.sendAct(
+      '#ops',
+      actTags('handoff', 'progress', TASK, 'did:plc:eliza', { note: 'halfway' }),
+    );
+    await settled(ws, 'PRIVMSG');
+    await sent;
+    // Nothing was ever echoed, and the line went out regardless.
+    expect(lines(ws)).toHaveLength(1);
+  });
+
+  it('waits for nothing when the caller asked for no line', async () => {
+    const { client, ws } = await signingClient(ECHOING);
+    await client.sendAct(
+      '#ops',
+      actTags('handoff', 'accept', TASK, 'did:plc:eliza', {}),
+      { humanText: '' },
+    );
+    await settled(ws, 'TAGMSG');
+    expect(events(ws)).toHaveLength(1);
+    expect(lines(ws)).toHaveLength(0);
+  });
+
+  it('keeps the next event off the wire until the one before it is answered', async () => {
+    const { client, ws } = await signingClient(ECHOING);
+    const first = client.sendAct(
+      '#ops',
+      actTags('handoff', 'progress', TASK, 'did:plc:eliza', { note: 'first' }),
+    );
+    const second = client.sendAct(
+      '#ops',
+      actTags('handoff', 'progress', TASK, 'did:plc:eliza', { note: 'second' }),
+    );
+    await settled(ws, 'TAGMSG');
+    // A refusal names no event id, so a second event in flight would make the
+    // next `FAIL` unattributable.
+    expect(events(ws)).toHaveLength(1);
+
+    ws.recv(echoOf(events(ws)[0]!));
+    await first;
+    await settled(ws, 'PRIVMSG');
+    expect(lines(ws).map((l) => l.includes('first'))).toEqual([true]);
+
+    // The second event only now goes out, and its line follows its own answer.
+    for (let i = 0; i < 50 && events(ws).length < 2; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(events(ws)).toHaveLength(2);
+    expect(lines(ws)).toHaveLength(1);
+    ws.recv(echoOf(events(ws)[1]!));
+    await second;
+    for (let i = 0; i < 50 && lines(ws).length < 2; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(lines(ws)[1]!).toContain('second');
   });
 });
 
