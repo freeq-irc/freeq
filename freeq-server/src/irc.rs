@@ -210,6 +210,23 @@ pub const ERR_SASLALREADY: &str = "907";
 // CAP / channel numerics
 pub const RPL_NAMREPLY: &str = "353";
 pub const RPL_ENDOFNAMES: &str = "366";
+
+/// Vendor numeric: the actor classes of non-human members, sent once after
+/// `366` so a client that joins a channel an agent is already in can tell it
+/// apart from a person.
+///
+/// `NAMES` cannot carry this — its last parameter is a space-separated nick
+/// list and per-nick metadata would break existing parsers — and the
+/// `extended-join` tag only reaches clients that were already watching. Format:
+///
+/// ```text
+/// :server 674 <nick> <channel> :<nick>=<class> <nick>=<class> …
+/// ```
+///
+/// Humans are omitted: the line flags the exceptions, so it stays small in a
+/// channel full of people. Unknown numerics are ignored by every IRC client,
+/// so this is additive.
+pub const RPL_ACTORCLASSES: &str = "674";
 pub const RPL_TOPIC: &str = "332";
 pub const RPL_TOPICWHOTIME: &str = "333";
 pub const RPL_NOTOPIC: &str = "331";

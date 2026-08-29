@@ -2516,6 +2516,59 @@ export class FreeqClient extends EventEmitter {
         break;
       }
 
+      // Actor classes for members already in the channel (vendor numeric).
+      //
+      // Sent right after 366. NAMES carries only nicks and prefixes, and the
+      // extended-join tag only reaches clients that were already watching, so
+      // without this a client that joins a room an agent is already in renders
+      // that agent as a person. Format:
+      //   :server 674 <me> <channel> :<nick>=<class> <nick>=<class> …
+      case '674': {
+        const classChannel = msg.params[1];
+        const entries = (msg.params[2] || '').split(' ').filter(Boolean);
+        for (const entry of entries) {
+          const eq = entry.lastIndexOf('=');
+          if (eq <= 0) continue;
+          const nick = entry.slice(0, eq);
+          const actorClass = entry.slice(eq + 1) as Member['actorClass'];
+          if (actorClass !== 'agent' && actorClass !== 'external_agent' && actorClass !== 'human') {
+            continue;
+          }
+          this.emit('memberJoined', classChannel, { nick, actorClass });
+        }
+        break;
+      }
+
+      // Structured presence relay. Unlike the AWAY back-compat line, this
+      // carries the status for EVERY state — including active/online/idle,
+      // where "back from away" is parameterless and the status used to be
+      // dropped on the floor.
+      case 'PRESENCE': {
+        const raw = msg.params[msg.params.length - 1] || '';
+        let state: string | undefined;
+        let status: string | undefined;
+        let task: string | undefined;
+        for (const part of raw.split(';')) {
+          const eq = part.indexOf('=');
+          if (eq <= 0) continue;
+          const k = part.slice(0, eq).trim();
+          const v = part.slice(eq + 1);
+          if (k === 'state') state = v;
+          else if (k === 'status') status = v || undefined;
+          else if (k === 'task') task = v || undefined;
+        }
+        if (from && state) {
+          this.emit('presence', {
+            nick: from,
+            did: this.getDidForNick(from),
+            state,
+            status,
+            task,
+          });
+        }
+        break;
+      }
+
       case '366': {
         const namesChannel = msg.params[1];
         // Emit the FULL accumulated roster so consumers can replace the member

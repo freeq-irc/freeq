@@ -3339,9 +3339,30 @@ where
                     } else {
                         format!(":{hostmask} AWAY :{away_text}\r\n")
                     };
+
+                    // Structured relay, alongside the AWAY above.
+                    //
+                    // AWAY cannot carry this: "back from away" is
+                    // parameterless by IRC semantics, so for online/active/idle
+                    // the status was computed and then thrown away, and an
+                    // agent could only publish what it was doing by lying about
+                    // its liveness. This line carries state, status and task
+                    // verbatim for EVERY state. Clients that do not understand
+                    // an unknown command ignore it, so the AWAY stays for
+                    // back-compat.
+                    let mut presence_parts = format!("state={ps}");
+                    if let Some(ref status) = status_text {
+                        presence_parts.push_str(&format!(";status={status}"));
+                    }
+                    if let Some(ref task) = presence.task {
+                        presence_parts.push_str(&format!(";task={task}"));
+                    }
+                    let presence_line = format!(":{hostmask} PRESENCE :{presence_parts}\r\n");
+
                     for sid in &targets {
                         if let Some(tx) = conns.get(sid) {
                             let _ = tx.try_send(line.clone());
+                            let _ = tx.try_send(presence_line.clone());
                         }
                     }
                 }

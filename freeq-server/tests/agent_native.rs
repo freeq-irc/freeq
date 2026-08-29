@@ -3613,3 +3613,209 @@ async fn naming_someone_else_as_sponsor_requires_their_consent() {
     op.quit(None).await.ok();
     server_handle.abort();
 }
+
+// ── Roster-time actor class (issue #72) ──────────────────────────────────────
+
+/// A client joining a channel an agent is ALREADY in must be able to tell that
+/// it is an agent.
+///
+/// NAMES (353) carries only nicks and prefixes, and the extended-join tag only
+/// reaches clients that were already watching. Without a roster-time signal,
+/// every client renders pre-existing agents as humans, or reinvents a
+/// WHOIS-per-member probe. This is that signal.
+#[tokio::test]
+async fn names_reports_actor_class_for_members_already_present() {
+    start_deadlock_detector();
+    let (addr, server_handle) = start_test_server_with_db(empty_resolver(), true).await;
+
+    // An agent is in the channel BEFORE anyone else arrives.
+    let (_d1, s1) = make_did_key_signer();
+    let (agent, mut agent_ev) = connect_did_key_with_signer(addr, "worker", s1).await;
+    agent.register_agent("agent").await.unwrap();
+    expect_raw_line(&mut agent_ev, 2000, "registered as agent", "AGENT REGISTER").await;
+    agent.join("#roster").await.unwrap();
+    expect_event(
+        &mut agent_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "agent joined",
+    )
+    .await;
+
+    // Someone else joins afterwards and must learn the class from the roster.
+    let (_d2, s2) = make_did_key_signer();
+    let (human, mut human_ev) = connect_did_key_with_signer(addr, "latecomer", s2).await;
+    human.join("#roster").await.unwrap();
+
+    let line = expect_raw_line(&mut human_ev, 3000, " 674 ", "actor-class roster line").await;
+    assert!(
+        line.contains("worker=agent"),
+        "the roster line must name the agent and its class, got: {line}"
+    );
+    assert!(
+        line.contains("#roster"),
+        "the roster line must name the channel, got: {line}"
+    );
+
+    agent.quit(None).await.unwrap();
+    human.quit(None).await.unwrap();
+    server_handle.abort();
+}
+
+/// Humans are the default and must not be listed: the line exists to flag the
+/// exceptions, and listing every human would make it grow with the channel.
+#[tokio::test]
+async fn actor_class_roster_line_omits_humans_and_is_skipped_when_empty() {
+    start_deadlock_detector();
+    let (addr, server_handle) = start_test_server_with_db(empty_resolver(), true).await;
+
+    let (_d1, s1) = make_did_key_signer();
+    let (first, mut first_ev) = connect_did_key_with_signer(addr, "personone", s1).await;
+    first.join("#humans").await.unwrap();
+    expect_event(
+        &mut first_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "first joined",
+    )
+    .await;
+
+    let (_d2, s2) = make_did_key_signer();
+    let (second, mut second_ev) = connect_did_key_with_signer(addr, "persontwo", s2).await;
+    second.join("#humans").await.unwrap();
+    // The join must complete without a 674 — a channel of humans emits none.
+    expect_event(
+        &mut second_ev,
+        3000,
+        |e| matches!(e, Event::RawLine(l) if l.contains(" 366 ")),
+        "end of NAMES",
+    )
+    .await;
+
+    let saw_674 = tokio::time::timeout(std::time::Duration::from_millis(400), async {
+        loop {
+            match second_ev.recv().await {
+                Some(Event::RawLine(l)) if l.contains(" 674 ") => return true,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(!saw_674, "a channel with no agents must not emit an actor-class line");
+
+    first.quit(None).await.unwrap();
+    second.quit(None).await.unwrap();
+    server_handle.abort();
+}
+
+// ── Presence status for active agents (issue #70) ────────────────────────────
+
+/// An agent that is *working* must be able to say what it is working on.
+///
+/// Presence was relayed only through the `AWAY` back-compat mechanism, and
+/// "back from away" is parameterless by IRC semantics — so for `online`,
+/// `active` and `idle` the status string was computed and then dropped. The
+/// practical effect: an agent grinding on a task appeared as a plain
+/// "available", and the only way to publish a status was to lie about
+/// liveness by claiming a non-active state.
+#[tokio::test]
+async fn presence_status_reaches_peers_for_active_states() {
+    start_deadlock_detector();
+    let (addr, server_handle) = start_test_server_with_db(empty_resolver(), true).await;
+
+    let (_d1, s1) = make_did_key_signer();
+    let (agent, mut agent_ev) = connect_did_key_with_signer(addr, "busybot", s1).await;
+    agent.register_agent("agent").await.unwrap();
+    expect_raw_line(&mut agent_ev, 2000, "registered as agent", "AGENT REGISTER").await;
+    agent.join("#presence").await.unwrap();
+    expect_event(
+        &mut agent_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "agent joined",
+    )
+    .await;
+
+    let (_d2, s2) = make_did_key_signer();
+    let (watcher, mut watch_ev) = connect_did_key_with_signer(addr, "watcher", s2).await;
+    watcher.join("#presence").await.unwrap();
+    expect_event(
+        &mut watch_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "watcher joined",
+    )
+    .await;
+
+    // `executing` is an away-ish state and already worked; `active` is the one
+    // that was silently losing its status.
+    agent
+        .raw("PRESENCE :state=active;status=project=freeq branch=main")
+        .await
+        .unwrap();
+
+    let line = expect_raw_line(&mut watch_ev, 3000, "PRESENCE", "presence relay to a peer").await;
+    assert!(
+        line.contains("project=freeq"),
+        "an active agent's status must reach peers, got: {line}"
+    );
+    assert!(
+        line.contains("busybot"),
+        "the relay must name the agent, got: {line}"
+    );
+
+    agent.quit(None).await.unwrap();
+    watcher.quit(None).await.unwrap();
+    server_handle.abort();
+}
+
+/// The task reference travels too, so a room can tie a working agent to the
+/// handoff it accepted.
+#[tokio::test]
+async fn presence_relay_carries_state_and_task() {
+    start_deadlock_detector();
+    let (addr, server_handle) = start_test_server_with_db(empty_resolver(), true).await;
+
+    let (_d1, s1) = make_did_key_signer();
+    let (agent, mut agent_ev) = connect_did_key_with_signer(addr, "taskbot", s1).await;
+    agent.register_agent("agent").await.unwrap();
+    expect_raw_line(&mut agent_ev, 2000, "registered as agent", "AGENT REGISTER").await;
+    agent.join("#presence2").await.unwrap();
+    expect_event(
+        &mut agent_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "agent joined",
+    )
+    .await;
+
+    let (_d2, s2) = make_did_key_signer();
+    let (watcher, mut watch_ev) = connect_did_key_with_signer(addr, "watcher2", s2).await;
+    watcher.join("#presence2").await.unwrap();
+    expect_event(
+        &mut watch_ev,
+        2000,
+        |e| matches!(e, Event::Joined { .. }),
+        "watcher joined",
+    )
+    .await;
+
+    agent
+        .raw("PRESENCE :state=executing;status=fixing the parser;task=01ABCDEF")
+        .await
+        .unwrap();
+
+    let line = expect_raw_line(&mut watch_ev, 3000, "PRESENCE", "presence relay").await;
+    assert!(line.contains("executing"), "state must travel, got: {line}");
+    assert!(
+        line.contains("fixing the parser"),
+        "status must travel, got: {line}"
+    );
+    assert!(line.contains("01ABCDEF"), "task ref must travel, got: {line}");
+
+    agent.quit(None).await.unwrap();
+    watcher.quit(None).await.unwrap();
+    server_handle.abort();
+}

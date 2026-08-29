@@ -3259,3 +3259,89 @@ describe('signed mutations', () => {
     ]);
   });
 });
+
+describe('roster-time actor class (numeric 674)', () => {
+  it('reports the class of members who were already in the channel', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: Array<{ channel: string; nick: string; actorClass?: string }> = [];
+    client.on('memberJoined', (channel, m) =>
+      seen.push({ channel, nick: m.nick, actorClass: m.actorClass }),
+    );
+
+    ws.recv(':srv 674 alice #ops :worker=agent bridge=external_agent');
+    await flushAsync();
+
+    expect(seen).toEqual([
+      { channel: '#ops', nick: 'worker', actorClass: 'agent' },
+      { channel: '#ops', nick: 'bridge', actorClass: 'external_agent' },
+    ]);
+  });
+
+  it('ignores malformed entries and unknown classes rather than inventing members', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: string[] = [];
+    client.on('memberJoined', (_c, m) => seen.push(m.nick));
+    ws.recv(':srv 674 alice #ops :garbage nick= =agent bot=wizard');
+    await flushAsync();
+    expect(seen).toEqual([]);
+  });
+
+  it('handles an empty list', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: string[] = [];
+    client.on('memberJoined', (_c, m) => seen.push(m.nick));
+    ws.recv(':srv 674 alice #ops :');
+    await flushAsync();
+    expect(seen).toEqual([]);
+  });
+});
+
+describe('structured presence relay', () => {
+  it('carries the status of an ACTIVE agent (the AWAY path cannot)', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: Array<{ nick: string; state: string; status?: string; task?: string }> = [];
+    client.on('presence', (p) => seen.push(p as never));
+
+    ws.recv(':busybot!u@h PRESENCE :state=active;status=project=freeq branch=main');
+    await flushAsync();
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0].nick).toBe('busybot');
+    expect(seen[0].state).toBe('active');
+    expect(seen[0].status).toBe('project=freeq branch=main');
+  });
+
+  it('carries state, status and task together', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: Array<{ state: string; status?: string; task?: string }> = [];
+    client.on('presence', (p) => seen.push(p as never));
+
+    ws.recv(':bot!u@h PRESENCE :state=executing;status=fixing the parser;task=01ABCDEF');
+    await flushAsync();
+
+    expect(seen[0]).toMatchObject({
+      state: 'executing',
+      status: 'fixing the parser',
+      task: '01ABCDEF',
+    });
+  });
+
+  it('tolerates a bare state with no status', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: Array<{ state: string; status?: string }> = [];
+    client.on('presence', (p) => seen.push(p as never));
+    ws.recv(':bot!u@h PRESENCE :state=idle');
+    await flushAsync();
+    expect(seen[0]).toMatchObject({ state: 'idle' });
+    expect(seen[0].status).toBeUndefined();
+  });
+
+  it('ignores a relay with no state', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: unknown[] = [];
+    client.on('presence', (p) => seen.push(p));
+    ws.recv(':bot!u@h PRESENCE :status=orphaned');
+    await flushAsync();
+    expect(seen).toEqual([]);
+  });
+});

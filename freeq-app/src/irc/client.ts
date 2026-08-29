@@ -64,10 +64,12 @@ let client: FreeqClient | null = null;
 const DM_PEER_WHOIS_TIMEOUT_MS = 2000;
 
 /**
- * Actor class (human / agent / external_agent) is only carried on an
- * extended-join tag and on WHOIS numeric 673 — never in NAMES. So for anyone
- * already in a channel when we arrive, we have to ask. Bounded per roster
- * sync, and remembered per session, so a busy channel cannot become a flood.
+ * Fallback for servers that predate the roster-time actor-class numeric (674).
+ *
+ * A current server annotates the roster right after 366, so nothing below
+ * runs. Against an older one, actor class is reachable only via WHOIS (673),
+ * so we probe — bounded per roster sync and remembered per session, since a
+ * busy channel would otherwise become a WHOIS flood.
  */
 const ACTOR_CLASS_PROBE_BUDGET = 25;
 const actorClassProbed = new Set<string>();
@@ -867,7 +869,10 @@ function wireEvents(c: FreeqClient) {
   c.on('membersSync', (channel, members) => {
     s().setMembers(channel, members);
     for (const m of members) if (m.did) prefetchProfiles([m.did]);
-    probeActorClasses(members);
+    // A current server sends 674 immediately after 366, which fills these in
+    // without a round trip. Give it a moment before falling back to WHOIS, so
+    // we do not probe for something already on its way.
+    setTimeout(() => probeActorClassesIfStillUnknown(channel), 750);
   });
 
   c.on('memberDid', (nick, did) => {
@@ -882,7 +887,11 @@ function wireEvents(c: FreeqClient) {
    * flood. The answer comes back as numeric 673 and lands via the
    * channel-less `memberJoined` above.
    */
-  function probeActorClasses(members: Array<{ nick: string; actorClass?: string }>): void {
+  function probeActorClassesIfStillUnknown(channel: string): void {
+    // Re-read from the store: 674 may have answered in the meantime.
+    const ch = useStore.getState().channels.get(channel.toLowerCase());
+    if (!ch) return;
+    const members = [...ch.members.values()];
     let budget = ACTOR_CLASS_PROBE_BUDGET;
     for (const m of members) {
       if (budget <= 0) break;

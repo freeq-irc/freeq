@@ -787,6 +787,7 @@ pub(super) fn handle_join(
     );
     send(state, session_id, format!("{names}\r\n"));
     send(state, session_id, format!("{end_names}\r\n"));
+    send_actor_classes(state, server_name, session_id, nick, channel, send);
 
     // Notify joining client about active AV session in this channel (if any)
     {
@@ -2186,6 +2187,7 @@ pub(super) fn handle_names(
     );
     send(state, session_id, format!("{names}\r\n"));
     send(state, session_id, format!("{end_names}\r\n"));
+    send_actor_classes(state, server_name, session_id, nick, channel, send);
 }
 
 pub(super) fn handle_list(
@@ -2282,4 +2284,63 @@ mod auto_mode_tests {
     fn a_plain_member_announces_nothing() {
         assert!(auto_modes_for(false, false, false).is_empty());
     }
+}
+
+/// Tell a client which members of a channel are not human.
+///
+/// Sent immediately after `366` (end of NAMES), so it annotates a roster the
+/// client has just built. This exists because neither of the other two
+/// carriers reaches a late arrival: `NAMES` has no room for per-nick metadata
+/// (its last parameter is a space-separated nick list, and adding structure
+/// there would break existing parsers), and the `extended-join` tag only goes
+/// to clients that were already in the room when the agent joined.
+///
+/// Humans are omitted deliberately — the line flags exceptions, so it stays
+/// short in a channel full of people, and a client can treat "absent" as
+/// "human" exactly as it does today.
+pub(super) fn send_actor_classes(
+    state: &Arc<SharedState>,
+    server_name: &str,
+    session_id: &str,
+    nick: &str,
+    channel: &str,
+    send: &impl Fn(&Arc<SharedState>, &str, String),
+) {
+    let classes: Vec<String> = {
+        let channels = state.channels.lock();
+        let member_sessions = match channels.get(channel) {
+            Some(ch) => ch.members.clone(),
+            None => return,
+        };
+        drop(channels);
+
+        let actor_classes = state.session_actor_class.lock();
+        let nicks = state.nick_to_session.lock();
+        let mut seen = std::collections::HashSet::new();
+        member_sessions
+            .iter()
+            .filter_map(|sid| {
+                let class = actor_classes.get(sid).copied()?;
+                if class == super::ActorClass::Human {
+                    return None;
+                }
+                let n = nicks.get_nick(sid)?;
+                // Multi-device: one entry per nick, not per session.
+                if !seen.insert(n.to_lowercase()) {
+                    return None;
+                }
+                Some(format!("{n}={class}"))
+            })
+            .collect()
+    };
+
+    if classes.is_empty() {
+        return;
+    }
+    let line = irc::Message::from_server(
+        server_name,
+        irc::RPL_ACTORCLASSES,
+        vec![nick, channel, &classes.join(" ")],
+    );
+    send(state, session_id, format!("{line}\r\n"));
 }
