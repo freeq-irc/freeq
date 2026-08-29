@@ -274,9 +274,7 @@ pub fn parse_actor_classes(raw: &str) -> Vec<(String, String)> {
                 return None;
             }
             match class {
-                "agent" | "external_agent" | "human" => {
-                    Some((nick.to_string(), class.to_string()))
-                }
+                "agent" | "external_agent" | "human" => Some((nick.to_string(), class.to_string())),
                 _ => None,
             }
         })

@@ -1499,6 +1499,218 @@ public func FfiConverterTypeFreeqP2p_lower(_ value: FreeqP2p) -> UnsafeMutableRa
 
 
 
+public struct ActEvent {
+    public var from: String
+    public var target: String
+    public var kind: String
+    public var verb: String
+    public var did: String?
+    public var eventId: String
+    public var taskId: String
+    public var fields: [TagEntry]
+    public var sigTag: String?
+    public var replayed: Bool
+    public var dmKey: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(from: String, target: String, kind: String, verb: String, did: String?, eventId: String, taskId: String, fields: [TagEntry], sigTag: String?, replayed: Bool, dmKey: String?) {
+        self.from = from
+        self.target = target
+        self.kind = kind
+        self.verb = verb
+        self.did = did
+        self.eventId = eventId
+        self.taskId = taskId
+        self.fields = fields
+        self.sigTag = sigTag
+        self.replayed = replayed
+        self.dmKey = dmKey
+    }
+}
+
+#if compiler(>=6)
+extension ActEvent: Sendable {}
+#endif
+
+
+extension ActEvent: Equatable, Hashable {
+    public static func ==(lhs: ActEvent, rhs: ActEvent) -> Bool {
+        if lhs.from != rhs.from {
+            return false
+        }
+        if lhs.target != rhs.target {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.verb != rhs.verb {
+            return false
+        }
+        if lhs.did != rhs.did {
+            return false
+        }
+        if lhs.eventId != rhs.eventId {
+            return false
+        }
+        if lhs.taskId != rhs.taskId {
+            return false
+        }
+        if lhs.fields != rhs.fields {
+            return false
+        }
+        if lhs.sigTag != rhs.sigTag {
+            return false
+        }
+        if lhs.replayed != rhs.replayed {
+            return false
+        }
+        if lhs.dmKey != rhs.dmKey {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(from)
+        hasher.combine(target)
+        hasher.combine(kind)
+        hasher.combine(verb)
+        hasher.combine(did)
+        hasher.combine(eventId)
+        hasher.combine(taskId)
+        hasher.combine(fields)
+        hasher.combine(sigTag)
+        hasher.combine(replayed)
+        hasher.combine(dmKey)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeActEvent: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ActEvent {
+        return
+            try ActEvent(
+                from: FfiConverterString.read(from: &buf), 
+                target: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterString.read(from: &buf), 
+                verb: FfiConverterString.read(from: &buf), 
+                did: FfiConverterOptionString.read(from: &buf), 
+                eventId: FfiConverterString.read(from: &buf), 
+                taskId: FfiConverterString.read(from: &buf), 
+                fields: FfiConverterSequenceTypeTagEntry.read(from: &buf), 
+                sigTag: FfiConverterOptionString.read(from: &buf), 
+                replayed: FfiConverterBool.read(from: &buf), 
+                dmKey: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ActEvent, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.from, into: &buf)
+        FfiConverterString.write(value.target, into: &buf)
+        FfiConverterString.write(value.kind, into: &buf)
+        FfiConverterString.write(value.verb, into: &buf)
+        FfiConverterOptionString.write(value.did, into: &buf)
+        FfiConverterString.write(value.eventId, into: &buf)
+        FfiConverterString.write(value.taskId, into: &buf)
+        FfiConverterSequenceTypeTagEntry.write(value.fields, into: &buf)
+        FfiConverterOptionString.write(value.sigTag, into: &buf)
+        FfiConverterBool.write(value.replayed, into: &buf)
+        FfiConverterOptionString.write(value.dmKey, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeActEvent_lift(_ buf: RustBuffer) throws -> ActEvent {
+    return try FfiConverterTypeActEvent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeActEvent_lower(_ value: ActEvent) -> RustBuffer {
+    return FfiConverterTypeActEvent.lower(value)
+}
+
+
+public struct ActorClassEntry {
+    public var nick: String
+    public var actorClass: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(nick: String, actorClass: String) {
+        self.nick = nick
+        self.actorClass = actorClass
+    }
+}
+
+#if compiler(>=6)
+extension ActorClassEntry: Sendable {}
+#endif
+
+
+extension ActorClassEntry: Equatable, Hashable {
+    public static func ==(lhs: ActorClassEntry, rhs: ActorClassEntry) -> Bool {
+        if lhs.nick != rhs.nick {
+            return false
+        }
+        if lhs.actorClass != rhs.actorClass {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(nick)
+        hasher.combine(actorClass)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeActorClassEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ActorClassEntry {
+        return
+            try ActorClassEntry(
+                nick: FfiConverterString.read(from: &buf), 
+                actorClass: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ActorClassEntry, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.nick, into: &buf)
+        FfiConverterString.write(value.actorClass, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeActorClassEntry_lift(_ buf: RustBuffer) throws -> ActorClassEntry {
+    return try FfiConverterTypeActorClassEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeActorClassEntry_lower(_ value: ActorClassEntry) -> RustBuffer {
+    return FfiConverterTypeActorClassEntry.lower(value)
+}
+
+
 public struct AvAudioDevice {
     public var id: String
     public var name: String
@@ -1981,10 +2193,11 @@ public struct IrcMessage {
     public var edited: Bool
     public var dmKey: String?
     public var coordination: CoordinationEvent?
+    public var tags: [TagEntry]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(fromNick: String, target: String, text: String, msgid: String?, replyTo: String?, replacesMsgid: String?, editOf: String?, batchId: String?, pinMsgid: String?, unpinMsgid: String?, isAction: Bool, isSigned: Bool, timestampMs: Int64, account: String?, origin: String?, reactions: [ReactionTally], edited: Bool, dmKey: String?, coordination: CoordinationEvent?) {
+    public init(fromNick: String, target: String, text: String, msgid: String?, replyTo: String?, replacesMsgid: String?, editOf: String?, batchId: String?, pinMsgid: String?, unpinMsgid: String?, isAction: Bool, isSigned: Bool, timestampMs: Int64, account: String?, origin: String?, reactions: [ReactionTally], edited: Bool, dmKey: String?, coordination: CoordinationEvent?, tags: [TagEntry] = []) {
         self.fromNick = fromNick
         self.target = target
         self.text = text
@@ -2004,6 +2217,7 @@ public struct IrcMessage {
         self.edited = edited
         self.dmKey = dmKey
         self.coordination = coordination
+        self.tags = tags
     }
 }
 
@@ -2071,6 +2285,9 @@ extension IrcMessage: Equatable, Hashable {
         if lhs.coordination != rhs.coordination {
             return false
         }
+        if lhs.tags != rhs.tags {
+            return false
+        }
         return true
     }
 
@@ -2094,6 +2311,7 @@ extension IrcMessage: Equatable, Hashable {
         hasher.combine(edited)
         hasher.combine(dmKey)
         hasher.combine(coordination)
+        hasher.combine(tags)
     }
 }
 
@@ -2124,7 +2342,8 @@ public struct FfiConverterTypeIrcMessage: FfiConverterRustBuffer {
                 reactions: FfiConverterSequenceTypeReactionTally.read(from: &buf), 
                 edited: FfiConverterBool.read(from: &buf), 
                 dmKey: FfiConverterOptionString.read(from: &buf), 
-                coordination: FfiConverterOptionTypeCoordinationEvent.read(from: &buf)
+                coordination: FfiConverterOptionTypeCoordinationEvent.read(from: &buf), 
+                tags: FfiConverterSequenceTypeTagEntry.read(from: &buf)
         )
     }
 
@@ -2148,6 +2367,7 @@ public struct FfiConverterTypeIrcMessage: FfiConverterRustBuffer {
         FfiConverterBool.write(value.edited, into: &buf)
         FfiConverterOptionString.write(value.dmKey, into: &buf)
         FfiConverterOptionTypeCoordinationEvent.write(value.coordination, into: &buf)
+        FfiConverterSequenceTypeTagEntry.write(value.tags, into: &buf)
     }
 }
 
@@ -3067,9 +3287,15 @@ public enum FreeqEvent {
     )
     case awayChanged(nick: String, awayMsg: String?
     )
+    case actorClasses(channel: String, classes: [ActorClassEntry]
+    )
+    case presence(nick: String, state: String, status: String?, task: String?
+    )
     case message(msg: IrcMessage
     )
     case tagMsg(msg: TagMessage
+    )
+    case act(event: ActEvent
     )
     case names(channel: String, members: [IrcMember]
     )
@@ -3139,52 +3365,61 @@ public struct FfiConverterTypeFreeqEvent: FfiConverterRustBuffer {
         case 8: return .awayChanged(nick: try FfiConverterString.read(from: &buf), awayMsg: try FfiConverterOptionString.read(from: &buf)
         )
         
-        case 9: return .message(msg: try FfiConverterTypeIrcMessage.read(from: &buf)
+        case 9: return .actorClasses(channel: try FfiConverterString.read(from: &buf), classes: try FfiConverterSequenceTypeActorClassEntry.read(from: &buf)
         )
         
-        case 10: return .tagMsg(msg: try FfiConverterTypeTagMessage.read(from: &buf)
+        case 10: return .presence(nick: try FfiConverterString.read(from: &buf), state: try FfiConverterString.read(from: &buf), status: try FfiConverterOptionString.read(from: &buf), task: try FfiConverterOptionString.read(from: &buf)
         )
         
-        case 11: return .names(channel: try FfiConverterString.read(from: &buf), members: try FfiConverterSequenceTypeIrcMember.read(from: &buf)
+        case 11: return .message(msg: try FfiConverterTypeIrcMessage.read(from: &buf)
         )
         
-        case 12: return .topicChanged(channel: try FfiConverterString.read(from: &buf), topic: try FfiConverterTypeChannelTopic.read(from: &buf)
+        case 12: return .tagMsg(msg: try FfiConverterTypeTagMessage.read(from: &buf)
         )
         
-        case 13: return .modeChanged(channel: try FfiConverterString.read(from: &buf), mode: try FfiConverterString.read(from: &buf), arg: try FfiConverterOptionString.read(from: &buf), setBy: try FfiConverterString.read(from: &buf)
+        case 13: return .act(event: try FfiConverterTypeActEvent.read(from: &buf)
         )
         
-        case 14: return .kicked(channel: try FfiConverterString.read(from: &buf), nick: try FfiConverterString.read(from: &buf), by: try FfiConverterString.read(from: &buf), reason: try FfiConverterString.read(from: &buf)
+        case 14: return .names(channel: try FfiConverterString.read(from: &buf), members: try FfiConverterSequenceTypeIrcMember.read(from: &buf)
         )
         
-        case 15: return .userQuit(nick: try FfiConverterString.read(from: &buf), reason: try FfiConverterString.read(from: &buf)
+        case 15: return .topicChanged(channel: try FfiConverterString.read(from: &buf), topic: try FfiConverterTypeChannelTopic.read(from: &buf)
         )
         
-        case 16: return .batchStart(id: try FfiConverterString.read(from: &buf), batchType: try FfiConverterString.read(from: &buf), target: try FfiConverterString.read(from: &buf)
+        case 16: return .modeChanged(channel: try FfiConverterString.read(from: &buf), mode: try FfiConverterString.read(from: &buf), arg: try FfiConverterOptionString.read(from: &buf), setBy: try FfiConverterString.read(from: &buf)
         )
         
-        case 17: return .batchEnd(id: try FfiConverterString.read(from: &buf)
+        case 17: return .kicked(channel: try FfiConverterString.read(from: &buf), nick: try FfiConverterString.read(from: &buf), by: try FfiConverterString.read(from: &buf), reason: try FfiConverterString.read(from: &buf)
         )
         
-        case 18: return .chatHistoryTarget(nick: try FfiConverterString.read(from: &buf), timestamp: try FfiConverterOptionString.read(from: &buf), partnerDid: try FfiConverterOptionString.read(from: &buf)
+        case 18: return .userQuit(nick: try FfiConverterString.read(from: &buf), reason: try FfiConverterString.read(from: &buf)
         )
         
-        case 19: return .memberDid(nick: try FfiConverterString.read(from: &buf), did: try FfiConverterString.read(from: &buf)
+        case 19: return .batchStart(id: try FfiConverterString.read(from: &buf), batchType: try FfiConverterString.read(from: &buf), target: try FfiConverterString.read(from: &buf)
         )
         
-        case 20: return .readMarker(target: try FfiConverterString.read(from: &buf), timestamp: try FfiConverterOptionString.read(from: &buf)
+        case 20: return .batchEnd(id: try FfiConverterString.read(from: &buf)
         )
         
-        case 21: return .whoisReply(nick: try FfiConverterString.read(from: &buf), info: try FfiConverterString.read(from: &buf)
+        case 21: return .chatHistoryTarget(nick: try FfiConverterString.read(from: &buf), timestamp: try FfiConverterOptionString.read(from: &buf), partnerDid: try FfiConverterOptionString.read(from: &buf)
         )
         
-        case 22: return .whoisEnd(nick: try FfiConverterString.read(from: &buf)
+        case 22: return .memberDid(nick: try FfiConverterString.read(from: &buf), did: try FfiConverterString.read(from: &buf)
         )
         
-        case 23: return .notice(text: try FfiConverterString.read(from: &buf)
+        case 23: return .readMarker(target: try FfiConverterString.read(from: &buf), timestamp: try FfiConverterOptionString.read(from: &buf)
         )
         
-        case 24: return .disconnected(reason: try FfiConverterString.read(from: &buf)
+        case 24: return .whoisReply(nick: try FfiConverterString.read(from: &buf), info: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 25: return .whoisEnd(nick: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 26: return .notice(text: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 27: return .disconnected(reason: try FfiConverterString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -3238,30 +3473,49 @@ public struct FfiConverterTypeFreeqEvent: FfiConverterRustBuffer {
             FfiConverterOptionString.write(awayMsg, into: &buf)
             
         
-        case let .message(msg):
+        case let .actorClasses(channel,classes):
             writeInt(&buf, Int32(9))
+            FfiConverterString.write(channel, into: &buf)
+            FfiConverterSequenceTypeActorClassEntry.write(classes, into: &buf)
+            
+        
+        case let .presence(nick,state,status,task):
+            writeInt(&buf, Int32(10))
+            FfiConverterString.write(nick, into: &buf)
+            FfiConverterString.write(state, into: &buf)
+            FfiConverterOptionString.write(status, into: &buf)
+            FfiConverterOptionString.write(task, into: &buf)
+            
+        
+        case let .message(msg):
+            writeInt(&buf, Int32(11))
             FfiConverterTypeIrcMessage.write(msg, into: &buf)
             
         
         case let .tagMsg(msg):
-            writeInt(&buf, Int32(10))
+            writeInt(&buf, Int32(12))
             FfiConverterTypeTagMessage.write(msg, into: &buf)
             
         
+        case let .act(event):
+            writeInt(&buf, Int32(13))
+            FfiConverterTypeActEvent.write(event, into: &buf)
+            
+        
         case let .names(channel,members):
-            writeInt(&buf, Int32(11))
+            writeInt(&buf, Int32(14))
             FfiConverterString.write(channel, into: &buf)
             FfiConverterSequenceTypeIrcMember.write(members, into: &buf)
             
         
         case let .topicChanged(channel,topic):
-            writeInt(&buf, Int32(12))
+            writeInt(&buf, Int32(15))
             FfiConverterString.write(channel, into: &buf)
             FfiConverterTypeChannelTopic.write(topic, into: &buf)
             
         
         case let .modeChanged(channel,mode,arg,setBy):
-            writeInt(&buf, Int32(13))
+            writeInt(&buf, Int32(16))
             FfiConverterString.write(channel, into: &buf)
             FfiConverterString.write(mode, into: &buf)
             FfiConverterOptionString.write(arg, into: &buf)
@@ -3269,7 +3523,7 @@ public struct FfiConverterTypeFreeqEvent: FfiConverterRustBuffer {
             
         
         case let .kicked(channel,nick,by,reason):
-            writeInt(&buf, Int32(14))
+            writeInt(&buf, Int32(17))
             FfiConverterString.write(channel, into: &buf)
             FfiConverterString.write(nick, into: &buf)
             FfiConverterString.write(by, into: &buf)
@@ -3277,60 +3531,60 @@ public struct FfiConverterTypeFreeqEvent: FfiConverterRustBuffer {
             
         
         case let .userQuit(nick,reason):
-            writeInt(&buf, Int32(15))
+            writeInt(&buf, Int32(18))
             FfiConverterString.write(nick, into: &buf)
             FfiConverterString.write(reason, into: &buf)
             
         
         case let .batchStart(id,batchType,target):
-            writeInt(&buf, Int32(16))
+            writeInt(&buf, Int32(19))
             FfiConverterString.write(id, into: &buf)
             FfiConverterString.write(batchType, into: &buf)
             FfiConverterString.write(target, into: &buf)
             
         
         case let .batchEnd(id):
-            writeInt(&buf, Int32(17))
+            writeInt(&buf, Int32(20))
             FfiConverterString.write(id, into: &buf)
             
         
         case let .chatHistoryTarget(nick,timestamp,partnerDid):
-            writeInt(&buf, Int32(18))
+            writeInt(&buf, Int32(21))
             FfiConverterString.write(nick, into: &buf)
             FfiConverterOptionString.write(timestamp, into: &buf)
             FfiConverterOptionString.write(partnerDid, into: &buf)
             
         
         case let .memberDid(nick,did):
-            writeInt(&buf, Int32(19))
+            writeInt(&buf, Int32(22))
             FfiConverterString.write(nick, into: &buf)
             FfiConverterString.write(did, into: &buf)
             
         
         case let .readMarker(target,timestamp):
-            writeInt(&buf, Int32(20))
+            writeInt(&buf, Int32(23))
             FfiConverterString.write(target, into: &buf)
             FfiConverterOptionString.write(timestamp, into: &buf)
             
         
         case let .whoisReply(nick,info):
-            writeInt(&buf, Int32(21))
+            writeInt(&buf, Int32(24))
             FfiConverterString.write(nick, into: &buf)
             FfiConverterString.write(info, into: &buf)
             
         
         case let .whoisEnd(nick):
-            writeInt(&buf, Int32(22))
+            writeInt(&buf, Int32(25))
             FfiConverterString.write(nick, into: &buf)
             
         
         case let .notice(text):
-            writeInt(&buf, Int32(23))
+            writeInt(&buf, Int32(26))
             FfiConverterString.write(text, into: &buf)
             
         
         case let .disconnected(reason):
-            writeInt(&buf, Int32(24))
+            writeInt(&buf, Int32(27))
             FfiConverterString.write(reason, into: &buf)
             
         }
@@ -4146,6 +4400,31 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeActorClassEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [ActorClassEntry]
+
+    public static func write(_ value: [ActorClassEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeActorClassEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ActorClassEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ActorClassEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeActorClassEntry.read(from: &buf))
         }
         return seq
     }
