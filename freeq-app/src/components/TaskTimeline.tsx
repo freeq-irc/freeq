@@ -10,6 +10,7 @@ import { useEffect, useState } from 'react';
 import { VerifySignaturePanel } from './VerifySignaturePanel';
 import { displayNameForKey } from '../lib/display-name';
 import { actHeadline } from '../lib/act-verbs';
+import { apiFetch } from '../lib/api';
 
 interface TaskEvent {
   event_id: string;
@@ -51,7 +52,10 @@ function ActionTimeline({ actId, onClose }: { actId: string; onClose: () => void
   const [verify, setVerify] = useState<{ id: string; signed: boolean; pos: { x: number; y: number } } | null>(null);
 
   useEffect(() => {
-    fetch(`/api/v1/actions/${encodeURIComponent(actId)}`)
+    // Authed: an action in a direct conversation is readable only by the two
+    // people in it, and the server tells them apart by the session bearer. A
+    // bare fetch 403s, and the panel shows a participant "Task not found".
+    apiFetch(`/api/v1/actions/${encodeURIComponent(actId)}`)
       .then(r => r.ok ? r.json() : null)
       .then(d => { setData(d); setLoading(false); })
       .catch(() => setLoading(false));

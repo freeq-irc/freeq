@@ -5,11 +5,21 @@
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render, cleanup, waitFor } from '@testing-library/react';
+
+// The fetch helper reads the bearer off the singleton SDK client, so stub the
+// module both it and the display-name helper take it from.
+const mockClient: { apiBearer: string | null; getNickForDid: () => undefined } = {
+  apiBearer: null,
+  getNickForDid: () => undefined,
+};
+vi.mock('../irc/client', () => ({ getClient: () => mockClient }));
+
 import { TaskTimeline } from './TaskTimeline';
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  mockClient.apiBearer = null;
 });
 
 const ACT_ID = '01KZACTION0000000000000ACT';
@@ -65,5 +75,30 @@ describe('the action timeline headline', () => {
     expect(container.textContent).not.toContain(ACT_ID);
     // The id fragment beside the headline is the badge every card carries.
     expect(container.textContent).toContain(ACT_ID.slice(0, 12));
+  });
+});
+
+describe('reading an action the server keeps private', () => {
+  it('sends the session bearer, which is what a DM action is authorized by', async () => {
+    mockClient.apiBearer = 'sess-abc';
+    serve([event(ACT_ID, { 'act-verb': 'offer', 'act-title': 'ship the release' })]);
+
+    const { container } = render(<TaskTimeline actId={ACT_ID} onClose={() => {}} />);
+    await waitFor(() => expect(container.textContent).toContain('ship the release'));
+    const [, init] = (globalThis.fetch as unknown as {
+      mock: { calls: [string, RequestInit][] };
+    }).mock.calls[0];
+    expect(new Headers(init.headers).get('Authorization')).toBe('Bearer sess-abc');
+  });
+
+  it('asks anyway with no bearer, so a guest still reads a public action', async () => {
+    serve([event(ACT_ID, { 'act-verb': 'offer', 'act-title': 'ship the release' })]);
+
+    const { container } = render(<TaskTimeline actId={ACT_ID} onClose={() => {}} />);
+    await waitFor(() => expect(container.textContent).toContain('ship the release'));
+    const [, init] = (globalThis.fetch as unknown as {
+      mock: { calls: [string, RequestInit][] };
+    }).mock.calls[0];
+    expect(new Headers(init.headers).has('Authorization')).toBe(false);
   });
 });
