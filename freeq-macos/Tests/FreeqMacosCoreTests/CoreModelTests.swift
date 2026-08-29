@@ -257,3 +257,73 @@ final class CoreModelTests: XCTestCase {
         }
     }
 }
+
+// MARK: - Agent badge and live activity (issues #70/#72)
+
+extension CoreModelTests {
+    /// An unlabelled member is a person. The server reports only the
+    /// exceptions, so "not stated" must keep reading as human.
+    func testUnlabelledMemberIsNotAnAgent() {
+        let m = MemberInfo(nick: "chad", isOp: false, isHalfop: false,
+                           isVoiced: false, awayMsg: nil, did: nil)
+        XCTAssertFalse(m.isAgent)
+        XCTAssertNil(m.activityLabel)
+    }
+
+    func testAgentClassesAreRecognised() {
+        for cls in ["agent", "external_agent"] {
+            let m = MemberInfo(nick: "bot", isOp: false, isHalfop: false,
+                               isVoiced: false, awayMsg: nil, did: nil,
+                               actorClass: cls)
+            XCTAssertTrue(m.isAgent, "\(cls) should read as an agent")
+        }
+        let human = MemberInfo(nick: "p", isOp: false, isHalfop: false,
+                               isVoiced: false, awayMsg: nil, did: nil,
+                               actorClass: "human")
+        XCTAssertFalse(human.isAgent)
+    }
+
+    /// A status the agent published wins over a generic state word.
+    func testActivityLabelPrefersTheAgentsOwnStatus() {
+        let m = MemberInfo(nick: "bot", isOp: false, isHalfop: false,
+                           isVoiced: false, awayMsg: nil, did: nil,
+                           actorClass: "agent",
+                           presenceState: "executing",
+                           presenceStatus: "answering chad")
+        XCTAssertEqual(m.activityLabel, "answering chad")
+    }
+
+    func testActivityLabelFallsBackToAReadableState() {
+        let cases = [
+            ("executing", "working"),
+            ("waiting_for_input", "waiting for input"),
+            ("blocked_on_permission", "needs approval"),
+            ("paused", "paused"),
+        ]
+        for (state, expected) in cases {
+            let m = MemberInfo(nick: "bot", isOp: false, isHalfop: false,
+                               isVoiced: false, awayMsg: nil, did: nil,
+                               actorClass: "agent", presenceState: state)
+            XCTAssertEqual(m.activityLabel, expected, "state \(state)")
+        }
+    }
+
+    /// An idle agent says nothing. A row that always carries a label teaches
+    /// people to stop reading it.
+    func testIdleAgentShowsNoActivityLabel() {
+        for state in ["active", "online", "idle"] {
+            let m = MemberInfo(nick: "bot", isOp: false, isHalfop: false,
+                               isVoiced: false, awayMsg: nil, did: nil,
+                               actorClass: "agent", presenceState: state)
+            XCTAssertNil(m.activityLabel, "state \(state) should be quiet")
+        }
+    }
+
+    /// A human never gets an activity line even if a state leaks through.
+    func testHumansNeverShowAnActivityLabel() {
+        let m = MemberInfo(nick: "chad", isOp: false, isHalfop: false,
+                           isVoiced: false, awayMsg: nil, did: nil,
+                           actorClass: "human", presenceState: "executing")
+        XCTAssertNil(m.activityLabel)
+    }
+}

@@ -2150,7 +2150,18 @@ extension AppState {
                 """)
             var existing = pendingNames[key] ?? []
             existing.append(contentsOf: memberList.map { m in
-                MemberInfo(nick: m.nick, isOp: m.isOp, isHalfop: m.isHalfop, isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: nil)
+                {
+                    // NAMES carries no actor class, so keep whatever we
+                    // already knew for this nick — otherwise every roster
+                    // refresh un-badges the agents in the room.
+                    let prior = ch.members.first { $0.nick.lowercased() == m.nick.lowercased() }
+                    return MemberInfo(
+                        nick: m.nick, isOp: m.isOp, isHalfop: m.isHalfop,
+                        isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: prior?.did,
+                        actorClass: prior?.actorClass,
+                        presenceState: prior?.presenceState,
+                        presenceStatus: prior?.presenceStatus)
+                }()
             })
             pendingNames[key] = existing
 
@@ -2167,8 +2178,8 @@ extension AppState {
                let idx = ch.members.firstIndex(where: { $0.nick.lowercased() == targetNick.lowercased() }) {
                 let m = ch.members[idx]
                 switch mode {
-                case "+o": ch.members[idx] = MemberInfo(nick: m.nick, isOp: true, isHalfop: m.isHalfop, isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: m.did)
-                case "-o": ch.members[idx] = MemberInfo(nick: m.nick, isOp: false, isHalfop: m.isHalfop, isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: m.did)
+                case "+o": ch.members[idx] = MemberInfo(nick: m.nick, isOp: true, isHalfop: m.isHalfop, isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: m.did, actorClass: m.actorClass, presenceState: m.presenceState, presenceStatus: m.presenceStatus)
+                case "-o": ch.members[idx] = MemberInfo(nick: m.nick, isOp: false, isHalfop: m.isHalfop, isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: m.did, actorClass: m.actorClass, presenceState: m.presenceState, presenceStatus: m.presenceStatus)
                 case "+h": ch.members[idx] = MemberInfo(nick: m.nick, isOp: m.isOp, isHalfop: true, isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: m.did)
                 case "-h": ch.members[idx] = MemberInfo(nick: m.nick, isOp: m.isOp, isHalfop: false, isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: m.did)
                 case "+v": ch.members[idx] = MemberInfo(nick: m.nick, isOp: m.isOp, isHalfop: m.isHalfop, isVoiced: true, awayMsg: m.awayMsg, did: m.did)
@@ -2225,6 +2236,37 @@ extension AppState {
                 }
             }
 
+        // Roster-time actor classes (vendor numeric 674): which members of
+        // this channel are agents. Humans are omitted, so absent stays human.
+        case .actorClasses(let classChannel, let classes):
+            guard let ch = allBuffers.first(where: { $0.name.lowercased() == classChannel.lowercased() }) else { break }
+            for entry in classes {
+                guard let idx = ch.members.firstIndex(where: { $0.nick.lowercased() == entry.nick.lowercased() }) else { continue }
+                let old = ch.members[idx]
+                ch.members[idx] = MemberInfo(
+                    nick: old.nick, isOp: old.isOp, isHalfop: old.isHalfop,
+                    isVoiced: old.isVoiced, awayMsg: old.awayMsg, did: old.did,
+                    actorClass: entry.actorClass,
+                    presenceState: old.presenceState,
+                    presenceStatus: old.presenceStatus)
+            }
+
+        // Live agent state. Applies in every channel we share with them, so a
+        // working agent reads as working wherever it is visible.
+        case .presence(let presenceNick, let state, let status, _):
+            for ch in allBuffers {
+                guard let idx = ch.members.firstIndex(where: { $0.nick.lowercased() == presenceNick.lowercased() }) else { continue }
+                let old = ch.members[idx]
+                ch.members[idx] = MemberInfo(
+                    nick: old.nick, isOp: old.isOp, isHalfop: old.isHalfop,
+                    isVoiced: old.isVoiced, awayMsg: old.awayMsg, did: old.did,
+                    // A presence update is also proof this is an agent: only
+                    // agents publish one.
+                    actorClass: old.actorClass ?? "agent",
+                    presenceState: state,
+                    presenceStatus: status)
+            }
+
         case .awayChanged(let awayNick, let awayMsg):
             if awayNick.lowercased() == nick.lowercased() {
                 selfAwayReason = awayMsg
@@ -2232,7 +2274,16 @@ extension AppState {
             for ch in allBuffers {
                 if let idx = ch.members.firstIndex(where: { $0.nick.lowercased() == awayNick.lowercased() }) {
                     let old = ch.members[idx]
-                    ch.members[idx] = MemberInfo(nick: old.nick, isOp: old.isOp, isHalfop: old.isHalfop, isVoiced: old.isVoiced, awayMsg: awayMsg, did: old.did)
+                    // Carry the agent metadata across: an AWAY change says
+                    // nothing about whether someone is an agent or what it is
+                    // working on, and rebuilding without these silently
+                    // un-badges every agent the moment it goes away.
+                    ch.members[idx] = MemberInfo(
+                        nick: old.nick, isOp: old.isOp, isHalfop: old.isHalfop,
+                        isVoiced: old.isVoiced, awayMsg: awayMsg, did: old.did,
+                        actorClass: old.actorClass,
+                        presenceState: old.presenceState,
+                        presenceStatus: old.presenceStatus)
                 }
             }
 

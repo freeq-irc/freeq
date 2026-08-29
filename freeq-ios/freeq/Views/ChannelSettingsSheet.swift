@@ -130,6 +130,21 @@ struct ChannelSettingsSheet: View {
                                         if member.isVerified {
                                             VerifiedBadge(size: 12)
                                         }
+                                        // Agent badge — only when the server
+                                        // said so; unlabelled stays a person.
+                                        if member.isAgent {
+                                            Image(systemName: "cpu")
+                                                .font(.system(size: 10, weight: .semibold))
+                                                .foregroundColor(Theme.accent)
+                                        }
+                                        // What it is doing right now, if it
+                                        // says. An idle agent shows nothing.
+                                        if let activity = member.activityLabel {
+                                            Text(activity)
+                                                .font(.fqCaption2)
+                                                .foregroundColor(Theme.accent)
+                                                .lineLimit(1)
+                                        }
                                         Spacer()
                                         Image(systemName: "shield.fill")
                                             .font(.system(size: 11))

@@ -142,6 +142,33 @@ pub enum Event {
         channel: String,
     },
 
+    /// Actor classes for channel members who are not human (vendor numeric 674).
+    ///
+    /// Sent right after 366. NAMES carries only nicks and prefixes, and the
+    /// `extended-join` tag only reaches clients that were already watching, so
+    /// this is the only way a client joining a room an agent is already in can
+    /// tell it apart from a person. Humans are omitted — absent means human.
+    ActorClasses {
+        channel: String,
+        /// `(nick, class)` where class is `agent` or `external_agent`.
+        classes: Vec<(String, String)>,
+    },
+
+    /// Structured presence for an agent (state, what it is doing, and the task
+    /// it is doing it for).
+    ///
+    /// Distinct from [`Event::AwayChanged`]: the AWAY back-compat line cannot
+    /// carry a status for `online`/`active`/`idle`, because "back from away"
+    /// is parameterless — so an *active* agent could never say what it was
+    /// working on. This one carries the status for every state.
+    Presence {
+        nick: String,
+        state: String,
+        status: Option<String>,
+        /// Task id this work belongs to, when the agent named one.
+        task: Option<String>,
+    },
+
     /// Channel mode changed.
     ModeChanged {
         channel: String,
@@ -229,4 +256,118 @@ pub enum Event {
 
     /// Raw server line (for debugging).
     RawLine(String),
+}
+
+/// Parse the member list of vendor numeric 674 (`<nick>=<class> …`).
+///
+/// Unknown classes and malformed entries are dropped rather than guessed at:
+/// a member we cannot classify is left alone, and "absent" already means
+/// "human", so a bad entry degrades to today's behaviour instead of
+/// mislabelling somebody.
+pub fn parse_actor_classes(raw: &str) -> Vec<(String, String)> {
+    raw.split_whitespace()
+        .filter_map(|entry| {
+            // rsplit: a nick cannot contain '=', but be tolerant of one in the
+            // class position rather than silently taking the wrong half.
+            let (nick, class) = entry.rsplit_once('=')?;
+            if nick.is_empty() || class.is_empty() {
+                return None;
+            }
+            match class {
+                "agent" | "external_agent" | "human" => {
+                    Some((nick.to_string(), class.to_string()))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Parse a structured PRESENCE payload (`state=…;status=…;task=…`).
+///
+/// Returns `None` without a state: a presence update that does not say what
+/// the agent *is* carries nothing a client can act on.
+pub fn parse_presence(raw: &str) -> Option<(String, Option<String>, Option<String>)> {
+    let mut state: Option<String> = None;
+    let mut status: Option<String> = None;
+    let mut task: Option<String> = None;
+
+    for part in raw.split(';') {
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        // The status is free text and may legitimately contain '=' (an agent
+        // reporting `project=freeq branch=main`), so only split on the first.
+        match k.trim() {
+            "state" => state = Some(v.trim().to_string()),
+            "status" if !v.is_empty() => status = Some(v.to_string()),
+            "task" if !v.is_empty() => task = Some(v.trim().to_string()),
+            _ => {}
+        }
+    }
+    let state = state.filter(|s| !s.is_empty())?;
+    Some((state, status, task))
+}
+
+#[cfg(test)]
+mod presence_parse_tests {
+    use super::*;
+
+    #[test]
+    fn reads_a_roster_of_agents() {
+        assert_eq!(
+            parse_actor_classes("worker=agent bridge=external_agent"),
+            vec![
+                ("worker".to_string(), "agent".to_string()),
+                ("bridge".to_string(), "external_agent".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn drops_malformed_and_unknown_entries_rather_than_guessing() {
+        // A member we cannot classify is left alone: absent already means
+        // human, so a bad entry degrades to today's behaviour.
+        assert!(parse_actor_classes("garbage nick= =agent bot=wizard").is_empty());
+    }
+
+    #[test]
+    fn handles_an_empty_list() {
+        assert!(parse_actor_classes("").is_empty());
+        assert!(parse_actor_classes("   ").is_empty());
+    }
+
+    #[test]
+    fn carries_the_status_of_an_active_agent() {
+        // The case the AWAY path cannot express at all.
+        let (state, status, task) =
+            parse_presence("state=active;status=project=freeq branch=main").unwrap();
+        assert_eq!(state, "active");
+        assert_eq!(status.as_deref(), Some("project=freeq branch=main"));
+        assert_eq!(task, None);
+    }
+
+    #[test]
+    fn carries_state_status_and_task() {
+        let (state, status, task) =
+            parse_presence("state=executing;status=fixing the parser;task=01ABCDEF").unwrap();
+        assert_eq!(state, "executing");
+        assert_eq!(status.as_deref(), Some("fixing the parser"));
+        assert_eq!(task.as_deref(), Some("01ABCDEF"));
+    }
+
+    #[test]
+    fn tolerates_a_bare_state() {
+        let (state, status, task) = parse_presence("state=idle").unwrap();
+        assert_eq!(state, "idle");
+        assert!(status.is_none());
+        assert!(task.is_none());
+    }
+
+    #[test]
+    fn rejects_a_payload_with_no_state() {
+        assert!(parse_presence("status=orphaned").is_none());
+        assert!(parse_presence("").is_none());
+        assert!(parse_presence("state=").is_none());
+    }
 }

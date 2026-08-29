@@ -121,6 +121,12 @@ dictionary IrcMember {
     string? away_msg;
 };
 
+dictionary ActorClassEntry {
+    string nick;
+    // "agent" | "external_agent" | "human"
+    string actor_class;
+};
+
 dictionary ChannelTopic {
     string text;
     string? set_by;
@@ -148,6 +154,12 @@ interface FreeqEvent {
     Parted(string channel, string nick);
     NickChanged(string old_nick, string new_nick);
     AwayChanged(string nick, string? away_msg);
+    // Actor classes for members already in the channel (vendor numeric 674).
+    // Humans are omitted — absent means human.
+    ActorClasses(string channel, sequence<ActorClassEntry> classes);
+    // Structured agent presence: carries a status for EVERY state, unlike the
+    // AWAY line, which cannot express one for active/online/idle.
+    Presence(string nick, string state, string? status, string? task);
     Message(IrcMessage msg);
     TagMsg(TagMessage msg);
     Act(ActEvent event);

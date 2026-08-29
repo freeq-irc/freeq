@@ -2326,6 +2326,22 @@ where
                                 let _ = event_tx.send(Event::NamesEnd { channel }).await;
                             }
                         }
+                        // Vendor numeric: actor classes for members already in
+                        // the channel, sent right after 366. Without it a client
+                        // that joins a room an agent is already in renders that
+                        // agent as a person — NAMES has no room for the class,
+                        // and extended-join only reached clients already there.
+                        "674" => {
+                            if msg.params.len() >= 3 {
+                                let channel = msg.params[1].clone();
+                                let classes = crate::event::parse_actor_classes(&msg.params[2]);
+                                if !classes.is_empty() {
+                                    let _ = event_tx
+                                        .send(Event::ActorClasses { channel, classes })
+                                        .await;
+                                }
+                            }
+                        }
                         "PING" => {
                             let token = msg.params.first().map(|s| s.as_str()).unwrap_or("");
                             writer.write_all(format!("PONG :{token}\r\n").as_bytes()).await?;
@@ -2430,6 +2446,25 @@ where
                                 .to_string();
                             let away_msg = msg.params.first().cloned();
                             let _ = event_tx.send(Event::AwayChanged { nick, away_msg }).await;
+                        }
+                        // Structured presence. Unlike the AWAY line above this
+                        // carries a status for every state, including the
+                        // active ones where "back from away" is parameterless
+                        // and the status used to be dropped on the floor.
+                        "PRESENCE" => {
+                            let nick = msg.prefix.as_deref()
+                                .and_then(|p| p.split('!').next())
+                                .unwrap_or("")
+                                .to_string();
+                            if let Some(raw) = msg.params.last()
+                                && !nick.is_empty()
+                                && let Some((state, status, task)) =
+                                    crate::event::parse_presence(raw)
+                            {
+                                let _ = event_tx
+                                    .send(Event::Presence { nick, state, status, task })
+                                    .await;
+                            }
                         }
                         // MARKREAD (draft/read-marker) — reply to our own
                         // get/set, or a push from another of our devices.

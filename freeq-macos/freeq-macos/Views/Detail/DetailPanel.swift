@@ -183,6 +183,16 @@ struct MemberRow: View {
                             .help("AT Protocol identity")
                     }
 
+                    // Agent badge. Only shown when the server actually said so
+                    // — an unlabelled member is a person, as before.
+                    if member.isAgent {
+                        Image(systemName: "cpu")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(Theme.blue)
+                            .help(member.actorClass == "external_agent"
+                                  ? "External agent" : "Agent")
+                    }
+
                     if member.isAway {
                         Text("Away")
                             .font(.system(size: 9, weight: .semibold))
@@ -194,8 +204,21 @@ struct MemberRow: View {
                     }
                 }
 
-                // Handle or away message
-                if let handle = profile?.handle {
+                // What an agent is doing right now, when it says. Takes
+                // precedence over the handle: a live "working on X" is the
+                // more useful thing to show, and an idle agent shows nothing
+                // rather than a label people learn to ignore.
+                if let activity = member.activityLabel {
+                    HStack(spacing: 3) {
+                        Image(systemName: member.presenceState == "waiting_for_input"
+                              ? "pause.circle" : "gearshape.fill")
+                            .font(.system(size: 8))
+                        Text(activity)
+                            .lineLimit(1)
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(Theme.blue)
+                } else if let handle = profile?.handle {
                     Text("@\(handle)")
                         .font(.caption2)
                         .foregroundStyle(Theme.textTertiary)

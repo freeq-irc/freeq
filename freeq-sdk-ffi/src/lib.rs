@@ -296,6 +296,13 @@ pub struct IrcMember {
     pub away_msg: Option<String>,
 }
 
+/// One member's actor class, as reported by the roster (vendor numeric 674).
+pub struct ActorClassEntry {
+    pub nick: String,
+    /// `agent` | `external_agent` | `human`
+    pub actor_class: String,
+}
+
 pub struct ChannelTopic {
     pub text: String,
     pub set_by: Option<String>,
@@ -327,6 +334,21 @@ pub enum FreeqEvent {
     AwayChanged {
         nick: String,
         away_msg: Option<String>,
+    },
+    /// Actor classes for members already in the channel (vendor numeric 674).
+    /// Humans are omitted: absent means human.
+    ActorClasses {
+        channel: String,
+        classes: Vec<ActorClassEntry>,
+    },
+    /// Structured agent presence. Unlike `AwayChanged`, this carries a status
+    /// for every state — including the active ones, where the AWAY line is
+    /// parameterless and the status used to be lost.
+    Presence {
+        nick: String,
+        state: String,
+        status: Option<String>,
+        task: Option<String>,
     },
     Message {
         msg: IrcMessage,
@@ -988,6 +1010,27 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
         Event::NickChanged { old_nick, new_nick } => FreeqEvent::NickChanged {
             old_nick: old_nick.clone(),
             new_nick: new_nick.clone(),
+        },
+        Event::ActorClasses { channel, classes } => FreeqEvent::ActorClasses {
+            channel: channel.clone(),
+            classes: classes
+                .iter()
+                .map(|(nick, actor_class)| ActorClassEntry {
+                    nick: nick.clone(),
+                    actor_class: actor_class.clone(),
+                })
+                .collect(),
+        },
+        Event::Presence {
+            nick,
+            state,
+            status,
+            task,
+        } => FreeqEvent::Presence {
+            nick: nick.clone(),
+            state: state.clone(),
+            status: status.clone(),
+            task: task.clone(),
         },
         Event::AwayChanged { nick, away_msg } => FreeqEvent::AwayChanged {
             nick: nick.clone(),

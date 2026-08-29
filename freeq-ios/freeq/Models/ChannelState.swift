@@ -185,6 +185,16 @@ struct MemberInfo: Identifiable, Equatable {
     let awayMsg: String?
     let did: String?
 
+    /// `agent` | `external_agent` | `human`, when the server has told us.
+    /// Learned from the roster (vendor numeric 674) or an extended JOIN.
+    /// `nil` means "not stated", which reads as human — the server reports
+    /// only the exceptions.
+    var actorClass: String? = nil
+
+    /// Live agent state and what it is doing. Only agents publish these.
+    var presenceState: String? = nil
+    var presenceStatus: String? = nil
+
     var id: String { nick.lowercased() }
 
     var prefix: String {
@@ -196,4 +206,23 @@ struct MemberInfo: Identifiable, Equatable {
 
     var isAway: Bool { awayMsg != nil }
     var isVerified: Bool { did != nil }
+
+    var isAgent: Bool { actorClass == "agent" || actorClass == "external_agent" }
+
+    /// What to show beside an agent's name: what it is doing, else its state.
+    /// An idle agent says nothing — a row that always carries a label teaches
+    /// people to stop reading it.
+    var activityLabel: String? {
+        guard isAgent else { return nil }
+        if let status = presenceStatus, !status.isEmpty { return status }
+        switch presenceState {
+        case "executing": return "working"
+        case "waiting_for_input": return "waiting for input"
+        case "blocked_on_permission": return "needs approval"
+        case "paused": return "paused"
+        case "degraded": return "degraded"
+        case "rate_limited": return "rate limited"
+        default: return nil
+        }
+    }
 }

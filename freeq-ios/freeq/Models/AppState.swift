@@ -2460,8 +2460,50 @@ class AppState: ObservableObject {
         for ch in channels {
             if let idx = ch.members.firstIndex(where: { $0.nick.lowercased() == nick.lowercased() }) {
                 let m = ch.members[idx]
-                ch.members[idx] = MemberInfo(nick: m.nick, isOp: m.isOp, isHalfop: m.isHalfop, isVoiced: m.isVoiced, awayMsg: awayMsg, did: m.did)
+                // Keep the agent metadata: an AWAY change says nothing about
+                // whether someone is an agent, and rebuilding without these
+                // silently un-badges every agent that goes away.
+                ch.members[idx] = MemberInfo(
+                    nick: m.nick, isOp: m.isOp, isHalfop: m.isHalfop,
+                    isVoiced: m.isVoiced, awayMsg: awayMsg, did: m.did,
+                    actorClass: m.actorClass, presenceState: m.presenceState,
+                    presenceStatus: m.presenceStatus)
             }
+        }
+    }
+
+    /// Apply roster-time actor classes (vendor numeric 674) to one channel.
+    /// Humans are omitted by the server, so anything absent stays human.
+    fileprivate func applyActorClasses(channel: String, classes: [ActorClassEntry]) {
+        guard let ch = channels.first(where: { $0.name.lowercased() == channel.lowercased() })
+        else { return }
+        for entry in classes {
+            guard let idx = ch.members.firstIndex(where: {
+                $0.nick.lowercased() == entry.nick.lowercased()
+            }) else { continue }
+            let m = ch.members[idx]
+            ch.members[idx] = MemberInfo(
+                nick: m.nick, isOp: m.isOp, isHalfop: m.isHalfop,
+                isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: m.did,
+                actorClass: entry.actorClass,
+                presenceState: m.presenceState, presenceStatus: m.presenceStatus)
+        }
+    }
+
+    /// Apply live agent presence everywhere we can see this nick, so a working
+    /// agent reads as working in every channel it is visible in.
+    fileprivate func applyPresence(nick: String, state: String, status: String?) {
+        for ch in channels {
+            guard let idx = ch.members.firstIndex(where: {
+                $0.nick.lowercased() == nick.lowercased()
+            }) else { continue }
+            let m = ch.members[idx]
+            ch.members[idx] = MemberInfo(
+                nick: m.nick, isOp: m.isOp, isHalfop: m.isHalfop,
+                isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: m.did,
+                // Publishing presence is itself proof this is an agent.
+                actorClass: m.actorClass ?? "agent",
+                presenceState: state, presenceStatus: status)
         }
     }
 
@@ -3193,6 +3235,12 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
 
         case .nickChanged(let oldNick, let newNick):
             state.renameUser(oldNick: oldNick, newNick: newNick)
+
+        case .actorClasses(let channel, let classes):
+            state.applyActorClasses(channel: channel, classes: classes)
+
+        case .presence(let nick, let presenceState, let status, _):
+            state.applyPresence(nick: nick, state: presenceState, status: status)
 
         case .awayChanged(let nick, let awayMsg):
             state.updateAwayStatus(nick: nick, awayMsg: awayMsg)
