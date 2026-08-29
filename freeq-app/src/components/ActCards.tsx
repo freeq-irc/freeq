@@ -8,6 +8,7 @@
  * progress report never reads as a claim.
  */
 import { useState } from 'react';
+import { createPortal } from 'react-dom';
 import type { Message, ActTask, ActEvent } from '../store';
 import { CardFrame } from './CoordinationCards';
 import { TaskTimeline } from './TaskTimeline';
@@ -75,7 +76,10 @@ export function ActEventCard({ msg, task, event }: {
           )}
         </CardFrame>
       </div>
-      {open && (
+      {open && createPortal(
+        // Portaled to the body: rendered inline, this overlay lives inside a
+        // virtualized list row, and rows after it hit-test above it — clicks
+        // pass through the modal into the list behind.
         <div
           className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
           onClick={() => setOpen(false)}
@@ -83,7 +87,8 @@ export function ActEventCard({ msg, task, event }: {
           <div onClick={e => e.stopPropagation()}>
             <TaskTimeline actId={task.taskId} onClose={() => setOpen(false)} />
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
     </>
   );
