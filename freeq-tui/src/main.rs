@@ -1475,6 +1475,15 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                 });
             }
         }
+        // An agent's structured presence. The TUI has no participant strip to
+        // hang it off, so it is not drawn per-event — rendering "still
+        // working" every heartbeat would bury the conversation it is supposed
+        // to annotate. Dropped deliberately, not by omission; the roster and
+        // the task's own lifecycle events already carry this for a reader.
+        Event::Presence { .. } => {}
+        // Likewise: which members are agents is roster decoration, and this
+        // client draws its roster from NAMES.
+        Event::ActorClasses { .. } => {}
         Event::AwayChanged { nick, away_msg } => {
             let msg = match &away_msg {
                 Some(reason) => format!("{nick} is now away: {reason}"),
