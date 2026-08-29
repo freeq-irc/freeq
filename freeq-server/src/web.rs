@@ -2472,6 +2472,14 @@ fn authorize_channel_member(
     }
 }
 
+/// Ceiling on how many channels may own a media space on one server.
+///
+/// Minting is a write to the *operator's* PDS account, and anyone who can
+/// create a channel can ask for one. Without a cap, a single authenticated
+/// user turns "create N channels" into "create N spaces on someone else's
+/// hosting bill".
+pub(crate) const MAX_MEDIA_SPACES: usize = 500;
+
 /// The channel's media space key.
 /// The space is created the first time media is uploaded.
 async fn channel_space_key(
@@ -2491,9 +2499,24 @@ async fn channel_space_key(
         return Ok(k);
     }
 
-    let _creating = mgr.create_lock.lock().await;
+    // One lock per channel: a global one would let a slow createSpace on
+    // #busy stall the first upload in every other channel.
+    let create_lock = mgr.create_lock_for(&key).await;
+    let _creating = create_lock.lock().await;
     if let Some(k) = stored(&key) {
         return Ok(k);
+    }
+    // Check the cap and confirm the channel still exists *before* spending a
+    // PDS write, so a refusal never leaves an orphan space behind.
+    if !state.channels.lock().contains_key(&key) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    if media_space_cap_reached(&state) {
+        tracing::warn!(
+            channel = %channel,
+            "media space cap reached; refusing to mint another"
+        );
+        return Err(StatusCode::INSUFFICIENT_STORAGE);
     }
     let new_key = ulid::Ulid::new().to_string();
     if let Err(err) = mgr.create_space(&state.did_resolver, &new_key).await {
@@ -2503,6 +2526,13 @@ async fn channel_space_key(
     let snapshot = {
         let mut channels = state.channels.lock();
         let Some(ch) = channels.get_mut(&key) else {
+            // The channel went away while the PDS was minting. The space is
+            // now orphaned there; say so loudly rather than losing it.
+            tracing::error!(
+                channel = %channel,
+                space_key = %new_key,
+                "channel vanished mid-create; space is orphaned on the PDS"
+            );
             return Err(StatusCode::NOT_FOUND);
         };
         ch.media_space_key = Some(new_key.clone());
@@ -2512,6 +2542,77 @@ async fn channel_space_key(
     Ok(new_key)
 }
 
+/// Whether this server already holds [`MAX_MEDIA_SPACES`] spaces.
+pub(crate) fn media_space_cap_reached(state: &SharedState) -> bool {
+    state
+        .channels
+        .lock()
+        .values()
+        .filter(|c| c.media_space_key.is_some())
+        .count()
+        >= MAX_MEDIA_SPACES
+}
+
+/// Whether the channel is `+E`. Space media sits unencrypted in a third
+/// party's repo and is proxied in the clear through us, which is the exact
+/// thing an encrypted-only channel exists to prevent.
+pub(crate) fn channel_is_encrypted_only(state: &SharedState, channel: &str) -> bool {
+    state
+        .channels
+        .lock()
+        .get(&channel.to_lowercase())
+        .is_some_and(|c| c.encrypted_only)
+}
+
+#[cfg(test)]
+mod media_space_gate_tests {
+    use super::*;
+
+    fn channel_named(state: &SharedState, name: &str, encrypted: bool, space: Option<&str>) {
+        state.channels.lock().insert(
+            name.to_string(),
+            crate::server::ChannelState {
+                encrypted_only: encrypted,
+                media_space_key: space.map(str::to_string),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// `+E` promises the server never handles this channel's plaintext, and
+    /// space media is proxied in the clear. The lookup is case-insensitive
+    /// because REST callers spell channels however they like.
+    #[test]
+    fn an_encrypted_channel_is_recognized_however_it_is_spelled() {
+        let state = crate::server::test_state();
+        channel_named(&state, "#secret", true, None);
+        channel_named(&state, "#open", false, None);
+        assert!(channel_is_encrypted_only(&state, "#secret"));
+        assert!(channel_is_encrypted_only(&state, "#SeCrEt"));
+        assert!(!channel_is_encrypted_only(&state, "#open"));
+        assert!(!channel_is_encrypted_only(&state, "#nosuchchannel"));
+    }
+
+    /// Only channels that actually hold a space count against the ceiling;
+    /// an idle channel costs the operator's PDS account nothing.
+    #[test]
+    fn the_cap_counts_channels_that_hold_a_space_and_no_others() {
+        let state = crate::server::test_state();
+        for i in 0..MAX_MEDIA_SPACES - 1 {
+            channel_named(&state, &format!("#c{i}"), false, Some(&format!("K{i}")));
+        }
+        for i in 0..50 {
+            channel_named(&state, &format!("#idle{i}"), false, None);
+        }
+        assert!(
+            !media_space_cap_reached(&state),
+            "one short of the ceiling is still room"
+        );
+        channel_named(&state, "#last", false, Some("KLAST"));
+        assert!(media_space_cap_reached(&state), "the ceiling is a ceiling");
+    }
+}
+
 /// GET /api/v1/space-media/{ref}/{filename} — serve a private space media
 /// file to a member of the channel that owns the space.
 ///
@@ -2519,10 +2620,17 @@ async fn channel_space_key(
 /// segment; the trailing filename gives clients the extension they use to
 /// decide how to render, exactly like the private-store capability URLs.
 async fn api_space_media(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     State(state): State<Arc<SharedState>>,
     Path((encoded_ref, _filename)): Path<(String, String)>,
     headers: axum::http::HeaderMap,
 ) -> Result<axum::response::Response, StatusCode> {
+    // A public channel's media URL needs no bearer, and a miss costs two
+    // round trips against the *uploader's* PDS. Meter it like every other
+    // expensive REST route.
+    if !state.rest_rate_limiter.check(addr.ip()) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
     let Some(mgr) = state.media_space.clone() else {
         return Err(StatusCode::NOT_FOUND);
     };
@@ -4348,6 +4456,17 @@ async fn api_upload(
                 "Private media spaces are not enabled on this server".into(),
             ));
         };
+        // The two destinations are mutually exclusive: the space branch
+        // returns before the PDS-share path, so accepting both would silently
+        // drop the Bluesky post the user asked for.
+        if share_pds || share_bluesky {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "A file goes either into this channel's private space or into a public \
+                 PDS/Bluesky copy, not both"
+                    .into(),
+            ));
+        }
         let Some(channel) = channel.clone().filter(|c| c.starts_with('#')) else {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -4358,6 +4477,16 @@ async fn api_upload(
             return Err((
                 StatusCode::FORBIDDEN,
                 "Only channel members can post private media".to_string(),
+            ));
+        }
+        // +E promises the server never handles plaintext for this channel.
+        // Space media is unencrypted in the author's repo and is proxied in
+        // the clear through us, so it cannot live in an encrypted channel.
+        // The web client hides the option; this is the rule itself.
+        if channel_is_encrypted_only(&state, &channel) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Encrypted-only (+E) channels do not support private media spaces".to_string(),
             ));
         }
         let session = {
@@ -4442,6 +4571,29 @@ async fn api_upload(
                     s.dpop_nonce = Some(nonce.clone());
                 }
             }
+        }
+        // The URI is whatever the uploader's PDS said it was, and it becomes
+        // a link we hand to every reader. Confirm it names a record in *this*
+        // channel's space, authored by the DID that just uploaded, before it
+        // goes anywhere: a buggy PDS would otherwise mint a permanently dead
+        // link, and a hostile one a cross-channel reference.
+        let parsed = mgr.parse_record_uri(&result.uri);
+        let sound = parsed.as_ref().is_some_and(|rec| {
+            rec.space_key == space_key
+                && rec.author_did == did
+                && rec.collection == crate::media_space::MEDIA_COLLECTION
+        });
+        if !sound {
+            tracing::warn!(
+                did = %did,
+                channel = %channel,
+                uri = %result.uri,
+                "PDS returned a space record URI that is not this channel's space"
+            );
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "Your PDS returned an unexpected record location for this upload".to_string(),
+            ));
         }
         tracing::info!(did = %did, channel = %channel, uri = %result.uri, "Space media stored");
         let (origin, _) = derive_web_origin(&headers);

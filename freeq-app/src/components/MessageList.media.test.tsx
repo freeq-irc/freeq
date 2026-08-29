@@ -1,10 +1,29 @@
 // @vitest-environment jsdom
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render, cleanup, waitFor } from '@testing-library/react';
+
+// The fetch helper reads the bearer off the singleton SDK client, so the
+// bearer race is only reproducible with that module stubbed.
+const mockClient: { apiBearer: string | null } | null = { apiBearer: null };
+let currentClient: typeof mockClient = null;
+vi.mock('../irc/client', () => ({
+  getClient: () => currentClient,
+  getNick: () => 'me',
+  requestHistory: vi.fn(),
+  sendReaction: vi.fn(),
+  sendUnreact: vi.fn(),
+  joinChannel: vi.fn(),
+}));
+
 import { MessageContent } from './MessageList';
 import type { Message } from '../store';
 
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+  currentClient = null;
+  mockClient!.apiBearer = null;
+});
 
 function msg(text: string): Message {
   return {
@@ -92,5 +111,89 @@ describe('private media (capability URL) rendering', () => {
     const url = `${ORIGIN}/api/v1/media/ghi789/SIGSIGSIG/cat.png`;
     const { container } = render(<MessageContent msg={msg(url)} />);
     expect(container.querySelector('img')).not.toBeNull();
+  });
+
+  it('plays private space audio through the bearer, not a bare <audio src>', async () => {
+    // An <audio src> cannot carry the Authorization header any more than an
+    // <img src> can, so the same fetch-and-object-URL path has to cover it.
+    const url = `${ORIGIN}/api/v1/space-media/YXQ6Ly9hdWRpbw/note.m4a`;
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      blob: async () => new Blob(['bytes'], { type: 'audio/mp4' }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    URL.createObjectURL = vi.fn().mockReturnValue('blob:audio-object-url');
+    URL.revokeObjectURL = vi.fn();
+
+    const { container } = render(<MessageContent msg={msg(url)} />);
+    await waitFor(() => expect(container.querySelector('audio')).not.toBeNull());
+    expect(fetchMock).toHaveBeenCalledWith(url, expect.anything());
+    expect(container.querySelector('audio')?.getAttribute('src')).toBe('blob:audio-object-url');
+  });
+
+  it('offers a private attachment with no inline renderer as a real link', async () => {
+    // A .pdf has no player; a plain <a href> would 403 on click in exactly
+    // the restricted channels this feature exists for.
+    const url = `${ORIGIN}/api/v1/space-media/YXQ6Ly9kb2M/report.pdf`;
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      blob: async () => new Blob(['bytes'], { type: 'application/pdf' }),
+    }));
+    URL.createObjectURL = vi.fn().mockReturnValue('blob:doc-object-url');
+    URL.revokeObjectURL = vi.fn();
+
+    const { container } = render(<MessageContent msg={msg(url)} />);
+    await waitFor(() => expect(container.querySelector('a')).not.toBeNull());
+    const a = container.querySelector('a')!;
+    expect(a.getAttribute('href')).toBe('blob:doc-object-url');
+    expect(a.getAttribute('download')).toBe('report.pdf');
+  });
+
+  it('retries once the session bearer lands instead of calling a member a stranger', async () => {
+    // History renders before the API-BEARER notice arrives, so the first
+    // fetch can lose the race. Reporting "not a member" then would be both
+    // wrong and permanent.
+    const url = `${ORIGIN}/api/v1/space-media/YXQ6Ly9yYWNl/late.png`;
+    currentClient = mockClient;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, status: 403, blob: async () => new Blob() })
+      .mockResolvedValue({
+        ok: true,
+        status: 200,
+        blob: async () => new Blob(['bytes'], { type: 'image/png' }),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+    URL.createObjectURL = vi.fn().mockReturnValue('blob:late-object-url');
+    URL.revokeObjectURL = vi.fn();
+
+    const { container } = render(<MessageContent msg={msg(url)} />);
+    // The bearer turns up a moment later, exactly as it does in the app.
+    setTimeout(() => { mockClient!.apiBearer = 'sess-late'; }, 250);
+
+    await waitFor(
+      () => expect(container.querySelector('img')?.getAttribute('src')).toBe('blob:late-object-url'),
+      { timeout: 3000 },
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(container.textContent).not.toContain('members of this channel');
+  });
+
+  it('does not stall on the bearer when there is no connection to wait for', async () => {
+    // A logged-out reader has no client at all. Waiting several seconds to
+    // tell them something we already know would be pure delay.
+    const url = `${ORIGIN}/api/v1/space-media/YXQ6Ly9ndWVzdA/nope.png`;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue({ ok: false, status: 403, blob: async () => new Blob() });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { container } = render(<MessageContent msg={msg(url)} />);
+    await waitFor(() =>
+      expect(container.textContent).toContain('only visible to members of this channel'),
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

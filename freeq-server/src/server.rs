@@ -329,6 +329,38 @@ impl OauthPurpose {
 /// - bsky.social granular grants may include extra `blob:` MIME entries
 ///   beyond what we asked; we only need one `blob:image/*` (or the
 ///   wildcard `blob:*/*`) for upload.
+///
+/// Does one granted scope token grant space access over `authority`?
+///
+/// Accepts `space:<type>?authority=<did>&collection=<c>` in any parameter
+/// order, with `*` as the wildcard for type and collection. The authority
+/// must match exactly: a grant over someone else's spaces is worth nothing
+/// here, and `*` is not accepted for it.
+fn space_scope_covers_authority(token: &str, authority: &str) -> bool {
+    let Some(rest) = token.strip_prefix("space:") else {
+        return false;
+    };
+    let (space_type, query) = match rest.split_once('?') {
+        Some((t, q)) => (t, q),
+        None => return false,
+    };
+    if space_type != "*" && space_type != crate::media_space::SPACE_TYPE {
+        return false;
+    }
+    let mut names_authority = false;
+    let mut collection_ok = false;
+    for param in query.split('&') {
+        match param.split_once('=') {
+            Some(("authority", v)) if v == authority => names_authority = true,
+            Some(("collection", v)) => {
+                collection_ok = v == "*" || v == crate::media_space::MEDIA_COLLECTION;
+            }
+            _ => {}
+        }
+    }
+    names_authority && collection_ok
+}
+
 pub fn scope_satisfies_purpose(
     granted: &str,
     purpose: OauthPurpose,
@@ -366,15 +398,17 @@ pub fn scope_satisfies_purpose(
             // createRecord to file them in the space. The space half must
             // also name this server's authority, since a grant for someone
             // else's spaces buys nothing here.
+            //
+            // Matched by parts rather than as a literal string: a PDS is free
+            // to reorder or re-encode the query parameters when it echoes a
+            // grant back, and a literal comparison would turn that into an
+            // endless step-up loop for the user.
             let Some(authority) = media_space_authority else {
                 return false;
             };
-            let wanted = crate::media_space::space_scope(authority);
-            let has_space = granted.split_whitespace().any(|s| {
-                wanted
-                    .split_whitespace()
-                    .any(|w| w == s && s.starts_with("space:"))
-            });
+            let has_space = granted
+                .split_whitespace()
+                .any(|s| space_scope_covers_authority(s, authority));
             let has_blob = granted.split_whitespace().any(|s| s.starts_with("blob:*"));
             has_space && has_blob
         }
