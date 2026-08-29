@@ -34,6 +34,30 @@ install them locally.
 Also `xcrun devicectl list devices` shows the iPhone `cf` (iPhone 15 Pro) as
 **unavailable** — not connected.
 
+### Re-checked with the phone plugged in (2026-08-29)
+
+Still blocked, on two independent things:
+
+1. **Device not reachable.** `devicectl` still reports `unavailable` after ~1 min
+   of polling; `xctrace list devices` lists `cf (26.5)` under *Devices Offline*;
+   `devicectl device info lockState` fails with CoreDeviceError 1011 ("unable to
+   locate a device"). The cached `device info details` record still resolves,
+   which is why the phone shows in the list at all. Needs: unlocked phone +
+   "Trust This Computer" accepted + a data-capable cable.
+2. **No usable signing identity.**
+   - `security find-identity -v -p codesigning` → the only identity,
+     `Apple Development: Chad Fowler (D6G9BYGH26)`, is **CSSMERR_TP_CERT_REVOKED**
+   - `defaults read com.apple.dt.Xcode IDEProvisioningTeams` → does not exist
+     (no Apple account signed into Xcode)
+   - `~/Library/MobileDevice/Provisioning Profiles/` is empty
+   - `/var/db/lockdown` is empty (no pairing records)
+
+   A free personal team would not be enough either: `freeq/freeq.entitlements`
+   requests App Group `group.at.freeq.ios`, which needs a paid membership.
+   Options are (a) wait for the Apple Developer Program approval, or (b) strip
+   App Groups + the Live Activity/Watch targets for a throwaway 7-day personal
+   -team build (breaks the share extension and Live Activity).
+
 To unblock: sign into the Apple ID in Xcode → Settings → Accounts, reconnect the
 phone, then:
 
