@@ -678,6 +678,26 @@ export function sendAvSignal(targetNick: string, data: string) {
 // ── Event wiring: SDK events → Zustand store ──
 
 /**
+ * Which buffer an act event belongs in — the task decides, not the sender.
+ *
+ * An event naming a task some thread already holds files there, whoever
+ * signed it, so a receipt the server signs lands beside the moves it confirms
+ * instead of in a thread named after the server, and a peer home's receipt in
+ * a federated conversation lands there too. An opener names no earlier task
+ * and opens its own thread, as before. Anything else naming a task nobody
+ * holds goes to the sender's thread when we have one and nowhere when we do
+ * not — the silence an unheld confirm has always had, rather than a thread
+ * conjured for one line that can say nothing.
+ */
+function actEventBuffer(ev: { channel: string; taskId: string; eventId: string }): string | undefined {
+  const holding = useStore.getState().bufferHoldingTask(ev.taskId);
+  if (holding) return holding;
+  // An opener's task is its own event, which is what makes it the opener.
+  if (ev.taskId === ev.eventId) return ev.channel;
+  return useStore.getState().channels.has(ev.channel.toLowerCase()) ? ev.channel : undefined;
+}
+
+/**
  * Test-only export of the event wiring. Production callers should
  * use {@link connect}, which wires events as part of bringing up the
  * real SDK client. Tests use this to drive synthetic events through
@@ -909,11 +929,13 @@ function wireEvents(c: FreeqClient) {
   c.on('actEvent', (ev) => {
     // The TAGMSG is the event; its companion prose line arrives separately as
     // a `message`. The store joins the two and keeps the task they describe.
-    const isChannel = ev.channel.startsWith('#') || ev.channel.startsWith('&');
-    if (!isChannel && !useStore.getState().channels.has(ev.channel.toLowerCase())) {
-      s().addChannel(ev.channel);
+    const buffer = actEventBuffer(ev);
+    if (!buffer) return;
+    const isChannel = buffer.startsWith('#') || buffer.startsWith('&');
+    if (!isChannel && !useStore.getState().channels.has(buffer.toLowerCase())) {
+      s().addChannel(buffer);
     }
-    s().addActEvent(ev.channel, ev);
+    s().addActEvent(buffer, ev);
   });
 
   c.on('messageEdited', (channel, originalMsgId, newText, newMsgId, isStreaming, editorNick, editorAccount) => {

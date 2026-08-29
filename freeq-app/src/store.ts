@@ -455,6 +455,7 @@ export interface Store {
   addPin: (channel: string, msgid: string, pinnedBy: string) => void;
   removePin: (channel: string, msgid: string) => void;
   addActEvent: (channel: string, ev: ActEventInput) => void;
+  bufferHoldingTask: (taskId: string) => string | undefined;
   setSearchQuery: (query: string) => void;
   setChannelListOpen: (open: boolean) => void;
   setChannelList: (list: ChannelListEntry[]) => void;
@@ -1735,6 +1736,14 @@ export const useStore = create<Store>((set, get) => ({
     const s = get();
     if (did && s.blockedDids.includes(did)) return true;
     return s.blockedNicks.includes(nick.toLowerCase());
+  },
+  /** The buffer whose task map already holds this task, if one does. A task
+   *  lives in one venue, so at most one thread can answer. */
+  bufferHoldingTask: (taskId) => {
+    for (const ch of get().channels.values()) {
+      if (ch.actTasks.has(taskId)) return ch.name;
+    }
+    return undefined;
   },
   isFavorite: (channel) => get().favorites.has(channel.toLowerCase()),
   isMuted: (channel) => get().mutedChannels.has(channel.toLowerCase()),
