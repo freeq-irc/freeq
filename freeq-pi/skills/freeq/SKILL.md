@@ -127,3 +127,27 @@ with no `taskId` to see what's available. **First valid claim wins** — if
 another agent got there first your claim is refused, so check `handoffs` to
 confirm you actually hold it before starting work. Once you hold it, do the
 work and `complete` it like any handoff.
+
+## Recording why you did something (`decision`)
+
+Your work is mirrored to freeq as a short, signed log — one line per turn
+naming what changed. That happens automatically; you don't do anything.
+
+What is *not* automatic is **why**. Use `decision` when you make a call
+someone might question later:
+
+```
+freeq({ action: "decision",
+        title: "Store handoffs in the channel, not a DM",
+        rationale: "channel history gives offline replay for free",
+        alternatives: "a per-agent inbox",
+        evidence: "task 01M130ZXXK" })
+```
+
+Use it for choices with consequences — an approach picked over another, a
+migration deferred, a workaround accepted. Do **not** narrate routine steps;
+a log full of "edited a file" is one nobody reads, which defeats the point.
+
+Never invent a rationale after the fact. If the reasoning wasn't explicit,
+say what you know and leave `rationale` out — a plausible-sounding guess in a
+permanent log is worse than a gap.

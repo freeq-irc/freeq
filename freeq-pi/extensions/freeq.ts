@@ -42,6 +42,15 @@ import {
 } from "../src/handoff.js";
 import { serverKeyFetcher, verifyActEvent, type KeyFetcher } from "../src/verify.js";
 import {
+  TurnRecorder,
+  buildProvenance,
+  formatDecision,
+  PROVENANCE_EVENT,
+  DECISION_EVENT,
+  PROVENANCE_TIERS,
+  type ProvenanceTier,
+} from "../src/provenance.js";
+import {
   decideInbound,
   frameInbound,
   reachesModel,
@@ -117,6 +126,9 @@ export default function (pi: ExtensionAPI): void {
   let workTask: string | undefined;
   /** Coalesce rapid tool-call updates — presence is not a debug log. */
   let lastStatusPush = 0;
+
+  /** Accumulates this turn's consequences for the provenance log. */
+  const turn = new TurnRecorder();
 
   function pushStatus(state: string, label?: string, task?: string, force = false): void {
     if (!conn || conn.state !== "online") return;
@@ -441,11 +453,15 @@ export default function (pi: ExtensionAPI): void {
     pushStatus("executing", workLabel ?? "working", workTask, true);
   });
 
-  // Name the current tool so a watcher sees movement, not just a spinner.
+  // Name the current tool so a watcher sees movement, not just a spinner,
+  // and note anything that counts as a consequence for the log.
   pi.on("tool_call", async (event) => {
-    const tool = (event as { toolName?: string }).toolName;
-    if (!tool) return;
-    pushStatus("executing", workLabel ? `${workLabel} · ${tool}` : tool, workTask);
+    const e = event as { toolName?: string; input?: Record<string, unknown> };
+    if (!e.toolName) return;
+    pushStatus("executing", workLabel ? `${workLabel} · ${e.toolName}` : e.toolName, workTask);
+    if (config?.provenance) {
+      turn.record({ name: e.toolName, input: e.input }, config.provenance);
+    }
   });
 
   // Capture assistant text so an inbound ask can be answered with it.
@@ -492,6 +508,11 @@ export default function (pi: ExtensionAPI): void {
       notify(ctx, `freeq: replied in ${item.channel} to ${item.from}`, "info");
     }
     lastAssistantText = "";
+
+    // Mirror what this turn actually changed. Before the offline early-return
+    // below, so the recorder is always drained — otherwise a turn taken while
+    // disconnected would leak into the next one's summary.
+    await mirrorTurn(ctx, config ?? (await ensureConfig(ctx)));
 
     if (!conn || conn.state !== "online") return;
 
@@ -644,6 +665,45 @@ export default function (pi: ExtensionAPI): void {
     });
   }
 
+  /**
+   * Publish this turn's consequences as a signed coordination event.
+   *
+   * Deliberately one line per turn. The point is a log a person will still
+   * read in six months, which rules out a running commentary of every tool
+   * call — that is what the `firehose` tier is for, and why it is not the
+   * default.
+   */
+  async function mirrorTurn(ctx: ExtensionContext, cfg: FreeqConfig): Promise<void> {
+    const tier = cfg.provenance ?? "decisions";
+    if (tier === "silent" || cfg.muted || !conn || conn.state !== "online") {
+      turn.reset();
+      return;
+    }
+    const summary = turn.summary();
+    const files = turn.files;
+    turn.reset();
+    if (!summary) return; // a turn that changed nothing says nothing
+
+    const channel = cfg.provenanceChannel ?? cfg.channels[0];
+    if (!channel) return;
+
+    const payload = buildProvenance({
+      v: 1,
+      kind: "turn",
+      text: summary,
+      files: files.length ? files : undefined,
+    });
+    try {
+      conn.sendTags(channel, {
+        "+freeq.at/event": PROVENANCE_EVENT,
+        "+freeq.at/payload": encodeURIComponent(JSON.stringify(payload)),
+      });
+    } catch {
+      // The log is a side effect; never let it disturb the session.
+    }
+    void ctx;
+  }
+
   // ── the tool ────────────────────────────────────────────────────────────
 
   pi.registerTool({
@@ -663,8 +723,10 @@ export default function (pi: ExtensionAPI): void {
       "accept. 'post' offers work to a CHANNEL without naming anyone, so whoever " +
       "is capable and available can take it; 'claim' takes such a task. " +
       "'handoffs' lists tasks you owe or are owed; 'complete' finishes " +
-      "one assigned to you. Never send secrets, credentials, or absolute " +
-      "filesystem paths.",
+      "one assigned to you. 'decision' records WHY you chose something, for " +
+      "the signed project log — use it when you make a call someone might " +
+      "question later, not for routine steps. Never send secrets, " +
+      "credentials, or absolute filesystem paths.",
     parameters: Type.Object({
       action: Type.Union(
         [
@@ -677,6 +739,7 @@ export default function (pi: ExtensionAPI): void {
           Type.Literal("complete"),
           Type.Literal("post"),
           Type.Literal("claim"),
+          Type.Literal("decision"),
         ],
         { description: "What to do" },
       ),
@@ -693,6 +756,15 @@ export default function (pi: ExtensionAPI): void {
         Type.String({ description: "Full context the other agent needs, for handoff" }),
       ),
       taskId: Type.Optional(Type.String({ description: "Task id, for complete/claim" })),
+      rationale: Type.Optional(
+        Type.String({ description: "Why, for 'decision' — the part worth keeping" }),
+      ),
+      alternatives: Type.Optional(
+        Type.String({ description: "What was rejected, for 'decision'" }),
+      ),
+      evidence: Type.Optional(
+        Type.String({ description: "Commit, task id, file or URL backing a 'decision'" }),
+      ),
       caps: Type.Optional(
         Type.String({
           description:
@@ -911,6 +983,43 @@ export default function (pi: ExtensionAPI): void {
           );
         }
 
+        case "decision": {
+          // Recorded only when stated explicitly. An agent that infers "why"
+          // from its own transcript writes plausible fiction, and a log of
+          // plausible fiction is worse than no log.
+          const choice = params.title ?? params.message;
+          if (!choice) {
+            return text(
+              "decision requires 'title' (what you decided). Add 'rationale' — " +
+                "the reasoning is the part worth keeping — plus optional " +
+                "'alternatives' and 'evidence'.",
+            );
+          }
+          const cfg3 = config ?? (await ensureConfig(_ctx));
+          const channel = params.channel ?? cfg3.provenanceChannel ?? cfg3.channels[0];
+          if (!channel) return text("No channel to record the decision in.");
+
+          const record = {
+            choice,
+            rationale: params.rationale,
+            alternatives: params.alternatives,
+            evidence: params.evidence,
+          };
+          const payload = buildProvenance({
+            v: 1,
+            kind: "decision",
+            text: formatDecision(record),
+            decision: record,
+          });
+          conn.sendTags(channel, {
+            "+freeq.at/event": DECISION_EVENT,
+            "+freeq.at/payload": encodeURIComponent(JSON.stringify(payload)),
+          });
+          // A human-readable companion, so the room sees prose too.
+          conn.send(channel, formatDecision(record));
+          return text(`Recorded the decision in ${channel}.`);
+        }
+
         case "handoffs": {
           const store = await ensureHandoffs();
           const me = conn.did;
@@ -998,6 +1107,8 @@ export default function (pi: ExtensionAPI): void {
               `muted:    ${cfg.muted ? "YES — silent everywhere (/freeq unmute)" : "no"}`,
               `channels: ${cfg.channels.length ? cfg.channels.join(", ") : "(none)"}`,
               `trusted:  ${Object.keys(cfg.trust).length} peer(s)`,
+              `provenance: ${cfg.provenance ?? "decisions"}` +
+                (cfg.provenanceChannel ? ` → ${cfg.provenanceChannel}` : ""),
               `config:   ${sources.length ? sources.join(", ") : "(defaults only)"}`,
             ].join("\n"),
             "info",
@@ -1025,6 +1136,26 @@ export default function (pi: ExtensionAPI): void {
           conn = undefined;
           const message = await connect(ctx);
           ctx.ui.notify(message, conn ? "info" : "warning");
+          return;
+        }
+
+        case "provenance": {
+          const level = rest[0];
+          if (!level || !(PROVENANCE_TIERS as readonly string[]).includes(level)) {
+            ctx.ui.notify(
+              `freeq: provenance is '${cfg.provenance ?? "decisions"}'\n` +
+                `usage: /freeq provenance <${PROVENANCE_TIERS.join("|")}>\n` +
+                `  silent    nothing is mirrored\n` +
+                `  decisions changes and outbound actions (default)\n` +
+                `  evidence  the above plus output excerpts\n` +
+                `  firehose  every tool call — for debugging the log itself`,
+              "info",
+            );
+            return;
+          }
+          cfg.provenance = level as ProvenanceTier;
+          await saveConfig(agentDir, cfg);
+          ctx.ui.notify(`freeq: provenance → ${level}`, "info");
           return;
         }
 
@@ -1171,7 +1302,8 @@ export default function (pi: ExtensionAPI): void {
           ctx.ui.notify(
             "/freeq [status | login <did> | join #c | leave #c | peers | " +
               "handoffs | mode #c <silent|addressed|participant> | " +
-              "trust <did> <tier> | mute | unmute | takeover | on | off]",
+              "trust <did> <tier> | provenance <tier> | mute | unmute | " +
+              "takeover | on | off]",
             "info",
           );
       }

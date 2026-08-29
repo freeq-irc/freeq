@@ -89,6 +89,13 @@ client.on("userAway", (nick, text) => {
   console.log(`${ts()} AWAY ${nick}: ${text === null ? "(cleared)" : text}`);
 });
 
+// Coordination events (discovery hellos, provenance, decisions) so a run can
+// be inspected from outside the agent that produced it.
+client.on("coordinationEvent", (e) => {
+  const payload = typeof e.payload === "object" ? JSON.stringify(e.payload) : String(e.payload);
+  console.log(`${ts()} EVENT ${e.eventType} from ${e.from} in ${e.channel}: ${payload.slice(0, 220)}`);
+});
+
 client.on("message", (channel, msg) => {
   if (msg.isSelf) return;
   console.log(`${ts()} [${channel}] <${msg.from}> ${msg.text.slice(0, 100)}`);

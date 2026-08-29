@@ -24,6 +24,8 @@ export const DEFAULT_MODE: Mode = "addressed";
  * Landing in M2; the type and storage live here from M1 so the config file
  * format doesn't change under users between milestones.
  */
+export type ProvenanceTier = "silent" | "decisions" | "evidence" | "firehose";
+
 export type Tier = "observe" | "message" | "request" | "handoff" | "control";
 export const TIER_RANK: Record<Tier, number> = {
   observe: 0,
@@ -61,6 +63,13 @@ export interface FreeqConfig {
    * Opt-in only, and only meaningful at `handoff` tier or above.
    */
   autoAccept?: string[];
+  /**
+   * How much of this agent's work is mirrored to freeq as a signed log.
+   * Default `decisions`: changes and outbound actions, not every read.
+   */
+  provenance?: ProvenanceTier;
+  /** Where provenance goes. Defaults to the first joined channel. */
+  provenanceChannel?: string;
 }
 
 export const DEFAULT_SERVER = "wss://irc.freeq.at/irc";
@@ -74,6 +83,7 @@ export function defaultConfig(): FreeqConfig {
     enabled: true,
     muted: false,
     autoAccept: [],
+    provenance: "decisions",
   };
 }
 
@@ -110,6 +120,15 @@ export function normalizeConfig(raw: unknown): FreeqConfig {
   if (typeof o.install === "string" && o.install) base.install = o.install;
   if (typeof o.enabled === "boolean") base.enabled = o.enabled;
   if (typeof o.muted === "boolean") base.muted = o.muted;
+  if (
+    typeof o.provenance === "string" &&
+    ["silent", "decisions", "evidence", "firehose"].includes(o.provenance)
+  ) {
+    base.provenance = o.provenance as ProvenanceTier;
+  }
+  if (typeof o.provenanceChannel === "string" && o.provenanceChannel.startsWith("#")) {
+    base.provenanceChannel = o.provenanceChannel;
+  }
   if (Array.isArray(o.autoAccept)) {
     base.autoAccept = o.autoAccept.filter(
       (d): d is string => typeof d === "string" && d.startsWith("did:"),
