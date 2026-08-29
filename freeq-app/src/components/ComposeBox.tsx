@@ -630,7 +630,7 @@ export function ComposeBox() {
                   <span>🔒</span>
                   <span>Private to {ch?.name || activeChannel} by default</span>
                 </div>
-                {spacesAvailable && activeChannel.startsWith('#') && (
+                {spacesAvailable && activeChannel.startsWith('#') && !ch?.isEncrypted && (
                   <label className="flex items-center gap-1.5 cursor-pointer">
                     <input
                       type="checkbox"
@@ -638,7 +638,11 @@ export function ComposeBox() {
                       onChange={(e) => setSpaceMedia(e.target.checked)}
                       className="w-3 h-3 rounded accent-blue"
                     />
-                    <span className="text-sm text-fg-dim">Keep it on my PDS (private to this channel)</span>
+                    <span className="text-sm text-fg-dim">
+                      Keep it on my PDS ({ch?.modes.has('i') || ch?.modes.has('k')
+                        ? 'private to this channel'
+                        : 'anyone who can read this channel'})
+                    </span>
                   </label>
                 )}
                 <label className="flex items-center gap-1.5 cursor-pointer">

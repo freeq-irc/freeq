@@ -2425,11 +2425,51 @@ async fn api_media_space(
         return Err(StatusCode::NOT_FOUND);
     };
     let channel = authorize_channel_read(&state, &q.channel, &headers)?;
+    authorize_channel_member(&state, &channel, &headers)?;
     let key = channel_space_key(&state, &mgr, &channel).await?;
     Ok(Json(serde_json::json!({
         "space": mgr.space_ref(&key),
         "type": crate::media_space::SPACE_TYPE,
     })))
+}
+
+/// Check if the DID is a member, founder, or op of the channel.
+pub(crate) fn did_is_channel_member(state: &SharedState, channel: &str, did: &str) -> bool {
+    let key = channel.to_lowercase();
+    let (members, founder, did_ops) = {
+        let channels = state.channels.lock();
+        let Some(ch) = channels.get(&key) else {
+            return false;
+        };
+        (
+            ch.members.clone(),
+            ch.founder_did.clone(),
+            ch.did_ops.clone(),
+        )
+    };
+    if founder.as_deref() == Some(did) || did_ops.contains(did) {
+        return true;
+    }
+    let session_dids = state.session_dids.lock();
+    members
+        .iter()
+        .any(|sid| session_dids.get(sid).map(|d| d == did).unwrap_or(false))
+}
+
+/// Grab the DID and ensure it's a valid member.
+fn authorize_channel_member(
+    state: &SharedState,
+    channel: &str,
+    headers: &axum::http::HeaderMap,
+) -> Result<String, StatusCode> {
+    let Some(did) = caller_did_from_bearer(state, headers) else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    if did_is_channel_member(state, channel, &did) {
+        Ok(did)
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
 }
 
 /// The channel's media space key.
@@ -2516,12 +2556,26 @@ async fn api_space_media(
             tracing::warn!(error = %err, uri = %uri, "space media fetch failed");
             StatusCode::BAD_GATEWAY
         })?;
+    // The type comes from the uploader's own record, which they can rewrite on
+    // their PDS at any time.
+    let renderable = matches!(mime.split('/').next(), Some("image" | "video" | "audio"))
+        && !mime.contains("svg");
+    let disposition = if renderable { "inline" } else { "attachment" };
+    let served_mime = if renderable {
+        mime
+    } else {
+        "application/octet-stream".to_string()
+    };
     Ok((
         [
-            (axum::http::header::CONTENT_TYPE, mime),
+            (axum::http::header::CONTENT_TYPE, served_mime),
             (
                 axum::http::header::CACHE_CONTROL,
                 "private, max-age=300".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                disposition.to_string(),
             ),
         ],
         bytes,
@@ -3183,7 +3237,7 @@ async fn client_metadata(
 /// is fully attacker-controlled in the worst case, so we validate at
 /// every hop. Returns a generic error message that does NOT echo the
 /// host or IP back to the requester (info-leak hardening).
-async fn safe_outbound_client(
+pub(crate) async fn safe_outbound_client(
     url_str: &str,
     timeout: std::time::Duration,
 ) -> Result<(url::Url, reqwest::Client), (StatusCode, &'static str)> {
@@ -4205,7 +4259,7 @@ async fn api_upload(
                     .bytes()
                     .await
                     .map_err(|e| (StatusCode::BAD_REQUEST, format!("File read error: {e}")))?;
-                if bytes.len() > 10 * 1024 * 1024 {
+                if bytes.len() > crate::media_store::MAX_MEDIA_BYTES {
                     return Err((
                         StatusCode::PAYLOAD_TOO_LARGE,
                         "File too large (max 10MB)".into(),
@@ -4300,13 +4354,25 @@ async fn api_upload(
                 "Private media spaces are per-channel; no channel given".into(),
             ));
         };
+        if !did_is_channel_member(&state, &channel, &did) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Only channel members can post private media".to_string(),
+            ));
+        }
         let session = {
             let sessions = state.web_sessions.lock();
             let purpose = crate::server::OauthPurpose::MediaSpace;
             sessions
                 .get(&(did.clone(), purpose))
                 .or_else(|| sessions.get(&(did.clone(), crate::server::OauthPurpose::Login)))
-                .filter(|s| crate::server::scope_satisfies_purpose(&s.granted_scope, purpose))
+                .filter(|s| {
+                    crate::server::scope_satisfies_purpose(
+                        &s.granted_scope,
+                        purpose,
+                        Some(mgr.authority_did.as_str()),
+                    )
+                })
                 .cloned()
         };
         let Some(session) = session else {
@@ -4366,6 +4432,17 @@ async fn api_upload(
             (StatusCode::BAD_GATEWAY, format!("{e}"))
         })?;
 
+        if let Some(nonce) = result.updated_nonce.clone() {
+            let mut sessions = state.web_sessions.lock();
+            for purpose in [
+                crate::server::OauthPurpose::MediaSpace,
+                crate::server::OauthPurpose::Login,
+            ] {
+                if let Some(s) = sessions.get_mut(&(did.clone(), purpose)) {
+                    s.dpop_nonce = Some(nonce.clone());
+                }
+            }
+        }
         tracing::info!(did = %did, channel = %channel, uri = %result.uri, "Space media stored");
         let (origin, _) = derive_web_origin(&headers);
         use base64::Engine;
@@ -4401,7 +4478,7 @@ async fn api_upload(
             if let Some(s) = sessions.get(&(did.clone(), purpose)) {
                 Some(s.clone())
             } else if let Some(s) = sessions.get(&(did.clone(), crate::server::OauthPurpose::Login))
-                && crate::server::scope_satisfies_purpose(&s.granted_scope, purpose)
+                && crate::server::scope_satisfies_purpose(&s.granted_scope, purpose, None)
             {
                 Some(s.clone())
             } else {

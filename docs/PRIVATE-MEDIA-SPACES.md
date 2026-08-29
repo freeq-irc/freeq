@@ -15,21 +15,24 @@ concepts.
 Today, private attachments are held by the freeq server instead. It stores
 the files, holds the key, and access rides on possession of a link. That
 works, but the files are not yours in any atproto sense: you cannot take
-them with you, truly delete them, or keep the server operator out of them.
+them with you or truly delete them.
 
-With spaces, a private file stays in your own repo on your PDS. The
-channel decides who may read it (joining grants access, a kick or ban
-removes it), the freeq server stores nothing, and deleting your file from
-your own repo is a real deletion.
+With spaces, a private file stays in your own repo on your PDS. The channel
+decides who may read it (joining grants access, a kick or ban removes it),
+the freeq server stores nothing, and deleting your file from your own repo
+is a real deletion. The server still handles the management of the media.
 
 ## How it works
 
-The server gets its own AT Protocol account, which acts as the gatekeeper
-for one private "space" per channel. Members' clients put media into the
-channel's space instead of uploading it publicly. Whenever someone tries to
-read from a space, the gatekeeper asks the freeq server "is this person in
-the channel right now?" and the server answers from its live member list.
-There is no separate access list to manage; the channel is the access list.
+The server gets its own AT Protocol account. That account is the gatekeeper,
+and owns a private "space" per channel.
+
+When you attach a file, it goes into your own repo inside that channel's
+space. The browser has no PDS credentials of its own, so freeq writes
+the media.
+
+Reading is the same, freeq confirms the member and fetches the file on
+their behalf.
 
 ## Using it
 
@@ -64,9 +67,7 @@ Two things to know when enabling it:
   `server_name` must be the server's public hostname, reachable over HTTPS.
   If a front proxy handles `/.well-known/` for certificate renewal, make
   sure `did.json` still reaches freeq.
-- Users who want private media need accounts on a Spaces-capable PDS, and
-  web users who were already logged in must log out and back in once to
-  grant the extra permission. Everyone else just keeps using public media.
+- Posting private media requires a Spaces-capable PDS. Viewing media does not.
 
 Uploads are a per-message choice in the client, opt-in per file.
 

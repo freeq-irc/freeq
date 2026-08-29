@@ -288,7 +288,6 @@ function isTrustedImageUrl(url: string): boolean {
   }
 }
 
-
 /** Why space media could not be shown: the viewer is not a member, or the
  *  fetch itself broke. */
 type MediaFailure = 'refused' | 'error' | null;
@@ -344,7 +343,7 @@ function useAuthedMedia(url: string): { src: string | null; failure: MediaFailur
 }
 
 /** Image that respects the "Load external media" setting. */
-function GatedImage({ url, onOpen }: { url: string; onOpen: () => void }) {
+function GatedImage({ url, onOpen }: { url: string; onOpen: (src: string) => void }) {
   const loadMedia = useStore((s) => s.loadExternalMedia);
   const [revealed, setRevealed] = useState(false);
   const trusted = isTrustedImageUrl(url);
@@ -370,7 +369,7 @@ function GatedImage({ url, onOpen }: { url: string; onOpen: () => void }) {
       );
     }
     return (
-      <button onClick={onOpen} className="block cursor-zoom-in">
+      <button onClick={() => onOpen(src)} className="block cursor-zoom-in">
         <img
           src={src}
           alt=""
@@ -630,7 +629,7 @@ function MessageContentImpl({ msg, channel, onNickClick }: {
       {imageUrls.length > 0 && (
         <div className="mt-1.5 flex flex-wrap gap-2">
           {imageUrls.map((url) => (
-            <GatedImage key={url} url={url} onOpen={() => setLightbox(url)} />
+            <GatedImage key={url} url={url} onOpen={(src) => setLightbox(src)} />
           ))}
         </div>
       )}

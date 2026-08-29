@@ -329,10 +329,16 @@ impl OauthPurpose {
 /// - bsky.social granular grants may include extra `blob:` MIME entries
 ///   beyond what we asked; we only need one `blob:image/*` (or the
 ///   wildcard `blob:*/*`) for upload.
-pub fn scope_satisfies_purpose(granted: &str, purpose: OauthPurpose) -> bool {
-    if granted
-        .split_whitespace()
-        .any(|s| s == "transition:generic")
+pub fn scope_satisfies_purpose(
+    granted: &str,
+    purpose: OauthPurpose,
+    media_space_authority: Option<&str>,
+) -> bool {
+    // The legacy wide grant covers every purpose except spaces.
+    if !matches!(purpose, OauthPurpose::MediaSpace)
+        && granted
+            .split_whitespace()
+            .any(|s| s == "transition:generic")
     {
         return true;
     }
@@ -357,14 +363,19 @@ pub fn scope_satisfies_purpose(granted: &str, purpose: OauthPurpose) -> bool {
             .any(|s| s == "repo:app.bsky.feed.post" || s == "repo:*"),
         OauthPurpose::MediaSpace => {
             // An upload is two PDS calls: uploadBlob for the bytes, then
-            // createRecord to file them in the space.
-            let prefix = format!("space:{}", crate::media_space::SPACE_TYPE);
+            // createRecord to file them in the space. The space half must
+            // also name this server's authority, since a grant for someone
+            // else's spaces buys nothing here.
+            let Some(authority) = media_space_authority else {
+                return false;
+            };
+            let wanted = crate::media_space::space_scope(authority);
             let has_space = granted.split_whitespace().any(|s| {
-                s == prefix || s.starts_with(&format!("{prefix}?")) || s.starts_with("space:*")
+                wanted
+                    .split_whitespace()
+                    .any(|w| w == s && s.starts_with("space:"))
             });
-            let has_blob = granted
-                .split_whitespace()
-                .any(|s| s == "blob:*/*" || s.starts_with("blob:*"));
+            let has_blob = granted.split_whitespace().any(|s| s.starts_with("blob:*"));
             has_space && has_blob
         }
     }

@@ -133,6 +133,89 @@ async fn fixture_with_ids(extra_ids: &[(&str, &PrivateKey)]) -> Fixture {
     }
 }
 
+const MEMBER_DID: &str = "did:plc:spacemember";
+
+/// Boot a fixture whose `#open` channel has one authenticated member, and
+/// return that member's handle, events and API bearer. Minting a space is a
+/// members-only action, so every test that mints one needs this.
+async fn fixture_with_member() -> (Fixture, freeq_sdk::client::ClientHandle, String) {
+    let key = PrivateKey::generate_ed25519();
+    let fx = fixture_with_ids(&[(MEMBER_DID, &key)]).await;
+    let (h, bearer) = join_as_member(&fx.irc, MEMBER_DID, &key, "member", "#open").await;
+    (fx, h, bearer)
+}
+
+/// Connect an authenticated client, join `channel`, and return its bearer.
+async fn join_as_member(
+    irc: &std::net::SocketAddr,
+    did: &str,
+    key: &PrivateKey,
+    nick: &str,
+    channel: &str,
+) -> (freeq_sdk::client::ClientHandle, String) {
+    let cfg = ConnectConfig {
+        server_addr: irc.to_string(),
+        nick: nick.to_string(),
+        user: nick.to_string(),
+        realname: "test".to_string(),
+        ..Default::default()
+    };
+    let (h, mut events) = client::connect(cfg, Some(signer_for(did, key)));
+    let bearer = wait_for_bearer(&mut events).await;
+    expect_event(
+        &mut events,
+        |e| matches!(e, Event::Registered { .. }),
+        "registered",
+    )
+    .await;
+    h.join(channel).await.unwrap();
+    expect_event(&mut events, |e| matches!(e, Event::Joined { .. }), "joined").await;
+    // The events receiver is dropped, so the session stays up but unread.
+    std::mem::forget(events);
+    (h, bearer)
+}
+
+/// The API bearer the server hands an authenticated session, from the
+/// `API-BEARER <session>` notice that follows SASL success. REST reads of a
+/// channel are authorized by this, so a test that wants to act as a member
+/// has to hold it.
+async fn wait_for_bearer(events: &mut mpsc::Receiver<Event>) -> String {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Some(Event::ServerNotice { text }) => {
+                    if let Some(b) = text.split_whitespace().nth(1)
+                        && text.starts_with("API-BEARER")
+                    {
+                        return b.to_string();
+                    }
+                }
+                Some(_) => continue,
+                None => panic!("stream ended before the API bearer arrived"),
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for the API bearer")
+}
+
+/// A member's GET: the session bearer is what proves channel membership.
+async fn get_as(web: std::net::SocketAddr, bearer: &str, path: &str) -> (u16, serde_json::Value) {
+    let r = reqwest::Client::new()
+        .get(format!("http://{web}{path}"))
+        .bearer_auth(bearer)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    let body = r.text().await.unwrap_or_default();
+    (
+        status,
+        serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+    )
+}
+
 fn signer_for(did: &str, key: &PrivateKey) -> Arc<dyn ChallengeSigner> {
     let key = PrivateKey::ed25519_from_bytes(&key.secret_bytes()).unwrap();
     Arc::new(KeySigner::new(did.to_string(), key))
@@ -320,10 +403,15 @@ async fn client_metadata_advertises_the_space_scope_only_when_enabled() {
 async fn an_expired_authority_session_is_renewed_and_the_space_still_created() {
     let (pds_addr, created) = mock_pds_expiring_session().await;
     let authority_key = PrivateKey::generate_secp256k1();
+    let member_key = PrivateKey::generate_ed25519();
     let mut docs: HashMap<String, DidDocument> = HashMap::new();
     docs.insert(
         AUTHORITY_DID.to_string(),
         make_test_did_document(AUTHORITY_DID, &authority_key.public_key_multibase()),
+    );
+    docs.insert(
+        MEMBER_DID.to_string(),
+        make_test_did_document(MEMBER_DID, &member_key.public_key_multibase()),
     );
     let config = freeq_server::config::ServerConfig {
         listen_addr: "127.0.0.1:0".to_string(),
@@ -342,24 +430,9 @@ async fn an_expired_authority_session_is_renewed_and_the_space_still_created() {
             .await
             .unwrap();
 
-    let cfg = ConnectConfig {
-        server_addr: irc.to_string(),
-        nick: "guest1".to_string(),
-        user: "guest1".to_string(),
-        realname: "test".to_string(),
-        ..Default::default()
-    };
-    let (h, mut events) = client::connect(cfg, None);
-    expect_event(
-        &mut events,
-        |e| matches!(e, Event::Registered { .. }),
-        "registered",
-    )
-    .await;
-    h.join("#open").await.unwrap();
-    expect_event(&mut events, |e| matches!(e, Event::Joined { .. }), "joined").await;
+    let (h, bearer) = join_as_member(&irc, MEMBER_DID, &member_key, "member", "#open").await;
 
-    let (status, body) = get(web, "/api/v1/media-space?channel=%23open").await;
+    let (status, body) = get_as(web, &bearer, "/api/v1/media-space?channel=%23open").await;
     assert_eq!(
         status, 200,
         "an expired session must not fail the request: {body}"
@@ -369,6 +442,80 @@ async fn an_expired_authority_session_is_renewed_and_the_space_still_created() {
 
     h.quit(None).await.ok();
     server.abort();
+}
+
+/// Ensure that an authenticated client can send media and non-members
+/// are refused.
+#[tokio::test]
+async fn only_members_can_post_space_media() {
+    let member_key = PrivateKey::generate_ed25519();
+    let outsider_key = PrivateKey::generate_ed25519();
+    let outsider_did = "did:plc:spaceoutsider";
+    let fx = fixture_with_ids(&[(MEMBER_DID, &member_key), (outsider_did, &outsider_key)]).await;
+    let (h, _bearer) = join_as_member(&fx.irc, MEMBER_DID, &member_key, "member", "#open").await;
+
+    let post = |did: &str| {
+        let form = reqwest::multipart::Form::new()
+            .text("did", did.to_string())
+            .text("channel", "#open".to_string())
+            .text("space_media", "true".to_string())
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(b"not really a png".to_vec())
+                    .file_name("x.png")
+                    .mime_str("image/png")
+                    .unwrap(),
+            );
+        reqwest::Client::new()
+            .post(format!("http://{}/api/v1/upload", fx.web))
+            .multipart(form)
+            .timeout(Duration::from_secs(5))
+            .send()
+    };
+
+    // A DID with no session at all cannot upload anywhere.
+    let r = post(outsider_did).await.unwrap();
+    let status = r.status().as_u16();
+    let body = r.text().await.unwrap_or_default();
+    assert!(
+        status == 401 || status == 403,
+        "a stranger must not post: {status} {body}"
+    );
+    assert_eq!(fx.created.load(Ordering::SeqCst), 0, "nothing was created");
+
+    // An authenticated non-member is refused by the membership gate, not by
+    // the step-up path: they are told they are not in the channel.
+    let (outsider, _b) = join_as_member(
+        &fx.irc,
+        outsider_did,
+        &outsider_key,
+        "outsider",
+        "#elsewhere",
+    )
+    .await;
+    let r = post(outsider_did).await.unwrap();
+    let status = r.status().as_u16();
+    let body = r.text().await.unwrap_or_default();
+    assert_eq!(status, 403, "non-member: {body}");
+    assert!(
+        body.contains("Only channel members"),
+        "a non-member must be told why, not sent to a step-up: {body}"
+    );
+    assert_eq!(fx.created.load(Ordering::SeqCst), 0);
+
+    // The member gets past membership and lands on the real next step: they
+    // have no space grant yet, so the server asks for one.
+    let r = post(MEMBER_DID).await.unwrap();
+    let status = r.status().as_u16();
+    let body = r.text().await.unwrap_or_default();
+    assert!(
+        body.contains("step_up_required") || body.contains("not_authenticated"),
+        "a member must pass the gate and be asked for the grant: {status} {body}"
+    );
+
+    outsider.quit(None).await.ok();
+    h.quit(None).await.ok();
+    fx.server.abort();
 }
 
 #[tokio::test]
@@ -425,26 +572,12 @@ async fn space_media_route_404s_for_an_unknown_space() {
 
 #[tokio::test]
 async fn space_media_route_refuses_anonymous_reads_of_a_restricted_channel() {
-    let fx = fixture_with_ids(&[]).await;
-    let config = ConnectConfig {
-        server_addr: fx.irc.to_string(),
-        nick: "own".to_string(),
-        user: "own".to_string(),
-        realname: "test".to_string(),
-        ..Default::default()
-    };
-    let (h, mut events) = client::connect(config, None);
-    expect_event(
-        &mut events,
-        |e| matches!(e, Event::Registered { .. }),
-        "registered",
-    )
-    .await;
-    h.join("#priv").await.unwrap();
-    expect_event(&mut events, |e| matches!(e, Event::Joined { .. }), "joined").await;
+    let member_key = PrivateKey::generate_ed25519();
+    let fx = fixture_with_ids(&[(MEMBER_DID, &member_key)]).await;
+    let (h, bearer) = join_as_member(&fx.irc, MEMBER_DID, &member_key, "own", "#priv").await;
 
     // Mint the space while the channel is still public, then lock it.
-    let (s, body) = get(fx.web, "/api/v1/media-space?channel=%23priv").await;
+    let (s, body) = get_as(fx.web, &bearer, "/api/v1/media-space?channel=%23priv").await;
     assert_eq!(s, 200);
     let space = body["space"].as_str().unwrap().to_string();
     let key = space.rsplit('/').next().unwrap().to_string();
@@ -503,30 +636,12 @@ async fn health_reports_whether_media_spaces_are_configured() {
 
 #[tokio::test]
 async fn first_use_creates_exactly_one_space_and_persists_it() {
-    let fx = fixture_with_ids(&[]).await;
-
-    // A guest keeps #open resident.
-    let config = ConnectConfig {
-        server_addr: fx.irc.to_string(),
-        nick: "guest1".to_string(),
-        user: "guest1".to_string(),
-        realname: "test".to_string(),
-        ..Default::default()
-    };
-    let (h, mut events) = client::connect(config, None);
-    expect_event(
-        &mut events,
-        |e| matches!(e, Event::Registered { .. }),
-        "registered",
-    )
-    .await;
-    h.join("#open").await.unwrap();
-    expect_event(&mut events, |e| matches!(e, Event::Joined { .. }), "joined").await;
+    let (fx, h, bearer) = fixture_with_member().await;
 
     // Two concurrent first requests race the creation.
     let (a, b) = tokio::join!(
-        get(fx.web, "/api/v1/media-space?channel=%23open"),
-        get(fx.web, "/api/v1/media-space?channel=%23open"),
+        get_as(fx.web, &bearer, "/api/v1/media-space?channel=%23open"),
+        get_as(fx.web, &bearer, "/api/v1/media-space?channel=%23open"),
     );
     assert_eq!(a.0, 200, "first: {:?}", a.1);
     assert_eq!(b.0, 200, "second: {:?}", b.1);
@@ -543,9 +658,41 @@ async fn first_use_creates_exactly_one_space_and_persists_it() {
     assert_eq!(fx.created.load(Ordering::SeqCst), 1, "createSpace ran once");
 
     // A later request returns the stored ref without creating again.
-    let (s, body) = get(fx.web, "/api/v1/media-space?channel=%23open").await;
+    let (s, body) = get_as(fx.web, &bearer, "/api/v1/media-space?channel=%23open").await;
     assert_eq!(s, 200);
     assert_eq!(body["space"].as_str().unwrap(), space);
+    assert_eq!(fx.created.load(Ordering::SeqCst), 1);
+
+    h.quit(None).await.ok();
+    fx.server.abort();
+}
+
+/// Minting a space writes to the operator's PDS, so only a member may cause
+/// one. A public channel is readable by anyone, which is exactly why the
+/// read rule alone is not enough here.
+#[tokio::test]
+async fn only_members_can_mint_a_space() {
+    let (fx, h, bearer) = fixture_with_member().await;
+
+    let (status, _) = get(fx.web, "/api/v1/media-space?channel=%23open").await;
+    assert_eq!(
+        status, 401,
+        "an anonymous caller must not be able to create a space"
+    );
+    assert_eq!(fx.created.load(Ordering::SeqCst), 0, "nothing was created");
+
+    let (status, _) = get_as(
+        fx.web,
+        "not-a-real-bearer",
+        "/api/v1/media-space?channel=%23open",
+    )
+    .await;
+    assert_eq!(status, 401, "an unknown bearer must not either");
+    assert_eq!(fx.created.load(Ordering::SeqCst), 0);
+
+    // The member can.
+    let (status, _) = get_as(fx.web, &bearer, "/api/v1/media-space?channel=%23open").await;
+    assert_eq!(status, 200);
     assert_eq!(fx.created.load(Ordering::SeqCst), 1);
 
     h.quit(None).await.ok();
@@ -558,10 +705,15 @@ async fn space_key_survives_a_server_restart() {
     let db_path = dir.path().join("media.db").to_str().unwrap().to_string();
     let (pds_addr, created) = mock_pds().await;
     let authority_key = PrivateKey::generate_secp256k1();
+    let member_key = PrivateKey::generate_ed25519();
     let mut docs: HashMap<String, DidDocument> = HashMap::new();
     docs.insert(
         AUTHORITY_DID.to_string(),
         make_test_did_document(AUTHORITY_DID, &authority_key.public_key_multibase()),
+    );
+    docs.insert(
+        MEMBER_DID.to_string(),
+        make_test_did_document(MEMBER_DID, &member_key.public_key_multibase()),
     );
     let config = || freeq_server::config::ServerConfig {
         listen_addr: "127.0.0.1:0".to_string(),
@@ -583,23 +735,8 @@ async fn space_key_survives_a_server_restart() {
     .start_with_web()
     .await
     .unwrap();
-    let cfg = ConnectConfig {
-        server_addr: irc.to_string(),
-        nick: "guest1".to_string(),
-        user: "guest1".to_string(),
-        realname: "test".to_string(),
-        ..Default::default()
-    };
-    let (h, mut events) = client::connect(cfg, None);
-    expect_event(
-        &mut events,
-        |e| matches!(e, Event::Registered { .. }),
-        "registered",
-    )
-    .await;
-    h.join("#open").await.unwrap();
-    expect_event(&mut events, |e| matches!(e, Event::Joined { .. }), "joined").await;
-    let (s, body) = get(web, "/api/v1/media-space?channel=%23open").await;
+    let (h, bearer) = join_as_member(&irc, MEMBER_DID, &member_key, "member", "#open").await;
+    let (s, body) = get_as(web, &bearer, "/api/v1/media-space?channel=%23open").await;
     assert_eq!(s, 200);
     let space = body["space"].as_str().unwrap().to_string();
     h.quit(None).await.ok();
@@ -609,12 +746,13 @@ async fn space_key_survives_a_server_restart() {
     // Second boot: the channel has no history, topic, or modes — only its
     // space key. The empty-channel prune must keep it, and the same space
     // ref must come back without another createSpace on the PDS.
-    let (_irc2, web2, server2) =
+    let (irc2, web2, server2) =
         freeq_server::server::Server::with_resolver(config(), DidResolver::static_map(docs))
             .start_with_web()
             .await
             .unwrap();
-    let (s, body) = get(web2, "/api/v1/media-space?channel=%23open").await;
+    let (h2, bearer2) = join_as_member(&irc2, MEMBER_DID, &member_key, "member", "#open").await;
+    let (s, body) = get_as(web2, &bearer2, "/api/v1/media-space?channel=%23open").await;
     assert_eq!(s, 200, "channel with a space must survive the boot prune");
     assert_eq!(
         body["space"].as_str().unwrap(),
@@ -622,6 +760,7 @@ async fn space_key_survives_a_server_restart() {
         "space key must persist"
     );
     assert_eq!(created.load(Ordering::SeqCst), 1, "no second createSpace");
+    h2.quit(None).await.ok();
     server2.abort();
 }
 
@@ -703,12 +842,7 @@ async fn check_user_access_follows_live_channel_membership() {
     };
     let (alice, mut alice_events) =
         client::connect(alice_cfg, Some(signer_for(alice_did, &alice_key)));
-    expect_event(
-        &mut alice_events,
-        |e| matches!(e, Event::Authenticated { .. }),
-        "auth",
-    )
-    .await;
+    let alice_bearer = wait_for_bearer(&mut alice_events).await;
     expect_event(
         &mut alice_events,
         |e| matches!(e, Event::Registered { .. }),
@@ -723,7 +857,7 @@ async fn check_user_access_follows_live_channel_membership() {
     )
     .await;
 
-    let (s, body) = get(fx.web, "/api/v1/media-space?channel=%23open").await;
+    let (s, body) = get_as(fx.web, &alice_bearer, "/api/v1/media-space?channel=%23open").await;
     assert_eq!(s, 200);
     let space = body["space"].as_str().unwrap().to_string();
     let jwt = service_jwt(&fx.authority_key, &managing_app(), LXM, 60);

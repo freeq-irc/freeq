@@ -11,6 +11,8 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use freeq_sdk::did::DidResolver;
 
+use crate::media_store::MAX_MEDIA_BYTES;
+
 /// NSID of the space type. Part of every space ref this server creates.
 pub const SPACE_TYPE: &str = "at.freeq.media";
 
@@ -20,6 +22,9 @@ pub const MANAGING_APP_FRAGMENT: &str = "freeq_media";
 
 /// Collection holding one media item per record inside a media space.
 pub const MEDIA_COLLECTION: &str = "at.freeq.media.item";
+
+/// Call timeout on a repo host.
+const REPO_HOST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// The OAuth scopes an upload to this server's media spaces takes:
 /// `blob:*/*` for the bytes, which go up through the ordinary uploadBlob,
@@ -31,7 +36,7 @@ pub fn space_scope(authority_did: &str) -> String {
     format!("blob:*/* space:*?authority={authority_did}&collection=*")
 }
 
-/// Check for a stale cached session token is stale.
+/// Check for a stale cached session token.
 fn session_expired(status: reqwest::StatusCode, body: &str) -> bool {
     status == reqwest::StatusCode::UNAUTHORIZED || body.contains("ExpiredToken")
 }
@@ -401,11 +406,14 @@ impl MediaSpaceManager {
         credential: &str,
         dpop_key: &freeq_sdk::oauth::DpopKey,
     ) -> Result<Vec<u8>> {
+        // An SSRF check is needed here as the DID document can point anywhere.
+        let (_, client) = crate::web::safe_outbound_client(url, REPO_HOST_TIMEOUT)
+            .await
+            .map_err(|(_, msg)| anyhow::anyhow!("{msg}"))?;
         let mut nonce: Option<String> = None;
         for attempt in 0..3 {
             let proof = dpop_key.proof("GET", url, nonce.as_deref(), Some(credential))?;
-            let res = self
-                .http
+            let res = client
                 .get(url)
                 .query(params)
                 .header("Authorization", format!("DPoP {credential}"))
@@ -421,7 +429,21 @@ impl MediaSpaceManager {
             }
             let status = res.status();
             if status.is_success() {
-                return Ok(res.bytes().await?.to_vec());
+                if let Some(len) = res.content_length()
+                    && len > MAX_MEDIA_BYTES as u64
+                {
+                    bail!("media is larger than the {} byte ceiling", MAX_MEDIA_BYTES);
+                }
+                // Read in chunks until we hit MAX_MEDIA_BYTES.
+                let mut res = res;
+                let mut body: Vec<u8> = Vec::new();
+                while let Some(chunk) = res.chunk().await? {
+                    if body.len() + chunk.len() > MAX_MEDIA_BYTES {
+                        bail!("media is larger than the {} byte ceiling", MAX_MEDIA_BYTES);
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                return Ok(body);
             }
             if (status == 401 || status == 400) && attempt < 2 {
                 continue;
