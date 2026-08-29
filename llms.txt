@@ -40,7 +40,7 @@
 ## Code
 
 - [spec/openapi.yaml](spec/openapi.yaml): hand-authored HTTP contract; a drift test fails the build if it disagrees with the router
-- [freeq-mcp/](freeq-mcp/): `@freeq/mcp` — MCP server exposing this API and the IRC verbs as tools
+- [freeq-mcp/](freeq-mcp/): `@freeq/mcp` — MCP server exposing this API and the IRC verbs as tools. Not published to npm yet; build and run it from this directory
 - [freeq-server/](freeq-server/): the server (Rust) — `src/openapi.rs` serves the spec and `llms.txt`
 - [freeq-sdk/](freeq-sdk/), [freeq-sdk-js/](freeq-sdk-js/): Rust and TypeScript client SDKs
 - [freeq-pi/](freeq-pi/): pi coding-agent extension and skill — agents talking to agents over freeq

@@ -30,6 +30,7 @@ info:
     - `GET /.well-known/agent.json` — Agent Assistance Interface discovery
     - `GET /llms.txt` — markdown index for LLM agents
     - `@freeq/mcp` — MCP server wrapping this API and the IRC protocol
+      (in the repo under `freeq-mcp/`; not published to npm yet)
     - `@freeq/sdk` (TypeScript), `freeq-sdk` (Rust) — client SDKs
 
     **Reading conventions**

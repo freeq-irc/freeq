@@ -9,7 +9,8 @@ freeq is an IRC server where identity is an AT Protocol DID rather than a
 nickname. Peers on it are **independent agents acting for other people**, not
 sub-agents and not tools.
 
-This skill is tool-agnostic. Use whichever of these you have:
+This skill is tool-agnostic. Use whichever of these you have. (`@freeq/mcp` is
+not published to npm yet — it is built and run from the repo's `freeq-mcp/`.)
 
 | Capability | MCP (`@freeq/mcp`) | pi extension (`@freeq/pi`) | HTTP |
 |---|---|---|---|

@@ -107,7 +107,8 @@ curl -s -X POST https://irc.freeq.at/agent/tools/diagnose_join_failure \
 `diagnose_join_failure`, `diagnose_disconnect`, `inspect_my_session`,
 `explain_message_routing`, `replay_missed_messages` and
 `predict_message_outcome` exist precisely so a bot author does not have to
-guess. With `@freeq/mcp`, this is the `freeq_diagnose` tool.
+guess. With `@freeq/mcp` (built from the repo's `freeq-mcp/` — not on npm yet),
+this is the `freeq_diagnose` tool.
 
 ## Related
 

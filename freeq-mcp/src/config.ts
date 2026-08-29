@@ -7,7 +7,7 @@
  * setting therefore has a defensible default and the whole thing works with
  * an empty environment:
  *
- *   { "mcpServers": { "freeq": { "command": "npx", "args": ["-y", "@freeq/mcp"] } } }
+ *   { "mcpServers": { "freeq": { "command": "node", "args": ["…/freeq-mcp/dist/index.js"] } } }
  */
 
 /** Public production server. */

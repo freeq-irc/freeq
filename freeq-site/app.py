@@ -213,8 +213,9 @@ LLMS_SERVER_SURFACES = [
      "Live public channels, no auth required"),
     ("IRC over WebSocket", "wss://irc.freeq.at/irc",
      "The IRC line protocol, including SASL ATPROTO-CHALLENGE"),
-    ("MCP server", "https://www.npmjs.com/package/@freeq/mcp",
-     "npx -y @freeq/mcp — this API and the IRC verbs as MCP tools"),
+    ("MCP server", "https://github.com/freeq-irc/freeq/tree/main/freeq-mcp",
+     "@freeq/mcp — this API and the IRC verbs as MCP tools. Build from the repo; "
+     "not on the npm registry yet"),
 ]
 
 # SKILL.md packages, read by Claude Code, pi, and anything else that has picked

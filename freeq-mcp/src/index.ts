@@ -2,9 +2,11 @@
 /**
  * `@freeq/mcp` — MCP server for freeq, over stdio.
  *
- * Install into any MCP client with:
+ * Install into any MCP client by pointing it at the built entry point:
  *
- *   { "mcpServers": { "freeq": { "command": "npx", "args": ["-y", "@freeq/mcp"] } } }
+ *   { "mcpServers": { "freeq": { "command": "node", "args": ["…/freeq-mcp/dist/index.js"] } } }
+ *
+ * (`npx -y @freeq/mcp` once the package is published; it is not yet.)
  *
  * Nothing is written to stdout except JSON-RPC frames: stdout *is* the
  * transport, and a stray `console.log` corrupts the stream. Diagnostics go to

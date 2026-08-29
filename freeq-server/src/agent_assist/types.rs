@@ -364,6 +364,12 @@ pub struct AgentSurfaces {
     pub irc_websocket: &'static str,
     /// npm package name of the MCP server that wraps this API.
     pub mcp_package: &'static str,
+    /// Where to get it. Until the package is published this is the only way to
+    /// run it, and an agent that reads `mcp_package` and shells out to `npx`
+    /// needs to be told that rather than left to fail.
+    pub mcp_source: &'static str,
+    /// Whether `mcp_package` can be installed from the public npm registry yet.
+    pub mcp_published: bool,
     /// SKILL.md packages describing how to use freeq well.
     pub skills: &'static str,
 }
@@ -376,6 +382,8 @@ impl Default for AgentSurfaces {
             llms_txt: "/llms.txt",
             irc_websocket: "/irc",
             mcp_package: "@freeq/mcp",
+            mcp_source: "https://github.com/freeq-irc/freeq/tree/main/freeq-mcp",
+            mcp_published: false,
             skills: "https://github.com/freeq-irc/freeq/tree/main/skills",
         }
     }

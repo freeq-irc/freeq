@@ -122,6 +122,18 @@ async fn agent_json_cross_links_the_other_surfaces() {
     assert_eq!(body["surfaces"]["llms_txt"], "/llms.txt");
     assert_eq!(body["surfaces"]["irc_websocket"], "/irc");
     assert_eq!(body["surfaces"]["mcp_package"], "@freeq/mcp");
+    // An agent that reads `mcp_package` and shells out to `npx` would fail
+    // today, so the document must say where the code actually is and that the
+    // package is not on the registry yet. Flip `mcp_published` in the same
+    // commit that publishes it.
+    assert!(
+        body["surfaces"]["mcp_source"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("freeq-mcp"),
+        "agent.json must say where to get the MCP server"
+    );
+    assert_eq!(body["surfaces"]["mcp_published"], false);
     assert!(
         body["surfaces"]["skills"]
             .as_str()

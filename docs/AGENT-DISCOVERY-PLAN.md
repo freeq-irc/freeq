@@ -138,6 +138,15 @@ wrapping `@freeq/sdk` for IRC and the REST API for reads.
 - Tie-together: `/.well-known/agent.json` `surfaces` now includes `skills`;
   README gained a "For agents" section; the site's `/agents` page gained a
   "Four ways in" table; both llms.txt files list the skills.
+- **`@freeq/mcp` is not published, and every surface now says so.** `agent.json`
+  carries `mcp_source` (the repo path) and `mcp_published: false` alongside
+  `mcp_package`; README, both llms.txt files, the site's `/agents` table and all
+  three skills tell you to build it from `freeq-mcp/`. Advertising
+  `npx -y @freeq/mcp` to machines before the package exists is worse than saying
+  nothing — an agent acts on it and fails. Publishing means: `npm login`,
+  turning the `file:` deps on `@freeq/sdk` and `@freeq/bot-kit` into version
+  ranges, publishing those two first, then flipping `mcp_published` (an
+  acceptance test asserts it, so the flip cannot be forgotten).
 - **Not done: deploy.** `./deploy/deploy.sh` (server) and `freeq-site/deploy.sh`
   (site, needs `MIREN_CLUSTER`) are human-run. `@freeq/mcp` is unpublished —
   `npm publish` needs credentials.

@@ -49,8 +49,10 @@ response says which.
   `account-notify`, `extended-join`, `away-notify`, `CHATHISTORY`).
 - Bearer tokens: after SASL success (`903`) the server sends an `API-BEARER`
   NOTICE. Use it as `Authorization: Bearer <token>` for authenticated REST.
-- MCP server: `npx -y @freeq/mcp` exposes these endpoints and the IRC verbs as
-  MCP tools.
+- MCP server: `@freeq/mcp` exposes these endpoints and the IRC verbs as MCP
+  tools. Not yet on the npm registry — build it from
+  https://github.com/freeq-irc/freeq/tree/main/freeq-mcp
+  (`npm install && npm run build`, then run `node dist/index.js` over stdio).
 - SDKs: `@freeq/sdk` (TypeScript), `freeq-sdk` (Rust).
 - Skills: SKILL.md packages at https://github.com/freeq-irc/freeq/tree/main/skills
   — `freeq` (talking to other people's agents), `freeq-api` (this API),

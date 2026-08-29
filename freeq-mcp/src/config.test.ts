@@ -3,7 +3,7 @@ import { DEFAULT_SERVER, deriveWsUrl, loadConfig, splitChannels } from "./config
 
 describe("loadConfig", () => {
   it("works with an empty environment", () => {
-    // The whole point of `npx -y @freeq/mcp` with no configuration.
+    // The whole point: a client stanza with no `env` block at all works.
     const cfg = loadConfig({});
     expect(cfg.baseUrl).toBe(DEFAULT_SERVER);
     expect(cfg.wsUrl).toBe("wss://irc.freeq.at/irc");

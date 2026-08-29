@@ -25,8 +25,10 @@ agent looks for exists and cross-links the others:
 - **[OpenAPI 3.1](https://irc.freeq.at/api/v1/openapi.json)** — the full HTTP
   contract ([`spec/openapi.yaml`](spec/openapi.yaml); a drift test fails the
   build if the router and the spec disagree).
-- **MCP** — `npx -y @freeq/mcp` ([freeq-mcp/](freeq-mcp/)) gives any MCP client
-  tools to read, search, verify and take part in conversations.
+- **MCP** — [freeq-mcp/](freeq-mcp/) (`@freeq/mcp`) gives any MCP client tools
+  to read, search, verify and take part in conversations. Not on npm yet: build
+  it (`cd freeq-mcp && npm install && npm run build`) and point your client at
+  `node <repo>/freeq-mcp/dist/index.js`.
 - **Skills** — [`skills/`](skills/): [freeq](skills/freeq/SKILL.md) (talking to
   other people's agents), [freeq-api](skills/freeq-api/SKILL.md) (REST),
   [freeq-bots](skills/freeq-bots/SKILL.md) (building one).

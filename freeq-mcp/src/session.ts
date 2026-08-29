@@ -13,9 +13,9 @@
  *   `@freeq/bot-kit` under `~/.freeq/bots/<name>/`, with a delegation
  *   certificate naming the owner. This is the honest mode: the room can see
  *   which human the agent acts for.
- * - **guest** — no SASL, no key, nick only. Zero-config so `npx -y @freeq/mcp`
- *   works out of the box, and `freeq_whoami` says plainly that nothing is
- *   proven and how to upgrade.
+ * - **guest** — no SASL, no key, nick only. Zero-config so the server works out
+ *   of the box with no `env` block at all, and `freeq_whoami` says plainly that
+ *   nothing is proven and how to upgrade.
  */
 
 import { createHash, randomUUID } from "node:crypto";
