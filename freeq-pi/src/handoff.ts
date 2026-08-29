@@ -746,6 +746,194 @@ export class WorkWatchdog {
   }
 }
 
+// ── resume: picking up where a restarted session left off ─────────────────
+//
+// A restart used to load the view and ask nobody anything, so work this
+// session had accepted simply stopped. The view alone cannot answer the
+// question either: it is a cache, and a cache that says "still mine" about
+// work somebody else has since taken is worse than no answer. So we ask the
+// server, which is the authority on who holds what.
+
+/** One row of `GET /api/v1/actions`, reduced to what a resume needs. */
+export interface ServerTask {
+  id: string;
+  kind: string;
+  state: string;
+  /** Where the task lives — a channel for everything we post. */
+  venue: string;
+  offerer?: string;
+  offeree?: string;
+  assignee?: string;
+  caps?: string;
+  /** Unix seconds. */
+  deadline?: number;
+  /** epoch ms the server last saw it move. */
+  updated?: number;
+}
+
+/**
+ * Read the listing.
+ *
+ * `stored_state` is preferred over `state` where the server sends both:
+ * `state` can read `orphaned`, which is this server's opinion about a task
+ * whose home it has lost contact with, not the task's own record. Our task is
+ * still assigned to us; a federation link being down does not un-assign it.
+ */
+export function parseServerTasks(body: unknown): ServerTask[] {
+  const rows = (body as { tasks?: unknown })?.tasks;
+  if (!Array.isArray(rows)) return [];
+  const out: ServerTask[] = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    const o = row as Record<string, unknown>;
+    const id = typeof o.act_id === "string" ? o.act_id : undefined;
+    const state = str(o.stored_state) ?? str(o.state);
+    if (!id || !state) continue;
+    out.push({
+      id,
+      kind: str(o.kind) ?? HANDOFF_KIND,
+      state,
+      venue: str(o.venue) ?? "",
+      offerer: str(o.offerer),
+      offeree: str(o.offeree),
+      assignee: str(o.assignee),
+      caps: str(o.caps),
+      deadline: typeof o.deadline === "number" ? o.deadline : undefined,
+      updated: epochMs(o.updated),
+    });
+  }
+  return out;
+}
+
+function str(v: unknown): string | undefined {
+  return typeof v === "string" && v ? v : undefined;
+}
+
+/** Timestamps arrive in seconds; everything in this package is in ms. */
+function epochMs(v: unknown): number | undefined {
+  if (typeof v !== "number" || !Number.isFinite(v)) return undefined;
+  return v < 1e12 ? v * 1000 : v;
+}
+
+/**
+ * Ask the server what it still holds for us.
+ *
+ * A failure here is an outage, not an answer: it returns nothing and says
+ * why, so the caller reports a resume it could not do rather than concluding
+ * there was nothing to resume.
+ */
+export async function fetchAssignedTasks(opts: {
+  origin: string;
+  did: string;
+  state?: string;
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+}): Promise<{ ok: true; tasks: ServerTask[] } | { ok: false; reason: string }> {
+  const url =
+    `${opts.origin.replace(/\/$/, "")}/api/v1/actions` +
+    `?assignee=${encodeURIComponent(opts.did)}&state=${encodeURIComponent(opts.state ?? "assigned")}`;
+  try {
+    const res = await (opts.fetchImpl ?? fetch)(url, {
+      signal: AbortSignal.timeout(opts.timeoutMs ?? 8000),
+    });
+    if (!res.ok) return { ok: false, reason: `the task listing returned ${res.status}` };
+    return { ok: true, tasks: parseServerTasks(await res.json()) };
+  } catch (err) {
+    return { ok: false, reason: (err as Error).message };
+  }
+}
+
+export interface ResumePlan {
+  /** Tasks to re-enter, oldest first. */
+  resume: HandoffRecord[];
+  /** Still assigned to us, but not started by this pass. */
+  skipped: number;
+  /** Local records claiming to be ours that the server does not list. */
+  stale: HandoffRecord[];
+}
+
+export interface ResumeOptions {
+  /** The server's answer, already filtered to `assignee=us&state=assigned`. */
+  serverTasks: ServerTask[];
+  /** What the local view holds. */
+  known: HandoffRecord[];
+  me: string;
+  max: number;
+  /** Tasks this session has already re-entered — resume must be idempotent. */
+  already: ReadonlySet<string>;
+}
+
+/**
+ * Decide what a resume re-enters.
+ *
+ * The server's list is the input, not the view's: a local record it does not
+ * name is stale by definition. Stale records are reported rather than
+ * rewritten — a task in a venue this reader cannot see is absent from the
+ * listing for a reason that has nothing to do with who holds it, and
+ * silently retiring somebody's work over an authorization gap is exactly the
+ * kind of confident wrongness the whole three-way verification rule exists to
+ * avoid.
+ */
+export function planResume(opts: ResumeOptions): ResumePlan {
+  const byId = new Map(opts.known.map((r) => [r.id, r]));
+  const mine = opts.serverTasks.filter(
+    (t) => t.kind === HANDOFF_KIND && t.state === "assigned" && t.assignee === opts.me,
+  );
+
+  const candidates: HandoffRecord[] = [];
+  let unusable = 0;
+  for (const t of mine) {
+    if (opts.already.has(t.id)) continue;
+    const known = byId.get(t.id);
+    if (known) {
+      candidates.push(known);
+      continue;
+    }
+    // Nothing local — a lost view, or work accepted from another machine. The
+    // row is enough to re-enter the work, as long as it names a venue we can
+    // post the lifecycle back into.
+    if (!t.venue.startsWith("#")) {
+      unusable++;
+      continue;
+    }
+    candidates.push(recordFromServer(t, opts.me));
+  }
+
+  candidates.sort((a, b) => a.createdAt - b.createdAt);
+  const resume = candidates.slice(0, Math.max(0, opts.max));
+
+  const listed = new Set(mine.map((t) => t.id));
+  const stale = opts.known.filter(
+    (r) => r.state === "assigned" && r.assignee === opts.me && !listed.has(r.id),
+  );
+
+  return { resume, skipped: candidates.length - resume.length + unusable, stale };
+}
+
+/** A view record built from a server row, for work we have no local memory of. */
+function recordFromServer(t: ServerTask, me: string): HandoffRecord {
+  const at = t.updated ?? Date.now();
+  return {
+    id: t.id,
+    kind: t.kind,
+    state: t.state,
+    offerer: t.offerer ?? "",
+    offeree: t.offeree,
+    assignee: t.assignee ?? me,
+    // The listing carries no title — it was never a signed field the server
+    // keeps for us — so say that plainly rather than inventing one.
+    title: "(title not in the server's listing)",
+    caps: t.caps,
+    deadline: t.deadline,
+    channel: t.venue,
+    fromReplay: false,
+    signed: true,
+    createdAt: at,
+    updatedAt: at,
+    log: [],
+  };
+}
+
 // ── referring to a task by the short id the notifications print ────────────
 
 export type TaskRef =

@@ -13,6 +13,10 @@ import {
   formatDuration,
   resolveTaskRef,
   WorkWatchdog,
+  planResume,
+  parseServerTasks,
+  fetchAssignedTasks,
+  type ServerTask,
   type ActEventLike,
   type HandoffRecord,
   type OfferPolicy,
@@ -770,5 +774,176 @@ describe("the watchdog on accepted work", () => {
 
   it("has nothing to say on a shutdown with no work in flight", () => {
     expect(dog().shutdown(1000)).toEqual([]);
+  });
+});
+
+describe("resume — the server says what is still ours", () => {
+  function known(over: Partial<HandoffRecord> = {}): HandoffRecord {
+    return {
+      id: "01AAAAAAAA0000000000000000",
+      kind: "handoff",
+      state: "assigned",
+      offerer: ALICE,
+      offeree: BOB,
+      assignee: BOB,
+      title: "Port the auth change",
+      channel: "#work",
+      fromReplay: false,
+      signed: true,
+      createdAt: 1000,
+      updatedAt: 1000,
+      log: [],
+      ...over,
+    };
+  }
+  function row(over: Partial<ServerTask> = {}): ServerTask {
+    return {
+      id: "01AAAAAAAA0000000000000000",
+      kind: "handoff",
+      state: "assigned",
+      venue: "#work",
+      offerer: ALICE,
+      offeree: BOB,
+      assignee: BOB,
+      ...over,
+    };
+  }
+  const plan = (over: Partial<Parameters<typeof planResume>[0]>) =>
+    planResume({ serverTasks: [], known: [], me: BOB, max: 3, already: new Set(), ...over });
+
+  it("re-enters work the server still lists as assigned to us", () => {
+    const out = plan({ serverTasks: [row()], known: [known()] });
+    expect(out.resume.map((r) => r.id)).toEqual(["01AAAAAAAA0000000000000000"]);
+    expect(out.skipped).toBe(0);
+    expect(out.stale).toEqual([]);
+  });
+
+  it("does NOT re-enter a local record the server no longer lists as ours", () => {
+    // The view is a cache. Work somebody else has since taken must not be
+    // restarted here just because our copy still says it is ours.
+    const out = plan({ serverTasks: [], known: [known()] });
+    expect(out.resume).toEqual([]);
+    expect(out.stale.map((r) => r.id)).toEqual(["01AAAAAAAA0000000000000000"]);
+  });
+
+  it("ignores rows assigned to somebody else, or in another state", () => {
+    const out = plan({
+      serverTasks: [
+        row({ id: "01OTHERS000000000000000000", assignee: MALLORY }),
+        row({ id: "01OPEN00000000000000000000", state: "open", assignee: undefined }),
+        row({ id: "01DONE00000000000000000000", state: "completed" }),
+        row({ id: "01BOUNTY000000000000000000", kind: "bounty" }),
+      ],
+    });
+    expect(out.resume).toEqual([]);
+  });
+
+  it("resumes work it has no local memory of, from the server row alone", () => {
+    // A lost view, or work accepted on another machine. The row names the
+    // venue, which is all the lifecycle needs to carry on.
+    const out = plan({ serverTasks: [row({ updated: 5 })] });
+    expect(out.resume).toHaveLength(1);
+    expect(out.resume[0].channel).toBe("#work");
+    expect(out.resume[0].assignee).toBe(BOB);
+    expect(out.resume[0].title).toMatch(/not in the server's listing/);
+  });
+
+  it("will not invent a venue it cannot post the lifecycle back into", () => {
+    const out = plan({ serverTasks: [row({ venue: "dm:did:key:zA,did:key:zB" })] });
+    expect(out.resume).toEqual([]);
+    expect(out.skipped).toBe(1); // counted, not silently dropped
+  });
+
+  it("caps the resume at maxResume, oldest first, and says how many are left", () => {
+    const ids = ["01C", "01A", "01B"];
+    const out = plan({
+      max: 2,
+      serverTasks: ids.map((id) => row({ id })),
+      known: ids.map((id, i) => known({ id, createdAt: [300, 100, 200][i] })),
+    });
+    expect(out.resume.map((r) => r.id)).toEqual(["01A", "01B"]);
+    expect(out.skipped).toBe(1);
+  });
+
+  it("resumes nothing at all when the cap is zero", () => {
+    const out = plan({ max: 0, serverTasks: [row()], known: [known()] });
+    expect(out.resume).toEqual([]);
+    expect(out.skipped).toBe(1);
+  });
+
+  it("is idempotent — a second call re-enters nothing", () => {
+    const serverTasks = [row()];
+    const first = plan({ serverTasks, known: [known()] });
+    expect(first.resume).toHaveLength(1);
+
+    const already = new Set(first.resume.map((r) => r.id));
+    const second = plan({ serverTasks, known: [known()], already });
+    expect(second.resume).toEqual([]);
+    expect(second.skipped).toBe(0); // already running is not "skipped"
+    expect(second.stale).toEqual([]);
+  });
+});
+
+describe("reading the server's task listing", () => {
+  it("keeps the task's own state, not this server's reading of it", () => {
+    // 'orphaned' says a federation link is down, not that the work moved.
+    const tasks = parseServerTasks({
+      tasks: [
+        {
+          act_id: "01A",
+          kind: "handoff",
+          venue: "#work",
+          state: "orphaned",
+          stored_state: "assigned",
+          assignee: BOB,
+          updated: 1700,
+        },
+      ],
+    });
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].state).toBe("assigned");
+    expect(tasks[0].updated).toBe(1_700_000); // seconds on the wire, ms here
+  });
+
+  it("drops rows it cannot make sense of instead of failing the resume", () => {
+    expect(parseServerTasks({ tasks: [null, 7, {}, { act_id: "01A" }] })).toEqual([]);
+    expect(parseServerTasks({})).toEqual([]);
+    expect(parseServerTasks("nope")).toEqual([]);
+  });
+
+  it("asks only for work assigned to us", async () => {
+    let asked = "";
+    const out = await fetchAssignedTasks({
+      origin: "https://irc.example/",
+      did: BOB,
+      fetchImpl: (async (url: string) => {
+        asked = url;
+        return { ok: true, json: async () => ({ tasks: [] }) };
+      }) as unknown as typeof fetch,
+    });
+    expect(out.ok).toBe(true);
+    expect(asked).toBe(
+      `https://irc.example/api/v1/actions?assignee=${encodeURIComponent(BOB)}&state=assigned`,
+    );
+  });
+
+  it("reports an outage as an outage, not as an empty answer", async () => {
+    const down = await fetchAssignedTasks({
+      origin: "https://irc.example",
+      did: BOB,
+      fetchImpl: (async () => {
+        throw new Error("connect ECONNREFUSED");
+      }) as unknown as typeof fetch,
+    });
+    expect(down.ok).toBe(false);
+    if (!down.ok) expect(down.reason).toMatch(/ECONNREFUSED/);
+
+    const rejected = await fetchAssignedTasks({
+      origin: "https://irc.example",
+      did: BOB,
+      fetchImpl: (async () => ({ ok: false, status: 503 })) as unknown as typeof fetch,
+    });
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) expect(rejected.reason).toMatch(/503/);
   });
 });
