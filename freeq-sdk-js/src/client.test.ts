@@ -1848,6 +1848,89 @@ describe('inbound: actEvent', () => {
   });
 });
 
+describe('inbound: actEvent in a DM', () => {
+  // A DM task event as the server relays it: addressed to the recipient's
+  // nick, sender named by the account tag the recipient learns them by.
+  const INCOMING =
+    '@account=did:plc:eliza;+freeq.at/eventid=01DMOFFER;+freeq.at/act=handoff;' +
+    '+freeq.at/act-verb=offer;+freeq.at/act-title=Cite\\s3\\ssources;' +
+    '+freeq.at/from=did:plc:eliza;+freeq.at/sig=ed25519:kid:sig :eliza TAGMSG alice';
+
+  it('files an incoming DM event under the thread key, not the wire target', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: ActEventPayload[] = [];
+    const bufs: string[] = [];
+    client.on('actEvent', (e) => seen.push(e));
+    client.on('message', (buf) => bufs.push(buf));
+    ws.recv(INCOMING);
+    ws.recv(
+      '@account=did:plc:eliza;msgid=01DMLINE;+freeq.at/ref=01DMOFFER ' +
+        ':eliza PRIVMSG alice :offered: Cite 3 sources',
+    );
+    await flushAsync();
+    // The event and the line it pairs with have to name one buffer, or the
+    // card has nothing to render against.
+    expect(seen.map((e) => e.channel)).toEqual(['did:plc:eliza']);
+    expect(bufs).toEqual(['did:plc:eliza']);
+  });
+
+  it("files our own echo under the same key as the peer's events", async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: ActEventPayload[] = [];
+    client.on('actEvent', (e) => seen.push(e));
+    ws.recv(INCOMING);
+    // Our own echo, addressed by the peer's DID the way the SDK sends it.
+    ws.recv(
+      '@+freeq.at/eventid=01DMCLAIM;+freeq.at/act=handoff;+freeq.at/act-verb=claim;' +
+        '+freeq.at/act-id=01DMOFFER;+freeq.at/from=did:plc:alice ' +
+        ':alice TAGMSG did:plc:eliza',
+    );
+    await flushAsync();
+    expect(seen.map((e) => e.channel)).toEqual(['did:plc:eliza', 'did:plc:eliza']);
+  });
+
+  it('flushes a DM event held in a history batch under the thread key', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: ActEventPayload[] = [];
+    const batches: string[] = [];
+    client.on('actEvent', (e) => seen.push(e));
+    client.on('historyBatch', (buf) => batches.push(buf));
+    ws.recv(':server BATCH +h chathistory did:plc:eliza');
+    ws.recv(
+      '@batch=h;time=2026-08-22T10:00:00.000Z;account=did:plc:eliza;' +
+        '+freeq.at/eventid=01DMREPLAY;+freeq.at/act=handoff;+freeq.at/act-verb=offer;' +
+        '+freeq.at/act-title=x;+freeq.at/from=did:plc:eliza :eliza TAGMSG alice',
+    );
+    ws.recv(
+      '@batch=h;time=2026-08-22T10:00:01.000Z;account=did:plc:eliza;msgid=01DMLINE;' +
+        '+freeq.at/ref=01DMREPLAY :eliza PRIVMSG alice :offered: x',
+    );
+    ws.recv(':server BATCH -h');
+    for (let i = 0; i < 4; i++) await flushAsync();
+    expect(batches).toEqual(['did:plc:eliza']);
+    expect(seen.map((e) => e.channel)).toEqual(['did:plc:eliza']);
+  });
+
+  it('leaves a channel event under the channel name, live and batched', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: ActEventPayload[] = [];
+    client.on('actEvent', (e) => seen.push(e));
+    ws.recv(
+      '@+freeq.at/eventid=01LIVE;+freeq.at/act=handoff;+freeq.at/act-verb=offer;' +
+        '+freeq.at/act-title=x;+freeq.at/from=did:plc:eliza :eliza TAGMSG #foo',
+    );
+    ws.recv(':server BATCH +h chathistory #foo');
+    ws.recv(
+      '@batch=h;time=2026-08-22T10:00:00.000Z;+freeq.at/eventid=01HELD;' +
+        '+freeq.at/act=handoff;+freeq.at/act-verb=claim;+freeq.at/act-id=01LIVE;' +
+        '+freeq.at/from=did:plc:scholar :scholar TAGMSG #foo',
+    );
+    ws.recv(':server BATCH -h');
+    for (let i = 0; i < 4; i++) await flushAsync();
+    expect(seen.map((e) => e.channel)).toEqual(['#foo', '#foo']);
+  });
+});
+
 describe('inbound: presence', () => {
   it("parses '<state>: <status>' AWAY text", async () => {
     const { client, ws } = await makeRegistered();

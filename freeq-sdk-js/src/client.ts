@@ -1289,7 +1289,7 @@ export class FreeqClient extends EventEmitter {
    * `act-events-replay-twice-to-a-joiner`, and dropping the second sighting
    * here is where it closes.
    */
-  private emitActEvent(channel: string, from: string, tags: Record<string, string>): void {
+  private emitActEvent(buffer: string, from: string, tags: Record<string, string>): void {
     const fields: Record<string, string> = {};
     for (const [name, value] of Object.entries(tags)) {
       if (signing.isActTag(name)) fields[signing.strippedTagName(name)] = value;
@@ -1315,7 +1315,7 @@ export class FreeqClient extends EventEmitter {
     // An opener carries no `act-id`: its own event id is the task's, for the
     // rest of the task's life. Every later move names that id.
     this.emit('actEvent', {
-      channel,
+      channel: buffer,
       from,
       did: tags['+freeq.at/from'] || tags['account'] || undefined,
       kind: fields['act'] || '',
@@ -2418,9 +2418,14 @@ export class FreeqClient extends EventEmitter {
           actBatch.type !== 'draft/multiline' &&
           Object.keys(msg.tags).some((n) => signing.isActTag(n))
         ) {
-          (actBatch.actEvents ??= []).push({ target, from, tags: msg.tags });
+          // The thread key, not the wire target: a DM's act event is
+          // addressed to whoever receives it, and only the key every other
+          // TAGMSG feature files under puts the event in the same thread as
+          // the line that renders it. Resolved here because the flush below
+          // no longer has the sender in hand.
+          (actBatch.actEvents ??= []).push({ buffer: bufName, from, tags: msg.tags });
         } else {
-          this.emitActEvent(target, from, msg.tags);
+          this.emitActEvent(bufName, from, msg.tags);
         }
 
         const avState = msg.tags['+freeq.at/av-state'];
@@ -2667,7 +2672,7 @@ export class FreeqClient extends EventEmitter {
             // Held task events ride out with the batch, in wire order,
             // after the lines they refer to.
             for (const held of batch.actEvents ?? []) {
-              this.emitActEvent(held.target, held.from, held.tags);
+              this.emitActEvent(held.buffer, held.from, held.tags);
             }
           }
         }

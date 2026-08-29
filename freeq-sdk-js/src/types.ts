@@ -201,9 +201,12 @@ export interface Batch {
   parentBatchId?: string;
   /**
    * Act TAGMSGs read inside this batch, in wire order, held so `actEvent`
-   * fires after the batch's companion lines are delivered.
+   * fires after the batch's companion lines are delivered. `buffer` is the
+   * thread key the handler resolved when it read the line — a channel name,
+   * or a DM's canonical peer key — because at flush time the line's own
+   * sender and target are no longer in hand.
    */
-  actEvents?: Array<{ target: string; from: string; tags: Record<string, string> }>;
+  actEvents?: Array<{ buffer: string; from: string; tags: Record<string, string> }>;
 }
 
 // ── Agent-native types ─────────────────────────────────────────────────────
@@ -276,7 +279,9 @@ export interface CoordinationEventPayload {
 
 /** Payload of the `actEvent` event — parsed `act-` tagged TAGMSG. */
 export interface ActEventPayload {
-  /** Channel (or DM target) the event was sent to. */
+  /** The thread the event belongs to: a channel name, or — for a DM — the
+   *  canonical peer key every other TAGMSG feature files under, never the
+   *  wire target (which for an incoming DM names the recipient). */
   channel: string;
   /** Sender's nick. */
   from: string;
