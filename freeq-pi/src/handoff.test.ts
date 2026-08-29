@@ -12,6 +12,7 @@ import {
   offerExpiry,
   formatDuration,
   resolveTaskRef,
+  WorkWatchdog,
   type ActEventLike,
   type HandoffRecord,
   type OfferPolicy,
@@ -667,5 +668,107 @@ describe("formatDuration", () => {
     expect(formatDuration(3600)).toBe("1h");
     expect(formatDuration(5400)).toBe("1.5h");
     expect(formatDuration(86_400)).toBe("1d");
+  });
+});
+
+describe("the watchdog on accepted work", () => {
+  const task = { taskId: "01WORK00000000000000000000", channel: "#work", title: "Port it" };
+  const dog = () => new WorkWatchdog({ progressIntervalSecs: 120, stallSecs: 900 });
+
+  it("says nothing while the work is fresh", () => {
+    const w = dog();
+    w.start(task, 0);
+    expect(w.tick(1000)).toEqual([]);
+  });
+
+  it("heartbeats while in flight, at the configured interval", () => {
+    const w = dog();
+    w.start(task, 0);
+    expect(w.tick(119_000)).toEqual([]);
+    const beat = w.tick(120_000);
+    expect(beat).toHaveLength(1);
+    expect(beat[0].kind).toBe("progress");
+    // The next beat is an interval later, not on every tick after the first.
+    expect(w.tick(121_000)).toEqual([]);
+    expect(w.tick(240_000)).toHaveLength(1);
+  });
+
+  it("stops heartbeating once the task is finished", () => {
+    const w = dog();
+    w.start(task, 0);
+    expect(w.tick(120_000)).toHaveLength(1);
+    expect(w.finish(task.taskId)).toBe(true);
+    expect(w.tick(240_000)).toEqual([]);
+    expect(w.tick(10_000_000)).toEqual([]); // and never fails afterwards either
+    expect(w.inFlight()).toEqual([]);
+  });
+
+  it("fails a stalled task exactly once, with a reason naming the stall", () => {
+    const w = dog();
+    w.start(task, 0);
+    const out = w.tick(900_000);
+    expect(out).toHaveLength(1);
+    expect(out[0].kind).toBe("fail");
+    if (out[0].kind === "fail") {
+      expect(out[0].reason).toBe("no progress for 15m — the session stopped working on it");
+      expect(out[0].task.taskId).toBe(task.taskId);
+    }
+    // Never twice: the task is gone the moment it fails.
+    expect(w.tick(900_001)).toEqual([]);
+    expect(w.tick(1_800_000)).toEqual([]);
+    expect(w.has(task.taskId)).toBe(false);
+  });
+
+  it("counts model activity as progress, not the heartbeats it emits", () => {
+    // Otherwise the heartbeat keeps its own task alive forever and the stall
+    // timeout never fires — the exact hang this is here to end.
+    const w = dog();
+    const fails = (out: ReturnType<WorkWatchdog["tick"]>) => out.filter((a) => a.kind === "fail");
+    w.start(task, 0);
+    w.tick(120_000);
+    w.tick(240_000);
+    expect(fails(w.tick(899_000))).toEqual([]);
+    w.touch(899_500); // the model did something
+    expect(fails(w.tick(900_000))).toEqual([]); // so the stall clock restarted
+    expect(fails(w.tick(1_799_499))).toEqual([]);
+    expect(fails(w.tick(1_799_500))).toHaveLength(1); // and now it has run out again
+  });
+
+  it("watches several tasks independently", () => {
+    const w = dog();
+    const other = { taskId: "01OTHER0000000000000000000", channel: "#work", title: "And this" };
+    w.start(task, 0);
+    w.start(other, 500_000);
+    const out = w.tick(900_000);
+    expect(out.filter((a) => a.kind === "fail").map((a) => a.task.taskId)).toEqual([task.taskId]);
+    expect(w.inFlight().map((t) => t.taskId)).toEqual([other.taskId]);
+  });
+
+  it("starting the same task twice does not double up on it", () => {
+    const w = dog();
+    w.start(task, 0);
+    w.start(task, 500_000); // e.g. resume racing a live accept
+    expect(w.inFlight()).toHaveLength(1);
+    expect(w.inFlight()[0].startedAt).toBe(0);
+    // The second start marked it alive, so the stall clock runs from there.
+    expect(w.tick(900_000).filter((a) => a.kind === "fail")).toEqual([]);
+    expect(w.tick(1_400_000).filter((a) => a.kind === "fail")).toHaveLength(1);
+  });
+
+  it("notes a shutdown rather than failing the work", () => {
+    // A restart may pick this straight back up; a false failure in a signed,
+    // permanent log is worse than a gap in it.
+    const w = dog();
+    w.start(task, 0);
+    const out = w.shutdown(60_000);
+    expect(out).toHaveLength(1);
+    expect(out[0].kind).toBe("progress");
+    if (out[0].kind === "progress") expect(out[0].note).toMatch(/shutting down/);
+    expect(w.inFlight()).toEqual([]);
+    expect(w.tick(10_000_000)).toEqual([]);
+  });
+
+  it("has nothing to say on a shutdown with no work in flight", () => {
+    expect(dog().shutdown(1000)).toEqual([]);
   });
 });

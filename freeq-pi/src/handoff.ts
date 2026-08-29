@@ -610,6 +610,142 @@ export function formatAge(ms: number): string {
   return `${formatDuration(ms / 1000)} ago`;
 }
 
+// ── a watchdog on work we accepted ────────────────────────────────────────
+//
+// Accepting used to be the last thing that happened: a presence label, a
+// prompt, and then nothing tracked the work at all. A model that wanders off
+// leaves the task `assigned` until the server's expiry sweep notices, days
+// later, and the offerer has no way to tell a busy agent from a dead one.
+//
+// Two clocks fix that. A heartbeat says the work is alive; a stall timeout
+// says honestly that it is not. `progress` is additive in the transition
+// table, so the heartbeat costs the task nothing.
+
+/** A task this session is working on right now. */
+export interface WatchedTask {
+  taskId: string;
+  channel: string;
+  title: string;
+  startedAt: number;
+  /** Last sign of life from the model — a turn starting, a tool running. */
+  lastProgressAt: number;
+  /** Last heartbeat we emitted, so beats are spaced rather than repeated. */
+  lastBeatAt: number;
+}
+
+/** Something the watchdog wants said on the wire. The caller emits it. */
+export type WatchdogAction =
+  | { kind: "progress"; task: WatchedTask; note: string }
+  | { kind: "fail"; task: WatchedTask; reason: string };
+
+/**
+ * The clocks on in-flight work.
+ *
+ * Deliberately has no timer of its own: the caller ticks it. That keeps the
+ * decision — beat, fail, or nothing — testable at any point in time without
+ * waiting fifteen real minutes for a stall, and it means teardown is a single
+ * `clearInterval` in one place rather than two timers per task to chase.
+ */
+export class WorkWatchdog {
+  #tasks = new Map<string, WatchedTask>();
+  #progressIntervalMs: number;
+  #stallMs: number;
+
+  constructor(opts: { progressIntervalSecs: number; stallSecs: number }) {
+    this.#progressIntervalMs = opts.progressIntervalSecs * 1000;
+    this.#stallMs = opts.stallSecs * 1000;
+  }
+
+  /** Begin watching. Starting a task we already watch only marks it alive. */
+  start(task: { taskId: string; channel: string; title: string }, now = Date.now()): void {
+    const existing = this.#tasks.get(task.taskId);
+    if (existing) {
+      existing.lastProgressAt = now;
+      return;
+    }
+    this.#tasks.set(task.taskId, {
+      taskId: task.taskId,
+      channel: task.channel,
+      title: task.title,
+      startedAt: now,
+      lastProgressAt: now,
+      lastBeatAt: now,
+    });
+  }
+
+  /** The model did something. Named `touch` because it only moves a clock. */
+  touch(now = Date.now(), taskId?: string): void {
+    for (const t of this.#tasks.values()) {
+      if (taskId && t.taskId !== taskId) continue;
+      t.lastProgressAt = now;
+    }
+  }
+
+  /** Stop watching — the task completed, failed, or is no longer ours. */
+  finish(taskId: string): boolean {
+    return this.#tasks.delete(taskId);
+  }
+
+  has(taskId: string): boolean {
+    return this.#tasks.has(taskId);
+  }
+
+  inFlight(): WatchedTask[] {
+    return [...this.#tasks.values()];
+  }
+
+  /**
+   * Advance the clocks.
+   *
+   * A stalled task is dropped as it fails, so the failure can only ever be
+   * emitted once however often this is called afterwards.
+   */
+  tick(now = Date.now()): WatchdogAction[] {
+    const out: WatchdogAction[] = [];
+    for (const task of [...this.#tasks.values()]) {
+      if (now - task.lastProgressAt >= this.#stallMs) {
+        this.#tasks.delete(task.taskId);
+        out.push({
+          kind: "fail",
+          task,
+          reason:
+            `no progress for ${formatDuration(this.#stallMs / 1000)} — ` +
+            `the session stopped working on it`,
+        });
+        continue;
+      }
+      if (now - task.lastBeatAt >= this.#progressIntervalMs) {
+        task.lastBeatAt = now;
+        out.push({
+          kind: "progress",
+          task,
+          note: `still on it — ${formatDuration((now - task.startedAt) / 1000)} so far`,
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * The session is going down.
+   *
+   * Every in-flight task gets a note saying so, and none of them fails: a
+   * restart may pick the work straight back up, and a false failure in a
+   * signed, permanent log is worse than a gap in it.
+   */
+  shutdown(now = Date.now()): WatchdogAction[] {
+    const out: WatchdogAction[] = this.inFlight().map((task) => ({
+      kind: "progress" as const,
+      task,
+      note:
+        `the pi session working on this is shutting down after ` +
+        `${formatDuration((now - task.startedAt) / 1000)} — not finished`,
+    }));
+    this.#tasks.clear();
+    return out;
+  }
+}
+
 // ── referring to a task by the short id the notifications print ────────────
 
 export type TaskRef =
