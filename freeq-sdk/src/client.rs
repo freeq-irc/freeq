@@ -7115,9 +7115,7 @@ mod did_maps_tests {
     ///
     /// Returns the handle to send with, the socket end the "server" writes to
     /// and reads from, and the caps the session negotiated.
-    async fn answering_session(
-        caps: &str,
-    ) -> (ClientHandle, tokio::io::DuplexStream) {
+    async fn answering_session(caps: &str) -> (ClientHandle, tokio::io::DuplexStream) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
         let (client_side, mut server_side) = tokio::io::duplex(8192);
@@ -7221,8 +7219,11 @@ mod did_maps_tests {
         use tokio::io::AsyncWriteExt;
 
         let (handle, mut server) = answering_session(ACT_CAPS).await;
-        let sending =
-            tokio::spawn(async move { handle.send_act("#room", probe_act_tags(), Some("halfway")).await });
+        let sending = tokio::spawn(async move {
+            handle
+                .send_act("#room", probe_act_tags(), Some("halfway"))
+                .await
+        });
 
         let first = wire_since(&mut server, 400).await;
         assert!(
@@ -7236,7 +7237,11 @@ mod did_maps_tests {
 
         // The server accepts it: our own echo of the event comes back.
         let event = crate::irc::Message::parse(first.lines().next().unwrap()).expect("parses");
-        let event_id = event.tags.get(crate::chatsig::EVENT_ID_TAG).unwrap().clone();
+        let event_id = event
+            .tags
+            .get(crate::chatsig::EVENT_ID_TAG)
+            .unwrap()
+            .clone();
         server
             .write_all(
                 format!(
@@ -7263,10 +7268,16 @@ mod did_maps_tests {
         use tokio::io::AsyncWriteExt;
 
         let (handle, mut server) = answering_session(ACT_CAPS).await;
-        let sending =
-            tokio::spawn(async move { handle.send_act("#room", probe_act_tags(), Some("halfway")).await });
+        let sending = tokio::spawn(async move {
+            handle
+                .send_act("#room", probe_act_tags(), Some("halfway"))
+                .await
+        });
         let first = wire_since(&mut server, 200).await;
-        assert!(first.contains("TAGMSG") && !first.contains("PRIVMSG"), "{first:?}");
+        assert!(
+            first.contains("TAGMSG") && !first.contains("PRIVMSG"),
+            "{first:?}"
+        );
 
         server
             .write_all(
@@ -7305,15 +7316,26 @@ mod did_maps_tests {
 
         let (handle, mut server) = answering_session(ACT_CAPS).await;
         let first_handle = handle.clone();
-        let first =
-            tokio::spawn(async move { first_handle.send_act("#room", probe_act_tags(), Some("first")).await });
+        let first = tokio::spawn(async move {
+            first_handle
+                .send_act("#room", probe_act_tags(), Some("first"))
+                .await
+        });
         let opened = wire_since(&mut server, 200).await;
-        let first_event = crate::irc::Message::parse(opened.lines().next().unwrap()).expect("parses");
-        let first_id = first_event.tags.get(crate::chatsig::EVENT_ID_TAG).unwrap().clone();
+        let first_event =
+            crate::irc::Message::parse(opened.lines().next().unwrap()).expect("parses");
+        let first_id = first_event
+            .tags
+            .get(crate::chatsig::EVENT_ID_TAG)
+            .unwrap()
+            .clone();
 
         // The second is issued while the first still awaits its answer.
-        let second =
-            tokio::spawn(async move { handle.send_act("#room", probe_act_tags(), Some("second")).await });
+        let second = tokio::spawn(async move {
+            handle
+                .send_act("#room", probe_act_tags(), Some("second"))
+                .await
+        });
         let while_waiting = wire_since(&mut server, 250).await;
         assert!(
             while_waiting.is_empty(),
@@ -7353,7 +7375,11 @@ mod did_maps_tests {
                 .expect("the second event"),
         )
         .expect("parses");
-        let second_id = second_event.tags.get(crate::chatsig::EVENT_ID_TAG).unwrap().clone();
+        let second_id = second_event
+            .tags
+            .get(crate::chatsig::EVENT_ID_TAG)
+            .unwrap()
+            .clone();
         assert_ne!(second_id, first_id, "a send of its own: {released:?}");
 
         server
@@ -7379,10 +7405,16 @@ mod did_maps_tests {
     #[tokio::test(start_paused = true)]
     async fn an_unanswered_event_writes_its_line_anyway() {
         let (handle, mut server) = answering_session(ACT_CAPS).await;
-        let sending =
-            tokio::spawn(async move { handle.send_act("#room", probe_act_tags(), Some("halfway")).await });
+        let sending = tokio::spawn(async move {
+            handle
+                .send_act("#room", probe_act_tags(), Some("halfway"))
+                .await
+        });
         let first = wire_since(&mut server, 200).await;
-        assert!(first.contains("TAGMSG") && !first.contains("PRIVMSG"), "{first:?}");
+        assert!(
+            first.contains("TAGMSG") && !first.contains("PRIVMSG"),
+            "{first:?}"
+        );
 
         tokio::time::advance(ACT_ANSWER_WINDOW + std::time::Duration::from_secs(1)).await;
 
@@ -7391,7 +7423,10 @@ mod did_maps_tests {
             after.contains("PRIVMSG") && after.contains("halfway"),
             "the line goes out once the window has passed: {after:?}"
         );
-        sending.await.unwrap().expect("and the caller is not told of a failure");
+        sending
+            .await
+            .unwrap()
+            .expect("and the caller is not told of a failure");
     }
 
     /// Without `echo-message` there is no answer to wait for, so both halves
@@ -7400,8 +7435,11 @@ mod did_maps_tests {
     async fn without_the_echo_capability_both_halves_go_out_at_once() {
         let (handle, mut server) =
             answering_session("message-tags server-time freeq.at/act freeq.at/msgsig").await;
-        let sending =
-            tokio::spawn(async move { handle.send_act("#room", probe_act_tags(), Some("halfway")).await });
+        let sending = tokio::spawn(async move {
+            handle
+                .send_act("#room", probe_act_tags(), Some("halfway"))
+                .await
+        });
 
         let wire = wire_since(&mut server, 300).await;
         assert!(wire.contains("TAGMSG"), "{wire:?}");
@@ -7428,7 +7466,10 @@ mod did_maps_tests {
 
         let wire = wire_since(&mut server, 200).await;
         assert!(wire.contains("TAGMSG"), "{wire:?}");
-        assert!(!wire.contains("PRIVMSG"), "with no line beside it: {wire:?}");
+        assert!(
+            !wire.contains("PRIVMSG"),
+            "with no line beside it: {wire:?}"
+        );
     }
 
     /// A kind and a verb this SDK has never heard of go out signed. Nothing in

@@ -1148,7 +1148,10 @@ async fn history_carries_a_direct_conversation_s_task_events() {
         wire.push(format!("{EVENT_ID_TAG}={id}"));
         wire.push(format!("+freeq.at/sig={sig}"));
         a.tx(&format!("@{} TAGMSG {DID_BOB}", wire.join(";")));
-        b.rx(|l| l.contains("+freeq.at/act="), "the task reaches bob live");
+        b.rx(
+            |l| l.contains("+freeq.at/act="),
+            "the task reaches bob live",
+        );
         // A message too, so the batch has one of each to interleave.
         a.tx(&format!("PRIVMSG {DID_BOB} :a line about it"));
         b.rx(|l| l.contains("a line about it"), "and so does the line");
