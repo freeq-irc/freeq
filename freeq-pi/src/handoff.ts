@@ -34,6 +34,7 @@ import {
   refusalDescription,
   type Task,
 } from "@freeq/bot-kit";
+import { tierAtLeast, type Tier } from "./config.js";
 
 /**
  * The verb a home server uses to acknowledge an event it filed. bot-kit does
@@ -369,4 +370,275 @@ export function describeHandoff(r: HandoffRecord, selfDid?: string): string {
 function short(did: string | undefined): string | undefined {
   if (!did) return undefined;
   return did.length > 22 ? `${did.slice(0, 18)}…` : did;
+}
+
+// ── intake: what a session does about an offer addressed to it ─────────────
+//
+// The old answer was a blocking modal, and a modal is exactly what loses
+// work: nobody at the terminal, or a restart while it is open, and the offer
+// is gone — the task sits `offered` forever and nothing ever revisits it.
+// Replay does not help, because the event did arrive; we dropped it.
+//
+// So an offer either starts now or goes in a queue that outlives the session.
+
+export type OfferAction =
+  /** Not even worth telling the user about — an untrusted DID. */
+  | "ignore"
+  /** Accept it now. */
+  | "accept"
+  /** Hold it until this session is free, or until it expires. */
+  | "queue";
+
+export interface OfferDecision {
+  action: OfferAction;
+  /** One sentence naming why, for the notification and the tests. */
+  reason: string;
+}
+
+export interface OfferPolicy {
+  /** The offerer's authority tier. */
+  tier: Tier;
+  /** Is this session free right now? */
+  idle: boolean;
+  /** The offerer is on `cfg.autoAccept` — an explicit per-DID override. */
+  autoAcceptDid: boolean;
+  /** `cfg.autoAcceptWhenIdle`. */
+  autoAcceptWhenIdle: boolean;
+}
+
+/**
+ * Decide what to do with an offer addressed to us.
+ *
+ * The trust gate comes first and is absolute: an unknown DID must not be able
+ * to raise a dialog in your terminal, put anything in your queue, or cost you
+ * a notification. Everything after it is about timing, not authority.
+ */
+export function decideOffer(p: OfferPolicy): OfferDecision {
+  if (!tierAtLeast(p.tier, "handoff")) {
+    return {
+      action: "ignore",
+      reason: `offerer is tier '${p.tier}', below 'handoff' — ignored entirely`,
+    };
+  }
+  if (p.autoAcceptDid) {
+    return { action: "accept", reason: "the offerer is on your auto-accept list" };
+  }
+  if (p.autoAcceptWhenIdle && p.idle) {
+    return { action: "accept", reason: "this session is idle and the offerer is trusted" };
+  }
+  return {
+    action: "queue",
+    reason: p.idle
+      ? "auto-accept when idle is off — queued for you to decide"
+      : "this session is busy — queued rather than interrupting the turn",
+  };
+}
+
+/** An offer waiting for this session to be free. */
+export interface QueuedOffer {
+  taskId: string;
+  /** epoch ms this offer was queued. */
+  queuedAt: number;
+}
+
+/**
+ * The queue of offers we have not answered yet.
+ *
+ * Persisted beside the handoff view rather than inside it: the view's on-disk
+ * shape is a plain array that older builds already read, and a queue entry is
+ * a decision we owe, not a fact about a task. The records themselves stay in
+ * `HandoffStore` — an entry here is only an id and a clock.
+ */
+export class OfferQueue {
+  #entries: QueuedOffer[] = [];
+  #path: string;
+  #dirty = false;
+
+  constructor(path: string) {
+    this.#path = path;
+  }
+
+  static pathFor(agentDir: string): string {
+    return join(agentDir, "freeq-offer-queue.json");
+  }
+
+  async load(): Promise<void> {
+    try {
+      const raw = JSON.parse(await readFile(this.#path, "utf8")) as unknown;
+      if (Array.isArray(raw)) {
+        for (const e of raw) {
+          if (!e || typeof e !== "object") continue;
+          const o = e as Record<string, unknown>;
+          if (typeof o.taskId !== "string") continue;
+          this.#entries.push({
+            taskId: o.taskId,
+            queuedAt: typeof o.queuedAt === "number" ? o.queuedAt : Date.now(),
+          });
+        }
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        // Losing the queue costs us pending offers, which is bad — but not as
+        // bad as refusing to start the session over a corrupt cache file.
+        this.#entries = [];
+      }
+    }
+  }
+
+  async save(): Promise<void> {
+    if (!this.#dirty) return;
+    this.#dirty = false;
+    await mkdir(dirname(this.#path), { recursive: true });
+    await writeFile(this.#path, `${JSON.stringify(this.#entries, null, 2)}\n`, { mode: 0o600 });
+  }
+
+  /** Oldest first — the order the queue is drained in. */
+  all(): QueuedOffer[] {
+    return [...this.#entries].sort((a, b) => a.queuedAt - b.queuedAt);
+  }
+
+  has(taskId: string): boolean {
+    return this.#entries.some((e) => e.taskId === taskId);
+  }
+
+  /** Queue an offer. Queuing one twice is a no-op, not a second entry. */
+  add(taskId: string, at = Date.now()): void {
+    if (this.has(taskId)) return;
+    this.#entries.push({ taskId, queuedAt: at });
+    this.#dirty = true;
+  }
+
+  remove(taskId: string): void {
+    const before = this.#entries.length;
+    this.#entries = this.#entries.filter((e) => e.taskId !== taskId);
+    if (this.#entries.length !== before) this.#dirty = true;
+  }
+}
+
+/** What a pass over the queue found to do. */
+export interface QueueSweep {
+  /** The one offer to accept now. At most one: accepting makes us busy. */
+  accept?: { entry: QueuedOffer; record: HandoffRecord };
+  /** Offers to decline, each with the reason to send with the decline. */
+  expire: Array<{ entry: QueuedOffer; record: HandoffRecord; reason: string }>;
+  /** Entries to forget silently — the task moved on without us. */
+  drop: QueuedOffer[];
+}
+
+export interface SweepOptions {
+  entries: QueuedOffer[];
+  /** The current record for a queued id, if the view still has one. */
+  lookup: (taskId: string) => HandoffRecord | undefined;
+  /** Is the offerer still trusted at `handoff` or above? */
+  trusted: (offererDid: string) => boolean;
+  /** Is this session free right now? */
+  idle: boolean;
+  now: number;
+  ttlSecs: number;
+}
+
+/**
+ * One pass over the queue: expire what has waited too long, then take the
+ * oldest thing left if we are free.
+ *
+ * Expiry runs first on purpose. An offer whose deadline has already passed is
+ * not work we can honestly start, so it must not be picked up by the same
+ * sweep that would have retired it.
+ */
+export function sweepOfferQueue(opts: SweepOptions): QueueSweep {
+  const sweep: QueueSweep = { expire: [], drop: [] };
+  const live: Array<{ entry: QueuedOffer; record: HandoffRecord }> = [];
+
+  for (const entry of [...opts.entries].sort((a, b) => a.queuedAt - b.queuedAt)) {
+    const record = opts.lookup(entry.taskId);
+    // A record we no longer hold, or one that has moved on (cancelled by the
+    // offerer, expired by the server, accepted from another window) is not an
+    // open question any more. Forget it without saying anything.
+    if (!record || record.state !== "offered" || isTerminal(record.kind, record.state)) {
+      sweep.drop.push(entry);
+      continue;
+    }
+    const expiry = offerExpiry(record, entry.queuedAt, opts.ttlSecs);
+    if (opts.now >= expiry.at) {
+      sweep.expire.push({ entry, record, reason: expiry.reason });
+      continue;
+    }
+    // Trust can be revoked while an offer sits in the queue. Do not act on it,
+    // but do not decline it either — the offer was legitimate when it arrived
+    // and its TTL will retire it soon enough.
+    if (opts.trusted(record.offerer)) live.push({ entry, record });
+  }
+
+  if (opts.idle && live.length) sweep.accept = live[0];
+  return sweep;
+}
+
+/**
+ * When a queued offer stops being answerable, and what to say about it.
+ *
+ * The task's own deadline wins when it is sooner: accepting work whose
+ * deadline has passed helps nobody, and our TTL is only a floor on how long
+ * we are willing to sit on a decision.
+ */
+export function offerExpiry(
+  rec: HandoffRecord,
+  queuedAt: number,
+  ttlSecs: number,
+): { at: number; reason: string } {
+  const ttlAt = queuedAt + ttlSecs * 1000;
+  const deadlineAt = rec.deadline ? rec.deadline * 1000 : undefined;
+  if (deadlineAt !== undefined && deadlineAt < ttlAt) {
+    return { at: deadlineAt, reason: "the offer's own deadline passed before this session was free" };
+  }
+  return {
+    at: ttlAt,
+    reason: `no decision for ${formatDuration(ttlSecs)} — this session was never free to take it`,
+  };
+}
+
+/** Durations as a human says them: 45s, 15m, 2h, 1d. */
+export function formatDuration(secs: number): string {
+  const s = Math.max(0, Math.round(secs));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  if (s < 86_400) return `${Math.round(s / 360) / 10}h`.replace(".0h", "h");
+  return `${Math.round(s / 8640) / 10}d`.replace(".0d", "d");
+}
+
+/** How long ago, for listings. */
+export function formatAge(ms: number): string {
+  return `${formatDuration(ms / 1000)} ago`;
+}
+
+// ── referring to a task by the short id the notifications print ────────────
+
+export type TaskRef =
+  | { ok: true; record: HandoffRecord }
+  | { ok: false; reason: string };
+
+/**
+ * Resolve the 10-character prefix our notifications print back to one task.
+ *
+ * An ambiguous prefix is refused by name rather than guessed: picking the
+ * newest match would eventually drop, fail, or accept the wrong piece of
+ * somebody's work, and the user is one keystroke from disambiguating it.
+ */
+export function resolveTaskRef(records: HandoffRecord[], ref: string): TaskRef {
+  const needle = ref.trim();
+  if (!needle) return { ok: false, reason: "no task id given" };
+
+  const exact = records.find((r) => r.id === needle);
+  if (exact) return { ok: true, record: exact };
+
+  const lower = needle.toLowerCase();
+  const hits = records.filter((r) => r.id.toLowerCase().startsWith(lower));
+  if (!hits.length) return { ok: false, reason: `no task on record starts with '${needle}'` };
+  if (hits.length === 1) return { ok: true, record: hits[0] };
+  return {
+    ok: false,
+    reason:
+      `'${needle}' matches ${hits.length} tasks (` +
+      hits.map((r) => r.id.slice(0, 14)).join(", ") +
+      `) — give more of the id`,
+  };
 }

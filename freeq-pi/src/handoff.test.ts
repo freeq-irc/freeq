@@ -2,7 +2,20 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HandoffStore, hashBrief, describeHandoff, type ActEventLike } from "./handoff.js";
+import {
+  HandoffStore,
+  hashBrief,
+  describeHandoff,
+  decideOffer,
+  OfferQueue,
+  sweepOfferQueue,
+  offerExpiry,
+  formatDuration,
+  resolveTaskRef,
+  type ActEventLike,
+  type HandoffRecord,
+  type OfferPolicy,
+} from "./handoff.js";
 
 const ALICE = "did:key:zAlice";
 const BOB = "did:key:zBob";
@@ -391,5 +404,268 @@ describe("open (claimable) tasks", () => {
     expect(b.get(id)!.state).toBe("open");
     expect(b.get(id)!.caps).toBe("pi/lang:ts");
     expect(b.get(id)!.offeree).toBeUndefined();
+  });
+});
+
+describe("intake — an offer can never be silently dropped", () => {
+  const policy = (over: Partial<OfferPolicy> = {}): OfferPolicy => ({
+    tier: "handoff",
+    idle: true,
+    autoAcceptDid: false,
+    autoAcceptWhenIdle: true,
+    ...over,
+  });
+
+  it("accepts trusted work when the session is idle", () => {
+    const d = decideOffer(policy());
+    expect(d.action).toBe("accept");
+    expect(d.reason).toMatch(/idle/);
+  });
+
+  it("queues rather than interrupting a session that is busy", () => {
+    const d = decideOffer(policy({ idle: false }));
+    expect(d.action).toBe("queue");
+    expect(d.reason).toMatch(/busy/);
+  });
+
+  it("accepts an auto-accept DID even mid-turn — that is what the list is for", () => {
+    expect(decideOffer(policy({ idle: false, autoAcceptDid: true })).action).toBe("accept");
+  });
+
+  it("queues when the idle default is switched off", () => {
+    expect(decideOffer(policy({ autoAcceptWhenIdle: false })).action).toBe("queue");
+  });
+
+  it("ignores an untrusted offerer entirely — idle or busy, queue or no queue", () => {
+    for (const tier of ["observe", "message", "request"] as const) {
+      for (const idle of [true, false]) {
+        const d = decideOffer(policy({ tier, idle, autoAcceptWhenIdle: true }));
+        expect(d.action, `${tier} while ${idle ? "idle" : "busy"}`).toBe("ignore");
+        expect(d.reason).toContain(tier);
+      }
+    }
+  });
+
+  it("does not let the auto-accept list smuggle past the trust gate", () => {
+    // A DID can be on the list and later have its tier revoked. Tier wins.
+    expect(decideOffer(policy({ tier: "observe", autoAcceptDid: true })).action).toBe("ignore");
+  });
+});
+
+describe("the offer queue", () => {
+  function rec(over: Partial<HandoffRecord> = {}): HandoffRecord {
+    return {
+      id: "01AAAAAAAA0000000000000000",
+      kind: "handoff",
+      state: "offered",
+      offerer: ALICE,
+      offeree: BOB,
+      title: "Port the auth change",
+      channel: "#work",
+      fromReplay: false,
+      signed: true,
+      createdAt: 1000,
+      updatedAt: 1000,
+      log: [],
+      ...over,
+    };
+  }
+
+  const trusted = () => true;
+  const sweep = (over: Partial<Parameters<typeof sweepOfferQueue>[0]>) =>
+    sweepOfferQueue({
+      entries: [],
+      lookup: () => undefined,
+      trusted,
+      idle: true,
+      now: 0,
+      ttlSecs: 1800,
+      ...over,
+    });
+
+  it("holds an offer while busy and takes it on the transition to idle", () => {
+    const r = rec();
+    const entries = [{ taskId: r.id, queuedAt: 0 }];
+    const lookup = (id: string) => (id === r.id ? r : undefined);
+
+    const busy = sweep({ entries, lookup, idle: false, now: 1000 });
+    expect(busy.accept).toBeUndefined();
+    expect(busy.expire).toEqual([]);
+    expect(busy.drop).toEqual([]);
+
+    const idle = sweep({ entries, lookup, idle: true, now: 1000 });
+    expect(idle.accept?.record.id).toBe(r.id);
+  });
+
+  it("takes the oldest queued offer first, and only one per pass", () => {
+    const old = rec({ id: "01OLD00000000000000000000A" });
+    const recent = rec({ id: "01NEW00000000000000000000B" });
+    const byId = new Map([old, recent].map((r) => [r.id, r]));
+    const out = sweep({
+      entries: [
+        { taskId: recent.id, queuedAt: 500 },
+        { taskId: old.id, queuedAt: 100 },
+      ],
+      lookup: (id) => byId.get(id),
+      now: 1000,
+    });
+    expect(out.accept?.record.id).toBe(old.id);
+  });
+
+  it("declines a queued offer past its TTL, with a reason", () => {
+    const r = rec();
+    const out = sweep({
+      entries: [{ taskId: r.id, queuedAt: 0 }],
+      lookup: () => r,
+      ttlSecs: 60,
+      now: 61_000,
+    });
+    expect(out.accept).toBeUndefined();
+    expect(out.expire).toHaveLength(1);
+    expect(out.expire[0].reason).toMatch(/no decision for 1m/);
+  });
+
+  it("expires rather than accepts, even when we are free at that very moment", () => {
+    const r = rec();
+    const out = sweep({
+      entries: [{ taskId: r.id, queuedAt: 0 }],
+      lookup: () => r,
+      ttlSecs: 60,
+      now: 999_999,
+      idle: true,
+    });
+    expect(out.accept).toBeUndefined();
+    expect(out.expire).toHaveLength(1);
+  });
+
+  it("honours the task's own deadline when it is sooner than the TTL", () => {
+    const r = rec({ deadline: 30 }); // unix seconds
+    const e = offerExpiry(r, 0, 1800);
+    expect(e.at).toBe(30_000);
+    expect(e.reason).toMatch(/deadline/);
+
+    const out = sweep({ entries: [{ taskId: r.id, queuedAt: 0 }], lookup: () => r, now: 31_000 });
+    expect(out.expire[0].reason).toMatch(/deadline/);
+  });
+
+  it("keeps the TTL when the deadline is further out", () => {
+    expect(offerExpiry(rec({ deadline: 9_999 }), 0, 60).at).toBe(60_000);
+  });
+
+  it("forgets an entry whose task moved on without us", () => {
+    const gone = rec({ id: "01GONE0000000000000000000A", state: "cancelled" });
+    const out = sweep({
+      entries: [{ taskId: gone.id, queuedAt: 0 }, { taskId: "01VANISHED000000000000000", queuedAt: 0 }],
+      lookup: (id) => (id === gone.id ? gone : undefined),
+      now: 1000,
+    });
+    expect(out.drop.map((e) => e.taskId)).toEqual([gone.id, "01VANISHED000000000000000"]);
+    expect(out.expire).toEqual([]);
+    expect(out.accept).toBeUndefined();
+  });
+
+  it("will not act on an offer whose offerer lost trust while it waited", () => {
+    const r = rec();
+    const out = sweep({
+      entries: [{ taskId: r.id, queuedAt: 0 }],
+      lookup: () => r,
+      trusted: () => false,
+      now: 1000,
+    });
+    expect(out.accept).toBeUndefined();
+    expect(out.drop).toEqual([]); // still on the books; the TTL will retire it
+  });
+
+  it("survives a restart — a queue that dies with the session is not a queue", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "offer-queue-"));
+    const path = join(dir, "q.json");
+    const a = new OfferQueue(path);
+    a.add("01AAAAAAAA0000000000000000", 100);
+    a.add("01BBBBBBBB0000000000000000", 200);
+    a.add("01AAAAAAAA0000000000000000", 300); // a duplicate is not a second entry
+    await a.save();
+
+    const b = new OfferQueue(path);
+    await b.load();
+    expect(b.all().map((e) => e.taskId)).toEqual([
+      "01AAAAAAAA0000000000000000",
+      "01BBBBBBBB0000000000000000",
+    ]);
+    expect(b.all()[0].queuedAt).toBe(100);
+    expect(b.has("01BBBBBBBB0000000000000000")).toBe(true);
+
+    b.remove("01AAAAAAAA0000000000000000");
+    expect(b.has("01AAAAAAAA0000000000000000")).toBe(false);
+  });
+
+  it("tolerates a corrupt queue file rather than failing the session", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "offer-queue-bad-"));
+    const path = join(dir, "q.json");
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(path, "not json at all");
+    const q = new OfferQueue(path);
+    await expect(q.load()).resolves.toBeUndefined();
+    expect(q.all()).toEqual([]);
+  });
+});
+
+describe("resolving the short id a notification printed", () => {
+  function rec(id: string): HandoffRecord {
+    return {
+      id,
+      kind: "handoff",
+      state: "offered",
+      offerer: ALICE,
+      title: "T",
+      channel: "#work",
+      fromReplay: false,
+      signed: true,
+      createdAt: 0,
+      updatedAt: 0,
+      log: [],
+    };
+  }
+  const records = [rec("01ABCDEF0000000000000000AA"), rec("01ABCDEF0000000000000000BB"), rec("01ZZZZ")];
+
+  it("resolves a unique prefix", () => {
+    const r = resolveTaskRef(records, "01ZZ");
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.record.id).toBe("01ZZZZ");
+  });
+
+  it("resolves a full id even when it is also a prefix of others", () => {
+    const r = resolveTaskRef(records, "01ABCDEF0000000000000000AA");
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.record.id).toBe("01ABCDEF0000000000000000AA");
+  });
+
+  it("refuses an ambiguous prefix by naming the candidates", () => {
+    const r = resolveTaskRef(records, "01ABCDEF00");
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toMatch(/matches 2 tasks/);
+      expect(r.reason).toContain("01ABCDEF000000");
+    }
+  });
+
+  it("says plainly when nothing matches", () => {
+    const r = resolveTaskRef(records, "01NOPE");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(/no task on record starts with '01NOPE'/);
+  });
+
+  it("refuses an empty reference instead of picking something", () => {
+    expect(resolveTaskRef(records, "   ").ok).toBe(false);
+  });
+});
+
+describe("formatDuration", () => {
+  it("reads the way a person says it", () => {
+    expect(formatDuration(45)).toBe("45s");
+    expect(formatDuration(900)).toBe("15m");
+    expect(formatDuration(1800)).toBe("30m");
+    expect(formatDuration(3600)).toBe("1h");
+    expect(formatDuration(5400)).toBe("1.5h");
+    expect(formatDuration(86_400)).toBe("1d");
   });
 });
