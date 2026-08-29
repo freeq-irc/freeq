@@ -8,7 +8,7 @@ import { isDid, isPeerBlocked } from '../lib/identity';
 import { claimForMessage } from '@freeq/sdk';
 import type { RowEvidence } from './UserPopover';
 import { displayNameForKey } from '../lib/display-name';
-import { apiFetch } from '../lib/api';
+import { apiFetch, bearerPending, hasBearer, waitForBearer } from '../lib/api';
 import { EmojiPicker } from './EmojiPicker';
 import { UserPopover } from './UserPopover';
 import { BlueskyEmbed } from './BlueskyEmbed';
@@ -219,6 +219,13 @@ function renderTextSafe(text: string, ctx?: RenderCtx): React.ReactElement {
         const content = seg.content;
         switch (seg.type) {
           case 'link':
+            // A space-media link has no renderer of its own (a .pdf, a .zip)
+            // and a plain anchor cannot send the bearer that proves
+            // membership, so a restricted channel's attachment would just
+            // 403 on click. Fetch it the same way the players do.
+            if (isSpaceMediaUrl(seg.href)) {
+              return <SpaceMediaLink key={i} url={seg.href} label={content} />;
+            }
             return <a key={i} href={seg.href} target="_blank" rel="noopener noreferrer" className="text-accent hover:underline break-all">{content}</a>;
           case 'mention':
             return (
@@ -303,43 +310,114 @@ function isSpaceMediaUrl(url: string): boolean {
 }
 
 /**
+ * Object URLs for space media, shared across every mount of the same file.
+ *
+ * The message list is virtualized, so a row unmounts as soon as it scrolls
+ * out of view. Revoking there meant two things went wrong: every scroll-back
+ * re-fetched the file from the *author's* PDS, and the lightbox — which
+ * outlives the row that opened it — was handed a URL already revoked out
+ * from under it. Entries are kept until pushed out by newer ones.
+ */
+const SPACE_MEDIA_CACHE_MAX = 32;
+const spaceMediaCache = new Map<string, string>();
+
+function rememberSpaceMedia(url: string, objectUrl: string): void {
+  spaceMediaCache.set(url, objectUrl);
+  while (spaceMediaCache.size > SPACE_MEDIA_CACHE_MAX) {
+    const oldest = spaceMediaCache.keys().next();
+    if (oldest.done) break;
+    const stale = spaceMediaCache.get(oldest.value);
+    spaceMediaCache.delete(oldest.value);
+    if (stale) URL.revokeObjectURL(stale);
+  }
+}
+
+/**
  * Space media is served only to channel members, and membership is proven by
  * the session bearer, which an `<img src>` cannot send. Fetch those URLs with
  * the header and hand back an object URL; everything else passes through.
  */
 function useAuthedMedia(url: string): { src: string | null; failure: MediaFailure } {
-  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [objectUrl, setObjectUrl] = useState<string | null>(() => spaceMediaCache.get(url) ?? null);
   const [failure, setFailure] = useState<MediaFailure>(null);
 
   useEffect(() => {
     if (!isSpaceMediaUrl(url)) return;
-    let revoked = false;
-    let made: string | null = null;
+    const cached = spaceMediaCache.get(url);
+    if (cached) {
+      setObjectUrl(cached);
+      setFailure(null);
+      return;
+    }
+    let cancelled = false;
     setFailure(null);
-    apiFetch(url)
-      .then((r) => {
-        if (r.ok) return r.blob();
-        // Being refused is a different thing to tell someone than a fetch
-        // that broke: one is about who they are, the other about the server.
-        throw new Error(r.status === 403 || r.status === 404 ? 'refused' : 'error');
-      })
-      .then((b) => {
-        if (revoked) return;
-        made = URL.createObjectURL(b);
+    (async () => {
+      try {
+        let resp = await apiFetch(url);
+        // The bearer lands asynchronously, shortly after `registered`. A
+        // fetch that beats it gets a 403 and would otherwise tell a member
+        // they are not a member, permanently, until the row remounts.
+        if (resp.status === 403 && bearerPending()) {
+          await waitForBearer();
+          if (hasBearer()) resp = await apiFetch(url);
+        }
+        if (!resp.ok) {
+          // Being refused is a different thing to tell someone than a fetch
+          // that broke: one is about who they are, the other about the server.
+          throw new Error(resp.status === 403 || resp.status === 404 ? 'refused' : 'error');
+        }
+        const blob = await resp.blob();
+        if (cancelled) return;
+        const made = URL.createObjectURL(blob);
+        rememberSpaceMedia(url, made);
         setObjectUrl(made);
-      })
-      .catch((e) => {
-        if (!revoked) setFailure(e?.message === 'refused' ? 'refused' : 'error');
-      });
+      } catch (e: any) {
+        if (!cancelled) setFailure(e?.message === 'refused' ? 'refused' : 'error');
+      }
+    })();
     return () => {
-      revoked = true;
-      if (made) URL.revokeObjectURL(made);
-      setObjectUrl(null);
+      cancelled = true;
     };
   }, [url]);
 
   if (!isSpaceMediaUrl(url)) return { src: url, failure: null };
   return { src: objectUrl, failure };
+}
+
+/**
+ * A private-space attachment with no inline renderer. Resolves to the fetched
+ * blob so the browser can open or download it without a bearer of its own.
+ */
+function SpaceMediaLink({ url, label }: { url: string; label: string }) {
+  const { src, failure } = useAuthedMedia(url);
+  const filename = (() => {
+    try {
+      return decodeURIComponent(new URL(url, window.location.origin).pathname.split('/').pop() || 'file');
+    } catch {
+      return 'file';
+    }
+  })();
+  if (failure) {
+    return (
+      <span className="text-fg-dim" title={label}>
+        🔒 {failure === 'refused'
+          ? 'Private file, only visible to members of this channel'
+          : 'Private file could not be loaded'}
+      </span>
+    );
+  }
+  if (!src) return <span className="text-fg-dim">🔒 Loading…</span>;
+  return (
+    <a
+      href={src}
+      download={filename}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="text-accent hover:underline break-all"
+    >
+      🔒 {filename}
+    </a>
+  );
 }
 
 /** Image that respects the "Load external media" setting. */
@@ -408,6 +486,9 @@ function InlineAudioPlayer({ url, label }: { url: string; label?: string }) {
   const [duration, setDuration] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
+  // Same reason as images and video: an <audio src> cannot carry the bearer
+  // that proves channel membership.
+  const { src, failure } = useAuthedMedia(url);
 
   const toggle = () => {
     const el = audioRef.current;
@@ -428,6 +509,18 @@ function InlineAudioPlayer({ url, label }: { url: string; label?: string }) {
     if (!s || !isFinite(s)) return '0:00';
     return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
   };
+
+  if (failure || !src) {
+    return (
+      <div className="mt-1.5 max-w-[300px] px-3 py-2 rounded-xl border border-border bg-bg-tertiary text-fg-dim text-sm">
+        {failure === 'refused'
+          ? 'Private audio, only visible to members of this channel'
+          : failure
+            ? 'Private audio could not be loaded'
+            : 'Loading…'}
+      </div>
+    );
+  }
 
   return (
     <div className="mt-1.5 flex items-center gap-3 bg-bg-tertiary border border-border rounded-xl px-3 py-2.5 max-w-[300px]">
@@ -469,7 +562,7 @@ function InlineAudioPlayer({ url, label }: { url: string; label?: string }) {
       </div>
       <audio
         ref={audioRef}
-        src={url}
+        src={src ?? undefined}
         preload="metadata"
         onLoadedMetadata={() => setDuration(audioRef.current?.duration || 0)}
         onTimeUpdate={() => setProgress(audioRef.current?.currentTime || 0)}

@@ -28,11 +28,12 @@ The server gets its own AT Protocol account. That account is the gatekeeper,
 and owns a private "space" per channel.
 
 When you attach a file, it goes into your own repo inside that channel's
-space. The browser has no PDS credentials of its own, so freeq writes
-the media.
+space. Your browser never holds your PDS tokens — they live on the freeq
+server from the OAuth flow — so freeq performs the write on your behalf.
 
-Reading is the same, freeq confirms the member and fetches the file on
-their behalf.
+Reading is the same: freeq confirms the member and fetches the file on
+their behalf. Fetched files are cached in memory for five minutes so a
+scrolling message list does not hammer the uploader's PDS.
 
 ## Using it
 
@@ -76,8 +77,19 @@ Uploads are a per-message choice in the client, opt-in per file.
 - Access control, not encryption: files sit unencrypted on the uploader's
   PDS, readable by anyone the gatekeeper authorizes. Encrypted (+E)
   channels are not supported yet.
-- Access is checked per request against live channel membership, so losing
-  the channel simultaneously stops media access.
+- Access is checked against live channel membership when a space credential
+  is *minted*, and the server caches that credential for up to 30 minutes.
+  A kick or ban therefore stops access eventually, not instantly: it takes
+  effect on the next mint. Treat revocation as bounded-lag, not immediate.
+- A file goes to exactly one place. Private-space upload and the public
+  "save a copy to my PDS" / "post to Bluesky" options are mutually
+  exclusive, and the server rejects a request asking for both.
+- Encrypted-only (`+E`) channels are refused server-side: space media sits
+  unencrypted in the author's repo and is proxied in the clear through the
+  server, which is the thing `+E` exists to prevent.
+- A server holds at most 500 media spaces (`MAX_MEDIA_SPACES`). Minting is a
+  write to the operator's own PDS account, and anyone who can create a
+  channel can ask for one.
 - Private media spaces are per channel: DMs and federated (S2S) members are
   not currently supported.
 - In a public channel, media is readable by anyone who can read the channel,

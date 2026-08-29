@@ -219,10 +219,16 @@ export function ComposeBox() {
         f.append('did', authDid);
         if (activeChannel !== 'server' && activeChannel.startsWith('#')) f.append('channel', activeChannel);
         if (text.trim()) f.append('alt', text.trim());
+        // A file goes to exactly one destination: the channel's private
+        // space, or a public PDS/Bluesky copy. The server rejects both at
+        // once, so never send both.
+        if (spaceMedia) {
+          f.append('space_media', 'true');
+          return f;
+        }
         // share_bluesky implies share_pds (feed embed references the PDS blob).
         if (sharePds || shareBluesky) f.append('share_pds', 'true');
         if (shareBluesky) f.append('share_bluesky', 'true');
-        if (spaceMedia) f.append('space_media', 'true');
         return f;
       };
 
@@ -635,7 +641,13 @@ export function ComposeBox() {
                     <input
                       type="checkbox"
                       checked={spaceMedia}
-                      onChange={(e) => setSpaceMedia(e.target.checked)}
+                      // A file goes to one place. Choosing the private space
+                      // clears the public options rather than letting the
+                      // server silently drop them.
+                      onChange={(e) => {
+                        setSpaceMedia(e.target.checked);
+                        if (e.target.checked) { setSharePds(false); setShareBluesky(false); }
+                      }}
                       className="w-3 h-3 rounded accent-blue"
                     />
                     <span className="text-sm text-fg-dim">
@@ -645,20 +657,21 @@ export function ComposeBox() {
                     </span>
                   </label>
                 )}
-                <label className="flex items-center gap-1.5 cursor-pointer">
+                <label className={`flex items-center gap-1.5 ${spaceMedia ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}`}>
                   <input
                     type="checkbox"
-                    checked={sharePds || shareBluesky}
-                    disabled={shareBluesky}
+                    checked={!spaceMedia && (sharePds || shareBluesky)}
+                    disabled={shareBluesky || spaceMedia}
                     onChange={(e) => setSharePds(e.target.checked)}
                     className="w-3 h-3 rounded accent-blue"
                   />
                   <span className="text-sm text-fg-dim">Save a public copy to my PDS</span>
                 </label>
-                <label className="flex items-center gap-1.5 cursor-pointer">
+                <label className={`flex items-center gap-1.5 ${spaceMedia ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}`}>
                   <input
                     type="checkbox"
-                    checked={shareBluesky}
+                    checked={!spaceMedia && shareBluesky}
+                    disabled={spaceMedia}
                     onChange={(e) => setShareBluesky(e.target.checked)}
                     className="w-3 h-3 rounded accent-blue"
                   />

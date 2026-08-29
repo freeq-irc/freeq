@@ -26,6 +26,18 @@ pub const MEDIA_COLLECTION: &str = "at.freeq.media.item";
 /// Call timeout on a repo host.
 const REPO_HOST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long a fetched blob stays in the in-process cache.
+///
+/// Matches the `max-age` we hand the browser. Without this, a virtualized
+/// message list re-fetches an image from the *author's* PDS every time the
+/// row scrolls back into view, and a public channel's media URL is an
+/// unauthenticated amplifier pointed at a third party.
+const MEDIA_CACHE_TTL_SECS: u64 = 300;
+
+/// Total bytes the media cache may hold before the oldest entries are
+/// dropped. Six or so files at the [`MAX_MEDIA_BYTES`] ceiling.
+const MEDIA_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 /// The OAuth scopes an upload to this server's media spaces takes:
 /// `blob:*/*` for the bytes, which go up through the ordinary uploadBlob,
 /// and the space scope for the record that pins them.
@@ -49,8 +61,13 @@ pub struct MediaSpaceManager {
     pds_override: Option<String>,
     pds_url: tokio::sync::Mutex<Option<String>>,
     session: tokio::sync::Mutex<Option<String>>,
-    pub create_lock: tokio::sync::Mutex<()>,
+    /// One creation lock per channel key. A global lock would let a single
+    /// slow `createSpace` stall every other channel's first upload.
+    create_locks: tokio::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    >,
     credentials: tokio::sync::Mutex<std::collections::HashMap<String, CachedCredential>>,
+    media_cache: tokio::sync::Mutex<std::collections::HashMap<String, CachedMedia>>,
     http: reqwest::Client,
     server_name: String,
 }
@@ -68,11 +85,22 @@ impl MediaSpaceManager {
             pds_override,
             pds_url: tokio::sync::Mutex::new(None),
             session: tokio::sync::Mutex::new(None),
-            create_lock: tokio::sync::Mutex::new(()),
+            create_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             credentials: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            media_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             http: reqwest::Client::new(),
             server_name,
         }
+    }
+
+    /// The creation lock for one channel key, minted on first use.
+    pub async fn create_lock_for(&self, channel_key: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.create_locks
+            .lock()
+            .await
+            .entry(channel_key.to_string())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     pub fn managing_app(&self) -> String {
@@ -118,8 +146,33 @@ impl MediaSpaceManager {
             .find(|s| s.id.ends_with("#atproto_pds"))
             .map(|s| s.service_endpoint.trim_end_matches('/').to_string())
             .context("authority DID document has no #atproto_pds service")?;
+        // The PLC directory is outside our control and the very next request
+        // carries the authority account's password. Refuse to send it in the
+        // clear no matter what the document says.
+        if !url.starts_with("https://") {
+            bail!("authority DID document names a non-HTTPS PDS endpoint");
+        }
         *cached = Some(url.clone());
         Ok(url)
+    }
+
+    /// HTTP client for a call to the authority's own PDS.
+    ///
+    /// An explicitly configured `media_space_pds` is operator input and is
+    /// trusted as given — dev and test setups point it at loopback. A URL
+    /// resolved from the authority's DID document is attacker-influenceable
+    /// (a hijacked PLC record redirects it), and these are the requests that
+    /// carry the account password and mint space credentials, so they get the
+    /// same DNS-pinned, redirect-refusing guard as every other resolved
+    /// endpoint.
+    async fn authority_client(&self, url: &str) -> Result<reqwest::Client> {
+        if self.pds_override.is_some() {
+            return Ok(self.http.clone());
+        }
+        let (_, client) = crate::web::safe_outbound_client(url, REPO_HOST_TIMEOUT)
+            .await
+            .map_err(|(_, msg)| anyhow::anyhow!("{msg}"))?;
+        Ok(client)
     }
 
     async fn session_token(&self, resolver: &DidResolver) -> Result<String> {
@@ -128,9 +181,11 @@ impl MediaSpaceManager {
             return Ok(token.clone());
         }
         let pds = self.pds_url(resolver).await?;
+        let url = format!("{pds}/xrpc/com.atproto.server.createSession");
         let res = self
-            .http
-            .post(format!("{pds}/xrpc/com.atproto.server.createSession"))
+            .authority_client(&url)
+            .await?
+            .post(&url)
             .json(&serde_json::json!({
                 "identifier": self.authority_did,
                 "password": self.password,
@@ -157,15 +212,16 @@ impl MediaSpaceManager {
     /// space (crash after create, before persist) is success.
     pub async fn create_space(&self, resolver: &DidResolver, key: &str) -> Result<()> {
         let pds = self.pds_url(resolver).await?;
+        let url = format!("{pds}/xrpc/com.atproto.simplespace.createSpace");
+        let client = self.authority_client(&url).await?;
         // One retry with a fresh session: the cached token may have expired.
         for attempt in 0..2 {
             if attempt > 0 {
                 *self.session.lock().await = None;
             }
             let token = self.session_token(resolver).await?;
-            let res = self
-                .http
-                .post(format!("{pds}/xrpc/com.atproto.simplespace.createSpace"))
+            let res = client
+                .post(&url)
                 .bearer_auth(&token)
                 .json(&serde_json::json!({
                     "type": SPACE_TYPE,
@@ -245,15 +301,16 @@ impl MediaSpaceManager {
 
         let pds = self.pds_url(resolver).await?;
         // Step 1: our PDS creates a delegation token for the space.
+        let delegation_url = format!("{pds}/xrpc/com.atproto.space.getDelegationToken");
+        let client = self.authority_client(&delegation_url).await?;
         let mut delegation = None;
         for attempt in 0..2 {
             if attempt > 0 {
                 *self.session.lock().await = None;
             }
             let token = self.session_token(resolver).await?;
-            let res = self
-                .http
-                .get(format!("{pds}/xrpc/com.atproto.space.getDelegationToken"))
+            let res = client
+                .get(&delegation_url)
                 .query(&[("space", space)])
                 .bearer_auth(&token)
                 .send()
@@ -282,8 +339,7 @@ impl MediaSpaceManager {
         let mut credential = None;
         for attempt in 0..3 {
             let proof = dpop_key.proof("POST", &url, nonce.as_deref(), None)?;
-            let res = self
-                .http
+            let res = client
                 .post(&url)
                 .header("Authorization", format!("Bearer {delegation}"))
                 .header("DPoP", proof)
@@ -326,9 +382,70 @@ impl MediaSpaceManager {
         Ok((credential, dpop_key))
     }
 
+    /// Fetch a media record and its blob, memoized for [`MEDIA_CACHE_TTL_SECS`].
+    ///
+    /// Every miss costs two round trips to a *third party's* PDS and up to
+    /// [`MAX_MEDIA_BYTES`] of their bandwidth. A virtualized message list
+    /// re-mounts the same image constantly, and a public channel's media URL
+    /// is readable without a bearer, so an uncached fetch here is an
+    /// amplifier aimed at the uploader's host.
+    pub async fn fetch_media(
+        &self,
+        resolver: &DidResolver,
+        rec: &SpaceRecordRef,
+    ) -> Result<(Vec<u8>, String)> {
+        let cache_key = format!(
+            "{}/{}/{}/{}",
+            rec.space, rec.author_did, rec.collection, rec.rkey
+        );
+        {
+            let cache = self.media_cache.lock().await;
+            if let Some(hit) = cache.get(&cache_key)
+                && hit.good_until > now_secs()
+            {
+                return Ok((hit.bytes.clone(), hit.mime.clone()));
+            }
+        }
+        let (bytes, mime) = self.fetch_media_uncached(resolver, rec).await?;
+        self.remember_media(cache_key, &bytes, &mime).await;
+        Ok((bytes, mime))
+    }
+
+    /// Insert into the media cache, first dropping anything expired and then,
+    /// if still over the ceiling, the entries closest to expiry.
+    async fn remember_media(&self, key: String, bytes: &[u8], mime: &str) {
+        if bytes.len() > MEDIA_CACHE_MAX_BYTES {
+            return;
+        }
+        let now = now_secs();
+        let mut cache = self.media_cache.lock().await;
+        cache.retain(|_, e| e.good_until > now);
+        cache.insert(
+            key,
+            CachedMedia {
+                bytes: bytes.to_vec(),
+                mime: mime.to_string(),
+                good_until: now + MEDIA_CACHE_TTL_SECS,
+            },
+        );
+        let mut total: usize = cache.values().map(|e| e.bytes.len()).sum();
+        while total > MEDIA_CACHE_MAX_BYTES {
+            let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, e)| e.good_until)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(dropped) = cache.remove(&oldest) {
+                total -= dropped.bytes.len();
+            }
+        }
+    }
+
     /// Fetch a media record and its blob from the author's PDS. Returns the
     /// bytes and the MIME type the record declares.
-    pub async fn fetch_media(
+    async fn fetch_media_uncached(
         &self,
         resolver: &DidResolver,
         rec: &SpaceRecordRef,
@@ -472,12 +589,27 @@ struct CachedCredential {
     good_until: u64,
 }
 
+struct CachedMedia {
+    bytes: Vec<u8>,
+    mime: String,
+    good_until: u64,
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
 }
+
+/// Longest `exp` we will honour on a service-auth token, measured from now.
+/// atproto mints these for a minute or two; anything claiming hours is either
+/// broken or an attempt to make a captured token durable.
+const MAX_SERVICE_AUTH_LIFETIME_SECS: i64 = 15 * 60;
+
+/// Signature algorithms an atproto service-auth token may declare. Anything
+/// else — `none` above all — is refused before a key is ever consulted.
+const ALLOWED_SERVICE_AUTH_ALGS: [&str; 2] = ["ES256K", "EdDSA"];
 
 pub async fn verify_service_auth(
     resolver: &DidResolver,
@@ -491,6 +623,18 @@ pub async fn verify_service_auth(
     else {
         bail!("malformed JWT");
     };
+    let header_json: serde_json::Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(header)
+            .context("JWT header base64")?,
+    )
+    .context("JWT header JSON")?;
+    let alg = header_json["alg"]
+        .as_str()
+        .context("service auth header has no alg")?;
+    if !ALLOWED_SERVICE_AUTH_ALGS.contains(&alg) {
+        bail!("service auth declares unsupported alg {alg}");
+    }
     let claims: serde_json::Value = serde_json::from_slice(
         &URL_SAFE_NO_PAD
             .decode(payload)
@@ -514,6 +658,9 @@ pub async fn verify_service_auth(
         .as_secs() as i64;
     if exp < now {
         bail!("service auth expired");
+    }
+    if exp > now + MAX_SERVICE_AUTH_LIFETIME_SECS {
+        bail!("service auth exp is further out than we accept");
     }
 
     let sig_bytes = URL_SAFE_NO_PAD

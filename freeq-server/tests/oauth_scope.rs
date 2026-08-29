@@ -232,6 +232,58 @@ fn media_space_needs_both_the_space_and_blob_halves() {
     ));
 }
 
+/// A PDS echoes a grant back in whatever shape it likes. Matching the space
+/// scope as a literal string turned a reordered query into an endless
+/// step-up loop; it is matched by parts instead.
+#[test]
+fn media_space_scope_survives_a_pds_reordering_the_parameters() {
+    for granted in [
+        "atproto blob:*/* space:*?authority=did:plc:a&collection=*",
+        "atproto blob:*/* space:*?collection=*&authority=did:plc:a",
+        // A grant narrowed to the exact type and collection we use is at
+        // least as strong as the wildcard we asked for.
+        "atproto blob:*/* space:at.freeq.media?authority=did:plc:a&collection=at.freeq.media.item",
+    ] {
+        assert!(
+            scope_satisfies_purpose(granted, OauthPurpose::MediaSpace, Some("did:plc:a")),
+            "should satisfy: {granted}"
+        );
+    }
+}
+
+/// A grant over someone else's spaces buys nothing here, and the authority
+/// is the one thing a wildcard must not stand in for.
+#[test]
+fn media_space_scope_must_name_our_own_authority() {
+    for granted in [
+        // Another server's authority.
+        "atproto blob:*/* space:*?authority=did:plc:someoneelse&collection=*",
+        // A wildcard authority is not the same as ours.
+        "atproto blob:*/* space:*?authority=*&collection=*",
+        // No authority at all.
+        "atproto blob:*/* space:*?collection=*",
+        // A space type we do not use.
+        "atproto blob:*/* space:com.example.other?authority=did:plc:a&collection=*",
+        // A collection in someone else's namespace.
+        "atproto blob:*/* space:*?authority=did:plc:a&collection=com.example.other",
+        // Not a space scope at all.
+        "atproto blob:*/* spaceship:*?authority=did:plc:a&collection=*",
+        // No query, so nothing is named.
+        "atproto blob:*/* space:*",
+    ] {
+        assert!(
+            !scope_satisfies_purpose(granted, OauthPurpose::MediaSpace, Some("did:plc:a")),
+            "must not satisfy: {granted}"
+        );
+    }
+    // And with no authority configured, nothing satisfies the purpose.
+    assert!(!scope_satisfies_purpose(
+        "atproto blob:*/* space:*?authority=did:plc:a&collection=*",
+        OauthPurpose::MediaSpace,
+        None
+    ));
+}
+
 #[test]
 fn requested_scopes_are_narrow_not_transition_generic() {
     for p in [
@@ -441,6 +493,10 @@ async fn metadata_scope_contains_every_requested_purpose_scope() {
         OauthPurpose::Login,
         OauthPurpose::BlobUpload,
         OauthPurpose::BlueskyPost,
+        // MediaSpace is only advertised when the feature is configured; the
+        // media_space integration suite covers that case against a server
+        // that has it on. Here the fixture has it off, so the purpose is
+        // checked against the same metadata with no authority.
     ] {
         for token in p.requested_scope(None).split_whitespace() {
             assert!(

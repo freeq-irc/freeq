@@ -369,6 +369,18 @@ async fn client_metadata_advertises_the_space_scope_only_when_enabled() {
         scope.split_whitespace().any(|t| t == expected),
         "feature-on metadata must advertise the space scope; got: {scope}"
     );
+    // The whole point of the metadata document is that a PDS refuses any
+    // scope it does not list. Every token the step-up will request must be
+    // in there, or the flow dies at the consent screen.
+    for token in freeq_server::server::OauthPurpose::MediaSpace
+        .requested_scope(Some(AUTHORITY_DID))
+        .split_whitespace()
+    {
+        assert!(
+            scope.split_whitespace().any(|t| t == token),
+            "metadata is missing `{token}`, which the media_space step-up requests; got: {scope}"
+        );
+    }
     fx.server.abort();
 
     let config = freeq_server::config::ServerConfig {
@@ -961,5 +973,206 @@ async fn check_user_access_rejects_bad_service_auth() {
     .await;
     assert_eq!(s, 401, "expired token must be rejected");
 
+    fx.server.abort();
+}
+
+/// Mint a service-auth JWT with a chosen `alg` header, so the algorithm
+/// check can be exercised independently of the signature.
+fn service_jwt_with_alg(
+    key: &PrivateKey,
+    alg: &str,
+    aud: &str,
+    lxm: &str,
+    exp_offset_secs: i64,
+) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let header = b64(serde_json::json!({ "typ": "JWT", "alg": alg }).to_string().as_bytes());
+    let payload = b64(serde_json::json!({
+        "iss": AUTHORITY_DID,
+        "aud": aud,
+        "lxm": lxm,
+        "exp": now + exp_offset_secs,
+    })
+    .to_string()
+    .as_bytes());
+    let signing_input = format!("{header}.{payload}");
+    let sig = key.sign(signing_input.as_bytes());
+    format!("{signing_input}.{}", b64(&sig))
+}
+
+/// `alg: none` is the classic JWT bypass, and an HMAC alg invites key
+/// confusion. Both are refused before a key is ever consulted, even when the
+/// rest of the token is otherwise perfect.
+#[tokio::test]
+async fn service_auth_rejects_algorithms_we_do_not_verify() {
+    let fx = fixture_with_ids(&[]).await;
+    let space = format!("at://{AUTHORITY_DID}/space/at.freeq.media/somekey");
+    for alg in ["none", "HS256", "RS256", "ES256K "] {
+        let (s, _) = check_access(
+            fx.web,
+            Some(&service_jwt_with_alg(
+                &fx.authority_key,
+                alg,
+                &managing_app(),
+                LXM,
+                60,
+            )),
+            &space,
+            "did:plc:x",
+        )
+        .await;
+        assert_eq!(s, 401, "alg `{alg}` must not be accepted");
+    }
+    // The real algorithm still works, so the check is a filter and not a wall.
+    let (s, body) = check_access(
+        fx.web,
+        Some(&service_jwt_with_alg(
+            &fx.authority_key,
+            "ES256K",
+            &managing_app(),
+            LXM,
+            60,
+        )),
+        &space,
+        "did:plc:x",
+    )
+    .await;
+    assert_eq!(s, 200, "a properly signed ES256K token is still honoured");
+    assert_eq!(body["authorized"], false, "and the answer is a real answer");
+    fx.server.abort();
+}
+
+/// atproto mints service auth for a minute or two. A token claiming to be
+/// good for a day is either broken or an attempt to make a captured token
+/// durable; either way we do not honour it.
+#[tokio::test]
+async fn service_auth_rejects_an_implausibly_distant_expiry() {
+    let fx = fixture_with_ids(&[]).await;
+    let space = format!("at://{AUTHORITY_DID}/space/at.freeq.media/somekey");
+    let (s, _) = check_access(
+        fx.web,
+        Some(&service_jwt(&fx.authority_key, &managing_app(), LXM, 86_400)),
+        &space,
+        "did:plc:x",
+    )
+    .await;
+    assert_eq!(s, 401, "a day-long service auth token must be rejected");
+    fx.server.abort();
+}
+
+/// A file goes to exactly one destination. The space branch returns before
+/// the PDS-share path, so silently accepting both would drop the public copy
+/// the user asked for without telling them.
+#[tokio::test]
+async fn a_file_cannot_go_to_a_space_and_a_public_copy_at_once() {
+    let (fx, h, _bearer) = fixture_with_member().await;
+    for (field, value) in [("share_pds", "true"), ("share_bluesky", "true")] {
+        let form = reqwest::multipart::Form::new()
+            .text("did", MEMBER_DID.to_string())
+            .text("channel", "#open".to_string())
+            .text("space_media", "true".to_string())
+            .text(field, value.to_string())
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(b"not really a png".to_vec())
+                    .file_name("x.png")
+                    .mime_str("image/png")
+                    .unwrap(),
+            );
+        let r = reqwest::Client::new()
+            .post(format!("http://{}/api/v1/upload", fx.web))
+            .multipart(form)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap();
+        let status = r.status().as_u16();
+        let body = r.text().await.unwrap_or_default();
+        assert_eq!(status, 400, "space + {field} must be refused: {body}");
+        assert!(
+            body.contains("not both"),
+            "the refusal must say why: {body}"
+        );
+    }
+    assert_eq!(fx.created.load(Ordering::SeqCst), 0, "nothing was created");
+    h.quit(None).await.ok();
+    fx.server.abort();
+}
+
+/// Space media sits unencrypted in the author's repo and is proxied in the
+/// clear through this server. That is precisely what `+E` exists to prevent,
+/// so the rule lives on the server and not only in the web client's UI.
+#[tokio::test]
+async fn encrypted_only_channels_refuse_space_media() {
+    let key = PrivateKey::generate_ed25519();
+    let fx = fixture_with_ids(&[(MEMBER_DID, &key)]).await;
+    let (h, _bearer) = join_as_member(&fx.irc, MEMBER_DID, &key, "member", "#vault").await;
+    h.mode("#vault", "+E", None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let form = reqwest::multipart::Form::new()
+        .text("did", MEMBER_DID.to_string())
+        .text("channel", "#vault".to_string())
+        .text("space_media", "true".to_string())
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"not really a png".to_vec())
+                .file_name("x.png")
+                .mime_str("image/png")
+                .unwrap(),
+        );
+    let r = reqwest::Client::new()
+        .post(format!("http://{}/api/v1/upload", fx.web))
+        .multipart(form)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    let body = r.text().await.unwrap_or_default();
+    assert_eq!(status, 403, "+E must refuse space media: {body}");
+    assert!(
+        body.contains("+E") || body.contains("Encrypted"),
+        "the refusal must name the reason: {body}"
+    );
+    assert_eq!(
+        fx.created.load(Ordering::SeqCst),
+        0,
+        "a refused upload must not mint a space"
+    );
+    h.quit(None).await.ok();
+    fx.server.abort();
+}
+
+/// A public channel's media URL carries no bearer, and every miss costs two
+/// round trips against the *uploader's* PDS plus up to 10 MB of their
+/// bandwidth. Without metering that URL is an amplifier pointed at a third
+/// party, so the route is behind the same IP limiter as the other expensive
+/// REST reads.
+#[tokio::test]
+async fn space_media_reads_are_rate_limited_per_ip() {
+    let fx = fixture_with_ids(&[]).await;
+    // Deliberately not one of ours: the ref check is cheap and comes after
+    // the limiter, so the only thing this measures is the limiter.
+    let path = format!(
+        "/api/v1/space-media/{}/x.png",
+        encode_ref("at://did:plc:someoneelse/space/at.freeq.media/K1/did:plc:a/c/3k")
+    );
+    let mut saw_limit = false;
+    for i in 0..40 {
+        let (status, _) = get(fx.web, &path).await;
+        if status == 429 {
+            saw_limit = true;
+            break;
+        }
+        assert_eq!(status, 400, "request {i} should be a plain refusal");
+    }
+    assert!(
+        saw_limit,
+        "an unauthenticated caller must eventually be rate limited"
+    );
     fx.server.abort();
 }
