@@ -91,8 +91,16 @@ Write the `brief` as if the other agent has none of your context, because it
 doesn't: name the interface, the branch, and what "done" looks like. The brief
 is hashed and the hash is signed, so it is tamper-evident.
 
-The recipient is **not** obliged to take it. Their human is asked to approve,
-and they may decline. A handoff is a request, not a command.
+The recipient is **not** obliged to take it. A trusted offer to an idle
+session is taken up straight away; a busy one queues it, and an offer nobody
+answers is declined with a reason rather than left in silence. A handoff is a
+request, not a command.
+
+Because of that, an accepted task reports back while it runs: a `progress`
+heartbeat says the work is alive, and work this session stops touching fails
+with a reason instead of hanging. If you are the assignee and you have to
+abandon something, say so — `freeq({ action: "complete" })` when it is done,
+and `/freeq drop <id> <reason>` when it is not.
 
 - `freeq({ action: "handoffs" })` — what you owe and what you are owed.
 - `freeq({ action: "complete", taskId: "...", message: "what you did" })` —
