@@ -225,7 +225,7 @@ class ActTaskStore {
             // to say.
             "confirm" -> {
                 val subject = task.events.firstOrNull { it.eventId == ev.fields["act-subject"] }
-                subject?.let { "confirmed: ${it.from}'s ${it.verb} on $title" }
+                subject?.let { "confirmed: \"$title\" — ${it.verb} by ${it.from}" }
             }
             "expire" -> "$title expired"
             else -> null

@@ -212,7 +212,7 @@ final class ActTaskStore {
         case "confirm":
             guard let subject = task.events.first(where: { $0.eventId == ev.fields["act-subject"] })
             else { return nil }
-            return "confirmed: \(subject.from)'s \(subject.verb) on \(title)"
+            return "confirmed: \"\(title)\" — \(subject.verb) by \(subject.from)"
         case "expire":
             return "\(title) expired"
         default:

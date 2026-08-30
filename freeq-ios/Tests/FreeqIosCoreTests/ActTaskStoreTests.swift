@@ -218,7 +218,7 @@ final class ActTaskStoreTests: XCTestCase {
         let line = store.record(
             move("confirm", "e3", ["act-subject": "e2"], who: "acceptance", did: nil))
 
-        XCTAssertEqual(line, "confirmed: worker's claim on ship the release")
+        XCTAssertEqual(line, "confirmed: \"ship the release\" — claim by worker")
     }
 
     func testAConfirmSaysNothingAboutAMoveItDoesNotHold() {

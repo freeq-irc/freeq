@@ -223,7 +223,7 @@ class ActTaskStoreTest {
             move("confirm", "e3", mapOf("act-subject" to "e2"), who = "acceptance", did = null)
         )
 
-        assertEquals("confirmed: worker's claim on ship the release", line)
+        assertEquals("confirmed: \"ship the release\" — claim by worker", line)
     }
 
     @Test fun a_confirm_says_nothing_about_a_move_it_does_not_hold() {

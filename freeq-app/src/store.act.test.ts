@@ -278,7 +278,7 @@ describe('the events that write no line of their own', () => {
 
     const lines = useStore.getState().channels.get(CH)!.messages.filter((m) => m.isSystem);
     expect(lines.map((m) => m.text)).toEqual([
-      "confirmed: worker's claim on ship the release",
+      'confirmed: "ship the release" — claim by worker',
     ]);
   });
 
