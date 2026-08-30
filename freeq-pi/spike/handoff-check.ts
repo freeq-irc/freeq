@@ -11,6 +11,9 @@
  *      channel history replay alone — nobody is online to tell him.
  *   4. Bob accepts and completes.
  *   5. Alice reconnects and must see the finished lifecycle.
+ *   6. Alice offers a second task, Bob takes it, and Alice RETRACTS it — the
+ *      cancellation must reach Bob and close the task on his side, because a
+ *      task withdrawn only in conversation stays assigned forever.
  *
  *   npx tsx spike/handoff-check.ts --server ws://127.0.0.1:18080/irc
  */
@@ -180,6 +183,54 @@ if (!finalRec) {
   }
   if (!finalRec.signed) fail("some event in the chain was unsigned");
   else ok("every event in the chain carried a signature");
+}
+
+// ── 6. A retraction must actually close the task on the worker's side ─────
+// Withdrawing work in prose leaves the ledger saying 'assigned', which is how
+// a worker ends up picking a dead task back up. Only `cancel` closes it.
+console.error("[m4] STEP 6 — alice retracts work bob already holds");
+const cancelId = await alice2.sendAct(channel, "offer", undefined, {
+  to: bobIdentity.did,
+  title: "Draft the migration notes",
+});
+if (!cancelId) {
+  fail("alice could not send the second offer");
+} else {
+  const seen = Date.now() + 20_000;
+  while (Date.now() < seen && !bobStore.get(cancelId)) {
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  if (!bobStore.get(cancelId)) fail("bob never saw the second offer");
+
+  await bob.sendAct(channel, "accept", cancelId, {});
+  await new Promise((r) => setTimeout(r, 2500));
+  if (bobStore.get(cancelId)?.state !== "assigned") {
+    fail(`bob should hold the second task; state=${bobStore.get(cancelId)?.state}`);
+  }
+
+  const sent = await alice2.sendAct(channel, "cancel", cancelId, {
+    note: "superseded — the batch was reorganised",
+  });
+  if (!sent) fail("alice could not send the cancellation");
+
+  const until = Date.now() + 20_000;
+  while (Date.now() < until && bobStore.get(cancelId)?.state !== "cancelled") {
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+
+  const cancelled = bobStore.get(cancelId);
+  if (cancelled?.state !== "cancelled") {
+    fail(`bob still sees '${cancelled?.state}' after the retraction — he would resume dead work`);
+  } else {
+    ok("the retraction reached the worker and closed the task");
+    if (bobStore.inboxFor(bob.did).some((r) => r.id === cancelId)) {
+      fail("the cancelled task is still in bob's inbox");
+    } else {
+      ok("it is gone from bob's inbox — nothing left to wander back to");
+    }
+    if (cancelled.log.at(-1)?.note) ok("the reason for the retraction came through");
+    else fail("the cancellation note did not survive the wire");
+  }
 }
 
 console.error(failed ? "\n[m4] FAILURES ABOVE" : "\n[m4] ALL CHECKS PASSED — handoffs survive offline");
