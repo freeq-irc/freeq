@@ -34,12 +34,6 @@ struct CoordinationCardView: View {
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(Theme.textTertiary)
                 }
-                if info.eventType.hasPrefix("task") || info.eventType == "evidence_attach" {
-                    Image(systemName: "lock.fill")
-                        .font(.system(size: 8))
-                        .foregroundStyle(Theme.success.opacity(0.8))
-                        .help("Cryptographically signed")
-                }
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 10)
