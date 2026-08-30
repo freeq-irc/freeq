@@ -266,3 +266,33 @@ fun actEventTimeMs(eventId: String): Long? {
     }
     return ms
 }
+
+/**
+ * Which buffer an act event belongs in — the task decides, not the sender.
+ *
+ * An event naming a task some thread already holds files there, whoever signed
+ * it, so a receipt the home signs lands beside the moves it confirms instead of
+ * in a thread named after the server, and a peer home's receipt in a federated
+ * conversation lands there too. An opener names no earlier task and opens its
+ * own thread, as before. Anything else naming a task nobody holds goes to the
+ * sender's thread when we have one and nowhere when we do not — the silence an
+ * unheld confirm has always had, rather than a thread conjured for one line
+ * that can say nothing.
+ *
+ * The same rule the web client (`actEventBuffer`) and the macOS client
+ * (`ActEventRouting.buffer`) read.
+ */
+object ActEventRouting {
+    fun buffer(
+        venue: String,
+        taskId: String,
+        eventId: String,
+        bufferHoldingTask: String?,
+        hasBuffer: (String) -> Boolean,
+    ): String? {
+        if (bufferHoldingTask != null) return bufferHoldingTask
+        // An opener's task is its own event, which is what makes it the opener.
+        if (taskId == eventId) return venue
+        return if (hasBuffer(venue)) venue else null
+    }
+}

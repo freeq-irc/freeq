@@ -390,6 +390,16 @@ class AppState(application: Application) : AndroidViewModel(application) {
                 ?: dmBuffers.firstOrNull { it.name.equals(name, ignoreCase = true) }
         }
 
+    /** The buffer with this name, channel or DM thread, if one is open. */
+    fun buffer(name: String): ChannelState? =
+        channels.firstOrNull { it.name.equals(name, ignoreCase = true) }
+            ?: dmBuffers.firstOrNull { it.name.equals(name, ignoreCase = true) }
+
+    /** The buffer whose task map already holds this task, if one does. A task
+     *  lives in one venue, so at most one thread can answer. */
+    fun bufferHoldingTask(taskId: String): String? =
+        (channels + dmBuffers).firstOrNull { it.actTasks.task(taskId) != null }?.name
+
     init {
         // Migrate secrets from plain prefs to encrypted prefs (one-time)
         if (prefs.contains("brokerToken") || prefs.contains("did")) {
@@ -1752,12 +1762,23 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
             }
 
             is FreeqEvent.Act -> {
-                // A task event rides as a TAGMSG, so it routes the way every
-                // other TAGMSG does. The SDK has already read the tags and
-                // dropped the repeats a joiner is handed.
+                // A task event rides as a TAGMSG, so it names its venue the
+                // way every other TAGMSG does. The SDK has already read the
+                // tags and dropped the repeats a joiner is handed.
                 val act = event.event
-                val bufferName =
+                // Where the event was said, and then where its task lives: a
+                // receipt the home signs for itself is keyed by the server, so
+                // the venue alone would file a DM's confirm in a thread named
+                // after the server rather than beside the moves it confirms.
+                val venue =
                     TagMsgRouter.routeTo(act.target, act.from, state.nick.value, act.dmKey)
+                val bufferName = ActEventRouting.buffer(
+                    venue = venue,
+                    taskId = act.taskId,
+                    eventId = act.eventId,
+                    bufferHoldingTask = state.bufferHoldingTask(act.taskId),
+                    hasBuffer = { name -> state.buffer(name) != null },
+                ) ?: return
                 val buf = if (bufferName.startsWith("#")) {
                     state.getOrCreateChannel(bufferName)
                 } else {
