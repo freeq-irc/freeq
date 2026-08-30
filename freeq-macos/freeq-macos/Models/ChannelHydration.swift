@@ -193,12 +193,16 @@ enum ServerNoticeRouter {
         // Speculative-history failures: the client requests DM history on its
         // own when a conversation opens; a guest (or a DM with a guest peer)
         // gets `CHATHISTORY <CODE> <target> …` back for a request the user
-        // never made — showing it reads as an error in the thread. Per-target
-        // failures are swallowed; a TARGETS (`*`) failure answers an explicit
-        // conversation-list request and stays visible.
+        // never made — showing it reads as an error in the thread. Exactly the
+        // two codes that answer an unfetchable target are swallowed, whatever
+        // the target, which is the web client's rule; every other CHATHISTORY
+        // failure is a real refusal and shows.
         if text.hasPrefix("CHATHISTORY ") {
             let parts = text.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
-            if parts.count >= 3, parts[2] != "*" { return .ignore }
+            if parts.count >= 2,
+               parts[1] == "INVALID_TARGET" || parts[1] == "ACCOUNT_REQUIRED" {
+                return .ignore
+            }
         }
         if text == "MOTD:START" { return .motdStart }
         if text == "MOTD:END" { return .motdEnd }
