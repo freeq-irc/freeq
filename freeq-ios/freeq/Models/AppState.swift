@@ -3371,10 +3371,13 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                 // (a guest-DM edit failing invisibly cost an evening).
                 // Background history probes (speculative CHATHISTORY on
                 // opening a thread) fail routinely for guest peers —
-                // toasting those spams with nothing actionable (mirror of
-                // the web client's filter).
+                // toasting those spams with nothing actionable. Only the two
+                // codes that answer an unfetchable target are swallowed,
+                // whatever the target, which is the web client's rule; every
+                // other CHATHISTORY failure is a real refusal and shows.
                 if text.range(of: #"^[A-Z]+ [A-Z_]+ "#, options: .regularExpression) != nil,
-                   !text.hasPrefix("CHATHISTORY ") {
+                   text.range(of: #"^CHATHISTORY (INVALID_TARGET|ACCOUNT_REQUIRED)"#,
+                              options: .regularExpression) == nil {
                     Task { @MainActor in
                         ToastManager.shared.show("Server: \(text)", icon: "exclamationmark.triangle")
                     }
