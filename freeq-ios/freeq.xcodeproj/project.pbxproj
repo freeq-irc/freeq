@@ -18,6 +18,10 @@
 		160583C1C4A46B49DB909D79 /* CatchUpDigestSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7209B1DA2E14FE9EC7681E46 /* CatchUpDigestSheet.swift */; };
 		1AF9A87111E0AB6A8533B406 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EA65B8D6263AAF104F9B06CE /* Security.framework */; };
 		1BD7A46E4BD6D8A4BE35029A /* CoordinationCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = F04E1A3210EB33E4454CE74D /* CoordinationCard.swift */; };
+		B0C71A5200000000000000A1 /* ActTasks.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0C71A5200000000000000A2 /* ActTasks.swift */; };
+		B0C71A5200000000000000B1 /* ActVerbs.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0C71A5200000000000000B2 /* ActVerbs.swift */; };
+		B0C71A5200000000000000D1 /* DmHistoryOnOpen.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0C71A5200000000000000D2 /* DmHistoryOnOpen.swift */; };
+		B0C71A5200000000000000C1 /* ActEventCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0C71A5200000000000000C2 /* ActEventCardView.swift */; };
 		1C03827BA2B28F3D2A0FEE28 /* AvMediaFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 90CFA49BA9803132D1A9979D /* AvMediaFlowTests.swift */; };
 		1D0A256D49EDDC69B0E09E66 /* SpotlightIndexer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91D4028719D43D3BBF97FA82 /* SpotlightIndexer.swift */; };
 		1F2A16FBB786A03B28150914 /* WatchPayloads.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13E68B84D80561E2B74C5B48 /* WatchPayloads.swift */; };
@@ -283,6 +287,10 @@
 		EA65B8D6263AAF104F9B06CE /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		ED2B936BFFD2FB65A3BBA961 /* WatchKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WatchKit.framework; path = System/Library/Frameworks/WatchKit.framework; sourceTree = SDKROOT; };
 		F04E1A3210EB33E4454CE74D /* CoordinationCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoordinationCard.swift; sourceTree = "<group>"; };
+		B0C71A5200000000000000A2 /* ActTasks.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActTasks.swift; sourceTree = "<group>"; };
+		B0C71A5200000000000000B2 /* ActVerbs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActVerbs.swift; sourceTree = "<group>"; };
+		B0C71A5200000000000000D2 /* DmHistoryOnOpen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DmHistoryOnOpen.swift; sourceTree = "<group>"; };
+		B0C71A5200000000000000C2 /* ActEventCardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActEventCardView.swift; sourceTree = "<group>"; };
 		F40F27BC70CA9C7E4307D2A3 /* SearchSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchSheet.swift; sourceTree = "<group>"; };
 		F48AA8A24FB24A8AC4F30461 /* ChatMessage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMessage.swift; sourceTree = "<group>"; };
 		F8A70269A0B1FFBA4A6B8F51 /* EmptyStateView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmptyStateView.swift; sourceTree = "<group>"; };
@@ -399,6 +407,7 @@
 				E4A25735A9E045465A3F1BAD /* ChatsTab.swift */,
 				9E160E4F6AA98C972AA5B794 /* ComposeView.swift */,
 				5623F20307924888306278FF /* ConnectView.swift */,
+				B0C71A5200000000000000C2 /* ActEventCardView.swift */,
 				01F3FF90C3280207C507F1F7 /* CoordinationCardView.swift */,
 				8114EBF122CE613364A0CAE7 /* DiscoverTab.swift */,
 				F8A70269A0B1FFBA4A6B8F51 /* EmptyStateView.swift */,
@@ -457,6 +466,9 @@
 				6283782A8FA9C9B10BEE7C3E /* ChannelE2eeState.swift */,
 				5CA24DC11B2BF464C7175F93 /* ChannelState.swift */,
 				F48AA8A24FB24A8AC4F30461 /* ChatMessage.swift */,
+				B0C71A5200000000000000A2 /* ActTasks.swift */,
+				B0C71A5200000000000000B2 /* ActVerbs.swift */,
+				B0C71A5200000000000000D2 /* DmHistoryOnOpen.swift */,
 				F04E1A3210EB33E4454CE74D /* CoordinationCard.swift */,
 				DA678EF1B2762175E6668C55 /* DidDisplay.swift */,
 				4CDE9B1546F27B7DC72AA1A5 /* DmResolver.swift */,
@@ -773,6 +785,10 @@
 				D0209F9328C9586D5B2849DE /* ConnectView.swift in Sources */,
 				B198511552ED975806FF24E9 /* ContentView.swift in Sources */,
 				1BD7A46E4BD6D8A4BE35029A /* CoordinationCard.swift in Sources */,
+				B0C71A5200000000000000A1 /* ActTasks.swift in Sources */,
+				B0C71A5200000000000000B1 /* ActVerbs.swift in Sources */,
+				B0C71A5200000000000000D1 /* DmHistoryOnOpen.swift in Sources */,
+				B0C71A5200000000000000C1 /* ActEventCardView.swift in Sources */,
 				B41304C5131C07D3928E5596 /* CoordinationCardView.swift in Sources */,
 				4047D67A42E04325ACEFECDA /* DidDisplay.swift in Sources */,
 				F5578CDEA68BCCE1C35408EF /* DiscoverTab.swift in Sources */,

@@ -272,9 +272,27 @@ struct MessageListView: View {
                 appState.markRead(channel.name)
                 scrollToBottom(proxy: proxy)
             }
+            .onChange(of: appState.scrollToMessageId) {
+                // A task card's prev/next link. Rows are identified by
+                // renderKey, so the target is resolved from the message.
+                guard let id = appState.scrollToMessageId,
+                      let target = channel.messages.first(where: { $0.id == id })
+                else { return }
+                withAnimation(.easeOut(duration: 0.2)) {
+                    proxy.scrollTo(target.renderKey, anchor: .center)
+                }
+                // Held, not cleared at once: the target card tints while this
+                // names it, which is the only sign the jump happened when the
+                // neighbour was already on screen.
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 1_400_000_000)
+                    if appState.scrollToMessageId == id { appState.scrollToMessageId = nil }
+                }
+            }
             .onChange(of: appState.activeChannel) {
                 if appState.activeChannel == channel.name {
                     appState.markRead(channel.name)
+                    appState.requestDmHistoryOnOpenIfNeeded(channel.name)
                     scrollToBottom(proxy: proxy)
                 }
             }
@@ -766,7 +784,7 @@ struct MessageListView: View {
                         .frame(width: 56, alignment: .center)
                         .padding(.top, 3)
 
-                    messageBody(msg)
+                    messageBody(msg, grouped: true)
                         .padding(.trailing, 16)
                 }
                 .padding(.vertical, 1)
@@ -918,12 +936,29 @@ struct MessageListView: View {
     private static let mdChannel = try! NSRegularExpression(pattern: #"(?<![\w/#])#[A-Za-z0-9][A-Za-z0-9._-]*"#)
 
     @ViewBuilder
-    private func messageBody(_ msg: ChatMessage) -> some View {
+    private func messageBody(_ msg: ChatMessage, grouped: Bool = false) -> some View {
         if msg.isAction {
             Text("*\(msg.from) \(msg.text)*")
                 .font(.fqSubheadline)
                 .italic()
                 .foregroundColor(Theme.textSecondary)
+        } else if let card = channel.actCards[msg.id] {
+            // A task event's companion line → its card. Every act event
+            // renders as its own card and stays one; a line whose event has
+            // not arrived has no card here and stays text below.
+            ActEventCardView(card: card, at: msg.timestamp,
+                             isHighlighted: appState.scrollToMessageId == msg.id) { msgId in
+                appState.scrollToMessageId = msgId
+            }
+            // The two row layouts hand this card different spans, so without
+            // this it renders at two sizes down the transcript. A header row
+            // starts at 16+40(avatar)+12(gap) = 68 and its HStack spacing puts
+            // another 12 between the body and the trailing Spacer, so it ends
+            // at width-28. A grouped row starts at the 56pt time column and
+            // ends at width-16. Twelve points on each side of the grouped card
+            // makes both 68 to width-28.
+            .padding(.horizontal, grouped ? 12 : 0)
+            .frame(maxWidth: .infinity, alignment: .leading)
         } else if let coord = msg.coordination {
             // Agent coordination event → structured card (parity with web + macOS).
             CoordinationCardView(info: coord, text: msg.text)
