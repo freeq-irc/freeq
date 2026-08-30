@@ -962,6 +962,8 @@ struct MessageListView: View {
         } else if let coord = msg.coordination {
             // Agent coordination event → structured card (parity with web + macOS).
             CoordinationCardView(info: coord, text: msg.text)
+                .padding(.horizontal, grouped ? 12 : 0)
+                .frame(maxWidth: .infinity, alignment: .leading)
         } else if let jumbo = Jumbomoji.size(msg.text) {
             // Jumbomoji: a message of just 1–3 emoji renders large.
             Text(msg.text.trimmingCharacters(in: .whitespacesAndNewlines))
