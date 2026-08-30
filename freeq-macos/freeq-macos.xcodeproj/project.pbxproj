@@ -88,6 +88,9 @@
 		C427D104D59E12468C135DAC /* MenuBarModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = DEE68D36BE8C58FE6D1A14BA /* MenuBarModel.swift */; };
 		C480A25B440D0373E17082D8 /* ComposeFormatting.swift in Sources */ = {isa = PBXBuildFile; fileRef = AFDA007C5D2E0294D534B5A4 /* ComposeFormatting.swift */; };
 		C5A5186C1534C70E22BC2912 /* CoordinationCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03305544EF084785B6229CD6 /* CoordinationCard.swift */; };
+		A0C71A5100000000000000A1 /* ActTasks.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0C71A5100000000000000A2 /* ActTasks.swift */; };
+		A0C71A5100000000000000B1 /* ActVerbs.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0C71A5100000000000000B2 /* ActVerbs.swift */; };
+		A0C71A5100000000000000C1 /* ActEventCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0C71A5100000000000000C2 /* ActEventCardView.swift */; };
 		C724476B94820275BA16E55F /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B11355062BDD7B9062AC22F /* ChatView.swift */; };
 		CAF04BC63962B2AD1BCB86FE /* FreeqAppIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99635569CD2711503B3DCF7E /* FreeqAppIntents.swift */; };
 		CB1EC774D4444A86144B5263 /* DmResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49F502D18AE018377ED62923 /* DmResolver.swift */; };
@@ -153,6 +156,9 @@
 /* Begin PBXFileReference section */
 		00BBD649F1BBDEBFC67FE0CE /* ScreenSharePicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenSharePicker.swift; sourceTree = "<group>"; };
 		03305544EF084785B6229CD6 /* CoordinationCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoordinationCard.swift; sourceTree = "<group>"; };
+		A0C71A5100000000000000A2 /* ActTasks.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActTasks.swift; sourceTree = "<group>"; };
+		A0C71A5100000000000000B2 /* ActVerbs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActVerbs.swift; sourceTree = "<group>"; };
+		A0C71A5100000000000000C2 /* ActEventCardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActEventCardView.swift; sourceTree = "<group>"; };
 		04D3AAFE430FB0DC2DA62F57 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
 		06360D5F1B334245B936F78F /* ComposeHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposeHistory.swift; sourceTree = "<group>"; };
 		06D79754C3E6C19E87D67F6E /* Jumbomoji.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Jumbomoji.swift; sourceTree = "<group>"; };
@@ -312,6 +318,7 @@
 		38C6F4ECE1B53363B9F87425 /* Chat */ = {
 			isa = PBXGroup;
 			children = (
+				A0C71A5100000000000000C2 /* ActEventCardView.swift */,
 				D2FF7FE3348FFE303622668A /* AppKitMessageList.swift */,
 				2B98D35F34492C2C6B3E504F /* AutocompletePopup.swift */,
 				B840984A8780805615D0846A /* CallView.swift */,
@@ -435,6 +442,8 @@
 				9E6BC4FEEBACC91D752966CC /* ChannelHydration.swift */,
 				1A0528F19FEFD2C3985CEB60 /* ChannelPolicy.swift */,
 				ED9F5A69D81B1BA80FC4782A /* ChannelState.swift */,
+				A0C71A5100000000000000A2 /* ActTasks.swift */,
+				A0C71A5100000000000000B2 /* ActVerbs.swift */,
 				DA3E838FFB8176761B9DAA50 /* ChatMessage.swift */,
 				B7C14C09FE9CB53438535F9C /* CommandRegistry.swift */,
 				D90D45494AECECE10448CB0E /* ComposeCommands.swift */,
@@ -681,6 +690,9 @@
 				E113828BDC95B387B70656BA /* ConnectGate.swift in Sources */,
 				D29F998C6DF599EA13C38C85 /* ConnectView.swift in Sources */,
 				C5A5186C1534C70E22BC2912 /* CoordinationCard.swift in Sources */,
+				A0C71A5100000000000000A1 /* ActTasks.swift in Sources */,
+				A0C71A5100000000000000B1 /* ActVerbs.swift in Sources */,
+				A0C71A5100000000000000C1 /* ActEventCardView.swift in Sources */,
 				F09B5C0D9F467AE052B47824 /* CoordinationCardView.swift in Sources */,
 				111A631DD747383DB85200BF /* DebugBridge.swift in Sources */,
 				40B19B4620E1FFA3196FBFAD /* DetailPanel.swift in Sources */,
