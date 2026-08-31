@@ -121,8 +121,8 @@ function TaskCompleteCard({ msg }: { msg: Message }) {
 
 function TaskFailedCard({ msg }: { msg: Message }) {
   return (
-    <CardFrame icon="❌" label="Task Failed" msg={msg} className="border-error/30">
-      <div className="text-error whitespace-pre-wrap">{msg.text}</div>
+    <CardFrame icon="❌" label="Task Failed" msg={msg} className="border-danger/30">
+      <div className="text-danger whitespace-pre-wrap">{msg.text}</div>
     </CardFrame>
   );
 }
