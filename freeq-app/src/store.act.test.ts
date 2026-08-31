@@ -278,7 +278,7 @@ describe('the events that write no line of their own', () => {
 
     const lines = useStore.getState().channels.get(CH)!.messages.filter((m) => m.isSystem);
     expect(lines.map((m) => m.text)).toEqual([
-      'confirmed: "ship the release" — claim by worker',
+      '✔️ confirmed: "ship the release" — claim by worker',
     ]);
   });
 
@@ -305,7 +305,7 @@ describe('the events that write no line of their own', () => {
     st.addActEvent(CH, move('expire', 'e2', {}, 'acceptance'));
 
     const lines = useStore.getState().channels.get(CH)!.messages.filter((m) => m.isSystem);
-    expect(lines.map((m) => m.text)).toEqual(['ship the release expired']);
+    expect(lines.map((m) => m.text)).toEqual(['⌛ ship the release expired']);
   });
 
   it('says when the home moved, not when the line reached us', () => {

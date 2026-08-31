@@ -13,7 +13,20 @@ import type { Message, ActTask, ActEvent } from '../store';
 import { CardFrame } from './CoordinationCards';
 import { TaskTimeline } from './TaskTimeline';
 import { useStore } from '../store';
-import { actHeadline } from '../lib/act-verbs';
+import { actHeadline, actEmoji, actAccent, type ActAccent } from '../lib/act-verbs';
+
+/**
+ * The left edge each accent paints, in this client's own theme colours.
+ *
+ * Only the moves that put work on a plate, end well, or fail carry one —
+ * an edge on every card is an edge that says nothing.
+ */
+const ACCENT_EDGE: Record<ActAccent, string> = {
+  none: '',
+  handoff: 'border-l-2 border-l-purple',
+  success: 'border-l-2 border-l-success',
+  failure: 'border-l-2 border-l-danger',
+};
 
 /**
  * The cards either side of this one, by companion msgid.
@@ -43,7 +56,29 @@ export function ActEventCard({ msg, task, event }: {
   return (
     <>
       <div data-testid="act-card" onClick={() => setOpen(true)} className="cursor-pointer">
-        <CardFrame icon="📋" label={actHeadline(event.verb)} msg={msg}>
+        <CardFrame
+          icon={actEmoji(event.verb)}
+          label={actHeadline(event.verb)}
+          uppercaseLabel
+          msg={msg}
+          className={ACCENT_EDGE[actAccent(event.verb)]}
+          footer={(prev || next) && (
+            // The links live under the body behind a hairline, so the
+            // header stays the card's only filled strip.
+            <div className="flex w-full items-center" onClick={e => e.stopPropagation()}>
+              {prev && (
+                <button className="text-fg-dim hover:text-fg-muted" onClick={() => setScrollToMsgId(prev)}>
+                  ← prev
+                </button>
+              )}
+              {next && (
+                <button className="ml-auto text-fg-dim hover:text-fg-muted" onClick={() => setScrollToMsgId(next)}>
+                  next →
+                </button>
+              )}
+            </div>
+          )}
+        >
           {task.title && <div className="text-fg whitespace-pre-wrap">{task.title}</div>}
           {note && <div className="text-fg-muted whitespace-pre-wrap">{note}</div>}
           {ctx && (
@@ -59,20 +94,6 @@ export function ActEventCard({ msg, task, event }: {
             >
               {ctx}
             </a>
-          )}
-          {(prev || next) && (
-            <div className="flex gap-3 mt-1.5 text-[11px]" onClick={e => e.stopPropagation()}>
-              {prev && (
-                <button className="text-fg-dim hover:text-fg-muted" onClick={() => setScrollToMsgId(prev)}>
-                  ← prev
-                </button>
-              )}
-              {next && (
-                <button className="text-fg-dim hover:text-fg-muted" onClick={() => setScrollToMsgId(next)}>
-                  next →
-                </button>
-              )}
-            </div>
           )}
         </CardFrame>
       </div>
