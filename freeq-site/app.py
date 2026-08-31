@@ -12,6 +12,8 @@ from markdown.extensions.fenced_code import FencedCodeExtension
 from markdown.extensions.tables import TableExtension
 from markdown.extensions.toc import TocExtension
 
+from agent_surfaces import register_agent_surfaces
+
 app = Flask(__name__)
 
 # Resolve git commit at startup (written by deploy.sh or read from git)
@@ -586,6 +588,8 @@ def well_known(filename):
 @app.route("/favicon.ico")
 def favicon():
     return "", 204
+
+register_agent_surfaces(app)   # after all existing routes are defined
 
 
 if __name__ == "__main__":
