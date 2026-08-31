@@ -148,6 +148,197 @@ paths:
             text/markdown:
               schema:
                 type: string
+  /agents.md:
+    get:
+      tags: [discovery]
+      operationId: getAgentsMarkdown
+      summary: When to use freeq, when not to, and the rules for agents.
+      description: |
+        Also served at `/AGENTS.md`. This is the *public* agent document, not
+        the repository's contributor file of the same name — that one is a
+        developer document and is never served.
+      security: [{}]
+      responses:
+        "200":
+          description: Agent instructions.
+          content:
+            text/markdown:
+              schema:
+                type: string
+  /auth.md:
+    get:
+      tags: [discovery, auth]
+      operationId: getAuthMarkdown
+      summary: How an agent obtains its own credentials (WorkOS auth.md format).
+      description: |
+        The walkthrough behind `/.well-known/oauth-protected-resource`: mint a
+        did:key, answer the SASL `ATPROTO-CHALLENGE`, capture the `API-BEARER`
+        token. No human approval step.
+      security: [{}]
+      responses:
+        "200":
+          description: Credential walkthrough.
+          content:
+            text/markdown:
+              schema:
+                type: string
+  /index.md:
+    get:
+      tags: [discovery]
+      operationId: getIndexMarkdown
+      summary: The homepage as markdown, for readers that do not run JavaScript.
+      security: [{}]
+      responses:
+        "200":
+          description: Markdown homepage.
+          content:
+            text/markdown:
+              schema:
+                type: string
+  /robots.txt:
+    get:
+      tags: [discovery]
+      operationId: getRobotsTxt
+      summary: Crawler policy, naming AI crawlers explicitly.
+      security: [{}]
+      responses:
+        "200":
+          description: robots.txt document.
+          content:
+            text/plain:
+              schema:
+                type: string
+  /sitemap.xml:
+    get:
+      tags: [discovery]
+      operationId: getSitemap
+      summary: Agent-relevant paths on this host.
+      security: [{}]
+      responses:
+        "200":
+          description: Sitemap.
+          content:
+            application/xml:
+              schema:
+                type: string
+  /openapi.json:
+    get:
+      tags: [discovery]
+      operationId: getOpenapiAtRoot
+      summary: Alias for /api/v1/openapi.json, where crawlers look first.
+      security: [{}]
+      responses:
+        "200":
+          description: This document.
+          content:
+            application/json:
+              schema:
+                type: object
+  /.well-known/ard.json:
+    get:
+      tags: [discovery]
+      operationId: getArdCatalog
+      summary: Agentic Resource Discovery catalog of this server's surfaces.
+      description: |
+        Also served at the legacy path `/.well-known/ai-catalog.json`.
+        Carries a `trustManifest` describing data use and how to verify
+        attribution.
+      security: [{}]
+      responses:
+        "200":
+          description: Discovery catalog.
+          content:
+            application/json:
+              schema:
+                type: object
+  /.well-known/ai-catalog.json:
+    get:
+      tags: [discovery]
+      operationId: getAiCatalog
+      summary: Legacy path for the ARD catalog.
+      security: [{}]
+      responses:
+        "200":
+          description: Discovery catalog.
+          content:
+            application/json:
+              schema:
+                type: object
+  /.well-known/agent-card.json:
+    get:
+      tags: [discovery]
+      operationId: getAgentCard
+      summary: A2A agent card describing this server's skills.
+      security: [{}]
+      responses:
+        "200":
+          description: Agent card.
+          content:
+            application/json:
+              schema:
+                type: object
+  /.well-known/api-catalog:
+    get:
+      tags: [discovery]
+      operationId: getApiCatalog
+      summary: RFC 9727 linkset pointing at the OpenAPI spec and status endpoint.
+      security: [{}]
+      responses:
+        "200":
+          description: API catalog linkset.
+          content:
+            application/json:
+              schema:
+                type: object
+  /.well-known/mcp/server-card.json:
+    get:
+      tags: [discovery]
+      operationId: getMcpServerCard
+      summary: MCP server card.
+      description: |
+        Reports `published: false` — `@freeq/mcp` is not on npm and must be
+        built from source. Deliberately does not advertise an `npx` command
+        for a package that does not exist.
+      security: [{}]
+      responses:
+        "200":
+          description: MCP server card.
+          content:
+            application/json:
+              schema:
+                type: object
+  /.well-known/oauth-protected-resource:
+    get:
+      tags: [discovery, auth]
+      operationId: getProtectedResourceMetadata
+      summary: RFC 9728 protected-resource metadata.
+      description: |
+        `authorization_servers` is empty: freeq mints bearer tokens through
+        SASL, not through an OAuth authorization server.
+        `resource_documentation` points at `/auth.md`, which is the real
+        instruction set. 401 responses carry a matching
+        `WWW-Authenticate: Bearer resource_metadata=…` header.
+      security: [{}]
+      responses:
+        "200":
+          description: Protected-resource metadata.
+          content:
+            application/json:
+              schema:
+                type: object
+  /.well-known/http-message-signatures-directory:
+    get:
+      tags: [discovery]
+      operationId: getWebBotAuthDirectory
+      summary: Web Bot Auth key directory (currently empty).
+      security: [{}]
+      responses:
+        "200":
+          description: Key directory.
+          content:
+            application/json:
+              schema:
+                type: object
 
   # ── server ───────────────────────────────────────────────────────────
   /api/v1/health:

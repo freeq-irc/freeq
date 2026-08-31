@@ -50,19 +50,27 @@ def _markdown(text):
     return Response(text, status=200, content_type=_MARKDOWN_CT)
 
 
+#: Public, agent-facing prose, shared byte-for-byte with irc.freeq.at (which
+#: compiles the same files in with `include_str!`). It lives in its own
+#: directory rather than the repo root for a filesystem reason: macOS is
+#: case-insensitive, so a repo-root `agents.md` IS `AGENTS.md` — the
+#: contributor file, a symlink to CLAUDE.md, with production hosts in it.
+#: Writing one silently overwrites the other.
+AGENT_DOCS = REPO_ROOT / "agent-docs"
+
+
 def _repo_markdown(name):
-    """Serve REPO_ROOT/<name> as markdown, 404 if absent.
+    """Serve AGENT_DOCS/<name> as markdown, 404 if absent.
 
     SECURITY: `name` must be matched against a hardcoded allowlist inside the
-    caller. Never join user input onto REPO_ROOT — the repo root contains
-    AGENTS.md and CLAUDE.md with deploy hosts in them, and *.secret files.
+    caller. Never join user input onto this path.
     """
-    target = (REPO_ROOT / name).resolve()
+    target = (AGENT_DOCS / name).resolve()
     # Belt and braces even though the caller passes a literal: the resolved
     # file must live directly inside the repo root, nowhere else. (This also
     # keeps a symlinked name from pointing outside the tree.)
     try:
-        target.relative_to(REPO_ROOT.resolve())
+        target.relative_to(AGENT_DOCS.resolve())
     except ValueError:
         abort(404)
     if not target.is_file():
@@ -73,21 +81,12 @@ def _repo_markdown(name):
 def _agent_facing_markdown():
     """The public agents.md, served at /agents.md and /AGENTS.md.
 
-    Deliberately NOT the repo-root AGENTS.md: in contributor checkouts that
-    path is an internal developer file (it is a symlink to CLAUDE.md in this
-    repo, with deploy hosts and task lists in it — the audit regression
-    guard is the 'deploy.sh' string). The public copy therefore lives here
-    next to this file, so the serving path can never resolve to internal
-    content.
+    Deliberately NOT the repo-root AGENTS.md: that path is an internal
+    developer file (a symlink to CLAUDE.md, with deploy hosts and task lists
+    in it — the audit regression guard is the 'deploy.sh' string). The public
+    copy lives in agent-docs/, which cannot collide with it.
     """
-    path = (SITE_ROOT / "agents.md").resolve()
-    try:
-        path.relative_to(SITE_ROOT.resolve())
-    except ValueError:
-        abort(404)
-    if not path.is_file():
-        abort(404)
-    return _markdown(path.read_text())
+    return _repo_markdown("agents.md")
 
 
 def ard_document():

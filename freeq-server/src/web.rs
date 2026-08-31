@@ -15,6 +15,7 @@ use std::time::SystemTime;
 use axum::Router;
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
+use axum::handler::HandlerWithoutStateExt;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json, Redirect};
 use axum::routing::{get, post};
@@ -193,6 +194,41 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .route("/api/v1/openapi.json", get(crate::openapi::openapi_json))
         .route("/api/v1/openapi.yaml", get(crate::openapi::openapi_yaml))
         .route("/llms.txt", get(crate::openapi::llms_txt))
+        // Crawler and agent discovery: the files a client looks for *before*
+        // it knows the contract exists. `/openapi.json` is an alias because
+        // that is where crawlers probe; the spec itself lives under /api/v1.
+        .route("/robots.txt", get(crate::agent_surfaces::robots_txt))
+        .route("/sitemap.xml", get(crate::agent_surfaces::sitemap_xml))
+        .route("/agents.md", get(crate::agent_surfaces::agents_md))
+        .route("/AGENTS.md", get(crate::agent_surfaces::agents_md))
+        .route("/auth.md", get(crate::agent_surfaces::auth_md))
+        .route("/index.md", get(crate::agent_surfaces::index_md))
+        .route("/openapi.json", get(crate::openapi::openapi_json))
+        .route("/.well-known/ard.json", get(crate::agent_surfaces::ard_json))
+        .route(
+            "/.well-known/ai-catalog.json",
+            get(crate::agent_surfaces::ai_catalog_json),
+        )
+        .route(
+            "/.well-known/agent-card.json",
+            get(crate::agent_surfaces::agent_card_json),
+        )
+        .route(
+            "/.well-known/api-catalog",
+            get(crate::agent_surfaces::api_catalog),
+        )
+        .route(
+            "/.well-known/mcp/server-card.json",
+            get(crate::agent_surfaces::mcp_server_card),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(crate::agent_surfaces::oauth_protected_resource),
+        )
+        .route(
+            "/.well-known/http-message-signatures-directory",
+            get(crate::agent_surfaces::web_bot_auth_directory),
+        )
         // REST API (read-only, v1)
         .route("/api/v1/health", get(api_health))
         // The mediated, metered model path: the server holds the provider
@@ -363,15 +399,28 @@ pub fn router(state: Arc<SharedState>) -> Router {
         let dir = std::path::PathBuf::from(web_dir);
         if dir.exists() {
             tracing::info!("Serving web client from {}", dir.display());
-            // SPA fallback: serve index.html for any path not matching a static file
+            // SPA fallback, but only for paths that look like client-side
+            // routes. Serving index.html with status 200 for *every* miss —
+            // which is what this did until the agent-readiness work — tells
+            // any crawler that `/robots.txt`, `/openapi.json` and every
+            // `/.well-known/*` document exists and is HTML. Auditors record
+            // that as "malformed", and agents probing for a resource conclude
+            // every path they can imagine is real.
             let index_path = dir.join("index.html");
+            crate::agent_surfaces::set_index_html(&index_path);
             let serve = tower_http::services::ServeDir::new(&dir)
                 .append_index_html_on_directories(true)
-                .fallback(tower_http::services::ServeFile::new(index_path));
+                .fallback(crate::agent_surfaces::spa_fallback.into_service());
             app = app.fallback_service(serve);
         } else {
             tracing::warn!("Web static dir not found: {}", dir.display());
+            app = app.fallback(crate::agent_surfaces::spa_fallback);
         }
+    } else {
+        // No web client on this host (a headless server, or a test): unknown
+        // paths still get a real 404 with somewhere to go, rather than
+        // axum's empty-bodied default.
+        app = app.fallback(crate::agent_surfaces::spa_fallback);
     }
 
     // Apply state, then merge verifier (which has its own state already applied)
@@ -406,7 +455,11 @@ pub fn router(state: Arc<SharedState>) -> Router {
     }
     // Security headers as outermost layer so they apply to all responses
     // including static files served via fallback_service
-    final_app.layer(axum::middleware::from_fn(security_headers))
+    final_app
+        .layer(axum::middleware::from_fn(security_headers))
+        .layer(axum::middleware::from_fn(
+            crate::agent_surfaces::discovery_headers,
+        ))
 }
 
 /// Handler for /verify/* paths with no mounted verifier (e.g. GitHub when
