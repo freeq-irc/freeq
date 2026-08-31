@@ -33,4 +33,50 @@ enum ActVerbs {
     ]
 
     static func headline(_ verb: String) -> String { headlines[verb] ?? verb }
+
+    /// The glyph each task verb shows a reader, beside its word.
+    ///
+    /// One row per verb, read the same way the word above it is: off the verb
+    /// the event carried, never off where the task got to. A verb with no row
+    /// here gets the generic pin, so a kind may add a move without this being
+    /// taught it.
+    private static let glyphs: [String: String] = [
+        "offer": "📋",
+        "accept": "👍",
+        "decline": "👎",
+        "claim": "✋",
+        "progress": "📌",
+        "complete": "🎉",
+        "fail": "❌",
+        "cancel": "🚫",
+        "bid": "💰",
+        "award": "🏆",
+        "submit": "📤",
+        "revise": "🔁",
+        "accept-work": "✅",
+        "forfeit": "🏳️",
+        // The two the home signs for itself. They write no companion line, so
+        // they carry their glyph on a system line rather than on a card.
+        "confirm": "✔️",
+        "expire": "⌛",
+    ]
+
+    static func emoji(_ verb: String) -> String { glyphs[verb] ?? "📌" }
+
+    /// The accent a card's left edge carries. Purple where the work lands on
+    /// someone's plate, green on a good end, red on a failure; every other
+    /// verb goes without, since an edge on everything is an edge that says
+    /// nothing.
+    static func accent(_ verb: String) -> ActAccent {
+        switch verb {
+        case "offer", "award": return .handoff
+        case "complete", "accept-work": return .success
+        case "fail": return .failure
+        default: return .none
+        }
+    }
 }
+
+/// An accent as a role rather than a colour — each client paints it in its own
+/// theme.
+enum ActAccent: Equatable { case none, handoff, success, failure }
