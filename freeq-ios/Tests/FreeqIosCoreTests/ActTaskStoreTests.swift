@@ -218,7 +218,7 @@ final class ActTaskStoreTests: XCTestCase {
         let line = store.record(
             move("confirm", "e3", ["act-subject": "e2"], who: "acceptance", did: nil))
 
-        XCTAssertEqual(line, "confirmed: \"ship the release\" — claim by worker")
+        XCTAssertEqual(line, "✔️ confirmed: \"ship the release\" — claim by worker")
     }
 
     func testAConfirmSaysNothingAboutAMoveItDoesNotHold() {
@@ -235,7 +235,7 @@ final class ActTaskStoreTests: XCTestCase {
 
         XCTAssertEqual(
             store.record(move("expire", "e2", who: "acceptance", did: nil)),
-            "ship the release expired")
+            "⌛ ship the release expired")
     }
 
     func testAnExpirySaysNothingWhenNoTitleIsHeld() {

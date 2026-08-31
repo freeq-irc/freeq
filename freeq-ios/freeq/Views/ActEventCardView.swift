@@ -1,105 +1,76 @@
 import SwiftUI
 
-/// One task event, as the line its sender wrote beside it.
-///
-/// The event itself rides as a TAGMSG the message list never shows; this card
-/// is the line beside it. The headline is the word for the verb that event
-/// carried, never one read off the task's state, so a progress report never
-/// reads as a claim.
-///
-/// Laid out like the web client's card (`freeq-app/src/components/ActCards.tsx`)
-/// and the macOS `ActEventCardView`: a header strip carrying the icon, the
-/// headline, the shortened task id and the time, over a body of title, note
-/// and context link.
-struct ActEventCardView: View {
-    let card: ActCard
-    let at: Date
-    /// True while this card is the target of a prev/next jump, so arriving at
-    /// it is visible — the list scrolls, and without this nothing marks where.
+/// The one layout every event card renders through — the web `CardFrame`
+/// arrangement: a header strip over a padded body, an optional prev/next
+/// footer behind a hairline, an accent edge for marked events, a hairline
+/// border and clip. Both the act and coordination families use it; layout
+/// decisions live here and nowhere else.
+struct EventCard<Content: View>: View {
+    let icon: String
+    let label: String
+    var detail: String? = nil
+    var time: String? = nil
+    var accent: Color? = nil
     var isHighlighted: Bool = false
-    /// Scrolls the list to a neighbouring card's line. Absent in previews.
-    var onJumpToMessage: ((String) -> Void)?
-
-    private var neighbours: ActNeighbours {
-        actCardNeighbours(task: card.task, event: card.event)
-    }
-    private var note: String? { card.event.fields["act-note"] }
-    private var ctx: String? { card.event.fields["act-ctx"] }
-    private var ctxHash: String? { card.event.fields["act-ctx-h"] }
+    var onPrev: (() -> Void)? = nil
+    var onNext: (() -> Void)? = nil
+    @ViewBuilder let content: Content
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Header strip.
             HStack(spacing: 6) {
-                Text("📋")
-                    .font(.system(size: 11))
-                Text(ActVerbs.headline(card.event.verb))
+                Text(icon).font(.system(size: 11))
+                Text(label)
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(Theme.textSecondary)
-                Text(Self.shortTaskId(card.task.taskId))
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(Theme.textMuted)
+                    .textCase(.uppercase)
+                if let detail {
+                    Text(detail)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Theme.textMuted)
+                }
                 Spacer(minLength: 0)
-                Text(Self.time.string(from: at))
-                    .font(.system(size: 10))
-                    .foregroundStyle(Theme.textMuted)
+                if let time {
+                    Text(time)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.textMuted)
+                }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
-            .background(Theme.bgElevated)
+            .background(Theme.cardHeaderStrip)
 
-            // Body.
             VStack(alignment: .leading, spacing: 3) {
-                if !card.task.title.isEmpty {
-                    Text(card.task.title)
-                        .font(.fqSubheadline)
-                        .foregroundStyle(Theme.textPrimary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if let note, !note.isEmpty {
-                    Text(note)
-                        .font(.fqSubheadline)
-                        .foregroundStyle(Theme.textSecondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if let ctx, !ctx.isEmpty {
-                    if let url = URL(string: ctx) {
-                        Link(ctx, destination: url)
-                            .font(.system(size: 11))
-                    } else {
-                        Text(ctx).font(.system(size: 11))
-                    }
-                    // The hash is what the signature covers, so it rides along
-                    // for anyone checking the bytes they fetched.
-                    if let ctxHash, !ctxHash.isEmpty {
-                        Text(ctxHash)
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(Theme.textMuted)
-                    }
-                }
-                // The cards either side of this one on the same task, absent
-                // at each end. Nothing is offered for a move the home signed:
-                // it wrote no line, so there is no card to land on.
-                if let onJumpToMessage, neighbours.prev != nil || neighbours.next != nil {
-                    HStack(spacing: 14) {
-                        if let prev = neighbours.prev {
-                            Button("← prev") { onJumpToMessage(prev) }
-                                .buttonStyle(.plain)
-                                .font(.system(size: 11))
-                                .foregroundStyle(Theme.textMuted)
-                        }
-                        if let next = neighbours.next {
-                            Button("next →") { onJumpToMessage(next) }
-                                .buttonStyle(.plain)
-                                .font(.system(size: 11))
-                                .foregroundStyle(Theme.textMuted)
-                        }
-                    }
-                    .padding(.top, 2)
-                }
+                content
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
+
+            if onPrev != nil || onNext != nil {
+                Divider()
+                HStack(spacing: 0) {
+                    if let onPrev {
+                        Button("← prev", action: onPrev)
+                            .buttonStyle(.plain)
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.textMuted)
+                    }
+                    Spacer(minLength: 0)
+                    if let onNext {
+                        Button("next →", action: onNext)
+                            .buttonStyle(.plain)
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.textMuted)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+            }
+        }
+        .overlay(alignment: .leading) {
+            if let accent {
+                Rectangle().fill(accent).frame(width: 2)
+            }
         }
         .background(
             RoundedRectangle(cornerRadius: 8)
@@ -113,6 +84,89 @@ struct ActEventCardView: View {
         )
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .animation(.easeInOut(duration: 0.2), value: isHighlighted)
+    }
+}
+
+/// One task event, as the line its sender wrote beside it.
+///
+/// The event itself rides as a TAGMSG the message list never shows; this card
+/// is the line beside it. The headline is the word for the verb that event
+/// carried, never one read off the task's state, so a progress report never
+/// reads as a claim.
+struct ActEventCardView: View {
+    let card: ActCard
+    let at: Date
+    /// True while this card is the target of a prev/next jump, so arriving at
+    /// it is visible — the list scrolls, and without this nothing marks where.
+    var isHighlighted: Bool = false
+    /// Scrolls the list to a neighbouring card's line. Absent in previews.
+    var onJumpToMessage: ((String) -> Void)?
+
+    private var neighbours: ActNeighbours {
+        actCardNeighbours(task: card.task, event: card.event)
+    }
+    /// Painted in this app's own theme, and only for the moves that put work
+    /// on a plate, end well, or fail — an edge on every card says nothing.
+    private var accentColor: Color? {
+        switch ActVerbs.accent(card.event.verb) {
+        case .handoff: return Theme.iris
+        case .success: return Theme.success
+        case .failure: return Theme.danger
+        case .none: return nil
+        }
+    }
+    private var note: String? { card.event.fields["act-note"] }
+    private var ctx: String? { card.event.fields["act-ctx"] }
+    private var ctxHash: String? { card.event.fields["act-ctx-h"] }
+
+    private var prevAction: (() -> Void)? {
+        guard let jump = onJumpToMessage, let prev = neighbours.prev else { return nil }
+        return { jump(prev) }
+    }
+    private var nextAction: (() -> Void)? {
+        guard let jump = onJumpToMessage, let next = neighbours.next else { return nil }
+        return { jump(next) }
+    }
+
+    var body: some View {
+        EventCard(
+            icon: ActVerbs.emoji(card.event.verb),
+            label: ActVerbs.headline(card.event.verb),
+            detail: Self.shortTaskId(card.task.taskId),
+            time: Self.time.string(from: at),
+            accent: accentColor,
+            isHighlighted: isHighlighted,
+            onPrev: prevAction,
+            onNext: nextAction
+        ) {
+            if !card.task.title.isEmpty {
+                Text(card.task.title)
+                    .font(.fqSubheadline)
+                    .foregroundStyle(Theme.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let note, !note.isEmpty {
+                Text(note)
+                    .font(.fqSubheadline)
+                    .foregroundStyle(Theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let ctx, !ctx.isEmpty {
+                if let url = URL(string: ctx) {
+                    Link(ctx, destination: url)
+                        .font(.system(size: 11))
+                } else {
+                    Text(ctx).font(.system(size: 11))
+                }
+                // The hash is what the signature covers, so it rides along
+                // for anyone checking the bytes they fetched.
+                if let ctxHash, !ctxHash.isEmpty {
+                    Text(ctxHash)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Theme.textMuted)
+                }
+            }
+        }
     }
 
     /// The task id, shortened the way the web's badge shortens it.

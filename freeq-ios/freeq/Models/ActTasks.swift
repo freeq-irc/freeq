@@ -197,7 +197,8 @@ final class ActTaskStore {
     ///
     /// The home signs `confirm` and `expire` itself and sends no companion, so
     /// these two are the only events the reader hears about as a system line
-    /// rather than a card.
+    /// rather than a card. Each opens with its verb's glyph, off the same table
+    /// a card reads, so a line and a card mark the same move the same way.
     private static func systemLine(task: ActTask, ev: ActEventInput) -> String? {
         // Both lines name the task by its title, which only the opener
         // carries, and the opener falls out of the replay window before the
@@ -212,9 +213,9 @@ final class ActTaskStore {
         case "confirm":
             guard let subject = task.events.first(where: { $0.eventId == ev.fields["act-subject"] })
             else { return nil }
-            return "confirmed: \"\(title)\" — \(subject.verb) by \(subject.from)"
+            return "\(ActVerbs.emoji("confirm")) confirmed: \"\(title)\" — \(subject.verb) by \(subject.from)"
         case "expire":
-            return "\(title) expired"
+            return "\(ActVerbs.emoji("expire")) \(title) expired"
         default:
             return nil
         }
