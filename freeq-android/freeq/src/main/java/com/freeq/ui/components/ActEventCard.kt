@@ -5,20 +5,26 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.freeq.model.ActAccent
 import com.freeq.model.ActCard
 import com.freeq.model.ActVerbs
 import com.freeq.model.actCardNeighbours
+import com.freeq.ui.theme.Theme
 import java.util.Date
 
 /**
@@ -42,11 +48,26 @@ fun ActEventCard(card: ActCard, at: Date? = null, onJumpToMessage: ((String) -> 
     val ctx = card.event.fields["act-ctx"]
     val ctxHash = card.event.fields["act-ctx-h"]
     val dim = MaterialTheme.colorScheme.onSurfaceVariant
+    // Only the moves that put work on a plate, end well, or fail carry an
+    // edge — an edge on every card is an edge that says nothing.
+    val accent: Color? = when (ActVerbs.accent(card.event.verb)) {
+        ActAccent.HANDOFF -> Theme.accent
+        ActAccent.SUCCESS -> Theme.success
+        ActAccent.FAILURE -> Theme.danger
+        ActAccent.NONE -> null
+    }
+    val edge = 2.dp
 
     Column(
         modifier = Modifier
             .padding(top = 4.dp)
             .clip(RoundedCornerShape(8.dp))
+            // Painted over the content, so the header's own tint does not
+            // wash the edge out where the two overlap.
+            .drawWithContent {
+                drawContent()
+                accent?.let { drawRect(it, size = Size(edge.toPx(), size.height)) }
+            }
             .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f), RoundedCornerShape(8.dp)),
     ) {
         // Header strip.
@@ -58,9 +79,9 @@ fun ActEventCard(card: ActCard, at: Date? = null, onJumpToMessage: ((String) -> 
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            Text("📋", fontSize = 12.sp)
+            Text(ActVerbs.emoji(card.event.verb), fontSize = 12.sp)
             Text(
-                text = ActVerbs.headline(card.event.verb),
+                text = ActVerbs.headline(card.event.verb).uppercase(),
                 fontSize = 12.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = dim,
@@ -110,30 +131,36 @@ fun ActEventCard(card: ActCard, at: Date? = null, onJumpToMessage: ((String) -> 
                     )
                 }
             }
-            // The cards either side of this one on the same task, absent at
-            // each end. Nothing is offered for a move the server signed: it
-            // wrote no line, so there is no card to land on.
-            if (onJumpToMessage != null && (neighbours.prev != null || neighbours.next != null)) {
-                Row(
-                    modifier = Modifier.padding(top = 2.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    neighbours.prev?.let { prev ->
-                        Text(
-                            text = "← prev",
-                            fontSize = 11.sp,
-                            color = dim.copy(alpha = 0.7f),
-                            modifier = Modifier.clickable { onJumpToMessage(prev) },
-                        )
-                    }
-                    neighbours.next?.let { next ->
-                        Text(
-                            text = "next →",
-                            fontSize = 11.sp,
-                            color = dim.copy(alpha = 0.7f),
-                            modifier = Modifier.clickable { onJumpToMessage(next) },
-                        )
-                    }
+        }
+
+        // The cards either side of this one on the same task, absent at each
+        // end. Nothing is offered for a move the server signed: it wrote no
+        // line, so there is no card to land on. They sit under the body behind
+        // a hairline, so the header stays the card's only filled strip.
+        if (onJumpToMessage != null && (neighbours.prev != null || neighbours.next != null)) {
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                neighbours.prev?.let { prev ->
+                    Text(
+                        text = "← prev",
+                        fontSize = 11.sp,
+                        color = dim.copy(alpha = 0.7f),
+                        modifier = Modifier.clickable { onJumpToMessage(prev) },
+                    )
+                }
+                Spacer(modifier = Modifier.weight(1f))
+                neighbours.next?.let { next ->
+                    Text(
+                        text = "next →",
+                        fontSize = 11.sp,
+                        color = dim.copy(alpha = 0.7f),
+                        modifier = Modifier.clickable { onJumpToMessage(next) },
+                    )
                 }
             }
         }
