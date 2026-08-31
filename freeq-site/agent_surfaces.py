@@ -1,4 +1,6 @@
 """Machine-readable discovery surfaces for agents (robots, sitemap, .well-known)."""
+import json
+import re
 from datetime import date
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -31,7 +33,7 @@ IDENTITY = {
 # Paths that appear in sitemap.xml. Keep in sync with app.py's routes.
 SITEMAP_PATHS = [
     "/", "/connect/", "/sdk/", "/agents/", "/protocol/", "/clients/",
-    "/about/", "/docs/", "/blog/",
+    "/about/", "/contact/", "/privacy/", "/docs/", "/blog/",
 ]
 
 AI_CRAWLERS = [
@@ -275,6 +277,244 @@ def mcp_server_card_document():
     }
 
 
+# ── Page metadata (canonical / og:* / JSON-LD) ─────────────────────────
+
+# One-line descriptions for the markdown link lists. Keyed by site path.
+MD_PAGE_LINKS = {
+    "/": ("Home", "This page"),
+    "/connect/": ("Connect", "The server address, channels, and how to authenticate"),
+    "/sdk/": ("SDK", "SDKs and libraries for building freeq clients and bots"),
+    "/agents/": ("Agents", "Agents as first-class protocol participants"),
+    "/protocol/": ("Protocol", "SASL, tags, signing, federation — the freeq protocol"),
+    "/clients/": ("Clients", "First-party clients, plus guest access from any IRC client"),
+    "/about/": ("About", "About the project, philosophy, and components"),
+    "/contact/": ("Contact", "GitHub issues, #general on irc.freeq.at, the Bluesky handle"),
+    "/privacy/": ("Privacy", "What a server stores, what it never sees, what operators can do"),
+    "/docs/": ("Docs", "The full documentation"),
+    "/blog/": ("Blog", "Engineering notes from the freeq project"),
+}
+
+
+def home_markdown_body():
+    """str — the homepage as markdown; the body of /index.md, ?mode=agent, and
+    the Accept: text/markdown negotiation of ``/``."""
+    lines = ["# freeq", "", IDENTITY["description"], "", "## Pages", ""]
+    for path in SITEMAP_PATHS:
+        name, desc = MD_PAGE_LINKS.get(path, (path, ""))
+        lines.append(f"- [{name}]({IDENTITY['url']}{path}): {desc}")
+    lines += ["", "## Agent surfaces", ""]
+    lines.append(f"- [llms.txt]({IDENTITY['llms_txt']}): the index an agent reads first")
+    lines.append(f"- [agents.md]({IDENTITY['agents_md']}): when and how to use freeq as an agent")
+    lines.append(f"- [auth.md]({IDENTITY['auth_md']}): credentials walkthrough — did:key self-registration and bearer tokens")
+    lines.append(f"- [OpenAPI 3.1]({IDENTITY['openapi']}): every HTTP endpoint, its parameters and its responses")
+    lines.append("")
+    return "\n".join(lines)
+
+
+# HTML top-level page → template. Used to build each page's markdown stub from
+# the page's own H1 and <meta description>, so the prose is never hand-copied
+# and cannot drift from the page it summarizes.
+PAGE_TEMPLATES = {
+    "/connect/": "connect.html",
+    "/sdk/": "sdk.html",
+    "/agents/": "agents.html",
+    "/protocol/": "protocol.html",
+    "/clients/": "clients.html",
+    "/about/": "about.html",
+    "/docs/": "docs_index.html",
+    "/contact/": "contact.html",
+    "/privacy/": "privacy.html",
+}
+
+_H1_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.S | re.I)
+_META_DESC_RE = re.compile(r'<meta name="description" content="([^"]*)"', re.I)
+
+
+def page_markdown_body(app, path):
+    """str — short markdown stub for an HTML top-level page.
+
+    H1 and description come from the rendered page itself, so the stub says
+    what the page says; the rest is links to the rendered page and the docs.
+    """
+    from flask import render_template
+
+    try:
+        html = render_template(PAGE_TEMPLATES[path])
+    except RuntimeError:  # no request context (direct call from tests)
+        with app.test_request_context(path):
+            html = render_template(PAGE_TEMPLATES[path])
+    h1 = next(iter(_H1_RE.findall(html)), "")
+    h1 = re.sub(r"<[^>]+>", " ", h1)
+    h1 = re.sub(r"\s+", " ", h1).strip() or "freeq"
+    m = _META_DESC_RE.search(html)
+    desc = (m.group(1).strip() if m else IDENTITY["description"])
+    url = IDENTITY["url"] + path
+    lines = [
+        f"# {h1}",
+        "",
+        desc,
+        "",
+        f"- [Rendered page]({url}): the HTML version of this page",
+        f"- [Documentation]({IDENTITY['url']}/docs/): the full guide",
+        f"- [llms.txt]({IDENTITY['llms_txt']}): the index an agent reads first",
+        f"- [agents.md]({IDENTITY['agents_md']}): how agents use freeq",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _blog_headline(slug):
+    """Post title from the local blog source, slug-derived as fallback."""
+    p = SITE_ROOT / "blog" / f"{slug}.md"
+    if p.is_file():
+        for line in p.read_text().splitlines():
+            if line.startswith("# "):
+                return line[2:].strip()
+    return re.sub(r"[-_]+", " ", slug).strip().capitalize() or "freeq post"
+
+
+def jsonld_graph(path):
+    """dict — schema.org ``@context`` + ``@graph`` for one page, from IDENTITY.
+
+    Three nodes on every page (Organization, SoftwareApplication, WebSite);
+    a BlogPosting is appended on ``/blog/<slug>`` paths because auditors
+    reward schema-type breadth. Organization and WebSite carry stable ``@id``
+    values so WebSite.publisher can reference the Organization by ``@id``.
+    """
+    org = {
+        "@type": "Organization",
+        "@id": "https://freeq.at/#organization",
+        "name": IDENTITY["name"],
+        "url": IDENTITY["url"],
+        "description": IDENTITY["description"],
+        "logo": IDENTITY["url"] + "/static/freeq.png",
+        "sameAs": [
+            IDENTITY["repo"],
+            IDENTITY["api_host"],
+            "https://bsky.app/profile/freeq.at",
+        ],
+        "contactPoint": {
+            "@type": "ContactPoint",
+            "contactType": "technical support",
+            "url": "https://freeq.at/contact/",
+        },
+    }
+    software = {
+        "@type": "SoftwareApplication",
+        "name": IDENTITY["name"],
+        "applicationCategory": "CommunicationApplication",
+        "operatingSystem": "Any",
+        "url": IDENTITY["url"],
+        "description": IDENTITY["description"],
+        "softwareHelp": "https://freeq.at/docs/",
+        "downloadUrl": IDENTITY["repo"],
+        "license": IDENTITY["license"],
+        "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"},
+    }
+    website = {
+        "@type": "WebSite",
+        "@id": "https://freeq.at/#website",
+        "name": IDENTITY["name"],
+        "url": IDENTITY["url"],
+        "publisher": {"@id": "https://freeq.at/#organization"},
+        "potentialAction": {
+            "@type": "SearchAction",
+            "target": "https://freeq.at/docs/?q={search_term_string}",
+            "query-input": "required name=search_term_string",
+        },
+    }
+    graph = [org, software, website]
+    m = re.match(r"^/blog/([^/]+)/?$", path)
+    if m:
+        graph.append({
+            "@type": "BlogPosting",
+            "headline": _blog_headline(m.group(1)),
+            "url": IDENTITY["url"] + m.group(0).rstrip("/") + "/",
+            "author": {"@id": "https://freeq.at/#organization"},
+            "publisher": {"@id": "https://freeq.at/#organization"},
+        })
+    return {"@context": "https://schema.org", "@graph": graph}
+
+
+# ── Section-scoped llms.txt indices (/docs/llms.txt, /sdk/llms.txt) ──
+
+def _md_index_sections():
+    """{(section name): {allowed slugs}} pairs for the two scoped indices."""
+    return {
+        "docs": {
+            "Start here": {"what-is-freeq", "getting-started", "features"},
+            "Protocol": {"protocol", "authentication", "tag-registry",
+                         "encryption", "federation", "limitations"},
+            "Building on freeq": {"api-reference", "self-hosting"},
+            "Governance": {"policy-system", "verifiers", "moderation"},
+        },
+        "sdk": {
+            "Start here": {"getting-started"},
+            "Agent surfaces": {"agents", "agent-quickstart", "agent-assistance",
+                              "well-known-agent", "watch-your-agent"},
+            "Building on freeq": {"typescript-sdk", "bot-quickstart", "bots",
+                                 "api-reference"},
+        },
+    }
+
+
+def section_llms_body(heading, kind):
+    """str — llms.txt filtered to one section scope, same shape as /llms.txt.
+
+    Built from app.py's curated registry (lazy import: app.py imports this
+    module at startup, so importing it at module level is circular).
+    """
+    import app as site  # lazy, as in sitemap_xml()
+
+    section_map = _md_index_sections()[kind]
+    lines = [f"# freeq — {heading}", "", f"> {site.LLMS_SUMMARY}", ""]
+    for section, entries in site.LLMS_SECTIONS:
+        allowed = section_map.get(section)
+        if allowed is None:
+            continue
+        kept = [(slug, desc) for slug, desc in entries if slug in allowed]
+        if not kept:
+            continue
+        lines.append(f"## {section}")
+        lines.append("")
+        for slug, desc in kept:
+            lines.append(f"- [{site._doc_title(slug)}]({site.SITE_URL}/docs/{slug}.md): {desc}")
+        lines.append("")
+    lines.append("- [Source](https://github.com/freeq-irc/freeq): the implementation is the specification of last resort")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _wants_markdown() -> bool:
+    """True when Accept names text/markdown and text/html does not outrank it.
+
+    Browsers send text/html without text/markdown (→ False); an agent sends
+    only text/markdown, or a higher q for it (→ True).
+    """
+    header = request.headers.get("Accept")
+    if not header or "text/markdown" not in header:
+        return False
+    md_q = 0.0
+    html_q = 0.0
+    for item in header.split(","):
+        parts = [p.strip() for p in item.split(";") if p.strip()]
+        if not parts:
+            continue
+        mime = parts[0].lower()
+        q = 1.0
+        for p in parts[1:]:
+            if p.lower().startswith("q="):
+                try:
+                    q = float(p[2:])
+                except ValueError:
+                    q = 0.0
+        if mime == "text/markdown":
+            md_q = max(md_q, q)
+        elif mime in ("text/html", "application/xhtml+xml"):
+            html_q = max(html_q, q)
+    return md_q > 0 and html_q <= md_q
+
+
 def robots_txt():
     """str — allow every UA and every AI crawler in AI_CRAWLERS explicitly.
 
@@ -427,5 +667,77 @@ def register_agent_surfaces(app):
             f"<{IDENTITY['llms_txt']}>; rel=\"describedby\""
         )
         return response
+
+
+    # ── Page metadata context: canonical / markdown_url / JSON-LD ────────────
+    @app.context_processor
+    def agent_metadata():
+        try:
+            path = request.path
+        except RuntimeError:  # pragma: no cover — render outside request
+            return {"canonical_url": IDENTITY["url"],
+                    "markdown_url": IDENTITY["url"] + "/index.md", "json_ld": ""}
+        md_path = "/index.md" if path == "/" else path.rstrip("/") + ".md"
+        return {
+            "canonical_url": IDENTITY["url"] + path,
+            "markdown_url": IDENTITY["url"] + md_path,
+            "json_ld": json.dumps(jsonld_graph(path)),
+        }
+
+    # ── Markdown surface: /index.md, /<page>.md ─────────────────────────────
+    # /agents.md deliberately stays the agent-facing document (pre-existing
+    # commitment; tests depend on it). The /agents/ page still negotiates to
+    # a markdown stub via Accept: text/markdown and ?mode=agent below.
+    _page_md_cache = {}
+
+    def _md_body_for_path(path):
+        if path == "/":
+            return home_markdown_body()
+        if path not in PAGE_TEMPLATES:
+            return None
+        if path not in _page_md_cache:
+            _page_md_cache[path] = page_markdown_body(app, path)
+        return _page_md_cache[path]
+
+    @app.route("/index.md")
+    def index_markdown():
+        return _markdown(home_markdown_body())
+
+    for _stem in ("connect", "sdk", "protocol", "clients", "about", "docs",
+                  "contact", "privacy"):
+        _path = f"/{_stem}/"
+
+        @app.route(f"/{_stem}.md", endpoint=f"page_markdown_{_stem}")
+        def page_markdown(_body=_md_body_for_path(_path)):
+            return _markdown(_body)
+
+    # ── Section-scoped llms.txt indices ─────────────────────────────────
+    @app.route("/docs/llms.txt")
+    def docs_llms_txt():
+        return _markdown(section_llms_body("docs index", "docs"))
+
+    @app.route("/sdk/llms.txt")
+    def sdk_llms_txt():
+        return _markdown(section_llms_body("SDK index", "sdk"))
+
+    # ── Content negotiation ─────────────────────────────────────────────
+    # Accept: text/markdown (or ?mode=agent) on an HTML page serves the
+    # markdown body instead. Every HTML response carries Vary: Accept, since
+    # the negotiation audit fails it without that header.
+    @app.after_request
+    def markdown_negotiation(response):
+        if not (response.headers.get("Content-Type") or "").startswith("text/html"):
+            return response
+        response.vary.add("Accept")
+        if response.status_code != 200:
+            return response
+        if not (_wants_markdown() or request.args.get("mode") == "agent"):
+            return response
+        body = _md_body_for_path(request.path)
+        if body is None:
+            return response
+        md = Response(body, status=200, content_type=_MARKDOWN_CT)
+        md.vary.add("Accept")
+        return md
 
     return app

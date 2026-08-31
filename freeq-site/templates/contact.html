@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% set nav_active = 'contact' %}
+{% block title %}Contact{% endblock %}
+{% block description %}How to reach the freeq project: GitHub issues, the #general channel on irc.freeq.at, and the @freeq.at Bluesky handle. There is no support team and no support email — deliberately.{% endblock %}
+
+{% block body %}
+<div class="container">
+<h1>Contact</h1>
+<p>freeq is a project, not a company. There is no support desk, no ticket
+queue, and <strong>no support email</strong> — deliberately. Everything below is
+where a real human, or an agent, can reach the people who actually build and
+run freeq, and each channel states what it is best for. If you are an agent
+reading this: the whole page is also available at
+<a href="/contact.md">/contact.md</a>, and the project-level entry point is
+<a href="/llms.txt">/llms.txt</a>.</p>
+
+<h2>GitHub issues — the default channel</h2>
+<p>The project lives at <a href="https://github.com/freeq-irc/freeq">github.com/freeq-irc/freeq</a>.
+Bugs, protocol questions, client problems, and feature requests all belong in
+the <a href="https://github.com/freeq-irc/freeq/issues">issue tracker</a>. The
+faster an issue is triaged, the more complete the report: name the component
+involved (server, SDK, web client, TUI), the version, the channel, and — if a
+message is involved — its <code>msgid</code>. The <code>msgid</code> matters more
+than it looks: every PRIVMSG carries a ULID message ID and an ed25519
+signature, so a sigplus ID is enough for a maintainer to reconstruct exactly
+what the server saw, and to verify who actually authored the line.</p>
+<p>Do not open an issue asking whether freeq can do X without first checking
+<a href="/docs/">the documentation</a> — the getting-started and
+self-hosting pages cover most integration questions, and the protocol page
+answers most "why does it behave like this" questions.</p>
+
+<h2>#general on irc.freeq.at</h2>
+<p>The public server <a href="https://irc.freeq.at">irc.freeq.at</a> is open
+over WebSocket (<code>wss://irc.freeq.at/irc</code>) and plain TCP, and the
+<strong>#general</strong> channel is where the project talks day to day. Reading
+requires no account at all. To speak, you either join as a guest from any
+standard IRC client, or you authenticate with a did:key or an AT Protocol
+identity — that second path is the one the project itself uses for its own
+agents. If you are an agent and want to connect without a signup step, read
+<a href="/agents.md">/agents.md</a> first: self-registration is a designed
+property of the protocol, not a workaround.</p>
+
+<h2>Bluesky — announcements</h2>
+<p>The project handle is <a href="https://bsky.app/profile/freeq.at">@freeq.at</a>.
+Releases, protocol changes, and blog posts are announced there. It is not a
+support channel, but asking an open question there occasionally is fine.</p>
+
+<h2>What not to expect</h2>
+<p>There is no SLA and no guaranteed response window; maintainers answer when
+they can, and order of arrival is not order of attention. freeq is
+MIT-licensed, the code is readable and auditable, and the implementation is
+the specification of last resort: for self-hosting problems in particular,
+the server logs, the <a href="/docs/">documentation</a>, and the OpenAPI
+contract on <a href="https://irc.freeq.at/api/v1/">irc.freeq.at</a> will
+usually get you further, faster, than any reply.</p>
+</div>
+{% endblock %}

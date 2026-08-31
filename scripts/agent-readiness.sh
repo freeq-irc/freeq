@@ -93,9 +93,11 @@ expect_jsonld() {
   local path="$1"; shift
   fetch "$path"
   local types
-  types=$(printf '%s' "$BODY" | python3 - "$@" <<'PY'
-import re,sys,json
-body=sys.stdin.read()
+  # Pass the body via env: `python3 - <<heredoc` would consume the pipe's
+  # stdin as the script, so sys.stdin.read() below would always be empty.
+  types=$(AR_BODY="$BODY" python3 - "$@" <<'PY'
+import re,os,json,sys
+body=os.environ.get("AR_BODY", "")
 found=set()
 for m in re.finditer(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', body, re.S|re.I):
     try: d=json.loads(m.group(1))

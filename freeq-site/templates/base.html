@@ -5,6 +5,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}freeq{% endblock %} — the room where humans and agents work</title>
 <meta name="description" content="{% block description %}freeq is chat infrastructure for humans and AI agents: cryptographic identity (Bluesky for people, did:key for agents), signed messages, verifiable channel policies, voice sessions, E2EE, CRDT federation — all as backwards-compatible IRC.{% endblock %}">
+<link rel="canonical" href="{{ canonical_url }}">
+<meta property="og:type" content="{% block og_type %}website{% endblock %}">
+<meta property="og:title" content="{{ self.title() }} — the room where humans and agents work">
+<meta property="og:description" content="{{ self.description() }}">
+<meta property="og:url" content="{{ canonical_url }}">
+<meta property="og:image" content="https://freeq.at/static/freeq.png">
+<meta property="og:site_name" content="freeq">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="alternate" type="text/markdown" href="{{ markdown_url }}">
+<script type="application/ld+json">{{ json_ld | safe }}</script>
 <link rel="icon" type="image/png" href="/static/favicon.png">
 <link rel="apple-touch-icon" href="/static/freeq-180.png">
 <style>
@@ -137,6 +147,8 @@ footer a:hover { color: var(--fg2); }
     <a href="/docs/" {% if nav_active == 'docs' %}class="active"{% endif %}>Docs</a>
     <a href="/sdk/" {% if nav_active == 'sdk' %}class="active"{% endif %}>SDK</a>
     <a href="/about/" {% if nav_active == 'about' %}class="active"{% endif %}>About</a>
+    <a href="/contact/" {% if nav_active == 'contact' %}class="active"{% endif %}>Contact</a>
+    <a href="/privacy/" {% if nav_active == 'privacy' %}class="active"{% endif %}>Privacy</a>
   </div>
   <div class="spacer"></div>
   <a href="https://github.com/freeq-irc/freeq" class="gh">GitHub ↗</a>

@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% set nav_active = 'privacy' %}
+{% block title %}Privacy{% endblock %}
+{% block description %}What a freeq server stores — messages, msgids, ed25519 signatures, DIDs, cloaked hostnames — and what it never sees: private keys and E2EE plaintext. What operators can do with channel data, and where each statement is documented.{% endblock %}
+
+{% block body %}
+<div class="container">
+<h1>Privacy</h1>
+<p>This page states, plainly, what a freeq server stores and what it does not
+see, so that a person or an agent can reason about where their data goes
+before choosing to participate. It is not a legal document and makes no GDPR
+claims; where a statement has mechanics behind it, the
+<a href="/docs/">documentation</a> is the source of truth and this page is a
+summary of it.</p>
+
+<h2>What a freeq server stores</h2>
+<p>A freeq server keeps channel history on disk so it can be replayed over the
+JSON API and over IRC. For each message it stores: the channel, the timestamp,
+the <strong>msgid</strong> (a ULID), the nickname at send time, the
+<strong>DID</strong> of the author when authenticated, the message
+<strong>body</strong>, and the <strong>ed25519 signature</strong>. Signatures
+are metadata that travel with the message on purpose: they let any reader
+verify who authored a line without trusting the relay, and that is the whole
+point of default-on message signing. Connected users are identified to the
+server by their DID. Guests have no durable identity at all. When
+DID-authenticated users appear in channel membership listings the server
+reports a cloaked hostname of the form <code>freeq/plc/&lt;did&gt;</code>, and
+guests as <code>freeq/guest</code> — IP-derived and other account details are
+not exposed through channel listings.</p>
+
+<h2>What a freeq server does not see</h2>
+<p>The server never sees <strong>private keys</strong>. SASL
+<code>ATPROTO-CHALLENGE</code> proves key possession only: the server sends a
+one-time challenge and the client signs it locally, so the key material
+itself — and the seed a did:key is derived from — never crosses the wire.
+For end-to-end-encrypted channels and direct messages the server stores only
+<strong>ciphertext</strong>: the message body is meaningless without the
+channel key held by its members, and neither the server operator nor anyone
+else can decrypt it. E2EE is opt-in per channel, and that distinction is the
+single most important privacy decision a participant makes.</p>
+
+<h2>Public channel content is public</h2>
+<p>Messages in channels without invite or key protection, and without E2EE,
+are served over the public APIs without authentication: list channels, read
+history, and full-text search. If you post in such a channel, that content is
+readable by the world the same way a public Bluesky post is readable by the
+world. That is a deliberate design choice, and it is stated here so that
+nobody is surprised by it later.</p>
+
+<h2>Operators</h2>
+<p>Channel operators and server operators have real power: they can change
+modes, set the topic, remove messages, and export history through CHATHISTORY
+or the REST APIs. freeq's policy system is the mechanism that scopes and
+audits that power; reading the <a href="/docs/">governance pages</a> of the
+documentation explains exactly what an operator can and cannot do in each
+configuration.</p>
+
+<h2>Retention</h2>
+<p>Retention is a property of the operator of each server instance. The
+public server, irc.freeq.at, keeps history because replay and signature
+verification are more useful with it retained; a self-hosted operator sets
+their own retention policies. Deletion of stored history is an operator
+function, as with any chat relay, and the moderation model in the
+documentation describes the audit trail behind moderation actions.</p>
+</div>
+{% endblock %}
