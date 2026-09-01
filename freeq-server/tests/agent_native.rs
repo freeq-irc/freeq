@@ -1478,7 +1478,13 @@ async fn coordination_create_task() {
 
     // Bot creates a task
     let task_id = bot_handle
-        .create_task("#tasks", "Build a todo app")
+        .emit_event(
+            "#tasks",
+            "task_request",
+            r#"{"description":"Build a todo app"}"#,
+            None,
+            "📋 New task: Build a todo app",
+        )
         .await
         .unwrap();
     assert!(!task_id.is_empty(), "Task ID should be non-empty");
@@ -1532,7 +1538,13 @@ async fn coordination_full_task_lifecycle() {
 
     // Create task
     let task_id = bot_handle
-        .create_task("#lifecycle", "Build something")
+        .emit_event(
+            "#lifecycle",
+            "task_request",
+            r#"{"description":"Build something"}"#,
+            None,
+            "📋 New task: Build something",
+        )
         .await
         .unwrap();
     expect_raw_line(&mut user_events, 3000, "New task", "User sees task").await;
@@ -1540,7 +1552,13 @@ async fn coordination_full_task_lifecycle() {
     // Update task through phases (small delays to avoid message ordering issues)
     tokio::time::sleep(Duration::from_millis(50)).await;
     bot_handle
-        .update_task("#lifecycle", &task_id, "designing", "Chose React stack")
+        .emit_event(
+            "#lifecycle",
+            "task_update",
+            r#"{"phase":"designing","summary":"Chose React stack"}"#,
+            Some(&task_id),
+            "🔄 [designing] Chose React stack",
+        )
         .await
         .unwrap();
     expect_raw_line(
@@ -1553,7 +1571,13 @@ async fn coordination_full_task_lifecycle() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     bot_handle
-        .update_task("#lifecycle", &task_id, "building", "Writing code")
+        .emit_event(
+            "#lifecycle",
+            "task_update",
+            r#"{"phase":"building","summary":"Writing code"}"#,
+            Some(&task_id),
+            "🔄 [building] Writing code",
+        )
         .await
         .unwrap();
     expect_raw_line(
@@ -1567,7 +1591,14 @@ async fn coordination_full_task_lifecycle() {
     // Attach evidence
     tokio::time::sleep(Duration::from_millis(50)).await;
     bot_handle
-        .attach_evidence("#lifecycle", &task_id, "test_result", "12/12 passed", None)
+        .emit_event_with_evidence(
+            "#lifecycle",
+            "evidence_attach",
+            r#"{"type":"test_result","summary":"12/12 passed"}"#,
+            Some(&task_id),
+            Some("test_result"),
+            "📎 Evidence (test_result): 12/12 passed",
+        )
         .await
         .unwrap();
     expect_raw_line(&mut user_events, 3000, "12/12 passed", "User sees evidence").await;
@@ -1575,11 +1606,12 @@ async fn coordination_full_task_lifecycle() {
     // Complete task
     tokio::time::sleep(Duration::from_millis(50)).await;
     bot_handle
-        .complete_task(
+        .emit_event(
             "#lifecycle",
-            &task_id,
-            "All done",
-            Some("https://example.com"),
+            "task_complete",
+            r#"{"summary":"All done","url":"https://example.com"}"#,
+            Some(&task_id),
+            "🎉 Task complete: All done — https://example.com",
         )
         .await
         .unwrap();
@@ -1630,13 +1662,25 @@ async fn coordination_task_failure() {
     .await;
 
     let task_id = bot_handle
-        .create_task("#failtest", "Doomed task")
+        .emit_event(
+            "#failtest",
+            "task_request",
+            r#"{"description":"Doomed task"}"#,
+            None,
+            "📋 New task: Doomed task",
+        )
         .await
         .unwrap();
     expect_raw_line(&mut user_events, 2000, "New task", "User sees task").await;
 
     bot_handle
-        .fail_task("#failtest", &task_id, "Out of memory")
+        .emit_event(
+            "#failtest",
+            "task_failed",
+            r#"{"error":"Out of memory"}"#,
+            Some(&task_id),
+            "❌ Task failed: Out of memory",
+        )
         .await
         .unwrap();
     expect_raw_line(&mut user_events, 2000, "Task failed", "User sees failure").await;
@@ -1671,14 +1715,26 @@ async fn coordination_events_rest_api() {
     .await;
 
     let task_id = bot_handle
-        .create_task("#resttest", "REST test task")
+        .emit_event(
+            "#resttest",
+            "task_request",
+            r#"{"description":"REST test task"}"#,
+            None,
+            "📋 New task: REST test task",
+        )
         .await
         .unwrap();
     // Wait for processing
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     bot_handle
-        .update_task("#resttest", &task_id, "building", "Making it")
+        .emit_event(
+            "#resttest",
+            "task_update",
+            r#"{"phase":"building","summary":"Making it"}"#,
+            Some(&task_id),
+            "🔄 [building] Making it",
+        )
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1758,29 +1814,49 @@ async fn coordination_evidence_rest_api() {
     .await;
 
     let task_id = bot_handle
-        .create_task("#evidence", "Evidence test")
+        .emit_event(
+            "#evidence",
+            "task_request",
+            r#"{"description":"Evidence test"}"#,
+            None,
+            "📋 New task: Evidence test",
+        )
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     bot_handle
-        .attach_evidence(
+        .emit_event_with_evidence(
             "#evidence",
-            &task_id,
-            "test_result",
-            "All pass",
-            Some("https://ci.example.com"),
+            "evidence_attach",
+            r#"{"type":"test_result","summary":"All pass","url":"https://ci.example.com"}"#,
+            Some(&task_id),
+            Some("test_result"),
+            "📎 Evidence (test_result): All pass — https://ci.example.com",
         )
         .await
         .unwrap();
     bot_handle
-        .attach_evidence("#evidence", &task_id, "deploy_log", "Deployed", None)
+        .emit_event_with_evidence(
+            "#evidence",
+            "evidence_attach",
+            r#"{"type":"deploy_log","summary":"Deployed"}"#,
+            Some(&task_id),
+            Some("deploy_log"),
+            "📎 Evidence (deploy_log): Deployed",
+        )
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     bot_handle
-        .complete_task("#evidence", &task_id, "Done", None)
+        .emit_event(
+            "#evidence",
+            "task_complete",
+            r#"{"summary":"Done"}"#,
+            Some(&task_id),
+            "🎉 Task complete: Done",
+        )
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;

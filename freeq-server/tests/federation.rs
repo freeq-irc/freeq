@@ -4824,7 +4824,13 @@ async fn a_stopgap_coordination_event_is_stored_on_the_peer_that_receives_it() {
     let deadline = tokio::time::Instant::now() + S2S_SETTLE;
     while stored.is_none() && tokio::time::Instant::now() < deadline {
         let task_id = ha
-            .create_task("#stopgap", "read the far server's copy")
+            .emit_event(
+                "#stopgap",
+                "task_request",
+                r#"{"description":"read the far server's copy"}"#,
+                None,
+                "📋 New task: read the far server's copy",
+            )
             .await
             .expect("the event goes out");
         tokio::time::sleep(Duration::from_millis(500)).await;
