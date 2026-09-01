@@ -2989,17 +2989,16 @@ fn s2s_channel_entry<'a>(
 
 /// The body a relayed message's signature covers, rebuilt from the wire.
 ///
-/// The S2S `text` field is not always the body the sender signed: a multiline
-/// message is escaped for transport (`encode_privmsg_text_for_s2s`) so that a
-/// peer relaying it to its own clients cannot break the IRC line. When the
-/// per-line breakdown rode along, reassemble from that — the exact bytes the
-/// origin assembled — and fall back to undoing the escape for peers that send
-/// only the escaped text.
-fn relayed_signed_body(
-    text: &str,
-    tags: &HashMap<String, String>,
-    lines: Option<&Vec<crate::s2s::MultilineLine>>,
-) -> String {
+/// A `draft/multiline` BATCH is signed over the assembled body and escaped for
+/// transport (`encode_privmsg_text_for_s2s`) so a peer relaying it to its own
+/// clients cannot break the IRC line; the per-line breakdown rides along and is
+/// reassembled here, giving back the exact bytes the origin signed.
+///
+/// Everything else is the body as transmitted — the inline form included: one
+/// line, newlines as the literal two chars `\n` under `+freeq.at/multiline`,
+/// signed by the client over those escaped bytes. Un-escaping it built a
+/// document its sender never signed, so every such message failed the check.
+fn relayed_signed_body(text: &str, lines: Option<&Vec<crate::s2s::MultilineLine>>) -> String {
     if let Some(lines) = lines {
         let mut out = String::new();
         for (i, line) in lines.iter().enumerate() {
@@ -3009,9 +3008,6 @@ fn relayed_signed_body(
             out.push_str(&line.body);
         }
         return out;
-    }
-    if tags.contains_key("+freeq.at/multiline") {
-        return text.replace("\\n", "\n");
     }
     text.to_string()
 }
@@ -3044,7 +3040,7 @@ fn verify_relayed_privmsg(
             "relayed message names no sender DID",
         ));
     };
-    let body = relayed_signed_body(text, tags, multiline_lines);
+    let body = relayed_signed_body(text, multiline_lines);
     let fields = SignedFields {
         body: &body,
         msgid: msgid.unwrap_or_default(),
@@ -5109,13 +5105,15 @@ pub(crate) async fn process_s2s_message(
             // Generate a local msgid if the remote didn't send one
             let msgid = msgid.unwrap_or_else(crate::msgid::generate);
 
-            // The body to FILE: the assembled form — the same bytes the
-            // verifier checked and the origin stored. The wire keeps the
-            // escaped form (a raw newline cannot ride an IRC line); the store
-            // must not, or REST, search, FTS and replay read escape sequences
-            // as text and the two servers hold different bytes for one
-            // message. Line bodies are peer-provided, so each is sanitized
-            // before reassembly; the joins are ours.
+            // The body to FILE: whatever the verifier checked, so this
+            // server's own later verification of the row agrees with the one
+            // it reached on receipt, and both servers hold the same bytes.
+            //
+            // A BATCH is reassembled — the origin signed and stored the
+            // assembled body, and the escape exists only because a raw newline
+            // cannot ride an IRC line. Line bodies are peer-provided, so each
+            // is sanitized before reassembly; the joins are ours. Anything
+            // else, the inline form included, is filed as transmitted.
             let stored_body = match multiline_lines.as_ref() {
                 Some(lines) => {
                     let mut out = String::new();
@@ -5137,9 +5135,6 @@ pub(crate) async fn process_s2s_message(
                         out.truncate(cut);
                     }
                     out
-                }
-                None if relayed_tags.contains_key("+freeq.at/multiline") => {
-                    text.replace("\\n", "\n")
                 }
                 None => text.clone(),
             };
@@ -8106,8 +8101,10 @@ mod s2s_adversarial_tests {
         );
     }
 
-    /// A multiline message is escaped for transport, so the wire `text` is not
-    /// the body its sender signed. Rebuilt from the per-line breakdown, it is.
+    /// A BATCH multiline message is escaped for transport, so the wire `text`
+    /// is not the body its sender signed. Rebuilt from the per-line breakdown,
+    /// it is. The inline form signs the escaped body instead, and is checked
+    /// against exactly what arrived.
     #[tokio::test]
     async fn relayed_multiline_verifies_against_the_assembled_body() {
         let state = test_state_with_db();
@@ -8148,8 +8145,12 @@ mod s2s_adversarial_tests {
             "a multiline body must be reassembled before it is hashed"
         );
 
-        // And with no per-line breakdown (an older peer), undoing the escape
-        // reaches the same body.
+        // The inline form is the other sender shape, and it signs the OTHER
+        // body: one line, newlines as literal `\n` under the same tag, signed
+        // over those escaped bytes. With no per-line breakdown to reassemble,
+        // the body is the one that arrived — un-escaping it here was what
+        // dropped every signed inline multiline message on receipt.
+        let inline_sig = sign_channel_message(&key, SIGNER, "01EVENTID", "#chat", &wire_text);
         assert_eq!(
             verify_relayed_privmsg(
                 &state,
@@ -8160,7 +8161,7 @@ mod s2s_adversarial_tests {
                 &wire_tags,
                 None,
                 None,
-                Some(&sig),
+                Some(&inline_sig),
             ),
             Some(ClientSigVerdict::Valid)
         );
