@@ -94,7 +94,10 @@ impl MediaSpaceManager {
     }
 
     /// The creation lock for one channel key, minted on first use.
-    pub async fn create_lock_for(&self, channel_key: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    pub async fn create_lock_for(
+        &self,
+        channel_key: &str,
+    ) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         self.create_locks
             .lock()
             .await

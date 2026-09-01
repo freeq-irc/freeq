@@ -989,7 +989,9 @@ fn service_jwt_with_alg(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let header = b64(serde_json::json!({ "typ": "JWT", "alg": alg }).to_string().as_bytes());
+    let header = b64(serde_json::json!({ "typ": "JWT", "alg": alg })
+        .to_string()
+        .as_bytes());
     let payload = b64(serde_json::json!({
         "iss": AUTHORITY_DID,
         "aud": aud,
@@ -1054,7 +1056,12 @@ async fn service_auth_rejects_an_implausibly_distant_expiry() {
     let space = format!("at://{AUTHORITY_DID}/space/at.freeq.media/somekey");
     let (s, _) = check_access(
         fx.web,
-        Some(&service_jwt(&fx.authority_key, &managing_app(), LXM, 86_400)),
+        Some(&service_jwt(
+            &fx.authority_key,
+            &managing_app(),
+            LXM,
+            86_400,
+        )),
         &space,
         "did:plc:x",
     )

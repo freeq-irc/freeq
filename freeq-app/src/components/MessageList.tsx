@@ -300,7 +300,8 @@ function isTrustedImageUrl(url: string): boolean {
 type MediaFailure = 'refused' | 'error' | null;
 
 /** Is this one of our authenticated space-media URLs? */
-function isSpaceMediaUrl(url: string): boolean {
+function isSpaceMediaUrl(url: string | undefined): url is string {
+  if (!url) return false;
   try {
     const u = new URL(url, window.location.origin);
     return u.origin === window.location.origin && u.pathname.startsWith('/api/v1/space-media/');

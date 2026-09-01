@@ -2511,7 +2511,7 @@ async fn channel_space_key(
     if !state.channels.lock().contains_key(&key) {
         return Err(StatusCode::NOT_FOUND);
     }
-    if media_space_cap_reached(&state) {
+    if media_space_cap_reached(state) {
         tracing::warn!(
             channel = %channel,
             "media space cap reached; refusing to mint another"
