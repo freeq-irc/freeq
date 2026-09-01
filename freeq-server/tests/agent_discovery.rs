@@ -361,3 +361,54 @@ async fn responses_carry_discovery_and_auth_headers() {
         assert!(wa.contains("resource_metadata="), "{wa}");
     }
 }
+
+/// The welcome mat: self-service enrollment, and the terms it points at.
+#[tokio::test]
+async fn serves_the_welcome_mat_and_its_terms() {
+    let (_irc, http, _h) = start_server().await;
+    let client = reqwest::Client::new();
+
+    let welcome = client
+        .get(url(http, "/.well-known/welcome.md"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(welcome.status(), 200);
+    assert!(
+        welcome
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("markdown")
+    );
+    let body = welcome.text().await.unwrap();
+    for section in [
+        "## requirements",
+        "## endpoints",
+        "## enrollment flow",
+        "## deviations",
+    ] {
+        assert!(body.contains(section), "welcome.md needs {section}");
+    }
+
+    let tos = client.get(url(http, "/tos")).send().await.unwrap();
+    assert_eq!(tos.status(), 200);
+    assert!(
+        tos.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain")
+    );
+    let terms = tos.text().await.unwrap();
+    assert!(terms.contains("terms of service"));
+    // Every endpoint welcome.md names as part of enrollment must exist on
+    // this host, or the document is lying to whoever follows it.
+    for path in ["/tos", "/agents.md", "/auth.md", "/api/v1/openapi.json"] {
+        let status = client.get(url(http, path)).send().await.unwrap().status();
+        assert_eq!(status, 200, "welcome.md promises {path}");
+    }
+}

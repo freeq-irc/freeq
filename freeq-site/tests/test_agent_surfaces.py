@@ -197,3 +197,46 @@ def test_link_header_on_html_responses():
     assert 'rel="service-desc"' in link
     assert 'rel="describedby"' in link
     assert link.startswith("<https://freeq.at/about/>")
+
+
+# ── welcome mat ──────────────────────────────────────────────────────────
+#
+# The enrollment document and the terms it points at. Both hosts serve the
+# same bytes from agent-docs/; these tests guard the site's half.
+
+
+def test_welcome_md_is_served_as_markdown():
+    resp = _client().get("/.well-known/welcome.md")
+    assert resp.status_code == 200
+    assert "markdown" in resp.headers["Content-Type"]
+    body = resp.data.decode()
+    for section in ("## requirements", "## endpoints", "## enrollment flow",
+                    "## deviations"):
+        assert section in body, f"welcome.md needs {section}"
+
+
+def test_welcome_md_does_not_promise_an_endpoint_we_lack():
+    """A conformant-looking file that 404s on signup is worse than none."""
+    body = _client().get("/.well-known/welcome.md").data.decode()
+    assert "no `POST /api/signup`" in body
+    assert "EdDSA" in body
+
+
+def test_tos_is_plain_text_and_stable():
+    resp = _client().get("/tos")
+    assert resp.status_code == 200
+    assert resp.headers["Content-Type"].startswith("text/plain")
+    body = resp.data.decode()
+    assert body.startswith("freeq — terms of service")
+    # An agent signs these bytes; CRLF or markup would change the hash.
+    assert "\r" not in body
+    assert "<" not in body
+
+
+def test_both_hosts_would_serve_identical_terms():
+    """The site reads the same file the Rust server compiles in."""
+    from pathlib import Path
+
+    shared = Path(__file__).resolve().parents[2] / "agent-docs" / "tos.txt"
+    assert shared.is_file()
+    assert _client().get("/tos").data.decode() == shared.read_text()

@@ -203,6 +203,13 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .route("/AGENTS.md", get(crate::agent_surfaces::agents_md))
         .route("/auth.md", get(crate::agent_surfaces::auth_md))
         .route("/index.md", get(crate::agent_surfaces::index_md))
+        // Self-service enrollment: an agent mints a key, signs a challenge,
+        // and is a first-class participant without a human in the loop.
+        .route(
+            "/.well-known/welcome.md",
+            get(crate::agent_surfaces::welcome_md),
+        )
+        .route("/tos", get(crate::agent_surfaces::tos_txt))
         .route("/openapi.json", get(crate::openapi::openapi_json))
         .route("/.well-known/ard.json", get(crate::agent_surfaces::ard_json))
         .route(

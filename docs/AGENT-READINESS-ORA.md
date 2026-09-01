@@ -97,6 +97,29 @@ Points are ora's own maxima. `[S]` = freeq.at (site), `[R]` = irc.freeq.at
 | T3.6 | Payments (MPP/x402/UCP/ACP/AP2) | skip — not commerce |
 | T3.7 | MCP Apps UI / A2UI generative UI | skip for now — 12 pts, large surface, low return until T2.1 exists |
 
+## The welcome mat (adjacent, not from the audit)
+
+`https://welcome-mat.info` specifies agent self-signup: a service publishes
+`/.well-known/welcome.md`, an agent generates a keypair, signs the terms, and
+enrols with no human in the loop. Adoption is near zero — 6 stars, one demo
+deployment, and none of the eight agent-forward domains probed serve the file
+— but the *shape* is what freeq already does, and the spec explicitly permits
+services whose ongoing protocol is not HTTP to enrol over HTTP and issue
+protocol-native credentials.
+
+Shipped: `agent-docs/welcome.md` and `agent-docs/tos.txt`, served from both
+hosts. The document is welcome-mat **shaped**, not conformant, and says so in
+its own `deviations` section — freeq proves possession with a SASL challenge
+per connection, not a DPoP proof per request, and has no `POST /api/signup`.
+Publishing a conformant-looking file that 404s on signup would be the exact
+failure this plan exists to avoid.
+
+**Worth adopting later, independent of the protocol's fate:** signed ToS
+consent bound into the credential (`tos_hash`), with a change of terms
+invalidating existing consent. freeq currently mints tokens with no record
+that anyone agreed to anything, which is a strange gap for a project whose
+thesis is non-repudiable speech. Consent as a signature, not a checkbox.
+
 ## Verification
 
 Both hosts, after deploy:

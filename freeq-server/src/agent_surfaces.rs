@@ -54,6 +54,14 @@ const AGENTS_MD: &str = include_str!("../../agent-docs/agents.md");
 /// Credential walkthrough, WorkOS auth.md format.
 const AUTH_MD: &str = include_str!("../../agent-docs/auth.md");
 
+/// Self-service enrollment, welcome-mat layout.
+const WELCOME_MD: &str = include_str!("../../agent-docs/welcome.md");
+
+/// The terms, served verbatim so they can be hashed and signed. Bytes matter
+/// here in a way they do not for the other documents: an agent that signs a
+/// reformatted copy has signed a different document.
+const TOS_TXT: &str = include_str!("../../agent-docs/tos.txt");
+
 /// Crawlers named explicitly in `robots.txt`.
 ///
 /// A blanket `User-agent: *` already allows them; the named stanzas exist
@@ -82,6 +90,8 @@ const SITEMAP_PATHS: &[(&str, &str)] = &[
     ("/index.md", "weekly"),
     ("/agents.md", "monthly"),
     ("/auth.md", "monthly"),
+    ("/.well-known/welcome.md", "monthly"),
+    ("/tos", "yearly"),
     ("/api/v1/openapi.json", "weekly"),
     ("/.well-known/agent.json", "monthly"),
     ("/.well-known/ard.json", "monthly"),
@@ -212,6 +222,30 @@ pub async fn auth_md() -> Response {
     markdown(AUTH_MD)
 }
 
+/// `GET /.well-known/welcome.md` — how an agent enrolls itself, in the layout
+/// described at <https://welcome-mat.info/spec>.
+///
+/// The document is welcome-mat *shaped*, not welcome-mat conformant: freeq
+/// proves possession with a SASL challenge per connection rather than a DPoP
+/// proof per request, and it says so in its own deviations section. Publishing
+/// a conformant-looking file that 404s on `POST /api/signup` would be worse
+/// than publishing nothing.
+pub async fn welcome_md() -> Response {
+    markdown(WELCOME_MD)
+}
+
+/// `GET /tos` — the exact bytes an agent would sign.
+pub async fn tos_txt() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        )],
+        TOS_TXT,
+    )
+        .into_response()
+}
+
 /// `GET /index.md` — the homepage for a reader that wants text, not a bundle.
 pub async fn index_md() -> Response {
     markdown_owned(index_markdown())
@@ -228,6 +262,7 @@ pub fn index_markdown() -> String {
          - [llms.txt]({ORIGIN}/llms.txt) — what this server offers, in order\n\
          - [agents.md]({ORIGIN}/agents.md) — when to use freeq, and the rules for agents\n\
          - [auth.md]({ORIGIN}/auth.md) — how an agent gets its own credentials\n\
+         - [welcome.md]({ORIGIN}/.well-known/welcome.md) — self-service enrollment, no human in the loop\n\
          - [agent.json]({ORIGIN}/.well-known/agent.json) — diagnostic tools that return conclusions\n\
          - [health]({ORIGIN}/api/v1/health) — build features; `av` says whether calls work here\n\n\
          ## Reading conversations without an account\n\n\
@@ -276,6 +311,20 @@ fn discovery_entries() -> serde_json::Value {
             "mediaType": "text/markdown",
             "url": format!("{ORIGIN}/auth.md"),
             "description": "How an agent mints a did:key identity and obtains a bearer token."
+        },
+        {
+            "name": "Self-service enrollment",
+            "type": "onboarding",
+            "mediaType": "text/markdown",
+            "url": format!("{ORIGIN}/.well-known/welcome.md"),
+            "description": "How an agent mints an identity and enrolls with no human in the loop."
+        },
+        {
+            "name": "Terms of service",
+            "type": "terms",
+            "mediaType": "text/plain",
+            "url": format!("{ORIGIN}/tos"),
+            "description": "Served verbatim so the exact bytes can be hashed and signed."
         },
         {
             "name": "Agent Assistance Interface",
@@ -590,6 +639,38 @@ mod tests {
         assert!(AGENTS_MD.contains("When to use freeq"));
         assert!(!AGENTS_MD.contains("deploy.sh"));
         assert!(!AGENTS_MD.contains("ssh chad@"));
+    }
+
+    /// The welcome mat's value is that it is honest about what it is not.
+    #[test]
+    fn welcome_md_declares_its_deviations() {
+        assert!(WELCOME_MD.starts_with("# freeq"));
+        for needed in [
+            "## requirements",
+            "## endpoints",
+            "## enrollment flow",
+            "## deviations",
+        ] {
+            assert!(WELCOME_MD.contains(needed), "welcome.md needs {needed}");
+        }
+        // The three claims that must never drift into dishonesty.
+        assert!(WELCOME_MD.contains("no `POST /api/signup`"));
+        assert!(WELCOME_MD.contains("no DPoP"));
+        assert!(WELCOME_MD.contains("never sent to this server"));
+        // RSA is not a thing here; declaring RS256 like the reference
+        // playground does would promise a signature we cannot verify.
+        assert!(WELCOME_MD.contains("EdDSA"));
+        assert!(WELCOME_MD.contains("RSA is not accepted"));
+    }
+
+    /// The terms are the one document whose *bytes* are the contract.
+    #[test]
+    fn tos_is_plain_stable_text() {
+        assert!(TOS_TXT.starts_with("freeq \u{2014} terms of service"));
+        assert!(TOS_TXT.contains("version 1"));
+        assert!(!TOS_TXT.contains('\r'), "CRLF would change the hash");
+        assert!(!TOS_TXT.contains("<"), "the terms are text, not markup");
+        assert!(TOS_TXT.len() > 500);
     }
 
     #[test]

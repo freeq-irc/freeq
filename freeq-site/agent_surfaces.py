@@ -633,6 +633,26 @@ def register_agent_surfaces(app):
     def auth_md():
         return _repo_markdown("auth.md")
 
+    # Self-service enrollment, welcome-mat layout. Served from both hosts
+    # because an agent that lands on the docs site should not have to guess
+    # that enrollment happens on another hostname; the document itself uses
+    # absolute irc.freeq.at URLs, so it is correct wherever it is read.
+    @app.route("/.well-known/welcome.md")
+    def welcome_md():
+        return _repo_markdown("welcome.md")
+
+    @app.route("/tos")
+    def tos_txt():
+        target = (AGENT_DOCS / "tos.txt").resolve()
+        if not target.is_file():
+            abort(404)
+        # text/plain, verbatim: an agent hashes these exact bytes.
+        return Response(
+            target.read_text(),
+            status=200,
+            content_type="text/plain; charset=utf-8",
+        )
+
     # ── 404: soft-404s poison agents, so a missing path must say so in the
     #    body a crawler can read. Markdown is the default for clients that
     #    have not explicitly asked for HTML (curl, crawlers, */*); a client

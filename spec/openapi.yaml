@@ -182,6 +182,42 @@ paths:
             text/markdown:
               schema:
                 type: string
+  /.well-known/welcome.md:
+    get:
+      tags: [discovery, auth]
+      operationId: getWelcomeMat
+      summary: Self-service enrollment for agents, in the welcome mat layout.
+      description: |
+        Follows the layout at https://welcome-mat.info/spec so an agent that
+        knows the pattern can read it, but freeq proves possession with a SASL
+        challenge per connection rather than a DPoP proof per request. The
+        document's own `deviations` section is normative: there is no
+        `POST /api/signup` on this host.
+      security: [{}]
+      responses:
+        "200":
+          description: Enrollment document.
+          content:
+            text/markdown:
+              schema:
+                type: string
+  /tos:
+    get:
+      tags: [discovery, auth]
+      operationId: getTermsOfService
+      summary: Terms of service, verbatim, for hashing and signing.
+      description: |
+        Served as `text/plain` with stable bytes. A future enrollment flow will
+        bind a signature over these bytes into the issued credential, so
+        reformatting this response is a breaking change.
+      security: [{}]
+      responses:
+        "200":
+          description: Terms text.
+          content:
+            text/plain:
+              schema:
+                type: string
   /index.md:
     get:
       tags: [discovery]
