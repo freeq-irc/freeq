@@ -885,39 +885,59 @@ describe('coordination event methods', () => {
     expect(line).toContain('%3B');
   });
 
-  it('createTask() returns an event ID', async () => {
+  it('emitEvent() returns an event ID', async () => {
     const { client } = await makeRegistered();
-    const taskId = client.createTask('#foo', 'do thing');
+    const taskId = client.emitEvent('#foo', 'task_request', { description: 'do thing' });
     expect(taskId).toMatch(/^[0-9a-f]+$/);
   });
 
-  it('updateTask() includes ref tag', async () => {
+  it('a task_update includes the ref tag', async () => {
     const { client, ws } = await makeRegistered();
-    client.updateTask('#foo', 'task-abc', 'reviewing', 'looking');
+    client.emitEvent(
+      '#foo',
+      'task_update',
+      { phase: 'reviewing', summary: 'looking' },
+      { refId: 'task-abc' },
+    );
     await flushAsync();
     const line = ws.sent.find((l) => l.includes('TAGMSG'));
     expect(line).toContain('+freeq.at/ref=task-abc');
   });
 
-  it('completeTask() emits task_complete', async () => {
+  it('emits task_complete', async () => {
     const { client, ws } = await makeRegistered();
-    client.completeTask('#foo', 'task-abc', 'done', 'https://result');
+    client.emitEvent(
+      '#foo',
+      'task_complete',
+      { summary: 'done', url: 'https://result' },
+      { refId: 'task-abc' },
+    );
     await flushAsync();
     const line = ws.sent.find((l) => l.includes('TAGMSG'));
     expect(line).toContain('+freeq.at/event=task_complete');
   });
 
-  it('failTask() emits task_failed', async () => {
+  it('emits task_failed', async () => {
     const { client, ws } = await makeRegistered();
-    client.failTask('#foo', 'task-abc', 'something broke');
+    client.emitEvent(
+      '#foo',
+      'task_failed',
+      { error: 'something broke' },
+      { refId: 'task-abc' },
+    );
     await flushAsync();
     const line = ws.sent.find((l) => l.includes('TAGMSG'));
     expect(line).toContain('+freeq.at/event=task_failed');
   });
 
-  it('attachEvidence() emits evidence_attach with evidence-type tag', async () => {
+  it('emits evidence_attach with the evidence-type tag', async () => {
     const { client, ws } = await makeRegistered();
-    client.attachEvidence('#foo', 'task-abc', 'code_review', 'looks ok');
+    client.emitEvent(
+      '#foo',
+      'evidence_attach',
+      { type: 'code_review', summary: 'looks ok' },
+      { refId: 'task-abc', extraTags: { '+freeq.at/evidence-type': 'code_review' } },
+    );
     await flushAsync();
     const line = ws.sent.find((l) => l.includes('TAGMSG'));
     expect(line).toContain('+freeq.at/event=evidence_attach');
@@ -2666,7 +2686,7 @@ describe('signed mutations', () => {
   it('registers the key before the first event a client emits on connect', async () => {
     const { client, ws } = await loggedIn('message-tags server-time freeq.at/msgsig');
     // The moment registration lands — exactly what the reference example does.
-    const eventId = client.createTask('#room', 'ship it');
+    const eventId = client.emitEvent('#room', 'task_request', { description: 'ship it' });
     await settle(ws, 'MSGSIG ', 'TAGMSG');
 
     const msgsig = ws.sent.findIndex((l) => l.startsWith('MSGSIG '));
@@ -2720,7 +2740,7 @@ describe('signed mutations', () => {
     ws2.recv(':srv 001 alice :Welcome');
     await flushAsync();
 
-    client.createTask('#room', 'again');
+    client.emitEvent('#room', 'task_request', { description: 'again' });
     await settle(ws2, 'MSGSIG ', 'TAGMSG');
     const msgsig = ws2.sent.findIndex((l) => l.startsWith('MSGSIG '));
     const tagmsg = ws2.sent.findIndex((l) => l.includes('TAGMSG'));
@@ -2865,7 +2885,9 @@ describe('signed mutations', () => {
   it('a coordination event is a TAGMSG signed over its own event id', async () => {
     const signing = await import('./signing.js');
     const { client, ws, verifyKey } = await makeSigningClient();
-    const eventId = client.createTask('#room', 'ship it');
+    // Driven through the generic emitter: this is a test of the coordination
+    // document, and the helper that used to send one now sends an act event.
+    const eventId = client.emitEvent('#room', 'task_request', { description: 'ship it' });
     const line = await waitForSent(ws, 'TAGMSG');
 
     expect(eventId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
@@ -2885,7 +2907,12 @@ describe('signed mutations', () => {
   it('an event that references a task covers the reference it names', async () => {
     const signing = await import('./signing.js');
     const { client, ws, verifyKey } = await makeSigningClient();
-    client.completeTask('#room', '01KYVT1W2P0000000000000000', 'done');
+    client.emitEvent(
+      '#room',
+      'task_complete',
+      { summary: 'done' },
+      { refId: '01KYVT1W2P0000000000000000' },
+    );
     const line = await waitForSent(ws, 'TAGMSG');
     const sigTag = tagOf(line, '+freeq.at/sig')!;
 
@@ -2984,7 +3011,12 @@ describe('signed mutations', () => {
   // produced is what pins this — a hand-written legacy fixture cannot.
   it('a signed pair read back is one event, carrying the event id', async () => {
     const { client: sender, ws: senderWs } = await makeSigningClient();
-    const eventId = sender.createTask('#room', 'ship it');
+    const eventId = sender.emitEvent(
+      '#room',
+      'task_request',
+      { description: 'ship it' },
+      { humanText: '📋 New task: ship it' },
+    );
     const tagmsgOut = await waitForSent(senderWs, 'TAGMSG');
     const privmsgOut = await waitForSent(senderWs, 'PRIVMSG');
 
@@ -3024,7 +3056,7 @@ describe('signed mutations', () => {
   it('files under the id it returned even when signing fails after the fact', async () => {
     const { client, ws } = await makeSigningClient();
     vi.spyOn(client.signing, 'signCoordination').mockResolvedValue(null);
-    const eventId = client.createTask('#room', 'ship it');
+    const eventId = client.emitEvent('#room', 'task_request', { description: 'ship it' });
     const line = await waitForSent(ws, 'TAGMSG');
     expect(line).not.toContain('+freeq.at/sig');
     expect(
@@ -3055,7 +3087,16 @@ describe('signed mutations', () => {
   it('covers the kind of evidence an event carries, on both halves', async () => {
     const signing = await import('./signing.js');
     const { client, ws, verifyKey } = await makeSigningClient();
-    client.attachEvidence('#room', '01KYVT1W2P0000000000000000', 'code_review', 'looks ok');
+    client.emitEvent(
+      '#room',
+      'evidence_attach',
+      { type: 'code_review', summary: 'looks ok' },
+      {
+        refId: '01KYVT1W2P0000000000000000',
+        extraTags: { '+freeq.at/evidence-type': 'code_review' },
+        humanText: '📎 Evidence (code_review): looks ok',
+      },
+    );
     const tagmsg = await waitForSent(ws, 'TAGMSG');
     const privmsg = await waitForSent(ws, 'PRIVMSG');
     expect(tagOf(tagmsg, '+freeq.at/evidence-type')).toBe('code_review');

@@ -42,6 +42,82 @@ export const SIGNING_CAP = 'freeq.at/msgsig';
  * JOIN replay followed by the CHATHISTORY it asks for, and a catch-up over a
  * slow link can put minutes between the two sightings of one event.
  */
+/**
+ * The content behind a piece of evidence: what `act-ctx` points at, and what
+ * `act-ctx-h` hashes.
+ *
+ * The RFC binds `act-ctx` to a content hash, so the helper needs the bytes —
+ * a URL nobody fetched has no hash to sign over. Three answers, because there
+ * are three real cases: the caller already holds the content, the content is
+ * a URL worth fetching, or the reference is one nothing can fetch (a `freeq:`
+ * capability URL) and travels as a link alone.
+ */
+export type Evidence =
+  /** Content the caller holds. `reference` is what `act-ctx` carries. */
+  | { reference: string; content: Uint8Array }
+  /** A URL the helper fetches and hashes; `act-ctx` is the URL itself. A
+   *  fetch that fails sends the link with no hash rather than failing the
+   *  send or inventing one. */
+  | { url: string }
+  /** A reference with no fetchable content: link, no hash. */
+  | { reference: string };
+
+/**
+ * `sha256:` + the lowercase hex digest of `content` — the one spelling
+ * `act-ctx-h` is written in, matching the RFC's wire examples.
+ *
+ * The hash covers the context bytes exactly as they are: no framing, no
+ * normalization, nothing about the URL they came from.
+ */
+async function ctxHash(content: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', content as BufferSource));
+  let hex = '';
+  for (const byte of digest) hex += byte.toString(16).padStart(2, '0');
+  return `sha256:${hex}`;
+}
+
+/** What rides as `act-ctx`, and the hash for `act-ctx-h` when there is
+ *  content to hash. */
+async function resolveEvidence(
+  evidence: Evidence,
+): Promise<{ reference: string; hash?: string }> {
+  if ('content' in evidence) {
+    return { reference: evidence.reference, hash: await ctxHash(evidence.content) };
+  }
+  if ('url' in evidence) {
+    try {
+      const resp = await fetch(evidence.url);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const body = new Uint8Array(await resp.arrayBuffer());
+      return { reference: evidence.url, hash: await ctxHash(body) };
+    } catch (e) {
+      // A browser meets CORS here more often than not, and a link with no
+      // hash is still worth sending.
+      console.warn(`evidence not hashed — ${evidence.url} could not be fetched:`, e);
+      return { reference: evidence.url };
+    }
+  }
+  return { reference: evidence.reference };
+}
+
+/** The five task helpers are kept, and each says once per process that it has
+ *  been superseded. A warning, never an error: a bot that still calls them
+ *  keeps working, and its author learns what to call instead. */
+const DEPRECATION_REPLACEMENT: Record<string, string> = {
+  createTask: 'send an act offer with sendAct + actTags',
+  updateTask: 'send an act progress step with sendAct + actTags',
+  completeTask: 'send an act complete step with sendAct + actTags',
+  failTask: 'send an act fail step with sendAct + actTags',
+  attachEvidence: 'send an act progress step with sendAct + actTags',
+};
+const deprecationWarned = new Set<string>();
+
+function warnDeprecated(helper: string): void {
+  if (deprecationWarned.has(helper)) return;
+  deprecationWarned.add(helper);
+  console.warn(`${helper} is deprecated: ${DEPRECATION_REPLACEMENT[helper]}.`);
+}
+
 const ACT_EVENT_DEDUPE_MS = 10 * 60_000;
 
 /**
@@ -3687,84 +3763,142 @@ export class FreeqClient extends EventEmitter {
   }
 
   /**
-   * Sugar over `emitEvent` for `task_request`. Returns the task ID.
+   * Open a task and take it, returning the task's id.
    *
-   * Superseded by `sendAct` carrying an `offer` built by `actTags` — the same
-   * work opened as a signed task event the sender then holds by accepting it.
-   * This one keeps sending the older task family until every caller has moved.
+   * Kept as a thin wrapper over {@link sendAct}: it opens a `handoff`
+   * directed at the sender's own DID and immediately accepts it, which is the
+   * two-event act spelling of "I have work and I am doing it". The returned
+   * id is the offer's — the id every later move on the task carries.
+   *
+   * @deprecated Build the tags with `actTags` and send them with `sendAct`,
+   * which lets you offer work to somebody else, set a deadline, or leave the
+   * offer open for anyone to claim.
    */
-  createTask(channel: string, description: string): string {
-    return this.emitEvent(channel, 'task_request', { description }, {
-      humanText: `📋 New task: ${description}`,
-    });
+  async createTask(channel: string, description: string): Promise<string> {
+    warnDeprecated('createTask');
+    const did = this.actActor();
+    const taskId = await this.sendAct(
+      channel,
+      signing.actTags('handoff', 'offer', undefined, did, { title: description, to: did }),
+    );
+    await this.sendAct(
+      channel,
+      signing.actTags('handoff', 'accept', taskId, did, {}),
+      { taskId },
+    );
+    return taskId;
   }
 
   /**
-   * Sugar for `task_update` — progress update on a task.
+   * Report progress on a task.
    *
-   * Superseded by `sendAct` carrying a `progress` built by `actTags`, which
-   * says the same thing on the task's own record. This one keeps sending the
-   * older task family until every caller has moved.
+   * Kept as a thin wrapper over {@link sendAct}: a `progress` step whose
+   * `act-note` reads "<phase>: <summary>", the two fields the older event
+   * split apart.
+   *
+   * @deprecated Build the tags with `actTags` and send them with `sendAct`.
    */
-  updateTask(channel: string, taskId: string, phase: string, summary: string): void {
-    this.emitEvent(channel, 'task_update', { phase, summary }, {
-      refId: taskId,
-      humanText: `🔄 [${phase}] ${summary}`,
-    });
+  async updateTask(
+    channel: string,
+    taskId: string,
+    phase: string,
+    summary: string,
+  ): Promise<void> {
+    warnDeprecated('updateTask');
+    const did = this.actActor();
+    await this.sendAct(
+      channel,
+      signing.actTags('handoff', 'progress', taskId, did, { note: `${phase}: ${summary}` }),
+      { taskId },
+    );
   }
 
   /**
-   * Sugar for `task_complete`.
+   * Complete a task.
    *
-   * Superseded by `sendAct` carrying a `complete` built by `actTags`. This one
-   * keeps sending the older task family until every caller has moved.
+   * Kept as a thin wrapper over {@link sendAct}: a `complete` carrying the
+   * summary as `act-note` and any result URL as `act-ctx`.
+   *
+   * @deprecated Build the tags with `actTags` and send them with `sendAct`.
    */
-  completeTask(channel: string, taskId: string, summary: string, url?: string): void {
-    const payload: Record<string, unknown> = { summary };
-    if (url) payload.url = url;
-    const urlStr = url ? ` — ${url}` : '';
-    this.emitEvent(channel, 'task_complete', payload, {
-      refId: taskId,
-      humanText: `🎉 Task complete: ${summary}${urlStr}`,
-    });
+  async completeTask(
+    channel: string,
+    taskId: string,
+    summary: string,
+    url?: string,
+  ): Promise<void> {
+    warnDeprecated('completeTask');
+    const did = this.actActor();
+    const fields: Record<string, string> = { note: summary };
+    if (url) fields.ctx = url;
+    await this.sendAct(
+      channel,
+      signing.actTags('handoff', 'complete', taskId, did, fields),
+      { taskId },
+    );
   }
 
   /**
-   * Sugar for `task_failed`.
+   * Fail a task.
    *
-   * Superseded by `sendAct` carrying a `fail` built by `actTags`. This one
-   * keeps sending the older task family until every caller has moved.
+   * Kept as a thin wrapper over {@link sendAct}: a `fail` carrying the error
+   * as `act-note`.
+   *
+   * @deprecated Build the tags with `actTags` and send them with `sendAct`.
    */
-  failTask(channel: string, taskId: string, error: string): void {
-    this.emitEvent(channel, 'task_failed', { error }, {
-      refId: taskId,
-      humanText: `❌ Task failed: ${error}`,
-    });
+  async failTask(channel: string, taskId: string, error: string): Promise<void> {
+    warnDeprecated('failTask');
+    const did = this.actActor();
+    await this.sendAct(
+      channel,
+      signing.actTags('handoff', 'fail', taskId, did, { note: error }),
+      { taskId },
+    );
   }
 
   /**
-   * Sugar for `evidence_attach` — attach evidence to a task.
+   * Attach evidence to a task.
    *
-   * Superseded by `sendAct` carrying a `progress` built by `actTags` with
-   * `ctx` and `ctx-h` fields — the materials and a hash of them, so what is
-   * fetched later is checkable against what was signed. This one keeps sending
-   * the older task family until every caller has moved.
+   * Kept as a thin wrapper over {@link sendAct}: a `progress` carrying the
+   * materials as `act-ctx` and, whenever the content can be read, a hash of
+   * them as `act-ctx-h` — so what is fetched later is checkable against what
+   * was signed. `evidenceType` and `summary` ride together in `act-note`, the
+   * way {@link updateTask} carries its phase.
+   *
+   * @deprecated Build the tags with `actTags` and send them with `sendAct`,
+   * hashing your own content.
    */
-  attachEvidence(
+  async attachEvidence(
     channel: string,
     taskId: string,
     evidenceType: string,
     summary: string,
-    url?: string,
-  ): void {
-    const payload: Record<string, unknown> = { type: evidenceType, summary };
-    if (url) payload.url = url;
-    const urlStr = url ? ` — ${url}` : '';
-    this.emitEvent(channel, 'evidence_attach', payload, {
-      refId: taskId,
-      extraTags: { '+freeq.at/evidence-type': evidenceType },
-      humanText: `📎 Evidence (${evidenceType}): ${summary}${urlStr}`,
-    });
+    evidence: Evidence,
+  ): Promise<void> {
+    warnDeprecated('attachEvidence');
+    const did = this.actActor();
+    const { reference, hash } = await resolveEvidence(evidence);
+    const fields: Record<string, string> = { note: `${evidenceType}: ${summary}` };
+    if (reference) fields.ctx = reference;
+    if (hash) fields['ctx-h'] = hash;
+    await this.sendAct(
+      channel,
+      signing.actTags('handoff', 'progress', taskId, did, fields),
+      { taskId },
+    );
+  }
+
+  /** The DID a wrapper's events act as. An act event must name its actor,
+   *  and a session that never authenticated has none to name. */
+  private actActor(): string {
+    const did = this.signing.getSigningDid();
+    if (!did) {
+      throw new Error(
+        'a task event must be signed: authenticate, register a signing key, ' +
+          'and address a channel or a DID',
+      );
+    }
+    return did;
   }
 
   // ── Spawning (Phase 4) ──

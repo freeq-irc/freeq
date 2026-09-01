@@ -602,6 +602,12 @@ export class SessionSigning {
     return sigTag ? { eventId, sigTag } : null;
   }
 
+  /** The DID this session authenticated as, or `null` for a guest session.
+   *  A signed task event names its actor, so anything building one needs it. */
+  getSigningDid(): string | null {
+    return this.authenticatedDid;
+  }
+
   /** Get the public key (for MSGSIG registration). */
   getPublicKey(): string | null {
     return this.publicKeyB64;
