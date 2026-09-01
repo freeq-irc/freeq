@@ -1,6 +1,6 @@
 //! Phase 3: Coordinated Work — Interactive Demo
 //!
-//! Simulates a factory agent building a todo app with typed coordination events,
+//! Simulates a factory agent building a todo app with signed act events,
 //! evidence attachments, and an audit trail. Owner says "next" to advance, "quit" to stop.
 //!
 //! Usage:
@@ -8,6 +8,7 @@
 
 use anyhow::Result;
 use clap::Parser;
+use freeq_sdk::act::{act_tags, ctx_hash};
 use freeq_sdk::auth::KeySigner;
 use freeq_sdk::client::{self, ClientHandle, ConnectConfig};
 use freeq_sdk::crypto::PrivateKey;
@@ -129,40 +130,34 @@ async fn drain(rx: &mut mpsc::Receiver<Event>) {
     while let Ok(Some(_)) = timeout(Duration::from_millis(100), rx.recv()).await {}
 }
 
-/// Send a typed coordination event as TAGMSG + human-readable PRIVMSG.
-/// This is what the SDK's emit_event() will do in the real implementation.
-async fn emit_event(
+/// Send one act event: the signed TAGMSG that *is* the event, plus the line
+/// people read beside it. Returns the event's id — which, for an opener, is
+/// the task's id for the rest of its life.
+async fn act(
     h: &ClientHandle,
     ch: &str,
-    event_type: &str,
-    task_id: &str,
-    phase: Option<&str>,
-    evidence_type: Option<&str>,
-    payload_json: &str,
+    did: &str,
+    verb: &str,
+    task: Option<&str>,
+    fields: &[(&str, &str)],
     human_msg: &str,
-) {
-    // Build tag string
-    let mut tags = format!("@+freeq.at/event={event_type};+freeq.at/ref={task_id}");
-    if let Some(p) = phase {
-        tags.push_str(&format!(";+freeq.at/phase={p}"));
-    }
-    if let Some(et) = evidence_type {
-        tags.push_str(&format!(";+freeq.at/evidence-type={et}"));
-    }
-
-    // Escape payload for tag value (no spaces, no semicolons)
-    let payload_escaped = payload_json.replace(';', "%3B").replace(' ', "%20");
-    let tags_with_payload = format!("{tags};+freeq.at/payload={payload_escaped}");
-
-    // TAGMSG with structured payload (machine-readable)
-    let tagmsg = format!("{tags_with_payload} TAGMSG {ch}");
-    let _ = h.raw(&tagmsg).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // PRIVMSG with same tags (for rich web client rendering) + human-readable text
-    let privmsg = format!("{tags_with_payload} PRIVMSG {ch} :{human_msg}");
-    let _ = h.raw(&privmsg).await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+) -> String {
+    let id = match h
+        .send_act(
+            ch,
+            act_tags("handoff", verb, task, did, fields),
+            Some(human_msg),
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("act {verb} refused: {e}");
+            String::new()
+        }
+    };
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    id
 }
 
 async fn shutdown(handle: ClientHandle) -> Result<()> {
@@ -252,9 +247,6 @@ async fn main() -> Result<()> {
     drain(&mut events).await;
     println!("Ready.");
 
-    // Use a fake ULID-style task ID for the demo
-    let task_id = "01JRXYZ4K7DEMO";
-
     // ─── Intro ──────────────────────────────────────
 
     say(
@@ -302,11 +294,31 @@ async fn main() -> Result<()> {
     .await;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    emit_event(
-        &handle, ch, "task_request", task_id, None, None,
-        &format!(r#"{{"description":"Build a todo app with user accounts","requested_by":"chadfowler.com"}}"#),
-        &format!("📋 New task: Build a todo app with user accounts (task: {task_id})"),
-    ).await;
+    // The opener mints the task's id; taking it is the second event, because
+    // a directed offer is not work in progress until its recipient accepts.
+    let task_id = act(
+        &handle,
+        ch,
+        &did,
+        "offer",
+        None,
+        &[
+            ("title", "Build a todo app with user accounts"),
+            ("to", &did),
+        ],
+        "📋 New task: Build a todo app with user accounts",
+    )
+    .await;
+    act(
+        &handle,
+        ch,
+        &did,
+        "accept",
+        Some(&task_id),
+        &[],
+        "👍 Taking it",
+    )
+    .await;
 
     say(
         &handle,
@@ -314,7 +326,7 @@ async fn main() -> Result<()> {
         &[
             "",
             "That sent two things at once:",
-            "  1. TAGMSG with +freeq.at/event=task_request (for rich clients)",
+            "  1. TAGMSG carrying the signed act tags (for rich clients)",
             "  2. PRIVMSG with the emoji text you just saw (for everyone)",
             "",
             "A rich client renders a task card. irssi sees the text.",
@@ -352,11 +364,20 @@ async fn main() -> Result<()> {
     .await;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    emit_event(
-        &handle, ch, "evidence_attach", task_id, None, Some("test_result"),
-        r#"{"summary":"12/12 tests passed","url":"https://ci.example.com/run/456","hash":"sha256:a1b2c3..."}"#,
+    act(
+        &handle,
+        ch,
+        &did,
+        "progress",
+        Some(&task_id),
+        &[
+            ("note", "test_result: 12/12 tests passed"),
+            ("ctx", "https://ci.example.com/run/456"),
+            ("ctx-h", &ctx_hash(b"12/12 tests passed")),
+        ],
         "✅ [qa] Evidence: 12/12 tests passed -- https://ci.example.com/run/456",
-    ).await;
+    )
+    .await;
 
     say(
         &handle,
@@ -389,7 +410,7 @@ async fn main() -> Result<()> {
             "",
             "REST API:",
             "  GET /api/v1/channels/{name}/events?actor=did:key:...&ref_id=01JRXYZ",
-            "  GET /api/v1/tasks/{task_id}  (full task with all events + evidence)",
+            "  GET /api/v1/actions/{task_id}  (full task with all its events)",
             "",
             "The web client renders this as a visual timeline:",
             "",
@@ -434,15 +455,27 @@ async fn main() -> Result<()> {
     handle
         .raw("PRESENCE :state=active;status=Accepted task: Build a todo app")
         .await?;
-    emit_event(
+    let task_id = act(
         &handle,
         ch,
-        "task_request",
-        task_id,
+        &did,
+        "offer",
         None,
-        None,
-        r#"{"description":"Build a todo app with user accounts","requested_by":"chadfowler.com"}"#,
-        &format!("📋 New task: Build a todo app with user accounts (task: {task_id})"),
+        &[
+            ("title", "Build a todo app with user accounts"),
+            ("to", &did),
+        ],
+        "📋 New task: Build a todo app with user accounts",
+    )
+    .await;
+    act(
+        &handle,
+        ch,
+        &did,
+        "accept",
+        Some(&task_id),
+        &[],
+        "👍 Taking it",
     )
     .await;
 
@@ -464,25 +497,33 @@ async fn main() -> Result<()> {
     handle.raw(&format!("AGENT MSG factory-product {ch} :📝 Users need: signup, login, create/edit/delete todos, mark complete")).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    emit_event(
+    act(
         &handle,
         ch,
-        "task_update",
-        task_id,
-        Some("specifying"),
-        None,
-        r#"{"phase":"specifying","summary":"Requirements clarified: CRUD + auth"}"#,
+        &did,
+        "progress",
+        Some(&task_id),
+        &[("note", "specifying: Requirements clarified: CRUD + auth")],
         "📝 [product] Spec complete: CRUD todos with user accounts",
     )
     .await;
-    emit_event(
+    act(
         &handle,
         ch,
-        "evidence_attach",
-        task_id,
-        None,
-        Some("spec_document"),
-        r#"{"summary":"Product spec: 4 user stories, 2 acceptance criteria each","raw":"..."}"#,
+        &did,
+        "progress",
+        Some(&task_id),
+        &[
+            (
+                "note",
+                "spec_document: 4 user stories, 2 acceptance criteria each",
+            ),
+            ("ctx", "https://example.org/factory/spec.md"),
+            (
+                "ctx-h",
+                &ctx_hash(b"Product spec: 4 user stories, 2 acceptance criteria each"),
+            ),
+        ],
         "📎 Evidence attached: spec_document (4 user stories)",
     )
     .await;
@@ -511,22 +552,39 @@ async fn main() -> Result<()> {
     handle.raw(&format!("AGENT MSG factory-architect {ch} :🏗 Decision: React + Express + SQLite. 6 components, 3 API routes.")).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    emit_event(
+    act(
         &handle,
         ch,
-        "task_update",
-        task_id,
-        Some("designing"),
-        None,
-        r#"{"phase":"designing","summary":"Stack: React + Express + SQLite, 6 components"}"#,
+        &did,
+        "progress",
+        Some(&task_id),
+        &[(
+            "note",
+            "designing: Stack: React + Express + SQLite, 6 components",
+        )],
         "🏗 [architect] Design complete: React + Express + SQLite",
     )
     .await;
-    emit_event(
-        &handle, ch, "evidence_attach", task_id, None, Some("architecture_doc"),
-        r#"{"summary":"Architecture: React SPA, Express API, SQLite, JWT auth","components":6,"routes":3}"#,
+    act(
+        &handle,
+        ch,
+        &did,
+        "progress",
+        Some(&task_id),
+        &[
+            (
+                "note",
+                "architecture_doc: React SPA, Express API, SQLite, JWT auth",
+            ),
+            ("ctx", "https://example.org/factory/architecture.md"),
+            (
+                "ctx-h",
+                &ctx_hash(b"React SPA, Express API, SQLite, JWT auth"),
+            ),
+        ],
         "📎 Evidence attached: architecture_doc (6 components, 3 routes)",
-    ).await;
+    )
+    .await;
 
     handle.raw("AGENT DESPAWN factory-architect").await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -564,20 +622,23 @@ async fn main() -> Result<()> {
         .await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    emit_event(
+    act(
         &handle,
         ch,
-        "task_update",
-        task_id,
-        Some("building"),
-        None,
-        r#"{"phase":"building","summary":"8 files created, 342 lines of code"}"#,
+        &did,
+        "progress",
+        Some(&task_id),
+        &[("note", "building: 8 files created, 342 lines of code")],
         "🔨 [builder] Build complete: 8 files, 342 lines",
     )
     .await;
-    emit_event(
-        &handle, ch, "evidence_attach", task_id, None, Some("file_manifest"),
-        r#"{"summary":"8 files: App.tsx, TodoList.tsx, TodoItem.tsx, LoginForm.tsx, SignupForm.tsx, server.ts, db.ts, auth.ts","total_lines":342}"#,
+    act(
+        &handle, ch, &did, "progress", Some(&task_id),
+        &[
+            ("note", "file_manifest: 8 files, 342 lines"),
+            ("ctx", "https://example.org/factory/files.txt"),
+            ("ctx-h", &ctx_hash(b"App.tsx TodoList.tsx TodoItem.tsx LoginForm.tsx SignupForm.tsx server.ts db.ts auth.ts")),
+        ],
         "📎 Evidence attached: file_manifest (8 files, 342 lines)",
     ).await;
 
@@ -607,22 +668,39 @@ async fn main() -> Result<()> {
     handle.raw(&format!("AGENT MSG factory-reviewer {ch} :✅ Review passed. No critical issues. 1 suggestion (add rate limiting).")).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    emit_event(
+    act(
         &handle,
         ch,
-        "task_update",
-        task_id,
-        Some("reviewing"),
-        None,
-        r#"{"phase":"reviewing","summary":"Code review passed, 0 critical, 1 suggestion"}"#,
+        &did,
+        "progress",
+        Some(&task_id),
+        &[(
+            "note",
+            "reviewing: Code review passed, 0 critical, 1 suggestion",
+        )],
         "🔍 [reviewer] Review passed: 0 critical issues, 1 suggestion",
     )
     .await;
-    emit_event(
-        &handle, ch, "evidence_attach", task_id, None, Some("code_review"),
-        r#"{"summary":"0 critical, 0 major, 1 minor (add rate limiting to /auth)","approved":true}"#,
+    act(
+        &handle,
+        ch,
+        &did,
+        "progress",
+        Some(&task_id),
+        &[
+            (
+                "note",
+                "code_review: 0 critical, 0 major, 1 minor (add rate limiting to /auth)",
+            ),
+            ("ctx", "https://example.org/factory/review.md"),
+            (
+                "ctx-h",
+                &ctx_hash(b"0 critical, 0 major, 1 minor (add rate limiting to /auth)"),
+            ),
+        ],
         "📎 Evidence attached: code_review (approved, 1 minor suggestion)",
-    ).await;
+    )
+    .await;
 
     handle.raw("AGENT DESPAWN factory-reviewer").await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -670,22 +748,30 @@ async fn main() -> Result<()> {
         .await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    emit_event(
+    act(
         &handle,
         ch,
-        "task_update",
-        task_id,
-        Some("testing"),
-        None,
-        r#"{"phase":"testing","summary":"12/12 tests passed"}"#,
+        &did,
+        "progress",
+        Some(&task_id),
+        &[("note", "testing: 12/12 tests passed")],
         "🧪 [qa] Tests complete: 12/12 passed",
     )
     .await;
-    emit_event(
-        &handle, ch, "evidence_attach", task_id, None, Some("test_result"),
-        r#"{"summary":"12/12 passed (4 auth, 6 CRUD, 2 edge)","passed":12,"failed":0,"url":"https://ci.example.com/run/789"}"#,
+    act(
+        &handle,
+        ch,
+        &did,
+        "progress",
+        Some(&task_id),
+        &[
+            ("note", "test_result: 12/12 passed (4 auth, 6 CRUD, 2 edge)"),
+            ("ctx", "https://ci.example.com/run/789"),
+            ("ctx-h", &ctx_hash(b"12/12 passed (4 auth, 6 CRUD, 2 edge)")),
+        ],
         "📎 Evidence attached: test_result (12/12 passed) -- https://ci.example.com/run/789",
-    ).await;
+    )
+    .await;
 
     handle.raw("AGENT DESPAWN factory-qa").await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -725,14 +811,13 @@ async fn main() -> Result<()> {
         .raw("PRESENCE :state=executing;status=Phase: deploying")
         .await?;
 
-    emit_event(
+    act(
         &handle,
         ch,
-        "task_update",
-        task_id,
-        Some("deploying"),
-        None,
-        r#"{"phase":"deploying","summary":"Deploying to production"}"#,
+        &did,
+        "progress",
+        Some(&task_id),
+        &[("note", "deploying: Deploying to production")],
         "🚀 [deploy] Deploying to production...",
     )
     .await;
@@ -740,26 +825,34 @@ async fn main() -> Result<()> {
 
     let deploy_url = "https://todo-app.example.com";
 
-    emit_event(
+    act(
         &handle,
         ch,
-        "evidence_attach",
-        task_id,
-        None,
-        Some("deploy_log"),
-        &format!(
-            r#"{{"summary":"Deployed successfully","url":"{deploy_url}","duration_seconds":8}}"#
-        ),
+        &did,
+        "progress",
+        Some(&task_id),
+        &[
+            ("note", "deploy_log: Deployed successfully in 8s"),
+            ("ctx", &deploy_url),
+            ("ctx-h", &ctx_hash(deploy_url.as_bytes())),
+        ],
         &format!("📎 Evidence attached: deploy_log -- {deploy_url}"),
     )
     .await;
 
     // ── Task complete
-    emit_event(
-        &handle, ch, "task_complete", task_id, None, None,
-        &format!(r#"{{"summary":"Todo app deployed","url":"{deploy_url}","duration_seconds":180,"phases_completed":6,"evidence_count":6}}"#),
-        &format!("🎉 Task complete: Todo app deployed at {deploy_url} (6 phases, 6 evidence items)"),
-    ).await;
+    act(
+        &handle,
+        ch,
+        &did,
+        "complete",
+        Some(&task_id),
+        &[("note", "Todo app deployed"), ("ctx", &deploy_url)],
+        &format!(
+            "🎉 Task complete: Todo app deployed at {deploy_url} (6 phases, 6 evidence items)"
+        ),
+    )
+    .await;
 
     handle
         .raw(&format!(

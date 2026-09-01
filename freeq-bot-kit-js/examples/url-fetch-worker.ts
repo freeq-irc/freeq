@@ -2,24 +2,23 @@
 /**
  * URL-fetch worker — the canonical agent pattern on freeq.
  *
- * Joins a channel, listens for `task_request` coordination events
- * declaring a `url_fetch` capability, claims them, fetches the URL,
- * reports the result via `task_complete` or `task_failed`. State
- * transitions between `idle` and `executing` are visible to observers
- * via PRESENCE broadcasts and WHOIS.
+ * Joins a channel, listens for open `handoff` offers declaring a `url_fetch`
+ * capability, claims them, fetches the URL named in the offer's context, and
+ * reports the result with `complete` or `fail`. State transitions between
+ * `idle` and `executing` are visible to observers via PRESENCE broadcasts and
+ * WHOIS.
  *
- * Fire a task from a raw IRC connection (or another bot). The event is a
- * TAGMSG — the server stores the event from that line, and workers listen
- * for it; a PRIVMSG carrying event tags is only a human-readable rendering:
- *   @+freeq.at/event=task_request;\
- *    +freeq.at/payload={"capability":"url_fetch","url":"https://httpbin.org/delay/3"} \
- *    TAGMSG #tasks
+ * Fire a task with the companion example:
+ *   npm run example:fire-task -- --owner did:plc:<your-did> \
+ *     --channel '#tasks' --url 'https://httpbin.org/delay/3'
  *
- * Or in TypeScript:
- *   bot.client.emitEvent('#tasks', 'task_request', {
- *     capability: 'url_fetch',
- *     url: 'https://httpbin.org/delay/3',
- *   });
+ * Or in TypeScript — an open offer is one that names no recipient, so anyone
+ * in the room may claim it:
+ *   bot.client.sendAct('#tasks', actTags('handoff', 'offer', undefined, myDid, {
+ *     title: 'fetch https://httpbin.org/delay/3',
+ *     caps: 'url_fetch',
+ *     ctx: 'https://httpbin.org/delay/3',
+ *   }));
  *
  * Run:
  *   npx tsx freeq-bot-kit-js/examples/url-fetch-worker.ts \
@@ -27,6 +26,7 @@
  */
 
 import { FreeqBot } from "../src/index.js";
+import { actTags } from "@freeq/sdk";
 import { parseArgs } from "node:util";
 
 const CAPABILITY = "url_fetch";
@@ -49,12 +49,6 @@ if (!values.owner) {
 
 const timeoutMs = Number(values["timeout-ms"]);
 
-interface TaskRequestPayload {
-  capability?: string;
-  url?: string;
-  description?: string;
-}
-
 const bot = await FreeqBot.create({
   name: "url-fetch-worker",
   ownerDid: values.owner,
@@ -64,24 +58,27 @@ const bot = await FreeqBot.create({
   initialState: "idle",
 });
 
-bot.on("coordinationEvent", async (event) => {
-  if (event.eventType !== "task_request") return;
-  if (event.from === bot.client.nick) return; // ignore our own emits
-  const payload = event.payload as TaskRequestPayload | null;
-  if (!payload || payload.capability !== CAPABILITY) return;
-  if (typeof payload.url !== "string") {
-    console.error(`[worker] ignoring task ${event.eventId}: payload.url is not a string`);
+bot.on("actEvent", async (event) => {
+  // Only open offers: an offer naming a recipient is somebody else's, and
+  // every other verb is a move on a task already under way.
+  if (event.kind !== "handoff" || event.verb !== "offer") return;
+  if (event.fields["act-to"]) return;
+  if (event.did === bot.identity.did) return; // ignore our own offers
+  if (event.fields["act-caps"] !== CAPABILITY) return;
+  const url = event.fields["act-ctx"];
+  if (!url) {
+    console.error(`[worker] ignoring task ${event.eventId}: the offer names no context to fetch`);
     return;
   }
-  const url = payload.url;
   const channel = event.channel;
-  const taskId = event.eventId;
+  // An opener's own event id is the task's id for the rest of its life.
+  const taskId = event.taskId;
+  const did = bot.identity.did;
+  const send = (verb: string, fields: Record<string, string>) =>
+    bot.client.sendAct(channel, actTags("handoff", verb, taskId, did, fields), { taskId });
 
-  // Claim by emitting a task_claim event referencing this taskId.
-  bot.client.emitEvent(channel, "task_claim", { worker: bot.identity.did }, {
-    refId: taskId,
-    humanText: `🙋 Claiming task: fetch ${url}`,
-  });
+  // First valid claim wins; the task's home server orders competing claims.
+  await send("claim", { note: `fetching ${url}` });
 
   bot.setState("executing", `fetching ${url}`);
   console.error(`[worker] executing ${taskId}: ${url}`);
@@ -97,11 +94,11 @@ bot.on("coordinationEvent", async (event) => {
     const elapsedMs = Date.now() - startedAt;
     const summary = `${response.status} ${response.statusText} — ${body.length}B in ${elapsedMs}ms`;
 
-    bot.client.completeTask(channel, taskId, summary);
+    await send("complete", { note: summary, ctx: url });
     console.error(`[worker] complete ${taskId}: ${summary}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    bot.client.failTask(channel, taskId, message);
+    await send("fail", { note: message });
     console.error(`[worker] failed ${taskId}: ${message}`);
   } finally {
     bot.setState("idle");
@@ -109,7 +106,7 @@ bot.on("coordinationEvent", async (event) => {
 });
 
 await bot.start();
-console.error(`[worker] up as ${bot.client.nick} — listening for task_request with capability=${CAPABILITY} on ${values.channel}`);
+console.error(`[worker] up as ${bot.client.nick} — listening for open offers with caps=${CAPABILITY} on ${values.channel}`);
 
 process.once("SIGINT",  () => bot.stop("SIGINT").then(()  => process.exit(0)));
 process.once("SIGTERM", () => bot.stop("SIGTERM").then(() => process.exit(0)));

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Helper: fire a single task_request at a channel, then exit.
+ * Helper: post a single open offer to a channel, then exit.
  *
  * Used to test url-fetch-worker. Run url-fetch-worker in one terminal,
  * then run this in another:
@@ -8,11 +8,13 @@
  *   npm run example:fire-task -- --owner did:plc:<your-did> \
  *     --channel '#tasks' --url 'https://httpbin.org/delay/3'
  *
- * Worker should claim the task, transition to executing, fetch, then
- * emit task_complete and transition back to idle.
+ * The offer names no recipient, so any worker in the room may claim it. The
+ * worker should claim, transition to executing, fetch, then complete and
+ * transition back to idle.
  */
 
 import { FreeqBot } from "../src/index.js";
+import { actTags } from "@freeq/sdk";
 import { parseArgs } from "node:util";
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -44,13 +46,20 @@ const bot = await FreeqBot.create({
 await bot.start();
 console.error(`[tasker] up as ${bot.client.nick}`);
 
-const taskId = bot.client.emitEvent(values.channel!, "task_request", {
-  capability: values.capability!,
-  url: values.url!,
-});
-console.error(`[tasker] fired task_request id=${taskId} for ${values.url}`);
+// An opener names no action — its own event id becomes the task's id.
+const taskId = await bot.client.sendAct(
+  values.channel!,
+  actTags("handoff", "offer", undefined, bot.identity.did, {
+    title: `fetch ${values.url!}`,
+    // A hint so a worker can self-select. Stored and filterable, never a
+    // gate: anyone in the room may claim an open offer.
+    caps: values.capability!,
+    ctx: values.url!,
+  }),
+);
+console.error(`[tasker] posted offer id=${taskId} for ${values.url}`);
 
-// Give the wire a moment so the task_request and our QUIT don't collide.
+// Give the wire a moment so the offer and our QUIT don't collide.
 await sleep(500);
 await bot.stop("done");
 process.exit(0);

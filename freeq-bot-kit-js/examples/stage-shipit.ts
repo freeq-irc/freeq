@@ -4,8 +4,9 @@
  *
  * Scripted participants (this process, connections held open for captures):
  *   - relay-agent : did:key bot (authenticated agent) — sets the topic, acks
- *                   the opener, emits task_update / task_complete coordination
- *                   events (rendered as cards in the web client).
+ *                   the opener, opens a handoff and drives it through
+ *                   progress and complete (rendered as cards in the web
+ *                   client).
  *   - maya        : guest human — confirms manually, reacts 🎉 to completion.
  *
  * External participants (driven by the operator around this script):
@@ -18,6 +19,7 @@
  * captures. SIGTERM to release.
  */
 import { FreeqBot, FreeqClient } from "../src/index.js";
+import { actTags } from "@freeq/sdk";
 
 const CHANNEL = process.env.STAGE_CHANNEL || "#ship-it";
 const URL = process.env.STAGE_URL || "wss://irc.freeq.at/irc";
@@ -56,12 +58,15 @@ async function main() {
       setTimeout(resolve, 800);
     });
   });
+  // The card maya reacts to is the completion's companion line — an ordinary
+  // message carrying the task's ref, which is what the reaction attaches to.
+  let completedTask: string | null = null;
   let completionMsgId: string | null = null;
+  maya.on("actEvent", (ev: any) => {
+    if (ev?.verb === "complete") completedTask = ev.taskId;
+  });
   maya.on("message", (_buf: string, msg: any) => {
-    if (
-      msg?.tags?.["+freeq.at/event"] === "task_complete" ||
-      msg?.tags?.["freeq.at/event"] === "task_complete"
-    ) {
+    if (completedTask && msg?.tags?.["+freeq.at/ref"] === completedTask) {
       completionMsgId = msg.id || null;
     }
   });
@@ -76,23 +81,33 @@ async function main() {
   bot.client.sendMessage(CHANNEL, "on it — running the checkout smoke suite.");
   await sleep(2600);
 
-  bot.client.sendMessage(CHANNEL, "cart → payment ok (3/5)", {
-    tags: {
-      "+freeq.at/event": "task_update",
-      "+freeq.at/task-id": "T4821",
-      "+freeq.at/phase": "testing",
-      "+freeq.at/payload": JSON.stringify({ step: 3, of: 5, suite: "checkout-smoke" }),
-    },
-  });
+  const did = bot.identity.did;
+  const act = (verb: string, task: string | undefined, fields: Record<string, string>, line: string) =>
+    bot.client.sendAct(CHANNEL, actTags("handoff", verb, task, did, fields), {
+      humanText: line,
+      taskId: task,
+    });
+
+  // Opened directed at ourselves and taken, so the later steps come from the
+  // assignee the rules require.
+  const task = await act(
+    "offer",
+    undefined,
+    { title: "checkout smoke suite", to: did },
+    "taking the checkout smoke suite",
+  );
+  await act("accept", task, {}, "on it");
+  await sleep(2600);
+
+  await act("progress", task, { note: "cart → payment ok (3/5)" }, "cart → payment ok (3/5)");
   await sleep(3200);
 
-  bot.client.sendMessage(CHANNEL, "checkout smoke suite — 5/5 green", {
-    tags: {
-      "+freeq.at/event": "task_complete",
-      "+freeq.at/task-id": "T4821",
-      "+freeq.at/payload": JSON.stringify({ passed: 5, of: 5, duration_s: 41 }),
-    },
-  });
+  await act(
+    "complete",
+    task,
+    { note: "checkout smoke suite — 5/5 green" },
+    "checkout smoke suite — 5/5 green",
+  );
   await sleep(2400);
 
   maya.sendMessage(CHANNEL, "payment flow looks good manually too 👍");
