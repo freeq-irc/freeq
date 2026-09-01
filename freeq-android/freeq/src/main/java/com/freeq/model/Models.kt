@@ -43,6 +43,9 @@ data class ChatMessage(
     // line. The only thing joining a line to the work it is about; null on an
     // ordinary message.
     val actRef: String? = null,
+    // A parsed +freeq.at/event coordination event riding on this message.
+    // When set, the row renders as a coordination card.
+    val coordination: com.freeq.ffi.CoordinationEvent? = null,
     val reactions: MutableMap<String, MutableSet<String>> = mutableMapOf()
 )
 
