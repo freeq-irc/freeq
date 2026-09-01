@@ -323,6 +323,10 @@ pub(crate) struct DidMapsState {
     nick_to_did: HashMap<String, String>,
     /// DID → lowercase nick. Display/keying-grade; survives QUIT.
     did_to_nick: HashMap<String, String>,
+    /// This session's own DID, learned at SASL success. Here rather than in
+    /// its own cell because a caller asking "who am I addressing as" is
+    /// asking the same map every other address question goes through.
+    own_did: Option<String>,
 }
 
 impl DidMapsState {
@@ -376,6 +380,11 @@ impl DidMapsState {
         self.nick_to_did.remove(&nick.to_lowercase());
     }
 
+    /// Record who this session authenticated as.
+    fn set_own_did(&mut self, did: &str) {
+        self.own_did = Some(did.to_string());
+    }
+
     /// A user renamed: move their addressing binding to the new nick and
     /// refresh the display binding.
     fn rename(&mut self, old_nick: &str, new_nick: &str) {
@@ -421,6 +430,15 @@ impl ClientHandle {
             return target.to_string();
         }
         self.did_maps.lock().wire_target(target)
+    }
+
+    /// The DID this session authenticated as, or `None` for a guest session
+    /// and before SASL succeeds.
+    ///
+    /// A signed task event names its actor, so anything building one needs
+    /// the answer; it is the same identity `+freeq.at/from` carries.
+    pub fn authenticated_did(&self) -> Option<String> {
+        self.did_maps.lock().own_did.clone()
     }
 
     /// The DID a DM to `target` will actually be addressed to, if the peer is
@@ -1044,9 +1062,12 @@ impl ClientHandle {
     }
 
     /// [`Self::emit_event`], plus the evidence type an `evidence_attach`
-    /// carries. Private: the public shape stays as it was, and the only
-    /// caller is [`Self::attach_evidence`].
-    async fn emit_event_with_evidence(
+    /// carries in `+freeq.at/evidence-type`.
+    ///
+    /// Public because it is the only way to send that tag: the helper that
+    /// used to reach it now sends an act event, and the older family stays
+    /// open to anyone still emitting it.
+    pub async fn emit_event_with_evidence(
         &self,
         channel: &str,
         event_type: &str,
@@ -1078,30 +1099,50 @@ impl ClientHandle {
         Ok(event_id)
     }
 
-    /// Create a new task and return its ID.
+    /// Open a task and take it, returning the task's id.
     ///
-    /// Superseded by [`ClientHandle::send_act`] carrying an `offer` built by
-    /// [`crate::act::act_tags`] — the same work opened as a signed task event
-    /// the sender then holds by accepting it. This one keeps sending the older
-    /// task family until every caller has moved.
+    /// Kept as a thin wrapper over [`ClientHandle::send_act`]: it opens a
+    /// `handoff` directed at the sender's own DID and immediately accepts it,
+    /// which is the two-event act spelling of "I have work and I am doing
+    /// it". The returned id is the offer's — the id every later move on the
+    /// task carries.
+    ///
+    /// Deprecated: build the tags with [`crate::act::act_tags`] and send them
+    /// with [`ClientHandle::send_act`], which lets you offer work to somebody
+    /// else, set a deadline, or leave the offer open for anyone to claim.
     pub async fn create_task(&self, channel: &str, description: &str) -> Result<String> {
-        let payload = serde_json::json!({"description": description}).to_string();
-        self.emit_event(
+        warn_deprecated_once(&CREATE_TASK_WARNED, CREATE_TASK_DEPRECATED);
+        let did = self.act_actor()?;
+        let task_id = self
+            .send_act(
+                channel,
+                crate::act::act_tags(
+                    "handoff",
+                    "offer",
+                    None,
+                    &did,
+                    &[("title", description), ("to", &did)],
+                ),
+                None,
+            )
+            .await?;
+        self.send_act(
             channel,
-            "task_request",
-            &payload,
+            crate::act::act_tags("handoff", "accept", Some(&task_id), &did, &[]),
             None,
-            &format!("📋 New task: {description}"),
         )
-        .await
+        .await?;
+        Ok(task_id)
     }
 
-    /// Update a task's status.
+    /// Report progress on a task.
     ///
-    /// Superseded by [`ClientHandle::send_act`] carrying a `progress` built by
-    /// [`crate::act::act_tags`], which says the same thing on the task's own
-    /// record. This one keeps sending the older task family until every caller
-    /// has moved.
+    /// Kept as a thin wrapper over [`ClientHandle::send_act`]: a `progress`
+    /// step whose `act-note` reads "<phase>: <summary>", the two fields the
+    /// older event split apart.
+    ///
+    /// Deprecated: build the tags with [`crate::act::act_tags`] and send them
+    /// with [`ClientHandle::send_act`].
     pub async fn update_task(
         &self,
         channel: &str,
@@ -1109,13 +1150,18 @@ impl ClientHandle {
         phase: &str,
         summary: &str,
     ) -> Result<()> {
-        let payload = serde_json::json!({"phase": phase, "summary": summary}).to_string();
-        self.emit_event(
+        warn_deprecated_once(&UPDATE_TASK_WARNED, UPDATE_TASK_DEPRECATED);
+        let did = self.act_actor()?;
+        self.send_act(
             channel,
-            "task_update",
-            &payload,
-            Some(task_id),
-            &format!("🔄 [{phase}] {summary}"),
+            crate::act::act_tags(
+                "handoff",
+                "progress",
+                Some(task_id),
+                &did,
+                &[("note", &format!("{phase}: {summary}"))],
+            ),
+            None,
         )
         .await?;
         Ok(())
@@ -1123,9 +1169,11 @@ impl ClientHandle {
 
     /// Complete a task.
     ///
-    /// Superseded by [`ClientHandle::send_act`] carrying a `complete` built by
-    /// [`crate::act::act_tags`]. This one keeps sending the older task family
-    /// until every caller has moved.
+    /// Kept as a thin wrapper over [`ClientHandle::send_act`]: a `complete`
+    /// carrying the summary as `act-note` and any result URL as `act-ctx`.
+    ///
+    /// Deprecated: build the tags with [`crate::act::act_tags`] and send them
+    /// with [`ClientHandle::send_act`].
     pub async fn complete_task(
         &self,
         channel: &str,
@@ -1133,17 +1181,16 @@ impl ClientHandle {
         summary: &str,
         url: Option<&str>,
     ) -> Result<()> {
-        let mut payload = serde_json::json!({"summary": summary});
+        warn_deprecated_once(&COMPLETE_TASK_WARNED, COMPLETE_TASK_DEPRECATED);
+        let did = self.act_actor()?;
+        let mut fields: Vec<(&str, &str)> = vec![("note", summary)];
         if let Some(u) = url {
-            payload["url"] = serde_json::json!(u);
+            fields.push(("ctx", u));
         }
-        let url_str = url.map(|u| format!(" — {u}")).unwrap_or_default();
-        self.emit_event(
+        self.send_act(
             channel,
-            "task_complete",
-            &payload.to_string(),
-            Some(task_id),
-            &format!("🎉 Task complete: {summary}{url_str}"),
+            crate::act::act_tags("handoff", "complete", Some(task_id), &did, &fields),
+            None,
         )
         .await?;
         Ok(())
@@ -1151,17 +1198,18 @@ impl ClientHandle {
 
     /// Fail a task.
     ///
-    /// Superseded by [`ClientHandle::send_act`] carrying a `fail` built by
-    /// [`crate::act::act_tags`]. This one keeps sending the older task family
-    /// until every caller has moved.
+    /// Kept as a thin wrapper over [`ClientHandle::send_act`]: a `fail`
+    /// carrying the error as `act-note`.
+    ///
+    /// Deprecated: build the tags with [`crate::act::act_tags`] and send them
+    /// with [`ClientHandle::send_act`].
     pub async fn fail_task(&self, channel: &str, task_id: &str, error: &str) -> Result<()> {
-        let payload = serde_json::json!({"error": error}).to_string();
-        self.emit_event(
+        warn_deprecated_once(&FAIL_TASK_WARNED, FAIL_TASK_DEPRECATED);
+        let did = self.act_actor()?;
+        self.send_act(
             channel,
-            "task_failed",
-            &payload,
-            Some(task_id),
-            &format!("❌ Task failed: {error}"),
+            crate::act::act_tags("handoff", "fail", Some(task_id), &did, &[("note", error)]),
+            None,
         )
         .await?;
         Ok(())
@@ -1169,40 +1217,48 @@ impl ClientHandle {
 
     /// Attach evidence to a task.
     ///
-    /// Superseded by [`ClientHandle::send_act`] carrying a `progress` built by
-    /// [`crate::act::act_tags`] with `ctx` and `ctx-h` fields — the materials
-    /// and a hash of them, so what is fetched later is checkable against what
-    /// was signed. This one keeps sending the older task family until every
-    /// caller has moved.
+    /// Kept as a thin wrapper over [`ClientHandle::send_act`]: a `progress`
+    /// carrying the materials as `act-ctx` and, whenever the content can be
+    /// read, a hash of them as `act-ctx-h` — so what is fetched later is
+    /// checkable against what was signed. `evidence_type` and `summary` ride
+    /// together in `act-note`, the way [`ClientHandle::update_task`] carries
+    /// its phase.
+    ///
+    /// Deprecated: build the tags with [`crate::act::act_tags`] and send them
+    /// with [`ClientHandle::send_act`], hashing your own content.
     pub async fn attach_evidence(
         &self,
         channel: &str,
         task_id: &str,
         evidence_type: &str,
         summary: &str,
-        url: Option<&str>,
+        evidence: Evidence<'_>,
     ) -> Result<()> {
-        let mut payload = serde_json::json!({
-            "type": evidence_type,
-            "summary": summary,
-        });
-        if let Some(u) = url {
-            payload["url"] = serde_json::json!(u);
+        warn_deprecated_once(&ATTACH_EVIDENCE_WARNED, ATTACH_EVIDENCE_DEPRECATED);
+        let did = self.act_actor()?;
+        let (reference, hash) = evidence.reference_and_hash().await;
+        let note = format!("{evidence_type}: {summary}");
+        let mut fields: Vec<(&str, &str)> = vec![("note", &note)];
+        if let Some(r) = reference {
+            fields.push(("ctx", r));
         }
-        let url_str = url.map(|u| format!(" — {u}")).unwrap_or_default();
-        // The type rides as a tag as well as inside the payload: the tag is
-        // what a reader renders and a bot reads, and both SDKs send it so the
-        // same event is covered the same way whichever emitted it.
-        self.emit_event_with_evidence(
+        if let Some(h) = hash.as_deref() {
+            fields.push(("ctx-h", h));
+        }
+        self.send_act(
             channel,
-            "evidence_attach",
-            &payload.to_string(),
-            Some(task_id),
-            Some(evidence_type),
-            &format!("📎 Evidence ({evidence_type}): {summary}{url_str}"),
+            crate::act::act_tags("handoff", "progress", Some(task_id), &did, &fields),
+            None,
         )
         .await?;
         Ok(())
+    }
+
+    /// The DID a wrapper's events act as. An act event must name its actor,
+    /// and a session that never authenticated has none to name.
+    fn act_actor(&self) -> Result<String> {
+        self.authenticated_did()
+            .ok_or_else(|| anyhow::anyhow!(ACT_UNSIGNABLE))
     }
 
     // ── Phase 4: Manifests and Spawning ────────────────────────────
@@ -2186,6 +2242,9 @@ where
                             let did = authenticated_did.take()
                                 .or_else(|| signer.as_ref().map(|s| s.did().to_string()))
                                 .unwrap_or_default();
+                            if !did.is_empty() {
+                                did_maps.lock().set_own_did(&did);
+                            }
                             // Only where the key can be used: a server that
                             // never negotiated the cap cannot verify a client
                             // document, so registering a key with it files a
@@ -3130,6 +3189,118 @@ fn sign_coordination_outgoing(
         doc = doc.with_evidence(evidence_type);
     }
     Some(doc.sign(key))
+}
+
+/// The content behind a piece of evidence: what `act-ctx` points at, and what
+/// `act-ctx-h` hashes.
+///
+/// The RFC binds `act-ctx` to a content hash, so the helper needs the bytes —
+/// a URL nobody fetched has no hash to sign over. Three answers, because
+/// there are three real cases: the caller already holds the content, the
+/// content is a URL worth fetching, or the reference is one nothing can fetch
+/// (a `freeq:` capability URL) and travels as a link alone.
+#[derive(Debug, Clone, Copy)]
+pub enum Evidence<'a> {
+    /// Content the caller holds. `reference` is what `act-ctx` carries;
+    /// `content` is what `act-ctx-h` covers.
+    Bytes {
+        reference: &'a str,
+        content: &'a [u8],
+    },
+    /// A URL the helper fetches and hashes. `act-ctx` is the URL itself. A
+    /// fetch that fails sends the link with no hash rather than failing the
+    /// send or inventing one.
+    Url(&'a str),
+    /// A reference with no fetchable content: link, no hash.
+    Reference(&'a str),
+}
+
+impl Evidence<'_> {
+    /// What rides as `act-ctx`, and the hash for `act-ctx-h` when there is
+    /// content to hash.
+    async fn reference_and_hash(&self) -> (Option<&str>, Option<String>) {
+        match self {
+            Evidence::Bytes { reference, content } => {
+                (Some(*reference), Some(crate::act::ctx_hash(content)))
+            }
+            Evidence::Reference(r) => (Some(*r), None),
+            Evidence::Url(url) => (Some(*url), fetch_and_hash(url).await),
+        }
+    }
+}
+
+/// Fetch a URL and hash what came back, or `None` when it cannot be read.
+///
+/// Guarded the way every other SDK fetch is: the host is resolved and checked
+/// before the request, and the client is pinned to the addresses that passed,
+/// so a name cannot be re-pointed between the check and the fetch.
+async fn fetch_and_hash(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_string();
+    let port = parsed
+        .port()
+        .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+    let addrs = match crate::ssrf::resolve_and_check(&host, port).await {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            tracing::warn!("evidence not hashed — {url} failed the address check: {e}");
+            return None;
+        }
+    };
+    let client =
+        crate::ssrf::pinned_client(&host, &addrs, std::time::Duration::from_secs(10)).ok()?;
+    match client
+        .get(url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+    {
+        Ok(resp) => match resp.bytes().await {
+            Ok(body) => Some(crate::act::ctx_hash(&body)),
+            Err(e) => {
+                tracing::warn!("evidence not hashed — {url} could not be read: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!("evidence not hashed — {url} could not be fetched: {e}");
+            None
+        }
+    }
+}
+
+// The five task helpers are kept, and each says once per process that it has
+// been superseded. A warning, never an error: a bot that still calls them
+// keeps working, and its operator learns what to call instead.
+const CREATE_TASK_DEPRECATED: &str =
+    "create_task is deprecated: build an offer with act_tags and send it with send_act";
+const UPDATE_TASK_DEPRECATED: &str =
+    "update_task is deprecated: build a progress step with act_tags and send it with send_act";
+const COMPLETE_TASK_DEPRECATED: &str =
+    "complete_task is deprecated: build a complete step with act_tags and send it with send_act";
+const FAIL_TASK_DEPRECATED: &str =
+    "fail_task is deprecated: build a fail step with act_tags and send it with send_act";
+const ATTACH_EVIDENCE_DEPRECATED: &str =
+    "attach_evidence is deprecated: build a progress step with act_tags and send it with send_act";
+
+static CREATE_TASK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static UPDATE_TASK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static COMPLETE_TASK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static FAIL_TASK_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ATTACH_EVIDENCE_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Write `message` the first time this flag is raised. Returns whether it
+/// wrote, which is how the once-ness is tested.
+fn warn_deprecated_once(fired: &std::sync::atomic::AtomicBool, message: &str) -> bool {
+    if fired.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    tracing::warn!("{message}");
+    true
 }
 
 /// What a caller is told when a task event cannot be signed.
@@ -4810,7 +4981,19 @@ mod multiline_tests {
             did_maps: Arc::new(parking_lot::Mutex::new(DidMapsState::default())),
         };
 
-        let task_id = handle.create_task("#room", "ship it").await.unwrap();
+        // Driven through the generic emitter: this is a test of the
+        // coordination document, and the helper that used to send one now
+        // sends an act event instead.
+        let task_id = handle
+            .emit_event(
+                "#room",
+                "task_request",
+                r#"{"description":"ship it"}"#,
+                None,
+                "📋 New task: ship it",
+            )
+            .await
+            .unwrap();
         assert_eq!(task_id.len(), 26, "a signed event is filed under a ULID");
 
         let mut buf: Vec<u8> = Vec::new();
@@ -4897,7 +5080,13 @@ mod multiline_tests {
         };
 
         handle
-            .complete_task("#room", root, "done", None)
+            .emit_event(
+                "#room",
+                "task_complete",
+                r#"{"summary":"done"}"#,
+                Some(root),
+                "🎉 Task complete: done",
+            )
             .await
             .unwrap();
         let mut buf: Vec<u8> = Vec::new();
@@ -7739,5 +7928,246 @@ mod did_maps_tests {
             dm_key_for(&maps, "me", "guest9", "me").as_deref(),
             Some("guest9")
         );
+    }
+
+    // ── the five old helpers, now act wrappers ────────────────────────────
+
+    /// A signing session whose sends do not wait: the wrappers put two events
+    /// on the wire in a row, and `echo-message` would hold each line for an
+    /// answer this test never sends.
+    const WRAPPER_CAPS: &str = "message-tags server-time freeq.at/act freeq.at/msgsig";
+
+    /// The act TAGMSGs a wrapper wrote, in order.
+    fn act_events(wire: &str) -> Vec<crate::irc::Message> {
+        wire.lines()
+            .filter_map(crate::irc::Message::parse)
+            .filter(|m| m.command == "TAGMSG" && m.tags.contains_key("+freeq.at/act"))
+            .collect()
+    }
+
+    fn tag<'a>(m: &'a crate::irc::Message, name: &str) -> Option<&'a str> {
+        m.tags.get(name).map(String::as_str)
+    }
+
+    /// `create_task` opens the work as a handoff directed at the sender's own
+    /// DID and immediately takes it, and hands back the offer's id — the id
+    /// every later move on the task carries.
+    #[tokio::test]
+    async fn create_task_offers_to_itself_and_accepts() {
+        let (handle, mut server) = answering_session(WRAPPER_CAPS).await;
+        let task_id = handle
+            .create_task("#room", "Build a todo app")
+            .await
+            .expect("the pair goes out");
+        let wire = wire_since(&mut server, 400).await;
+        let events = act_events(&wire);
+        assert_eq!(events.len(), 2, "an offer and its acceptance: {wire}");
+
+        let offer = &events[0];
+        assert_eq!(tag(offer, "+freeq.at/act"), Some("handoff"));
+        assert_eq!(tag(offer, "+freeq.at/act-verb"), Some("offer"));
+        assert_eq!(tag(offer, "+freeq.at/act-title"), Some("Build a todo app"));
+        assert_eq!(
+            tag(offer, "+freeq.at/act-to"),
+            Some("did:plc:tester"),
+            "directed at the sender's own DID: {wire}"
+        );
+        assert_eq!(tag(offer, "+freeq.at/from"), Some("did:plc:tester"));
+        assert_eq!(
+            tag(offer, "+freeq.at/act-id"),
+            None,
+            "an opener names no action — its own id becomes the action's"
+        );
+        assert_eq!(
+            tag(offer, crate::chatsig::EVENT_ID_TAG),
+            Some(task_id.as_str()),
+            "the returned id is the offer's: {wire}"
+        );
+
+        let accept = &events[1];
+        assert_eq!(tag(accept, "+freeq.at/act-verb"), Some("accept"));
+        assert_eq!(tag(accept, "+freeq.at/act-id"), Some(task_id.as_str()));
+        assert_eq!(tag(accept, "+freeq.at/from"), Some("did:plc:tester"));
+    }
+
+    /// `update_task` is a `progress` step whose note carries both the phase
+    /// and the summary the old payload split into two fields.
+    #[tokio::test]
+    async fn update_task_reports_progress_with_the_phase_in_the_note() {
+        let (handle, mut server) = answering_session(WRAPPER_CAPS).await;
+        handle
+            .update_task("#room", "01OFFER", "designing", "Chose React")
+            .await
+            .expect("sent");
+        let wire = wire_since(&mut server, 400).await;
+        let events = act_events(&wire);
+        assert_eq!(events.len(), 1, "{wire}");
+        assert_eq!(tag(&events[0], "+freeq.at/act-verb"), Some("progress"));
+        assert_eq!(tag(&events[0], "+freeq.at/act-id"), Some("01OFFER"));
+        assert_eq!(
+            tag(&events[0], "+freeq.at/act-note"),
+            Some("designing: Chose React")
+        );
+    }
+
+    /// `complete_task` completes the action; a result URL rides as the
+    /// context the signature covers.
+    #[tokio::test]
+    async fn complete_task_completes_and_carries_the_result_url_as_context() {
+        let (handle, mut server) = answering_session(WRAPPER_CAPS).await;
+        handle
+            .complete_task("#room", "01OFFER", "shipped", Some("https://e.g/build/9"))
+            .await
+            .expect("sent");
+        let wire = wire_since(&mut server, 400).await;
+        let events = act_events(&wire);
+        assert_eq!(events.len(), 1, "{wire}");
+        assert_eq!(tag(&events[0], "+freeq.at/act-verb"), Some("complete"));
+        assert_eq!(tag(&events[0], "+freeq.at/act-id"), Some("01OFFER"));
+        assert_eq!(tag(&events[0], "+freeq.at/act-note"), Some("shipped"));
+        assert_eq!(
+            tag(&events[0], "+freeq.at/act-ctx"),
+            Some("https://e.g/build/9")
+        );
+    }
+
+    /// No URL, no context tag — a `complete` says only what it was given.
+    #[tokio::test]
+    async fn complete_task_without_a_url_carries_no_context() {
+        let (handle, mut server) = answering_session(WRAPPER_CAPS).await;
+        handle
+            .complete_task("#room", "01OFFER", "shipped", None)
+            .await
+            .expect("sent");
+        let wire = wire_since(&mut server, 400).await;
+        let events = act_events(&wire);
+        assert_eq!(tag(&events[0], "+freeq.at/act-ctx"), None, "{wire}");
+    }
+
+    /// `fail_task` fails the action with the error as its note.
+    #[tokio::test]
+    async fn fail_task_fails_with_the_error_as_the_note() {
+        let (handle, mut server) = answering_session(WRAPPER_CAPS).await;
+        handle
+            .fail_task("#room", "01OFFER", "Out of memory")
+            .await
+            .expect("sent");
+        let wire = wire_since(&mut server, 400).await;
+        let events = act_events(&wire);
+        assert_eq!(events.len(), 1, "{wire}");
+        assert_eq!(tag(&events[0], "+freeq.at/act-verb"), Some("fail"));
+        assert_eq!(tag(&events[0], "+freeq.at/act-id"), Some("01OFFER"));
+        assert_eq!(tag(&events[0], "+freeq.at/act-note"), Some("Out of memory"));
+    }
+
+    /// Evidence the caller holds the bytes for: the helper hashes them, and
+    /// the hash rides beside the reference inside the signature.
+    #[tokio::test]
+    async fn attach_evidence_hashes_the_bytes_it_is_given() {
+        let (handle, mut server) = answering_session(WRAPPER_CAPS).await;
+        handle
+            .attach_evidence(
+                "#room",
+                "01OFFER",
+                "test_result",
+                "12/12 passed",
+                Evidence::Bytes {
+                    reference: "https://e.g/report.txt",
+                    content: b"12/12 passed",
+                },
+            )
+            .await
+            .expect("sent");
+        let wire = wire_since(&mut server, 400).await;
+        let events = act_events(&wire);
+        assert_eq!(events.len(), 1, "{wire}");
+        assert_eq!(tag(&events[0], "+freeq.at/act-verb"), Some("progress"));
+        assert_eq!(tag(&events[0], "+freeq.at/act-id"), Some("01OFFER"));
+        assert_eq!(
+            tag(&events[0], "+freeq.at/act-note"),
+            Some("test_result: 12/12 passed"),
+            "the evidence type and its summary keep a home: {wire}"
+        );
+        assert_eq!(
+            tag(&events[0], "+freeq.at/act-ctx"),
+            Some("https://e.g/report.txt")
+        );
+        // sha256 of the bytes, lowercase hex, `sha256:`-prefixed — the form
+        // the RFC's examples carry.
+        assert_eq!(
+            tag(&events[0], "+freeq.at/act-ctx-h"),
+            Some(crate::act::ctx_hash(b"12/12 passed").as_str()),
+            "{wire}"
+        );
+    }
+
+    /// A reference nobody could fetch carries the link and no hash — the
+    /// external best-effort case, rather than a failed send or a hash over
+    /// nothing.
+    #[tokio::test]
+    async fn attach_evidence_without_content_sends_the_reference_alone() {
+        let (handle, mut server) = answering_session(WRAPPER_CAPS).await;
+        handle
+            .attach_evidence(
+                "#room",
+                "01OFFER",
+                "artifact_link",
+                "the built bundle",
+                Evidence::Reference("freeq:blob/cap/abc"),
+            )
+            .await
+            .expect("sent");
+        let wire = wire_since(&mut server, 400).await;
+        let events = act_events(&wire);
+        assert_eq!(
+            tag(&events[0], "+freeq.at/act-ctx"),
+            Some("freeq:blob/cap/abc")
+        );
+        assert_eq!(tag(&events[0], "+freeq.at/act-ctx-h"), None, "{wire}");
+    }
+
+    /// The hash is over the content bytes exactly, and spelled the one way
+    /// every reader expects.
+    #[test]
+    fn the_evidence_hash_is_sha256_over_the_content_bytes() {
+        assert_eq!(
+            crate::act::ctx_hash(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            crate::act::ctx_hash(b""),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    /// A wrapper says once per process that it is deprecated, and says which
+    /// call replaces it.
+    #[test]
+    fn a_deprecation_notice_is_written_once() {
+        use std::sync::atomic::AtomicBool;
+        let fired = AtomicBool::new(false);
+        assert!(warn_deprecated_once(&fired, CREATE_TASK_DEPRECATED));
+        assert!(
+            !warn_deprecated_once(&fired, CREATE_TASK_DEPRECATED),
+            "the second call through the same flag says nothing"
+        );
+    }
+
+    /// Each helper names the call that replaces it.
+    #[test]
+    fn every_deprecation_notice_names_its_replacement() {
+        for notice in [
+            CREATE_TASK_DEPRECATED,
+            UPDATE_TASK_DEPRECATED,
+            COMPLETE_TASK_DEPRECATED,
+            FAIL_TASK_DEPRECATED,
+            ATTACH_EVIDENCE_DEPRECATED,
+        ] {
+            assert!(
+                notice.contains("send_act") && notice.contains("act_tags"),
+                "a notice must name the replacement: {notice}"
+            );
+            assert!(notice.contains("deprecated"), "{notice}");
+        }
     }
 }

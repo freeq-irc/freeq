@@ -270,6 +270,23 @@ pub fn act_tags(
     t
 }
 
+/// `sha256:` + the lowercase hex digest of `content` — the one spelling
+/// `act-ctx-h` is written in, matching the RFC's wire examples.
+///
+/// The hash covers the context bytes exactly as they are: no framing, no
+/// normalization, nothing about the URL they came from. A reader who fetches
+/// what `act-ctx` names hashes what it got and compares.
+pub fn ctx_hash(content: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(content);
+    let mut out = String::with_capacity(7 + digest.len() * 2);
+    out.push_str("sha256:");
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 /// The line people read beside a task event, when the sender writes none.
 ///
 /// The companion is prose for a room, so it is the one place a verb has to be
