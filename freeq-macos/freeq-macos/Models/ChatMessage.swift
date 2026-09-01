@@ -30,6 +30,10 @@ struct ChatMessage: Identifiable, Equatable {
     // Agent coordination event (+freeq.at/event family). When set, the row
     // renders as a structured task/evidence card (parity with web).
     var coordination: CoordinationInfo? = nil
+    // The task a companion line names (`+freeq.at/ref`). The only thing
+    // joining a line to the act event it was written beside; the row renders
+    // as a task card once its event has arrived.
+    var actRef: String? = nil
     var reactions: [String: Set<String>] = [:]  // emoji -> set of nicks
 
     static func == (lhs: ChatMessage, rhs: ChatMessage) -> Bool {
@@ -46,6 +50,7 @@ struct ChatMessage: Identifiable, Equatable {
             && lhs.origin == rhs.origin
             && lhs.editOf == rhs.editOf
             && lhs.coordination == rhs.coordination
+            && lhs.actRef == rhs.actRef
             && lhs.reactions == rhs.reactions
     }
 }

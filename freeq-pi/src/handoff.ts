@@ -339,6 +339,21 @@ function normalizeRecord(raw: unknown): HandoffRecord | undefined {
   };
 }
 
+/**
+ * Is this task finished, by any route?
+ *
+ * The terminal set is the transition table's, not ours — a kind that grows a
+ * new ending gets it here for free.
+ */
+export function isTerminalRecord(rec: HandoffRecord): boolean {
+  return isTerminal(rec.kind, rec.state);
+}
+
+/** A DID, shortened for display. */
+export function shortDid(did: string | undefined): string {
+  return short(did) ?? "someone";
+}
+
 /** Fold a new verification outcome into a record, keeping the worst. */
 export function noteVerification(
   rec: HandoffRecord,

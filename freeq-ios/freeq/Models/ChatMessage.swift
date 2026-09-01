@@ -35,6 +35,14 @@ struct ChatMessage: Identifiable, Equatable {
     // Agent coordination event (+freeq.at/event family). When set, the row
     // renders as a structured task/evidence card (parity with web + macOS).
     var coordination: CoordinationInfo? = nil
+    // The task a companion line names (`+freeq.at/ref`). The only thing
+    // joining a line to the act event it was written beside.
+    var actRef: String? = nil
+    // Whether this row's task card is ready to draw. The card itself lives in
+    // ChannelState.actCards; this bit rides on the row so `renderKey` changes
+    // when the card arrives — an in-place update of a same-identity row has
+    // been observed not to reach the screen.
+    var actCarded: Bool = false
     var reactions: [String: Set<String>] = [:]  // emoji -> set of nicks
 
     // Equality is memberwise (synthesized). An id-only == here made SwiftUI
@@ -51,6 +59,6 @@ struct ChatMessage: Identifiable, Equatable {
     /// persist it.
     var renderKey: String {
         let reactionsPart = reactions.map { "\($0.key)\($0.value.count)" }.sorted().joined()
-        return "\(id)|\(isDeleted ? 1 : 0)|\(isEdited ? 1 : 0)|\(text.hashValue)|\(reactionsPart)"
+        return "\(id)|\(isDeleted ? 1 : 0)|\(isEdited ? 1 : 0)|\(actCarded ? 1 : 0)|\(text.hashValue)|\(reactionsPart)"
     }
 }

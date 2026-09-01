@@ -660,8 +660,13 @@ private fun MessageBubble(
                 // A task event's companion line is that event's card, and
                 // stays one: every event keeps a card of its own.
                 val actCard = channelState.actCards[msg.id]
+                val coordination = msg.coordination
                 if (actCard != null) {
                     ActEventCard(actCard, msg.timestamp, onJumpToMessage)
+                } else if (coordination != null) {
+                    // Agent coordination event → structured card (parity with
+                    // the other three clients).
+                    CoordinationEventCard(coordination, msg.text)
                 } else {
                     // Message text + inline embeds
                     MessageContent(

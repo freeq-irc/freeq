@@ -47,6 +47,9 @@ let package = Package(
             sources: [
                 "ChatMessage.swift",
                 "CoordinationCard.swift",
+                "ActVerbs.swift",
+                "ActTasks.swift",
+                "DmHistoryOnOpen.swift",
                 "Jumbomoji.swift",
                 "CallLayoutPolicies.swift",
                 "FavoritesSync.swift",

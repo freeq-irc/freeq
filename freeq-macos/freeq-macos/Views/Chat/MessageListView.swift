@@ -794,6 +794,14 @@ struct MessageRow: View {
                     .foregroundStyle(Theme.textSecondary)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
+            } else if let card = appState.activeChannelState?.actCards[message.id] {
+                // A task event's companion line → its card. Every act event
+                // renders as its own card and stays one; a line whose event
+                // has not arrived has no card here and stays text below.
+                ActEventCardView(card: card, at: message.timestamp) { msgId in
+                    appState.scrollToMessageId = msgId
+                }
+                .fixedSize(horizontal: false, vertical: true)
             } else if let coord = message.coordination {
                 // Agent coordination event → structured card (parity with web).
                 CoordinationCardView(info: coord, text: message.text)

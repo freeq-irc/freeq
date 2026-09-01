@@ -170,8 +170,9 @@ final class DidDisplayTests: XCTestCase {
 /// Speculative-history failure suppression (the TUI 67365d80 lesson): the
 /// client fetches DM history on its own when a conversation opens; a guest,
 /// or a DM with a guest peer, gets a CHATHISTORY failure back that the user
-/// never asked for. Per-target failures are swallowed; a TARGETS (`*`)
-/// failure — the reply to an explicit conversation-list request — surfaces.
+/// never asked for. Exactly the two codes that answer an unfetchable target
+/// are swallowed, whatever the target — the web client's rule; every other
+/// CHATHISTORY failure is a real refusal and surfaces.
 final class ChatHistoryNoticeRoutingTests: XCTestCase {
 
     func testPerTargetChatHistoryFailureIsIgnored() {
@@ -184,8 +185,20 @@ final class ChatHistoryNoticeRoutingTests: XCTestCase {
             .ignore)
     }
 
-    func testTargetsChatHistoryFailureStillDisplays() {
-        let text = "CHATHISTORY ACCOUNT_REQUIRED * You must be authenticated to list DM targets"
+    func testAnUnfetchableTargetIsHiddenForTheTargetsListToo() {
+        // The web hides these two codes on the code alone, target included,
+        // and the native clients read the same rule.
+        XCTAssertEqual(
+            ServerNoticeRouter.route(
+                "CHATHISTORY ACCOUNT_REQUIRED * You must be authenticated to list DM targets"),
+            .ignore)
+    }
+
+    func testChatHistoryFailuresOtherThanAnUnfetchableTargetStillDisplay() {
+        // `FAIL CHATHISTORY MESSAGE_ERROR <subcommand> <target> :…` is the
+        // spec's reply when history exists but could not be read. Nothing
+        // about it is speculative, so hiding it hides a real refusal.
+        let text = "CHATHISTORY MESSAGE_ERROR BEFORE #freeq Could not read history"
         XCTAssertEqual(ServerNoticeRouter.route(text), .display(text))
     }
 

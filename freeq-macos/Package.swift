@@ -65,6 +65,8 @@ let package = Package(
                 "ConnectGate.swift",
                 "MessageTranscript.swift",
                 "CoordinationCard.swift",
+                "ActVerbs.swift",
+                "ActTasks.swift",
                 "Jumbomoji.swift",
                 "FavoritesSync.swift",
                 "ApiAuth.swift",

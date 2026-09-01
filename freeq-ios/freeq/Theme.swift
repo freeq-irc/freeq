@@ -19,6 +19,10 @@ enum Theme {
     static let bgHover     = Color(light: 0xDDE4EE, dark: 0x1A2436)
     /// A slightly raised surface for cards floating over bgPrimary.
     static let bgElevated  = Color(light: 0xFFFFFF, dark: 0x0F1622)
+    /// The tinted strip across a card's header. Ink-based in light because
+    /// `bgElevated` is pure white there and vanished on a white card; dark
+    /// keeps bgElevated's value, so dark is unchanged.
+    static let cardHeaderStrip = Color(light: Color.black.opacity(0.05), dark: bgElevated)
 
     // MARK: Text
     static let textPrimary   = Color(light: 0x0B1220, dark: 0xEAF1F9)

@@ -458,7 +458,7 @@ export function UserPopover({ nick, did, origin, evidence, position, onClose }: 
                 {actorInfo.heartbeat.healthy ? (
                   <span className="text-success">💓 healthy</span>
                 ) : (
-                  <span className="text-error">💔 unhealthy</span>
+                  <span className="text-danger">💔 unhealthy</span>
                 )}
                 {actorInfo.heartbeat.ttl && <span>· TTL {actorInfo.heartbeat.ttl}s</span>}
               </div>

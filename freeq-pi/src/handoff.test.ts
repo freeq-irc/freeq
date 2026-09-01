@@ -2,7 +2,14 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HandoffStore, hashBrief, describeHandoff, type ActEventLike } from "./handoff.js";
+import {
+  HandoffStore,
+  hashBrief,
+  describeHandoff,
+  isTerminalRecord,
+  shortDid,
+  type ActEventLike,
+} from "./handoff.js";
 
 const ALICE = "did:key:zAlice";
 const BOB = "did:key:zBob";
@@ -178,6 +185,73 @@ describe("malformed and hostile input", () => {
       }),
     );
     expect(store.get(id)!.signed).toBe(false);
+  });
+});
+
+describe("retraction — work called off after it was taken on", () => {
+  // The failure this covers: an offer withdrawn in conversation stays
+  // 'assigned' in the ledger, so the worker can legitimately wander back to it
+  // (and did). Cancel is the only thing that closes it.
+  it("the offerer can cancel work already assigned", () => {
+    const id = offer(store);
+    move(store, "accept", id, BOB);
+    expect(store.get(id)!.state).toBe("assigned");
+
+    expect(move(store, "cancel", id, ALICE).ok).toBe(true);
+    expect(store.get(id)!.state).toBe("cancelled");
+    expect(isTerminalRecord(store.get(id)!)).toBe(true);
+  });
+
+  it("a cancelled task leaves both the worker's inbox and the offerer's outbox", () => {
+    const id = offer(store);
+    move(store, "accept", id, BOB);
+    move(store, "cancel", id, ALICE);
+    expect(store.inboxFor(BOB)).toEqual([]);
+    expect(store.outboxFor(ALICE)).toEqual([]);
+  });
+
+  it("the worker cannot resume a cancelled task", () => {
+    const id = offer(store);
+    move(store, "accept", id, BOB);
+    move(store, "cancel", id, ALICE);
+    for (const verb of ["progress", "complete", "fail"]) {
+      expect(move(store, verb, id, BOB).ok, verb).toBe(false);
+    }
+    expect(store.get(id)!.state).toBe("cancelled");
+  });
+
+  it("cancelling twice is refused, so the first retraction stands", () => {
+    const id = offer(store);
+    move(store, "cancel", id, ALICE);
+    expect(move(store, "cancel", id, ALICE).ok).toBe(false);
+  });
+
+  it("keeps the stated reason, so the worker can be told why", () => {
+    const id = offer(store);
+    move(store, "accept", id, BOB);
+    move(store, "cancel", id, ALICE, { "act-note": "superseded by the batch rewrite" });
+    const last = store.get(id)!.log.at(-1)!;
+    expect(last.verb).toBe("cancel");
+    expect(last.note).toBe("superseded by the batch rewrite");
+  });
+
+  it("an open task cancelled by its poster can no longer be claimed", () => {
+    const id = offer(store, { fields: { act: "handoff", "act-title": "Open work" } });
+    expect(store.get(id)!.state).toBe("open");
+    expect(move(store, "cancel", id, ALICE).ok).toBe(true);
+    expect(move(store, "claim", id, BOB).ok).toBe(false);
+  });
+
+  it("isTerminalRecord agrees with the transition table on live states", () => {
+    const id = offer(store);
+    expect(isTerminalRecord(store.get(id)!)).toBe(false);
+    move(store, "accept", id, BOB);
+    expect(isTerminalRecord(store.get(id)!)).toBe(false);
+  });
+
+  it("shortDid never renders an empty actor", () => {
+    expect(shortDid(undefined)).toBeTruthy();
+    expect(shortDid(ALICE)).toContain("Alice");
   });
 });
 

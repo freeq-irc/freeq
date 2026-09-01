@@ -193,7 +193,7 @@ function CoordinationTimeline({ taskId, onClose }: { taskId: string; onClose: ()
       <div className="px-3 py-2 border-b border-border/30">
         <div className="text-sm text-fg">{description}</div>
         <div className="flex items-center gap-2 mt-1 text-xs text-fg-dim">
-          <span className={complete ? 'text-success' : failed ? 'text-error' : 'text-accent'}>
+          <span className={complete ? 'text-success' : failed ? 'text-danger' : 'text-accent'}>
             {complete ? '✅ Complete' : failed ? '❌ Failed' : '⏳ In Progress'}
           </span>
           <span>•</span>

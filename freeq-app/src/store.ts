@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type { TransportState } from './irc/transport';
 import { setLastReadMsgId } from './lib/db';
+import { actEmoji } from './lib/act-verbs';
 
 // ── Types ──
 
@@ -630,7 +631,8 @@ function pairActCompanions(ch: Channel): void {
  *
  * The home signs `confirm` and `expire` itself and sends no companion, so
  * these two are the only events the reader hears about as a system line
- * rather than a card.
+ * rather than a card. Each opens with its verb's glyph, off the same table a
+ * card reads, so a line and a card mark the same move the same way.
  */
 function actSystemLine(task: ActTask, ev: ActEventInput): string | undefined {
   // Both lines name the task by its title, which only the opener carries, and
@@ -645,10 +647,10 @@ function actSystemLine(task: ActTask, ev: ActEventInput): string | undefined {
       // event held there is nothing to name, and nothing to say.
       const subject = task.events.find((e) => e.eventId === ev.fields['act-subject']);
       if (!subject) return undefined;
-      return `confirmed: ${subject.from}'s ${subject.verb} on ${title}`;
+      return `${actEmoji('confirm')} confirmed: "${title}" — ${subject.verb} by ${subject.from}`;
     }
     case 'expire':
-      return `${title} expired`;
+      return `${actEmoji('expire')} ${title} expired`;
     default:
       return undefined;
   }

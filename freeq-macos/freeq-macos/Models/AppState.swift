@@ -426,6 +426,18 @@ class AppState {
         channels + dmBuffers
     }
 
+    /// The buffer with this name, channel or DM thread, if one is open.
+    func buffer(named name: String) -> ChannelState? {
+        let lower = name.lowercased()
+        return allBuffers.first { $0.name.lowercased() == lower }
+    }
+
+    /// The buffer whose task map already holds this task, if one does. A task
+    /// lives in one venue, so at most one buffer can answer.
+    func bufferHoldingTask(_ taskId: String) -> String? {
+        allBuffers.first { $0.actTasks.task(taskId) != nil }?.name
+    }
+
     var totalUnread: Int {
         unreadCounts.values.reduce(0, +)
     }
@@ -1727,10 +1739,45 @@ extension AppState {
 
     func handleEvent(_ event: FreeqEvent) {
         switch event {
-        case .act:
-            // A task event; the native card for it is upcoming work, so the
-            // event is deliberately ignored rather than unhandled.
-            break
+        case .act(let act):
+            // A task event rides as a TAGMSG, so it names its venue the way
+            // every other TAGMSG does. The SDK has already read the tags and
+            // dropped the repeats a joiner is handed.
+            let actSelf = isSelfSender(nick: act.from, account: act.did)
+            let venue = act.target.hasPrefix("#")
+                ? act.target
+                : (act.dmKey ?? (actSelf ? act.target : act.from))
+            guard let bufferName = ActEventRouting.buffer(
+                venue: venue, taskId: act.taskId, eventId: act.eventId,
+                bufferHoldingTask: bufferHoldingTask(act.taskId),
+                hasBuffer: { self.buffer(named: $0) != nil })
+            else { return }
+
+            let buf = bufferName.hasPrefix("#")
+                ? getOrCreateChannel(bufferName)
+                : getOrCreateDM(bufferName)
+            let line = buf.recordActEvent(ActEventInput(
+                from: act.from, did: act.did, kind: act.kind, verb: act.verb,
+                eventId: act.eventId, taskId: act.taskId,
+                fields: Dictionary(act.fields.map { ($0.key, $0.value) },
+                                   uniquingKeysWith: { _, last in last })))
+            buf.pairActCompanions()
+            // The home signs confirm and expire itself and sends no line
+            // beside them, so the room hears about those two here. Dated by
+            // the id the home minted the event under — a receipt handed back
+            // on join is old news, and saying "now" would date it wrong and
+            // file it under the newest thing said. Keyed by that id too, so a
+            // replayed receipt lands on the dedup rather than printing twice.
+            if let line {
+                buf.appendIfNew(ChatMessage(
+                    id: act.eventId,
+                    from: "",
+                    text: line,
+                    isAction: false,
+                    timestamp: actEventTimeMs(act.eventId)
+                        .map { Date(timeIntervalSince1970: Double($0) / 1000.0) } ?? Date(),
+                    replyTo: nil))
+            }
 
         case .readMarker(let target, let timestamp):
             // draft/read-marker (S1) — cross-device read state. The unread
@@ -1958,6 +2005,9 @@ extension AppState {
                         eventType: $0.eventType, taskId: $0.taskId, phase: $0.phase,
                         evidenceType: $0.evidenceType, reference: $0.reference, payload: $0.payload)
                 },
+                // The task this line was written beside, when it names one.
+                // Its card is drawn once the matching act event arrives.
+                actRef: msg.tags.first(where: { $0.key == "+freeq.at/ref" })?.value,
                 reactions: initialReactions
             )
 
@@ -2149,12 +2199,14 @@ extension AppState {
                 NAMES channel=\(channel, privacy: .public)                 incoming=\(memberList.count)                 pendingBefore=\(self.pendingNames[key]?.count ?? -1)                 nicks=\(memberList.prefix(8).map { ($0.isOp ? "@" : "") + $0.nick }.joined(separator: ","), privacy: .public)
                 """)
             var existing = pendingNames[key] ?? []
+            // NAMES carries no actor class, so keep whatever we already knew
+            // for this nick — otherwise every roster refresh un-badges the
+            // agents in the room. The buffer may not exist yet (first NAMES
+            // after JOIN), in which case there is nothing to carry over.
+            let priorMembers = allBuffers.first { $0.name.lowercased() == key }?.members ?? []
             existing.append(contentsOf: memberList.map { m in
                 {
-                    // NAMES carries no actor class, so keep whatever we
-                    // already knew for this nick — otherwise every roster
-                    // refresh un-badges the agents in the room.
-                    let prior = ch.members.first { $0.nick.lowercased() == m.nick.lowercased() }
+                    let prior = priorMembers.first { $0.nick.lowercased() == m.nick.lowercased() }
                     return MemberInfo(
                         nick: m.nick, isOp: m.isOp, isHalfop: m.isHalfop,
                         isVoiced: m.isVoiced, awayMsg: m.awayMsg, did: prior?.did,

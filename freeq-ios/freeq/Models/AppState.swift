@@ -249,6 +249,9 @@ class AppState: ObservableObject {
     @Published var errorMessage: String? = nil
     @Published var authenticatedDID: String? = nil
     @Published var dmBuffers: [ChannelState] = []
+    /// A message the list should scroll to, cleared once it has. Set by a task
+    /// card's prev/next links; the list watches it inside its ScrollViewReader.
+    @Published var scrollToMessageId: String? = nil
     @Published var autoJoinChannels: [String] = ["#general"]
 
     /// Channels this device asked to leave, and when.
@@ -2335,6 +2338,37 @@ class AppState: ObservableObject {
     /// We route mis-typed callers automatically so a stray event from the
     /// wire (or a future code path) can't pollute the Channels pane —
     /// that's how `@yokota` ended up showing as a channel.
+    /// Thread names that have already asked the server for their history this
+    /// session, lowercased. A DM asks once per session; see `DmHistoryOnOpen`.
+    private var dmHistoryAsked: Set<String> = []
+
+    /// Opening a DM is the closest thing it has to a join: a channel replays
+    /// its task events with the JOIN, a DM has nothing to hang replay off, so
+    /// a thread restored from the disk cache would show its lines uncarded.
+    /// Asks once per session, never for a channel, never as a guest.
+    func requestDmHistoryOnOpenIfNeeded(_ name: String) {
+        guard DmHistoryOnOpen.shouldFetch(
+            name: name,
+            authenticated: authenticatedDID != nil,
+            alreadyAsked: dmHistoryAsked
+        ) else { return }
+        dmHistoryAsked.insert(name.lowercased())
+        requestHistory(channel: name)
+    }
+
+    /// The buffer with this name, channel or DM thread, if one is open.
+    func buffer(named name: String) -> ChannelState? {
+        let lower = name.lowercased()
+        return channels.first { $0.name.lowercased() == lower }
+            ?? dmBuffers.first { $0.name.lowercased() == lower }
+    }
+
+    /// The buffer whose task map already holds this task, if one does. A task
+    /// lives in one venue, so at most one buffer can answer.
+    func bufferHoldingTask(_ taskId: String) -> String? {
+        (channels + dmBuffers).first { $0.actTasks.task(taskId) != nil }?.name
+    }
+
     func getOrCreateChannel(_ name: String) -> ChannelState {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         guard trimmed.hasPrefix("#") || trimmed.hasPrefix("&") else {
@@ -2642,10 +2676,45 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
         guard let state = appState else { return }
 
         switch event {
-        case .act:
-            // A task event; the native card for it is upcoming work, so the
-            // event is deliberately ignored rather than unhandled.
-            break
+        case .act(let act):
+            // A task event rides as a TAGMSG, so it names its venue the way
+            // every other TAGMSG does. The SDK has already read the tags and
+            // dropped the repeats a joiner is handed.
+            let actSelf = state.isSelfSender(nick: act.from, account: act.did)
+            let venue = act.target.hasPrefix("#")
+                ? act.target
+                : (act.dmKey ?? (actSelf ? act.target : act.from))
+            guard let bufferName = ActEventRouting.buffer(
+                venue: venue, taskId: act.taskId, eventId: act.eventId,
+                bufferHoldingTask: state.bufferHoldingTask(act.taskId),
+                hasBuffer: { state.buffer(named: $0) != nil })
+            else { return }
+
+            let buf = bufferName.hasPrefix("#")
+                ? state.getOrCreateChannel(bufferName)
+                : state.getOrCreateDM(bufferName)
+            let line = buf.recordActEvent(ActEventInput(
+                from: act.from, did: act.did, kind: act.kind, verb: act.verb,
+                eventId: act.eventId, taskId: act.taskId,
+                fields: Dictionary(act.fields.map { ($0.key, $0.value) },
+                                   uniquingKeysWith: { _, last in last })))
+            buf.pairActCompanions()
+            // The home signs confirm and expire itself and sends no line
+            // beside them, so the room hears about those two here. Dated by
+            // the id the home minted the event under — a receipt handed back
+            // on join is old news, and saying "now" would date it wrong and
+            // file it under the newest thing said. Keyed by that id too, so a
+            // replayed receipt lands on the dedup rather than printing twice.
+            if let line {
+                buf.appendIfNew(ChatMessage(
+                    id: act.eventId,
+                    from: "",
+                    text: line,
+                    isAction: false,
+                    timestamp: actEventTimeMs(act.eventId)
+                        .map { Date(timeIntervalSince1970: Double($0) / 1000.0) } ?? Date(),
+                    replyTo: nil))
+            }
 
         case .connected:
             print("[freeq.event] .connected")
@@ -2860,6 +2929,9 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                         eventType: $0.eventType, taskId: $0.taskId, phase: $0.phase,
                         evidenceType: $0.evidenceType, reference: $0.reference, payload: $0.payload)
                 },
+                // The task this line was written beside, when it names one.
+                // Its card is drawn once the matching act event arrives.
+                actRef: ircMsg.tags.first(where: { $0.key == "+freeq.at/ref" })?.value,
                 reactions: initialReactions
             )
 
@@ -3299,10 +3371,13 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                 // (a guest-DM edit failing invisibly cost an evening).
                 // Background history probes (speculative CHATHISTORY on
                 // opening a thread) fail routinely for guest peers —
-                // toasting those spams with nothing actionable (mirror of
-                // the web client's filter).
+                // toasting those spams with nothing actionable. Only the two
+                // codes that answer an unfetchable target are swallowed,
+                // whatever the target, which is the web client's rule; every
+                // other CHATHISTORY failure is a real refusal and shows.
                 if text.range(of: #"^[A-Z]+ [A-Z_]+ "#, options: .regularExpression) != nil,
-                   !text.hasPrefix("CHATHISTORY ") {
+                   text.range(of: #"^CHATHISTORY (INVALID_TARGET|ACCOUNT_REQUIRED)"#,
+                              options: .regularExpression) == nil {
                     Task { @MainActor in
                         ToastManager.shared.show("Server: \(text)", icon: "exclamationmark.triangle")
                     }
