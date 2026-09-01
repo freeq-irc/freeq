@@ -664,9 +664,9 @@ private fun MessageBubble(
                 if (actCard != null) {
                     ActEventCard(actCard, msg.timestamp, onJumpToMessage)
                 } else if (coordination != null) {
-                    // Agent coordination event → structured card (parity with
-                    // the other three clients).
-                    CoordinationEventCard(coordination, msg.text)
+                    // Every event-tagged message is a card, whatever its type
+                    // says (parity with the other three clients).
+                    CoordinationEventCard(coordination, msg.text, msg.timestamp)
                 } else {
                     // Message text + inline embeds
                     MessageContent(

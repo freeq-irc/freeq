@@ -22,13 +22,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.freeq.ffi.CoordinationEvent
 import com.freeq.model.ActAccent
 import com.freeq.model.ActCard
 import com.freeq.model.ActVerbs
-import com.freeq.model.CoordinationCardStyle
+import com.freeq.model.EventCardPayload
 import com.freeq.model.actCardNeighbours
 import com.freeq.ui.theme.Theme
 import java.util.Date
@@ -192,53 +193,72 @@ fun ActEventCard(card: ActCard, at: Date? = null, onJumpToMessage: ((String) -> 
 }
 
 /**
- * An agent coordination event (`+freeq.at/event` family) as a card — the
- * Android twin of the other three clients' coordination cards, rendered
- * through the same frame as the act cards.
+ * A coordination event as a card — one card for every event type there is.
+ *
+ * There is no list of types that card and no per-type face, so an event this
+ * client has never been taught reads exactly like one it knows. Grayscale and
+ * edgeless throughout: colour and a left edge belong to the act cards, and are
+ * how a reader tells the two classes apart.
  */
 @Composable
-fun CoordinationEventCard(ev: CoordinationEvent, text: String) {
-    val style = CoordinationCardStyle.style(ev)
+fun CoordinationEventCard(ev: CoordinationEvent, text: String, at: Date? = null) {
     val dim = MaterialTheme.colorScheme.onSurfaceVariant
-    var expanded by remember { mutableStateOf(false) }
-    val payload = if (style.expandablePayload) CoordinationCardStyle.prettyPayload(ev.payload) else null
+    val rows = EventCardPayload.rows(ev.payload)
 
-    EventCardFrame(
-        icon = style.icon,
-        label = style.label,
-        detail = ev.taskId?.let { shortTaskId(it) },
-        accent = accentColor(style.accent),
+    Column(
+        modifier = Modifier
+            .padding(top = 4.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f), RoundedCornerShape(8.dp)),
     ) {
-        if (text.isNotEmpty()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text("\u25C7", fontSize = 12.sp, color = dim)
             Text(
-                text = text,
-                fontSize = 14.sp,
-                color = when (style.accent) {
-                    ActAccent.SUCCESS -> Theme.success
-                    ActAccent.FAILURE -> Theme.danger
-                    else -> dim
-                },
+                text = ev.eventType.lowercase(),
+                fontSize = 12.sp,
+                fontFamily = FontFamily.Monospace,
+                color = dim,
             )
+            Spacer(modifier = Modifier.weight(1f))
+            if (at != null) {
+                Text(text = formatCardTime(at), fontSize = 10.sp, color = dim.copy(alpha = 0.5f))
+            }
         }
-        if (payload != null) {
-            Text(
-                text = if (expanded) "Hide payload" else "Show payload",
-                fontSize = 11.sp,
-                color = dim.copy(alpha = 0.7f),
-                modifier = Modifier.clickable { expanded = !expanded },
-            )
-            if (expanded) {
-                Text(
-                    text = payload,
-                    fontSize = 12.sp,
-                    fontFamily = FontFamily.Monospace,
-                    color = dim,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(5.dp))
-                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                        .padding(8.dp),
-                )
+
+        Column(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            if (text.isNotEmpty()) {
+                Text(text = text, fontSize = 14.sp, color = dim)
+            }
+            for (row in rows) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = row.key,
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = dim.copy(alpha = 0.7f),
+                    )
+                    Text(
+                        text = row.value,
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = dim,
+                        // A long value scrolls inside its own row rather than
+                        // growing the card without bound.
+                        maxLines = 6,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f).heightIn(max = 96.dp),
+                    )
+                }
             }
         }
     }
