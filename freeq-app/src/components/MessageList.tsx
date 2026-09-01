@@ -15,7 +15,7 @@ import { BlueskyEmbed } from './BlueskyEmbed';
 import { LinkPreview } from './LinkPreview';
 import { MessageContextMenu } from './MessageContextMenu';
 import { MarkdownMessage } from './MarkdownRenderer';
-import { CoordinationEventCard, isCoordinationEvent } from './CoordinationCards';
+import { CoordinationEventCard } from './CoordinationCards';
 import { ActEventCard, useActCompanion } from './ActCards';
 import { jumbomojiSize } from '../lib/jumbomoji';
 import { buildTranscript, rowsInSelection } from '../lib/transcript';
@@ -624,10 +624,9 @@ function MessageContentImpl({ msg, channel, onNickClick }: {
     return <ActEventCard msg={msg} task={actCompanion.task} event={actCompanion.event} />;
   }
 
-  // Coordination event cards (Phase 3)
-  if (isCoordinationEvent(msg)) {
-    const card = <CoordinationEventCard msg={msg} />;
-    if (card) return card;
+  // Every event-tagged message is a card, whatever its type says.
+  if (msg.tags?.['+freeq.at/event'] || msg.tags?.['freeq.at/event']) {
+    return <CoordinationEventCard msg={msg} />;
   }
 
   // Jumbomoji: a message of just 1–3 emoji renders large.

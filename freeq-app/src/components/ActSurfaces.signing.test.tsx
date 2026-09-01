@@ -12,14 +12,16 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+// A coordination type that still cards: the six task names lost theirs and
+// render as ordinary text, so they carry no card ink to check.
 function signedEventMsg(): Message {
   return {
     id: '01KZTEST00000000000000TEST',
     from: 'workerbot',
-    text: '📋 New task: fetch this URL',
+    text: 'handed the fetch to bob',
     timestamp: new Date(0),
     tags: {
-      '+freeq.at/event': 'task_request',
+      '+freeq.at/event': 'delegation_notice',
       '+freeq.at/payload': '%7B%7D',
       '+freeq.at/sig': 'ed25519:kid:sigsigsig',
     },
@@ -32,7 +34,7 @@ function signedEventMsg(): Message {
 describe('act surfaces carry no resting signature ink', () => {
   it('coordination card renders without a lock or signed-claim for a signed event', () => {
     const { container } = render(<CoordinationEventCard msg={signedEventMsg()} />);
-    expect(container.textContent).toContain('New Task');
+    expect(container.textContent).toContain('delegation_notice');
     expect(container.textContent).not.toContain('🔒');
     expect(container.querySelector('[title="Cryptographically signed"]')).toBeNull();
   });
