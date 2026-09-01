@@ -10,9 +10,11 @@ struct CoordinationCardView: View {
 
     private var style: CoordinationCard.Style { CoordinationCard.style(for: info) }
 
-    private var accentColor: Color {
+    /// The act cards' left-edge accent, adopted here so both families speak
+    /// one language: nil for routine events, an edge for the marked ones.
+    private var accentColor: Color? {
         switch style.accent {
-        case .neutral: return Theme.borderStrong
+        case .neutral: return nil
         case .agent: return Theme.iris
         case .success: return Theme.success
         case .error: return Theme.danger
@@ -28,63 +30,42 @@ struct CoordinationCardView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 6) {
-                Text(style.icon)
-                Text(style.label.uppercased())
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(Theme.textSecondary)
-                if let task = info.taskId {
-                    Text(task.count > 10 ? String(task.prefix(10)) + "…" : task)
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(Theme.textMuted)
-                }
-                Spacer(minLength: 0)
+        EventCard(
+            icon: style.icon,
+            label: style.label,
+            detail: info.taskId.map { $0.count > 10 ? String($0.prefix(10)) + "…" : $0 },
+            accent: accentColor
+        ) {
+            if !text.isEmpty {
+                Text(text)
+                    .font(.system(size: 14))
+                    .foregroundStyle(bodyColor)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(Theme.bgElevated)
-
-            VStack(alignment: .leading, spacing: 6) {
-                if !text.isEmpty {
-                    Text(text)
-                        .font(.system(size: 14))
-                        .foregroundStyle(bodyColor)
+            if style.expandablePayload,
+               let payload = CoordinationCard.prettyPayload(info.payload) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 9))
+                        Text(expanded ? "Hide payload" : "Show payload")
+                            .font(.system(size: 11))
+                    }
+                    .foregroundStyle(Theme.textMuted)
+                }
+                .buttonStyle(.plain)
+                if expanded {
+                    Text(payload)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(Theme.textMuted)
                         .fixedSize(horizontal: false, vertical: true)
-                }
-                if style.expandablePayload,
-                   let payload = CoordinationCard.prettyPayload(info.payload) {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                                .font(.system(size: 9))
-                            Text(expanded ? "Hide payload" : "Show payload")
-                                .font(.system(size: 11))
-                        }
-                        .foregroundStyle(Theme.textMuted)
-                    }
-                    .buttonStyle(.plain)
-                    if expanded {
-                        Text(payload)
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundStyle(Theme.textMuted)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .padding(8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Theme.bgElevated, in: RoundedRectangle(cornerRadius: 6))
-                    }
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Theme.bgElevated, in: RoundedRectangle(cornerRadius: 6))
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
         }
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(accentColor.opacity(0.5), lineWidth: 1)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-        .frame(maxWidth: 420, alignment: .leading)
     }
 }

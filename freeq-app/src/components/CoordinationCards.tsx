@@ -84,7 +84,7 @@ export function CardFrame({ icon, label, children, msg, className, uppercaseLabe
 
 function TaskRequestCard({ msg }: { msg: Message }) {
   return (
-    <CardFrame icon="📋" label="New Task" msg={msg} className="border-accent/30">
+    <CardFrame icon="📋" label="New Task" msg={msg} className="border-l-2 border-l-purple">
       <div className="text-fg whitespace-pre-wrap">{msg.text}</div>
     </CardFrame>
   );
@@ -113,7 +113,7 @@ function TaskUpdateCard({ msg }: { msg: Message }) {
 
 function TaskCompleteCard({ msg }: { msg: Message }) {
   return (
-    <CardFrame icon="🎉" label="Task Complete" msg={msg} className="border-success/30">
+    <CardFrame icon="🎉" label="Task Complete" msg={msg} className="border-l-2 border-l-success">
       <div className="text-success whitespace-pre-wrap">{msg.text}</div>
     </CardFrame>
   );
@@ -121,7 +121,7 @@ function TaskCompleteCard({ msg }: { msg: Message }) {
 
 function TaskFailedCard({ msg }: { msg: Message }) {
   return (
-    <CardFrame icon="❌" label="Task Failed" msg={msg} className="border-danger/30">
+    <CardFrame icon="❌" label="Task Failed" msg={msg} className="border-l-2 border-l-danger">
       <div className="text-danger whitespace-pre-wrap">{msg.text}</div>
     </CardFrame>
   );
