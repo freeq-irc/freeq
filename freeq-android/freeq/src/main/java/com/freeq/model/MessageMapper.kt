@@ -36,6 +36,7 @@ internal object MessageMapper {
             isSigned = ircMsg.isSigned,
             account = ircMsg.account,
             origin = ircMsg.origin,
+            coordination = ircMsg.coordination,
             reactions = reactions,
             // What makes this a companion line, if it is one: the task it was
             // written beside. No named FFI field carries it.

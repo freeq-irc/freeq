@@ -239,6 +239,19 @@ pub struct ServerConfig {
     #[arg(long, env = "BROKER_SHARED_SECRET")]
     pub broker_shared_secret: Option<String>,
 
+    /// DID of the private-media space authority. The account must be on a
+    /// spaces-capable PDS. Enables private media via AT Protocol spaces.
+    #[arg(long, env = "FREEQ_MEDIA_SPACE_DID")]
+    pub media_space_did: Option<String>,
+
+    /// Password for the space authority account.
+    #[arg(long, env = "FREEQ_MEDIA_SPACE_PASSWORD")]
+    pub media_space_password: Option<String>,
+
+    /// Base URL of the spaces PDS.
+    #[arg(long, env = "FREEQ_MEDIA_SPACE_PDS")]
+    pub media_space_pds: Option<String>,
+
     /// Server operator password. If set, the OPER command is enabled.
     /// OPER grants global operator privileges (can kick/ban in any channel, etc.)
     /// Can also be set via OPER_PASSWORD environment variable.
@@ -383,6 +396,9 @@ impl Default for ServerConfig {
             github_client_id: None,
             github_client_secret: None,
             broker_shared_secret: None,
+            media_space_did: None,
+            media_space_password: None,
+            media_space_pds: None,
             oper_password: None,
             oper_dids: vec![],
             allowed_dids: vec![],
@@ -524,6 +540,9 @@ struct FileConfig {
     github_client_id: Option<String>,
     github_client_secret: Option<String>,
     broker_shared_secret: Option<String>,
+    media_space_did: Option<String>,
+    media_space_password: Option<String>,
+    media_space_pds: Option<String>,
     oper_password: Option<String>,
     oper_dids: Option<Vec<String>>,
     allowed_dids: Option<Vec<String>>,
@@ -666,6 +685,9 @@ fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConf
         github_client_id,
         github_client_secret,
         broker_shared_secret,
+        media_space_did,
+        media_space_password,
+        media_space_pds,
         oper_password,
         llm_provider,
         llm_base_url,

@@ -740,8 +740,8 @@ impl Db {
         let did_ops_json = serde_json::to_string(&ch.did_ops.iter().collect::<Vec<_>>())
             .unwrap_or_else(|_| "[]".to_string());
         self.conn.execute(
-            "INSERT INTO channels (name, topic_text, topic_set_by, topic_set_at, topic_locked, invite_only, no_ext_msg, moderated, key, founder_did, did_ops_json, encrypted_only)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "INSERT INTO channels (name, topic_text, topic_set_by, topic_set_at, topic_locked, invite_only, no_ext_msg, moderated, key, founder_did, did_ops_json, encrypted_only, media_space_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(name) DO UPDATE SET
                 topic_text=excluded.topic_text,
                 topic_set_by=excluded.topic_set_by,
@@ -753,7 +753,8 @@ impl Db {
                 key=excluded.key,
                 founder_did=excluded.founder_did,
                 did_ops_json=excluded.did_ops_json,
-                encrypted_only=excluded.encrypted_only",
+                encrypted_only=excluded.encrypted_only,
+                media_space_key=excluded.media_space_key",
             params![
                 name,
                 ch.topic.as_ref().map(|t| &t.text),
@@ -767,6 +768,7 @@ impl Db {
                 ch.founder_did.as_deref(),
                 did_ops_json,
                 ch.encrypted_only as i32,
+                ch.media_space_key.as_deref(),
             ],
         )?;
         Ok(())
@@ -791,7 +793,7 @@ impl Db {
         let mut channels = HashMap::new();
 
         let mut stmt = self.conn.prepare(
-            "SELECT name, topic_text, topic_set_by, topic_set_at, topic_locked, invite_only, key, no_ext_msg, moderated, founder_did, did_ops_json, encrypted_only
+            "SELECT name, topic_text, topic_set_by, topic_set_at, topic_locked, invite_only, key, no_ext_msg, moderated, founder_did, did_ops_json, encrypted_only, media_space_key
              FROM channels"
         )?;
         let rows = stmt.query_map([], |row| {
@@ -809,6 +811,7 @@ impl Db {
                 .get::<_, Option<String>>(10)?
                 .unwrap_or_else(|| "[]".to_string());
             let encrypted_only: bool = row.get::<_, Option<i32>>(11)?.unwrap_or(0) != 0;
+            let media_space_key: Option<String> = row.get(12)?;
 
             let topic = match (topic_text, topic_set_by, topic_set_at) {
                 (Some(text), Some(set_by), Some(set_at)) => Some(TopicInfo {
@@ -832,6 +835,7 @@ impl Db {
                 founder_did,
                 did_ops,
                 encrypted_only,
+                media_space_key,
                 ..Default::default()
             };
             Ok((name, ch))

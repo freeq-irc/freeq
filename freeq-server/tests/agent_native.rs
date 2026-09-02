@@ -3703,7 +3703,10 @@ async fn actor_class_roster_line_omits_humans_and_is_skipped_when_empty() {
     })
     .await
     .unwrap_or(false);
-    assert!(!saw_674, "a channel with no agents must not emit an actor-class line");
+    assert!(
+        !saw_674,
+        "a channel with no agents must not emit an actor-class line"
+    );
 
     first.quit(None).await.unwrap();
     second.quit(None).await.unwrap();
@@ -3813,7 +3816,10 @@ async fn presence_relay_carries_state_and_task() {
         line.contains("fixing the parser"),
         "status must travel, got: {line}"
     );
-    assert!(line.contains("01ABCDEF"), "task ref must travel, got: {line}");
+    assert!(
+        line.contains("01ABCDEF"),
+        "task ref must travel, got: {line}"
+    );
 
     agent.quit(None).await.unwrap();
     watcher.quit(None).await.unwrap();

@@ -39,6 +39,8 @@ import {
   WorkWatchdog,
   hashBrief,
   describeHandoff,
+  isTerminalRecord,
+  shortDid,
   noteVerification,
   decideOffer,
   sweepOfferQueue,
@@ -828,6 +830,17 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
+    // Work we hold was called off (retracted by its offerer, or expired by the
+    // server). A notice is not enough: this session was TOLD to do the work as
+    // an instruction in its context, so it must be told to stop the same way,
+    // or it wanders back to a task the ledger already closed.
+    if (!created && (ev.verb === "cancel" || ev.verb === "expire")) {
+      if (rec.assignee === me || rec.offeree === me) {
+        standDown(ctx, cfg, rec, ev.verb, ev.from);
+        return;
+      }
+    }
+
     // Something we offered moved.
     if (rec.offerer === me && !created) {
       const who = rec.assignee ? ` by ${rec.assignee.slice(0, 22)}…` : "";
@@ -950,6 +963,58 @@ export default function (pi: ExtensionAPI): void {
   }
 
   /**
+   * Stop work this session was carrying when the task ends underneath it.
+   *
+   * Mirrors `startAssignedWork`: presence is released, and the model is told
+   * through the same tier-gated pipeline that started it. It is deliberately
+   * an instruction rather than a notification — an agent that only sees a UI
+   * notice keeps the task in its head.
+   */
+  function standDown(
+    ctx: ExtensionContext,
+    cfg: FreeqConfig,
+    rec: HandoffRecord,
+    verb: string,
+    fromNick: string,
+  ): void {
+    const held = workTask === rec.id;
+    if (held) {
+      workLabel = undefined;
+      workTask = undefined;
+      pushStatus("active", undefined, undefined, true);
+    }
+
+    const why = verb === "expire" ? "expired" : "was cancelled by the agent that offered it";
+    const note = rec.log[rec.log.length - 1]?.note;
+
+    // Never accepted: nothing was started, so this is news, not an interrupt.
+    if (!held && rec.assignee !== conn?.did) {
+      notify(ctx, `freeq: handoff ${rec.id.slice(0, 10)} ${why} — ${rec.title}`, "info");
+      return;
+    }
+
+    deliver(ctx, {
+      kind: "chat",
+      channel: rec.channel,
+      from: fromNick,
+      did: rec.offerer,
+      text:
+        `The freeq task you were working on ${why}. It is now '${rec.state}' — a ` +
+        `terminal state, so there is nothing further to do on it and no ` +
+        `completion to report.\n\n` +
+        `Task: ${rec.title}\n` +
+        `Task id: ${rec.id}\n` +
+        (note ? `Reason given: ${note}\n` : "") +
+        `\nStop work on it. Leave whatever you have already changed in place ` +
+        `unless you are asked to revert it, say briefly where you got to, and ` +
+        `do not pick this task up again.`,
+      addressed: true,
+      mode: cfg.muted ? "silent" : "addressed",
+      tier: tierFor(cfg, rec.offerer),
+    });
+  }
+
+  /**
    * Publish this turn's consequences as a signed coordination event.
    *
    * Deliberately one line per turn. The point is a log a person will still
@@ -1007,7 +1072,10 @@ export default function (pi: ExtensionAPI): void {
       "accept. 'post' offers work to a CHANNEL without naming anyone, so whoever " +
       "is capable and available can take it; 'claim' takes such a task. " +
       "'handoffs' lists tasks you owe or are owed; 'complete' finishes " +
-      "one assigned to you. 'decision' records WHY you chose something, for " +
+      "one assigned to you; 'cancel' RETRACTS one you offered — use it the " +
+      "moment you call work off, because a task left assigned is one the " +
+      "other agent may legitimately come back to later. " +
+      "'decision' records WHY you chose something, for " +
       "the signed project log — use it when you make a call someone might " +
       "question later, not for routine steps. Never send secrets, " +
       "credentials, or absolute filesystem paths.",
@@ -1021,6 +1089,7 @@ export default function (pi: ExtensionAPI): void {
           Type.Literal("handoff"),
           Type.Literal("handoffs"),
           Type.Literal("complete"),
+          Type.Literal("cancel"),
           Type.Literal("post"),
           Type.Literal("claim"),
           Type.Literal("decision"),
@@ -1031,7 +1100,11 @@ export default function (pi: ExtensionAPI): void {
         Type.String({ description: "Peer nick for ask/send; peer DID or nick for handoff" }),
       ),
       channel: Type.Optional(Type.String({ description: "Channel like #dev, for say/handoff" })),
-      message: Type.Optional(Type.String({ description: "Message, question, or completion note" })),
+      message: Type.Optional(
+        Type.String({
+          description: "Message, question, completion note, or reason for 'cancel'",
+        }),
+      ),
       timeoutSec: Type.Optional(
         Type.Number({ description: "Seconds to wait for an ask reply (default 120)" }),
       ),
@@ -1039,7 +1112,9 @@ export default function (pi: ExtensionAPI): void {
       brief: Type.Optional(
         Type.String({ description: "Full context the other agent needs, for handoff" }),
       ),
-      taskId: Type.Optional(Type.String({ description: "Task id, for complete/claim" })),
+      taskId: Type.Optional(
+        Type.String({ description: "Task id, for complete/cancel/claim" }),
+      ),
       rationale: Type.Optional(
         Type.String({ description: "Why, for 'decision' — the part worth keeping" }),
       ),
@@ -1343,6 +1418,60 @@ export default function (pi: ExtensionAPI): void {
             ok
               ? `Marked ${rec.id.slice(0, 10)} complete. The signed lifecycle is in ${rec.channel}.`
               : "Could not send the completion event.",
+          );
+        }
+
+        /**
+         * Retract an offer.
+         *
+         * Calling work off in prose does not move the task: until `cancel` is
+         * on the wire the ledger still says 'assigned', the assignee's inbox
+         * still lists it, and a replay weeks later is indistinguishable from
+         * live work. The transition table already had the verb (offerer, from
+         * offered/assigned/open) — only this surface was missing.
+         */
+        case "cancel": {
+          const store = await ensureHandoffs();
+          const me = conn.did;
+          if (!params.taskId) {
+            // Be useful: show what is actually cancellable rather than erroring.
+            const mine = store.outboxFor(me);
+            if (!mine.length) return text("No live tasks you offered — nothing to cancel.");
+            return text(
+              `cancel requires 'taskId'. Tasks you offered that are still live:\n` +
+                mine.map((r) => `  ${describeHandoff(r, me)}`).join("\n"),
+            );
+          }
+          const rec =
+            store.get(params.taskId) ?? store.all().find((r) => r.id.startsWith(params.taskId!));
+          if (!rec) return text(`No handoff known with id ${params.taskId}.`);
+          if (rec.offerer !== me) {
+            return text(
+              `You did not offer ${rec.id.slice(0, 10)} — only the offerer can cancel it. ` +
+                (rec.assignee === me
+                  ? `You hold it: 'complete' it, or say in ${rec.channel} that you are dropping it.`
+                  : `Ask ${shortDid(rec.offerer)} to retract it.`),
+            );
+          }
+          if (isTerminalRecord(rec)) {
+            return text(
+              `Task ${rec.id.slice(0, 10)} is already '${rec.state}' — nothing to cancel.`,
+            );
+          }
+
+          const ok = await conn.sendAct(
+            rec.channel,
+            "cancel",
+            rec.id,
+            params.message ? { note: params.message } : {},
+          );
+          return text(
+            ok
+              ? `Cancelled ${rec.id.slice(0, 10)} — "${rec.title}".` +
+                (rec.assignee ? ` ${shortDid(rec.assignee)} is told to stand down.` : "") +
+                ` The retraction is signed and in ${rec.channel}, so the task is closed` +
+                ` in the ledger and not just in conversation.`
+              : "Could not send the cancellation.",
           );
         }
 

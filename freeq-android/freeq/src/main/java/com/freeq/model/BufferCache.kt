@@ -33,7 +33,7 @@ internal object BufferCache {
     // 3: a companion line's task reference joined the cached fields. A cache
     //    written without it can never draw its cards, and dedup on replay
     //    keeps the cached copy, so the old shape is discarded rather than read.
-    const val VERSION = 3
+    const val VERSION = 4
     const val MAX_MESSAGES_PER_BUFFER = 50
     const val FILE_NAME = "buffers.json"
 
@@ -95,6 +95,15 @@ internal object BufferCache {
                         .put("account", m.account)
                         .put("origin", m.origin)
                         .put("actRef", m.actRef)
+                        .put("coordination", m.coordination?.let { c ->
+                            JSONObject()
+                                .put("eventType", c.eventType)
+                                .put("taskId", c.taskId)
+                                .put("phase", c.phase)
+                                .put("evidenceType", c.evidenceType)
+                                .put("reference", c.reference)
+                                .put("payload", c.payload)
+                        })
                         .put("reactions", reactions)
                 )
             }
@@ -157,6 +166,16 @@ internal object BufferCache {
             account = obj.optString("account").takeIf { it.isNotEmpty() },
             origin = obj.optString("origin").takeIf { it.isNotEmpty() },
             actRef = obj.optString("actRef").takeIf { it.isNotEmpty() },
+            coordination = obj.optJSONObject("coordination")?.let { c ->
+                com.freeq.ffi.CoordinationEvent(
+                    eventType = c.optString("eventType"),
+                    taskId = c.optString("taskId").takeIf { it.isNotEmpty() },
+                    phase = c.optString("phase").takeIf { it.isNotEmpty() },
+                    evidenceType = c.optString("evidenceType").takeIf { it.isNotEmpty() },
+                    reference = c.optString("reference").takeIf { it.isNotEmpty() },
+                    payload = c.optString("payload").takeIf { it.isNotEmpty() },
+                )
+            },
             reactions = reactions,
         )
     }

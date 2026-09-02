@@ -20,9 +20,9 @@ mod util;
 
 use tokio::sync::mpsc;
 use util::lying_peer::{
-    LyingPeer, NO_EFFECT_WINDOW, TestId, TestServer, connect, is_deleted, msgid_of, registered_kid,
-    revision_count, spawn_server_with_peer, try_event, wait_auth_and_register, wait_event,
-    warm_link,
+    LyingPeer, NO_EFFECT_WINDOW, SETTLE, TestId, TestServer, connect, is_deleted, msgid_of,
+    registered_kid, revision_count, spawn_server_with_peer, try_event, wait_auth_and_register,
+    wait_event, warm_link,
 };
 
 /// A DID the lying peer asserts but has never proven — the shape of a forged
@@ -652,7 +652,12 @@ async fn a_peer_claiming_to_be_a_tasks_home_does_not_rule_on_its_task() {
 
     let signing = ed25519_dalek::SigningKey::from_bytes(&[61u8; 32]);
     register_key(&ha, &signing).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // SETTLE, not a hand-rolled 5s: this waits on a *persisted* row, and the
+    // suite runs ~20 server test binaries at once (on a 2-core CI runner, not
+    // this laptop). The loop exits the moment the row lands, so a longer
+    // ceiling costs nothing when the machine is idle and removes a false
+    // failure when it is not.
+    let deadline = tokio::time::Instant::now() + SETTLE;
     while registered_kid(&srv.db_path, &agent.did).is_none() {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -701,7 +706,7 @@ async fn a_peer_claiming_to_be_a_tasks_home_does_not_rule_on_its_task() {
     })
     .await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + SETTLE;
     let mut row = None;
     while tokio::time::Instant::now() < deadline {
         row = task_row(&srv.db_path, &offer_id);

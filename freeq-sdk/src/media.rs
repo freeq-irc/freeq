@@ -587,6 +587,110 @@ async fn dpop_post(
     anyhow::bail!("Request failed after retries")
 }
 
+/// Upload media into one of a freeq server's private media spaces, on behalf
+/// of the user whose OAuth session is supplied.
+///
+/// Spaces have no upload method of their own: the blob goes up through the
+/// normal `uploadBlob` (where it stays untethered and unreachable) and becomes
+/// permanent, and private to the space, once a space record references it.
+///
+/// Returns the `at://` URI of the record.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_media_to_space(
+    pds_url: &str,
+    did: &str,
+    access_token: &str,
+    dpop_key: Option<&crate::oauth::DpopKey>,
+    dpop_nonce: Option<&str>,
+    space: &str,
+    collection: &str,
+    content_type: &str,
+    data: &[u8],
+    alt_text: Option<&str>,
+) -> Result<SpaceUploadResult> {
+    let client = reqwest::Client::new();
+    let base = pds_url.trim_end_matches('/');
+    let mut current_nonce = dpop_nonce.map(|s| s.to_string());
+
+    let blob_json = dpop_post(
+        &client,
+        base,
+        "com.atproto.repo.uploadBlob",
+        dpop_key,
+        access_token,
+        &mut current_nonce,
+        Some(content_type),
+        data.to_vec(),
+    )
+    .await
+    .context("Blob upload to PDS failed — your session may have expired.")?;
+
+    let blob = &blob_json["blob"];
+    let cid = blob["ref"]["$link"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("No CID in upload response"))?
+        .to_string();
+    let size = blob["size"].as_u64().unwrap_or(data.len() as u64);
+    let mime = blob["mimeType"]
+        .as_str()
+        .unwrap_or(content_type)
+        .to_string();
+
+    // The record both pins the blob and describes it, so the media stays
+    // meaningful on its own once the chat message is gone.
+    let now = chrono::Utc::now().to_rfc3339();
+    let body = serde_json::json!({
+        "space": space,
+        "repo": did,
+        "collection": collection,
+        "record": {
+            "$type": collection,
+            "blob": blob.clone(),
+            "mimeType": mime,
+            "alt": alt_text.unwrap_or(""),
+            "createdAt": now,
+        }
+    });
+
+    let created = dpop_post(
+        &client,
+        base,
+        "com.atproto.space.createRecord",
+        dpop_key,
+        access_token,
+        &mut current_nonce,
+        None,
+        serde_json::to_vec(&body)?,
+    )
+    .await
+    .context("Space record creation failed")?;
+
+    let uri = created["uri"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("No uri in space createRecord response"))?
+        .to_string();
+
+    Ok(SpaceUploadResult {
+        uri,
+        cid,
+        size,
+        mime_type: mime,
+        updated_nonce: current_nonce,
+    })
+}
+
+/// Result of a space media upload.
+#[derive(Debug, Clone)]
+pub struct SpaceUploadResult {
+    /// `at://` URI of the record holding the blob.
+    pub uri: String,
+    /// Content identifier of the blob itself.
+    pub cid: String,
+    pub size: u64,
+    pub mime_type: String,
+    pub updated_nonce: Option<String>,
+}
+
 /// Result of a media upload.
 #[derive(Debug, Clone)]
 pub struct MediaUploadResult {

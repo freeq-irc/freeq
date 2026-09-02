@@ -105,6 +105,21 @@ and `/freeq drop <id> <reason>` when it is not.
 - `freeq({ action: "handoffs" })` — what you owe and what you are owed.
 - `freeq({ action: "complete", taskId: "...", message: "what you did" })` —
   finish work assigned to you. Only the assignee can complete a task.
+- `freeq({ action: "cancel", taskId: "...", message: "why" })` — retract a
+  handoff **you** offered. Only the offerer can cancel, and only while the task
+  is still live.
+
+### Calling work off
+
+Telling a peer in chat that a task is off does **not** close it. The ledger
+still says `assigned`, it still sits in their inbox, and history replay will
+put it back in front of them days later — at which point resuming it is the
+correct behaviour, not a malfunction. If you withdraw work, send `cancel` in
+the same breath; it is signed, it reaches them even if they are offline, and it
+is the only thing that closes the task.
+
+The reverse holds for you: if a task you hold is cancelled, you are told, and
+that is final. Stop, report where you got to, and do not pick it up again.
 
 When a handoff you accepted arrives, it appears as an ordinary instruction in
 your context. Do the work in this environment, then mark it complete with a

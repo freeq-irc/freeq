@@ -117,6 +117,29 @@ impl DidDocument {
     }
 }
 
+/// Is this a syntactically valid AT Protocol handle?
+///
+/// A handle is a bare domain name. Anything else names a different host once
+/// it lands in a URL or gets suffix-matched against an allowed domain.
+pub fn is_valid_handle(handle: &str) -> bool {
+    if handle.len() > 253 {
+        return false;
+    }
+    let labels: Vec<&str> = handle.split('.').collect();
+    if labels.len() < 2 {
+        return false;
+    }
+    labels.iter().enumerate().all(|(i, label)| {
+        let valid_chars = label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        let is_tld = i + 1 == labels.len();
+        (1..=63).contains(&label.len())
+            && valid_chars
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && (!is_tld || label.starts_with(|c: char| c.is_ascii_alphabetic()))
+    })
+}
+
 /// DID resolver — resolves DIDs to DID documents.
 ///
 /// Use `DidResolver::http()` for production, `DidResolver::static_map()` for tests.
@@ -137,7 +160,20 @@ impl DidResolver {
 
     /// Create a resolver with pre-loaded DID documents (for testing).
     pub fn static_map(documents: HashMap<String, DidDocument>) -> Self {
-        DidResolver::Static(StaticResolver { documents })
+        DidResolver::Static(StaticResolver {
+            documents,
+            handles: HashMap::new(),
+        })
+    }
+
+    /// Like `static_map`, plus an explicit handle to DID table (for testing).
+    /// When two documents claim the same handle and the test needs to know who
+    /// owns it.
+    pub fn static_map_with_handles(
+        documents: HashMap<String, DidDocument>,
+        handles: HashMap<String, String>,
+    ) -> Self {
+        DidResolver::Static(StaticResolver { documents, handles })
     }
 
     /// Resolve a DID to its DID document.
@@ -152,7 +188,7 @@ impl DidResolver {
     pub async fn resolve_handle(&self, handle: &str) -> Result<String> {
         match self {
             DidResolver::Http(r) => r.resolve_handle(handle).await,
-            DidResolver::Static(_) => bail!("Handle resolution not supported in static mode"),
+            DidResolver::Static(r) => r.resolve_handle(handle),
         }
     }
 }
@@ -236,6 +272,9 @@ impl HttpResolver {
     }
 
     async fn resolve_handle(&self, handle: &str) -> Result<String> {
+        if !is_valid_handle(handle) {
+            bail!("Not a valid handle: {handle}");
+        }
         // Try HTTP well-known first (self-hosted domains)
         let url = format!("https://{handle}/.well-known/atproto-did");
         tracing::debug!("Resolving handle {handle} via {url}");
@@ -295,6 +334,7 @@ impl HttpResolver {
 #[derive(Clone)]
 pub struct StaticResolver {
     documents: HashMap<String, DidDocument>,
+    handles: HashMap<String, String>,
 }
 
 impl StaticResolver {
@@ -307,6 +347,20 @@ impl StaticResolver {
             .get(did)
             .cloned()
             .context(format!("DID not found in static resolver: {did}"))
+    }
+
+    /// Check the explicit handle table first, then fall back to the
+    /// document that claims `handle` in its `alsoKnownAs`.
+    fn resolve_handle(&self, handle: &str) -> Result<String> {
+        if let Some(did) = self.handles.get(handle) {
+            return Ok(did.clone());
+        }
+        let aka = format!("at://{handle}");
+        self.documents
+            .values()
+            .find(|doc| doc.also_known_as.contains(&aka))
+            .map(|doc| doc.id.clone())
+            .context(format!("Handle not found in static resolver: {handle}"))
     }
 }
 
@@ -455,9 +509,55 @@ mod tests {
     }
 
     #[test]
+    fn accepts_ordinary_handles() {
+        assert!(is_valid_handle("alice.bsky.social"));
+        assert!(is_valid_handle("acme.com"));
+        assert!(is_valid_handle("a-b.acme.com"));
+        assert!(is_valid_handle("xn--80ak6aa92e.com"));
+        assert!(is_valid_handle("8bit.acme.com"));
+    }
+
+    #[test]
+    fn rejects_anything_that_would_redirect_the_url_to_another_host() {
+        assert!(!is_valid_handle("evil.com/x.acme.com"));
+        assert!(!is_valid_handle("evil.com?x.acme.com"));
+        assert!(!is_valid_handle("evil.com#x.acme.com"));
+        assert!(!is_valid_handle("evil.com:8443"));
+        assert!(!is_valid_handle("user@evil.com"));
+        assert!(!is_valid_handle("evil.com\\x.acme.com"));
+    }
+
+    #[test]
+    fn rejects_malformed_domains() {
+        assert!(!is_valid_handle("acme"));
+        assert!(!is_valid_handle("acme.com."));
+        assert!(!is_valid_handle(".acme.com"));
+        assert!(!is_valid_handle("alice..acme.com"));
+        assert!(!is_valid_handle("-alice.acme.com"));
+        assert!(!is_valid_handle("alice-.acme.com"));
+        assert!(!is_valid_handle("alice.acme.123"));
+        assert!(!is_valid_handle(&format!("{}.com", "a".repeat(64))));
+        assert!(!is_valid_handle(&format!("{}.com", "a.".repeat(200))));
+    }
+
+    #[tokio::test]
+    async fn resolve_handle_refuses_to_build_a_url_from_a_bad_handle() {
+        let resolver = HttpResolver {
+            client: reqwest::Client::new(),
+            plc_directory: "https://plc.directory".to_string(),
+        };
+        let err = resolver
+            .resolve_handle("evil.com/x.acme.com")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Not a valid handle"));
+    }
+
+    #[test]
     fn static_resolver_handles_did_key() {
         let resolver = StaticResolver {
             documents: HashMap::new(),
+            handles: HashMap::new(),
         };
         let key = PrivateKey::generate_ed25519();
         let did = format!("did:key:{}", key.public_key_multibase());

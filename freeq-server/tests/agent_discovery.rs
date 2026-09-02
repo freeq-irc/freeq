@@ -208,3 +208,276 @@ async fn documented_parameterless_get_endpoints_all_exist() {
         missing.join("\n  ")
     );
 }
+
+// ── Crawler and agent discovery surfaces ─────────────────────────────────
+//
+// These assert over the wire what `agent_surfaces` asserts in isolation,
+// because the failure that mattered was never in the documents themselves —
+// it was the router handing every one of these paths to the SPA fallback.
+
+#[tokio::test]
+async fn serves_robots_sitemap_and_the_markdown_documents() {
+    let (_irc, http, _h) = start_server().await;
+    let client = reqwest::Client::new();
+
+    let robots = client.get(url(http, "/robots.txt")).send().await.unwrap();
+    assert_eq!(robots.status(), 200);
+    assert!(
+        robots
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain")
+    );
+    let body = robots.text().await.unwrap();
+    assert!(body.contains("Sitemap:"));
+    for ua in ["GPTBot", "ClaudeBot", "ora-agent"] {
+        assert!(body.contains(ua), "robots.txt must name {ua}");
+    }
+
+    let sitemap = client.get(url(http, "/sitemap.xml")).send().await.unwrap();
+    assert_eq!(sitemap.status(), 200);
+    assert!(
+        sitemap
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("xml")
+    );
+    assert!(sitemap.text().await.unwrap().contains("<lastmod>"));
+
+    for path in ["/agents.md", "/AGENTS.md", "/auth.md", "/index.md"] {
+        let resp = client.get(url(http, path)).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{path}");
+        assert!(
+            resp.headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("markdown"),
+            "{path} must be served as markdown"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(!body.is_empty(), "{path} is empty");
+        // The repository's own AGENTS.md documents production hosts. If this
+        // ever starts serving that file, this is the string that says so.
+        assert!(!body.contains("deploy.sh"), "{path} leaked internal docs");
+    }
+}
+
+#[tokio::test]
+async fn serves_the_well_known_documents_as_valid_json() {
+    let (_irc, http, _h) = start_server().await;
+    let client = reqwest::Client::new();
+
+    for path in [
+        "/openapi.json",
+        "/.well-known/ard.json",
+        "/.well-known/ai-catalog.json",
+        "/.well-known/agent-card.json",
+        "/.well-known/api-catalog",
+        "/.well-known/mcp/server-card.json",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/http-message-signatures-directory",
+    ] {
+        let resp = client.get(url(http, path)).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{path}");
+        let ctype = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ctype.contains("json"), "{path} served as {ctype}");
+        let body = resp.text().await.unwrap();
+        serde_json::from_str::<serde_json::Value>(&body)
+            .unwrap_or_else(|e| panic!("{path} is not valid JSON: {e}"));
+    }
+}
+
+/// The regression this whole module exists for: unknown paths used to answer
+/// `200 text/html` with the web client's shell.
+#[tokio::test]
+async fn unknown_paths_are_a_real_404_with_somewhere_to_go() {
+    let (_irc, http, _h) = start_server().await;
+    let client = reqwest::Client::new();
+
+    for path in [
+        "/this-path-does-not-exist-9f3a",
+        "/.well-known/this-does-not-exist-9f3a",
+        "/nope.json",
+        "/api/v1/definitely-not-a-route",
+    ] {
+        let resp = client.get(url(http, path)).send().await.unwrap();
+        assert_eq!(resp.status(), 404, "{path} must not soft-404");
+    }
+
+    let resp = client.get(url(http, "/nope.json")).send().await.unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("llms.txt") && body.contains("openapi.json"),
+        "a 404 body should tell an agent where to look instead: {body}"
+    );
+}
+
+/// RFC 8288 on every response, RFC 9728's hint on every 401.
+#[tokio::test]
+async fn responses_carry_discovery_and_auth_headers() {
+    let (_irc, http, _h) = start_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(url(http, "/api/v1/health"))
+        .send()
+        .await
+        .unwrap();
+    let link = resp
+        .headers()
+        .get("link")
+        .expect("every response should carry a Link header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(link.contains("rel=\"service-desc\""));
+    assert!(link.contains("/api/v1/openapi.json"));
+
+    // An authenticated endpoint without a token must say where auth is
+    // described, rather than leaving the caller to guess.
+    let resp = client
+        .get(url(http, "/api/v1/sessions"))
+        .send()
+        .await
+        .unwrap();
+    if resp.status() == 401 {
+        let wa = resp
+            .headers()
+            .get("www-authenticate")
+            .expect("401 must carry WWW-Authenticate")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(wa.contains("resource_metadata="), "{wa}");
+    }
+}
+
+/// The welcome mat: self-service enrollment, and the terms it points at.
+#[tokio::test]
+async fn serves_the_welcome_mat_and_its_terms() {
+    let (_irc, http, _h) = start_server().await;
+    let client = reqwest::Client::new();
+
+    let welcome = client
+        .get(url(http, "/.well-known/welcome.md"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(welcome.status(), 200);
+    assert!(
+        welcome
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("markdown")
+    );
+    let body = welcome.text().await.unwrap();
+    for section in [
+        "## requirements",
+        "## endpoints",
+        "## enrollment flow",
+        "## deviations",
+    ] {
+        assert!(body.contains(section), "welcome.md needs {section}");
+    }
+
+    let tos = client.get(url(http, "/tos")).send().await.unwrap();
+    assert_eq!(tos.status(), 200);
+    assert!(
+        tos.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain")
+    );
+    let terms = tos.text().await.unwrap();
+    assert!(terms.contains("terms of service"));
+    // Every endpoint welcome.md names as part of enrollment must exist on
+    // this host, or the document is lying to whoever follows it.
+    for path in ["/tos", "/agents.md", "/auth.md", "/api/v1/openapi.json"] {
+        let status = client.get(url(http, path)).send().await.unwrap().status();
+        assert_eq!(status, 200, "welcome.md promises {path}");
+    }
+}
+
+/// The shell is for `/` and nothing else. Anything unmatched is absent, and
+/// says so with a status code rather than 200 and a bundle.
+#[tokio::test]
+async fn a_path_the_app_does_not_route_is_not_pretended_into_existence() {
+    let (_irc, http, _h) = start_server().await;
+    let client = reqwest::Client::new();
+
+    for path in ["/this-does-not-exist", "/settings", "/c/general"] {
+        let resp = client.get(url(http, path)).send().await.unwrap();
+        assert_eq!(resp.status(), 404, "{path} must not answer with the shell");
+    }
+}
+
+/// `/` serves markdown to a client that asks for it and HTML to a browser,
+/// and says so with `Vary` so a cache never crosses the two.
+#[tokio::test]
+async fn the_root_negotiates_markdown() {
+    let (_irc, http, _h) = start_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(url(http, "/"))
+        .header("accept", "text/markdown")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let vary = resp
+        .headers()
+        .get("vary")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    assert!(ctype.contains("markdown"), "got {ctype}");
+    assert!(vary.to_lowercase().contains("accept"), "Vary: {vary}");
+    let body = resp.text().await.unwrap();
+    assert!(body.starts_with("# freeq"));
+
+    // A browser's Accept must not be answered with a 200 markdown document.
+    // This test server has no web client configured, so the honest answer is
+    // 404 - what it must never be is "here is the markdown instead".
+    // `agent_surfaces::a_browser_is_never_handed_markdown` covers the
+    // negotiation itself.
+    let resp = client
+        .get(url(http, "/"))
+        .header(
+            "accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        200,
+        "a browser was served a document it did not ask for"
+    );
+}

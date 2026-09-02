@@ -244,6 +244,40 @@ pub fn convert_event(event: &freeq_sdk::event::Event) -> DomainEvent {
             nick: nick.clone(),
             away_msg: away_msg.clone(),
         },
+        // Structured agent presence carries what AWAY cannot: a status for an
+        // *active* agent, and the task the work belongs to. This surface has
+        // no richer shape to put it in yet, so it rides the away channel with
+        // the status as its message — which is what a reader wants to see —
+        // and the task id appended when the agent named one.
+        Event::Presence {
+            nick,
+            state,
+            status,
+            task,
+        } => DomainEvent::AwayChanged {
+            nick: nick.clone(),
+            away_msg: Some(match (status, task) {
+                (Some(s), Some(t)) => format!("{state}: {s} [{t}]"),
+                (Some(s), None) => format!("{state}: {s}"),
+                (None, Some(t)) => format!("{state} [{t}]"),
+                (None, None) => state.clone(),
+            }),
+        },
+        // Who in the room is not a person. Absent means human, so an empty
+        // list says nothing and produces an empty notice like NamesEnd does.
+        Event::ActorClasses { channel, classes } => DomainEvent::Notice {
+            text: match classes.is_empty() {
+                true => String::new(),
+                false => format!(
+                    "{channel}: {}",
+                    classes
+                        .iter()
+                        .map(|(nick, class)| format!("{nick} is an {class}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            },
+        },
         Event::UserQuit { nick, reason } => DomainEvent::UserQuit {
             nick: nick.clone(),
             reason: reason.clone(),

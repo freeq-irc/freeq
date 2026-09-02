@@ -2538,6 +2538,192 @@ async fn federated_multiline_edit_stores_the_verified_body() {
     drop((srv_a, srv_b));
 }
 
+// ── a signed inline-escaped multiline message survives the hop ────
+//
+// The web's `sendMarkdown` shape: one PRIVMSG line, real newlines carried as
+// the literal two chars `\n` under `+freeq.at/multiline`, and the client's
+// signature taken over those escaped bytes — the body as transmitted. The
+// receiver used to un-escape before rebuilding the signed document, so the
+// hash disagreed with the signature: the message was called invalid and
+// dropped outright. The ones that slipped through before the signer's key
+// arrived were filed un-escaped instead, and the receiver's own verify
+// endpoint called them invalid for good. Both faces come from one rule, which
+// is what this pins: verify and file the inline form exactly as transmitted.
+
+/// One inline-escaped multiline PRIVMSG, signed over the escaped body — the
+/// form no SDK send path produces, so it is built and signed here.
+/// Returns `(escaped body, assembled body, minted event id)`.
+async fn send_inline_multiline(
+    ha: &client::ClientHandle,
+    did: &str,
+    channel: &str,
+    signing: &ed25519_dalek::SigningKey,
+    first_line: &str,
+    edit_of: Option<&str>,
+) -> (String, String, String) {
+    let escaped = format!("{first_line}\\nsecond paragraph");
+    let assembled = escaped.replace("\\n", "\n");
+    let id = freeq_sdk::chatsig::new_event_id();
+    let venue = freeq_sdk::chatsig::channel_venue(channel);
+    let mut doc = freeq_sdk::chatsig::ChatDoc::message(did, &id, &venue, &escaped);
+    if let Some(root) = edit_of {
+        doc = doc.with_edit(root);
+    }
+    let sig = doc.sign(signing);
+    let mut wire = vec![
+        "+freeq.at/multiline".to_string(),
+        format!("{}={id}", freeq_sdk::chatsig::EVENT_ID_TAG),
+        format!("+freeq.at/sig={sig}"),
+    ];
+    if let Some(root) = edit_of {
+        wire.push(format!("+draft/edit={root}"));
+    }
+    ha.raw(&format!("@{} PRIVMSG {channel} :{escaped}", wire.join(";")))
+        .await
+        .ok();
+    (escaped, assembled, id)
+}
+
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn signed_inline_multiline_crosses_the_hop_and_verifies_at_the_receiver() {
+    let alice = TestId::new("did:plc:aliceinline");
+    let bob = TestId::new("did:plc:bobinline");
+    let (srv_a, srv_b) = spawn_pair(&[&alice, &bob]).await;
+
+    let (hb, mut rxb) = connect(&srv_b, &bob, "bob");
+    wait_auth_and_register(&mut rxb).await;
+    hb.join("#inline").await.unwrap();
+
+    let (ha, mut rxa) = connect(&srv_a, &alice, "alice");
+    wait_auth_and_register(&mut rxa).await;
+    warm_link(&ha, &bob.did, &mut rxb).await;
+    ha.join("#inline").await.unwrap();
+
+    // A signing key of the test's own, registered the way a signing client
+    // registers one, so B can fetch it when a signature names it.
+    let signing = ed25519_dalek::SigningKey::from_bytes(&[163u8; 32]);
+    register_key(&ha, &signing).await;
+    let kid = freeq_sdk::sigtag::derive_kid(&signing.verifying_key());
+
+    // Land the key on B before the probe that matters. A relayed signature
+    // whose key B does not hold reads *unverifiable*, not invalid, and is
+    // delivered — so without this the probe would measure whichever of the
+    // two faces of the bug happened to fire first.
+    let key_url = format!(
+        "http://{}/api/v1/signing-keys/{}/{kid}",
+        srv_b.web_addr, alice.did
+    );
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut b_has_key = false;
+    while tokio::time::Instant::now() < deadline {
+        send_inline_multiline(&ha, &alice.did, "#inline", &signing, "key warmup", None).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        if let Ok(resp) = reqwest::get(&key_url).await
+            && resp.status().is_success()
+        {
+            b_has_key = true;
+            break;
+        }
+    }
+    assert!(b_has_key, "server B never learned alice's session key");
+
+    // Unique text per attempt, so the send that crossed is the one measured.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut landed = None;
+    let mut attempt = 0u32;
+    while tokio::time::Instant::now() < deadline {
+        attempt += 1;
+        let (escaped, assembled, id) = send_inline_multiline(
+            &ha,
+            &alice.did,
+            "#inline",
+            &signing,
+            &format!("inline probe {attempt}"),
+            None,
+        )
+        .await;
+        if recv_channel_msgid(&mut rxb, &assembled, Duration::from_secs(2))
+            .await
+            .is_some()
+        {
+            landed = Some((escaped, id));
+            break;
+        }
+    }
+    let (escaped, msgid) = landed.expect(
+        "a signed inline-escaped multiline message never reached bob's server: \
+         the receiver rebuilt the signed document from the un-escaped body, \
+         found it disagreed with the signature, and dropped the message",
+    );
+
+    // Both servers hold one message, so both must hold the same bytes — the
+    // escaped form the signature covers, which is what the origin filed.
+    let on_a = poll_verify(&srv_a.web_addr, &msgid).await;
+    let on_b = poll_verify(&srv_b.web_addr, &msgid).await;
+    assert_eq!(
+        on_a["text"].as_str(),
+        Some(escaped.as_str()),
+        "the origin files the inline form it verified: {on_a}"
+    );
+    assert_eq!(
+        on_b["text"].as_str(),
+        Some(escaped.as_str()),
+        "the receiver must file the inline form as transmitted, byte-equal to \
+         the origin's copy: {on_b}"
+    );
+    // And the receiver's own later check of its stored copy holds up — the
+    // face of the bug that outlives delivery.
+    assert_eq!(
+        on_b["verification"]["verdict"], "valid",
+        "the receiver must reach a valid verdict on its own stored copy: {on_b}"
+    );
+    assert_eq!(
+        on_b["verification"]["verified_by"], "client-session-key",
+        "and it must be the sender's device that signed: {on_b}"
+    );
+
+    // The edit path rebuilds the same document through the same call, and a
+    // relayed edit that fails the check is dropped rather than downgraded.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut edited = None;
+    while tokio::time::Instant::now() < deadline {
+        attempt += 1;
+        let (escaped, assembled, id) = send_inline_multiline(
+            &ha,
+            &alice.did,
+            "#inline",
+            &signing,
+            &format!("inline edit {attempt}"),
+            Some(&msgid),
+        )
+        .await;
+        if recv_channel_msgid(&mut rxb, &assembled, Duration::from_secs(2))
+            .await
+            .is_some()
+        {
+            edited = Some((escaped, id));
+            break;
+        }
+    }
+    let (edit_body, edit_id) =
+        edited.expect("a signed inline-escaped multiline edit never reached bob's server");
+    let edit_on_b = poll_verify(&srv_b.web_addr, &edit_id).await;
+    assert_eq!(
+        edit_on_b["text"].as_str(),
+        Some(edit_body.as_str()),
+        "the receiver must file an edit's inline form as transmitted: {edit_on_b}"
+    );
+    assert_eq!(
+        edit_on_b["verification"]["verdict"], "valid",
+        "and reach a valid verdict on it: {edit_on_b}"
+    );
+
+    ha.quit(None).await.ok();
+    hb.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}
+
 // ── a server that was away heals its task view, not just its log ──
 //
 // The end-to-end half of feeding caught-up task events through the same

@@ -74,6 +74,8 @@ pub struct ChannelState {
     pub key: Option<String>,
     /// Pinned message IDs (msgid strings), most recent first.
     pub pins: Vec<PinnedMessage>,
+    /// Key for this channel's private-media space.
+    pub media_space_key: Option<String>,
 }
 
 /// A pinned message reference.
@@ -104,6 +106,10 @@ pub(crate) fn did_allowed(
     }
     if let Some(h) = handle {
         let h = h.trim_start_matches('@').to_lowercase();
+        // "evil.com/x.acme.com" ends with an allowed domain but isn't in it.
+        if !freeq_sdk::did::is_valid_handle(&h) {
+            return false;
+        }
         if allowed_domains.iter().any(|dom| {
             let dom = dom
                 .trim_start_matches('@')
@@ -257,6 +263,10 @@ pub enum OauthPurpose {
     /// Cross-posting messages to Bluesky. Scope: adds `repo:app.bsky.feed.post`.
     /// Triggered the first time a user enables Bluesky mirroring on a channel.
     BlueskyPost,
+    /// Writing private media into this server's channel spaces. Scope: adds
+    /// `space:at.freeq.media` for this server's space authority. Triggered
+    /// the first time a user makes a private upload.
+    MediaSpace,
 }
 
 impl OauthPurpose {
@@ -266,6 +276,7 @@ impl OauthPurpose {
             "login" => Some(Self::Login),
             "blob_upload" => Some(Self::BlobUpload),
             "bluesky_post" => Some(Self::BlueskyPost),
+            "media_space" => Some(Self::MediaSpace),
             _ => None,
         }
     }
@@ -276,16 +287,19 @@ impl OauthPurpose {
             Self::Login => "login",
             Self::BlobUpload => "blob_upload",
             Self::BlueskyPost => "bluesky_post",
+            Self::MediaSpace => "media_space",
         }
     }
 
     /// The OAuth scope string we *request* for this purpose. The PDS may
     /// grant a different one — store that in [`WebSession::granted_scope`]
     /// and check it at use time via [`scope_satisfies_purpose`].
-    pub fn requested_scope(self) -> &'static str {
+    ///
+    /// `media_space_authority` is the server's space authority DID.
+    pub fn requested_scope(self, media_space_authority: Option<&str>) -> String {
         match self {
             // Identity-only. Same as a vanilla "Login with Bluesky" button.
-            Self::Login => "atproto",
+            Self::Login => "atproto".to_string(),
             // Upload images to the user's repo. Narrow MIME on purpose so
             // the consent screen says "upload images" instead of "upload
             // anything". Also requests `repo:blue.irc.media?action=create`
@@ -294,10 +308,17 @@ impl OauthPurpose {
             // alongside the blob — without this scope the PDS rejects
             // record creation with ScopeMissingError even though the blob
             // upload itself succeeds.
-            Self::BlobUpload => "atproto blob:image/* repo:blue.irc.media?action=create",
+            Self::BlobUpload => {
+                "atproto blob:image/* repo:blue.irc.media?action=create".to_string()
+            }
             // Cross-post to Bluesky's feed. Repo write narrowed to a single
             // collection.
-            Self::BlueskyPost => "atproto repo:app.bsky.feed.post",
+            Self::BlueskyPost => "atproto repo:app.bsky.feed.post".to_string(),
+            // Read and write this server's channel media spaces.
+            Self::MediaSpace => format!(
+                "atproto {}",
+                crate::media_space::space_scope(media_space_authority.unwrap_or("*")),
+            ),
         }
     }
 }
@@ -312,10 +333,48 @@ impl OauthPurpose {
 /// - bsky.social granular grants may include extra `blob:` MIME entries
 ///   beyond what we asked; we only need one `blob:image/*` (or the
 ///   wildcard `blob:*/*`) for upload.
-pub fn scope_satisfies_purpose(granted: &str, purpose: OauthPurpose) -> bool {
-    if granted
-        .split_whitespace()
-        .any(|s| s == "transition:generic")
+///
+/// Does one granted scope token grant space access over `authority`?
+///
+/// Accepts `space:<type>?authority=<did>&collection=<c>` in any parameter
+/// order, with `*` as the wildcard for type and collection. The authority
+/// must match exactly: a grant over someone else's spaces is worth nothing
+/// here, and `*` is not accepted for it.
+fn space_scope_covers_authority(token: &str, authority: &str) -> bool {
+    let Some(rest) = token.strip_prefix("space:") else {
+        return false;
+    };
+    let (space_type, query) = match rest.split_once('?') {
+        Some((t, q)) => (t, q),
+        None => return false,
+    };
+    if space_type != "*" && space_type != crate::media_space::SPACE_TYPE {
+        return false;
+    }
+    let mut names_authority = false;
+    let mut collection_ok = false;
+    for param in query.split('&') {
+        match param.split_once('=') {
+            Some(("authority", v)) if v == authority => names_authority = true,
+            Some(("collection", v)) => {
+                collection_ok = v == "*" || v == crate::media_space::MEDIA_COLLECTION;
+            }
+            _ => {}
+        }
+    }
+    names_authority && collection_ok
+}
+
+pub fn scope_satisfies_purpose(
+    granted: &str,
+    purpose: OauthPurpose,
+    media_space_authority: Option<&str>,
+) -> bool {
+    // The legacy wide grant covers every purpose except spaces.
+    if !matches!(purpose, OauthPurpose::MediaSpace)
+        && granted
+            .split_whitespace()
+            .any(|s| s == "transition:generic")
     {
         return true;
     }
@@ -338,6 +397,25 @@ pub fn scope_satisfies_purpose(granted: &str, purpose: OauthPurpose) -> bool {
         OauthPurpose::BlueskyPost => granted
             .split_whitespace()
             .any(|s| s == "repo:app.bsky.feed.post" || s == "repo:*"),
+        OauthPurpose::MediaSpace => {
+            // An upload is two PDS calls: uploadBlob for the bytes, then
+            // createRecord to file them in the space. The space half must
+            // also name this server's authority, since a grant for someone
+            // else's spaces buys nothing here.
+            //
+            // Matched by parts rather than as a literal string: a PDS is free
+            // to reorder or re-encode the query parameters when it echoes a
+            // grant back, and a literal comparison would turn that into an
+            // endless step-up loop for the user.
+            let Some(authority) = media_space_authority else {
+                return false;
+            };
+            let has_space = granted
+                .split_whitespace()
+                .any(|s| space_scope_covers_authority(s, authority));
+            let has_blob = granted.split_whitespace().any(|s| s.starts_with("blob:*"));
+            has_space && has_blob
+        }
     }
 }
 
@@ -626,6 +704,8 @@ pub struct SharedState {
     pub server_name: String,
     pub challenge_store: ChallengeStore,
     pub did_resolver: DidResolver,
+    /// Private-media spaces. None = feature off.
+    pub media_space: Option<std::sync::Arc<crate::media_space::MediaSpaceManager>>,
     /// session_id -> sender for writing lines to that client
     pub connections: Mutex<HashMap<String, mpsc::Sender<String>>>,
     /// nick -> session_id (case-insensitive: keys are always lowercase)
@@ -902,7 +982,7 @@ impl SharedState {
     /// keyed (`+k`), not encrypted-only (`+E`), and not gated by a join policy.
     /// Any restriction means it is effectively private, and advertising its
     /// name/topic to strangers or other tenants only leaks it. Members always
-    /// see their own channels regardless (the callers OR-in membership).
+    /// see their own channels regardless (see `channel_visible_to`).
     pub fn channel_is_discoverable(&self, name: &str, ch: &ChannelState) -> bool {
         if ch.is_mode_restricted() {
             return false;
@@ -913,6 +993,23 @@ impl SharedState {
             return false;
         }
         true
+    }
+
+    /// Can this session see the channel? Shared by LIST, NAMES, WHO, and WHOIS.
+    pub fn channel_visible_to(&self, name: &str, ch: &ChannelState, session_id: &str) -> bool {
+        self.channel_is_discoverable(name, ch) || ch.members.contains(session_id)
+    }
+
+    /// Same, for an HTTP caller who may have several sessions open.
+    /// Empty means anonymous.
+    pub fn channel_visible_to_sessions(
+        &self,
+        name: &str,
+        ch: &ChannelState,
+        viewer_sessions: &[String],
+    ) -> bool {
+        self.channel_is_discoverable(name, ch)
+            || viewer_sessions.iter().any(|s| ch.members.contains(s))
     }
 
     /// Connect-time allowlist (Phase 3.2, opt-in). Returns whether a DID may
@@ -926,6 +1023,47 @@ impl SharedState {
             did,
             handle,
         )
+    }
+
+    /// Handles the case where the allowlist rejected a DID because the handle
+    /// wasn't in an allowed domain. Admits the DID if any claimed handles match.
+    pub async fn did_is_allowed_resolved(&self, did: &str, handle: Option<&str>) -> bool {
+        if self.did_is_allowed(did, handle) {
+            return true;
+        }
+        if self.config.allowed_did_domains.is_empty() {
+            return false;
+        }
+        let doc = match self.did_resolver.resolve(did).await {
+            Ok(doc) => doc,
+            Err(e) => {
+                tracing::warn!(%did, "allowlist: DID document resolution failed: {e}");
+                return false;
+            }
+        };
+        for aka in &doc.also_known_as {
+            let Some(claimed) = aka.strip_prefix("at://") else {
+                continue;
+            };
+            if self.did_is_allowed(did, Some(claimed)) && self.handle_owned_by(claimed, did).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn handle_owned_by(&self, handle: &str, did: &str) -> bool {
+        match self.did_resolver.resolve_handle(handle).await {
+            Ok(resolved) if resolved == did => true,
+            Ok(resolved) => {
+                tracing::warn!(%did, %handle, %resolved, "allowlist: handle belongs to another DID");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(%did, %handle, "allowlist: handle resolution failed: {e}");
+                false
+            }
+        }
     }
 
     /// Run a closure with the database, if persistence is enabled.
@@ -1579,6 +1717,7 @@ impl Server {
                     && !ch.moderated
                     && ch.key.is_none()
                     && ch.bans.is_empty()
+                    && ch.media_space_key.is_none()
                 {
                     // Don't prune if channel has policy (check later)
                     let _ = db.delete_channel(name);
@@ -1628,10 +1767,36 @@ impl Server {
             bundles
         };
 
+        // Docker compose's `${VAR:-}` passes SET-BUT-EMPTY env vars, which
+        // clap surfaces as Some(""). Empty means unset here.
+        fn non_empty(v: &Option<String>) -> Option<&str> {
+            v.as_deref().filter(|s| !s.is_empty())
+        }
+        let media_space = match (
+            non_empty(&self.config.media_space_did),
+            non_empty(&self.config.media_space_password),
+        ) {
+            (Some(did), Some(password)) => Some(std::sync::Arc::new(
+                crate::media_space::MediaSpaceManager::new(
+                    did.to_string(),
+                    password.to_string(),
+                    non_empty(&self.config.media_space_pds).map(str::to_string),
+                    self.config.server_name.clone(),
+                ),
+            )),
+            (Some(_), None) => {
+                tracing::warn!(
+                    "media_space_did set without media_space_password; private media disabled"
+                );
+                None
+            }
+            _ => None,
+        };
         let state = Arc::new(SharedState {
             server_name: self.config.server_name.clone(),
             challenge_store: ChallengeStore::new(self.config.challenge_timeout_secs),
             did_resolver: self.resolver.clone(),
+            media_space,
             connections: Mutex::new(HashMap::new()),
             nick_to_session: Mutex::new(NickMap::new()),
             session_dids: Mutex::new(HashMap::new()),
@@ -2989,17 +3154,16 @@ fn s2s_channel_entry<'a>(
 
 /// The body a relayed message's signature covers, rebuilt from the wire.
 ///
-/// The S2S `text` field is not always the body the sender signed: a multiline
-/// message is escaped for transport (`encode_privmsg_text_for_s2s`) so that a
-/// peer relaying it to its own clients cannot break the IRC line. When the
-/// per-line breakdown rode along, reassemble from that — the exact bytes the
-/// origin assembled — and fall back to undoing the escape for peers that send
-/// only the escaped text.
-fn relayed_signed_body(
-    text: &str,
-    tags: &HashMap<String, String>,
-    lines: Option<&Vec<crate::s2s::MultilineLine>>,
-) -> String {
+/// A `draft/multiline` BATCH is signed over the assembled body and escaped for
+/// transport (`encode_privmsg_text_for_s2s`) so a peer relaying it to its own
+/// clients cannot break the IRC line; the per-line breakdown rides along and is
+/// reassembled here, giving back the exact bytes the origin signed.
+///
+/// Everything else is the body as transmitted — the inline form included: one
+/// line, newlines as the literal two chars `\n` under `+freeq.at/multiline`,
+/// signed by the client over those escaped bytes. Un-escaping it built a
+/// document its sender never signed, so every such message failed the check.
+fn relayed_signed_body(text: &str, lines: Option<&Vec<crate::s2s::MultilineLine>>) -> String {
     if let Some(lines) = lines {
         let mut out = String::new();
         for (i, line) in lines.iter().enumerate() {
@@ -3009,9 +3173,6 @@ fn relayed_signed_body(
             out.push_str(&line.body);
         }
         return out;
-    }
-    if tags.contains_key("+freeq.at/multiline") {
-        return text.replace("\\n", "\n");
     }
     text.to_string()
 }
@@ -3044,7 +3205,7 @@ fn verify_relayed_privmsg(
             "relayed message names no sender DID",
         ));
     };
-    let body = relayed_signed_body(text, tags, multiline_lines);
+    let body = relayed_signed_body(text, multiline_lines);
     let fields = SignedFields {
         body: &body,
         msgid: msgid.unwrap_or_default(),
@@ -5109,13 +5270,15 @@ pub(crate) async fn process_s2s_message(
             // Generate a local msgid if the remote didn't send one
             let msgid = msgid.unwrap_or_else(crate::msgid::generate);
 
-            // The body to FILE: the assembled form — the same bytes the
-            // verifier checked and the origin stored. The wire keeps the
-            // escaped form (a raw newline cannot ride an IRC line); the store
-            // must not, or REST, search, FTS and replay read escape sequences
-            // as text and the two servers hold different bytes for one
-            // message. Line bodies are peer-provided, so each is sanitized
-            // before reassembly; the joins are ours.
+            // The body to FILE: whatever the verifier checked, so this
+            // server's own later verification of the row agrees with the one
+            // it reached on receipt, and both servers hold the same bytes.
+            //
+            // A BATCH is reassembled — the origin signed and stored the
+            // assembled body, and the escape exists only because a raw newline
+            // cannot ride an IRC line. Line bodies are peer-provided, so each
+            // is sanitized before reassembly; the joins are ours. Anything
+            // else, the inline form included, is filed as transmitted.
             let stored_body = match multiline_lines.as_ref() {
                 Some(lines) => {
                     let mut out = String::new();
@@ -5137,9 +5300,6 @@ pub(crate) async fn process_s2s_message(
                         out.truncate(cut);
                     }
                     out
-                }
-                None if relayed_tags.contains_key("+freeq.at/multiline") => {
-                    text.replace("\\n", "\n")
                 }
                 None => text.clone(),
             };
@@ -7720,25 +7880,43 @@ mod s2s_adversarial_tests {
 
     /// Build a minimal SharedState for testing (no DB, no iroh).
     pub(crate) fn test_state() -> Arc<SharedState> {
-        test_state_inner(None, None)
+        test_state_inner(None, None, None)
     }
 
     /// Like `test_state` but with an in-memory SQLite DB attached, so
     /// persistence paths (`identities`, `messages`, …) are exercised. Shared
     /// with other modules' tests (e.g. web endpoints) via the re-export below.
     pub(crate) fn test_state_with_db() -> Arc<SharedState> {
-        test_state_inner(Some(crate::db::Db::open_memory().unwrap()), None)
+        test_state_inner(Some(crate::db::Db::open_memory().unwrap()), None, None)
     }
 
     /// Like `test_state_with_db`, for the flags a test needs to set — the
     /// config is read at runtime, so it cannot be adjusted after construction.
     pub(crate) fn test_state_with_config(config: crate::config::ServerConfig) -> Arc<SharedState> {
-        test_state_inner(Some(crate::db::Db::open_memory().unwrap()), Some(config))
+        test_state_inner(
+            Some(crate::db::Db::open_memory().unwrap()),
+            Some(config),
+            None,
+        )
+    }
+
+    /// Like `test_state_with_config`, for tests where the resolver actually
+    /// needs to answer.
+    pub(crate) fn test_state_with_resolver(
+        config: crate::config::ServerConfig,
+        resolver: freeq_sdk::did::DidResolver,
+    ) -> Arc<SharedState> {
+        test_state_inner(
+            Some(crate::db::Db::open_memory().unwrap()),
+            Some(config),
+            Some(resolver),
+        )
     }
 
     fn test_state_inner(
         db: Option<crate::db::Db>,
         config: Option<crate::config::ServerConfig>,
+        resolver: Option<freeq_sdk::did::DidResolver>,
     ) -> Arc<SharedState> {
         let config = config.unwrap_or_else(|| crate::config::ServerConfig {
             listen_addr: "127.0.0.1:0".to_string(),
@@ -7750,7 +7928,9 @@ mod s2s_adversarial_tests {
         Arc::new(SharedState {
             server_name: config.server_name.clone(),
             challenge_store: crate::sasl::ChallengeStore::new(60),
-            did_resolver: freeq_sdk::did::DidResolver::static_map(HashMap::new()),
+            did_resolver: resolver
+                .unwrap_or_else(|| freeq_sdk::did::DidResolver::static_map(HashMap::new())),
+            media_space: None,
             connections: Mutex::new(HashMap::new()),
             nick_to_session: Mutex::new(NickMap::new()),
             session_dids: Mutex::new(HashMap::new()),
@@ -8106,8 +8286,10 @@ mod s2s_adversarial_tests {
         );
     }
 
-    /// A multiline message is escaped for transport, so the wire `text` is not
-    /// the body its sender signed. Rebuilt from the per-line breakdown, it is.
+    /// A BATCH multiline message is escaped for transport, so the wire `text`
+    /// is not the body its sender signed. Rebuilt from the per-line breakdown,
+    /// it is. The inline form signs the escaped body instead, and is checked
+    /// against exactly what arrived.
     #[tokio::test]
     async fn relayed_multiline_verifies_against_the_assembled_body() {
         let state = test_state_with_db();
@@ -8148,8 +8330,12 @@ mod s2s_adversarial_tests {
             "a multiline body must be reassembled before it is hashed"
         );
 
-        // And with no per-line breakdown (an older peer), undoing the escape
-        // reaches the same body.
+        // The inline form is the other sender shape, and it signs the OTHER
+        // body: one line, newlines as literal `\n` under the same tag, signed
+        // over those escaped bytes. With no per-line breakdown to reassemble,
+        // the body is the one that arrived — un-escaping it here was what
+        // dropped every signed inline multiline message on receipt.
+        let inline_sig = sign_channel_message(&key, SIGNER, "01EVENTID", "#chat", &wire_text);
         assert_eq!(
             verify_relayed_privmsg(
                 &state,
@@ -8160,7 +8346,7 @@ mod s2s_adversarial_tests {
                 &wire_tags,
                 None,
                 None,
-                Some(&sig),
+                Some(&inline_sig),
             ),
             Some(ClientSigVerdict::Valid)
         );
@@ -12996,9 +13182,183 @@ mod allowlist_tests {
 
     #[test]
     fn no_handle_denies_domain_only_allowlist() {
-        // Challenge SASL has no handle → domain-only allowlists can't match.
+        // A domain can't match without a handle; callers fetch one first.
         let doms = v(&["acme.com"]);
         assert!(!did_allowed(&[], &doms, "did:plc:x", None));
+    }
+
+    #[test]
+    fn a_handle_naming_another_host_denies_the_domain_match() {
+        // These end with ".acme.com" but resolve against evil.com.
+        let doms = v(&["acme.com"]);
+        for h in [
+            "evil.com/x.acme.com",
+            "evil.com?x.acme.com",
+            "evil.com#x.acme.com",
+            "127.0.0.1/x.acme.com",
+        ] {
+            assert!(!did_allowed(&[], &doms, "did:plc:mallory", Some(h)), "{h}");
+        }
+    }
+
+    #[test]
+    fn an_exact_did_is_allowed_even_with_a_malformed_handle() {
+        let dids = v(&["did:plc:alice"]);
+        let doms = v(&["acme.com"]);
+        assert!(did_allowed(
+            &dids,
+            &doms,
+            "did:plc:alice",
+            Some("evil.com/x.acme.com")
+        ));
+    }
+}
+
+#[cfg(test)]
+mod allowlist_resolution_tests {
+    //! Covers the handle lookup for a domain allowlist, including the
+    //! case where a claimed handle belongs to someone else's DID.
+
+    use super::s2s_adversarial_tests::test_state_with_resolver;
+    use freeq_sdk::did::{DidDocument, DidResolver};
+    use std::collections::HashMap;
+
+    fn doc(did: &str, handles: &[&str]) -> DidDocument {
+        DidDocument {
+            id: did.to_string(),
+            also_known_as: handles.iter().map(|h| format!("at://{h}")).collect(),
+            verification_method: vec![],
+            authentication: vec![],
+            assertion_method: vec![],
+            service: vec![],
+        }
+    }
+
+    fn resolver(docs: &[DidDocument]) -> DidResolver {
+        DidResolver::static_map(
+            docs.iter()
+                .map(|d| (d.id.clone(), d.clone()))
+                .collect::<HashMap<_, _>>(),
+        )
+    }
+
+    fn config(domains: &[&str]) -> crate::config::ServerConfig {
+        crate::config::ServerConfig {
+            listen_addr: "127.0.0.1:0".to_string(),
+            server_name: "test".to_string(),
+            allowed_did_domains: domains.iter().map(|d| d.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn domain_allowlist_admits_a_did_whose_handle_is_in_the_domain() {
+        let state = test_state_with_resolver(
+            config(&["acme.com"]),
+            resolver(&[doc("did:plc:alice", &["alice.acme.com"])]),
+        );
+        assert!(state.did_is_allowed_resolved("did:plc:alice", None).await);
+    }
+
+    #[tokio::test]
+    async fn a_claimed_handle_naming_another_host_does_not_admit() {
+        // The static resolver would confirm ownership here, so the syntax
+        // check is all that stands between mallory and admission.
+        let state = test_state_with_resolver(
+            config(&["acme.com"]),
+            resolver(&[doc("did:plc:mallory", &["evil.com/x.acme.com"])]),
+        );
+        assert!(!state.did_is_allowed_resolved("did:plc:mallory", None).await);
+    }
+
+    #[tokio::test]
+    async fn a_supplied_handle_naming_another_host_does_not_admit() {
+        // The web token carries whatever handle the user typed at login.
+        let state = test_state_with_resolver(config(&["acme.com"]), resolver(&[]));
+        assert!(
+            !state
+                .did_is_allowed_resolved("did:plc:mallory", Some("evil.com?x.acme.com"))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_allowlist_rejects_a_handle_outside_the_domain() {
+        let state = test_state_with_resolver(
+            config(&["acme.com"]),
+            resolver(&[doc("did:plc:mallory", &["mallory.evil.com"])]),
+        );
+        assert!(!state.did_is_allowed_resolved("did:plc:mallory", None).await);
+    }
+
+    #[tokio::test]
+    async fn unverified_also_known_as_does_not_admit() {
+        // Mallory claims a handle that really belongs to alice.
+        let docs = [doc("did:plc:mallory", &["alice.acme.com"])];
+        let resolver = DidResolver::static_map_with_handles(
+            docs.iter()
+                .map(|d| (d.id.clone(), d.clone()))
+                .collect::<HashMap<_, _>>(),
+            HashMap::from([("alice.acme.com".to_string(), "did:plc:alice".to_string())]),
+        );
+        let state = test_state_with_resolver(config(&["acme.com"]), resolver);
+        assert!(!state.did_is_allowed_resolved("did:plc:mallory", None).await);
+    }
+
+    #[tokio::test]
+    async fn a_second_claimed_handle_admits_when_the_first_is_out_of_domain() {
+        // The PDS lists the personal handle first, but membership rests on the
+        // other one.
+        let state = test_state_with_resolver(
+            config(&["pds.acme.com"]),
+            resolver(&[doc(
+                "did:plc:alice",
+                &["alice.example.com", "alice.pds.acme.com"],
+            )]),
+        );
+        assert!(state.did_is_allowed_resolved("did:plc:alice", None).await);
+    }
+
+    #[tokio::test]
+    async fn a_supplied_handle_outside_the_domain_still_checks_the_others() {
+        // A web login carries this handle from OAuth; both paths must agree.
+        let state = test_state_with_resolver(
+            config(&["pds.acme.com"]),
+            resolver(&[doc(
+                "did:plc:alice",
+                &["alice.example.com", "alice.pds.acme.com"],
+            )]),
+        );
+        assert!(
+            state
+                .did_is_allowed_resolved("did:plc:alice", Some("alice.example.com"))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn supplied_handle_skips_resolution() {
+        let state = test_state_with_resolver(config(&["acme.com"]), resolver(&[]));
+        assert!(
+            state
+                .did_is_allowed_resolved("did:plc:alice", Some("alice.acme.com"))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn open_instance_never_resolves() {
+        let state = test_state_with_resolver(config(&[]), resolver(&[]));
+        assert!(state.did_is_allowed_resolved("did:plc:anyone", None).await);
+    }
+
+    #[tokio::test]
+    async fn did_allowlist_alone_still_decides_without_resolution() {
+        let mut cfg = config(&[]);
+        cfg.allowed_dids = vec!["did:plc:alice".to_string()];
+        let state = test_state_with_resolver(cfg, resolver(&[]));
+        assert!(state.did_is_allowed_resolved("did:plc:alice", None).await);
+        assert!(!state.did_is_allowed_resolved("did:plc:mallory", None).await);
     }
 }
 

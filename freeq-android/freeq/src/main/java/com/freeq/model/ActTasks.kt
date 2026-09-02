@@ -209,7 +209,8 @@ class ActTaskStore {
      *
      * The home signs `confirm` and `expire` itself and sends no companion, so
      * these two are the only events the reader hears about as a system line
-     * rather than a card.
+     * rather than a card. Each opens with its verb's glyph, off the same table
+     * a card reads, so a line and a card mark the same move the same way.
      */
     private fun systemLine(task: ActTask, ev: ActEventInput): String? {
         // Both lines name the task by its title, which only the opener
@@ -225,9 +226,9 @@ class ActTaskStore {
             // to say.
             "confirm" -> {
                 val subject = task.events.firstOrNull { it.eventId == ev.fields["act-subject"] }
-                subject?.let { "confirmed: ${it.from}'s ${it.verb} on $title" }
+                subject?.let { "${ActVerbs.emoji("confirm")} confirmed: \"$title\" — ${it.verb} by ${it.from}" }
             }
-            "expire" -> "$title expired"
+            "expire" -> "${ActVerbs.emoji("expire")} $title expired"
             else -> null
         }
     }
@@ -265,4 +266,34 @@ fun actEventTimeMs(eventId: String): Long? {
         ms = ms * 32 + digit
     }
     return ms
+}
+
+/**
+ * Which buffer an act event belongs in — the task decides, not the sender.
+ *
+ * An event naming a task some thread already holds files there, whoever signed
+ * it, so a receipt the home signs lands beside the moves it confirms instead of
+ * in a thread named after the server, and a peer home's receipt in a federated
+ * conversation lands there too. An opener names no earlier task and opens its
+ * own thread, as before. Anything else naming a task nobody holds goes to the
+ * sender's thread when we have one and nowhere when we do not — the silence an
+ * unheld confirm has always had, rather than a thread conjured for one line
+ * that can say nothing.
+ *
+ * The same rule the web client (`actEventBuffer`) and the macOS client
+ * (`ActEventRouting.buffer`) read.
+ */
+object ActEventRouting {
+    fun buffer(
+        venue: String,
+        taskId: String,
+        eventId: String,
+        bufferHoldingTask: String?,
+        hasBuffer: (String) -> Boolean,
+    ): String? {
+        if (bufferHoldingTask != null) return bufferHoldingTask
+        // An opener's task is its own event, which is what makes it the opener.
+        if (taskId == eventId) return venue
+        return if (hasBuffer(venue)) venue else null
+    }
 }

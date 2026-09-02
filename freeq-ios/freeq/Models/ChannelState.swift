@@ -16,6 +16,10 @@ class ChannelState: ObservableObject, Identifiable {
     /// auth required, …) so the UI can explain why a join didn't happen.
     /// Cleared on a successful join. Parity with macOS.
     @Published var accessDeniedReason: String? = nil
+    /// The tasks this buffer has seen, keyed by each opener's event id.
+    let actTasks = ActTaskStore()
+    /// The card each companion line draws, keyed by that line's id.
+    @Published var actCards: [String: ActCard] = [:]
     /// Tracks the most recent activity (message, join, topic change, etc.)
     var lastActivity: Date = Date()
 
@@ -108,6 +112,47 @@ class ChannelState: ObservableObject, Identifiable {
         // Update last activity for sorting
         if msg.timestamp > lastActivity {
             lastActivity = msg.timestamp
+        }
+        // Either side can land first, so joining runs from both.
+        if msg.actRef != nil { pairActCompanions() }
+    }
+
+    /// Join the task events this buffer holds to the companion lines it holds.
+    ///
+    /// Cheap to repeat: already-joined pairs are left alone, and a line whose
+    /// event has not arrived waits for it.
+    func pairActCompanions() {
+        if actTasks.tasks.isEmpty { return }
+        actTasks.pair(messages.compactMap { m in
+            m.actRef.map {
+                ActLine(id: m.id, from: m.from, account: m.account,
+                        timestampMs: Int64(m.timestamp.timeIntervalSince1970 * 1000), ref: $0)
+            }
+        })
+        refreshActCards()
+    }
+
+    /// File one task event, and hand back the line the room is told, if any.
+    func recordActEvent(_ ev: ActEventInput) -> String? {
+        let line = actTasks.record(ev)
+        refreshActCards()
+        return line
+    }
+
+    private func refreshActCards() {
+        for task in actTasks.tasks.values {
+            for ev in task.events {
+                guard let id = ev.msgId else { continue }
+                let card = ActCard(task: task, event: ev)
+                if actCards[id] == card { continue }
+                actCards[id] = card
+                // The row carries a bit for the card so its identity changes
+                // when one arrives; without it the row keeps its old identity
+                // and the card has been observed not to reach the screen.
+                if let idx = findMessage(byId: id), !messages[idx].actCarded {
+                    messages[idx].actCarded = true
+                }
+            }
         }
     }
 

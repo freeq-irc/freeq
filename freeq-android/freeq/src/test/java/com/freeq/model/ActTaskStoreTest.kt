@@ -223,7 +223,7 @@ class ActTaskStoreTest {
             move("confirm", "e3", mapOf("act-subject" to "e2"), who = "acceptance", did = null)
         )
 
-        assertEquals("confirmed: worker's claim on ship the release", line)
+        assertEquals("✔️ confirmed: \"ship the release\" — claim by worker", line)
     }
 
     @Test fun a_confirm_says_nothing_about_a_move_it_does_not_hold() {
@@ -239,7 +239,10 @@ class ActTaskStoreTest {
         val store = ActTaskStore()
         store.record(ev())
 
-        assertEquals("ship the release expired", store.record(move("expire", "e2", who = "acceptance", did = null)))
+        assertEquals(
+            "⌛ ship the release expired",
+            store.record(move("expire", "e2", who = "acceptance", did = null)),
+        )
     }
 
     @Test fun an_expiry_says_nothing_when_no_title_is_held() {

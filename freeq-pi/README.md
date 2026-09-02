@@ -214,4 +214,11 @@ All five are optional in `freeq.json`; a config written before they existed
 keeps working untouched. `autoAccept` is still the stronger, per-DID form —
 it accepts even mid-turn.
 
+Work is withdrawn with `cancel`, not with a message saying so — the offerer
+can retract a task while it is offered, open, or already assigned. Anything
+less leaves the ledger reading `assigned`, and a worker that comes back to it
+weeks later after a history replay is behaving correctly. A cancellation is
+signed like every other move, reaches a recipient who was offline when it was
+sent, and tells a session that currently holds the task to stand down.
+
 To demo or test this, read `DEMO.md`.

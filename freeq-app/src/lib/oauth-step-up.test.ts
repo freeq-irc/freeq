@@ -215,6 +215,14 @@ describe('detectStepUpRequired', () => {
     expect(await detectStepUpRequired(r)).toBeNull();
   });
 
+  it('recognizes the media_space purpose', async () => {
+    const r = jsonResp(403, {
+      error: 'step_up_required',
+      purpose: 'media_space',
+    });
+    expect(await detectStepUpRequired(r)).toBe('media_space');
+  });
+
   it('does not consume the original response body', async () => {
     const r = jsonResp(403, { error: 'step_up_required', purpose: 'blob_upload' });
     await detectStepUpRequired(r);

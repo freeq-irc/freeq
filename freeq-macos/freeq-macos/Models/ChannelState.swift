@@ -14,6 +14,11 @@ class ChannelState: Identifiable {
     var lastActivity: Date = Date()
     var isEncrypted: Bool = false
     var accessDeniedReason: String?
+    /// The tasks this buffer has seen, keyed by each opener's event id.
+    let actTasks = ActTaskStore()
+    /// The card each companion line draws, keyed by that line's id. Observed,
+    /// so a line already on screen becomes its card the moment its event lands.
+    var actCards: [String: ActCard] = [:]
 
     var id: String { name }
     var isChannel: Bool { name.hasPrefix("#") }
@@ -101,6 +106,40 @@ class ChannelState: Identifiable {
         }
         if msg.timestamp > lastActivity {
             lastActivity = msg.timestamp
+        }
+        // Either side can land first, so joining runs from both.
+        if msg.actRef != nil { pairActCompanions() }
+    }
+
+    /// Join the task events this buffer holds to the companion lines it holds.
+    ///
+    /// Cheap to repeat: already-joined pairs are left alone, and a line whose
+    /// event has not arrived waits for it.
+    func pairActCompanions() {
+        if actTasks.tasks.isEmpty { return }
+        actTasks.pair(messages.compactMap { m in
+            m.actRef.map {
+                ActLine(id: m.id, from: m.from, account: m.account,
+                        timestampMs: Int64(m.timestamp.timeIntervalSince1970 * 1000), ref: $0)
+            }
+        })
+        refreshActCards()
+    }
+
+    /// File one task event, and hand back the line the room is told, if any.
+    func recordActEvent(_ ev: ActEventInput) -> String? {
+        let line = actTasks.record(ev)
+        refreshActCards()
+        return line
+    }
+
+    private func refreshActCards() {
+        for task in actTasks.tasks.values {
+            for ev in task.events {
+                guard let id = ev.msgId else { continue }
+                let card = ActCard(task: task, event: ev)
+                if actCards[id] != card { actCards[id] = card }
+            }
         }
     }
 

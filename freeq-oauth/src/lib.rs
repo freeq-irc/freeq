@@ -63,21 +63,36 @@ pub fn urlencode(s: &str) -> String {
 }
 
 /// Build the OAuth `client_id`.
-///
-/// Loopback origins (`http://127.*`, `http://192.168.*`, `http://10.*`)
-/// use the `http://localhost?redirect_uri=…&scope=…` form the AT Protocol
-/// spec defines for development clients; everything else uses the URL of
-/// the hosted `client-metadata.json` document. The advertised scope is the
-/// full [`CLIENT_METADATA_SCOPE`] union in both cases.
 pub fn build_client_id(web_origin: &str, redirect_uri: &str) -> String {
+    build_client_id_with_scopes(web_origin, redirect_uri, None)
+}
+
+/// Build the OAuth `client_id` with `extra_scopes`.
+///
+/// Loopback origins (`http://127.*`, `http://192.168.*`, `http://10.*`) take
+/// the `http://localhost?redirect_uri=…&scope=…` form the AT Protocol spec
+/// defines for development clients; everything else names the hosted
+/// `client-metadata.json`. A loopback client carries its scope list inside
+/// the id, matched token for token against what a flow requests, so a scope
+/// absent here cannot be requested at all. The id is the client's identity,
+/// so callers pass the same extras across login and step-up alike.
+pub fn build_client_id_with_scopes(
+    web_origin: &str,
+    redirect_uri: &str,
+    extra_scopes: Option<&str>,
+) -> String {
     if web_origin.starts_with("http://127.")
         || web_origin.starts_with("http://192.168.")
         || web_origin.starts_with("http://10.")
     {
+        let scopes = match extra_scopes {
+            Some(extra) if !extra.is_empty() => format!("{CLIENT_METADATA_SCOPE} {extra}"),
+            _ => CLIENT_METADATA_SCOPE.to_string(),
+        };
         format!(
             "http://localhost?redirect_uri={}&scope={}",
             urlencode(redirect_uri),
-            urlencode(CLIENT_METADATA_SCOPE),
+            urlencode(&scopes),
         )
     } else {
         format!("{web_origin}/client-metadata.json")

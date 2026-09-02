@@ -34,6 +34,7 @@ extension AppState {
     /// `activeChannel`) and the iPhone navigation stacks (via the pending nav).
     func navigate(toBuffer name: String) {
         activeChannel = name
+        requestDmHistoryOnOpenIfNeeded(name)
         if name.hasPrefix("#") || name.hasPrefix("&") {
             pendingChannelNav = name
         } else {
