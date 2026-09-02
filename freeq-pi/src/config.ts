@@ -70,9 +70,36 @@ export interface FreeqConfig {
   provenance?: ProvenanceTier;
   /** Where provenance goes. Defaults to the first joined channel. */
   provenanceChannel?: string;
+
+  /**
+   * Accept an offer straight away when this session is idle and the offerer
+   * is trusted at `handoff` or above. The alternative is a queue, and a queue
+   * only pays off when somebody eventually looks at it — an idle session that
+   * declines to start trusted work is just a slower way of dropping it.
+   * `autoAccept` above is the stronger, per-DID form: it accepts even mid-turn.
+   */
+  autoAcceptWhenIdle: boolean;
+  /**
+   * How long a queued offer may wait before it is declined with a reason.
+   * Silence teaches an offerer nothing; a decline lets them re-offer
+   * somewhere else while the work still matters.
+   */
+  offerTtlSecs: number;
+  /** How often an in-flight task emits a `progress` heartbeat. */
+  progressIntervalSecs: number;
+  /** How long an in-flight task may go without model activity before it fails. */
+  stallSecs: number;
+  /** How many assigned tasks a restart re-enters at once. */
+  maxResume: number;
 }
 
 export const DEFAULT_SERVER = "wss://irc.freeq.at/irc";
+
+/** Resilience defaults, named so tests and help text quote one source. */
+export const DEFAULT_OFFER_TTL_SECS = 1800;
+export const DEFAULT_PROGRESS_INTERVAL_SECS = 120;
+export const DEFAULT_STALL_SECS = 900;
+export const DEFAULT_MAX_RESUME = 3;
 
 export function defaultConfig(): FreeqConfig {
   return {
@@ -84,6 +111,11 @@ export function defaultConfig(): FreeqConfig {
     muted: false,
     autoAccept: [],
     provenance: "decisions",
+    autoAcceptWhenIdle: true,
+    offerTtlSecs: DEFAULT_OFFER_TTL_SECS,
+    progressIntervalSecs: DEFAULT_PROGRESS_INTERVAL_SECS,
+    stallSecs: DEFAULT_STALL_SECS,
+    maxResume: DEFAULT_MAX_RESUME,
   };
 }
 
@@ -134,6 +166,14 @@ export function normalizeConfig(raw: unknown): FreeqConfig {
       (d): d is string => typeof d === "string" && d.startsWith("did:"),
     );
   }
+  if (typeof o.autoAcceptWhenIdle === "boolean") base.autoAcceptWhenIdle = o.autoAcceptWhenIdle;
+  // A config written before these keys existed simply keeps the defaults, and
+  // a nonsensical value (zero, negative, a string) does too — a stall timeout
+  // of 0 would fail every task the instant it started.
+  base.offerTtlSecs = duration(o.offerTtlSecs, base.offerTtlSecs);
+  base.progressIntervalSecs = duration(o.progressIntervalSecs, base.progressIntervalSecs);
+  base.stallSecs = duration(o.stallSecs, base.stallSecs);
+  base.maxResume = count(o.maxResume, base.maxResume);
   base.channels = normalizeChannels(o.channels);
 
   if (o.modes && typeof o.modes === "object") {
@@ -151,6 +191,18 @@ export function normalizeConfig(raw: unknown): FreeqConfig {
     }
   }
   return base;
+}
+
+/** A positive number of seconds, or the default. */
+function duration(raw: unknown, fallback: number): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) return fallback;
+  return Math.round(raw);
+}
+
+/** A non-negative count — zero is meaningful here (resume nothing). */
+function count(raw: unknown, fallback: number): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) return fallback;
+  return Math.floor(raw);
 }
 
 function normalizeChannels(raw: unknown): string[] {

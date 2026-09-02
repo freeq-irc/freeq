@@ -190,6 +190,33 @@ describe("transport state handling (the churn regression)", () => {
     bot.emit("connectionStateChanged", "disconnected");
     expect(notices.filter((n) => /dropped/.test(n.text)).length).toBe(0);
   });
+
+  it("reports coming online once per gap, not once per event", async () => {
+    // The host resumes assigned work here. bot.start() returning and the
+    // transport's own 'connected' both mean online, and a resume that ran
+    // twice for one connect would re-enter every task twice.
+    const online: number[] = [];
+    const { conn, bot } = mk({ onOnline: () => online.push(1) });
+    await conn.start();
+    bot.emit("connectionStateChanged", "connected");
+    bot.emit("connectionStateChanged", "connected");
+    expect(online).toHaveLength(1);
+
+    bot.emit("connectionStateChanged", "disconnected");
+    bot.emit("connectionStateChanged", "connected");
+    expect(online).toHaveLength(2); // a real gap closed — resume again
+  });
+
+  it("survives a throwing online handler", async () => {
+    const { conn, notices } = mk({
+      onOnline: () => {
+        throw new Error("resume exploded");
+      },
+    });
+    await expect(conn.start()).resolves.toBeUndefined();
+    expect(conn.state).toBe("online");
+    expect(notices.some((n) => /online handler error/.test(n.text))).toBe(true);
+  });
 });
 
 describe("peer discovery", () => {

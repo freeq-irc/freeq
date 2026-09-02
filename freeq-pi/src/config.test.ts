@@ -8,6 +8,10 @@ import {
   tierFor,
   tierAtLeast,
   DEFAULT_MODE,
+  DEFAULT_OFFER_TTL_SECS,
+  DEFAULT_PROGRESS_INTERVAL_SECS,
+  DEFAULT_STALL_SECS,
+  DEFAULT_MAX_RESUME,
 } from "./config.js";
 
 describe("normalizeConfig", () => {
@@ -134,5 +138,72 @@ describe("mute", () => {
 
   it("is not settable from project config", () => {
     expect(projectOverrides({ muted: true })).not.toHaveProperty("muted");
+  });
+});
+
+describe("resilience settings", () => {
+  it("defaults to accepting trusted work when idle, and to the documented timings", () => {
+    const cfg = defaultConfig();
+    expect(cfg.autoAcceptWhenIdle).toBe(true);
+    expect(cfg.offerTtlSecs).toBe(DEFAULT_OFFER_TTL_SECS);
+    expect(cfg.progressIntervalSecs).toBe(DEFAULT_PROGRESS_INTERVAL_SECS);
+    expect(cfg.stallSecs).toBe(DEFAULT_STALL_SECS);
+    expect(cfg.maxResume).toBe(DEFAULT_MAX_RESUME);
+  });
+
+  it("leaves a config written before these keys existed exactly as it was", () => {
+    // The whole point: an older freeq.json must keep working untouched.
+    const older = { ownerDid: "did:plc:me", channels: ["#a"], autoAccept: ["did:plc:mate"] };
+    const cfg = normalizeConfig(older);
+    expect(cfg.ownerDid).toBe("did:plc:me");
+    expect(cfg.autoAccept).toEqual(["did:plc:mate"]);
+    expect(cfg.stallSecs).toBe(DEFAULT_STALL_SECS);
+    expect(cfg.autoAcceptWhenIdle).toBe(true);
+  });
+
+  it("keeps explicit values", () => {
+    const cfg = normalizeConfig({
+      autoAcceptWhenIdle: false,
+      offerTtlSecs: 60,
+      progressIntervalSecs: 30,
+      stallSecs: 120,
+      maxResume: 0,
+    });
+    expect(cfg.autoAcceptWhenIdle).toBe(false);
+    expect(cfg.offerTtlSecs).toBe(60);
+    expect(cfg.progressIntervalSecs).toBe(30);
+    expect(cfg.stallSecs).toBe(120);
+    expect(cfg.maxResume).toBe(0);
+  });
+
+  it("falls back on values that would break the mechanism", () => {
+    // A zero stall timeout fails every task the moment it starts; a negative
+    // resume cap is not a smaller cap, it is nonsense.
+    const cfg = normalizeConfig({
+      offerTtlSecs: 0,
+      progressIntervalSecs: -5,
+      stallSecs: "900",
+      maxResume: -1,
+      autoAcceptWhenIdle: "yes",
+    });
+    expect(cfg.offerTtlSecs).toBe(DEFAULT_OFFER_TTL_SECS);
+    expect(cfg.progressIntervalSecs).toBe(DEFAULT_PROGRESS_INTERVAL_SECS);
+    expect(cfg.stallSecs).toBe(DEFAULT_STALL_SECS);
+    expect(cfg.maxResume).toBe(DEFAULT_MAX_RESUME);
+    expect(cfg.autoAcceptWhenIdle).toBe(true);
+  });
+
+  it("ignores unknown keys rather than failing the load", () => {
+    expect(() => normalizeConfig({ somethingFromTheFuture: 1 })).not.toThrow();
+    expect(normalizeConfig({ somethingFromTheFuture: 1 })).not.toHaveProperty(
+      "somethingFromTheFuture",
+    );
+  });
+
+  it("is not settable from project config", () => {
+    // A cloned repo must not be able to hand you a 1-second stall timeout.
+    for (const key of ["autoAcceptWhenIdle", "offerTtlSecs", "stallSecs", "maxResume"]) {
+      expect(projectOverrides({ [key]: 1 })).not.toHaveProperty(key);
+    }
   });
 });

@@ -32,13 +32,23 @@ import { deriveInstallSlug, defaultNick, isDid } from "../src/identity.js";
 import { collectSessionMeta, describeMeta } from "../src/presence.js";
 import { FreeqConnection, type InboundAsk } from "../src/connection.js";
 import { ConnectionLock } from "../src/lock.js";
+import { isTerminal } from "@freeq/bot-kit";
 import {
   HandoffStore,
+  OfferQueue,
+  WorkWatchdog,
   hashBrief,
   describeHandoff,
   isTerminalRecord,
   shortDid,
   noteVerification,
+  decideOffer,
+  sweepOfferQueue,
+  planResume,
+  fetchAssignedTasks,
+  resolveTaskRef,
+  formatAge,
+  formatDuration,
   HANDOFF_KIND,
   type HandoffRecord,
 } from "../src/handoff.js";
@@ -153,6 +163,224 @@ export default function (pi: ExtensionAPI): void {
     await store.load();
     handoffs = store;
     return store;
+  }
+
+  // ── resilience ──────────────────────────────────────────────────────────
+  //
+  // Three things a distracted agent used to get wrong: it missed an offer and
+  // never went back to it, it accepted work and then hung, and a restart had
+  // no idea what it had been doing. See src/handoff.ts for the mechanisms;
+  // this is where they are driven.
+
+  /** Offers waiting for this session to be free. Survives a restart. */
+  let offers: OfferQueue | undefined;
+  /** Clocks on work we accepted. */
+  let watchdog: WorkWatchdog | undefined;
+  /**
+   * One interval drives both. Two would have to be torn down in the same two
+   * places anyway, and a single cancel is one thing to get right rather than
+   * three.
+   */
+  let maintenanceTimer: NodeJS.Timeout | undefined;
+  const MAINTENANCE_MS = 5_000;
+  /**
+   * Armed on the transition to idle and disarmed by taking an offer, so a
+   * session that is still settling cannot be handed two tasks in ten seconds.
+   */
+  let idleAcceptArmed = true;
+  /** Tasks this session has already re-entered — resume must be idempotent. */
+  const resumed = new Set<string>();
+
+  async function ensureOffers(): Promise<OfferQueue> {
+    if (offers) return offers;
+    const q = new OfferQueue(OfferQueue.pathFor(agentDir));
+    await q.load();
+    offers = q;
+    return q;
+  }
+
+  function ensureWatchdog(cfg: FreeqConfig): WorkWatchdog {
+    watchdog ??= new WorkWatchdog({
+      progressIntervalSecs: cfg.progressIntervalSecs,
+      stallSecs: cfg.stallSecs,
+    });
+    return watchdog;
+  }
+
+  function startMaintenance(ctx: ExtensionContext, cfg: FreeqConfig): void {
+    if (maintenanceTimer) return;
+    maintenanceTimer = setInterval(() => {
+      void maintain(ctx, cfg);
+    }, MAINTENANCE_MS);
+    maintenanceTimer.unref?.();
+  }
+
+  function stopMaintenance(): void {
+    if (!maintenanceTimer) return;
+    clearInterval(maintenanceTimer);
+    maintenanceTimer = undefined;
+  }
+
+  /** One pass: drain what we can take, retire what waited too long, tick the clocks. */
+  async function maintain(ctx: ExtensionContext, cfg: FreeqConfig): Promise<void> {
+    if (!conn || conn.state !== "online") return;
+    const store = await ensureHandoffs();
+    const queue = await ensureOffers();
+
+    const idle = ctx.isIdle();
+    if (!idle) idleAcceptArmed = true;
+
+    const sweep = sweepOfferQueue({
+      entries: queue.all(),
+      lookup: (id) => store.get(id),
+      trusted: (did) => tierAtLeast(tierFor(cfg, did), "handoff"),
+      idle: idle && idleAcceptArmed,
+      now: Date.now(),
+      ttlSecs: cfg.offerTtlSecs,
+    });
+
+    for (const entry of sweep.drop) queue.remove(entry.taskId);
+    for (const { entry, record, reason } of sweep.expire) {
+      queue.remove(entry.taskId);
+      await declineOffer(ctx, record, reason);
+    }
+    if (sweep.accept) {
+      idleAcceptArmed = false;
+      queue.remove(sweep.accept.entry.taskId);
+      await acceptOffer(ctx, cfg, sweep.accept.record, sweep.accept.record.lastActor ?? "freeq");
+    }
+    await queue.save();
+
+    for (const action of ensureWatchdog(cfg).tick()) {
+      if (action.kind === "progress") {
+        await conn.sendAct(action.task.channel, "progress", action.task.taskId, {
+          note: action.note,
+        });
+        continue;
+      }
+      await conn.sendAct(action.task.channel, "fail", action.task.taskId, {
+        note: action.reason,
+      });
+      if (workTask === action.task.taskId) {
+        workLabel = undefined;
+        workTask = undefined;
+        pushStatus("active", undefined, undefined, true);
+      }
+      notify(
+        ctx,
+        `freeq: gave up on ${action.task.taskId.slice(0, 10)} — ${action.reason}. ` +
+          `The offerer has been told.`,
+        "warning",
+      );
+    }
+  }
+
+  /** Accept an offer and start the work. The one place either happens. */
+  async function acceptOffer(
+    ctx: ExtensionContext,
+    cfg: FreeqConfig,
+    rec: HandoffRecord,
+    fromNick: string,
+  ): Promise<void> {
+    const sent = await conn?.sendAct(rec.channel, "accept", rec.id, {});
+    if (!sent) {
+      // Put it back: an accept we could not send is not an acceptance, and
+      // the next sweep will try again or let the TTL retire it.
+      notify(ctx, `freeq: could not accept ${rec.id.slice(0, 10)} — will retry`, "warning");
+      const queue = await ensureOffers();
+      queue.add(rec.id);
+      await queue.save();
+      return;
+    }
+    notify(ctx, `freeq: accepted handoff ${rec.id.slice(0, 10)} — ${rec.title}`, "info");
+    startAssignedWork(ctx, cfg, rec, fromNick);
+  }
+
+  /** Decline an offer, always with a reason — silence teaches an offerer nothing. */
+  async function declineOffer(
+    ctx: ExtensionContext,
+    rec: HandoffRecord,
+    reason: string,
+  ): Promise<void> {
+    await conn?.sendAct(rec.channel, "decline", rec.id, { note: reason });
+    notify(ctx, `freeq: declined ${rec.id.slice(0, 10)} — ${reason}`, "info");
+  }
+
+  /**
+   * Ask the server what is still assigned to us, and take it back up.
+   *
+   * Called on every connect, including a reconnect after a dropped socket:
+   * the gap is exactly when work goes quiet without anybody deciding it
+   * should. `resumed` makes a second pass a no-op rather than a second start.
+   */
+  async function resumeAssigned(
+    ctx: ExtensionContext,
+    cfg: FreeqConfig,
+    only?: string,
+  ): Promise<string> {
+    const me = conn?.did;
+    if (!conn || conn.state !== "online" || !me) return "freeq: offline — cannot ask the server";
+
+    const answer = await fetchAssignedTasks({ origin: httpOriginFor(cfg.server), did: me });
+    if (!answer.ok) {
+      // An outage is not "nothing to resume", and reporting it that way is how
+      // a session quietly abandons work it still holds.
+      return `freeq: could not ask the server what is still yours — ${answer.reason}`;
+    }
+
+    const store = await ensureHandoffs();
+    // Work already in flight here is not work to resume. A reconnect on a
+    // flapping link would otherwise inject the same task's brief again on
+    // every recovery.
+    const running = new Set([...resumed, ...(watchdog?.inFlight().map((t) => t.taskId) ?? [])]);
+    const plan = planResume({
+      serverTasks: answer.tasks,
+      known: store.all(),
+      me,
+      // Filter to a named task AFTER planning, so the cap cannot decide the
+      // oldest task is the one you asked for.
+      max: only ? answer.tasks.length : cfg.maxResume,
+      already: running,
+    });
+
+    const wanted = only
+      ? plan.resume.filter((r) => r.id === only || r.id.startsWith(only))
+      : plan.resume;
+    if (only && !wanted.length) {
+      return running.has(only) || [...running].some((id) => id.startsWith(only))
+        ? `freeq: ${only} is already in flight here`
+        : `freeq: the server does not list ${only} as assigned to you`;
+    }
+
+    const lines: string[] = [];
+    for (const rec of wanted) {
+      resumed.add(rec.id);
+      if (!store.get(rec.id)) store.put(rec);
+      lines.push(`freeq: resuming ${rec.id.slice(0, 10)} — ${rec.title}`);
+      notify(ctx, `freeq: resuming ${rec.id.slice(0, 10)} — ${rec.title}`, "info");
+      // Say so on the wire too: the offerer watched this go quiet, and a
+      // progress note is how they learn it did not stay that way.
+      await conn.sendAct(rec.channel, "progress", rec.id, {
+        note: "resumed after the assignee's session restarted",
+      });
+      startAssignedWork(ctx, cfg, rec, rec.lastActor ?? "freeq");
+    }
+    await store.save();
+
+    if (!only && plan.skipped > 0) {
+      lines.push(
+        `freeq: ${plan.skipped} more still assigned to you, not started ` +
+          `(cap is maxResume=${cfg.maxResume}) — /freeq resume <id> to take one`,
+      );
+    }
+    for (const rec of plan.stale) {
+      lines.push(
+        `freeq: ${rec.id.slice(0, 10)} is not in the server's list of your assigned work ` +
+          `— not resuming it`,
+      );
+    }
+    if (!lines.length) return "freeq: nothing to resume";
+    return lines.join("\n");
   }
 
   const notify = (
@@ -386,6 +614,16 @@ export default function (pi: ExtensionAPI): void {
         })();
       },
 
+      // Every connect, including a reconnect after a dropped socket — the gap
+      // is exactly when accepted work goes quiet without anybody deciding it
+      // should.
+      onOnline: () => {
+        void (async () => {
+          const message = await resumeAssigned(ctx, cfg);
+          if (message !== "freeq: nothing to resume") notify(ctx, message, "info");
+        })();
+      },
+
       onAsk: (ask) => {
         deliver(
           ctx,
@@ -408,6 +646,7 @@ export default function (pi: ExtensionAPI): void {
     });
 
     await conn.start();
+    startMaintenance(ctx, cfg);
     return `freeq: ${conn.describe()}`;
   }
 
@@ -423,6 +662,7 @@ export default function (pi: ExtensionAPI): void {
     // server replays channel history on join, so offers made overnight land
     // as replayed act events; anything still open is reported once here.
     const store = await ensureHandoffs();
+    await ensureOffers();
     setTimeout(() => {
       const me = conn?.did;
       const waiting = store.inboxFor(me);
@@ -431,7 +671,7 @@ export default function (pi: ExtensionAPI): void {
           ctx,
           `freeq: ${waiting.length} handoff(s) waiting for you:\n` +
             waiting.map((r) => `  ${describeHandoff(r, me)}`).join("\n") +
-            `\nUse the freeq tool (action 'handoffs') to review.`,
+            `\n/freeq tasks to review, /freeq accept <id> to take one.`,
           "warning",
         );
       }
@@ -439,6 +679,18 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
+    stopMaintenance();
+    // Say why the work stopped rather than letting it simply go quiet. NOT a
+    // failure: a restart may pick it straight back up (see resumeAssigned),
+    // and a false failure in a signed, permanent log is worse than a gap.
+    for (const action of watchdog?.shutdown() ?? []) {
+      if (action.kind !== "progress") continue;
+      await conn?.sendAct(action.task.channel, "progress", action.task.taskId, {
+        note: action.note,
+      });
+    }
+    await offers?.save();
+    await handoffs?.save();
     await conn?.stop("pi session ended");
     conn = undefined;
     if (lockTimer) {
@@ -451,13 +703,19 @@ export default function (pi: ExtensionAPI): void {
   });
 
   // Report "working" for the whole run, and go quiet again when it settles.
+  // A run also counts as life, which is what the stall timeout measures.
   pi.on("agent_start", async () => {
+    watchdog?.touch();
     pushStatus("executing", workLabel ?? "working", workTask, true);
   });
 
   // Name the current tool so a watcher sees movement, not just a spinner,
   // and note anything that counts as a consequence for the log.
   pi.on("tool_call", async (event) => {
+    // A tool call is the model doing something, which is exactly what the
+    // stall timer needs to hear about — otherwise long, quiet work looks
+    // stalled and gets failed out from under itself.
+    watchdog?.touch();
     const e = event as { toolName?: string; input?: Record<string, unknown> };
     if (!e.toolName) return;
     pushStatus("executing", workLabel ? `${workLabel} · ${e.toolName}` : e.toolName, workTask);
@@ -534,8 +792,9 @@ export default function (pi: ExtensionAPI): void {
    * What a pi session does when a handoff moves.
    *
    * The only branch with teeth is an inbound offer: accepting it means
-   * agreeing to do someone else's work, so it is HUMAN-GATED by default.
-   * Auto-accept must be opted into per-DID.
+   * agreeing to do someone else's work. The gate is the offerer's tier plus
+   * the owner's idle policy — never a modal, because a modal is what loses
+   * work when nobody is at the terminal.
    */
   async function onHandoffEvent(
     ctx: ExtensionContext,
@@ -546,10 +805,26 @@ export default function (pi: ExtensionAPI): void {
   ): Promise<void> {
     const me = conn?.did;
 
+    // Work of ours that ended, however it ended. Stop the clocks before
+    // anything else, so a completed task can never be failed for stalling.
+    if (rec.assignee === me && isTerminal(rec.kind, rec.state)) {
+      if (watchdog?.finish(rec.id) && workTask === rec.id) {
+        workLabel = undefined;
+        workTask = undefined;
+        pushStatus("active", undefined, undefined, true);
+      }
+      resumed.delete(rec.id);
+    }
+    // An offer we were holding has been answered by someone, somewhere.
+    if (!created && offers?.has(rec.id) && rec.state !== "offered") {
+      offers.remove(rec.id);
+      await offers.save();
+    }
+
     // We just became the assignee — by claiming an open task, or by our own
     // accept echoing back. Either way the work is now ours, so start it.
-    // (An accept we initiated via the confirm dialog already injected; guard
-    // on the verb so we do not do it twice.)
+    // (An accept we initiated already injected; guard on the verb so we do
+    // not do it twice.)
     if (!created && ev.verb === "claim" && rec.assignee === me) {
       startAssignedWork(ctx, cfg, rec, ev.from);
       return;
@@ -600,52 +875,56 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
-    const tier = tierFor(cfg, rec.offerer);
-    if (!tierAtLeast(tier, "handoff")) {
-      // Below handoff tier we do not even prompt — an unknown DID must not be
-      // able to raise a dialog in your terminal, let alone queue you work.
+    const decision = decideOffer({
+      tier: tierFor(cfg, rec.offerer),
+      idle: ctx.isIdle(),
+      autoAcceptDid: !!cfg.autoAccept?.includes(rec.offerer),
+      autoAcceptWhenIdle: cfg.autoAcceptWhenIdle,
+    });
+
+    if (decision.action === "ignore") {
+      // An unknown DID must not be able to raise a dialog in your terminal,
+      // queue you work, or cost you a notification you have to read.
       notify(
         ctx,
-        `freeq: ignoring handoff from ${rec.offerer} (tier '${tier}', needs 'handoff'). ` +
-          `/freeq handoffs to review, /freeq trust <did> handoff to allow.`,
+        `freeq: ignoring handoff from ${rec.offerer} — ${decision.reason}. ` +
+          `/freeq tasks to review, /freeq trust <did> handoff to allow.`,
         "warning",
       );
       return;
     }
 
-    const age = rec.fromReplay || ev.replayed ? " (offered while you were offline)" : "";
-    const auto = cfg.autoAccept?.includes(rec.offerer);
-
-    if (!auto) {
-      // Blocked on a human decision — say so, rather than looking idle or busy.
-      pushStatus("waiting_for_input", `handoff offer: ${rec.title}`.slice(0, 80), rec.id, true);
-      const ok = await ctx.ui.confirm(
-        "freeq: incoming handoff",
-        `${rec.title}${age}\n\n` +
-          `from:     ${rec.offerer}\n` +
-          `task:     ${rec.id}\n` +
-          `context:  ${rec.ctxHash ?? "(none)"}\n` +
-          `deadline: ${rec.deadline ? new Date(rec.deadline * 1000).toISOString() : "(none)"}\n\n` +
-          `Accepting means this session takes on the work.`,
-      );
-      if (!ok) {
-        await conn?.sendAct(rec.channel, "decline", rec.id, {}, undefined);
-        notify(ctx, `freeq: declined handoff ${rec.id.slice(0, 10)}`, "info");
-        return;
-      }
+    if (decision.action === "accept") {
+      await acceptOffer(ctx, cfg, rec, ev.from);
+      return;
     }
 
-    await conn?.sendAct(rec.channel, "accept", rec.id, {}, undefined);
-    notify(ctx, `freeq: accepted handoff ${rec.id.slice(0, 10)} — ${rec.title}`, "info");
-    startAssignedWork(ctx, cfg, rec, ev.from);
+    // Queued. Notify ONCE, naming the id and how to act on it — a queue
+    // nobody is told about is just a slower way of dropping the offer.
+    const queue = await ensureOffers();
+    const fresh = !queue.has(rec.id);
+    queue.add(rec.id);
+    await queue.save();
+    if (!fresh) return;
+
+    const age = rec.fromReplay || ev.replayed ? " (offered while you were offline)" : "";
+    notify(
+      ctx,
+      `freeq: handoff ${rec.id.slice(0, 10)} from ${rec.offerer} — ${rec.title}${age}\n` +
+        `  ${decision.reason}; it will be taken when this session is free, or ` +
+        `declined after ${formatDuration(cfg.offerTtlSecs)}.\n` +
+        `  /freeq accept ${rec.id.slice(0, 10)} · /freeq decline ${rec.id.slice(0, 10)}`,
+      "info",
+    );
   }
 
   /**
    * Begin work that is now assigned to this session.
    *
-   * Shared by the directed path (offer → confirm → accept) and the open path
-   * (post → claim), so both report presence identically and both enter the
-   * model through the same tier-gated pipeline.
+   * Shared by the directed path (offer → accept), the open path
+   * (post → claim), and a resume after a restart, so all three report
+   * presence identically, arm the same clocks, and enter the model through
+   * the same tier-gated pipeline. There is one way to start work, not three.
    */
   function startAssignedWork(
     ctx: ExtensionContext,
@@ -657,6 +936,11 @@ export default function (pi: ExtensionAPI): void {
     workLabel = `handoff: ${rec.title}`.slice(0, 80);
     workTask = rec.id;
     pushStatus("executing", workLabel, workTask, true);
+
+    // Start the clocks. Nothing tracked the work past this point before, so a
+    // model that wandered off left the task assigned until the server's
+    // expiry sweep noticed, days later.
+    ensureWatchdog(cfg).start({ taskId: rec.id, channel: rec.channel, title: rec.title });
 
     deliver(ctx, {
       kind: "chat",
@@ -1368,6 +1652,187 @@ export default function (pi: ExtensionAPI): void {
           return;
         }
 
+        case "tasks": {
+          const store = await ensureHandoffs();
+          const queue = await ensureOffers();
+          const me = conn?.did;
+          const now = Date.now();
+          const age = (r: HandoffRecord) => formatAge(now - r.updatedAt);
+
+          const mine = store
+            .all()
+            .filter((r) => r.assignee === me && !isTerminal(r.kind, r.state));
+          const queued = queue
+            .all()
+            .flatMap((e) => {
+              const rec = store.get(e.taskId);
+              return rec ? [{ rec, queuedAt: e.queuedAt }] : [];
+            });
+          const queuedIds = new Set(queued.map((q) => q.rec.id));
+          const waiting = store
+            .all()
+            .filter(
+              (r) => r.state === "offered" && r.offeree === me && !queuedIds.has(r.id),
+            );
+          const nearby = store.all().filter((r) => r.state === "open" && r.offerer !== me);
+
+          const sections = [
+            mine.length
+              ? `Assigned to you:\n` +
+                mine
+                  .map(
+                    (r) =>
+                      `  ${describeHandoff(r, me)}  ${age(r)}` +
+                      (watchdog?.has(r.id) ? "  [in flight]" : "  [not being worked on]"),
+                  )
+                  .join("\n")
+              : "",
+            queued.length
+              ? `Queued for when this session is free:\n` +
+                queued
+                  .map(
+                    (q) =>
+                      `  ${describeHandoff(q.rec, me)}  queued ${formatAge(now - q.queuedAt)}`,
+                  )
+                  .join("\n")
+              : "",
+            waiting.length
+              ? `Offered to you:\n` +
+                waiting.map((r) => `  ${describeHandoff(r, me)}  ${age(r)}`).join("\n")
+              : "",
+            nearby.length
+              ? `Open nearby (anyone may claim):\n` +
+                nearby
+                  .map(
+                    (r) =>
+                      `  ${describeHandoff(r, me)}  ${age(r)}` +
+                      (r.caps ? `  caps: ${r.caps}` : ""),
+                  )
+                  .join("\n")
+              : "",
+          ].filter(Boolean);
+
+          ctx.ui.notify(
+            sections.length
+              ? sections.join("\n\n")
+              : "freeq: nothing assigned, queued, offered, or open nearby",
+            "info",
+          );
+          return;
+        }
+
+        case "resume": {
+          ctx.ui.notify(await resumeAssigned(ctx, cfg, rest[0]), "info");
+          return;
+        }
+
+        case "accept":
+        case "decline": {
+          if (!rest[0]) {
+            ctx.ui.notify(
+              `usage: /freeq ${sub} <id>${sub === "decline" ? " [reason]" : ""}`,
+              "warning",
+            );
+            return;
+          }
+          const store = await ensureHandoffs();
+          const found = resolveTaskRef(store.all(), rest[0]);
+          if (!found.ok) {
+            ctx.ui.notify(`freeq: ${found.reason}`, "warning");
+            return;
+          }
+          const rec = found.record;
+          if (rec.state !== "offered") {
+            ctx.ui.notify(
+              `freeq: ${rec.id.slice(0, 10)} is '${rec.state}', not an open offer`,
+              "warning",
+            );
+            return;
+          }
+          const queue = await ensureOffers();
+          queue.remove(rec.id);
+          await queue.save();
+          // No tier check on either: the owner typed this, and the trust map
+          // exists to decide what happens WITHOUT them, not to overrule them.
+          if (sub === "accept") {
+            await acceptOffer(ctx, cfg, rec, rec.lastActor ?? "freeq");
+          } else {
+            await declineOffer(ctx, rec, rest.slice(1).join(" ") || "declined by the operator");
+          }
+          return;
+        }
+
+        case "drop": {
+          if (!rest[0]) {
+            ctx.ui.notify("usage: /freeq drop <id> [reason]", "warning");
+            return;
+          }
+          const store = await ensureHandoffs();
+          const found = resolveTaskRef(store.all(), rest[0]);
+          if (!found.ok) {
+            ctx.ui.notify(`freeq: ${found.reason}`, "warning");
+            return;
+          }
+          const rec = found.record;
+          if (rec.assignee !== conn?.did || rec.state !== "assigned") {
+            ctx.ui.notify(
+              `freeq: ${rec.id.slice(0, 10)} is not work in flight here ` +
+                `(state '${rec.state}') — nothing to drop`,
+              "warning",
+            );
+            return;
+          }
+          const reason = rest.slice(1).join(" ") || "dropped by the operator";
+          watchdog?.finish(rec.id);
+          resumed.delete(rec.id);
+          const ok = await conn?.sendAct(rec.channel, "fail", rec.id, { note: reason });
+          if (workTask === rec.id) {
+            workLabel = undefined;
+            workTask = undefined;
+            pushStatus("active", undefined, undefined, true);
+          }
+          ctx.ui.notify(
+            ok
+              ? `freeq: dropped ${rec.id.slice(0, 10)} — ${reason}. The offerer has been told.`
+              : `freeq: could not send the failure for ${rec.id.slice(0, 10)}`,
+            ok ? "info" : "warning",
+          );
+          return;
+        }
+
+        case "progress": {
+          const note = rest.slice(1).join(" ");
+          if (!rest[0] || !note) {
+            ctx.ui.notify("usage: /freeq progress <id> <note>", "warning");
+            return;
+          }
+          const store = await ensureHandoffs();
+          const found = resolveTaskRef(store.all(), rest[0]);
+          if (!found.ok) {
+            ctx.ui.notify(`freeq: ${found.reason}`, "warning");
+            return;
+          }
+          const rec = found.record;
+          if (rec.assignee !== conn?.did || rec.state !== "assigned") {
+            ctx.ui.notify(
+              `freeq: only the assignee of work in flight can report progress on it ` +
+                `(${rec.id.slice(0, 10)} is '${rec.state}')`,
+              "warning",
+            );
+            return;
+          }
+          // A manual heartbeat is also a sign of life: it resets the stall clock.
+          watchdog?.touch(Date.now(), rec.id);
+          const ok = await conn?.sendAct(rec.channel, "progress", rec.id, { note });
+          ctx.ui.notify(
+            ok
+              ? `freeq: reported progress on ${rec.id.slice(0, 10)}`
+              : `freeq: could not send the progress note`,
+            ok ? "info" : "warning",
+          );
+          return;
+        }
+
         case "peers": {
           const peers = conn?.peers() ?? [];
           if (!peers.length) {
@@ -1429,10 +1894,22 @@ export default function (pi: ExtensionAPI): void {
 
         default:
           ctx.ui.notify(
-            "/freeq [status | login <did> | join #c | leave #c | peers | " +
-              "handoffs | mode #c <silent|addressed|participant> | " +
-              "trust <did> <tier> | provenance <tier> | mute | unmute | " +
-              "takeover | on | off]",
+            [
+              "/freeq [status | login <did> | join #c | leave #c | peers |",
+              "        handoffs | mode #c <silent|addressed|participant> |",
+              "        trust <did> <tier> | provenance <tier> | mute | unmute |",
+              "        takeover | on | off]",
+              "",
+              "work:",
+              "  tasks                    what is assigned, queued, offered, or open nearby",
+              "  resume [id]              re-enter assigned work (all of it, capped, if no id)",
+              "  accept <id>              take a queued or offered task now",
+              "  decline <id> [reason]    turn one down, with a reason",
+              "  drop <id> [reason]       fail work in flight honestly instead of leaving it hanging",
+              "  progress <id> <note>     report progress by hand",
+              "",
+              "Ids may be the short prefix the notifications print.",
+            ].join("\n"),
             "info",
           );
       }

@@ -125,6 +125,14 @@ export interface ConnectionOptions {
   onAsk?: (ask: InboundAsk) => void;
   /** A `freeq.at/act` task event (handoffs). */
   onActEvent?: (ev: ActEventPayload) => void;
+  /**
+   * We are online, on the first connect and after every reconnect.
+   *
+   * The transport recovers a dropped socket on its own, so nothing above here
+   * otherwise learns that a gap happened — and a session that was cut off
+   * mid-task needs to ask the server what is still assigned to it.
+   */
+  onOnline?: () => void;
 }
 
 export interface InboundAsk {
@@ -279,7 +287,7 @@ export class FreeqConnection {
       // ghost-mode churn and re-registration, and peers saw a hello storm.
       bot.on("connectionStateChanged", (s: string) => {
         if (s === "connected") {
-          this.#state = "online";
+          this.#goOnline();
           this.#noticed.delete("offline");
         } else if (s === "connecting") {
           if (this.#state === "online") this.#state = "connecting";
@@ -299,7 +307,7 @@ export class FreeqConnection {
       });
 
       await bot.start();
-      this.#state = "online";
+      this.#goOnline();
       this.#retry = RECONNECT_INITIAL_MS;
     } catch (err) {
       // Only the INITIAL connect is retried here. Once a bot exists, the
@@ -315,6 +323,25 @@ export class FreeqConnection {
       this.#scheduleInitialRetry();
     } finally {
       this.#starting = false;
+    }
+  }
+
+  /**
+   * Become online, telling the host once per gap.
+   *
+   * Both `bot.start()` returning and the transport's own 'connected' event
+   * land here, and a reconnect fires the second one again — so the transition
+   * is what is reported, not the event. A handler that resumes work would
+   * otherwise run twice for one connect.
+   */
+  #goOnline(): void {
+    const wasOnline = this.#state === "online";
+    this.#state = "online";
+    if (wasOnline) return;
+    try {
+      this.#opts.onOnline?.();
+    } catch (err) {
+      this.#opts.onNotice?.(`freeq: online handler error: ${(err as Error).message}`, "error");
     }
   }
 

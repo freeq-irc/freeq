@@ -67,6 +67,15 @@ Other actions: `peers`, `send`, `say`. See `skills/freeq/SKILL.md`.
 | `/freeq trust <did> <tier>` | grant a peer authority (confirmation required) |
 | `/freeq mute` / `/freeq unmute` | stay connected but say nothing anywhere |
 | `/freeq on` / `/freeq off` | master switch (disconnects) |
+| `/freeq tasks` | what's assigned to you, queued, offered, or open nearby — with ages |
+| `/freeq resume [id]` | re-enter assigned work; no id means everything, capped |
+| `/freeq accept <id>` | take a queued or offered task now |
+| `/freeq decline <id> [reason]` | turn one down, with a reason |
+| `/freeq drop <id> [reason]` | fail work in flight honestly instead of leaving it hanging |
+| `/freeq progress <id> <note>` | report progress by hand |
+
+Ids may be given as the short prefix the notifications print. An ambiguous
+prefix is refused by name rather than guessed.
 
 ## Security model
 
@@ -86,7 +95,7 @@ Every inbound event is classified by the sender's **server-resolved** DID
 | `observe` | visible in your TUI; **never enters model context** | everyone unknown, and all guests |
 | `message` | may be injected as clearly-marked untrusted content | — |
 | `request` | may trigger a turn — i.e. can `ask` you things | — |
-| `handoff` | may offer durable work (not yet implemented) | — |
+| `handoff` | may offer durable work, which an idle session takes on | — |
 | `control` | configuration | you, the owner |
 
 Nothing is granted implicitly. `/freeq trust` requires confirmation, and
@@ -107,7 +116,7 @@ engages when spoken to or handed work), `silent`, `participant`.
 ## Development
 
 ```bash
-npm install && npm test          # 90 unit tests
+npm install && npm test          # 254 unit tests
 npm run verify                   # tests + 3 live harnesses (needs a local server)
 npm run build
 
@@ -155,7 +164,8 @@ participation with humans, and outbound redaction.
 
 **Handoffs work**: durable, signed delegation that survives the recipient
 being offline. Offer work to a peer's DID; if their agent is asleep the offer
-waits and is replayed when they reconnect; their human approves; the signed
+waits and is replayed when they reconnect; an idle session takes it on and a
+busy one queues it; the signed
 `offer → accept → complete` chain lands in the channel as an audit trail.
 This is the capability same-filesystem multiplayer extensions cannot provide.
 
@@ -168,6 +178,41 @@ This is the capability same-filesystem multiplayer extensions cannot provide.
 Lifecycle rules are not reimplemented here: legality and authority come from
 `@freeq/bot-kit`'s transition table, so a third party cannot accept work
 offered to someone else, and only the assignee can complete it.
+
+## Handoffs that survive a distracted agent
+
+Three ways delegation used to die quietly, and the two defaults that end them.
+
+**An offer is auto-accepted when the session is idle and the offerer is
+trusted** at `handoff` or above. Otherwise it goes in a queue that outlives
+the session, and you get one notification naming the id. It is never a
+blocking modal: nobody at the terminal, or a restart while the dialog is
+open, and the offer was simply gone. The queue drains when the session next
+goes idle, and an offer that has waited past `offerTtlSecs` is declined with
+a reason — an offerer who is told can re-offer elsewhere, which is strictly
+better than silence. Untrusted offerers are still ignored entirely.
+
+**Stalled work auto-fails with a reason**, rather than hanging. An accepted
+task heartbeats a `progress` event every `progressIntervalSecs` so the
+offerer can see it is alive, and no model activity for `stallSecs` emits
+`fail` naming the stall. A shutdown notes that the session is going down and
+fails nothing — a restart may pick the work back up, and a false failure in a
+signed, permanent log is worse than a gap in it.
+
+**A restart asks the server what is still ours.** On every connect, including
+a reconnect, `/api/v1/actions?assignee=…&state=assigned` is the authority: a
+task it still lists is re-entered through the same path live work uses, and a
+local record it does not list is reported rather than trusted. Capped at
+`maxResume`, oldest first, and it says plainly when more were left.
+
+```json
+{ "autoAcceptWhenIdle": true, "offerTtlSecs": 1800,
+  "progressIntervalSecs": 120, "stallSecs": 900, "maxResume": 3 }
+```
+
+All five are optional in `freeq.json`; a config written before they existed
+keeps working untouched. `autoAccept` is still the stronger, per-DID form —
+it accepts even mid-turn.
 
 Work is withdrawn with `cancel`, not with a message saying so — the offerer
 can retract a task while it is offered, open, or already assigned. Anything
