@@ -151,7 +151,14 @@ expect_json  /.well-known/agent-card.json   freeq
 expect_json  /.well-known/api-catalog       openapi.json
 expect_json  /.well-known/mcp/server-card.json freeq
 
-expect_jsonld / Organization SoftwareApplication WebSite
+# The two hosts describe themselves differently on purpose: freeq.at is the
+# site (WebSite), irc.freeq.at is the running client (WebApplication). Both
+# carry Organization + SoftwareApplication and cross-link via sameAs.
+if [ "$KIND" = "server" ]; then
+  expect_jsonld / Organization SoftwareApplication WebApplication
+else
+  expect_jsonld / Organization SoftwareApplication WebSite
+fi
 expect_text  / text/html '<link rel="canonical"'
 expect_text  / text/html 'og:type'
 expect_header / 'link:.*rel='
