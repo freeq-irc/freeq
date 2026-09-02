@@ -2588,6 +2588,7 @@ async fn api_user(
 async fn api_user_whois(
     Path(nick): Path<String>,
     State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<WhoisResponse>, StatusCode> {
     let session = state
         .nick_to_session
@@ -2609,11 +2610,29 @@ async fn api_user_whois(
         return Err(StatusCode::NOT_FOUND);
     }
 
+    // Every session the caller holds, resolved before taking `channels` (never
+    // hold both locks at once). Anonymous callers get an empty set, so they see
+    // only the channels the unauthenticated channel list would already name.
+    let caller_sessions: Vec<String> = match caller_did_from_bearer(&state, &headers) {
+        Some(did) => {
+            let session_dids = state.session_dids.lock();
+            session_dids
+                .iter()
+                .filter(|(_, d)| *d == &did)
+                .map(|(s, _)| s.clone())
+                .collect()
+        }
+        None => Vec::new(),
+    };
+
     let channels = if let Some(ref session_id) = session {
         let chans = state.channels.lock();
         chans
             .iter()
-            .filter(|(_, ch)| ch.members.contains(session_id))
+            .filter(|(name, ch)| {
+                ch.members.contains(session_id)
+                    && state.channel_visible_to_sessions(name, ch, &caller_sessions)
+            })
             .map(|(name, _)| name.clone())
             .collect()
     } else {
