@@ -17,6 +17,7 @@ pub mod events;
 pub mod irc;
 pub mod iroh;
 pub mod manifest;
+pub mod media_space;
 pub mod media_store;
 pub mod migrations;
 pub mod model_proxy;

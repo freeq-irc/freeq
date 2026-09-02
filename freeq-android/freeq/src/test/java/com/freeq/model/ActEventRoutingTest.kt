@@ -104,7 +104,7 @@ class ActEventRoutingTest {
                 bufferHoldingTask = poster, hasBuffer = { false }),
         )
         assertEquals(
-            "confirmed: \"tidy the DM inbox\" — cancel by actdmcards",
+            "✔️ confirmed: \"tidy the DM inbox\" — cancel by actdmcards",
             store.record(
                 ActEventInput(
                     from = "irc.example", did = server, kind = "handoff", verb = "confirm",

@@ -688,8 +688,8 @@ export class FreeqClient extends EventEmitter {
   // ── Channel management ──
 
   /** Join a channel. */
-  join(channel: string): void {
-    this.raw(`JOIN ${channel}`);
+  join(channel: string, key?: string): void {
+    this.raw(key ? `JOIN ${channel} ${key}` : `JOIN ${channel}`);
   }
 
   /** Leave a channel. */
@@ -2949,14 +2949,17 @@ export class FreeqClient extends EventEmitter {
       }
       case '671': {
         const whoisNick = msg.params[1] || '';
-        const handle = msg.params[2]?.trim();
-        this.emit('whois', whoisNick, { handle });
+        const info = msg.params[2]?.trim() ?? '';
         const lc = whoisNick.toLowerCase();
-        const buf = this._whoisBuffer.get(lc) ?? { nick: whoisNick, fetchedAt: 0 };
-        buf.handle = handle;
-        this._whoisBuffer.set(lc, buf);
+        const handle = info.match(/^AT Protocol handle:\s*(\S+)$/)?.[1];
+        if (handle) {
+          this.emit('whois', whoisNick, { handle });
+          const buf = this._whoisBuffer.get(lc) ?? { nick: whoisNick, fetchedAt: 0 };
+          buf.handle = handle;
+          this._whoisBuffer.set(lc, buf);
+        }
         if (!this.backgroundWhois.has(lc)) {
-          this.emit('systemMessage', 'server', `  Handle: ${handle}`);
+          this.emit('systemMessage', 'server', `  ${info}`);
         }
         break;
       }

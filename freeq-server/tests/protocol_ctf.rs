@@ -313,6 +313,7 @@ async fn ctf_21_plus_e_channel_rejects_plaintext_with_encrypted_tag() {
                 encrypted_only: true,
                 key: None,
                 pins: vec![],
+                media_space_key: None,
             },
         );
     }

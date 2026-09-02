@@ -46,6 +46,12 @@ enum Theme {
     static let surface = dynamic(
         light: .white,
         dark: rgb(0.165, 0.165, 0.175))
+    /// The tinted strip across a card's header. Ink-based in light because
+    /// `surface` is pure white there and vanished on a white card; the dark
+    /// value is `surface` at half opacity, flattened, so dark is unchanged.
+    static let cardHeaderStrip = dynamic(
+        light: rgb(0, 0, 0, 0.05),
+        dark: rgb(0.165, 0.165, 0.175, 0.5))
     static let surfaceSoft = dynamic(
         light: rgb(0.982, 0.980, 0.966),
         dark: rgb(0.188, 0.188, 0.198))

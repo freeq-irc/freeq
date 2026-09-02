@@ -2,11 +2,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // The helper reads the bearer off the singleton SDK client, so stub that module.
 const mockClient: { apiBearer: string | null } = { apiBearer: null };
+let currentClient: typeof mockClient | null = mockClient;
 vi.mock('../irc/client', () => ({
-  getClient: () => mockClient,
+  getClient: () => currentClient,
 }));
 
-import { authHeaders, apiFetch } from './api';
+import { authHeaders, apiFetch, bearerPending, hasBearer, waitForBearer } from './api';
 
 describe('authHeaders', () => {
   beforeEach(() => {
@@ -63,5 +64,46 @@ describe('apiFetch', () => {
       .mock.calls[0];
     expect(init.method).toBe('PUT');
     expect(init.body).toBe('{"favorites":[]}');
+  });
+});
+
+describe('bearer readiness', () => {
+  beforeEach(() => {
+    currentClient = mockClient;
+    mockClient.apiBearer = null;
+  });
+  afterEach(() => {
+    currentClient = mockClient;
+  });
+
+  it('reports a bearer only once it has actually arrived', () => {
+    expect(hasBearer()).toBe(false);
+    mockClient.apiBearer = 'sess-abc';
+    expect(hasBearer()).toBe(true);
+  });
+
+  // The window between `registered` and the API-BEARER notice. A caller that
+  // 403s here should wait rather than report a member as a stranger.
+  it('treats a connected client with no bearer yet as still pending', () => {
+    expect(bearerPending()).toBe(true);
+    mockClient.apiBearer = 'sess-abc';
+    expect(bearerPending()).toBe(false);
+  });
+
+  // A logged-out reader has no client at all; there is nothing coming, so
+  // waiting would be pure delay in front of an answer we already have.
+  it('is not pending when there is no connection at all', () => {
+    currentClient = null;
+    expect(bearerPending()).toBe(false);
+    expect(hasBearer()).toBe(false);
+  });
+
+  it('resolves as soon as the bearer lands', async () => {
+    setTimeout(() => { mockClient.apiBearer = 'sess-late'; }, 250);
+    expect(await waitForBearer(3000)).toBe('sess-late');
+  });
+
+  it('gives up rather than waiting forever for a bearer that never comes', async () => {
+    expect(await waitForBearer(300)).toBeNull();
   });
 });

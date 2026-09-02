@@ -6,7 +6,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { render, cleanup } from '@testing-library/react';
 import { ActEventCard, cardNeighbours } from './ActCards';
-import { actHeadline } from '../lib/act-verbs';
+import { actHeadline, actEmoji, actAccent } from '../lib/act-verbs';
 import type { Message, ActTask, ActEvent } from '../store';
 
 afterEach(cleanup);
@@ -78,6 +78,90 @@ describe('the headline word', () => {
   });
 });
 
+const GLYPHS: Array<[string, string]> = [
+  ['offer', '📋'],
+  ['accept', '👍'],
+  ['decline', '👎'],
+  ['claim', '✋'],
+  ['progress', '📌'],
+  ['complete', '🎉'],
+  ['fail', '❌'],
+  ['cancel', '🚫'],
+  ['bid', '💰'],
+  ['award', '🏆'],
+  ['submit', '📤'],
+  ['revise', '🔁'],
+  ['accept-work', '✅'],
+  ['forfeit', '🏳️'],
+];
+
+describe('the headline glyph', () => {
+  it.each(GLYPHS)('a %s shows %s', (verb, glyph) => {
+    expect(actEmoji(verb)).toBe(glyph);
+  });
+
+  // Same discipline as the word table: a kind may add a move without this
+  // having to be taught it.
+  it('pins a verb it has not been taught', () => {
+    expect(actEmoji('withdraw-bid')).toBe('📌');
+    expect(actEmoji('')).toBe('📌');
+  });
+
+  it('puts the event\'s own glyph on the card, not a fixed one', () => {
+    const ev = event('complete');
+    const { container } = render(<ActEventCard msg={msg(ev.msgId!)} task={task([ev])} event={ev} />);
+    expect(container.textContent).toContain('🎉');
+    expect(container.textContent).not.toContain('📋');
+  });
+});
+
+describe('the accent edge', () => {
+  it('marks the moves that put work on a plate', () => {
+    expect(actAccent('offer')).toBe('handoff');
+    expect(actAccent('award')).toBe('handoff');
+  });
+
+  it('marks a good end and a bad one', () => {
+    expect(actAccent('complete')).toBe('success');
+    expect(actAccent('accept-work')).toBe('success');
+    expect(actAccent('fail')).toBe('failure');
+  });
+
+  it('leaves every other verb unaccented', () => {
+    const plain = ['accept', 'decline', 'claim', 'progress', 'cancel', 'bid',
+                   'submit', 'revise', 'forfeit', 'escalate'];
+    for (const verb of plain) expect(actAccent(verb)).toBe('none');
+  });
+
+  it('paints the edge in the colour the accent names', () => {
+    const cases: Array<[string, string]> = [
+      ['offer', 'border-l-purple'],
+      ['complete', 'border-l-success'],
+      ['fail', 'border-l-danger'],
+    ];
+    for (const [verb, edge] of cases) {
+      const ev = event(verb);
+      const { container } = render(<ActEventCard msg={msg(ev.msgId!)} task={task([ev])} event={ev} />);
+      expect(container.querySelector('[data-testid="act-card"] > div')!.className).toContain(edge);
+      cleanup();
+    }
+  });
+
+  it('draws no edge on a verb with no accent', () => {
+    const ev = event('progress');
+    const { container } = render(<ActEventCard msg={msg(ev.msgId!)} task={task([ev])} event={ev} />);
+    expect(container.querySelector('[data-testid="act-card"] > div')!.className).not.toContain('border-l-');
+  });
+});
+
+describe('the headline casing', () => {
+  it('is uppercased by the style, so the word itself is untouched', () => {
+    const ev = event('progress');
+    const { getByText } = render(<ActEventCard msg={msg(ev.msgId!)} task={task([ev])} event={ev} />);
+    expect(getByText('in progress').className).toContain('uppercase');
+  });
+});
+
 describe('what the card carries', () => {
   it('shows the task title and the event\'s own note', () => {
     const ev = event('progress', { 'act-note': 'tagged the build' });
@@ -123,6 +207,22 @@ describe('skipping between a task\'s cards', () => {
       lifecycle[1],
     ];
     expect(cardNeighbours(task(confirmed), lifecycle[0])).toEqual({ prev: undefined, next: 'm-claim' });
+  });
+
+  it('puts the links in a footer of the card, under a divider', () => {
+    const { container } = render(<ActEventCard msg={msg('m-claim')} task={task(lifecycle)} event={lifecycle[1]} />);
+    const footer = container.querySelector('[data-testid="card-footer"]')!;
+    expect(footer.className).toContain('border-t');
+    // The header is the card's only filled strip, so the footer takes no tint.
+    expect(footer.className).not.toContain('bg-');
+    expect(footer.textContent).toContain('← prev');
+    expect(footer.textContent).toContain('next →');
+  });
+
+  it('renders no footer on a card with no neighbours', () => {
+    const only = [event('offer')];
+    const { container } = render(<ActEventCard msg={msg('m-offer')} task={task(only)} event={only[0]} />);
+    expect(container.querySelector('[data-testid="card-footer"]')).toBeNull();
   });
 
   it('shows a link for each neighbour a card has', () => {

@@ -209,7 +209,8 @@ class ActTaskStore {
      *
      * The home signs `confirm` and `expire` itself and sends no companion, so
      * these two are the only events the reader hears about as a system line
-     * rather than a card.
+     * rather than a card. Each opens with its verb's glyph, off the same table
+     * a card reads, so a line and a card mark the same move the same way.
      */
     private fun systemLine(task: ActTask, ev: ActEventInput): String? {
         // Both lines name the task by its title, which only the opener
@@ -225,9 +226,9 @@ class ActTaskStore {
             // to say.
             "confirm" -> {
                 val subject = task.events.firstOrNull { it.eventId == ev.fields["act-subject"] }
-                subject?.let { "confirmed: \"$title\" — ${it.verb} by ${it.from}" }
+                subject?.let { "${ActVerbs.emoji("confirm")} confirmed: \"$title\" — ${it.verb} by ${it.from}" }
             }
-            "expire" -> "$title expired"
+            "expire" -> "${ActVerbs.emoji("expire")} $title expired"
             else -> null
         }
     }

@@ -42,12 +42,16 @@ function TaskIdBadge({ taskId }: { taskId?: string }) {
 
 // ─── Card Wrapper ───────────────────────────────────
 
-export function CardFrame({ icon, label, children, msg, className }: {
+export function CardFrame({ icon, label, children, msg, className, uppercaseLabel = true, footer }: {
   icon: string;
   label: string;
   children: React.ReactNode;
   msg: Message;
   className?: string;
+  /** Uppercases the label by style, leaving the word itself as written. */
+  uppercaseLabel?: boolean;
+  /** A strip under the body, off the header's tint and behind a hairline. */
+  footer?: React.ReactNode;
 }) {
   const taskId = tag(msg, 'ref') || tag(msg, 'task-id');
 
@@ -55,7 +59,7 @@ export function CardFrame({ icon, label, children, msg, className }: {
     <div className={`mt-1 rounded-lg border border-border/50 overflow-hidden ${className || ''}`}>
       <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-surface/50 text-xs text-fg-dim">
         <span>{icon}</span>
-        <span className="font-semibold text-fg-muted">{label}</span>
+        <span className={`font-semibold text-fg-muted ${uppercaseLabel ? 'uppercase' : ''}`}>{label}</span>
         <TaskIdBadge taskId={taskId} />
         <span className="ml-auto text-[10px] text-fg-dim/50">
           {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
@@ -64,6 +68,14 @@ export function CardFrame({ icon, label, children, msg, className }: {
       <div className="px-2.5 py-2 text-sm">
         {children}
       </div>
+      {footer && (
+        <div
+          data-testid="card-footer"
+          className="flex items-center border-t border-border/50 px-2.5 py-1.5 text-[11px]"
+        >
+          {footer}
+        </div>
+      )}
     </div>
   );
 }
@@ -72,7 +84,7 @@ export function CardFrame({ icon, label, children, msg, className }: {
 
 function TaskRequestCard({ msg }: { msg: Message }) {
   return (
-    <CardFrame icon="📋" label="New Task" msg={msg} className="border-accent/30">
+    <CardFrame icon="📋" label="New Task" msg={msg} className="border-l-2 border-l-purple">
       <div className="text-fg whitespace-pre-wrap">{msg.text}</div>
     </CardFrame>
   );
@@ -101,7 +113,7 @@ function TaskUpdateCard({ msg }: { msg: Message }) {
 
 function TaskCompleteCard({ msg }: { msg: Message }) {
   return (
-    <CardFrame icon="🎉" label="Task Complete" msg={msg} className="border-success/30">
+    <CardFrame icon="🎉" label="Task Complete" msg={msg} className="border-l-2 border-l-success">
       <div className="text-success whitespace-pre-wrap">{msg.text}</div>
     </CardFrame>
   );
@@ -109,8 +121,8 @@ function TaskCompleteCard({ msg }: { msg: Message }) {
 
 function TaskFailedCard({ msg }: { msg: Message }) {
   return (
-    <CardFrame icon="❌" label="Task Failed" msg={msg} className="border-error/30">
-      <div className="text-error whitespace-pre-wrap">{msg.text}</div>
+    <CardFrame icon="❌" label="Task Failed" msg={msg} className="border-l-2 border-l-danger">
+      <div className="text-danger whitespace-pre-wrap">{msg.text}</div>
     </CardFrame>
   );
 }

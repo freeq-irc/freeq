@@ -8,6 +8,7 @@ import { isDid, isPeerBlocked } from '../lib/identity';
 import { claimForMessage } from '@freeq/sdk';
 import type { RowEvidence } from './UserPopover';
 import { displayNameForKey } from '../lib/display-name';
+import { apiFetch, bearerPending, hasBearer, waitForBearer } from '../lib/api';
 import { EmojiPicker } from './EmojiPicker';
 import { UserPopover } from './UserPopover';
 import { BlueskyEmbed } from './BlueskyEmbed';
@@ -218,6 +219,13 @@ function renderTextSafe(text: string, ctx?: RenderCtx): React.ReactElement {
         const content = seg.content;
         switch (seg.type) {
           case 'link':
+            // A space-media link has no renderer of its own (a .pdf, a .zip)
+            // and a plain anchor cannot send the bearer that proves
+            // membership, so a restricted channel's attachment would just
+            // 403 on click. Fetch it the same way the players do.
+            if (isSpaceMediaUrl(seg.href)) {
+              return <SpaceMediaLink key={i} url={seg.href} label={content} />;
+            }
             return <a key={i} href={seg.href} target="_blank" rel="noopener noreferrer" className="text-accent hover:underline break-all">{content}</a>;
           case 'mention':
             return (
@@ -273,7 +281,10 @@ function isTrustedImageUrl(url: string): boolean {
     const u = new URL(url, window.location.origin);
     // Private freeq media served from our own origin is always first-party —
     // never gate it behind the "load external media" setting.
-    if (u.origin === window.location.origin && u.pathname.startsWith('/api/v1/media/')) {
+    if (
+      u.origin === window.location.origin &&
+      (u.pathname.startsWith('/api/v1/media/') || u.pathname.startsWith('/api/v1/space-media/'))
+    ) {
       return true;
     }
     const h = u.hostname;
@@ -284,17 +295,162 @@ function isTrustedImageUrl(url: string): boolean {
   }
 }
 
+/** Why space media could not be shown: the viewer is not a member, or the
+ *  fetch itself broke. */
+type MediaFailure = 'refused' | 'error' | null;
+
+/** Is this one of our authenticated space-media URLs? */
+function isSpaceMediaUrl(url: string | undefined): url is string {
+  if (!url) return false;
+  try {
+    const u = new URL(url, window.location.origin);
+    return u.origin === window.location.origin && u.pathname.startsWith('/api/v1/space-media/');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Object URLs for space media, shared across every mount of the same file.
+ *
+ * The message list is virtualized, so a row unmounts as soon as it scrolls
+ * out of view. Revoking there meant two things went wrong: every scroll-back
+ * re-fetched the file from the *author's* PDS, and the lightbox — which
+ * outlives the row that opened it — was handed a URL already revoked out
+ * from under it. Entries are kept until pushed out by newer ones.
+ */
+const SPACE_MEDIA_CACHE_MAX = 32;
+const spaceMediaCache = new Map<string, string>();
+
+function rememberSpaceMedia(url: string, objectUrl: string): void {
+  spaceMediaCache.set(url, objectUrl);
+  while (spaceMediaCache.size > SPACE_MEDIA_CACHE_MAX) {
+    const oldest = spaceMediaCache.keys().next();
+    if (oldest.done) break;
+    const stale = spaceMediaCache.get(oldest.value);
+    spaceMediaCache.delete(oldest.value);
+    if (stale) URL.revokeObjectURL(stale);
+  }
+}
+
+/**
+ * Space media is served only to channel members, and membership is proven by
+ * the session bearer, which an `<img src>` cannot send. Fetch those URLs with
+ * the header and hand back an object URL; everything else passes through.
+ */
+function useAuthedMedia(url: string): { src: string | null; failure: MediaFailure } {
+  const [objectUrl, setObjectUrl] = useState<string | null>(() => spaceMediaCache.get(url) ?? null);
+  const [failure, setFailure] = useState<MediaFailure>(null);
+
+  useEffect(() => {
+    if (!isSpaceMediaUrl(url)) return;
+    const cached = spaceMediaCache.get(url);
+    if (cached) {
+      setObjectUrl(cached);
+      setFailure(null);
+      return;
+    }
+    let cancelled = false;
+    setFailure(null);
+    (async () => {
+      try {
+        let resp = await apiFetch(url);
+        // The bearer lands asynchronously, shortly after `registered`. A
+        // fetch that beats it gets a 403 and would otherwise tell a member
+        // they are not a member, permanently, until the row remounts.
+        if (resp.status === 403 && bearerPending()) {
+          await waitForBearer();
+          if (hasBearer()) resp = await apiFetch(url);
+        }
+        if (!resp.ok) {
+          // Being refused is a different thing to tell someone than a fetch
+          // that broke: one is about who they are, the other about the server.
+          throw new Error(resp.status === 403 || resp.status === 404 ? 'refused' : 'error');
+        }
+        const blob = await resp.blob();
+        if (cancelled) return;
+        const made = URL.createObjectURL(blob);
+        rememberSpaceMedia(url, made);
+        setObjectUrl(made);
+      } catch (e: any) {
+        if (!cancelled) setFailure(e?.message === 'refused' ? 'refused' : 'error');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [url]);
+
+  if (!isSpaceMediaUrl(url)) return { src: url, failure: null };
+  return { src: objectUrl, failure };
+}
+
+/**
+ * A private-space attachment with no inline renderer. Resolves to the fetched
+ * blob so the browser can open or download it without a bearer of its own.
+ */
+function SpaceMediaLink({ url, label }: { url: string; label: string }) {
+  const { src, failure } = useAuthedMedia(url);
+  const filename = (() => {
+    try {
+      return decodeURIComponent(new URL(url, window.location.origin).pathname.split('/').pop() || 'file');
+    } catch {
+      return 'file';
+    }
+  })();
+  if (failure) {
+    return (
+      <span className="text-fg-dim" title={label}>
+        🔒 {failure === 'refused'
+          ? 'Private file, only visible to members of this channel'
+          : 'Private file could not be loaded'}
+      </span>
+    );
+  }
+  if (!src) return <span className="text-fg-dim">🔒 Loading…</span>;
+  return (
+    <a
+      href={src}
+      download={filename}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="text-accent hover:underline break-all"
+    >
+      🔒 {filename}
+    </a>
+  );
+}
+
 /** Image that respects the "Load external media" setting. */
-function GatedImage({ url, onOpen }: { url: string; onOpen: () => void }) {
+function GatedImage({ url, onOpen }: { url: string; onOpen: (src: string) => void }) {
   const loadMedia = useStore((s) => s.loadExternalMedia);
   const [revealed, setRevealed] = useState(false);
   const trusted = isTrustedImageUrl(url);
+  const { src, failure } = useAuthedMedia(url);
+
+  if (failure) {
+    return (
+      <div className="flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-bg-tertiary text-fg-dim text-sm">
+        <span className="text-lg">🔒</span>
+        <span>
+          {failure === 'refused'
+            ? 'Private media, only visible to members of this channel'
+            : 'Private media could not be loaded'}
+        </span>
+      </div>
+    );
+  }
 
   if (trusted || loadMedia || revealed) {
+    if (!src) {
+      return (
+        <div className="w-40 h-24 rounded-lg border border-border bg-bg-tertiary animate-pulse" />
+      );
+    }
     return (
-      <button onClick={onOpen} className="block cursor-zoom-in">
+      <button onClick={() => onOpen(src)} className="block cursor-zoom-in">
         <img
-          src={url}
+          src={src}
           alt=""
           className="max-w-sm max-h-80 rounded-lg border border-border object-contain bg-bg-tertiary hover:opacity-90 transition-opacity"
           loading="lazy"
@@ -320,7 +476,7 @@ function GatedImage({ url, onOpen }: { url: string; onOpen: () => void }) {
 
 // Bluesky post URL pattern
 const BSKY_POST_RE = /https?:\/\/bsky\.app\/profile\/([^/]+)\/post\/([a-zA-Z0-9]+)/;
-// YouTube URL pattern  
+// YouTube URL pattern
 const YT_RE = /(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/;
 
 /** Inline audio player for voice messages and audio files */
@@ -331,6 +487,9 @@ function InlineAudioPlayer({ url, label }: { url: string; label?: string }) {
   const [duration, setDuration] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
+  // Same reason as images and video: an <audio src> cannot carry the bearer
+  // that proves channel membership.
+  const { src, failure } = useAuthedMedia(url);
 
   const toggle = () => {
     const el = audioRef.current;
@@ -351,6 +510,18 @@ function InlineAudioPlayer({ url, label }: { url: string; label?: string }) {
     if (!s || !isFinite(s)) return '0:00';
     return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
   };
+
+  if (failure || !src) {
+    return (
+      <div className="mt-1.5 max-w-[300px] px-3 py-2 rounded-xl border border-border bg-bg-tertiary text-fg-dim text-sm">
+        {failure === 'refused'
+          ? 'Private audio, only visible to members of this channel'
+          : failure
+            ? 'Private audio could not be loaded'
+            : 'Loading…'}
+      </div>
+    );
+  }
 
   return (
     <div className="mt-1.5 flex items-center gap-3 bg-bg-tertiary border border-border rounded-xl px-3 py-2.5 max-w-[300px]">
@@ -392,7 +563,7 @@ function InlineAudioPlayer({ url, label }: { url: string; label?: string }) {
       </div>
       <audio
         ref={audioRef}
-        src={url}
+        src={src ?? undefined}
         preload="metadata"
         onLoadedMetadata={() => setDuration(audioRef.current?.duration || 0)}
         onTimeUpdate={() => setProgress(audioRef.current?.currentTime || 0)}
@@ -405,10 +576,22 @@ function InlineAudioPlayer({ url, label }: { url: string; label?: string }) {
 
 /** Inline video player */
 function InlineVideoPlayer({ url }: { url: string }) {
+  const { src, failure } = useAuthedMedia(url);
+  if (failure || !src) {
+    return (
+      <div className="mt-1.5 max-w-sm px-3 py-2 rounded-lg border border-border bg-bg-tertiary text-fg-dim text-sm">
+        {failure === 'refused'
+          ? 'Private video, only visible to members of this channel'
+          : failure
+            ? 'Private video could not be loaded'
+            : 'Loading...'}
+      </div>
+    );
+  }
   return (
     <div className="mt-1.5 max-w-sm">
       <video
-        src={url}
+        src={src}
         controls
         preload="metadata"
         className="rounded-lg border border-border max-h-72 bg-black"
@@ -540,7 +723,7 @@ function MessageContentImpl({ msg, channel, onNickClick }: {
       {imageUrls.length > 0 && (
         <div className="mt-1.5 flex flex-wrap gap-2">
           {imageUrls.map((url) => (
-            <GatedImage key={url} url={url} onOpen={() => setLightbox(url)} />
+            <GatedImage key={url} url={url} onOpen={(src) => setLightbox(src)} />
           ))}
         </div>
       )}

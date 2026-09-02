@@ -133,4 +133,30 @@ test.describe('Channels', () => {
 
     await ctx.close();
   });
+
+  test('joining with a key does not leave a channel named after the key', async ({ page }) => {
+    const nick = uniqueNick('key');
+    const ch1 = uniqueChannel();
+    const keyed = uniqueChannel();
+    await connectGuest(page, nick, ch1);
+
+    // Own the channel, lock it, leave it.
+    await sendMessage(page, `/join ${keyed}`);
+    await expect((await openSidebar(page)).getByText(keyed)).toBeVisible({ timeout: 10_000 });
+    await sendMessage(page, `/mode ${keyed} +k s3cret`);
+    await page.waitForTimeout(500);
+    await sendMessage(page, `/part ${keyed}`);
+    await page.waitForTimeout(500);
+
+    await sendMessage(page, `/join ${keyed} s3cret`);
+
+    const sidebar = await openSidebar(page);
+    await expect(sidebar.getByText(keyed)).toBeVisible({ timeout: 10_000 });
+    await expect(sidebar).not.toContainText('s3cret');
+
+    // And the key actually got us in: the channel takes messages.
+    await switchChannel(page, keyed);
+    await sendMessage(page, 'inside the locked channel');
+    await expect(page.getByTestId('message-list').getByText('inside the locked channel')).toBeVisible({ timeout: 10_000 });
+  });
 });

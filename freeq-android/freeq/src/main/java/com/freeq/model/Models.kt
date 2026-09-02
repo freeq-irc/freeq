@@ -43,6 +43,9 @@ data class ChatMessage(
     // line. The only thing joining a line to the work it is about; null on an
     // ordinary message.
     val actRef: String? = null,
+    // A parsed +freeq.at/event coordination event riding on this message.
+    // When set, the row renders as a coordination card.
+    val coordination: com.freeq.ffi.CoordinationEvent? = null,
     val reactions: MutableMap<String, MutableSet<String>> = mutableMapOf()
 )
 
@@ -771,14 +774,14 @@ class AppState(application: Application) : AndroidViewModel(application) {
     // ── Channel operations ──
 
     fun joinChannel(channel: String, navigate: Boolean = true) {
-        val ch = if (channel.startsWith("#")) channel else "#$channel"
+        val target = JoinTarget.parse(channel) ?: return
         // Track for navigation after JOIN confirmation (only for user-initiated joins)
-        if (navigate) pendingJoinChannel = ch
+        if (navigate) pendingJoinChannel = target.channel
         try {
-            client?.join(ch)
+            client?.join(target.line)
         } catch (_: Exception) {
             if (navigate) pendingJoinChannel = null
-            errorMessage.value = "Failed to join $ch"
+            errorMessage.value = "Failed to join ${target.channel}"
         }
     }
 

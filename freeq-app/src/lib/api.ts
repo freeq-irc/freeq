@@ -28,3 +28,39 @@ export function authHeaders(extra?: HeadersInit): HeadersInit {
 export function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
   return fetch(path, { ...init, headers: authHeaders(init.headers) });
 }
+
+/** Is there a session bearer right now? */
+export function hasBearer(): boolean {
+  return !!getClient()?.apiBearer;
+}
+
+/**
+ * Is a bearer plausibly still on its way?
+ *
+ * True only when a client exists but has no bearer yet — the window between
+ * `registered` and the API-BEARER notice. A guest connection also lands here
+ * briefly and then simply times out, which costs one wait and nothing else.
+ * With no client at all there is nothing to wait for.
+ */
+export function bearerPending(): boolean {
+  const c = getClient();
+  return !!c && !c.apiBearer;
+}
+
+/**
+ * Resolve once a session bearer exists, or give up after `timeoutMs`.
+ *
+ * The API-BEARER notice arrives shortly after `registered`, so anything that
+ * fires on mount can race it. Callers that would otherwise report "you are
+ * not allowed" should wait here first and retry, rather than tell an
+ * authenticated member they are a stranger.
+ */
+export async function waitForBearer(timeoutMs = 4000): Promise<string | null> {
+  const step = 200;
+  for (let waited = 0; waited < timeoutMs; waited += step) {
+    const b = getClient()?.apiBearer;
+    if (b) return b;
+    await new Promise((r) => setTimeout(r, step));
+  }
+  return getClient()?.apiBearer ?? null;
+}

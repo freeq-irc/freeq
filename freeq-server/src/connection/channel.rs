@@ -2090,13 +2090,13 @@ pub(super) fn handle_names(
     let nick_list: Vec<String> = {
         let channels = state.channels.lock();
         let (member_sessions, remote_members, ops, voiced) = match channels.get(channel) {
-            Some(ch) => (
+            Some(ch) if state.channel_visible_to(channel, ch, session_id) => (
                 ch.members.clone(),
                 ch.remote_members.clone(),
                 ch.ops.clone(),
                 ch.voiced.clone(),
             ),
-            None => Default::default(),
+            _ => Default::default(),
         };
         // Read from the guard already held; re-locking here deadlocks
         // (parking_lot mutexes are not reentrant).
@@ -2203,7 +2203,7 @@ pub(super) fn handle_list(
         // Don't advertise restricted (+i/+k/+E/policy-gated) channels to
         // non-members — listing them only leaks a private channel's existence,
         // name, and topic. Members still see their own channels.
-        if !state.channel_is_discoverable(name, ch) && !ch.members.contains(session_id) {
+        if !state.channel_visible_to(name, ch, session_id) {
             continue;
         }
         let count = ch.members.len() + ch.remote_members.len();

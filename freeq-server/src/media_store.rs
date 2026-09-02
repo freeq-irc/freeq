@@ -23,6 +23,10 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Cap on media size.
+/// Whole files are decrypted in memory, which is what keeps this modest.
+pub const MAX_MEDIA_BYTES: usize = 10 * 1024 * 1024;
+
 /// Derive a 32-byte key for `domain` from the server signing seed.
 /// Mirrors `server::derive_key_from_signing` but with per-use domain separation.
 fn derive(signing_seed: &[u8; 32], domain: &[u8]) -> [u8; 32] {

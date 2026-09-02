@@ -856,6 +856,62 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "413": { description: Body too large. }
+  /api/v1/media-space:
+    get:
+      tags: [media]
+      operationId: getMediaSpace
+      summary: The AT Protocol space backing a channel's private media.
+      description: |
+        Creates the space on first use, so only members may ask. Answers 404
+        unless the server is configured with a media space authority.
+      parameters:
+        - name: channel
+          in: query
+          required: true
+          schema: { type: string }
+      security: [bearerAuth: []]
+      responses:
+        "200":
+          description: The channel's space ref and space type.
+          content:
+            application/json:
+              schema:
+                type: object
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "507": { description: This server already holds its maximum number of media spaces. }
+  /api/v1/space-media/{ref}/{filename}:
+    get:
+      tags: [media]
+      operationId: getSpaceMedia
+      summary: Fetch private media held in a member's own repo.
+      description: |
+        `ref` is the record's `at://` URI, base64url-encoded. The server
+        fetches from the uploader's PDS on behalf of a caller who holds the
+        channel; `filename` is cosmetic so clients see the right extension.
+      parameters:
+        - name: ref
+          in: path
+          required: true
+          schema: { type: string }
+        - name: filename
+          in: path
+          required: true
+          schema: { type: string }
+      security: [bearerAuth: []]
+      responses:
+        "200":
+          description: Blob bytes.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { description: Rate limit exceeded. }
   /api/v1/media/{id}/{sig}/{filename}:
     get:
       tags: [media]
@@ -1890,6 +1946,11 @@ components:
         av:
           type: boolean
           description: AV built in (`--features av-native`) *and* SFU up.
+        media_spaces:
+          type: boolean
+          description: >-
+            Private media via AT Protocol spaces is configured. Clients use
+            this to decide whether to offer the per-upload option at all.
     ChannelInfo:
       type: object
       required: [name, members]
