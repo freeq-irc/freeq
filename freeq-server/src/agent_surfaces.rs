@@ -726,10 +726,7 @@ mod tests {
 
     #[test]
     fn well_known_documents_are_valid_json() {
-        for body in [
-            ard_body(),
-            serde_json::json!({ "probe": "sanity" }),
-        ] {
+        for body in [ard_body(), serde_json::json!({ "probe": "sanity" })] {
             let s = serde_json::to_string(&body).unwrap();
             serde_json::from_str::<serde_json::Value>(&s).unwrap();
         }

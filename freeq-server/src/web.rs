@@ -217,7 +217,10 @@ pub fn router(state: Arc<SharedState>) -> Router {
         )
         .route("/tos", get(crate::agent_surfaces::tos_txt))
         .route("/openapi.json", get(crate::openapi::openapi_json))
-        .route("/.well-known/ard.json", get(crate::agent_surfaces::ard_json))
+        .route(
+            "/.well-known/ard.json",
+            get(crate::agent_surfaces::ard_json),
+        )
         .route(
             "/.well-known/ai-catalog.json",
             get(crate::agent_surfaces::ai_catalog_json),

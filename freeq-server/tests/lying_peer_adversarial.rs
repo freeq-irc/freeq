@@ -21,9 +21,8 @@ mod util;
 use tokio::sync::mpsc;
 use util::lying_peer::{
     LyingPeer, NO_EFFECT_WINDOW, SETTLE, TestId, TestServer, connect, is_deleted, msgid_of,
-    registered_kid,
-    revision_count, spawn_server_with_peer, try_event, wait_auth_and_register, wait_event,
-    warm_link,
+    registered_kid, revision_count, spawn_server_with_peer, try_event, wait_auth_and_register,
+    wait_event, warm_link,
 };
 
 /// A DID the lying peer asserts but has never proven — the shape of a forged

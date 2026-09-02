@@ -332,7 +332,11 @@ async fn responses_carry_discovery_and_auth_headers() {
     let (_irc, http, _h) = start_server().await;
     let client = reqwest::Client::new();
 
-    let resp = client.get(url(http, "/api/v1/health")).send().await.unwrap();
+    let resp = client
+        .get(url(http, "/api/v1/health"))
+        .send()
+        .await
+        .unwrap();
     let link = resp
         .headers()
         .get("link")
