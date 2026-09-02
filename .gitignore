@@ -103,3 +103,6 @@ freeq-site/docs/
 freeq-site/.git_commit
 freeq-ios/.build/
 docs/MIREN-GOLDEN-PATH.html
+
+# run output from scripts/smoke-act-signing.mjs
+/smoke-evidence/
