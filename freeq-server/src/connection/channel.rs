@@ -2337,10 +2337,106 @@ pub(super) fn send_actor_classes(
     if classes.is_empty() {
         return;
     }
-    let line = irc::Message::from_server(
-        server_name,
-        irc::RPL_ACTORCLASSES,
-        vec![nick, channel, &classes.join(" ")],
-    );
-    send(state, session_id, format!("{line}\r\n"));
+    // Chunk to the IRC line limit. A channel with enough agents in it would
+    // otherwise build one 674 longer than 512 bytes, and an over-long line is
+    // truncated in transit — which here means a client silently rendering the
+    // agents that fell off the end as humans. That is the exact failure this
+    // numeric exists to prevent, so it must not reappear at scale.
+    for chunk in chunk_to_line_limit(server_name, nick, channel, &classes) {
+        let line = irc::Message::from_server(
+            server_name,
+            irc::RPL_ACTORCLASSES,
+            vec![nick, channel, &chunk],
+        );
+        send(state, session_id, format!("{line}\r\n"));
+    }
+}
+
+/// Split `entries` into space-joined trailing parameters that keep each
+/// rendered 674 within the 512-byte IRC line limit (CRLF included).
+///
+/// A single entry longer than the budget still goes out on its own line: it
+/// cannot be split without corrupting it, and one over-long line is a better
+/// failure than dropping a member from the roster entirely.
+fn chunk_to_line_limit(
+    server_name: &str,
+    nick: &str,
+    channel: &str,
+    entries: &[String],
+) -> Vec<String> {
+    // `:{server} 674 {nick} {channel} :` plus the trailing CRLF.
+    let overhead = 1 + server_name.len() + 1 + 3 + 1 + nick.len() + 1 + channel.len() + 2 + 2;
+    let budget = 512usize.saturating_sub(overhead).max(1);
+
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for e in entries {
+        let added = if cur.is_empty() {
+            e.len()
+        } else {
+            cur.len() + 1 + e.len()
+        };
+        if !cur.is_empty() && added > budget {
+            out.push(std::mem::take(&mut cur));
+        }
+        if cur.is_empty() {
+            cur.push_str(e);
+        } else {
+            cur.push(' ');
+            cur.push_str(e);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+#[cfg(test)]
+mod actor_class_roster_tests {
+    use super::*;
+
+    fn rendered_len(server: &str, nick: &str, chan: &str, body: &str) -> usize {
+        format!(":{server} 674 {nick} {chan} :{body}\r\n").len()
+    }
+
+    #[test]
+    fn a_roster_of_agents_is_split_below_the_line_limit() {
+        let server = "irc.freeq.at";
+        let nick = "watcher";
+        let chan = "#swarm";
+        let entries: Vec<String> = (0..200).map(|i| format!("agent{i:03}=agent")).collect();
+
+        let chunks = chunk_to_line_limit(server, nick, chan, &entries);
+        assert!(chunks.len() > 1, "200 agents must not fit on one line");
+        for c in &chunks {
+            assert!(
+                rendered_len(server, nick, chan, c) <= 512,
+                "chunk renders to {} bytes: {c}",
+                rendered_len(server, nick, chan, c)
+            );
+        }
+        // Nothing invented, nothing dropped, order preserved.
+        let flat: Vec<&str> = chunks.iter().flat_map(|c| c.split(' ')).collect();
+        assert_eq!(flat.len(), entries.len());
+        assert_eq!(flat[0], entries[0]);
+        assert_eq!(*flat.last().unwrap(), entries.last().unwrap());
+    }
+
+    #[test]
+    fn a_small_roster_still_goes_out_on_one_line() {
+        let entries = vec!["piwork=agent".to_string(), "botty=bot".to_string()];
+        let chunks = chunk_to_line_limit("irc.freeq.at", "n", "#x", &entries);
+        assert_eq!(chunks, vec!["piwork=agent botty=bot"]);
+    }
+
+    #[test]
+    fn one_absurd_entry_is_sent_rather_than_dropped() {
+        // Truncation loses a member silently; an over-long line at least
+        // arrives and is visibly wrong.
+        let entries = vec![format!("{}=agent", "n".repeat(600))];
+        let chunks = chunk_to_line_limit("irc.freeq.at", "n", "#x", &entries);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], entries[0]);
+    }
 }
