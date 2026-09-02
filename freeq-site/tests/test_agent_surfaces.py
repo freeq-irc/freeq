@@ -240,3 +240,25 @@ def test_both_hosts_would_serve_identical_terms():
     shared = Path(__file__).resolve().parents[2] / "agent-docs" / "tos.txt"
     assert shared.is_file()
     assert _client().get("/tos").data.decode() == shared.read_text()
+
+
+def test_the_sites_agent_docs_copy_has_not_drifted():
+    """freeq-site/agent-docs/ is a deploy artifact, not a second source.
+
+    Miren uploads git-tracked files, so the copy has to be committed the same
+    way freeq-site/docs/ is — which makes drift possible. deploy.sh refreshes
+    it on every deploy; this turns a stale copy into a red test rather than
+    two hosts quietly serving different bytes.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    for name in ("agents.md", "auth.md", "welcome.md", "tos.txt"):
+        canonical = root / "agent-docs" / name
+        shipped = root / "freeq-site" / "agent-docs" / name
+        assert canonical.is_file(), f"missing canonical {name}"
+        assert shipped.is_file(), f"deploy copy missing {name} — run deploy.sh"
+        assert shipped.read_text() == canonical.read_text(), (
+            f"freeq-site/agent-docs/{name} has drifted from agent-docs/{name}; "
+            "deploy.sh refreshes it, so commit the refreshed copy"
+        )
