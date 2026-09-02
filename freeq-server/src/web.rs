@@ -205,6 +205,10 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .route("/AGENTS.md", get(crate::agent_surfaces::agents_md))
         .route("/auth.md", get(crate::agent_surfaces::auth_md))
         .route("/index.md", get(crate::agent_surfaces::index_md))
+        // `/` negotiates: markdown for a client that asks for it, the app
+        // shell for a browser. Registered explicitly so it wins over the
+        // static directory's index.html.
+        .route("/", get(crate::agent_surfaces::root))
         // Self-service enrollment: an agent mints a key, signs a challenge,
         // and is a first-class participant without a human in the loop.
         .route(

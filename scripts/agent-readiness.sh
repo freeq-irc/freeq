@@ -164,14 +164,16 @@ printf '%s' "$BODY" | grep -qi 'llms.txt\|sitemap\|docs' && ok || bad "404 body"
 
 # ---- host-specific -------------------------------------------------------
 if [ "$KIND" = "server" ]; then
-  expect_json /api/v1/health '"ok"'
+  expect_json /api/v1/health server_name
   expect_json /api/v1/openapi.json openapi
   expect_json /openapi.json        openapi
   expect_json /.well-known/agent.json surfaces
   expect_json /.well-known/oauth-protected-resource resource
   expect_json /.well-known/http-message-signatures-directory keys
   # 401s must say where the auth metadata lives, per RFC 9728 §5.1.
-  hdr=$("${CURL[@]}" -D - -o /dev/null "$BASE/api/v1/sessions" 2>/dev/null)
+  # /api/v1/favorites is genuinely bearer-gated; /sessions answers 200 to
+  # anyone and tested nothing.
+  hdr=$("${CURL[@]}" -D - -o /dev/null "$BASE/api/v1/favorites" 2>/dev/null)
   if printf '%s' "$hdr" | grep -qi 'www-authenticate:.*resource_metadata='; then ok
   else bad "/api/v1 401" "no WWW-Authenticate: Bearer resource_metadata=…"; fi
   # The SPA shell must carry crawlable text for agents that do not run JS.

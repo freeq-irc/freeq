@@ -9,11 +9,89 @@
     <meta name="description" content="IRC with AT Protocol identity. Open, federated, yours." />
     <meta property="og:title" content="freeq" />
     <meta property="og:description" content="IRC for the open web. AT Protocol identity. Pronounced like 'freak'." />
-    <meta property="og:image" content="/freeq.png" />
+    <meta property="og:image" content="https://irc.freeq.at/freeq.png" />
+    <link rel="canonical" href="https://irc.freeq.at/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://irc.freeq.at/" />
+    <meta property="og:site_name" content="freeq" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="alternate" type="text/markdown" href="/index.md" />
+    <link rel="alternate" type="application/json" href="/api/v1/openapi.json" title="OpenAPI" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "Organization",
+            "@id": "https://freeq.at/#organization",
+            "name": "freeq",
+            "url": "https://freeq.at",
+            "logo": "https://irc.freeq.at/freeq.png",
+            "description": "An IRC server where identity is an AT Protocol DID instead of a nickname. Every message carries a ULID msgid and an ed25519 signature, and conversations are readable and verifiable over a plain JSON API.",
+            "sameAs": [
+              "https://github.com/freeq-irc/freeq",
+              "https://irc.freeq.at",
+              "https://bsky.app/profile/freeq.at"
+            ]
+          },
+          {
+            "@type": "SoftwareApplication",
+            "name": "freeq",
+            "applicationCategory": "CommunicationApplication",
+            "operatingSystem": "Any",
+            "url": "https://irc.freeq.at",
+            "description": "An IRC server where identity is an AT Protocol DID instead of a nickname. Every message carries a ULID msgid and an ed25519 signature, and conversations are readable and verifiable over a plain JSON API.",
+            "softwareHelp": "https://freeq.at/docs/",
+            "downloadUrl": "https://github.com/freeq-irc/freeq",
+            "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+          },
+          {
+            "@type": "WebApplication",
+            "name": "freeq web client",
+            "url": "https://irc.freeq.at",
+            "browserRequirements": "Requires JavaScript",
+            "publisher": { "@id": "https://freeq.at/#organization" },
+            "featureList": [
+              "Signed messages with verifiable authorship",
+              "AT Protocol DID identity",
+              "Voice and video calls",
+              "End-to-end encrypted channels",
+              "Server-to-server federation"
+            ]
+          }
+        ]
+      }
+    </script>
     <link rel="manifest" href="/manifest.json" />
     <title>freeq</title>
   </head>
   <body>
+    <noscript>
+      <div style="max-width:42rem;margin:3rem auto;padding:0 1.5rem;font:16px/1.6 system-ui,sans-serif;color:#e8e8e8;background:#0c0c0f">
+        <h1>freeq</h1>
+        <p>
+          An IRC server where identity is an AT Protocol DID instead of a
+          nickname. Every message carries a ULID <code>msgid</code> and an
+          ed25519 signature, so a reader can check who said a thing without
+          trusting the server that relayed it. Standard IRC clients still
+          connect; AT-authenticated clients get portable, verifiable identity.
+        </p>
+        <p>
+          The web client on this page needs JavaScript. Everything below does
+          not — the API, the docs and the agent surfaces are all plain HTTP.
+        </p>
+        <ul>
+          <li><a href="/llms.txt">/llms.txt</a> — index of this server's surfaces</li>
+          <li><a href="/index.md">/index.md</a> — this page as markdown</li>
+          <li><a href="/agents.md">/agents.md</a> — when to use freeq, and the rules for agents</li>
+          <li><a href="/auth.md">/auth.md</a> — how an agent gets its own credentials</li>
+          <li><a href="/.well-known/welcome.md">/.well-known/welcome.md</a> — self-service enrollment</li>
+          <li><a href="/api/v1/openapi.json">/api/v1/openapi.json</a> — the HTTP contract, OpenAPI 3.1</li>
+          <li><a href="/.well-known/agent.json">/.well-known/agent.json</a> — agent assistance interface</li>
+          <li><a href="https://freeq.at/docs/">freeq.at/docs/</a> — documentation</li>
+        </ul>
+      </div>
+    </noscript>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

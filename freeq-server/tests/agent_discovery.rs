@@ -412,3 +412,68 @@ async fn serves_the_welcome_mat_and_its_terms() {
         assert_eq!(status, 200, "welcome.md promises {path}");
     }
 }
+
+/// The shell is for `/` and nothing else. Anything unmatched is absent, and
+/// says so with a status code rather than 200 and a bundle.
+#[tokio::test]
+async fn a_path_the_app_does_not_route_is_not_pretended_into_existence() {
+    let (_irc, http, _h) = start_server().await;
+    let client = reqwest::Client::new();
+
+    for path in ["/this-does-not-exist", "/settings", "/c/general"] {
+        let resp = client.get(url(http, path)).send().await.unwrap();
+        assert_eq!(resp.status(), 404, "{path} must not answer with the shell");
+    }
+}
+
+/// `/` serves markdown to a client that asks for it and HTML to a browser,
+/// and says so with `Vary` so a cache never crosses the two.
+#[tokio::test]
+async fn the_root_negotiates_markdown() {
+    let (_irc, http, _h) = start_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(url(http, "/"))
+        .header("accept", "text/markdown")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let vary = resp
+        .headers()
+        .get("vary")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    assert!(ctype.contains("markdown"), "got {ctype}");
+    assert!(vary.to_lowercase().contains("accept"), "Vary: {vary}");
+    let body = resp.text().await.unwrap();
+    assert!(body.starts_with("# freeq"));
+
+    // A browser's Accept must not be answered with a 200 markdown document.
+    // This test server has no web client configured, so the honest answer is
+    // 404 - what it must never be is "here is the markdown instead".
+    // `agent_surfaces::a_browser_is_never_handed_markdown` covers the
+    // negotiation itself.
+    let resp = client
+        .get(url(http, "/"))
+        .header(
+            "accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        200,
+        "a browser was served a document it did not ask for"
+    );
+}

@@ -251,6 +251,45 @@ pub async fn index_md() -> Response {
     markdown_owned(index_markdown())
 }
 
+/// Does this `Accept` header prefer markdown over HTML?
+///
+/// Deliberately strict: a browser sends `text/html,...,*/*`, and `*/*` must
+/// not count as asking for markdown or every browser gets the text version.
+pub fn prefers_markdown(accept: &str) -> bool {
+    let mut saw_markdown = false;
+    for part in accept.split(',') {
+        let media = part.split(';').next().unwrap_or("").trim();
+        match media {
+            "text/markdown" => saw_markdown = true,
+            "text/html" | "application/xhtml+xml" => return false,
+            _ => {}
+        }
+    }
+    saw_markdown
+}
+
+/// `GET /` with `Accept: text/markdown` — the same document as `/index.md`.
+/// Falls through to the app shell for everyone else.
+pub async fn root(headers: axum::http::HeaderMap) -> Response {
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if prefers_markdown(accept) {
+        let mut resp = markdown_owned(index_markdown());
+        resp.headers_mut()
+            .insert(header::VARY, HeaderValue::from_static("Accept"));
+        return resp;
+    }
+    let mut resp = match INDEX_HTML.get().and_then(|o| o.as_deref()) {
+        Some(html) => axum::response::Html(html.to_string()).into_response(),
+        None => not_found_markdown(),
+    };
+    resp.headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Accept"));
+    resp
+}
+
 pub fn index_markdown() -> String {
     format!(
         "# freeq\n\n\
@@ -531,21 +570,24 @@ pub fn set_index_html(path: &std::path::Path) {
     let _ = INDEX_HTML.set(std::fs::read_to_string(path).ok());
 }
 
-/// Does this path ask for a *file* rather than a client-side route?
+/// Paths that legitimately render the web client's shell.
 ///
-/// The distinction is the whole fix. `/settings` is a React route and must
-/// return the shell; `/robots.txt`, `/nope.json` and anything under
-/// `/.well-known/` or `/api/` are resources that either exist or do not.
-pub fn is_file_request(path: &str) -> bool {
-    if path.starts_with("/.well-known/") || path.starts_with("/api/") {
-        return true;
-    }
-    path.rsplit('/').next().is_some_and(|seg| seg.contains('.'))
+/// The web app has no client-side router: it reads query parameters, and every
+/// deep link — `/join/{channel}` included — is a real server route rendered
+/// before the bundle loads. So exactly one path gets the shell, and everything
+/// unmatched is absent.
+///
+/// The looser rule this replaced ("anything without a dot might be a client
+/// route") still answered 200 for `/this-does-not-exist`, which is the same
+/// lie in a smaller font: an auditor, and an agent probing for a resource,
+/// concludes the path exists.
+pub fn serves_app_shell(path: &str) -> bool {
+    matches!(path, "/" | "/index.html")
 }
 
 /// Fallback for everything the router and the static directory did not match.
 pub async fn spa_fallback(uri: Uri) -> Response {
-    if is_file_request(uri.path()) {
+    if !serves_app_shell(uri.path()) {
         return not_found_markdown();
     }
     match INDEX_HTML.get().and_then(|o| o.as_deref()) {
@@ -730,21 +772,39 @@ mod tests {
     }
 
     #[test]
-    fn file_requests_are_distinguished_from_client_routes() {
-        // Files: must 404 when absent.
+    fn only_the_root_renders_the_app_shell() {
+        assert!(serves_app_shell("/"));
+        assert!(serves_app_shell("/index.html"));
+        // Everything else is either a real route (registered in web.rs, so it
+        // never reaches this fallback) or absent. `/join/{channel}` is a
+        // *server* route rendering an OG-tagged invite page — if that ever
+        // moves into the bundle, add it here or invite links start 404ing.
         for p in [
             "/robots.txt",
             "/nope.json",
             "/.well-known/anything",
             "/api/v1/nothing",
             "/assets/app.a1b2.js",
+            "/this-does-not-exist",
+            "/settings",
         ] {
-            assert!(is_file_request(p), "{p} should be treated as a file");
+            assert!(!serves_app_shell(p), "{p} must not answer with the shell");
         }
-        // Client-side routes: must still get the shell.
-        for p in ["/", "/settings", "/c/general", "/join/abc", "/av/room"] {
-            assert!(!is_file_request(p), "{p} should be treated as an SPA route");
-        }
+    }
+
+    #[test]
+    fn a_browser_is_never_handed_markdown() {
+        // Chrome, Safari, Firefox.
+        assert!(!prefers_markdown(
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        ));
+        assert!(!prefers_markdown("*/*"));
+        assert!(!prefers_markdown(""));
+        // Agents that ask for it, and only them.
+        assert!(prefers_markdown("text/markdown"));
+        assert!(prefers_markdown("text/markdown, text/plain;q=0.9"));
+        // Asking for both means the client can render HTML: give it HTML.
+        assert!(!prefers_markdown("text/markdown, text/html"));
     }
 
     #[test]
