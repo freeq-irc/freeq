@@ -154,6 +154,7 @@ fn make_channel(state: &Arc<SharedState>, name: &str) {
             encrypted_only: false,
             key: None,
             pins: vec![],
+            media_space_key: None,
         }
     });
 }

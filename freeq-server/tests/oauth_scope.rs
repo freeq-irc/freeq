@@ -122,10 +122,15 @@ async fn step_up_refuses_login_purpose() {
 
 #[test]
 fn scope_satisfies_login_with_granular_grant() {
-    assert!(scope_satisfies_purpose("atproto", OauthPurpose::Login));
+    assert!(scope_satisfies_purpose(
+        "atproto",
+        OauthPurpose::Login,
+        None
+    ));
     assert!(scope_satisfies_purpose(
         "atproto blob:image/*",
-        OauthPurpose::Login
+        OauthPurpose::Login,
+        None
     ));
 }
 
@@ -135,22 +140,26 @@ fn scope_satisfies_blob_upload_with_granular_grant() {
     // grant — the upload path creates a record alongside the blob.
     assert!(scope_satisfies_purpose(
         "atproto blob:image/* repo:blue.irc.media?action=create",
-        OauthPurpose::BlobUpload
+        OauthPurpose::BlobUpload,
+        None
     ));
     assert!(scope_satisfies_purpose(
         "atproto blob:*/* repo:blue.irc.media?action=create",
-        OauthPurpose::BlobUpload
+        OauthPurpose::BlobUpload,
+        None
     ));
     // Identity-only grant must NOT be enough for upload.
     assert!(!scope_satisfies_purpose(
         "atproto",
-        OauthPurpose::BlobUpload
+        OauthPurpose::BlobUpload,
+        None
     ));
     // Blob grant alone (no record) must NOT be enough — record creation
     // would fail at the PDS.
     assert!(!scope_satisfies_purpose(
         "atproto blob:image/*",
-        OauthPurpose::BlobUpload
+        OauthPurpose::BlobUpload,
+        None
     ));
 }
 
@@ -160,11 +169,13 @@ fn scope_satisfies_legacy_transition_generic_for_anything() {
     // Treat that as satisfying any purpose for backward compatibility.
     assert!(scope_satisfies_purpose(
         "atproto transition:generic",
-        OauthPurpose::BlobUpload
+        OauthPurpose::BlobUpload,
+        None
     ));
     assert!(scope_satisfies_purpose(
         "atproto transition:generic",
-        OauthPurpose::BlueskyPost
+        OauthPurpose::BlueskyPost,
+        None
     ));
 }
 
@@ -172,11 +183,13 @@ fn scope_satisfies_legacy_transition_generic_for_anything() {
 fn scope_does_not_satisfy_bluesky_post_with_blob_only() {
     assert!(!scope_satisfies_purpose(
         "atproto blob:image/*",
-        OauthPurpose::BlueskyPost
+        OauthPurpose::BlueskyPost,
+        None
     ));
     assert!(scope_satisfies_purpose(
         "atproto repo:app.bsky.feed.post",
-        OauthPurpose::BlueskyPost
+        OauthPurpose::BlueskyPost,
+        None
     ));
 }
 
@@ -193,14 +206,93 @@ fn purpose_round_trips_through_string() {
     assert_eq!(OauthPurpose::parse("nonsense"), None);
 }
 
+/// An upload is two PDS calls, uploadBlob then createRecord, so it takes the
+/// blob scope and the space scope together. Holding one without the other is
+/// insufficient, and the client re-prompts.
+#[test]
+fn media_space_needs_both_the_space_and_blob_halves() {
+    let full = "atproto blob:*/* space:*?authority=did:plc:a&collection=*";
+    assert!(scope_satisfies_purpose(
+        full,
+        OauthPurpose::MediaSpace,
+        Some("did:plc:a")
+    ));
+
+    let space_only = "atproto space:*?authority=did:plc:a&collection=*";
+    assert!(
+        !scope_satisfies_purpose(space_only, OauthPurpose::MediaSpace, Some("did:plc:a")),
+        "a space grant without blob access cannot upload"
+    );
+
+    let blob_only = "atproto blob:*/*";
+    assert!(!scope_satisfies_purpose(
+        blob_only,
+        OauthPurpose::MediaSpace,
+        Some("did:plc:a")
+    ));
+}
+
+/// A PDS echoes a grant back in whatever shape it likes. Matching the space
+/// scope as a literal string turned a reordered query into an endless
+/// step-up loop; it is matched by parts instead.
+#[test]
+fn media_space_scope_survives_a_pds_reordering_the_parameters() {
+    for granted in [
+        "atproto blob:*/* space:*?authority=did:plc:a&collection=*",
+        "atproto blob:*/* space:*?collection=*&authority=did:plc:a",
+        // A grant narrowed to the exact type and collection we use is at
+        // least as strong as the wildcard we asked for.
+        "atproto blob:*/* space:at.freeq.media?authority=did:plc:a&collection=at.freeq.media.item",
+    ] {
+        assert!(
+            scope_satisfies_purpose(granted, OauthPurpose::MediaSpace, Some("did:plc:a")),
+            "should satisfy: {granted}"
+        );
+    }
+}
+
+/// A grant over someone else's spaces buys nothing here, and the authority
+/// is the one thing a wildcard must not stand in for.
+#[test]
+fn media_space_scope_must_name_our_own_authority() {
+    for granted in [
+        // Another server's authority.
+        "atproto blob:*/* space:*?authority=did:plc:someoneelse&collection=*",
+        // A wildcard authority is not the same as ours.
+        "atproto blob:*/* space:*?authority=*&collection=*",
+        // No authority at all.
+        "atproto blob:*/* space:*?collection=*",
+        // A space type we do not use.
+        "atproto blob:*/* space:com.example.other?authority=did:plc:a&collection=*",
+        // A collection in someone else's namespace.
+        "atproto blob:*/* space:*?authority=did:plc:a&collection=com.example.other",
+        // Not a space scope at all.
+        "atproto blob:*/* spaceship:*?authority=did:plc:a&collection=*",
+        // No query, so nothing is named.
+        "atproto blob:*/* space:*",
+    ] {
+        assert!(
+            !scope_satisfies_purpose(granted, OauthPurpose::MediaSpace, Some("did:plc:a")),
+            "must not satisfy: {granted}"
+        );
+    }
+    // And with no authority configured, nothing satisfies the purpose.
+    assert!(!scope_satisfies_purpose(
+        "atproto blob:*/* space:*?authority=did:plc:a&collection=*",
+        OauthPurpose::MediaSpace,
+        None
+    ));
+}
+
 #[test]
 fn requested_scopes_are_narrow_not_transition_generic() {
     for p in [
         OauthPurpose::Login,
         OauthPurpose::BlobUpload,
         OauthPurpose::BlueskyPost,
+        OauthPurpose::MediaSpace,
     ] {
-        let s = p.requested_scope();
+        let s = p.requested_scope(Some("did:plc:testauthority"));
         assert!(
             !s.contains("transition:generic"),
             "purpose {:?} requests legacy scope: {s}",
@@ -223,14 +315,17 @@ fn scope_predicate_handles_extra_whitespace() {
     assert!(scope_satisfies_purpose(
         "atproto    blob:image/*    repo:blue.irc.media?action=create",
         OauthPurpose::BlobUpload,
+        None
     ));
     assert!(scope_satisfies_purpose(
         "atproto\tblob:image/*\trepo:blue.irc.media?action=create",
         OauthPurpose::BlobUpload,
+        None
     ));
     assert!(scope_satisfies_purpose(
         "\n  atproto  \n",
-        OauthPurpose::Login
+        OauthPurpose::Login,
+        None
     ));
 }
 
@@ -239,27 +334,35 @@ fn scope_predicate_is_case_sensitive_per_spec() {
     // OAuth scope strings are case-sensitive. ATPROTO (uppercase) is not
     // a valid scope; predicate must reject so we don't wrongly accept a
     // typo or a confused PDS.
-    assert!(!scope_satisfies_purpose("ATPROTO", OauthPurpose::Login));
+    assert!(!scope_satisfies_purpose(
+        "ATPROTO",
+        OauthPurpose::Login,
+        None
+    ));
     assert!(!scope_satisfies_purpose(
         "atproto BLOB:image/*",
         OauthPurpose::BlobUpload,
+        None
     ));
 }
 
 #[test]
 fn scope_predicate_rejects_empty_or_unrelated() {
-    assert!(!scope_satisfies_purpose("", OauthPurpose::Login));
+    assert!(!scope_satisfies_purpose("", OauthPurpose::Login, None));
     assert!(!scope_satisfies_purpose(
         "openid email",
-        OauthPurpose::Login
+        OauthPurpose::Login,
+        None
     ));
     assert!(!scope_satisfies_purpose(
         "atproto",
-        OauthPurpose::BlobUpload
+        OauthPurpose::BlobUpload,
+        None
     ));
     assert!(!scope_satisfies_purpose(
         "atproto blob:audio/*",
         OauthPurpose::BlobUpload,
+        None
     ));
 }
 
@@ -274,10 +377,12 @@ fn scope_predicate_accepts_blob_image_subtype_grant() {
     assert!(scope_satisfies_purpose(
         "atproto blob:image/png repo:blue.irc.media?action=create",
         OauthPurpose::BlobUpload,
+        None
     ));
     assert!(scope_satisfies_purpose(
         "atproto blob:image/jpeg repo:blue.irc.media?action=create",
         OauthPurpose::BlobUpload,
+        None
     ));
 }
 
@@ -288,6 +393,7 @@ fn scope_predicate_treats_repo_wildcard_as_satisfying_post() {
     assert!(scope_satisfies_purpose(
         "atproto repo:*",
         OauthPurpose::BlueskyPost,
+        None
     ));
 }
 
@@ -304,7 +410,7 @@ fn legacy_transition_generic_satisfies_all_purposes_for_grace_period() {
         OauthPurpose::BlueskyPost,
     ] {
         assert!(
-            scope_satisfies_purpose("atproto transition:generic", p),
+            scope_satisfies_purpose("atproto transition:generic", p, None),
             "legacy wide grant should satisfy {:?}",
             p
         );
@@ -314,6 +420,7 @@ fn legacy_transition_generic_satisfies_all_purposes_for_grace_period() {
     assert!(scope_satisfies_purpose(
         "transition:generic",
         OauthPurpose::BlobUpload,
+        None
     ));
 }
 
@@ -386,8 +493,12 @@ async fn metadata_scope_contains_every_requested_purpose_scope() {
         OauthPurpose::Login,
         OauthPurpose::BlobUpload,
         OauthPurpose::BlueskyPost,
+        // MediaSpace is only advertised when the feature is configured; the
+        // media_space integration suite covers that case against a server
+        // that has it on. Here the fixture has it off, so the purpose is
+        // checked against the same metadata with no authority.
     ] {
-        for token in p.requested_scope().split_whitespace() {
+        for token in p.requested_scope(None).split_whitespace() {
             assert!(
                 metadata_scope.contains(token),
                 "client-metadata.json scope ({:?}) is missing token `{token}` requested by purpose {:?}; \

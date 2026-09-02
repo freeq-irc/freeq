@@ -88,6 +88,14 @@
 # github_client_secret = "..."
 # broker_shared_secret = "..."
 
+## ── Private media space ────────────────────────────────────────────
+## Leave this unset to keep the private media feature off.
+## The DID is an account on a spaces-capable PDS.
+# media_space_did = "did:plc:..."
+# media_space_password = "..."
+## Optional. Default is resolved from the authority DID's document.
+# media_space_pds = "https://pds.example.com"
+
 ## ── MOTD ───────────────────────────────────────────────────────────
 # motd = "welcome"
 # motd_file = "/etc/freeq/motd.txt"

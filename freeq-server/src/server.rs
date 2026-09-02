@@ -74,6 +74,8 @@ pub struct ChannelState {
     pub key: Option<String>,
     /// Pinned message IDs (msgid strings), most recent first.
     pub pins: Vec<PinnedMessage>,
+    /// Key for this channel's private-media space.
+    pub media_space_key: Option<String>,
 }
 
 /// A pinned message reference.
@@ -261,6 +263,10 @@ pub enum OauthPurpose {
     /// Cross-posting messages to Bluesky. Scope: adds `repo:app.bsky.feed.post`.
     /// Triggered the first time a user enables Bluesky mirroring on a channel.
     BlueskyPost,
+    /// Writing private media into this server's channel spaces. Scope: adds
+    /// `space:at.freeq.media` for this server's space authority. Triggered
+    /// the first time a user makes a private upload.
+    MediaSpace,
 }
 
 impl OauthPurpose {
@@ -270,6 +276,7 @@ impl OauthPurpose {
             "login" => Some(Self::Login),
             "blob_upload" => Some(Self::BlobUpload),
             "bluesky_post" => Some(Self::BlueskyPost),
+            "media_space" => Some(Self::MediaSpace),
             _ => None,
         }
     }
@@ -280,16 +287,19 @@ impl OauthPurpose {
             Self::Login => "login",
             Self::BlobUpload => "blob_upload",
             Self::BlueskyPost => "bluesky_post",
+            Self::MediaSpace => "media_space",
         }
     }
 
     /// The OAuth scope string we *request* for this purpose. The PDS may
     /// grant a different one — store that in [`WebSession::granted_scope`]
     /// and check it at use time via [`scope_satisfies_purpose`].
-    pub fn requested_scope(self) -> &'static str {
+    ///
+    /// `media_space_authority` is the server's space authority DID.
+    pub fn requested_scope(self, media_space_authority: Option<&str>) -> String {
         match self {
             // Identity-only. Same as a vanilla "Login with Bluesky" button.
-            Self::Login => "atproto",
+            Self::Login => "atproto".to_string(),
             // Upload images to the user's repo. Narrow MIME on purpose so
             // the consent screen says "upload images" instead of "upload
             // anything". Also requests `repo:blue.irc.media?action=create`
@@ -298,10 +308,17 @@ impl OauthPurpose {
             // alongside the blob — without this scope the PDS rejects
             // record creation with ScopeMissingError even though the blob
             // upload itself succeeds.
-            Self::BlobUpload => "atproto blob:image/* repo:blue.irc.media?action=create",
+            Self::BlobUpload => {
+                "atproto blob:image/* repo:blue.irc.media?action=create".to_string()
+            }
             // Cross-post to Bluesky's feed. Repo write narrowed to a single
             // collection.
-            Self::BlueskyPost => "atproto repo:app.bsky.feed.post",
+            Self::BlueskyPost => "atproto repo:app.bsky.feed.post".to_string(),
+            // Read and write this server's channel media spaces.
+            Self::MediaSpace => format!(
+                "atproto {}",
+                crate::media_space::space_scope(media_space_authority.unwrap_or("*")),
+            ),
         }
     }
 }
@@ -316,10 +333,48 @@ impl OauthPurpose {
 /// - bsky.social granular grants may include extra `blob:` MIME entries
 ///   beyond what we asked; we only need one `blob:image/*` (or the
 ///   wildcard `blob:*/*`) for upload.
-pub fn scope_satisfies_purpose(granted: &str, purpose: OauthPurpose) -> bool {
-    if granted
-        .split_whitespace()
-        .any(|s| s == "transition:generic")
+///
+/// Does one granted scope token grant space access over `authority`?
+///
+/// Accepts `space:<type>?authority=<did>&collection=<c>` in any parameter
+/// order, with `*` as the wildcard for type and collection. The authority
+/// must match exactly: a grant over someone else's spaces is worth nothing
+/// here, and `*` is not accepted for it.
+fn space_scope_covers_authority(token: &str, authority: &str) -> bool {
+    let Some(rest) = token.strip_prefix("space:") else {
+        return false;
+    };
+    let (space_type, query) = match rest.split_once('?') {
+        Some((t, q)) => (t, q),
+        None => return false,
+    };
+    if space_type != "*" && space_type != crate::media_space::SPACE_TYPE {
+        return false;
+    }
+    let mut names_authority = false;
+    let mut collection_ok = false;
+    for param in query.split('&') {
+        match param.split_once('=') {
+            Some(("authority", v)) if v == authority => names_authority = true,
+            Some(("collection", v)) => {
+                collection_ok = v == "*" || v == crate::media_space::MEDIA_COLLECTION;
+            }
+            _ => {}
+        }
+    }
+    names_authority && collection_ok
+}
+
+pub fn scope_satisfies_purpose(
+    granted: &str,
+    purpose: OauthPurpose,
+    media_space_authority: Option<&str>,
+) -> bool {
+    // The legacy wide grant covers every purpose except spaces.
+    if !matches!(purpose, OauthPurpose::MediaSpace)
+        && granted
+            .split_whitespace()
+            .any(|s| s == "transition:generic")
     {
         return true;
     }
@@ -342,6 +397,25 @@ pub fn scope_satisfies_purpose(granted: &str, purpose: OauthPurpose) -> bool {
         OauthPurpose::BlueskyPost => granted
             .split_whitespace()
             .any(|s| s == "repo:app.bsky.feed.post" || s == "repo:*"),
+        OauthPurpose::MediaSpace => {
+            // An upload is two PDS calls: uploadBlob for the bytes, then
+            // createRecord to file them in the space. The space half must
+            // also name this server's authority, since a grant for someone
+            // else's spaces buys nothing here.
+            //
+            // Matched by parts rather than as a literal string: a PDS is free
+            // to reorder or re-encode the query parameters when it echoes a
+            // grant back, and a literal comparison would turn that into an
+            // endless step-up loop for the user.
+            let Some(authority) = media_space_authority else {
+                return false;
+            };
+            let has_space = granted
+                .split_whitespace()
+                .any(|s| space_scope_covers_authority(s, authority));
+            let has_blob = granted.split_whitespace().any(|s| s.starts_with("blob:*"));
+            has_space && has_blob
+        }
     }
 }
 
@@ -630,6 +704,8 @@ pub struct SharedState {
     pub server_name: String,
     pub challenge_store: ChallengeStore,
     pub did_resolver: DidResolver,
+    /// Private-media spaces. None = feature off.
+    pub media_space: Option<std::sync::Arc<crate::media_space::MediaSpaceManager>>,
     /// session_id -> sender for writing lines to that client
     pub connections: Mutex<HashMap<String, mpsc::Sender<String>>>,
     /// nick -> session_id (case-insensitive: keys are always lowercase)
@@ -1641,6 +1717,7 @@ impl Server {
                     && !ch.moderated
                     && ch.key.is_none()
                     && ch.bans.is_empty()
+                    && ch.media_space_key.is_none()
                 {
                     // Don't prune if channel has policy (check later)
                     let _ = db.delete_channel(name);
@@ -1690,10 +1767,36 @@ impl Server {
             bundles
         };
 
+        // Docker compose's `${VAR:-}` passes SET-BUT-EMPTY env vars, which
+        // clap surfaces as Some(""). Empty means unset here.
+        fn non_empty(v: &Option<String>) -> Option<&str> {
+            v.as_deref().filter(|s| !s.is_empty())
+        }
+        let media_space = match (
+            non_empty(&self.config.media_space_did),
+            non_empty(&self.config.media_space_password),
+        ) {
+            (Some(did), Some(password)) => Some(std::sync::Arc::new(
+                crate::media_space::MediaSpaceManager::new(
+                    did.to_string(),
+                    password.to_string(),
+                    non_empty(&self.config.media_space_pds).map(str::to_string),
+                    self.config.server_name.clone(),
+                ),
+            )),
+            (Some(_), None) => {
+                tracing::warn!(
+                    "media_space_did set without media_space_password; private media disabled"
+                );
+                None
+            }
+            _ => None,
+        };
         let state = Arc::new(SharedState {
             server_name: self.config.server_name.clone(),
             challenge_store: ChallengeStore::new(self.config.challenge_timeout_secs),
             did_resolver: self.resolver.clone(),
+            media_space,
             connections: Mutex::new(HashMap::new()),
             nick_to_session: Mutex::new(NickMap::new()),
             session_dids: Mutex::new(HashMap::new()),
@@ -7827,6 +7930,7 @@ mod s2s_adversarial_tests {
             challenge_store: crate::sasl::ChallengeStore::new(60),
             did_resolver: resolver
                 .unwrap_or_else(|| freeq_sdk::did::DidResolver::static_map(HashMap::new())),
+            media_space: None,
             connections: Mutex::new(HashMap::new()),
             nick_to_session: Mutex::new(NickMap::new()),
             session_dids: Mutex::new(HashMap::new()),
