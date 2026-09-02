@@ -20,6 +20,40 @@ use axum::Router;
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 
+/// Serve a verifier result page. The page's inline script has to carry this
+/// nonce; `onclick`-style attributes won't run at all.
+pub(crate) fn result_page(html: String, nonce: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        [
+            ("content-type", "text/html; charset=utf-8".to_string()),
+            (
+                "content-security-policy",
+                format!(
+                    "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; \
+                     img-src 'self' https: data:"
+                ),
+            ),
+        ],
+        html,
+    )
+        .into_response()
+}
+
+/// A single-use nonce for one result page's inline script.
+pub(crate) fn script_nonce() -> String {
+    hex::encode(rand::random::<[u8; 16]>())
+}
+
+/// Escape text for interpolation into HTML.
+pub(crate) fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 // ─── Shared upstream-fetch helpers ───────────────────────────────────────────
 
 /// Error classification for calls to upstream APIs (Bluesky AppView/PDS,
@@ -317,6 +351,40 @@ mod tests {
             FetchError::from_status(reqwest::StatusCode::FORBIDDEN),
             Some(FetchError::Permanent(_))
         ));
+    }
+
+    #[test]
+    fn html_escape_neutralizes_markup() {
+        assert_eq!(
+            html_escape("</code><script>alert(1)</script>"),
+            "&lt;/code&gt;&lt;script&gt;alert(1)&lt;/script&gt;"
+        );
+        assert_eq!(html_escape(r#"" onload=""#), "&quot; onload=&quot;");
+        assert_eq!(html_escape("' onload='"), "&#39; onload=&#39;");
+    }
+
+    #[test]
+    fn a_result_page_admits_only_its_own_nonce() {
+        let nonce = script_nonce();
+        let resp = result_page("<p>ok</p>".into(), &nonce);
+        let csp = resp
+            .headers()
+            .get("content-security-policy")
+            .expect("result pages must carry their own CSP")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            csp.contains(&format!("script-src 'nonce-{nonce}'")),
+            "{csp}"
+        );
+        // 'unsafe-inline' here would re-admit injected <script> and onclick=.
+        assert!(!csp.contains("script-src 'unsafe-inline'"), "{csp}");
+    }
+
+    #[test]
+    fn script_nonces_are_single_use() {
+        assert_ne!(script_nonce(), script_nonce());
     }
 }
 
