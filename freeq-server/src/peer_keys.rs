@@ -484,7 +484,19 @@ mod tests {
         for _ in 0..5 {
             fetch_on_miss(&state, PEER, did, &sig);
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Wait for the single lookup to land rather than assuming a fixed
+        // round-trip time. The property under test is "exactly one lookup",
+        // not "within 300 ms": a cold client on a loaded box can take well
+        // over a few hundred milliseconds to complete the request, and a
+        // fixed sleep as the only sync point makes this test flaky there
+        // (same bounded-wait idiom as wait_for_key above).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while hits.load(std::sync::atomic::Ordering::SeqCst) == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),

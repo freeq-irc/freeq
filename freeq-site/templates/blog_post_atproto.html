@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% set nav_active = 'blog' %}
 {% block title %}{{ post.title }}{% endblock %}
+{% block og_type %}article{% endblock %}
 {% block head %}
 <meta name="description" content="{{ post.description }}">
 <meta property="og:title" content="{{ post.title }}">
