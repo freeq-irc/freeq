@@ -688,8 +688,8 @@ export class FreeqClient extends EventEmitter {
   // ── Channel management ──
 
   /** Join a channel. */
-  join(channel: string): void {
-    this.raw(`JOIN ${channel}`);
+  join(channel: string, key?: string): void {
+    this.raw(key ? `JOIN ${channel} ${key}` : `JOIN ${channel}`);
   }
 
   /** Leave a channel. */
