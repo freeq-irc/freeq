@@ -219,13 +219,15 @@ pub(super) async fn handle_authenticate(
     } else if conn.sasl_in_progress {
         if let Some(response) = sasl::decode_response(param) {
             // Check for web-token method first (server-side OAuth pre-verified)
+            let mut web_handle: Option<String> = None;
             let web_token_result = if response.method.as_deref() == Some("web-token") {
                 let mut tokens = state.web_auth_tokens.lock();
-                if let Some((did, _handle, created)) = tokens.remove(&response.signature) {
+                if let Some((did, handle, created)) = tokens.remove(&response.signature) {
                     // Single-use: token consumed on first authentication.
                     // 5-minute TTL limits exposure if a token is leaked.
                     // Broker issues fresh tokens on each /session call for reconnects.
                     if created.elapsed() < std::time::Duration::from_secs(300) {
+                        web_handle = Some(handle);
                         Some(Ok(did.clone()))
                     } else {
                         Some(Err("Web auth token expired".to_string()))
@@ -251,13 +253,18 @@ pub(super) async fn handle_authenticate(
                         )
                         .await
                     };
+                    // Connect-time allowlist, if the instance opted in. A web
+                    // token brings its handle along; the challenge path doesn't.
+                    let allowed = match &verify_result {
+                        Ok(did) => {
+                            state
+                                .did_is_allowed_resolved(did, web_handle.as_deref())
+                                .await
+                        }
+                        Err(_) => true,
+                    };
                     match verify_result {
-                        // Connect-time allowlist (opt-in): reject verified DIDs
-                        // that aren't permitted on this instance. Handle isn't
-                        // resolved on the challenge path, so domain-only
-                        // allowlists gate here by DID only — use the OAuth flow
-                        // for handle-domain matching.
-                        Ok(did) if !state.did_is_allowed(&did, None) => {
+                        Ok(did) if !allowed => {
                             conn.sasl_in_progress = false;
                             conn.sasl_failures += 1;
                             crate::server::Metrics::bump(&state.metrics.sasl_failure_total);
@@ -270,7 +277,11 @@ pub(super) async fn handle_authenticate(
                                 ],
                             );
                             send(state, session_id, format!("{fail}\r\n"));
-                            tracing::warn!(%did, "connection denied by connect allowlist (challenge SASL)");
+                            tracing::warn!(
+                                %did,
+                                method = response.method.as_deref().unwrap_or("crypto"),
+                                "connection denied by connect allowlist"
+                            );
                         }
                         Ok(did) => {
                             conn.authenticated_did = Some(did.clone());
