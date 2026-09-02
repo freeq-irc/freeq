@@ -56,7 +56,17 @@ def _markdown(text):
 #: case-insensitive, so a repo-root `agents.md` IS `AGENTS.md` — the
 #: contributor file, a symlink to CLAUDE.md, with production hosts in it.
 #: Writing one silently overwrites the other.
-AGENT_DOCS = REPO_ROOT / "agent-docs"
+#: The deploy uploads only this directory, so it carries its own copy of
+#: agent-docs/ (deploy.sh refreshes it, exactly as it does for docs/). Locally
+#: that copy may not exist yet, so fall back to the repo's. Without the
+#: fallback a freshly added document looks broken in development and works in
+#: production - the failure mode `_doc_path()` already exists to avoid.
+def _agent_docs_dir():
+    local = SITE_ROOT / "agent-docs"
+    return local if local.is_dir() else REPO_ROOT / "agent-docs"
+
+
+AGENT_DOCS = _agent_docs_dir()
 
 
 def _repo_markdown(name):

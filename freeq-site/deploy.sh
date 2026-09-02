@@ -9,6 +9,13 @@ cd "$(dirname "$0")"
 rm -rf docs
 cp -r ../docs ./docs
 
+# Same for the agent-facing documents both hosts serve byte-for-byte
+# (agents.md, auth.md, welcome.md, tos.txt). The deploy uploads only this
+# directory, so without this copy /agents.md and /auth.md 404 in production
+# while passing every test locally.
+rm -rf agent-docs
+cp -r ../agent-docs ./agent-docs
+
 # Write git commit hash for the /version endpoint
 git -C .. rev-parse --short HEAD 2>/dev/null > .git_commit || echo "unknown" > .git_commit
 
@@ -24,4 +31,27 @@ if [ -z "$CLUSTER" ]; then
 fi
 miren deploy -f -C "$CLUSTER"
 
-echo "Deployed! Docs will be at https://www.freeq.at/docs/"
+# Verify we deployed the thing we think we did.
+#
+# A deploy that reports success while the public site serves the old build is
+# the expensive failure: it happened for two weeks (#74) because the app went
+# to a cluster the DNS does not point at, and every local test still passed.
+# Same shape as the "av":true gate in deploy/deploy.sh.
+SITE_URL="${SITE_URL:-https://freeq.at}"
+WANT="$(cat .git_commit)"
+echo "==> Verifying $SITE_URL serves $WANT ..."
+for attempt in $(seq 1 20); do
+    GOT=$(curl -fsS --max-time 10 "$SITE_URL/version" 2>/dev/null \
+          | sed -n 's/.*"git_commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    [ "$GOT" = "$WANT" ] && break
+    sleep 3
+done
+if [ "$GOT" != "$WANT" ]; then
+    echo "DEPLOY FAILED: $SITE_URL/version reports '${GOT:-nothing}', expected '$WANT'." >&2
+    echo "The app deployed to cluster '$CLUSTER', but that is not what this" >&2
+    echo "hostname serves. Check 'miren app list -C <cluster>' against DNS." >&2
+    exit 1
+fi
+echo "    $SITE_URL is serving $WANT"
+
+echo "Deployed! Docs will be at https://freeq.at/docs/"

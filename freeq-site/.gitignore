@@ -1,2 +1,6 @@
 .venv/
 __pycache__/
+
+# Refreshed from the repo root by deploy.sh; not a second source of truth.
+/docs/
+/agent-docs/

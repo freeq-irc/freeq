@@ -5,13 +5,13 @@
 ## Step 1: Redeploy staging with working SFU + port exposure
 
 The SFU auth bug is already fixed (commit 6750e88) but staging hasn't been redeployed.
-Also need to expose SFU port (4443 internal → 30443 external) via Miren node_port on blueyard-projects.
+Also need to expose SFU port (4443 internal → 30443 external) via a Miren node_port on the staging cluster.
 
 - [x] Update SessionIndicator.tsx to use /av/call (same origin, no separate SFU URL)
 - [x] Fix Procfile to include --iroh flag (Miren uses Procfile over Dockerfile CMD)
 - [x] Move call page + JS assets from av_sfu.rs to web.rs (/av/call, /av/assets/*)
 - [x] Bind SFU QUIC (UDP) to web server's $PORT — no separate port needed
-- [x] Deploy to blueyard-projects cluster
+- [x] Deploy to the staging cluster
 - [x] Verify SFU starts on :3000, call page loads at staging.freeq.at/av/call
 
 ## Step 2: Verify browser audio through SFU

@@ -121,6 +121,8 @@ const taskId = bot.client.emitEvent('#chan', 'task_request', { … });
 bot.client.spawnAgent('#chan', 'worker-bot', ['url_fetch']);
 ```
 
+Note on `sendEdit` / `sendDelete` / `sendReaction`: changing a message requires a valid signature from a logged-in sender — unsigned changes are refused with a visible error. Bots on bot-kit/SDK defaults sign automatically; a bot that explicitly disabled signing will have these actions refused. In a DM, signing needs the peer's identity known — resolve the peer (WHOIS) before changing messages in a fresh DM thread.
+
 ### Examples
 
 Runnable bots under [`@freeq/bot-kit`'s `examples/`](../freeq-bot-kit-js/examples/):

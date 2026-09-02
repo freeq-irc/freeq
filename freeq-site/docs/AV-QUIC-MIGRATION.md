@@ -46,14 +46,15 @@ gradual; if not, clients must cut over together.
 
 ### Phase 0 — Cert plumbing  (`av-deploy.sh cert`; no code)
 
-`freeq-server` runs as user `chad`; Let's Encrypt's `privkey.pem` is root-only.
-Copy the cert to a `chad`-readable directory and keep it fresh on renewal.
+`freeq-server` runs as a non-root service user; Let's Encrypt's `privkey.pem`
+is root-only. Copy the cert to a service-user-readable directory and keep it
+fresh on renewal.
 
-- Copy `/etc/letsencrypt/live/tech.blueyard.com/{fullchain,privkey}.pem`
-  → `/home/chad/freeq-certs/` (owner `chad`, mode `600`).
+- Copy `/etc/letsencrypt/live/<your-domain>/{fullchain,privkey}.pem`
+  → `/srv/freeq-certs/` (owned by the service user, mode `600`).
 - Install `/etc/letsencrypt/renewal-hooks/deploy/freeq-av-cert.sh` to re-copy
   the cert and restart `freeq-server` on each renewal.
-- **Verify:** the two `.pem` files exist, are `chad`-owned, mode `600`.
+- **Verify:** the two `.pem` files exist, are service-user-owned, mode `600`.
 
 ### Phase 1 — SFU QUIC on the real cert  (`freeq-server/src/av_sfu.rs`)
 
@@ -74,11 +75,11 @@ match (std::env::var("FREEQ_AV_TLS_CERT"), std::env::var("FREEQ_AV_TLS_KEY")) {
 `moq_native::ServerTlsConfig` takes `cert: Vec<PathBuf>` + `key: Vec<PathBuf>`,
 zipped pairwise (see moq-native `tls.rs::load_certs`).
 
-Add to `/home/chad/src/freeq/.env.secrets` (the systemd `EnvironmentFile`):
+Add to the systemd `EnvironmentFile` (e.g. `/etc/freeq/secrets`):
 
 ```
-FREEQ_AV_TLS_CERT=/home/chad/freeq-certs/fullchain.pem
-FREEQ_AV_TLS_KEY=/home/chad/freeq-certs/privkey.pem
+FREEQ_AV_TLS_CERT=/srv/freeq-certs/fullchain.pem
+FREEQ_AV_TLS_KEY=/srv/freeq-certs/privkey.pem
 ```
 
 Deploy + restart. **Verify:** a native client connects to
@@ -135,5 +136,5 @@ moq-native-raced fallback. Acceptance:
 ## Automation
 
 `deploy/av-deploy.sh [cert|deploy|verify|all]` — pushes the current branch, then
-over SSH pulls/builds/restarts `freeq-server` on `chad@tech.blueyard.com` and
+over SSH pulls/builds/restarts `freeq-server` on `$FREEQ_SERVER` and
 health-checks the SFU.
