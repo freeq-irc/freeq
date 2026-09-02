@@ -898,11 +898,15 @@ function handleCommand(text: string, activeChannel: string) {
     : '';
 
   switch (cmd) {
-    case 'join': case 'j':
-      args.split(',').map((s) => s.trim()).filter(Boolean).forEach((c) =>
-        joinChannel(c.startsWith('#') ? c : `#${c}`)
+    case 'join': case 'j': {
+      // Trim spaces around the commas for multiple channel lists.
+      const [chanList = '', keyList = ''] = args.trim().replace(/\s*,\s*/g, ',').split(/\s+/);
+      const keys = keyList.split(',');
+      chanList.split(',').filter(Boolean).forEach((c, i) =>
+        joinChannel(c.startsWith('#') ? c : `#${c}`, keys[i] || undefined)
       );
       break;
+    }
     case 'part': case 'leave':
       partChannel(args || target);
       break;

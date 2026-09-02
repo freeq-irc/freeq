@@ -774,14 +774,14 @@ class AppState(application: Application) : AndroidViewModel(application) {
     // ── Channel operations ──
 
     fun joinChannel(channel: String, navigate: Boolean = true) {
-        val ch = if (channel.startsWith("#")) channel else "#$channel"
+        val target = JoinTarget.parse(channel) ?: return
         // Track for navigation after JOIN confirmation (only for user-initiated joins)
-        if (navigate) pendingJoinChannel = ch
+        if (navigate) pendingJoinChannel = target.channel
         try {
-            client?.join(ch)
+            client?.join(target.line)
         } catch (_: Exception) {
             if (navigate) pendingJoinChannel = null
-            errorMessage.value = "Failed to join $ch"
+            errorMessage.value = "Failed to join ${target.channel}"
         }
     }
 

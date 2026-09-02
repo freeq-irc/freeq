@@ -93,7 +93,10 @@ pub(super) fn handle_whois(
                 let channels = state.channels.lock();
                 channels
                     .iter()
-                    .filter(|(_, ch)| ch.remote_members.contains_key(target_nick))
+                    .filter(|(name, ch)| {
+                        ch.remote_members.contains_key(target_nick)
+                            && state.channel_visible_to(name, ch, session_id)
+                    })
                     .map(|(name, ch)| {
                         let is_op = rm.did.as_ref().is_some_and(|d| {
                             ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d)
@@ -336,6 +339,11 @@ pub(super) fn handle_whois(
         let mut listed: Vec<String> = channels
             .iter()
             .filter_map(|(name, ch)| {
+                // Naming a restricted channel here would hand back exactly what
+                // NAMES and WHO refuse to, keyed by nick instead of channel.
+                if !state.channel_visible_to(name, ch, session_id) {
+                    return None;
+                }
                 // Every session belonging to this person, not just the resolved one.
                 let sessions: Vec<String> = ch
                     .members
@@ -416,7 +424,10 @@ pub(super) fn handle_who(
         // note in channel.rs::handle_names.
         let dids_snapshot = state.session_dids.lock().clone();
         let channels = state.channels.lock();
-        if let Some(ch) = channels.get(&channel) {
+        if let Some(ch) = channels
+            .get(&channel)
+            .filter(|ch| state.channel_visible_to(&channel, ch, session_id))
+        {
             let n2s = state.nick_to_session.lock();
             let away = state.session_away.lock();
 
