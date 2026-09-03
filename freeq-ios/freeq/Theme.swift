@@ -46,6 +46,8 @@ enum Theme {
     static let danger  = Color(light: 0xDA3B3B, dark: 0xFB6B6B)
     /// Secondary brand hue — presence, links-in-glass, subtle depth.
     static let iris    = Color(light: 0x4E60D8, dark: 0x8A9BFF)
+    /// In-progress register on act cards; the web token's values (--color-blue).
+    static let blue    = Color(light: 0x3B7DFF, dark: 0x5C9EFF)
 
     // MARK: Borders — hairlines read as translucent, not painted lines
     static let border       = Color(light: Color.black.opacity(0.08),

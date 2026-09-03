@@ -947,9 +947,9 @@ struct MessageListView: View {
             // renders as its own card and stays one; a line whose event has
             // not arrived has no card here and stays text below.
             ActEventCardView(card: card, at: msg.timestamp,
-                             isHighlighted: appState.scrollToMessageId == msg.id) { msgId in
-                appState.scrollToMessageId = msgId
-            }
+                             isHighlighted: appState.scrollToMessageId == msg.id,
+                             onJumpToMessage: { msgId in appState.scrollToMessageId = msgId },
+                             resolveName: { appState.displayNameForKey($0) })
             // The two row layouts hand this card different spans, so without
             // this it renders at two sizes down the transcript. A header row
             // starts at 16+40(avatar)+12(gap) = 68 and its HStack spacing puts
@@ -960,8 +960,9 @@ struct MessageListView: View {
             .padding(.horizontal, grouped ? 12 : 0)
             .frame(maxWidth: .infinity, alignment: .leading)
         } else if let coord = msg.coordination {
-            // Agent coordination event → structured card (parity with web + macOS).
-            CoordinationCardView(info: coord, text: msg.text)
+            // Every event-tagged message is a card, whatever its type says
+            // (parity with the other three clients).
+            CoordinationCardView(info: coord, text: msg.text, at: msg.timestamp)
                 .padding(.horizontal, grouped ? 12 : 0)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else if let jumbo = Jumbomoji.size(msg.text) {

@@ -48,6 +48,7 @@ let package = Package(
                 "ChatMessage.swift",
                 "CoordinationCard.swift",
                 "ActVerbs.swift",
+                "ActFacts.swift",
                 "ActTasks.swift",
                 "DmHistoryOnOpen.swift",
                 "Jumbomoji.swift",
@@ -69,6 +70,11 @@ let package = Package(
                 "DmResolver.swift",
                 "IdentityClaim.swift",
                 "SignatureProof.swift",
+            ],
+            resources: [
+                // The seal panel's words, bundled byte-identical from
+                // `spec/act-card-copy.json` and pinned by a test.
+                .process("act-card-copy.json"),
             ]
         ),
         .testTarget(
