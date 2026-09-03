@@ -209,6 +209,16 @@ jobs:
         working-directory: freeq-sdk-js
         run: npm ci
 
+      # @freeq/sdk is a file: dependency whose entry point is dist/index.js,
+      # and dist/ is gitignored — so without this the dev server cannot
+      # resolve the SDK and the app renders an empty page. Every test then
+      # fails as "element(s) not found", which reads like broken assertions
+      # rather than a missing build. Verified by deleting dist/ locally and
+      # reproducing the CI failure exactly.
+      - name: Build SDK
+        working-directory: freeq-sdk-js
+        run: npm run build
+
       - name: Install web deps
         working-directory: freeq-app
         run: npm ci
