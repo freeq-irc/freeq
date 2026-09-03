@@ -1,0 +1,19 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.freeq-irc/freeq",
+  "title": "freeq",
+  "description": "Read and verify freeq conversations: channels, history, search, signatures, pins.",
+  "version": "0.1.0",
+  "websiteUrl": "https://freeq.at",
+  "repository": {
+    "url": "https://github.com/freeq-irc/freeq",
+    "source": "github",
+    "subfolder": "freeq-server/src/mcp.rs"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://irc.freeq.at/mcp"
+    }
+  ]
+}
