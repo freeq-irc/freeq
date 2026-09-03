@@ -152,7 +152,7 @@ GET /api/v1/channels/mychannel/audit   (chronological audit trail)
 
 There is no task view over these rows. The server stores and relays them as the freeform events they are and reads no lifecycle into the six task names; a reader that wants a task's history asks for its `ref_id` and assembles it.
 
-Clients render `delegation_notice` and `status_update` as cards, and any event type they do not recognize as a generic one. The six task names above render as their plain companion text — the line is still there and history stays readable, but the card that used to interpret them is gone. Task cards are what the `act-` family gets.
+Clients render every `+freeq.at/event` message as one generic card: the event type, the line its sender wrote, and the payload as key/value rows. There are no per-type faces and no list of types that card — the six task names above, `delegation_notice`, `status_update`, and a type nobody has taught the client all look the same, which is the design. Task cards, with their verb glyph, hue and seal, are what the `act-` family gets. `docs/EVENT-CARDS.md` describes both.
 
 ### Task messages: what to know before building on them
 
