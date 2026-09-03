@@ -17,56 +17,6 @@ function tag(msg: Message, key: string): string | undefined {
   return msg.tags?.[`+freeq.at/${key}`] || msg.tags?.[`freeq.at/${key}`];
 }
 
-function TaskIdBadge({ taskId }: { taskId?: string }) {
-  if (!taskId) return null;
-  const short = taskId.length > 10 ? taskId.slice(0, 10) + '…' : taskId;
-  return (
-    <span className="text-[10px] font-mono text-fg-dim/60 ml-1" title={taskId}>
-      {short}
-    </span>
-  );
-}
-
-// ─── Card Wrapper ───────────────────────────────────
-
-export function CardFrame({ icon, label, children, msg, className, uppercaseLabel = true, footer }: {
-  icon: string;
-  label: string;
-  children: React.ReactNode;
-  msg: Message;
-  className?: string;
-  /** Uppercases the label by style, leaving the word itself as written. */
-  uppercaseLabel?: boolean;
-  /** A strip under the body, off the header's tint and behind a hairline. */
-  footer?: React.ReactNode;
-}) {
-  const taskId = tag(msg, 'ref') || tag(msg, 'task-id');
-
-  return (
-    <div className={`mt-1 rounded-lg border border-border/50 overflow-hidden ${className || ''}`}>
-      <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-surface/50 text-xs text-fg-dim">
-        <span>{icon}</span>
-        <span className={`font-semibold text-fg-muted ${uppercaseLabel ? 'uppercase' : ''}`}>{label}</span>
-        <TaskIdBadge taskId={taskId} />
-        <span className="ml-auto text-[10px] text-fg-dim/50">
-          {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-        </span>
-      </div>
-      <div className="px-2.5 py-2 text-sm">
-        {children}
-      </div>
-      {footer && (
-        <div
-          data-testid="card-footer"
-          className="flex items-center border-t border-border/50 px-2.5 py-1.5 text-[11px]"
-        >
-          {footer}
-        </div>
-      )}
-    </div>
-  );
-}
-
 // ─── The generic card ───────────────────────────────
 
 /** The payload as always-visible rows. A long value scrolls inside its own

@@ -1,0 +1,27 @@
+{
+  "_readme": [
+    "The words a card's seal panel shows a reader, in one place so the four clients cannot",
+    "drift apart on them. A client bundles this file byte-identical and pins the copy with a",
+    "test; none of them holds the prose itself.",
+    "",
+    "A panel's sentence is chosen mechanically: the transition row this event matched in",
+    "act-transitions.json names a `who`, and that `who` is the key here. An opening verb has no",
+    "transition row of its own — it is the kind's `opens.verb` — and takes the `opener` key.",
+    "Rows whose `who` is `system` write no card and so ask for no sentence.",
+    "",
+    "`header_format` is the panel's title with KIND replaced by the event's own act kind,",
+    "uppercased. `link_text` labels the link to the action's full history."
+  ],
+  "version": "0.1",
+  "seal_panel": {
+    "header_format": "<KIND>: Rules Enforced",
+    "link_text": "View full history",
+    "sentences": {
+      "opener": "This opened a task with known rules: who may take it, who may work it, who may finish it. Every later step is checked against those rules before the server accepts it — an illegal step is refused and never appears here.",
+      "offeree": "Only the person this task was offered to could take this step. The server checked that before accepting it — this step from anyone else is refused and never appears here.",
+      "assignee": "Only the worker this task is assigned to could take this step. The server checked that before accepting it — this step from anyone else is refused and never appears here.",
+      "offerer": "Only the person who posted this task could take this step. The server checked that before accepting it — this step from anyone else is refused and never appears here.",
+      "anyone": "Any signed-in account could take this step, and the server checked it was legal from the task's current state before accepting it — an illegal step is refused and never appears here."
+    }
+  }
+}

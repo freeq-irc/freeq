@@ -3,11 +3,12 @@
  * The card a task event's companion line becomes: its headline is the word
  * for the verb that event carried, and every event keeps its own card.
  */
-import { describe, it, expect, afterEach } from 'vitest';
-import { render, cleanup } from '@testing-library/react';
+import { describe, it, expect, afterEach, beforeEach } from 'vitest';
+import { render, cleanup, fireEvent } from '@testing-library/react';
 import { ActEventCard, cardNeighbours } from './ActCards';
-import { actHeadline, actEmoji, actAccent } from '../lib/act-verbs';
+import { actHeadline, actEmoji, actRegister } from '../lib/act-verbs';
 import type { Message, ActTask, ActEvent } from '../store';
+import { useStore } from '../store';
 
 afterEach(cleanup);
 
@@ -49,6 +50,12 @@ const WORDS: Array<[string, string]> = [
   ['accept-work', 'accepted'],
   ['forfeit', 'forfeited'],
 ];
+
+beforeEach(() => {
+  // The seal panel's open state lives in the store now; a test must not
+  // inherit the previous test's open card.
+  useStore.setState({ sealPanelFor: null });
+});
 
 describe('the headline word', () => {
   it.each(WORDS)('a %s shows "%s"', (verb, word) => {
@@ -115,42 +122,151 @@ describe('the headline glyph', () => {
   });
 });
 
-describe('the accent edge', () => {
-  it('marks the moves that put work on a plate', () => {
-    expect(actAccent('offer')).toBe('handoff');
-    expect(actAccent('award')).toBe('handoff');
+describe('the colour law', () => {
+  /** register → the token this client paints it in. */
+  const PAINT: Array<[string, string, string]> = [
+    // verb, the class on the headline word, the class on the card's edge
+    ['offer', 'text-purple', 'border-l-purple'],
+    ['claim', 'text-blue', 'border-l-blue'],
+    ['progress', 'text-blue', 'border-l-blue'],
+    ['bid', 'text-blue', 'border-l-blue'],
+    ['complete', 'text-success', 'border-l-success'],
+    ['accept-work', 'text-success', 'border-l-success'],
+    ['fail', 'text-danger', 'border-l-danger'],
+    ['forfeit', 'text-danger', 'border-l-danger'],
+    ['cancel', 'text-danger', 'border-l-danger'],
+    ['decline', 'text-danger', 'border-l-danger'],
+    ['escalate', 'text-warning', 'border-l-warning'],
+  ];
+
+  function frame(verb: string): HTMLElement {
+    const ev = event(verb);
+    const { container } = render(<ActEventCard msg={msg(ev.msgId!)} task={task([ev])} event={ev} />);
+    return container.querySelector('[data-testid="act-card"] > div') as HTMLElement;
+  }
+
+  it.each(PAINT)('a %s paints its word %s and its edge %s', (verb, word, edge) => {
+    const el = frame(verb);
+    expect(el.className).toContain(edge);
+    expect(el.querySelector('[data-testid="act-headline"]')!.className).toContain(word);
   });
 
-  it('marks a good end and a bad one', () => {
-    expect(actAccent('complete')).toBe('success');
-    expect(actAccent('accept-work')).toBe('success');
-    expect(actAccent('fail')).toBe('failure');
+  it.each(PAINT)('a %s washes the border in the same hue', (verb, word) => {
+    const hue = word.replace('text-', '');
+    expect(frame(verb).className).toContain(`border-${hue}/`);
   });
 
-  it('leaves every other verb unaccented', () => {
-    const plain = ['accept', 'decline', 'claim', 'progress', 'cancel', 'bid',
-                   'submit', 'revise', 'forfeit', 'escalate'];
-    for (const verb of plain) expect(actAccent(verb)).toBe('none');
-  });
-
-  it('paints the edge in the colour the accent names', () => {
-    const cases: Array<[string, string]> = [
-      ['offer', 'border-l-purple'],
-      ['complete', 'border-l-success'],
-      ['fail', 'border-l-danger'],
-    ];
-    for (const [verb, edge] of cases) {
-      const ev = event(verb);
-      const { container } = render(<ActEventCard msg={msg(ev.msgId!)} task={task([ev])} event={ev} />);
-      expect(container.querySelector('[data-testid="act-card"] > div')!.className).toContain(edge);
+  it('every act card carries an edge — it is the act-vs-generic tell', () => {
+    for (const [verb] of PAINT) {
+      expect(frame(verb).className, verb).toContain('border-l-[3px]');
       cleanup();
     }
   });
 
-  it('draws no edge on a verb with no accent', () => {
-    const ev = event('progress');
+  it('the register is what picks the hue, not the verb', () => {
+    for (const [verb, word] of PAINT) {
+      const byRegister: Record<string, string> = {
+        new: 'text-purple', inProgress: 'text-blue', endedWell: 'text-success',
+        didNotEndWell: 'text-danger', neutralEnd: 'text-warning',
+      };
+      expect(byRegister[actRegister(verb)!], verb).toBe(word);
+    }
+  });
+});
+
+describe('the seal', () => {
+  function card(verb: string, fields: Record<string, string> = {}) {
+    const ev = event(verb, fields);
+    return render(<ActEventCard msg={msg(ev.msgId!)} task={task([ev])} event={ev} />);
+  }
+
+  const CARDING = ['offer', 'accept', 'decline', 'claim', 'progress', 'complete', 'fail',
+                   'cancel', 'bid', 'award', 'submit', 'revise', 'accept-work', 'forfeit',
+                   'escalate'];
+
+  it.each(CARDING)('a %s card carries the seal', (verb) => {
+    const { container } = card(verb);
+    expect(container.querySelector('[data-testid="act-seal"]')).not.toBeNull();
+  });
+
+  it.each(CARDING)('the seal on a %s card is monochrome, never the card hue', (verb) => {
+    const { container } = card(verb);
+    const seal = container.querySelector('[data-testid="act-seal"]') as HTMLElement;
+    expect(seal.className).toContain('text-fg-dim');
+    expect(seal.className).not.toMatch(/text-(purple|blue|success|danger|warning)/);
+    // `currentColor` and nothing else: no fill or stroke of its own.
+    expect(seal.querySelector('svg')!.outerHTML).not.toMatch(/#[0-9a-fA-F]{3,6}/);
+  });
+
+  it('is shut until it is asked for', () => {
+    const { container } = card('claim');
+    expect(container.querySelector('[data-testid="act-seal-panel"]')).toBeNull();
+  });
+
+  it('opens the panel without opening the timeline modal', () => {
+    const { container } = card('claim');
+    fireEvent.click(container.querySelector('[data-testid="act-seal"]')!);
+    expect(container.querySelector('[data-testid="act-seal-panel"]')).not.toBeNull();
+    expect(document.body.querySelector('[data-testid="act-timeline-modal"]')).toBeNull();
+  });
+
+  it('shuts again on a second click', () => {
+    const { container } = card('claim');
+    const seal = container.querySelector('[data-testid="act-seal"]')!;
+    fireEvent.click(seal);
+    fireEvent.click(seal);
+    expect(container.querySelector('[data-testid="act-seal-panel"]')).toBeNull();
+  });
+});
+
+describe("the seal panel's words", () => {
+  function panelOf(verb: string, kind = 'handoff'): HTMLElement {
+    const ev = event(verb, { act: kind });
     const { container } = render(<ActEventCard msg={msg(ev.msgId!)} task={task([ev])} event={ev} />);
-    expect(container.querySelector('[data-testid="act-card"] > div')!.className).not.toContain('border-l-');
+    fireEvent.click(container.querySelector('[data-testid="act-seal"]')!);
+    return container.querySelector('[data-testid="act-seal-panel"]') as HTMLElement;
+  }
+
+  it('heads the panel with the kind off the event tag, uppercased', () => {
+    expect(panelOf('claim', 'handoff').textContent).toContain('HANDOFF: Rules Enforced');
+    cleanup();
+    expect(panelOf('bid', 'bounty').textContent).toContain('BOUNTY: Rules Enforced');
+  });
+
+  it('takes a kind nobody has taught it', () => {
+    expect(panelOf('claim', 'society-question').textContent)
+      .toContain('SOCIETY-QUESTION: Rules Enforced');
+  });
+
+  const SENTENCES: Array<[string, string]> = [
+    ['offer', 'This opened a task with known rules: who may take it, who may work it, who may finish it. Every later step is checked against those rules before the server accepts it — an illegal step is refused and never appears here.'],
+    ['accept', 'Only the person this task was offered to could take this step. The server checked that before accepting it — this step from anyone else is refused and never appears here.'],
+    ['progress', 'Only the worker this task is assigned to could take this step. The server checked that before accepting it — this step from anyone else is refused and never appears here.'],
+    ['cancel', 'Only the person who posted this task could take this step. The server checked that before accepting it — this step from anyone else is refused and never appears here.'],
+    ['claim', "Any signed-in account could take this step, and the server checked it was legal from the task's current state before accepting it — an illegal step is refused and never appears here."],
+  ];
+
+  it.each(SENTENCES)('a %s says what the server enforced', (verb, sentence) => {
+    expect(panelOf(verb).textContent).toContain(sentence);
+  });
+
+  it('offers the link to the full history', () => {
+    const panel = panelOf('claim');
+    expect(panel.textContent).toContain('View full history');
+  });
+
+  it('opens the timeline from that link', () => {
+    const ev = event('claim', { act: 'handoff' });
+    const { container } = render(<ActEventCard msg={msg(ev.msgId!)} task={task([ev])} event={ev} />);
+    fireEvent.click(container.querySelector('[data-testid="act-seal"]')!);
+    fireEvent.click(container.querySelector('[data-testid="act-seal-history"]')!);
+    expect(document.body.querySelector('[data-testid="act-timeline-modal"]')).not.toBeNull();
+  });
+
+  it('claims nothing for a verb it has no rule for', () => {
+    const panel = panelOf('escalate');
+    expect(panel.textContent).toContain('ESCALATE'.length ? 'Rules Enforced' : '');
+    expect(panel.textContent).not.toContain('could take this step');
   });
 });
 
@@ -185,6 +301,33 @@ describe('what the card carries', () => {
     const ev = event('claim');
     const { container } = render(<ActEventCard msg={msg(ev.msgId!)} task={task([ev])} event={ev} />);
     expect(container.textContent).not.toContain('whatever the sender wrote');
+  });
+});
+
+describe('the way into the history', () => {
+  function card(fields: Record<string, string> = {}) {
+    const ev = event('progress', fields);
+    return render(<ActEventCard msg={msg(ev.msgId!)} task={task([ev])} event={ev} />);
+  }
+
+  const modal = () => document.body.querySelector('[data-testid="act-timeline-modal"]');
+
+  it('opens the timeline from the title', () => {
+    const { getByText } = card();
+    fireEvent.click(getByText('ship the release'));
+    expect(modal()).not.toBeNull();
+  });
+
+  it('opens the timeline from the task id', () => {
+    const { getByText } = card();
+    fireEvent.click(getByText('01JOPENER0…'));
+    expect(modal()).not.toBeNull();
+  });
+
+  it('leaves the rest of the body alone — a click on the note opens nothing', () => {
+    const { getByText } = card({ 'act-note': 'tagged the build' });
+    fireEvent.click(getByText('tagged the build'));
+    expect(modal()).toBeNull();
   });
 });
 

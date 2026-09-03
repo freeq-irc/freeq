@@ -300,6 +300,10 @@ export interface Store {
   blockedNicks: string[]; // lowercase nicks — fallback for DID-less (guest) users
   searchOpen: boolean;
   scrollToMsgId: string | null;
+  /** The msgid whose act card shows its open seal panel. In the store, not
+   *  row state: virtualized rows recycle, and per-row state lands the panel
+   *  on the wrong card. One panel at a time by construction. */
+  sealPanelFor: string | null;
   searchQuery: string;
   channelListOpen: boolean;
   channelList: ChannelListEntry[];
@@ -452,6 +456,7 @@ export interface Store {
   setBookmarksPanelOpen: (open: boolean) => void;
   setSearchOpen: (open: boolean) => void;
   setScrollToMsgId: (id: string | null) => void;
+  setSealPanelFor: (id: string | null) => void;
   setPins: (channel: string, pins: PinnedMessage[]) => void;
   addPin: (channel: string, msgid: string, pinnedBy: string) => void;
   removePin: (channel: string, msgid: string) => void;
@@ -747,6 +752,7 @@ export const useStore = create<Store>((set, get) => ({
   blockedNicks: safeJsonParse(localStorage.getItem('freeq-blocked-nicks'), []),
   searchOpen: false,
   scrollToMsgId: null,
+  sealPanelFor: null,
   searchQuery: '',
   channelListOpen: false,
   channelList: [],
@@ -1798,6 +1804,7 @@ export const useStore = create<Store>((set, get) => ({
   setBookmarksPanelOpen: (open) => set({ bookmarksPanelOpen: open }),
   setSearchOpen: (open) => set({ searchOpen: open, searchQuery: open ? '' : '' }),
   setScrollToMsgId: (id) => set({ scrollToMsgId: id }),
+  setSealPanelFor: (id) => set({ sealPanelFor: id }),
   setPins: (channel, pins) => set((state) => {
     const channels = new Map(state.channels);
     const ch = channels.get(channel.toLowerCase());
