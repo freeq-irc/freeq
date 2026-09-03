@@ -40,32 +40,30 @@ describe('act surfaces carry no resting signature ink', () => {
   });
 
   it('task timeline shows verify actions instead of resting locks', async () => {
-    const task = {
-      event_id: '01KZTASK00000000000000TASK',
-      event_type: 'task_request',
+    const ACT_ID = '01KZTASK00000000000000TASK';
+    const offer = {
+      event_id: ACT_ID,
+      canonical: JSON.stringify({ 'act-verb': 'offer', 'act-title': 'fetch this URL' }),
       actor_did: 'did:plc:worker',
-      channel: '#tasks',
-      payload_json: '{"description":"fetch this URL"}',
       signature: 'ed25519:kid:sigsigsig',
       timestamp: 0,
     };
-    const evidence = {
-      ...task,
-      event_id: '01KZEVID00000000000000EVID',
-      event_type: 'evidence_attach',
-      payload_json: '{"type":"commit","summary":"done"}',
+    const accept = {
+      ...offer,
+      event_id: '01KZACPT00000000000000ACPT',
+      canonical: JSON.stringify({ 'act-verb': 'accept', 'act-id': ACT_ID }),
     };
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true,
-      json: () => Promise.resolve({ task, events: [evidence] }),
+      json: () => Promise.resolve({ task: null, events: [offer, accept] }),
     }));
 
     const { container, getAllByText } = render(
-      <TaskTimeline taskId={task.event_id} onClose={() => {}} />,
+      <TaskTimeline actId={ACT_ID} onClose={() => {}} />,
     );
     await waitFor(() => expect(container.textContent).toContain('fetch this URL'));
     expect(container.textContent).not.toContain('🔒');
-    // Header + evidence row each offer an explicit check.
+    // Each event row offers an explicit check.
     expect(getAllByText('verify').length).toBe(2);
   });
 });
