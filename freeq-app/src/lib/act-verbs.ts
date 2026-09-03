@@ -21,10 +21,11 @@ const HEADLINE: Record<string, string> = {
   revise: 'revisions requested',
   'accept-work': 'accepted',
   forfeit: 'forfeited',
-  // The two the home signs for itself. They write no companion line, so these
-  // words are read in the timeline rather than on a card.
+  // The three the home signs for itself. They write no companion line, so
+  // these words are read on a system line rather than on a card.
   confirm: 'confirmed',
   expire: 'expired',
+  'auto-accept': 'accepted (review window closed)',
 };
 
 export function actHeadline(verb: string): string {
@@ -53,10 +54,11 @@ const EMOJI: Record<string, string> = {
   revise: '🔁',
   'accept-work': '✅',
   forfeit: '🏳️',
-  // The two the home signs for itself. They write no companion line, so they
-  // carry their glyph on a system line rather than on a card.
+  // The three the home signs for itself. They write no companion line, so
+  // they carry their glyph on a system line rather than on a card.
   confirm: '✔️',
   expire: '⌛',
+  'auto-accept': '⏱️',
 };
 
 export function actEmoji(verb: string): string {

@@ -27,10 +27,11 @@ object ActVerbs {
         "revise" to "revisions requested",
         "accept-work" to "accepted",
         "forfeit" to "forfeited",
-        // The two the home signs for itself. They write no companion line, so
-        // these words are read in the timeline rather than on a card.
+        // The three the home signs for itself. They write no companion line,
+        // so these words are read on a system line rather than on a card.
         "confirm" to "confirmed",
         "expire" to "expired",
+        "auto-accept" to "accepted (review window closed)",
     )
 
     fun headline(verb: String): String = HEADLINE[verb] ?: verb
@@ -58,10 +59,11 @@ object ActVerbs {
         "revise" to "🔁",
         "accept-work" to "✅",
         "forfeit" to "🏳️",
-        // The two the home signs for itself. They write no companion line, so
-        // they carry their glyph on a system line rather than on a card.
+        // The three the home signs for itself. They write no companion line,
+        // so they carry their glyph on a system line rather than on a card.
         "confirm" to "✔️",
         "expire" to "⌛",
+        "auto-accept" to "⏱️",
     )
 
     fun emoji(verb: String): String = EMOJI[verb] ?: "📌"

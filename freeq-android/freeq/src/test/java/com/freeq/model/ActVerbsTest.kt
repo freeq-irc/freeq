@@ -64,9 +64,16 @@ class ActVerbsTest {
         assertEquals("📌", ActVerbs.emoji(""))
     }
 
-    @Test fun the_home_own_two_verbs_carry_the_glyphs_their_lines_open_with() {
+    @Test fun the_home_own_verbs_carry_the_glyphs_their_lines_open_with() {
         assertEquals("✔️", ActVerbs.emoji("confirm"))
         assertEquals("⌛", ActVerbs.emoji("expire"))
+        assertEquals("⏱️", ActVerbs.emoji("auto-accept"))
+    }
+
+    @Test fun the_home_own_verbs_have_words_for_their_system_lines() {
+        assertEquals("confirmed", ActVerbs.headline("confirm"))
+        assertEquals("expired", ActVerbs.headline("expire"))
+        assertEquals("accepted (review window closed)", ActVerbs.headline("auto-accept"))
     }
 
     @Test fun an_opening_move_is_new_and_the_moves_onto_a_plate_are_in_progress() {

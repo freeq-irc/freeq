@@ -68,11 +68,18 @@ describe('the headline word', () => {
     expect(actHeadline('withdraw-bid')).toBe('withdraw-bid');
   });
 
-  // The home's own two verbs write no companion, so they have no card — their
-  // words are read in the timeline, off the same table.
+  // The home's own three verbs write no companion, so they have no card —
+  // their words are read on a system line, off the same table.
   it('has a word for each verb the home signs itself', () => {
     expect(actHeadline('confirm')).toBe('confirmed');
     expect(actHeadline('expire')).toBe('expired');
+    expect(actHeadline('auto-accept')).toBe('accepted (review window closed)');
+  });
+
+  it('has a glyph for each verb the home signs itself', () => {
+    expect(actEmoji('confirm')).toBe('✔️');
+    expect(actEmoji('expire')).toBe('⌛');
+    expect(actEmoji('auto-accept')).toBe('⏱️');
   });
 
   it('reads a progress off the event, not off where the task got to', () => {
