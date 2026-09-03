@@ -8,33 +8,34 @@ package com.freeq.model
  * report never reads as a claim. A verb with no row here shows itself, which
  * is how a kind may add one without this having to be taught it.
  *
- * The same rows the web client reads (`freeq-app/src/lib/act-verbs.ts`), so
- * the same move is called the same thing wherever it is read.
+ * The rows live in the bundled copy of `spec/act-card-copy.json`, the same
+ * file the other three clients read, so the same move is called the same
+ * thing wherever it is read. A verb with no row shows itself, with the
+ * fallback glyph.
  */
 object ActVerbs {
-    private val HEADLINE = mapOf(
-        "offer" to "offered",
-        "accept" to "accepted",
-        "decline" to "declined",
-        "claim" to "claimed",
-        "progress" to "in progress",
-        "complete" to "completed",
-        "fail" to "failed",
-        "cancel" to "cancelled",
-        "bid" to "bid",
-        "award" to "awarded",
-        "submit" to "submitted",
-        "revise" to "revisions requested",
-        "accept-work" to "accepted",
-        "forfeit" to "forfeited",
-        // The three the home signs for itself. They write no companion line,
-        // so these words are read on a system line rather than on a card.
-        "confirm" to "confirmed",
-        "expire" to "expired",
-        "auto-accept" to "accepted (review window closed)",
-    )
+    private val VERBS: Map<String, Pair<String, String>> by lazy {
+        val text = ActVerbs::class.java.classLoader!!
+            .getResourceAsStream("act-card-copy.json")!!
+            .reader(Charsets.UTF_8).readText()
+        val verbs = org.json.JSONObject(text).getJSONObject("verbs")
+        buildMap {
+            for (key in verbs.keys()) {
+                val row = verbs.getJSONObject(key)
+                put(key, row.getString("word") to row.getString("glyph"))
+            }
+        }
+    }
 
-    fun headline(verb: String): String = HEADLINE[verb] ?: verb
+    private val FALLBACK_GLYPH: String by lazy {
+        val text = ActVerbs::class.java.classLoader!!
+            .getResourceAsStream("act-card-copy.json")!!
+            .reader(Charsets.UTF_8).readText()
+        org.json.JSONObject(text).getString("fallback_glyph")
+    }
+
+    fun headline(verb: String): String = VERBS[verb]?.first ?: verb
+
 
     /**
      * The glyph each task verb shows a reader, beside its word.
@@ -44,29 +45,7 @@ object ActVerbs {
      * here gets the generic pin, so a kind may add a move without this being
      * taught it.
      */
-    private val EMOJI = mapOf(
-        "offer" to "📋",
-        "accept" to "👍",
-        "decline" to "👎",
-        "claim" to "✋",
-        "progress" to "📌",
-        "complete" to "🎉",
-        "fail" to "❌",
-        "cancel" to "🚫",
-        "bid" to "💰",
-        "award" to "🏆",
-        "submit" to "📤",
-        "revise" to "🔁",
-        "accept-work" to "✅",
-        "forfeit" to "🏳️",
-        // The three the home signs for itself. They write no companion line,
-        // so they carry their glyph on a system line rather than on a card.
-        "confirm" to "✔️",
-        "expire" to "⌛",
-        "auto-accept" to "⏱️",
-    )
-
-    fun emoji(verb: String): String = EMOJI[verb] ?: "📌"
+    fun emoji(verb: String): String = VERBS[verb]?.second ?: FALLBACK_GLYPH
 
     /**
      * The register a card wears: the state the step it carries lands the

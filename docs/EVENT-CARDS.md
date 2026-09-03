@@ -78,7 +78,7 @@ transition row of its own and takes the `opener` sentence. A `system` row
 never cards, and a verb the rules file does not name has no rule about a
 person to state, so neither gets a sentence.
 
-**The sentences themselves live in one place: `spec/act-card-copy.json`.**
+**The sentences — and since 2026-09-03 the verb words and glyphs too — live in one place: `spec/act-card-copy.json`.** The `verbs` table is the headline word and glyph per verb; a verb absent from it shows itself with the fallback glyph. No client holds any of this text in code.
 Each client bundles that file byte-identical and pins the copy with a test;
 none of them holds the prose. The header format and the link text live there
 too.

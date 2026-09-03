@@ -1,68 +1,24 @@
 /**
- * The word each task verb shows a reader.
+ * The word and glyph each task verb shows a reader.
  *
  * The headline of a card is the word for the verb its event carried — the
  * verb is on the wire and the client computes nothing from it, so a progress
- * report never reads as a claim. A verb with no row here shows itself, which
- * is how a kind may add one without this having to be taught it.
+ * report never reads as a claim. The rows live in `spec/act-card-copy.json`
+ * (this file bundles a byte-pinned copy) so the four clients cannot drift; a
+ * verb with no row shows itself, with the fallback glyph, which is how a kind
+ * may add a move without any client being taught it.
  */
-const HEADLINE: Record<string, string> = {
-  offer: 'offered',
-  accept: 'accepted',
-  decline: 'declined',
-  claim: 'claimed',
-  progress: 'in progress',
-  complete: 'completed',
-  fail: 'failed',
-  cancel: 'cancelled',
-  bid: 'bid',
-  award: 'awarded',
-  submit: 'submitted',
-  revise: 'revisions requested',
-  'accept-work': 'accepted',
-  forfeit: 'forfeited',
-  // The three the home signs for itself. They write no companion line, so
-  // these words are read on a system line rather than on a card.
-  confirm: 'confirmed',
-  expire: 'expired',
-  'auto-accept': 'accepted (review window closed)',
-};
+import copySpec from './act-card-copy.json';
+
+const VERBS: Record<string, { word: string; glyph: string }> = copySpec.verbs;
+const FALLBACK_GLYPH: string = copySpec.fallback_glyph;
 
 export function actHeadline(verb: string): string {
-  return HEADLINE[verb] ?? verb;
+  return VERBS[verb]?.word ?? verb;
 }
 
-/**
- * The glyph each task verb shows a reader, beside its word.
- *
- * One row per verb, read the same way the word above it is: off the verb the
- * event carried, never off where the task got to. A verb with no row here
- * gets the generic pin, so a kind may add a move without this being taught it.
- */
-const EMOJI: Record<string, string> = {
-  offer: '📋',
-  accept: '👍',
-  decline: '👎',
-  claim: '✋',
-  progress: '📌',
-  complete: '🎉',
-  fail: '❌',
-  cancel: '🚫',
-  bid: '💰',
-  award: '🏆',
-  submit: '📤',
-  revise: '🔁',
-  'accept-work': '✅',
-  forfeit: '🏳️',
-  // The three the home signs for itself. They write no companion line, so
-  // they carry their glyph on a system line rather than on a card.
-  confirm: '✔️',
-  expire: '⌛',
-  'auto-accept': '⏱️',
-};
-
 export function actEmoji(verb: string): string {
-  return EMOJI[verb] ?? '📌';
+  return VERBS[verb]?.glyph ?? FALLBACK_GLYPH;
 }
 
 /**
