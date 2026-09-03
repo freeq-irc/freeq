@@ -662,7 +662,7 @@ private fun MessageBubble(
                 val actCard = channelState.actCards[msg.id]
                 val coordination = msg.coordination
                 if (actCard != null) {
-                    ActEventCard(actCard, msg.timestamp, onJumpToMessage)
+                    ActEventCard(actCard, msg.timestamp, onJumpToMessage, resolveName = { appState.displayNameForKey(it) })
                 } else if (coordination != null) {
                     // Every event-tagged message is a card, whatever its type
                     // says (parity with the other three clients).

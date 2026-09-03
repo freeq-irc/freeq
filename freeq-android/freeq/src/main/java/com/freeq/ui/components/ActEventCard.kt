@@ -9,6 +9,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Verified
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -22,13 +23,18 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.freeq.ffi.CoordinationEvent
+import com.freeq.model.ActFacts
 import com.freeq.model.ActRegister
 import com.freeq.model.ActCard
 import com.freeq.model.ActVerbs
@@ -52,17 +58,25 @@ import java.util.Date
  * the edge is how a reader tells the two apart.
  */
 @Composable
-fun ActEventCard(card: ActCard, at: Date? = null, onJumpToMessage: ((String) -> Unit)? = null) {
+fun ActEventCard(card: ActCard, at: Date? = null, onJumpToMessage: ((String) -> Unit)? = null, resolveName: (String) -> String = { it }) {
     val uriHandler = LocalUriHandler.current
     val neighbours = actCardNeighbours(card.task, card.event)
-    val note = card.event.fields["act-note"]
-    val ctx = card.event.fields["act-ctx"]
-    val ctxHash = card.event.fields["act-ctx-h"]
     val kind = card.event.fields["act"] ?: card.task.kind
     val dim = MaterialTheme.colorScheme.onSurfaceVariant
     // A system verb draws no card at all, so the fallback is only ever reached
     // by a verb the rules file has not been taught.
     val hue = registerColor(ActVerbs.register(card.event.verb) ?: ActRegister.NEUTRAL_END)
+    // The award's winner is the author of the bid it names; absent when that
+    // bid never reached this client.
+    val winnerDid = card.event.fields["act-accepts"]
+        ?.let { accepts -> card.task.events.find { it.eventId == accepts }?.did }
+    val facts = ActFacts.facts(
+        card.event.fields,
+        isOpener = ActVerbs.register(card.event.verb) == ActRegister.NEW,
+        resolve = resolveName,
+        winnerDid = winnerDid,
+    )
+    val bodyRows = facts + ActFacts.unknownFields(card.event.fields)
     var sealOpen by remember { mutableStateOf(false) }
     val edge = 3.dp
 
@@ -130,24 +144,38 @@ fun ActEventCard(card: ActCard, at: Date? = null, onJumpToMessage: ((String) -> 
                     color = MaterialTheme.colorScheme.onBackground,
                 )
             }
-            if (!note.isNullOrEmpty()) {
-                Text(text = note, fontSize = 14.sp, color = dim)
-            }
-            if (!ctx.isNullOrEmpty()) {
-                Text(
-                    text = ctx,
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.clickable { uriHandler.openUri(ctx) },
-                )
-                // The hash is what the signature covers, so it rides along for
-                // anyone checking the bytes they fetched.
-                if (!ctxHash.isNullOrEmpty()) {
+            // The same key/value rows the generic card gives its payload, so a
+            // fact and a payload field read alike wherever they are met. The
+            // card body is the title and these rows: every value the card
+            // carries arrives here under a key.
+            val keyWidth = keyColumnWidth(bodyRows.map { it.first })
+            for ((label, value) in bodyRows) {
+                val isCtx = label == ActFacts.ctxLabel
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = ctxHash,
-                        fontSize = 10.sp,
+                        text = label,
+                        fontSize = 12.sp,
                         fontFamily = FontFamily.Monospace,
-                        color = dim.copy(alpha = 0.6f),
+                        color = dim.copy(alpha = 0.7f),
+                        modifier = Modifier.width(keyWidth),
+                    )
+                    Text(
+                        text = value,
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = if (isCtx) MaterialTheme.colorScheme.primary else dim,
+                        // A value wraps to the width it is given; past six
+                        // lines it ends in an ellipsis rather than growing the
+                        // card without bound.
+                        maxLines = 6,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(max = 96.dp)
+                            .then(
+                                if (isCtx) Modifier.clickable { uriHandler.openUri(value) }
+                                else Modifier
+                            ),
                     )
                 }
             }
@@ -269,6 +297,7 @@ fun CoordinationEventCard(ev: CoordinationEvent, text: String, at: Date? = null)
             if (text.isNotEmpty()) {
                 Text(text = text, fontSize = 14.sp, color = dim)
             }
+            val keyWidth = keyColumnWidth(rows.map { it.key })
             for (row in rows) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
@@ -276,14 +305,16 @@ fun CoordinationEventCard(ev: CoordinationEvent, text: String, at: Date? = null)
                         fontSize = 12.sp,
                         fontFamily = FontFamily.Monospace,
                         color = dim.copy(alpha = 0.7f),
+                        modifier = Modifier.width(keyWidth),
                     )
                     Text(
                         text = row.value,
                         fontSize = 12.sp,
                         fontFamily = FontFamily.Monospace,
                         color = dim,
-                        // A long value scrolls inside its own row rather than
-                        // growing the card without bound.
+                        // A value wraps to the width it is given; past six
+                        // lines it ends in an ellipsis rather than growing the
+                        // card without bound.
                         maxLines = 6,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f).heightIn(max = 96.dp),
@@ -291,6 +322,26 @@ fun CoordinationEventCard(ev: CoordinationEvent, text: String, at: Date? = null)
                 }
             }
         }
+    }
+}
+
+/**
+ * The width of a card's key column: the widest key, measured in the font the
+ * keys are drawn in, so every value on the card starts at the same x rather
+ * than wherever its own key ended.
+ */
+@Composable
+private fun keyColumnWidth(keys: List<String>): Dp {
+    val measurer = rememberTextMeasurer()
+    val style = LocalTextStyle.current.merge(
+        TextStyle(fontSize = 12.sp, fontFamily = FontFamily.Monospace),
+    )
+    val density = LocalDensity.current
+    return remember(keys, style, density) {
+        val widest = keys.maxOfOrNull { measurer.measure(it, style).size.width } ?: 0
+        // A hair over the measurement: the width rounds back to whole pixels,
+        // and a key landing a fraction short would ellipsize.
+        with(density) { (widest + 1).toDp() }
     }
 }
 

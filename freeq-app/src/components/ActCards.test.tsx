@@ -286,22 +286,40 @@ describe('the headline casing', () => {
 });
 
 describe('what the card carries', () => {
-  it('shows the task title and the event\'s own note', () => {
+  const grid = (c: HTMLElement) => c.querySelector('[data-testid="act-facts"]')!;
+  const keys = (c: HTMLElement) => Array.from(grid(c).querySelectorAll('dt')).map(e => e.textContent);
+  const values = (c: HTMLElement) => Array.from(grid(c).querySelectorAll('dd')).map(e => e.textContent);
+
+  it('shows the task title, and the note as a row of the grid', () => {
     const ev = event('progress', { 'act-note': 'tagged the build' });
     const { container } = render(<ActEventCard msg={msg(ev.msgId!)} task={task([ev])} event={ev} />);
     expect(container.textContent).toContain('ship the release');
-    expect(container.textContent).toContain('tagged the build');
+    expect(keys(container)).toEqual(['note']);
+    expect(values(container)).toEqual(['tagged the build']);
   });
 
-  it('links the context the event carried, under the hash its signature covers', () => {
+  it('carries the context and its hash as rows, the context still a link', () => {
     const ev = event('progress', {
       'act-ctx': 'https://example.com/checks/abc',
       'act-ctx-h': 'sha256:9f00',
     });
     const { container } = render(<ActEventCard msg={msg(ev.msgId!)} task={task([ev])} event={ev} />);
-    const link = container.querySelector('a')!;
+    expect(keys(container)).toEqual(['context', 'hash']);
+    expect(values(container)).toEqual(['https://example.com/checks/abc', 'sha256:9f00']);
+    const link = grid(container).querySelector('dd a')!;
     expect(link.getAttribute('href')).toBe('https://example.com/checks/abc');
-    expect(link.getAttribute('title')).toBe('sha256:9f00');
+    expect(link.getAttribute('target')).toBe('_blank');
+    expect(link.getAttribute('rel')).toBe('noopener noreferrer');
+  });
+
+  it('draws nothing under the grid — the body is the title and the grid', () => {
+    const ev = event('progress', {
+      'act-note': 'tagged the build',
+      'act-ctx': 'https://example.com/checks/abc',
+      'act-ctx-h': 'sha256:9f00',
+    });
+    const { container } = render(<ActEventCard msg={msg(ev.msgId!)} task={task([ev])} event={ev} />);
+    expect(grid(container).parentElement!.children.length).toBe(2);
   });
 
   it('never shows the sender\'s prose in place of the card', () => {

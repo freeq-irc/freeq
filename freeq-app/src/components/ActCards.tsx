@@ -19,6 +19,8 @@ import { TaskTimeline } from './TaskTimeline';
 import { useStore } from '../store';
 import { actHeadline, actEmoji, actRegister, type ActRegister } from '../lib/act-verbs';
 import { sealPanelHeader, sealPanelSentence, sealPanelLinkText } from '../lib/seal-panel-copy';
+import { actFacts, unknownFields, ctxLabel } from '../lib/act-facts';
+import { displayNameForKey } from '../lib/display-name';
 
 /**
  * The hue each register wears, in this client's own tokens.
@@ -132,14 +134,19 @@ export function ActEventCard({ msg, task, event }: {
   const sealOpen = useStore(s => s.sealPanelFor === msg.id);
   const setSealPanelFor = useStore(s => s.setSealPanelFor);
   const setScrollToMsgId = useStore(s => s.setScrollToMsgId);
-  const note = event.fields['act-note'];
-  const ctx = event.fields['act-ctx'];
   const kind = event.fields['act'] || task.kind;
   const { prev, next } = cardNeighbours(task, event);
   // A system verb draws no card at all, so the fallback is only ever reached
   // by a verb the rules file has not been taught.
   const paint = PAINT[actRegister(event.verb) ?? 'neutralEnd'];
   const taskId = msg.tags?.['+freeq.at/ref'] || msg.tags?.['+freeq.at/task-id'];
+  // The award's winner is the author of the bid it names; resolved from the
+  // task's own events, absent when that bid never reached this client.
+  const winnerDid = event.fields['act-accepts']
+    ? task.events.find(e => e.eventId === event.fields['act-accepts'])?.did
+    : undefined;
+  const facts = actFacts(event.fields, actRegister(event.verb) === 'new', displayNameForKey, winnerDid);
+  const extra = unknownFields(event.fields);
 
   return (
     <>
@@ -175,24 +182,32 @@ export function ActEventCard({ msg, task, event }: {
                 {task.title}
               </div>
             )}
-            {note && <div className="text-fg-muted whitespace-pre-wrap">{note}</div>}
-            {ctx && (
-              <a
-                href={ctx}
-                target="_blank"
-                rel="noopener noreferrer"
-                // The hash is what the signature covers, so it rides along for
-                // anyone checking the bytes they fetched.
-                title={event.fields['act-ctx-h']}
-                className="text-accent hover:underline break-all text-xs"
+            {/* The card body is the title and this grid: every value the card
+                carries, including the note, the context link and its hash,
+                arrives here under a key. */}
+            {(facts.length > 0 || extra.length > 0) && (
+              <dl
+                data-testid="act-facts"
+                className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-xs"
               >
-                {ctx}
-              </a>
-            )}
-            {ctx && event.fields['act-ctx-h'] && (
-              <div className="font-mono text-[10px] text-fg-dim break-all">
-                {event.fields['act-ctx-h']}
-              </div>
+                {[...facts, ...extra].map(([label, value]) => (
+                  <React.Fragment key={label}>
+                    <dt className="font-mono text-fg-dim">{label}</dt>
+                    <dd className="font-mono text-fg-muted max-h-24 overflow-auto whitespace-pre-wrap break-all">
+                      {label === ctxLabel ? (
+                        <a
+                          href={value}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-accent hover:underline"
+                        >
+                          {value}
+                        </a>
+                      ) : value}
+                    </dd>
+                  </React.Fragment>
+                ))}
+              </dl>
             )}
           </div>
 

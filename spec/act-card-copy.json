@@ -14,7 +14,15 @@
     "",
     "`verbs` is the headline word and glyph each verb's card or system line shows — the",
     "table the four clients previously each hardcoded. A verb absent here shows itself,",
-    "with the fallback glyph."
+    "with the fallback glyph.",
+    "",
+    "`facts` are the labels an act card puts on the machine fields it understands — the",
+    "audience, money and deadline rows. The card draws one label/value row per fact in the",
+    "same key-value grid the generic card's payload rows use; names are resolved displays,",
+    "never raw DIDs. A field no entry here labels draws in the same grid under its own key,",
+    "so nothing signed is ever invisible. The note, the context link and its hash are rows of",
+    "the same grid, after the labelled facts and before any unlabelled field; pay to, payment,",
+    "replaces and scope follow them."
   ],
   "version": "0.1",
   "seal_panel": {
@@ -98,5 +106,22 @@
       "glyph": "⏱️"
     }
   },
-  "fallback_glyph": "📌"
+  "fallback_glyph": "📌",
+  "facts": {
+    "offered_to": "offered to",
+    "anyone": "anyone",
+    "awarded_to": "awarded to",
+    "price": "price",
+    "bid": "bid",
+    "deadline": "deadline",
+    "bid_deadline": "bids close",
+    "caps": "skills required",
+    "note": "note",
+    "ctx": "context",
+    "ctx_h": "hash",
+    "pay_to": "pay to",
+    "tx": "payment",
+    "replaces": "replaces",
+    "scope": "scope"
+  }
 }
