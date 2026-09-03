@@ -443,9 +443,7 @@ async fn dispatch(state: &Arc<SharedState>, headers: &HeaderMap, req: &Value) ->
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     // A notification (no id) gets no response body, per JSON-RPC.
-    let Some(id) = id else {
-        return None;
-    };
+    let id = id?;
 
     if req.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Some(rpc_error(id, INVALID_REQUEST, "jsonrpc must be \"2.0\""));
