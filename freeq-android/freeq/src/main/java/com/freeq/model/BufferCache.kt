@@ -137,7 +137,13 @@ internal object BufferCache {
                     isDM = obj.optBoolean("isDM"),
                     topic = obj.optString("topic").takeIf { it.isNotEmpty() },
                     displayName = obj.optString("displayName").takeIf { it.isNotEmpty() },
-                    messages = (0 until messages.length()).map { decodeMessage(messages.getJSONObject(it)) },
+                    // The file is a JSON array, so rows come back in exactly
+                    // the order they were written — including a same-second
+                    // pair written inverted before this sort existed. Ordering
+                    // here repairs those without a cache migration.
+                    messages = (0 until messages.length())
+                        .map { decodeMessage(messages.getJSONObject(it)) }
+                        .sortedWith(ChatMessage.replayOrder),
                 )
             }
         } catch (_: Exception) {

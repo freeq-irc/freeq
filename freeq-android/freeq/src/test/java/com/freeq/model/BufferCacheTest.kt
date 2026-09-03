@@ -38,6 +38,48 @@ class BufferCacheTest {
         return ch
     }
 
+    @Test fun a_same_second_pair_decodes_offer_first_from_either_stored_order() {
+        // The file is a JSON array, so it hands rows back in the order they
+        // were written. A pair written inverted — before the decode sorted —
+        // would stay inverted for the life of the cache, and appendIfNew
+        // appends rather than reorders when timestamps are equal.
+        val offer = msg(id = "01M1FDM7HM4E9H8FPB7ND1DZKA", at = 1_756_760_000_000)
+        val accept = msg(id = "01M1FDM7HQ7Z9K2XR4V6TB0C3E", at = 1_756_760_000_000)
+
+        for (stored in listOf(listOf(offer, accept), listOf(accept, offer))) {
+            val back = BufferCache.decode(
+                BufferCache.encode(
+                    listOf(CachedBuffer("#work", isDM = false, topic = null, messages = stored))
+                )
+            )!!
+            assertEquals(
+                listOf(offer.id, accept.id),
+                back.single().messages.map { it.id },
+            )
+        }
+    }
+
+    @Test fun decode_keeps_the_clock_above_the_msgid_tiebreak() {
+        // The lower msgid is the later row here, and it has to decode last.
+        val later = msg(id = "01M1FDM7HM4E9H8FPB7ND1DZKA", at = 1_756_760_100_000)
+        val earlier = msg(id = "01M1FDM7HQ7Z9K2XR4V6TB0C3E", at = 1_756_760_000_000)
+
+        val back = BufferCache.decode(
+            BufferCache.encode(
+                listOf(CachedBuffer("#work", isDM = false, topic = null, messages = listOf(later, earlier)))
+            )
+        )!!
+        assertEquals(listOf(earlier.id, later.id), back.single().messages.map { it.id })
+    }
+
+    @Test fun appendIfNew_appends_rather_than_reorders_on_equal_timestamps() {
+        // What makes the decode sort the only thing deciding a tie.
+        val ch = ChannelState("#work")
+        ch.appendIfNew(msg(id = "01B", at = 1_756_760_000_000))
+        ch.appendIfNew(msg(id = "01A", at = 1_756_760_000_000))
+        assertEquals(listOf("01B", "01A"), ch.messages.map { it.id })
+    }
+
     @Test fun a_cached_companion_keeps_the_task_it_names() {
         // Dedup on replay is by id, so a cached line shadows the copy history
         // sends back: whatever it lost on the way to disk it never gets back,

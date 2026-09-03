@@ -47,7 +47,15 @@ data class ChatMessage(
     // When set, the row renders as a coordination card.
     val coordination: com.freeq.ffi.CoordinationEvent? = null,
     val reactions: MutableMap<String, MutableSet<String>> = mutableMapOf()
-)
+) {
+    companion object {
+        /** Order for rows arriving in bulk — a history batch, or the buffer
+         *  cache. The server's replay `time` tag is second-precision, so
+         *  same-second rows need a second key: msgids are ULIDs, so id order
+         *  is mint order. */
+        val replayOrder: Comparator<ChatMessage> = compareBy({ it.timestamp }, { it.id })
+    }
+}
 
 data class MemberInfo(
     val nick: String,

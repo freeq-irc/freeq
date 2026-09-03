@@ -22,7 +22,7 @@ internal object BatchFlush {
      *  channel via `appendIfNew` (which dedups + maintains order). */
     fun flushInto(buffer: BatchBuffer, channel: ChannelState) {
         buffer.messages
-            .sortedBy { it.timestamp }
+            .sortedWith(ChatMessage.replayOrder)
             .forEach { channel.appendIfNew(it) }
     }
 

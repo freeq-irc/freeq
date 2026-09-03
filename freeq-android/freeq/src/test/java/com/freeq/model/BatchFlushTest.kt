@@ -65,6 +65,25 @@ class BatchFlushTest {
         )
     }
 
+    @Test fun flush_orders_same_second_rows_by_msgid_in_both_input_orders() {
+        // The server's replay time tag is second-precision, so an act offer
+        // and its accept minted in the same second arrive with equal
+        // timestamps. ULID order is mint order, so the offer must lead
+        // whichever order the two were buffered in.
+        val ts = 1_756_760_000_000
+        val offer = msg("01M1FDM7HM4E9H8FPB7ND1DZKA", ts)
+        val accept = msg("01M1FDM7HQ7Z9K2XR4V6TB0C3E", ts)
+
+        for (buffered in listOf(listOf(offer, accept), listOf(accept, offer))) {
+            val ch = ChannelState("#test")
+            BatchFlush.flushInto(
+                BatchBuffer(target = "#test", messages = buffered.toMutableList()),
+                ch,
+            )
+            assertEquals(listOf(offer.id, accept.id), ch.messages.map { it.id })
+        }
+    }
+
     @Test fun isExhaustedHistory_true_for_empty_chathistory_batch() {
         val buf = BatchBuffer(target = "#test", batchType = "chathistory")
         assertTrue(BatchFlush.isExhaustedHistory(buf))
