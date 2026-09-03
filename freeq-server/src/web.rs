@@ -216,11 +216,6 @@ pub fn router(state: Arc<SharedState>) -> Router {
             get(crate::agent_surfaces::welcome_md),
         )
         .route("/tos", get(crate::agent_surfaces::tos_txt))
-        // Remote MCP (Streamable HTTP). Zero-install: an agent points its MCP
-        // client at the URL instead of cloning the repo to build the stdio
-        // server. Read-only, and every tool goes through the REST handlers so
-        // it inherits their authorization rather than reimplementing it.
-        .route("/mcp", post(crate::mcp::mcp_post).get(crate::mcp::mcp_get))
         .route("/openapi.json", get(crate::openapi::openapi_json))
         .route(
             "/.well-known/ard.json",
@@ -371,6 +366,44 @@ pub fn router(state: Arc<SharedState>) -> Router {
                 ])
                 .allow_credentials(true)
         });
+
+    // Remote MCP (Streamable HTTP). Zero-install: an agent points its MCP
+    // client at the URL instead of cloning the repo to build the stdio server.
+    // Read-only, and every tool goes through the REST handlers so it inherits
+    // their authorization rather than reimplementing it.
+    //
+    // Its own CORS layer, because the app's is an origin allowlist with
+    // credentials on - correct for a browser session, wrong for a public
+    // endpoint a client on any origin is meant to call. Here: any origin, no
+    // credentials (our auth is a Bearer header, never a cookie, and
+    // wildcard-plus-credentials is both forbidden and dangerous), plus the MCP
+    // headers a client sends after initialize. Without `mcp-protocol-version`
+    // in the allow list a browser preflight fails and the endpoint is
+    // unreachable from any web-based MCP client.
+    app = app.merge(
+        Router::new()
+            .route("/mcp", post(crate::mcp::mcp_post).get(crate::mcp::mcp_get))
+            .layer(
+                CorsLayer::new()
+                    .allow_origin(tower_http::cors::Any)
+                    .allow_methods([
+                        axum::http::Method::GET,
+                        axum::http::Method::POST,
+                        axum::http::Method::OPTIONS,
+                    ])
+                    .allow_headers([
+                        axum::http::header::CONTENT_TYPE,
+                        axum::http::header::AUTHORIZATION,
+                        axum::http::header::ACCEPT,
+                        "mcp-protocol-version"
+                            .parse::<axum::http::HeaderName>()
+                            .unwrap(),
+                        "mcp-session-id".parse::<axum::http::HeaderName>().unwrap(),
+                        "last-event-id".parse::<axum::http::HeaderName>().unwrap(),
+                    ])
+                    .expose_headers(["mcp-session-id".parse::<axum::http::HeaderName>().unwrap()]),
+            ),
+    );
 
     // Policy API endpoints
     if state.policy_engine.is_some() {

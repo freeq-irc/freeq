@@ -109,7 +109,9 @@ async fn calling_a_tool_returns_content_and_structured_output() {
     .await;
     assert_eq!(r["result"]["isError"], false);
     assert_eq!(r["result"]["content"][0]["type"], "text");
-    assert!(r["result"]["structuredContent"].is_array());
+    // Wrapped in an object because outputSchema must be one, and
+    // structuredContent has to conform to it.
+    assert!(r["result"]["structuredContent"]["channels"].is_array());
 }
 
 /// The point of routing tools through the REST handlers: a restricted channel
@@ -223,4 +225,151 @@ async fn the_endpoint_is_discoverable() {
         .await
         .unwrap();
     assert_eq!(v["stdio"]["published"], false);
+}
+
+/// A browser-based MCP client lives on somebody else's origin, and preflights
+/// with the headers the spec tells it to send. If either the origin or
+/// `mcp-protocol-version` is missing from the CORS answer, the endpoint is
+/// simply unreachable from the web — which is most of the clients that would
+/// find us through a registry listing.
+#[tokio::test]
+async fn a_browser_client_on_a_foreign_origin_can_reach_the_endpoint() {
+    let (_irc, http, _h) = start_server().await;
+    let resp = reqwest::Client::new()
+        .request(reqwest::Method::OPTIONS, format!("http://{http}/mcp"))
+        .header("Origin", "https://smithery.ai")
+        .header("Access-Control-Request-Method", "POST")
+        .header(
+            "Access-Control-Request-Headers",
+            "content-type,mcp-protocol-version",
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success(), "preflight: {}", resp.status());
+    let h = resp.headers();
+    let origin = h
+        .get("access-control-allow-origin")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    assert!(
+        origin == "*" || origin == "https://smithery.ai",
+        "a third-party origin must be allowed, got {origin:?}"
+    );
+    let allowed = h
+        .get("access-control-allow-headers")
+        .map(|v| v.to_str().unwrap().to_lowercase())
+        .unwrap_or_default();
+    for needed in ["content-type", "authorization", "mcp-protocol-version"] {
+        assert!(allowed.contains(needed), "CORS blocks {needed}: {allowed}");
+    }
+    // Wildcard origin with credentials is forbidden by the CORS spec and
+    // browsers reject the response outright.
+    if origin == "*" {
+        assert!(
+            h.get("access-control-allow-credentials").is_none(),
+            "wildcard origin must not be paired with credentials"
+        );
+    }
+}
+
+/// The app's own routes keep their stricter, credentialed CORS.
+#[tokio::test]
+async fn the_permissive_cors_does_not_leak_onto_the_rest_of_the_api() {
+    let (_irc, http, _h) = start_server().await;
+    let resp = reqwest::Client::new()
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("http://{http}/api/v1/channels"),
+        )
+        .header("Origin", "https://smithery.ai")
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+    let origin = resp
+        .headers()
+        .get("access-control-allow-origin")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    assert_ne!(origin, "*", "the REST API must keep its origin allowlist");
+}
+
+/// A declared `outputSchema` is a promise about `structuredContent`. If the two
+/// drift, a client that trusts the schema breaks on real data — worse than
+/// declaring nothing, which is why this is checked against a live call rather
+/// than by eye.
+#[tokio::test]
+async fn structured_output_matches_the_declared_schema() {
+    let (_irc, http, _h) = start_server().await;
+
+    let listed = rpc(
+        http,
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+    )
+    .await;
+    let tools = listed["result"]["tools"].as_array().unwrap().clone();
+
+    // Every tool must declare one, and it must be an object schema.
+    for t in &tools {
+        let name = t["name"].as_str().unwrap();
+        assert_eq!(
+            t["outputSchema"]["type"], "object",
+            "{name} has no object outputSchema"
+        );
+        assert!(
+            t["outputSchema"]["properties"].is_object(),
+            "{name}: outputSchema declares no properties"
+        );
+    }
+
+    // And the one tool that needs no arguments must actually produce it.
+    let called = rpc(
+        http,
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                           "params":{"name":"freeq_channels","arguments":{}}}),
+    )
+    .await;
+    let structured = &called["result"]["structuredContent"];
+    let schema = tools
+        .iter()
+        .find(|t| t["name"] == "freeq_channels")
+        .unwrap()["outputSchema"]
+        .clone();
+
+    assert!(
+        structured.is_object(),
+        "structuredContent must be an object"
+    );
+    for key in schema["required"].as_array().unwrap() {
+        let key = key.as_str().unwrap();
+        assert!(
+            structured.get(key).is_some(),
+            "structuredContent is missing required key {key}: {structured}"
+        );
+    }
+    assert!(structured["channels"].is_array());
+}
+
+/// Registries build their listings from `initialize`, so the metadata has to be
+/// there and has to resolve.
+#[tokio::test]
+async fn server_info_carries_listing_metadata() {
+    let (_irc, http, _h) = start_server().await;
+    let r = rpc(
+        http,
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+    )
+    .await;
+    let info = &r["result"]["serverInfo"];
+    assert!(info["description"].as_str().unwrap_or("").len() > 40);
+    assert_eq!(info["websiteUrl"], "https://freeq.at");
+    let icons = info["icons"].as_array().expect("icons");
+    assert!(!icons.is_empty());
+    for i in icons {
+        assert!(i["src"].as_str().unwrap().starts_with("https://"));
+        assert_eq!(i["mimeType"], "image/png");
+        assert!(i["sizes"].is_array());
+    }
 }
