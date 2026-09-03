@@ -146,17 +146,23 @@ Events are stored in SQLite and queryable via REST:
 
 ```
 GET /api/v1/channels/mychannel/events?type=task_request&actor=did:key:z6Mkq3...
-GET /api/v1/tasks/TASK001   (full task with all events and evidence)
+GET /api/v1/channels/mychannel/events?ref_id=TASK001   (one task's events)
 GET /api/v1/channels/mychannel/audit   (chronological audit trail)
 ```
 
-The web client renders these as structured cards instead of plain text — task cards with phase progression, evidence cards with expandable payloads, completion cards with result links.
+There is no task view over these rows. The server stores and relays them as the freeform events they are and reads no lifecycle into the six task names; a reader that wants a task's history asks for its `ref_id` and assembles it.
 
-### Task messages: one limitation to plan around
+Clients render `delegation_notice` and `status_update` as cards, and any event type they do not recognize as a generic one. The six task names above render as their plain companion text — the line is still there and history stays readable, but the card that used to interpret them is gone. Task cards are what the `act-` family gets.
 
-Alongside the coordination events above, freeq is growing a refereed task family — `act-` tags on a TAGMSG, signed by the sender, checked against a rules file before the server accepts them. One limit is worth knowing before you build on it, and it is not a bug to wait out.
+### Task messages: what to know before building on them
+
+Tasks on freeq are the refereed `act-` family: tags on a TAGMSG, signed by the sender, checked against a rules file before the server accepts them. That is what a client draws a task card for, what the REST task routes serve, and what a new bot should send. The coordination events above still work and are still stored — nothing about them is refused — but nothing reads them as a task any more.
+
+Three things are worth knowing before you build on task messages, and none is a bug to wait out.
 
 Two words appear throughout freeq's errors and records, and they are not interchangeable: the **author** of a message is whoever wrote it; the **actor** of an event is whoever performed it. They can be different people in one event — when an op deletes someone else's message, the op is the actor and the person who wrote it is the author. Error codes follow the split: `AUTHOR_MISMATCH` (edit/delete) is about who wrote the thing you're touching; `ACTOR_MISMATCH` and `ACTOR_REQUIRED` (task messages) are about who is performing the step.
+
+The server files coordination events without interpreting them — the type and payload are opaque to it; only act task messages are checked against rules before they are accepted.
 
 **A task's history contains an event nobody sent.** The server that owns a task appends a `confirm` of its own — signed under its `did:web:` name, naming the event it confirms, and carrying nothing else. It is the record of an ordering decision, not a step in the lifecycle: no kind's table lists it, sending one draws `FAIL TAGMSG WRONG_SENDER :Only the action's home confirms it`, and a client rendering a task should read it as "this is the move that stood" rather than as another transition on the card.
 
@@ -1119,7 +1125,6 @@ By using freeq's primitives instead of rolling your own:
 |---|---|
 | `GET /api/v1/actors/{did}` | Identity card: actor class, provenance, presence, heartbeat |
 | `GET /api/v1/channels/{name}/events` | Coordination events with filters (type, actor, ref_id, since) |
-| `GET /api/v1/tasks/{task_id}` | Single task with all events and evidence |
 | `GET /api/v1/channels/{name}/audit` | Chronological audit trail (coordination + governance + membership) |
 
 ---

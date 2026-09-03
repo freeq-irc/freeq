@@ -23,8 +23,8 @@ Six illustrative bots live under [`examples/`](examples/):
 - [`daemon.ts`](examples/daemon.ts) — the echo bot wrapped in `createDaemonCLI`, with `launch / stop / status / doctor / tail` out of the box
 - [`gated-bot.ts`](examples/gated-bot.ts) — owner-gated bot with allowlist, refusal cooldown, channel addressing, and rate-limiting. The full pattern, end-to-end, in one file
 - [`streaming.ts`](examples/streaming.ts) — types out a message word-by-word using the edit-message hack
-- [`url-fetch-worker.ts`](examples/url-fetch-worker.ts) — the canonical agent pattern: claims `task_request` coordination events, fetches the URL, reports via `task_complete`, transitions state along the way
-- [`fire-task.ts`](examples/fire-task.ts) — helper that fires a single `task_request` and exits; pairs with `url-fetch-worker` for end-to-end testing
+- [`url-fetch-worker.ts`](examples/url-fetch-worker.ts) — the canonical agent pattern: claims open `handoff` offers declaring a `url_fetch` capability, fetches the URL, reports with `complete` or `fail`, transitions state along the way
+- [`fire-task.ts`](examples/fire-task.ts) — helper that posts a single open `handoff` offer and exits; pairs with `url-fetch-worker` for end-to-end testing
 
 Run any of them with `npm run example:<name> -- --owner did:plc:<your-did> --channel '#test'`. See [`examples/README.md`](examples/README.md) for the full worker walk-through.
 
@@ -314,7 +314,7 @@ const bot = await FreeqBot.create({
 bot.on('message',       (channel, msg) => { /* ... */ });
 bot.on('memberJoined',  (channel, member) => { /* ... */ });
 bot.on('governance',    (signal) => { /* react to pause/resume/revoke */ });
-bot.on('coordinationEvent', (event) => { /* react to task_request etc */ });
+bot.on('coordinationEvent', (event) => { /* react to delegation_notice etc */ });
 ```
 
 ### Properties

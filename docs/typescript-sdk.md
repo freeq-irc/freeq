@@ -170,7 +170,7 @@ Fire when an agent broadcasts or is targeted by a governance/coordination/spawni
 |-------|---------|-------------|
 | `presence` | `(payload: PresencePayload)` | Another participant's PRESENCE update (state/status/task) |
 | `governance` | `(payload: GovernancePayload)` | Governance signal targeting us (pause/resume/revoke/approval_granted/approval_denied/budget_exceeded) |
-| `coordinationEvent` | `(payload: CoordinationEventPayload)` | `+freeq.at/event=*` TAGMSG/PRIVMSG (task_request, task_update, evidence_attach, etc.) |
+| `coordinationEvent` | `(payload: CoordinationEventPayload)` | `+freeq.at/event=*` TAGMSG/PRIVMSG (delegation_notice, status_update, etc.) |
 | `agentSpawned` | `(payload: AgentSpawnedPayload)` | A parent agent spawned a child in a channel we're in |
 | `agentDespawned` | `(payload: AgentDespawnedPayload)` | A spawned child agent disconnected (TTL expired or explicit despawn) |
 | `spend` | `(payload: SpendPayload)` | SPEND broadcast *(reserved; depends on future server broadcast)* |
@@ -383,29 +383,37 @@ client.on('governance', ({ signal, target, by, reason }) => {
 
 ## Coordination Events
 
-Structured task lifecycle events. `emitEvent` is the primitive; the rest are typed sugar on top.
+A task is an act event: `sendAct` sends one, `actTags` builds its tags. `emitEvent` is the freeform rail for any other `+freeq.at/event` type.
 
 ```typescript
-// Emit a raw coordination event (paired TAGMSG + PRIVMSG; server stores via the TAGMSG, web client renders via the PRIVMSG)
-const eventId = client.emitEvent('#tasks', 'task_request', {
-  description: 'review PR #42',
-}, {
-  humanText: '📋 review PR #42',
-});
+import { actTags } from '@freeq/sdk';
 
-// Task lifecycle sugar
-const taskId = client.createTask('#tasks', 'review PR #42');
-client.updateTask('#tasks', taskId, 'reviewing', 'fetching diff');
-client.attachEvidence('#tasks', taskId, 'code_review', 'looks good');
-client.completeTask('#tasks', taskId, 'approved', 'https://example.com/result');
-// or:
-client.failTask('#tasks', taskId, 'tests didn\'t pass');
+// Open a task — a `handoff` offer naming no recipient, so anyone in the room
+// may claim it. Returns the offer's id, which every later move carries.
+const actId = await client.sendAct('#tasks', actTags('handoff', 'offer', undefined, myDid, {
+  title: 'review PR #42',
+  caps: 'code_review',
+}));
+
+await client.sendAct('#tasks', actTags('handoff', 'progress', actId, myDid, { note: 'fetching diff' }));
+await client.sendAct('#tasks', actTags('handoff', 'complete', actId, myDid, { note: 'approved' }));
+
+// Emit a freeform coordination event (paired TAGMSG + PRIVMSG; server stores via the TAGMSG, web client renders via the PRIVMSG)
+const eventId = client.emitEvent('#agents', 'status_update', {
+  summary: 'still reading the diff',
+}, {
+  humanText: '💬 still reading the diff',
+});
 
 // Consume inbound coordination events
 client.on('coordinationEvent', ({ eventType, eventId, taskId, payload }) => {
   console.log(`[${eventType}] task=${taskId}`, payload);
 });
 ```
+
+`sendAct` signs on the sender's device and rejects an event it cannot sign, so it returns a promise and throws.
+
+`createTask`, `updateTask`, `completeTask`, `failTask` and `attachEvidence` are deprecated. They send act events now, they return promises rather than ids directly, and they throw where they used to be fire-and-forget.
 
 ## Spawning
 

@@ -380,7 +380,7 @@ This document catalogs every feature implemented in Freeq, organized by category
 | `POST /api/v1/upload` | ✅ | 🆕 Upload media to PDS (auth required) |
 | `GET /api/v1/blob` | ✅ | 🆕 PDS blob proxy with Range support |
 | `GET /api/v1/og` | ✅ | 🆕 OpenGraph link preview |
-| `GET /api/v1/tasks/{task_id}` | ✅ | 🆕 Agent task status |
+| `GET /api/v1/actions/{id}` | ✅ | 🆕 One task and every event of it |
 | `GET /api/v1/agents/manifests` | ✅ | 🆕 List agent manifests |
 | `GET /api/v1/agents/manifests/{did}` | ✅ | 🆕 Get agent manifest |
 | `GET /api/v1/agents/spawned` | ✅ | 🆕 List spawned agents |

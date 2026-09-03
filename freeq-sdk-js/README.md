@@ -54,7 +54,7 @@ Building a bot? See **[`@freeq/bot-kit`](../freeq-bot-kit-js/)** for higher-leve
 ### Agent protocol (Phases 1–5)
 - **Lifecycle** — `registerAgent`, `submitProvenance`, `setPresence`, `sendHeartbeat`, `startHeartbeat`
 - **Governance** — typed `governance` event (pause/resume/revoke/approval/budget) + `requestApproval`, `pauseAgent`, `resumeAgent`, `revokeAgent`, `approveAgent`, `denyAgent`
-- **Coordination events** — `emitEvent`, `createTask`, `updateTask`, `completeTask`, `failTask`, `attachEvidence` + typed `coordinationEvent` inbound
+- **Coordination events** — `sendAct` + `actTags` for tasks, `emitEvent` for any other event type, typed `coordinationEvent` inbound. `createTask`, `updateTask`, `completeTask`, `failTask` and `attachEvidence` are deprecated wrappers that send act events
 - **Spawning** — `spawnAgent`, `despawnAgent`, `sendAsChild` + `agentSpawned` / `agentDespawned` events
 - **Economics** — `submitSpend`, `setBudget`, `requestBudget`
 - **Manifest** — `submitManifest` for declaring capabilities and identity metadata
