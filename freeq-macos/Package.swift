@@ -32,7 +32,6 @@ let package = Package(
                 "ComposeCommands.swift",
                 "DebugBridge.swift",
                 "E2eeManager.swift",
-                "MessageStore.swift",
             ],
             sources: [
                 "AudioLevelMeter.swift",
@@ -82,6 +81,7 @@ let package = Package(
                 "ShareURL.swift",
                 "Logger.swift",
                 "KeychainHelper.swift",
+                "MessageStore.swift",
             ]
         ),
         .testTarget(

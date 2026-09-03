@@ -55,6 +55,14 @@ private struct CachedMessage: Codable {
     // stripped copy then shadowed the tag-bearing CHATHISTORY replay.
     let origin: String?
     let account: String?
+    // The task a companion line names. A cached line that lost it can never
+    // draw its card, and dedup on hydrate keeps the cached copy, so the
+    // replay that carries the tag is discarded.
+    let actRef: String?
+    // The coordination event the row carries, all six fields, matching what
+    // Android's buffer cache stores. Same reason as `actRef`: a cached
+    // delegation_notice or status_update that lost it renders as plain text.
+    let coordination: CoordinationInfo?
 
     init(_ m: ChatMessage) {
         self.id = m.id
@@ -69,6 +77,8 @@ private struct CachedMessage: Codable {
         self.reactions = CachedReactions(m.reactions)
         self.origin = m.origin
         self.account = m.account
+        self.actRef = m.actRef
+        self.coordination = m.coordination
     }
 
     func toChatMessage() -> ChatMessage {
@@ -80,6 +90,8 @@ private struct CachedMessage: Codable {
         m.reactions = reactions.toDict()
         m.origin = origin
         m.account = account
+        m.actRef = actRef
+        m.coordination = coordination
         return m
     }
 }
@@ -99,7 +111,10 @@ private struct BufferCacheRoot: Codable {
 enum BufferCacheStore {
     // 2: messages carry origin + account. The bump discards caches written
     // without them, so stale evidence-less rows rebuild from replay.
-    static let version = 2
+    // 3: a companion line's task reference and the row's coordination event
+    //    joined the cached fields — a cache written without them can never
+    //    draw its cards, so the old shape is discarded rather than read.
+    static let version = 3
     static let maxMessagesPerBuffer = 50
 
     static func cacheURL() -> URL? {
@@ -1475,8 +1490,13 @@ class AppState: ObservableObject {
             if let topic = cb.topic, !topic.isEmpty {
                 buffer.topic = topic
             }
-            for cm in cb.messages {
-                buffer.appendIfNew(cm.toChatMessage())
+            // The cache is a JSON array, so it hands rows back in exactly the
+            // order they were written — including an inverted same-second pair
+            // written before this sort existed. Ordering on the way in repairs
+            // those without a cache migration.
+            for msg in cb.messages.map({ $0.toChatMessage() })
+                .sorted(by: ChatMessage.replayOrder) {
+                buffer.appendIfNew(msg)
             }
             // The most recent cached message sets a reasonable lastActivity
             // so the sidebar sort order on cold launch matches what the user
@@ -3102,7 +3122,7 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
 
         case .batchEnd(let id):
             guard let batch = state.batches.removeValue(forKey: id) else { return }
-            let sorted = batch.messages.sorted { $0.timestamp < $1.timestamp }
+            let sorted = batch.messages.sorted(by: ChatMessage.replayOrder)
             if batch.target.hasPrefix("#") {
                 let ch = state.getOrCreateChannel(batch.target)
                 for msg in sorted { ch.appendIfNew(msg) }

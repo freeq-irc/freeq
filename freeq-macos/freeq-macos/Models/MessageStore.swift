@@ -6,16 +6,23 @@ actor MessageStore {
     static let shared = MessageStore()
     private var db: OpaquePointer?
 
-    init() {
-        openDatabase()
+    /// `path` overrides the shared caches location so a test can open a
+    /// throwaway database instead of the user's own.
+    init(path: String? = nil) {
+        openDatabase(at: path)
         createTable()
     }
 
-    private func openDatabase() {
-        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        let dir = caches.appendingPathComponent("at.freeq.macos", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let dbPath = dir.appendingPathComponent("messages.sqlite").path
+    private func openDatabase(at override: String?) {
+        let dbPath: String
+        if let override {
+            dbPath = override
+        } else {
+            let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            let dir = caches.appendingPathComponent("at.freeq.macos", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            dbPath = dir.appendingPathComponent("messages.sqlite").path
+        }
 
         if sqlite3_open(dbPath, &db) != SQLITE_OK {
             Log.irc.error("Failed to open message database")
@@ -38,6 +45,8 @@ actor MessageStore {
             is_deleted INTEGER DEFAULT 0,
             reply_to TEXT,
             origin TEXT,
+            act_ref TEXT,
+            coordination TEXT,
             UNIQUE(id)
         );
         CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel, timestamp);
@@ -48,13 +57,36 @@ actor MessageStore {
         // Without it, federated messages reload from cache with origin == nil and
         // render as local — re-showing the verified/signed badges we suppress.
         sqlite3_exec(db, "ALTER TABLE messages ADD COLUMN origin TEXT;", nil, nil, nil)
+        // Same again for the task a companion line names. A cached line that
+        // lost it can never draw its card, and dedup on load keeps the cached
+        // copy, so the replay that carries the tag is discarded.
+        sqlite3_exec(db, "ALTER TABLE messages ADD COLUMN act_ref TEXT;", nil, nil, nil)
+        // And again for the coordination event a row carries. Same reason: a
+        // cached delegation_notice or status_update line that lost it renders
+        // as plain text, and dedup keeps the cached copy over the replay.
+        sqlite3_exec(db, "ALTER TABLE messages ADD COLUMN coordination TEXT;", nil, nil, nil)
+    }
+
+    /// The coordination event as one JSON object, matching what Android's
+    /// buffer cache stores — all six fields, so every card the style policy
+    /// still draws can be redrawn from cache alone.
+    private static func encodeCoordination(_ info: CoordinationInfo?) -> String {
+        guard let info,
+              let data = try? JSONEncoder().encode(info),
+              let json = String(data: data, encoding: .utf8) else { return "" }
+        return json
+    }
+
+    private static func decodeCoordination(_ raw: String?) -> CoordinationInfo? {
+        guard let raw, !raw.isEmpty, let data = raw.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(CoordinationInfo.self, from: data)
     }
 
     /// Store a message.
     func store(_ msg: ChatMessage, channel: String) {
         let sql = """
-        INSERT OR REPLACE INTO messages (id, channel, from_nick, text, timestamp, is_action, is_signed, is_edited, is_deleted, reply_to, origin)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO messages (id, channel, from_nick, text, timestamp, is_action, is_signed, is_edited, is_deleted, reply_to, origin, act_ref, coordination)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
@@ -71,6 +103,8 @@ actor MessageStore {
         sqlite3_bind_int(stmt, 9, msg.isDeleted ? 1 : 0)
         sqlite3_bind_text(stmt, 10, ((msg.replyTo ?? "") as NSString).utf8String, -1, nil)
         sqlite3_bind_text(stmt, 11, ((msg.origin ?? "") as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 12, ((msg.actRef ?? "") as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 13, (Self.encodeCoordination(msg.coordination) as NSString).utf8String, -1, nil)
         let rc = sqlite3_step(stmt)
         if rc != SQLITE_DONE {
             Log.ui.error("MessageStore.save sqlite3_step rc=\(rc, privacy: .public) channel=\(channel, privacy: .public)")
@@ -80,10 +114,10 @@ actor MessageStore {
     /// Load recent messages for a channel.
     func loadMessages(channel: String, limit: Int = 200) -> [ChatMessage] {
         let sql = """
-        SELECT id, from_nick, text, timestamp, is_action, is_signed, is_edited, is_deleted, reply_to, origin
+        SELECT id, from_nick, text, timestamp, is_action, is_signed, is_edited, is_deleted, reply_to, origin, act_ref, coordination
         FROM messages
         WHERE channel = ? AND is_deleted = 0
-        ORDER BY timestamp DESC
+        ORDER BY timestamp DESC, id DESC
         LIMIT ?
         """
         var stmt: OpaquePointer?
@@ -104,6 +138,8 @@ actor MessageStore {
             let isEdited = sqlite3_column_int(stmt, 6) != 0
             let replyTo = sqlite3_column_text(stmt, 8).map(String.init(cString:))
             let origin = sqlite3_column_text(stmt, 9).map(String.init(cString:))
+            let actRef = sqlite3_column_text(stmt, 10).map(String.init(cString:))
+            let coordination = sqlite3_column_text(stmt, 11).map(String.init(cString:))
 
             var msg = ChatMessage(
                 id: id, from: from, text: text, isAction: isAction,
@@ -112,9 +148,14 @@ actor MessageStore {
             msg.isSigned = isSigned
             msg.isEdited = isEdited
             msg.origin = (origin?.isEmpty == true) ? nil : origin
+            msg.actRef = (actRef?.isEmpty == true) ? nil : actRef
+            msg.coordination = Self.decodeCoordination(coordination)
             messages.append(msg)
         }
-        return messages.reversed()  // Oldest first
+        // Flipped to ascending (timestamp, id). `timestamp` is REAL seconds,
+        // so same-second rows need the id to come back in a fixed order;
+        // ids are ULIDs, so that order is mint order.
+        return messages.reversed()
     }
 
     /// Re-key a conversation's cached messages (nick-keyed DM folded into its
@@ -168,7 +209,7 @@ actor MessageStore {
         WHERE is_deleted = 0 AND (text LIKE ? OR from_nick LIKE ?)
         """
         if channel != nil { sql += " AND channel = ?" }
-        sql += " ORDER BY timestamp DESC LIMIT ?"
+        sql += " ORDER BY timestamp DESC, id DESC LIMIT ?"
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }

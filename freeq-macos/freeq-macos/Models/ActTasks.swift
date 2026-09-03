@@ -1,5 +1,20 @@
 import Foundation
 
+/// Where a line sits relative to the event it is being offered to.
+private enum ActLinePlacement { case fits, tooOld, tooNew }
+
+/// A companion goes out in its event's own second or the one after, and a
+/// replayed line's stamp is that second floored. An event whose id carries no
+/// time takes any line, which is all a synthetic id can be judged on.
+private func actLinePlacement(_ ev: ActTaskEvent, _ line: ActLine) -> ActLinePlacement {
+    guard let at = actEventTimeMs(ev.eventId) else { return .fits }
+    let evSecond = at / 1000
+    let lineSecond = line.timestampMs / 1000
+    if lineSecond < evSecond { return .tooOld }
+    if lineSecond - evSecond > 1 { return .tooNew }
+    return .fits
+}
+
 /// A link an event carried as context, with the hash its signature covers.
 struct ActCtxLink: Equatable {
     var url: String
@@ -134,13 +149,22 @@ final class ActTaskStore {
     /// Join each event to the companion line carrying its prose.
     ///
     /// The companion names only the task, never the event, so the two are
-    /// matched by their sender and then by how close in time they are: a
-    /// joiner is handed the lines and the task events as two windows that
-    /// truncate independently, so a line missing from its window must leave
-    /// its event unpaired rather than shift every later line onto the wrong
-    /// event. Either side can land first, so this runs from both, and never
-    /// re-pairs what it has already paired: the message list is capped, and an
-    /// evicted companion must not shift its successors.
+    /// matched by sender and then by order: within one sender the events
+    /// still needing a line and the lines still free are both in mint order,
+    /// and they pair off in step. Nearest-in-time cannot do this — a replayed
+    /// line carries a second-truncated stamp, so of a same-second pair the
+    /// later event sits nearer to both lines and takes the first one.
+    ///
+    /// Walking in step needs one guard, since the two lists truncate
+    /// independently and either can arrive first: a line is only taken when
+    /// it could belong to the event standing opposite it. An older line is
+    /// dropped, because no later event can want it either; a newer one is
+    /// left where it is and the event goes unpaired, which is what stops a
+    /// missing line shifting every successor onto the wrong event.
+    ///
+    /// This runs from both sides and never re-pairs what it has already
+    /// paired: the message list is capped, and an evicted companion must not
+    /// shift its successors.
     func pair(_ lines: [ActLine]) {
         if tasks.isEmpty || lines.isEmpty { return }
         var claimed = Set<String>()
@@ -155,27 +179,37 @@ final class ActTaskStore {
 
         for (id, task) in Array(tasks) {
             guard let candidates = free[id] else { continue }
-            // Every line each unpaired event could take, nearest in time
-            // first, and in arrival order where neither side dates itself.
-            var near: [(evIdx: Int, lineIdx: Int, gap: Double)] = []
-            for (evIdx, ev) in task.events.enumerated() where ev.msgId == nil {
-                let at = actEventTimeMs(ev.eventId)
-                for (lineIdx, line) in candidates.enumerated() where Self.sameSender(ev, line) {
-                    let gap = at.map { Double(abs(line.timestampMs - $0)) } ?? .infinity
-                    near.append((evIdx, lineIdx, gap))
-                }
-            }
-            near.sort {
-                if $0.gap != $1.gap { return $0.gap < $1.gap }
-                if $0.evIdx != $1.evIdx { return $0.evIdx < $1.evIdx }
-                return $0.lineIdx < $1.lineIdx
-            }
+            // Events still waiting on a line, oldest first — ids are ULIDs.
+            let pending = task.events.enumerated()
+                .filter { $0.element.msgId == nil }
+                .sorted { $0.element.eventId < $1.element.eventId }
             var pairedTo: [Int: String] = [:]
-            var used = Set<Int>()
-            for cand in near {
-                if pairedTo[cand.evIdx] != nil || used.contains(cand.lineIdx) { continue }
-                pairedTo[cand.evIdx] = candidates[cand.lineIdx].id
-                used.insert(cand.lineIdx)
+            var usedLines = Set<String>()
+            var done = Set<String>()
+            for (_, ev) in pending {
+                let sender = ev.did ?? ev.from.lowercased()
+                if !done.insert(sender).inserted { continue }
+                let mine = pending.filter {
+                    ($0.element.did ?? $0.element.from.lowercased()) == sender
+                }
+                let theirs = candidates
+                    .filter { !usedLines.contains($0.id) && Self.sameSender(ev, $0) }
+                    .sorted { ($0.timestampMs, $0.id) < ($1.timestampMs, $1.id) }
+                var mi = 0
+                var li = 0
+                while mi < mine.count && li < theirs.count {
+                    switch actLinePlacement(mine[mi].element, theirs[li]) {
+                    case .fits:
+                        pairedTo[mine[mi].offset] = theirs[li].id
+                        usedLines.insert(theirs[li].id)
+                        mi += 1
+                        li += 1
+                    case .tooOld:
+                        li += 1
+                    case .tooNew:
+                        mi += 1
+                    }
+                }
             }
             if pairedTo.isEmpty { continue }
             var updated = task

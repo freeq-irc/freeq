@@ -36,6 +36,14 @@ struct ChatMessage: Identifiable, Equatable {
     var actRef: String? = nil
     var reactions: [String: Set<String>] = [:]  // emoji -> set of nicks
 
+    /// Replay order for a history batch. The server's replay `time` tag is
+    /// second-precision and Swift's sort is not stable, so same-second rows
+    /// need a second key: msgids are ULIDs, so id order is mint order.
+    static func replayOrder(_ lhs: ChatMessage, _ rhs: ChatMessage) -> Bool {
+        if lhs.timestamp == rhs.timestamp { return lhs.id < rhs.id }
+        return lhs.timestamp < rhs.timestamp
+    }
+
     static func == (lhs: ChatMessage, rhs: ChatMessage) -> Bool {
         lhs.id == rhs.id
             && lhs.from == rhs.from

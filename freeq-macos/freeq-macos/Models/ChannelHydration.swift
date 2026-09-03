@@ -72,7 +72,7 @@ enum HistoryBatchRouting {
             }
         }
 
-        for message in buffer.messages.sorted(by: { $0.timestamp < $1.timestamp }) {
+        for message in buffer.messages.sorted(by: ChatMessage.replayOrder) {
             destination.appendIfNew(message)
         }
         return true

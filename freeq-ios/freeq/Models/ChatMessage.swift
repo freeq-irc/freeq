@@ -61,4 +61,12 @@ struct ChatMessage: Identifiable, Equatable {
         let reactionsPart = reactions.map { "\($0.key)\($0.value.count)" }.sorted().joined()
         return "\(id)|\(isDeleted ? 1 : 0)|\(isEdited ? 1 : 0)|\(actCarded ? 1 : 0)|\(text.hashValue)|\(reactionsPart)"
     }
+
+    /// Replay order for a history batch. The server's replay `time` tag is
+    /// second-precision and Swift's sort is not stable, so same-second rows
+    /// need a second key: msgids are ULIDs, so id order is mint order.
+    static func replayOrder(_ lhs: ChatMessage, _ rhs: ChatMessage) -> Bool {
+        if lhs.timestamp == rhs.timestamp { return lhs.id < rhs.id }
+        return lhs.timestamp < rhs.timestamp
+    }
 }

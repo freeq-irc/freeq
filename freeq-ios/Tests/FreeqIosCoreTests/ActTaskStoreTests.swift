@@ -173,9 +173,11 @@ final class ActTaskStoreTests: XCTestCase {
         XCTAssertNil(store.task(opener)?.events[0].msgId)
     }
 
-    func testEachLineTakesTheEventNearestItInTimeNotTheNextInOrder() {
+    func testALineOutsideTheWindowLeavesItsEventUnpaired() {
         // The lines and the task events replay as two windows that truncate
-        // independently: here the opener's line fell outside its window.
+        // independently: here the opener's line fell outside its window, and
+        // the first line is a minute from the opener, so no line stands
+        // opposite it and every later event still gets its own.
         let store = ActTaskStore()
         let t0: Int64 = 1_755_000_000_000
         let at: [Int64] = [t0, t0 + 60_000, t0 + 120_000, t0 + 180_000]

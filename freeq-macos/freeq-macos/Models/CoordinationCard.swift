@@ -4,7 +4,11 @@ import Foundation
 /// (`+freeq.at/event` + friends). Pure/Foundation-only so it lives in the
 /// test-harness core; `AppState` maps the FFI `CoordinationEvent` into this
 /// at the event boundary.
-struct CoordinationInfo: Equatable {
+///
+/// `Codable` because the local caches persist it: a cached row that lost its
+/// event renders as plain text after a relaunch, and dedup on load keeps the
+/// cached copy, so the replay that carries the tags is discarded.
+struct CoordinationInfo: Equatable, Codable {
     var eventType: String
     var taskId: String?
     var phase: String?
