@@ -1,73 +1,83 @@
 import SwiftUI
 
-/// Renders an agent coordination event as a structured card — the macOS
-/// analogue of the web `CoordinationCards`. Driven by the pure
-/// `CoordinationCard` style policy; a tag-unaware fallback (plain text) is
-/// never reached because the row only builds this when `coordination != nil`.
+/// A coordination event as a card — one card for every event type there is.
+///
+/// There is no list of types that card and no per-type face, so an event this
+/// app has never been taught reads exactly like one it knows. Grayscale and
+/// edgeless throughout: colour and a left edge belong to the act cards, and
+/// are how a reader tells the two classes apart.
 struct CoordinationCardView: View {
     let info: CoordinationInfo
     let text: String
-    @State private var expanded = false
+    var at: Date?
 
-    private var style: CoordinationCard.Style { CoordinationCard.style(for: info) }
-
-    /// The act cards' left-edge accent, adopted here so both families speak
-    /// one language: nil for routine events, an edge for the marked ones.
-    private var accentColor: Color? {
-        switch style.accent {
-        case .neutral: return nil
-        case .agent: return Theme.purple
-        case .success: return Theme.success
-        case .error: return Theme.danger
-        }
-    }
+    private var rows: [PayloadRow] { EventCardPayload.rows(info.payload) }
 
     var body: some View {
-        EventCard(
-            icon: style.icon,
-            label: style.label,
-            detail: info.taskId.map { $0.count > 10 ? String($0.prefix(10)) + "…" : $0 },
-            accent: accentColor
-        ) {
-            if !text.isEmpty {
-                Text(text)
-                    .font(.system(size: 13))
-                    .foregroundStyle(bodyColor)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if style.expandablePayload, let payload = CoordinationCard.prettyPayload(info.payload) {
-                Button {
-                    expanded.toggle()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                            .font(.system(size: 9))
-                        Text(expanded ? "Hide payload" : "Show payload")
-                            .font(.system(size: 11))
-                    }
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Text("◇")
+                    .font(.system(size: 11))
                     .foregroundStyle(Theme.textTertiary)
-                }
-                .buttonStyle(.plain)
-                if expanded {
-                    Text(payload)
-                        .font(.system(size: 12, design: .monospaced))
+                Text(info.eventType.lowercased())
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(Theme.textSecondary)
+                Spacer(minLength: 0)
+                if let at {
+                    Text(Self.time.string(from: at))
+                        .font(.system(size: 10))
                         .foregroundStyle(Theme.textTertiary)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Theme.cardHeaderStrip)
+
+            VStack(alignment: .leading, spacing: 4) {
+                if !text.isEmpty {
+                    Text(text)
+                        .font(.system(size: 13))
+                        .foregroundStyle(Theme.textSecondary)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
-                        .padding(8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 5))
+                }
+                // Keys in one aligned column, values in a second: every
+                // value starts at the same x, as on the web card.
+                Grid(alignment: .topLeading, horizontalSpacing: 8, verticalSpacing: 4) {
+                    ForEach(rows, id: \.key) { row in
+                        GridRow {
+                            Text(row.key)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(Theme.textTertiary)
+                                .gridColumnAlignment(.leading)
+                            // A value wraps to the width it is given; past six
+                            // lines it ends in an ellipsis rather than growing
+                            // the card without bound.
+                            Text(row.value)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(Theme.textSecondary)
+                                .textSelection(.enabled)
+                                .lineLimit(6)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
                 }
             }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
         }
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Theme.border.opacity(0.5), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .frame(maxWidth: 460, alignment: .leading)
     }
 
-    private var bodyColor: Color {
-        switch style.accent {
-        case .success: return Theme.success
-        case .error: return Theme.danger
-        default: return Theme.textSecondary
-        }
-    }
+    private static let time: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f
+    }()
 }

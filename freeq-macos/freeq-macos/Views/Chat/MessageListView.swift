@@ -798,13 +798,14 @@ struct MessageRow: View {
                 // A task event's companion line → its card. Every act event
                 // renders as its own card and stays one; a line whose event
                 // has not arrived has no card here and stays text below.
-                ActEventCardView(card: card, at: message.timestamp) { msgId in
-                    appState.scrollToMessageId = msgId
-                }
+                ActEventCardView(card: card, at: message.timestamp,
+                                 onJumpToMessage: { msgId in appState.scrollToMessageId = msgId },
+                                 resolveName: { appState.displayNameForKey($0) })
                 .fixedSize(horizontal: false, vertical: true)
             } else if let coord = message.coordination {
-                // Agent coordination event → structured card (parity with web).
-                CoordinationCardView(info: coord, text: message.text)
+                // Every event-tagged message is a card, whatever its type says
+                // (parity with the other three clients).
+                CoordinationCardView(info: coord, text: message.text, at: message.timestamp)
                     .fixedSize(horizontal: false, vertical: true)
             } else if let jumbo = Jumbomoji.size(message.text) {
                 // Jumbomoji: a message of just 1–3 emoji renders large.

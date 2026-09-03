@@ -100,6 +100,7 @@
 		D2DC1C78722C6743877143B7 /* MessageTimeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94E7AF9D701F15529729BA91 /* MessageTimeline.swift */; };
 		D520A6580822EF5314066E14 /* LinkPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1561609D65E3676C79D46E2 /* LinkPreview.swift */; };
 		D78576DC05AD84FE32E408D2 /* QuickSendPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7B5CC4E0945A336F1B9303AF /* QuickSendPanel.swift */; };
+		D8710A03D5096C7FDD800769 /* ActFacts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 75222B6AD422CC6E2435F600 /* ActFacts.swift */; };
 		D96E350E7A49137316852CC7 /* CallController.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA939865F12BCD7A51A4E5D0 /* CallController.swift */; };
 		DE8F1528542FEB83C2A987CE /* ChannelListBrowser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B238AA9ACDF3723BB74BB45 /* ChannelListBrowser.swift */; };
 		E04A550CE7A7BD40DA6CFD36 /* GlobalHotKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9194BD66D242EE2DD6C3BA20 /* GlobalHotKey.swift */; };
@@ -110,6 +111,7 @@
 		E8ABEEDF45BB77FFA7112E96 /* MessageStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41E19D6BE7C80AAE06A5EB97 /* MessageStore.swift */; };
 		E915DE84D6C922B1A64D4FE0 /* MessageBlocks.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62B0B9FB9D87D335C6B9327D /* MessageBlocks.swift */; };
 		E9D804C750ACFB7EDA49E40F /* ActVerbs.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5A3CB043C6B1897ECD7E6EF /* ActVerbs.swift */; };
+		EA5891F27147EAF6960F6DF9 /* act-card-copy.json in Resources */ = {isa = PBXBuildFile; fileRef = 977E7A7356716C09988E9E8E /* act-card-copy.json */; };
 		EC17044DE0222489BF5FD85D /* IdentityClaim.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49CC1244CD3756E771AE3933 /* IdentityClaim.swift */; };
 		ECC92464E4422B5DCFDC770B /* KeychainHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D0D657E5F637E5EFD232E19 /* KeychainHelper.swift */; };
 		F09B5C0D9F467AE052B47824 /* CoordinationCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7DFCEDBA7A1F2BA99F60CA4 /* CoordinationCardView.swift */; };
@@ -207,6 +209,7 @@
 		7244978703DC2ECAD43DFEB1 /* SelfPartResolve.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfPartResolve.swift; sourceTree = "<group>"; };
 		7340BE5C80B24DD16B066ABC /* ChannelSettingsSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelSettingsSheet.swift; sourceTree = "<group>"; };
 		746E6E96E986EB369B491948 /* CameraEffects.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraEffects.swift; sourceTree = "<group>"; };
+		75222B6AD422CC6E2435F600 /* ActFacts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActFacts.swift; sourceTree = "<group>"; };
 		7B5CC4E0945A336F1B9303AF /* QuickSendPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickSendPanel.swift; sourceTree = "<group>"; };
 		7BD3C7CC942BA721E1572347 /* JoinChannelSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JoinChannelSheet.swift; sourceTree = "<group>"; };
 		7D0EC24463EE36CAB1182A07 /* StatusEditorSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusEditorSheet.swift; sourceTree = "<group>"; };
@@ -217,6 +220,7 @@
 		923CB3DCE2113F08CCB9E8F7 /* SidebarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarView.swift; sourceTree = "<group>"; };
 		932AFF9B3AF0BCF257A2DCE2 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
 		94E7AF9D701F15529729BA91 /* MessageTimeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageTimeline.swift; sourceTree = "<group>"; };
+		977E7A7356716C09988E9E8E /* act-card-copy.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "act-card-copy.json"; sourceTree = "<group>"; };
 		97D9476297DE1E9683156C4C /* MessageActions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageActions.swift; sourceTree = "<group>"; };
 		99635569CD2711503B3DCF7E /* FreeqAppIntents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FreeqAppIntents.swift; sourceTree = "<group>"; };
 		9B238AA9ACDF3723BB74BB45 /* ChannelListBrowser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelListBrowser.swift; sourceTree = "<group>"; };
@@ -419,6 +423,8 @@
 		9FEEFDA2BB675FA6773DD208 /* Models */ = {
 			isa = PBXGroup;
 			children = (
+				977E7A7356716C09988E9E8E /* act-card-copy.json */,
+				75222B6AD422CC6E2435F600 /* ActFacts.swift */,
 				AC100BDE977036018B6D8873 /* ActTasks.swift */,
 				E5A3CB043C6B1897ECD7E6EF /* ActVerbs.swift */,
 				69D7F8C4D262E9181F0888CF /* ApiAuth.swift */,
@@ -614,6 +620,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				141F5EE2389E6C8A8801E692 /* Assets.xcassets in Resources */,
+				EA5891F27147EAF6960F6DF9 /* act-card-copy.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -647,6 +654,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				7C0C927C7229AD74D19BB835 /* ActEventCardView.swift in Sources */,
+				D8710A03D5096C7FDD800769 /* ActFacts.swift in Sources */,
 				8318D6CBA44856BE605795E3 /* ActTasks.swift in Sources */,
 				E9D804C750ACFB7EDA49E40F /* ActVerbs.swift in Sources */,
 				F32E9C6E2C26DC15931F9430 /* ApiAuth.swift in Sources */,

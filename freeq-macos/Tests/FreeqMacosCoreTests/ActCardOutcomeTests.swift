@@ -99,7 +99,8 @@ final class ActCardOutcomeTests: XCTestCase {
     private func transcript(_ ch: ChannelState) -> [String] {
         ch.messages.map { m in
             if let card = ch.actCards[m.id] { return "card:\(card.event.verb)" }
-            if let coord = m.coordination { return CoordinationCard.style(for: coord) == nil ? "text" : "card:\(coord.eventType)" }
+            // Every event-tagged message is a card, whatever its type says.
+            if let coord = m.coordination { return "card:\(coord.eventType)" }
             if m.from.isEmpty { return "system" }
             return "text"
         }
@@ -166,7 +167,8 @@ final class ActCardOutcomeTests: XCTestCase {
             let ch = run(eventsFirst: eventsFirst, cachedRows: rows)
             XCTAssertEqual(
                 transcript(ch),
-                ["card:offer", "card:accept", "card:delegation_notice", "text", "text", "system"],
+                ["card:offer", "card:accept", "card:delegation_notice",
+                 "card:task_request", "card:task_complete", "system"],
                 "eventsFirst=\(eventsFirst)")
         }
     }
@@ -203,6 +205,5 @@ final class ActCardOutcomeTests: XCTestCase {
         XCTAssertEqual(drawn, CoordinationInfo(eventType: "delegation_notice", taskId: "TASK001",
                                                phase: nil, evidenceType: nil,
                                                reference: nil, payload: nil))
-        XCTAssertNotNil(drawn.flatMap { CoordinationCard.style(for: $0) })
     }
 }

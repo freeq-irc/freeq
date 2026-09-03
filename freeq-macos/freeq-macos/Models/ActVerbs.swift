@@ -1,82 +1,165 @@
 import Foundation
 
-/// The word each task verb shows a reader.
+/// The word and glyph each task verb shows a reader.
 ///
 /// The headline of a card is the word for the verb its event carried — the
 /// verb is on the wire and the client computes nothing from it, so a progress
-/// report never reads as a claim. A verb with no row here shows itself, which
-/// is how a kind may add one without this having to be taught it.
-///
-/// The same rows the web client reads (`freeq-app/src/lib/act-verbs.ts`) and
-/// the Android app reads (`ActVerbs.kt`), so the same move is called the same
-/// thing wherever it is read.
+/// report never reads as a claim. The rows live in the bundled copy of
+/// `spec/act-card-copy.json`, the same file the other three clients read, so
+/// the same move is called the same thing wherever it is read. A verb with no
+/// row shows itself, with the fallback glyph, which is how a kind may add a
+/// move without any client being taught it.
 enum ActVerbs {
-    private static let headlines: [String: String] = [
-        "offer": "offered",
-        "accept": "accepted",
-        "decline": "declined",
-        "claim": "claimed",
-        "progress": "in progress",
-        "complete": "completed",
-        "fail": "failed",
-        "cancel": "cancelled",
-        "bid": "bid",
-        "award": "awarded",
-        "submit": "submitted",
-        "revise": "revisions requested",
-        "accept-work": "accepted",
-        "forfeit": "forfeited",
-        // The two the home signs for itself. They write no companion line, so
-        // these words are read in the timeline rather than on a card.
-        "confirm": "confirmed",
-        "expire": "expired",
-    ]
+    private struct VerbRow: Decodable { let word: String; let glyph: String }
 
-    static func headline(_ verb: String) -> String { headlines[verb] ?? verb }
+    private static let verbRows: [String: VerbRow] = {
+        guard let data = SealPanelCopy.bundledText?.data(using: .utf8),
+              let doc = try? JSONDecoder().decode(CopyDoc.self, from: data)
+        else { return [:] }
+        return doc.verbs
+    }()
 
-    /// The glyph each task verb shows a reader, beside its word.
+    private static let fallbackGlyph: String = {
+        guard let data = SealPanelCopy.bundledText?.data(using: .utf8),
+              let doc = try? JSONDecoder().decode(CopyDoc.self, from: data)
+        else { return "📌" }
+        return doc.fallback_glyph
+    }()
+
+    private struct CopyDoc: Decodable {
+        let verbs: [String: VerbRow]
+        let fallback_glyph: String
+    }
+
+    static func headline(_ verb: String) -> String { verbRows[verb]?.word ?? verb }
+
+    static func emoji(_ verb: String) -> String { verbRows[verb]?.glyph ?? fallbackGlyph }
+
+    /// The register a card wears: the state the step it carries lands the
+    /// action in, as a role rather than a colour — each client paints the role
+    /// in its own theme.
     ///
-    /// One row per verb, read the same way the word above it is: off the verb
-    /// the event carried, never off where the task got to. A verb with no row
-    /// here gets the generic pin, so a kind may add a move without this being
-    /// taught it.
-    private static let glyphs: [String: String] = [
-        "offer": "📋",
-        "accept": "👍",
-        "decline": "👎",
-        "claim": "✋",
-        "progress": "📌",
-        "complete": "🎉",
-        "fail": "❌",
-        "cancel": "🚫",
-        "bid": "💰",
-        "award": "🏆",
-        "submit": "📤",
-        "revise": "🔁",
-        "accept-work": "✅",
-        "forfeit": "🏳️",
-        // The two the home signs for itself. They write no companion line, so
-        // they carry their glyph on a system line rather than on a card.
-        "confirm": "✔️",
-        "expire": "⌛",
+    /// Read off `spec/act-transitions.json`: the `to` of the row the verb
+    /// matched, except that a step landing where it started is in-progress
+    /// whatever state that is. A row whose `who` is `system` writes no card and
+    /// so has no register; a verb with no row at all falls to the neutral end.
+    private static let registers: [String: ActRegister?] = [
+        // lands open / offered
+        "offer": .new,
+        // lands assigned / under_review, and the two additive steps
+        "accept": .inProgress,
+        "claim": .inProgress,
+        "award": .inProgress,
+        "submit": .inProgress,
+        "revise": .inProgress,
+        "progress": .inProgress,
+        "bid": .inProgress,
+        // lands completed / accepted
+        "complete": .endedWell,
+        "accept-work": .endedWell,
+        // lands failed / forfeited / cancelled / declined
+        "fail": .didNotEndWell,
+        "forfeit": .didNotEndWell,
+        "cancel": .didNotEndWell,
+        "decline": .didNotEndWell,
+        // The rows a home signs for itself. No card, so no register.
+        "confirm": ActRegister?.none,
+        "expire": ActRegister?.none,
+        "auto-accept": ActRegister?.none,
     ]
 
-    static func emoji(_ verb: String) -> String { glyphs[verb] ?? "📌" }
+    static func register(_ verb: String) -> ActRegister? {
+        guard let row = registers[verb] else { return .neutralEnd }
+        return row
+    }
 
-    /// The accent a card's left edge carries. Purple where the work lands on
-    /// someone's plate, green on a good end, red on a failure; every other
-    /// verb goes without, since an edge on everything is an edge that says
-    /// nothing.
-    static func accent(_ verb: String) -> ActAccent {
-        switch verb {
-        case "offer", "award": return .handoff
-        case "complete", "accept-work": return .success
-        case "fail": return .failure
-        default: return .none
-        }
+    /// Who the rules file lets take this step — the `who` of the row the verb
+    /// matched, and the key the seal panel picks its sentence by.
+    ///
+    /// An opening verb has no transition row of its own and reports `opener`.
+    /// A system row and an unteached verb report nothing, because neither has
+    /// a rule about a person to state.
+    private static let whos: [String: String?] = [
+        "offer": "opener",
+        "accept": "offeree",
+        "decline": "offeree",
+        "claim": "anyone",
+        "bid": "anyone",
+        "progress": "assignee",
+        "complete": "assignee",
+        "fail": "assignee",
+        "submit": "assignee",
+        "forfeit": "assignee",
+        "cancel": "offerer",
+        "award": "offerer",
+        "revise": "offerer",
+        "accept-work": "offerer",
+        "confirm": String?.none,
+        "expire": String?.none,
+        "auto-accept": String?.none,
+    ]
+
+    static func whoRole(_ verb: String) -> String? {
+        guard let row = whos[verb] else { return nil }
+        return row
     }
 }
 
-/// An accent as a role rather than a colour — each client paints it in its own
-/// theme.
-enum ActAccent: Equatable { case none, handoff, success, failure }
+/// The register a card wears, as a role rather than a colour — each client
+/// paints it in its own theme.
+enum ActRegister: Equatable { case new, inProgress, endedWell, didNotEndWell, neutralEnd }
+
+/// The seal panel's words, read from the bundled copy of
+/// `spec/act-card-copy.json`.
+///
+/// The prose is not written here and is not written in the other three clients
+/// either: all four read the same file so a sentence cannot drift between them.
+/// A test pins the bundled copy byte-identical to the canonical file.
+enum SealPanelCopy {
+
+    /// The bundled file's bytes, so a test can pin them against the canonical
+    /// spec file without reaching into another target's bundle.
+    static let bundledText: String? = {
+        var bundles: [Bundle] = [.main]
+        #if SWIFT_PACKAGE
+        bundles.insert(.module, at: 0)
+        #endif
+        for bundle in bundles {
+            guard let url = bundle.url(forResource: "act-card-copy", withExtension: "json"),
+                  let text = try? String(contentsOf: url, encoding: .utf8)
+            else { continue }
+            return text
+        }
+        return nil
+    }()
+
+    private static let panel: [String: Any] = {
+        guard let data = bundledText?.data(using: .utf8),
+              let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let panel = doc["seal_panel"] as? [String: Any]
+        else { return [:] }
+        return panel
+    }()
+
+    /// `HANDOFF: Rules Enforced` — the kind comes off the event's own act tag.
+    static func header(_ kind: String) -> String {
+        let format = panel["header_format"] as? String ?? "<KIND>: Rules Enforced"
+        return format.replacingOccurrences(of: "<KIND>", with: kind.uppercased())
+    }
+
+    static func linkText() -> String {
+        panel["link_text"] as? String ?? "View full history"
+    }
+
+    /// What the server enforced on this step, in one sentence.
+    ///
+    /// Chosen off the `who` of the transition row the verb matched — never off
+    /// the verb's name and never off the kind. A system row and a verb with no
+    /// row at all claim nothing, so neither gets a sentence.
+    static func sentence(_ verb: String) -> String? {
+        guard let role = ActVerbs.whoRole(verb),
+              let sentences = panel["sentences"] as? [String: String]
+        else { return nil }
+        return sentences[role]
+    }
+}

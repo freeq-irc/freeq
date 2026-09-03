@@ -65,6 +65,7 @@ let package = Package(
                 "MessageTranscript.swift",
                 "CoordinationCard.swift",
                 "ActVerbs.swift",
+                "ActFacts.swift",
                 "ActTasks.swift",
                 "Jumbomoji.swift",
                 "FavoritesSync.swift",
@@ -82,6 +83,11 @@ let package = Package(
                 "Logger.swift",
                 "KeychainHelper.swift",
                 "MessageStore.swift",
+            ],
+            resources: [
+                // The seal panel's words, bundled byte-identical from
+                // `spec/act-card-copy.json` and pinned by a test.
+                .process("act-card-copy.json"),
             ]
         ),
         .testTarget(
