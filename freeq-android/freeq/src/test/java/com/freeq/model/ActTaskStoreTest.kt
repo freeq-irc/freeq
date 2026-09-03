@@ -173,7 +173,7 @@ class ActTaskStoreTest {
         assertNull(store.task(opener)!!.events[0].msgId)
     }
 
-    @Test fun each_line_takes_the_event_nearest_it_in_time_not_the_next_in_order() {
+    @Test fun a_line_outside_the_window_leaves_its_event_unpaired() {
         // The lines and the task events replay as two windows that truncate
         // independently: here the opener's line fell outside its window.
         val store = ActTaskStore()

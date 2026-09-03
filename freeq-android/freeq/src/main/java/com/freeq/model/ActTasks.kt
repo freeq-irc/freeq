@@ -138,13 +138,22 @@ class ActTaskStore {
      * Join each event to the companion line carrying its prose.
      *
      * The companion names only the task, never the event, so the two are
-     * matched by their sender and then by how close in time they are: a
-     * joiner is handed the lines and the task events as two windows that
-     * truncate independently, so a line missing from its window must leave
-     * its event unpaired rather than shift every later line onto the wrong
-     * event. Either side can land first, so this runs from both, and never
-     * re-pairs what it has already paired: the message list is capped, and an
-     * evicted companion must not shift its successors.
+     * matched by sender and then by order: within one sender the events still
+     * needing a line and the lines still free are both in mint order, and they
+     * pair off in step. Nearest-in-time cannot do this — a replayed line
+     * carries a second-truncated stamp, so of a same-second pair the later
+     * event sits nearer to both lines and takes the first one.
+     *
+     * Walking in step needs one guard, since the two lists truncate
+     * independently and either can arrive first: a line is only taken when it
+     * could belong to the event standing opposite it. An older line is
+     * dropped, because no later event can want it either; a newer one is left
+     * where it is and the event goes unpaired, which is what stops a missing
+     * line shifting every successor onto the wrong event.
+     *
+     * This runs from both sides and never re-pairs what it has already
+     * paired: the message list is capped, and an evicted companion must not
+     * shift its successors.
      */
     fun pair(lines: List<ActLine>) {
         if (byId.isEmpty() || lines.isEmpty()) return
@@ -160,29 +169,35 @@ class ActTaskStore {
 
         for ((id, task) in byId.entries.toList()) {
             val candidates = free[id] ?: continue
-            // Every line each unpaired event could take, nearest in time
-            // first, and in arrival order where neither side dates itself.
-            val near = mutableListOf<Triple<Int, Int, Double>>()
-            task.events.forEachIndexed events@{ evIdx, ev ->
-                if (ev.msgId != null) return@events
-                val at = actEventTimeMs(ev.eventId)
-                candidates.forEachIndexed lines@{ lineIdx, line ->
-                    if (!sameSender(ev, line)) return@lines
-                    val gap = if (at != null) {
-                        Math.abs(line.timestampMs - at).toDouble()
-                    } else {
-                        Double.POSITIVE_INFINITY
-                    }
-                    near.add(Triple(evIdx, lineIdx, gap))
-                }
-            }
-            near.sortWith(compareBy({ it.third }, { it.first }, { it.second }))
+            // Events still waiting on a line, oldest first — ids are ULIDs.
+            val pending = task.events
+                .mapIndexed { evIdx, ev -> evIdx to ev }
+                .filter { it.second.msgId == null }
+                .sortedBy { it.second.eventId }
             val pairedTo = mutableMapOf<Int, String>()
-            val used = mutableSetOf<Int>()
-            for ((evIdx, lineIdx, _) in near) {
-                if (evIdx in pairedTo || lineIdx in used) continue
-                pairedTo[evIdx] = candidates[lineIdx].id
-                used.add(lineIdx)
+            val usedLines = mutableSetOf<String>()
+            val done = mutableSetOf<String>()
+            for ((_, ev) in pending) {
+                val sender = ev.did ?: ev.from.lowercase()
+                if (!done.add(sender)) continue
+                val mine = pending.filter { (it.second.did ?: it.second.from.lowercase()) == sender }
+                val theirs = candidates
+                    .filter { it.id !in usedLines && sameSender(ev, it) }
+                    .sortedWith(compareBy({ it.timestampMs }, { it.id }))
+                var mi = 0
+                var li = 0
+                while (mi < mine.size && li < theirs.size) {
+                    when (linePlacement(mine[mi].second, theirs[li])) {
+                        LinePlacement.FITS -> {
+                            pairedTo[mine[mi].first] = theirs[li].id
+                            usedLines.add(theirs[li].id)
+                            mi++
+                            li++
+                        }
+                        LinePlacement.TOO_OLD -> li++
+                        LinePlacement.TOO_NEW -> mi++
+                    }
+                }
             }
             if (pairedTo.isEmpty()) continue
             byId[id] = task.copy(
@@ -190,6 +205,25 @@ class ActTaskStore {
                     pairedTo[evIdx]?.let { ev.copy(msgId = it) } ?: ev
                 },
             )
+        }
+    }
+
+    /** Where a line sits relative to the event it is being offered to. */
+    private enum class LinePlacement { FITS, TOO_OLD, TOO_NEW }
+
+    /**
+     * A companion goes out in its event's own second or the one after, and a
+     * replayed line's stamp is that second floored. An event whose id carries
+     * no time takes any line, which is all a synthetic id can be judged on.
+     */
+    private fun linePlacement(ev: ActTaskEvent, line: ActLine): LinePlacement {
+        val at = actEventTimeMs(ev.eventId) ?: return LinePlacement.FITS
+        val evSecond = at / 1000
+        val lineSecond = line.timestampMs / 1000
+        return when {
+            lineSecond < evSecond -> LinePlacement.TOO_OLD
+            lineSecond - evSecond > 1 -> LinePlacement.TOO_NEW
+            else -> LinePlacement.FITS
         }
     }
 

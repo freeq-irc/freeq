@@ -216,7 +216,7 @@ describe('companion lines', () => {
     expect(tasks().get(OPENER)!.events[0].msgId).toBe('m1');
   });
 
-  it('gives each line the event nearest it in time, not the next one in order', () => {
+  it('leaves an event unpaired when its own line fell outside the window', () => {
     // The lines and the task events replay as two windows that truncate
     // independently: here the offer's line fell outside its window.
     const s = useStore.getState();

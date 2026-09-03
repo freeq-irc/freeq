@@ -569,6 +569,23 @@ function actSameSender(ev: ActEvent, m: Message): boolean {
  * it has already paired: the message list is capped, and an evicted companion
  * must not shift its successors.
  */
+/**
+ * Where a line sits relative to the event it is being offered to. A companion
+ * goes out in its event's own second or the one after, and a replayed line's
+ * stamp is that second floored. An event whose id carries no time takes any
+ * line, which is all a synthetic id can be judged on.
+ */
+function actLinePlacement(ev: ActEvent, line: Message): 'fits' | 'tooOld' | 'tooNew' {
+  const at = actEventTime(ev.eventId);
+  const wrote = line.timestamp?.getTime?.();
+  if (at === undefined || wrote === undefined || Number.isNaN(wrote)) return 'fits';
+  const evSecond = Math.floor(at / 1000);
+  const lineSecond = Math.floor(wrote / 1000);
+  if (lineSecond < evSecond) return 'tooOld';
+  if (lineSecond - evSecond > 1) return 'tooNew';
+  return 'fits';
+}
+
 function pairActCompanions(ch: Channel): void {
   if (ch.actTasks.size === 0) return;
   const claimed = new Set<string>();
@@ -589,29 +606,47 @@ function pairActCompanions(ch: Channel): void {
   for (const [id, task] of tasks) {
     const lines = free.get(id);
     if (!lines) continue;
-    // Every line each unpaired event could take, nearest in time first, and
-    // in arrival order where neither side dates itself.
-    const near: { ev: number; line: number; gap: number }[] = [];
-    task.events.forEach((ev, evIdx) => {
-      if (ev.msgId) return;
-      const at = actEventTime(ev.eventId);
-      lines.forEach((m, lineIdx) => {
-        if (!actSameSender(ev, m)) return;
-        const wrote = m.timestamp?.getTime?.();
-        const gap =
-          at !== undefined && wrote !== undefined && !Number.isNaN(wrote)
-            ? Math.abs(wrote - at)
-            : Infinity;
-        near.push({ ev: evIdx, line: lineIdx, gap });
-      });
-    });
-    near.sort((a, b) => (a.gap === b.gap ? a.ev - b.ev || a.line - b.line : a.gap - b.gap));
+    // Within one sender the events still waiting on a line and the lines
+    // still free are both in mint order, and they pair off in step. The two
+    // lists truncate independently and either can arrive first, so a line is
+    // only taken when it could belong to the event standing opposite it: an
+    // older line is dropped, a newer one is left where it is and the event
+    // goes unpaired.
+    const pending = task.events
+      .map((ev, evIdx) => ({ ev, evIdx }))
+      .filter(({ ev }) => !ev.msgId)
+      .sort((a, b) => (a.ev.eventId < b.ev.eventId ? -1 : a.ev.eventId > b.ev.eventId ? 1 : 0));
     const pairedTo = new Map<number, string>();
-    const used = new Set<number>();
-    for (const { ev, line } of near) {
-      if (pairedTo.has(ev) || used.has(line)) continue;
-      pairedTo.set(ev, lines[line].id);
-      used.add(line);
+    const usedLines = new Set<string>();
+    const done = new Set<string>();
+    for (const { ev } of pending) {
+      const sender = ev.did ?? ev.from.toLowerCase();
+      if (done.has(sender)) continue;
+      done.add(sender);
+      const mine = pending.filter(({ ev: e }) => (e.did ?? e.from.toLowerCase()) === sender);
+      const theirs = lines
+        .filter((m) => !usedLines.has(m.id) && actSameSender(ev, m))
+        .sort((a, b) => {
+          const ta = a.timestamp?.getTime?.() ?? 0;
+          const tb = b.timestamp?.getTime?.() ?? 0;
+          if (ta !== tb) return ta - tb;
+          return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+        });
+      let mi = 0;
+      let li = 0;
+      while (mi < mine.length && li < theirs.length) {
+        const placement = actLinePlacement(mine[mi].ev, theirs[li]);
+        if (placement === 'fits') {
+          pairedTo.set(mine[mi].evIdx, theirs[li].id);
+          usedLines.add(theirs[li].id);
+          mi++;
+          li++;
+        } else if (placement === 'tooOld') {
+          li++;
+        } else {
+          mi++;
+        }
+      }
     }
     if (pairedTo.size === 0) continue;
     tasks.set(id, {
