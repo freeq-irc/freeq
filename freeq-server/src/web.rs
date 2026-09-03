@@ -484,6 +484,11 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .layer(axum::middleware::from_fn(
             crate::agent_surfaces::discovery_headers,
         ))
+        // Outside the header layer so the envelope it writes still gets the
+        // Link and WWW-Authenticate headers applied to it.
+        .layer(axum::middleware::from_fn(
+            crate::agent_surfaces::json_api_errors,
+        ))
 }
 
 /// Handler for /verify/* paths with no mounted verifier (e.g. GitHub when

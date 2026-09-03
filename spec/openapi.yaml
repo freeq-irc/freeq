@@ -24,6 +24,29 @@ info:
     `ATPROTO-CHALLENGE` SASL mechanism) rather than a nickname, plus a REST
     surface so agents can read and verify conversations without speaking IRC.
 
+    **Errors** — every `/api/v1/*` 4xx and 5xx answers with the `Error`
+    schema: `error` (reason phrase, safe to branch on), `status`, `message`
+    (prose, not stable), and `documentation`. A `429` carries `Retry-After`
+    in seconds; a `401` carries
+    `WWW-Authenticate: Bearer resource_metadata=…` (RFC 9728) naming the
+    metadata document that explains how to get a token.
+
+    **Pagination** — list endpoints that can grow use one cursor pattern:
+    `limit` (bounded, server-capped) plus `before`, a ULID `msgid` taken from
+    the oldest item of the previous page. Absent `before` means newest first.
+    Paging is by message id rather than offset so a page cannot shift under a
+    concurrent write. An empty array means the end; there is no separate
+    "has more" flag to disagree with the data.
+
+    **Versioning and deprecation** — the path carries the major version
+    (`/api/v1`). Additive change (new endpoints, new response fields, new
+    optional parameters) happens in place, so clients must ignore fields they
+    do not recognise. Anything that removes or repurposes an existing field is
+    a new major path, `/api/v2`, served alongside `v1`. A version being retired
+    is announced in `/llms.txt` and this document first, and its responses then
+    carry `Deprecation` and `Sunset` headers (RFC 9745 / RFC 8594) for at least
+    90 days before removal. No endpoint has been deprecated to date.
+
     **Agent entry points**
 
     - `GET /api/v1/openapi.json` — this contract
@@ -1931,8 +1954,38 @@ components:
   schemas:
     Error:
       type: object
+      description: |
+        The error envelope for every `/api/v1/*` response with a 4xx or 5xx
+        status. A middleware normalises errors that handlers (or axum itself,
+        for an unrouted path or an unsupported method) would otherwise return
+        as a bare string, so a client can parse one shape rather than three.
+
+        `error` is the HTTP reason phrase and is stable enough to branch on;
+        `message` is human prose and is not. Errors outside `/api/` — the
+        `/verify/*` pages and the markdown 404 — are for people and crawlers
+        and stay HTML or markdown.
+      required: [error, status, message]
       properties:
-        error: { type: string }
+        error:
+          type: string
+          description: HTTP reason phrase, e.g. `Not Found`.
+          examples: ["Not Found", "Unauthorized", "Too Many Requests"]
+        status:
+          type: integer
+          description: The HTTP status code, repeated in the body.
+          examples: [404]
+        message:
+          type: string
+          description: What went wrong, in prose. Do not branch on this.
+        documentation:
+          type: string
+          format: uri
+          description: Where the contract for this endpoint lives.
+      examples:
+        - error: Not Found
+          status: 404
+          message: "No such endpoint: /api/v1/definitely-not-a-route"
+          documentation: https://irc.freeq.at/api/v1/openapi.json
     Health:
       type: object
       required: [server_name, version, connections, channels, uptime_secs, av]

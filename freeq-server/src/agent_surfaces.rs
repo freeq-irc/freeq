@@ -39,6 +39,12 @@ pub const SITE: &str = "https://freeq.at";
 
 pub const REPO: &str = "https://github.com/freeq-irc/freeq";
 
+/// `Retry-After` for a rate-limited response, in seconds.
+///
+/// The REST limiter's window is 60s, so waiting one full window is always
+/// enough. Stated as a constant string because the header takes one.
+const RETRY_AFTER_SECS: &str = "60";
+
 /// One-sentence description, identical to the one in `llms.txt` and the one
 /// freeq.at serves. Agents dedupe on this text; drift makes one service look
 /// like two.
@@ -588,6 +594,25 @@ pub fn serves_app_shell(path: &str) -> bool {
 /// Fallback for everything the router and the static directory did not match.
 pub async fn spa_fallback(uri: Uri) -> Response {
     if !serves_app_shell(uri.path()) {
+        // Under /api/ the caller is a program: answer in the envelope the rest
+        // of the API uses, not in prose it would have to parse.
+        if uri.path().starts_with("/api/") {
+            return (
+                StatusCode::NOT_FOUND,
+                [(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                )],
+                serde_json::json!({
+                    "error": "Not Found",
+                    "status": 404,
+                    "message": format!("No such endpoint: {}", uri.path()),
+                    "documentation": format!("{ORIGIN}/api/v1/openapi.json"),
+                })
+                .to_string(),
+            )
+                .into_response();
+        }
         return not_found_markdown();
     }
     match INDEX_HTML.get().and_then(|o| o.as_deref()) {
@@ -600,6 +625,66 @@ pub async fn spa_fallback(uri: Uri) -> Response {
 
 // ── Response headers ─────────────────────────────────────────────────────
 
+/// One JSON error envelope for the whole REST surface.
+///
+/// Handlers under `/api/` return errors three different ways — a JSON
+/// `{"error": …}` body, a bare `(StatusCode, &str)`, and axum's own empty
+/// responses for 404/405/413. An agent cannot parse three shapes, and the two
+/// that are not JSON force it to guess from the status code alone.
+///
+/// Normalising here rather than editing ~27 call sites keeps the diff out of a
+/// 6k-line hotspot and also covers the errors no handler produces — the ones
+/// axum itself returns, which are exactly the ones nobody remembers.
+///
+/// Scoped to `/api/`: `/verify/*` and the OAuth pages answer humans in a
+/// browser and are meant to stay HTML.
+pub async fn json_api_errors(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let is_api = req.uri().path().starts_with("/api/");
+    let resp = next.run(req).await;
+    if !is_api || !resp.status().is_client_error() && !resp.status().is_server_error() {
+        return resp;
+    }
+    let already_json = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("json"));
+    if already_json {
+        return resp;
+    }
+
+    let status = resp.status();
+    let (mut parts, body) = resp.into_parts();
+    // Bounded: an error body is a sentence, and reading an unbounded one here
+    // would turn a bad response into a memory problem.
+    let detail = match axum::body::to_bytes(body, 8 * 1024).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).trim().to_string(),
+        Err(_) => String::new(),
+    };
+
+    let envelope = serde_json::json!({
+        "error": status.canonical_reason().unwrap_or("Error"),
+        "status": status.as_u16(),
+        "message": if detail.is_empty() {
+            status.canonical_reason().unwrap_or("Error").to_string()
+        } else {
+            detail
+        },
+        "documentation": format!("{ORIGIN}/api/v1/openapi.json"),
+    });
+    let body = serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".to_string());
+
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, axum::body::Body::from(body))
+}
+
 /// RFC 8288 `Link` relations on every response, and RFC 9728's
 /// `WWW-Authenticate` hint on every 401.
 ///
@@ -611,6 +696,7 @@ pub async fn discovery_headers(
 ) -> Response {
     let mut resp = next.run(req).await;
     let unauthorized = resp.status() == StatusCode::UNAUTHORIZED;
+    let rate_limited = resp.status() == StatusCode::TOO_MANY_REQUESTS;
     let headers = resp.headers_mut();
 
     if !headers.contains_key(header::LINK) {
@@ -621,6 +707,15 @@ pub async fn discovery_headers(
                  </llms.txt>; rel=\"describedby\"; type=\"text/markdown\", \
                  </agents.md>; rel=\"alternate\"; type=\"text/markdown\"",
             ),
+        );
+    }
+
+    // A bare 429 tells an agent to back off but not for how long, so it either
+    // hammers or gives up. Both are worse than being told.
+    if rate_limited && !headers.contains_key(header::RETRY_AFTER) {
+        headers.insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_static(RETRY_AFTER_SECS),
         );
     }
 

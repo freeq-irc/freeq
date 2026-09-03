@@ -481,3 +481,54 @@ async fn the_root_negotiates_markdown() {
         "a browser was served a document it did not ask for"
     );
 }
+
+/// Every REST error is the same JSON shape, whatever produced it — a handler
+/// returning a bare string, or axum answering for a route that isn't there.
+#[tokio::test]
+async fn rest_errors_share_one_json_envelope() {
+    let (_irc, http, _h) = start_server().await;
+    let client = reqwest::Client::new();
+
+    for path in ["/api/v1/definitely-not-a-route", "/api/v1/channels/%23nope/history"] {
+        let resp = client.get(url(http, path)).send().await.unwrap();
+        if resp.status().is_success() {
+            continue;
+        }
+        let ctype = resp
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        assert!(
+            ctype.contains("json"),
+            "{path} answered {} as {ctype}, not JSON",
+            resp.status()
+        );
+        let status = resp.status().as_u16();
+        let body: serde_json::Value = resp.json().await.unwrap_or_else(|e| {
+            panic!("{path} error body is not JSON: {e}");
+        });
+        assert!(body["error"].is_string(), "{path}: no error field: {body}");
+        assert_eq!(body["status"], status, "{path}: status mismatch: {body}");
+        assert!(body["message"].is_string(), "{path}: no message: {body}");
+        assert!(
+            body["documentation"]
+                .as_str()
+                .is_some_and(|d| d.contains("openapi.json")),
+            "{path}: an error should say where the contract is: {body}"
+        );
+    }
+
+    // A non-API error stays human-readable — /verify pages and the markdown
+    // 404 are for people and crawlers, not for API clients.
+    let resp = client.get(url(http, "/nope.json")).send().await.unwrap();
+    assert_eq!(resp.status(), 404);
+    assert!(
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("markdown")
+    );
+}
