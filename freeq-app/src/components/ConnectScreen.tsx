@@ -48,6 +48,23 @@ let brokerAutoAttempts = 0;
 const MAX_BROKER_AUTO_ATTEMPTS = 3;
 // Synchronous guard: prevents broker effect from racing with OAuth result effect
 let oauthConnectInProgress = false;
+/**
+ * One session restore per load, not one per effect invocation.
+ *
+ * React StrictMode double-invokes effects in development, and `brokerAutoAttempts`
+ * does not stop it: both invocations run before either increments past the
+ * limit, so the app fires two POST /session calls for one page load. Each one
+ * rotates a single-use AT Protocol refresh token upstream, and racing that
+ * rotation is what bricked persistent sessions until 2026-07-03. The broker
+ * serialises callers now, so this is no longer a correctness bug — but two PDS
+ * round-trips per load is still waste, and it is the precondition the race
+ * needed. Reported in #33 by an outside contributor before any of it happened.
+ *
+ * Module-level, matching `oauthConnectInProgress` above: a ref would be
+ * per-component-instance, and StrictMode's second instance is exactly the
+ * caller being guarded against.
+ */
+let sessionRefreshInFlight = false;
 
 type OAuthResultData = {
   did?: string;
@@ -223,6 +240,7 @@ export function ConnectScreen() {
     // Synchronous check: if OAuth result effect already called connect(), skip
     if (oauthConnectInProgress) return;
     if (brokerAutoAttempts >= MAX_BROKER_AUTO_ATTEMPTS) return;
+    if (sessionRefreshInFlight) return;
     const brokerToken = localStorage.getItem(LS_BROKER_TOKEN);
     if (!brokerToken) return;
     // Refresh via `${brokerOrigin}/session` regardless of deployment: for a
@@ -231,6 +249,7 @@ export function ConnectScreen() {
     // stale/cross-server token simply 401s below and is cleared there.
 
     brokerAutoAttempts++;
+    sessionRefreshInFlight = true;
     setAutoConnecting(true);
     // Use saved joined channels if available (reflects actual PART/JOIN state),
     // otherwise fall back to the saved channels from connect screen input.
@@ -257,10 +276,15 @@ export function ConnectScreen() {
           if (!r2.ok) throw new Error(await r2.text());
           return r2.json();
         }
-        // 401 = broker token is genuinely invalid/expired — only then remove it
+        // 401 = broker token is genuinely invalid/expired — only then remove it.
+        // Tagged, because the catch below has to tell "your session ended, sign
+        // in again" apart from "the network is having a moment": one is final
+        // and the user must act, the other resolves itself on a retry.
         if (res.status === 401) {
           localStorage.removeItem(LS_BROKER_TOKEN);
-          throw new Error(await res.text());
+          const err = new Error(await res.text());
+          err.name = 'SessionExpired';
+          throw err;
         }
         if (!res.ok) throw new Error(await res.text());
         return res.json();
@@ -276,13 +300,35 @@ export function ConnectScreen() {
         // Don't remove broker token on transient errors (timeout, 502, network).
         // Only removed above on explicit 401.
         setAutoConnecting(false);
+
+        // A dead session is final: the token is gone, so retrying cannot
+        // succeed, and saying nothing drops the user on the sign-in form with
+        // no idea why they were signed out. That silence is the whole
+        // complaint in #33 and #71 — it reads as "the app forgot me" and the
+        // user has nothing to report.
+        if (e?.name === 'SessionExpired') {
+          brokerAutoAttempts = MAX_BROKER_AUTO_ATTEMPTS;
+          setError('Your session expired. Sign in with AT Protocol again, or connect as guest.');
+          return;
+        }
         if (brokerAutoAttempts < MAX_BROKER_AUTO_ATTEMPTS) {
           // Retry with backoff
           const delay = 2000 * brokerAutoAttempts;
           setTimeout(() => setAutoConnecting(false), delay); // triggers re-run of this effect
-        } else if (e?.name === 'AbortError') {
-          setError('Authentication service unavailable. Try again or connect as guest.');
+          return;
         }
+        // Out of retries. Whatever went wrong, say something — an unexplained
+        // sign-in form is the failure users cannot report.
+        setError(
+          e?.name === 'AbortError'
+            ? 'Authentication service unavailable. Try again or connect as guest.'
+            : 'Could not restore your session. Try again or connect as guest.',
+        );
+      })
+      // Released however it settles: a guard that leaks on failure would block
+      // every later attempt, turning one bad response into a permanent one.
+      .finally(() => {
+        sessionRefreshInFlight = false;
       });
   }, [registered, oauthPending, autoConnecting, brokerOrigin, server]);
 

@@ -176,6 +176,66 @@ jobs:
         working-directory: freeq-app
         run: npm run build
 
+  auth-journey:
+    name: Auth journey (e2e)
+    runs-on: ubuntu-latest
+    # The first five minutes: signing in, staying signed in, and being told
+    # when that fails. This path had no end-to-end coverage while a
+    # refresh-token race bricked persistent sessions for six weeks in 2026
+    # (#33, fixed 2026-07-03 after it reached production) and rejected users
+    # were returned to the sign-in form with no message.
+    #
+    # Deliberately NOT the whole Playwright suite: that has a standing 7-8
+    # flaky failures per full run (see #100), and a job that is red by default
+    # teaches everyone to ignore CI. This is the subset that must never break.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux audio dev packages
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            freeq-app/package-lock.json
+            freeq-sdk-js/package-lock.json
+
+      - name: Install SDK deps
+        working-directory: freeq-sdk-js
+        run: npm ci
+
+      - name: Install web deps
+        working-directory: freeq-app
+        run: npm ci
+
+      - name: Install Playwright chromium
+        working-directory: freeq-app
+        run: npx playwright install --with-deps chromium
+
+      # The rig builds freeq-server itself and refuses to start if the binary
+      # lacks av-native (health must report av=true), so this only warms the
+      # cache — but it makes a compile failure show up as a build error rather
+      # than as a rig timeout.
+      - name: Build server (av-native)
+        run: cargo build --release --bin freeq-server --features av-native
+
+      - name: Auth journey
+        working-directory: freeq-app
+        run: npx playwright test --project=chromium e2e/auth-session.spec.ts
+
+      - name: Upload traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: auth-journey-traces
+          path: freeq-app/test-results/
+          retention-days: 7
+
   macos-swift:
     name: macOS Client (SwiftPM tests)
     runs-on: macos-15
