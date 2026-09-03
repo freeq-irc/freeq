@@ -1,6 +1,7 @@
 package com.freeq.model
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 /**
@@ -68,20 +69,25 @@ class ActVerbsTest {
         assertEquals("⌛", ActVerbs.emoji("expire"))
     }
 
-    @Test fun the_moves_that_put_work_on_a_plate_are_accented() {
-        assertEquals(ActAccent.HANDOFF, ActVerbs.accent("offer"))
-        assertEquals(ActAccent.HANDOFF, ActVerbs.accent("award"))
+    @Test fun an_opening_move_is_new_and_the_moves_onto_a_plate_are_in_progress() {
+        assertEquals(ActRegister.NEW, ActVerbs.register("offer"))
+        assertEquals(ActRegister.IN_PROGRESS, ActVerbs.register("award"))
+        assertEquals(ActRegister.IN_PROGRESS, ActVerbs.register("claim"))
+        assertEquals(ActRegister.IN_PROGRESS, ActVerbs.register("accept"))
     }
 
-    @Test fun a_good_end_and_a_bad_one_are_accented() {
-        assertEquals(ActAccent.SUCCESS, ActVerbs.accent("complete"))
-        assertEquals(ActAccent.SUCCESS, ActVerbs.accent("accept-work"))
-        assertEquals(ActAccent.FAILURE, ActVerbs.accent("fail"))
+    @Test fun a_good_end_and_a_bad_one_each_have_a_register() {
+        assertEquals(ActRegister.ENDED_WELL, ActVerbs.register("complete"))
+        assertEquals(ActRegister.ENDED_WELL, ActVerbs.register("accept-work"))
+        assertEquals(ActRegister.DID_NOT_END_WELL, ActVerbs.register("fail"))
+        assertEquals(ActRegister.DID_NOT_END_WELL, ActVerbs.register("forfeit"))
+        assertEquals(ActRegister.DID_NOT_END_WELL, ActVerbs.register("cancel"))
+        assertEquals(ActRegister.DID_NOT_END_WELL, ActVerbs.register("decline"))
     }
 
-    @Test fun every_other_verb_goes_unaccented() {
-        val plain = listOf("accept", "decline", "claim", "progress", "cancel",
-                           "bid", "submit", "revise", "forfeit", "escalate")
-        for (verb in plain) assertEquals(ActAccent.NONE, ActVerbs.accent(verb))
+    @Test fun the_verbs_a_home_signs_for_itself_have_no_register_so_they_cannot_card() {
+        assertNull(ActVerbs.register("confirm"))
+        assertNull(ActVerbs.register("expire"))
+        assertNull(ActVerbs.register("auto-accept"))
     }
 }

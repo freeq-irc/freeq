@@ -34,6 +34,8 @@ object FreeqColors {
     // Accent — same in both themes
     val accent = Color(0xFF6C63FF)
     val accentLight = Color(0xFF8B83FF)
+    /// In-progress register on act cards; the web token's value (--color-blue).
+    val blue = Color(0xFF5C9EFF)
 
     // Status — same in both themes
     val success = Color(0xFF43B581)
@@ -142,6 +144,7 @@ object Theme {
 
     val accent = FreeqColors.accent
     val accentLight = FreeqColors.accentLight
+    val blue = FreeqColors.blue
     val success = FreeqColors.success
     val warning = FreeqColors.warning
     val danger = FreeqColors.danger
