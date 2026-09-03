@@ -2226,15 +2226,23 @@ async fn a_signed_coordination_event_is_filed_under_the_id_it_signed() {
     assert_eq!(done["subject"], task_id, "{done}");
     assert_eq!(done["verification"]["verdict"], "valid", "{done}");
 
-    // …and the task API reaches the same linkage from the other end.
-    let task: serde_json::Value = reqwest::get(format!("http://{web_addr}/api/v1/tasks/{task_id}"))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(task["task_id"], task_id, "{task}");
-    assert_eq!(task["status"], "task_complete", "{task}");
+    // …and the stored rows reach the same linkage from the other end. The
+    // generic events route serves the older family like any other event type.
+    let events: serde_json::Value = reqwest::get(format!(
+        "http://{web_addr}/api/v1/channels/coordsig/events?ref_id={task_id}"
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let rows = events["events"].as_array().expect("events array");
+    let done = rows
+        .iter()
+        .find(|e| e["event_type"] == "task_complete")
+        .unwrap_or_else(|| panic!("no completion among {events}"));
+    assert_eq!(done["event_id"], done_id, "{events}");
+    assert_eq!(done["ref_id"], task_id, "{events}");
 }
 
 /// A signature that fails against the key it names is not a coordination

@@ -1756,15 +1756,18 @@ async fn coordination_events_rest_api() {
         events
     );
 
-    // Query task detail
+    // The server no longer interprets these six names as a task: the route
+    // that did is gone, and the rows above are how a reader gets at them.
     let resp = client
         .get(format!("http://{web_addr}/api/v1/tasks/{task_id}"))
         .send()
         .await
         .unwrap();
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["task_id"], task_id);
-    assert_eq!(body["status"], "in_progress");
+    assert_eq!(
+        resp.status(),
+        404,
+        "the task route is retired, not answering"
+    );
 
     // The id the SDK handed back is the id the event is filed under, and the
     // event answers for itself: signed on the sender's device, not vouched
@@ -1861,22 +1864,33 @@ async fn coordination_evidence_rest_api() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Check task detail
+    // The stored rows, read through the route that keeps serving them: the
+    // two evidence events and the completion are all on file.
     let client = reqwest::Client::new();
     let resp = client
-        .get(format!("http://{web_addr}/api/v1/tasks/{task_id}"))
+        .get(format!(
+            "http://{web_addr}/api/v1/channels/evidence/events?ref_id={task_id}"
+        ))
         .send()
         .await
         .unwrap();
+    assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["status"], "task_complete");
-    let evidence = body["evidence"].as_array().unwrap();
+    let rows = body["events"].as_array().unwrap();
+    let evidence: Vec<&serde_json::Value> = rows
+        .iter()
+        .filter(|e| e["event_type"] == "evidence_attach")
+        .collect();
     assert_eq!(
         evidence.len(),
         2,
         "Expected 2 evidence items, got {}: {:?}",
         evidence.len(),
         evidence
+    );
+    assert!(
+        rows.iter().any(|e| e["event_type"] == "task_complete"),
+        "the completion is on file: {body}"
     );
 
     bot_handle.quit(None).await.unwrap();

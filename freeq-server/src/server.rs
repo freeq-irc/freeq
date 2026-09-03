@@ -16685,7 +16685,7 @@ mod relayed_task_verdict_tests {
         // …and is filed the same way local ingress files one, under the
         // signer's own id.
         let filed = state
-            .with_db(|db| Ok(db.get_task(event_id)))
+            .with_db(|db| db.coordination_event(event_id))
             .flatten()
             .expect("a verified coordination event is stored");
         assert_eq!(filed.actor_did, SIGNER);

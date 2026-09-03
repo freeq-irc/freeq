@@ -316,7 +316,6 @@ pub fn router(state: Arc<SharedState>) -> Router {
         )
         .route("/api/v1/channels/{name}/events", get(api_channel_events))
         .route("/api/v1/channels/{name}/audit", get(api_channel_audit))
-        .route("/api/v1/tasks/{task_id}", get(api_task))
         .route("/api/v1/agents/manifests", get(api_list_manifests))
         .route("/api/v1/agents/manifests/{did}", get(api_get_manifest))
         .route("/api/v1/agents/spawned", get(api_spawned_agents))
@@ -1166,60 +1165,6 @@ async fn api_act_task(
         "task": task,
         "events": history,
     })))
-}
-
-/// GET /api/v1/tasks/{task_id} — task detail with all related events.
-async fn api_task(
-    State(state): State<Arc<SharedState>>,
-    axum::extract::Path(task_id): axum::extract::Path<String>,
-) -> Json<serde_json::Value> {
-    let result = state.with_db(|db| {
-        let task = db.get_task(&task_id);
-        let events = db.get_task_events_all_channels(&task_id);
-        Ok((task, events))
-    });
-
-    match result {
-        Some((Some(task), events)) => {
-            let status = events
-                .iter()
-                .rev()
-                .find(|e| e.event_type == "task_complete" || e.event_type == "task_failed")
-                .map(|e| e.event_type.clone())
-                .unwrap_or_else(|| "in_progress".to_string());
-            let evidence: Vec<serde_json::Value> = events.iter()
-                .filter(|e| e.event_type == "evidence_attach")
-                .map(|e| serde_json::json!({
-                    "event_id": e.event_id,
-                    "payload": serde_json::from_str::<serde_json::Value>(&e.payload_json).unwrap_or(serde_json::json!({})),
-                    "timestamp": e.timestamp,
-                }))
-                .collect();
-            let all_events: Vec<serde_json::Value> = events.iter()
-                .map(|e| serde_json::json!({
-                    "event_id": e.event_id,
-                    "event_type": e.event_type,
-                    "actor_did": e.actor_did,
-                    "payload": serde_json::from_str::<serde_json::Value>(&e.payload_json).unwrap_or(serde_json::json!({})),
-                    "signature": e.signature,
-                    "timestamp": e.timestamp,
-                }))
-                .collect();
-            Json(serde_json::json!({
-                "task_id": task.event_id,
-                "description": serde_json::from_str::<serde_json::Value>(&task.payload_json)
-                    .ok().and_then(|v| v.get("description").cloned())
-                    .unwrap_or(serde_json::json!(null)),
-                "status": status,
-                "actor_did": task.actor_did,
-                "channel": task.channel,
-                "created_at": task.timestamp,
-                "events": all_events,
-                "evidence": evidence,
-            }))
-        }
-        _ => Json(serde_json::json!({ "error": "Task not found" })),
-    }
 }
 
 /// GET /api/v1/channels/{name}/audit — unified audit timeline.

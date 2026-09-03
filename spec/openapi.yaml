@@ -1205,23 +1205,6 @@ paths:
             application/json:
               schema: { type: object }
         "404": { $ref: "#/components/responses/NotFound" }
-  /api/v1/tasks/{task_id}:
-    get:
-      tags: [coordination]
-      operationId: getTask
-      summary: Status of a delegated task.
-      parameters:
-        - name: task_id
-          in: path
-          required: true
-          schema: { type: string }
-      security: [{}]
-      responses:
-        "200":
-          description: Task.
-          content:
-            application/json:
-              schema: { type: object }
   /api/v1/agents/manifests:
     get:
       tags: [coordination]

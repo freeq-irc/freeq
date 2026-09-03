@@ -9483,7 +9483,7 @@ impl Db {
     }
 
     /// A coordination event by id, whatever kind it is.
-    fn coordination_event(&self, event_id: &str) -> SqlResult<Option<CoordinationEventRow>> {
+    pub fn coordination_event(&self, event_id: &str) -> SqlResult<Option<CoordinationEventRow>> {
         self.conn
             .query_row(
                 "SELECT event_id, event_type, actor_did, channel, ref_id, payload_json,
@@ -9573,58 +9573,11 @@ impl Db {
         }
     }
 
-    /// Get a task and all its related events.
-    pub fn get_task(&self, task_id: &str) -> Option<CoordinationEventRow> {
-        let mut stmt = self.conn.prepare(
-            "SELECT event_id, event_type, actor_did, channel, ref_id, payload_json, signature, timestamp
-             FROM coordination_events WHERE event_id = ?1 AND event_type = 'task_request'"
-        ).ok()?;
-        stmt.query_row(params![task_id], |row| {
-            Ok(CoordinationEventRow {
-                event_id: row.get(0)?,
-                event_type: row.get(1)?,
-                actor_did: row.get(2)?,
-                channel: row.get(3)?,
-                ref_id: row.get(4)?,
-                payload_json: row.get(5)?,
-                signature: row.get(6)?,
-                timestamp: row.get(7)?,
-            })
-        })
-        .ok()
-    }
-
     /// Get all events referencing a task ID.
     pub fn get_task_events(&self, task_id: &str) -> Vec<CoordinationEventRow> {
         self.query_coordination_events("", None, Some(task_id), None, None, 1000)
             .into_iter()
             .collect()
-    }
-
-    /// Get task events regardless of channel (by ref_id).
-    pub fn get_task_events_all_channels(&self, task_id: &str) -> Vec<CoordinationEventRow> {
-        let mut stmt = match self.conn.prepare(
-            "SELECT event_id, event_type, actor_did, channel, ref_id, payload_json, signature, timestamp
-             FROM coordination_events WHERE ref_id = ?1 ORDER BY timestamp ASC"
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        match stmt.query_map(params![task_id], |row| {
-            Ok(CoordinationEventRow {
-                event_id: row.get(0)?,
-                event_type: row.get(1)?,
-                actor_did: row.get(2)?,
-                channel: row.get(3)?,
-                ref_id: row.get(4)?,
-                payload_json: row.get(5)?,
-                signature: row.get(6)?,
-                timestamp: row.get(7)?,
-            })
-        }) {
-            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-            Err(_) => Vec::new(),
-        }
     }
 
     // ── Agent manifests ──────────────────────────────────────────────
