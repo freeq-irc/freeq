@@ -216,6 +216,11 @@ pub fn router(state: Arc<SharedState>) -> Router {
             get(crate::agent_surfaces::welcome_md),
         )
         .route("/tos", get(crate::agent_surfaces::tos_txt))
+        // Remote MCP (Streamable HTTP). Zero-install: an agent points its MCP
+        // client at the URL instead of cloning the repo to build the stdio
+        // server. Read-only, and every tool goes through the REST handlers so
+        // it inherits their authorization rather than reimplementing it.
+        .route("/mcp", post(crate::mcp::mcp_post).get(crate::mcp::mcp_get))
         .route("/openapi.json", get(crate::openapi::openapi_json))
         .route(
             "/.well-known/ard.json",
@@ -232,6 +237,10 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .route(
             "/.well-known/api-catalog",
             get(crate::agent_surfaces::api_catalog),
+        )
+        .route(
+            "/.well-known/mcp",
+            get(crate::agent_surfaces::mcp_well_known),
         )
         .route(
             "/.well-known/mcp/server-card.json",
@@ -651,7 +660,7 @@ struct HealthResponse {
 }
 
 #[derive(Serialize)]
-struct ChannelInfo {
+pub(crate) struct ChannelInfo {
     name: String,
     members: usize,
     topic: Option<String>,
@@ -666,7 +675,7 @@ struct ChannelTopicResponse {
 }
 
 #[derive(Serialize)]
-struct MessageResponse {
+pub(crate) struct MessageResponse {
     id: i64,
     sender: String,
     text: String,
@@ -677,17 +686,17 @@ struct MessageResponse {
 }
 
 #[derive(Deserialize)]
-struct HistoryQuery {
-    limit: Option<usize>,
-    before: Option<u64>,
+pub(crate) struct HistoryQuery {
+    pub(crate) limit: Option<usize>,
+    pub(crate) before: Option<u64>,
 }
 
 #[derive(Deserialize)]
-struct SearchQuery {
-    channel: String,
-    q: String,
-    limit: Option<usize>,
-    before: Option<u64>,
+pub(crate) struct SearchQuery {
+    pub(crate) channel: String,
+    pub(crate) q: String,
+    pub(crate) limit: Option<usize>,
+    pub(crate) before: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -1803,7 +1812,7 @@ fn classify_message_signature(
     }
 }
 
-async fn api_verify_message(
+pub(crate) async fn api_verify_message(
     State(state): State<Arc<SharedState>>,
     axum::extract::Path(msgid): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
@@ -2030,7 +2039,7 @@ async fn api_health(State(state): State<Arc<SharedState>>) -> Json<HealthRespons
     })
 }
 
-async fn api_channels(State(state): State<Arc<SharedState>>) -> Json<Vec<ChannelInfo>> {
+pub(crate) async fn api_channels(State(state): State<Arc<SharedState>>) -> Json<Vec<ChannelInfo>> {
     let channels = state.channels.lock();
     let mut list: Vec<ChannelInfo> = channels
         .iter()
@@ -2240,7 +2249,7 @@ async fn api_get_group_keys(
     )
 }
 
-async fn api_channel_history(
+pub(crate) async fn api_channel_history(
     Path(name): Path<String>,
     Query(params): Query<HistoryQuery>,
     State(state): State<Arc<SharedState>>,
@@ -2926,7 +2935,7 @@ async fn api_metrics(State(state): State<Arc<SharedState>>) -> impl axum::respon
 /// Channels only: DM search requires DID auth and goes through the IRC
 /// SEARCH command. Access rules mirror /channels/{name}/history: channels
 /// with +i or +k return 403.
-async fn api_search(
+pub(crate) async fn api_search(
     Query(params): Query<SearchQuery>,
     State(state): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
@@ -2977,7 +2986,7 @@ async fn api_channel_topic(
     }
 }
 
-async fn api_channel_pins(
+pub(crate) async fn api_channel_pins(
     Path(name): Path<String>,
     State(state): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,

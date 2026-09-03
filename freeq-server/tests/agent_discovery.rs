@@ -489,7 +489,10 @@ async fn rest_errors_share_one_json_envelope() {
     let (_irc, http, _h) = start_server().await;
     let client = reqwest::Client::new();
 
-    for path in ["/api/v1/definitely-not-a-route", "/api/v1/channels/%23nope/history"] {
+    for path in [
+        "/api/v1/definitely-not-a-route",
+        "/api/v1/channels/%23nope/history",
+    ] {
         let resp = client.get(url(http, path)).send().await.unwrap();
         if resp.status().is_success() {
             continue;

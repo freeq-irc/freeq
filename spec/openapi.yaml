@@ -32,11 +32,15 @@ info:
     metadata document that explains how to get a token.
 
     **Pagination** — list endpoints that can grow use one cursor pattern:
-    `limit` (bounded, server-capped) plus `before`, a ULID `msgid` taken from
-    the oldest item of the previous page. Absent `before` means newest first.
-    Paging is by message id rather than offset so a page cannot shift under a
-    concurrent write. An empty array means the end; there is no separate
-    "has more" flag to disagree with the data.
+    `limit` (bounded, server-capped at 200) plus `before`, the unix-seconds
+    `timestamp` of the oldest item on the page you already have. Absent
+    `before` means newest first. Paging by timestamp rather than offset means a
+    page cannot shift under a concurrent write. An empty array means the end;
+    there is no separate "has more" flag to disagree with the data.
+
+    Note the cursor is the `timestamp` field, not `msgid`: msgids are ULIDs and
+    sort the same way, but the server compares timestamps, so passing a msgid
+    here silently returns nothing.
 
     **Versioning and deprecation** — the path carries the major version
     (`/api/v1`). Additive change (new endpoints, new response fields, new
@@ -345,6 +349,52 @@ paths:
       responses:
         "200":
           description: API catalog linkset.
+          content:
+            application/json:
+              schema:
+                type: object
+  /mcp:
+    post:
+      tags: [discovery]
+      operationId: postMcp
+      summary: Remote MCP endpoint (Streamable HTTP, JSON-RPC 2.0).
+      description: |
+        Zero-install MCP: point an MCP client at this URL rather than building
+        the stdio server from source. Read-only tools over public
+        conversations — `freeq_channels`, `freeq_history`, `freeq_search`,
+        `freeq_verify`, `freeq_pins` — each of which calls the same REST
+        handler documented here and inherits its authorization. Send
+        `Authorization: Bearer <API-BEARER>` to read a restricted channel you
+        are a member of.
+
+        Answers a POST with a single `application/json` body; it opens no
+        server-initiated SSE stream, so `GET /mcp` is 405.
+      security: [{}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: A JSON-RPC 2.0 request, or an array of them.
+      responses:
+        "200":
+          description: JSON-RPC response (or array of responses).
+          content:
+            application/json:
+              schema:
+                type: object
+        "202":
+          description: Accepted — the request was entirely notifications.
+  /.well-known/mcp:
+    get:
+      tags: [discovery]
+      operationId: getMcpWellKnown
+      summary: MCP endpoint discovery.
+      security: [{}]
+      responses:
+        "200":
+          description: Endpoint URL and transport.
           content:
             application/json:
               schema:

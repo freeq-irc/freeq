@@ -28,6 +28,10 @@ pub const OPENAPI_YAML: &str = include_str!("../../spec/openapi.yaml");
 /// parse failure here degrades to 500 rather than taking the process down.
 static OPENAPI_JSON: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
+pub fn openapi_json_string() -> Option<&'static str> {
+    openapi_json_body()
+}
+
 fn openapi_json_body() -> Option<&'static str> {
     OPENAPI_JSON
         .get_or_init(|| {
@@ -75,7 +79,7 @@ pub async fn openapi_yaml() -> Response {
 /// `GET /llms.txt` — the server-side index. Short by design: it says what
 /// this host is and points at the machine-readable surfaces plus the docs
 /// site, which carries the long-form index.
-const LLMS_TXT: &str = include_str!("llms.txt");
+pub const LLMS_TXT: &str = include_str!("llms.txt");
 
 pub async fn llms_txt() -> Response {
     (

@@ -218,6 +218,17 @@ pub fn sitemap_body() -> String {
     out
 }
 
+/// The agent instructions, for callers that want the text rather than a
+/// response (the MCP resource surface).
+pub fn agents_md_text() -> &'static str {
+    AGENTS_MD
+}
+
+/// The credentials walkthrough as text.
+pub fn auth_md_text() -> &'static str {
+    AUTH_MD
+}
+
 /// `GET /agents.md` and `GET /AGENTS.md`
 pub async fn agents_md() -> Response {
     markdown(AGENTS_MD)
@@ -356,6 +367,13 @@ fn discovery_entries() -> serde_json::Value {
             "mediaType": "text/markdown",
             "url": format!("{ORIGIN}/auth.md"),
             "description": "How an agent mints a did:key identity and obtains a bearer token."
+        },
+        {
+            "name": "MCP endpoint",
+            "type": "mcp",
+            "mediaType": "application/json",
+            "url": format!("{ORIGIN}/mcp"),
+            "description": "Streamable HTTP MCP server: read-only tools over public conversations."
         },
         {
             "name": "Self-service enrollment",
@@ -502,13 +520,42 @@ pub async fn api_catalog() -> Response {
 pub async fn mcp_server_card() -> Response {
     json(serde_json::json!({
         "name": "freeq",
-        "description": "MCP server wrapping freeq's IRC verbs and REST reads: channels, history, search, verify, pins, and connect/join/say.",
-        "version": "0.1.0",
-        "source": format!("{REPO}/tree/main/freeq-mcp"),
-        "transport": "stdio",
-        "published": false,
-        "install": "Clone the repository, then `cd freeq-mcp && npm install && npm run build` and run `node dist/index.js` over stdio.",
+        "description": "Read freeq conversations as MCP tools: list channels, read history, \
+                        search, check who signed a message, and read pinned context.",
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocolVersion": crate::mcp::PROTOCOL_VERSION,
+        // Zero-install: point an MCP client here.
+        "remote": {
+            "url": format!("{ORIGIN}/mcp"),
+            "transport": "streamable-http",
+            "authentication": "none for public channels; \
+                               Authorization: Bearer <API-BEARER> to read a restricted \
+                               channel you are a member of"
+        },
+        // The stdio package covers writing (join, say, ask) and is still not
+        // on npm, so it still says so.
+        "stdio": {
+            "package": "@freeq/mcp",
+            "published": false,
+            "source": format!("{REPO}/tree/main/freeq-mcp"),
+            "install": "Clone the repository, then `cd freeq-mcp && npm install && npm run build` \
+                        and run `node dist/index.js` over stdio."
+        },
+        "capabilities": {"tools": true, "resources": true, "prompts": false},
         "documentation": format!("{ORIGIN}/agents.md")
+    }))
+}
+
+/// `GET /.well-known/mcp` — the endpoint URL, for clients that probe the bare
+/// well-known path rather than the server card.
+pub async fn mcp_well_known() -> Response {
+    json(serde_json::json!({
+        "mcp": {
+            "url": format!("{ORIGIN}/mcp"),
+            "transport": "streamable-http",
+            "protocolVersion": crate::mcp::PROTOCOL_VERSION,
+            "serverCard": format!("{ORIGIN}/.well-known/mcp/server-card.json")
+        }
     }))
 }
 

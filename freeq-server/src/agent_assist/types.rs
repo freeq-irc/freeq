@@ -363,6 +363,7 @@ pub struct AgentSurfaces {
     /// IRC-over-WebSocket transport (relative; scheme follows the request).
     pub irc_websocket: &'static str,
     /// npm package name of the MCP server that wraps this API.
+    pub mcp_remote: &'static str,
     pub mcp_package: &'static str,
     /// Where to get it. Until the package is published this is the only way to
     /// run it, and an agent that reads `mcp_package` and shells out to `npx`
@@ -381,6 +382,7 @@ impl Default for AgentSurfaces {
             openapi_yaml: "/api/v1/openapi.yaml",
             llms_txt: "/llms.txt",
             irc_websocket: "/irc",
+            mcp_remote: "/mcp",
             mcp_package: "@freeq/mcp",
             mcp_source: "https://github.com/freeq-irc/freeq/tree/main/freeq-mcp",
             mcp_published: false,
