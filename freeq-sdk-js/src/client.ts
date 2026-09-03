@@ -1333,14 +1333,23 @@ export class FreeqClient extends EventEmitter {
         }
       }
     }
-    // Payload is percent-encoded JSON per the wire format.
+    // Payload is percent-encoded JSON by convention, not by guarantee. A tag
+    // that arrived is never dropped: what does not decode keeps its wire bytes
+    // and what does not parse rides on as the decoded string, so a consumer
+    // can show a reader what was actually sent.
     let payload: unknown = null;
+    let payloadRaw: string | undefined;
     const rawPayload = tags['+freeq.at/payload'];
     if (rawPayload) {
       try {
-        payload = JSON.parse(decodeURIComponent(rawPayload));
+        payloadRaw = decodeURIComponent(rawPayload);
       } catch {
-        payload = null;
+        payloadRaw = rawPayload;
+      }
+      try {
+        payload = JSON.parse(payloadRaw);
+      } catch {
+        payload = payloadRaw;
       }
     }
     const did = this.getDidForNick(from);
@@ -1355,6 +1364,7 @@ export class FreeqClient extends EventEmitter {
       taskId: taskId || undefined,
       evidenceType: evidenceType || undefined,
       payload,
+      payloadRaw,
       tags,
     };
     this.emit('coordinationEvent', eventPayload);

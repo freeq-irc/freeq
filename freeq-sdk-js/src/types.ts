@@ -271,8 +271,13 @@ export interface CoordinationEventPayload {
   taskId?: string;
   /** Evidence subtype for `evidence_attach` events. */
   evidenceType?: string;
-  /** Decoded payload JSON. `null` if no payload tag. */
+  /** The payload the tag carried: the parsed JSON when it parses, and
+   *  otherwise the decoded string itself. `null` only when there is no
+   *  payload tag at all. */
   payload: unknown;
+  /** The payload tag decoded but not parsed. Absent when there is no payload
+   *  tag; falls back to the undecoded tag value if the escaping is malformed. */
+  payloadRaw?: string;
   /** Raw IRCv3 tags from the wire (for advanced consumers). */
   tags: Record<string, string>;
 }

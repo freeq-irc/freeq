@@ -1583,6 +1583,75 @@ describe('inbound: coordinationEvent', () => {
   });
 });
 
+describe('inbound: coordinationEvent payload shapes', () => {
+  /** The one event a payload tag rides on, with `payload` and `payloadRaw`
+   *  as the consumer receives them. */
+  async function payloadOf(rawTagValue: string): Promise<{
+    payload: unknown;
+    payloadRaw?: string;
+  }> {
+    const { client, ws } = await makeRegistered();
+    const seen: { payload: unknown; payloadRaw?: string }[] = [];
+    client.on('coordinationEvent', (e) => seen.push(e));
+    ws.recv(
+      `@msgid=p1;+freeq.at/event=status_update;+freeq.at/payload=${rawTagValue} :alice TAGMSG #foo`,
+    );
+    await flushAsync();
+    expect(seen).toHaveLength(1);
+    return seen[0];
+  }
+
+  it('an object payload parses to an object', async () => {
+    const e = await payloadOf(encodeURIComponent('{"a":1,"b":"two"}'));
+    expect(e.payload).toEqual({ a: 1, b: 'two' });
+    expect(e.payloadRaw).toBe('{"a":1,"b":"two"}');
+  });
+
+  it('an array payload parses to an array', async () => {
+    const e = await payloadOf(encodeURIComponent('[1,2,3]'));
+    expect(e.payload).toEqual([1, 2, 3]);
+    expect(e.payloadRaw).toBe('[1,2,3]');
+  });
+
+  it('a scalar payload parses to that scalar', async () => {
+    const e = await payloadOf(encodeURIComponent('42'));
+    expect(e.payload).toBe(42);
+    expect(e.payloadRaw).toBe('42');
+  });
+
+  it('a payload that does not parse arrives as the raw decoded string', async () => {
+    const e = await payloadOf(encodeURIComponent('not json at all'));
+    expect(e.payload).toBe('not json at all');
+    expect(e.payloadRaw).toBe('not json at all');
+  });
+
+  it('a percent-encoded payload is decoded before it is parsed', async () => {
+    // The value carries the characters IRCv3 tag escaping and percent-encoding
+    // both care about, so a decode that ran once and only once is observable.
+    const e = await payloadOf(encodeURIComponent('{"note":"50% done; a b"}'));
+    expect(e.payload).toEqual({ note: '50% done; a b' });
+    expect(e.payloadRaw).toBe('{"note":"50% done; a b"}');
+  });
+
+  it('a malformed percent-escape keeps the tag value rather than dropping it', async () => {
+    // `decodeURIComponent` throws on a lone `%`; the consumer still gets the
+    // bytes that arrived.
+    const e = await payloadOf('100%-sure');
+    expect(e.payload).toBe('100%-sure');
+    expect(e.payloadRaw).toBe('100%-sure');
+  });
+
+  it('no payload tag leaves payload null and payloadRaw absent', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: { payload: unknown; payloadRaw?: string }[] = [];
+    client.on('coordinationEvent', (e) => seen.push(e));
+    ws.recv('@msgid=p2;+freeq.at/event=status_update :alice TAGMSG #foo');
+    await flushAsync();
+    expect(seen[0].payload).toBeNull();
+    expect(seen[0].payloadRaw).toBeUndefined();
+  });
+});
+
 describe('outbound: sendAct', () => {
   /** A registered client with a real session key, so a task event can be
    *  signed and put on the wire. */
