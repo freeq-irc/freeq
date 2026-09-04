@@ -53,10 +53,33 @@ struct ChatDetailView: View {
                             Image(systemName: "wifi.slash")
                                 .font(.system(size: 12))
                         }
-                        Text(appState.connectionState == .disconnected ? "Disconnected — pull down to reconnect" :
+                        Text(appState.connectionState == .disconnected ? "Disconnected" :
                              appState.connectionState == .connecting ? "Connecting..." : "Registering...")
                             .font(.fqFootnote.weight(.medium))
                         Spacer()
+                        // A button, not an instruction. This used to read
+                        // "pull down to reconnect", but the pull gesture lives
+                        // on the message list's ScrollView — and an empty
+                        // channel has no content to pull, which is exactly
+                        // when you are most likely to be disconnected. An
+                        // instruction the user cannot follow is worse than no
+                        // instruction: they conclude the app is broken.
+                        // Pull-to-refresh still works where it works.
+                        // Gated on hasSavedSession because reconnectSavedSession()
+                        // no-ops without a broker token, and a button that
+                        // silently does nothing is the same bug wearing a
+                        // different hat. A guest's escape hatch is Sign out.
+                        if appState.connectionState == .disconnected, appState.hasSavedSession {
+                            Button("Reconnect") { appState.reconnectSavedSession() }
+                                .font(.fqFootnote.weight(.semibold))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 2)
+                                .background(Color.white.opacity(0.18))
+                                .clipShape(Capsule())
+                                .accessibilityLabel("Reconnect")
+                                .accessibilityHint("Reconnects using your saved session")
+                        }
                         Button("Sign out") { appState.logout() }
                             .font(.fqFootnote.weight(.semibold))
                             .foregroundColor(.white)
