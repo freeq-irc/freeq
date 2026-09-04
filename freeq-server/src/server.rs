@@ -1661,6 +1661,25 @@ impl Server {
                 .map_err(|e| anyhow::anyhow!("Failed to load channels: {e}"))?;
             tracing::info!("Loaded {} channels from database", channels.len());
 
+            // Restore outstanding invites. `+i` is persisted, so these must be
+            // too: without them a restart seals every invite-only channel
+            // against people who were invited but had not yet joined.
+            match db.load_invites() {
+                Ok(invites) => {
+                    let mut restored = 0usize;
+                    for (name, tokens) in invites {
+                        if let Some(ch) = channels.get_mut(&name) {
+                            restored += tokens.len();
+                            ch.invites.extend(tokens);
+                        }
+                    }
+                    if restored > 0 {
+                        tracing::info!("Restored {restored} outstanding channel invites");
+                    }
+                }
+                Err(e) => tracing::warn!("Failed to load channel invites: {e}"),
+            }
+
             // Load message history into each channel
             for (name, ch) in channels.iter_mut() {
                 let messages = db

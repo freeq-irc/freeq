@@ -49,6 +49,8 @@ mod m008_act_dropped_unchecked;
 mod m009_event_confirm_state;
 #[path = "010_channel_media_space.rs"]
 mod m010_channel_media_space;
+#[path = "011_channel_invites.rs"]
+mod m011_channel_invites;
 
 // db.rs unit tests exercise the backfill directly against hand-built rows.
 // Production reaches it only as a rung of the ladder below.
@@ -69,6 +71,7 @@ fn rungs() -> Vec<rusqlite_migration::M<'static>> {
         m008_act_dropped_unchecked::migration(),
         m009_event_confirm_state::migration(),
         m010_channel_media_space::migration(),
+        m011_channel_invites::migration(),
     ]
 }
 
@@ -212,6 +215,7 @@ mod tests {
         migration_ladder().to_version(&mut stepped, 8).unwrap();
         migration_ladder().to_version(&mut stepped, 9).unwrap();
         migration_ladder().to_version(&mut stepped, 10).unwrap();
+        migration_ladder().to_version(&mut stepped, 11).unwrap();
 
         let mut direct = Connection::open_in_memory().unwrap();
         migration_ladder().to_latest(&mut direct).unwrap();

@@ -130,6 +130,19 @@ pub(super) fn handle_join(
                     drop(channels);
                     let mut channels = state.channels.lock();
                     if let Some(ch) = channels.get_mut(channel) {
+                        // Consume in the DB as well, or a restart resurrects
+                        // a one-shot grant that was already spent.
+                        {
+                            let channel_owned = channel.to_string();
+                            let did_owned = did.map(str::to_string);
+                            let nick_token = format!("nick:{nick}");
+                            state.with_db(move |db| {
+                                if let Some(ref d) = did_owned {
+                                    db.remove_invite(&channel_owned, d)?;
+                                }
+                                db.remove_invite(&channel_owned, &nick_token)
+                            });
+                        }
                         ch.invites.remove(session_id);
                         if let Some(d) = did {
                             ch.invites.remove(d);
@@ -1323,6 +1336,8 @@ pub(super) fn handle_mode(
                         chan.invite_only = adding;
                         if !adding {
                             chan.invites.clear();
+                            let channel_owned = channel.to_string();
+                            state.with_db(move |db| db.clear_invites(&channel_owned));
                         }
                         let ch_clone = chan.clone();
                         drop(channels);
@@ -1690,6 +1705,20 @@ pub(super) fn handle_invite(
                 // For S2S, prefer DID over nick-based token
                 did.unwrap_or_else(|| format!("nick:{target_nick}"))
             };
+
+            // Durable, because `+i` is. An invite that evaporates on restart
+            // leaves a locked channel and an invitee with no signal.
+            {
+                let inviter = state
+                    .session_dids
+                    .lock()
+                    .get(session_id)
+                    .cloned()
+                    .unwrap_or_else(|| nick.to_string());
+                let channel_owned = channel.to_string();
+                let token = s2s_invitee.clone();
+                state.with_db(|db| db.add_invite(&channel_owned, &token, &inviter));
+            }
 
             // Notify inviter
             let reply = Message::from_server(server_name, "341", vec![nick, target_nick, channel]);

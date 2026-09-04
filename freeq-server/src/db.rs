@@ -784,6 +784,10 @@ impl Db {
             "DELETE FROM invite_exceptions WHERE channel = ?1",
             params![name],
         )?;
+        self.conn.execute(
+            "DELETE FROM channel_invites WHERE channel = ?1",
+            params![name],
+        )?;
         Ok(())
     }
 
@@ -969,6 +973,72 @@ impl Db {
             params![channel, mask],
         )?;
         Ok(())
+    }
+
+    // ── One-shot invites ───────────────────────────────────────────────
+    //
+    // Distinct from `+I` invite *exceptions* above: those are standing masks,
+    // these are single-use grants consumed on join. `+i` is durable, so these
+    // must be too — a persistent gate whose keys evaporate on restart locks
+    // out everyone who was invited but had not yet joined.
+
+    /// Record an invite. `token` is a DID or a `nick:<name>` fallback; raw
+    /// session ids are deliberately never stored, because they cannot match
+    /// anything after a restart.
+    pub fn add_invite(&self, channel: &str, token: &str, invited_by: &str) -> SqlResult<()> {
+        if !Self::is_persistable_invite(token) {
+            return Ok(());
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.conn.execute(
+            "INSERT OR IGNORE INTO channel_invites (channel, token, invited_by, invited_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![channel, token, invited_by, now as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Consume an invite (on join) or revoke one.
+    pub fn remove_invite(&self, channel: &str, token: &str) -> SqlResult<()> {
+        self.conn.execute(
+            "DELETE FROM channel_invites WHERE channel = ?1 AND token = ?2",
+            params![channel, token],
+        )?;
+        Ok(())
+    }
+
+    /// Drop every invite for a channel (e.g. when `-i` is set).
+    pub fn clear_invites(&self, channel: &str) -> SqlResult<()> {
+        self.conn.execute(
+            "DELETE FROM channel_invites WHERE channel = ?1",
+            params![channel],
+        )?;
+        Ok(())
+    }
+
+    /// All persisted invites, as `channel -> tokens`.
+    pub fn load_invites(&self) -> SqlResult<HashMap<String, Vec<String>>> {
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT channel, token FROM channel_invites")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (channel, token) = row?;
+            out.entry(channel).or_default().push(token);
+        }
+        Ok(out)
+    }
+
+    /// Is this token worth persisting? Identities survive a restart; session
+    /// ids do not.
+    fn is_persistable_invite(token: &str) -> bool {
+        token.starts_with("did:") || token.starts_with("nick:")
     }
 
     // ── Messages ───────────────────────────────────────────────────────
@@ -2954,6 +3024,73 @@ mod tests {
             Some("did:plc:alice"),
         )
         .unwrap();
+    }
+
+    // ── One-shot invites ──────────────────────────────────────────────────
+
+    /// The bug this table exists for: `+i` persisted, its invites did not, so
+    /// a restart sealed the channel against everyone already invited.
+    #[test]
+    fn an_invite_outlives_a_restart() {
+        let db = Db::open_memory().unwrap();
+        db.add_invite("#room", "did:plc:guest", "did:plc:host")
+            .unwrap();
+
+        let loaded = db.load_invites().unwrap();
+        assert_eq!(
+            loaded.get("#room").map(Vec::as_slice),
+            Some(["did:plc:guest".to_string()].as_slice())
+        );
+    }
+
+    /// Session ids are meaningless after a restart. Storing one would restore
+    /// an invite that can never match, so they are dropped at the door.
+    #[test]
+    fn session_ids_are_never_persisted() {
+        let db = Db::open_memory().unwrap();
+        db.add_invite("#room", "stream-42", "did:plc:host").unwrap();
+        db.add_invite("#room", "nick:guest", "did:plc:host")
+            .unwrap();
+
+        let loaded = db.load_invites().unwrap();
+        let tokens = loaded.get("#room").cloned().unwrap_or_default();
+        assert_eq!(tokens, vec!["nick:guest".to_string()]);
+    }
+
+    /// A one-shot grant is spent on join; a restart must not resurrect it.
+    #[test]
+    fn a_consumed_invite_does_not_come_back() {
+        let db = Db::open_memory().unwrap();
+        db.add_invite("#room", "did:plc:guest", "did:plc:host")
+            .unwrap();
+        db.remove_invite("#room", "did:plc:guest").unwrap();
+        assert!(db.load_invites().unwrap().get("#room").is_none());
+    }
+
+    /// Dropping `+i` opens the room, so the outstanding grants are moot and
+    /// must not linger to be honoured if `+i` ever returns.
+    #[test]
+    fn clearing_the_mode_clears_the_invites() {
+        let db = Db::open_memory().unwrap();
+        db.add_invite("#room", "did:plc:a", "did:plc:host").unwrap();
+        db.add_invite("#room", "did:plc:b", "did:plc:host").unwrap();
+        db.add_invite("#other", "did:plc:c", "did:plc:host")
+            .unwrap();
+
+        db.clear_invites("#room").unwrap();
+        let loaded = db.load_invites().unwrap();
+        assert!(loaded.get("#room").is_none());
+        assert_eq!(loaded.get("#other").map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn inviting_the_same_identity_twice_is_idempotent() {
+        let db = Db::open_memory().unwrap();
+        db.add_invite("#room", "did:plc:guest", "did:plc:host")
+            .unwrap();
+        db.add_invite("#room", "did:plc:guest", "did:plc:other")
+            .unwrap();
+        assert_eq!(db.load_invites().unwrap()["#room"].len(), 1);
     }
 
     // ── Task events: the log, and the view derived from it ────────────────
