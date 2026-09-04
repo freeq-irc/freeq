@@ -4023,7 +4023,6 @@ async fn a_verified_agent_joins_an_invite_only_channel_its_owner_is_in() {
 /// with no signature, that a member owns it.
 #[tokio::test]
 async fn an_unsigned_delegation_does_not_open_an_invite_only_channel() {
-    use base64::Engine;
     start_deadlock_detector();
     let (addr, _srv) = start_test_server_with_db(empty_resolver(), true).await;
 
