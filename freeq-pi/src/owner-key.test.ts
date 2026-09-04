@@ -2,12 +2,12 @@ import { describe, it, expect } from "vitest";
 import { mkdtemp, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EventEmitter } from "node:events";
 
 import {
-  authorizeOwner,
+  authorizeInstructions,
   creatorKeyPath,
   creatorPublicKeyB64,
+  interpretProvenanceNotice,
   loadOrCreateCreatorSeed,
 } from "./owner-key.js";
 
@@ -19,16 +19,14 @@ describe("the owner's creator key", () => {
     const b = await loadOrCreateCreatorSeed(path);
     expect(a).toEqual(b);
     expect(a.length).toBe(32);
-    // The seed can sign anything the owner is; it must not be readable by
-    // anyone else on the machine.
+    // The seed signs anything the owner is; nobody else on the box reads it.
     expect((await stat(path)).mode & 0o777).toBe(0o600);
   });
 
   it("derives a base64url raw public key, which is what MSGSIG takes", () => {
     const seed = new Uint8Array(32).fill(7);
     const pk = creatorPublicKeyB64(seed);
-    // 32 bytes → 43 base64url chars, unpadded, no +/=.
-    expect(pk).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(pk).toMatch(/^[A-Za-z0-9_-]{43}$/); // 32 bytes, unpadded
     expect(creatorPublicKeyB64(seed)).toBe(pk); // deterministic
   });
 
@@ -38,95 +36,58 @@ describe("the owner's creator key", () => {
   });
 });
 
-/** A freeq client that answers MSGSIG the way the server does. */
-class FakeClient extends EventEmitter {
-  sent: string[] = [];
-  opts: Record<string, unknown>;
-  constructor(opts: Record<string, unknown>) {
-    super();
-    this.opts = opts;
-  }
-  connect() {
-    queueMicrotask(() => this.emit("registered", "owner-authorize"));
-  }
-  raw(line: string) {
-    this.sent.push(line);
-    if (line.startsWith("MSGSIG ")) {
-      queueMicrotask(() => this.emit("systemMessage", "server", "MSGSIG OK"));
-    }
-  }
-  quit() {}
-}
-
-describe("authorizeOwner", () => {
-  it("proves ownership once and registers the key under the owner's DID", async () => {
+describe("the ceremony", () => {
+  it("is a public key to paste and nothing else - no password, no network", async () => {
     const root = await mkdtemp(join(tmpdir(), "freeq-owner-"));
-    let made: FakeClient | undefined;
-    const sessions: Array<[string, string, string]> = [];
+    const ins = await authorizeInstructions({ ownerDid: "did:plc:alice", root });
 
-    const result = await authorizeOwner({
-      identifier: "alice.test",
-      appPassword: "app-pass-used-once",
-      server: "wss://test/irc",
-      root,
-      resolve: async () => ({ did: "did:plc:alice", pdsUrl: "https://pds.test" }),
-      createSession: async (pds, id, pw) => {
-        sessions.push([pds, id, pw]);
-        return "access-jwt";
-      },
-      clientFactory: (o) => {
-        made = new FakeClient(o as Record<string, unknown>);
-        return made as unknown as ReturnType<NonNullable<typeof made>["constructor"]> as never;
-      },
-    });
+    const seed = new Uint8Array(await readFile(ins.creatorKeyPath));
+    const pub = creatorPublicKeyB64(seed);
+    expect(ins.publicKey).toBe(pub);
+    expect(ins.pasteLine).toBe(`/raw MSGSIG ${pub}`);
 
-    // One PDS exchange, with the password, and never again.
-    expect(sessions).toEqual([["https://pds.test", "alice.test", "app-pass-used-once"]]);
-
-    // The freeq session is the OWNER's, via pds-session, not the agent's.
-    const sasl = made!.opts.sasl as { did: string; method: string; token: string };
-    expect(sasl).toMatchObject({ did: "did:plc:alice", method: "pds-session", token: "access-jwt" });
-    // The SDK's throwaway per-session key is suppressed: only ours goes on file.
-    expect(made!.opts.autoMsgSig).toBe(false);
-
-    // Exactly one MSGSIG, and it is the persisted seed's public key.
-    const seed = await readFile(result.creatorKeyPath);
-    const msgsig = made!.sent.filter((l) => l.startsWith("MSGSIG "));
-    expect(msgsig).toEqual([`MSGSIG ${creatorPublicKeyB64(new Uint8Array(seed))}`]);
-
-    expect(result.ownerDid).toBe("did:plc:alice");
-    expect(result.publicKey).toBe(creatorPublicKeyB64(new Uint8Array(seed)));
+    // What the user is shown must never contain the private half.
+    const shown = ins.steps.join("\n");
+    expect(shown).toContain(ins.pasteLine);
+    expect(shown).not.toContain(Buffer.from(seed).toString("base64url"));
+    expect(shown).not.toContain(Buffer.from(seed).toString("hex"));
+    expect(shown.toLowerCase()).not.toMatch(/password/);
   });
 
-  it("does not persist the app password anywhere", async () => {
+  it("is idempotent: running it twice shows the same key", async () => {
     const root = await mkdtemp(join(tmpdir(), "freeq-owner-"));
-    await authorizeOwner({
-      identifier: "alice.test",
-      appPassword: "hunter2-secret",
-      server: "wss://test/irc",
-      root,
-      resolve: async () => ({ did: "did:plc:alice", pdsUrl: "https://pds.test" }),
-      createSession: async () => "jwt",
-      clientFactory: (o) => new FakeClient(o as Record<string, unknown>) as never,
-    });
-    const { execSync } = await import("node:child_process");
-    const grep = execSync(`grep -rl "hunter2-secret" "${root}" || true`).toString().trim();
-    expect(grep).toBe("");
+    const a = await authorizeInstructions({ ownerDid: "did:plc:alice", root });
+    const b = await authorizeInstructions({ ownerDid: "did:plc:alice", root });
+    expect(a.pasteLine).toBe(b.pasteLine);
+  });
+});
+
+describe("reading the server's verdict", () => {
+  it("recognises success", () => {
+    const v = interpretProvenanceNotice("Provenance verified: Verified against creator key for did:plc:alice");
+    expect(v.verified).toBe(true);
   });
 
-  it("surfaces a rejected app password in words", async () => {
-    const root = await mkdtemp(join(tmpdir(), "freeq-owner-"));
-    await expect(
-      authorizeOwner({
-        identifier: "alice.test",
-        appPassword: "wrong",
-        server: "wss://test/irc",
-        root,
-        resolve: async () => ({ did: "did:plc:alice", pdsUrl: "https://pds.test" }),
-        createSession: async () => {
-          throw new Error("The PDS rejected that app password.");
-        },
-      }),
-    ).rejects.toThrow(/rejected that app password/);
+  it("tells the user exactly which step is missing", () => {
+    expect(
+      interpretProvenanceNotice(
+        "Provenance stored (unverified): No registered MSGSIG key for did:plc:alice; creator must register one before signing",
+      ).message,
+    ).toMatch(/Paste the \/raw MSGSIG line/);
+
+    expect(
+      interpretProvenanceNotice(
+        "Provenance stored (unverified): Signature did not verify against any of the creator's 2 registered key(s)",
+      ).message,
+    ).toMatch(/not this one/);
+
+    expect(
+      interpretProvenanceNotice("Provenance stored (unverified): Cert has no signature; declarative only")
+        .message,
+    ).toMatch(/unsigned/);
+  });
+
+  it("never claims success on silence", () => {
+    expect(interpretProvenanceNotice(undefined).verified).toBe(false);
   });
 });

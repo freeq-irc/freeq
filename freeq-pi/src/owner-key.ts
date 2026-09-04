@@ -7,34 +7,32 @@
  * downstream feature that trusts delegation (channel access for an owner's
  * agent, provenance badges, handoff authority) correctly refuses it.
  *
- * This module gives the owner a persistent ed25519 key on this machine and
- * registers its public half under the owner's DID on the server. bot-kit then
- * signs the installation's certificate with it (`creatorKeyPath`), and the
- * server verifies that signature against the registered key.
+ * This module gives the owner a persistent ed25519 key on this machine.
+ * bot-kit signs the installation's certificate with it (`creatorKeyPath`),
+ * and the server verifies that signature against a key registered under the
+ * owner's DID.
  *
- * Registering the key requires proving you *are* the owner once. That is done
- * with an AT Protocol app password: `createSession` on the owner's PDS yields
- * an access token, the server checks it against the PDS via the `pds-session`
- * SASL method, and on that authenticated session a single `MSGSIG` puts the
- * key on file. The app password is used for that one exchange and never
- * stored — after this the extension holds only the creator seed, and the
- * seed only ever signs certificates.
+ * REGISTERING THE KEY — WHY THERE IS NO PASSWORD PROMPT. Putting a key on
+ * file under your DID takes exactly one `MSGSIG <pubkey>` on a session that is
+ * already authenticated as you. You have one of those open whenever the web
+ * client is logged in, and it has a `/raw` command. So the ceremony is:
  *
- * Why a persistent key rather than the web client's: the web client registers
- * a fresh MSGSIG key per browser session. A certificate is signed once and
- * presented for months. The server now verifies against every key an owner
- * has registered (not just the newest), so this would work either way — but a
- * key that exists for exactly this purpose is easier to reason about, easier
- * to revoke, and does not depend on a browser tab that happened to be open.
+ *     pi prints:   /raw MSGSIG <your-public-key>
+ *     you paste it into the web client, in any channel
+ *     pi reconnects, presents the signed cert, and the server says verified
+ *
+ * Nothing secret moves. The line you paste is a public key. pi never sees a
+ * password, never talks to your PDS, and never holds anything that could act
+ * as you — only the creator seed, which signs certificates and nothing else.
+ *
+ * The earlier design asked for an AT Protocol app password to do this
+ * through `pds-session` SASL. That was a second credential to protect for a
+ * one-time job, and it is gone.
  */
 
 import { mkdir, readFile, writeFile, chmod, access } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { randomBytes } from "node:crypto";
-
-import { createPrivateKey } from "node:crypto";
-
-import { FreeqClient } from "@freeq/sdk";
+import { createPrivateKey, randomBytes } from "node:crypto";
 
 /** Where the owner's creator seed lives, per owner DID. Mode 0600. */
 export function creatorKeyPath(root: string, ownerDid: string): string {
@@ -78,141 +76,83 @@ export function creatorPublicKeyB64(seed: Uint8Array): string {
   return jwk.x;
 }
 
-export interface AuthorizeOptions {
-  /** Owner handle (`alice.bsky.social`) or DID. */
-  identifier: string;
-  /** App password, used once and discarded. */
-  appPassword: string;
-  /** freeq server WebSocket URL. */
-  server: string;
-  /** Root of `~/.freeq`, for the seed path. */
-  root: string;
-  /** Optional: resolve a handle to its DID + PDS. Defaults to the public resolver. */
-  resolve?: (identifier: string) => Promise<{ did: string; pdsUrl: string }>;
-  /** Optional: override the PDS session exchange (tests). */
-  createSession?: (pdsUrl: string, identifier: string, appPassword: string) => Promise<string>;
-  /** Optional: override the freeq client factory (tests). */
-  clientFactory?: (opts: ConstructorParameters<typeof FreeqClient>[0]) => FreeqClient;
-  /** Report progress in words a human can act on. */
-  onProgress?: (line: string) => void;
-}
-
-export interface AuthorizeResult {
+export interface AuthorizeInstructions {
   ownerDid: string;
   creatorKeyPath: string;
   publicKey: string;
-}
-
-/** Resolve a handle or DID to `{ did, pdsUrl }` via the public directory. */
-async function defaultResolve(identifier: string): Promise<{ did: string; pdsUrl: string }> {
-  let did = identifier;
-  if (!identifier.startsWith("did:")) {
-    const r = await fetch(
-      `https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle?handle=${encodeURIComponent(identifier)}`,
-    );
-    if (!r.ok) throw new Error(`Could not resolve handle ${identifier}: HTTP ${r.status}`);
-    did = ((await r.json()) as { did: string }).did;
-  }
-  const docUrl = did.startsWith("did:plc:")
-    ? `https://plc.directory/${did}`
-    : `https://${did.replace(/^did:web:/, "")}/.well-known/did.json`;
-  const doc = (await (await fetch(docUrl)).json()) as {
-    service?: Array<{ id: string; serviceEndpoint: string }>;
-  };
-  const pds = doc.service?.find((s) => s.id.endsWith("#atproto_pds"))?.serviceEndpoint;
-  if (!pds) throw new Error(`DID document for ${did} names no PDS`);
-  return { did, pdsUrl: pds.replace(/\/$/, "") };
-}
-
-/** `com.atproto.server.createSession` → access JWT. */
-async function defaultCreateSession(
-  pdsUrl: string,
-  identifier: string,
-  appPassword: string,
-): Promise<string> {
-  const r = await fetch(`${pdsUrl}/xrpc/com.atproto.server.createSession`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ identifier, password: appPassword }),
-  });
-  if (!r.ok) {
-    const body = await r.text().catch(() => "");
-    throw new Error(
-      r.status === 401
-        ? "The PDS rejected that app password."
-        : `createSession failed: HTTP ${r.status} ${body.slice(0, 120)}`,
-    );
-  }
-  const j = (await r.json()) as { accessJwt: string };
-  return j.accessJwt;
+  /** The one line to paste into an authenticated client. Public material only. */
+  pasteLine: string;
+  /** What to tell the user. */
+  steps: string[];
 }
 
 /**
- * Prove ownership once, and put the creator key on file under the owner's
- * DID. After this, the installation's delegation can be signed and verified.
+ * Step one of the ceremony: make sure the key exists, and say what to paste
+ * where. Pure and local — no network.
  */
-export async function authorizeOwner(opts: AuthorizeOptions): Promise<AuthorizeResult> {
-  const say = opts.onProgress ?? (() => {});
-  const resolve = opts.resolve ?? defaultResolve;
-  const createSession = opts.createSession ?? defaultCreateSession;
-
-  say(`resolving ${opts.identifier}…`);
-  const { did, pdsUrl } = await resolve(opts.identifier);
-
-  const keyPath = creatorKeyPath(opts.root, did);
+export async function authorizeInstructions(opts: {
+  ownerDid: string;
+  root: string;
+}): Promise<AuthorizeInstructions> {
+  const keyPath = creatorKeyPath(opts.root, opts.ownerDid);
   const seed = await loadOrCreateCreatorSeed(keyPath);
   const publicKey = creatorPublicKeyB64(seed);
+  const pasteLine = `/raw MSGSIG ${publicKey}`;
+  return {
+    ownerDid: opts.ownerDid,
+    creatorKeyPath: keyPath,
+    publicKey,
+    pasteLine,
+    steps: [
+      `1. In the freeq web client (or any client logged in as ${opts.ownerDid}), paste this into the message box:`,
+      `      ${pasteLine}`,
+      `   It is a public key. Nothing secret is being sent.`,
+      `2. Back here, run:  /freeq authorize verify`,
+      `   pi will reconnect with a signed delegation and confirm the server accepted it.`,
+    ],
+  };
+}
 
-  say(`signing in to ${pdsUrl} as ${did}…`);
-  const accessJwt = await createSession(pdsUrl, opts.identifier, opts.appPassword);
-
-  say("registering the signing key with freeq…");
-  const make =
-    opts.clientFactory ?? ((o: ConstructorParameters<typeof FreeqClient>[0]) => new FreeqClient(o));
-  const client = make({
-    url: opts.server,
-    nick: "owner-authorize",
-    // We are registering our own key, so the SDK's auto-generated one would
-    // only add noise under the owner's DID.
-    autoMsgSig: false,
-    skipInitialBrokerRefresh: true,
-    sasl: { did, pdsUrl, method: "pds-session", token: accessJwt },
-  } as ConstructorParameters<typeof FreeqClient>[0]);
-
-  const registered = new Promise<void>((resolveP, rejectP) => {
-    const timer = setTimeout(
-      () => rejectP(new Error("timed out waiting for the server to accept the key")),
-      15_000,
-    );
-    client.on("systemMessage", (_from: string, text: string) => {
-      if (/MSGSIG OK/i.test(text)) {
-        clearTimeout(timer);
-        resolveP();
-      } else if (/MSGSIG/i.test(text) && /fail|error|invalid/i.test(text)) {
-        clearTimeout(timer);
-        rejectP(new Error(text));
-      }
-    });
-    client.on("authError", (err: string) => {
-      clearTimeout(timer);
-      rejectP(new Error(`freeq refused the owner session: ${err}`));
-    });
-    client.on("registered", () => {
-      client.raw(`MSGSIG ${publicKey}`);
-    });
-  });
-
-  client.connect();
-  try {
-    await registered;
-  } finally {
-    try {
-      client.quit("owner key registered");
-    } catch {
-      /* already gone */
-    }
+/**
+ * Has the server got a key on file for this owner that verifies our cert?
+ * Answered by the server itself: after reconnecting, the PROVENANCE reply is
+ * either "Provenance verified" or says why not. Callers pass in whatever
+ * the connection layer observed.
+ */
+export function interpretProvenanceNotice(notice: string | undefined): {
+  verified: boolean;
+  message: string;
+} {
+  if (!notice) {
+    return {
+      verified: false,
+      message:
+        "No provenance reply seen yet. Reconnect and try again; if it persists, the cert may not have been re-sent.",
+    };
   }
-
-  say(`registered. ${did} can now sign delegations from this machine.`);
-  return { ownerDid: did, creatorKeyPath: keyPath, publicKey };
+  if (/Provenance verified/i.test(notice)) {
+    return { verified: true, message: "Delegation verified — this installation provably acts for you." };
+  }
+  if (/No registered MSGSIG key/i.test(notice)) {
+    return {
+      verified: false,
+      message:
+        "The server has no signing key on file for your DID yet. Paste the /raw MSGSIG line into a client logged in as you, then run /freeq authorize verify again.",
+    };
+  }
+  if (/did not verify against/i.test(notice)) {
+    return {
+      verified: false,
+      message:
+        "A key is on file for your DID, but not this one. Paste the /raw MSGSIG line from /freeq authorize (it must be this machine's key), then verify again.",
+    };
+  }
+  if (/no signature/i.test(notice)) {
+    return {
+      verified: false,
+      message:
+        "The cert went out unsigned — the creator key was not found at connect time. Run /freeq authorize to create it, then verify again.",
+    };
+  }
+  return { verified: false, message: `Server said: ${notice}` };
 }

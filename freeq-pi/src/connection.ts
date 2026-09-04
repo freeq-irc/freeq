@@ -157,6 +157,8 @@ export class FreeqConnection {
   #peers = new Map<string, Peer>();
   #opts: ConnectionOptions;
   #meta: SessionMeta;
+  /** The server's verdict on our delegation cert, from its PROVENANCE reply. */
+  #provenanceNotice: string | undefined;
   #stopped = false;
   /** Guards against two concurrent start() calls building two bots. */
   #starting = false;
@@ -183,6 +185,11 @@ export class FreeqConnection {
   get did(): string | undefined {
     return this.#bot?.identity.did;
   }
+  /** Latest server verdict on our delegation, if any was seen this connection. */
+  get provenanceNotice(): string | undefined {
+    return this.#provenanceNotice;
+  }
+
   get meta(): SessionMeta {
     return this.#meta;
   }
@@ -255,6 +262,14 @@ export class FreeqConnection {
       });
 
       bot.on("presence", (p: PresencePayload) => this.#onPresence(p));
+
+      // The server answers PROVENANCE with one NOTICE: "Provenance verified:
+      // ..." or "Provenance stored (unverified): <why>". Keep the latest so
+      // /freeq authorize verify can report the server's own verdict rather
+      // than guessing.
+      bot.on("systemMessage", (_from: string, text: string) => {
+        if (/^Provenance /.test(text)) this.#provenanceNotice = text;
+      });
 
       // Task events (handoffs). Replayed events arrive here too, which is
       // how an offer made while we were offline reaches us.
