@@ -54,7 +54,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/freeq-irc/freeq",
+    "url": "git+https://github.com/freeq-irc/freeq.git",
     "directory": "freeq-bot-kit-js"
+  },
+  "homepage": "https://freeq.at",
+  "bugs": {
+    "url": "https://github.com/freeq-irc/freeq/issues"
   }
 }

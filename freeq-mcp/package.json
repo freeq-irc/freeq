@@ -1,7 +1,7 @@
 {
   "name": "@freeq/mcp",
   "version": "0.1.0",
-  "description": "Model Context Protocol server for freeq — read, verify and participate in DID-authenticated IRC conversations from any MCP client.",
+  "description": "Model Context Protocol server for freeq \u2014 read, verify and participate in DID-authenticated IRC conversations from any MCP client.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -55,7 +55,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/freeq-irc/freeq",
+    "url": "git+https://github.com/freeq-irc/freeq.git",
     "directory": "freeq-mcp"
+  },
+  "homepage": "https://freeq.at",
+  "bugs": {
+    "url": "https://github.com/freeq-irc/freeq/issues"
   }
 }

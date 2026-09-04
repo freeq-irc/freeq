@@ -38,11 +38,22 @@
     "typescript": "~5.9.3",
     "vitest": "^4.1.2"
   },
-  "keywords": ["irc", "freeq", "at-protocol", "bluesky", "e2ee", "websocket"],
+  "keywords": [
+    "irc",
+    "freeq",
+    "at-protocol",
+    "bluesky",
+    "e2ee",
+    "websocket"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/freeq-irc/freeq",
+    "url": "git+https://github.com/freeq-irc/freeq.git",
     "directory": "freeq-sdk-js"
+  },
+  "homepage": "https://freeq.at",
+  "bugs": {
+    "url": "https://github.com/freeq-irc/freeq/issues"
   }
 }
