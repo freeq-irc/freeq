@@ -6389,6 +6389,7 @@ pub(crate) async fn process_s2s_message(
             channel,
             topic,
             set_by,
+            set_by_did,
             ..
         } => {
             let channel = sanitize_s2s_str(&channel, 200).to_lowercase();
@@ -6405,12 +6406,17 @@ pub(crate) async fn process_s2s_message(
                 if let Some(ch) = channels.get(&channel)
                     && ch.topic_locked
                 {
+                    let did_is_authority =
+                        |d: &str| ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d);
+                    // By roster entry if the setter is still here, else by the
+                    // DID the event carries. Authority attaches to the DID; a
+                    // nick is only a way to find it, and it stops resolving the
+                    // moment the setter's session leaves — which is instant for
+                    // a script that sets a topic and quits. Same bug, and same
+                    // fix, as S2S Mode.
                     let is_authorized = ch.remote_member(&set_by).is_some_and(|rm| {
-                        rm.is_op
-                            || rm.did.as_ref().is_some_and(|d| {
-                                ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d)
-                            })
-                    });
+                        rm.is_op || rm.did.as_deref().is_some_and(did_is_authority)
+                    }) || set_by_did.as_deref().is_some_and(did_is_authority);
                     if !is_authorized {
                         tracing::warn!(
                             channel = %channel, set_by = %set_by,
@@ -7241,6 +7247,7 @@ pub(crate) async fn process_s2s_message(
         S2sMessage::Kick {
             nick,
             channel,
+            by_did,
             by,
             reason,
             ..
@@ -7254,12 +7261,15 @@ pub(crate) async fn process_s2s_message(
             {
                 let channels = state.channels.lock();
                 if let Some(ch) = channels.get(&channel_key) {
+                    let did_is_authority =
+                        |d: &str| ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d);
+                    // See S2S Mode/Topic: a kicker who has already left the
+                    // roster is still an op, and dropping their kick silently
+                    // leaves the two servers disagreeing about who is in the
+                    // room.
                     let is_authorized = ch.remote_member(&by).is_some_and(|rm| {
-                        rm.is_op
-                            || rm.did.as_ref().is_some_and(|d| {
-                                ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d)
-                            })
-                    });
+                        rm.is_op || rm.did.as_deref().is_some_and(did_is_authority)
+                    }) || by_did.as_deref().is_some_and(did_is_authority);
                     if !is_authorized {
                         tracing::warn!(
                             channel = %channel_key, by = %by, target = %nick,
@@ -10335,6 +10345,93 @@ mod s2s_adversarial_tests {
     // S2S TOPIC: +t enforcement
     // ═══════════════════════════════════════════════════════════
 
+    /// The bug this guards: authority was looked up by NICK in remote_members,
+    /// so an op whose session had already left the roster - a script that sets
+    /// a topic and quits, which is most scripts - failed the check and the
+    /// event was silently dropped. The two servers then disagreed about the
+    /// topic with nothing in the log but a warning. Same shape as the S2S Mode
+    /// bug found in production on 2026-09-04.
+    #[tokio::test]
+    async fn s2s_topic_accepted_from_founder_who_has_already_left() {
+        let state = test_state();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+
+        const FOUNDER_DID: &str = "did:key:zFounderTopic";
+        {
+            let mut channels = state.channels.lock();
+            let ch = channels.entry("#departed".to_string()).or_default();
+            ch.topic_locked = true;
+            ch.founder_did = Some(FOUNDER_DID.to_string());
+        }
+        // Deliberately NO remote_member entry: the setter is gone.
+
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Topic {
+                event_id: format!("{PEER}:departed-topic"),
+                channel: "#departed".to_string(),
+                topic: "set after quitting".to_string(),
+                set_by: "ghost".to_string(),
+                set_by_did: Some(FOUNDER_DID.to_string()),
+                origin: PEER.to_string(),
+            },
+        )
+        .await;
+
+        let topic = state.channels.lock().get("#departed").unwrap().topic.clone();
+        assert_eq!(
+            topic.map(|t| t.text),
+            Some("set after quitting".to_string()),
+            "a founder's topic must survive their session leaving before the event lands"
+        );
+    }
+
+    /// The DID is checked, not merely carried: a stranger who supplies one
+    /// gains nothing.
+    #[tokio::test]
+    async fn s2s_topic_rejected_when_carried_did_is_not_an_authority() {
+        let state = test_state();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+
+        {
+            let mut channels = state.channels.lock();
+            let ch = channels.entry("#departed2".to_string()).or_default();
+            ch.topic_locked = true;
+            ch.founder_did = Some("did:key:zTheRealFounder".to_string());
+            ch.topic = Some(TopicInfo {
+                text: "original".to_string(),
+                set_by: "founder".to_string(),
+                set_at: 1000,
+            });
+        }
+
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Topic {
+                event_id: format!("{PEER}:imposter"),
+                channel: "#departed2".to_string(),
+                topic: "hijacked".to_string(),
+                set_by: "imposter".to_string(),
+                set_by_did: Some("did:key:zSomebodyElse".to_string()),
+                origin: PEER.to_string(),
+            },
+        )
+        .await;
+
+        let topic = state.channels.lock().get("#departed2").unwrap().topic.clone();
+        assert_eq!(
+            topic.map(|t| t.text),
+            Some("original".to_string()),
+            "a DID that is not the founder or an op must not pass the +t gate"
+        );
+    }
+
     #[tokio::test]
     async fn s2s_topic_rejected_on_locked_channel_from_non_op() {
         let state = test_state();
@@ -10370,6 +10467,7 @@ mod s2s_adversarial_tests {
                 channel: "#locked".to_string(),
                 topic: "hijacked topic".to_string(),
                 set_by: "nonop".to_string(),
+                set_by_did: None,
                 origin: PEER.to_string(),
             },
         )
@@ -10491,6 +10589,7 @@ mod s2s_adversarial_tests {
                 nick: "victim".to_string(),
                 channel: "#kicktest".to_string(),
                 by: "non_op_kicker".to_string(),
+                by_did: None,
                 reason: "unauthorized kick".to_string(),
                 origin: PEER.to_string(),
             },
@@ -10778,6 +10877,7 @@ mod s2s_adversarial_tests {
                 channel: "#fedtopicmodes".to_string(),
                 topic: "hello".to_string(),
                 set_by: "alice".to_string(),
+                set_by_did: None,
                 origin: PEER.to_string(),
             },
         )

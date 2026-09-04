@@ -1658,6 +1658,9 @@ pub(super) fn handle_kick(
                     nick: target_nick.to_string(),
                     channel: channel.to_string(),
                     by: conn.nick.as_deref().unwrap_or("*").to_string(),
+                    // Carry the DID so the receiver can authorise the kick
+                    // against its own founder/did_ops even after we are gone.
+                    by_did: conn.authenticated_did.clone(),
                     reason: reason.to_string(),
                     origin,
                 },
@@ -1955,6 +1958,7 @@ pub(super) fn handle_topic(
                     channel: channel.to_string(),
                     topic: text.to_string(),
                     set_by: conn.nick.as_deref().unwrap_or("*").to_string(),
+                    set_by_did: conn.authenticated_did.clone(),
                     origin,
                 },
             );

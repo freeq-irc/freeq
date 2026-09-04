@@ -620,6 +620,13 @@ pub enum S2sMessage {
         channel: String,
         topic: String,
         set_by: String,
+        /// The setter's DID, when authenticated. Same reasoning as `Mode`:
+        /// authority attaches to the DID, and a nick stops resolving the
+        /// moment the setter's session leaves the roster — which for a script
+        /// that sets a topic and quits is immediately. Optional for peers
+        /// that predate it.
+        #[serde(default)]
+        set_by_did: Option<String>,
         origin: String,
     },
 
@@ -752,6 +759,9 @@ pub enum S2sMessage {
         channel: String,
         /// Nick of the op who kicked them.
         by: String,
+        /// The kicker's DID, when authenticated. See `Mode::set_by_did`.
+        #[serde(default)]
+        by_did: Option<String>,
         reason: String,
         origin: String,
     },
