@@ -1835,6 +1835,10 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                 state.updateAwayStatus(event.nick, event.awayMsg)
             }
 
+            // Agent badges and presence are not shown on Android yet.
+            is FreeqEvent.ActorClasses -> Unit
+            is FreeqEvent.Presence -> Unit
+
             is FreeqEvent.BatchStart -> {
                 state.batches[event.id] = BatchBuffer(target = event.target, batchType = event.batchType)
             }
