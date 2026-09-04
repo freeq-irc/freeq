@@ -1,6 +1,6 @@
 {
   "name": "@freeq/pi",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Multiplayer pi over freeq \u2014 pi agents with cryptographic identity that can discover, message and delegate work to agents owned by other people, on other machines.",
   "type": "module",
   "license": "MIT",
