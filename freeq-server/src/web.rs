@@ -1170,6 +1170,32 @@ async fn api_act_task(
     })))
 }
 
+/// The name an audit row's actor wears, or none when it has no name.
+///
+/// A server signs rows of its own — an expiry, a receipt — under its
+/// `did:web:` identity, which resolves to no nick and would reach the reader
+/// as a compacted identifier in a list of people. Every home is named the
+/// same way, its own host after the word: a federated room can hold rows from
+/// more than one, and which one is which is the part worth reading.
+///
+/// `resolved` is what `display_nick_for_did` answered, which is the DID
+/// itself when every source missed — that is no name at all.
+fn audit_actor_name(did: &str, resolved: &str) -> Option<String> {
+    if let Some(host) = did.strip_prefix("did:web:") {
+        return Some(format!("server: {host}"));
+    }
+    (resolved != did).then(|| resolved.to_string())
+}
+
+/// The task a signed act event belongs to: the id it names, or its own when
+/// it opens one.
+fn act_task_id(e: &crate::db::ActLoggedEvent, view: &crate::events::ActView) -> String {
+    view.fields
+        .get("act-id")
+        .cloned()
+        .unwrap_or_else(|| e.event_id.clone())
+}
+
 /// GET /api/v1/channels/{name}/audit — unified audit timeline.
 async fn api_channel_audit(
     State(state): State<Arc<SharedState>>,
@@ -1233,6 +1259,123 @@ async fn api_channel_audit(
         timeline.extend(entries);
     }
 
+    // 3. Signed task events
+    //
+    // A room's tasks live in the events log, not in the coordination table,
+    // so the timeline reads them from there. The venue of a channel's task is
+    // the channel name folded, which is what `channel_venue` returns; the
+    // query has no actor parameter, so that filter is applied here.
+    if let Some(events) = state.with_db(|db| {
+        db.act_events_for_venue(&channel.to_lowercase(), since.unwrap_or(0), i64::MAX, limit)
+    }) {
+        // A receipt is not a row of its own: it says nothing about the room
+        // beyond "this step was ruled on", and a reader watching a task move
+        // wants the moves. It rides on the step it names instead, carrying
+        // enough for that step's reader to check the home's signature.
+        // The document field a receipt names its subject in, spelled once in
+        // the rules file rather than here.
+        let subject_field = freeq_sdk::act_transitions::confirmation_subject_tag();
+        let mut receipts: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+        let mut steps: Vec<(crate::db::ActLoggedEvent, crate::events::ActView)> = Vec::new();
+        for e in events {
+            let Some(view) = crate::events::derive_act_view(&e.canonical) else {
+                tracing::warn!(
+                    event_id = %e.event_id,
+                    "Audit row skipped: the task event's document does not parse"
+                );
+                continue;
+            };
+            // How the log marks a receipt: it carries no confirm state of its
+            // own, being the ruling rather than something awaiting one.
+            if e.confirm.is_none() {
+                if let Some(subject) = view.fields.get(subject_field) {
+                    receipts.insert(
+                        subject.clone(),
+                        serde_json::json!({
+                            "event_id": e.event_id,
+                            "timestamp": e.timestamp,
+                            "signature": e.signature,
+                        }),
+                    );
+                }
+                continue;
+            }
+            // The actor filter asks who acted, and a receipt's actor is this
+            // server: it is applied to the steps, and a step's receipt rides
+            // with it.
+            if actor.is_some() && e.actor_did.as_deref() != actor {
+                continue;
+            }
+            steps.push((e, view));
+        }
+
+        // Only the opener carries the task's title in its own bytes; every
+        // later step names the task by id. Read the titles those steps are
+        // missing in one pass, so each row can say which task it belongs to.
+        let titles: std::collections::HashMap<String, String> = {
+            let wanted: std::collections::HashSet<String> = steps
+                .iter()
+                .filter(|(_, view)| !view.fields.contains_key("act-title"))
+                .map(|(e, view)| act_task_id(e, view))
+                .collect();
+            state
+                .with_db(|db| {
+                    let mut found = std::collections::HashMap::new();
+                    for id in wanted {
+                        if let Some(title) = db.act_task_title(&id)? {
+                            found.insert(id, title);
+                        }
+                    }
+                    Ok(found)
+                })
+                .unwrap_or_default()
+        };
+
+        for (e, view) in steps {
+            let act_id = act_task_id(&e, &view);
+            let mut details = serde_json::Map::new();
+            details.insert("kind".to_string(), serde_json::json!(view.kind));
+            // An event that opens a task carries no `act-id`: it is the task.
+            details.insert("act_id".to_string(), serde_json::json!(act_id));
+            if let Some(confirm) = e.confirm {
+                details.insert(
+                    "confirm_state".to_string(),
+                    serde_json::json!(confirm.as_str()),
+                );
+            }
+            for (name, value) in &view.fields {
+                if name == "act" || name == "act-id" {
+                    continue;
+                }
+                details.insert(
+                    name.strip_prefix("act-").unwrap_or(name).to_string(),
+                    serde_json::json!(value),
+                );
+            }
+            if !details.contains_key("title")
+                && let Some(title) = titles.get(&act_id)
+            {
+                details.insert("title".to_string(), serde_json::json!(title));
+            }
+            // A receipt whose step is not on this page has nothing to ride on
+            // and is dropped: the step was filtered out or falls outside the
+            // window, and a ruling about a step nobody is shown says nothing.
+            if let Some(receipt) = receipts.remove(&e.event_id) {
+                details.insert("receipt".to_string(), receipt);
+            }
+            timeline.push(serde_json::json!({
+                "timestamp": e.timestamp,
+                "category": "act",
+                "event": view.verb,
+                "actor_did": e.actor_did,
+                "details": details,
+                "signature": e.signature,
+                "event_id": e.event_id,
+            }));
+        }
+    }
+
     // A row says who acted, not what their identifier is. Resolve every actor
     // the same way the rest of the server does — a client can only name a DID
     // it has seen, and an audit row's actor is usually an agent that is long
@@ -1248,8 +1391,8 @@ async fn api_channel_audit(
         else {
             continue;
         };
-        let name = state.display_nick_for_did(&did);
-        if name != did {
+        let resolved = state.display_nick_for_did(&did);
+        if let Some(name) = audit_actor_name(&did, &resolved) {
             row["actor_name"] = serde_json::json!(name);
         }
     }
@@ -6630,6 +6773,35 @@ mod audit_actor_name_tests {
             state.display_nick_for_did(stranger),
             stranger,
             "an unknown DID resolves to itself — the audit row must treat this as no name",
+        );
+    }
+
+    /// The rows a server signs for itself: an expiry, a receipt. Nothing
+    /// resolves a `did:web:` to a nick, so without this they reach the reader
+    /// as a compacted identifier in a list of people.
+    #[test]
+    fn a_server_is_named_as_one_whichever_home_it_is() {
+        use super::audit_actor_name;
+
+        assert_eq!(
+            audit_actor_name("did:web:eyeball.local", "did:web:eyeball.local").as_deref(),
+            Some("server: eyeball.local"),
+            "the home the reader is talking to",
+        );
+        assert_eq!(
+            audit_actor_name("did:web:irc.zerosum.org", "did:web:irc.zerosum.org").as_deref(),
+            Some("server: irc.zerosum.org"),
+            "a peer's home is named the same way, by its own host",
+        );
+        assert_eq!(
+            audit_actor_name("did:key:zBOT", "taskbot").as_deref(),
+            Some("taskbot"),
+            "a resolved actor still carries its nick",
+        );
+        assert_eq!(
+            audit_actor_name("did:key:zNEVERSEEN", "did:key:zNEVERSEEN"),
+            None,
+            "an unresolved actor carries no name",
         );
     }
 }

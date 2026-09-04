@@ -192,6 +192,67 @@ impl C {
         self.rx(|l| l.contains(&id), "the offer is accepted and echoed");
         id
     }
+
+    /// Open a handoff directed at `to`, so the offeree can `accept` it.
+    fn offer_to(
+        &mut self,
+        target: &str,
+        venue: &str,
+        to: &str,
+        from: &str,
+        key: &SigningKey,
+    ) -> String {
+        let id = freeq_sdk::chatsig::new_event_id();
+        let tags: Vec<(String, String)> = vec![
+            ("+freeq.at/act".into(), "handoff".into()),
+            ("+freeq.at/act-verb".into(), "offer".into()),
+            ("+freeq.at/from".into(), from.into()),
+            ("+freeq.at/act-to".into(), to.into()),
+            ("+freeq.at/act-title".into(), "Cite 3 sources".into()),
+        ];
+        let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let sig = freeq_sdk::act::sign_act(pairs, venue, &id, key).unwrap();
+        // The title has spaces in it, which a tag value carries escaped.
+        let mut wire: Vec<String> = tags
+            .iter()
+            .map(|(k, v)| format!("{k}={}", v.replace(' ', "\\s")))
+            .collect();
+        wire.push(format!("{EVENT_ID_TAG}={id}"));
+        wire.push(format!("+freeq.at/sig={sig}"));
+        self.tx(&format!("@{} TAGMSG {target}", wire.join(";")));
+        self.rx(
+            |l| l.contains(&id),
+            "the directed offer is accepted and echoed",
+        );
+        id
+    }
+
+    /// Move the task `act_id` along with `verb`, and return the event's id.
+    fn step(
+        &mut self,
+        target: &str,
+        venue: &str,
+        act_id: &str,
+        verb: &str,
+        from: &str,
+        key: &SigningKey,
+    ) -> String {
+        let id = freeq_sdk::chatsig::new_event_id();
+        let tags: Vec<(String, String)> = vec![
+            ("+freeq.at/act".into(), "handoff".into()),
+            ("+freeq.at/act-verb".into(), verb.into()),
+            ("+freeq.at/from".into(), from.into()),
+            ("+freeq.at/act-id".into(), act_id.into()),
+        ];
+        let pairs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let sig = freeq_sdk::act::sign_act(pairs, venue, &id, key).unwrap();
+        let mut wire: Vec<String> = tags.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        wire.push(format!("{EVENT_ID_TAG}={id}"));
+        wire.push(format!("+freeq.at/sig={sig}"));
+        self.tx(&format!("@{} TAGMSG {target}", wire.join(";")));
+        self.rx(|l| l.contains(&id), "the step is accepted and echoed");
+        id
+    }
 }
 
 fn ids(body: &serde_json::Value) -> Vec<String> {
@@ -665,4 +726,126 @@ async fn a_task_nobody_ever_opened_is_not_found() {
     let (_irc, web, _h) = start(resolver_with(vec![(DID_ALICE, &k)])).await;
     let (status, _) = get(web, "/api/v1/actions/01JNOSUCHTASK00000000000X", None).await;
     assert_eq!(status, 404);
+}
+
+/// The audit timeline is where a room's history is read, and a task event is
+/// part of that history: the signed steps appear there with their verb, their
+/// actor, their signed fields and the receipt the home wrote for them, under
+/// the same filters every other row obeys.
+#[tokio::test]
+async fn the_audit_timeline_carries_the_channel_s_task_events() {
+    let ka = PrivateKey::generate_ed25519();
+    let kb = PrivateKey::generate_ed25519();
+    let (irc, web, _h) = start(resolver_with(vec![(DID_ALICE, &ka), (DID_BOB, &kb)])).await;
+    let (offer_id, accept_id, complete_id, bearer, _a, _b) =
+        tokio::task::spawn_blocking(move || {
+            let alice_key = SigningKey::from_bytes(&[21u8; 32]);
+            let bob_key = SigningKey::from_bytes(&[22u8; 32]);
+            let mut a = C::authenticated(irc, "alice", DID_ALICE, ka);
+            a.msgsig(&alice_key);
+            a.join("#work");
+            let mut b = C::authenticated(irc, "bob", DID_BOB, kb);
+            b.msgsig(&bob_key);
+            b.join("#work");
+
+            let venue = channel_venue("#work");
+            let offer = a.offer_to("#work", &venue, DID_BOB, DID_ALICE, &alice_key);
+            let accept = b.step("#work", &venue, &offer, "accept", DID_BOB, &bob_key);
+            let complete = b.step("#work", &venue, &offer, "complete", DID_BOB, &bob_key);
+            let bearer = a.bearer.clone();
+            (offer, accept, complete, bearer, a, b)
+        })
+        .await
+        .unwrap();
+
+    let acts = |body: &serde_json::Value| -> Vec<serde_json::Value> {
+        body["timeline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["category"] == "act")
+            .cloned()
+            .collect()
+    };
+
+    let (status, body) = get(web, "/api/v1/channels/work/audit", Some(&bearer)).await;
+    assert_eq!(status, 200);
+    let rows = acts(&body);
+    // One row per step somebody took. The two receipts this server minted are
+    // not rows: each rides on the step it rules on.
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["event"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["offer", "accept", "complete"],
+        "{body}"
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["event_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![offer_id.as_str(), accept_id.as_str(), complete_id.as_str()]
+    );
+    for row in &rows {
+        assert_eq!(row["details"]["act_id"], offer_id, "{row}");
+        assert_eq!(row["details"]["kind"], "handoff", "{row}");
+        assert_eq!(row["details"]["confirm_state"], "confirmed", "{row}");
+        // Every row names its task, not only the one that opened it.
+        assert_eq!(row["details"]["title"], "Cite 3 sources", "{row}");
+    }
+    assert_eq!(rows[0]["details"]["to"], DID_BOB);
+    assert_eq!(rows[0]["actor_did"], DID_ALICE);
+    assert_eq!(rows[1]["actor_did"], DID_BOB);
+
+    // The offer was applied on arrival and no receipt was written for it; the
+    // two steps that moved the task each carry theirs, with enough to check
+    // the home's signature over the ruling itself.
+    assert!(rows[0]["details"].get("receipt").is_none(), "{}", rows[0]);
+    let steps = [offer_id.as_str(), accept_id.as_str(), complete_id.as_str()];
+    for row in &rows[1..] {
+        let receipt = &row["details"]["receipt"];
+        let id = receipt["event_id"].as_str().unwrap_or_default();
+        assert_eq!(id.len(), 26, "{row}");
+        assert!(!steps.contains(&id), "a receipt has its own id: {row}");
+        assert!(receipt["timestamp"].is_i64(), "{row}");
+        assert!(!receipt["signature"].is_null(), "{row}");
+    }
+
+    // `actor` filters task rows the way it filters every other row — and a
+    // step's receipt rides with it, though the receipt is the home's.
+    let (status, only_bob) = get(
+        web,
+        &format!("/api/v1/channels/work/audit?actor={DID_BOB}"),
+        Some(&bearer),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let bob_rows = acts(&only_bob);
+    assert_eq!(
+        bob_rows
+            .iter()
+            .map(|r| r["event_id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>(),
+        vec![accept_id.clone(), complete_id.clone()],
+        "{only_bob}"
+    );
+    for row in &bob_rows {
+        assert!(row["details"]["receipt"]["event_id"].is_string(), "{row}");
+    }
+
+    // So does `since`: a window that opens after the offer does not carry it.
+    let offer_ts = rows[0]["timestamp"].as_i64().unwrap();
+    let (status, later) = get(
+        web,
+        &format!("/api/v1/channels/work/audit?since={}", offer_ts + 1),
+        Some(&bearer),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        !acts(&later)
+            .iter()
+            .any(|r| r["event_id"] == serde_json::json!(offer_id)),
+        "{later}"
+    );
 }
