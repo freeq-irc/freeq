@@ -259,6 +259,11 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .route("/api/v1/space-media/{ref}/{filename}", get(api_space_media))
         // REST API (read-only, v1)
         .route("/api/v1/health", get(api_health))
+        // The web app checks `<auth origin>/health` before sending anyone to
+        // the PDS. With embedded auth that origin is this server, which only
+        // ever answered here by way of the SPA fallback's 200; the fallback
+        // now 404s unknown paths, so the route has to be real.
+        .route("/health", get(api_health))
         // The mediated, metered model path: the server holds the provider
         // credential, the caller holds only an identity and a budget.
         .route(

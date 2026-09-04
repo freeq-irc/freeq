@@ -126,6 +126,22 @@ async fn get(web: std::net::SocketAddr, path: &str) -> (u16, String) {
     (status, r.text().await.unwrap_or_default())
 }
 
+/// The web app refuses to start sign-in unless `<auth origin>/health` answers
+/// OK. On a server with embedded auth that origin is the server itself, so
+/// `/health` must be a real route, not a path the SPA fallback happens to
+/// answer for.
+#[tokio::test]
+async fn health_is_served_at_the_root_for_the_sign_in_preflight() {
+    let (_addr, web, _handle) = start_test_server_with_web(empty_resolver()).await;
+    let (status, body) = get(web, "/health").await;
+    assert_eq!(status, 200, "GET /health answered {status}: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("health is JSON");
+    assert!(
+        json.get("git_commit").is_some(),
+        "health carries the build: {body}"
+    );
+}
+
 #[tokio::test]
 async fn private_channel_topic_is_not_public() {
     let (web, server) = fixture().await;
