@@ -66,6 +66,22 @@ let oauthConnectInProgress = false;
  */
 let sessionRefreshInFlight = false;
 
+/**
+ * Is this shaped like an AT Protocol handle — that is, a domain?
+ *
+ * Deliberately loose: the server's `is_valid_handle` is the authority, and a
+ * client that rejects something the server would have accepted is worse than
+ * one that lets a doomed request through. This only catches what is certainly
+ * wrong (no dot, spaces, a URL someone pasted) so the user is told here
+ * instead of on a page they cannot get back from.
+ */
+function isProbablyHandle(h: string): boolean {
+  if (h.length > 253 || /[\s/@:\\?#]/.test(h)) return false;
+  const labels = h.split('.');
+  if (labels.length < 2) return false;
+  return labels.every((l) => l.length >= 1 && l.length <= 63 && /^[a-zA-Z0-9-]+$/.test(l) && !l.startsWith('-') && !l.endsWith('-'));
+}
+
 type OAuthResultData = {
   did?: string;
   handle?: string;
@@ -349,8 +365,17 @@ export function ConnectScreen() {
 
   // AT Protocol OAuth login
   const doAtLogin = useCallback(async () => {
-    const h = handle.trim();
+    const h = handle.trim().replace(/^@/, '');
     if (!h) { setError('Enter your AT Protocol handle'); return; }
+    // Catch an obvious typo here rather than after a navigation. Signing in
+    // leaves the app for the PDS, so a handle the server cannot resolve used
+    // to land the user on a bare error page with no way back — on the single
+    // most common first-run mistake there is. The server still validates;
+    // this only stops the trip.
+    if (!isProbablyHandle(h)) {
+      setError(`"${h}" doesn't look like an AT Protocol handle. Handles are domains, like you.bsky.social.`);
+      return;
+    }
     setError('');
     setOauthPending(true);
 

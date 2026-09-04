@@ -90,6 +90,42 @@ test.describe('session restore', () => {
   });
 });
 
+test.describe('signing in', () => {
+  test('a mistyped handle is caught before it navigates anywhere', async ({ page }) => {
+    // Signing in leaves the app for the PDS. A handle the server cannot
+    // resolve used to land the user on a bare error page with no links and no
+    // buttons — browser-back was the only way home, on the most common
+    // first-run mistake there is.
+    await prepPage(page);
+    await page.goto('/');
+    const before = page.url();
+
+    await page.getByPlaceholder('you.bsky.social').fill('definitely not a handle');
+    await page.getByRole('button', { name: /sign in with at protocol/i }).click();
+
+    await expect(page.getByText(/doesn't look like an AT Protocol handle/i)).toBeVisible({
+      timeout: 10_000,
+    });
+    // Still on the form, with the guest route still available.
+    expect(page.url()).toBe(before);
+    await expect(page.getByRole('button', { name: 'Guest' })).toBeVisible();
+  });
+
+  test('a sign-in failure the server rejects still offers a way back', async ({ page }) => {
+    // The client only catches obvious typos; anything else (unresolvable
+    // handle, PDS down, org restrictions) is answered by the server. That
+    // answer has to be a page, not a bare string.
+    await prepPage(page);
+    await page.goto('/auth/login?handle=nope.invalid&return_to=http%3A%2F%2F127.0.0.1%3A5173');
+
+    await expect(page.getByRole('link', { name: /back to freeq/i })).toBeVisible({
+      timeout: 15_000,
+    });
+    await page.getByRole('link', { name: /back to freeq/i }).click();
+    await expect(page.getByRole('button', { name: 'Guest' })).toBeVisible({ timeout: 15_000 });
+  });
+});
+
 test.describe('staying connected', () => {
   test('a guest reload returns to sign-in, and the words they said survive', async ({ page }) => {
     // Guests deliberately do not persist: there is no credential to

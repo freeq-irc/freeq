@@ -732,6 +732,77 @@ pub async fn json_api_errors(
     Response::from_parts(parts, axum::body::Body::from(body))
 }
 
+/// Turn a bare `/auth/*` failure into a page with a way out.
+///
+/// The sign-in handlers return `(StatusCode, String)`, which axum renders as
+/// plain text. A user who mistypes their handle is therefore navigated out of
+/// the app to a white page reading `Cannot resolve handle: …` with no links
+/// and no buttons — browser-back is the only way home, on the single most
+/// common first-run mistake there is.
+///
+/// Same shape as [`json_api_errors`]: one layer instead of editing every
+/// handler, and it also catches the failures no handler wrote.
+pub async fn html_auth_errors(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let is_auth = req.uri().path().starts_with("/auth/");
+    let resp = next.run(req).await;
+    if !is_auth || !(resp.status().is_client_error() || resp.status().is_server_error()) {
+        return resp;
+    }
+    let already_html = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("html"));
+    if already_html {
+        return resp;
+    }
+
+    let status = resp.status();
+    let (mut parts, body) = resp.into_parts();
+    let detail = match axum::body::to_bytes(body, 8 * 1024).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).trim().to_string(),
+        Err(_) => String::new(),
+    };
+    let detail = if detail.is_empty() {
+        status
+            .canonical_reason()
+            .unwrap_or("Sign-in failed")
+            .to_string()
+    } else {
+        detail
+    };
+    let safe = crate::verifiers::html_escape(&detail);
+
+    let html = format!(
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>freeq — sign-in failed</title><style>\
+         body{{background:#0c0c0f;color:#e8e8e8;font:16px/1.6 system-ui,sans-serif;\
+         display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}}\
+         .card{{max-width:34rem;padding:2rem}}h1{{font-size:1.3rem;margin:0 0 .75rem}}\
+         p{{color:#b9b9c3}}code{{background:#1a1a1f;padding:.15rem .4rem;border-radius:4px}}\
+         a{{display:inline-block;margin-top:1.25rem;color:#0c0c0f;background:#00e5ff;\
+         padding:.6rem 1.1rem;border-radius:6px;text-decoration:none;font-weight:600}}\
+         </style></head><body><div class=\"card\">\
+         <h1>Sign-in didn't work</h1>\
+         <p><code>{safe}</code></p>\
+         <p>Check the handle and try again — it looks like <code>you.bsky.social</code>. \
+         You can also continue as a guest.</p>\
+         <a href=\"/\">Back to freeq</a>\
+         </div></body></html>"
+    );
+
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, axum::body::Body::from(html))
+}
+
 /// RFC 8288 `Link` relations on every response, and RFC 9728's
 /// `WWW-Authenticate` hint on every 401.
 ///

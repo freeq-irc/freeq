@@ -1,0 +1,86 @@
+name: Production synthetic
+
+# Is freeq working right now, from outside?
+#
+# Every outage this project has had was found late, by accident, or by a
+# stranger: AV silently down for ~2h (a build without --features av-native),
+# freeq.at serving a two-week-stale build because deploys landed on a cluster
+# DNS does not point at, persistent sessions bricked for six weeks. None of
+# them needed clever detection — they needed someone to check.
+#
+# A failure here opens an issue, because a red run nobody is watching is the
+# same as no monitoring at all.
+
+on:
+  schedule:
+    # Every 15 minutes. Fine-grained enough that an outage is measured in
+    # minutes, coarse enough to stay far inside free Actions minutes.
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+  push:
+    paths:
+      - 'scripts/synthetic.sh'
+      - '.github/workflows/synthetic.yml'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  probe:
+    name: Probe production
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check irc.freeq.at and freeq.at
+        id: probe
+        run: ./scripts/synthetic.sh 2>&1 | tee /tmp/synthetic.log
+
+      - name: Open an issue if production is down
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let log = '(no output captured)';
+            try { log = fs.readFileSync('/tmp/synthetic.log', 'utf8'); } catch {}
+
+            const title = 'Production synthetic check is failing';
+            // One open issue, not one per run — a monitor that opens 96 issues
+            // a day gets muted, and muted monitoring is worse than none.
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'synthetic',
+            });
+
+            const body = [
+              `The scheduled production check failed at ${new Date().toISOString()}.`,
+              '',
+              '```',
+              log.trim().slice(-4000),
+              '```',
+              '',
+              `[Run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+              '',
+              'Reproduce locally with `./scripts/synthetic.sh`.',
+            ].join('\n');
+
+            if (open.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: open[0].number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                labels: ['synthetic', 'bug'],
+                body,
+              });
+            }
