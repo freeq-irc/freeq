@@ -2030,7 +2030,18 @@ export class FreeqClient extends EventEmitter {
         for (const ch of toJoin) {
           if (ch.trim()) this.raw(`JOIN ${ch.trim()}`);
         }
-        this.autoJoinChannels = [];
+        // Deliberately NOT cleared. Configured channels are configuration, not
+        // a one-shot: an authenticated client used to join nothing on every
+        // reconnect and lean entirely on the server's auto-rejoin of saved
+        // channels. That is one dependency too many — a ghost reclaim
+        // suppresses the auto-rejoin ("suppressing quit/join churn") and
+        // restores the ghost's set instead, so a ghost that had joined nothing
+        // propagates emptiness forward and the client stays in no channels
+        // through every later restart. Re-sending JOIN is cheap and idempotent;
+        // being silently in zero channels is not.
+        //
+        // Guests keep the old behaviour of falling back to whatever they were
+        // in, because they have no server-side saved set to rejoin.
         if (this.sasl?.did) this.requestHistoryTargets();
         // Re-assert AWAY across reconnects so the server stops thinking
         // we're present. We deliberately re-send even on the first 001

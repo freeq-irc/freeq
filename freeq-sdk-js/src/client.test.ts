@@ -3479,3 +3479,47 @@ describe('structured presence relay', () => {
     expect(seen).toEqual([]);
   });
 });
+
+describe('reconnect rejoins configured channels', () => {
+  it('an authenticated client joins its configured channels again on reconnect', async () => {
+    // The bug: autoJoinChannels was cleared after the first connect, so an
+    // authenticated reconnect joined nothing and leaned entirely on the
+    // server's auto-rejoin of saved channels. A ghost reclaim suppresses that
+    // auto-rejoin and restores the ghost's set instead, so a ghost that had
+    // joined nothing left the client in no channels — through every later
+    // restart, silently.
+    const { FreeqClient } = await import('./client.js');
+    const client = new FreeqClient({
+      url: 'wss://test/irc',
+      nick: 'agent',
+      channels: ['#alpha', '#beta'],
+      skipInitialBrokerRefresh: true,
+      sasl: { did: 'did:key:zAgent', method: 'crypto', signer: async () => 'sig' },
+    } as ConstructorParameters<typeof FreeqClient>[0]);
+    client.connect();
+    await flushAsync();
+
+    const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    ws.recv(':srv CAP * LS :');
+    await flushAsync();
+    ws.recv(':srv 001 agent :Welcome');
+    await flushAsync();
+    expect(ws.sent.filter((l) => l.startsWith('JOIN'))).toEqual(['JOIN #alpha', 'JOIN #beta']);
+
+    // Reconnect — the same guarantee has to hold, not be spent.
+    ws.close();
+    await flushAsync();
+    client.connect();
+    await flushAsync();
+    const ws2 = MockWebSocket.instances[MockWebSocket.instances.length - 1]!;
+    ws2.recv(':srv CAP * LS :');
+    await flushAsync();
+    ws2.recv(':srv 001 agent :Welcome');
+    await flushAsync();
+
+    expect(
+      ws2.sent.filter((l) => l.startsWith('JOIN')),
+      `wire: ${ws2.sent.join(' | ')}`,
+    ).toEqual(['JOIN #alpha', 'JOIN #beta']);
+  });
+});
