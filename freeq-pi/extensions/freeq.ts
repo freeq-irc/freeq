@@ -30,6 +30,13 @@ import {
 } from "../src/config.js";
 import { deriveInstallSlug, defaultNick, isDid } from "../src/identity.js";
 import { authorizeOwner, creatorKeyPath } from "../src/owner-key.js";
+import {
+  JOURNAL_ENTRY,
+  notesFor,
+  resumePreamble,
+  summarizeTurn,
+  type TaskNote,
+} from "../src/journal.js";
 import { homedir } from "node:os";
 import { join as joinPath } from "node:path";
 import { access as fsAccess } from "node:fs/promises";
@@ -387,7 +394,7 @@ export default function (pi: ExtensionAPI): void {
       await conn.sendAct(rec.channel, "progress", rec.id, {
         note: "resumed after the assignee's session restarted",
       });
-      startAssignedWork(ctx, cfg, rec, rec.lastActor ?? "freeq");
+      startAssignedWork(ctx, cfg, rec, rec.lastActor ?? "freeq", true);
     }
     await store.save();
 
@@ -761,6 +768,9 @@ export default function (pi: ExtensionAPI): void {
       .join("\n")
       .trim();
     if (text) lastAssistantText = text;
+    // A turn taken while carrying a task is a step on that task. Journal the
+    // gist so a restart resumes from here rather than from the title.
+    if (text && workTask) journal("turn", workTask, summarizeTurn(text));
   });
 
   let lastModel: string | undefined;
@@ -952,16 +962,36 @@ export default function (pi: ExtensionAPI): void {
    * presence identically, arm the same clocks, and enter the model through
    * the same tier-gated pipeline. There is one way to start work, not three.
    */
+  /**
+   * Leave a breadcrumb in the pi session log for the task in flight.
+   *
+   * The server remembers WHAT is assigned; this remembers HOW far it got.
+   * `appendEntry` persists without entering model context, so the journal
+   * costs nothing until the exact task is resumed.
+   */
+  function journal(kind: TaskNote["kind"], taskId: string, text: string): void {
+    if (!text.trim()) return;
+    const note: TaskNote = { taskId, at: Date.now(), kind, text };
+    pi.appendEntry(JOURNAL_ENTRY, note);
+  }
+
   function startAssignedWork(
     ctx: ExtensionContext,
     cfg: FreeqConfig,
     rec: HandoffRecord,
     fromNick: string,
+    resuming = false,
   ): void {
     // Tie presence to the task, so the room can see who is on what.
     workLabel = `handoff: ${rec.title}`.slice(0, 80);
     workTask = rec.id;
     pushStatus("executing", workLabel, workTask, true);
+
+    // On a fresh start, note the brief. On a resume, read back what this
+    // session had done and put it in front of the model - a resumed task that
+    // arrives as a bare title makes the agent start over.
+    const previous = resuming ? resumePreamble(notesFor(ctx.sessionManager.getEntries(), rec.id)) : "";
+    journal(resuming ? "resume" : "start", rec.id, resuming ? "resumed after restart" : `took on: ${rec.title}`);
 
     // Start the clocks. Nothing tracked the work past this point before, so a
     // model that wandered off left the task assigned until the server's
@@ -979,6 +1009,7 @@ export default function (pi: ExtensionAPI): void {
         `Task id: ${rec.id}\n` +
         (rec.caps ? `Declared capabilities: ${rec.caps}\n` : "") +
         (rec.note ? `\nBrief:\n${rec.note}\n` : "") +
+        (previous ? `\n${previous}\n` : "") +
         `\nWork on this in THIS environment. When you are done, report what you ` +
         `did and mark it complete with the freeq tool (action 'complete', ` +
         `taskId '${rec.id}'). Do not send secrets or absolute paths back.`,
@@ -1898,6 +1929,7 @@ export default function (pi: ExtensionAPI): void {
           // A manual heartbeat is also a sign of life: it resets the stall clock.
           watchdog?.touch(Date.now(), rec.id);
           const ok = await conn?.sendAct(rec.channel, "progress", rec.id, { note });
+          journal("progress", rec.id, note);
           ctx.ui.notify(
             ok
               ? `freeq: reported progress on ${rec.id.slice(0, 10)}`
