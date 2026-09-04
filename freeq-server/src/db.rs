@@ -225,6 +225,15 @@ pub struct ActLoggedEvent {
     /// `None` for a receipt, which carries no confirm state of its own: it is
     /// the answer, not something awaiting one.
     pub confirm: Option<crate::events::ConfirmState>,
+    /// Whether this server could check the signature, and what it found.
+    ///
+    /// Surfaced because a receipt page that only shows a green tick is asking
+    /// to be trusted; a reader needs to see the verdict AND the bytes it was
+    /// reached from.
+    pub sig_state: String,
+    /// The server this event reached us from, when it was relayed. Empty for
+    /// events raised here.
+    pub origin: String,
     pub timestamp: i64,
 }
 
@@ -9350,7 +9359,7 @@ impl Db {
         // caller, which interleaves them with messages in time order.
         let mut stmt = self.conn.prepare(
             "SELECT event_id, canonical, signature, actor_did, venue, confirm_state,
-                    timestamp
+                    timestamp, sig_state, COALESCE(origin, '')
                FROM events
               WHERE kind = 'act' AND venue = ?1
                 AND timestamp >= ?2 AND timestamp <= ?3
@@ -9372,6 +9381,8 @@ impl Db {
                 actor_did: row.get(3)?,
                 venue: row.get(4)?,
                 timestamp: row.get(6)?,
+                sig_state: row.get(7)?,
+                origin: row.get(8)?,
             })
         })?;
         let mut events: Vec<ActLoggedEvent> = rows.collect::<SqlResult<_>>()?;
@@ -9406,7 +9417,7 @@ impl Db {
     pub fn act_task_events(&self, act_id: &str) -> SqlResult<Vec<ActLoggedEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT event_id, canonical, signature, actor_did, venue, confirm_state,
-                    timestamp
+                    timestamp, sig_state, COALESCE(origin, '')
                FROM events
               WHERE kind = 'act' AND (event_id = ?1 OR subject = ?1)
               ORDER BY timestamp, event_id",
@@ -9426,6 +9437,8 @@ impl Db {
                 actor_did: row.get(3)?,
                 venue: row.get(4)?,
                 timestamp: row.get(6)?,
+                sig_state: row.get(7)?,
+                origin: row.get(8)?,
             })
         })?;
         rows.collect()

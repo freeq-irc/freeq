@@ -273,6 +273,10 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .route("/metrics", get(api_metrics))
         .route("/api/v1/actions", get(api_act_tasks))
         .route("/api/v1/actions/{act_id}", get(api_act_task))
+        // The human-readable twin of the JSON above: a claim about signed,
+        // cross-server delegation should be a URL a sceptic can open, not a
+        // sentence in a README.
+        .route("/act/{act_id}", get(crate::receipt::act_receipt))
         .route("/api/v1/channels", get(api_channels))
         .route("/api/v1/channels/{name}/history", get(api_channel_history))
         .route("/api/v1/search", get(api_search))
@@ -974,7 +978,7 @@ async fn api_channel_events(
 /// conversation is readable only by its two participants — channel
 /// authorization says nothing about DMs, and without this the listing would
 /// publish who is tasking whom.
-fn authorize_venue_read(state: &SharedState, venue: &str, headers: &axum::http::HeaderMap) -> bool {
+pub(crate) fn authorize_venue_read(state: &SharedState, venue: &str, headers: &axum::http::HeaderMap) -> bool {
     match venue.strip_prefix("dm:") {
         Some(pair) => caller_did_from_bearer(state, headers)
             .is_some_and(|did| pair.split(',').any(|p| p == did)),

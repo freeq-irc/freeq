@@ -2,6 +2,7 @@
 //! IRC server with AT Protocol SASL authentication.
 
 pub mod act_relay;
+pub mod receipt;
 pub mod agent_assist;
 pub mod agent_surfaces;
 pub mod av;
