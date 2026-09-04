@@ -122,15 +122,51 @@ pub(super) fn attach_same_did(
             "Reclaimed ghost session — suppressing quit/join churn"
         );
 
-        // Adopt the ghost's nick
-        if conn.nick.as_ref().map(|n| n.to_lowercase()) != Some(ghost.nick.to_lowercase()) {
-            if let Some(ref old_nick) = conn.nick {
-                state.nick_to_session.lock().remove_by_nick(old_nick);
+        // Adopt the ghost's nick — unless this session deliberately asked for
+        // a different one.
+        //
+        // Ghost adoption exists so a blip does not churn a nick, not to veto a
+        // rename. Overriding unconditionally meant a client that changed its
+        // configured nick and restarted silently got the old one back, because
+        // a restart almost always lands inside the 30s grace window. The
+        // change looked like it had been ignored, and the only way to make one
+        // stick was to stay disconnected for half a minute — which nobody
+        // guesses.
+        let requested = conn.nick.clone();
+        let wants_rename = requested
+            .as_ref()
+            .is_some_and(|n| !n.eq_ignore_ascii_case(&ghost.nick));
+        let effective_nick = if wants_rename {
+            // `bind_identity_with_fallback` moves the DID's registration and
+            // releases the old name; if the request collides with somebody
+            // else it derives a stable variant rather than failing.
+            let requested = requested.expect("wants_rename implies a requested nick");
+            let assigned = state.bind_identity_with_fallback(&did, &requested);
+            tracing::info!(
+                did = %did, from = %ghost.nick, to = %assigned,
+                "Honouring a rename across a ghost reclaim"
+            );
+            {
+                let mut n2s = state.nick_to_session.lock();
+                n2s.remove_by_nick(&ghost.nick);
+                n2s.remove_by_nick(&requested);
             }
-            conn.nick = Some(ghost.nick.clone());
-        }
+            conn.nick = Some(assigned.clone());
+            assigned
+        } else {
+            if conn.nick.as_ref().map(|n| n.to_lowercase()) != Some(ghost.nick.to_lowercase()) {
+                if let Some(ref old_nick) = conn.nick {
+                    state.nick_to_session.lock().remove_by_nick(old_nick);
+                }
+                conn.nick = Some(ghost.nick.clone());
+            }
+            ghost.nick.clone()
+        };
         // Point the nick at the new session
-        state.nick_to_session.lock().insert(&ghost.nick, session_id);
+        state
+            .nick_to_session
+            .lock()
+            .insert(&effective_nick, session_id);
 
         // Re-join all channels the ghost was in (silently — no broadcast).
         // Remove the stale ghost session_id and replace with the new one.

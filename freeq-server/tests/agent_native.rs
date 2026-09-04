@@ -3915,3 +3915,49 @@ async fn presence_relay_carries_state_and_task() {
     watcher.quit(None).await.unwrap();
     server_handle.abort();
 }
+
+/// A rename must survive a ghost reclaim.
+///
+/// Ghost adoption exists so a blip does not churn a nick. It used to override
+/// the requested nick unconditionally, which meant changing your configured
+/// nick and restarting silently gave you the old one back — a restart almost
+/// always lands inside the 30s grace window. The only way to make a rename
+/// stick was to stay disconnected for half a minute, which nobody guesses.
+#[tokio::test]
+async fn a_reconnect_that_asks_for_a_new_nick_keeps_it() {
+    start_deadlock_detector();
+    let (addr, _server_handle) = start_test_server_with_db(empty_resolver(), true).await;
+
+    let (_did, signer) = make_did_key_signer();
+
+    let (first, mut first_ev) = connect_did_key_with_signer(addr, "old-name", signer.clone()).await;
+    first.join("#room").await.unwrap();
+    expect_event(
+        &mut first_ev,
+        2000,
+        |e| matches!(e, Event::Joined { channel, .. } if channel == "#room"),
+        "joined #room",
+    )
+    .await;
+
+    // Disconnect and come straight back — inside the ghost grace window,
+    // which is what a real restart does.
+    first.quit(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let (second, mut second_ev) =
+        connect_did_key_with_signer(addr, "new-name", signer.clone()).await;
+
+    // The reclaim still happens — channels come back — and the synthetic
+    // NAMES names the recipient, so one line proves both halves at once.
+    let line = expect_raw_line(&mut second_ev, 3000, " 353 ", "ghost reclaim NAMES").await;
+    assert!(
+        line.contains("353 new-name"),
+        "a deliberate rename must survive a ghost reclaim; server still calls us: {line}"
+    );
+    assert!(
+        line.contains("#room"),
+        "the reclaim must still restore channels: {line}"
+    );
+    let _ = second;
+}
