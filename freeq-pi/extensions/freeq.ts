@@ -33,6 +33,7 @@ import { authorizeInstructions, creatorKeyPath, interpretProvenanceNotice } from
 import { McpStdioClient } from "../src/mcp-stdio.js";
 import { addressedUtterances, parseListenResult, toBridgeCall, type AvParams } from "../src/av.js";
 import { parseVerbositySteer } from "../src/steer.js";
+import { footerLine, offerCardLines, rosterLines } from "../src/ui.js";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import {
@@ -178,11 +179,70 @@ export default function (pi: ExtensionAPI): void {
   /** Accumulates this turn's consequences for the provenance log. */
   const turn = new TurnRecorder();
 
+  /**
+   * Paint everything persistent from current state: footer status, terminal
+   * title, and the offer card above the editor. Called from every event that
+   * changes any of it, and cheap enough to call generously - it renders from
+   * memory and pi coalesces redraws.
+   *
+   * Before this the extension used exactly two UI primitives, notify and
+   * confirm. Every fact scrolled past as a toast and was gone; you could not
+   * glance at the terminal and see that you were online, who was around, or
+   * that work was waiting for you.
+   */
+  let uiCtx: ExtensionContext | undefined;
+  function refreshUi(ctx?: ExtensionContext): void {
+    const c = ctx ?? uiCtx;
+    if (!c?.hasUI) return;
+    uiCtx = c;
+    const online = conn?.state === "online";
+    const waiting = offers?.all() ?? [];
+    const store = handoffs;
+
+    c.ui.setStatus(
+      "freeq",
+      footerLine({
+        online,
+        passive,
+        nick: conn?.nick,
+        channels: config?.channels.length ?? 0,
+        peers: conn?.peers().length ?? 0,
+        offersWaiting: waiting.length,
+        working: workLabel,
+        inCall: avChannel,
+      }),
+    );
+
+    // Title: which agent this window is, so a row of terminals reads.
+    if (online && conn?.nick) c.ui.setTitle(`pi · ${conn.nick}`);
+
+    // Offer card: the oldest waiting offer, until acted on.
+    const first = waiting[0];
+    const rec = first && store ? store.get(first.taskId) : undefined;
+    if (rec && config) {
+      c.ui.setWidget(
+        "freeq-offer",
+        offerCardLines({
+          taskId: rec.id,
+          title: rec.title,
+          from: rec.lastActor ?? rec.offerer.slice(0, 16),
+          tier: tierFor(config, rec.offerer),
+          queuedAt: first.queuedAt,
+          deadline: rec.deadline,
+          brief: rec.note,
+        }),
+      );
+    } else {
+      c.ui.setWidget("freeq-offer", undefined);
+    }
+  }
+
   function pushStatus(state: string, label?: string, task?: string, force = false): void {
     if (!conn || conn.state !== "online") return;
     const now = Date.now();
     if (!force && now - lastStatusPush < 2500) return;
     lastStatusPush = now;
+    refreshUi();
     conn.setWorkState(state, label, task);
   }
 
@@ -691,6 +751,7 @@ export default function (pi: ExtensionAPI): void {
       // is exactly when accepted work goes quiet without anybody deciding it
       // should.
       onOnline: () => {
+        refreshUi(ctx);
         void (async () => {
           const message = await resumeAssigned(ctx, cfg);
           if (message !== "freeq: nothing to resume") notify(ctx, message, "info");
@@ -726,6 +787,7 @@ export default function (pi: ExtensionAPI): void {
   // ── lifecycle ───────────────────────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
+    uiCtx = ctx;
     const cfg = await ensureConfig(ctx);
     if (!cfg.enabled || !isDid(cfg.ownerDid)) return; // silent when not set up
     const msg = await connect(ctx);
@@ -1779,6 +1841,66 @@ export default function (pi: ExtensionAPI): void {
 
   // ── /freeq ──────────────────────────────────────────────────────────────
 
+  // ── Autocomplete ───────────────────────────────────────────────────────
+  //
+  // Task ids are ULIDs and peer nicks are things like chad-bot-mdsnd. Nobody
+  // types those. After `/freeq <sub> `, complete the argument from live
+  // state: subcommands, then peers or task ids as the subcommand demands.
+  const SUBCOMMANDS = [
+    "status", "peers", "join", "leave", "mode", "trust", "mute", "unmute", "on", "off",
+    "tasks", "resume", "accept", "decline", "drop", "progress", "login", "authorize",
+    "takeover", "verbosity", "provenance", "call", "hangup",
+  ];
+  const TASK_SUBS = new Set(["accept", "decline", "drop", "progress", "resume"]);
+  const PEER_SUBS = new Set(["trust"]);
+  pi.on("session_start", async (_e, ctx) => {
+    if (!ctx.hasUI) return;
+    ctx.ui.addAutocompleteProvider((current) => ({
+      triggerCharacters: [],
+      async getSuggestions(lines, line, col, options) {
+        const before = (lines[line] ?? "").slice(0, col);
+        const m = before.match(/^\/freeq(?:\s+(\S*))?(?:\s+(\S*))?$/);
+        if (!m) return current.getSuggestions(lines, line, col, options);
+        const [, sub = "", arg] = m;
+        // Completing the subcommand.
+        if (arg === undefined) {
+          const items = SUBCOMMANDS.filter((c) => c.startsWith(sub)).map((c) => ({ value: c, label: c }));
+          return { prefix: sub, items };
+        }
+        // Completing the argument.
+        if (TASK_SUBS.has(sub)) {
+          const recs = handoffs?.all() ?? [];
+          const items = recs
+            .filter((r) => r.id.toLowerCase().startsWith(arg.toLowerCase()))
+            .slice(0, 12)
+            .map((r) => ({ value: r.id.slice(0, 10), label: r.id.slice(0, 10), description: `${r.state} · ${r.title}` }));
+          return { prefix: arg, items };
+        }
+        if (PEER_SUBS.has(sub)) {
+          const items = (conn?.peers() ?? [])
+            .filter((p) => p.did)
+            .filter((p) => p.nick.toLowerCase().startsWith(arg.toLowerCase()) || (p.did ?? "").startsWith(arg))
+            .map((p) => ({ value: p.did!, label: p.nick, description: p.did }));
+          return { prefix: arg, items };
+        }
+        if (sub === "join" || sub === "leave" || sub === "mode" || sub === "call") {
+          const chans = (config?.channels ?? []).filter((c) => c.startsWith(arg || "#"));
+          return { prefix: arg, items: chans.map((c) => ({ value: c, label: c })) };
+        }
+        return current.getSuggestions(lines, line, col, options);
+      },
+      applyCompletion(lines, line, col, item, prefix) {
+        return current.applyCompletion(lines, line, col, item, prefix);
+      },
+      shouldTriggerFileCompletion(lines, line, col) {
+        const before = (lines[line] ?? "").slice(0, col);
+        if (/^\/freeq\b/.test(before)) return false;
+        return current.shouldTriggerFileCompletion?.(lines, line, col) ?? true;
+      },
+    }));
+    refreshUi(ctx);
+  });
+
   pi.registerCommand("freeq", {
     description: "freeq multiplayer: login, authorize, status, join, leave, peers, mode, trust, call, hangup",
     handler: async (args, ctx) => {
@@ -2190,12 +2312,18 @@ export default function (pi: ExtensionAPI): void {
             );
             return;
           }
-          const lines = peers.map((p) => {
-            const age = Math.round((Date.now() - p.seen) / 1000);
-            const tier = tierFor(cfg, p.did);
-            return `${p.nick}${p.isPi ? " (agent)" : ""}  ${describeMeta(p.meta)}  ` +
-              `tier=${tier}  [${p.did ?? "no did"}]  ${age}s ago`;
-          });
+          const lines = rosterLines(
+            peers.map((p) => ({
+              nick: p.nick,
+              did: p.did,
+              state: p.state,
+              working: p.meta.status,
+              project: p.meta.project,
+              model: p.meta.model,
+              seen: p.seen,
+              tier: p.did ? tierFor(cfg, p.did) : undefined,
+            })),
+          );
           ctx.ui.notify(`freeq peers (${peers.length}):\n${lines.join("\n")}`, "info");
           return;
         }

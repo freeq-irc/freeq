@@ -70,7 +70,9 @@ export function offerCardLines(o: OfferCardInput, width = 72): string[] {
   const age = formatAge(now - o.queuedAt);
   const due = o.deadline ? ` · due ${formatAge(o.deadline - now, true)}` : "";
   const id = o.taskId.slice(0, 10);
-  const head = `┌─ handoff offered ${"─".repeat(Math.max(0, width - 22))}┐`;
+  // Header is `┌─ <label> ─…─┐`, padded so every row is exactly `width` wide.
+  const label = "─ handoff offered ";
+  const head = `┌${label}${"─".repeat(Math.max(0, width - 2 - [...label].length))}┐`;
   const rows: string[] = [
     head,
     `│ ${fit(o.title, width - 4)} │`,
