@@ -17,19 +17,27 @@ pi (philipp, laptop)─┘
 ## Install
 
 ```bash
+pi install npm:@freeq/pi
+```
+
+That is the whole of it. The extension loads on pi's next start.
+
+From a clone instead, if you mean to work on it:
+
+```bash
 git clone https://github.com/freeq-irc/freeq.git
 cd freeq/freeq-pi
 npm install            # also builds the linked @freeq/sdk and @freeq/bot-kit
 pi install "$(pwd)"
 ```
 
-`npm install` is required before `pi install`: the SDK and bot-kit are linked
-from the same repo and must be compiled first (a `prepare` script handles it).
+`npm install` is required before `pi install` in that case: the SDK and
+bot-kit are linked from the same repo and must be compiled first (a `prepare`
+script handles it).
 
-Publishing to npm — which would make this `pi install npm:@freeq/pi` — is not
-done yet. Note that `pi install git:github.com/freeq-irc/freeq` reports
-success but installs nothing, since pi expects the package manifest at the
-repo root and this package lives in a subdirectory.
+Note that `pi install git:github.com/freeq-irc/freeq` reports success and
+installs nothing, because pi expects the package manifest at the repo root and
+this package lives in a subdirectory. Use the npm form.
 
 Then, in pi:
 

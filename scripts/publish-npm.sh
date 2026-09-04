@@ -28,7 +28,12 @@ DRY=""
 # consumer of pi installed minutes after pi went up still needs bot-kit to be
 # there — hence the order, not just the convention.
 PKGS=(freeq-sdk-js freeq-bot-kit-js freeq-mcp freeq-pi)
-VERSION="0.1.0"
+
+# Read each package's own version rather than pinning one here. A hardcoded
+# version silently skips a package that has moved on - which is exactly what a
+# patch release is - and "already published, skipping" is the least helpful
+# possible way to learn that.
+pkg_version() { node -e "process.stdout.write(require('./$1/package.json').version)"; }
 
 restore() {
   git checkout -- freeq-bot-kit-js/package.json freeq-mcp/package.json freeq-pi/package.json 2>/dev/null || true
@@ -60,8 +65,8 @@ if [[ -n "$(git status --porcelain)" ]]; then
 fi
 
 echo
-echo "── rewriting sibling deps to ^${VERSION} ─────────────"
-python3 - "$VERSION" <<'PY'
+echo "── rewriting sibling deps ───────────────────────────"
+python3 - "$(pkg_version freeq-sdk-js)" <<'PY'
 import json, pathlib, sys
 version = sys.argv[1]
 for d in ("freeq-bot-kit-js", "freeq-mcp", "freeq-pi"):
@@ -85,11 +90,12 @@ echo
 echo "── publishing ───────────────────────────────────────"
 for p in "${PKGS[@]}"; do
   name=$(node -e "process.stdout.write(require('./$p/package.json').name)")
-  if npm view "$name@$VERSION" version >/dev/null 2>&1; then
-    echo "  $name@$VERSION already published — skipping"
+  v=$(pkg_version "$p")
+  if npm view "$name@$v" version >/dev/null 2>&1; then
+    echo "  $name@$v already published — skipping"
     continue
   fi
-  echo "  publishing $name@$VERSION"
+  echo "  publishing $name@$v"
   ( cd "$p" && npm publish --access public $DRY )
 done
 
@@ -97,5 +103,6 @@ echo
 if [[ -n "$DRY" ]]; then
   echo "dry run complete — nothing was published."
 else
-  echo "published. Verify with:  npx -y @freeq/mcp --help"
+  echo "published. Verify the on-ramp from a CLEAN directory, not this one:"
+  echo "    cd \$(mktemp -d) && npm init -y >/dev/null && pi install npm:@freeq/pi && pi -p 'say READY'"
 fi
