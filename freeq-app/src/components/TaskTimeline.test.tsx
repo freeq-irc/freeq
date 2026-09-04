@@ -149,3 +149,23 @@ describe('a row of a task s history', () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 });
+
+describe('public receipt permalink', () => {
+  it('offers a link a stranger can open, pointing at the task id', async () => {
+    // The in-app panel proves a signature to whoever is already logged in.
+    // This is the version you paste to someone who is not, and who has no
+    // reason to take our word for anything.
+    vi.spyOn(api, 'apiFetch').mockResolvedValue(
+      new Response(JSON.stringify({ task: null, events: served() }), { status: 200 }),
+    );
+    const { container } = render(<TaskTimeline actId={OPENER} onClose={() => {}} />);
+    await waitFor(() => expect(container.querySelector('a[href^="/act/"]')).toBeTruthy());
+
+    const link = container.querySelector('a[href^="/act/"]') as HTMLAnchorElement;
+    expect(link.getAttribute('href')).toBe(`/act/${OPENER}`);
+    // Opening evidence must not navigate away from the conversation, and an
+    // external tab gets no handle back on this one.
+    expect(link.target).toBe('_blank');
+    expect(link.rel).toContain('noopener');
+  });
+});

@@ -68,7 +68,29 @@ function ActionTimeline({ actId, onClose }: { actId: string; onClose: () => void
           {title && <span className="font-semibold text-sm text-fg">{title}</span>}
           <span className="text-[10px] font-mono text-fg-dim/60">{actId.slice(0, 12)}</span>
         </div>
-        <button onClick={onClose} className="text-fg-dim hover:text-fg text-sm">✕</button>
+        <div className="flex items-center gap-2">
+          {/*
+            A permalink to the public receipt.
+            The in-app panel already proves a signature to whoever is logged
+            in; this is the version you can paste to somebody who is not, and
+            who has no reason to take our word for anything. The page carries
+            the canonical bytes and the key-fetch command rather than a tick.
+            It inherits the room's privacy - a task in a +i, +k or E2EE
+            channel answers 403 to a stranger - so the link is offered for
+            every task and is honest either way rather than us guessing here
+            which rooms are public.
+          */}
+          <a
+            href={`/act/${encodeURIComponent(actId)}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            title="Public receipt: the signed chain, with the exact bytes, checkable by anyone"
+            className="text-[10px] text-fg-dim/60 hover:text-fg-muted underline decoration-dotted"
+          >
+            receipt ↗
+          </a>
+          <button onClick={onClose} className="text-fg-dim hover:text-fg text-sm">✕</button>
+        </div>
       </div>
 
       <div className="px-3 py-2">
