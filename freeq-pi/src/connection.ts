@@ -544,6 +544,15 @@ export class FreeqConnection {
    * through here — keeping it in one place is what makes the guarantee
    * auditable, rather than relying on each call site to remember.
    */
+  /**
+   * Scrub text bound for the wire by any path - a channel message, an ask, a
+   * spoken line in a call. Public so the AV tool gets the same redaction as
+   * everything else; a secret said out loud is still a leaked secret.
+   */
+  scrubForWire(text: string, target: string): string {
+    return this.#clean(text, target);
+  }
+
   #clean(text: string, target: string): string {
     const { text: scrubbed, hits } = scrubOutbound(text);
     if (hits.length) this.#opts.onScrub?.(hits, target);

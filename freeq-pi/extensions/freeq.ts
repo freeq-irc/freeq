@@ -30,6 +30,9 @@ import {
 } from "../src/config.js";
 import { deriveInstallSlug, defaultNick, isDid } from "../src/identity.js";
 import { authorizeOwner, creatorKeyPath } from "../src/owner-key.js";
+import { McpStdioClient } from "../src/mcp-stdio.js";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import {
   JOURNAL_ENTRY,
   notesFor,
@@ -711,6 +714,7 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
+    await hangup("session shutdown");
     stopMaintenance();
     // Say why the work stopped rather than letting it simply go quiet. NOT a
     // failure: a restart may pick it straight back up (see resumeAssigned),
@@ -1111,6 +1115,179 @@ export default function (pi: ExtensionAPI): void {
   }
 
   // ── the tool ────────────────────────────────────────────────────────────
+
+  // ── Voice: join a freeq AV call ────────────────────────────────────────
+  //
+  // The AV bridge (freeq-claude-mcp) is an MCP server: it joins a call, runs
+  // STT, speaks via TTS, projects a visual tile. Until now only Claude Code
+  // could drive it, because only Claude Code speaks MCP. pi drives it here
+  // through the small stdio client in src/mcp-stdio.ts.
+  //
+  // What comes IN from the call goes through the same tier-gated `deliver`
+  // as a channel message: a voice line addressed to the agent is an inbound
+  // event from a server-resolved participant, not a privileged instruction.
+  // What goes OUT is under the model's control via the `freeq_av` tool.
+
+  let av: McpStdioClient | undefined;
+  let avChannel: string | undefined;
+  let avListening = false;
+
+  /** Where the bridge binary is. Built by `cargo build --release -p freeq-claude-mcp`. */
+  function avBinary(): string | undefined {
+    const candidates = [
+      process.env.FREEQ_AV_BRIDGE,
+      joinPath(homedir(), "src", "freeq", "target", "release", "freeq-claude-mcp"),
+    ].filter((c): c is string => !!c);
+    return candidates.find((c) => existsSync(c));
+  }
+
+  /**
+   * STT/TTS keys. Read from the environment first; failing that, from Claude
+   * Code's settings, which is where the AV skill has always kept them. They
+   * are handed to the bridge process and never logged or written.
+   */
+  async function avEnv(): Promise<NodeJS.ProcessEnv> {
+    const env: NodeJS.ProcessEnv = {};
+    const want = ["GROQ_API_KEY", "ELEVENLABS_API_KEY", "FREEQ_ELEVEN_VOICE_ID", "FREEQ_ELEVEN_MODEL"];
+    for (const k of want) if (process.env[k]) env[k] = process.env[k];
+    if (!env.GROQ_API_KEY || !env.ELEVENLABS_API_KEY) {
+      try {
+        const raw = await readFile(joinPath(homedir(), ".claude", "settings.json"), "utf8");
+        const settings = JSON.parse(raw) as { env?: Record<string, string> };
+        for (const k of want) if (!env[k] && settings.env?.[k]) env[k] = settings.env[k];
+      } catch {
+        /* no Claude settings; the bridge will say what it is missing */
+      }
+    }
+    return env;
+  }
+
+  async function hangup(reason: string): Promise<void> {
+    avListening = false;
+    const client = av;
+    av = undefined;
+    const ch = avChannel;
+    avChannel = undefined;
+    if (!client) return;
+    try {
+      if (client.alive) await client.call("freeq_disconnect", {}, 5_000);
+    } catch {
+      /* leaving is best-effort */
+    }
+    await client.close();
+    if (ch) pushStatus("active", undefined, undefined, true);
+    void reason;
+  }
+
+  /**
+   * Long-poll the bridge for transcripts and feed addressed ones to the
+   * model. Runs until hangup. Unaddressed lines are what the room is saying
+   * to each other - context, not a request - so they are not delivered; the
+   * model can ask for recent context with freeq_av(freeq_recall) if it needs
+   * it.
+   */
+  async function listenLoop(ctx: ExtensionContext, cfg: FreeqConfig): Promise<void> {
+    while (avListening && av?.alive) {
+      let result;
+      try {
+        // The bridge long-polls; give it generous room before we call it hung.
+        result = await av.call("freeq_listen", {}, 70_000);
+      } catch (err) {
+        if (!avListening) return;
+        notify(ctx, `freeq call: listen failed - ${(err as Error).message}`, "warning");
+        await new Promise((r) => setTimeout(r, 2_000));
+        continue;
+      }
+      let parsed: { transcripts?: Array<{ speaker: string; text: string; addressed?: boolean; question?: string }> } = {};
+      try {
+        parsed = JSON.parse(McpStdioClient.text(result));
+      } catch {
+        continue;
+      }
+      for (const t of parsed.transcripts ?? []) {
+        if (!t.addressed || !avChannel) continue;
+        const text = (t.question ?? t.text ?? "").trim();
+        if (!text) continue;
+        // Voice participants are resolved by the bridge from the AV roster;
+        // a nick we cannot map to a DID is a guest and gets the guest tier.
+        deliver(ctx, {
+          kind: "chat",
+          channel: avChannel,
+          from: t.speaker,
+          did: null,
+          text: `(spoken in the call) ${text}`,
+          addressed: true,
+          mode: cfg.muted ? "silent" : "addressed",
+          tier: tierFor(cfg, null),
+        });
+      }
+    }
+  }
+
+  pi.registerTool({
+    name: "freeq_av",
+    label: "freeq call",
+    description:
+      "Act in the freeq voice call this session has joined with /freeq call. " +
+      "'say' speaks a line (TTS) and posts it to the channel; 'post' drops text " +
+      "in the channel without speaking (links, code, decisions); 'show' puts a " +
+      "card on your video tile; 'show_file' renders a file slice; 'show_diff' a " +
+      "diff; 'participants' lists who is on the call; 'recall' searches recent " +
+      "transcript; 'status' sets your visual state (listening/thinking/presenting/idle). " +
+      "Use 'say' for what you would say out loud and 'post' for what people will " +
+      "want to scroll back to. Never speak secrets or absolute paths.",
+    parameters: Type.Object({
+      action: Type.Union([
+        Type.Literal("say"),
+        Type.Literal("post"),
+        Type.Literal("show"),
+        Type.Literal("show_file"),
+        Type.Literal("show_diff"),
+        Type.Literal("participants"),
+        Type.Literal("recall"),
+        Type.Literal("status"),
+      ]),
+      text: Type.Optional(Type.String({ description: "For say/post: the words. For recall: the query." })),
+      priority: Type.Optional(
+        Type.Union([Type.Literal("addressed"), Type.Literal("volunteer")], {
+          description: "For say: 'addressed' always speaks; 'volunteer' respects the room's cooldown.",
+        }),
+      ),
+      title: Type.Optional(Type.String()),
+      bullets: Type.Optional(Type.Array(Type.String())),
+      path: Type.Optional(Type.String({ description: "For show_file/show_diff: file path in the working tree." })),
+      lines: Type.Optional(Type.String({ description: "For show_file/show_diff: a line range like 40-80." })),
+      label: Type.Optional(Type.String({ description: "For status: listening | thinking | presenting | idle" })),
+    }),
+    async execute(_id, params) {
+      const out = (text: string, isError = false) => ({
+        content: [{ type: "text" as const, text }],
+        details: {},
+        isError,
+      });
+      if (!av?.alive || !avChannel) {
+        return out("Not in a call. Ask the user to run /freeq call #channel.", true);
+      }
+      const p = params as Record<string, unknown>;
+      const map: Record<string, [string, Record<string, unknown>]> = {
+        say: ["freeq_say", { text: p.text, priority: p.priority ?? "addressed" }],
+        post: ["freeq_post", { text: p.text }],
+        show: ["freeq_show", { kind: "card", title: p.title, bullets: p.bullets }],
+        show_file: ["freeq_show_file", { path: p.path, lines: p.lines }],
+        show_diff: ["freeq_show_diff", { path: p.path, lines: p.lines }],
+        participants: ["freeq_participants", {}],
+        recall: ["freeq_recall", { query: p.text }],
+        status: ["freeq_set_status", { label: p.label }],
+      };
+      const [tool, args] = map[String(p.action)] ?? [];
+      if (!tool) return out(`unknown action ${String(p.action)}`, true);
+      // Everything that leaves this process is scrubbed the same way a
+      // channel message is: secrets and absolute paths never reach a call.
+      if (typeof args.text === "string" && conn) args.text = conn.scrubForWire(args.text, avChannel);
+      const r = await av.call(tool, args, 30_000);
+      return out(McpStdioClient.text(r) || "(ok)", !!r.isError);
+    },
+  });
 
   pi.registerTool({
     name: "freeq",
@@ -1541,7 +1718,7 @@ export default function (pi: ExtensionAPI): void {
   // ── /freeq ──────────────────────────────────────────────────────────────
 
   pi.registerCommand("freeq", {
-    description: "freeq multiplayer: login, authorize, status, join, leave, peers, mode, trust",
+    description: "freeq multiplayer: login, authorize, status, join, leave, peers, mode, trust, call, hangup",
     handler: async (args, ctx) => {
       const [sub = "status", ...rest] = args.trim().split(/\s+/).filter(Boolean);
       const cfg = await ensureConfig(ctx);
@@ -1601,10 +1778,74 @@ export default function (pi: ExtensionAPI): void {
             );
             await conn?.stop("re-signing delegation");
             conn = undefined;
-            ctx.ui.notify(await connect(ctx), conn?.state === "online" ? "info" : "warning");
+            const reconnected = await connect(ctx);
+            ctx.ui.notify(reconnected, (conn as FreeqConnection | undefined)?.state === "online" ? "info" : "warning");
           } catch (err) {
             ctx.ui.notify(`freeq: authorize failed — ${(err as Error).message}`, "error");
           }
+          return;
+        }
+
+        case "call": {
+          const channel = rest[0];
+          if (!channel?.startsWith("#")) {
+            ctx.ui.notify("usage: /freeq call #channel", "warning");
+            return;
+          }
+          const bin = avBinary();
+          if (!bin) {
+            ctx.ui.notify(
+              "freeq call: bridge binary not found. Build it with " +
+                "`cargo build --release -p freeq-claude-mcp` in the freeq repo, or set FREEQ_AV_BRIDGE.",
+              "error",
+            );
+            return;
+          }
+          if (av) await hangup("switching calls");
+          const env = await avEnv();
+          const missing = ["GROQ_API_KEY", "ELEVENLABS_API_KEY"].filter((k) => !env[k]);
+          if (missing.length) {
+            ctx.ui.notify(`freeq call: missing ${missing.join(", ")} (STT/TTS keys)`, "warning");
+          }
+          try {
+            ctx.ui.notify(`freeq call: starting the bridge…`, "info");
+            av = await McpStdioClient.start({
+              command: bin,
+              env: { ...env, FREEQ_SERVER: cfg.server },
+              onStderr: () => {},
+              onExit: (code) => {
+                if (avListening) notify(ctx, `freeq call: bridge exited (code ${code})`, "warning");
+                avListening = false;
+                av = undefined;
+                avChannel = undefined;
+              },
+            });
+            const nick = cfg.nick ?? defaultNick(cfg.install ?? deriveInstallSlug());
+            const r = await av.call("freeq_connect", { channel, nick: `${nick}-voice`, start_if_idle: false }, 30_000);
+            if (r.isError) throw new Error(McpStdioClient.text(r));
+            avChannel = channel;
+            avListening = true;
+            pushStatus("executing", `on a call in ${channel}`, undefined, true);
+            ctx.ui.notify(
+              `freeq call: in ${channel}. Speak to the agent by name; it answers with the freeq_av tool. /freeq hangup to leave.`,
+              "info",
+            );
+            void listenLoop(ctx, cfg);
+          } catch (err) {
+            ctx.ui.notify(`freeq call: could not join - ${(err as Error).message}`, "error");
+            await hangup("join failed");
+          }
+          return;
+        }
+
+        case "hangup": {
+          if (!av) {
+            ctx.ui.notify("freeq: not in a call", "info");
+            return;
+          }
+          const ch = avChannel;
+          await hangup("user");
+          ctx.ui.notify(`freeq: left the call in ${ch}`, "info");
           return;
         }
 
