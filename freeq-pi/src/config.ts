@@ -36,9 +36,22 @@ export const TIER_RANK: Record<Tier, number> = {
 };
 export const DEFAULT_TIER: Tier = "observe";
 
+/**
+ * Per-project overrides, keyed by project slug (the git root's directory
+ * name). Identity is already per-project; channels had stayed global, so two
+ * windows in different repos joined the same rooms and a music project sat in
+ * a work channel. A project's entry REPLACES the global channel list rather
+ * than adding to it - "also join" is what the global list already means.
+ */
+export interface ProjectSettings {
+  channels?: string[];
+}
+
 export interface FreeqConfig {
   /** Owner DID (`did:plc:…`) — set by `/freeq login`. Undefined = not set up. */
   ownerDid?: string;
+  /** Per-project channel overrides, keyed by project slug. */
+  projects?: Record<string, ProjectSettings>;
   /** WebSocket URL of the freeq server. */
   server: string;
   /** Nick to register with. Defaults to `pi-<install>`. */
@@ -176,6 +189,18 @@ export function normalizeConfig(raw: unknown): FreeqConfig {
   base.maxResume = count(o.maxResume, base.maxResume);
   base.channels = normalizeChannels(o.channels);
 
+  if (o.projects && typeof o.projects === "object") {
+    const out: Record<string, ProjectSettings> = {};
+    for (const [slug, v] of Object.entries(o.projects as Record<string, unknown>)) {
+      if (!slug || !v || typeof v !== "object") continue;
+      const chans = normalizeChannels((v as Record<string, unknown>).channels);
+      // An entry with an empty list is meaningful: "this project joins
+      // nothing". Keep it; only drop entries that say nothing at all.
+      if (Array.isArray((v as Record<string, unknown>).channels)) out[slug] = { channels: chans };
+    }
+    if (Object.keys(out).length) base.projects = out;
+  }
+
   if (o.modes && typeof o.modes === "object") {
     for (const [k, v] of Object.entries(o.modes as Record<string, unknown>)) {
       if (typeof v === "string" && (MODES as readonly string[]).includes(v)) {
@@ -273,6 +298,34 @@ export async function saveConfig(agentDir: string, config: FreeqConfig): Promise
   const path = userConfigPath(agentDir);
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+}
+
+/**
+ * The channels this project should be in.
+ *
+ * A project entry wins outright when present; otherwise the global list. The
+ * caller passes the project slug because config does not know the cwd.
+ */
+export function channelsForProject(config: FreeqConfig, project?: string): string[] {
+  const entry = project ? config.projects?.[project] : undefined;
+  return entry?.channels ? [...entry.channels] : [...config.channels];
+}
+
+/**
+ * Return a config in which `project` joins exactly `channels`.
+ *
+ * Writing pins the project: once a window has said "join here" or "leave
+ * there", it stops inheriting later edits to the global list, which is the
+ * only reading under which /freeq leave means what it says.
+ */
+export function withProjectChannels(
+  config: FreeqConfig,
+  project: string,
+  channels: string[],
+): FreeqConfig {
+  const projects = { ...(config.projects ?? {}) };
+  projects[project] = { channels: [...new Set(channels.map((c) => c.trim()).filter(Boolean))] };
+  return { ...config, projects };
 }
 
 /** Effective mode for a channel. Mute forces `silent` everywhere. */

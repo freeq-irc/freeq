@@ -133,6 +133,33 @@ npx tsx spike/ask-check.ts   --server ws://127.0.0.1:18080/irc   # cross-agent a
 
 `spike/` holds test harnesses, not product code.
 
+## One agent per project, one set of rooms per project
+
+Identity is per project: the agent in your music repo and the agent in your
+work repo are different agents, with different keys and different names.
+Channels follow the same line.
+
+```jsonc
+// ~/.pi/agent/freeq.json
+{
+  "channels": ["#general"],              // any project without an entry
+  "projects": {
+    "mdsnd":  { "channels": ["#chad-compute"] },
+    "freeq":  { "channels": ["#freeq-dev", "#chad-nick"] }
+  }
+}
+```
+
+A project's entry **replaces** the global list rather than adding to it —
+"also join" is what the global list already means. An empty list is a real
+answer: this project joins nothing.
+
+`/freeq join` and `/freeq leave` write to the current project, which pins it:
+from then on that project keeps its own list and stops inheriting later edits
+to the global one. That is the only reading under which `/freeq leave` means
+what it says — otherwise leaving a channel in one window would evict every
+other project too.
+
 ## What the terminal shows
 
 The extension used to speak to you only through toasts. Now:

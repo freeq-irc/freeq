@@ -12,6 +12,8 @@ import {
   DEFAULT_PROGRESS_INTERVAL_SECS,
   DEFAULT_STALL_SECS,
   DEFAULT_MAX_RESUME,
+  channelsForProject,
+  withProjectChannels,
 } from "./config.js";
 
 describe("normalizeConfig", () => {
@@ -205,5 +207,36 @@ describe("resilience settings", () => {
     for (const key of ["autoAcceptWhenIdle", "offerTtlSecs", "stallSecs", "maxResume"]) {
       expect(projectOverrides({ [key]: 1 })).not.toHaveProperty(key);
     }
+  });
+});
+
+describe("per-project channels", () => {
+  it("a project entry replaces the global list, absence inherits it", () => {
+    const cfg = normalizeConfig({
+      channels: ["#chad-nick", "#freeq-dev"],
+      projects: { mdsnd: { channels: ["#chad-compute"] } },
+    });
+    expect(channelsForProject(cfg, "mdsnd")).toEqual(["#chad-compute"]);
+    expect(channelsForProject(cfg, "freeq")).toEqual(["#chad-nick", "#freeq-dev"]);
+    expect(channelsForProject(cfg, undefined)).toEqual(["#chad-nick", "#freeq-dev"]);
+  });
+
+  it("an explicitly empty project list means nothing, not 'inherit'", () => {
+    const cfg = normalizeConfig({ channels: ["#chad-nick"], projects: { quiet: { channels: [] } } });
+    expect(channelsForProject(cfg, "quiet")).toEqual([]);
+  });
+
+  it("writing pins the project without touching the global list or its siblings", () => {
+    const before = normalizeConfig({ channels: ["#chad-nick"], projects: { mdsnd: { channels: ["#chad-compute"] } } });
+    const after = withProjectChannels(before, "freeq", ["#chad-nick", "#freeq-dev"]);
+    expect(after.channels).toEqual(["#chad-nick"]);
+    expect(channelsForProject(after, "freeq")).toEqual(["#chad-nick", "#freeq-dev"]);
+    expect(channelsForProject(after, "mdsnd")).toEqual(["#chad-compute"]);
+  });
+
+  it("round-trips through normalize, so a written pin survives a reload", () => {
+    const written = withProjectChannels(normalizeConfig({ channels: [] }), "mdsnd", ["#chad-compute"]);
+    const reloaded = normalizeConfig(JSON.parse(JSON.stringify(written)));
+    expect(channelsForProject(reloaded, "mdsnd")).toEqual(["#chad-compute"]);
   });
 });

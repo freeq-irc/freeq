@@ -20,6 +20,8 @@ import { Container, Text } from "@earendil-works/pi-tui";
 import {
   loadConfig,
   saveConfig,
+  channelsForProject,
+  withProjectChannels,
   modeFor,
   tierFor,
   tierAtLeast,
@@ -230,6 +232,7 @@ export default function (pi: ExtensionAPI): void {
   }
   pi.on("turn_start", async (_e, ctx) => clearMark(ctx));
 
+  let currentProject: string | undefined;
   let uiCtx: ExtensionContext | undefined;
   function refreshUi(ctx?: ExtensionContext): void {
     const c = ctx ?? uiCtx;
@@ -631,6 +634,7 @@ export default function (pi: ExtensionAPI): void {
     // Claim this PROJECT's connection slot. The meta is collected first so the
     // lock, the identity and the nick all key off the same project name.
     const meta = await collectSessionMeta({ cwd: ctx.cwd, model: ctx.model?.id });
+    currentProject = meta.project;
     lock ??= new ConnectionLock(ConnectionLock.pathFor(agentDir, meta.project));
     const claim = await lock.acquire(ctx.cwd);
     if (!claim.held) {
@@ -668,7 +672,9 @@ export default function (pi: ExtensionAPI): void {
       slug: cfg.install ?? deriveInstallSlug(),
       nick: cfg.nick,
       creatorKeyPath: await existingCreatorKey(cfg),
-      channels: cfg.channels,
+      // Per-project: a music repo and a work repo are different agents and
+      // belong in different rooms. Falls back to the global list.
+      channels: channelsForProject(cfg, meta.project),
       meta,
       onNotice: (text, level) => notify(ctx, text, level),
 
@@ -2127,7 +2133,14 @@ export default function (pi: ExtensionAPI): void {
                     : "offline (not connected)"
               }`,
               `muted:    ${cfg.muted ? "YES — silent everywhere (/freeq unmute)" : "no"}`,
-              `channels: ${cfg.channels.length ? cfg.channels.join(", ") : "(none)"}`,
+              (() => {
+                const eff = channelsForProject(cfg, currentProject);
+                const pinned = currentProject ? cfg.projects?.[currentProject] !== undefined : false;
+                return (
+                  `channels: ${eff.length ? eff.join(", ") : "(none)"}` +
+                  (pinned ? ` (this project only)` : ` (global)`)
+                );
+              })(),
               `trusted:  ${Object.keys(cfg.trust).length} peer(s)`,
               `provenance: ${cfg.provenance ?? "decisions"}` +
                 (cfg.provenanceChannel ? ` → ${cfg.provenanceChannel}` : ""),
@@ -2224,10 +2237,16 @@ export default function (pi: ExtensionAPI): void {
             ctx.ui.notify(`usage: /freeq ${sub} #channel`, "warning");
             return;
           }
+          // Writing pins the project: from the first join or leave, this
+          // project keeps its own list and stops inheriting the global one.
+          const project = currentProject;
+          const current = channelsForProject(cfg, project);
           if (sub === "join") {
-            if (!cfg.channels.some((c) => c.toLowerCase() === channel.toLowerCase())) {
-              cfg.channels.push(channel);
-            }
+            const next = current.some((c) => c.toLowerCase() === channel.toLowerCase())
+              ? current
+              : [...current, channel];
+            if (project) Object.assign(cfg, withProjectChannels(cfg, project, next));
+            else cfg.channels = next;
             await saveConfig(agentDir, cfg);
             const ok = conn?.join(channel);
             ctx.ui.notify(
@@ -2237,10 +2256,17 @@ export default function (pi: ExtensionAPI): void {
               ok ? "info" : "warning",
             );
           } else {
-            cfg.channels = cfg.channels.filter((c) => c.toLowerCase() !== channel.toLowerCase());
+            const next = current.filter((c) => c.toLowerCase() !== channel.toLowerCase());
+            if (project) Object.assign(cfg, withProjectChannels(cfg, project, next));
+            else cfg.channels = next;
             await saveConfig(agentDir, cfg);
             conn?.leave(channel);
-            ctx.ui.notify(`freeq: left ${channel}`, "info");
+            ctx.ui.notify(
+              project
+                ? `freeq: left ${channel} for this project (${project}); other projects unaffected`
+                : `freeq: left ${channel}`,
+              "info",
+            );
           }
           return;
         }
