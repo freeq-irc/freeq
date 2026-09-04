@@ -12,7 +12,13 @@
 // — that last one by ruling, not omission: act-caps is a hint to store and
 // filter on, never a gate.
 
-import spec from "./act-transitions.json";
+// `with { type: "json" }` is not decoration: Node's ESM loader has required
+// the attribute since v22, so without it *any* consumer running this package
+// as plain ESM dies at import time with ERR_IMPORT_ATTRIBUTE_MISSING.
+// Bundlers tolerate the bare form, which is why it survives local dev and
+// breaks the first person to `node` against it. Same bug @freeq/sdk had in
+// identity-claim.ts; `module: esnext` below is what makes tsc emit it.
+import spec from "./act-transitions.json" with { type: "json" };
 
 /** How far an event's own clock may sit from a deadline and still count as
  * inside it — the same grace client-minted ids get, because federated
