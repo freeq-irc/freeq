@@ -9,6 +9,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.outlined.Memory
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -111,7 +112,8 @@ private fun SheetMemberRow(member: MemberInfo, onMemberClick: (String) -> Unit) 
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        val isAway = member.awayMsg != null
+        val isAway = member.isAway
+        val awayText = member.awayText
 
         // Presence dot
         Box(
@@ -151,12 +153,16 @@ private fun SheetMemberRow(member: MemberInfo, onMemberClick: (String) -> Unit) 
                         modifier = Modifier.size(14.dp)
                     )
                 }
-            }
-            if (isAway) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
+                // Only when the server said so; unlabelled stays a person.
+                if (member.isAgent) {
+                    Icon(
+                        Icons.Outlined.Memory,
+                        contentDescription = "Agent",
+                        tint = FreeqColors.accent,
+                        modifier = Modifier.size(13.dp)
+                    )
+                }
+                if (isAway) {
                     Surface(
                         shape = RoundedCornerShape(4.dp),
                         color = FreeqColors.warning.copy(alpha = 0.15f)
@@ -169,15 +175,24 @@ private fun SheetMemberRow(member: MemberInfo, onMemberClick: (String) -> Unit) 
                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
                         )
                     }
-                    if (!member.awayMsg.isNullOrEmpty()) {
-                        Text(
-                            text = member.awayMsg,
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
-                            maxLines = 1
-                        )
-                    }
                 }
+            }
+            // Under the name: what it is doing, else the away text.
+            member.activityLabel?.let {
+                Text(
+                    text = it,
+                    fontSize = 12.sp,
+                    color = FreeqColors.accent,
+                    maxLines = 1
+                )
+            }
+            if (!awayText.isNullOrEmpty()) {
+                Text(
+                    text = awayText,
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                    maxLines = 1
+                )
             }
         }
     }

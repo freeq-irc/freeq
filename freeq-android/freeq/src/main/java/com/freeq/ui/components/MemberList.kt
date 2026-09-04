@@ -9,6 +9,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.outlined.Memory
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -86,7 +87,8 @@ private fun MemberRow(member: MemberInfo, onMemberClick: ((String) -> Unit)? = n
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        val isAway = member.awayMsg != null
+        val isAway = member.isAway
+        val awayText = member.awayText
 
         // Presence dot — yellow if away, green if available
         Box(
@@ -125,6 +127,15 @@ private fun MemberRow(member: MemberInfo, onMemberClick: ((String) -> Unit)? = n
                         modifier = Modifier.size(13.dp)
                     )
                 }
+                // Only when the server said so; unlabelled stays a person.
+                if (member.isAgent) {
+                    Icon(
+                        Icons.Outlined.Memory,
+                        contentDescription = "Agent",
+                        tint = FreeqColors.accent,
+                        modifier = Modifier.size(13.dp)
+                    )
+                }
                 if (isAway) {
                     Surface(
                         shape = RoundedCornerShape(4.dp),
@@ -140,10 +151,19 @@ private fun MemberRow(member: MemberInfo, onMemberClick: ((String) -> Unit)? = n
                     }
                 }
             }
-            // Away message text
-            if (isAway && !member.awayMsg.isNullOrEmpty()) {
+            // What it is doing right now, if it says. An idle agent shows nothing.
+            member.activityLabel?.let {
                 Text(
-                    text = member.awayMsg,
+                    text = it,
+                    fontSize = 12.sp,
+                    color = FreeqColors.accent,
+                    maxLines = 1
+                )
+            }
+            // Away message text
+            if (!awayText.isNullOrEmpty()) {
+                Text(
+                    text = awayText,
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
                     maxLines = 1

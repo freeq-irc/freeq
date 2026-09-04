@@ -63,7 +63,14 @@ data class MemberInfo(
     val isHalfop: Boolean = false,
     val isVoiced: Boolean,
     val awayMsg: String? = null,
-    val did: String? = null
+    val did: String? = null,
+    /** `agent` | `external_agent` | `human`, when the server has told us.
+     *  Null means "not stated", which reads as human — the server reports
+     *  only the exceptions. */
+    val actorClass: String? = null,
+    /** Live agent state and what it is doing. Only agents publish these. */
+    val presenceState: String? = null,
+    val presenceStatus: String? = null
 ) {
     val prefix: String
         get() = when {
@@ -72,6 +79,36 @@ data class MemberInfo(
             isVoiced -> "+"
             else -> ""
         }
+
+    val isAgent: Boolean
+        get() = actorClass == "agent" || actorClass == "external_agent"
+
+    /** What to show beside an agent's name: what it is doing, else its state.
+     *  An idle agent says nothing — a row that always carries a label teaches
+     *  people to stop reading it. */
+    val activityLabel: String?
+        get() {
+            if (!isAgent) return null
+            if (!presenceStatus.isNullOrEmpty()) return presenceStatus
+            return when (presenceState) {
+                null, "online", "active", "idle" -> null
+                "executing" -> "working"
+                "waiting_for_input" -> "waiting for input"
+                "blocked_on_permission" -> "needs approval"
+                "paused" -> "paused"
+                "degraded" -> "degraded"
+                "rate_limited" -> "rate limited"
+                else -> presenceState.replace('_', ' ')
+            }
+        }
+
+    val isAway: Boolean
+        get() = awayMsg != null
+
+    /** The line under the name: the activity label wins, the away text
+     *  shows only when there is no label. Same as the macOS member row. */
+    val awayText: String?
+        get() = if (activityLabel == null) awayMsg else null
 }
 
 // ── Channel state ──
@@ -231,6 +268,29 @@ class ChannelState(val name: String) {
         change(target)
         if (target.isNotEmpty()) newReactions[emoji] = target
         messages[idx] = msg.copy(reactions = newReactions)
+    }
+
+    /** Apply roster-time actor classes to this channel's members. Humans are
+     *  omitted by the server, so anything absent stays human. */
+    fun applyActorClasses(classes: List<ActorClassEntry>) {
+        for (entry in classes) {
+            val idx = members.indexOfFirst { it.nick.equals(entry.nick, ignoreCase = true) }
+            if (idx < 0) continue
+            members[idx] = members[idx].copy(actorClass = entry.actorClass)
+        }
+    }
+
+    /** Apply live agent presence to this channel's copy of the nick. */
+    fun applyPresence(nick: String, state: String, status: String?) {
+        val idx = members.indexOfFirst { it.nick.equals(nick, ignoreCase = true) }
+        if (idx < 0) return
+        val m = members[idx]
+        members[idx] = m.copy(
+            // Publishing presence is itself proof this is an agent.
+            actorClass = m.actorClass ?: "agent",
+            presenceState = state,
+            presenceStatus = status
+        )
     }
 }
 
@@ -1835,9 +1895,18 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                 state.updateAwayStatus(event.nick, event.awayMsg)
             }
 
-            // Agent badges and presence are not shown on Android yet.
-            is FreeqEvent.ActorClasses -> Unit
-            is FreeqEvent.Presence -> Unit
+            is FreeqEvent.ActorClasses -> {
+                val ch = state.channels.firstOrNull { it.name.equals(event.channel, ignoreCase = true) }
+                ch?.applyActorClasses(event.classes)
+            }
+
+            // Every channel, so a working agent reads as working everywhere
+            // it is visible. `task` is not shown.
+            is FreeqEvent.Presence -> {
+                for (ch in state.channels) {
+                    ch.applyPresence(event.nick, event.state, event.status)
+                }
+            }
 
             is FreeqEvent.BatchStart -> {
                 state.batches[event.id] = BatchBuffer(target = event.target, batchType = event.batchType)
