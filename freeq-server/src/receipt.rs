@@ -391,6 +391,21 @@ mod tests {
     }
 
     #[test]
+    fn an_e2ee_channel_is_not_publicly_discoverable() {
+        // Distributing group keys makes a channel E2EE, and the receipt
+        // surface must follow: a public page describing work in a room whose
+        // contents nobody outside can read is a metadata leak dressed as
+        // transparency. encrypted_only is what restricts it.
+        let mut ch = crate::server::ChannelState::default();
+        assert!(!ch.is_mode_restricted());
+        ch.encrypted_only = true;
+        assert!(
+            ch.is_mode_restricted(),
+            "an E2EE channel must be restricted, so receipts for it are not public"
+        );
+    }
+
+    #[test]
     fn the_crossed_boundary_claim_needs_two_signers() {
         // Rendering "crossed an ownership boundary" for work that never left
         // one machine would be the page lying about the only thing it exists

@@ -2339,6 +2339,40 @@ async fn api_put_group_keys(
         }
     }
 
+    // A channel that has group keys is end-to-end encrypted, and an E2EE
+    // channel must not be publicly discoverable — its metadata surfaces
+    // (LIST, NAMES, REST reads, and now task receipts) would describe a room
+    // whose contents nobody outside can read. `encrypted_only` already
+    // restricts all of them; nothing was ever setting it, because clients
+    // publish keys and never think to also send MODE +E. So the server draws
+    // the conclusion itself.
+    //
+    // Hooked HERE rather than on seeing ciphertext in a message, because this
+    // path is already founder/DID-op gated. Inferring from a message would let
+    // any single member restrict a public channel by sending one encrypted
+    // line. The direction is also one-way on purpose: turning encryption on
+    // tightens access, and only an explicit MODE -E loosens it again.
+    if stored > 0 {
+        let mut changed = None;
+        {
+            let mut channels = state.channels.lock();
+            if let Some(ch) = channels.get_mut(&channel.to_lowercase())
+                && !ch.encrypted_only
+            {
+                ch.encrypted_only = true;
+                changed = Some(ch.clone());
+            }
+        }
+        if let Some(ch) = changed {
+            let key = channel.to_lowercase();
+            state.with_db(|db| db.save_channel(&key, &ch));
+            tracing::info!(
+                channel = %channel,
+                "channel marked +E: group keys were distributed, so it is E2EE and no longer publicly discoverable"
+            );
+        }
+    }
+
     (
         axum::http::StatusCode::OK,
         axum::Json(serde_json::json!({ "ok": true, "epoch": epoch, "stored": stored })),
