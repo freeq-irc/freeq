@@ -314,10 +314,13 @@ export class FreeqConnection {
       // reporting the channel as joined - which is how #freeq-dev sat in the
       // footer for a whole session while the agent was not in it. Being
       // wrong about where you are is worse than being nowhere.
-      bot.on("joinGateRequired", (channel: string) => {
+      bot.on("joinRejected", (channel: string, numeric: string, reason: string) => {
+        if (!channel) return;
         this.#joined.delete(channel.toLowerCase());
-        this.#refused.set(channel.toLowerCase(), "policy");
-        this.#opts.onJoinRefused?.(channel, "policy");
+        // 477 keeps its own word because it is the one with a remedy the
+        // agent can perform itself.
+        this.#refused.set(channel.toLowerCase(), numeric === "477" ? "policy" : reason);
+        this.#opts.onJoinRefused?.(channel, numeric === "477" ? "policy" : reason);
       });
 
       // Transport state is only 'connected' | 'connecting' | 'disconnected'.

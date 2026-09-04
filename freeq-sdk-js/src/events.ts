@@ -166,6 +166,16 @@ export interface FreeqEvents {
   /** Fired when the join gate (policy acceptance) is required. */
   joinGateRequired: (channel: string) => void;
 
+  /**
+   * A JOIN the server refused, with the numeric and a human reason.
+   *
+   * 477 also fires `joinGateRequired` (kept for callers that only handle the
+   * policy gate). This exists because a client that treats a refused JOIN as
+   * a successful one is confidently wrong about where it is - it waits for
+   * messages that were never coming and never notices their absence.
+   */
+  joinRejected: (channel: string, numeric: string, reason: string) => void;
+
   /** Fired when a user is kicked from a channel. */
   userKicked: (channel: string, kicked: string, by: string, reason: string) => void;
 

@@ -2911,17 +2911,21 @@ export class FreeqClient extends EventEmitter {
         break;
       case '473':
         this.emit('systemMessage', msg.params[1] || 'server', `Cannot join ${msg.params[1]} — invite only (+i)`);
+        this.emit('joinRejected', msg.params[1] || '', '473', 'invite only (+i)');
         break;
       case '474':
         this.emit('systemMessage', msg.params[1] || 'server', `Cannot join ${msg.params[1]} — you are banned`);
+        this.emit('joinRejected', msg.params[1] || '', '474', 'you are banned');
         break;
       case '475':
         this.emit('systemMessage', msg.params[1] || 'server', `Cannot join ${msg.params[1]} — incorrect channel key`);
+        this.emit('joinRejected', msg.params[1] || '', '475', 'incorrect channel key');
         break;
       case '477': {
         const ch = msg.params[1] || '';
         this.emit('systemMessage', 'server', `Cannot join ${ch}: ${msg.params[2] || 'Policy acceptance required'}`);
         this.emit('joinGateRequired', ch);
+        this.emit('joinRejected', ch, '477', 'policy acceptance required');
         break;
       }
       case '482':
