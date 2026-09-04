@@ -501,13 +501,15 @@ export default function (pi: ExtensionAPI): void {
       conn = undefined;
     }
 
-    // Claim the installation's single connection slot.
-    lock ??= new ConnectionLock(ConnectionLock.pathFor(agentDir));
+    // Claim this PROJECT's connection slot. The meta is collected first so the
+    // lock, the identity and the nick all key off the same project name.
+    const meta = await collectSessionMeta({ cwd: ctx.cwd, model: ctx.model?.id });
+    lock ??= new ConnectionLock(ConnectionLock.pathFor(agentDir, meta.project));
     const claim = await lock.acquire(ctx.cwd);
     if (!claim.held) {
       passive = true;
       return (
-        `freeq: another pi session on this installation holds the connection` +
+        `freeq: another pi session in this project holds the connection` +
         (claim.holder?.label ? ` (${claim.holder.label})` : "") +
         `. This window stays passive — one agent identity, one presence. ` +
         `Close that session, or run /freeq takeover here.`
@@ -532,8 +534,6 @@ export default function (pi: ExtensionAPI): void {
       }, 60_000);
       lockTimer.unref?.();
     }
-
-    const meta = await collectSessionMeta({ cwd: ctx.cwd, model: ctx.model?.id });
 
     conn = new FreeqConnection({
       ownerDid: cfg.ownerDid,

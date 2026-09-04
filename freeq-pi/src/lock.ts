@@ -55,8 +55,12 @@ export class ConnectionLock {
     this.#path = path;
   }
 
-  static pathFor(agentDir: string): string {
-    return join(agentDir, "freeq-connection.lock");
+  static pathFor(agentDir: string, project?: string): string {
+    // One lock per project identity, not per installation. Two windows in the
+    // same project are the same agent and must not both speak; two windows in
+    // different projects are different agents and must not block each other.
+    const suffix = project ? `-${project.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40)}` : "";
+    return join(agentDir, `freeq-connection${suffix}.lock`);
   }
 
   get held(): boolean {

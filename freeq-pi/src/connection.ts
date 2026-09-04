@@ -14,7 +14,7 @@ import type {
   PresencePayload,
 } from "@freeq/sdk";
 import { actTags } from "@freeq/sdk";
-import { botName, defaultNick } from "./identity.js";
+import { defaultNick, projectBotName, projectNick } from "./identity.js";
 import { describeMeta, formatStatus, parseStatus, type SessionMeta } from "./presence.js";
 import {
   buildHello,
@@ -218,10 +218,13 @@ export class FreeqConnection {
       const create: BotFactory =
         this.#opts.botFactory ?? ((o) => FreeqBot.create(o) as unknown as Promise<BotLike>);
       const bot = await create({
-        name: botName(this.#opts.slug),
+        // Identity is per project: a music repo and a work repo are different
+        // participants. The state dir and the nick both carry the project so
+        // the key is stable across restarts and the name says whose and which.
+        name: projectBotName(this.#opts.slug, this.#meta.project),
         ownerDid: this.#opts.ownerDid,
         creatorKeyPath: this.#opts.creatorKeyPath,
-        nick: this.#opts.nick ?? defaultNick(this.#opts.slug),
+        nick: projectNick(this.#opts.nick ?? defaultNick(this.#opts.slug), this.#meta.project),
         url: this.#opts.server,
         root: this.#opts.root,
         channels: this.#opts.channels,
@@ -417,6 +420,11 @@ export class FreeqConnection {
     if (liveNick) names.add(liveNick);
     const desired = this.#opts.nick;
     if (desired) names.add(desired);
+    // The project nick is what we actually registered as; the base nick is
+    // what teammates were told. "chad-bot" in a room where only
+    // "chad-bot-freeq" is present should still get an answer.
+    const base = this.#opts.nick ?? defaultNick(this.#opts.slug);
+    names.add(projectNick(base, this.#meta.project));
     for (const name of names) {
       const hit = matchMention(name, text);
       if (hit) return hit.stripped;
