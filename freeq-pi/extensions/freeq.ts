@@ -149,7 +149,6 @@ export default function (pi: ExtensionAPI): void {
   }
 
   /** Channel replies are chat, not essays. */
-  const MAX_CHANNEL_REPLY = 1200;
 
   // ── live work status ────────────────────────────────────────────────────
   //
@@ -784,13 +783,14 @@ export default function (pi: ExtensionAPI): void {
         continue;
       }
 
-      // Channel reply (Demo 2). Keep it chat-sized.
+      // Channel reply. Sent whole: the SDK already splits long text into a
+      // draft/multiline BATCH (or line-by-line where the cap is not acked),
+      // so a cap here only ever threw away the end of an answer. A reply cut
+      // at 1200 chars with "…(truncated)" is the worst of both worlds - it
+      // costs the tokens to produce and then withholds the part that
+      // usually held the conclusion.
       if (!lastAssistantText) continue;
-      const body =
-        lastAssistantText.length > MAX_CHANNEL_REPLY
-          ? `${lastAssistantText.slice(0, MAX_CHANNEL_REPLY)}\n…(truncated)`
-          : lastAssistantText;
-      conn.send(item.channel, `${item.from}: ${body}`);
+      conn.send(item.channel, `${item.from}: ${lastAssistantText}`);
       notify(ctx, `freeq: replied in ${item.channel} to ${item.from}`, "info");
     }
     lastAssistantText = "";
