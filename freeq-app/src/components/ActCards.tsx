@@ -60,18 +60,38 @@ function TaskIdBadge({ taskId, onClick }: { taskId?: string; onClick: () => void
  * clients draw (`checkmark.seal` on Apple, `verified` on Android), inline so
  * it inherits `currentColor` and nothing else.
  */
-function Seal({ onClick }: { onClick: () => void }) {
+export function Seal({ onClick, title }: { onClick?: (e: React.MouseEvent) => void; title?: string }) {
+  const mark = (
+    <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true">
+      <path d="M23 12l-2.44-2.79.34-3.69-3.61-.82-1.89-3.2L12 2.96 8.6 1.5 6.71 4.69 3.1 5.5l.34 3.7L1 12l2.44 2.79-.34 3.7 3.61.82L8.6 22.5l3.4-1.47 3.4 1.46 1.89-3.19 3.61-.82-.34-3.69L23 12zm-12.91 4.72l-3.8-3.81 1.48-1.48 2.32 2.33 5.85-5.87 1.48 1.48-7.33 7.35z" />
+    </svg>
+  );
+  // The seal states that a server checked this step against the rules. Where
+  // there is no panel behind it, it stays a statement: a button would invite a
+  // click it does not answer, and the seal does not mean "open me".
+  if (!onClick) {
+    return (
+      <span
+        data-testid="act-seal"
+        role="img"
+        aria-label="What the server enforced"
+        title={title}
+        className="text-fg-dim leading-none"
+      >
+        {mark}
+      </span>
+    );
+  }
   return (
     <button
       type="button"
       data-testid="act-seal"
       aria-label="What the server enforced"
+      title={title}
       onClick={onClick}
       className="text-fg-dim hover:text-fg-muted leading-none"
     >
-      <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true">
-        <path d="M23 12l-2.44-2.79.34-3.69-3.61-.82-1.89-3.2L12 2.96 8.6 1.5 6.71 4.69 3.1 5.5l.34 3.7L1 12l2.44 2.79-.34 3.7 3.61.82L8.6 22.5l3.4-1.47 3.4 1.46 1.89-3.19 3.61-.82-.34-3.69L23 12zm-12.91 4.72l-3.8-3.81 1.48-1.48 2.32 2.33 5.85-5.87 1.48 1.48-7.33 7.35z" />
-      </svg>
+      {mark}
     </button>
   );
 }
@@ -84,10 +104,11 @@ function Seal({ onClick }: { onClick: () => void }) {
  * the verb's name and never off the kind. A verb the rules file does not name
  * has no rule about a person to state, so the panel states none.
  */
-function SealPanel({ kind, verb, onHistory }: {
+export function SealPanel({ kind, verb, onHistory }: {
   kind: string;
   verb: string;
-  onHistory: () => void;
+  /** Absent on a surface with no task timeline to open, which drops the link. */
+  onHistory?: () => void;
 }) {
   const sentence = sealPanelSentence(verb);
   return (
@@ -99,14 +120,16 @@ function SealPanel({ kind, verb, onHistory }: {
         {sealPanelHeader(kind)}
       </div>
       {sentence && <p className="mt-1 text-fg-dim">{sentence}</p>}
-      <button
-        type="button"
-        data-testid="act-seal-history"
-        onClick={onHistory}
-        className="mt-1.5 text-accent hover:underline"
-      >
-        {sealPanelLinkText()}
-      </button>
+      {onHistory && (
+        <button
+          type="button"
+          data-testid="act-seal-history"
+          onClick={onHistory}
+          className="mt-1.5 text-accent hover:underline"
+        >
+          {sealPanelLinkText()}
+        </button>
+      )}
     </div>
   );
 }

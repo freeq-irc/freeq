@@ -82,7 +82,10 @@ export function ChannelSettingsPanel() {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm" onClick={() => setOpen(null)}>
-      <div className="bg-bg-secondary border border-border rounded-xl shadow-2xl w-full max-w-lg max-h-[80vh] flex flex-col overflow-hidden" onClick={(e) => e.stopPropagation()}>
+      {/* The audit list is a six-column table and needs the room; every other
+          tab keeps the narrow dialog. Read off the open tab's own marker so
+          the tab state stays where it is. */}
+      <div className="bg-bg-secondary border border-border rounded-xl shadow-2xl w-full max-w-lg has-[[data-tab=audit]]:max-w-3xl max-h-[80vh] flex flex-col overflow-hidden" onClick={(e) => e.stopPropagation()}>
         <SettingsContent channel={settingsChannel} onClose={() => setOpen(null)} />
       </div>
     </div>
@@ -639,7 +642,7 @@ function SettingsContent({ channel, onClose }: { channel: string; onClose: () =>
         )}
 
         {tab === 'audit' && (
-          <div className="h-[500px]">
+          <div data-tab="audit" className="h-[500px]">
             <AuditTimeline channel={channel} onClose={onClose} />
           </div>
         )}
