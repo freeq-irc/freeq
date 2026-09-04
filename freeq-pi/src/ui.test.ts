@@ -1,9 +1,11 @@
 import { describe, it, expect } from "vitest";
 import {
+  PEER_PALETTE,
   PEER_PALETTE_SIZE,
   footerLine,
   formatAge,
   offerCardLines,
+  peerColor,
   peerColorIndex,
   rosterLines,
 } from "./ui.js";
@@ -104,5 +106,28 @@ describe("footer names who is waiting", () => {
     expect(line).toContain("3 withheld");
     const quiet = footerLine({ online: true, nick: "chad-bot-freeq", channels: 2, peers: 1, offers: 0 });
     expect(quiet).not.toContain("withheld");
+  });
+});
+
+describe("peer colours", () => {
+  it("is stable for a DID and drab for a stranger", () => {
+    const a = peerColor("did:plc:k2n3e2vsihf3farequ44t5j7");
+    expect(peerColor("did:plc:k2n3e2vsihf3farequ44t5j7")).toBe(a);
+    expect(PEER_PALETTE).toContain(a);
+    // No DID means no server-resolved identity, so no identity colour.
+    expect(peerColor(undefined)).toBe("muted");
+  });
+
+  it("spreads DIDs across the palette rather than clustering", () => {
+    const seen = new Set(
+      Array.from({ length: 200 }, (_, i) => peerColor(`did:key:z6Mk${i}`)),
+    );
+    expect(seen.size).toBeGreaterThan(PEER_PALETTE.length / 2);
+  });
+
+  it("keys on the DID, not the nick, so a suffixed nick keeps its colour", () => {
+    // pi auto-suffixes on nick collision; recolouring someone at exactly the
+    // moment they become hard to identify would be the wrong trade.
+    expect(peerColor("did:key:zSame")).toBe(peerColor("did:key:zSame"));
   });
 });

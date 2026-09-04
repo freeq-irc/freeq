@@ -110,11 +110,46 @@ export function offerCardLines(o: OfferCardInput, width = 72): string[] {
  * can map it onto whatever the active theme offers. Eight entries: enough to
  * tell a handful of peers apart, few enough that the colours stay distinct.
  */
-export const PEER_PALETTE_SIZE = 8;
+/**
+ * Theme roles used to tell peers apart.
+ *
+ * Roles, not raw colours: pi themes are user-chosen and come in light and
+ * dark, so a hardcoded palette would be illegible in half of them and would
+ * ignore a preference the user has already expressed. These are picked for
+ * mutual contrast within any sane theme, and every one of them is a
+ * foreground role that a theme is required to define.
+ */
+export const PEER_PALETTE = [
+  "accent",
+  "success",
+  "warning",
+  "mdLink",
+  "syntaxKeyword",
+  "syntaxString",
+  "syntaxFunction",
+  "syntaxType",
+] as const;
+
+export type PeerColor = (typeof PEER_PALETTE)[number];
+export const PEER_PALETTE_SIZE = PEER_PALETTE.length;
 
 export function peerColorIndex(did: string): number {
   const h = createHash("sha256").update(did).digest();
   return h[0]! % PEER_PALETTE_SIZE;
+}
+
+/**
+ * A peer's colour, derived from their DID.
+ *
+ * Stable by construction: the same person is the same colour in every
+ * session, on every machine, with no shared state and no assignment protocol.
+ * Keyed on the DID rather than the nick because the nick is the part that
+ * changes - and colouring by nick would silently recolour someone the moment
+ * they suffixed it, which is exactly when you most want to recognise them.
+ */
+export function peerColor(did: string | undefined): PeerColor {
+  if (!did) return "muted" as PeerColor; // unauthenticated: deliberately drab
+  return PEER_PALETTE[peerColorIndex(did)]!;
 }
 
 // ── Peer roster ─────────────────────────────────────────────────────────

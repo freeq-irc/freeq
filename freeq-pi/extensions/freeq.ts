@@ -39,6 +39,7 @@ import { parseVerbositySteer } from "../src/steer.js";
 import { footerLine, offerCardLines, rosterLines } from "../src/ui.js";
 import { markForTerminal, supportsTruecolor, WORDMARK } from "../src/logo.js";
 import { WithheldBuffer, senderKey, withheldSummary } from "../src/withheld.js";
+import { peerColor } from "../src/ui.js";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import {
@@ -231,7 +232,16 @@ export default function (pi: ExtensionAPI): void {
     markVisible = false;
     ctx.ui.setWidget("freeq-mark", undefined);
   }
-  pi.on("turn_start", async (_e, ctx) => clearMark(ctx));
+  let peersVisible = false;
+  function clearPeers(ctx: ExtensionContext): void {
+    if (!peersVisible) return;
+    peersVisible = false;
+    ctx.ui.setWidget("freeq-peers", undefined);
+  }
+  pi.on("turn_start", async (_e, ctx) => {
+    clearMark(ctx);
+    clearPeers(ctx);
+  });
 
   // Messages addressed to us that the tier gate refused. Held so the agent
   // can say who is waiting instead of being indistinguishable from ignoring
@@ -1597,7 +1607,10 @@ export default function (pi: ExtensionAPI): void {
         cancel: "✗", peers: "⬡", handoffs: "≡", decision: "§",
       };
       let line = theme.fg("toolTitle", theme.bold("freeq ")) + theme.fg("accent", `${icon[verb] ?? "·"} ${verb}`);
-      if (who) line += theme.fg("dim", " → ") + theme.fg("accent", who);
+      // Colour the peer by their DID when we know it, so the same
+      // correspondent looks the same across sessions and machines.
+      const whoDid = conn?.peers().find((p) => p.nick.toLowerCase() === who.toLowerCase())?.did;
+      if (who) line += theme.fg("dim", " → ") + theme.fg(peerColor(whoDid), who);
       const text = (a.message as string | undefined) ?? (a.title as string | undefined);
       if (text) {
         const one = text.replace(/\s+/g, " ").trim();
@@ -2591,7 +2604,21 @@ export default function (pi: ExtensionAPI): void {
               tier: p.did ? tierFor(cfg, p.did) : undefined,
             })),
           );
-          ctx.ui.notify(`freeq peers (${peers.length}):\n${lines.join("\n")}`, "info");
+          // A widget rather than a toast: the roster is something you read and
+          // compare, and each row is coloured by its peer's DID so the same
+          // correspondent is recognisable at a glance across sessions.
+          const rows = peers.map((p) => p.did);
+          ctx.ui.setWidget("freeq-peers", (_tui, theme) => {
+            const box = new Container();
+            box.addChild(new Text(theme.fg("toolTitle", theme.bold(`freeq peers (${peers.length})`)), 1, 0));
+            lines.forEach((line, i) => {
+              box.addChild(new Text(theme.fg(peerColor(rows[i]), line), 1, 0));
+            });
+            box.addChild(new Text(theme.fg("dim", "  (clears on your next turn)"), 1, 0));
+            return box;
+          });
+          peersVisible = true;
+          setTimeout(() => clearPeers(ctx), 30_000).unref?.();
           return;
         }
 
