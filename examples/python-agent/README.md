@@ -45,15 +45,14 @@ irssi -c 127.0.0.1 -p 6889
 
 | Event | Payload |
 |---|---|
-| `task_request` | the objective it was given |
-| `task_update` | the phase it entered, and the tool it is about to invoke |
+| `objective` | the objective it was given |
+| `phase` | the phase it entered, and the tool it is about to invoke |
 | `evidence` | what the tool produced — exit code, counts, duration |
-| `task_complete` / `task_failed` | how it ended |
+| `result` | how it ended |
 
-Each is a `TAGMSG` carrying `+freeq.at/event`, `+freeq.at/task-id` and a
-URL-encoded JSON `+freeq.at/payload`, paired with an ordinary `PRIVMSG` that
-says the same thing in a sentence. The server files the typed half and relays
-both; a client that has never heard of the tags sees only the sentences.
+Each is a `TAGMSG` carrying `+freeq.at/event` and a URL-encoded JSON `+freeq.at/payload`, paired with an ordinary `PRIVMSG` that says the same thing in a sentence. The server files the typed half and relays both; a client that has never heard of the tags sees only the sentences.
+
+The same tags ride the `PRIVMSG` too, so a client that knows them draws each step as a card with the payload as key/value rows, and one that does not sees only the sentence. These kind names are freeform, chosen by the sender; for a task with a lifecycle — offered, accepted, completed, signed at every transition — see the act RFC (`docs/RFC-ACT-v05-DRAFT.md`) and the SDKs.
 
 ## Governance
 
