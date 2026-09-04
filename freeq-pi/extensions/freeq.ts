@@ -15,6 +15,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { Text } from "@earendil-works/pi-tui";
 
 import {
   loadConfig,
@@ -34,6 +35,7 @@ import { McpStdioClient } from "../src/mcp-stdio.js";
 import { addressedUtterances, parseListenResult, toBridgeCall, type AvParams } from "../src/av.js";
 import { parseVerbositySteer } from "../src/steer.js";
 import { footerLine, offerCardLines, rosterLines } from "../src/ui.js";
+import { logoLines, supportsTruecolor, WORDMARK } from "../src/logo.js";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import {
@@ -190,6 +192,36 @@ export default function (pi: ExtensionAPI): void {
    * glance at the terminal and see that you were online, who was around, or
    * that work was waiting for you.
    */
+  /**
+   * The freeq mark, once per session, on the first successful connect. Not
+   * on reconnect - a mark that repaints every time the socket blips is noise.
+   * Rendered as a widget above the editor and cleared on the next turn, so it
+   * is a greeting, not furniture.
+   */
+  let markShown = false;
+  function showMarkOnce(ctx: ExtensionContext): void {
+    if (markShown || !ctx.hasUI) return;
+    markShown = true;
+    const lines = supportsTruecolor() ? logoLines() : [];
+    if (lines.length === 0) {
+      ctx.ui.notify(`${WORDMARK} · connected as ${conn?.nick ?? "?"}`, "info");
+      return;
+    }
+    const caption = `  ${conn?.nick ?? "?"} · ${config?.channels.join(" ") ?? ""}`;
+    ctx.ui.setWidget("freeq-mark", [...lines, caption]);
+    markVisible = true;
+    // A greeting should not outlive the hello: cleared on the next model
+    // turn (handler below), or after 20s, whichever first.
+    setTimeout(() => clearMark(ctx), 20_000).unref?.();
+  }
+  let markVisible = false;
+  function clearMark(ctx: ExtensionContext): void {
+    if (!markVisible) return;
+    markVisible = false;
+    ctx.ui.setWidget("freeq-mark", undefined);
+  }
+  pi.on("turn_start", async (_e, ctx) => clearMark(ctx));
+
   let uiCtx: ExtensionContext | undefined;
   function refreshUi(ctx?: ExtensionContext): void {
     const c = ctx ?? uiCtx;
@@ -752,6 +784,7 @@ export default function (pi: ExtensionAPI): void {
       // should.
       onOnline: () => {
         refreshUi(ctx);
+        showMarkOnce(ctx);
         void (async () => {
           const message = await resumeAssigned(ctx, cfg);
           if (message !== "freeq: nothing to resume") notify(ctx, message, "info");
@@ -1490,6 +1523,38 @@ export default function (pi: ExtensionAPI): void {
         }),
       ),
     }),
+    // What a call looks like in the transcript. The default is the raw JSON
+    // arguments, which reads as plumbing; this reads as what it is - a message
+    // to a named peer, or a piece of work offered to one.
+    renderCall(args, theme) {
+      const a = args as Record<string, unknown>;
+      const who = (a.to as string | undefined) ?? (a.channel as string | undefined) ?? "";
+      const verb = String(a.action ?? "");
+      const icon: Record<string, string> = {
+        ask: "?", send: "→", say: "#", handoff: "⇢", post: "⇢", claim: "✓", complete: "✔",
+        cancel: "✗", peers: "⬡", handoffs: "≡", decision: "§",
+      };
+      let line = theme.fg("toolTitle", theme.bold("freeq ")) + theme.fg("accent", `${icon[verb] ?? "·"} ${verb}`);
+      if (who) line += theme.fg("dim", " → ") + theme.fg("accent", who);
+      const text = (a.message as string | undefined) ?? (a.title as string | undefined);
+      if (text) {
+        const one = text.replace(/\s+/g, " ").trim();
+        line += theme.fg("dim", `  "${one.length > 72 ? `${one.slice(0, 71)}…` : one}"`);
+      }
+      return new Text(line, 0, 0);
+    },
+    renderResult(result, { isPartial }, theme) {
+      if (isPartial) return new Text(theme.fg("warning", "…waiting on the wire"), 0, 0);
+      const text = result.content
+        .filter((c): c is { type: "text"; text: string } => c.type === "text")
+        .map((c) => c.text)
+        .join("\n")
+        .trim();
+      const first = text.split("\n")[0] ?? "";
+      const more = text.includes("\n") ? theme.fg("dim", `  (+${text.split("\n").length - 1} lines)`) : "";
+      const tone = /^(No answer|Cannot|not |Error|failed)/i.test(first) ? "warning" : "success";
+      return new Text(theme.fg(tone, first.length > 100 ? `${first.slice(0, 99)}…` : first) + more, 0, 0);
+    },
     async execute(_id, params, _signal, _onUpdate, _ctx) {
       const text = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: {} });
 
@@ -1967,6 +2032,14 @@ export default function (pi: ExtensionAPI): void {
         }
 
         case "status": {
+          if (ctx.hasUI && supportsTruecolor()) {
+            const lines = logoLines();
+            if (lines.length) {
+              ctx.ui.setWidget("freeq-mark", lines);
+              markVisible = true;
+              setTimeout(() => clearMark(ctx), 12_000).unref?.();
+            }
+          }
           ctx.ui.notify(
             [
               `owner:    ${cfg.ownerDid ?? "(not logged in — /freeq login <did>)"}`,
@@ -2317,7 +2390,7 @@ export default function (pi: ExtensionAPI): void {
               nick: p.nick,
               did: p.did,
               state: p.state,
-              working: p.meta.status,
+              working: undefined,
               project: p.meta.project,
               model: p.meta.model,
               seen: p.seen,
