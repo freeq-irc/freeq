@@ -29,6 +29,31 @@ import {
   type Tier,
 } from "../src/config.js";
 import { deriveInstallSlug, defaultNick, isDid } from "../src/identity.js";
+import { authorizeOwner, creatorKeyPath } from "../src/owner-key.js";
+import { homedir } from "node:os";
+import { join as joinPath } from "node:path";
+import { access as fsAccess } from "node:fs/promises";
+
+/** Root of freeq state on this machine — bot-kit's `~/.freeq`. */
+const FREEQ_ROOT = joinPath(homedir(), ".freeq");
+
+/**
+ * The owner's creator key, if `/freeq authorize` has been run. When present,
+ * bot-kit signs the installation's delegation certificate with it and the
+ * server verifies that signature — which is what turns "this agent claims to
+ * be Chad's" into "this agent provably is". Absent, the cert ships unsigned
+ * and every delegation-trusting feature correctly refuses it.
+ */
+async function existingCreatorKey(cfg: { ownerDid?: string }): Promise<string | undefined> {
+  if (!cfg.ownerDid) return undefined;
+  const path = creatorKeyPath(FREEQ_ROOT, cfg.ownerDid);
+  try {
+    await fsAccess(path);
+    return path;
+  } catch {
+    return undefined;
+  }
+}
 import { collectSessionMeta, describeMeta } from "../src/presence.js";
 import { FreeqConnection, type InboundAsk } from "../src/connection.js";
 import { ConnectionLock } from "../src/lock.js";
@@ -515,6 +540,7 @@ export default function (pi: ExtensionAPI): void {
       server: cfg.server,
       slug: cfg.install ?? deriveInstallSlug(),
       nick: cfg.nick,
+      creatorKeyPath: await existingCreatorKey(cfg),
       channels: cfg.channels,
       meta,
       onNotice: (text, level) => notify(ctx, text, level),
@@ -1484,7 +1510,7 @@ export default function (pi: ExtensionAPI): void {
   // ── /freeq ──────────────────────────────────────────────────────────────
 
   pi.registerCommand("freeq", {
-    description: "freeq multiplayer: login, status, join, leave, peers, mode, trust",
+    description: "freeq multiplayer: login, authorize, status, join, leave, peers, mode, trust",
     handler: async (args, ctx) => {
       const [sub = "status", ...rest] = args.trim().split(/\s+/).filter(Boolean);
       const cfg = await ensureConfig(ctx);
@@ -1502,6 +1528,52 @@ export default function (pi: ExtensionAPI): void {
           await saveConfig(agentDir, cfg);
           ctx.ui.notify(`freeq: owner set to ${did}; connecting…`, "info");
           ctx.ui.notify(await connect(ctx), conn?.state === "online" ? "info" : "warning");
+          return;
+        }
+
+        case "authorize": {
+          // One-time ceremony: prove you are the owner, put a signing key on
+          // file under your DID, and from then on this installation's
+          // delegation is signed and verifiable. The app password is used for
+          // exactly one PDS exchange and never written anywhere.
+          if (!cfg.ownerDid) {
+            ctx.ui.notify("freeq: run /freeq login <did> first", "warning");
+            return;
+          }
+          const identifier =
+            rest[0] ??
+            (await ctx.ui.input("Your AT Protocol handle (e.g. you.bsky.social)", ""));
+          if (!identifier) return;
+          const appPassword = await ctx.ui.input(
+            `App password for ${identifier} (Settings → App Passwords; used once, not stored)`,
+            "",
+          );
+          if (!appPassword) return;
+          try {
+            const result = await authorizeOwner({
+              identifier,
+              appPassword,
+              server: cfg.server,
+              root: FREEQ_ROOT,
+              onProgress: (line) => ctx.ui.notify(`freeq: ${line}`, "info"),
+            });
+            if (result.ownerDid !== cfg.ownerDid) {
+              ctx.ui.notify(
+                `freeq: ${identifier} resolves to ${result.ownerDid}, but this installation is logged in as ${cfg.ownerDid}. Key registered, but run /freeq login ${result.ownerDid} to use it.`,
+                "warning",
+              );
+              return;
+            }
+            ctx.ui.notify(
+              "freeq: signing key registered. Reconnecting so the delegation gets signed…",
+              "info",
+            );
+            await conn?.stop("re-signing delegation");
+            conn = undefined;
+            ctx.ui.notify(await connect(ctx), conn?.state === "online" ? "info" : "warning");
+          } catch (err) {
+            ctx.ui.notify(`freeq: authorize failed — ${(err as Error).message}`, "error");
+          }
           return;
         }
 

@@ -71,6 +71,8 @@ export interface BotLike {
 export type BotFactory = (opts: {
   name: string;
   ownerDid: string;
+  /** Owner's creator seed; when set, bot-kit signs the delegation cert. */
+  creatorKeyPath?: string;
   nick: string;
   url: string;
   root?: string;
@@ -101,6 +103,8 @@ export interface Peer {
 
 export interface ConnectionOptions {
   ownerDid: string;
+  /** Owner's creator seed; when set, bot-kit signs the delegation cert. */
+  creatorKeyPath?: string;
   server: string;
   slug: string;
   nick?: string;
@@ -216,6 +220,7 @@ export class FreeqConnection {
       const bot = await create({
         name: botName(this.#opts.slug),
         ownerDid: this.#opts.ownerDid,
+        creatorKeyPath: this.#opts.creatorKeyPath,
         nick: this.#opts.nick ?? defaultNick(this.#opts.slug),
         url: this.#opts.server,
         root: this.#opts.root,

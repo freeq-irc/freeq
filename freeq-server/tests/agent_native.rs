@@ -4065,3 +4065,40 @@ async fn an_unsigned_delegation_does_not_open_an_invite_only_channel() {
     )
     .await;
 }
+
+/// A delegation certificate is signed once and presented for months; the web
+/// client registers a fresh MSGSIG key every session. Verifying against only
+/// the newest key rejected every certificate older than the owner's last
+/// browser tab — including the flagship installation's own.
+#[tokio::test]
+async fn a_certificate_signed_with_an_older_key_still_verifies() {
+    use base64::Engine;
+    start_deadlock_detector();
+    let (addr, _srv) = start_test_server_with_db(empty_resolver(), true).await;
+
+    // The owner registers key A, signs a cert with it…
+    let (owner_did, key_a) = register_creator_msgsig(addr, "keyowner").await;
+
+    // …then comes back from another device and registers key B, which is now
+    // the newest key on file.
+    let owner_pk = PrivateKey::ed25519_from_bytes(&key_a.to_bytes()).unwrap();
+    let signer: Arc<dyn ChallengeSigner> = Arc::new(KeySigner::new(owner_did.clone(), owner_pk));
+    let (owner2, mut owner2_ev) = connect_did_key_with_signer(addr, "keyowner", signer).await;
+    let key_b = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    let pub_b =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_b.verifying_key().as_bytes());
+    owner2.raw(&format!("MSGSIG {pub_b}")).await.unwrap();
+    expect_raw_line(&mut owner2_ev, 2000, "MSGSIG OK", "newer key registered").await;
+
+    // The cert signed with key A must still verify.
+    let (bot_did, bot, mut bot_ev) = connect_did_key(addr, "oldcertbot").await;
+    let cert = build_signed_cert(&bot_did, &owner_did, &key_a);
+    bot.submit_provenance(&cert).await.unwrap();
+    expect_raw_line(
+        &mut bot_ev,
+        2000,
+        "Provenance verified",
+        "a cert signed with an older registered key verifies",
+    )
+    .await;
+}

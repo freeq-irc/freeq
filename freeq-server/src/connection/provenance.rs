@@ -102,25 +102,20 @@ pub(super) fn verify_provenance(
             "Server has no DB; cannot look up creator key",
         ));
     };
-    let pubkey_bytes = match db.get_signing_key(&creator_did) {
-        Ok(Some(b)) => b,
-        Ok(None) => {
+    // Every key the creator has ever registered, not just the newest. A cert
+    // is signed once and presented for months; the web client registers a
+    // fresh MSGSIG key per session. Checking only the latest key rejected
+    // every cert older than the owner's last browser tab.
+    let candidate_keys = match db.get_signing_keys(&creator_did) {
+        Ok(keys) if keys.is_empty() => {
             return Ok(VerificationOutcome::unverified(format!(
                 "No registered MSGSIG key for {creator_did}; creator must register one before signing"
             )));
         }
+        Ok(keys) => keys,
         Err(e) => {
             return Ok(VerificationOutcome::unverified(format!(
                 "DB error looking up signing key: {e}"
-            )));
-        }
-    };
-
-    let vk = match VerifyingKey::from_bytes(&pubkey_bytes) {
-        Ok(k) => k,
-        Err(e) => {
-            return Ok(VerificationOutcome::unverified(format!(
-                "Stored creator key is malformed: {e}"
             )));
         }
     };
@@ -158,12 +153,18 @@ pub(super) fn verify_provenance(
     let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().unwrap();
     let sig = Signature::from_bytes(&sig_arr);
 
-    if vk.verify(canonical_bytes.as_bytes(), &sig).is_ok() {
+    let verified = candidate_keys.iter().any(|bytes| {
+        VerifyingKey::from_bytes(bytes)
+            .map(|vk| vk.verify(canonical_bytes.as_bytes(), &sig).is_ok())
+            .unwrap_or(false)
+    });
+    if verified {
         Ok(VerificationOutcome::ok(creator_did))
     } else {
-        Ok(VerificationOutcome::unverified(
-            "Signature did not verify against creator's registered key",
-        ))
+        Ok(VerificationOutcome::unverified(format!(
+            "Signature did not verify against any of the creator's {} registered key(s)",
+            candidate_keys.len()
+        )))
     }
 }
 
