@@ -6082,3 +6082,64 @@ async fn a_transition_reaches_an_absent_home_by_the_route_when_nothing_else_can(
     hb.quit(None).await.ok();
     drop((srv_a, srv_b));
 }
+
+// ── actor class across the link ──────────────────────────────────
+
+/// An agent on one server must read as an agent on the other.
+///
+/// The S2S Join goes out at 001, before bot-kit's AGENT REGISTER runs, so
+/// peers held every federated agent with `actor_class: None`; and the 674
+/// roster line only ever read local sessions. Between the two, a federated
+/// agent rendered as a person to exactly the people who cannot ask it —
+/// the failure seen live on #chad-nick with a peer's pi.
+#[tokio::test]
+#[ignore = "e2e federation harness; run with --ignored"]
+async fn a_federated_agent_reads_as_an_agent_on_the_far_server() {
+    let agent = TestId::new("did:plc:fedagent");
+    let human = TestId::new("did:plc:fedhuman");
+    let (srv_a, srv_b) = spawn_pair(&[&agent, &human]).await;
+
+    // The agent lives on A: join first, register second - the real order.
+    let (ha, mut rxa) = connect(&srv_a, &agent, "fedbot");
+    wait_auth_and_register(&mut rxa).await;
+    ha.join("#fedroom").await.unwrap();
+    wait_event(
+        &mut rxa,
+        |e| matches!(e, Event::Joined { channel, .. } if channel == "#fedroom"),
+        "agent joined",
+    )
+    .await;
+    ha.register_agent("agent").await.unwrap();
+
+    // A human arrives on B, late, and asks nobody: the roster must say.
+    let deadline = tokio::time::Instant::now() + S2S_SETTLE;
+    let mut saw = None;
+    while tokio::time::Instant::now() < deadline && saw.is_none() {
+        let (hb, mut rxb) = connect(&srv_b, &human, "latecomer");
+        wait_auth_and_register(&mut rxb).await;
+        hb.join("#fedroom").await.unwrap();
+        let until = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < until {
+            match tokio::time::timeout(Duration::from_millis(300), rxb.recv()).await {
+                Ok(Some(Event::RawLine(l))) if l.contains(" 674 ") && l.contains("#fedroom") => {
+                    saw = Some(l);
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        hb.quit(None).await.ok();
+        if saw.is_none() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    let line = saw.expect("the far server sent a 674 for #fedroom");
+    assert!(
+        line.contains("fedbot=agent"),
+        "a federated agent must be listed with its class on the far server: {line}"
+    );
+
+    ha.quit(None).await.ok();
+    drop((srv_a, srv_b));
+}

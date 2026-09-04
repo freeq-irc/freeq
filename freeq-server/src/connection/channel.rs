@@ -2379,8 +2379,26 @@ pub(super) fn send_actor_classes(
 ) {
     let classes: Vec<String> = {
         let channels = state.channels.lock();
-        let member_sessions = match channels.get(channel) {
-            Some(ch) => ch.members.clone(),
+        let (member_sessions, remote) = match channels.get(channel) {
+            Some(ch) => (
+                ch.members.clone(),
+                // Federated members carry their class on the S2S Join and
+                // it is stored on RemoteMember - but this roster line only
+                // ever read local sessions, so an agent on a peer server
+                // rendered as a human to everyone here. The whole point of
+                // 674 is that a late joiner learns who is an agent; a
+                // federated agent is exactly the one nobody else can ask.
+                ch.remote_members
+                    .iter()
+                    .filter_map(|(n, rm)| {
+                        let class = rm.actor_class.as_deref()?;
+                        if class == "human" {
+                            return None;
+                        }
+                        Some((n.clone(), class.to_string()))
+                    })
+                    .collect::<Vec<(String, String)>>(),
+            ),
             None => return,
         };
         drop(channels);
@@ -2388,7 +2406,7 @@ pub(super) fn send_actor_classes(
         let actor_classes = state.session_actor_class.lock();
         let nicks = state.nick_to_session.lock();
         let mut seen = std::collections::HashSet::new();
-        member_sessions
+        let mut out: Vec<String> = member_sessions
             .iter()
             .filter_map(|sid| {
                 let class = actor_classes.get(sid).copied()?;
@@ -2402,7 +2420,13 @@ pub(super) fn send_actor_classes(
                 }
                 Some(format!("{n}={class}"))
             })
-            .collect()
+            .collect();
+        for (n, class) in remote {
+            if seen.insert(n.to_lowercase()) {
+                out.push(format!("{n}={class}"));
+            }
+        }
+        out
     };
 
     if classes.is_empty() {

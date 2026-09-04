@@ -1739,6 +1739,46 @@ where
                                 send(&state, &session_id, format!("{reply}\r\n"));
                                 tracing::info!(nick = %nick, session = %session_id, actor_class = %class, "AGENT REGISTER");
 
+                                // Tell peers. The S2S Join for each channel
+                                // went out at 001, BEFORE this command ran
+                                // (bot-kit joins, then registers), so every
+                                // peer holds this member with actor_class:
+                                // None and renders the agent as a person - to
+                                // the people who can least afford to be
+                                // wrong about it, because they cannot ask.
+                                // A Join is idempotent on the receiving side
+                                // and carries the class, so re-sending one
+                                // per shared channel is the update.
+                                {
+                                    let did = state.session_dids.lock().get(&session_id).cloned();
+                                    let handle =
+                                        state.session_handles.lock().get(&session_id).cloned();
+                                    let origin =
+                                        state.server_iroh_id.lock().clone().unwrap_or_default();
+                                    let my_channels: Vec<String> = state
+                                        .channels
+                                        .lock()
+                                        .iter()
+                                        .filter(|(_, ch)| ch.members.contains(&session_id))
+                                        .map(|(name, _)| name.clone())
+                                        .collect();
+                                    for channel in my_channels {
+                                        helpers::s2s_broadcast(
+                                            &state,
+                                            crate::s2s::S2sMessage::Join {
+                                                event_id: helpers::s2s_next_event_id(&state),
+                                                nick: nick.clone(),
+                                                channel,
+                                                did: did.clone(),
+                                                handle: handle.clone(),
+                                                is_op: false,
+                                                actor_class: Some(class.to_string()),
+                                                origin: origin.clone(),
+                                            },
+                                        );
+                                    }
+                                }
+
                                 // Broadcast actor class to shared channels if they support the cap
                                 if conn.cap_message_tags {
                                     let hostmask = conn.hostmask();
