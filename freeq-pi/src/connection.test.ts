@@ -518,3 +518,33 @@ describe("mention matching", () => {
     expect(conn.checkMention("#work", "anything").addressed).toBe(false);
   });
 });
+
+describe("channels this session means to be in", () => {
+  it("parts a channel the server rejoined us into unasked", async () => {
+    const { conn, bot } = mk();
+    await conn.start();
+    bot.emit("channelJoined", "#somewhere-else");
+    expect(bot.sent.some((m) => m.kind === "raw" && String(m.payload).startsWith("PART #somewhere-else"))).toBe(true);
+    expect(conn.joinedChannels()).not.toContain("#somewhere-else");
+  });
+
+  it("keeps a channel joined after /freeq join, which the snapshot could not", async () => {
+    // The regression: the guard read the channel list captured at CONNECT, so
+    // a channel joined later was not in it, and every /freeq join was parted a
+    // moment after the server confirmed it.
+    const { conn, bot } = mk();
+    await conn.start();
+    conn.join("#chad-compute");
+    bot.emit("channelJoined", "#chad-compute");
+    expect(bot.sent.some((m) => m.kind === "raw" && String(m.payload).startsWith("PART #chad-compute"))).toBe(false);
+    expect(conn.joinedChannels()).toContain("#chad-compute");
+  });
+
+  it("stops wanting a channel after leave, so a server rejoin is undone", async () => {
+    const { conn, bot } = mk();
+    await conn.start();
+    conn.leave("#work");
+    bot.emit("channelJoined", "#work");
+    expect(bot.sent.some((m) => m.kind === "raw" && String(m.payload).startsWith("PART #work"))).toBe(true);
+  });
+});

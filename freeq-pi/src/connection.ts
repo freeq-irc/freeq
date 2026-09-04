@@ -158,6 +158,16 @@ export class FreeqConnection {
   #bot: BotLike | undefined;
   #state: ConnState = "offline";
   readonly #joined = new Set<string>();
+  /**
+   * Channels this session means to be in, lowercased.
+   *
+   * Seeded from config and then kept live by join()/leave(). It must NOT be
+   * read off #opts.channels, which is a snapshot taken at connect: a channel
+   * joined later is absent from that snapshot, so the unexpected-channel guard
+   * treated every /freeq join as a channel the server had foisted on us and
+   * parted it a moment after joining.
+   */
+  readonly #wanted = new Set<string>();
   readonly #refused = new Map<string, string>();
   #lastError: string | undefined;
   #peers = new Map<string, Peer>();
@@ -175,6 +185,8 @@ export class FreeqConnection {
   #asks = new AskRegistry((reason) => this.#opts.onNotice?.(`freeq ask: ${reason}`, "warning"));
 
   constructor(opts: ConnectionOptions) {
+    // The configured list is the initial intent; join()/leave() keep it live.
+    for (const c of opts.channels ?? []) if (c.trim()) this.#wanted.add(c.trim().toLowerCase());
     this.#opts = opts;
     this.#meta = opts.meta;
   }
@@ -308,8 +320,7 @@ export class FreeqConnection {
         // stays for good: config asks, server remembers, server wins. Leave
         // anything we did not ask for. Announcing into it first would be
         // announcing our arrival somewhere we are about to leave.
-        const wanted = this.#opts.channels.map((c) => c.toLowerCase());
-        if (wanted.length && !wanted.includes(channel.toLowerCase())) {
+        if (this.#wanted.size && !this.#wanted.has(channel.toLowerCase())) {
           this.#joined.delete(channel.toLowerCase());
           this.#bot?.client.raw(`PART ${channel} :not this project's channel`);
           this.#opts.onUnexpectedChannel?.(channel);
@@ -619,6 +630,12 @@ export class FreeqConnection {
     return scrubbed;
   }
 
+  /** Replace the set of channels this session means to be in. */
+  setWantedChannels(channels: string[]): void {
+    this.#wanted.clear();
+    for (const c of channels) if (c.trim()) this.#wanted.add(c.trim().toLowerCase());
+  }
+
   /** Channels the server has CONFIRMED we are in, not the ones we asked for. */
   joinedChannels(): string[] {
     return [...this.#joined];
@@ -631,6 +648,7 @@ export class FreeqConnection {
 
   /** Accept a channel's join policy, then retry the join. */
   acceptPolicy(channel: string): boolean {
+    this.#wanted.add(channel.toLowerCase());
     if (!this.#bot || this.#state !== "online") return false;
     this.#bot.client.raw(`POLICY ${channel} ACCEPT`);
     this.#bot.client.raw(`JOIN ${channel}`);
@@ -638,12 +656,16 @@ export class FreeqConnection {
   }
 
   join(channel: string): boolean {
+    // Record the intent BEFORE the wire, so the join we are about to make is
+    // already wanted by the time the server confirms it.
+    this.#wanted.add(channel.toLowerCase());
     if (!this.#bot || this.#state !== "online") return false;
     this.#bot.client.join(channel);
     return true;
   }
 
   leave(channel: string): boolean {
+    this.#wanted.delete(channel.toLowerCase());
     if (!this.#bot || this.#state !== "online") return false;
     this.#bot.client.raw(`PART ${channel}`);
     return true;

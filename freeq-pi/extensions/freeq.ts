@@ -2301,6 +2301,9 @@ export default function (pi: ExtensionAPI): void {
             if (project) Object.assign(cfg, withProjectChannels(cfg, project, next));
             else cfg.channels = next;
             await saveConfig(agentDir, cfg);
+            // Keep the live intent in step with the config we just wrote, so
+            // the unexpected-channel guard judges against the new list.
+            conn?.setWantedChannels(next);
             const ok = conn?.join(channel);
             ctx.ui.notify(
               ok
@@ -2313,6 +2316,7 @@ export default function (pi: ExtensionAPI): void {
             if (project) Object.assign(cfg, withProjectChannels(cfg, project, next));
             else cfg.channels = next;
             await saveConfig(agentDir, cfg);
+            conn?.setWantedChannels(next);
             conn?.leave(channel);
             ctx.ui.notify(
               project
