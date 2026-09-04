@@ -41,8 +41,8 @@
     "prepare": "node scripts/build-deps.mjs"
   },
   "dependencies": {
-    "@freeq/bot-kit": "file:../freeq-bot-kit-js",
-    "@freeq/sdk": "file:../freeq-sdk-js"
+    "@freeq/bot-kit": "^0.1.0",
+    "@freeq/sdk": "^0.1.0"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.3",

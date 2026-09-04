@@ -29,8 +29,8 @@
     "inspector": "npx -y @modelcontextprotocol/inspector node dist/index.js"
   },
   "dependencies": {
-    "@freeq/bot-kit": "file:../freeq-bot-kit-js",
-    "@freeq/sdk": "file:../freeq-sdk-js",
+    "@freeq/bot-kit": "^0.1.0",
+    "@freeq/sdk": "^0.1.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "zod": "^3.25.76"
   },
