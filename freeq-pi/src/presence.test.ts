@@ -111,3 +111,28 @@ describe("looksLikePath", () => {
     }
   });
 });
+
+describe("what a peer is doing", () => {
+  it("round-trips prose through a space-separated k=v wire format", () => {
+    const wire = formatStatus({ project: "freeq", branch: "main", doing: "answering zapnap" });
+    expect(wire).toContain("doing=answering+zapnap");
+    expect(wire).toContain("project=freeq");
+    const back = parseStatus(wire);
+    expect(back.doing).toBe("answering zapnap");
+    expect(back.project).toBe("freeq");
+  });
+
+  it("keeps metadata and work label in one string instead of overwriting", () => {
+    // The bug: setWorkState and updateMeta wrote the same presence slot, so a
+    // peer saw project/branch/model OR the work label, never both.
+    const meta = { project: "freeq", branch: "main", model: "sonnet" };
+    const both = parseStatus(formatStatus({ ...meta, doing: "handoff: fix parser" }));
+    expect(both.project).toBe("freeq");
+    expect(both.model).toBe("sonnet");
+    expect(both.doing).toBe("handoff: fix parser");
+  });
+
+  it("still drops identifier fields containing spaces", () => {
+    expect(formatStatus({ project: "two words", doing: "ok" })).not.toContain("project=");
+  });
+});

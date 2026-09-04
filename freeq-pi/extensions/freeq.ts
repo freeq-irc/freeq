@@ -2582,7 +2582,9 @@ export default function (pi: ExtensionAPI): void {
               nick: p.nick,
               did: p.did,
               state: p.state,
-              working: undefined,
+              // Now a real field: peers publish what they are doing in the
+              // same presence string as their project and branch.
+              working: p.meta.doing,
               project: p.meta.project,
               model: p.meta.model,
               seen: p.seen,

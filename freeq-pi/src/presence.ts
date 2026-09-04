@@ -30,6 +30,15 @@ export interface SessionMeta {
   branch?: string;
   /** Active model id. */
   model?: string;
+  /**
+   * What the agent is doing right now, in words — "answering zapnap",
+   * "handoff: fix parser".
+   *
+   * Distinct from liveness: a peer wants to know whether asking now is rude,
+   * and "active" does not answer that. Spaces are encoded on the wire because
+   * the status format is space-separated k=v; see formatStatus.
+   */
+  doing?: string;
 }
 
 async function git(cwd: string, args: string[]): Promise<string | undefined> {
@@ -101,8 +110,13 @@ export async function collectSessionMeta(opts: CollectOptions): Promise<SessionM
  */
 export function formatStatus(meta: SessionMeta): string {
   const parts: string[] = [];
-  for (const [k, v] of Object.entries(meta)) {
-    if (!v || typeof v !== "string") continue;
+  for (const [k, v0] of Object.entries(meta)) {
+    if (!v0 || typeof v0 !== "string") continue;
+    // 'doing' is prose by design, so it is the one field allowed to contain
+    // spaces; they ride as '+' and are decoded on the way back in. Every
+    // other field is an identifier and a space in one means something is
+    // wrong, so those are still dropped.
+    const v = k === "doing" ? v0.trim().replace(/\s+/g, "+").slice(0, 60) : v0;
     if (/[\s;]/.test(v)) continue;
     if (looksLikePath(v)) continue; // paranoia: never leak local disk layout
     parts.push(`${k}=${v}`);
@@ -137,6 +151,8 @@ export function parseStatus(status: string | undefined): SessionMeta {
     if (!v) continue;
     if (k === "session" || k === "project" || k === "repo" || k === "branch" || k === "model") {
       meta[k] = v;
+    } else if (k === "doing") {
+      meta.doing = v.replace(/\+/g, " ");
     }
   }
   return meta;

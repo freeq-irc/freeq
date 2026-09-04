@@ -477,11 +477,12 @@ describe("work status", () => {
     const { conn, bot } = mk();
     await conn.start();
     conn.setWorkState("executing", "answering chad", "task-1");
-    expect(bot.states.at(-1)).toEqual({
-      state: "executing",
-      status: "answering chad",
-      task: "task-1",
-    });
+    // The label rides inside the k=v presence string as 'doing=', alongside
+    // the session metadata, rather than replacing it — see setWorkState.
+    const last = bot.states.at(-1)!;
+    expect(last.state).toBe("executing");
+    expect(last.task).toBe("task-1");
+    expect(last.status).toContain("doing=answering+chad");
   });
 
   it("is a no-op when offline rather than throwing", async () => {

@@ -570,7 +570,14 @@ export class FreeqConnection {
   setWorkState(state: string, status?: string, task?: string): void {
     if (!this.#bot || this.#state !== "online") return;
     try {
-      this.#bot.setState(state, status, task);
+      // One presence slot, two things that wanted it: the session metadata
+      // (project, branch, model) and the current work label. They used to
+      // overwrite each other, so a peer's roster showed whichever was pushed
+      // last and the metadata fields went missing the moment work started.
+      // Compose instead: the label rides as 'doing=' inside the same k=v
+      // string, so a peer gets both and neither is lost.
+      const composed = formatStatus({ ...this.#meta, doing: status });
+      this.#bot.setState(state, composed, task);
     } catch {
       /* presence is best-effort and must never break a turn */
     }
