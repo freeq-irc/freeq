@@ -38,6 +38,7 @@ import { addressedUtterances, parseListenResult, toBridgeCall, type AvParams } f
 import { parseVerbositySteer } from "../src/steer.js";
 import { footerLine, offerCardLines, rosterLines } from "../src/ui.js";
 import { markForTerminal, supportsTruecolor, WORDMARK } from "../src/logo.js";
+import { WithheldBuffer, senderKey, withheldSummary } from "../src/withheld.js";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import {
@@ -232,6 +233,10 @@ export default function (pi: ExtensionAPI): void {
   }
   pi.on("turn_start", async (_e, ctx) => clearMark(ctx));
 
+  // Messages addressed to us that the tier gate refused. Held so the agent
+  // can say who is waiting instead of being indistinguishable from ignoring
+  // them. See src/withheld.ts for why this exists.
+  const withheld = new WithheldBuffer();
   let currentProject: string | undefined;
   let uiCtx: ExtensionContext | undefined;
   function refreshUi(ctx?: ExtensionContext): void {
@@ -252,6 +257,7 @@ export default function (pi: ExtensionAPI): void {
         // where we ARE. A refused channel shows as a shortfall, not a count.
         channels: conn?.joinedChannels().length ?? 0,
         channelsRefused: conn?.refusedChannels().length ?? 0,
+        withheld: withheld.size,
         peers: conn?.peers().length ?? 0,
         offersWaiting: waiting.length,
         working: workLabel,
@@ -568,7 +574,24 @@ export default function (pi: ExtensionAPI): void {
     const decision = decideInbound(ev);
 
     if (!reachesModel(decision.action)) {
-      if (decision.action === "surface") surface(ctx, summarize(ev, decision));
+      if (decision.action === "surface") {
+        surface(ctx, summarize(ev, decision));
+        // Only messages meant for us. Room chatter we are merely not injecting
+        // is not a message anyone is waiting on an answer to.
+        if (ev.addressed || ev.kind === "ask") {
+          withheld.add({
+            did: ev.did ?? undefined,
+            from: ev.from,
+            channel: ev.channel,
+            text: ev.text,
+            reason: decision.reason,
+            at: Date.now(),
+          });
+          const line = withheldSummary(withheld.senders());
+          if (line) notify(ctx, `freeq: ${line}`, "warning");
+          refreshUi();
+        }
+      }
       // An unanswerable ask still gets a reply — silence is indistinguishable
       // from a broken agent on the far side.
       if (ask && conn) {
@@ -1999,7 +2022,7 @@ export default function (pi: ExtensionAPI): void {
   const SUBCOMMANDS = [
     "status", "peers", "join", "leave", "mode", "trust", "mute", "unmute", "on", "off",
     "tasks", "resume", "accept", "decline", "drop", "progress", "login", "authorize",
-    "takeover", "verbosity", "provenance", "call", "hangup",
+    "takeover", "verbosity", "provenance", "call", "hangup", "policy", "withheld",
   ];
   const TASK_SUBS = new Set(["accept", "decline", "drop", "progress", "resume"]);
   const PEER_SUBS = new Set(["trust"]);
@@ -2386,6 +2409,38 @@ export default function (pi: ExtensionAPI): void {
           return;
         }
 
+        case "withheld": {
+          const senders = withheld.senders();
+          if (!senders.length) {
+            ctx.ui.notify("freeq: nothing withheld — everyone who addressed you got through", "info");
+            return;
+          }
+          if ((rest[0] ?? "").toLowerCase() === "drop") {
+            const n = senders.reduce((acc, x) => acc + withheld.discard(x.key), 0);
+            ctx.ui.notify(`freeq: dropped ${n} withheld message${n === 1 ? "" : "s"}`, "info");
+            refreshUi();
+            return;
+          }
+          ctx.ui.notify(
+            ["freeq: messages addressed to you that were not delivered:", ""]
+              .concat(
+                senders.map(
+                  (x) =>
+                    `  ${x.from}${x.did ? ` (${x.did.slice(0, 28)}…)` : " (guest)"} — ` +
+                    `${x.count} message${x.count === 1 ? "" : "s"}, ${formatAge(Date.now() - x.latest)} ago`,
+                ),
+              )
+              .concat([
+                "",
+                "  /freeq trust <did> message   — trust them, then choose whether to deliver",
+                "  /freeq withheld drop         — discard them",
+              ])
+              .join("\n"),
+            "warning",
+          );
+          return;
+        }
+
         case "policy": {
           const ch = rest[0];
           const verb = (rest[1] ?? "accept").toLowerCase();
@@ -2575,6 +2630,35 @@ export default function (pi: ExtensionAPI): void {
           cfg.trust[did] = tier as Tier;
           await saveConfig(agentDir, cfg);
           ctx.ui.notify(`freeq: ${did} → ${tier}`, "info");
+          // A sender who was refused has already said their piece. Asking them
+          // to repeat it is asking for a second chance to be misunderstood.
+          const held = withheld.drain(did);
+          if (held.length && TIER_RANK[tier as Tier] >= TIER_RANK.message) {
+            const wanted = await ctx.ui.confirm(
+              "freeq: deliver held messages",
+              `${held.length} message${held.length === 1 ? "" : "s"} from ${held[0]!.from} ` +
+                `arrived while they were untrusted. Deliver ${held.length === 1 ? "it" : "them"} now?`,
+            );
+            if (wanted) {
+              for (const m of held) {
+                deliver(
+                  ctx,
+                  {
+                    kind: "chat",
+                    from: m.from,
+                    did: m.did ?? null,
+                    channel: m.channel,
+                    text: m.text,
+                    tier: tier as Tier,
+                    mode: modeFor(cfg, m.channel),
+                    addressed: true,
+                  },
+                  { replyToChannel: true },
+                );
+              }
+            }
+          }
+          refreshUi();
           return;
         }
 

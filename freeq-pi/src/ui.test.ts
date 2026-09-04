@@ -97,3 +97,12 @@ describe("footer honesty about channels", () => {
     expect(clean).not.toContain("refused");
   });
 });
+
+describe("footer names who is waiting", () => {
+  it("shows withheld messages, because the alternative is looking like you ignored them", () => {
+    const line = footerLine({ online: true, nick: "chad-bot-freeq", channels: 2, peers: 1, offers: 0, withheld: 3 });
+    expect(line).toContain("3 withheld");
+    const quiet = footerLine({ online: true, nick: "chad-bot-freeq", channels: 2, peers: 1, offers: 0 });
+    expect(quiet).not.toContain("withheld");
+  });
+});

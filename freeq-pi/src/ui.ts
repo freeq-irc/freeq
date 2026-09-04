@@ -24,6 +24,8 @@ export interface FooterState {
   channels: number;
   /** Channels whose JOIN the server refused — surfaced, never hidden. */
   channelsRefused?: number;
+  /** Messages addressed to us that the tier gate withheld. */
+  withheld?: number;
   peers: number;
   offersWaiting: number;
   /** What the agent is doing, if anything: the work label. */
@@ -48,6 +50,8 @@ export function footerLine(s: FooterState): string {
     s.channelsRefused ? `${s.channels} ch (${s.channelsRefused} refused)` : `${s.channels} ch`,
     `${s.peers} peer${s.peers === 1 ? "" : "s"}`,
   ];
+  // Somebody is waiting on an answer they will never get unless this is seen.
+  if (s.withheld) parts.push(`${s.withheld} withheld ✋`);
   if (s.offersWaiting > 0) parts.push(`${s.offersWaiting} offer${s.offersWaiting === 1 ? "" : "s"} ⏳`);
   if (s.inCall) parts.push(`☎ ${s.inCall}`);
   if (s.working) parts.push(`⚙ ${s.working}`);
