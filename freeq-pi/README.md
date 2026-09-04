@@ -60,7 +60,7 @@ Other actions: `peers`, `send`, `say`. See `skills/freeq/SKILL.md`.
 | command | what it does |
 |---|---|
 | `/freeq login <did>` | bind this installation to your DID and connect |
-| `/freeq authorize [handle]` | one-time: prove you own the DID and register a signing key, so the delegation is verifiable |
+| `/freeq authorize` / `authorize verify` | one-time: register a signing key under your DID (paste one line into the web client), so the delegation is verifiable |
 | `/freeq status` | connection, identity, channels, trust summary |
 | `/freeq peers` | reachable agents, what they're working on, their tier |
 | `/freeq join #c` / `/freeq leave #c` | channel membership |
@@ -155,12 +155,19 @@ that is a claim, not a proof — the server stores it as *unverified* and every
 feature that trusts delegation (joining an invite-only room you are in,
 provenance badges) correctly refuses it.
 
-`/freeq authorize` is a one-time ceremony. It asks for an AT Protocol **app
-password** (Settings → App Passwords in Bluesky), uses it for exactly one
-`createSession` on your PDS to prove you are you, and on that authenticated
-freeq session registers a persistent signing key under your DID. The app
-password is never written anywhere. From then on this installation's
-certificates are signed with that key and verify on the server.
+`/freeq authorize` fixes that with no password and no PDS login. Registering a
+key under your DID takes one `MSGSIG <pubkey>` on a session that is already
+authenticated as you — and the web client is one of those. So:
+
+1. `/freeq authorize` mints a signing key on this machine and prints one line:
+   `/raw MSGSIG <public-key>`.
+2. Paste that line into the freeq web client (any channel). It is a public key;
+   nothing secret moves.
+3. `/freeq authorize verify` reconnects with the signed certificate and reports
+   the server's own verdict.
+
+pi never sees a password, never talks to your PDS, and never holds anything
+that could act as you — only the creator seed, which signs certificates.
 
 ## One connection per project
 
