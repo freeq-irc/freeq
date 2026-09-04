@@ -3961,3 +3961,107 @@ async fn a_reconnect_that_asks_for_a_new_nick_keeps_it() {
     );
     let _ = second;
 }
+
+// ── Delegated access to invite-only channels ─────────────────────────
+
+/// An agent may go where the person it acts for already is.
+///
+/// Telling your agent to join a room you are sitting in should not require a
+/// second human to invite a `did:key` nobody has ever seen. If the delegation
+/// certificate is *verified* and names someone already in the channel, the
+/// agent is admitted.
+#[tokio::test]
+async fn a_verified_agent_joins_an_invite_only_channel_its_owner_is_in() {
+    use base64::Engine;
+    start_deadlock_detector();
+    let (addr, _srv) = start_test_server_with_db(empty_resolver(), true).await;
+
+    // One owner session throughout: reconnecting would let the SDK register a
+    // fresh MSGSIG over the key the certificate is signed with.
+    let owner_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    let owner_pk = PrivateKey::ed25519_from_bytes(&owner_key.to_bytes()).unwrap();
+    let owner_did = format!("did:key:{}", owner_pk.public_key_multibase());
+    let owner_signer: Arc<dyn ChallengeSigner> =
+        Arc::new(KeySigner::new(owner_did.clone(), owner_pk));
+    let (owner, mut owner_ev) = connect_did_key_with_signer(addr, "owner", owner_signer).await;
+
+    // Put the known key on file, over the SDK's auto-generated one.
+    let owner_pub = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(owner_key.verifying_key().as_bytes());
+    owner.raw(&format!("MSGSIG {owner_pub}")).await.unwrap();
+    expect_raw_line(&mut owner_ev, 2000, "MSGSIG OK", "owner key on file").await;
+
+    owner.join("#closed").await.unwrap();
+    expect_event(
+        &mut owner_ev,
+        2000,
+        |e| matches!(e, Event::Joined { channel, .. } if channel == "#closed"),
+        "owner joined",
+    )
+    .await;
+    owner.raw("MODE #closed +i").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The agent presents a certificate signed by the owner, then joins with no
+    // invite of its own.
+    let (agent_did, agent, mut agent_ev) = connect_did_key(addr, "helper").await;
+    let cert = build_signed_cert(&agent_did, &owner_did, &owner_key);
+    agent.submit_provenance(&cert).await.unwrap();
+    expect_raw_line(&mut agent_ev, 2000, "Provenance verified", "cert verified").await;
+
+    agent.join("#closed").await.unwrap();
+    expect_event(
+        &mut agent_ev,
+        3000,
+        |e| matches!(e, Event::Joined { channel, .. } if channel == "#closed"),
+        "the agent is admitted on its owner's presence",
+    )
+    .await;
+}
+
+/// The attack the signature requirement exists to stop: an agent declaring,
+/// with no signature, that a member owns it.
+#[tokio::test]
+async fn an_unsigned_delegation_does_not_open_an_invite_only_channel() {
+    use base64::Engine;
+    start_deadlock_detector();
+    let (addr, _srv) = start_test_server_with_db(empty_resolver(), true).await;
+
+    let (owner_did, _owner_key) = register_creator_msgsig(addr, "owner2").await;
+    let owner_pk_signer: Arc<dyn ChallengeSigner> = {
+        let (_d, s) = make_did_key_signer();
+        s
+    };
+    let (owner, mut owner_ev) =
+        connect_did_key_with_signer(addr, "owner2live", owner_pk_signer).await;
+    owner.join("#closed2").await.unwrap();
+    expect_event(
+        &mut owner_ev,
+        2000,
+        |e| matches!(e, Event::Joined { channel, .. } if channel == "#closed2"),
+        "owner joined",
+    )
+    .await;
+    owner.raw("MODE #closed2 +i").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Same claim, no signature.
+    let (agent_did, agent, mut agent_ev) = connect_did_key(addr, "liar").await;
+    let cert = serde_json::json!({
+        "type": "FreeqBotDelegation/v1",
+        "bot_did": agent_did,
+        "creator_did": owner_did,
+        "created_at": "2026-05-08T15:00:00Z",
+    });
+    agent.submit_provenance(&cert).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    agent.join("#closed2").await.unwrap();
+    expect_raw_line(
+        &mut agent_ev,
+        3000,
+        "473",
+        "an unsigned delegation must not open the door",
+    )
+    .await;
+}

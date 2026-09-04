@@ -115,7 +115,49 @@ pub(super) fn handle_join(
                     || did.is_some_and(|d| ch.invites.contains(d))
                     || ch.invites.contains(&format!("nick:{nick}"));
                 let on_invite_exception = ch.is_invite_excepted(&hostmask, did);
-                if !has_invite && !on_invite_exception {
+
+                // Delegated access: an agent may go where the person it acts
+                // for already is.
+                //
+                // Telling your agent to join a room you are sitting in should
+                // not require a second human to invite a did:key nobody has
+                // seen. The delegation certificate already says who the agent
+                // belongs to, and `verified_owner` returns that owner only
+                // when a signature checked out — an unsigned claim grants
+                // nothing, or any agent could name an operator and walk in.
+                //
+                // Deliberately NOT a ban bypass: `is_banned` is checked above
+                // and stands. A banned person cannot send their agent instead,
+                // and an owner who is merely *invited* but not present does
+                // not carry their agent in — the rule is "where you are", not
+                // "where you could go".
+                let delegated = !has_invite
+                    && !on_invite_exception
+                    && did
+                        .and_then(|d| super::provenance::verified_owner(state, d))
+                        .is_some_and(|owner| {
+                            let owner_present = ch.members.iter().any(|sid| {
+                                state
+                                    .session_dids
+                                    .lock()
+                                    .get(sid)
+                                    .is_some_and(|d| *d == owner)
+                            });
+                            let owner_is_authority = ch.founder_did.as_deref()
+                                == Some(owner.as_str())
+                                || ch.did_ops.contains(&owner);
+                            if owner_present || owner_is_authority {
+                                tracing::info!(
+                                    agent = %did.unwrap_or("?"), %owner, channel = %channel,
+                                    "Admitting an agent on a verified delegation from a member"
+                                );
+                                true
+                            } else {
+                                false
+                            }
+                        });
+
+                if !has_invite && !on_invite_exception && !delegated {
                     let reply = Message::from_server(
                         server_name,
                         irc::ERR_INVITEONLYCHAN,

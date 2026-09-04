@@ -192,3 +192,94 @@ pub(super) fn annotate(json: &mut Value, outcome: &VerificationOutcome) {
         );
     }
 }
+
+/// The DID this agent claims to act for, but **only** when that claim was
+/// cryptographically verified.
+///
+/// The distinction is the whole point. A delegation certificate is just JSON
+/// until someone's key signs it: `bot_did` and `creator_did` are strings the
+/// agent chose. Granting anything on an unverified claim would let any agent
+/// name a channel operator as its owner and walk in — so this returns `None`
+/// unless `_verified` is true, and callers get no way to ask the looser
+/// question.
+pub(super) fn verified_owner(
+    state: &crate::server::SharedState,
+    agent_did: &str,
+) -> Option<String> {
+    let declarations = state.provenance_declarations.lock();
+    let cert = declarations.get(agent_did)?;
+    if cert.get("_verified").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    // The cert must be about the DID we are asking about. Without this an
+    // agent could present a certificate belonging to somebody else entirely.
+    let bot_did = cert.get("bot_did").and_then(|v| v.as_str())?;
+    if bot_did != agent_did {
+        return None;
+    }
+    cert.get("creator_did")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod delegated_access_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn state_with(
+        did: &str,
+        cert: serde_json::Value,
+    ) -> std::sync::Arc<crate::server::SharedState> {
+        let state = crate::server::test_state();
+        state
+            .provenance_declarations
+            .lock()
+            .insert(did.to_string(), cert);
+        state
+    }
+
+    const AGENT: &str = "did:key:zAgent";
+    const OWNER: &str = "did:plc:owner";
+
+    #[test]
+    fn a_verified_certificate_names_its_owner() {
+        let state = state_with(
+            AGENT,
+            json!({"bot_did": AGENT, "creator_did": OWNER, "_verified": true}),
+        );
+        assert_eq!(verified_owner(&state, AGENT), Some(OWNER.to_string()));
+    }
+
+    /// The attack this exists to stop: an agent declaring, without a
+    /// signature, that a channel operator owns it.
+    #[test]
+    fn an_unsigned_claim_grants_nothing() {
+        let state = state_with(
+            AGENT,
+            json!({"bot_did": AGENT, "creator_did": OWNER, "_verified": false}),
+        );
+        assert_eq!(verified_owner(&state, AGENT), None);
+
+        // Absent flag is not a pass either.
+        let state = state_with(AGENT, json!({"bot_did": AGENT, "creator_did": OWNER}));
+        assert_eq!(verified_owner(&state, AGENT), None);
+    }
+
+    /// A cert that verifies but describes a different bot proves nothing about
+    /// the presenter.
+    #[test]
+    fn a_certificate_about_someone_else_grants_nothing() {
+        let state = state_with(
+            AGENT,
+            json!({"bot_did": "did:key:zSomeoneElse", "creator_did": OWNER, "_verified": true}),
+        );
+        assert_eq!(verified_owner(&state, AGENT), None);
+    }
+
+    #[test]
+    fn no_certificate_at_all_grants_nothing() {
+        let state = crate::server::test_state();
+        assert_eq!(verified_owner(&state, AGENT), None);
+    }
+}
