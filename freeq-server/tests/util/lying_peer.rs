@@ -546,6 +546,9 @@ impl LyingPeer {
             mode: mode.to_string(),
             arg: arg.map(str::to_string),
             set_by: set_by.to_string(),
+            // A lying peer asserts a nick, not a DID it can prove. The DID
+            // path is covered separately; this harness tests the nick path.
+            set_by_did: None,
             origin: self.id.clone(),
         }
     }

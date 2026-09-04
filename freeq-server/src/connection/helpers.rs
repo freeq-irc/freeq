@@ -178,6 +178,7 @@ pub(super) fn s2s_broadcast_mode(
             mode: mode.to_string(),
             arg: arg.map(|s| s.to_string()),
             set_by: conn.nick.as_deref().unwrap_or("*").to_string(),
+            set_by_did: conn.authenticated_did.clone(),
             origin,
         },
     );

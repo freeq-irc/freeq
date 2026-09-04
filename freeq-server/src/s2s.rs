@@ -632,6 +632,13 @@ pub enum S2sMessage {
         mode: String,
         arg: Option<String>,
         set_by: String,
+        /// The setter's DID, when authenticated. The receiver authorises a
+        /// mode by checking the setter against the channel's founder/did_ops,
+        /// and a nick alone cannot be checked once the setter has left the
+        /// room — which a short-lived session does within seconds of setting
+        /// the mode. Optional for peers that predate it.
+        #[serde(default)]
+        set_by_did: Option<String>,
         origin: String,
     },
 

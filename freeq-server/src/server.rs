@@ -7116,6 +7116,7 @@ pub(crate) async fn process_s2s_message(
             mode,
             arg,
             set_by,
+            set_by_did,
             ..
         } => {
             let channel = channel.to_lowercase();
@@ -7124,12 +7125,18 @@ pub(crate) async fn process_s2s_message(
             {
                 let channels = state.channels.lock();
                 if let Some(ch) = channels.get(&channel) {
+                    let did_is_authority =
+                        |d: &str| ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d);
+                    // By roster entry if the setter is still here, else by the
+                    // DID the event carries. The roster-only check silently
+                    // dropped every mode set by a session that left before the
+                    // event was processed - and a founder's script that joins,
+                    // sets +i, and quits is exactly that. The DID is what the
+                    // authority is actually attached to; the nick was only ever
+                    // a way to find it.
                     let is_authorized = ch.remote_member(&set_by).is_some_and(|rm| {
-                        rm.is_op
-                            || rm.did.as_ref().is_some_and(|d| {
-                                ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d)
-                            })
-                    });
+                        rm.is_op || rm.did.as_deref().is_some_and(did_is_authority)
+                    }) || set_by_did.as_deref().is_some_and(did_is_authority);
                     if !is_authorized {
                         tracing::warn!(
                             channel = %channel, set_by = %set_by, mode = %mode,
@@ -9463,6 +9470,7 @@ mod s2s_adversarial_tests {
                 mode: "+o".to_string(),
                 arg: Some("target_user".to_string()),
                 set_by: "faker".to_string(),
+                set_by_did: None,
                 origin: PEER.to_string(),
             },
         )
@@ -10373,6 +10381,87 @@ mod s2s_adversarial_tests {
         assert_eq!(
             topic.text, "original topic",
             "BUG: Non-op changed topic on +t channel via S2S"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // S2S MODE: authority is the DID, not the roster entry
+    // ═══════════════════════════════════════════════════════════
+
+    /// A founder's session that joins, sets a mode, and quits is gone from the
+    /// receiver's roster by the time the Mode arrives. Authorising only by
+    /// roster entry dropped every such mode silently - and left two servers
+    /// disagreeing about whether a channel was invite-only.
+    #[tokio::test]
+    async fn s2s_mode_from_a_founder_who_already_left_still_applies() {
+        let state = test_state();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#agreed");
+        state
+            .channels
+            .lock()
+            .get_mut("#agreed")
+            .unwrap()
+            .founder_did = Some("did:key:zFounder".to_string());
+        // Deliberately NOT in remote_members: the setter has left.
+
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Mode {
+                event_id: format!("{PEER}:41"),
+                channel: "#agreed".to_string(),
+                mode: "+i".to_string(),
+                arg: None,
+                set_by: "gone-already".to_string(),
+                set_by_did: Some("did:key:zFounder".to_string()),
+                origin: PEER.to_string(),
+            },
+        )
+        .await;
+
+        assert!(
+            state.channels.lock().get("#agreed").unwrap().invite_only,
+            "a founder's +i must apply even after their session left the roster"
+        );
+    }
+
+    /// The DID on the event is checked against THIS server's authority, so a
+    /// peer asserting a founder's DID for a stranger gains nothing.
+    #[tokio::test]
+    async fn s2s_mode_with_a_did_that_is_not_an_authority_is_refused() {
+        let state = test_state();
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#agreed2");
+        state
+            .channels
+            .lock()
+            .get_mut("#agreed2")
+            .unwrap()
+            .founder_did = Some("did:key:zFounder".to_string());
+
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Mode {
+                event_id: format!("{PEER}:42"),
+                channel: "#agreed2".to_string(),
+                mode: "+i".to_string(),
+                arg: None,
+                set_by: "mallory".to_string(),
+                set_by_did: Some("did:key:zMallory".to_string()),
+                origin: PEER.to_string(),
+            },
+        )
+        .await;
+
+        assert!(
+            !state.channels.lock().get("#agreed2").unwrap().invite_only,
+            "a DID that is neither founder nor did-op must not set modes"
         );
     }
 
