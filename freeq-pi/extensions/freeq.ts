@@ -1604,8 +1604,10 @@ export default function (pi: ExtensionAPI): void {
         case "takeover": {
           // Deliberate, explicit, and destructive to the other window's
           // connection: it will find the slot gone and go passive.
+          // Same project as the slot we would claim on connect.
+          const takeoverMeta = await collectSessionMeta({ cwd: ctx.cwd, model: ctx.model?.id });
           const holder = await (lock ??= new ConnectionLock(
-            ConnectionLock.pathFor(agentDir),
+            ConnectionLock.pathFor(agentDir, takeoverMeta.project),
           )).read();
           const ok = await ctx.ui.confirm(
             "freeq: take over the connection",
@@ -1616,7 +1618,7 @@ export default function (pi: ExtensionAPI): void {
           if (!ok) return;
           await lock.release();
           // Force a fresh claim by clearing any stale in-memory state.
-          lock = new ConnectionLock(ConnectionLock.pathFor(agentDir));
+          lock = new ConnectionLock(ConnectionLock.pathFor(agentDir, takeoverMeta.project));
           await conn?.stop("takeover");
           conn = undefined;
           const message = await connect(ctx);
