@@ -1461,7 +1461,7 @@ export default function (pi: ExtensionAPI): void {
       "happen in their environment, when it is too big for one question, or when " +
       "they may be offline — the offer waits for them and they must explicitly " +
       "accept. 'post' offers work to a CHANNEL without naming anyone, so whoever " +
-      "is capable and available can take it; 'claim' takes such a task. " +
+      "is capable and available can take it; 'claim' takes such a task. 'accept' takes work OFFERED to you by name (a handoff); 'decline' turns it down with a reason - an offerer who is told can re-offer elsewhere, and silence helps nobody. " +
       "'handoffs' lists tasks you owe or are owed; 'complete' finishes " +
       "one assigned to you; 'cancel' RETRACTS one you offered — use it the " +
       "moment you call work off, because a task left assigned is one the " +
@@ -1483,6 +1483,8 @@ export default function (pi: ExtensionAPI): void {
           Type.Literal("cancel"),
           Type.Literal("post"),
           Type.Literal("claim"),
+          Type.Literal("accept"),
+          Type.Literal("decline"),
           Type.Literal("decision"),
         ],
         { description: "What to do" },
@@ -1729,6 +1731,52 @@ export default function (pi: ExtensionAPI): void {
               (params.caps ? `\ncaps: ${params.caps}` : "") +
               `\n\nAnyone capable in that room can claim it. It stays open until ` +
               `someone does, so it survives everyone being offline.`,
+          );
+        }
+
+        case "accept":
+        case "decline": {
+          // An agent that can be handed work must be able to take it. This
+          // was a slash command only, so a peer's agent could see an offer
+          // addressed to its own DID and had no way to act on it - the human
+          // had to accept on its behalf, which defeats the point of an
+          // offer that survives its recipient being offline.
+          const store = await ensureHandoffs();
+          const me = conn.did;
+          if (!params.taskId) {
+            const waiting = store.all().filter((r) => r.state === "offered" && r.offeree === me);
+            if (!waiting.length) return text("Nothing is offered to you right now.");
+            return text(
+              `${params.action} requires 'taskId'. Offered to you:\n` +
+                waiting.map((r) => `  ${describeHandoff(r, me)}`).join("\n"),
+            );
+          }
+          const found = resolveTaskRef(store.all(), params.taskId);
+          if (!found.ok) return text(`freeq: ${found.reason}`);
+          const rec = found.record;
+          if (rec.state !== "offered") {
+            return text(`Task ${rec.id.slice(0, 10)} is '${rec.state}', not offered — nothing to ${params.action}.`);
+          }
+          if (rec.offeree && rec.offeree !== me) {
+            return text(
+              `Task ${rec.id.slice(0, 10)} is offered to ${rec.offeree.slice(0, 24)}…, not to you. ` +
+                `A handoff is addressed to an identity; only its offeree can take it.`,
+            );
+          }
+          const queue = await ensureOffers();
+          queue.remove(rec.id);
+          await queue.save();
+          if (params.action === "decline") {
+            const why = params.message?.trim() || "declined";
+            await conn.sendAct(rec.channel, "fail", rec.id, { note: why });
+            refreshUi();
+            return text(`Declined ${rec.id.slice(0, 10)} — ${why}`);
+          }
+          await acceptOffer(_ctx, config ?? (await ensureConfig(_ctx)), rec, rec.lastActor ?? "freeq");
+          refreshUi();
+          return text(
+            `Accepted ${rec.id.slice(0, 10)} — ${rec.title}. The brief is now in your context; ` +
+              `report what you did and finish with action 'complete', taskId '${rec.id}'.`,
           );
         }
 
