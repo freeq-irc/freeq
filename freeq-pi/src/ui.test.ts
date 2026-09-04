@@ -85,3 +85,15 @@ describe("formatAge", () => {
     expect(formatAge(172_800_000)).toBe("2d");
   });
 });
+
+describe("footer honesty about channels", () => {
+  it("counts confirmed joins and names refusals", () => {
+    // The bug this encodes: #freeq-dev was policy-gated, the server said 477,
+    // nothing listened, and the footer counted it as joined all session.
+    const line = footerLine({ online: true, nick: "chad-bot-freeq", channels: 1, channelsRefused: 1, peers: 0, offers: 0 });
+    expect(line).toContain("1 ch (1 refused)");
+    const clean = footerLine({ online: true, nick: "chad-bot-freeq", channels: 2, peers: 0, offers: 0 });
+    expect(clean).toContain("2 ch");
+    expect(clean).not.toContain("refused");
+  });
+});

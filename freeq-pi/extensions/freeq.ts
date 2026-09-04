@@ -245,7 +245,10 @@ export default function (pi: ExtensionAPI): void {
         online,
         passive,
         nick: conn?.nick,
-        channels: config?.channels.length ?? 0,
+        // Confirmed joins, not configured ones: the footer's job is to say
+        // where we ARE. A refused channel shows as a shortfall, not a count.
+        channels: conn?.joinedChannels().length ?? 0,
+        channelsRefused: conn?.refusedChannels().length ?? 0,
         peers: conn?.peers().length ?? 0,
         offersWaiting: waiting.length,
         working: workLabel,
@@ -669,6 +672,18 @@ export default function (pi: ExtensionAPI): void {
       meta,
       onNotice: (text, level) => notify(ctx, text, level),
 
+      onJoinRefused: (channel, reason) => {
+        // Loud, with the remedy, because the alternative is what just
+        // happened: a channel that looks joined and is not.
+        notify(
+          uiCtx,
+          reason === "policy"
+            ? `freeq: ${channel} refused the join — it requires policy acceptance. Run /freeq policy ${channel} accept`
+            : `freeq: could not join ${channel} — ${reason}`,
+          "warning",
+        );
+        refreshUi();
+      },
       onScrub: (hits, target) =>
         notify(ctx, `freeq: redacted ${hits.join(", ")} from a message to ${target}`, "warning"),
 
@@ -2325,6 +2340,25 @@ export default function (pi: ExtensionAPI): void {
 
         case "resume": {
           ctx.ui.notify(await resumeAssigned(ctx, cfg, rest[0]), "info");
+          return;
+        }
+
+        case "policy": {
+          const ch = rest[0];
+          const verb = (rest[1] ?? "accept").toLowerCase();
+          if (!ch || !ch.startsWith("#")) {
+            ctx.ui.notify("usage: /freeq policy <#channel> accept", "warning");
+            return;
+          }
+          if (verb !== "accept") {
+            ctx.ui.notify("only 'accept' is supported here; use the web client for the rest", "warning");
+            return;
+          }
+          const ok = conn?.acceptPolicy(ch);
+          ctx.ui.notify(
+            ok ? `freeq: accepted ${ch}'s policy and re-sent the join` : "freeq: not connected",
+            ok ? "info" : "warning",
+          );
           return;
         }
 

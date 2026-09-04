@@ -22,6 +22,8 @@ export interface FooterState {
   passive?: boolean;
   nick?: string;
   channels: number;
+  /** Channels whose JOIN the server refused — surfaced, never hidden. */
+  channelsRefused?: number;
   peers: number;
   offersWaiting: number;
   /** What the agent is doing, if anything: the work label. */
@@ -39,7 +41,13 @@ export function footerLine(s: FooterState): string {
   if (!s.online) {
     return s.passive ? "⬡ freeq · passive (another window holds this project)" : "⬡ freeq · offline";
   }
-  const parts = [`⬡ freeq`, s.nick ?? "?", `${s.channels} ch`, `${s.peers} peer${s.peers === 1 ? "" : "s"}`];
+  const parts = [
+    `⬡ freeq`,
+    s.nick ?? "?",
+    // A refused join is part of the count's story, not a footnote elsewhere.
+    s.channelsRefused ? `${s.channels} ch (${s.channelsRefused} refused)` : `${s.channels} ch`,
+    `${s.peers} peer${s.peers === 1 ? "" : "s"}`,
+  ];
   if (s.offersWaiting > 0) parts.push(`${s.offersWaiting} offer${s.offersWaiting === 1 ? "" : "s"} ⏳`);
   if (s.inCall) parts.push(`☎ ${s.inCall}`);
   if (s.working) parts.push(`⚙ ${s.working}`);

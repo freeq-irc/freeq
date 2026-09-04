@@ -116,6 +116,8 @@ export interface ConnectionOptions {
   onNotice?: (text: string, level: "info" | "warning" | "error") => void;
   /** Called when outbound redaction fired, so the user can be told. */
   onScrub?: (hits: string[], target: string) => void;
+  /** Called when the server refuses a JOIN, with the channel and the reason. */
+  onJoinRefused?: (channel: string, reason: string) => void;
   /** Inbound channel/DM messages (routed through the tier pipeline). */
   onMessage?: (channel: string, msg: Message) => void;
   /** Override how the bot is created. Tests inject a fake; production omits it. */
@@ -153,6 +155,8 @@ const RECONNECT_MAX_MS = 60_000;
 export class FreeqConnection {
   #bot: BotLike | undefined;
   #state: ConnState = "offline";
+  readonly #joined = new Set<string>();
+  readonly #refused = new Map<string, string>();
   #lastError: string | undefined;
   #peers = new Map<string, Peer>();
   #opts: ConnectionOptions;
@@ -296,7 +300,24 @@ export class FreeqConnection {
 
       // Announce into each channel once we're actually in it.
       bot.on("channelJoined", (channel: string) => {
+        this.#joined.add(channel.toLowerCase());
+        this.#refused.delete(channel.toLowerCase());
         this.#announce(channel, PI_HELLO);
+      });
+
+      bot.on("channelLeft", (channel: string) => {
+        this.#joined.delete(channel.toLowerCase());
+      });
+
+      // A JOIN that the server refuses. Without this the client sends JOIN,
+      // the server says 477, nobody listens, and every surface goes on
+      // reporting the channel as joined - which is how #freeq-dev sat in the
+      // footer for a whole session while the agent was not in it. Being
+      // wrong about where you are is worse than being nowhere.
+      bot.on("joinGateRequired", (channel: string) => {
+        this.#joined.delete(channel.toLowerCase());
+        this.#refused.set(channel.toLowerCase(), "policy");
+        this.#opts.onJoinRefused?.(channel, "policy");
       });
 
       // Transport state is only 'connected' | 'connecting' | 'disconnected'.
@@ -572,6 +593,24 @@ export class FreeqConnection {
     const { text: scrubbed, hits } = scrubOutbound(text);
     if (hits.length) this.#opts.onScrub?.(hits, target);
     return scrubbed;
+  }
+
+  /** Channels the server has CONFIRMED we are in, not the ones we asked for. */
+  joinedChannels(): string[] {
+    return [...this.#joined];
+  }
+
+  /** Channels whose JOIN was refused, and why. */
+  refusedChannels(): Array<{ channel: string; reason: string }> {
+    return [...this.#refused].map(([channel, reason]) => ({ channel, reason }));
+  }
+
+  /** Accept a channel's join policy, then retry the join. */
+  acceptPolicy(channel: string): boolean {
+    if (!this.#bot || this.#state !== "online") return false;
+    this.#bot.client.raw(`POLICY ${channel} ACCEPT`);
+    this.#bot.client.raw(`JOIN ${channel}`);
+    return true;
   }
 
   join(channel: string): boolean {
