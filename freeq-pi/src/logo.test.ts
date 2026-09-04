@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { logoAnsi, logoLines, supportsTruecolor, WORDMARK } from "./logo.js";
+import { logoAnsi, logoCompactLines, logoLines, markForTerminal, supportsTruecolor, WORDMARK } from "./logo.js";
 
 describe("the mark", () => {
   it("ships, is truecolor half-block art, and fits an 80-column terminal", () => {
@@ -23,5 +23,22 @@ describe("the mark", () => {
     // NO_COLOR is an instruction, not a hint.
     expect(supportsTruecolor({ NO_COLOR: "1", COLORTERM: "truecolor" })).toBe(false);
     expect(WORDMARK).toContain("freeq");
+  });
+
+  it("has a half-scale mark for terminals without the room", () => {
+    const compact = logoCompactLines();
+    expect(compact.length).toBeGreaterThan(8);
+    expect(compact.length).toBeLessThan(logoLines().length);
+    const plain = compact.map((l) => l.replace(/\x1b\[[0-9;]*m/g, ""));
+    expect(new Set(plain.map((p) => p.length)).size).toBe(1); // rectangular
+    expect(plain[0]!.length).toBeLessThanOrEqual(40);
+  });
+
+  it("picks the biggest mark that fits, and none when nothing does", () => {
+    // pi caps string-array widgets at 10 lines, so a 27-row mark must go
+    // through a component factory; height is still the real constraint.
+    expect(markForTerminal(60)).toEqual(logoLines());
+    expect(markForTerminal(24)).toEqual(logoCompactLines());
+    expect(markForTerminal(12)).toEqual([]);
   });
 });

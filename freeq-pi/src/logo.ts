@@ -15,25 +15,59 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-let cached: string | undefined;
+const cache = new Map<string, string>();
+
+function readAsset(name: string): string {
+  const hit = cache.get(name);
+  if (hit !== undefined) return hit;
+  let out = "";
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    // dist/logo.js → ../assets/… ; src/logo.ts → ../assets/…
+    out = readFileSync(join(here, "..", "assets", name), "utf8").replace(/\n+$/, "");
+  } catch {
+    out = "";
+  }
+  cache.set(name, out);
+  return out;
+}
 
 /** The raw ANSI, trailing newline stripped. Empty string if the asset is missing. */
 export function logoAnsi(): string {
-  if (cached !== undefined) return cached;
-  try {
-    const here = dirname(fileURLToPath(import.meta.url));
-    // dist/logo.js → ../assets/logo.ans ; src/logo.ts → ../assets/logo.ans
-    cached = readFileSync(join(here, "..", "assets", "logo.ans"), "utf8").replace(/\n+$/, "");
-  } catch {
-    cached = "";
-  }
-  return cached;
+  return readAsset("logo.ans");
 }
 
-/** Lines, for a widget that takes an array. */
+/** Half-scale (30×14), for terminals without room for the full mark. */
+export function logoCompactAnsi(): string {
+  return readAsset("logo-compact.ans");
+}
+
+/** Lines of the full mark. */
 export function logoLines(): string[] {
   const s = logoAnsi();
   return s ? s.split("\n") : [];
+}
+
+/** Lines of the half-scale mark. */
+export function logoCompactLines(): string[] {
+  const s = logoCompactAnsi();
+  return s ? s.split("\n") : [];
+}
+
+/**
+ * The biggest mark this terminal has room for, or none.
+ *
+ * Height is the constraint, not width: pi caps a string-array widget at 10
+ * lines (the caller uses a component factory to avoid that), and a mark taller
+ * than the window is worse than no mark. Leave room for the editor and a few
+ * lines of transcript.
+ */
+export function markForTerminal(rows = process.stdout.rows ?? 24): string[] {
+  const full = logoLines();
+  const compact = logoCompactLines();
+  if (full.length && rows >= full.length + 10) return full;
+  if (compact.length && rows >= compact.length + 8) return compact;
+  return [];
 }
 
 /**

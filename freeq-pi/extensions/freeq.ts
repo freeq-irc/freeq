@@ -15,7 +15,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { Text } from "@earendil-works/pi-tui";
+import { Container, Text } from "@earendil-works/pi-tui";
 
 import {
   loadConfig,
@@ -35,7 +35,7 @@ import { McpStdioClient } from "../src/mcp-stdio.js";
 import { addressedUtterances, parseListenResult, toBridgeCall, type AvParams } from "../src/av.js";
 import { parseVerbositySteer } from "../src/steer.js";
 import { footerLine, offerCardLines, rosterLines } from "../src/ui.js";
-import { logoLines, supportsTruecolor, WORDMARK } from "../src/logo.js";
+import { markForTerminal, supportsTruecolor, WORDMARK } from "../src/logo.js";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import {
@@ -202,13 +202,21 @@ export default function (pi: ExtensionAPI): void {
   function showMarkOnce(ctx: ExtensionContext): void {
     if (markShown || !ctx.hasUI) return;
     markShown = true;
-    const lines = supportsTruecolor() ? logoLines() : [];
+    const lines = supportsTruecolor() ? markForTerminal() : [];
     if (lines.length === 0) {
       ctx.ui.notify(`${WORDMARK} · connected as ${conn?.nick ?? "?"}`, "info");
       return;
     }
     const caption = `  ${conn?.nick ?? "?"} · ${config?.channels.join(" ") ?? ""}`;
-    ctx.ui.setWidget("freeq-mark", [...lines, caption]);
+    // A component factory, not a string[]: pi truncates an array widget at
+    // MAX_WIDGET_LINES (10) and says so, which is how the mark first shipped
+    // with its ears cut off. The factory path has no such cap.
+    ctx.ui.setWidget("freeq-mark", (_tui, theme) => {
+      const box = new Container();
+      for (const line of lines) box.addChild(new Text(line, 1, 0));
+      box.addChild(new Text(theme.fg("muted", caption), 1, 0));
+      return box;
+    });
     markVisible = true;
     // A greeting should not outlive the hello: cleared on the next model
     // turn (handler below), or after 20s, whichever first.
@@ -2081,9 +2089,13 @@ export default function (pi: ExtensionAPI): void {
 
         case "status": {
           if (ctx.hasUI && supportsTruecolor()) {
-            const lines = logoLines();
+            const lines = markForTerminal();
             if (lines.length) {
-              ctx.ui.setWidget("freeq-mark", lines);
+              ctx.ui.setWidget("freeq-mark", (_tui, _theme) => {
+                const box = new Container();
+                for (const line of lines) box.addChild(new Text(line, 1, 0));
+                return box;
+              });
               markVisible = true;
               setTimeout(() => clearMark(ctx), 12_000).unref?.();
             }
