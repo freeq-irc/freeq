@@ -13,8 +13,10 @@ import {
 const bash = (command: string) => ({ name: "bash", input: { command } });
 
 describe("what is worth recording", () => {
-  it("defaults to decisions, not a firehose", () => {
-    expect(DEFAULT_PROVENANCE_TIER).toBe("decisions");
+  it("defaults to evidence: the room sees the work, not just the answer", () => {
+    // Not `decisions` (the room saw nothing between question and answer) and
+    // not `firehose` (every read narrated). One readable line per turn.
+    expect(DEFAULT_PROVENANCE_TIER).toBe("evidence");
   });
 
   it("records changes and outbound actions", () => {

@@ -75,6 +75,7 @@ Other actions: `peers`, `send`, `say`. See `skills/freeq/SKILL.md`.
 | `/freeq drop <id> [reason]` | fail work in flight honestly instead of leaving it hanging |
 | `/freeq progress <id> <note>` | report progress by hand |
 | `/freeq call #c` / `/freeq hangup` | join a voice call in a channel as a speaking, listening participant |
+| `/freeq verbosity <quiet\|normal\|more\|off>` | how much of the agent's work is narrated into the channel (default: one line per turn) |
 
 Ids may be given as the short prefix the notifications print. An ambiguous
 prefix is refused by name rather than guessed.
@@ -131,6 +132,31 @@ npx tsx spike/ask-check.ts   --server ws://127.0.0.1:18080/irc   # cross-agent a
 ```
 
 `spike/` holds test harnesses, not product code.
+
+## Working in the open
+
+By default the agent posts **one readable line per turn** into its channel as
+it works — what it edited, what it ran, which files it touched:
+
+```
+⚙ edited connection.ts; ran cargo test; wrote journal.test.ts  [connection.ts, journal.test.ts]
+```
+
+Before this the room saw only the finished answer; everything in between
+happened in the terminal. To someone following along on freeq the agent
+appeared to do nothing for ten minutes and then produce a wall of text.
+Working in a shared room means working where the room can see.
+
+Four levels, one knob (`/freeq verbosity`, alias of `/freeq provenance`):
+`off` (nothing), `quiet` (decisions only, as tags), `normal` (one line per
+turn — default), `more` (every consequential tool call, live, rate-limited).
+
+**The owner can steer it from the room.** "be quieter", "narrate what you're
+doing", "tone it down", "back to normal verbosity" — typed into freeq, from
+the owner's server-resolved DID — change the setting and get an
+acknowledgement. Gated on the DID, never the nick; a settings knob is exactly
+what an impostor would reach for. The parser is deliberately narrow: "tell me
+more about the parser" is a question and leaves the setting alone.
 
 ## Voice: `/freeq call #channel`
 

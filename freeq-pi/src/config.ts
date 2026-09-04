@@ -110,7 +110,7 @@ export function defaultConfig(): FreeqConfig {
     enabled: true,
     muted: false,
     autoAccept: [],
-    provenance: "decisions",
+    provenance: "evidence",
     autoAcceptWhenIdle: true,
     offerTtlSecs: DEFAULT_OFFER_TTL_SECS,
     progressIntervalSecs: DEFAULT_PROGRESS_INTERVAL_SECS,

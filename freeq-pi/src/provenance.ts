@@ -26,7 +26,18 @@ export const PROVENANCE_TIERS: readonly ProvenanceTier[] = [
   "evidence",
   "firehose",
 ] as const;
-export const DEFAULT_PROVENANCE_TIER: ProvenanceTier = "decisions";
+/**
+ * `evidence` by default, not `decisions`.
+ *
+ * With `decisions` a watcher in the channel saw only the finished answer;
+ * everything between — the reads, the edits, the test runs — happened in the
+ * terminal and nowhere else. To a person following along on freeq the agent
+ * appeared to do nothing for ten minutes and then produce a wall of text.
+ * Working in the open is the point of working in a shared room, so the room
+ * gets the same picture the terminal does, one line per turn. Anyone who
+ * wants less says so (`/freeq verbosity quiet`, or just tells the agent).
+ */
+export const DEFAULT_PROVENANCE_TIER: ProvenanceTier = "evidence";
 
 const TIER_RANK: Record<ProvenanceTier, number> = {
   silent: 0,

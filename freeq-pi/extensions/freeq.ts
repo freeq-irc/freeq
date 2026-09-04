@@ -32,6 +32,7 @@ import { deriveInstallSlug, defaultNick, isDid } from "../src/identity.js";
 import { authorizeInstructions, creatorKeyPath, interpretProvenanceNotice } from "../src/owner-key.js";
 import { McpStdioClient } from "../src/mcp-stdio.js";
 import { addressedUtterances, parseListenResult, toBridgeCall, type AvParams } from "../src/av.js";
+import { parseVerbositySteer } from "../src/steer.js";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import {
@@ -487,7 +488,20 @@ export default function (pi: ExtensionAPI): void {
 
     // deliverAs is REQUIRED while streaming; omitting it throws. When idle,
     // pi sends immediately and triggers a turn.
-    const deliveryOpts = ctx.isIdle() ? undefined : ({ deliverAs: "followUp" } as const);
+    // `followUp` waits for the agent to have NO more tool calls - i.e. until
+    // the whole task is done, every build and test run included. Someone
+    // talking to a working agent got silence for ten minutes and then four
+    // answers at once. `steer` delivers after the current tool call, before
+    // the next model call: the agent finishes what it is doing, reads the
+    // message, and can answer before continuing. That is what steering a
+    // working agent means, and what the mode is named for.
+    //
+    // Only for addressed input from `request` tier and up. Lower-tier chat
+    // still waits; it should not interrupt work.
+    const interrupts = ev.addressed && tierAtLeast(ev.tier, "request");
+    const deliveryOpts = ctx.isIdle()
+      ? undefined
+      : ({ deliverAs: interrupts ? "steer" : "followUp" } as const);
     try {
       void pi.sendUserMessage(framed, deliveryOpts);
       notify(ctx, summarize(ev, decision), "info");
@@ -572,6 +586,29 @@ export default function (pi: ExtensionAPI): void {
           if (mention.cooling) {
             surface(ctx, `freeq [${channel}] <${msg.from}> (rate-limited, not answered)`);
             return;
+          }
+
+          // Steering from the room, owner only. "be more verbose" typed into
+          // freeq should do the same thing as /freeq verbosity in the
+          // terminal - the person following along is the one who knows
+          // whether it is too much or too little. Gated on the OWNER's DID
+          // (server-resolved), never on the nick: anyone can call themselves
+          // chad, and a config knob is exactly what an impostor would reach for.
+          if (mention.addressed && did && did === cfg.ownerDid) {
+            const steer = parseVerbositySteer(mention.stripped);
+            if (steer) {
+              cfg.provenance = steer;
+              await saveConfig(agentDir, cfg);
+              const words: Record<ProvenanceTier, string> = {
+                silent: "I'll stop mirroring my work here entirely.",
+                decisions: "I'll keep it quiet - only decisions, and only as tags.",
+                evidence: "I'll post one line per turn here as I work.",
+                firehose: "I'll narrate every consequential tool call as it happens.",
+              };
+              conn!.send(channel, `${msg.from}: ${words[steer]} (verbosity → ${steer})`);
+              notify(ctx, `freeq: verbosity → ${steer} (set by ${msg.from} in ${channel})`, "info");
+              return;
+            }
           }
 
           deliver(
@@ -758,6 +795,14 @@ export default function (pi: ExtensionAPI): void {
     pushStatus("executing", workLabel ? `${workLabel} · ${e.toolName}` : e.toolName, workTask);
     if (config?.provenance) {
       turn.record({ name: e.toolName, input: e.input }, config.provenance);
+      if (config.provenance === "firehose") {
+        const input = e.input ?? {};
+        const what =
+          typeof input.command === "string" ? `bash: ${String(input.command).split("\n")[0].slice(0, 80)}` :
+          typeof input.path === "string" ? `${e.toolName}: ${String(input.path).split(/[\\/]/).pop()}` :
+          e.toolName;
+        firehose(config, what);
+      }
     }
   });
 
@@ -781,6 +826,7 @@ export default function (pi: ExtensionAPI): void {
   let lastModel: string | undefined;
   pi.on("agent_settled", async (_event, ctx) => {
     // Pay back whatever this run was triggered by.
+    const channelReplies = new Map<string, string>(); // channel -> last asker
     while (pendingReplies.length) {
       const item = pendingReplies.shift()!;
       if (!conn) continue;
@@ -798,15 +844,19 @@ export default function (pi: ExtensionAPI): void {
         continue;
       }
 
-      // Channel reply. Sent whole: the SDK already splits long text into a
-      // draft/multiline BATCH (or line-by-line where the cap is not acked),
-      // so a cap here only ever threw away the end of an answer. A reply cut
-      // at 1200 chars with "…(truncated)" is the worst of both worlds - it
-      // costs the tokens to produce and then withholds the part that
-      // usually held the conclusion.
+      // Channel replies are collected and sent once per channel below. A
+      // turn produces ONE answer; if four messages queued while we worked,
+      // that answer used to go out four times, once per queued item.
       if (!lastAssistantText) continue;
-      conn.send(item.channel, `${item.from}: ${lastAssistantText}`);
-      notify(ctx, `freeq: replied in ${item.channel} to ${item.from}`, "info");
+      channelReplies.set(item.channel, item.from);
+    }
+    // Sent whole: the SDK splits long text into a draft/multiline BATCH, so a
+    // cap here only ever threw away the end of an answer - the part that
+    // usually held the conclusion, after paying the tokens to produce it.
+    for (const [channel, from] of channelReplies) {
+      if (!conn) break;
+      conn.send(channel, `${from}: ${lastAssistantText}`);
+      notify(ctx, `freeq: replied in ${channel} to ${from}`, "info");
     }
     lastAssistantText = "";
 
@@ -1109,10 +1159,43 @@ export default function (pi: ExtensionAPI): void {
         "+freeq.at/event": PROVENANCE_EVENT,
         "+freeq.at/payload": encodeURIComponent(JSON.stringify(payload)),
       });
+      // At `evidence` and above the room also gets it as readable text, not
+      // only as a tag most clients do not render. This is the difference
+      // between "the agent went quiet for ten minutes" and watching it work.
+      if (tierAtLeastProv(tier, "evidence")) {
+        conn.send(channel, `⚙ ${summary}${files.length ? `  [${files.join(", ")}]` : ""}`);
+      }
     } catch {
       // The log is a side effect; never let it disturb the session.
     }
     void ctx;
+  }
+
+  /** Provenance tier ordering, local so the extension need not import it. */
+  function tierAtLeastProv(a: ProvenanceTier, b: ProvenanceTier): boolean {
+    const rank = { silent: 0, decisions: 1, evidence: 2, firehose: 3 } as const;
+    return rank[a] >= rank[b];
+  }
+
+  /**
+   * Live per-tool lines, `firehose` only. One line as each consequential tool
+   * call starts, so a watcher sees the agent move rather than a summary after
+   * the fact. Rate-limited: a burst of reads is one line, not forty.
+   */
+  let lastFirehoseAt = 0;
+  function firehose(cfg: FreeqConfig, line: string): void {
+    if ((cfg.provenance ?? "evidence") !== "firehose" || cfg.muted) return;
+    if (!conn || conn.state !== "online") return;
+    const channel = cfg.provenanceChannel ?? cfg.channels[0];
+    if (!channel) return;
+    const now = Date.now();
+    if (now - lastFirehoseAt < 1500) return;
+    lastFirehoseAt = now;
+    try {
+      conn.send(channel, `⚙ ${line}`);
+    } catch {
+      /* side effect */
+    }
   }
 
   // ── the tool ────────────────────────────────────────────────────────────
@@ -1810,15 +1893,21 @@ export default function (pi: ExtensionAPI): void {
           return;
         }
 
+        case "verbosity":
         case "provenance": {
-          const level = rest[0];
+          // Friendly names map onto the provenance tiers; the two commands are
+          // one knob. `verbosity` is the word a person reaches for.
+          const friendly: Record<string, ProvenanceTier> = {
+            quiet: "decisions", less: "decisions", normal: "evidence", more: "firehose", loud: "firehose", off: "silent",
+          };
+          const level = rest[0] && friendly[rest[0]] ? friendly[rest[0]] : rest[0];
           if (!level || !(PROVENANCE_TIERS as readonly string[]).includes(level)) {
             ctx.ui.notify(
               `freeq: provenance is '${cfg.provenance ?? "decisions"}'\n` +
                 `usage: /freeq provenance <${PROVENANCE_TIERS.join("|")}>\n` +
                 `  silent    nothing is mirrored\n` +
-                `  decisions changes and outbound actions (default)\n` +
-                `  evidence  the above plus output excerpts\n` +
+                `  decisions changes and outbound actions, tags only (quiet)\n` +
+                `  evidence  one readable line per turn in the channel (default)\n` +
                 `  firehose  every tool call — for debugging the log itself`,
               "info",
             );
