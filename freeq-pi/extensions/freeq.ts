@@ -678,6 +678,14 @@ export default function (pi: ExtensionAPI): void {
       meta,
       onNotice: (text, level) => notify(ctx, text, level),
 
+      onUnexpectedChannel: (channel) => {
+        notify(
+          uiCtx,
+          `freeq: left ${channel} — the server had rejoined us there, but this project's channels are ${config ? channelsForProject(config, currentProject).join(", ") || "(none)" : "(none)"}`,
+          "info",
+        );
+        refreshUi();
+      },
       onJoinRefused: (channel, reason) => {
         // Loud, with the remedy, because the alternative is what just
         // happened: a channel that looks joined and is not.
@@ -2134,12 +2142,21 @@ export default function (pi: ExtensionAPI): void {
               }`,
               `muted:    ${cfg.muted ? "YES — silent everywhere (/freeq unmute)" : "no"}`,
               (() => {
+                // Two different facts, and conflating them is what made
+                // status disagree with the server: where we are CONFIGURED to
+                // be, and where the server says we ARE. Print both, and only
+                // remark on the difference when there is one.
                 const eff = channelsForProject(cfg, currentProject);
                 const pinned = currentProject ? cfg.projects?.[currentProject] !== undefined : false;
-                return (
+                const live = conn?.joinedChannels() ?? [];
+                const refused = conn?.refusedChannels() ?? [];
+                const lines = [
                   `channels: ${eff.length ? eff.join(", ") : "(none)"}` +
-                  (pinned ? ` (this project only)` : ` (global)`)
-                );
+                    (pinned ? ` (this project only)` : ` (global)`),
+                  `joined:   ${live.length ? live.join(", ") : "(none confirmed)"}`,
+                ];
+                for (const r of refused) lines.push(`refused:  ${r.channel} — ${r.reason}`);
+                return lines.join("\n");
               })(),
               `trusted:  ${Object.keys(cfg.trust).length} peer(s)`,
               `provenance: ${cfg.provenance ?? "decisions"}` +

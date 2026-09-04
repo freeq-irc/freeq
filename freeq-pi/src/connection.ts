@@ -118,6 +118,8 @@ export interface ConnectionOptions {
   onScrub?: (hits: string[], target: string) => void;
   /** Called when the server refuses a JOIN, with the channel and the reason. */
   onJoinRefused?: (channel: string, reason: string) => void;
+  /** Called when we left a channel the server put us in unasked. */
+  onUnexpectedChannel?: (channel: string) => void;
   /** Inbound channel/DM messages (routed through the tier pipeline). */
   onMessage?: (channel: string, msg: Message) => void;
   /** Override how the bot is created. Tests inject a fake; production omits it. */
@@ -301,6 +303,18 @@ export class FreeqConnection {
       // Announce into each channel once we're actually in it.
       bot.on("channelJoined", (channel: string) => {
         this.#joined.add(channel.toLowerCase());
+        // The server restores a session's saved channel set on reconnect, so
+        // a channel this project no longer wants comes back by itself and
+        // stays for good: config asks, server remembers, server wins. Leave
+        // anything we did not ask for. Announcing into it first would be
+        // announcing our arrival somewhere we are about to leave.
+        const wanted = this.#opts.channels.map((c) => c.toLowerCase());
+        if (wanted.length && !wanted.includes(channel.toLowerCase())) {
+          this.#joined.delete(channel.toLowerCase());
+          this.#bot?.client.raw(`PART ${channel} :not this project's channel`);
+          this.#opts.onUnexpectedChannel?.(channel);
+          return;
+        }
         this.#refused.delete(channel.toLowerCase());
         this.#announce(channel, PI_HELLO);
       });
