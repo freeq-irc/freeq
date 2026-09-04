@@ -56,6 +56,9 @@ const eventIcons: Record<string, string> = {
 export function AuditTimeline({ channel, onClose }: AuditTimelineProps) {
   const [events, setEvents] = useState<AuditEvent[]>([]);
   const [loading, setLoading] = useState(true);
+  /** Why the list is empty when it is: the server refused the read, or the
+   *  request failed. An empty answer is neither. */
+  const [refused, setRefused] = useState<'forbidden' | 'failed' | null>(null);
   const [actorFilter, setActorFilter] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('');
   const [verify, setVerify] = useState<{ id: string; signed: boolean; pos: { x: number; y: number } } | null>(null);
@@ -66,8 +69,14 @@ export function AuditTimeline({ channel, onClose }: AuditTimelineProps) {
     const params = new URLSearchParams({ limit: '200' });
     if (actorFilter) params.set('actor', actorFilter);
 
+    setRefused(null);
     apiFetch(`/api/v1/channels/${encodeURIComponent(channel.replace(/^#/, ''))}/audit?${params}`)
-      .then(r => r.ok ? r.json() : { events: [] })
+      .then(r => {
+        if (r.ok) return r.json();
+        // A refusal is not an empty audit: say which it was.
+        setRefused(r.status === 401 || r.status === 403 ? 'forbidden' : 'failed');
+        return { events: [] };
+      })
       .then(data => {
         const rows: AuditEvent[] = data.timeline || data.events || [];
         setEvents(rows);
@@ -87,7 +96,7 @@ export function AuditTimeline({ channel, onClose }: AuditTimelineProps) {
         }
         setLoading(false);
       })
-      .catch(() => setLoading(false));
+      .catch(() => { setRefused('failed'); setLoading(false); });
   }, [channel, actorFilter]);
 
   // The route filters by actor and by window; the kind of row is filtered
@@ -142,6 +151,10 @@ export function AuditTimeline({ channel, onClose }: AuditTimelineProps) {
       <div className="flex-1 overflow-y-auto px-4 py-2">
         {loading ? (
           <div className="text-fg-dim text-center py-8">Loading...</div>
+        ) : refused === 'forbidden' ? (
+          <div className="text-fg-dim text-center py-8">This channel's audit is shown only to signed-in members.</div>
+        ) : refused === 'failed' ? (
+          <div className="text-fg-dim text-center py-8">The audit could not be loaded.</div>
         ) : filtered.length === 0 ? (
           <div className="text-fg-dim text-center py-8">No audit events found.</div>
         ) : (

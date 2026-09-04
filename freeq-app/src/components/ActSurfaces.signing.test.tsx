@@ -112,6 +112,38 @@ describe('the audit timeline never renders a raw DID', () => {
 // The audit timeline is one time order over three kinds of row, and a task
 // event is one of them: the verb word the cards use, the title the step
 // named, the cards' seal, and the same verify link every signed row carries.
+describe('the audit timeline says why it is empty', () => {
+  it('tells a refused reader the audit is for signed-in members', async () => {
+    vi.spyOn(api, 'apiFetch').mockResolvedValue({
+      ok: false,
+      status: 403,
+      json: () => Promise.resolve({ error: 'Forbidden' }),
+    } as unknown as Response);
+    const { container } = render(<AuditTimeline channel="#naptest" onClose={() => {}} />);
+    await waitFor(() => expect(container.textContent).toContain("This channel's audit is shown only to signed-in members."));
+    expect(container.textContent).not.toContain('No audit events found.');
+  });
+
+  it('says when the audit could not be loaded', async () => {
+    vi.spyOn(api, 'apiFetch').mockResolvedValue({
+      ok: false,
+      status: 500,
+      json: () => Promise.resolve({}),
+    } as unknown as Response);
+    const { container } = render(<AuditTimeline channel="#naptest" onClose={() => {}} />);
+    await waitFor(() => expect(container.textContent).toContain('The audit could not be loaded.'));
+  });
+
+  it('still says no events for an empty answer', async () => {
+    vi.spyOn(api, 'apiFetch').mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ timeline: [] }),
+    } as unknown as Response);
+    const { container } = render(<AuditTimeline channel="#naptest" onClose={() => {}} />);
+    await waitFor(() => expect(container.textContent).toContain('No audit events found.'));
+  });
+});
+
 describe('the audit timeline reads task events', () => {
   function mockRows(rows: unknown[]) {
     vi.spyOn(api, 'apiFetch').mockResolvedValue({
