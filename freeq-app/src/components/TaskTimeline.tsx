@@ -9,6 +9,7 @@ import { VerifySignaturePanel } from './VerifySignaturePanel';
 import { displayNameForKey } from '../lib/display-name';
 import { actHeadline } from '../lib/act-verbs';
 import { apiFetch } from '../lib/api';
+import { useStore } from '../store';
 
 export function TaskTimeline(props: { actId: string; onClose: () => void }) {
   return <ActionTimeline actId={props.actId} onClose={props.onClose} />;
@@ -28,6 +29,12 @@ function ActionTimeline({ actId, onClose }: { actId: string; onClose: () => void
   const [data, setData] = useState<{ task: any; events: ActionEvent[] } | null>(null);
   const [loading, setLoading] = useState(true);
   const [verify, setVerify] = useState<{ id: string; signed: boolean; pos: { x: number; y: number } } | null>(null);
+  // The line a step wrote is known to the store, not to the endpoint: the
+  // task's events carry the msgid of the companion each one was paired with.
+  const holder = useStore(s => s.bufferHoldingTask(actId));
+  const actTasks = useStore(s => (holder ? s.channels.get(holder.toLowerCase())?.actTasks : undefined));
+  const task = actTasks?.get(actId);
+  const setScrollToMsgId = useStore(s => s.setScrollToMsgId);
 
   useEffect(() => {
     // Authed: an action in a direct conversation is readable only by the two
@@ -65,8 +72,16 @@ function ActionTimeline({ actId, onClose }: { actId: string; onClose: () => void
       </div>
 
       <div className="px-3 py-2">
-        {docs.map(({ event, doc }) => (
-          <div key={event.event_id} className="flex items-center gap-2 text-xs py-1">
+        {docs.map(({ event, doc }) => {
+          // A receipt and an expiry send no companion line, so there is
+          // nothing for their row to jump to and it does not react.
+          const msgId = task?.events.find(e => e.eventId === event.event_id)?.msgId;
+          return (
+          <div
+            key={event.event_id}
+            className={`flex items-center gap-2 text-xs py-1${msgId ? ' rounded px-1 hover:bg-surface/30' : ''}`}
+            onClick={msgId ? () => { setScrollToMsgId(msgId); onClose(); } : undefined}
+          >
             <span className="font-semibold text-fg-muted">{actHeadline(doc['act-verb'] ?? '')}</span>
             <span className="text-fg-dim truncate">
               {event.actor_did ? displayNameForKey(event.actor_did) : ''}
@@ -77,12 +92,16 @@ function ActionTimeline({ actId, onClose }: { actId: string; onClose: () => void
             <button
               className="text-[10px] text-fg-dim/60 hover:text-fg-muted underline decoration-dotted"
               title="Check this event's signature"
-              onClick={ev => setVerify({ id: event.event_id, signed: !!event.signature, pos: { x: ev.clientX, y: ev.clientY } })}
+              onClick={ev => {
+                ev.stopPropagation();
+                setVerify({ id: event.event_id, signed: !!event.signature, pos: { x: ev.clientX, y: ev.clientY } });
+              }}
             >
               verify
             </button>
           </div>
-        ))}
+          );
+        })}
       </div>
 
       {verify && (
