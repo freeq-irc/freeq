@@ -74,6 +74,7 @@ Other actions: `peers`, `send`, `say`. See `skills/freeq/SKILL.md`.
 | `/freeq decline <id> [reason]` | turn one down, with a reason |
 | `/freeq drop <id> [reason]` | fail work in flight honestly instead of leaving it hanging |
 | `/freeq progress <id> <note>` | report progress by hand |
+| `/freeq call #c` / `/freeq hangup` | join a voice call in a channel as a speaking, listening participant |
 
 Ids may be given as the short prefix the notifications print. An ambiguous
 prefix is refused by name rather than guessed.
@@ -130,6 +131,31 @@ npx tsx spike/ask-check.ts   --server ws://127.0.0.1:18080/irc   # cross-agent a
 ```
 
 `spike/` holds test harnesses, not product code.
+
+## Voice: `/freeq call #channel`
+
+Your agent can join a freeq voice call — hear the room, speak, post artifacts
+to the channel, and project a visual tile. This was Claude-Code-only, because
+the AV bridge (`freeq-claude-mcp`) is an MCP server and only Claude Code spoke
+MCP. `@freeq/pi` now carries a ~150-line MCP-over-stdio client and drives the
+same bridge.
+
+Build the bridge once: `cargo build --release -p freeq-claude-mcp` in the
+freeq repo (or point `FREEQ_AV_BRIDGE` at a binary). It needs `GROQ_API_KEY`
+(STT) and `ELEVENLABS_API_KEY` (TTS) in the environment, or in Claude Code's
+`~/.claude/settings.json` `env` block, which is read as a fallback.
+
+In the call, the model acts through one tool, `freeq_av`: `say` speaks (and
+mirrors to the channel), `post` drops text without speaking, `show` /
+`show_file` / `show_diff` put cards on the tile, `participants`, `recall`,
+`status`. Everything spoken or posted goes through the same secret-and-path
+redaction as a typed message: a secret said out loud is still leaked.
+
+What the model hears is gated the same way as chat. Only lines that address
+the agent by name are delivered, at the **guest** tier — a voice carries no
+server-resolved DID, and a voice cannot be more trusted than a typed message
+from the same unknown person. The rest of the conversation is context the
+model can pull with `recall`, not a reason to wake it.
 
 ## One identity per project
 

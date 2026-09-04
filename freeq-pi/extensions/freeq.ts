@@ -31,6 +31,7 @@ import {
 import { deriveInstallSlug, defaultNick, isDid } from "../src/identity.js";
 import { authorizeInstructions, creatorKeyPath, interpretProvenanceNotice } from "../src/owner-key.js";
 import { McpStdioClient } from "../src/mcp-stdio.js";
+import { addressedUtterances, parseListenResult, toBridgeCall, type AvParams } from "../src/av.js";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import {
@@ -1198,24 +1199,14 @@ export default function (pi: ExtensionAPI): void {
         await new Promise((r) => setTimeout(r, 2_000));
         continue;
       }
-      let parsed: { transcripts?: Array<{ speaker: string; text: string; addressed?: boolean; question?: string }> } = {};
-      try {
-        parsed = JSON.parse(McpStdioClient.text(result));
-      } catch {
-        continue;
-      }
-      for (const t of parsed.transcripts ?? []) {
-        if (!t.addressed || !avChannel) continue;
-        const text = (t.question ?? t.text ?? "").trim();
-        if (!text) continue;
-        // Voice participants are resolved by the bridge from the AV roster;
-        // a nick we cannot map to a DID is a guest and gets the guest tier.
+      for (const u of addressedUtterances(parseListenResult(McpStdioClient.text(result)))) {
+        if (!avChannel) break;
         deliver(ctx, {
           kind: "chat",
           channel: avChannel,
-          from: t.speaker,
+          from: u.from,
           did: null,
-          text: `(spoken in the call) ${text}`,
+          text: u.text,
           addressed: true,
           mode: cfg.muted ? "silent" : "addressed",
           tier: tierFor(cfg, null),
@@ -1268,22 +1259,10 @@ export default function (pi: ExtensionAPI): void {
       if (!av?.alive || !avChannel) {
         return out("Not in a call. Ask the user to run /freeq call #channel.", true);
       }
-      const p = params as Record<string, unknown>;
-      const map: Record<string, [string, Record<string, unknown>]> = {
-        say: ["freeq_say", { text: p.text, priority: p.priority ?? "addressed" }],
-        post: ["freeq_post", { text: p.text }],
-        show: ["freeq_show", { kind: "card", title: p.title, bullets: p.bullets }],
-        show_file: ["freeq_show_file", { path: p.path, lines: p.lines }],
-        show_diff: ["freeq_show_diff", { path: p.path, lines: p.lines }],
-        participants: ["freeq_participants", {}],
-        recall: ["freeq_recall", { query: p.text }],
-        status: ["freeq_set_status", { label: p.label }],
-      };
-      const [tool, args] = map[String(p.action)] ?? [];
-      if (!tool) return out(`unknown action ${String(p.action)}`, true);
-      // Everything that leaves this process is scrubbed the same way a
-      // channel message is: secrets and absolute paths never reach a call.
-      if (typeof args.text === "string" && conn) args.text = conn.scrubForWire(args.text, avChannel);
+      const channel = avChannel;
+      const { tool, args } = toBridgeCall(params as AvParams, (t) =>
+        conn ? conn.scrubForWire(t, channel) : t,
+      );
       const r = await av.call(tool, args, 30_000);
       return out(McpStdioClient.text(r) || "(ok)", !!r.isError);
     },
