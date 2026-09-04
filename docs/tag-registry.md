@@ -36,8 +36,8 @@ values are strings per the IRCv3 escaping rules.
 
 | Tag | On | Meaning |
 |---|---|---|
-| `+freeq.at/event` | PRIVMSG | Typed coordination event: `task_request`, `task_update`, `task_complete`, … |
-| `+freeq.at/task-id` | PRIVMSG | The task this event belongs to. |
+| `+freeq.at/event` | PRIVMSG | Freeform typed event, any kind the sender chooses (`objective`, `status_update`, `delegation_notice`, …). Not a task: a task with a lifecycle is `+freeq.at/act` below. |
+| `+freeq.at/task-id` | PRIVMSG | Second wire spelling of `+freeq.at/ref` — both are the same `ref` field in the signed canonical, and `ref` is read first. New senders use `ref`. |
 | `+freeq.at/payload` | PRIVMSG | JSON payload for the event (machine-readable half of the message). |
 | `+freeq.at/parent`, `+freeq.at/ref` | PRIVMSG | Event lineage / cross-references (delegation, evidence links). |
 | `+freeq.at/evidence-type` | PRIVMSG | Kind of evidence attached to a task event. |
