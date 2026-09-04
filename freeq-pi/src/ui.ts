@@ -26,6 +26,8 @@ export interface FooterState {
   channelsRefused?: number;
   /** Messages addressed to us that the tier gate withheld. */
   withheld?: number;
+  /** No identity minted for this project yet — deliberately, not by failure. */
+  dormant?: boolean;
   peers: number;
   offersWaiting: number;
   /** What the agent is doing, if anything: the work label. */
@@ -41,6 +43,11 @@ export interface FooterState {
  */
 export function footerLine(s: FooterState): string {
   if (!s.online) {
+    if (s.dormant) {
+      // Not a failure and not a warning: no identity has been minted for this
+      // project yet, on purpose. Say what it costs to change that.
+      return "⬡ freeq · dormant here (any /freeq command joins as this project)";
+    }
     return s.passive ? "⬡ freeq · passive (another window holds this project)" : "⬡ freeq · offline";
   }
   const parts = [

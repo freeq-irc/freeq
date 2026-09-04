@@ -31,7 +31,9 @@ import {
   type Mode,
   type Tier,
 } from "../src/config.js";
-import { deriveInstallSlug, defaultNick, isDid } from "../src/identity.js";
+import { deriveInstallSlug, defaultNick, isDid,
+  resolveBotName,
+} from "../src/identity.js";
 import { authorizeInstructions, creatorKeyPath, interpretProvenanceNotice } from "../src/owner-key.js";
 import { McpStdioClient } from "../src/mcp-stdio.js";
 import { addressedUtterances, parseListenResult, toBridgeCall, type AvParams } from "../src/av.js";
@@ -55,6 +57,8 @@ import { access as fsAccess } from "node:fs/promises";
 
 /** Root of freeq state on this machine — bot-kit's `~/.freeq`. */
 const FREEQ_ROOT = joinPath(homedir(), ".freeq");
+/** Where bot-kit keeps per-identity state; one directory per minted identity. */
+const BOTS_ROOT = joinPath(FREEQ_ROOT, "bots");
 
 /**
  * The owner's creator key, if `/freeq authorize` has been run. When present,
@@ -248,6 +252,33 @@ export default function (pi: ExtensionAPI): void {
   // them. See src/withheld.ts for why this exists.
   const withheld = new WithheldBuffer();
   let currentProject: string | undefined;
+  /**
+   * True when we deliberately did not connect because this project has no
+   * freeq identity yet. Cleared by the first thing that needs the wire.
+   */
+  let dormant = false;
+
+  /**
+   * Has this installation used freeq in this project before?
+   *
+   * Three signals, any of which means yes: the project has its own channel
+   * list, a bot-kit state directory already exists for it (so a keypair was
+   * minted at some point), or the user gave a global channel list and this is
+   * a git repository rather than a scratch directory.
+   */
+  async function projectIsKnown(ctx: ExtensionContext, cfg: FreeqConfig): Promise<boolean> {
+    const meta = await collectSessionMeta({ cwd: ctx.cwd, model: ctx.model?.id });
+    currentProject = meta.project;
+    if (meta.project && cfg.projects?.[meta.project]) return true;
+    const slug = cfg.install ?? deriveInstallSlug();
+    const name = resolveBotName(slug, meta.project, (n: string) => existsSync(joinPath(BOTS_ROOT, n)));
+    if (existsSync(joinPath(BOTS_ROOT, name))) return true;
+    // A git checkout is a project someone means to keep; a bare directory is
+    // usually a place to try something.
+    // A git checkout is somewhere someone means to keep working; a bare
+    // directory is usually somewhere they are trying something out.
+    return !!meta.repo || !!meta.branch;
+  }
   let uiCtx: ExtensionContext | undefined;
   function refreshUi(ctx?: ExtensionContext): void {
     const c = ctx ?? uiCtx;
@@ -268,6 +299,7 @@ export default function (pi: ExtensionAPI): void {
         channels: conn?.joinedChannels().length ?? 0,
         channelsRefused: conn?.refusedChannels().length ?? 0,
         withheld: withheld.size,
+        dormant,
         peers: conn?.peers().length ?? 0,
         offersWaiting: waiting.length,
         working: workLabel,
@@ -650,6 +682,24 @@ export default function (pi: ExtensionAPI): void {
     }
   }
 
+  /**
+   * Connect if we are dormant, minting this project's identity on the way.
+   *
+   * Called by everything that needs the wire. The first /freeq command in a
+   * new project is the "reason" lazy minting waits for - deliberate use, as
+   * against pi merely having been started in a directory.
+   */
+  async function wake(ctx: ExtensionContext): Promise<void> {
+    if (!dormant) return;
+    dormant = false;
+    const cfg = await ensureConfig(ctx);
+    if (!cfg.enabled || !isDid(cfg.ownerDid)) return;
+    notify(ctx, "freeq: first use in this project — minting its identity", "info");
+    const msg = await connect(ctx);
+    if (conn?.state !== "online") notify(ctx, msg, "warning");
+    refreshUi(ctx);
+  }
+
   async function connect(ctx: ExtensionContext): Promise<string> {
     const cfg = await ensureConfig(ctx);
     if (!cfg.enabled) return "freeq is disabled (`/freeq on` to enable)";
@@ -703,6 +753,7 @@ export default function (pi: ExtensionAPI): void {
       ownerDid: cfg.ownerDid,
       server: cfg.server,
       slug: cfg.install ?? deriveInstallSlug(),
+      root: BOTS_ROOT,
       nick: cfg.nick,
       creatorKeyPath: await existingCreatorKey(cfg),
       // Per-project: a music repo and a work repo are different agents and
@@ -893,6 +944,22 @@ export default function (pi: ExtensionAPI): void {
     uiCtx = ctx;
     const cfg = await ensureConfig(ctx);
     if (!cfg.enabled || !isDid(cfg.ownerDid)) return; // silent when not set up
+
+    // Mint lazily. An identity is a keypair and a nick registered on a public
+    // server, and connecting on sight meant every directory pi was ever
+    // started in acquired one — three throwaway test directories produced
+    // three permanent agents, indistinguishable from real projects to anyone
+    // reading the roster.
+    //
+    // A project this installation already knows still connects on sight, so
+    // nothing about working in a real project changes. An unknown one waits
+    // for a reason: any /freeq command connects, and so does anything else
+    // that needs the wire. Trying freeq out should not cost you an identity.
+    if (!(await projectIsKnown(ctx, cfg))) {
+      dormant = true;
+      refreshUi(ctx);
+      return;
+    }
     const msg = await connect(ctx);
     if (conn?.state !== "online") notify(ctx, msg, "warning");
 
@@ -2091,6 +2158,9 @@ export default function (pi: ExtensionAPI): void {
     description: "freeq multiplayer: login, authorize, status, join, leave, peers, mode, trust, call, hangup",
     handler: async (args, ctx) => {
       const [sub = "status", ...rest] = args.trim().split(/\s+/).filter(Boolean);
+      // Deliberate use of freeq is the reason a dormant project connects.
+      // 'off' is exempt: turning it off must not first turn it on.
+      if (sub !== "off") await wake(ctx);
       const cfg = await ensureConfig(ctx);
 
       switch (sub) {

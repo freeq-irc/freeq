@@ -14,7 +14,15 @@ import type {
   PresencePayload,
 } from "@freeq/sdk";
 import { actTags } from "@freeq/sdk";
-import { defaultNick, projectBotName, projectNick } from "./identity.js";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+/** bot-kit's default state root, mirrored so identity lookup agrees with it. */
+function defaultBotsRoot(): string {
+  return join(homedir(), ".freeq", "bots");
+}
+import { defaultNick, projectNick, resolveBotName } from "./identity.js";
 import { describeMeta, formatStatus, parseStatus, type SessionMeta } from "./presence.js";
 import {
   buildHello,
@@ -246,7 +254,12 @@ export class FreeqConnection {
         // Identity is per project: a music repo and a work repo are different
         // participants. The state dir and the nick both carry the project so
         // the key is stable across restarts and the name says whose and which.
-        name: projectBotName(this.#opts.slug, this.#meta.project),
+        // Prefer an identity that already exists on disk: the slug format
+        // changed, and renaming an agent would hand it a new DID and a new
+        // nick, making it a stranger to everyone who trusts it.
+        name: resolveBotName(this.#opts.slug, this.#meta.project, (n) =>
+          existsSync(join(this.#opts.root ?? defaultBotsRoot(), n)),
+        ),
         ownerDid: this.#opts.ownerDid,
         creatorKeyPath: this.#opts.creatorKeyPath,
         nick: projectNick(this.#opts.nick ?? defaultNick(this.#opts.slug), this.#meta.project),

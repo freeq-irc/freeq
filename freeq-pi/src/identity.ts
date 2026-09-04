@@ -60,7 +60,50 @@ export function botName(slug: string): string {
  * used raw when it does not survive sanitising, so two projects with
  * awkward names cannot collide.
  */
+/**
+ * How much of a nick the project may occupy.
+ *
+ * A nick is capped at 30, and it has to carry both who you are and which of
+ * your projects this is. 16 leaves 13 for the base, which is enough for
+ * `chad-bot` and most names people actually use.
+ */
+export const SLUG_MAX = 16;
+
+/**
+ * A short, stable, readable name for a project.
+ *
+ * This used to hash anything over 12 characters, which meant `my-new-project`
+ * became `278cc566` — stable and unique and completely unreadable, and the
+ * first thing a stranger sees of their own agent. Most repository names are
+ * longer than 12, so the opaque case was the common one.
+ *
+ * Now a name that fits is used verbatim, and one that does not is truncated
+ * to a readable stem with four hex of the FULL name appended. `some-very-long
+ * -project` reads as `some-very--a1b2`: you can tell which project it is, and
+ * two projects sharing a prefix still differ, because the hash is taken over
+ * the whole name rather than the part that survived truncation.
+ */
 export function projectSlug(project: string | undefined): string | undefined {
+  if (!project) return undefined;
+  const clean = project.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  // Nothing usable survived (a name of only punctuation, say): fall back to
+  // the hash, since an unreadable name beats no name.
+  if (!clean) return createHash("sha256").update(project).digest("hex").slice(0, 8);
+  if (clean.length <= SLUG_MAX) return clean;
+  const tag = createHash("sha256").update(project).digest("hex").slice(0, 4);
+  const stem = clean.slice(0, SLUG_MAX - tag.length - 1).replace(/-+$/, "");
+  return `${stem}-${tag}`;
+}
+
+/**
+ * What `projectSlug` used to return, for finding an identity minted before
+ * the change.
+ *
+ * A slug names a keypair and a registered nick, so changing the function
+ * silently orphans an existing agent and mints a new one under a new DID.
+ * Callers check here first and keep using the old name if that state exists.
+ */
+export function legacyProjectSlug(project: string | undefined): string | undefined {
   if (!project) return undefined;
   const clean = project.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
   if (clean && clean.length <= 12) return clean;
@@ -71,6 +114,30 @@ export function projectSlug(project: string | undefined): string | undefined {
 export function projectBotName(installSlug: string, project: string | undefined): string {
   const ps = projectSlug(project);
   return ps ? `${INSTALL_PREFIX}-${installSlug}-${ps}` : botName(installSlug);
+}
+
+/**
+ * The state name to actually use, preferring an identity that already exists.
+ *
+ * `projectSlug` changed, and a slug names a keypair and a registered nick. An
+ * agent whose name moved would come back as a stranger: new DID, new nick,
+ * every trust entry pointing at the old one. So if state exists under the old
+ * name and not the new one, keep the old name. Nobody's agent is renamed by
+ * an upgrade; only new projects get the readable form.
+ */
+export function resolveBotName(
+  installSlug: string,
+  project: string | undefined,
+  exists: (name: string) => boolean,
+): string {
+  const current = projectBotName(installSlug, project);
+  if (exists(current)) return current;
+  const legacy = legacyProjectSlug(project);
+  if (legacy) {
+    const legacyName = `${INSTALL_PREFIX}-${installSlug}-${legacy}`;
+    if (legacyName !== current && exists(legacyName)) return legacyName;
+  }
+  return current;
 }
 
 /**

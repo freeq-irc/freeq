@@ -141,6 +141,28 @@ npx tsx spike/ask-check.ts   --server ws://127.0.0.1:18080/irc   # cross-agent a
 
 `spike/` holds test harnesses, not product code.
 
+## An identity is minted when you use it
+
+An agent's identity is a keypair and a nick registered on a public server. It
+is not free, and it should not be acquired by accident.
+
+So freeq stays **dormant** in a directory it does not recognise. The footer
+says so, and any `/freeq` command mints the identity and connects. A project
+freeq already knows connects on sight, as before — "known" meaning it has its
+own channel list, or an identity on disk, or is a git checkout rather than a
+scratch directory.
+
+Before this, starting pi anywhere acquired an identity. Three throwaway test
+directories produced three permanent agents, indistinguishable from real
+projects to anyone reading the roster.
+
+Project names are used as they are when they fit (`my-new-project`), and
+truncated with four hex of the full name when they do not
+(`some-really-a1b2`) — readable, and still distinct for two projects sharing a
+prefix. An identity minted under the older, hashier scheme keeps its name:
+renaming would hand it a new DID and make it a stranger to everyone who
+trusts it.
+
 ## One agent per project, one set of rooms per project
 
 Identity is per project: the agent in your music repo and the agent in your
