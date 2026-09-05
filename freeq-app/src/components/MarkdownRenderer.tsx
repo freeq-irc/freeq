@@ -7,6 +7,7 @@
 import { memo } from 'react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkBreaks from 'remark-breaks';
 import type { Components } from 'react-markdown';
 
 const ALLOWED_URL_SCHEMES = /^https?:\/\//i;
@@ -115,7 +116,7 @@ export const MarkdownMessage = memo(function MarkdownMessage({ text }: Props) {
   return (
     <div className="text-[15px] leading-relaxed [&_pre]:my-1 [&_a]:break-all markdown-message">
       <Markdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkBreaks]}
         components={components}
         // Disable raw HTML passthrough (XSS prevention)
         skipHtml
