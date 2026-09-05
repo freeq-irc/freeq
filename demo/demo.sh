@@ -26,10 +26,19 @@ say() {
 }
 note() { printf '%s   %s%s\n' "$DIM" "$1" "$OFF"; }
 run()  { printf '\n%s$ %s%s\n' "$BOLD" "$1" "$OFF"; sleep 0.4; eval "$1"; }
+# Like run(), but keeps the output so the task id can be read off it. The id is
+# minted while this records; hardcoding one would be staging the demo, and
+# reading it back out of the channel picked up somebody else's offer last time.
+capture() {
+  printf '\n%s$ %s%s\n' "$BOLD" "$1" "$OFF"; sleep 0.4
+  CAPTURED=$(eval "$1" 2>&1); printf '%s\n' "$CAPTURED"
+}
 pause() { sleep "${1:-1.5}"; }
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-DEMO_AGENT="$HOME/src/demo-agent"
+AGENT_A="$HOME/src/demo-a"
+AGENT_B="$HOME/src/demo-b"
+B_DID="did:key:z6MkvwfGoiBa1w1qURUvYeAdSE4DxTQJ9eMV4A2FaUswYLFP"
 
 clear
 cat <<'BANNER'
@@ -56,28 +65,21 @@ unset PI_CODING_AGENT_DIR
 pause 2
 
 # ─────────────────────────────────────────────────────────────────────────
-say "2. Two agents that are already set up — in two different projects."
-note "Identity is per project: the agent in one repo is not the agent in another."
-run "ls ~/.freeq/bots | grep -E 'pi-mac-studio-(freeq|demo-agent)$'"
-pause 1
-
-say "Each has its own did:key. Nobody assigned them; they minted their own."
-run "cd $DEMO_AGENT && pi -p 'Use the freeq tool, action peers. Print only its raw output.' 2>&1 | tail -4"
+say "2. Two agents, in two different projects, each with its own key."
+note "Identity is per project. Nobody assigned these; each minted its own on first use."
+run "ls ~/.freeq/bots | grep -E 'pi-mac-studio-demo-[ab]$'"
+run "grep -ho 'did:key:[A-Za-z0-9]*' ~/.freeq/bots/pi-mac-studio-demo-[ab]/*.json | sort -u"
 pause 2
 
-# ─────────────────────────────────────────────────────────────────────────
-say "3. Agent A hands work to agent B, addressed to B's key — not its nickname."
-TASK_TITLE="Count the Rust source files in the freeq server"
-run "cd $REPO && pi -p \"Use the freeq tool: action handoff, to did:key:z6MkvGFiq49kB51KuPT9qYsRHZ6ypndwLVmPM2P5wbeqJizV, channel #freeq-demo, title '$TASK_TITLE', message 'Report how many .rs files are under freeq-server/src, and the three largest by line count. Accept with the freeq tool, post the answer to #freeq-demo, then complete.'. Print only the task id it returns.\" 2>&1 | tail -3"
-
-# Read the id back off the wire rather than trusting the transcript.
-TASK=$(ssh chad@160.202.129.155 "cd ~/src/freeq && sqlite3 -readonly irc.db \"select act_id from act_actions where venue='#freeq-demo' order by updated desc limit 1;\"" 2>/dev/null)
-note "task: $TASK"
+say "3. Agent A hands work to agent B — addressed to B's key, not its nickname."
+capture "cd \$AGENT_A && pi -p \"Use the freeq tool: action handoff, to \$B_DID, channel #freeq-demo, title 'Count the Rust source files in the freeq server', message 'Report how many .rs files are under freeq-server/src and the three largest by line count. Accept with the freeq tool, post the answer to #freeq-demo, then complete.'. Print ONLY the task id.\" 2>&1 | tail -3"
 pause 2
 
-# ─────────────────────────────────────────────────────────────────────────
 say "4. Agent B accepts it itself. No human approves this step."
-run "cd $DEMO_AGENT && pi -p 'You have freeq handoff $TASK offered to you. Accept it with the freeq tool, do the work against ~/src/freeq, post the answer to #freeq-demo, and complete it. Be brief.' 2>&1 | tail -8"
+TASK=$(printf '%s' "$CAPTURED" | grep -oE '01[0-9A-HJKMNP-TV-Z]{24}' | head -1)
+note "task ${TASK:-<none>} — minted just now, addressed to agent B's key"
+pause 1
+run "cd \$AGENT_B && pi -p 'You have freeq handoff $TASK offered to you. Accept it with the freeq tool, do the work against ~/src/freeq, post the answer to #freeq-demo, then complete it. Be brief.' 2>&1 | tail -6"
 pause 2
 
 # ─────────────────────────────────────────────────────────────────────────
