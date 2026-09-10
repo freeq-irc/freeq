@@ -1,0 +1,325 @@
+{
+  "description": "Identity records a person publishes in their own AT Protocol repository. `at.freeq.deviceKey` announces a signing key a device holds, or retires one; `at.freeq.agentKey` announces a bot the account claims as its own, or retires that claim. `bindingSig` is an ed25519 signature, base64url without padding, over the UTF-8 bytes of the JCS (RFC 8785) canonical form of the record with its `bindingSig` field removed, and `signedBytes` is that canonical form. This is the recipe every freeq document signature uses: chat documents (freeq-sdk/src/chatsig.rs), task events (freeq-sdk/src/act.rs), the bot certificate (freeq-bot-id/src/main.rs, verified in freeq-server/src/connection/provenance.rs and minted in TypeScript by freeq-bot-kit-js/src/delegation.ts) and policy credentials (freeq-server/src/policy/credentials.rs). Absent fields are absent rather than null, so they are not in the canonical form, and `kid` is base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16]). Every implementation must rebuild each vector's `record`, `signedBytes` and `bindingSig` from its `seed`, and must fold each case's records at its `at` into exactly `liveDeviceKids` and `liveAgentDids`.",
+  "folds": [
+    {
+      "agentRecords": [],
+      "at": "2026-03-01T00:00:00Z",
+      "deviceRecords": [
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "5jBEtnieaGHEoHYH_rves50_lFeJ7TygOBrP__fZejfdwtpVjR01FGPXOe2L_LNX-8irRvu1iYRA7CHDKm5MDA",
+          "createdAt": "2026-01-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+          "label": "laptop",
+          "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+        },
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "shnHAKFIPLuZs4D25c35_NazHZ6p_YDl7n_kyKIY_Z2XlZfw8yTeQjFyzb6EeBPzgTSS7INEgKA0OoeE_ttZAg",
+          "createdAt": "2026-02-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+          "revokes": "NHUPmL1Z_PyUbaRaqr6TOw"
+        }
+      ],
+      "liveAgentDids": [],
+      "liveDeviceKids": [],
+      "name": "device-key-retired-by-itself"
+    },
+    {
+      "agentRecords": [],
+      "at": "2026-03-01T00:00:00Z",
+      "deviceRecords": [
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "5jBEtnieaGHEoHYH_rves50_lFeJ7TygOBrP__fZejfdwtpVjR01FGPXOe2L_LNX-8irRvu1iYRA7CHDKm5MDA",
+          "createdAt": "2026-01-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+          "label": "laptop",
+          "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+        },
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "IkbKafCg-2zpSN4r2vZAL3jHigECPaYjOb9XSOL81grow4YXIA7YC-DVvzmAXaY7EEF-UOZ2M9Jqyzprd5SIDQ",
+          "createdAt": "2026-01-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "kid": "ajgD1fBZkCocba-8m6Rykg",
+          "label": "phone",
+          "publicKeyMultibase": "z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH"
+        },
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "sDWKcfGSsViJsNMSShwJMcwr4f-4YVpHHHZp8RGO7iNwrvXQdEF5ThfczEyVcIUvJ0SM1tL3OsW4mfjKpj1uAg",
+          "createdAt": "2026-02-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "kid": "ajgD1fBZkCocba-8m6Rykg",
+          "revokes": "NHUPmL1Z_PyUbaRaqr6TOw"
+        }
+      ],
+      "liveAgentDids": [],
+      "liveDeviceKids": [
+        "ajgD1fBZkCocba-8m6Rykg"
+      ],
+      "name": "device-key-retired-by-a-second-key"
+    },
+    {
+      "agentRecords": [],
+      "at": "2026-03-01T00:00:00Z",
+      "deviceRecords": [
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "5jBEtnieaGHEoHYH_rves50_lFeJ7TygOBrP__fZejfdwtpVjR01FGPXOe2L_LNX-8irRvu1iYRA7CHDKm5MDA",
+          "createdAt": "2026-01-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+          "label": "laptop",
+          "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+        },
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "tY5LaaIVL55R132jn0swVrAQczCxRg5KQ_YQ9MmZ5GHqImIwjz8R7Ya1d3kAVBwv0Bt2U5G0Sz2hmRAqSJUUAg",
+          "createdAt": "2026-02-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "kid": "ti6Gf6LzOv5i1daxZC4WIQ",
+          "revokes": "NHUPmL1Z_PyUbaRaqr6TOw"
+        }
+      ],
+      "liveAgentDids": [],
+      "liveDeviceKids": [
+        "NHUPmL1Z_PyUbaRaqr6TOw"
+      ],
+      "name": "retirement-signed-by-a-key-with-no-record"
+    },
+    {
+      "agentRecords": [],
+      "at": "2026-03-01T00:00:00Z",
+      "deviceRecords": [
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "itLKtLV2hW_k5vA5yP1ebZFm4xr0VgLia4osEJ0Surx0wYQ4QQVOEAIwUqtNS8J8WPbOdi7K1pQsRbteP3ujAQ",
+          "createdAt": "2026-01-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "kid": "ti6Gf6LzOv5i1daxZC4WIQ",
+          "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+        },
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "IkbKafCg-2zpSN4r2vZAL3jHigECPaYjOb9XSOL81grow4YXIA7YC-DVvzmAXaY7EEF-UOZ2M9Jqyzprd5SIDQ",
+          "createdAt": "2026-01-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "kid": "ajgD1fBZkCocba-8m6Rykg",
+          "label": "phone",
+          "publicKeyMultibase": "z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH"
+        }
+      ],
+      "liveAgentDids": [],
+      "liveDeviceKids": [
+        "ajgD1fBZkCocba-8m6Rykg"
+      ],
+      "name": "device-key-whose-kid-does-not-match"
+    },
+    {
+      "agentRecords": [
+        {
+          "$type": "at.freeq.agentKey",
+          "agentDid": "did:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3",
+          "bindingSig": "uQ618o96sytoeXdBlwdtgInOdHmP2fIZedTbDQQciTlrzt_-mAWstknmiDs-b5l_gC7TSIiyStQgaLDhvcpODQ",
+          "createdAt": "2026-02-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+          "label": "helper"
+        }
+      ],
+      "at": "2026-03-01T00:00:00Z",
+      "deviceRecords": [
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "5jBEtnieaGHEoHYH_rves50_lFeJ7TygOBrP__fZejfdwtpVjR01FGPXOe2L_LNX-8irRvu1iYRA7CHDKm5MDA",
+          "createdAt": "2026-01-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+          "label": "laptop",
+          "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+        }
+      ],
+      "liveAgentDids": [
+        "did:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3"
+      ],
+      "liveDeviceKids": [
+        "NHUPmL1Z_PyUbaRaqr6TOw"
+      ],
+      "name": "agent-link-from-a-live-key"
+    },
+    {
+      "agentRecords": [
+        {
+          "$type": "at.freeq.agentKey",
+          "agentDid": "did:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3",
+          "bindingSig": "821Oa9V9ZaeJThBhZHpm-zpO8Fv6ai9nj0YysXdrp21obJzl6VYx6mi2Syg3P-teL7nHAagM6KHlMBb7UvU9CQ",
+          "createdAt": "2026-03-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "kid": "NHUPmL1Z_PyUbaRaqr6TOw"
+        }
+      ],
+      "at": "2026-04-01T00:00:00Z",
+      "deviceRecords": [
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "5jBEtnieaGHEoHYH_rves50_lFeJ7TygOBrP__fZejfdwtpVjR01FGPXOe2L_LNX-8irRvu1iYRA7CHDKm5MDA",
+          "createdAt": "2026-01-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+          "label": "laptop",
+          "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+        },
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "shnHAKFIPLuZs4D25c35_NazHZ6p_YDl7n_kyKIY_Z2XlZfw8yTeQjFyzb6EeBPzgTSS7INEgKA0OoeE_ttZAg",
+          "createdAt": "2026-02-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+          "revokes": "NHUPmL1Z_PyUbaRaqr6TOw"
+        }
+      ],
+      "liveAgentDids": [],
+      "liveDeviceKids": [],
+      "name": "agent-link-from-a-retired-key"
+    },
+    {
+      "agentRecords": [
+        {
+          "$type": "at.freeq.agentKey",
+          "agentDid": "did:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3",
+          "bindingSig": "uQ618o96sytoeXdBlwdtgInOdHmP2fIZedTbDQQciTlrzt_-mAWstknmiDs-b5l_gC7TSIiyStQgaLDhvcpODQ",
+          "createdAt": "2026-02-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+          "label": "helper"
+        },
+        {
+          "$type": "at.freeq.agentKey",
+          "bindingSig": "HvX8l22nRl1DsLSHmsJsNy_SaoHKSslMP9BXqqW4CwNQISe1jXWGYqdBdzBDv2dUZQf3J06RL42sdDcMcaZzBg",
+          "createdAt": "2026-03-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+          "revokes": "did:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3"
+        }
+      ],
+      "at": "2026-04-01T00:00:00Z",
+      "deviceRecords": [
+        {
+          "$type": "at.freeq.deviceKey",
+          "bindingSig": "5jBEtnieaGHEoHYH_rves50_lFeJ7TygOBrP__fZejfdwtpVjR01FGPXOe2L_LNX-8irRvu1iYRA7CHDKm5MDA",
+          "createdAt": "2026-01-01T00:00:00Z",
+          "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+          "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+          "label": "laptop",
+          "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+        }
+      ],
+      "liveAgentDids": [],
+      "liveDeviceKids": [
+        "NHUPmL1Z_PyUbaRaqr6TOw"
+      ],
+      "name": "agent-link-retired"
+    }
+  ],
+  "vectors": [
+    {
+      "bindingSig": "5jBEtnieaGHEoHYH_rves50_lFeJ7TygOBrP__fZejfdwtpVjR01FGPXOe2L_LNX-8irRvu1iYRA7CHDKm5MDA",
+      "createdAt": "2026-01-01T00:00:00Z",
+      "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+      "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+      "label": "laptop",
+      "name": "device-key",
+      "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
+      "record": {
+        "$type": "at.freeq.deviceKey",
+        "bindingSig": "5jBEtnieaGHEoHYH_rves50_lFeJ7TygOBrP__fZejfdwtpVjR01FGPXOe2L_LNX-8irRvu1iYRA7CHDKm5MDA",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+        "label": "laptop",
+        "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX"
+      },
+      "seed": "0101010101010101010101010101010101010101010101010101010101010101",
+      "signedBytes": "{\"$type\":\"at.freeq.deviceKey\",\"createdAt\":\"2026-01-01T00:00:00Z\",\"did\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kid\":\"NHUPmL1Z_PyUbaRaqr6TOw\",\"label\":\"laptop\",\"publicKeyMultibase\":\"z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX\"}"
+    },
+    {
+      "bindingSig": "shnHAKFIPLuZs4D25c35_NazHZ6p_YDl7n_kyKIY_Z2XlZfw8yTeQjFyzb6EeBPzgTSS7INEgKA0OoeE_ttZAg",
+      "createdAt": "2026-02-01T00:00:00Z",
+      "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+      "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+      "name": "device-retirement-signed-by-the-retired-key",
+      "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
+      "record": {
+        "$type": "at.freeq.deviceKey",
+        "bindingSig": "shnHAKFIPLuZs4D25c35_NazHZ6p_YDl7n_kyKIY_Z2XlZfw8yTeQjFyzb6EeBPzgTSS7INEgKA0OoeE_ttZAg",
+        "createdAt": "2026-02-01T00:00:00Z",
+        "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+        "revokes": "NHUPmL1Z_PyUbaRaqr6TOw"
+      },
+      "seed": "0101010101010101010101010101010101010101010101010101010101010101",
+      "signedBytes": "{\"$type\":\"at.freeq.deviceKey\",\"createdAt\":\"2026-02-01T00:00:00Z\",\"did\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kid\":\"NHUPmL1Z_PyUbaRaqr6TOw\",\"revokes\":\"NHUPmL1Z_PyUbaRaqr6TOw\"}"
+    },
+    {
+      "bindingSig": "sDWKcfGSsViJsNMSShwJMcwr4f-4YVpHHHZp8RGO7iNwrvXQdEF5ThfczEyVcIUvJ0SM1tL3OsW4mfjKpj1uAg",
+      "createdAt": "2026-02-01T00:00:00Z",
+      "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+      "kid": "ajgD1fBZkCocba-8m6Rykg",
+      "name": "device-retirement-signed-by-a-second-key",
+      "publicKeyMultibase": "z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+      "record": {
+        "$type": "at.freeq.deviceKey",
+        "bindingSig": "sDWKcfGSsViJsNMSShwJMcwr4f-4YVpHHHZp8RGO7iNwrvXQdEF5ThfczEyVcIUvJ0SM1tL3OsW4mfjKpj1uAg",
+        "createdAt": "2026-02-01T00:00:00Z",
+        "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "kid": "ajgD1fBZkCocba-8m6Rykg",
+        "revokes": "NHUPmL1Z_PyUbaRaqr6TOw"
+      },
+      "seed": "0202020202020202020202020202020202020202020202020202020202020202",
+      "signedBytes": "{\"$type\":\"at.freeq.deviceKey\",\"createdAt\":\"2026-02-01T00:00:00Z\",\"did\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kid\":\"ajgD1fBZkCocba-8m6Rykg\",\"revokes\":\"NHUPmL1Z_PyUbaRaqr6TOw\"}"
+    },
+    {
+      "bindingSig": "uQ618o96sytoeXdBlwdtgInOdHmP2fIZedTbDQQciTlrzt_-mAWstknmiDs-b5l_gC7TSIiyStQgaLDhvcpODQ",
+      "createdAt": "2026-02-01T00:00:00Z",
+      "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+      "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+      "label": "helper",
+      "name": "agent-link",
+      "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
+      "record": {
+        "$type": "at.freeq.agentKey",
+        "agentDid": "did:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3",
+        "bindingSig": "uQ618o96sytoeXdBlwdtgInOdHmP2fIZedTbDQQciTlrzt_-mAWstknmiDs-b5l_gC7TSIiyStQgaLDhvcpODQ",
+        "createdAt": "2026-02-01T00:00:00Z",
+        "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+        "label": "helper"
+      },
+      "seed": "0101010101010101010101010101010101010101010101010101010101010101",
+      "signedBytes": "{\"$type\":\"at.freeq.agentKey\",\"agentDid\":\"did:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3\",\"createdAt\":\"2026-02-01T00:00:00Z\",\"did\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kid\":\"NHUPmL1Z_PyUbaRaqr6TOw\",\"label\":\"helper\"}"
+    },
+    {
+      "bindingSig": "HvX8l22nRl1DsLSHmsJsNy_SaoHKSslMP9BXqqW4CwNQISe1jXWGYqdBdzBDv2dUZQf3J06RL42sdDcMcaZzBg",
+      "createdAt": "2026-03-01T00:00:00Z",
+      "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+      "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+      "name": "agent-retirement",
+      "publicKeyMultibase": "z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
+      "record": {
+        "$type": "at.freeq.agentKey",
+        "bindingSig": "HvX8l22nRl1DsLSHmsJsNy_SaoHKSslMP9BXqqW4CwNQISe1jXWGYqdBdzBDv2dUZQf3J06RL42sdDcMcaZzBg",
+        "createdAt": "2026-03-01T00:00:00Z",
+        "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
+        "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
+        "revokes": "did:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3"
+      },
+      "seed": "0101010101010101010101010101010101010101010101010101010101010101",
+      "signedBytes": "{\"$type\":\"at.freeq.agentKey\",\"createdAt\":\"2026-03-01T00:00:00Z\",\"did\":\"did:plc:k2n3e2vsihf3farequ44t5j7\",\"kid\":\"NHUPmL1Z_PyUbaRaqr6TOw\",\"revokes\":\"did:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3\"}"
+    }
+  ]
+}

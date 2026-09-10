@@ -34,6 +34,7 @@ pub mod e2ee_did;
 pub mod e2ee_group;
 pub mod event;
 pub mod identity_claim;
+pub mod identity_records;
 pub mod irc;
 pub mod media;
 pub mod oauth;
