@@ -1927,8 +1927,12 @@ async fn api_channel_evidence(
 /// signature over the retired canonical (never checkable by anyone, ours
 /// included) and a key we don't hold. Reporting either as invalid would
 /// present our own history, or a missing key, as forgery.
+///
+/// `msgid` dates the signature: its ULID carries the time the message was
+/// made, which is what a key retired since then has to be judged against.
 fn classify_message_signature(
     state: &Arc<SharedState>,
+    msgid: &str,
     sender_did: Option<&str>,
     canonical: Option<&str>,
     sig_tag: Option<&str>,
@@ -1955,17 +1959,19 @@ fn classify_message_signature(
     };
 
     let server_vk = state.msg_signing_key.verifying_key();
-    let key = if kid == freeq_sdk::sigtag::derive_kid(&server_vk) {
-        Some((server_vk, "server-key"))
+    let (key, removed_at) = if kid == freeq_sdk::sigtag::derive_kid(&server_vk) {
+        (Some((server_vk, "server-key")), None)
     } else {
-        sender_did
-            .and_then(|did| {
-                state
-                    .with_db(|db| db.get_signing_key_by_kid(did, kid))
-                    .flatten()
-            })
-            .and_then(|bytes| ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok())
-            .map(|vk| (vk, "client-session-key"))
+        let row = sender_did.and_then(|did| {
+            state
+                .with_db(|db| db.get_signing_key_row(did, kid))
+                .flatten()
+        });
+        let removed_at = row.as_ref().and_then(|r| r.removed_at);
+        let key = row
+            .and_then(|r| ed25519_dalek::VerifyingKey::from_bytes(&r.pubkey).ok())
+            .map(|vk| (vk, "client-session-key"));
+        (key, removed_at)
     };
     let Some((vk, which)) = key else {
         return ("unverifiable", "unverifiable-unknown-key", None);
@@ -1974,6 +1980,18 @@ fn classify_message_signature(
     use base64::Engine;
     let client_public_key = (which == "client-session-key")
         .then(|| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.as_bytes()));
+
+    // A key its owner retired cannot vouch for a message made after the
+    // retirement, however well the bytes check out — that is what retiring a
+    // key is for. An id we cannot date falls through to the signature check:
+    // the bytes are then the only thing there is to judge it by.
+    if let Some(removed_at) = removed_at {
+        let signed_at = crate::msgid::timestamp_ms(msgid).map(|ms| (ms / 1000) as i64);
+        if signed_at.is_some_and(|at| at > removed_at) {
+            return ("invalid", "key-retired", client_public_key);
+        }
+    }
+
     match freeq_sdk::sigtag::verify_canonical(canonical, sig_tag, &vk) {
         Ok(()) => ("valid", which, client_public_key),
         Err(e) if e.is_unverifiable() => (
@@ -2045,6 +2063,7 @@ pub(crate) async fn api_verify_message(
                 let canonical = (!ev.canonical.is_empty()).then_some(ev.canonical.as_str());
                 let (verdict, verified_by, client_public_key) = classify_message_signature(
                     &state,
+                    &msgid,
                     ev.actor_did.as_deref(),
                     canonical,
                     ev.signature.as_deref(),
@@ -2123,6 +2142,7 @@ pub(crate) async fn api_verify_message(
 
     let (verdict, verified_by, client_public_key) = classify_message_signature(
         &state,
+        &msgid,
         sender_did.as_deref(),
         canonical.as_deref(),
         sig_tag.as_deref(),
@@ -6535,7 +6555,7 @@ mod signature_verdict_tests {
         let canonical = doc().canonical();
         let sig = doc().sign(&key);
         let (verdict, by, client_key) =
-            classify_message_signature(&state, Some(DID), Some(&canonical), Some(&sig));
+            classify_message_signature(&state, MSGID, Some(DID), Some(&canonical), Some(&sig));
         assert_eq!((verdict, by), ("valid", "client-session-key"));
         assert!(client_key.is_some(), "the key that verified is reported");
     }
@@ -6548,7 +6568,7 @@ mod signature_verdict_tests {
         let canonical = doc().canonical();
         let sig = doc().sign(&state.msg_signing_key);
         let (verdict, by, client_key) =
-            classify_message_signature(&state, Some(DID), Some(&canonical), Some(&sig));
+            classify_message_signature(&state, MSGID, Some(DID), Some(&canonical), Some(&sig));
         assert_eq!((verdict, by), ("valid", "server-key"));
         assert_eq!(client_key, None);
     }
@@ -6565,7 +6585,7 @@ mod signature_verdict_tests {
         let sig = doc().sign(&key);
         let tampered = ChatDoc::message(DID, MSGID, "#freeq", "the edited text").canonical();
         let (verdict, by, _) =
-            classify_message_signature(&state, Some(DID), Some(&tampered), Some(&sig));
+            classify_message_signature(&state, MSGID, Some(DID), Some(&tampered), Some(&sig));
         assert_eq!((verdict, by), ("invalid", "client-session-key"));
     }
 
@@ -6582,7 +6602,7 @@ mod signature_verdict_tests {
         let sig = ChatDoc::message(DID, MSGID, "#private-team", "the number is 12").sign(&key);
         let elsewhere = ChatDoc::message(DID, MSGID, "#public", "the number is 12").canonical();
         let (verdict, _, _) =
-            classify_message_signature(&state, Some(DID), Some(&elsewhere), Some(&sig));
+            classify_message_signature(&state, MSGID, Some(DID), Some(&elsewhere), Some(&sig));
         assert_eq!(verdict, "invalid");
     }
 
@@ -6657,7 +6677,7 @@ mod signature_verdict_tests {
         let canonical = doc().canonical();
         let sig = doc().sign(&old);
         let (verdict, by, _) =
-            classify_message_signature(&state, Some(DID), Some(&canonical), Some(&sig));
+            classify_message_signature(&state, MSGID, Some(DID), Some(&canonical), Some(&sig));
         assert_eq!(
             (verdict, by),
             ("valid", "client-session-key"),
@@ -6842,11 +6862,11 @@ mod signature_verdict_tests {
         let legacy =
             "Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZg";
         assert_eq!(
-            classify_message_signature(&state, Some(DID), Some(&canonical), Some(legacy)).0,
+            classify_message_signature(&state, MSGID, Some(DID), Some(&canonical), Some(legacy)).0,
             "unverifiable"
         );
         assert_eq!(
-            classify_message_signature(&state, Some(DID), Some(&canonical), Some(legacy)).1,
+            classify_message_signature(&state, MSGID, Some(DID), Some(&canonical), Some(legacy)).1,
             "unverifiable-legacy-format"
         );
 
@@ -6854,7 +6874,7 @@ mod signature_verdict_tests {
         let stranger = SigningKey::from_bytes(&[11u8; 32]);
         let sig = doc().sign(&stranger);
         assert_eq!(
-            classify_message_signature(&state, Some(DID), Some(&canonical), Some(&sig)),
+            classify_message_signature(&state, MSGID, Some(DID), Some(&canonical), Some(&sig)),
             (
                 "unverifiable",
                 "unverifiable-unknown-key",
@@ -6864,13 +6884,13 @@ mod signature_verdict_tests {
 
         // No sender DID → no document to rebuild.
         assert_eq!(
-            classify_message_signature(&state, None, None, Some(&sig)).1,
+            classify_message_signature(&state, MSGID, None, None, Some(&sig)).1,
             "unverifiable-unknown-sender"
         );
 
         // And an unsigned message is not a failed one.
         assert_eq!(
-            classify_message_signature(&state, Some(DID), Some(&canonical), None),
+            classify_message_signature(&state, MSGID, Some(DID), Some(&canonical), None),
             ("unverifiable", "unsigned", None)
         );
     }
@@ -6883,12 +6903,88 @@ mod signature_verdict_tests {
         let canonical = doc().canonical();
         let (verdict, by, _) = classify_message_signature(
             &state,
+            MSGID,
             Some(DID),
             Some(&canonical),
             Some("ml-dsa-44:somekid:c2ln"),
         );
         assert_eq!(verdict, "unverifiable");
         assert_eq!(by, "unverifiable-unknown-algorithm");
+    }
+
+    /// The seconds MSGID's ULID encodes — the time the message was made, and
+    /// the time a retirement is judged against.
+    const MSGID_AT: i64 = 1_785_492_339;
+
+    /// A key retired before the message was made cannot vouch for it, however
+    /// well the bytes check out. This is the one verdict that is about the
+    /// key's standing rather than the signature.
+    #[test]
+    fn a_key_retired_before_the_message_makes_it_invalid() {
+        assert_eq!(
+            crate::msgid::timestamp_ms(MSGID).unwrap() / 1000,
+            MSGID_AT as u64,
+            "the retirement boundary is only meaningful if MSGID_AT is when MSGID says it was made"
+        );
+        let state = test_state_with_db();
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let kid = freeq_sdk::act::derive_kid_bytes(key.verifying_key().as_bytes());
+        state
+            .with_db(|db| {
+                db.save_signing_key(DID, key.verifying_key().as_bytes())?;
+                assert!(db.retire_signing_key(DID, &kid, MSGID_AT - 3_600)?);
+                Ok(())
+            })
+            .expect("test state has a database");
+
+        let canonical = doc().canonical();
+        let sig = doc().sign(&key);
+        let (verdict, by, client_key) =
+            classify_message_signature(&state, MSGID, Some(DID), Some(&canonical), Some(&sig));
+        assert_eq!((verdict, by), ("invalid", "key-retired"));
+        assert!(
+            client_key.is_some(),
+            "the key that was retired is still reported"
+        );
+    }
+
+    /// Retirement is not retroactive: a signature made while the key was live
+    /// stays good after its owner stops using it.
+    #[test]
+    fn a_key_retired_after_the_message_still_verifies_it() {
+        let state = test_state_with_db();
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let kid = freeq_sdk::act::derive_kid_bytes(key.verifying_key().as_bytes());
+        state
+            .with_db(|db| {
+                db.save_signing_key(DID, key.verifying_key().as_bytes())?;
+                assert!(db.retire_signing_key(DID, &kid, MSGID_AT + 3_600)?);
+                Ok(())
+            })
+            .expect("test state has a database");
+
+        let canonical = doc().canonical();
+        let sig = doc().sign(&key);
+        let (verdict, by, _) =
+            classify_message_signature(&state, MSGID, Some(DID), Some(&canonical), Some(&sig));
+        assert_eq!((verdict, by), ("valid", "client-session-key"));
+    }
+
+    /// A live key is untouched by any of this — the same message, the same
+    /// signature, no retirement on file.
+    #[test]
+    fn a_key_that_was_never_retired_verifies() {
+        let state = test_state_with_db();
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        state
+            .with_db(|db| db.save_signing_key(DID, key.verifying_key().as_bytes()))
+            .expect("test state has a database");
+
+        let canonical = doc().canonical();
+        let sig = doc().sign(&key);
+        let (verdict, by, _) =
+            classify_message_signature(&state, MSGID, Some(DID), Some(&canonical), Some(&sig));
+        assert_eq!((verdict, by), ("valid", "client-session-key"));
     }
 }
 
