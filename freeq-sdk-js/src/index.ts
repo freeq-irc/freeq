@@ -82,8 +82,35 @@ export type { ATProfile } from './profiles.js';
 // did:key SASL — generate a fresh authenticatable identity with no
 // PDS, no OAuth, no external service. See `examples/full-validation-bot/`
 // for the canonical usage pattern.
-export { generateDidKey, importDidKey } from './did-key.js';
+export {
+  generateDidKey,
+  importDidKey,
+  decodeMultibaseEd25519,
+  verifyEd25519,
+} from './did-key.js';
 export type { DidKey } from './did-key.js';
+
+// Identity records: the entries an account publishes saying which signing
+// keys and which bots are its own, and the rule for reading a list of them.
+// Byte-compatible with the Rust `freeq_sdk::identity_records` via
+// spec/identity-record-vectors.json.
+export {
+  DEVICE_KEY_TYPE,
+  AGENT_KEY_TYPE,
+  recordSignedBytes,
+  buildDeviceRecord,
+  buildDeviceRetirement,
+  buildAgentRecord,
+  buildAgentRetirement,
+  foldDeviceRecords,
+  foldAgentRecords,
+} from './identity-records.js';
+export type {
+  DeviceKeyRecord,
+  AgentKeyRecord,
+  LiveDeviceKey,
+  LiveAgentLink,
+} from './identity-records.js';
 
 // VC-bootstrapped E2E group channels (EG1/EGK1) — passphrase-free, server-blind
 // channel encryption with per-epoch revocation. Interop-compatible with the

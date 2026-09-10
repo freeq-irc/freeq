@@ -86,7 +86,7 @@ function hex(bytes: Uint8Array): string {
  * (`\"`, `\\`, `\b\f\n\r\t`, `\uXXXX` for other controls, raw UTF-8
  * otherwise), matching `serde_json` on the Rust side.
  */
-function canonicalize(value: unknown): string {
+export function canonicalize(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
   if (Array.isArray(value)) return `[${value.map(canonicalize).join(',')}]`;
   const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>

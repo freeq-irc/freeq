@@ -54,6 +54,90 @@ function base58btcEncode(bytes: Uint8Array): string {
 /** ed25519 multicodec public-key prefix (varint). */
 const MULTICODEC_ED25519_PUB = new Uint8Array([0xed, 0x01]);
 
+/**
+ * Base58btc decode, the inverse of [`base58btcEncode`]. Throws on any
+ * character outside the alphabet.
+ */
+function base58btcDecode(text: string): Uint8Array {
+  // Leading '1's are the leading zero bytes the encoder dropped.
+  let zeros = 0;
+  while (zeros < text.length && text[zeros] === '1') zeros++;
+
+  const bytes: number[] = [];
+  for (let i = zeros; i < text.length; i++) {
+    const digit = BASE58_ALPHABET.indexOf(text[i]!);
+    if (digit < 0) throw new Error(`invalid base58 character ${text[i]}`);
+    let carry = digit;
+    for (let j = 0; j < bytes.length; j++) {
+      carry += bytes[j]! * 58;
+      bytes[j] = carry & 0xff;
+      carry >>= 8;
+    }
+    while (carry > 0) {
+      bytes.push(carry & 0xff);
+      carry >>= 8;
+    }
+  }
+
+  const out = new Uint8Array(zeros + bytes.length);
+  for (let i = 0; i < bytes.length; i++) out[zeros + bytes.length - 1 - i] = bytes[i]!;
+  return out;
+}
+
+/**
+ * Decode a `z…` multibase public key to its raw 32 ed25519 bytes.
+ *
+ * Throws if the string is not base58btc, not an ed25519 multicodec key, or
+ * not 32 bytes long — callers reading keys off the wire catch and discard.
+ */
+export function decodeMultibaseEd25519(multibase: string): Uint8Array {
+  if (!multibase.startsWith('z')) {
+    throw new Error("multibase key must start with 'z' (base58btc)");
+  }
+  const bytes = base58btcDecode(multibase.slice(1));
+  if (bytes.length !== 34 || bytes[0] !== MULTICODEC_ED25519_PUB[0] || bytes[1] !== MULTICODEC_ED25519_PUB[1]) {
+    throw new Error('not an ed25519 multicodec public key');
+  }
+  return bytes.slice(2);
+}
+
+/**
+ * Verify a base64url (unpadded) ed25519 signature over `message`.
+ *
+ * Returns false rather than throwing for anything malformed — a bad
+ * signature and an unreadable one are both "does not verify" to a caller
+ * reading records it did not write.
+ */
+export async function verifyEd25519(
+  publicKey: Uint8Array,
+  message: Uint8Array,
+  signatureBase64url: string,
+): Promise<boolean> {
+  // base64url without padding, as everywhere else in freeq: anything else
+  // is refused here rather than silently re-interpreted by atob.
+  if (!/^[A-Za-z0-9_-]+$/.test(signatureBase64url)) return false;
+  try {
+    const signature = base64UrlDecode(signatureBase64url);
+    if (signature.length !== 64) return false;
+    const key = await crypto.subtle.importKey(
+      'raw',
+      publicKey as BufferSource,
+      'Ed25519',
+      false,
+      ['verify'],
+    );
+    return await crypto.subtle.verify(
+      'Ed25519',
+      key,
+      signature as BufferSource,
+      message as BufferSource,
+    );
+  } catch {
+    return false;
+  }
+}
+
+
 function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
   const out = new Uint8Array(a.length + b.length);
   out.set(a, 0);
