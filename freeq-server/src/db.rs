@@ -117,6 +117,20 @@ pub struct ReactionRow {
     pub timestamp: u64,
 }
 
+/// One row of a DID's signing key history, with both edges of its window.
+///
+/// `registered_at` is when the key was first seen and never moves;
+/// `last_seen_at` moves every time the key is registered again. `removed_at`
+/// is the owner's retirement of the key, NULL while the key is live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigningKeyRow {
+    pub kid: String,
+    pub pubkey: [u8; 32],
+    pub registered_at: i64,
+    pub last_seen_at: i64,
+    pub removed_at: Option<i64>,
+}
+
 /// Who wrote a message, and where it is filed — the minimum needed to
 /// authorize an operation on a message without reading its contents.
 #[derive(Debug, Clone)]
@@ -508,14 +522,19 @@ impl Db {
                  kid            TEXT NOT NULL,
                  pubkey         BLOB NOT NULL,
                  registered_at  INTEGER NOT NULL,
+                 last_seen_at   INTEGER,
+                 removed_at     INTEGER,
                  PRIMARY KEY (did, kid)
              );",
         )?;
         for (did, pubkey, registered_at) in legacy {
             let kid = freeq_sdk::act::derive_kid_bytes(&pubkey);
+            // last_seen_at = registered_at: a converted row has one stamp on
+            // file, and it is the best evidence for both edges of the window.
             tx.execute(
-                "INSERT OR IGNORE INTO signing_keys (did, kid, pubkey, registered_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR IGNORE INTO signing_keys
+                     (did, kid, pubkey, registered_at, last_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
                 params![did, kid, pubkey, registered_at],
             )?;
         }
@@ -2729,19 +2748,21 @@ impl Db {
             .as_secs();
         let kid = freeq_sdk::act::derive_kid_bytes(pubkey);
         // Append-only: a new (did, kid) is inserted, never overwriting a
-        // different key. Re-registering an *existing* kid bumps registered_at
-        // so "latest" (`get_signing_key`) tracks the most recently used key,
-        // not the first one ever seen — no key is lost either way.
+        // different key, and both edges of its window start at now.
+        // Re-registering an *existing* kid moves only last_seen_at, so
+        // registered_at keeps saying when the key was first seen while
+        // "latest" (`get_signing_key`) still tracks the most recently used key.
         self.conn.execute(
-            "INSERT INTO signing_keys (did, kid, pubkey, registered_at) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(did, kid) DO UPDATE SET registered_at = excluded.registered_at",
+            "INSERT INTO signing_keys (did, kid, pubkey, registered_at, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(did, kid) DO UPDATE SET last_seen_at = excluded.last_seen_at",
             params![did, kid, pubkey, now as i64],
         )?;
         Ok(())
     }
 
-    /// The DID's most-recently-registered signing key (raw 32-byte ed25519
-    /// public key), or None.
+    /// The DID's most-recently-used signing key (raw 32-byte ed25519 public
+    /// key), or None.
     ///
     /// **Not a verification lookup.** This answers "what key is this identity
     /// using now", which the public key endpoint publishes and the provenance
@@ -2758,11 +2779,11 @@ impl Db {
     /// uncheckable on every path, classified `unverifiable-legacy-format`,
     /// and never evidence of forgery.
     pub fn get_signing_key(&self, did: &str) -> SqlResult<Option<[u8; 32]>> {
-        // rowid DESC breaks ties: registered_at is second-granularity, so two
-        // keys registered in the same second must fall back to insertion order.
+        // rowid DESC breaks ties: last_seen_at is second-granularity, so two
+        // keys last used in the same second must fall back to insertion order.
         self.query_signing_key(
             "SELECT pubkey FROM signing_keys WHERE did = ?1
-             ORDER BY registered_at DESC, rowid DESC LIMIT 1",
+             ORDER BY last_seen_at DESC, rowid DESC LIMIT 1",
             params![did],
         )
     }
@@ -2789,6 +2810,73 @@ impl Db {
             }
         }
         Ok(out)
+    }
+
+    /// Every key a DID has registered, with its window, newest first.
+    ///
+    /// This is the reader for anything that has to judge a key by *when* it
+    /// was usable rather than just fetch its bytes: publishing the key set,
+    /// and checking a signature made at a known time against a key its owner
+    /// may since have retired.
+    pub fn get_signing_key_set(&self, did: &str) -> SqlResult<Vec<SigningKeyRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kid, pubkey, registered_at,
+                    COALESCE(last_seen_at, registered_at), removed_at
+             FROM signing_keys WHERE did = ?1
+             ORDER BY registered_at DESC, rowid DESC",
+        )?;
+        let rows = stmt.query_map(params![did], Self::signing_key_row)?;
+        // A blob that is not 32 bytes is a manual edit or legacy corruption,
+        // not a key; it is dropped rather than reported as one.
+        Ok(rows
+            .collect::<SqlResult<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
+    /// One key's row by kid, or None.
+    pub fn get_signing_key_row(&self, did: &str, kid: &str) -> SqlResult<Option<SigningKeyRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kid, pubkey, registered_at,
+                    COALESCE(last_seen_at, registered_at), removed_at
+             FROM signing_keys WHERE did = ?1 AND kid = ?2",
+        )?;
+        let mut rows = stmt.query_map(params![did, kid], Self::signing_key_row)?;
+        match rows.next() {
+            Some(row) => Ok(row?),
+            None => Ok(None),
+        }
+    }
+
+    /// Shared read: build a `SigningKeyRow`, or None if the stored blob is not
+    /// a 32-byte key.
+    fn signing_key_row(row: &rusqlite::Row<'_>) -> SqlResult<Option<SigningKeyRow>> {
+        let pubkey: Vec<u8> = row.get(1)?;
+        let Ok(pubkey) = <[u8; 32]>::try_from(pubkey.as_slice()) else {
+            return Ok(None);
+        };
+        Ok(Some(SigningKeyRow {
+            kid: row.get(0)?,
+            pubkey,
+            registered_at: row.get(2)?,
+            last_seen_at: row.get(3)?,
+            removed_at: row.get(4)?,
+        }))
+    }
+
+    /// Retire a key, stamping `removed_at`. Returns whether a row changed.
+    ///
+    /// Only a live key is stamped: a key already retired keeps the time it was
+    /// retired at, so re-running this cannot move a retirement forward and
+    /// quietly re-validate signatures made in between.
+    pub fn retire_signing_key(&self, did: &str, kid: &str, removed_at: i64) -> SqlResult<bool> {
+        let changed = self.conn.execute(
+            "UPDATE signing_keys SET removed_at = ?3
+             WHERE did = ?1 AND kid = ?2 AND removed_at IS NULL",
+            params![did, kid, removed_at],
+        )?;
+        Ok(changed > 0)
     }
 
     /// The exact key a DID registered under `kid`, or None. This is the lookup
@@ -7833,6 +7921,120 @@ mod tests {
             )
             .unwrap();
         assert!(db.get_signing_key("did:plc:short").unwrap().is_none());
+    }
+
+    #[test]
+    fn signing_key_reregistration_moves_last_seen_not_registered() {
+        // Re-registering a key already on file is the same identity using the
+        // same key again: the first sighting must survive it.
+        let db = Db::open_memory().unwrap();
+        let did = "did:plc:window";
+        let key = [3u8; 32];
+        let kid = freeq_sdk::act::derive_kid_bytes(&key);
+        db.save_signing_key(did, &key).unwrap();
+
+        // Age the row so the re-registration has somewhere to move to.
+        db.conn
+            .execute(
+                "UPDATE signing_keys SET registered_at = 1000, last_seen_at = 1000
+                 WHERE did = ?1 AND kid = ?2",
+                params![did, kid],
+            )
+            .unwrap();
+
+        db.save_signing_key(did, &key).unwrap();
+        let row = db.get_signing_key_row(did, &kid).unwrap().expect("on file");
+        assert_eq!(row.registered_at, 1000, "first sighting must not move");
+        assert!(
+            row.last_seen_at > 1000,
+            "last_seen_at must move to now, got {}",
+            row.last_seen_at
+        );
+        assert_eq!(row.removed_at, None, "re-registering does not retire");
+    }
+
+    #[test]
+    fn signing_key_set_lists_every_key_newest_first() {
+        use freeq_sdk::act::derive_kid_bytes;
+        let db = Db::open_memory().unwrap();
+        let did = "did:plc:set";
+        let (k1, k2) = ([1u8; 32], [2u8; 32]);
+        db.save_signing_key(did, &k1).unwrap();
+        db.save_signing_key(did, &k2).unwrap();
+
+        let set = db.get_signing_key_set(did).unwrap();
+        assert_eq!(set.len(), 2);
+        assert_eq!(set[0].kid, derive_kid_bytes(&k2), "newest first");
+        assert_eq!(set[0].pubkey, k2);
+        assert_eq!(set[1].kid, derive_kid_bytes(&k1));
+        assert!(set.iter().all(|r| r.removed_at.is_none()));
+
+        assert!(
+            db.get_signing_key_set("did:plc:nobody").unwrap().is_empty(),
+            "a DID with no keys has an empty set, not an error"
+        );
+    }
+
+    #[test]
+    fn retire_signing_key_stamps_once() {
+        let db = Db::open_memory().unwrap();
+        let did = "did:plc:retire";
+        let key = [4u8; 32];
+        let kid = freeq_sdk::act::derive_kid_bytes(&key);
+        db.save_signing_key(did, &key).unwrap();
+
+        assert!(
+            db.retire_signing_key(did, &kid, 5_000).unwrap(),
+            "the first retirement changes the row"
+        );
+        let row = db.get_signing_key_row(did, &kid).unwrap().expect("on file");
+        assert_eq!(row.removed_at, Some(5_000));
+
+        assert!(
+            !db.retire_signing_key(did, &kid, 9_000).unwrap(),
+            "a second retirement changes nothing"
+        );
+        let row = db.get_signing_key_row(did, &kid).unwrap().expect("on file");
+        assert_eq!(row.removed_at, Some(5_000), "the first stamp stands");
+
+        assert!(
+            !db.retire_signing_key(did, "nosuchkid", 1).unwrap(),
+            "retiring a key that is not on file changes nothing"
+        );
+        assert_eq!(db.get_signing_key_row(did, "nosuchkid").unwrap(), None);
+    }
+
+    #[test]
+    fn signing_key_legacy_rows_gain_the_window_columns() {
+        // The out-of-ladder kid migration rebuilds the table itself, so it has
+        // to land on the same schema the ladder produces.
+        let db = Db::open_memory_with_legacy_signing_keys().unwrap();
+        let cols: Vec<String> = db
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('signing_keys')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<SqlResult<Vec<String>>>()
+            .unwrap();
+        for expected in ["last_seen_at", "removed_at"] {
+            assert!(
+                cols.iter().any(|c| c == expected),
+                "a converted legacy table needs `{expected}`; got {cols:?}"
+            );
+        }
+
+        let key = [7u8; 32];
+        let kid = freeq_sdk::act::derive_kid_bytes(&key);
+        let row = db
+            .get_signing_key_row("did:plc:legacy", &kid)
+            .unwrap()
+            .expect("the legacy key survives the conversion");
+        assert_eq!(
+            row.last_seen_at, row.registered_at,
+            "the one stamp on file stands for both edges"
+        );
+        assert_eq!(row.removed_at, None);
     }
 }
 
