@@ -28,6 +28,7 @@
 //   - Validate DID syntax (caller's `parse` decides what's valid)
 
 import { readFile, stat } from "node:fs/promises";
+import { log } from "@freeq/sdk";
 
 /** Discriminated source: file (auto-watched), function (manual reload), or
  *  a static array (no reload). */
@@ -112,7 +113,7 @@ export async function createDidMap<T extends { did: string }>(
       } catch (err) {
         // A bad listener shouldn't break the others.
         // eslint-disable-next-line no-console
-        console.warn(`[did-map] onChange listener threw: ${(err as Error).message}`);
+        log.warn(`[did-map] onChange listener threw: ${(err as Error).message}`);
       }
     }
   };
@@ -174,7 +175,7 @@ export async function createDidMap<T extends { did: string }>(
           // failure. Operator notices via the warning; next correct edit
           // picks up.
           // eslint-disable-next-line no-console
-          console.warn(
+          log.warn(
             `[did-map] reload failed for ${filePath}: ${(err as Error).message}. Retaining previous state.`,
           );
         }

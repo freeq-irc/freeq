@@ -35,6 +35,13 @@ export { parse, format, prefixNick } from './parser.js';
 // Transport
 export { Transport } from './transport.js';
 
+/**
+ * Where the SDK's diagnostics go. A host that owns the terminal (a TUI) must
+ * install a sink, or SDK warnings will be painted over its layout.
+ */
+export { setLogger, log } from './log.js';
+export type { Logger } from './log.js';
+
 // Types
 export type {
   IRCMessage,

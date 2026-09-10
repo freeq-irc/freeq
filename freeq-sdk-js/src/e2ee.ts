@@ -15,6 +15,7 @@
 import { openDB, type IDBPDatabase } from 'idb';
 import * as ratchet from './ratchet.js';
 import * as x3dh from './x3dh.js';
+import { log } from "./log.js";
 
 // ── Constants ──
 
@@ -139,7 +140,7 @@ export async function initialize(did: string, serverOrigin: string): Promise<voi
   try {
     await (crypto.subtle.generateKey as any)({ name: 'X25519' }, false, ['deriveBits']);
   } catch {
-    console.warn('[e2ee] X25519 not available — E2EE disabled');
+    log.warn('[e2ee] X25519 not available — E2EE disabled');
     return;
   }
 
@@ -202,7 +203,7 @@ export async function initialize(did: string, serverOrigin: string): Promise<voi
   try {
     bundlePublished = await uploadPreKeyBundle(serverOrigin, did, identityKeys);
   } catch (e) {
-    console.warn('[e2ee] Failed to upload pre-key bundle:', e);
+    log.warn('[e2ee] Failed to upload pre-key bundle:', e);
   }
 
   initialized = true;
@@ -268,7 +269,7 @@ export async function encryptMessage(
     await rememberSession(session);
     return wire;
   } catch (e) {
-    console.error('[e2ee] Encrypt failed:', e);
+    log.error('[e2ee] Encrypt failed:', e);
     return null;
   }
 }
@@ -304,7 +305,7 @@ export async function decryptMessage(
   if (!intro) {
     // An ordinary message with no session to read it under. Nothing to do —
     // the sender has to open a conversation before continuing one.
-    if (!existing) console.warn('[e2ee] No session for a DM from', remoteDid);
+    if (!existing) log.warn('[e2ee] No session for a DM from', remoteDid);
     return null;
   }
 
@@ -333,7 +334,7 @@ export async function decryptMessage(
     });
     return plaintext;
   } catch (e) {
-    console.error('[e2ee] Decrypt failed:', e);
+    log.error('[e2ee] Decrypt failed:', e);
     return null;
   }
 }
@@ -391,9 +392,9 @@ export async function decryptChannel(channel: string, wire: string): Promise<str
     const isWrongKey =
       e instanceof Error && (e as any).name === 'OperationError';
     if (isWrongKey) {
-      console.debug('[e2ee] ENC1 decrypt failed (wrong key):', e);
+      log.debug('[e2ee] ENC1 decrypt failed (wrong key):', e);
     } else {
-      console.warn('[e2ee] ENC1 decrypt failed:', e);
+      log.warn('[e2ee] ENC1 decrypt failed:', e);
     }
     return null;
   }
@@ -463,7 +464,7 @@ async function uploadPreKeyBundle(origin: string, did: string, keys: IdentityKey
     body: JSON.stringify({ did, bundle }),
   });
   if (!resp.ok) {
-    console.warn('[e2ee] Pre-key bundle upload rejected:', resp.status);
+    log.warn('[e2ee] Pre-key bundle upload rejected:', resp.status);
     return false;
   }
   return true;
@@ -491,7 +492,7 @@ export async function publishPreKeyBundle(serverOrigin: string): Promise<boolean
     bundlePublished = await uploadPreKeyBundle(serverOrigin, ownDid, identityKeys);
     return bundlePublished;
   } catch (e) {
-    console.warn('[e2ee] Failed to upload pre-key bundle:', e);
+    log.warn('[e2ee] Failed to upload pre-key bundle:', e);
     return false;
   }
 }
@@ -522,11 +523,11 @@ async function establishSession(
           theirSignedPreKey as BufferSource,
         );
         if (!valid) {
-          console.error('[e2ee] SPK signature verification failed for', remoteDid);
+          log.error('[e2ee] SPK signature verification failed for', remoteDid);
           return null;
         }
       } catch (e) {
-        console.warn('[e2ee] Could not verify SPK signature:', e);
+        log.warn('[e2ee] Could not verify SPK signature:', e);
       }
     }
 
@@ -555,7 +556,7 @@ async function establishSession(
     await rememberSession(session);
     return session;
   } catch (e) {
-    console.error('[e2ee] Key agreement failed:', e);
+    log.error('[e2ee] Key agreement failed:', e);
     return null;
   }
 }

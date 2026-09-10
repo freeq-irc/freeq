@@ -1,6 +1,7 @@
 /** IRC message parser and formatter. */
 
 import type { IRCMessage } from './types.js';
+import { log } from "./log.js";
 
 /** Extract nick from a prefix like "nick!user@host". */
 export function prefixNick(prefix: string): string {
@@ -133,7 +134,7 @@ export function format(
   ) {
     const target = params[0] ?? '<no-target>';
     // eslint-disable-next-line no-console
-    console.warn(
+    log.warn(
       `[freeq-sdk] oversize ${command} to ${target}: line=${line.length}B (warn>${LINE_SIZE_WARN_THRESHOLD}), tags=${serializedTagsLen}B (warn>${TAG_SIZE_WARN_THRESHOLD}). Server may truncate or drop silently.`,
     );
   }

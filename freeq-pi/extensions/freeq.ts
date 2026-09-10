@@ -39,6 +39,7 @@ import { McpStdioClient } from "../src/mcp-stdio.js";
 import { addressedUtterances, parseListenResult, toBridgeCall, type AvParams } from "../src/av.js";
 import { parseVerbositySteer } from "../src/steer.js";
 import { nextUpdate, type ProgressState } from "../src/progress.js";
+import { setLogger } from "@freeq/sdk";
 import { gistOf, renderStatus, toolDetail } from "../src/status.js";
 import {
   footerLine,
@@ -1252,6 +1253,17 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     uiCtx = ctx;
+    // The SDK used to write diagnostics straight to the console, which in a
+    // full-screen TUI means straight over whatever the renderer had drawn —
+    // a flapping connection painted one "dropped message" line per heartbeat
+    // across the layout and left it corrupted until a repaint. pi owns this
+    // screen, so the SDK's diagnostics come here instead: errors surface as
+    // notices, everything quieter is dropped rather than drawn.
+    setLogger({
+      error: (m, ...a) => notify(uiCtx, `freeq sdk: ${m} ${a.join(" ")}`.trim(), "error"),
+      warn: () => {},
+      debug: () => {},
+    });
     const cfg = await ensureConfig(ctx);
     if (!cfg.enabled || !isDid(cfg.ownerDid)) return; // silent when not set up
 

@@ -20,6 +20,7 @@ import type {
   PinnedMessage, WhoisInfo, HistoryOptions, HistoryBatchInfo, EmitEventOptions,
   HeartbeatHandle, GovernanceSignal, CoordinationEventPayload, ActEventPayload,
 } from './types.js';
+import { log } from "./log.js";
 
 /**
  * The capability a server advertises to say it verifies the chat signing
@@ -93,7 +94,7 @@ async function resolveEvidence(
     } catch (e) {
       // A browser meets CORS here more often than not, and a link with no
       // hash is still worth sending.
-      console.warn(`evidence not hashed — ${evidence.url} could not be fetched:`, e);
+      log.warn(`evidence not hashed — ${evidence.url} could not be fetched:`, e);
       return { reference: evidence.url };
     }
   }
@@ -115,7 +116,7 @@ const deprecationWarned = new Set<string>();
 function warnDeprecated(helper: string): void {
   if (deprecationWarned.has(helper)) return;
   deprecationWarned.add(helper);
-  console.warn(`${helper} is deprecated: ${DEPRECATION_REPLACEMENT[helper]}.`);
+  log.warn(`${helper} is deprecated: ${DEPRECATION_REPLACEMENT[helper]}.`);
 }
 
 const ACT_EVENT_DEDUPE_MS = 10 * 60_000;
@@ -330,7 +331,7 @@ export class FreeqClient extends EventEmitter {
     let lineQueue: Promise<void> = Promise.resolve();
     const serializedHandleLine = (line: string) => {
       lineQueue = lineQueue.then(() => this.handleLine(line)).catch((e) =>
-        console.error('[freeq-sdk] line handler error:', e)
+        log.error('[freeq-sdk] line handler error:', e)
       );
     };
 
@@ -1138,7 +1139,7 @@ export class FreeqClient extends EventEmitter {
           this.failReconnectAuth('Could not re-establish your session (timed out). Please sign in again.');
           return;
         }
-        console.warn('[freeq-sdk] Registration safety timeout — sending as guest');
+        log.warn('[freeq-sdk] Registration safety timeout — sending as guest');
         this.sasl = null;
         sendRegistration();
       }, 15000);
@@ -1924,7 +1925,7 @@ export class FreeqClient extends EventEmitter {
         if (this._authDid) {
           prefetchProfiles([this._authDid]);
           e2ee.initialize(this._authDid, this.serverOrigin).catch((e) =>
-            console.warn('[e2ee] Init failed:', e)
+            log.warn('[e2ee] Init failed:', e)
           );
         }
         break;
@@ -3198,14 +3199,14 @@ export class FreeqClient extends EventEmitter {
     let signature = this.sasl?.token ?? '';
     if (method === 'crypto') {
       if (!this.sasl?.signer) {
-        console.warn('[freeq-sdk] SASL method=crypto requires a signer callback in setSaslCredentials; aborting');
+        log.warn('[freeq-sdk] SASL method=crypto requires a signer callback in setSaslCredentials; aborting');
         this.raw('AUTHENTICATE *');
         return;
       }
       try {
         signature = await this.sasl.signer(rawChallengeBytes);
       } catch (e) {
-        console.error('[freeq-sdk] Crypto SASL signer threw:', e);
+        log.error('[freeq-sdk] Crypto SASL signer threw:', e);
         this.raw('AUTHENTICATE *');
         return;
       }

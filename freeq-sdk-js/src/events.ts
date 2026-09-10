@@ -14,6 +14,7 @@ import type {
   SpendPayload, BudgetSnapshot, AgentSpawnedPayload, AgentDespawnedPayload,
   HistoryBatchInfo,
 } from './types.js';
+import { log } from "./log.js";
 
 /** Map of event names to their handler signatures. */
 export interface FreeqEvents {
@@ -297,7 +298,7 @@ export class EventEmitter {
       try {
         fn(...args);
       } catch (e) {
-        console.error(`[freeq-sdk] Error in ${event} handler:`, e);
+        log.error(`[freeq-sdk] Error in ${event} handler:`, e);
       }
     }
   }

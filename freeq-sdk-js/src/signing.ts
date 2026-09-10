@@ -15,6 +15,7 @@
  * adopts as the message's `msgid`), so any receiver — now or years later —
  * rebuilds exactly what was signed from the wire alone.
  */
+import { log } from "./log.js";
 
 /** The tag carrying the id the signer minted for this event. */
 export const EVENT_ID_TAG = '+freeq.at/eventid';
@@ -438,7 +439,7 @@ export class SessionSigning {
       this.publicKeyKid = await deriveKid(rawPub);
       return this.publicKeyB64;
     } catch (e) {
-      console.warn('Ed25519 not available in Web Crypto, falling back to server signing:', e);
+      log.warn('Ed25519 not available in Web Crypto, falling back to server signing:', e);
       return null;
     }
   }

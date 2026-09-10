@@ -1,6 +1,7 @@
 /** WebSocket IRC transport with auto-reconnect and heartbeat. */
 
 import type { TransportState } from './types.js';
+import { log } from "./log.js";
 
 export interface TransportOptions {
   url: string;
@@ -73,13 +74,17 @@ export class Transport {
   send(line: string) {
     if (this.ws?.readyState === WebSocket.OPEN) {
       if (this.ws.bufferedAmount > 65536) {
-        console.warn('[transport] High bufferedAmount, forcing reconnect');
+        log.warn('[transport] High bufferedAmount, forcing reconnect');
         this.ws.close();
         return;
       }
       this.ws.send(line);
     } else {
-      console.warn('[transport] Dropped message (ws not open):', line);
+      // Expected while the transport is reconnecting, and it used to be one
+      // line per heartbeat written straight into the host's terminal. Debug,
+      // not warn: a caller that needs to know a send was lost has
+      // onStateChange for that.
+      log.debug('[transport] dropped while disconnected:', line);
     }
   }
 
@@ -120,7 +125,9 @@ export class Transport {
     this.heartbeatTimer = setInterval(() => {
       const elapsed = Date.now() - this.lastDataReceived;
       if (elapsed > Transport.DEAD_TIMEOUT) {
-        console.warn('[transport] No data for 90s, forcing reconnect');
+        log.warn(
+          `[transport] no data for ${Transport.DEAD_TIMEOUT / 1000}s, forcing reconnect`,
+        );
         this.stopHeartbeat();
         if (this.ws) {
           this.ws.close();
