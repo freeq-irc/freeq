@@ -38,6 +38,7 @@ import { authorizeInstructions, creatorKeyPath, interpretProvenanceNotice } from
 import { McpStdioClient } from "../src/mcp-stdio.js";
 import { addressedUtterances, parseListenResult, toBridgeCall, type AvParams } from "../src/av.js";
 import { parseVerbositySteer } from "../src/steer.js";
+import { scrubSeverity } from "../src/scrub.js";
 import { nextUpdate, type ProgressState } from "../src/progress.js";
 import { setLogger } from "@freeq/sdk";
 import { gistOf, renderStatus, toolDetail } from "../src/status.js";
@@ -1087,8 +1088,21 @@ export default function (pi: ExtensionAPI): void {
         );
         refreshUi();
       },
-      onScrub: (hits, target) =>
-        notify(ctx, `freeq: redacted ${hits.join(", ")} from a message to ${target}`, "warning"),
+      onScrub: (hits, target) => {
+        // Not every redaction is news. Rewriting the home directory to `~`
+        // loses nothing and used to fire a warning on every message, which is
+        // how a notice stops being read before the one that matters arrives.
+        const level = scrubSeverity(hits);
+        if (level === "silent") return;
+        const kinds = hits.filter((h) => h !== "home-path").join(", ") || hits.join(", ");
+        notify(
+          ctx,
+          level === "warning"
+            ? `freeq: redacted ${kinds} from a message to ${target} — check what you were about to send`
+            : `freeq: shortened an absolute path in a message to ${target}`,
+          level,
+        );
+      },
 
       onMessage: (channel, msg) => {
         void (async () => {

@@ -121,6 +121,32 @@ function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/**
+ * Kinds that are a *rewrite*, not a save.
+ *
+ * `~` for the home directory loses nothing a reader wanted and is what a
+ * person would have typed anyway. Telling the user about it, per message, as
+ * a WARNING, trains them to ignore the notice that matters — the one where
+ * this net caught a token on its way into durable public history.
+ */
+const COSMETIC_KINDS = new Set(["home-path"]);
+
+/**
+ * How loudly the host should mention a redaction.
+ *
+ * - `silent`   — only cosmetic rewrites happened; say nothing.
+ * - `info`     — an absolute path was shortened; the message changed shape,
+ *                which is worth a quiet word but is not an incident.
+ * - `warning`  — something secret-shaped was caught. This is the one that
+ *                should make somebody look.
+ */
+export function scrubSeverity(hits: string[]): "silent" | "info" | "warning" {
+  if (!hits.length) return "silent";
+  const meaningful = hits.filter((h) => !COSMETIC_KINDS.has(h));
+  if (!meaningful.length) return "silent";
+  return meaningful.every((h) => h === "abs-path") ? "info" : "warning";
+}
+
 /** Redact secrets and absolute paths from outbound text. */
 export function scrubOutbound(text: string): ScrubResult {
   const hits = new Set<string>();

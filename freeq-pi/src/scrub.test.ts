@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { homedir } from "node:os";
-import { scrubOutbound } from "./scrub.js";
+import { scrubOutbound, scrubSeverity } from "./scrub.js";
 
 describe("the M0 regression — absolute paths", () => {
   it("redacts the exact leak that reached public channel history", () => {
@@ -128,5 +128,27 @@ describe("general behaviour", () => {
   it("is idempotent", () => {
     const once = scrubOutbound("token ghp_abcdefghijklmnopqrstuvwxyz0123456789 at /Users/x/y/z").text;
     expect(scrubOutbound(once).text).toBe(once);
+  });
+});
+
+describe("scrubSeverity", () => {
+  it("says nothing when the only change was ~ for the home directory", () => {
+    // The complaint that produced this: a WARNING per message, for a
+    // substitution that loses nothing and that a person would have typed
+    // themselves. A notice that fires on every message is a notice nobody
+    // reads when it finally matters.
+    expect(scrubSeverity(["home-path"])).toBe("silent");
+    expect(scrubSeverity([])).toBe("silent");
+  });
+
+  it("mentions a shortened absolute path quietly", () => {
+    expect(scrubSeverity(["abs-path"])).toBe("info");
+    expect(scrubSeverity(["home-path", "abs-path"])).toBe("info");
+  });
+
+  it("warns about anything secret-shaped", () => {
+    expect(scrubSeverity(["github-token"])).toBe("warning");
+    expect(scrubSeverity(["home-path", "bearer"])).toBe("warning");
+    expect(scrubSeverity(["abs-path", "private-key"])).toBe("warning");
   });
 });
