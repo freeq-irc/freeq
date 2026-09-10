@@ -6,7 +6,9 @@
 //! The verifier matches the canonical form used by `freeq-bot-id` (see S3):
 //! the cert is JCS-canonicalized with the `signature` field removed, then
 //! the bytes are checked against an ed25519 signature using the creator's
-//! registered MSGSIG public key (looked up via `db.get_signing_key`).
+//! registered MSGSIG public keys (looked up via `db.get_signing_key_set`).
+//! A key its owner retired before the cert's own `created_at` is skipped: it
+//! could not have signed a cert made after it was withdrawn.
 //!
 //! Verification is fully synchronous — no DID resolution, no network I/O,
 //! no async — so it runs inside the IRC command handler without blocking.
@@ -106,7 +108,7 @@ pub(super) fn verify_provenance(
     // is signed once and presented for months; the web client registers a
     // fresh MSGSIG key per session. Checking only the latest key rejected
     // every cert older than the owner's last browser tab.
-    let candidate_keys = match db.get_signing_keys(&creator_did) {
+    let registered = match db.get_signing_key_set(&creator_did) {
         Ok(keys) if keys.is_empty() => {
             return Ok(VerificationOutcome::unverified(format!(
                 "No registered MSGSIG key for {creator_did}; creator must register one before signing"
@@ -119,6 +121,32 @@ pub(super) fn verify_provenance(
             )));
         }
     };
+
+    // The cert says when it was made, so a key retired before that date is not
+    // a candidate — its owner had withdrawn it by then. A key retired later
+    // still is: the cert was made while it was live, and retiring a key does
+    // not undo what it signed beforehand. An undated cert cannot be judged
+    // this way at all, so it is not verified.
+    let Some(created_at) = json
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.timestamp())
+    else {
+        return Ok(VerificationOutcome::unverified(
+            "Cert created_at is not RFC 3339",
+        ));
+    };
+    let candidate_keys: Vec<[u8; 32]> = registered
+        .iter()
+        .filter(|row| row.removed_at.is_none_or(|removed| removed > created_at))
+        .map(|row| row.pubkey)
+        .collect();
+    if candidate_keys.is_empty() {
+        return Ok(VerificationOutcome::unverified(format!(
+            "Every registered key for {creator_did} was retired before this certificate was made"
+        )));
+    }
 
     // Build the canonical form: cert with the `signature` field removed.
     // This mirrors freeq-bot-id main.rs at sign-time, where `signature` is

@@ -2788,30 +2788,6 @@ impl Db {
         )
     }
 
-    /// Every key a DID has ever registered, newest first.
-    ///
-    /// A delegation certificate is signed once and presented for months, but
-    /// the web client registers a fresh MSGSIG key on every session. Checking
-    /// only the newest key (`get_signing_key`) therefore rejected every
-    /// certificate older than the owner's last browser tab, and the flagship
-    /// installation's own delegation verified as false. A verifier that does
-    /// not know the kid must try all of them.
-    pub fn get_signing_keys(&self, did: &str) -> SqlResult<Vec<[u8; 32]>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT pubkey FROM signing_keys WHERE did = ?1
-             ORDER BY registered_at DESC, rowid DESC",
-        )?;
-        let rows = stmt.query_map(params![did], |row| row.get::<_, Vec<u8>>(0))?;
-        let mut out = Vec::new();
-        for row in rows {
-            let bytes = row?;
-            if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                out.push(arr);
-            }
-        }
-        Ok(out)
-    }
-
     /// Every key a DID has registered, with its window, newest first.
     ///
     /// This is the reader for anything that has to judge a key by *when* it

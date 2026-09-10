@@ -71,6 +71,27 @@ async fn start_test_server_with_db(
     server.start().await.unwrap()
 }
 
+/// A server whose database is a file, so the test can open the same store and
+/// read or change what the server wrote. `:memory:` is private to the server's
+/// own connection and nothing else can reach it.
+async fn start_test_server_with_db_file(
+    resolver: DidResolver,
+    db_path: &str,
+) -> (
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let config = freeq_server::config::ServerConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        server_name: "test-server".to_string(),
+        challenge_timeout_secs: 60,
+        db_path: Some(db_path.to_string()),
+        ..Default::default()
+    };
+    let server = freeq_server::server::Server::with_resolver(config, resolver);
+    server.start().await.unwrap()
+}
+
 async fn start_test_server_with_web_and_db(
     resolver: DidResolver,
 ) -> (
@@ -636,6 +657,87 @@ async fn provenance_freeq_bot_delegation_creator_not_registered() {
         line.contains("No registered MSGSIG key"),
         "expected no-registered-key reason, got: {line}"
     );
+
+    handle.quit(None).await.unwrap();
+    server_handle.abort();
+}
+
+/// The moment `build_signed_cert` dates its certificate, in seconds since the
+/// epoch — what a retirement is early or late against.
+const CERT_CREATED_AT: i64 = 1_778_252_400; // 2026-05-08T15:00:00Z
+
+/// Retire every key `did` has registered, stamping `removed_at`. The creator's
+/// session registers two: the SDK's automatic one and the known key the test
+/// installed over it, and only retiring both leaves no key that could have
+/// signed the cert.
+fn retire_all_keys(db_path: &str, did: &str, removed_at: i64) -> usize {
+    let db = freeq_server::db::Db::open(db_path).unwrap();
+    let keys = db.get_signing_key_set(did).unwrap();
+    assert!(!keys.is_empty(), "the creator registered at least one key");
+    for key in &keys {
+        assert!(
+            db.retire_signing_key(did, &key.kid, removed_at).unwrap(),
+            "a live key is retired once"
+        );
+    }
+    keys.len()
+}
+
+#[tokio::test]
+async fn provenance_freeq_bot_delegation_key_retired_before_cert() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("retired.db");
+    let db_path = db_path.to_str().unwrap();
+    let (addr, server_handle) = start_test_server_with_db_file(empty_resolver(), db_path).await;
+
+    let (creator_did, creator_key) = register_creator_msgsig(addr, "creator").await;
+    // The creator withdrew every key an hour before the cert was made, so
+    // nothing on file could have signed it.
+    retire_all_keys(db_path, &creator_did, CERT_CREATED_AT - 3_600);
+
+    let (bot_did, handle, mut events) = connect_did_key(addr, "retiredbot").await;
+    let cert = build_signed_cert(&bot_did, &creator_did, &creator_key);
+    handle.submit_provenance(&cert).await.unwrap();
+
+    let line = expect_raw_line(
+        &mut events,
+        2000,
+        "Provenance stored (unverified)",
+        "cert signed by a retired key stored unverified",
+    )
+    .await;
+    assert!(
+        line.contains("was retired before this certificate was made"),
+        "expected the retirement reason, got: {line}"
+    );
+
+    handle.quit(None).await.unwrap();
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn provenance_freeq_bot_delegation_key_retired_after_cert_still_verifies() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("retired-later.db");
+    let db_path = db_path.to_str().unwrap();
+    let (addr, server_handle) = start_test_server_with_db_file(empty_resolver(), db_path).await;
+
+    let (creator_did, creator_key) = register_creator_msgsig(addr, "creator").await;
+    // Retired an hour *after* the cert was made: it was live when it signed,
+    // and retiring a key does not undo what it signed beforehand.
+    retire_all_keys(db_path, &creator_did, CERT_CREATED_AT + 3_600);
+
+    let (bot_did, handle, mut events) = connect_did_key(addr, "laterbot").await;
+    let cert = build_signed_cert(&bot_did, &creator_did, &creator_key);
+    handle.submit_provenance(&cert).await.unwrap();
+
+    expect_raw_line(
+        &mut events,
+        2000,
+        "Provenance verified",
+        "cert made while the key was live verifies",
+    )
+    .await;
 
     handle.quit(None).await.unwrap();
     server_handle.abort();
