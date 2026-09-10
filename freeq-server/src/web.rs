@@ -790,29 +790,61 @@ async fn api_signing_key(State(state): State<Arc<SharedState>>) -> Json<serde_js
     }))
 }
 
-/// Per-DID signing key: the DID's latest registered signing key, from the
-/// durable store (the single source of truth — survives restart, covers every
-/// DID that ever registered). A specific historical key is fetched via
-/// `/{did}/{kid}`.
+/// Per-DID signing keys: the whole key set from the durable store (the single
+/// source of truth — survives restart, covers every DID that ever registered).
+///
+/// `public_key` is the key the DID is signing with now, which every proof
+/// sheet reads, and `keys` is the history behind it: each key with the window
+/// it was in use for, newest registration first. A verifier checking an old
+/// message needs the window, not just the current key — a signature made
+/// while a key was live stays good after the owner retires it, and one made
+/// afterwards does not.
+///
+/// A DID with no keys is 200 with a null `public_key` and an empty set:
+/// "this identity has registered nothing" is an answer, not a missing page.
 async fn api_did_signing_key(
     State(state): State<Arc<SharedState>>,
     axum::extract::Path(did): axum::extract::Path<String>,
-) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
+) -> Json<serde_json::Value> {
     use base64::Engine;
+    let b64 = |k: &[u8; 32]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(k);
     let did_decoded = urlencoding::decode(&did).unwrap_or(std::borrow::Cow::Borrowed(&did));
-    match state
-        .with_db(|db| db.get_signing_key(did_decoded.as_ref()))
-        .flatten()
-    {
-        Some(pubkey) => Ok(Json(serde_json::json!({
-            "did": did_decoded.as_ref(),
-            "algorithm": "ed25519",
-            "public_key": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pubkey),
-            "encoding": "base64url",
-            "source": "key-store"
-        }))),
-        None => Err(axum::http::StatusCode::NOT_FOUND),
-    }
+    let rows = state
+        .with_db(|db| db.get_signing_key_set(did_decoded.as_ref()))
+        .unwrap_or_default();
+
+    // The most recently used key its owner has not retired. Rows arrive
+    // newest registration first, so taking only a strictly later last_seen_at
+    // leaves ties with the more recently registered key.
+    let current = rows.iter().filter(|r| r.removed_at.is_none()).fold(
+        None::<&crate::db::SigningKeyRow>,
+        |best, row| match best {
+            Some(b) if b.last_seen_at >= row.last_seen_at => Some(b),
+            _ => Some(row),
+        },
+    );
+
+    let keys: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "kid": r.kid,
+                "public_key": b64(&r.pubkey),
+                "registered_at": r.registered_at,
+                "last_seen_at": r.last_seen_at,
+                "removed_at": r.removed_at,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "did": did_decoded.as_ref(),
+        "algorithm": "ed25519",
+        "public_key": current.map(|r| b64(&r.pubkey)),
+        "encoding": "base64url",
+        "source": "key-store",
+        "keys": keys
+    }))
 }
 
 /// Per-DID, per-kid signing key: the exact historical key the DID registered
@@ -827,16 +859,19 @@ async fn api_did_signing_key_by_kid(
     let did_decoded = urlencoding::decode(&did).unwrap_or(std::borrow::Cow::Borrowed(&did));
     let kid_decoded = urlencoding::decode(&kid).unwrap_or(std::borrow::Cow::Borrowed(&kid));
     match state
-        .with_db(|db| db.get_signing_key_by_kid(did_decoded.as_ref(), kid_decoded.as_ref()))
+        .with_db(|db| db.get_signing_key_row(did_decoded.as_ref(), kid_decoded.as_ref()))
         .flatten()
     {
-        Some(pubkey) => Ok(Json(serde_json::json!({
+        Some(row) => Ok(Json(serde_json::json!({
             "did": did_decoded.as_ref(),
             "kid": kid_decoded.as_ref(),
             "algorithm": "ed25519",
-            "public_key": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pubkey),
+            "public_key": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(row.pubkey),
             "encoding": "base64url",
-            "source": "key-store"
+            "source": "key-store",
+            "registered_at": row.registered_at,
+            "last_seen_at": row.last_seen_at,
+            "removed_at": row.removed_at
         }))),
         None => Err(axum::http::StatusCode::NOT_FOUND),
     }
@@ -6357,8 +6392,9 @@ mod signing_key_endpoint_tests {
     }
 
     /// The `/api/v1/signing-keys/{did}` and `/{did}/{kid}` endpoints serve the
-    /// durable key store: `/{did}` returns the latest, `/{did}/{kid}` returns a
-    /// specific historical key, and misses are 404. Drives the real handlers.
+    /// durable key store: `/{did}` returns the current key and the whole set,
+    /// `/{did}/{kid}` returns a specific historical key, and an unknown kid is
+    /// 404. Drives the real handlers.
     #[tokio::test]
     async fn endpoints_serve_the_durable_store() {
         let state = test_state_with_db();
@@ -6374,12 +6410,22 @@ mod signing_key_endpoint_tests {
             })
             .expect("db present");
 
-        // /{did} → latest (k2), from the key store.
-        let latest = api_did_signing_key(State(state.clone()), Path(did.to_string()))
-            .await
-            .expect("200");
+        // /{did} → the current key (k2), from the key store, and the set
+        // behind it: every key the DID has registered, newest first.
+        let latest = api_did_signing_key(State(state.clone()), Path(did.to_string())).await;
         assert_eq!(latest.0["public_key"], b64(&k2));
         assert_eq!(latest.0["source"], "key-store");
+        let keys = latest.0["keys"].as_array().expect("keys is a list");
+        assert_eq!(keys.len(), 2, "both keys are in the set");
+        assert_eq!(keys[0]["kid"], kid2, "newest registration first");
+        assert_eq!(keys[0]["public_key"], b64(&k2));
+        assert_eq!(keys[1]["kid"], kid1);
+        assert_eq!(keys[1]["public_key"], b64(&k1));
+        for key in keys {
+            assert!(key["removed_at"].is_null(), "a live key has no removed_at");
+            assert!(key["registered_at"].is_i64());
+            assert!(key["last_seen_at"].is_i64());
+        }
 
         // /{did}/{kid} → each specific historical key.
         let by1 =
@@ -6389,10 +6435,14 @@ mod signing_key_endpoint_tests {
         assert_eq!(by1.0["public_key"], b64(&k1));
         assert_eq!(by1.0["kid"], kid1);
 
-        let by2 = api_did_signing_key_by_kid(State(state.clone()), Path((did.to_string(), kid2)))
-            .await
-            .expect("200 kid2");
+        let by2 =
+            api_did_signing_key_by_kid(State(state.clone()), Path((did.to_string(), kid2.clone())))
+                .await
+                .expect("200 kid2");
         assert_eq!(by2.0["public_key"], b64(&k2));
+        assert!(by2.0["registered_at"].is_i64(), "the window comes with it");
+        assert!(by2.0["last_seen_at"].is_i64());
+        assert!(by2.0["removed_at"].is_null());
 
         // Unknown kid → 404.
         let miss_kid = api_did_signing_key_by_kid(
@@ -6402,9 +6452,58 @@ mod signing_key_endpoint_tests {
         .await;
         assert_eq!(miss_kid.unwrap_err(), axum::http::StatusCode::NOT_FOUND);
 
-        // Unknown DID → 404.
+        // A DID that has registered nothing is an answer, not a miss.
         let miss_did = api_did_signing_key(State(state), Path("did:plc:nobody".to_string())).await;
-        assert_eq!(miss_did.unwrap_err(), axum::http::StatusCode::NOT_FOUND);
+        assert!(miss_did.0["public_key"].is_null(), "no key to name");
+        assert_eq!(
+            miss_did.0["keys"].as_array().expect("keys is a list").len(),
+            0
+        );
+        assert_eq!(miss_did.0["did"], "did:plc:nobody");
+    }
+
+    /// A retired key stays in the set, carrying the time it was retired, and
+    /// stops being the key the DID is presented as signing with.
+    #[tokio::test]
+    async fn a_retired_key_keeps_its_place_in_the_set_but_not_the_top() {
+        let state = test_state_with_db();
+        let did = "did:plc:retired";
+        let (live, retired) = ([1u8; 32], [2u8; 32]);
+        let retired_kid = freeq_sdk::act::derive_kid_bytes(&retired);
+        state
+            .with_db(|db| {
+                db.save_signing_key(did, &live)?;
+                // Registered after the live one, so recency alone would pick it.
+                db.save_signing_key(did, &retired)?;
+                assert!(db.retire_signing_key(did, &retired_kid, 4_000)?);
+                Ok(())
+            })
+            .expect("db present");
+
+        let out = api_did_signing_key(State(state.clone()), Path(did.to_string())).await;
+        assert_eq!(
+            out.0["public_key"],
+            b64(&live),
+            "a retired key is never presented as the current one"
+        );
+        let keys = out.0["keys"].as_array().expect("keys is a list");
+        assert_eq!(
+            keys.len(),
+            2,
+            "retirement does not remove a key from history"
+        );
+        let retired_entry = keys
+            .iter()
+            .find(|k| k["kid"] == retired_kid.as_str())
+            .expect("the retired key is still listed");
+        assert_eq!(retired_entry["removed_at"], 4_000);
+
+        // And the same fact on the per-kid endpoint.
+        let by_kid = api_did_signing_key_by_kid(State(state), Path((did.to_string(), retired_kid)))
+            .await
+            .expect("200 retired kid");
+        assert_eq!(by_kid.0["removed_at"], 4_000);
+        assert_eq!(by_kid.0["public_key"], b64(&retired));
     }
 }
 

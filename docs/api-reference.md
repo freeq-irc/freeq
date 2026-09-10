@@ -72,6 +72,20 @@ GET /api/v1/signing-key
 
 Returns the server's ed25519 public key (base64url-encoded) used for message attestation.
 
+### Signing Keys by DID
+
+```
+GET /api/v1/signing-keys/{did}
+```
+
+Returns the signing keys an identity has registered. `public_key` is the key it is signing with now — the most recently used key its owner has not retired — or `null` if it has registered none. `keys` lists every key, newest registration first: `kid`, `public_key`, `registered_at`, `last_seen_at`, and `removed_at`, which is `null` while the key is live and otherwise the time its owner retired it. Times are seconds since the epoch. A DID with no keys is a 200 with a null `public_key` and an empty list, not a 404.
+
+```
+GET /api/v1/signing-keys/{did}/{kid}
+```
+
+Returns the one key that identity registered under `kid`, with the same window fields. This is the lookup a verifier uses when a signature names its kid: the key stays fetchable after the session that made it ends. An unknown kid is a 404.
+
 ### Blob Proxy
 
 ```
