@@ -62,7 +62,7 @@ Returns recent messages. Requires the channel name without `#` prefix.
 GET /api/v1/verify/{msgid}
 ```
 
-Verify a message's cryptographic signature. Returns the signing key, signature, and verification result.
+Verify a message's cryptographic signature. Returns the signing key, signature, and verification result. A `verified_by` of `key-retired` means the key that signed was retired by its owner before the message was made, and the verdict is `invalid`: the signature is not evidence of anything once the key it names was withdrawn. `key_source` names where the key that checked the signature came from: `server-key` for this server's own key, otherwise `local-session`, `origin-server`, `identity-record`, `did-document`, or `unknown` for a key filed before sources were recorded; it is absent when no key was found.
 
 ### Server Signing Key
 
@@ -70,7 +70,21 @@ Verify a message's cryptographic signature. Returns the signing key, signature, 
 GET /api/v1/signing-key
 ```
 
-Returns the server's ed25519 public key (base64url-encoded) used for message attestation.
+Returns the server's ed25519 public key (base64url-encoded) used for message attestation. `kid` is the key's id, and `registered_at` is when this server first filed the key in its own key store, in seconds since the epoch, or `null` for a server running without a database. `did` is the name the server files its own keys under, `did:web:<server-name>`; the server's whole key set, current and retired, is at `/api/v1/signing-keys/{did}` for that value.
+
+### Signing Keys by DID
+
+```
+GET /api/v1/signing-keys/{did}
+```
+
+Returns the signing keys an identity has registered. `public_key` is the key it is signing with now — the most recently used key its owner has not retired — or `null` if it has registered none. `keys` lists every key, newest registration first: `kid`, `public_key`, `registered_at`, `last_seen_at`, and `removed_at`, which is `null` while the key is live and otherwise the time its owner retired it. Times are seconds since the epoch. A DID with no keys is a 200 with a null `public_key` and an empty list, not a 404.
+
+```
+GET /api/v1/signing-keys/{did}/{kid}
+```
+
+Returns the one key that identity registered under `kid`, with the same window fields. This is the lookup a verifier uses when a signature names its kid: the key stays fetchable after the session that made it ends. An unknown kid is a 404.
 
 ### Blob Proxy
 

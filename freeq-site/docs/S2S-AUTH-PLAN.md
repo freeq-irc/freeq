@@ -10,7 +10,7 @@ Layer 2: Mutual Hello/HelloAck              — BOTH sides agree to peer
 Layer 3: Signed Message Envelopes           — messages can't be tampered
 Layer 4: Capability-Based Trust             — WHAT each peer can do
 Layer 5: Key Rotation & Revocation          — operational safety
-Layer 6: DID-Based Server Identity          — human-readable peering
+Layer 6: DID-based server identity — the did:web document and key set
 ```
 
 All layers are implemented and active.
@@ -127,26 +127,16 @@ To permanently block a peer, remove them from `--s2s-allowed-peers` and restart.
 
 ## Layer 6: DID-Based Server Identity
 
-Servers can optionally identify via DID:
+A server's identity is `did:web:<server-name>`. It comes from `--server-name`; there is no separate setting.
 
-```bash
---server-did did:web:irc.example.com   # default: easy, DNS-based
---server-did did:plc:abc123...          # advanced: registry-backed, DNS-independent
-```
+The server publishes a DID document at `/.well-known/did.json`. The document carries two things:
 
-The DID is included in Hello handshakes. The DID document publishes:
-- **Identity key** (`#id-1`): stable server identity
-- **S2S signing key** (`#s2s-sig-1`): used for message envelope signatures
-- **Service endpoints**: iroh transport address, IRC connection info
+- the key the server signs task receipts and expiries with, under `#freeq`;
+- a pointer to the server's full key set, `/api/v1/signing-keys/did:web:<server-name>`, which lists every key the server has had, with dates, including retired ones.
 
-Today both keys are the same (the iroh keypair). The DID document is structured with separate key IDs so they can be split later without changing the document shape.
+The peering handshake does not carry the DID. Who may peer is decided by the transport key and the allowlist, layers 1 and 2. A handshake that proves the DID, which would allow peering by domain rather than by transport id, is not supported at this time.
 
-**`did:web` vs `did:plc`:**
-- `did:web` is simpler (just serve a JSON file over HTTPS) but depends on DNS + TLS security
-- `did:plc` is registry-backed, survives domain changes and CA compromise, but requires the PLC directory
-- Hybrid approach: start with `did:web`, add `did:plc` later, link via `alsoKnownAs`
-
-See [Server DID Setup](server-did.md) for full setup instructions.
+A `did:plc` for a server is not supported at this time.
 
 ---
 

@@ -157,6 +157,7 @@ freeq-server --config /etc/freeq/server.toml
 | `--db-path` | *(none — in-memory)* | SQLite database file |
 | `--migrate-to` | *(none)* | Run the schema ladder to this version and exit (see [Schema migrations](#schema-migrations)) |
 | `--data-dir` | parent of `--db-path` | Directory for keys and iroh state |
+| `--rotate-signing-key` | off | Replaces the server's message signing key with a new one at startup and marks the old key retired in the server's key store. Use it when the key may have leaked or the host was rebuilt from a copy. It rotates once per start, so remove the flag after that start. |
 | `--max-messages-per-channel` | `10000` | Prune oldest messages beyond this count |
 
 ### Identity & Auth
@@ -189,9 +190,8 @@ freeq-server \
 | `--s2s-allowed-peers` | *(none — open)* | Allowlist for incoming peer connections |
 | `--s2s-peer-api` | *(none — peer signatures stay uncheckable)* | Where each peer serves its users' signing keys: `<endpoint-id>=<https://base>` (the peer's REST API base URL). Deliberately operator configuration, never peer-announced |
 | `--s2s-peer-trust` | *(none)* | Trust levels per peer: `id:full`, `id:relay`, `id:readonly` |
-| `--server-did` | *(none)* | Server DID for federation identity (e.g. `did:web:irc.example.com`) |
 
-See [Federation](federation.md), [S2S Auth](S2S-AUTH-PLAN.md), [Server DID Setup](server-did.md), and [Security Guide](SECURITY.md) for details.
+See [Federation](federation.md), [S2S Auth](S2S-AUTH-PLAN.md), and [Security Guide](SECURITY.md) for details.
 
 ### MOTD
 
@@ -266,6 +266,7 @@ WantedBy=multi-user.target
 | `msg-signing-key.secret` | Server message signing key (ed25519) |
 | `verifier-signing-key.secret` | Credential verifier signing key |
 | `db-encryption-key.secret` | Database encryption-at-rest key |
+| `media-key.secret` | Seed for the private media store's encryption and link-signing keys |
 | `iroh-key.secret` | iroh QUIC endpoint identity key |
 
 All key files are generated automatically on first run.
