@@ -484,8 +484,8 @@ fn verify_binding(public_key: &PublicKey, message: &[u8], binding_sig: &str) -> 
 /// client for each URL comes from the caller's provider: the server hands in
 /// one that refuses private addresses, other callers a plain shared client.
 pub struct RecordReader<P: freeq_oauth::ClientProvider> {
-    resolver: DidResolver,
-    clients: P,
+    pub(crate) resolver: DidResolver,
+    pub(crate) clients: P,
 }
 
 /// One page of a `com.atproto.repo.listRecords` answer.

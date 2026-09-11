@@ -36,6 +36,7 @@ pub mod event;
 pub mod identity_claim;
 pub mod identity_records;
 pub mod irc;
+pub mod key_lookup;
 pub mod media;
 pub mod oauth;
 #[cfg(feature = "iroh-transport")]

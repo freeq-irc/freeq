@@ -124,6 +124,11 @@ export type {
   ProofOutcome,
 } from './identity-records.js';
 
+// Finding a signer's key by kid: their records, a did:web document, then the
+// origin server. Twin of the Rust `freeq_sdk::key_lookup`.
+export { KeyLookup } from './key-lookup.js';
+export type { FoundKey, KeySource, RecordReader } from './key-lookup.js';
+
 // VC-bootstrapped E2E group channels (EG1/EGK1) — passphrase-free, server-blind
 // channel encryption with per-epoch revocation. Interop-compatible with the
 // Rust `freeq-sdk::e2ee_group`. See docs/VC-BOOTSTRAPPED-CHANNEL-E2EE.md.
