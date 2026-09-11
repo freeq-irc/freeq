@@ -6,11 +6,18 @@
  * repository: `at.freeq.deviceKey` announces a signing key a device holds,
  * or retires one; `at.freeq.agentKey` announces a bot the account claims as
  * its own, or retires that claim. The PDS writes them into a signed commit;
- * that part happens elsewhere.
+ * that part happens elsewhere. This module builds the entries, reads them
+ * back from the account's PDS, and folds them into the set live at an instant.
  *
  * The Rust SDK owns the contract. `spec/identity-record-vectors.json` is the
  * shared file, and `identity-records.vectors.test.ts` holds this side to it.
  */
+import { fromUint8Array } from '@atcute/car';
+import { decode, encode, isBytes, isCidLink, fromBytes } from '@atcute/cbor';
+import { CODEC_DCBOR, create, equals, toString as cidToString } from '@atcute/cid';
+import { verifySigWithDidKey } from '@atcute/crypto';
+import { MemoryBlockStore, NodeStore, findRpathAndBuildProof, verifyInclusion } from '@atcute/mst';
+
 import { type DidKey, decodeMultibaseEd25519, verifyEd25519 } from './did-key.js';
 import { canonicalize, deriveKid } from './signing.js';
 
@@ -446,4 +453,277 @@ function firstOfEach<T>(sorted: T[], keyOf: (item: T) => string): T[] {
     if (out.length === 0 || keyOf(out[out.length - 1]!) !== keyOf(item)) out.push(item);
   }
   return out;
+}
+
+// ─── reading from the account's PDS ─────────────────────────────────────
+
+/** The parts of a DID document the reader uses. */
+export interface DidDocument {
+  id: string;
+  verificationMethod?: {
+    id: string;
+    type?: string;
+    controller?: string;
+    publicKeyMultibase?: string;
+  }[];
+  service?: { id?: string; type: string; serviceEndpoint: string }[];
+}
+
+/** Resolves a DID to its document. */
+export type ResolveDid = (did: string) => Promise<DidDocument>;
+
+/**
+ * One HTTP GET. The PDS address comes from a DID document anyone can write,
+ * so a caller that must refuse private addresses does it in this function.
+ */
+export type Fetch = (url: string) => Promise<Response>;
+
+/**
+ * Every record of `collection` in `did`'s repository, as its PDS lists them,
+ * unauthenticated. A DID whose document names no PDS has none.
+ */
+export async function listRecords(
+  fetch: Fetch,
+  resolveDid: ResolveDid,
+  did: string,
+  collection: string,
+): Promise<unknown[]> {
+  const pds = pdsEndpoint(await resolveDid(did));
+  if (pds === undefined) return [];
+  const records: unknown[] = [];
+  let cursor: string | undefined;
+  for (;;) {
+    const params: Record<string, string> = { repo: did, collection, limit: '100' };
+    if (cursor !== undefined) params.cursor = cursor;
+    const page = (await (
+      await get(fetch, xrpcUrl(pds, 'com.atproto.repo.listRecords', params))
+    ).json()) as { records?: unknown; cursor?: unknown };
+    if (!Array.isArray(page.records)) throw new Error('listRecords answer is not a record list');
+    for (const listed of page.records as { value?: unknown }[]) {
+      if (typeof listed !== 'object' || listed === null || !('value' in listed)) {
+        throw new Error('listRecords answer has a record with no value');
+      }
+      records.push(listed.value);
+    }
+    // An empty page ends the listing even if it carries a cursor, so a PDS
+    // cannot keep the reader asking forever for nothing.
+    if (typeof page.cursor !== 'string' || page.records.length === 0) break;
+    cursor = page.cursor;
+  }
+  return records;
+}
+
+/** The device keys of `did` that are live at `at`. */
+export async function liveDeviceKeys(
+  fetch: Fetch,
+  resolveDid: ResolveDid,
+  did: string,
+  at: Date,
+): Promise<LiveDeviceKey[]> {
+  return foldDeviceRecords(did, await listRecords(fetch, resolveDid, did, DEVICE_KEY_TYPE), at);
+}
+
+/** The bots `did` claims at `at`. */
+export async function liveAgentLinks(
+  fetch: Fetch,
+  resolveDid: ResolveDid,
+  did: string,
+  at: Date,
+): Promise<LiveAgentLink[]> {
+  const devices = await listRecords(fetch, resolveDid, did, DEVICE_KEY_TYPE);
+  const agents = await listRecords(fetch, resolveDid, did, AGENT_KEY_TYPE);
+  return foldAgentRecords(did, devices, agents, at);
+}
+
+function pdsEndpoint(doc: DidDocument): string | undefined {
+  return doc.service?.find((s) => s.type === 'AtprotoPersonalDataServer')?.serviceEndpoint;
+}
+
+function xrpcUrl(pds: string, method: string, params: Record<string, string>): string {
+  const url = new URL(`${pds.replace(/\/+$/, '')}/xrpc/${method}`);
+  for (const [name, value] of Object.entries(params)) url.searchParams.append(name, value);
+  return url.toString();
+}
+
+/** GET `url`; an HTTP error status is an error. */
+async function get(fetch: Fetch, url: string): Promise<Response> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${new URL(url).pathname} answered ${res.status}`);
+  return res;
+}
+
+
+// ─── proofs ─────────────────────────────────────────────────────────────
+
+/** What checking a record's proof found. The record is proven only when all three hold. */
+export interface ProofOutcome {
+  /** The signed commit names the account asked about. */
+  commitDidMatches: boolean;
+  /** The commit's signature checks under the account's repository key. */
+  signatureValid: boolean;
+  /** The commit's tree holds the expected record at `collection/rkey`. */
+  recordPresent: boolean;
+}
+
+/**
+ * The CID an AT Protocol repository gives `record`: CID v1, dag-cbor codec,
+ * SHA-256 of the record's DAG-CBOR encoding, as its base32 string.
+ */
+export async function recordCid(record: unknown): Promise<string> {
+  return cidToString(await create(CODEC_DCBOR, encode(record)));
+}
+
+/** The `com.atproto.sync.getRecord` proof for one record from the PDS at `pdsUrl`, a CAR file. */
+export async function fetchProof(
+  fetch: Fetch,
+  pdsUrl: string,
+  did: string,
+  collection: string,
+  rkey: string,
+): Promise<Uint8Array> {
+  const url = xrpcUrl(pdsUrl, 'com.atproto.sync.getRecord', { did, collection, rkey });
+  return new Uint8Array(await (await get(fetch, url)).arrayBuffer());
+}
+
+/**
+ * Fetch one record's proof and check it under the account's repository key,
+ * the `#atproto` entry of its DID document.
+ */
+export async function verifyRecord(
+  fetch: Fetch,
+  resolveDid: ResolveDid,
+  did: string,
+  collection: string,
+  rkey: string,
+  expectedCid: string,
+): Promise<ProofOutcome> {
+  const doc = await resolveDid(did);
+  const repoKey = repoSigningKey(doc);
+  if (repoKey === undefined) throw new Error('DID document has no #atproto key');
+  const pds = pdsEndpoint(doc);
+  if (pds === undefined) throw new Error('DID document names no PDS');
+  const car = await fetchProof(fetch, pds, did, collection, rkey);
+  return verifyProof(car, did, collection, rkey, expectedCid, repoKey);
+}
+
+/**
+ * Check a `com.atproto.sync.getRecord` proof: a CAR whose root is the
+ * repository's signed commit and whose blocks are the tree path from that
+ * commit to the record at `collection/rkey`. `repoKeyMultibase` is the
+ * `#atproto` key of the account's DID document.
+ *
+ * Each result is worked out on its own. A malformed CAR is an answer from a
+ * PDS, not a crash: whatever throws makes its own result false.
+ */
+export async function verifyProof(
+  car: Uint8Array,
+  did: string,
+  collection: string,
+  rkey: string,
+  expectedCid: string,
+  repoKeyMultibase: string,
+): Promise<ProofOutcome> {
+  const outcome: ProofOutcome = {
+    commitDidMatches: false,
+    signatureValid: false,
+    recordPresent: false,
+  };
+  let proof: { root: string; store: MemoryBlockStore };
+  try {
+    proof = await readProof(car);
+  } catch {
+    return outcome;
+  }
+  let commit: SignedCommit | undefined;
+  try {
+    commit = parseCommit(await proof.store.get(proof.root));
+  } catch {
+    commit = undefined;
+  }
+  if (commit === undefined) return outcome;
+
+  outcome.commitDidMatches = commit.did === did;
+  try {
+    // The signature is over the commit's DAG-CBOR bytes without `sig`.
+    const { sig: _omit, ...unsigned } = commit.value;
+    outcome.signatureValid = await verifySigWithDidKey(
+      `did:key:${repoKeyMultibase}`,
+      commit.sig,
+      encode(unsigned),
+    );
+  } catch {
+    outcome.signatureValid = false;
+  }
+  try {
+    outcome.recordPresent = await holdsRecord(
+      proof.store,
+      commit.data,
+      `${collection}/${rkey}`,
+      expectedCid,
+    );
+  } catch {
+    outcome.recordPresent = false;
+  }
+  return outcome;
+}
+
+/** A decoded signed commit: the whole object, and the fields read from it. */
+interface SignedCommit {
+  value: Record<string, unknown>;
+  did: string;
+  data: string;
+  sig: Uint8Array<ArrayBuffer>;
+}
+
+/**
+ * The CAR's root and its blocks. A block is kept only if its bytes hash to
+ * its CID, the check the Rust side makes when it opens a CAR; a block that
+ * fails is treated as missing.
+ */
+async function readProof(car: Uint8Array): Promise<{ root: string; store: MemoryBlockStore }> {
+  const reader = fromUint8Array(car);
+  const root = reader.roots[0];
+  if (reader.roots.length !== 1 || root === undefined) throw new Error('proof names no single root');
+  const store = new MemoryBlockStore();
+  for (const entry of reader) {
+    const bytes = entry.bytes.slice();
+    // The reader accepts only dag-cbor and raw codecs, both SHA-256.
+    const hashed = await create(entry.cid.codec as typeof CODEC_DCBOR, bytes);
+    if (equals(hashed, entry.cid)) await store.put(cidToString(entry.cid), bytes);
+  }
+  return { root: root.$link, store };
+}
+
+function parseCommit(bytes: Uint8Array | null): SignedCommit | undefined {
+  if (bytes === null) return undefined;
+  const value: unknown = decode(bytes);
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+  const fields = value as Record<string, unknown>;
+  const { did, data, sig } = fields;
+  if (typeof did !== 'string' || !isCidLink(data) || !isBytes(sig)) return undefined;
+  return { value: fields, did, data: data.$link, sig: new Uint8Array(fromBytes(sig)) };
+}
+
+/**
+ * Whether the tree under `root` holds `expectedCid` at `rpath`. The store
+ * holds only blocks that hash to their CID, so a record block found at the
+ * leaf is the record the tree commits to.
+ */
+async function holdsRecord(
+  store: MemoryBlockStore,
+  root: string,
+  rpath: string,
+  expectedCid: string,
+): Promise<boolean> {
+  const nodes = new NodeStore(store);
+  await verifyInclusion(nodes, root, rpath);
+  const [leaf] = await findRpathAndBuildProof(nodes, root, rpath);
+  return leaf !== null && leaf.$link === expectedCid && (await store.has(leaf.$link));
+}
+
+/** The `#atproto` key of a DID document, as a multikey. */
+function repoSigningKey(doc: DidDocument): string | undefined {
+  const fullId = `${doc.id}#atproto`;
+  return doc.verificationMethod?.find((m) => m.id === fullId || m.id === '#atproto')
+    ?.publicKeyMultibase;
 }

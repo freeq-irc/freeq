@@ -10,19 +10,28 @@
 import { webcrypto } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { Secp256k1PrivateKeyExportable } from '@atcute/crypto';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { decodeMultibaseEd25519, importDidKey } from './did-key.js';
 import {
   AGENT_KEY_TYPE,
   DEVICE_KEY_TYPE,
+  type DidDocument,
   buildAgentRecord,
   buildAgentRetirement,
   buildDeviceRecord,
   buildDeviceRetirement,
+  fetchProof,
   foldAgentRecords,
   foldDeviceRecords,
+  listRecords,
+  liveAgentLinks,
+  liveDeviceKeys,
+  recordCid,
   recordSignedBytes,
+  verifyProof,
+  verifyRecord,
 } from './identity-records.js';
 import { deriveKid } from './signing.js';
 
@@ -37,6 +46,7 @@ interface Vector {
   signedBytes: string;
   bindingSig: string;
   record: Record<string, string>;
+  cid: string;
 }
 
 interface FoldCase {
@@ -105,6 +115,10 @@ describe('identity record vectors', () => {
       expect(key.publicKeyMultibase).toBe(v.publicKeyMultibase);
       expect(await deriveKid(decodeMultibaseEd25519(v.publicKeyMultibase))).toBe(v.kid);
     });
+
+    it(`computes the cid of ${v.name}`, async () => {
+      expect(await recordCid(v.record)).toBe(v.cid);
+    });
   }
 
   for (const f of spec.folds) {
@@ -119,5 +133,235 @@ describe('identity record vectors', () => {
       );
       expect(agents).toEqual(f.liveAgentDids);
     });
+
+    it(`reads ${f.name} from a PDS across two pages`, async () => {
+      const did = f.deviceRecords[0]!.did!;
+      const at = new Date(f.at);
+      const fetch = stubListRecords(did, {
+        [DEVICE_KEY_TYPE]: f.deviceRecords,
+        [AGENT_KEY_TYPE]: f.agentRecords,
+      });
+      const resolveDid = resolverFor(did, PDS);
+      expect(await listRecords(fetch, resolveDid, did, DEVICE_KEY_TYPE)).toEqual(f.deviceRecords);
+      const kids = (await liveDeviceKeys(fetch, resolveDid, did, at)).map((k) => k.kid);
+      expect(kids).toEqual(f.liveDeviceKids);
+      const agents = (await liveAgentLinks(fetch, resolveDid, did, at)).map((l) => l.agentDid);
+      expect(agents).toEqual(f.liveAgentDids);
+    });
   }
+});
+
+// ─── reading from a PDS ─────────────────────────────────────────────────
+
+const PDS = 'https://pds.example';
+
+function resolverFor(did: string, pds: string | undefined) {
+  const doc: DidDocument = {
+    id: did,
+    service:
+      pds === undefined
+        ? []
+        : [{ id: '#atproto_pds', type: 'AtprotoPersonalDataServer', serviceEndpoint: pds }],
+  };
+  return async (asked: string): Promise<DidDocument> => {
+    if (asked !== did) throw new Error(`unknown DID ${asked}`);
+    return doc;
+  };
+}
+
+/**
+ * A stub PDS answering `listRecords` in two pages per collection: the first
+ * half of the records with a cursor, then the rest without one.
+ */
+function stubListRecords(did: string, collections: Record<string, unknown[]>) {
+  return vi.fn(async (input: string): Promise<Response> => {
+    const url = new URL(input);
+    const q = url.searchParams;
+    if (
+      url.origin !== PDS ||
+      url.pathname !== '/xrpc/com.atproto.repo.listRecords' ||
+      q.get('repo') !== did ||
+      q.get('limit') !== '100'
+    ) {
+      return new Response('bad request', { status: 400 });
+    }
+    const collection = q.get('collection') ?? '';
+    const records = collections[collection] ?? [];
+    const half = Math.ceil(records.length / 2);
+    const cursor = q.get('cursor');
+    if (cursor !== null && cursor !== 'page-2') return new Response('bad cursor', { status: 400 });
+    const page = cursor === null ? records.slice(0, half) : records.slice(half);
+    const body: Record<string, unknown> = {
+      records: page.map((value, i) => ({
+        uri: `at://${did}/${collection}/${i}`,
+        cid: 'bafyreistub',
+        value,
+      })),
+    };
+    if (cursor === null) body.cursor = 'page-2';
+    return Response.json(body);
+  });
+}
+
+// ─── proofs ─────────────────────────────────────────────────────────────
+
+/** The account and record the committed proof fixture was fetched for. */
+const PROOF_DID = 'did:plc:lc2sd5msatepbr55mhtwgdvy';
+const PROOF_RKEY = '3mv2l5ebug2ql';
+
+function proofFixture(name: string): Buffer {
+  return readFileSync(join(__dirname, '../../spec/fixtures/identity-record-proof', name));
+}
+
+const proofDocument = JSON.parse(proofFixture('did.json').toString('utf8')) as DidDocument;
+const proofListing = JSON.parse(proofFixture('record.json').toString('utf8')) as {
+  cid: string;
+  value: unknown;
+};
+const proofCar = new Uint8Array(proofFixture('proof.car'));
+const proofCid = proofListing.cid;
+const proofRepoKey = proofDocument.verificationMethod!.find((m) => m.id.endsWith('#atproto'))!
+  .publicKeyMultibase!;
+
+const ALL_TRUE = { commitDidMatches: true, signatureValid: true, recordPresent: true };
+const ALL_FALSE = { commitDidMatches: false, signatureValid: false, recordPresent: false };
+
+/** A PDS serving the fixture proof for the fixture record, and nothing else. */
+const stubGetRecord = () =>
+  vi.fn(async (input: string): Promise<Response> => {
+    const url = new URL(input);
+    const q = url.searchParams;
+    if (
+      url.origin !== PDS ||
+      url.pathname !== '/xrpc/com.atproto.sync.getRecord' ||
+      q.get('did') !== PROOF_DID ||
+      q.get('collection') !== DEVICE_KEY_TYPE ||
+      q.get('rkey') !== PROOF_RKEY
+    ) {
+      return new Response('not found', { status: 404 });
+    }
+    return new Response(proofCar, { headers: { 'content-type': 'application/vnd.ipld.car' } });
+  });
+
+describe('identity record proofs', () => {
+  it('computes the cid the PDS reported for the fixture record', async () => {
+    expect(await recordCid(proofListing.value)).toBe(proofListing.cid);
+  });
+
+  it('verifies the fixture proof under the account key', async () => {
+    const outcome = await verifyProof(
+      proofCar,
+      PROOF_DID,
+      DEVICE_KEY_TYPE,
+      PROOF_RKEY,
+      proofCid,
+      proofRepoKey,
+    );
+    expect(outcome).toEqual(ALL_TRUE);
+  });
+
+  it('finds no valid signature under another key', async () => {
+    const keypair = await Secp256k1PrivateKeyExportable.createKeypair();
+    const other = await keypair.exportPublicKey('multikey');
+    const outcome = await verifyProof(
+      proofCar,
+      PROOF_DID,
+      DEVICE_KEY_TYPE,
+      PROOF_RKEY,
+      proofCid,
+      other,
+    );
+    expect(outcome).toEqual({ ...ALL_TRUE, signatureValid: false });
+  });
+
+  it('does not hold a record with another cid', async () => {
+    const wrong = await recordCid({ $type: DEVICE_KEY_TYPE });
+    const outcome = await verifyProof(
+      proofCar,
+      PROOF_DID,
+      DEVICE_KEY_TYPE,
+      PROOF_RKEY,
+      wrong,
+      proofRepoKey,
+    );
+    expect(outcome).toEqual({ ...ALL_TRUE, recordPresent: false });
+  });
+
+  it('does not match the commit for another account', async () => {
+    const outcome = await verifyProof(
+      proofCar,
+      'did:plc:k2n3e2vsihf3farequ44t5j7',
+      DEVICE_KEY_TYPE,
+      PROOF_RKEY,
+      proofCid,
+      proofRepoKey,
+    );
+    expect(outcome).toEqual({ ...ALL_TRUE, commitDidMatches: false });
+  });
+
+  // The fixture's blocks, in order: the commit (bytes 97-285), the record
+  // (323-627), and two tree nodes (665-895, 933-1114). A block whose bytes no
+  // longer hash to its CID is left out, as if the CAR never carried it.
+  for (const [what, offset, expected] of [
+    ['the last tree node', 1113, { ...ALL_TRUE, recordPresent: false }],
+    ['the record', 400, { ...ALL_TRUE, recordPresent: false }],
+    ['the commit', 200, ALL_FALSE],
+  ] as const) {
+    it(`gives false without throwing when a byte of ${what} is flipped`, async () => {
+      const car = proofCar.slice();
+      car[offset]! ^= 0x01;
+      const outcome = await verifyProof(
+        car,
+        PROOF_DID,
+        DEVICE_KEY_TYPE,
+        PROOF_RKEY,
+        proofCid,
+        proofRepoKey,
+      );
+      expect(outcome).toEqual(expected);
+    });
+  }
+
+  it('gives all false without throwing for bytes that are not a CAR', async () => {
+    const outcome = await verifyProof(
+      new Uint8Array([1, 2, 3]),
+      PROOF_DID,
+      DEVICE_KEY_TYPE,
+      PROOF_RKEY,
+      proofCid,
+      proofRepoKey,
+    );
+    expect(outcome).toEqual(ALL_FALSE);
+  });
+
+  it('fetches the proof from the PDS', async () => {
+    const fetched = await fetchProof(
+      stubGetRecord(),
+      PDS,
+      PROOF_DID,
+      DEVICE_KEY_TYPE,
+      PROOF_RKEY,
+    );
+    expect(fetched).toEqual(proofCar);
+  });
+
+  it('verifies a record through its DID document and PDS', async () => {
+    const doc: DidDocument = {
+      ...proofDocument,
+      service: [{ id: '#atproto_pds', type: 'AtprotoPersonalDataServer', serviceEndpoint: PDS }],
+    };
+    const resolveDid = async (asked: string): Promise<DidDocument> => {
+      if (asked !== PROOF_DID) throw new Error(`unknown DID ${asked}`);
+      return doc;
+    };
+    const outcome = await verifyRecord(
+      stubGetRecord(),
+      resolveDid,
+      PROOF_DID,
+      DEVICE_KEY_TYPE,
+      PROOF_RKEY,
+      proofCid,
+    );
+    expect(outcome).toEqual(ALL_TRUE);
+  });
 });

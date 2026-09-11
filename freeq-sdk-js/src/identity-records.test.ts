@@ -6,16 +6,27 @@
  * inputs.
  */
 import { webcrypto } from 'node:crypto';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { writeCarStream } from '@atcute/car';
+import { BytesWrapper, encode, toCidLink } from '@atcute/cbor';
+import { CODEC_DCBOR, CODEC_RAW, type Cid, create } from '@atcute/cid';
+import { Secp256k1PrivateKeyExportable } from '@atcute/crypto';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { type DidKey, decodeMultibaseEd25519, importDidKey } from './did-key.js';
 import {
+  DEVICE_KEY_TYPE,
+  type DidDocument,
   buildAgentRecord,
   buildAgentRetirement,
   buildDeviceRecord,
   buildDeviceRetirement,
   foldAgentRecords,
   foldDeviceRecords,
+  listRecords,
+  liveAgentLinks,
+  liveDeviceKeys,
+  recordCid,
+  verifyProof,
 } from './identity-records.js';
 import { deriveKid } from './signing.js';
 
@@ -188,5 +199,152 @@ describe('agent link fold', () => {
     ];
     expect(await liveAgents(devices, links, '2026-02-15T00:00:00Z')).toEqual([agent]);
     expect(await liveAgents(devices, links, T3)).toEqual([]);
+  });
+});
+
+// ─── reading from a PDS ─────────────────────────────────────────────────
+
+const PDS = 'https://pds.example';
+
+function resolverFor(did: string, pds: string | undefined) {
+  const doc: DidDocument = {
+    id: did,
+    service:
+      pds === undefined
+        ? []
+        : [{ id: '#atproto_pds', type: 'AtprotoPersonalDataServer', serviceEndpoint: pds }],
+  };
+  return async (): Promise<DidDocument> => doc;
+}
+
+describe('reading records from a PDS', () => {
+  it('reads every page until the PDS stops sending a cursor', async () => {
+    const [k1, k2] = [await key(1), await key(2)];
+    const records = [
+      await buildDeviceRecord(k1, ALICE, T0, 'laptop'),
+      await buildDeviceRecord(k2, ALICE, T0, 'phone'),
+      await buildDeviceRetirement(k2, ALICE, await kidOf(k1), T1),
+    ];
+    const fetch = vi.fn(async (input: string): Promise<Response> => {
+      const cursor = new URL(input).searchParams.get('cursor');
+      const page = cursor === null ? records.slice(0, 2) : records.slice(2);
+      return Response.json({
+        records: page.map((value) => ({ uri: 'at://x', cid: 'bafyreistub', value })),
+        ...(cursor === null ? { cursor: 'page-2' } : {}),
+      });
+    });
+    const resolveDid = resolverFor(ALICE, PDS);
+    expect(await listRecords(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE)).toEqual(records);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const kids = (await liveDeviceKeys(fetch, resolveDid, ALICE, new Date(T2))).map((k) => k.kid);
+    expect(kids).toEqual([await kidOf(k2)]);
+  });
+
+  it('finds no records for a DID with no PDS', async () => {
+    const fetch = vi.fn(async (): Promise<Response> => new Response('unreachable'));
+    const resolveDid = resolverFor(ALICE, undefined);
+    expect(await listRecords(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE)).toEqual([]);
+    expect(await liveDeviceKeys(fetch, resolveDid, ALICE, new Date(T1))).toEqual([]);
+    expect(await liveAgentLinks(fetch, resolveDid, ALICE, new Date(T1))).toEqual([]);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('fails when the PDS answers 500', async () => {
+    const fetch = vi.fn(async (): Promise<Response> => new Response('down', { status: 500 }));
+    const resolveDid = resolverFor(ALICE, PDS);
+    await expect(listRecords(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE)).rejects.toThrow();
+    await expect(liveDeviceKeys(fetch, resolveDid, ALICE, new Date(T1))).rejects.toThrow();
+    await expect(liveAgentLinks(fetch, resolveDid, ALICE, new Date(T1))).rejects.toThrow();
+  });
+});
+
+// ─── hostile proofs ─────────────────────────────────────────────────────
+
+const RKEY = '3mv2l5ebug2ql';
+
+/**
+ * A one-record repository proof built here: a commit for ALICE signed by a
+ * fresh secp256k1 key, one tree node whose single leaf is `leaf`, and the
+ * blocks given. Returns the CAR and the repository key as a multikey.
+ */
+async function buildProof(
+  leaf: Cid,
+  blocks: { cid: Cid; bytes: Uint8Array }[],
+  forgedLeaf?: Cid,
+): Promise<{ car: Uint8Array; repoKey: string }> {
+  const keypair = await Secp256k1PrivateKeyExportable.createKeypair();
+  const key = new TextEncoder().encode(`${DEVICE_KEY_TYPE}/${RKEY}`);
+  const node = (value: Cid) =>
+    encode({ e: [{ k: new BytesWrapper(key), p: 0, t: null, v: toCidLink(value) }], l: null });
+  const nodeCid = await create(CODEC_DCBOR, node(leaf));
+  // With `forgedLeaf`, the CAR files a different node under the real node's CID.
+  const nodeBytes = node(forgedLeaf ?? leaf);
+  const unsigned = { did: ALICE, version: 3, data: toCidLink(nodeCid), rev: RKEY, prev: null };
+  const sig = await keypair.sign(encode(unsigned));
+  const commitBytes = encode({ ...unsigned, sig: new BytesWrapper(sig) });
+  const commitCid = await create(CODEC_DCBOR, commitBytes);
+  const entries = [
+    { cid: commitCid.bytes, data: commitBytes },
+    { cid: nodeCid.bytes, data: nodeBytes },
+    ...blocks.map((b) => ({ cid: b.cid.bytes, data: b.bytes })),
+  ];
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of writeCarStream([toCidLink(commitCid)], entries)) chunks.push(chunk);
+  const car = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+  let offset = 0;
+  for (const chunk of chunks) {
+    car.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return { car, repoKey: await keypair.exportPublicKey('multikey') };
+}
+
+describe('a proof built here', () => {
+  it('verifies a record it holds', async () => {
+    const record = await buildDeviceRecord(await key(1), ALICE, T0, 'laptop');
+    const bytes = encode(record);
+    const cid = await create(CODEC_DCBOR, bytes);
+    const { car, repoKey } = await buildProof(cid, [{ cid, bytes }]);
+    const expected = await recordCid(record);
+    expect(await verifyProof(car, ALICE, DEVICE_KEY_TYPE, RKEY, expected, repoKey)).toEqual({
+      commitDidMatches: true,
+      signatureValid: true,
+      recordPresent: true,
+    });
+  });
+
+  it('reports no record when a tree node does not hash to its CID', async () => {
+    // A real signed commit, with a forged tree node filed under the real
+    // node's CID; the forged node's leaf is the record asked about.
+    const genuine = encode({ $type: DEVICE_KEY_TYPE, label: 'genuine' });
+    const genuineCid = await create(CODEC_DCBOR, genuine);
+    const forged = await buildDeviceRecord(await key(2), ALICE, T0, 'forged');
+    const forgedBytes = encode(forged);
+    const forgedCid = await create(CODEC_DCBOR, forgedBytes);
+    const { car, repoKey } = await buildProof(
+      genuineCid,
+      [{ cid: forgedCid, bytes: forgedBytes }],
+      forgedCid,
+    );
+    const expected = await recordCid(forged);
+    expect(await verifyProof(car, ALICE, DEVICE_KEY_TYPE, RKEY, expected, repoKey)).toEqual({
+      commitDidMatches: true,
+      signatureValid: true,
+      recordPresent: false,
+    });
+  });
+
+  it('reports no record when the leaf links to a block that is not DAG-CBOR', async () => {
+    // A validly signed commit whose tree leaf for the record is a raw block:
+    // the tree walk runs and finds a leaf that is not the record asked for.
+    const bytes = new TextEncoder().encode('not a record');
+    const cid = await create(CODEC_RAW, bytes);
+    const { car, repoKey } = await buildProof(cid, [{ cid, bytes }]);
+    const expected = await recordCid({ $type: DEVICE_KEY_TYPE });
+    expect(await verifyProof(car, ALICE, DEVICE_KEY_TYPE, RKEY, expected, repoKey)).toEqual({
+      commitDidMatches: true,
+      signatureValid: true,
+      recordPresent: false,
+    });
   });
 });

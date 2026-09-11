@@ -91,7 +91,8 @@ export {
 export type { DidKey } from './did-key.js';
 
 // Identity records: the entries an account publishes saying which signing
-// keys and which bots are its own, and the rule for reading a list of them.
+// keys and which bots are its own, reading them and their proofs from the
+// account's PDS, and the rule for reading a list of them.
 // Byte-compatible with the Rust `freeq_sdk::identity_records` via
 // spec/identity-record-vectors.json.
 export {
@@ -104,12 +105,23 @@ export {
   buildAgentRetirement,
   foldDeviceRecords,
   foldAgentRecords,
+  listRecords,
+  liveDeviceKeys,
+  liveAgentLinks,
+  recordCid,
+  fetchProof,
+  verifyProof,
+  verifyRecord,
 } from './identity-records.js';
 export type {
   DeviceKeyRecord,
   AgentKeyRecord,
   LiveDeviceKey,
   LiveAgentLink,
+  DidDocument,
+  ResolveDid,
+  Fetch,
+  ProofOutcome,
 } from './identity-records.js';
 
 // VC-bootstrapped E2E group channels (EG1/EGK1) — passphrase-free, server-blind
