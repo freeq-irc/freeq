@@ -378,15 +378,36 @@ pub(crate) struct DidMapsState {
     /// its own cell because a caller asking "who am I addressing as" is
     /// asking the same map every other address question goes through.
     own_did: Option<String>,
+    /// lowercase nicks whose binding came from a message whose signature
+    /// checked out on the sender's device.
+    verified: HashSet<String>,
 }
 
 impl DidMapsState {
     /// Learn an authoritative binding (extended-join, WHOIS 330, account
     /// tag). Returns true when new/changed — the caller emits
     /// [`Event::MemberDid`] exactly then.
-    fn learn(&mut self, nick: &str, did: &str) -> bool {
+    ///
+    /// `verified`: the message that taught it carried a device verdict. A
+    /// verified binding replaces any other; an unverified one replaces
+    /// nothing that was learned verified.
+    fn learn(&mut self, nick: &str, did: &str, verified: bool) -> bool {
         let lc = nick.to_lowercase();
-        let is_new = self.nick_to_did.get(&lc).map(|d| d.as_str()) != Some(did);
+        let current = self.nick_to_did.get(&lc).map(|d| d.as_str());
+        if !verified && current != Some(did) && self.verified.contains(&lc) {
+            return false;
+        }
+        let is_new = current != Some(did);
+        if verified {
+            self.verified.insert(lc.clone());
+        } else if is_new {
+            self.verified.remove(&lc);
+        }
+        // A DID keeps one nick: drop the pairing this one replaces.
+        if let Some(previous) = self.did_to_nick.get(did).filter(|n| **n != lc).cloned() {
+            self.nick_to_did.remove(&previous);
+            self.verified.remove(&previous);
+        }
         self.nick_to_did.insert(lc.clone(), did.to_string());
         self.did_to_nick.insert(did.to_string(), lc);
         is_new
@@ -429,6 +450,7 @@ impl DidMapsState {
     /// recycled) but keep the display binding (the DID is permanent).
     fn forget_nick(&mut self, nick: &str) {
         self.nick_to_did.remove(&nick.to_lowercase());
+        self.verified.remove(&nick.to_lowercase());
     }
 
     /// Record who this session authenticated as.
@@ -440,7 +462,8 @@ impl DidMapsState {
     /// refresh the display binding.
     fn rename(&mut self, old_nick: &str, new_nick: &str) {
         if let Some(did) = self.nick_to_did.remove(&old_nick.to_lowercase()) {
-            self.learn(new_nick, &did);
+            let verified = self.verified.remove(&old_nick.to_lowercase());
+            self.learn(new_nick, &did, verified);
         }
     }
 }
@@ -2443,19 +2466,41 @@ fn verdict_at_delivery(
     (Some(verdict), follow_up)
 }
 
+/// Whether a delivered verdict is a signature from the sender's device.
+fn is_device(verdict: &Option<crate::verdict::Verdict>) -> bool {
+    verdict
+        .as_ref()
+        .is_some_and(|v| v.state == crate::verdict::VerdictState::Device)
+}
+
 /// Finish a pending check off the receive path and send its verdict.
+///
+/// `taught` is the (nick, DID) pairing the line's account tag taught; a
+/// device verdict for that DID makes the pairing a verified one.
 fn spawn_verdict_check(
     checker: Option<&Arc<SignatureChecker>>,
     signed: Option<crate::verdict::Signed>,
+    taught: Option<(String, String)>,
+    maps: &DidMaps,
     event_tx: &mpsc::Sender<Event>,
 ) {
     let (Some(checker), Some(signed)) = (checker, signed) else {
         return;
     };
     let checker = checker.clone();
+    let maps = maps.clone();
     let event_tx = event_tx.clone();
     tokio::spawn(async move {
         let verdict = checker.resolve(&signed).await;
+        // Learned before the verdict goes out, so a consumer that has the
+        // verdict can rely on the pairing.
+        if verdict.state == crate::verdict::VerdictState::Device
+            && let Some((nick, did)) = taught
+            && did == signed.did
+            && maps.lock().learn(&nick, &did, true)
+        {
+            let _ = event_tx.send(Event::MemberDid { nick, did }).await;
+        }
         let _ = event_tx
             .send(Event::Verdict {
                 msgid: signed.msgid,
@@ -2814,12 +2859,21 @@ where
                                             &batch.from,
                                             &batch.target,
                                         );
+                                        let taught = batch
+                                            .opener_tags
+                                            .get("account")
+                                            .filter(|did| {
+                                                !batch.from.eq_ignore_ascii_case(&own_nick)
+                                                    && crate::address::is_did(did)
+                                            })
+                                            .map(|did| (batch.from.clone(), did.clone()));
                                         dispatch_assembled_multiline(
                                             &event_tx,
                                             batch,
                                             dm_key,
                                             checker.as_ref(),
                                             &did_maps,
+                                            taught,
                                         )
                                         .await;
                                     } else {
@@ -2924,7 +2978,7 @@ where
                                 .cloned();
                             if let Some(did) = account.as_deref()
                                 && crate::address::is_did(did)
-                                && did_maps.lock().learn(&nick, did)
+                                && did_maps.lock().learn(&nick, did, false)
                             {
                                 let _ = event_tx
                                     .send(Event::MemberDid { nick: nick.clone(), did: did.to_string() })
@@ -3115,7 +3169,7 @@ where
                                 let nick = msg.params[1].clone();
                                 let account = &msg.params[2];
                                 if crate::address::is_did(account)
-                                    && did_maps.lock().learn(&nick, account)
+                                    && did_maps.lock().learn(&nick, account, false)
                                 {
                                     let _ = event_tx
                                         .send(Event::MemberDid {
@@ -3231,10 +3285,20 @@ where
                                     // there, it is the only one it will ever
                                     // get: it saw no extended JOIN, and NAMES
                                     // carries no DIDs.
-                                    if !from.eq_ignore_ascii_case(&own_nick)
-                                        && let Some(did) = tags.get("account")
-                                        && crate::address::is_did(did)
-                                        && did_maps.lock().learn(&from, did)
+                                    // Checked over the wire body, before any
+                                    // legacy newline rewrite above.
+                                    let (verdict, follow_up) = verdict_at_delivery(
+                                        checker.as_ref(), &did_maps, &tags, &target, Some(&msg.params[1]),
+                                    );
+                                    let taught = tags
+                                        .get("account")
+                                        .filter(|did| {
+                                            !from.eq_ignore_ascii_case(&own_nick)
+                                                && crate::address::is_did(did)
+                                        })
+                                        .map(|did| (from.clone(), did.clone()));
+                                    if let Some((_, did)) = &taught
+                                        && did_maps.lock().learn(&from, did, is_device(&verdict))
                                     {
                                         let _ = event_tx
                                             .send(Event::MemberDid {
@@ -3245,13 +3309,8 @@ where
                                     }
                                     let dm_key =
                                         dm_key_for(&did_maps, &own_nick, &from, &target);
-                                    // Checked over the wire body, before any
-                                    // legacy newline rewrite above.
-                                    let (verdict, follow_up) = verdict_at_delivery(
-                                        checker.as_ref(), &did_maps, &tags, &target, Some(&msg.params[1]),
-                                    );
                                     let _ = event_tx.send(Event::Message { from, target, text, tags, dm_key, verdict }).await;
-                                    spawn_verdict_check(checker.as_ref(), follow_up, &event_tx);
+                                    spawn_verdict_check(checker.as_ref(), follow_up, taught, &did_maps, &event_tx);
                                 }
                             }
                         }
@@ -3268,10 +3327,19 @@ where
                                 // just as well. The JS SDK learns here too;
                                 // leaving it out would mean a peer known to
                                 // one client and nameless to the other.
-                                if !from.eq_ignore_ascii_case(&own_nick)
-                                    && let Some(did) = msg.tags.get("account")
-                                    && crate::address::is_did(did)
-                                    && did_maps.lock().learn(&from, did)
+                                let (verdict, follow_up) = verdict_at_delivery(
+                                    checker.as_ref(), &did_maps, &msg.tags, &target, None,
+                                );
+                                let taught = msg
+                                    .tags
+                                    .get("account")
+                                    .filter(|did| {
+                                        !from.eq_ignore_ascii_case(&own_nick)
+                                            && crate::address::is_did(did)
+                                    })
+                                    .map(|did| (from.clone(), did.clone()));
+                                if let Some((_, did)) = &taught
+                                    && did_maps.lock().learn(&from, did, is_device(&verdict))
                                 {
                                     let _ = event_tx
                                         .send(Event::MemberDid {
@@ -3281,9 +3349,6 @@ where
                                         .await;
                                 }
                                 let dm_key = dm_key_for(&did_maps, &own_nick, &from, &target);
-                                let (verdict, follow_up) = verdict_at_delivery(
-                                    checker.as_ref(), &did_maps, &msg.tags, &target, None,
-                                );
                                 // A task event is handed up as its own event
                                 // as well as the raw TAGMSG, the way a
                                 // coordination TAGMSG is — once per event id.
@@ -3309,7 +3374,7 @@ where
                                         .await;
                                 }
                                 let _ = event_tx.send(Event::TagMsg { from, target, tags: msg.tags.clone(), dm_key, verdict }).await;
-                                spawn_verdict_check(checker.as_ref(), follow_up, &event_tx);
+                                spawn_verdict_check(checker.as_ref(), follow_up, taught, &did_maps, &event_tx);
                             }
                         }
                         "CHATHISTORY" => {
@@ -3438,12 +3503,15 @@ where
 /// `draft/multiline-concat` joins its predecessor with no separator;
 /// otherwise the join is `\n`. The opener's tags become the assembled
 /// message's tags (msgid, time, sender's account, etc.).
+/// `taught` is the (nick, DID) pairing the opener's account tag taught, as on
+/// the single-line paths.
 async fn dispatch_assembled_multiline(
     event_tx: &mpsc::Sender<Event>,
     batch: InboundMultilineBatch,
     dm_key: Option<String>,
     checker: Option<&Arc<SignatureChecker>>,
     maps: &DidMaps,
+    taught: Option<(String, String)>,
 ) {
     let mut text = String::new();
     for (i, line) in batch.lines.iter().enumerate() {
@@ -3469,7 +3537,7 @@ async fn dispatch_assembled_multiline(
             verdict,
         })
         .await;
-    spawn_verdict_check(checker, follow_up, event_tx);
+    spawn_verdict_check(checker, follow_up, taught, maps, event_tx);
     // Nested-batch parent (e.g. multiline inside CHATHISTORY) is
     // exposed to the consumer via the `batch` tag so UI layers can
     // attach the assembled message to the outer batch.
@@ -4808,7 +4876,7 @@ mod multiline_tests {
             ],
             parent_batch_id: None,
         };
-        dispatch_assembled_multiline(&tx, batch, None, None, &DidMaps::default()).await;
+        dispatch_assembled_multiline(&tx, batch, None, None, &DidMaps::default(), None).await;
         match rx.recv().await.unwrap() {
             Event::Message {
                 from, target, text, ..
@@ -4844,7 +4912,7 @@ mod multiline_tests {
             ],
             parent_batch_id: None,
         };
-        dispatch_assembled_multiline(&tx, batch, None, None, &DidMaps::default()).await;
+        dispatch_assembled_multiline(&tx, batch, None, None, &DidMaps::default(), None).await;
         match rx.recv().await.unwrap() {
             Event::Message { text, .. } => assert_eq!(text, "alphabeta\ngamma"),
             other => panic!("expected Message, got {other:?}"),
@@ -4877,7 +4945,7 @@ mod multiline_tests {
             ],
             parent_batch_id: None,
         };
-        dispatch_assembled_multiline(&tx, batch, None, None, &DidMaps::default()).await;
+        dispatch_assembled_multiline(&tx, batch, None, None, &DidMaps::default(), None).await;
         match rx.recv().await.unwrap() {
             Event::Message { tags, .. } => {
                 assert_eq!(tags.get("msgid").map(String::as_str), Some("01XYZ"));
@@ -5244,7 +5312,7 @@ mod multiline_tests {
     #[tokio::test]
     async fn a_client_can_ask_whether_a_dm_peer_is_identified() {
         let did_maps: DidMaps = Arc::new(parking_lot::Mutex::new(DidMapsState::default()));
-        did_maps.lock().learn("bob", "did:plc:bob");
+        did_maps.lock().learn("bob", "did:plc:bob", false);
         let (cmd_tx, _cmd_rx) = mpsc::channel(16);
         let handle = ClientHandle {
             cmd_tx,
@@ -5290,7 +5358,7 @@ mod multiline_tests {
         let key = SigningKey::from_bytes(&[11u8; 32]);
 
         let did_maps: DidMaps = Arc::new(parking_lot::Mutex::new(DidMapsState::default()));
-        did_maps.lock().learn("bob", peer);
+        did_maps.lock().learn("bob", peer, false);
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         let handle = ClientHandle {
             cmd_tx,
@@ -5379,7 +5447,7 @@ mod multiline_tests {
     #[tokio::test]
     async fn a_channel_mutation_target_is_never_rewritten() {
         let did_maps: DidMaps = Arc::new(parking_lot::Mutex::new(DidMapsState::default()));
-        did_maps.lock().learn("bob", "did:plc:peer");
+        did_maps.lock().learn("bob", "did:plc:peer", false);
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         let handle = ClientHandle {
             cmd_tx,
@@ -7784,9 +7852,58 @@ mod did_maps_tests {
     #[test]
     fn learn_reports_new_and_changed_bindings_only() {
         let mut m = DidMapsState::default();
-        assert!(m.learn("Bob", BOB)); // new
-        assert!(!m.learn("bob", BOB)); // same (case-insensitive nick)
-        assert!(m.learn("bob", "did:plc:other")); // changed
+        assert!(m.learn("Bob", BOB, false)); // new
+        assert!(!m.learn("bob", BOB, false)); // same (case-insensitive nick)
+        assert!(m.learn("bob", "did:plc:other", false)); // changed
+    }
+
+    #[test]
+    fn an_unverified_pairing_does_not_replace_a_verified_one() {
+        let mut m = DidMapsState::default();
+        assert!(m.learn("bob", BOB, true));
+        assert!(!m.learn("bob", "did:plc:other", false));
+        assert_eq!(m.wire_target("bob"), BOB);
+        // The same pairing again, unverified, keeps it verified.
+        assert!(!m.learn("bob", BOB, false));
+        assert!(!m.learn("bob", "did:plc:other", false));
+        assert_eq!(m.wire_target("bob"), BOB);
+    }
+
+    #[test]
+    fn a_verified_pairing_replaces_an_unverified_one() {
+        let mut m = DidMapsState::default();
+        assert!(m.learn("bob", "did:plc:other", false));
+        assert!(m.learn("bob", BOB, true));
+        assert_eq!(m.wire_target("bob"), BOB);
+        // And a later verified pairing replaces that one too.
+        assert!(m.learn("bob", "did:plc:third", true));
+        assert_eq!(m.wire_target("bob"), "did:plc:third");
+    }
+
+    #[test]
+    fn a_new_nick_for_a_did_drops_the_pairing_it_replaces() {
+        let mut m = DidMapsState::default();
+        m.learn("bob", BOB, true);
+        assert!(m.learn("robert", BOB, false));
+        assert_eq!(m.wire_target("robert"), BOB);
+        assert_eq!(
+            m.wire_target("bob"),
+            "bob",
+            "the old nick no longer names the DID"
+        );
+        // Its verified mark went with it: anyone may pair that nick now.
+        assert!(m.learn("bob", "did:plc:other", false));
+        assert_eq!(m.wire_target("bob"), "did:plc:other");
+    }
+
+    #[test]
+    fn a_quit_ends_the_verified_pairing_and_a_rename_keeps_it() {
+        let mut m = DidMapsState::default();
+        m.learn("bob", BOB, true);
+        m.rename("bob", "bobby");
+        assert!(!m.learn("bobby", "did:plc:other", false));
+        m.forget_nick("bobby");
+        assert!(m.learn("bobby", "did:plc:other", false));
     }
 
     #[test]
@@ -7800,7 +7917,7 @@ mod did_maps_tests {
     #[test]
     fn forget_nick_clears_addressing_but_keeps_display() {
         let mut m = DidMapsState::default();
-        m.learn("bob", BOB);
+        m.learn("bob", BOB, false);
         m.forget_nick("bob");
         assert_eq!(m.wire_target("bob"), "bob"); // routing must not follow
         assert_eq!(m.dm_key("bob"), BOB); // thread key survives the quit
@@ -7810,7 +7927,7 @@ mod did_maps_tests {
     #[test]
     fn rename_moves_the_binding() {
         let mut m = DidMapsState::default();
-        m.learn("bob", BOB);
+        m.learn("bob", BOB, false);
         m.rename("bob", "bobby");
         assert_eq!(m.wire_target("bobby"), BOB);
         assert_eq!(m.wire_target("bob"), "bob");
@@ -8446,7 +8563,7 @@ mod did_maps_tests {
     #[test]
     fn dm_key_for_selects_the_peer_end_and_skips_channels() {
         let maps: DidMaps = Arc::new(parking_lot::Mutex::new(DidMapsState::default()));
-        maps.lock().learn("bob", BOB);
+        maps.lock().learn("bob", BOB, false);
         // Channel → None.
         assert_eq!(dm_key_for(&maps, "me", "bob", "#dev"), None);
         // Incoming: peer is the sender.
@@ -9862,6 +9979,91 @@ mod verdict_tests {
                 key_source: Some(crate::key_lookup::KeySource::IdentityRecord),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn a_device_verdict_makes_a_pairing_a_join_cannot_replace() {
+        let origin = Origin::default();
+        origin.hold(SIGNER, public(28), None);
+        let base = serve_origin(Arc::new(origin)).await;
+        let mut session = Session::open(Some(key_lookup(&base, vec![])), OWN_DID).await;
+        let bound = |s: &Session| s._handle.did_maps.lock().nick_to_did.get("sender").cloned();
+
+        let (wire, _) = signed_message(28, "it is me");
+        session.send(&wire).await;
+        let seen = session.next_line().await;
+        assert_eq!(seen.settled.map(|v| v.state), Some(VerdictState::Device));
+        session
+            .send(":sender!u@h JOIN #room did:plc:impostor :someone")
+            .await;
+        session.wait(|e| matches!(e, Event::Joined { .. })).await;
+        assert_eq!(bound(&session).as_deref(), Some(SIGNER));
+
+        // Unsigned, the same line teaches a pairing a JOIN does replace.
+        let mut plain = HashMap::from([("account".to_string(), SIGNER.to_string())]);
+        plain.insert("msgid".to_string(), crate::chatsig::new_event_id());
+        session
+            .send(&line(plain, "PRIVMSG", "#room", Some("unsigned")).replace("sender!", "carol!"))
+            .await;
+        session.next_line().await;
+        session
+            .send(":carol!u@h JOIN #room did:plc:impostor :someone")
+            .await;
+        session.wait(|e| matches!(e, Event::Joined { .. })).await;
+        let carol = session
+            ._handle
+            .did_maps
+            .lock()
+            .nick_to_did
+            .get("carol")
+            .cloned();
+        assert_eq!(carol.as_deref(), Some("did:plc:impostor"));
+    }
+
+    #[tokio::test]
+    async fn a_verified_multiline_message_makes_a_pairing_a_join_cannot_replace() {
+        let origin = Origin::default();
+        origin.hold(SIGNER, public(29), None);
+        let base = serve_origin(Arc::new(origin)).await;
+        let mut session = Session::open(Some(key_lookup(&base, vec![])), OWN_DID).await;
+
+        let body = "first line\nsecond line";
+        let msgid = crate::chatsig::new_event_id();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[29; 32]);
+        let sig = crate::chatsig::ChatDoc::message(SIGNER, &msgid, "#room", body).sign(&key);
+        let tags = HashMap::from([
+            ("account".to_string(), SIGNER.to_string()),
+            ("msgid".to_string(), msgid),
+            (crate::sigtag::SIG_TAG.to_string(), sig),
+        ]);
+        session
+            .send(
+                &line(tags, "BATCH", "+b1", Some("draft/multiline #room"))
+                    .replace(":draft/multiline", "draft/multiline"),
+            )
+            .await;
+        for chunk in body.split('\n') {
+            let batch = HashMap::from([("batch".to_string(), "b1".to_string())]);
+            session
+                .send(&line(batch, "PRIVMSG", "#room", Some(chunk)))
+                .await;
+        }
+        session.send(":sender!u@h BATCH -b1").await;
+        let seen = session.next_line().await;
+        assert_eq!(seen.settled.map(|v| v.state), Some(VerdictState::Device));
+
+        session
+            .send(":sender!u@h JOIN #room did:plc:impostor :someone")
+            .await;
+        session.wait(|e| matches!(e, Event::Joined { .. })).await;
+        let bound = session
+            ._handle
+            .did_maps
+            .lock()
+            .nick_to_did
+            .get("sender")
+            .cloned();
+        assert_eq!(bound.as_deref(), Some(SIGNER));
     }
 
     #[tokio::test]
