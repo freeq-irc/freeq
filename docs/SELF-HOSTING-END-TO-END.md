@@ -393,7 +393,6 @@ Flags marked *(env)* can also be set via the named environment variable.
 | `--s2s-peers` | none | leave empty |
 | `--s2s-allowed-peers` | none (**= open federation if `--iroh` is on**) | leave empty |
 | `--s2s-peer-trust` | none | leave empty |
-| `--server-did` | none | leave empty (only needed for federation identity) |
 | `--require-did-for-ops` | off | n/a unless federating |
 
 > **Hardening note:** `--s2s-allowed-peers` empty means *any* peer may connect —
@@ -549,10 +548,9 @@ These are real limitations discovered in the code — plan around them:
 ## 8. Optional extras (you probably don't need)
 
 ### Federation (`did:web` + iroh S2S)
-Only if you want to peer with *other* freeq servers. Enable `--iroh`, set a
-`--server-did did:web:chat.example.com`, publish `/.well-known/did.json`, and
+Only if you want to peer with *other* freeq servers. Enable `--iroh` and
 restrict peers with `--s2s-allowed-peers`. Full details:
-[`docs/server-did.md`](server-did.md) and [`docs/federation.md`](federation.md).
+[`docs/federation.md`](federation.md).
 For a private company instance, **skip this**.
 
 ### Standalone auth broker (split-origin login)

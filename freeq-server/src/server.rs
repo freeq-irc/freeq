@@ -1410,6 +1410,17 @@ fn register_server_signing_key(state: &Arc<SharedState>) {
     }
 }
 
+/// The startup warning for `--server-did`, which is still accepted so an old
+/// config file keeps starting, but no longer read.
+fn deprecated_server_did_warning(config: &ServerConfig) -> Option<String> {
+    config.server_did.as_ref().map(|_| {
+        format!(
+            "server_did is deprecated and ignored; the server's DID is {}; remove it from your config",
+            server_did(&config.server_name)
+        )
+    })
+}
+
 fn load_msg_signing_key(data_dir: &str) -> ed25519_dalek::SigningKey {
     let key_path = std::path::Path::new(data_dir).join("msg-signing-key.secret");
     if key_path.exists() {
@@ -1581,6 +1592,9 @@ impl Server {
         // not configured). Lives in a process-wide slot rather than
         // SharedState so existing constructors don't need to change.
         install_llm_provider(&self.config);
+        if let Some(warning) = deprecated_server_did_warning(&self.config) {
+            tracing::warn!("{warning}");
+        }
 
         // Load message signing key early — it's used to derive DB encryption key
         let msg_signing_key = load_msg_signing_key(self.config.data_dir.as_deref().unwrap_or("."));
@@ -17499,5 +17513,28 @@ mod relayed_task_verdict_tests {
             filed.payload_json, r#"{"description":"ship it"}"#,
             "the payload is decoded on the way in, as it is locally"
         );
+    }
+}
+
+#[cfg(test)]
+mod deprecated_option_tests {
+    use super::deprecated_server_did_warning;
+
+    #[test]
+    fn a_config_that_sets_server_did_gets_one_warning_naming_the_real_did() {
+        let set = crate::config::ServerConfig {
+            server_name: "irc.example.com".to_string(),
+            server_did: Some("did:web:elsewhere.example".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            deprecated_server_did_warning(&set).as_deref(),
+            Some(
+                "server_did is deprecated and ignored; the server's DID is \
+                 did:web:irc.example.com; remove it from your config"
+            )
+        );
+        let unset = crate::config::ServerConfig::default();
+        assert_eq!(deprecated_server_did_warning(&unset), None);
     }
 }

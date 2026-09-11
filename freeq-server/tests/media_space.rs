@@ -316,7 +316,7 @@ fn urlencoding_encode(s: &str) -> String {
 // ── Feature off ────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn feature_off_answers_404_everywhere() {
+async fn feature_off_answers_404_on_every_media_endpoint() {
     let config = freeq_server::config::ServerConfig {
         listen_addr: "127.0.0.1:0".to_string(),
         web_addr: Some("127.0.0.1:0".to_string()),
@@ -333,14 +333,18 @@ async fn feature_off_answers_404_everywhere() {
     .await
     .unwrap();
 
-    let (s1, _) = get(web, "/.well-known/did.json").await;
     let (s2, _) = get(web, "/api/v1/media-space?channel=%23open").await;
     let (s3, _) = check_access(web, None, "at://x/space/at.freeq.media/k", "did:plc:x").await;
-    assert_eq!((s1, s2, s3), (404, 404, 404));
+    assert_eq!((s2, s3), (404, 404));
     server.abort();
 }
 
 // ── did:web document ───────────────────────────────────────────────────
+
+/// The entry of `doc`'s `service` list whose `id` is `id`.
+fn service<'a>(doc: &'a serde_json::Value, id: &str) -> Option<&'a serde_json::Value> {
+    doc["service"].as_array()?.iter().find(|s| s["id"] == id)
+}
 
 #[tokio::test]
 async fn did_web_document_names_the_managing_app_service() {
@@ -348,12 +352,66 @@ async fn did_web_document_names_the_managing_app_service() {
     let (status, doc) = get(fx.web, "/.well-known/did.json").await;
     assert_eq!(status, 200);
     assert_eq!(doc["id"], format!("did:web:{SERVER_NAME}"));
-    assert_eq!(doc["service"][0]["id"], "#freeq_media");
-    assert_eq!(
-        doc["service"][0]["serviceEndpoint"],
-        format!("https://{SERVER_NAME}")
-    );
+    let media = service(&doc, "#freeq_media").expect("the managing-app service");
+    assert_eq!(media["serviceEndpoint"], format!("https://{SERVER_NAME}"));
     fx.server.abort();
+}
+
+/// With no media space the document still answers: it carries the server's
+/// signing key and points at the server's key set.
+#[tokio::test]
+async fn did_web_document_carries_the_servers_key_without_a_media_space() {
+    let server_name = "test-media-off";
+    let config = freeq_server::config::ServerConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        web_addr: Some("127.0.0.1:0".to_string()),
+        server_name: server_name.to_string(),
+        challenge_timeout_secs: 60,
+        db_path: Some(":memory:".to_string()),
+        ..Default::default()
+    };
+    let (_irc, web, server) = freeq_server::server::Server::with_resolver(
+        config,
+        DidResolver::static_map(HashMap::new()),
+    )
+    .start_with_web()
+    .await
+    .unwrap();
+
+    let (status, doc) = get(web, "/.well-known/did.json").await;
+    assert_eq!(status, 200);
+    let did = format!("did:web:{server_name}");
+    assert_eq!(doc["id"], did);
+    assert!(
+        service(&doc, "#freeq_media").is_none(),
+        "no media space, no media service"
+    );
+
+    let method = &doc["verificationMethod"][0];
+    assert_eq!(method["id"], format!("{did}#freeq"));
+    assert_eq!(method["type"], "Multikey");
+    assert_eq!(method["controller"], did);
+    assert_eq!(doc["assertionMethod"][0], format!("{did}#freeq"));
+    let key = freeq_sdk::crypto::PublicKey::from_multibase(
+        method["publicKeyMultibase"].as_str().unwrap(),
+    )
+    .unwrap();
+    let freeq_sdk::crypto::PublicKey::Ed25519(key) = key else {
+        panic!("the server's key is ed25519");
+    };
+    let (_, signing_key) = get(web, "/api/v1/signing-key").await;
+    assert_eq!(
+        signing_key["public_key"],
+        URL_SAFE_NO_PAD.encode(key.as_bytes())
+    );
+
+    let keys = service(&doc, "#freeq_keys").expect("the key-set service");
+    assert_eq!(keys["type"], "FreeqSigningKeys");
+    assert_eq!(
+        keys["serviceEndpoint"],
+        format!("https://{server_name}/api/v1/signing-keys/{did}")
+    );
+    server.abort();
 }
 
 // ── OAuth scope surface ────────────────────────────────────────────────

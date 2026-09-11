@@ -125,10 +125,10 @@ pub struct ServerConfig {
     #[arg(long, value_delimiter = ',')]
     pub s2s_peer_trust: Vec<String>,
 
-    /// Server DID for federated identity (Phase 5). Format: did:web:irc.example.com
-    /// When set, this DID is included in Hello handshakes and can be used by peers
-    /// for DID-based allowlisting instead of raw endpoint IDs.
-    #[arg(long)]
+    /// Deprecated and ignored: the server's DID is `did:web:<server-name>`.
+    /// Still accepted, so a config file that sets it keeps starting; setting it
+    /// logs a warning at startup.
+    #[arg(long, hide = true)]
     pub server_did: Option<String>,
 
     /// Data directory for server state files (iroh key, etc.).

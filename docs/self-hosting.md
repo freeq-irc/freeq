@@ -189,9 +189,8 @@ freeq-server \
 | `--s2s-allowed-peers` | *(none — open)* | Allowlist for incoming peer connections |
 | `--s2s-peer-api` | *(none — peer signatures stay uncheckable)* | Where each peer serves its users' signing keys: `<endpoint-id>=<https://base>` (the peer's REST API base URL). Deliberately operator configuration, never peer-announced |
 | `--s2s-peer-trust` | *(none)* | Trust levels per peer: `id:full`, `id:relay`, `id:readonly` |
-| `--server-did` | *(none)* | Server DID for federation identity (e.g. `did:web:irc.example.com`) |
 
-See [Federation](federation.md), [S2S Auth](S2S-AUTH-PLAN.md), [Server DID Setup](server-did.md), and [Security Guide](SECURITY.md) for details.
+See [Federation](federation.md), [S2S Auth](S2S-AUTH-PLAN.md), and [Security Guide](SECURITY.md) for details.
 
 ### MOTD
 

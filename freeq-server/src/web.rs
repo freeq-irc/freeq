@@ -250,8 +250,9 @@ pub fn router(state: Arc<SharedState>) -> Router {
             "/.well-known/http-message-signatures-directory",
             get(crate::agent_surfaces::web_bot_auth_directory),
         )
+        // This server's did:web document: its signing key and key set.
+        .route("/.well-known/did.json", get(did_document))
         // Private media spaces. Returns a 404 if the feature is unconfigured.
-        .route("/.well-known/did.json", get(media_space_did_doc))
         .route(
             "/xrpc/com.atproto.simplespace.checkUserAccess",
             get(xrpc_check_user_access),
@@ -778,15 +779,61 @@ async fn api_signing_key(State(state): State<Arc<SharedState>>) -> Json<serde_js
     let vk = state.msg_signing_key.verifying_key();
     use base64::Engine;
     let pubkey_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.as_bytes());
+    let kid = freeq_sdk::sigtag::derive_kid(&vk);
+    // When the key was first filed in this server's own store; null without one.
+    let registered_at = state
+        .with_db(|db| db.get_signing_key_row(&crate::server::server_did(&state.server_name), &kid))
+        .flatten()
+        .map(|row| row.registered_at);
     Json(serde_json::json!({
         "algorithm": "ed25519",
         "public_key": pubkey_b64,
+        "kid": kid,
+        "registered_at": registered_at,
         "encoding": "base64url",
         "usage": "message-signing",
         "canonical_form": "jcs-per-event-kind",
         "spec": "https://github.com/freeq-irc/freeq/blob/main/spec/chat-signing-vectors.json",
         "sig_tag_format": "ed25519:<kid>:<base64url-nopad signature>",
         "tag": "+freeq.at/sig"
+    }))
+}
+
+/// GET /.well-known/did.json — this server's did:web document.
+///
+/// It carries the key the server signs receipts and expiries with, as `#freeq`,
+/// and points at the server's whole key set, current and retired. With media
+/// spaces configured it also names the managing-app service, where the spaces
+/// PDS finds the checkUserAccess endpoint.
+async fn did_document(State(state): State<Arc<SharedState>>) -> Json<serde_json::Value> {
+    let did = crate::server::server_did(&state.server_name);
+    let key_id = format!("{did}#freeq");
+    let key =
+        freeq_sdk::crypto::PublicKey::Ed25519(state.msg_signing_key.verifying_key()).to_multibase();
+    let mut service = Vec::new();
+    if state.media_space.is_some() {
+        service.push(serde_json::json!({
+            "id": format!("#{}", crate::media_space::MANAGING_APP_FRAGMENT),
+            "type": "FreeqMediaManagingApp",
+            "serviceEndpoint": format!("https://{}", state.server_name),
+        }));
+    }
+    service.push(serde_json::json!({
+        "id": "#freeq_keys",
+        "type": "FreeqSigningKeys",
+        "serviceEndpoint": format!("https://{}/api/v1/signing-keys/{did}", state.server_name),
+    }));
+    Json(serde_json::json!({
+        "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
+        "id": did,
+        "verificationMethod": [{
+            "id": key_id,
+            "type": "Multikey",
+            "controller": did,
+            "publicKeyMultibase": key,
+        }],
+        "assertionMethod": [key_id],
+        "service": service,
     }))
 }
 
@@ -2621,26 +2668,6 @@ fn authorize_channel_read(
 }
 
 // ── Private media spaces ───────────────────────────────────────────────
-
-/// GET /.well-known/did.json — the did:web document for this server's
-/// managing-app identity. The spaces PDS resolves `did:web:{server_name}`
-/// here to find the checkUserAccess endpoint.
-async fn media_space_did_doc(
-    State(state): State<Arc<SharedState>>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    if state.media_space.is_none() {
-        return Err(StatusCode::NOT_FOUND);
-    }
-    Ok(Json(serde_json::json!({
-        "@context": ["https://www.w3.org/ns/did/v1"],
-        "id": format!("did:web:{}", state.server_name),
-        "service": [{
-            "id": format!("#{}", crate::media_space::MANAGING_APP_FRAGMENT),
-            "type": "FreeqMediaManagingApp",
-            "serviceEndpoint": format!("https://{}", state.server_name),
-        }],
-    })))
-}
 
 #[derive(serde::Deserialize)]
 struct CheckUserAccessParams {
@@ -6546,6 +6573,31 @@ mod signing_key_endpoint_tests {
             .expect("200 retired kid");
         assert_eq!(by_kid.0["removed_at"], 4_000);
         assert_eq!(by_kid.0["public_key"], b64(&retired));
+    }
+}
+
+#[cfg(test)]
+mod server_signing_key_tests {
+    use crate::server::test_state_with_db;
+
+    /// The server key endpoint names the key's id and when it was filed.
+    #[tokio::test]
+    async fn the_server_key_carries_its_kid_and_registration() {
+        let state = test_state_with_db();
+        let vk = state.msg_signing_key.verifying_key();
+        let did = crate::server::server_did(&state.server_name);
+        state
+            .with_db(|db| db.save_signing_key(&did, vk.as_bytes()))
+            .expect("test state has a database");
+        let kid = freeq_sdk::sigtag::derive_kid(&vk);
+        let row = state
+            .with_db(|db| db.get_signing_key_row(&did, &kid))
+            .flatten()
+            .expect("on file");
+
+        let out = super::api_signing_key(axum::extract::State(state)).await;
+        assert_eq!(out.0["kid"], kid);
+        assert_eq!(out.0["registered_at"], row.registered_at);
     }
 }
 

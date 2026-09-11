@@ -20,6 +20,7 @@
 
 ## ── Identity ───────────────────────────────────────────────────────
 # server_name = "irc.example.com"
+## server_did is deprecated and ignored: the server's DID is did:web:<server_name>.
 # server_did = "did:web:irc.example.com"
 # challenge_timeout_secs = 60
 

@@ -70,7 +70,7 @@ Verify a message's cryptographic signature. Returns the signing key, signature, 
 GET /api/v1/signing-key
 ```
 
-Returns the server's ed25519 public key (base64url-encoded) used for message attestation.
+Returns the server's ed25519 public key (base64url-encoded) used for message attestation. `kid` is the key's id, and `registered_at` is when this server first filed the key in its own key store, in seconds since the epoch, or `null` for a server running without a database.
 
 ### Signing Keys by DID
 

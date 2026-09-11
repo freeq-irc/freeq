@@ -95,6 +95,23 @@ impl PublicKey {
             PublicKey::Ed25519(_) => "ed25519",
         }
     }
+
+    /// Encode as a `publicKeyMultibase` value, the inverse of
+    /// [`PublicKey::from_multibase`]: "z" + base58btc(multicodec prefix + key).
+    pub fn to_multibase(&self) -> String {
+        let mut bytes = Vec::new();
+        match self {
+            PublicKey::Secp256k1(key) => {
+                bytes.extend_from_slice(&MULTICODEC_SECP256K1_PUB);
+                bytes.extend_from_slice(&key.to_sec1_bytes());
+            }
+            PublicKey::Ed25519(key) => {
+                bytes.extend_from_slice(&MULTICODEC_ED25519_PUB);
+                bytes.extend_from_slice(key.as_bytes());
+            }
+        }
+        format!("z{}", bs58::encode(&bytes).into_string())
+    }
 }
 
 impl PrivateKey {
@@ -186,6 +203,20 @@ impl PrivateKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_public_key_round_trips_through_its_multibase_form() {
+        for private in [
+            PrivateKey::generate_ed25519(),
+            PrivateKey::generate_secp256k1(),
+        ] {
+            let multibase = private.public_key_multibase();
+            let public = PublicKey::from_multibase(&multibase).unwrap();
+            assert_eq!(public.to_multibase(), multibase, "{}", public.key_type());
+            let again = PublicKey::from_multibase(&public.to_multibase()).unwrap();
+            assert_eq!(again.to_multibase(), multibase);
+        }
+    }
 
     #[test]
     fn secp256k1_sign_verify_roundtrip() {
