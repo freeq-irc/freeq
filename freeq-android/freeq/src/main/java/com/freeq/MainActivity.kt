@@ -91,6 +91,7 @@ class MainActivity : ComponentActivity() {
                 val brokerTok = uri.getQueryParameter("broker_token")
                 val nick = uri.getQueryParameter("nick") ?: return
                 val did = uri.getQueryParameter("did")
+                val handle = uri.getQueryParameter("handle")
 
                 state.pendingWebToken = token
                 brokerTok?.let { state.brokerToken = it }
@@ -103,6 +104,12 @@ class MainActivity : ComponentActivity() {
                 }
                 did?.let {
                     state.securePrefs.edit().putString("did", it).apply()
+                }
+                // The handle the account signed in under. Settings needs it to
+                // start a sign-in of its own — the broker's login resolves a
+                // handle, and a DID will not do.
+                handle?.takeIf { it.isNotEmpty() }?.let {
+                    state.prefs.edit().putString("handle", it).apply()
                 }
                 state.serverAddress.value = ServerConfig.ircServer
                 state.connect(nick)

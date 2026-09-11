@@ -46,6 +46,10 @@ data class ChatMessage(
     // A parsed +freeq.at/event coordination event riding on this message.
     // When set, the row renders as a coordination card.
     val coordination: com.freeq.ffi.CoordinationEvent? = null,
+    // What the SDK made of this line's signature, checked here on the device:
+    // the state, the layer the signer's key rests on, and the sentence every
+    // freeq client shows for it. Null until the check settles.
+    val verdict: com.freeq.ffi.SignatureVerdict? = null,
     val reactions: MutableMap<String, MutableSet<String>> = mutableMapOf()
 ) {
     companion object {
@@ -353,8 +357,35 @@ class AppState(application: Application) : AndroidViewModel(application) {
     var brokerToken: String? = null
     private val authBrokerBase: String
         get() = ServerConfig.authBrokerBase
+
     private var brokerRetryCount = 0
     private var consecutive401Count = 0  // Require 3 consecutive 401s before nuking token
+
+    /** This device's signing key, kept under a key that never leaves the
+     *  Android Keystore. One key per device, so it outlives a session and a
+     *  reader can learn it once. */
+    internal val deviceKeyStore by lazy { AndroidDeviceKeyStore(securePrefs) }
+
+    /** Said once per session, never on a loop. */
+    private val signingKeyNotice = SigningKeyNotice()
+
+    /** True while this device's key is not published to the account. Drives
+     *  the dot on Settings; messages keep sending either way. */
+    val signingKeyUnpublished = mutableStateOf(false)
+
+    /** The handle this account signed in under. The broker's login resolves a
+     *  handle and will not take a DID, so a sign-in Settings starts needs it. */
+    val accountHandle: String?
+        get() = prefs.getString("handle", null)
+
+    /**
+     * The account would not take this device's key. The key stays and keeps
+     * signing — the room is told once, and Settings keeps the state.
+     */
+    fun noteSigningKeyUnpublished() {
+        signingKeyUnpublished.value = true
+        signingKeyNotice.line()?.let { errorMessage.value = it }
+    }
 
     // Keep users logged in for at least 14 days unless they explicitly log out
     private val lastLoginTime: Long
@@ -592,6 +623,17 @@ class AppState(application: Application) : AndroidViewModel(application) {
                 client?.setWebToken(token)
                 pendingWebToken = null
             }
+
+            // This device's key, and the way it reaches the account. Both are
+            // set before connect and neither blocks it: a key that cannot be
+            // published still signs every message this session sends.
+            client?.setDeviceKeyStore(deviceKeyStore)
+            client?.setEnrollment(BrokerEnrollment({ authBrokerBase }, { brokerToken }))
+            client?.setDeviceLabel(android.os.Build.MODEL)
+            client?.setVerifySignatures(true)
+            // A key that made it to the account clears the dot; nothing else
+            // does, so a refusal stays visible until it is fixed.
+            if (deviceKeyStore.isPublished()) signingKeyUnpublished.value = false
 
             client?.connect()
         } catch (e: Exception) {
@@ -1552,6 +1594,9 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                 }
 
                 val msg = MessageMapper.fromIrc(ircMsg)
+                // File what the SDK said, so the row and the proof sheet read
+                // one answer and a late verdict replaces it in place.
+                SignatureVerdict.record(msg.id, msg.verdict)
 
                 // Handle edits (prefer editOf, fall back to replacesMsgid)
                 val editTarget = ircMsg.editOf ?: ircMsg.replacesMsgid
@@ -1752,6 +1797,19 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                 }
             }
 
+            // The account would not take this device's key. Nothing about the
+            // connection changes: the session stays up and keeps signing with
+            // that key, and the room is told once.
+            is FreeqEvent.SigningKeyUnpublished -> {
+                state.noteSigningKeyUnpublished()
+            }
+
+            // A signature whose key took a moment to find. The line was
+            // delivered already; this settles what it says.
+            is FreeqEvent.Verdict -> {
+                SignatureVerdict.record(event.msgid, event.verdict)
+            }
+
             is FreeqEvent.Disconnected -> {
                 state.connectionState.value = ConnectionState.Disconnected
                 if (event.reason.isNotEmpty() && !state.intentionalDisconnect) {
@@ -1837,6 +1895,7 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                 // way every other TAGMSG does. The SDK has already read the
                 // tags and dropped the repeats a joiner is handed.
                 val act = event.event
+                SignatureVerdict.record(act.eventId, act.verdict)
                 // Where the event was said, and then where its task lives: a
                 // receipt the home signs for itself is keyed by the server, so
                 // the venue alone would file a DM's confirm in a thread named

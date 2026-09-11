@@ -1,5 +1,7 @@
 package com.freeq.ui.screens
 
+import android.net.Uri
+import androidx.browser.customtabs.CustomTabsIntent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -16,14 +18,17 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.freeq.model.AppState
 import com.freeq.model.ConnectionState
+import com.freeq.model.ServerConfig
 import com.freeq.ui.components.UserAvatar
 import com.freeq.ui.theme.FreeqColors
+import java.net.URLEncoder
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -34,6 +39,8 @@ fun SettingsTab(appState: AppState) {
     val connectionState by appState.connectionState
     val isDarkTheme by appState.isDarkTheme
     val customStatus by appState.customStatus
+    val signingKeyUnpublished by appState.signingKeyUnpublished
+    val context = LocalContext.current
     var showDisconnectDialog by remember { mutableStateOf(false) }
     var showStatusDialog by remember { mutableStateOf(false) }
 
@@ -118,6 +125,41 @@ fun SettingsTab(appState: AppState) {
                     }
 
                     HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
+
+                    // This device's signing key, while it is not on the
+                    // account. Messages still send and still carry that key —
+                    // the row is here to fix the one thing missing, and it
+                    // goes away once the key is published.
+                    if (signingKeyUnpublished) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.Key,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Text(
+                                "Key not published · this device",
+                                fontSize = 14.sp,
+                                color = MaterialTheme.colorScheme.onBackground,
+                                modifier = Modifier.weight(1f)
+                            )
+                            // The broker's login resolves a handle, so the
+                            // action is offered only where we know one.
+                            appState.accountHandle?.let { handle ->
+                                Text(
+                                    "Publish key",
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = FreeqColors.accent,
+                                    modifier = Modifier.clickable { publishKey(context, handle) }
+                                )
+                            }
+                        }
+                    }
 
                     // Custom status — shipped as the IRC AWAY message
                     Row(
@@ -601,4 +643,17 @@ private fun StatusEditorDialog(
             }
         }
     )
+}
+
+/**
+ * Start a sign-in that asks the account for permission to write this device's
+ * key records. The same link the connect screen builds.
+ */
+private fun publishKey(context: android.content.Context, handle: String) {
+    val encoded = URLEncoder.encode(handle, "UTF-8")
+    val url = "${ServerConfig.authBrokerBase}/auth/login?handle=$encoded&mobile=1&intent=enroll"
+    CustomTabsIntent.Builder()
+        .setShowTitle(true)
+        .build()
+        .launchUrl(context, Uri.parse(url))
 }

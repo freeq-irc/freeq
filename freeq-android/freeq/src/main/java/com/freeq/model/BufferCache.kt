@@ -33,7 +33,10 @@ internal object BufferCache {
     // 3: a companion line's task reference joined the cached fields. A cache
     //    written without it can never draw its cards, and dedup on replay
     //    keeps the cached copy, so the old shape is discarded rather than read.
-    const val VERSION = 4
+    // 5: the signature verdict joined them, for the same reason — a restored
+    //    row shadows the copy history replays, so a verdict left behind is one
+    //    the reader never gets back, mark and all.
+    const val VERSION = 5
     const val MAX_MESSAGES_PER_BUFFER = 50
     const val FILE_NAME = "buffers.json"
 
@@ -103,6 +106,17 @@ internal object BufferCache {
                                 .put("evidenceType", c.evidenceType)
                                 .put("reference", c.reference)
                                 .put("payload", c.payload)
+                        })
+                        // What this device concluded about the signature. Kept
+                        // whole, sentence included, so a cold launch says what
+                        // the row said before it.
+                        .put("verdict", m.verdict?.let { v ->
+                            JSONObject()
+                                .put("state", v.state.name)
+                                .put("layer", v.layer?.name)
+                                .put("kid", v.kid)
+                                .put("keySource", v.keySource)
+                                .put("sentence", v.sentence)
                         })
                         .put("reactions", reactions)
                 )
@@ -180,6 +194,21 @@ internal object BufferCache {
                     evidenceType = c.optString("evidenceType").takeIf { it.isNotEmpty() },
                     reference = c.optString("reference").takeIf { it.isNotEmpty() },
                     payload = c.optString("payload").takeIf { it.isNotEmpty() },
+                )
+            },
+            verdict = obj.optJSONObject("verdict")?.let { v ->
+                // A state this build does not know is no verdict at all —
+                // better to check again than to show words for a state we
+                // cannot reason about.
+                val state = com.freeq.ffi.VerdictState.entries
+                    .firstOrNull { it.name == v.optString("state") } ?: return@let null
+                FfiVerdict(
+                    state = state,
+                    layer = com.freeq.ffi.KeyLayer.entries
+                        .firstOrNull { it.name == v.optString("layer") },
+                    kid = v.optString("kid").takeIf { it.isNotEmpty() },
+                    keySource = v.optString("keySource").takeIf { it.isNotEmpty() },
+                    sentence = v.optString("sentence"),
                 )
             },
             reactions = reactions,

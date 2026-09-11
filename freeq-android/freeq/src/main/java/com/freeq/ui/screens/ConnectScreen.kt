@@ -397,7 +397,9 @@ private fun ErrorBanner(text: String) {
 private fun startBlueskyLogin(context: android.content.Context, handle: String) {
     if (handle.isEmpty()) return
     val encoded = URLEncoder.encode(handle, "UTF-8")
-    val url = "${ServerConfig.authBrokerBase}/auth/login?handle=$encoded&mobile=1"
+    // `intent=enroll` asks the account for permission to write this device's
+    // key records, on top of the identity-only default.
+    val url = "${ServerConfig.authBrokerBase}/auth/login?handle=$encoded&mobile=1&intent=enroll"
     val customTabsIntent = CustomTabsIntent.Builder()
         .setShowTitle(true)
         .build()

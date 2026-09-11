@@ -637,7 +637,8 @@ private fun MessageBubble(
                         // came back saying the signature does not match the
                         // key it names. Never speculative — only after
                         // evidence.
-                        if (SignatureVerdict.checked[msg.id]?.marksTheRow == true) {
+                        val rowVerdict = SignatureVerdict.checked[msg.id] ?: msg.verdict
+                        if (rowVerdict != null && SignatureVerdict.marksTheRow(rowVerdict.state)) {
                             Icon(
                                 Icons.Default.Warning,
                                 contentDescription = "Signature does not match its key",
@@ -884,7 +885,7 @@ private fun MessageBubble(
         // neither claims nor disowns an identity.
         if (showMessageProof) {
             VerifiedProofSheet(
-                request = ProofRequest.Message(msg.id, signed = msg.isSigned),
+                request = ProofRequest.Message(msg.id, signed = msg.isSigned, verdict = msg.verdict),
                 onDismiss = { showMessageProof = false }
             )
         }
@@ -904,6 +905,7 @@ private fun MessageBubble(
                     senderLiveDid = senderMember?.did,
                     msgId = msg.id,
                     signed = msg.isSigned,
+                    verdict = msg.verdict,
                 ),
                 onDismiss = { showIdentityProof = false },
                 appState = appState

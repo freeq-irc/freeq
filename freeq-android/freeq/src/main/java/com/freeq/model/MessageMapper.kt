@@ -37,6 +37,10 @@ internal object MessageMapper {
             account = ircMsg.account,
             origin = ircMsg.origin,
             coordination = ircMsg.coordination,
+            // What the SDK made of this line's signature, checked here on the
+            // device. Absent while the signer's key is still being looked up;
+            // a `Verdict` event settles it shortly after.
+            verdict = ircMsg.verdict,
             reactions = reactions,
             // What makes this a companion line, if it is one: the task it was
             // written beside. No named FFI field carries it.

@@ -111,7 +111,16 @@ fun MainScreen(appState: AppState) {
                     )
 
                     NavigationBarItem(
-                        icon = { Icon(Icons.Default.Settings, contentDescription = "Settings") },
+                        icon = {
+                            // A dot while this device's key is not published to
+                            // the account — the one place Settings can be
+                            // opened from, so it is where the state is shown.
+                            BadgedBox(badge = {
+                                if (appState.signingKeyUnpublished.value) Badge()
+                            }) {
+                                Icon(Icons.Default.Settings, contentDescription = "Settings")
+                            }
+                        },
                         label = { Text(Tab.Settings.label) },
                         selected = currentRoute == Tab.Settings.route,
                         onClick = {
