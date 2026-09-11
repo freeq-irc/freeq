@@ -1,0 +1,34 @@
+{
+  "mark": "signed",
+  "states": {
+    "device": {
+      "sentence": "Signed on the sender’s device.",
+      "layers": [
+        "vouched",
+        "published"
+      ]
+    },
+    "server": {
+      "sentence": "The server confirms it arrived from the sender’s account, but they didn’t sign it themselves — so you’re taking the server’s word for it."
+    },
+    "unsigned": {
+      "sentence": "Nothing was signed — there is no signature to check. Typical for guest accounts and messages from legacy servers."
+    },
+    "unverifiable": {
+      "sentence": "This device can’t check this signature — usually an older message, sometimes a newer app."
+    },
+    "invalid": {
+      "sentence": "This message is signed, but the signature doesn’t check out. Treat it with suspicion."
+    },
+    "retired": {
+      "sentence": "Signed after this key was retired."
+    },
+    "pending": {
+      "sentence": "This signature hasn’t been checked yet."
+    }
+  },
+  "layers": {
+    "vouched": "Signed on the sender’s device. Key vouched for by their server.",
+    "published": "Signed on the sender’s device. Key published in their identity record."
+  }
+}

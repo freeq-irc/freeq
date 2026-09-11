@@ -18,6 +18,7 @@
 //! - [`pds`] — AT Protocol PDS client (session creation/verification)
 //! - [`event`] — Events emitted by the client
 //! - [`irc`] — IRC message parsing/formatting
+//! - [`verdict`] — what a client shows for a message's signature
 
 pub mod act;
 pub mod act_transitions;
@@ -50,4 +51,5 @@ pub mod sigtag;
 // so the `freeq_sdk::ssrf::` path stays stable for existing consumers.
 pub use freeq_ssrf as ssrf;
 pub mod streaming;
+pub mod verdict;
 pub mod x3dh;
