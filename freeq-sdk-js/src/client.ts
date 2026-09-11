@@ -197,6 +197,9 @@ export class FreeqClient extends EventEmitter {
   private enrollmentEpoch = 0;
   /** Checks received signatures for this connection, when `keyLookup` is set. */
   private checker: SignatureChecker | null = null;
+  /** Lowercase nicks whose pairing came from a message that checked out on
+   *  the sender's device. */
+  private readonly _verifiedNicks = new Set<string>();
   /** Set when SASL was attempted and 904 was received. Suppresses any
    *  subsequent registration completion as a guest, and blocks outgoing
    *  PRIVMSGs that would silently leak under the guest identity. */
@@ -1332,17 +1335,43 @@ export class FreeqClient extends EventEmitter {
    * `from` is always a sender, never a target; the channel guard below is
    * belt and braces against a caller that confuses the two.
    */
-  private rememberSenderDid(from: string, tags?: Record<string, string>): void {
+  private rememberSenderDid(
+    from: string,
+    tags?: Record<string, string>,
+    verdict?: Verdict,
+  ): void {
     const did = tags?.['+freeq.at/account'] ?? tags?.['account'];
     if (!did || !isDid(did) || !from || from.startsWith('#') || from.startsWith('&')) return;
-    const lc = from.toLowerCase();
-    const isNews = this._nickToDid.get(lc) !== did || this._didToNick.get(did) !== lc;
-    this._nickToDid.set(lc, did);
-    this._didToNick.set(did, lc);
     // Whatever is already on screen resolved this peer's name before we knew
     // it. Say so, or a thread keyed by the DID wears the raw DID until
     // something unrelated happens to re-render it.
-    if (isNews) this.emit('memberDid', from, did);
+    if (this.learn(from, did, verdict?.state === 'device')) this.emit('memberDid', from, did);
+  }
+
+  /**
+   * Learn a nick↔DID pairing. Returns true when it is new or changed — the
+   * caller emits `memberDid` exactly then.
+   *
+   * `verified`: the message that taught it carried a device verdict. A
+   * verified pairing replaces any other; an unverified one replaces nothing
+   * that was learned verified. Twin of the Rust `DidMapsState::learn`.
+   */
+  private learn(nick: string, did: string, verified: boolean): boolean {
+    const lc = nick.toLowerCase();
+    const current = this._nickToDid.get(lc);
+    if (!verified && current !== did && this._verifiedNicks.has(lc)) return false;
+    const isNews = current !== did || this._didToNick.get(did) !== lc;
+    if (verified) this._verifiedNicks.add(lc);
+    else if (current !== did) this._verifiedNicks.delete(lc);
+    // A DID keeps one nick: drop the pairing this one replaces.
+    const previous = this._didToNick.get(did);
+    if (previous !== undefined && previous !== lc) {
+      this._nickToDid.delete(previous);
+      this._verifiedNicks.delete(previous);
+    }
+    this._nickToDid.set(lc, did);
+    this._didToNick.set(did, lc);
+    return isNews;
   }
 
   /** Resolve nick to DID — set by the app layer for E2EE support. */
@@ -1641,7 +1670,7 @@ export class FreeqClient extends EventEmitter {
    */
   private checkLater(
     delivered: Verdict | undefined,
-    line: { tags: Record<string, string>; target: string; body?: string },
+    line: { tags: Record<string, string>; target: string; body?: string; from?: string },
     onSettled?: (verdict: Verdict) => void,
   ): void {
     const checker = this.checker;
@@ -1661,6 +1690,12 @@ export class FreeqClient extends EventEmitter {
               : { state: 'unverifiable', kid: look.kid };
       } catch {
         verdict = { state: 'unverifiable', kid: delivered.kid };
+      }
+      // Learned before the verdict goes out, so a consumer that has the
+      // verdict can rely on the pairing.
+      const did = line.tags['account'];
+      if (verdict.state === 'device' && line.from && did && isDid(did) && this.learn(line.from, did, true)) {
+        this.emit('memberDid', line.from, did);
       }
       onSettled?.(verdict);
       if (this.checker === checker) this.emit('verdict', id, verdict);
@@ -1921,7 +1956,8 @@ export class FreeqClient extends EventEmitter {
     const target = batch.target;
     const isChannel = target.startsWith('#') || target.startsWith('&');
     const isSelf = this.isSelfSender(from, openerTags);
-    if (!isSelf) this.rememberSenderDid(from, openerTags);
+    const openerVerdict = this.deliveredVerdict(openerTags, false);
+    if (!isSelf) this.rememberSenderDid(from, openerTags, openerVerdict);
     // DM thread key = the peer's canonical DID when known (else the nick):
     // our own echo is keyed by the wire target, an incoming DM by the sender,
     // and both collapse to the same DID so a conversation is never split.
@@ -1929,8 +1965,8 @@ export class FreeqClient extends EventEmitter {
 
     const wireText = this.assembleMultiline(lines);
     // The signature covers the assembled wire body and the opener's tags.
-    const verdict = this.deliveredVerdict(openerTags, false);
-    const wireLine = { tags: openerTags, target, body: wireText };
+    const verdict = openerVerdict;
+    const wireLine = { tags: openerTags, target, body: wireText, from: isSelf ? undefined : from };
 
     // Decryption — match the single-PRIVMSG path's logic exactly,
     // but applied to the assembled body so ciphertext-chunked E2EE
@@ -2372,9 +2408,8 @@ export class FreeqClient extends EventEmitter {
         if (joinDid) {
           prefetchProfiles([joinDid]);
           // Populate internal nick↔DID cache (account-notify tag carries DID).
-          const lc = from.toLowerCase();
-          this._nickToDid.set(lc, joinDid);
-          this._didToNick.set(joinDid, lc);
+          // The server's word, not a signature: unverified.
+          this.learn(from, joinDid, false);
         }
         // Spawned-agent broadcast (`+freeq.at/parent=<nick>` indicates
         // a child agent joining the channel; see server connection/mod.rs
@@ -2447,7 +2482,8 @@ export class FreeqClient extends EventEmitter {
         const isAction = text.startsWith('\x01ACTION ') && text.endsWith('\x01');
         const isChannel = target.startsWith('#') || target.startsWith('&');
         const isSelf = this.isSelfSender(from, msg.tags);
-        if (!isSelf) this.rememberSenderDid(from, msg.tags);
+        const privmsgVerdict = this.deliveredVerdict(msg.tags, false);
+        if (!isSelf) this.rememberSenderDid(from, msg.tags, privmsgVerdict);
         // DM thread key = the peer's canonical DID when known (else the nick):
         // our own echo is keyed by the wire target, an incoming DM by the
         // sender, and both collapse to the same DID so a conversation is
@@ -2484,8 +2520,8 @@ export class FreeqClient extends EventEmitter {
 
         // Checked over the wire body, before decryption or the legacy
         // newline rewrite.
-        const verdict = this.deliveredVerdict(msg.tags, false);
-        const wireLine = { tags: msg.tags, target, body: text };
+        const verdict = privmsgVerdict;
+        const wireLine = { tags: msg.tags, target, body: text, from: isSelf ? undefined : from };
 
         let displayText = isAction ? text.slice(8, -1) : text;
         let isEncryptedMsg = false;
@@ -2733,16 +2769,16 @@ export class FreeqClient extends EventEmitter {
         const target = msg.params[0];
         const isChannel = target.startsWith('#') || target.startsWith('&');
         const isSelf = this.isSelfSender(from, msg.tags);
-        if (!isSelf) this.rememberSenderDid(from, msg.tags);
+        const verdict = this.deliveredVerdict(msg.tags, true);
+        if (!isSelf) this.rememberSenderDid(from, msg.tags, verdict);
         // DM thread key = the peer's canonical DID when known (else the nick):
         // our own echo is keyed by the wire target, an incoming DM by the
         // sender, and both collapse to the same DID so a conversation is
         // never split.
         const bufName = isChannel ? target : this.dmKey(isSelf ? target : from);
-        const verdict = this.deliveredVerdict(msg.tags, true);
         // Payloads this line produced, given the verdict when it settles.
         const carriers: { verdict?: Verdict }[] = [];
-        this.checkLater(verdict, { tags: msg.tags, target }, (settled) => {
+        this.checkLater(verdict, { tags: msg.tags, target, from: isSelf ? undefined : from }, (settled) => {
           for (const carrier of carriers) carrier.verdict = settled;
         });
 
@@ -3294,10 +3330,7 @@ export class FreeqClient extends EventEmitter {
           const lc = whoisNick.toLowerCase();
           const prevDid = this._nickToDid.get(lc);
           if (prevDid && prevDid !== did) this._didToNick.delete(prevDid);
-          const prevNick = this._didToNick.get(did);
-          if (prevNick && prevNick !== lc) this._nickToDid.delete(prevNick);
-          this._nickToDid.set(lc, did);
-          this._didToNick.set(did, lc);
+          this.learn(whoisNick, did, false);
           // Accumulate for the requestWhois() Promise.
           const buf = this._whoisBuffer.get(lc) ?? { nick: whoisNick, fetchedAt: 0 };
           buf.did = did;

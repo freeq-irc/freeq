@@ -205,3 +205,34 @@ describe('announcing a learned binding', () => {
     expect(later, 'a repeat of a known binding is not news').toEqual([]);
   });
 });
+
+/**
+ * A pairing learned from a message whose signature checked out on the
+ * sender's device is not replaced by one the server merely asserts.
+ */
+describe('a verified pairing beats an unverified one', () => {
+  it('keeps the verified pairing when an unverified one follows', async () => {
+    const { client, ws } = await connectedClient();
+    // The signed message's verdict settles on `device`, so the binding it
+    // teaches is verified.
+    (client as any).learn(BOT_NICK, BOT_DID, true);
+    ws.recv(`@account=did:plc:impostor :${BOT_NICK}!u@h PRIVMSG #room :hello`);
+    await flushAsync();
+    expect(client.getDidForNick(BOT_NICK)).toBe(BOT_DID);
+
+    ws.recv(`:${BOT_NICK}!u@h JOIN #room did:plc:impostor :someone`);
+    await flushAsync();
+    expect(client.getDidForNick(BOT_NICK)).toBe(BOT_DID);
+  });
+
+  it('replaces an unverified pairing with a verified one', async () => {
+    const { client, ws } = await connectedClient();
+    ws.recv(`@account=did:plc:impostor :${BOT_NICK}!u@h PRIVMSG #room :hello`);
+    await flushAsync();
+    expect(client.getDidForNick(BOT_NICK)).toBe('did:plc:impostor');
+
+    expect((client as any).learn(BOT_NICK, BOT_DID, true)).toBe(true);
+    expect(client.getDidForNick(BOT_NICK)).toBe(BOT_DID);
+    expect(client.getNickForDid(BOT_DID)).toBe(BOT_NICK);
+  });
+});
