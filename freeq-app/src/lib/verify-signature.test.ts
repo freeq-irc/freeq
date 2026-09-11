@@ -1,219 +1,121 @@
 /**
- * What a verification answer is allowed to claim, given what actually happened.
+ * What a verdict is allowed to claim, and the words each one wears.
+ *
+ * The check itself is the SDK's and is covered by its own vectors; what this
+ * pins is the app's side: the verdict a row and the panel read, and the copy
+ * shown for it.
  */
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
+import { sentence } from '@freeq/sdk';
 import {
-  verifySignature,
   cachedVerdict,
+  copyForVerdict,
+  recordVerdict,
   subscribeVerdicts,
-  __resetVerifyCacheForTests,
-  VERIFY_LABELS,
-  CHECKING_COPY,
   unsignedCopy,
   verdictCopy,
+  CHECKING_COPY,
+  __resetVerifyCacheForTests,
   type VerifyOutcome,
 } from './verify-signature';
 
-/** Answer the verify endpoint with `body`, or fail the request. */
-function serverSays(body: unknown, ok = true, status = 200) {
-  return vi.fn().mockResolvedValue({
-    ok,
-    status,
-    json: () => Promise.resolve(body),
-  });
-}
+const STATES: VerifyOutcome[] = [
+  'device',
+  'server',
+  'unsigned',
+  'unverifiable',
+  'invalid',
+  'retired',
+  'pending',
+];
 
 beforeEach(() => {
   __resetVerifyCacheForTests();
 });
 
-afterEach(() => {
-  vi.restoreAllMocks();
-});
-
-describe('reading the server verdict', () => {
-  const cases: Array<[string, unknown, VerifyOutcome]> = [
-    [
-      'a signature the sender made on their own device',
-      { verification: { verdict: 'valid', verified_by: 'client-session-key' } },
-      'device',
-    ],
-    [
-      'a signature the server made on the sender’s behalf',
-      { verification: { verdict: 'valid', verified_by: 'server-key' } },
-      'server',
-    ],
-    [
-      'a signature that does not match the key it names',
-      { verification: { verdict: 'invalid', verified_by: 'client-session-key' } },
-      'invalid',
-    ],
-    [
-      'a signature nobody here can check',
-      { verification: { verdict: 'unverifiable' } },
-      'unverifiable',
-    ],
-    [
-      // A message nobody signed is not a message that failed a check, and
-      // every other client already says so in those words.
-      'a message that was never signed at all',
-      { verification: { verdict: 'unverifiable', verified_by: 'unsigned' } },
-      'unsigned',
-    ],
-    ['a verdict this client has never heard of', { verification: { verdict: 'shrug' } }, 'unverifiable'],
-    ['an answer with no verification at all', {}, 'unverifiable'],
-  ];
-
-  for (const [name, body, expected] of cases) {
-    it(`${name} reads as ${expected}`, async () => {
-      vi.stubGlobal('fetch', serverSays(body));
-      expect((await verifySignature('01MSG')).outcome).toBe(expected);
-    });
-  }
-
-  it('reads the older boolean from a server that predates the three-way verdict', async () => {
-    vi.stubGlobal('fetch', serverSays({ verification: { valid: true, verified_by: 'client-session-key' } }));
-    expect((await verifySignature('01MSG')).outcome).toBe('device');
-
-    __resetVerifyCacheForTests();
-    vi.stubGlobal('fetch', serverSays({ verification: { valid: false } }));
-    expect(
-      (await verifySignature('01MSG')).outcome,
-      'an old server saying "not valid" is not the same as saying "forged"',
-    ).toBe('unverifiable');
+describe('the verdict a row and the panel read', () => {
+  it('is the one the SDK gave for that message', () => {
+    expect(cachedVerdict('01MSG')).toBeUndefined();
+    recordVerdict('01MSG', { state: 'device', layer: 'published', kid: 'k1' });
+    expect(cachedVerdict('01MSG')).toEqual({ state: 'device', layer: 'published', kid: 'k1' });
   });
 
-  it('treats no record on file as unverifiable, not as an accusation', async () => {
-    vi.stubGlobal('fetch', serverSays({ error: 'not found' }, false, 404));
-    expect((await verifySignature('01MSG')).outcome).toBe('unverifiable');
-  });
-});
-
-describe('a check that never happened is not a verdict', () => {
-  it('a network failure reads as unreachable, and is not remembered', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')));
-    expect((await verifySignature('01MSG')).outcome).toBe('unreachable');
-    expect(
-      cachedVerdict('01MSG'),
-      'a failed check must be retryable, so it is not remembered',
-    ).toBeUndefined();
+  it('is replaced when a pending one settles, and tells subscribers', () => {
+    let told = 0;
+    const stop = subscribeVerdicts(() => told++);
+    recordVerdict('01MSG', { state: 'pending', kid: 'k1' });
+    expect(told).toBe(1);
+    recordVerdict('01MSG', { state: 'device', layer: 'vouched', kid: 'k1' });
+    expect(told).toBe(2);
+    expect(cachedVerdict('01MSG')?.state).toBe('device');
+    // The same answer again is not news.
+    recordVerdict('01MSG', { state: 'device', layer: 'vouched', kid: 'k1' });
+    expect(told).toBe(2);
+    stop();
   });
 
-  it('a server (or proxy) error reads as unreachable, not as "could not be checked"', async () => {
-    // The observed failure this pins: a broken dev proxy answered every
-    // verify with an empty 500, and provably-valid messages were shown as
-    // "could not be checked here" — a transport fault dressed as a verdict.
-    vi.stubGlobal('fetch', serverSays(undefined, false, 500));
-    expect((await verifySignature('01MSG')).outcome).toBe('unreachable');
+  it('ignores a line with no id and a message with no verdict', () => {
+    recordVerdict('', { state: 'device' });
+    recordVerdict('01MSG', undefined);
     expect(cachedVerdict('01MSG')).toBeUndefined();
   });
 });
 
-describe('what is already on file', () => {
-  it('remembers a definitive answer instead of asking again', async () => {
-    const fetchMock = serverSays({ verification: { verdict: 'valid', verified_by: 'client-session-key' } });
-    vi.stubGlobal('fetch', fetchMock);
-    expect((await verifySignature('01MSG')).outcome).toBe('device');
-    expect((await verifySignature('01MSG')).outcome).toBe('device');
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(cachedVerdict('01MSG')?.outcome).toBe('device');
-  });
-
-  it('knows nothing about a message it has not checked', () => {
-    expect(cachedVerdict('01NEVER-CHECKED')).toBeUndefined();
-  });
-
-  it('remembers a bad verdict too, so no other row can show it as good', async () => {
-    vi.stubGlobal('fetch', serverSays({ verification: { verdict: 'invalid' } }));
-    expect((await verifySignature('01BAD')).outcome).toBe('invalid');
-    expect(cachedVerdict('01BAD')?.outcome).toBe('invalid');
-  });
-
-  it('tells subscribers when a verdict lands, so a row can wear the ⚠', async () => {
-    const seen = vi.fn();
-    const unsubscribe = subscribeVerdicts(seen);
-    vi.stubGlobal('fetch', serverSays({ verification: { verdict: 'invalid' } }));
-    await verifySignature('01BAD');
-    expect(seen).toHaveBeenCalled();
-    unsubscribe();
-  });
-});
-
-describe('the one retryable flavour of can’t-check', () => {
-  it('a key the server hasn’t fetched yet is transient and not cached', async () => {
-    vi.stubGlobal('fetch', serverSays({ verification: { verdict: 'unverifiable', verified_by: 'unverifiable-unknown-key' } }));
-    const a = await verifySignature('01FED');
-    expect(a.outcome).toBe('unverifiable');
-    expect(a.transient, 'answering is what starts the key fetch — worth re-asking').toBe(true);
-    expect(cachedVerdict('01FED'), 'a transient answer must stay retryable').toBeUndefined();
-  });
-
-  it('every other flavour of can’t-check is final and cached', async () => {
-    vi.stubGlobal('fetch', serverSays({ verification: { verdict: 'unverifiable', verified_by: 'unverifiable-legacy-format' } }));
-    const a = await verifySignature('01OLD');
-    expect(a.transient).toBe(false);
-    expect(cachedVerdict('01OLD')?.outcome).toBe('unverifiable');
-  });
-});
-
-describe('valid is not verified (ruled 2026-08-07)', () => {
-  it('sender proof wears green; a server vouch stays quiet and never claims "Verified"', () => {
-    expect(VERIFY_LABELS.device.tone).toBe('text-success');
-    expect(VERIFY_LABELS.device.heading).toBe('Verified');
-    expect(VERIFY_LABELS.server.tone).toBe('text-fg-muted');
-    expect(VERIFY_LABELS.server.heading).not.toMatch(/Verified/);
-    // The distinction the reader has to come away with: the server stands
-    // behind it, the sender did not sign it.
-    expect(VERIFY_LABELS.server.line).toMatch(/didn’t sign it themselves/);
-  });
-
-  it('only the sender-proof answer wears green, and only a mismatch wears red', () => {
-    const tones = Object.fromEntries(
-      Object.entries(VERIFY_LABELS).map(([k, v]) => [k, v.tone]),
+describe('the words for a verdict', () => {
+  it('are the SDK sentences, for every state', () => {
+    for (const state of STATES) {
+      expect(verdictCopy(state).line).toBe(sentence(state));
+    }
+    expect(copyForVerdict({ state: 'device', layer: 'published' }).line).toBe(
+      sentence('device', 'published'),
     );
-    expect(tones).toEqual({
-      device: 'text-success',
-      server: 'text-fg-muted',
-      unsigned: 'text-fg-muted',
-      unverifiable: 'text-fg-muted',
-      invalid: 'text-danger',
-      unreachable: 'text-fg-muted',
-    });
-    expect(unsignedCopy().tone).toBe('text-fg-muted');
-    expect(CHECKING_COPY.tone).toBe('text-fg-muted');
+    expect(copyForVerdict({ state: 'device', layer: 'vouched' }).line).toBe(
+      sentence('device', 'vouched'),
+    );
   });
 
-  it('every answer says what it is and what it means, in two parts', () => {
-    const all = [...Object.values(VERIFY_LABELS), unsignedCopy(), unsignedCopy('event'), CHECKING_COPY];
-    for (const c of all) {
-      expect(c.heading.length).toBeGreaterThan(0);
-      expect(c.line.length).toBeGreaterThan(0);
-      // The heading is the answer, not a restatement of the line.
-      expect(c.line).not.toBe(c.heading);
-    }
-  });
-});
-
-describe('an answer names what the id actually points at', () => {
-  it('the two lines that say "message" say "event" over a coordination event', () => {
-    expect(verdictCopy('unverifiable', 'event').line).toContain('older event');
-    expect(verdictCopy('invalid', 'event').line).toMatch(/^This event is signed/);
-    expect(unsignedCopy('event').line).toContain('before event signing');
-    // Reached through the server's answer instead of the caller's knowledge,
-    // it is still the same answer in the same words.
-    expect(verdictCopy('unsigned', 'event')).toEqual(unsignedCopy('event'));
-    expect(verdictCopy('unsigned')).toEqual(unsignedCopy());
-    expect(verdictCopy('unsigned').line).toContain('guest accounts');
-  });
-
-  it('the noun-neutral answers are the same object either way', () => {
-    for (const o of ['device', 'server', 'unreachable'] as VerifyOutcome[]) {
-      expect(verdictCopy(o, 'event')).toBe(verdictCopy(o, 'message'));
+  it('say what the answer is and what it means, in two parts', () => {
+    for (const state of STATES) {
+      const copy = verdictCopy(state);
+      expect(copy.heading.length, state).toBeGreaterThan(0);
+      expect(copy.line.length, state).toBeGreaterThan(0);
+      expect(copy.heading, state).not.toBe(copy.line);
     }
   });
 
-  it('a message reads as a message', () => {
-    expect(verdictCopy('unverifiable').line).toContain('older message');
-    expect(verdictCopy('invalid').line).toMatch(/^This message is signed/);
+  it('wear green only for sender proof, and red only where the check failed', () => {
+    // Ruled 2026-08-07: valid is not verified. A server signature is the
+    // server vouching for what it received, so it stays quiet.
+    expect(verdictCopy('device').tone).toBe('text-success');
+    expect(verdictCopy('device').heading).toBe('Signed');
+    expect(verdictCopy('server').tone).toBe('text-fg-muted');
+    expect(verdictCopy('server').heading).not.toBe('Signed');
+    for (const state of ['invalid', 'retired'] as VerifyOutcome[]) {
+      expect(verdictCopy(state).tone, state).toBe('text-danger');
+    }
+    for (const state of ['unsigned', 'unverifiable', 'pending'] as VerifyOutcome[]) {
+      expect(verdictCopy(state).tone, state).toBe('text-fg-muted');
+    }
+  });
+
+  it('word the three answers that name what was signed for an event', () => {
+    for (const state of ['unsigned', 'unverifiable', 'invalid'] as VerifyOutcome[]) {
+      expect(verdictCopy(state, 'event').line, state).not.toBe(verdictCopy(state).line);
+      expect(verdictCopy(state, 'event').line, state).toContain('event');
+    }
+    // The rest read the same either way.
+    for (const state of ['device', 'server', 'retired', 'pending'] as VerifyOutcome[]) {
+      expect(verdictCopy(state, 'event'), state).toEqual(verdictCopy(state));
+    }
+  });
+
+  it('say nothing was signed, rather than that a check failed', () => {
+    expect(unsignedCopy()).toEqual(verdictCopy('unsigned'));
+    expect(unsignedCopy('event')).toEqual(verdictCopy('unsigned', 'event'));
+  });
+
+  it('say the key is still being looked up while it is', () => {
+    expect(CHECKING_COPY).toEqual(verdictCopy('pending'));
+    expect(CHECKING_COPY.line).toBe(sentence('pending'));
   });
 });

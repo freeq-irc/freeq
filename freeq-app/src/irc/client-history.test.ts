@@ -45,6 +45,16 @@ class MockFreeqClient {
 
 vi.mock('@freeq/sdk', () => ({
   FreeqClient: MockFreeqClient,
+  // The device key, the lookup and the verdict words the bridge now reads.
+  IndexedDbDeviceKeyStore: class {},
+  KeyLookup: class { originBase() { return null; } },
+  makeDidResolver: () => async () => ({ id: 'did:plc:x' }),
+  recordKeyOf: async () => ({ publicKeyMultibase: 'z', signer: async () => '' }),
+  decodeMultibaseEd25519: () => new Uint8Array(32),
+  buildDeviceRecord: async () => ({}),
+  buildDeviceRetirement: async () => ({}),
+  sentence: () => 'sentence',
+  mark: () => 'signed',
   format: {},
   prefetchProfiles: () => {},
   claimForMessage: () => undefined,

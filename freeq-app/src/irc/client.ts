@@ -5,13 +5,155 @@
  * Internally, all protocol handling is delegated to the SDK's FreeqClient.
  */
 
-import { FreeqClient, format } from '@freeq/sdk';
+import {
+  FreeqClient,
+  IndexedDbDeviceKeyStore,
+  KeyLookup,
+  decodeMultibaseEd25519,
+  format,
+  makeDidResolver,
+  recordKeyOf,
+  type DeviceKeyStore,
+  type StoredDeviceKey,
+} from '@freeq/sdk';
+import { recordVerdict } from '../lib/verify-signature';
 import { useStore } from '../store';
 import { notify } from '../lib/notifications';
 import { prefetchProfiles } from '@freeq/sdk';
 import { shouldRejoinCall, AV_REJOIN_WINDOW_MS, type PendingCallRejoin } from '../lib/av-mesh';
 import { fetchFavorites, pushFavorites, mergeFavorites, favoritesEqual } from '../lib/favorites-sync';
 import { createDmSendGate, dmThreadKey } from './dm-resolve';
+
+// ── This device's signing key ──────────────────────────────────────────
+//
+// The key is kept in this browser's IndexedDB, where the page cannot read it
+// out, and published to the account once.
+
+/** What this device's key is, for the settings row and the banner. */
+export interface DeviceKeyState {
+  /** Where the key is kept. */
+  store: 'browser' | null;
+  /** Set once the key's record is in the account. */
+  published: boolean;
+  /** The key's id, short form, and when it was made. */
+  kid?: string;
+  createdAt?: string;
+  /** The broker refused to publish it: the user has to sign in again. */
+  needsSignIn: boolean;
+}
+
+let deviceKeyState: DeviceKeyState = {
+  store: null,
+  published: false,
+  needsSignIn: false,
+};
+const deviceKeyListeners = new Set<() => void>();
+
+export function subscribeDeviceKey(fn: () => void): () => void {
+  deviceKeyListeners.add(fn);
+  return () => deviceKeyListeners.delete(fn);
+}
+
+export function getDeviceKeyState(): DeviceKeyState {
+  return deviceKeyState;
+}
+
+function setDeviceKeyState(patch: Partial<DeviceKeyState>): void {
+  deviceKeyState = { ...deviceKeyState, ...patch };
+  for (const fn of deviceKeyListeners) fn();
+}
+
+/**
+ * The store this browser keeps the device key in: its IndexedDB. One per
+ * account for the life of the page.
+ */
+const chosenStores = new Map<string, ChosenDeviceKeyStore>();
+
+function chosenStoreFor(did: string): ChosenDeviceKeyStore {
+  let store = chosenStores.get(did);
+  if (!store) {
+    store = new ChosenDeviceKeyStore(did);
+    chosenStores.set(did, store);
+  }
+  return store;
+}
+
+class ChosenDeviceKeyStore implements DeviceKeyStore {
+  private inner: Promise<DeviceKeyStore> | null = null;
+  private readonly did: string;
+
+  constructor(did: string) {
+    this.did = did;
+  }
+
+  private resolve(): Promise<DeviceKeyStore> {
+    return (this.inner ??= (async () => {
+      setDeviceKeyState({ store: 'browser' });
+      return new IndexedDbDeviceKeyStore(this.did);
+    })());
+  }
+
+  async load(): Promise<StoredDeviceKey | null> {
+    const stored = await (await this.resolve()).load();
+    if (stored) await noteDeviceKey(stored);
+    return stored;
+  }
+
+  async save(key: StoredDeviceKey): Promise<void> {
+    await (await this.resolve()).save(key);
+    await noteDeviceKey(key);
+  }
+}
+
+/** What the settings row shows about the key this device holds. */
+async function noteDeviceKey(key: StoredDeviceKey): Promise<void> {
+  setDeviceKeyState({
+    published: !!key.recordUri,
+    createdAt: key.createdAt,
+    kid: await kidOfKeyPair(key.keyPair),
+    needsSignIn: key.recordUri ? false : deviceKeyState.needsSignIn,
+  });
+}
+
+/** The key's id, by the recipe every freeq signer uses: base64url of the
+ *  first 16 bytes of SHA-256 over the raw public key. */
+async function kidOfKeyPair(keyPair: CryptoKeyPair): Promise<string> {
+  const raw = decodeMultibaseEd25519((await recordKeyOf(keyPair)).publicKeyMultibase);
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', raw as BufferSource));
+  return bytesToBase64Url(digest.slice(0, 16));
+}
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/**
+ * Start the sign-in that grants permission to publish keys. The same link the
+ * connect screen builds, with `intent=enroll` — what the account provider asks
+ * the user to allow.
+ */
+export function signInToPublishKeys(): void {
+  const broker = localStorage.getItem('freeq-broker-base');
+  const handle = localStorage.getItem('freeq-handle');
+  if (!broker || !handle) return;
+  const url =
+    `${broker}/auth/login?handle=${encodeURIComponent(handle)}&intent=enroll` +
+    `&return_to=${encodeURIComponent(window.location.origin)}`;
+  window.location.href = url;
+}
+
+/** This browser's name, for the published record's label. */
+function browserLabel(): string {
+  const ua = navigator.userAgent;
+  if (/Edg\//.test(ua)) return 'Edge';
+  if (/OPR\//.test(ua)) return 'Opera';
+  if (/Firefox\//.test(ua)) return 'Firefox';
+  if (/Chrome\//.test(ua)) return 'Chrome';
+  if (/Safari\//.test(ua)) return 'Safari';
+  return 'Browser';
+}
 
 // Roaming-favorites state (module scope so it survives reconnects).
 let favoritesSynced = false;
@@ -151,9 +293,20 @@ export function __getPendingCallRejoinForTests(): PendingCallRejoin | null {
   return pendingCallRejoin;
 }
 
+/** Test-only: the state a broker that refused to publish the key leaves
+ *  behind, without a broker to refuse it. */
+export function __setKeyUnpublishedForTests(): void {
+  setDeviceKeyState({ needsSignIn: true, published: false, store: 'browser' });
+}
+
 // ── Public API (same signatures as before) ──
 
-export function connect(url: string, desiredNick: string, channels?: string[]) {
+/**
+ * `freshSignIn`: this connect is made from a returned sign-in, the only one
+ * allowed to replace a device key the account has retired. A saved session
+ * and every reconnect leave it false.
+ */
+export function connect(url: string, desiredNick: string, channels?: string[], freshSignIn = false) {
   if (client) {
     try { client.disconnect(); } catch { /* ignore */ }
     client = null;
@@ -162,6 +315,16 @@ export function connect(url: string, desiredNick: string, channels?: string[]) {
   const store = useStore.getState();
   store.reset();
 
+  // The key this device signs with, and the lookup that checks what others
+  // send. A guest signs nothing and publishes nothing, so neither is set up
+  // for one.
+  const deviceKeyStore = saslState.did ? chosenStoreFor(saslState.did) : undefined;
+  const keyLookup = new KeyLookup(
+    { fetch: (target: string) => fetch(target), resolveDid: makeDidResolver() },
+    window.location.origin,
+    60 * 60 * 1000,
+  );
+
   client = new FreeqClient({
     url,
     nick: desiredNick,
@@ -169,6 +332,9 @@ export function connect(url: string, desiredNick: string, channels?: string[]) {
     brokerUrl: localStorage.getItem('freeq-broker-base') || undefined,
     brokerToken: localStorage.getItem('freeq-broker-token') || undefined,
     skipInitialBrokerRefresh: !!saslState.skipBrokerRefresh,
+    ...(deviceKeyStore ? { deviceKeyStore, deviceLabel: browserLabel() } : {}),
+    freshSignIn,
+    keyLookup,
   });
 
   // Set SASL credentials if we have them
@@ -917,7 +1083,14 @@ function wireEvents(c: FreeqClient) {
     }
   }
 
+  // What the SDK said about each line's signature. A verdict that settles
+  // after the line was drawn arrives as its own event.
+  c.on('verdict', (msgid, verdict) => recordVerdict(msgid, verdict));
+
+  c.on('signingKeyUnpublished', () => setDeviceKeyState({ needsSignIn: true }));
+
   c.on('message', (channel, message) => {
+    recordVerdict(message.id, message.verdict);
     // Prefetch avatar by DID if available (from account-tag)
     if (message.tags?.account) prefetchProfiles([message.tags.account]);
 
@@ -944,6 +1117,7 @@ function wireEvents(c: FreeqClient) {
   });
 
   c.on('actEvent', (ev) => {
+    recordVerdict(ev.eventId, ev.verdict);
     // The TAGMSG is the event; its companion prose line arrives separately as
     // a `message`. The store joins the two and keeps the task they describe.
     const buffer = actEventBuffer(ev);
@@ -1003,6 +1177,7 @@ function wireEvents(c: FreeqClient) {
   });
 
   c.on('historyBatch', (channel, messages, info, rows) => {
+    for (const m of messages) recordVerdict(m.id, m.verdict);
     // Prefetch avatars by DID for history messages
     const dids = messages.map((m: any) => m.tags?.account).filter(Boolean);
     if (dids.length) prefetchProfiles(dids);

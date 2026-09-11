@@ -245,7 +245,8 @@ export function ConnectScreen() {
         const loc = window.location;
         const proto = loc.protocol === 'https:' ? 'wss:' : 'ws:';
         const host = loc.host.replace('localhost', '127.0.0.1');
-        connect(`${proto}//${host}/irc`, finalNick, ch);
+        // A returned sign-in: the one connect that may replace a retired key.
+        connect(`${proto}//${host}/irc`, finalNick, ch, true);
       }
     } catch { /* ignore parse errors */ }
   }, [brokerOrigin]);
@@ -389,7 +390,9 @@ export function ConnectScreen() {
       try { localStorage.removeItem('freeq-oauth-result'); } catch { /* ignore */ }
 
       // Use webOrigin for auth URLs (same-origin in browser, explicit server in Tauri)
-      const baseAuthUrl = `${brokerOrigin}/auth/login?handle=${encodeURIComponent(h)}`;
+      // `intent=enroll` asks for the grant that lets this device publish its
+      // signing key to the account; every other sign-in stays identity-only.
+      const baseAuthUrl = `${brokerOrigin}/auth/login?handle=${encodeURIComponent(h)}&intent=enroll`;
       const authUrl = `${baseAuthUrl}&return_to=${encodeURIComponent(window.location.origin)}`;
 
       // Pre-flight check: verify broker is reachable before redirecting

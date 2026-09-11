@@ -12,6 +12,7 @@ import { QuickSwitcher } from './components/QuickSwitcher';
 import { SettingsPanel } from './components/SettingsPanel';
 import { ReconnectBanner } from './components/ReconnectBanner';
 import { GuestUpgradeBanner } from './components/GuestUpgradeBanner';
+import { UpgradeBanner } from './components/UpgradeBanner';
 import { ImageLightbox } from './components/ImageLightbox';
 import { SearchModal } from './components/SearchModal';
 import { ChannelListModal } from './components/ChannelListModal';
@@ -243,6 +244,7 @@ export default function App() {
     <div className="fixed inset-0 flex flex-col bg-bg overflow-hidden" style={{ bottom: 'var(--vk-offset, 0px)' }}>
       <ReconnectBanner />
       <GuestUpgradeBanner />
+      <UpgradeBanner />
       <div className="flex flex-1 min-h-0">
         <div
           className={`app-sidebar-backdrop fixed inset-0 bg-black/40 z-20 md:hidden ${

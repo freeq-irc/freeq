@@ -334,14 +334,8 @@ describe('the audit timeline reads task events', () => {
 
   it('checks the receipt s own signature, not the step s', async () => {
     mockRows([actRow]);
-    // The panel does not print the id it was handed; what it does with it is
-    // ask the verify endpoint, so the request is the assertion.
-    const asked = vi.fn().mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve({ verification: { verdict: 'valid' } }),
-    });
-    vi.stubGlobal('fetch', asked);
-
+    // The check ran when the line arrived, so the panel asks nothing: the id
+    // it was opened for is the assertion.
     const { container, getByTitle, getByTestId, getByLabelText } = render(
       <AuditTimeline channel="#naptest" onClose={() => {}} />,
     );
@@ -349,10 +343,9 @@ describe('the audit timeline reads task events', () => {
     fireEvent.click(getByLabelText('Details'));
     fireEvent.click(getByTitle("Check the receipt's signature"));
 
-    expect(getByTestId('verify-panel')).toBeTruthy();
-    await waitFor(() => expect(asked).toHaveBeenCalled());
-    expect(asked.mock.calls[0][0]).toContain(RECEIPT_ID);
-    expect(asked.mock.calls[0][0]).not.toContain('01KZACPT');
+    const panel = getByTestId('verify-panel');
+    expect(panel.getAttribute('data-msgid')).toBe(RECEIPT_ID);
+    expect(panel.getAttribute('data-msgid')).not.toContain('01KZACPT');
   });
 
   it('says nothing in the column when the home ruled the step confirmed, receipt or not', async () => {

@@ -20,7 +20,8 @@ import { CoordinationEventCard } from './CoordinationCards';
 import { ActEventCard, useActCompanion } from './ActCards';
 import { jumbomojiSize } from '../lib/jumbomoji';
 import { buildTranscript, rowsInSelection } from '../lib/transcript';
-import { useCachedVerdict, VERIFY_LABELS } from '../lib/verify-signature';
+import { useCachedVerdict, copyForVerdict, verdictCopy, type Verdict } from '../lib/verify-signature';
+import { mark as signedMark } from '@freeq/sdk';
 import { VerifySignaturePanel } from './VerifySignaturePanel';
 
 // ── Colors ──
@@ -869,7 +870,7 @@ function FullMessageImpl({ msg, channel, onNickClick }: MessageProps) {
   const [verifyPanel, setVerifyPanel] = useState<{ x: number; y: number } | null>(null);
   // The only signature state a resting row ever shows: a check that already
   // answered "invalid". Everything short of that answer is silent.
-  const sigInvalid = useCachedVerdict(msg.id)?.outcome === 'invalid';
+  const verdict = useCachedVerdict(msg.id);
   const color = msg.isSelf ? '#b18cff' : nickColor(msg.from);
   const currentNick = getNick();
   const isMention = !msg.isSelf && msg.text.toLowerCase().includes(currentNick.toLowerCase());
@@ -932,9 +933,11 @@ function FullMessageImpl({ msg, channel, onNickClick }: MessageProps) {
           >
             {displayNameForKey(msg.from)}
           </button>
-          {rowClaim.showsMark && <VerifiedBadge />}
+          {rowClaim.showsMark && (
+            <VerifiedBadge onOpen={(e) => onNickClick(msg.from, member?.did, origin, e, rowEvidence)} />
+          )}
           {isFederated && <ViaBadge origin={origin!} line={rowClaim.line} />}
-          {sigInvalid && <InvalidSigMark />}
+          {rowMark(verdict)}
           {member?.away != null && (
             <span className="text-xs text-fg-dim bg-warning/10 text-warning px-1.5 py-0.5 rounded">away</span>
           )}
@@ -1017,7 +1020,8 @@ function GroupedMessageImpl({ msg, channel, onNickClick }: MessageProps) {
   const [pickerPos, setPickerPos] = useState<{ x: number; y: number } | undefined>();
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
   const [verifyPanel, setVerifyPanel] = useState<{ x: number; y: number } | null>(null);
-  const sigInvalid = useCachedVerdict(msg.id)?.outcome === 'invalid';
+  const verdict = useCachedVerdict(msg.id);
+  const sigMark = rowMark(verdict);
   const currentNick = getNick();
   const isMention = !msg.isSelf && msg.text.toLowerCase().includes(currentNick.toLowerCase());
   const isPinned = useStore((s) => s.channels.get(channel.toLowerCase())?.pins?.some(p => p.msgid === msg.id) ?? false);
@@ -1041,10 +1045,10 @@ function GroupedMessageImpl({ msg, channel, onNickClick }: MessageProps) {
       {/* A follow-up line aligns with the full rows above it — no reserved
           slot. The rare badges (E2EE, or the ⚠ after a check answered
           "invalid") take their space only on the lines that carry them. */}
-      {(msg.encrypted || sigInvalid) && (
+      {(msg.encrypted || sigMark) && (
         <span className="shrink-0 flex items-start gap-1 leading-[24px]">
           {msg.encrypted && <EncryptedBadge />}
-          {sigInvalid && <InvalidSigMark />}
+          {sigMark}
         </span>
       )}
 
@@ -1121,14 +1125,15 @@ const SystemMessage = memo(SystemMessageImpl);
 const FullMessage = memo(FullMessageImpl);
 const GroupedMessage = memo(GroupedMessageImpl);
 
-/** The mark for an AT Protocol identity — the one claim that earns one. */
-function VerifiedBadge() {
+/** The mark for an AT Protocol identity — the one claim that earns one. Opens
+ *  what the name beside it opens. */
+function VerifiedBadge({ onOpen }: { onOpen: (e: React.MouseEvent) => void }) {
   return (
-    <span className="text-accent text-xs" title="AT Protocol identity">
+    <button type="button" className="text-accent text-xs" title="AT Protocol identity — click for proof" onClick={onOpen}>
       <svg className="w-3.5 h-3.5 inline -mt-0.5" viewBox="0 0 16 16" fill="currentColor">
         <path d="M8 0a8 8 0 100 16A8 8 0 008 0zm3.78 5.97l-4.5 5a.75.75 0 01-1.06.02l-2-1.86a.75.75 0 011.02-1.1l1.45 1.35 3.98-4.43a.75.75 0 011.11 1.02z"/>
       </svg>
-    </span>
+    </button>
   );
 }
 
@@ -1145,18 +1150,60 @@ function ViaBadge({ origin, line }: { origin: string; line: string | null }) {
   );
 }
 
-/** The one signature mark a resting row can wear: a check that actually
- *  answered "invalid". Never speculative — it exists only after evidence. */
-function InvalidSigMark() {
+/** The one signature mark a resting row can wear when the check failed: a
+ *  signature that did not hold, or one made after its key was retired. */
+function InvalidSigMark({ verdict }: { verdict?: Verdict }) {
   return (
     <span
       data-testid="sig-invalid-mark"
       className="text-danger text-xs cursor-default"
-      title={VERIFY_LABELS.invalid.line}
+      title={verdict ? copyForVerdict(verdict).line : verdictCopy('invalid').line}
     >
       ⚠
     </span>
   );
+}
+
+/**
+ * What this client found when it checked the signature, shown without being
+ * asked: the sender's own device signed it (the brighter mark once their
+ * account publishes the key, dimmer while only their server vouches for it),
+ * or the server signed on their behalf — the lock alone, because the sender
+ * did not sign. Every other state stays silent: a can't-know is a fact, not
+ * a warning, and the panel says the rest.
+ */
+function SignedMark({ verdict }: { verdict: Verdict }) {
+  const line = copyForVerdict(verdict).line;
+  if (verdict.state === 'server') {
+    return (
+      <span data-testid="sig-server-mark" className="text-fg-dim text-xs cursor-default" title={line}>
+        🔒
+      </span>
+    );
+  }
+  const published = verdict.layer === 'published';
+  return (
+    <span
+      data-testid="sig-device-mark"
+      data-layer={verdict.layer ?? ''}
+      className={`text-success text-xs cursor-default ${published ? '' : 'opacity-60'}`}
+      title={line}
+    >
+      🔒 {signedMark()}
+    </span>
+  );
+}
+
+/** The mark a verdict earns on a resting row, if any. */
+function rowMark(verdict: Verdict | undefined) {
+  if (!verdict) return null;
+  if (verdict.state === 'invalid' || verdict.state === 'retired') {
+    return <InvalidSigMark verdict={verdict} />;
+  }
+  if (verdict.state === 'device' || verdict.state === 'server') {
+    return <SignedMark verdict={verdict} />;
+  }
+  return null;
 }
 
 function EncryptedBadge() {

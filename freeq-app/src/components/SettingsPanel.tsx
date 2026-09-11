@@ -4,6 +4,12 @@ import { requestPermission } from '../lib/notifications';
 import { getPreferences, setPreferences } from '../lib/db';
 import { useState, useEffect } from 'react';
 import { AudioTest } from './AudioTest';
+import { useSyncExternalStore } from 'react';
+import {
+  getDeviceKeyState,
+  signInToPublishKeys,
+  subscribeDeviceKey,
+} from '../irc/client';
 
 interface SettingsPanelProps {
   open: boolean;
@@ -62,6 +68,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
               return <InfoRow label="Server" value={isProxy && target ? `${target} (via proxy)` : stripped} />;
             })()}
             {authDid && <InfoRow label="DID" value={authDid} mono />}
+            {authDid && <DeviceKeyRows />}
           </Section>
 
           {/* Appearance */}
@@ -206,6 +213,59 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
             </p>
           </Section>
         </div>
+      </div>
+    </>
+  );
+}
+
+/**
+ * This device's signing key: where it is kept, and whether the account knows
+ * about it. A key the account does not have yet can be published from here,
+ * which means signing in again for the permission to write the record.
+ */
+function DeviceKeyRows() {
+  const key = useSyncExternalStore(subscribeDeviceKey, getDeviceKeyState);
+  const [confirm, setConfirm] = useState(false);
+
+  const shortKid = key.kid ? `${key.kid.slice(0, 8)}…` : '';
+  const made = key.createdAt ? new Date(key.createdAt).toLocaleDateString() : '';
+
+  return (
+    <>
+      <div className="flex items-center justify-between text-sm gap-2">
+        <span className="text-fg-muted">
+          {key.published ? `${shortKid} · ${made}` : 'Key not published · this device'}
+        </span>
+        {!key.published && (
+          <button
+            onClick={() => setConfirm(true)}
+            className="text-accent text-xs font-semibold hover:underline"
+          >
+            {'Publish key'}
+          </button>
+        )}
+      </div>
+      {confirm && (
+        <div className="rounded-lg border border-border bg-bg p-3 space-y-2">
+          <p className="text-sm font-semibold">{'Sign in to continue'}</p>
+          <p className="text-[11px] text-fg-dim leading-relaxed">
+            {'freeq needs permission to publish keys to your account. Continue to your account provider?'}
+          </p>
+          <div className="flex justify-end gap-3 text-xs">
+            <button onClick={() => setConfirm(false)} className="text-fg-dim hover:text-fg">
+              {'Not now'}
+            </button>
+            <button
+              onClick={() => signInToPublishKeys()}
+              className="text-accent font-semibold hover:underline"
+            >
+              {'Continue'}
+            </button>
+          </div>
+        </div>
+      )}
+      <div className="flex items-center justify-between text-sm gap-2">
+        <span className="text-fg-muted">{'Signing key · kept in this browser'}</span>
       </div>
     </>
   );
