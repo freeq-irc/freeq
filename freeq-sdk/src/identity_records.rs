@@ -251,6 +251,32 @@ pub fn fold_device_records(
         .collect()
 }
 
+/// A device key of the account, with the retirement the fold accepted for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceKeyHistory {
+    pub kid: String,
+    pub public_key_multibase: String,
+    pub created_at: DateTime<Utc>,
+    pub retired_at: Option<DateTime<Utc>>,
+    pub record: serde_json::Value,
+}
+
+/// Every checked device key of `did`, earliest first, each with the date of
+/// the retirement that counts for it, if any. Retirements the fold ignores
+/// (wrong signer, dated before the key) are not reflected.
+pub fn device_key_history(did: &str, records: &[serde_json::Value]) -> Vec<DeviceKeyHistory> {
+    device_state(did, records)
+        .into_iter()
+        .map(|k| DeviceKeyHistory {
+            kid: k.kid,
+            public_key_multibase: k.public_key_multibase,
+            created_at: k.created_at,
+            retired_at: k.retired_at,
+            record: k.record,
+        })
+        .collect()
+}
+
 /// The bots `did` claims at `at`, earliest first. A claim counts only if the
 /// owner key that signed it was itself live under the device fold when the
 /// claim was written.
@@ -775,6 +801,22 @@ mod tests {
 
     fn instant(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn the_history_carries_the_retirement_the_fold_accepted() {
+        // An earlier retirement signed by a key the account never published is
+        // ignored; the later one, signed by the key itself, counts.
+        let records = [
+            value(&build_device_record(&key(1), ALICE, T0, None).unwrap()),
+            value(&build_device_retirement(&key(2), ALICE, &kid_of(1), T1).unwrap()),
+            value(&build_device_retirement(&key(1), ALICE, &kid_of(1), T2).unwrap()),
+        ];
+        let history = device_key_history(ALICE, &records);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].kid, kid_of(1));
+        assert_eq!(history[0].created_at, instant(T0));
+        assert_eq!(history[0].retired_at, Some(instant(T2)));
     }
 
     fn hex_seed(byte: u8) -> String {

@@ -331,6 +331,10 @@ pub fn convert_event(event: &freeq_sdk::event::Event) -> DomainEvent {
         Event::Act { .. } => DomainEvent::Notice {
             text: String::new(),
         },
+        // Windows supplies no key store or enrollment, so this never fires.
+        Event::SigningKeyUnpublished => DomainEvent::Notice {
+            text: String::new(),
+        },
     }
 }
 

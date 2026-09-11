@@ -525,6 +525,7 @@ impl FreeqClient {
             tls_insecure: false,
             web_token,
             websocket_url,
+            ..Default::default()
         };
 
         // MUST call connect() inside the runtime — it uses tokio::spawn internally.
@@ -1073,6 +1074,8 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
         Event::RawLine(_) => FreeqEvent::Notice {
             text: String::new(),
         },
+        // Not exposed through the UDL yet.
+        Event::SigningKeyUnpublished => return None,
     })
 }
 

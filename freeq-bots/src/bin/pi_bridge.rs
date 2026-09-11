@@ -105,6 +105,7 @@ async fn run_once(cfg: Config) -> anyhow::Result<()> {
         tls_insecure: false,
         web_token,
         websocket_url: None,
+        ..Default::default()
     };
 
     let (handle, mut events) = client::connect(config, None);

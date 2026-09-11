@@ -54,6 +54,7 @@ async fn main() -> Result<()> {
         tls_insecure: false,
         web_token: None,
         websocket_url: None,
+        ..Default::default()
     })
     .await?;
 
@@ -66,6 +67,7 @@ async fn main() -> Result<()> {
         tls_insecure: false,
         web_token: None,
         websocket_url: None,
+        ..Default::default()
     };
 
     // No signer = guest mode (no AT Protocol authentication)

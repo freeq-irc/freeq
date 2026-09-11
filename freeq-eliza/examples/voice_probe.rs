@@ -353,6 +353,7 @@ fn connect_config(server: &str, nick: &str) -> anyhow::Result<ConnectConfig> {
         tls_insecure: false,
         web_token: None,
         websocket_url,
+        ..Default::default()
     })
 }
 

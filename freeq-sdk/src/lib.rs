@@ -13,6 +13,7 @@
 //! - [`chatsig`] — signing profile for chat events (messages, deletes, reactions)
 //! - [`act`] — signing profile for `freeq.at/act` action messages
 //! - [`crypto`] — secp256k1 and ed25519 key operations
+//! - [`device_key`] — a device's durable signing key and publishing it
 //! - [`did`] — DID document resolution (did:plc, did:web)
 //! - [`pds`] — AT Protocol PDS client (session creation/verification)
 //! - [`event`] — Events emitted by the client
@@ -28,6 +29,7 @@ pub mod canonical;
 pub mod chatsig;
 pub mod client;
 pub mod crypto;
+pub mod device_key;
 pub mod did;
 pub mod e2ee;
 pub mod e2ee_did;

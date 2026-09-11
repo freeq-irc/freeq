@@ -48,7 +48,7 @@ type EchoRegistry =
     std::sync::Arc<parking_lot::Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>>;
 
 /// Configuration for connecting to an IRC server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnectConfig {
     /// Server address (host:port).
     pub server_addr: String,
@@ -69,6 +69,35 @@ pub struct ConnectConfig {
     /// client's transport (`freeq-sdk-js/src/transport.ts`) so iOS can
     /// reach the server on networks that block port 6667.
     pub websocket_url: Option<String>,
+    /// Keeps this device's signing key across connects. `None`: a fresh
+    /// session key every connect.
+    pub device_key_store: Option<Arc<dyn crate::device_key::DeviceKeyStore>>,
+    /// Publishes a stored key that is not yet published.
+    pub enrollment: Option<Arc<dyn crate::device_key::Enrollment>>,
+    /// The published record's `label`, e.g. the device's name.
+    pub device_label: Option<String>,
+    /// This connect follows a new sign-in, not a saved login or a reconnect.
+    /// Only then is a stored key the account has retired replaced.
+    pub fresh_sign_in: bool,
+}
+
+impl std::fmt::Debug for ConnectConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectConfig")
+            .field("server_addr", &self.server_addr)
+            .field("nick", &self.nick)
+            .field("user", &self.user)
+            .field("realname", &self.realname)
+            .field("tls", &self.tls)
+            .field("tls_insecure", &self.tls_insecure)
+            .field("web_token", &self.web_token)
+            .field("websocket_url", &self.websocket_url)
+            .field("device_key_store", &self.device_key_store.is_some())
+            .field("enrollment", &self.enrollment.is_some())
+            .field("device_label", &self.device_label)
+            .field("fresh_sign_in", &self.fresh_sign_in)
+            .finish()
+    }
 }
 
 impl Default for ConnectConfig {
@@ -82,6 +111,10 @@ impl Default for ConnectConfig {
             tls_insecure: false,
             web_token: None,
             websocket_url: None,
+            device_key_store: None,
+            enrollment: None,
+            device_label: None,
+            fresh_sign_in: false,
         }
     }
 }
@@ -1571,6 +1604,7 @@ pub async fn discover_iroh_id(server_addr: &str, tls: bool, tls_insecure: bool) 
 }
 
 /// Send CAP LS and parse iroh endpoint ID from response.
+#[cfg(feature = "iroh-transport")]
 async fn probe_cap_ls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     stream: S,
 ) -> Option<String> {
@@ -2060,6 +2094,138 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
     }
 }
 
+/// The key this connection signs with. With a store, the stored key, or a
+/// fresh one saved into it; the stored copy comes back too while it is not
+/// yet published. Without a store, or when the store fails, a fresh session
+/// key, as before stores existed.
+fn session_signing_key(
+    store: Option<&dyn crate::device_key::DeviceKeyStore>,
+) -> (
+    ed25519_dalek::SigningKey,
+    Option<crate::device_key::StoredDeviceKey>,
+) {
+    let fresh = || ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    let Some(store) = store else {
+        return (fresh(), None);
+    };
+    let stored = match store.load() {
+        Ok(Some(stored)) => stored,
+        Ok(None) => {
+            let key = fresh();
+            let stored = crate::device_key::StoredDeviceKey {
+                seed: key.to_bytes(),
+                created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                record_uri: None,
+            };
+            if let Err(e) = store.save(&stored) {
+                tracing::warn!(error = %e, "device key not saved; signing with a session key");
+                return (key, None);
+            }
+            stored
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "device key not loaded; signing with a session key");
+            return (fresh(), None);
+        }
+    };
+    let key = ed25519_dalek::SigningKey::from_bytes(&stored.seed);
+    let unpublished = stored.record_uri.is_none().then_some(stored);
+    (key, unpublished)
+}
+
+/// Right after a new sign-in, replace a stored key the account's records have
+/// retired with a new one, saved with no record URI so this connect publishes
+/// it. A saved login or a reconnect reads and changes nothing.
+async fn replace_retired_device_key<P: freeq_oauth::ClientProvider>(
+    fresh_sign_in: bool,
+    store: Option<&dyn crate::device_key::DeviceKeyStore>,
+    reader: &crate::identity_records::RecordReader<P>,
+    did: &str,
+) {
+    let (true, Some(store)) = (fresh_sign_in, store) else {
+        return;
+    };
+    let Ok(Some(stored)) = store.load() else {
+        return;
+    };
+    let kid = crate::sigtag::derive_kid(
+        &ed25519_dalek::SigningKey::from_bytes(&stored.seed).verifying_key(),
+    );
+    let records = match reader
+        .list_records(did, crate::identity_records::DEVICE_KEY_TYPE)
+        .await
+    {
+        Ok(records) => records,
+        Err(e) => {
+            tracing::warn!(error = %e, "device key records not read; keeping the stored key");
+            return;
+        }
+    };
+    let now = chrono::Utc::now();
+    let retired = crate::identity_records::device_key_history(did, &records)
+        .iter()
+        .any(|k| k.kid == kid && k.retired_at.is_some_and(|r| r <= now));
+    if !retired {
+        return;
+    }
+    let key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    let replacement = crate::device_key::StoredDeviceKey {
+        seed: key.to_bytes(),
+        created_at: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        record_uri: None,
+    };
+    if let Err(e) = store.save(&replacement) {
+        tracing::warn!(error = %e, "replacement device key not saved; keeping the retired one");
+    }
+}
+
+/// Publish a stored device key through the app's `Enrollment`, off the
+/// connect path. A published key is saved with its record's URI; one that
+/// needs a new sign-in is reported; a failure is tried again next connect.
+fn spawn_enrollment(
+    store: Arc<dyn crate::device_key::DeviceKeyStore>,
+    enrollment: Arc<dyn crate::device_key::Enrollment>,
+    stored: crate::device_key::StoredDeviceKey,
+    key: ed25519_dalek::SigningKey,
+    did: String,
+    label: Option<String>,
+    event_tx: mpsc::Sender<Event>,
+) {
+    use crate::device_key::EnrollOutcome;
+    tokio::spawn(async move {
+        let key = crate::crypto::PrivateKey::Ed25519(key);
+        let record = match crate::identity_records::build_device_record(
+            &key,
+            &did,
+            &stored.created_at,
+            label.as_deref(),
+        ) {
+            Ok(record) => record,
+            Err(e) => {
+                tracing::warn!(error = %e, "device key record not built");
+                return;
+            }
+        };
+        match enrollment.publish(record, key.public_key_multibase()).await {
+            EnrollOutcome::Published { uri } => {
+                let published = crate::device_key::StoredDeviceKey {
+                    record_uri: Some(uri),
+                    ..stored
+                };
+                if let Err(e) = store.save(&published) {
+                    tracing::warn!(error = %e, "published device key not saved");
+                }
+            }
+            EnrollOutcome::NeedsSignIn => {
+                let _ = event_tx.send(Event::SigningKeyUnpublished).await;
+            }
+            EnrollOutcome::Failed(reason) => {
+                tracing::warn!(%reason, "device key not published; tried again next connect");
+            }
+        }
+    });
+}
+
 async fn run_irc<R, W>(
     mut reader: R,
     mut writer: W,
@@ -2104,6 +2270,9 @@ where
     // The session signing key's public half, waiting for registration to
     // finish so `MSGSIG` isn't sent into a connection that will discard it.
     let mut pending_msgsig: Option<String> = None;
+    // A stored device key the account does not have yet, published once
+    // `MSGSIG` has gone out.
+    let mut pending_enrollment: Option<crate::device_key::StoredDeviceKey> = None;
     // Open `draft/multiline` batches keyed by batch id. Chunks
     // accumulate here while the batch is open; the BATCH closer drains
     // and emits a single Event::Message with the assembled body.
@@ -2257,8 +2426,29 @@ where
                                 let _ = event_tx.send(Event::Authenticated { did: did.clone() }).await;
                             }
                             if !did.is_empty() && server_verifies_documents {
-                                // Generate session message-signing keypair
-                                let key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+                                // Bounded: a slow account provider must not
+                                // hold up registration.
+                                if config.fresh_sign_in {
+                                    let reader = crate::identity_records::RecordReader::new(
+                                        crate::did::DidResolver::http(),
+                                        freeq_oauth::SharedClient(reqwest::Client::new()),
+                                    );
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_secs(10),
+                                        replace_retired_device_key(
+                                            true,
+                                            config.device_key_store.as_deref(),
+                                            &reader,
+                                            &did,
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                let (key, unpublished) =
+                                    session_signing_key(config.device_key_store.as_deref());
+                                if config.enrollment.is_some() {
+                                    pending_enrollment = unpublished;
+                                }
                                 let pubkey_bytes = key.verifying_key().as_bytes().to_vec();
                                 use base64::Engine;
                                 let pubkey_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&pubkey_bytes);
@@ -2351,6 +2541,22 @@ where
                                 writer
                                     .write_all(format!("MSGSIG {pubkey_b64}\r\n").as_bytes())
                                     .await?;
+                                if let Some(stored) = pending_enrollment.take()
+                                    && let (Some(store), Some(enrollment)) =
+                                        (config.device_key_store.clone(), config.enrollment.clone())
+                                    && let (Some(key), Some(did)) =
+                                        (msg_signing_key.clone(), msg_signing_did.clone())
+                                {
+                                    spawn_enrollment(
+                                        store,
+                                        enrollment,
+                                        stored,
+                                        key,
+                                        did,
+                                        config.device_label.clone(),
+                                        event_tx.clone(),
+                                    );
+                                }
                             }
                             // Flush any commands that were queued before registration
                             let verifies = caps_acked.lock().acked.contains(MSGSIG_CAP);
@@ -5196,6 +5402,7 @@ mod multiline_tests {
                 tls_insecure: false,
                 web_token: None,
                 websocket_url: None,
+                ..Default::default()
             };
             let (reader, writer) = tokio::io::split(client_side);
             tokio::spawn(async move {
@@ -5280,6 +5487,7 @@ mod multiline_tests {
                 tls_insecure: false,
                 web_token: None,
                 websocket_url: None,
+                ..Default::default()
             };
             let (reader, writer) = tokio::io::split(client_side);
             tokio::spawn(async move {
@@ -5355,6 +5563,7 @@ mod multiline_tests {
             tls_insecure: false,
             web_token: None,
             websocket_url: None,
+            ..Default::default()
         };
         let (reader, writer) = tokio::io::split(client_side);
 
@@ -5470,6 +5679,7 @@ mod multiline_tests {
             tls_insecure: false,
             web_token: None,
             websocket_url: None,
+            ..Default::default()
         };
         let (reader, writer) = tokio::io::split(client_side);
 
@@ -5621,6 +5831,7 @@ mod irc_loop_tests {
             tls_insecure: false,
             web_token: None,
             websocket_url: None,
+            ..Default::default()
         }
     }
 
@@ -7363,6 +7574,7 @@ mod did_maps_tests {
             tls_insecure: false,
             web_token: None,
             websocket_url: None,
+            ..Default::default()
         };
         let (reader, writer) = tokio::io::split(client_side);
         tokio::spawn(async move {
@@ -8169,5 +8381,373 @@ mod did_maps_tests {
             );
             assert!(notice.contains("deprecated"), "{notice}");
         }
+    }
+}
+
+#[cfg(test)]
+mod device_key_tests {
+    use super::*;
+    use crate::device_key::{DeviceKeyStore, EnrollOutcome, Enrollment, StoredDeviceKey};
+    use crate::identity_records::DeviceKeyRecord;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const CREATED: &str = "2026-09-11T10:00:00.000Z";
+
+    #[derive(Default)]
+    struct MemoryStore {
+        key: parking_lot::Mutex<Option<StoredDeviceKey>>,
+        saves: parking_lot::Mutex<Vec<StoredDeviceKey>>,
+    }
+
+    impl MemoryStore {
+        fn holding(seed: u8, record_uri: Option<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                key: parking_lot::Mutex::new(Some(StoredDeviceKey {
+                    seed: [seed; 32],
+                    created_at: CREATED.to_string(),
+                    record_uri: record_uri.map(str::to_string),
+                })),
+                saves: Default::default(),
+            })
+        }
+    }
+
+    impl DeviceKeyStore for MemoryStore {
+        fn load(&self) -> anyhow::Result<Option<StoredDeviceKey>> {
+            Ok(self.key.lock().clone())
+        }
+        fn save(&self, key: &StoredDeviceKey) -> anyhow::Result<()> {
+            *self.key.lock() = Some(key.clone());
+            self.saves.lock().push(key.clone());
+            Ok(())
+        }
+    }
+
+    struct StubEnrollment {
+        outcome: EnrollOutcome,
+        calls: parking_lot::Mutex<Vec<(DeviceKeyRecord, String)>>,
+    }
+
+    impl StubEnrollment {
+        fn answering(outcome: EnrollOutcome) -> Arc<Self> {
+            Arc::new(Self {
+                outcome,
+                calls: Default::default(),
+            })
+        }
+    }
+
+    impl Enrollment for StubEnrollment {
+        fn publish(
+            &self,
+            record: DeviceKeyRecord,
+            signer_public_key: String,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = EnrollOutcome> + Send>> {
+            self.calls.lock().push((record, signer_public_key));
+            let outcome = self.outcome.clone();
+            Box::pin(async move { outcome })
+        }
+    }
+
+    struct Connection {
+        wire: String,
+        events: Vec<Event>,
+    }
+
+    impl Connection {
+        /// The public key the client registered with `MSGSIG`.
+        fn msgsig(&self) -> String {
+            self.wire
+                .lines()
+                .find_map(|l| l.strip_prefix("MSGSIG "))
+                .expect("the client registered a key")
+                .trim()
+                .to_string()
+        }
+
+        fn unpublished_events(&self) -> usize {
+            self.events
+                .iter()
+                .filter(|e| matches!(e, Event::SigningKeyUnpublished))
+                .count()
+        }
+    }
+
+    /// One authenticated registration, through `connect_with_stream` over a
+    /// loopback socket, against a server that verifies documents:
+    /// everything the client wrote and every event it sent.
+    async fn connect_once(config: ConnectConfig) -> Connection {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_side = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server_side, _) = listener.accept().await.unwrap();
+        let (_handle, mut event_rx) =
+            connect_with_stream(EstablishedConnection::Plain(client_side), config, None);
+
+        let caps = format!("sasl message-tags server-time {MSGSIG_CAP}");
+        for line in [
+            format!(":srv CAP * LS :{caps}"),
+            format!(":srv CAP * ACK :{caps}"),
+            ":srv 900 tester :You are now logged in as did:plc:tester".to_string(),
+            ":srv 903 tester :SASL authentication successful".to_string(),
+            ":srv 001 tester :Welcome".to_string(),
+        ] {
+            server_side
+                .write_all(format!("{line}\r\n").as_bytes())
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let mut wire = Vec::new();
+        let mut chunk = vec![0u8; 4096];
+        while let Ok(Ok(n)) = tokio::time::timeout(
+            std::time::Duration::from_millis(120),
+            server_side.read(&mut chunk),
+        )
+        .await
+        {
+            if n == 0 {
+                break;
+            }
+            wire.extend_from_slice(&chunk[..n]);
+        }
+        let mut events = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv()).await
+        {
+            events.push(event);
+        }
+        Connection {
+            wire: String::from_utf8_lossy(&wire).into_owned(),
+            events,
+        }
+    }
+
+    fn config_with(
+        store: Option<Arc<MemoryStore>>,
+        enrollment: Option<Arc<StubEnrollment>>,
+    ) -> ConnectConfig {
+        ConnectConfig {
+            nick: "tester".to_string(),
+            device_key_store: store.map(|s| s as Arc<dyn DeviceKeyStore>),
+            enrollment: enrollment.map(|e| e as Arc<dyn Enrollment>),
+            device_label: Some("laptop".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn public_b64(seed: &[u8; 32]) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            ed25519_dalek::SigningKey::from_bytes(seed)
+                .verifying_key()
+                .as_bytes(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_stored_key_is_presented_on_every_connect() {
+        let store = MemoryStore::holding(5, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
+        let first = connect_once(config_with(Some(store.clone()), None)).await;
+        let second = connect_once(config_with(Some(store.clone()), None)).await;
+        assert_eq!(first.msgsig(), public_b64(&[5; 32]));
+        assert_eq!(second.msgsig(), public_b64(&[5; 32]));
+        assert!(store.saves.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_empty_store_keeps_the_minted_key() {
+        let store = Arc::new(MemoryStore::default());
+        let first = connect_once(config_with(Some(store.clone()), None)).await;
+        let saved = store.saves.lock().clone();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].record_uri, None);
+        assert!(chrono::DateTime::parse_from_rfc3339(&saved[0].created_at).is_ok());
+        assert_eq!(first.msgsig(), public_b64(&saved[0].seed));
+
+        let second = connect_once(config_with(Some(store.clone()), None)).await;
+        assert_eq!(second.msgsig(), first.msgsig());
+        assert_eq!(
+            store.saves.lock().len(),
+            1,
+            "a loaded key is not saved again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_published_key_is_saved_with_its_uri() {
+        let uri = "at://did:plc:tester/at.freeq.deviceKey/3kdevice";
+        let store = MemoryStore::holding(6, None);
+        let enrollment = StubEnrollment::answering(EnrollOutcome::Published {
+            uri: uri.to_string(),
+        });
+        let conn = connect_once(config_with(Some(store.clone()), Some(enrollment.clone()))).await;
+
+        let key = crate::crypto::PrivateKey::ed25519_from_bytes(&[6; 32]).unwrap();
+        let calls = enrollment.calls.lock().clone();
+        assert_eq!(calls.len(), 1);
+        let (record, signer) = &calls[0];
+        assert_eq!(signer, &key.public_key_multibase());
+        assert_eq!(
+            record,
+            &crate::identity_records::build_device_record(
+                &key,
+                "did:plc:tester",
+                CREATED,
+                Some("laptop")
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            store.saves.lock().clone(),
+            vec![StoredDeviceKey {
+                seed: [6; 32],
+                created_at: CREATED.to_string(),
+                record_uri: Some(uri.to_string()),
+            }]
+        );
+        assert_eq!(conn.unpublished_events(), 0);
+
+        connect_once(config_with(Some(store.clone()), Some(enrollment.clone()))).await;
+        assert_eq!(
+            enrollment.calls.lock().len(),
+            1,
+            "a published key is not sent again"
+        );
+    }
+
+    #[tokio::test]
+    async fn needs_sign_in_is_reported_once_per_connection() {
+        let store = MemoryStore::holding(7, None);
+        let enrollment = StubEnrollment::answering(EnrollOutcome::NeedsSignIn);
+        let first = connect_once(config_with(Some(store.clone()), Some(enrollment.clone()))).await;
+        assert_eq!(first.unpublished_events(), 1);
+        assert_eq!(
+            first.msgsig(),
+            public_b64(&[7; 32]),
+            "the key is still used"
+        );
+        let second = connect_once(config_with(Some(store.clone()), Some(enrollment.clone()))).await;
+        assert_eq!(second.unpublished_events(), 1);
+        assert_eq!(enrollment.calls.lock().len(), 2);
+        assert!(store.saves.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_publish_is_retried_on_the_next_connect_without_an_event() {
+        let store = MemoryStore::holding(8, None);
+        let enrollment = StubEnrollment::answering(EnrollOutcome::Failed("502".to_string()));
+        let first = connect_once(config_with(Some(store.clone()), Some(enrollment.clone()))).await;
+        let second = connect_once(config_with(Some(store.clone()), Some(enrollment.clone()))).await;
+        assert_eq!(first.unpublished_events() + second.unpublished_events(), 0);
+        assert_eq!(enrollment.calls.lock().len(), 2);
+        assert!(store.saves.lock().is_empty());
+    }
+
+    const RETIRED: &str = "2026-09-12T10:00:00.000Z";
+
+    fn record_for(seed: u8) -> serde_json::Value {
+        let key = crate::crypto::PrivateKey::ed25519_from_bytes(&[seed; 32]).unwrap();
+        serde_json::to_value(
+            crate::identity_records::build_device_record(&key, "did:plc:tester", CREATED, None)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn retirement_of(seed: u8) -> serde_json::Value {
+        let key = crate::crypto::PrivateKey::ed25519_from_bytes(&[seed; 32]).unwrap();
+        let kid = crate::sigtag::derive_kid(
+            &ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key(),
+        );
+        serde_json::to_value(
+            crate::identity_records::build_device_retirement(&key, "did:plc:tester", &kid, RETIRED)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A reader whose PDS, on a loopback port, lists `records` as the
+    /// account's device keys, and a count of the listings it answered.
+    async fn reader_listing(
+        records: Vec<serde_json::Value>,
+    ) -> (
+        crate::identity_records::RecordReader<freeq_oauth::SharedClient>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        let router = axum::Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            axum::routing::get(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let listed: Vec<serde_json::Value> = records
+                    .iter()
+                    .map(
+                        |value| serde_json::json!({"uri": "at://x", "cid": "bafy", "value": value}),
+                    )
+                    .collect();
+                async move { axum::Json(serde_json::json!({ "records": listed })) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let atproto = crate::crypto::PrivateKey::generate_secp256k1().public_key_multibase();
+        let doc =
+            crate::did::make_test_did_document_with_pds("did:plc:tester", &atproto, Some(&base));
+        let resolver = crate::did::DidResolver::static_map(HashMap::from([(
+            "did:plc:tester".to_string(),
+            doc,
+        )]));
+        let reader = crate::identity_records::RecordReader::new(
+            resolver,
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        );
+        (reader, hits)
+    }
+
+    #[tokio::test]
+    async fn after_a_new_sign_in_a_retired_key_is_replaced_and_a_live_one_kept() {
+        let (reader, _) =
+            reader_listing(vec![record_for(11), retirement_of(11), record_for(12)]).await;
+
+        let retired = MemoryStore::holding(11, Some("at://did:plc:tester/at.freeq.deviceKey/3old"));
+        replace_retired_device_key(true, Some(retired.as_ref()), &reader, "did:plc:tester").await;
+        let saved = retired.saves.lock().clone();
+        assert_eq!(saved.len(), 1, "the retired key is replaced");
+        assert_ne!(saved[0].seed, [11; 32]);
+        assert_eq!(
+            saved[0].record_uri, None,
+            "the new key is not yet published"
+        );
+        assert!(chrono::DateTime::parse_from_rfc3339(&saved[0].created_at).is_ok());
+
+        let live = MemoryStore::holding(12, Some("at://did:plc:tester/at.freeq.deviceKey/3live"));
+        replace_retired_device_key(true, Some(live.as_ref()), &reader, "did:plc:tester").await;
+        assert!(live.saves.lock().is_empty(), "a live key is kept");
+    }
+
+    #[tokio::test]
+    async fn without_a_new_sign_in_a_retired_key_is_kept() {
+        assert!(!ConnectConfig::default().fresh_sign_in);
+        let (reader, hits) = reader_listing(vec![record_for(11), retirement_of(11)]).await;
+        let store = MemoryStore::holding(11, Some("at://did:plc:tester/at.freeq.deviceKey/3old"));
+        replace_retired_device_key(false, Some(store.as_ref()), &reader, "did:plc:tester").await;
+        assert!(store.saves.lock().is_empty());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn without_a_store_a_session_key_is_minted_and_nothing_is_published() {
+        let enrollment = StubEnrollment::answering(EnrollOutcome::NeedsSignIn);
+        let first = connect_once(config_with(None, Some(enrollment.clone()))).await;
+        let second = connect_once(config_with(None, Some(enrollment.clone()))).await;
+        assert_ne!(first.msgsig(), second.msgsig());
+        assert!(enrollment.calls.lock().is_empty());
+        assert_eq!(first.unpublished_events(), 0);
     }
 }

@@ -1,0 +1,216 @@
+//! A device's own signing key, kept across connects, and publishing it to the
+//! account.
+//!
+//! Without a store the client mints a fresh session key on every connect.
+//! With one, the device presents the same key every time, so it can be
+//! published once as an `at.freeq.deviceKey` record. The client app supplies
+//! the store (a file, the Keychain, the Android Keystore) and the write
+//! (`Enrollment`), since only the app holds a session that can write to the
+//! account; the SDK decides when to call it.
+
+use crate::identity_records::DeviceKeyRecord;
+use anyhow::{Context, Result};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
+
+/// The device key as a store keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredDeviceKey {
+    /// The ed25519 private key's 32-byte seed.
+    pub seed: [u8; 32],
+    /// When the key was made, RFC 3339; the published record carries it.
+    pub created_at: String,
+    /// The `at://` URI of the record that publishes the key, once written.
+    pub record_uri: Option<String>,
+}
+
+/// Where a device keeps its signing key between connects.
+pub trait DeviceKeyStore: Send + Sync {
+    /// The stored key, or `None` when the device has none yet.
+    fn load(&self) -> Result<Option<StoredDeviceKey>>;
+    /// Replace the stored key.
+    fn save(&self, key: &StoredDeviceKey) -> Result<()>;
+}
+
+/// What publishing a device key came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnrollOutcome {
+    /// The record was written; `uri` names it.
+    Published { uri: String },
+    /// The app's session cannot write the record; the user has to sign in
+    /// again with the grant.
+    NeedsSignIn,
+    /// Anything else. Tried again on the next connect.
+    Failed(String),
+}
+
+/// Writes a device key record to the account. Supplied by the client app.
+pub trait Enrollment: Send + Sync {
+    fn publish(
+        &self,
+        record: DeviceKeyRecord,
+        signer_public_key: String,
+    ) -> Pin<Box<dyn Future<Output = EnrollOutcome> + Send>>;
+}
+
+/// The file form: the seed as base64url, as the session file keeps its
+/// DPoP key.
+#[derive(Serialize, Deserialize)]
+struct KeyFile {
+    seed: String,
+    created_at: String,
+    #[serde(default)]
+    record_uri: Option<String>,
+}
+
+/// A [`DeviceKeyStore`] in one JSON file, readable by its owner only.
+pub struct FileDeviceKeyStore {
+    path: PathBuf,
+}
+
+impl FileDeviceKeyStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl DeviceKeyStore for FileDeviceKeyStore {
+    fn load(&self) -> Result<Option<StoredDeviceKey>> {
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).context("reading the device key file"),
+        };
+        let file: KeyFile = serde_json::from_str(&text).context("device key file is not JSON")?;
+        let seed: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(&file.seed)
+            .context("device key seed is not base64url")?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("device key seed is not 32 bytes"))?;
+        Ok(Some(StoredDeviceKey {
+            seed,
+            created_at: file.created_at,
+            record_uri: file.record_uri,
+        }))
+    }
+
+    fn save(&self, key: &StoredDeviceKey) -> Result<()> {
+        let json = serde_json::to_string_pretty(&KeyFile {
+            seed: URL_SAFE_NO_PAD.encode(key.seed),
+            created_at: key.created_at.clone(),
+            record_uri: key.record_uri.clone(),
+        })?;
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&self.path)?;
+        // A file made before this code, or by hand, keeps its old mode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::io::Write::write_all(&mut file, json.as_bytes())?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("freeq-device-key-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("nested").join("device-key.json")
+    }
+
+    #[test]
+    fn a_missing_file_holds_no_key() {
+        let store = FileDeviceKeyStore::new(temp_path("missing"));
+        assert_eq!(store.load().unwrap(), None);
+    }
+
+    #[test]
+    fn the_file_store_round_trips() {
+        let path = temp_path("round-trip");
+        let store = FileDeviceKeyStore::new(&path);
+        let key = StoredDeviceKey {
+            seed: [7; 32],
+            created_at: "2026-09-11T10:00:00.000Z".to_string(),
+            record_uri: None,
+        };
+        store.save(&key).unwrap();
+        assert_eq!(store.load().unwrap(), Some(key.clone()));
+
+        let published = StoredDeviceKey {
+            record_uri: Some("at://did:plc:alice/at.freeq.deviceKey/3k".to_string()),
+            ..key
+        };
+        store.save(&published).unwrap();
+        assert_eq!(
+            FileDeviceKeyStore::new(&path).load().unwrap(),
+            Some(published)
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_key_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_path("mode");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A file that already exists with a wide mode is narrowed on save.
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let store = FileDeviceKeyStore::new(&path);
+        store
+            .save(&StoredDeviceKey {
+                seed: [1; 32],
+                created_at: "2026-09-11T10:00:00.000Z".to_string(),
+                record_uri: None,
+            })
+            .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let fresh = temp_path("mode-fresh");
+        FileDeviceKeyStore::new(&fresh)
+            .save(&StoredDeviceKey {
+                seed: [2; 32],
+                created_at: "2026-09-11T10:00:00.000Z".to_string(),
+                record_uri: None,
+            })
+            .unwrap();
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+        let _ = std::fs::remove_dir_all(fresh.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn a_seed_of_the_wrong_length_is_an_error() {
+        let path = temp_path("short");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"seed":"AAAA","created_at":"2026-09-11T10:00:00.000Z"}"#,
+        )
+        .unwrap();
+        assert!(FileDeviceKeyStore::new(&path).load().is_err());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+}

@@ -254,6 +254,12 @@ pub enum Event {
         reason: String,
     },
 
+    /// This device's signing key is not published to the account, and the
+    /// app's session lacks the permission to publish it: the user has to sign
+    /// in again. Sent at most once per connection, after registration, when
+    /// the app's `Enrollment` answers `NeedsSignIn`.
+    SigningKeyUnpublished,
+
     /// Raw server line (for debugging).
     RawLine(String),
 }

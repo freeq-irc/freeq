@@ -187,6 +187,7 @@ async fn main() -> Result<()> {
         tls_insecure: false,
         web_token: None,
         websocket_url: None,
+        ..Default::default()
     };
 
     let reconnect = ReconnectConfig {

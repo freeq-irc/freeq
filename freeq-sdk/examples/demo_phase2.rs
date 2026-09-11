@@ -166,6 +166,7 @@ async fn main() -> Result<()> {
         tls_insecure: false,
         web_token: None,
         websocket_url: None,
+        ..Default::default()
     };
     let conn = client::establish_connection(&config).await?;
     let (handle, mut events) =

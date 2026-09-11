@@ -202,6 +202,7 @@ impl Orchestrator {
             tls_insecure: false,
             web_token: None,
             websocket_url,
+            ..Default::default()
         };
         let signer = Arc::new(KeySigner::new(ident.did.clone(), ident.private_key));
         let (handle, mut events) = client::connect(conn_config, Some(signer));

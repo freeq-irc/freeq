@@ -281,6 +281,7 @@ async fn main() -> Result<()> {
             tls_insecure: resolved.tls_insecure,
             web_token: None,
             websocket_url: None,
+            ..Default::default()
         })
         .await?
     };
@@ -294,6 +295,7 @@ async fn main() -> Result<()> {
         tls_insecure: resolved.tls_insecure,
         web_token: None,
         websocket_url: None,
+        ..Default::default()
     };
 
     let (mut handle, mut events) =
@@ -1448,6 +1450,9 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
         // The TUI prints WHOIS lines as they arrive and has nothing waiting on
         // the answer being complete, so the end of one is not news here.
         Event::WhoisEnd { nick: _ } => {}
+
+        // The TUI supplies no key store or enrollment yet.
+        Event::SigningKeyUnpublished => {}
 
         Event::WhoisReply { nick: _, info } => {
             let buf = app.active_buffer.clone();
