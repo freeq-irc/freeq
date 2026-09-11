@@ -546,6 +546,7 @@ fn session_routes() -> Router<Arc<BrokerState>> {
         .route("/api/graph/follow", post(graph_follow))
         .route("/api/graph/unfollow", post(graph_unfollow))
         .route("/api/pfp/set-avatar", post(pfp_set_avatar))
+        .route("/enroll", post(enroll))
 }
 
 /// Ready-to-mount `/session` + `/api/graph/*` router for an embedding server.
@@ -633,12 +634,10 @@ async fn client_metadata(State(state): State<Arc<BrokerState>>) -> Json<serde_js
         "tos_uri": state.config.public_url,
         "policy_uri": state.config.public_url,
         "redirect_uris": [redirect_uri],
-        // Union of scopes the broker may ever request, plus
-        // `transition:generic` for backward compat with refresh tokens
-        // issued before this change. We never request it at /authorize
-        // — the broker only asks for `atproto`. Remove transition:generic
-        // once the PDS grace period closes.
-        "scope": "atproto blob:image/* repo:app.bsky.actor.profile repo:blue.irc.media?action=create repo:app.bsky.feed.post transition:generic",
+        // The shared scope union, plus the profile grant the broker's avatar
+        // routes need, in the position the metadata has always carried it.
+        "scope": freeq_oauth::CLIENT_METADATA_SCOPE
+            .replacen("blob:image/*", "blob:image/* repo:app.bsky.actor.profile", 1),
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
@@ -698,11 +697,14 @@ async fn auth_login(
     // touches, nothing more: upload image blobs, write the profile record, and
     // create a post. No `transition:generic` (that's full-account access). Only
     // this opt-in flow gets that consent screen; every other sign-in stays
-    // identity-only. Each scope here must be within the client-metadata union.
-    let scope = if q.intent.as_deref() == Some("pfp") {
-        "atproto blob:image/* repo:app.bsky.actor.profile repo:app.bsky.feed.post"
-    } else {
-        "atproto"
+    // identity-only. `intent=enroll` asks to create the two key records a
+    // client publishes. Each scope here must be within the client-metadata union.
+    let scope = match q.intent.as_deref() {
+        Some("pfp") => "atproto blob:image/* repo:app.bsky.actor.profile repo:app.bsky.feed.post",
+        Some("enroll") => {
+            "atproto repo:at.freeq.deviceKey?action=create repo:at.freeq.agentKey?action=create"
+        }
+        _ => "atproto",
     };
     let client_id = build_client_id(&state.config.public_url, &redirect_uri);
 
@@ -1159,11 +1161,12 @@ struct GraphFollowRequest {
 
 /// Authenticate a broker token and produce a fresh access token, persisting
 /// the rotated refresh token — the same discipline as `/session` (shared
-/// per-token lock, read-inside-lock, encrypt-before-store).
+/// per-token lock, read-inside-lock, encrypt-before-store). Also returns the
+/// scope the refresh reported as granted.
 async fn authed_access_token(
     state: &Arc<BrokerState>,
     broker_token: &str,
-) -> Result<(BrokerSessionRecord, String, Option<String>), (StatusCode, String)> {
+) -> Result<(BrokerSessionRecord, String, Option<String>, String), (StatusCode, String)> {
     let token_lock = {
         let mut locks = state.refresh_locks.lock().await;
         locks
@@ -1179,7 +1182,7 @@ async fn authed_access_token(
         .await
         .ok_or((StatusCode::UNAUTHORIZED, "Invalid broker token".to_string()))?;
 
-    let (access_token, refresh_token, dpop_nonce, _scope) =
+    let (access_token, refresh_token, dpop_nonce, granted_scope) =
         refresh_access_token(&state.config, &record)
             .await
             .map_err(|e| match e {
@@ -1198,7 +1201,7 @@ async fn authed_access_token(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
 
-    Ok((record, access_token, dpop_nonce))
+    Ok((record, access_token, dpop_nonce, granted_scope))
 }
 
 /// DPoP-authenticated POST to the user's PDS, with the standard
@@ -1208,7 +1211,7 @@ async fn pds_dpop_post(
     access_token: &str,
     nonce: Option<String>,
     url: &str,
-    body: serde_json::Value,
+    body: impl Serialize,
 ) -> Result<(reqwest::StatusCode, String), anyhow::Error> {
     let dpop_key = DpopKey::from_base64url(&record.dpop_key_b64)?;
     let client = upstream_client()?;
@@ -1266,7 +1269,7 @@ async fn graph_follow(
         .filter(|d| d.starts_with("did:"))
         .ok_or((StatusCode::BAD_REQUEST, "subject_did required".to_string()))?;
 
-    let (record, access_token, nonce) = authed_access_token(&state, &req.broker_token).await?;
+    let (record, access_token, nonce, _) = authed_access_token(&state, &req.broker_token).await?;
     if subject == record.did {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1316,7 +1319,7 @@ async fn graph_unfollow(
         .as_deref()
         .ok_or((StatusCode::BAD_REQUEST, "follow_uri required".to_string()))?;
 
-    let (record, access_token, nonce) = authed_access_token(&state, &req.broker_token).await?;
+    let (record, access_token, nonce, _) = authed_access_token(&state, &req.broker_token).await?;
 
     // at://did:plc:xxx/app.bsky.graph.follow/rkey — the repo DID must be the
     // caller's own (you can only delete your own follow records).
@@ -1352,6 +1355,127 @@ async fn graph_unfollow(
             "follow_uri must be an app.bsky.graph.follow record in your own repo".to_string(),
         )),
     }
+}
+
+// ── Key enrollment ──────────────────────────────────────────────────────────
+//
+// A client publishes its signing key (or a bot claim) as a record in the
+// user's own repo. The client builds and signs the record; the broker checks
+// it belongs to this session and is signed by the key it names, then writes
+// it with createRecord, exactly as received.
+
+#[derive(Deserialize)]
+struct EnrollRequest {
+    broker_token: String,
+    record: Box<serde_json::value::RawValue>,
+    /// Multibase public key of the key that signed `record`.
+    signer_public_key: String,
+}
+
+#[derive(Serialize)]
+struct CreateRecordBody<'a> {
+    repo: &'a str,
+    collection: &'a str,
+    record: &'a serde_json::value::RawValue,
+}
+
+/// Why a record may not be written for this session, or `None` when it may.
+fn enroll_refusal(record: &serde_json::Value, did: &str, signer: &str) -> Option<&'static str> {
+    use freeq_sdk::identity_records::{AGENT_KEY_TYPE, DEVICE_KEY_TYPE, verify_record_binding};
+    let record_type = record.get("$type").and_then(|v| v.as_str());
+    if record_type != Some(DEVICE_KEY_TYPE) && record_type != Some(AGENT_KEY_TYPE) {
+        return Some("record $type must be at.freeq.deviceKey or at.freeq.agentKey");
+    }
+    if record.get("did").and_then(|v| v.as_str()) != Some(did) {
+        return Some("record did is not the signed-in account");
+    }
+    let Ok(freeq_sdk::crypto::PublicKey::Ed25519(key)) =
+        freeq_sdk::crypto::PublicKey::from_multibase(signer)
+    else {
+        return Some("signer_public_key must be an ed25519 multibase key");
+    };
+    if record.get("kid").and_then(|v| v.as_str()) != Some(&freeq_sdk::sigtag::derive_kid(&key)) {
+        return Some("record kid is not the signer's key id");
+    }
+    if record_type == Some(DEVICE_KEY_TYPE)
+        && let Some(announced) = record.get("publicKeyMultibase")
+        && announced.as_str() != Some(signer)
+    {
+        return Some("record publicKeyMultibase is not the signer's key");
+    }
+    if !verify_record_binding(record, &freeq_sdk::crypto::PublicKey::Ed25519(key)) {
+        return Some("record bindingSig does not verify under signer_public_key");
+    }
+    // A retirement takes effect from its date, so it may only say "now".
+    if record.get("revokes").is_some() {
+        let current = record
+            .get("createdAt")
+            .and_then(|v| v.as_str())
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .is_some_and(|t| (chrono::Utc::now() - t.to_utc()).num_seconds().abs() <= 300);
+        if !current {
+            return Some("retirement createdAt must be the current time");
+        }
+    }
+    None
+}
+
+/// POST /enroll {broker_token, record, signer_public_key} — write an
+/// at.freeq.deviceKey or at.freeq.agentKey record to the user's own repo.
+async fn enroll(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<EnrollRequest>,
+) -> Result<Json<serde_json::Value>, Response> {
+    if !origin_allowed(&headers) {
+        return Err((StatusCode::FORBIDDEN, "Origin not allowed").into_response());
+    }
+    let (session, access_token, nonce, granted_scope) =
+        authed_access_token(&state, &req.broker_token)
+            .await
+            .map_err(IntoResponse::into_response)?;
+
+    let record: serde_json::Value = serde_json::from_str(req.record.get())
+        .map_err(|_| (StatusCode::BAD_REQUEST, "record must be JSON").into_response())?;
+    if let Some(reason) = enroll_refusal(&record, &session.did, &req.signer_public_key) {
+        return Err((StatusCode::BAD_REQUEST, reason).into_response());
+    }
+    let collection = record["$type"].as_str().unwrap_or_default();
+    let needed = format!("repo:{collection}?action=create");
+    let granted = granted_scope
+        .split_whitespace()
+        .any(|s| s == needed || s == "transition:generic");
+    if !granted {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "insufficient_scope" })),
+        )
+            .into_response());
+    }
+
+    let url = format!("{}/xrpc/com.atproto.repo.createRecord", session.pds_url);
+    let body = CreateRecordBody {
+        repo: &session.did,
+        collection,
+        record: &req.record,
+    };
+    let (status, text) = pds_dpop_post(&session, &access_token, nonce, &url, body)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("PDS call failed: {e}")).into_response())?;
+    if !status.is_success() {
+        tracing::warn!(did = %session.did, status = %status, "enroll createRecord failed");
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("PDS rejected record: {text}"),
+        )
+            .into_response());
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::json!({}));
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "uri": parsed.get("uri"),
+        "cid": parsed.get("cid"),
+    })))
 }
 
 // ── PFP avatar delegation ──────────────────────────────────────────────────
@@ -1472,7 +1596,7 @@ async fn pfp_set_avatar(
         ));
     }
 
-    let (record, access_token, nonce) = authed_access_token(&state, &req.broker_token).await?;
+    let (record, access_token, nonce, _) = authed_access_token(&state, &req.broker_token).await?;
 
     // 1. uploadBlob (avatar)
     let upload_url = format!("{}/xrpc/com.atproto.repo.uploadBlob", record.pds_url);
@@ -2009,6 +2133,60 @@ mod tests {
             ("host", "irc.zerosum.org"),
             ("origin", "https://evil.example"),
         ])));
+    }
+
+    fn enroll_key() -> freeq_sdk::crypto::PrivateKey {
+        freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&[3; 32]).unwrap()
+    }
+
+    fn retirement_dated(created_at: &str) -> serde_json::Value {
+        let key = enroll_key();
+        serde_json::to_value(
+            freeq_sdk::identity_records::build_device_retirement(
+                &key,
+                "did:plc:x",
+                "some-other-kid",
+                created_at,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_retirement_must_be_dated_now() {
+        let signer = enroll_key().public_key_multibase();
+        let now = chrono::Utc::now();
+        let dated = |t: chrono::DateTime<chrono::Utc>| t.to_rfc3339();
+
+        assert_eq!(
+            enroll_refusal(&retirement_dated(&dated(now)), "did:plc:x", &signer),
+            None
+        );
+        for stale in [
+            now - chrono::Duration::days(1),
+            now + chrono::Duration::days(1),
+        ] {
+            assert_eq!(
+                enroll_refusal(&retirement_dated(&dated(stale)), "did:plc:x", &signer),
+                Some("retirement createdAt must be the current time")
+            );
+        }
+    }
+
+    #[test]
+    fn a_device_record_may_carry_an_old_date() {
+        let key = enroll_key();
+        let day_ago = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let record = serde_json::to_value(
+            freeq_sdk::identity_records::build_device_record(&key, "did:plc:x", &day_ago, None)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            enroll_refusal(&record, "did:plc:x", &key.public_key_multibase()),
+            None
+        );
     }
 
     #[tokio::test]

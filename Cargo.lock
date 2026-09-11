@@ -2593,6 +2593,7 @@ dependencies = [
  "base64",
  "chrono",
  "freeq-oauth",
+ "freeq-sdk",
  "freeq-ssrf",
  "hkdf",
  "hmac",

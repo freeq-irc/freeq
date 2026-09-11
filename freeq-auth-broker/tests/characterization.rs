@@ -528,7 +528,7 @@ async fn client_metadata_document() {
     // The advertised scope union (incl. transition:generic grace period).
     assert_eq!(
         json["scope"],
-        "atproto blob:image/* repo:app.bsky.actor.profile repo:blue.irc.media?action=create repo:app.bsky.feed.post transition:generic"
+        "atproto blob:image/* repo:app.bsky.actor.profile repo:blue.irc.media?action=create repo:app.bsky.feed.post repo:at.freeq.deviceKey?action=create repo:at.freeq.agentKey?action=create transition:generic"
     );
     assert_eq!(
         json["grant_types"],
@@ -1441,4 +1441,206 @@ async fn graph_unfollow_only_own_repo_records() {
     assert_eq!(method, "com.atproto.repo.deleteRecord");
     assert_eq!(body["rkey"], "3kabc");
     assert_eq!(body["repo"], "did:plc:alice123");
+}
+
+// ═══ POST /enroll ═══════════════════════════════════════════════════════
+
+use freeq_sdk::crypto::PrivateKey;
+use freeq_sdk::identity_records::{build_device_record, record_signed_bytes};
+
+/// The scope a sign-in with `intent=enroll` asks for.
+const ENROLL_SCOPE: &str =
+    "atproto repo:at.freeq.deviceKey?action=create repo:at.freeq.agentKey?action=create";
+
+#[derive(Default)]
+struct RawPdsCapture {
+    /// (xrpc method, raw request body) per request, in order.
+    calls: Vec<(String, String)>,
+}
+
+/// A PDS that keeps each request body as it arrived on the wire.
+fn mock_pds_raw(cap: Arc<std::sync::Mutex<RawPdsCapture>>) -> axum::Router {
+    use axum::extract::Path;
+    use axum::routing::post;
+    axum::Router::new().route(
+        "/xrpc/{method}",
+        post(move |Path(method): Path<String>, body: Bytes| {
+            let cap = cap.clone();
+            async move {
+                let text = String::from_utf8(body.to_vec()).unwrap();
+                cap.lock().unwrap().calls.push((method, text));
+                axum::Json(serde_json::json!({
+                    "uri": "at://did:plc:alice123/at.freeq.deviceKey/3kdevice",
+                    "cid": "bafydevice",
+                }))
+            }
+        }),
+    )
+}
+
+/// A broker whose session BT1 refreshes to `scope` (None: the field is
+/// absent), writing to a PDS that records what it receives.
+async fn enroll_setup(scope: Option<&str>) -> (String, Arc<std::sync::Mutex<RawPdsCapture>>) {
+    let server_url = spawn(mock_freeq_server(Default::default())).await;
+    let token_url = spawn(mock_refresh_endpoint(rotate_state(scope))).await;
+    let pds_cap = Arc::new(std::sync::Mutex::new(RawPdsCapture::default()));
+    let pds_url = spawn(mock_pds_raw(pds_cap.clone())).await;
+    let state = broker_state(&server_url);
+    seed_session(&state, "BT1", "R0", &format!("{token_url}/token"), &pds_url).await;
+    (spawn(router(state)).await, pds_cap)
+}
+
+fn device_key(seed: u8) -> PrivateKey {
+    PrivateKey::ed25519_from_bytes(&[seed; 32]).unwrap()
+}
+
+/// Re-sign `record` with `key` after a field was changed, so only the
+/// changed field is wrong.
+fn resigned(mut record: serde_json::Value, key: &PrivateKey) -> serde_json::Value {
+    record["bindingSig"] = serde_json::json!(key.sign_base64url(&record_signed_bytes(&record)));
+    record
+}
+
+/// POST /enroll with the record written out as `record_text`, verbatim.
+async fn enroll_call(base: &str, record_text: &str, signer: &PrivateKey) -> reqwest::Response {
+    let body = format!(
+        r#"{{"broker_token":"BT1","record":{record_text},"signer_public_key":"{}"}}"#,
+        signer.public_key_multibase()
+    );
+    http()
+        .post(format!("{base}/enroll"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn enroll_writes_the_device_record_as_sent() {
+    let (base, cap) = enroll_setup(Some(ENROLL_SCOPE)).await;
+    let key = device_key(1);
+    let record = build_device_record(
+        &key,
+        "did:plc:alice123",
+        "2026-09-11T00:00:00Z",
+        Some("laptop"),
+    )
+    .unwrap();
+    // Field order as the struct writes it, which is not sorted: a record
+    // that went through a map on the way would arrive reordered.
+    let record_text = serde_json::to_string(&record).unwrap();
+    assert!(record_text.starts_with(r#"{"$type":"at.freeq.deviceKey","did":"#));
+
+    let resp = enroll_call(&base, &record_text, &key).await;
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(
+        json["uri"],
+        "at://did:plc:alice123/at.freeq.deviceKey/3kdevice"
+    );
+    assert_eq!(json["cid"], "bafydevice");
+
+    let c = cap.lock().unwrap();
+    assert_eq!(c.calls.len(), 1);
+    let (method, body) = &c.calls[0];
+    assert_eq!(method, "com.atproto.repo.createRecord");
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(parsed["repo"], "did:plc:alice123");
+    assert_eq!(parsed["collection"], "at.freeq.deviceKey");
+    assert!(
+        body.contains(&format!(r#""record":{record_text}"#)),
+        "the record was not forwarded byte for byte: {body}"
+    );
+}
+
+#[tokio::test]
+async fn enroll_refuses_a_bad_binding_signature_before_the_pds() {
+    let (base, cap) = enroll_setup(Some(ENROLL_SCOPE)).await;
+    let key = device_key(1);
+    let mut record = serde_json::to_value(
+        build_device_record(&key, "did:plc:alice123", "2026-09-11T00:00:00Z", None).unwrap(),
+    )
+    .unwrap();
+    let sig = record["bindingSig"].as_str().unwrap().to_string();
+    let flipped = if sig.starts_with('A') { 'B' } else { 'A' };
+    record["bindingSig"] = serde_json::json!(format!("{flipped}{}", &sig[1..]));
+
+    let resp = enroll_call(&base, &record.to_string(), &key).await;
+    assert_eq!(resp.status(), 400);
+    assert!(cap.lock().unwrap().calls.is_empty());
+}
+
+#[tokio::test]
+async fn enroll_refuses_a_record_that_is_not_the_sessions_own_key() {
+    let (base, cap) = enroll_setup(Some(ENROLL_SCOPE)).await;
+    let key = device_key(1);
+    let good = serde_json::to_value(
+        build_device_record(&key, "did:plc:alice123", "2026-09-11T00:00:00Z", None).unwrap(),
+    )
+    .unwrap();
+
+    let mut wrong_type = good.clone();
+    wrong_type["$type"] = serde_json::json!("app.bsky.feed.post");
+    let wrong_type = resigned(wrong_type, &key);
+
+    let other_did = serde_json::to_value(
+        build_device_record(&key, "did:plc:someoneelse", "2026-09-11T00:00:00Z", None).unwrap(),
+    )
+    .unwrap();
+
+    let mut wrong_kid = good.clone();
+    wrong_kid["kid"] = serde_json::json!(
+        build_device_record(
+            &device_key(3),
+            "did:plc:alice123",
+            "2026-09-11T00:00:00Z",
+            None
+        )
+        .unwrap()
+        .kid
+    );
+    let wrong_kid = resigned(wrong_kid, &key);
+
+    let mut other_key = good.clone();
+    other_key["publicKeyMultibase"] = serde_json::json!(device_key(2).public_key_multibase());
+    let other_key = resigned(other_key, &key);
+
+    for (name, record) in [
+        ("wrong $type", wrong_type),
+        ("another account's DID", other_did),
+        ("kid of another key", wrong_kid),
+        ("announces another key", other_key),
+    ] {
+        let resp = enroll_call(&base, &record.to_string(), &key).await;
+        assert_eq!(resp.status(), 400, "{name}");
+    }
+    assert!(cap.lock().unwrap().calls.is_empty());
+}
+
+#[tokio::test]
+async fn enroll_needs_the_grant() {
+    let (base, cap) = enroll_setup(Some("atproto")).await;
+    let key = device_key(1);
+    let record =
+        build_device_record(&key, "did:plc:alice123", "2026-09-11T00:00:00Z", None).unwrap();
+
+    let resp = enroll_call(&base, &serde_json::to_string(&record).unwrap(), &key).await;
+    assert_eq!(resp.status(), 403);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json, serde_json::json!({ "error": "insufficient_scope" }));
+    assert!(cap.lock().unwrap().calls.is_empty());
+}
+
+#[tokio::test]
+async fn enroll_allows_a_legacy_session_whose_refresh_names_no_scope() {
+    let (base, cap) = enroll_setup(None).await;
+    let key = device_key(1);
+    let record =
+        build_device_record(&key, "did:plc:alice123", "2026-09-11T00:00:00Z", None).unwrap();
+
+    let resp = enroll_call(&base, &serde_json::to_string(&record).unwrap(), &key).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(cap.lock().unwrap().calls.len(), 1);
 }

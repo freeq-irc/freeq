@@ -273,7 +273,7 @@ pub fn fold_agent_records(
                 let Some(public_key) = signer_live_at(&devices, &record.kid, created_at) else {
                     continue;
                 };
-                if !verify_binding(public_key, &record_signed_bytes(value), &record.binding_sig) {
+                if !verify_record_binding(value, public_key) {
                     continue;
                 }
                 links.push(LinkCandidate {
@@ -306,7 +306,7 @@ pub fn fold_agent_records(
         let Some(public_key) = signer_live_at(&devices, &record.kid, created_at) else {
             continue;
         };
-        if !verify_binding(public_key, &record_signed_bytes(value), &record.binding_sig) {
+        if !verify_record_binding(value, public_key) {
             continue;
         }
         let retired = &mut links[target].retired_at;
@@ -352,11 +352,7 @@ fn device_state(did: &str, records: &[serde_json::Value]) -> Vec<Candidate> {
                 if record.kid != derive_kid_bytes(&raw) {
                     continue;
                 }
-                if !verify_binding(
-                    &public_key,
-                    &record_signed_bytes(value),
-                    &record.binding_sig,
-                ) {
+                if !verify_record_binding(value, &public_key) {
                     continue;
                 }
                 keys.push(Candidate {
@@ -400,8 +396,7 @@ fn device_state(did: &str, records: &[serde_json::Value]) -> Vec<Candidate> {
         if signer != target && keys[signer].retired_at.is_some_and(|r| r <= created_at) {
             continue;
         }
-        let message = record_signed_bytes(value);
-        if !verify_binding(&keys[signer].public_key, &message, &record.binding_sig) {
+        if !verify_record_binding(value, &keys[signer].public_key) {
             continue;
         }
         let retired = &mut keys[target].retired_at;
@@ -469,11 +464,18 @@ fn ed25519_from_multibase(multibase: &str) -> Option<(PublicKey, [u8; 32])> {
     }
 }
 
-fn verify_binding(public_key: &PublicKey, message: &[u8], binding_sig: &str) -> bool {
+/// Whether `record`'s `bindingSig` checks under `signer` over the record's
+/// signed bytes. Pass the record exactly as received.
+pub fn verify_record_binding(record: &serde_json::Value, signer: &PublicKey) -> bool {
+    let Some(binding_sig) = record.get("bindingSig").and_then(|s| s.as_str()) else {
+        return false;
+    };
     let Ok(signature) = URL_SAFE_NO_PAD.decode(binding_sig) else {
         return false;
     };
-    public_key.verify(message, &signature).is_ok()
+    signer
+        .verify(&record_signed_bytes(record), &signature)
+        .is_ok()
 }
 
 // ─── reading from the account's PDS ─────────────────────────────────────
@@ -823,6 +825,28 @@ mod tests {
         let sig = record["bindingSig"].as_str().unwrap().to_string();
         record["bindingSig"] = json!(format!("A{}", &sig[1..]));
         assert!(fold_device_records(ALICE, &[record], instant(T1)).is_empty());
+    }
+
+    #[test]
+    fn verify_record_binding_checks_the_signer_over_every_field() {
+        let signer = PublicKey::from_multibase(&key(1).public_key_multibase()).unwrap();
+        let other = PublicKey::from_multibase(&key(2).public_key_multibase()).unwrap();
+        let record = value(&build_device_record(&key(1), ALICE, T0, Some("laptop")).unwrap());
+        assert!(verify_record_binding(&record, &signer));
+        assert!(!verify_record_binding(&record, &other));
+
+        let mut altered = record.clone();
+        altered["label"] = json!("phone");
+        assert!(!verify_record_binding(&altered, &signer));
+
+        let mut unsigned = record.clone();
+        unsigned.as_object_mut().unwrap().remove("bindingSig");
+        assert!(!verify_record_binding(&unsigned, &signer));
+
+        let retirement = value(&build_device_retirement(&key(2), ALICE, &kid_of(1), T1).unwrap());
+        assert!(verify_record_binding(&retirement, &other));
+        let link = value(&build_agent_record(&key(1), ALICE, &agent_did(), T1, None).unwrap());
+        assert!(verify_record_binding(&link, &signer));
     }
 
     #[test]
