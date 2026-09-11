@@ -10,7 +10,7 @@ Layer 2: Mutual Hello/HelloAck              — BOTH sides agree to peer
 Layer 3: Signed Message Envelopes           — messages can't be tampered
 Layer 4: Capability-Based Trust             — WHAT each peer can do
 Layer 5: Key Rotation & Revocation          — operational safety
-Layer 6: DID-based server identity — the did:web document and key set
+Layer 6: DID-Based Server Identity          — the did:web document and key set
 ```
 
 All layers are implemented and active.
