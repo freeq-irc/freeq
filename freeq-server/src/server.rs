@@ -1520,10 +1520,20 @@ fn load_media_key_seed(data_dir: &str, signing_key: &ed25519_dalek::SigningKey) 
         )
     };
     match crate::secrets::write_secret(&key_path, &seed) {
-        Ok(()) => tracing::info!("Generated media key at {} {case}", key_path.display()),
-        Err(e) => tracing::error!("Failed to persist media key: {e}"),
+        Ok(()) => {
+            tracing::info!("Generated media key at {} {case}", key_path.display());
+            seed
+        }
+        Err(e) => {
+            // A seed that was not saved would differ on the next start, so
+            // fall back to the one derivation that is the same every start.
+            tracing::error!(
+                "Failed to persist media key at {}: {e}; deriving media keys from the signing key",
+                key_path.display()
+            );
+            signing_key.to_bytes()
+        }
     }
-    seed
 }
 
 /// Whether `dir` holds at least one file, at any depth.
@@ -17701,6 +17711,25 @@ mod media_key_tests {
         let seed = media_key_file(dir.path());
         assert_eq!(seed.len(), 32);
         assert_ne!(seed, state.msg_signing_key.to_bytes().to_vec());
+    }
+
+    /// A seed that could not be saved would differ on the next start, so an
+    /// unwritable data dir gets the signing-key derivation instead.
+    #[test]
+    fn an_unwritable_data_dir_falls_back_to_the_signing_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(dir.path().join("probe"), b"x").is_ok() {
+            // Running as root: permissions do not bind, nothing to test.
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let seed = load_media_key_seed(dir.path().to_str().unwrap(), &signing_key);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(seed, signing_key.to_bytes());
+        assert!(!dir.path().join("media-key.secret").exists());
     }
 
     #[test]
