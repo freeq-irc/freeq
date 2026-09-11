@@ -1445,6 +1445,43 @@ fn load_msg_signing_key(data_dir: &str) -> ed25519_dalek::SigningKey {
     key
 }
 
+/// Replace `{data_dir}/msg-signing-key.secret` with a new key. `None` when the
+/// file cannot be written, so the old key stays in use rather than being
+/// retired while it is still the one on disk.
+fn rotate_msg_signing_key(data_dir: &str) -> Option<ed25519_dalek::SigningKey> {
+    let key_path = std::path::Path::new(data_dir).join("msg-signing-key.secret");
+    let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    match crate::secrets::write_secret(&key_path, &key.to_bytes()) {
+        Ok(()) => Some(key),
+        Err(e) => {
+            tracing::error!(
+                "Could not write a new signing key to {}: {e}; not rotating",
+                key_path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Stamp the rotated-out key retired in this server's own key store, after
+/// the new key has been registered.
+fn retire_rotated_signing_key(state: &Arc<SharedState>, old: &ed25519_dalek::SigningKey) {
+    let did = server_did(&state.server_name);
+    let old_kid = freeq_sdk::sigtag::derive_kid(&old.verifying_key());
+    let new_kid = freeq_sdk::sigtag::derive_kid(&state.msg_signing_key.verifying_key());
+    let now = chrono::Utc::now().timestamp();
+    match state.with_db(|db| db.retire_signing_key(&did, &old_kid, now)) {
+        Some(true) => {}
+        Some(false) => tracing::warn!(%old_kid, "The old signing key was not on file to retire"),
+        None => tracing::warn!(%old_kid, "No database; the old signing key is not retired"),
+    }
+    tracing::warn!(
+        %old_kid, %new_kid,
+        "Rotated the server's message signing key. Remove --rotate-signing-key now: \
+         while it is set, the key rotates again on every start"
+    );
+}
+
 /// The seed the media store's keys are derived from, kept in
 /// `{data_dir}/media-key.secret` so it does not change when the signing key
 /// does.
@@ -1720,6 +1757,18 @@ impl Server {
             }
         } else {
             None
+        };
+
+        // A rotation takes effect only now: the database and media keys fall
+        // back to the key on disk when their own files are missing, so both
+        // were read from it first.
+        let (msg_signing_key, rotated_out) = if self.config.rotate_signing_key {
+            match rotate_msg_signing_key(self.config.data_dir.as_deref().unwrap_or(".")) {
+                Some(new) => (new, Some(msg_signing_key)),
+                None => (msg_signing_key, None),
+            }
+        } else {
+            (msg_signing_key, None)
         };
 
         // Load persisted state from DB
@@ -2008,6 +2057,9 @@ impl Server {
             metrics: Metrics::default(),
         });
         register_server_signing_key(&state);
+        if let Some(old) = rotated_out {
+            retire_rotated_signing_key(&state, &old);
+        }
         Ok(state)
     }
 
@@ -17670,5 +17722,85 @@ mod media_key_tests {
         )
         .unwrap();
         assert_eq!(by_seed.get("ijklmnop").unwrap(), b"after restart");
+    }
+}
+
+#[cfg(test)]
+mod signing_key_rotation_tests {
+    use super::*;
+
+    /// Start a server state on `dir`, rotating the signing key if asked.
+    fn start(dir: &std::path::Path, rotate: bool) -> Arc<SharedState> {
+        let config = ServerConfig {
+            server_name: "rotation-test".to_string(),
+            data_dir: Some(dir.to_str().unwrap().to_string()),
+            db_path: Some(dir.join("irc.db").to_str().unwrap().to_string()),
+            rotate_signing_key: rotate,
+            ..Default::default()
+        };
+        Server::new(config).build_state().unwrap()
+    }
+
+    fn key_file(dir: &std::path::Path) -> Vec<u8> {
+        std::fs::read(dir.join("msg-signing-key.secret")).unwrap()
+    }
+
+    fn kid_of(key: &ed25519_dalek::SigningKey) -> String {
+        freeq_sdk::sigtag::derive_kid(&key.verifying_key())
+    }
+
+    #[test]
+    fn rotating_retires_the_old_key_and_files_the_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]);
+        crate::secrets::write_secret(&dir.path().join("msg-signing-key.secret"), &old.to_bytes())
+            .unwrap();
+        let first = start(dir.path(), false);
+        assert_eq!(first.msg_signing_key.to_bytes(), old.to_bytes());
+        drop(first);
+
+        let rotated = start(dir.path(), true);
+        let new = rotated.msg_signing_key.clone();
+        assert_ne!(new.to_bytes(), old.to_bytes());
+        assert_eq!(
+            key_file(dir.path()),
+            new.to_bytes().to_vec(),
+            "the file holds the new key"
+        );
+        let set = rotated
+            .with_db(|db| db.get_signing_key_set(&server_did("rotation-test")))
+            .expect("a database");
+        let row = |kid: &str| set.iter().find(|r| r.kid == kid).cloned();
+        let old_row = row(&kid_of(&old)).expect("the old key stays listed");
+        assert!(old_row.removed_at.is_some(), "the old key is retired");
+        let new_row = row(&kid_of(&new)).expect("the new key is filed");
+        assert_eq!(new_row.removed_at, None, "the new key is live");
+        assert_eq!(new_row.source.as_deref(), Some("local-session"));
+        drop(rotated);
+
+        let third = start(dir.path(), false);
+        assert_eq!(
+            third.msg_signing_key.to_bytes(),
+            new.to_bytes(),
+            "a plain start keeps it"
+        );
+        assert_eq!(key_file(dir.path()), new.to_bytes().to_vec());
+    }
+
+    #[test]
+    fn rotating_leaves_stored_attachments_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = start(dir.path(), false);
+        first
+            .media_store
+            .as_ref()
+            .expect("media store")
+            .put("abcdefgh", b"kept across rotation")
+            .unwrap();
+        drop(first);
+
+        let rotated = start(dir.path(), true);
+        let store = rotated.media_store.as_ref().expect("media store");
+        assert_eq!(store.get("abcdefgh").unwrap(), b"kept across rotation");
     }
 }

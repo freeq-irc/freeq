@@ -136,6 +136,13 @@ pub struct ServerConfig {
     #[arg(long)]
     pub data_dir: Option<String>,
 
+    /// Replace the server's message signing key at startup: a new key is
+    /// generated and written to msg-signing-key.secret, and the old key is
+    /// retired in the key store. It rotates on every start while set, so
+    /// remove it after one.
+    #[arg(long)]
+    pub rotate_signing_key: bool,
+
     /// TEST/DEV ONLY: resolve these DIDs from a static in-memory map instead of
     /// the network. Comma-separated `did=<publicKeyMultibase>` entries. When set,
     /// the server uses a static DID resolver (no HTTP/PLC lookups). Used by the
@@ -380,6 +387,7 @@ impl Default for ServerConfig {
             s2s_peer_trust: vec![],
             server_did: None,
             data_dir: None,
+            rotate_signing_key: false,
             did_resolver_static: vec![],
             max_messages_per_channel: 10000,
             act_expiry_secs: 604_800,
@@ -524,6 +532,7 @@ struct FileConfig {
     s2s_peer_trust: Option<MapOrPairs>,
     server_did: Option<String>,
     data_dir: Option<String>,
+    rotate_signing_key: Option<bool>,
     did_resolver_static: Option<MapOrPairs>,
     max_messages_per_channel: Option<usize>,
     act_expiry_secs: Option<u64>,
@@ -664,6 +673,7 @@ fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConf
         allowed_dids,
         allowed_did_domains,
         no_guest,
+        rotate_signing_key,
         reverify_identity_mins,
         message_retention_days,
         event_retention_days,

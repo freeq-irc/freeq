@@ -157,6 +157,7 @@ freeq-server --config /etc/freeq/server.toml
 | `--db-path` | *(none — in-memory)* | SQLite database file |
 | `--migrate-to` | *(none)* | Run the schema ladder to this version and exit (see [Schema migrations](#schema-migrations)) |
 | `--data-dir` | parent of `--db-path` | Directory for keys and iroh state |
+| `--rotate-signing-key` | off | Replaces the server's message signing key with a new one at startup and marks the old key retired in the server's key store. Use it when the key may have leaked or the host was rebuilt from a copy. It rotates once per start, so remove the flag after that start. |
 | `--max-messages-per-channel` | `10000` | Prune oldest messages beyond this count |
 
 ### Identity & Auth
