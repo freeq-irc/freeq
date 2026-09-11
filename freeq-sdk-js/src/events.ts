@@ -38,6 +38,12 @@ export interface FreeqEvents {
    *  to sign in again with the permission to publish it. */
   signingKeyUnpublished: () => void;
 
+  /** A signature's verdict that was `pending` when its line was delivered,
+   *  now known. `msgid` is the id the signature covers — a message's
+   *  `msgid` tag, a TAGMSG's `+freeq.at/eventid` — so the line can be
+   *  updated in place. */
+  verdict: (msgid: string, verdict: import('./verdict.js').Verdict) => void;
+
   /** Fired when a new message arrives in a channel or DM. */
   message: (channel: string, message: Message) => void;
 

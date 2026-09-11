@@ -215,6 +215,33 @@ export async function foldDeviceRecords(
     }));
 }
 
+/** A device key of the account, with the retirement the fold accepted for it. */
+export interface DeviceKeyHistory {
+  kid: string;
+  publicKeyMultibase: string;
+  createdAt: Date;
+  retiredAt: Date | null;
+  record: unknown;
+}
+
+/**
+ * Every checked device key of `did`, earliest first, each with the date of
+ * the retirement that counts for it, if any. Retirements the fold ignores
+ * (wrong signer, dated before the key) are not reflected.
+ */
+export async function deviceKeyHistory(
+  did: string,
+  records: unknown[],
+): Promise<DeviceKeyHistory[]> {
+  return (await deviceState(did, records)).map((k) => ({
+    kid: k.kid,
+    publicKeyMultibase: k.publicKeyMultibase,
+    createdAt: new Date(k.createdAt),
+    retiredAt: k.retiredAt === null ? null : new Date(k.retiredAt),
+    record: k.record,
+  }));
+}
+
 /**
  * The bots `did` claims at `at`, earliest first. A claim counts only if the
  * owner key that signed it was itself live under the device fold when the

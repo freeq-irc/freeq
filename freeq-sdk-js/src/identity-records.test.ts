@@ -217,6 +217,24 @@ function resolverFor(did: string, pds: string | undefined) {
   return async (): Promise<DidDocument> => doc;
 }
 
+describe('device key history', () => {
+  it('carries the retirement the fold accepted', async () => {
+    // An earlier retirement signed by a key the account never published is
+    // ignored; the later one, signed by the key itself, counts.
+    const { deviceKeyHistory } = await import('./identity-records.js');
+    const [k1, k2] = [await key(1), await key(2)];
+    const records = [
+      await buildDeviceRecord(k1, ALICE, T0),
+      await buildDeviceRetirement(k2, ALICE, await kidOf(k1), T1),
+      await buildDeviceRetirement(k1, ALICE, await kidOf(k1), T2),
+    ];
+    const history = await deviceKeyHistory(ALICE, records);
+    expect(history.map((k) => k.kid)).toEqual([await kidOf(k1)]);
+    expect(history[0]!.createdAt).toEqual(new Date(T0));
+    expect(history[0]!.retiredAt).toEqual(new Date(T2));
+  });
+});
+
 describe('reading records from a PDS', () => {
   it('reads every page until the PDS stops sending a cursor', async () => {
     const [k1, k2] = [await key(1), await key(2)];

@@ -7,8 +7,8 @@ import { webcrypto } from 'node:crypto';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { type DidKey, decodeMultibaseEd25519, importDidKey } from './did-key.js';
-import { type DidDocument, buildDeviceRecord } from './identity-records.js';
-import { KeyLookup } from './key-lookup.js';
+import { type DidDocument, buildDeviceRecord, buildDeviceRetirement } from './identity-records.js';
+import { KeyLookup, makeDidResolver } from './key-lookup.js';
 import { deriveKid } from './signing.js';
 
 const ALICE = 'did:plc:k2n3e2vsihf3farequ44t5j7';
@@ -98,6 +98,7 @@ describe('KeyLookup', () => {
     expect(await lookup.keyFor(ALICE, await kidOf(1))).toEqual({
       publicKey: await raw(1),
       source: 'IdentityRecord',
+      retiredAt: null,
     });
     expect(hits.origin).toBe(0);
   });
@@ -111,6 +112,7 @@ describe('KeyLookup', () => {
     expect(await lookup.keyFor(ALICE, await kidOf(2))).toEqual({
       publicKey: await raw(2),
       source: 'OriginServer',
+      retiredAt: null,
     });
     expect(hits.origin).toBe(1);
   });
@@ -147,6 +149,7 @@ describe('KeyLookup', () => {
     expect(await lookup.keyFor(WEB_SIGNER, await kidOf(4))).toEqual({
       publicKey: await raw(4),
       source: 'DidDocument',
+      retiredAt: null,
     });
     expect(hits.origin).toBe(0);
   });
@@ -220,5 +223,96 @@ describe('KeyLookup', () => {
     vi.setSystemTime(new Date('2026-09-11T01:01:00Z'));
     expect(await lookup.keyFor(ALICE, await kidOf(1))).toEqual(first);
     expect(hits.pds).toBe(2);
+  });
+
+  it('folds the records at the time asked, from one listing', async () => {
+    const { fetch, hits } = network([
+      await buildDeviceRecord(await key(1), ALICE, T0),
+      await buildDeviceRetirement(await key(1), ALICE, await kidOf(1), '2026-03-01T00:00:00Z'),
+    ]);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR);
+    const kid = await kidOf(1);
+    expect((await lookup.keyForAt(ALICE, kid, new Date('2026-02-01T00:00:00Z')))?.source).toBe(
+      'IdentityRecord',
+    );
+    expect(await lookup.keyForAt(ALICE, kid, new Date('2026-04-01T00:00:00Z'))).toBeNull();
+    expect(await lookup.keyForAt(ALICE, kid, new Date('2025-12-01T00:00:00Z'))).toBeNull();
+    expect(hits.pds).toBe(1);
+  });
+
+  it('carries the date the origin removed a key', async () => {
+    const key2 = await raw(2);
+    const fetch = vi.fn(async (input: string): Promise<Response> => {
+      const url = new URL(input);
+      if (url.origin === PDS) return Response.json({ records: [] });
+      return Response.json({ public_key: b64url(key2), removed_at: 1_780_000_000 });
+    });
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR);
+    expect(await lookup.keyFor(ALICE, await kidOf(2))).toEqual({
+      publicKey: key2,
+      source: 'OriginServer',
+      retiredAt: 1_780_000_000,
+    });
+  });
+
+  it('asks a default origin only when none was given', async () => {
+    const { fetch } = network([], { [`${ALICE} ${await kidOf(2)}`]: await raw(2) });
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR);
+    expect(lookup.originBase()).toBeNull();
+    lookup.setDefaultOriginBase(ORIGIN);
+    expect(lookup.originBase()).toBe(ORIGIN);
+    expect((await lookup.keyFor(ALICE, await kidOf(2)))?.source).toBe('OriginServer');
+
+    const given = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR);
+    given.setDefaultOriginBase('https://elsewhere.example');
+    expect(given.originBase()).toBe(ORIGIN);
+  });
+});
+
+describe('makeDidResolver', () => {
+  it('resolves a did:plc from the directory and a did:web from its host', async () => {
+    const plcDoc = {
+      '@context': ['https://www.w3.org/ns/did/v1'],
+      id: ALICE,
+      alsoKnownAs: ['at://alice.test'],
+      verificationMethod: [
+        {
+          id: `${ALICE}#atproto`,
+          type: 'Multikey',
+          controller: ALICE,
+          publicKeyMultibase: (await key(1)).publicKeyMultibase,
+        },
+      ],
+      service: [{ id: '#atproto_pds', type: 'AtprotoPersonalDataServer', serviceEndpoint: PDS }],
+    };
+    const webDoc = {
+      '@context': ['https://www.w3.org/ns/did/v1'],
+      id: WEB_SIGNER,
+      verificationMethod: [
+        {
+          id: `${WEB_SIGNER}#freeq`,
+          type: 'Multikey',
+          controller: WEB_SIGNER,
+          publicKeyMultibase: (await key(4)).publicKeyMultibase,
+        },
+      ],
+    };
+    const asked: string[] = [];
+    const fetch = vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      // The PLC resolver percent-encodes the DID in its path.
+      const url = decodeURIComponent(String(input instanceof Request ? input.url : input));
+      asked.push(url);
+      if (url === `https://plc.directory/${ALICE}`) return Response.json(plcDoc);
+      if (url === 'https://bot.example.com/.well-known/did.json') return Response.json(webDoc);
+      return new Response('not found', { status: 404 });
+    });
+    const resolve = makeDidResolver({ fetch: fetch as unknown as typeof globalThis.fetch });
+    expect((await resolve(ALICE)).service?.[0]?.serviceEndpoint).toBe(PDS);
+    expect((await resolve(WEB_SIGNER)).verificationMethod?.[0]?.id).toBe(`${WEB_SIGNER}#freeq`);
+    expect(asked).toEqual([
+      `https://plc.directory/${ALICE}`,
+      'https://bot.example.com/.well-known/did.json',
+    ]);
+    await expect(resolve('did:key:z6Mkabc')).rejects.toThrow();
   });
 });

@@ -302,3 +302,108 @@ describe('publishing the device key through the broker', () => {
     expect(enrollCalls).toEqual([]);
   });
 });
+
+describe('a stored key the account has retired', () => {
+  const RETIRED = '2026-09-12T10:00:00.000Z';
+
+  /** The account's device records for `stored`: its record, and a
+   *  retirement signed by the key itself when `retired`. */
+  async function accountRecords(stored: StoredDeviceKey, retired: boolean): Promise<unknown[]> {
+    const { buildDeviceRecord, buildDeviceRetirement } = await import('./identity-records.js');
+    const { recordKeyOf } = await import('./device-key.js');
+    const key = await recordKeyOf(stored.keyPair);
+    const record = await buildDeviceRecord(key, DID, stored.createdAt);
+    if (!retired) return [record];
+    const kid = await deriveKid(decodeMultibaseEd25519(key.publicKeyMultibase));
+    return [record, await buildDeviceRetirement(key, DID, kid, RETIRED)];
+  }
+
+  /** A client whose record reader lists `records` for the account; how many
+   *  listings it served. */
+  async function clientReading(
+    store: MemoryDeviceKeyStore,
+    records: () => unknown[],
+    freshSignIn?: boolean,
+  ) {
+    const { FreeqClient } = await import('./client.js');
+    const { KeyLookup } = await import('./key-lookup.js');
+    let listings = 0;
+    const reader = {
+      fetch: async (url: string): Promise<Response> => {
+        if (!url.includes('com.atproto.repo.listRecords')) return new Response('{}', { status: 404 });
+        listings++;
+        return Response.json({
+          records: records().map((value) => ({ uri: 'at://x', cid: 'bafy', value })),
+        });
+      },
+      resolveDid: async (did: string) => ({
+        id: did,
+        service: [{ type: 'AtprotoPersonalDataServer', serviceEndpoint: 'https://pds.test.example' }],
+      }),
+    };
+    const client = new FreeqClient({
+      url: 'wss://test/irc',
+      nick: 'alice',
+      skipInitialBrokerRefresh: true,
+      brokerUrl: BROKER,
+      brokerToken: 'BT1',
+      deviceKeyStore: store,
+      deviceLabel: 'Chrome',
+      keyLookup: new KeyLookup(reader, null, 60_000),
+      ...(freshSignIn === undefined ? {} : { freshSignIn }),
+    });
+    client.setSaslCredentials({ token: 't', did: DID, pdsUrl: 'https://pds.example', method: 'oauth' });
+    return { client, listings: () => listings };
+  }
+
+  it('is replaced right after a new sign-in, and the new key is published', async () => {
+    const old = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3old');
+    const records = await accountRecords(old, true);
+    const store = new MemoryDeviceKeyStore(old);
+    const { client } = await clientReading(store, () => records, true);
+    const ws = await login(client);
+
+    expect(msgsigOf(ws)).not.toBe(await rawPublicB64(old.keyPair));
+    const now = (await store.load())!;
+    expect(now.keyPair).not.toBe(old.keyPair);
+    expect(msgsigOf(ws)).toBe(await rawPublicB64(now.keyPair));
+    await until(() => enrollCalls.length > 0);
+    expect(enrollCalls).toHaveLength(1);
+    expect(enrollCalls[0]!.record.publicKeyMultibase).toBeDefined();
+  });
+
+  it('is not replaced when it is still live', async () => {
+    const live = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3live');
+    const records = await accountRecords(live, false);
+    const store = new MemoryDeviceKeyStore(live);
+    const { client } = await clientReading(store, () => records, true);
+    const ws = await login(client);
+    expect(msgsigOf(ws)).toBe(await rawPublicB64(live.keyPair));
+    expect((await store.load())!.keyPair).toBe(live.keyPair);
+  });
+
+  it('is kept on a connect that does not follow a new sign-in', async () => {
+    const old = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3old');
+    const records = await accountRecords(old, true);
+    const store = new MemoryDeviceKeyStore(old);
+    const { client, listings } = await clientReading(store, () => records);
+    const ws = await login(client);
+    expect(msgsigOf(ws)).toBe(await rawPublicB64(old.keyPair));
+    expect(listings()).toBe(0);
+  });
+
+  it('is kept on a reconnect after the sign-in connect', async () => {
+    const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
+    let records = await accountRecords(stored, false);
+    const store = new MemoryDeviceKeyStore(stored);
+    const { client } = await clientReading(store, () => records, true);
+    const ws = await login(client);
+    expect(msgsigOf(ws)).toBe(await rawPublicB64(stored.keyPair));
+
+    records = await accountRecords(stored, true);
+    ws.close();
+    await flushAsync();
+    const ws2 = await login(client);
+    expect(msgsigOf(ws2)).toBe(await rawPublicB64(stored.keyPair));
+  });
+});

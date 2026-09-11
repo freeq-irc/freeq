@@ -1,6 +1,8 @@
 /** Core types for the freeq SDK. */
 
 import type { DeviceKeyStore } from './device-key.js';
+import type { KeyLookup } from './key-lookup.js';
+import type { Verdict } from './verdict.js';
 
 /** Parsed IRC message with optional IRCv3 tags. */
 export interface IRCMessage {
@@ -26,6 +28,9 @@ export interface Message {
   deleted?: boolean;
   reactions?: Map<string, Set<string>>;
   encrypted?: boolean;
+  /** The signature's verdict, when the client checks signatures:
+   *  `pending` while the key is looked up, with a `verdict` event to follow. */
+  verdict?: Verdict;
 }
 
 /** A channel or DM member. */
@@ -176,6 +181,15 @@ export interface FreeqClientOptions {
   /** The published key record's `label`, e.g. the browser's name. */
   deviceLabel?: string;
 
+  /** This client was made right after a new sign-in. Its first connect
+   *  replaces a stored key the account has retired; a reconnect does not. */
+  freshSignIn?: boolean;
+
+  /** Checks the signature on every received message and TAGMSG and puts a
+   *  verdict on it. Built without an origin base, it asks `serverOrigin`.
+   *  Unset: no verdicts. */
+  keyLookup?: KeyLookup;
+
   /** Policy on 433 ERR_NICKNAMEINUSE during registration:
    *   - `'refuse'` (default for new code): emit `authError` and disconnect.
    *   - `'auto-suffix'`: append `_` until accepted (legacy SDK behavior).
@@ -223,7 +237,12 @@ export interface Batch {
    * or a DM's canonical peer key — because at flush time the line's own
    * sender and target are no longer in hand.
    */
-  actEvents?: Array<{ buffer: string; from: string; tags: Record<string, string> }>;
+  actEvents?: Array<{
+    buffer: string;
+    from: string;
+    tags: Record<string, string>;
+    verdict?: import('./verdict.js').Verdict;
+  }>;
 }
 
 // ── Agent-native types ─────────────────────────────────────────────────────
@@ -297,6 +316,8 @@ export interface CoordinationEventPayload {
   payloadRaw?: string;
   /** Raw IRCv3 tags from the wire (for advanced consumers). */
   tags: Record<string, string>;
+  /** Same as `Message.verdict`. */
+  verdict?: Verdict;
 }
 
 /** Payload of the `actEvent` event — parsed `act-` tagged TAGMSG. */
@@ -330,6 +351,8 @@ export interface ActEventPayload {
   /** True when this arrived from history rather than live — a replayed line
    *  carries the server's `time` tag. */
   replayed: boolean;
+  /** Same as `Message.verdict`. */
+  verdict?: Verdict;
 }
 
 /** Payload of the `spend` event — SPEND wire command relayed by the server. */

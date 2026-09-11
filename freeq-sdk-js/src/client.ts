@@ -14,8 +14,15 @@ import * as signing from './signing.js';
 import * as e2ee from './e2ee.js';
 import { dmPeerKey, isDid } from './address.js';
 import { prefetchProfiles } from './profiles.js';
-import { recordKeyOf, type StoredDeviceKey } from './device-key.js';
-import { buildDeviceRecord } from './identity-records.js';
+import { recordKeyOf, type DeviceKeyStore, type StoredDeviceKey } from './device-key.js';
+import {
+  DEVICE_KEY_TYPE,
+  buildDeviceRecord,
+  deviceKeyHistory,
+  listRecords,
+} from './identity-records.js';
+import { makeDidResolver } from './key-lookup.js';
+import { SignatureChecker, firstLook, sigTagKid, type Verdict } from './verdict.js';
 import type {
   IRCMessage, Message, Member, AvSession, AvParticipant,
   FreeqClientOptions, SaslCredentials, Batch, TransportState,
@@ -183,9 +190,13 @@ export class FreeqClient extends EventEmitter {
   /** A stored device key the account does not have yet, published once
    *  `MSGSIG` is on the wire. */
   private pendingEnrollment: StoredDeviceKey | null = null;
+  /** Set once a connect has used `freshSignIn`, so a reconnect does not. */
+  private freshSignInUsed = false;
   /** Bumped on every new connection, so a publish answered after a
    *  reconnect reports nothing for a connection that is gone. */
   private enrollmentEpoch = 0;
+  /** Checks received signatures for this connection, when `keyLookup` is set. */
+  private checker: SignatureChecker | null = null;
   /** Set when SASL was attempted and 904 was received. Suppresses any
    *  subsequent registration completion as a guest, and blocks outgoing
    *  PRIVMSGs that would silently leak under the guest identity. */
@@ -1132,6 +1143,9 @@ export class FreeqClient extends EventEmitter {
       this.clearNickResume();
       this.enrollmentEpoch++;
       this.pendingEnrollment = null;
+      const lookup = this.opts.keyLookup;
+      if (lookup && lookup.originBase() === null) lookup.setDefaultOriginBase(this.serverOrigin);
+      this.checker = lookup ? new SignatureChecker(lookup) : null;
       let registrationSent = false;
 
       const sendRegistration = (token?: string) => {
@@ -1340,7 +1354,12 @@ export class FreeqClient extends EventEmitter {
    *  event tags is a rendering of the event (the human-readable companion),
    *  so it fires `message`, never `coordinationEvent`. De-dupes by eventId
    *  against echo and multi-path delivery. */
-  private emitCoordinationEvent(channel: string, from: string, tags: Record<string, string>): void {
+  private emitCoordinationEvent(
+    channel: string,
+    from: string,
+    tags: Record<string, string>,
+    verdict?: Verdict,
+  ): CoordinationEventPayload | undefined {
     const eventType = tags['+freeq.at/event'];
     if (!eventType) return;
     // A signed event through an adopting server arrives with the id in
@@ -1397,8 +1416,10 @@ export class FreeqClient extends EventEmitter {
       payload,
       payloadRaw,
       tags,
+      ...(verdict ? { verdict } : {}),
     };
     this.emit('coordinationEvent', eventPayload);
+    return eventPayload;
   }
 
   /**
@@ -1416,7 +1437,12 @@ export class FreeqClient extends EventEmitter {
    * `act-events-replay-twice-to-a-joiner`, and dropping the second sighting
    * here is where it closes.
    */
-  private emitActEvent(buffer: string, from: string, tags: Record<string, string>): void {
+  private emitActEvent(
+    buffer: string,
+    from: string,
+    tags: Record<string, string>,
+    verdict?: Verdict,
+  ): ActEventPayload | undefined {
     const fields: Record<string, string> = {};
     for (const [name, value] of Object.entries(tags)) {
       if (signing.isActTag(name)) fields[signing.strippedTagName(name)] = value;
@@ -1441,7 +1467,7 @@ export class FreeqClient extends EventEmitter {
 
     // An opener carries no `act-id`: its own event id is the task's, for the
     // rest of the task's life. Every later move names that id.
-    this.emit('actEvent', {
+    const payload: ActEventPayload = {
       channel: buffer,
       from,
       did: tags['+freeq.at/from'] || tags['account'] || undefined,
@@ -1453,7 +1479,10 @@ export class FreeqClient extends EventEmitter {
       tags,
       sigTag: tags[signing.SIG_TAG] || undefined,
       replayed: tags['time'] !== undefined,
-    } satisfies ActEventPayload);
+      ...(verdict ? { verdict } : {}),
+    };
+    this.emit('actEvent', payload);
+    return payload;
   }
 
   /**
@@ -1585,6 +1614,59 @@ export class FreeqClient extends EventEmitter {
     });
   }
 
+  /** The id a line's signature covers: a message's `msgid`, a TAGMSG's event id. */
+  private signedLineId(tags: Record<string, string>, isTagmsg: boolean): string | undefined {
+    const eventId = tags[signing.EVENT_ID_TAG] ?? tags['freeq.at/eventid'];
+    return (isTagmsg ? eventId || tags['msgid'] : tags['msgid'] || eventId) || undefined;
+  }
+
+  /**
+   * The verdict a received line is delivered with, when this client checks
+   * signatures: final when nothing needs fetching, else `pending`, with the
+   * check started by `checkLater`.
+   */
+  private deliveredVerdict(tags: Record<string, string>, isTagmsg: boolean): Verdict | undefined {
+    if (!this.checker) return undefined;
+    const sigTag = tags[signing.SIG_TAG] ?? tags['freeq.at/sig'];
+    if (sigTag === undefined) return { state: 'unsigned' };
+    const kid = sigTagKid(sigTag);
+    if (kid === null) return { state: 'unverifiable' };
+    if (!this.signedLineId(tags, isTagmsg)) return { state: 'unverifiable', kid };
+    return { state: 'pending', kid };
+  }
+
+  /**
+   * Finish a pending check off the receive path: `onSettled` gets the verdict
+   * first, then `verdict` is emitted. Never awaited by the caller.
+   */
+  private checkLater(
+    delivered: Verdict | undefined,
+    line: { tags: Record<string, string>; target: string; body?: string },
+    onSettled?: (verdict: Verdict) => void,
+  ): void {
+    const checker = this.checker;
+    if (!checker || delivered?.state !== 'pending') return;
+    const id = this.signedLineId(line.tags, line.body === undefined)!;
+    const ownDid = this.sasl?.did ?? this._authDid ?? undefined;
+    const targetDid = this.didForNick(line.target);
+    void (async () => {
+      let verdict: Verdict;
+      try {
+        const look = await firstLook({ ...line, ownDid, targetDid });
+        verdict =
+          look.kind === 'check'
+            ? await checker.resolve(look.signed)
+            : look.kind === 'unsigned'
+              ? { state: 'unsigned' }
+              : { state: 'unverifiable', kid: look.kid };
+      } catch {
+        verdict = { state: 'unverifiable', kid: delivered.kid };
+      }
+      onSettled?.(verdict);
+      if (this.checker === checker) this.emit('verdict', id, verdict);
+    })();
+  }
+
   /**
    * The stored device key, or a new one saved into the store when it is
    * empty; its base64url public key. A store that fails leaves this
@@ -1593,8 +1675,12 @@ export class FreeqClient extends EventEmitter {
   private async presentDeviceKey(): Promise<string | null> {
     const store = this.opts.deviceKeyStore!;
     this.pendingEnrollment = null;
+    // Only the first connect of a client made right after a sign-in.
+    const freshSignIn = this.opts.freshSignIn === true && !this.freshSignInUsed;
+    this.freshSignInUsed = true;
     try {
       let stored = await store.load();
+      if (stored && freshSignIn) stored = await this.replaceRetiredKey(store, stored);
       if (!stored) {
         const keyPair = (await crypto.subtle.generateKey('Ed25519', false, [
           'sign',
@@ -1609,6 +1695,56 @@ export class FreeqClient extends EventEmitter {
     } catch (e) {
       log.warn('[freeq-sdk] device key unavailable, signing with a session key:', e);
       return this.signing.generateSigningKey();
+    }
+  }
+
+  /**
+   * Right after a new sign-in, replace a stored key the account's records have
+   * retired with a new one, saved with no record URI so this connect publishes
+   * it. Bounded, so a slow account provider cannot hold up signing; a failed
+   * read keeps the stored key.
+   */
+  private async replaceRetiredKey(
+    store: DeviceKeyStore,
+    stored: StoredDeviceKey,
+  ): Promise<StoredDeviceKey> {
+    const did = this.sasl?.did;
+    if (!did) return stored;
+    const reader = this.opts.keyLookup?.reader ?? {
+      fetch: (target: string) => fetch(target),
+      resolveDid: makeDidResolver(),
+    };
+    const check = async (): Promise<StoredDeviceKey> => {
+      const records = await listRecords(reader.fetch, reader.resolveDid, did, DEVICE_KEY_TYPE);
+      const raw = new Uint8Array(await crypto.subtle.exportKey('raw', stored.keyPair.publicKey));
+      const kid = await signing.deriveKid(raw);
+      const now = Date.now();
+      const retired = (await deviceKeyHistory(did, records)).some(
+        (k) => k.kid === kid && k.retiredAt !== null && k.retiredAt.getTime() <= now,
+      );
+      if (!retired) return stored;
+      const keyPair = (await crypto.subtle.generateKey('Ed25519', false, [
+        'sign',
+        'verify',
+      ])) as CryptoKeyPair;
+      const replacement: StoredDeviceKey = { keyPair, createdAt: new Date().toISOString() };
+      await store.save(replacement);
+      return replacement;
+    };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const giveUp = new Promise<StoredDeviceKey>((resolve) => {
+      timer = setTimeout(() => {
+        log.warn('[freeq-sdk] the account read outlasted sixty seconds; keeping the stored key');
+        resolve(stored);
+      }, 60_000);
+    });
+    try {
+      return await Promise.race([check(), giveUp]);
+    } catch (e) {
+      log.warn('[freeq-sdk] device key records not read; keeping the stored key:', e);
+      return stored;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -1792,6 +1928,9 @@ export class FreeqClient extends EventEmitter {
     const bufName = isChannel ? target : this.dmKey(isSelf ? target : from);
 
     const wireText = this.assembleMultiline(lines);
+    // The signature covers the assembled wire body and the opener's tags.
+    const verdict = this.deliveredVerdict(openerTags, false);
+    const wireLine = { tags: openerTags, target, body: wireText };
 
     // Decryption — match the single-PRIVMSG path's logic exactly,
     // but applied to the assembled body so ciphertext-chunked E2EE
@@ -1836,7 +1975,11 @@ export class FreeqClient extends EventEmitter {
       replyTo: openerTags['+reply'],
       encrypted: isEncryptedMsg,
       isStreaming: openerTags['+freeq.at/streaming'] === '1',
+      ...(verdict ? { verdict } : {}),
     };
+    this.checkLater(verdict, wireLine, (settled) => {
+      message.verdict = settled;
+    });
 
     // Persisted reactions from CHATHISTORY replay (multiline-nested case)
     const reactionsTag = openerTags['+freeq.at/reactions'];
@@ -2339,6 +2482,11 @@ export class FreeqClient extends EventEmitter {
         // and the only thing that fires `coordinationEvent`; this fires the
         // regular `message` event below so the text renders normally.
 
+        // Checked over the wire body, before decryption or the legacy
+        // newline rewrite.
+        const verdict = this.deliveredVerdict(msg.tags, false);
+        const wireLine = { tags: msg.tags, target, body: text };
+
         let displayText = isAction ? text.slice(8, -1) : text;
         let isEncryptedMsg = false;
 
@@ -2441,6 +2589,7 @@ export class FreeqClient extends EventEmitter {
           }
           const isStreaming = msg.tags['+freeq.at/streaming'] === '1';
           this.emit('messageEdited', bufName, editOf, displayText, msg.tags['msgid'], isStreaming, from, msg.tags['account'], msg.tags);
+          this.checkLater(verdict, wireLine);
           break;
         }
 
@@ -2455,7 +2604,12 @@ export class FreeqClient extends EventEmitter {
           replyTo: msg.tags['+reply'],
           encrypted: isEncryptedMsg,
           isStreaming: msg.tags['+freeq.at/streaming'] === '1',
+          ...(verdict ? { verdict } : {}),
         };
+        // Settles after this line is out: the check only resolves after an await.
+        this.checkLater(verdict, wireLine, (settled) => {
+          message.verdict = settled;
+        });
 
         // Parse persisted reactions from CHATHISTORY
         const reactionsTag = msg.tags['+freeq.at/reactions'];
@@ -2585,6 +2739,12 @@ export class FreeqClient extends EventEmitter {
         // sender, and both collapse to the same DID so a conversation is
         // never split.
         const bufName = isChannel ? target : this.dmKey(isSelf ? target : from);
+        const verdict = this.deliveredVerdict(msg.tags, true);
+        // Payloads this line produced, given the verdict when it settles.
+        const carriers: { verdict?: Verdict }[] = [];
+        this.checkLater(verdict, { tags: msg.tags, target }, (settled) => {
+          for (const carrier of carriers) carrier.verdict = settled;
+        });
 
         const deleteOf = msg.tags['+draft/delete'];
         if (deleteOf) { this.emit('messageDeleted', bufName, deleteOf, from, msg.tags['account']); break; }
@@ -2629,7 +2789,8 @@ export class FreeqClient extends EventEmitter {
         // `coordinationEvent` fires. De-dupe by eventId against echo.
         const eventType = msg.tags['+freeq.at/event'];
         if (eventType) {
-          this.emitCoordinationEvent(target, from, msg.tags);
+          const payload = this.emitCoordinationEvent(target, from, msg.tags, verdict);
+          if (payload) carriers.push(payload);
         }
 
         // Task event (`act-` tags). Same rule as the coordination branch: the
@@ -2648,9 +2809,12 @@ export class FreeqClient extends EventEmitter {
           // TAGMSG feature files under puts the event in the same thread as
           // the line that renders it. Resolved here because the flush below
           // no longer has the sender in hand.
-          (actBatch.actEvents ??= []).push({ buffer: bufName, from, tags: msg.tags });
+          const held = { buffer: bufName, from, tags: msg.tags, verdict };
+          (actBatch.actEvents ??= []).push(held);
+          carriers.push(held);
         } else {
-          this.emitActEvent(bufName, from, msg.tags);
+          const payload = this.emitActEvent(bufName, from, msg.tags, verdict);
+          if (payload) carriers.push(payload);
         }
 
         const avState = msg.tags['+freeq.at/av-state'];
@@ -2953,7 +3117,7 @@ export class FreeqClient extends EventEmitter {
             // Held task events ride out with the batch, in wire order,
             // after the lines they refer to.
             for (const held of batch.actEvents ?? []) {
-              this.emitActEvent(held.buffer, held.from, held.tags);
+              this.emitActEvent(held.buffer, held.from, held.tags, held.verdict);
             }
           }
         }

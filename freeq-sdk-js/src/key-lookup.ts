@@ -8,8 +8,20 @@
  *
  * Twin of the Rust `freeq_sdk::key_lookup`.
  */
+import {
+  CompositeDidDocumentResolver,
+  PlcDidDocumentResolver,
+  WebDidDocumentResolver,
+} from '@atcute/identity-resolver';
 import { decodeMultibaseEd25519 } from './did-key.js';
-import { type Fetch, type ResolveDid, liveDeviceKeys } from './identity-records.js';
+import {
+  DEVICE_KEY_TYPE,
+  type DidDocument,
+  type Fetch,
+  type ResolveDid,
+  foldDeviceRecords,
+  listRecords,
+} from './identity-records.js';
 import { deriveKid } from './signing.js';
 
 /** Where a key was found. */
@@ -19,6 +31,8 @@ export type KeySource = 'IdentityRecord' | 'DidDocument' | 'OriginServer';
 export interface FoundKey {
   publicKey: Uint8Array;
   source: KeySource;
+  /** When the origin server says the key was removed, unix seconds. */
+  retiredAt: number | null;
 }
 
 /** What the identity-record reader needs: an HTTP GET and a DID resolver. */
@@ -28,68 +42,114 @@ export interface RecordReader {
 }
 
 /**
+ * One (DID, kid)'s cached answer: the signer's device records as listed,
+ * folded again at whatever time is asked, and what the other sources said
+ * once they have been asked (`undefined` until then).
+ */
+interface Cached {
+  records: unknown[];
+  other: FoundKey | null | undefined;
+  at: number;
+}
+
+/**
  * Looks keys up by (DID, kid), caching each answer for `ttlMs`: a key found,
  * or a miss, when every source answered without the key.
  */
 export class KeyLookup {
-  private readonly cache = new Map<string, { found: FoundKey | null; at: number }>();
+  private readonly cache = new Map<string, Cached>();
+  private defaultOrigin: string | null = null;
 
   /** `originBase` is the origin server's base URL; the reader's `fetch` serves its requests. */
   constructor(
-    private readonly reader: RecordReader,
-    private readonly originBase: string | null,
+    readonly reader: RecordReader,
+    private readonly givenOrigin: string | null,
     private readonly ttlMs: number,
   ) {}
 
+  /** The origin to ask when none was given at construction. Set once; a
+   *  client sets it to the server it connected to. */
+  setDefaultOriginBase(base: string): void {
+    if (this.defaultOrigin === null) this.defaultOrigin = base;
+  }
+
+  /** The origin server this lookup asks: the one given, else the default. */
+  originBase(): string | null {
+    return this.givenOrigin ?? this.defaultOrigin;
+  }
+
+  /** The key `did` signs with under `kid` now; see `keyForAt`. */
+  keyFor(did: string, kid: string): Promise<FoundKey | null> {
+    return this.keyForAt(did, kid, new Date());
+  }
+
   /**
-   * The key `did` signs with under `kid`, or null when no source has it.
+   * The key `did` signed with under `kid` at `at`, or null when no source has
+   * it. The signer's records are folded at `at`, so a record key counts only
+   * if it was live then; the other sources are not dated.
    *
    * A source that fails is skipped and the next one asked; the first failure
    * is thrown only if no later source finds the key. A miss is remembered only
    * when no source failed, since a failed source did not say it lacks the key.
    */
-  async keyFor(did: string, kid: string): Promise<FoundKey | null> {
+  async keyForAt(did: string, kid: string, at: Date): Promise<FoundKey | null> {
     const slot = JSON.stringify([did, kid]);
-    const cached = this.cache.get(slot);
-    if (cached !== undefined && Date.now() - cached.at < this.ttlMs) return cached.found;
+    const hit = this.cache.get(slot);
+    const cached = hit !== undefined && Date.now() - hit.at < this.ttlMs ? hit : undefined;
 
     let failure: unknown;
     let failed = false;
-    const sources: [KeySource, () => Promise<Uint8Array | null>][] = [
-      ['IdentityRecord', () => this.fromRecords(did, kid)],
-    ];
-    if (did.startsWith('did:web:')) sources.push(['DidDocument', () => this.fromDocument(did, kid)]);
-    const origin = this.originBase;
+    let records: unknown[] = [];
+    if (cached !== undefined) {
+      records = cached.records;
+    } else {
+      try {
+        records = await listRecords(this.reader.fetch, this.reader.resolveDid, did, DEVICE_KEY_TYPE);
+      } catch (e) {
+        [failed, failure] = [true, e];
+      }
+    }
+    const inRecords = await fromRecords(did, kid, records, at);
+    if (inRecords !== null) {
+      if (!failed && cached === undefined) this.remember(slot, records, undefined);
+      return inRecords;
+    }
+    if (cached !== undefined && cached.other !== undefined) return cached.other;
+
+    const sources: [KeySource, () => Promise<[Uint8Array | null, number | null]>][] = [];
+    if (did.startsWith('did:web:')) {
+      sources.push(['DidDocument', async () => [await this.fromDocument(did, kid), null]]);
+    }
+    const origin = this.originBase();
     if (origin !== null) sources.push(['OriginServer', () => this.fromOrigin(origin, did, kid)]);
 
     for (const [source, ask] of sources) {
       let key: Uint8Array | null;
+      let retiredAt: number | null;
       try {
-        key = await ask();
+        [key, retiredAt] = await ask();
       } catch (e) {
         if (!failed) [failed, failure] = [true, e];
         continue;
       }
       if (key === null || key.length !== 32 || (await deriveKid(key)) !== kid) continue;
-      const found: FoundKey = { publicKey: key, source };
-      this.cache.set(slot, { found, at: Date.now() });
+      const found: FoundKey = { publicKey: key, source, retiredAt };
+      this.remember(slot, records, found);
       return found;
     }
     if (failed) throw failure;
-    this.cache.set(slot, { found: null, at: Date.now() });
+    this.remember(slot, records, null);
     return null;
   }
 
   /** Clear a remembered miss for `(did, kid)`, so the next lookup asks again. A key found stays cached. */
   forget(did: string, kid: string): void {
     const slot = JSON.stringify([did, kid]);
-    if (this.cache.get(slot)?.found === null) this.cache.delete(slot);
+    if (this.cache.get(slot)?.other === null) this.cache.delete(slot);
   }
 
-  private async fromRecords(did: string, kid: string): Promise<Uint8Array | null> {
-    const live = await liveDeviceKeys(this.reader.fetch, this.reader.resolveDid, did, new Date());
-    const match = live.find((k) => k.kid === kid);
-    return match === undefined ? null : ed25519Raw(match.publicKeyMultibase);
+  private remember(slot: string, records: unknown[], other: FoundKey | null | undefined): void {
+    this.cache.set(slot, { records, other, at: Date.now() });
   }
 
   private async fromDocument(did: string, kid: string): Promise<Uint8Array | null> {
@@ -101,16 +161,58 @@ export class KeyLookup {
     return null;
   }
 
-  private async fromOrigin(base: string, did: string, kid: string): Promise<Uint8Array | null> {
+  /** The key the origin holds for `(did, kid)`, and when it was removed. */
+  private async fromOrigin(
+    base: string,
+    did: string,
+    kid: string,
+  ): Promise<[Uint8Array | null, number | null]> {
     const path = `/api/v1/signing-keys/${encodeURIComponent(did)}/${encodeURIComponent(kid)}`;
     const res = await this.reader.fetch(`${base.replace(/\/+$/, '')}${path}`);
-    if (res.status === 404) return null;
+    if (res.status === 404) return [null, null];
     if (!res.ok) throw new Error(`the origin key store answered ${res.status}`);
-    const answer = (await res.json()) as { public_key?: unknown };
+    const answer = (await res.json()) as { public_key?: unknown; removed_at?: unknown };
     if (typeof answer.public_key !== 'string') throw new Error('the origin answer is not a key');
+    const removedAt = typeof answer.removed_at === 'number' ? answer.removed_at : null;
     // A key that does not decode is refused like a wrong one.
-    return base64UrlDecode(answer.public_key);
+    return [base64UrlDecode(answer.public_key), removedAt];
   }
+}
+
+/** The key `kid` names among `did`'s device records, if it was live at `at`. */
+async function fromRecords(
+  did: string,
+  kid: string,
+  records: unknown[],
+  at: Date,
+): Promise<FoundKey | null> {
+  const live = await foldDeviceRecords(did, records, at);
+  const match = live.find((k) => k.kid === kid);
+  const key = match === undefined ? null : ed25519Raw(match.publicKeyMultibase);
+  if (key === null || (await deriveKid(key)) !== kid) return null;
+  return { publicKey: key, source: 'IdentityRecord', retiredAt: null };
+}
+
+/**
+ * A `ResolveDid` for did:plc (the PLC directory) and did:web, built on
+ * `@atcute/identity-resolver`. Anything else is refused.
+ */
+export function makeDidResolver(
+  options: { fetch?: typeof globalThis.fetch; plcUrl?: string } = {},
+): ResolveDid {
+  const resolver = new CompositeDidDocumentResolver({
+    methods: {
+      plc: new PlcDidDocumentResolver({ fetch: options.fetch, apiUrl: options.plcUrl }),
+      web: new WebDidDocumentResolver({ fetch: options.fetch }),
+    },
+  });
+  return async (did: string): Promise<DidDocument> => {
+    if (!did.startsWith('did:plc:') && !did.startsWith('did:web:')) {
+      throw new Error(`no resolver for ${did}`);
+    }
+    const doc = await resolver.resolve(did as `did:plc:${string}` | `did:web:${string}`);
+    return doc as unknown as DidDocument;
+  };
 }
 
 /** The raw bytes of a `z6Mk…` ed25519 key; anything else is not a signing key here. */
