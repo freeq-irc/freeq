@@ -5,8 +5,9 @@
 //! repository: `at.freeq.deviceKey` announces a signing key a device holds,
 //! or retires one; `at.freeq.agentKey` announces a bot the account claims as
 //! its own, or retires that claim. The PDS writes them into a signed commit;
-//! that part happens elsewhere. This module builds the entries and folds a
-//! list of them into the set that is live at an instant.
+//! that part happens elsewhere. This module builds the entries, reads them
+//! back from the account's PDS, and folds a list of them into the set that is
+//! live at an instant.
 //!
 //! Every record carries a `bindingSig`: an ed25519 signature made by the key
 //! the record is about (a device key) or by a device key of the account
@@ -17,8 +18,10 @@
 //! account's repository, or altered in any field, says nothing.
 
 use crate::crypto::{PrivateKey, PublicKey};
+use crate::did::DidResolver;
+use crate::pds::pds_endpoint;
 use crate::sigtag::derive_kid_bytes;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
@@ -468,6 +471,114 @@ fn verify_binding(public_key: &PublicKey, message: &[u8], binding_sig: &str) -> 
     public_key.verify(message, &signature).is_ok()
 }
 
+// ─── reading from the account's PDS ─────────────────────────────────────
+
+/// Reads an account's identity records from its PDS, unauthenticated.
+///
+/// The PDS address comes from a DID document anyone can write, so the HTTP
+/// client for each URL comes from the caller's provider: the server hands in
+/// one that refuses private addresses, other callers a plain shared client.
+pub struct RecordReader<P: freeq_oauth::ClientProvider> {
+    resolver: DidResolver,
+    clients: P,
+}
+
+/// One page of a `com.atproto.repo.listRecords` answer.
+#[derive(Deserialize)]
+struct ListRecordsPage {
+    records: Vec<ListedRecord>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ListedRecord {
+    value: serde_json::Value,
+}
+
+impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
+    pub fn new(resolver: DidResolver, clients: P) -> Self {
+        Self { resolver, clients }
+    }
+
+    /// Every record of `collection` in `did`'s repository, as the PDS lists
+    /// them. A DID whose document names no PDS has none.
+    pub async fn list_records(
+        &self,
+        did: &str,
+        collection: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        let doc = self.resolver.resolve(did).await?;
+        let Some(pds) = pds_endpoint(&doc) else {
+            return Ok(Vec::new());
+        };
+        let endpoint = format!(
+            "{}/xrpc/com.atproto.repo.listRecords",
+            pds.trim_end_matches('/')
+        );
+        let mut records = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut url = url::Url::parse(&endpoint).context("invalid PDS endpoint")?;
+            url.query_pairs_mut()
+                .append_pair("repo", did)
+                .append_pair("collection", collection)
+                .append_pair("limit", "100");
+            if let Some(cursor) = &cursor {
+                url.query_pairs_mut().append_pair("cursor", cursor);
+            }
+            let page: ListRecordsPage = self
+                .get(&url)
+                .await?
+                .json()
+                .await
+                .context("listRecords answer is not a record list")?;
+            // An empty page ends the listing even if it carries a cursor, so a
+            // PDS cannot keep the reader asking forever for nothing.
+            let empty = page.records.is_empty();
+            records.extend(page.records.into_iter().map(|r| r.value));
+            match page.cursor {
+                Some(next) if !empty => cursor = Some(next),
+                _ => break,
+            }
+        }
+        Ok(records)
+    }
+
+    /// The device keys of `did` that are live at `at`.
+    pub async fn live_device_keys(
+        &self,
+        did: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Vec<LiveDeviceKey>> {
+        let records = self.list_records(did, DEVICE_KEY_TYPE).await?;
+        Ok(fold_device_records(did, &records, at))
+    }
+
+    /// The bots `did` claims at `at`.
+    pub async fn live_agent_links(
+        &self,
+        did: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Vec<LiveAgentLink>> {
+        let devices = self.list_records(did, DEVICE_KEY_TYPE).await?;
+        let agents = self.list_records(did, AGENT_KEY_TYPE).await?;
+        Ok(fold_agent_records(did, &devices, &agents, at))
+    }
+
+    /// GET `url` with the provider's client for it; an HTTP error status is
+    /// an error.
+    async fn get(&self, url: &url::Url) -> Result<reqwest::Response> {
+        let client = self.clients.client_for(url.as_str()).await?;
+        client
+            .get(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("request to {} failed", url.path()))?
+            .error_for_status()
+            .with_context(|| format!("{} answered with an error", url.path()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -882,5 +993,171 @@ mod tests {
                 "{name}: live agent links"
             );
         }
+    }
+
+    // ─── reading from a PDS ─────────────────────────────────────────────
+
+    use axum::extract::Query;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// Serve `router` on an ephemeral loopback port and return its base URL.
+    async fn spawn_stub(router: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        base
+    }
+
+    /// A stub PDS answering `listRecords` in two pages per collection: the
+    /// first half of the records with a cursor, then the rest without one.
+    fn list_records_router(
+        did: &str,
+        collections: HashMap<String, Vec<serde_json::Value>>,
+    ) -> axum::Router {
+        let did = did.to_string();
+        let collections = Arc::new(collections);
+        axum::Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(move |Query(q): Query<HashMap<String, String>>| {
+                let did = did.clone();
+                let collections = collections.clone();
+                async move {
+                    if q.get("repo") != Some(&did)
+                        || q.get("limit").map(String::as_str) != Some("100")
+                    {
+                        return Err(StatusCode::BAD_REQUEST);
+                    }
+                    let collection = q.get("collection").cloned().unwrap_or_default();
+                    let records = collections.get(&collection).cloned().unwrap_or_default();
+                    let half = records.len().div_ceil(2);
+                    let (page, cursor) = match q.get("cursor").map(String::as_str) {
+                        None => (&records[..half], Some("page-2")),
+                        Some("page-2") => (&records[half..], None),
+                        Some(_) => return Err(StatusCode::BAD_REQUEST),
+                    };
+                    let listed: Vec<serde_json::Value> = page
+                        .iter()
+                        .enumerate()
+                        .map(|(i, value)| {
+                            json!({
+                                "uri": format!("at://{did}/{collection}/{i}"),
+                                "cid": "bafyreistub",
+                                "value": value,
+                            })
+                        })
+                        .collect();
+                    let mut body = json!({ "records": listed });
+                    if let Some(cursor) = cursor {
+                        body["cursor"] = json!(cursor);
+                    }
+                    Ok(axum::Json(body))
+                }
+            }),
+        )
+    }
+
+    fn reader_for(did: &str, pds: Option<&str>) -> RecordReader<freeq_oauth::SharedClient> {
+        let doc =
+            crate::did::make_test_did_document_with_pds(did, &key(1).public_key_multibase(), pds);
+        let resolver = DidResolver::static_map(HashMap::from([(did.to_string(), doc)]));
+        RecordReader::new(resolver, freeq_oauth::SharedClient(reqwest::Client::new()))
+    }
+
+    #[tokio::test]
+    async fn records_read_across_two_pages_fold_to_each_vector_live_set() {
+        let spec: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixtures_path()).unwrap()).unwrap();
+        for case in spec["folds"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let collections = HashMap::from([
+                (
+                    DEVICE_KEY_TYPE.to_string(),
+                    case["deviceRecords"].as_array().unwrap().clone(),
+                ),
+                (
+                    AGENT_KEY_TYPE.to_string(),
+                    case["agentRecords"].as_array().unwrap().clone(),
+                ),
+            ]);
+            let base = spawn_stub(list_records_router(ALICE, collections)).await;
+            let reader = reader_for(ALICE, Some(&base));
+            let at = instant(case["at"].as_str().unwrap());
+
+            let listed = reader.list_records(ALICE, DEVICE_KEY_TYPE).await.unwrap();
+            assert_eq!(
+                &json!(listed),
+                &case["deviceRecords"],
+                "{name}: listed records"
+            );
+
+            let kids: Vec<String> = reader
+                .live_device_keys(ALICE, at)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|k| k.kid)
+                .collect();
+            assert_eq!(
+                json!(kids),
+                case["liveDeviceKids"],
+                "{name}: live device keys"
+            );
+            let dids: Vec<String> = reader
+                .live_agent_links(ALICE, at)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|l| l.agent_did)
+                .collect();
+            assert_eq!(
+                json!(dids),
+                case["liveAgentDids"],
+                "{name}: live agent links"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_did_with_no_pds_has_no_records() {
+        let reader = reader_for(ALICE, None);
+        assert!(
+            reader
+                .list_records(ALICE, DEVICE_KEY_TYPE)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            reader
+                .live_device_keys(ALICE, instant(T1))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            reader
+                .live_agent_links(ALICE, instant(T1))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pds_answering_500_is_an_error() {
+        let router = axum::Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+        let base = spawn_stub(router).await;
+        let reader = reader_for(ALICE, Some(&base));
+        assert!(reader.list_records(ALICE, DEVICE_KEY_TYPE).await.is_err());
+        assert!(reader.live_device_keys(ALICE, instant(T1)).await.is_err());
+        assert!(reader.live_agent_links(ALICE, instant(T1)).await.is_err());
     }
 }
