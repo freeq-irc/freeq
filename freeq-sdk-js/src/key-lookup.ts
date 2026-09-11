@@ -27,9 +27,12 @@ export interface RecordReader {
   resolveDid: ResolveDid;
 }
 
-/** Looks keys up by (DID, kid), caching each key found for `ttlMs`. */
+/**
+ * Looks keys up by (DID, kid), caching each answer for `ttlMs`: a key found,
+ * or a miss, when every source answered without the key.
+ */
 export class KeyLookup {
-  private readonly cache = new Map<string, { found: FoundKey; at: number }>();
+  private readonly cache = new Map<string, { found: FoundKey | null; at: number }>();
 
   /** `originBase` is the origin server's base URL; the reader's `fetch` serves its requests. */
   constructor(
@@ -42,7 +45,8 @@ export class KeyLookup {
    * The key `did` signs with under `kid`, or null when no source has it.
    *
    * A source that fails is skipped and the next one asked; the first failure
-   * is thrown only if no later source finds the key.
+   * is thrown only if no later source finds the key. A miss is remembered only
+   * when no source failed, since a failed source did not say it lacks the key.
    */
   async keyFor(did: string, kid: string): Promise<FoundKey | null> {
     const slot = JSON.stringify([did, kid]);
@@ -72,7 +76,14 @@ export class KeyLookup {
       return found;
     }
     if (failed) throw failure;
+    this.cache.set(slot, { found: null, at: Date.now() });
     return null;
+  }
+
+  /** Clear a remembered miss for `(did, kid)`, so the next lookup asks again. A key found stays cached. */
+  forget(did: string, kid: string): void {
+    const slot = JSON.stringify([did, kid]);
+    if (this.cache.get(slot)?.found === null) this.cache.delete(slot);
   }
 
   private async fromRecords(did: string, kid: string): Promise<Uint8Array | null> {

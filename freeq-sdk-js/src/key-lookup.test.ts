@@ -162,6 +162,51 @@ describe('KeyLookup', () => {
     await expect(alone.keyFor(ALICE, await kidOf(2))).rejects.toThrow();
   });
 
+  it('makes one round of requests for two misses inside the ttl', async () => {
+    const { fetch, hits } = network([await buildDeviceRecord(await key(1), ALICE, T0)]);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR);
+    expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
+    expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
+    expect(hits).toEqual({ pds: 1, origin: 1 });
+  });
+
+  it('finds a key that appears after a miss once the ttl passes', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
+    const originKeys: Record<string, Uint8Array> = {};
+    const { fetch, hits } = network([], originKeys);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR);
+    expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
+
+    originKeys[`${ALICE} ${await kidOf(2)}`] = await raw(2);
+    vi.setSystemTime(new Date('2026-09-11T00:59:00Z'));
+    expect(await lookup.keyFor(ALICE, await kidOf(2)), 'inside the ttl the miss stands').toBeNull();
+    vi.setSystemTime(new Date('2026-09-11T01:01:00Z'));
+    expect((await lookup.keyFor(ALICE, await kidOf(2)))?.source).toBe('OriginServer');
+    expect(hits.origin).toBe(2);
+  });
+
+  it('asks again after a remembered miss is forgotten', async () => {
+    const originKeys: Record<string, Uint8Array> = {};
+    const { fetch, hits } = network([], originKeys);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR);
+    expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
+
+    originKeys[`${ALICE} ${await kidOf(2)}`] = await raw(2);
+    lookup.forget(ALICE, await kidOf(2));
+    expect((await lookup.keyFor(ALICE, await kidOf(2)))?.source).toBe('OriginServer');
+    expect(hits.origin).toBe(2);
+  });
+
+  it('keeps a found key cached when asked to forget', async () => {
+    const { fetch, hits } = network([await buildDeviceRecord(await key(1), ALICE, T0)]);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR);
+    expect(await lookup.keyFor(ALICE, await kidOf(1))).not.toBeNull();
+    lookup.forget(ALICE, await kidOf(1));
+    expect(await lookup.keyFor(ALICE, await kidOf(1))).not.toBeNull();
+    expect(hits.pds).toBe(1);
+  });
+
   it('makes no request for a second lookup inside the ttl, and asks again after it', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));

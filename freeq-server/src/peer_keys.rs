@@ -178,6 +178,9 @@ pub fn fetch_on_miss(state: &Arc<SharedState>, origin: &str, did: &str, sig_tag:
 pub fn fetch_again(state: &Arc<SharedState>, origin: &str, did: &str, kid: &str) {
     let bases: Vec<String> = base_for_origin(state, origin).into_iter().collect();
     LOOKUPS.lock().remove(&(did.to_string(), kid.to_string()));
+    // The record lookup's remembered miss goes too, so the signer's records
+    // are read again rather than answered from the cache.
+    state.key_lookup.forget(did, kid);
     start_lookup(state, bases, did, kid);
 }
 
@@ -309,14 +312,26 @@ async fn fetch_key(base: &str, did: &str, kid: &str) -> anyhow::Result<[u8; 32]>
 /// resolver whose document for `did` names it.
 #[cfg(test)]
 pub(crate) async fn stub_pds_resolver(did: &str, records: Vec<serde_json::Value>) -> DidResolver {
-    let records = Arc::new(records);
+    stub_pds_holding(did, Arc::new(Mutex::new(records))).await.0
+}
+
+/// [`stub_pds_resolver`] over records a test can change, with a count of the
+/// listing requests the stub has answered.
+#[cfg(test)]
+pub(crate) async fn stub_pds_holding(
+    did: &str,
+    records: Arc<Mutex<Vec<serde_json::Value>>>,
+) -> (DidResolver, Arc<std::sync::atomic::AtomicUsize>) {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = hits.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let app = axum::Router::new().route(
         "/xrpc/com.atproto.repo.listRecords",
         axum::routing::get(
             move |axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>| {
-                let records = records.clone();
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let records = records.lock().clone();
                 async move {
                     let device = q.get("collection").map(String::as_str)
                         == Some(freeq_sdk::identity_records::DEVICE_KEY_TYPE);
@@ -339,7 +354,10 @@ pub(crate) async fn stub_pds_resolver(did: &str, records: Vec<serde_json::Value>
     // Any key works for the document's own `#atproto` entry; it signs nothing here.
     let atproto = freeq_sdk::crypto::PrivateKey::generate_secp256k1().public_key_multibase();
     let doc = freeq_sdk::did::make_test_did_document_with_pds(did, &atproto, Some(&base));
-    DidResolver::static_map(HashMap::from([(did.to_string(), doc)]))
+    (
+        DidResolver::static_map(HashMap::from([(did.to_string(), doc)])),
+        hits,
+    )
 }
 
 /// Whether a `(did, kid)` lookup is currently remembered — in flight, or
@@ -849,6 +867,55 @@ mod tests {
             source_of(&state, did, &kid).as_deref(),
             Some("did-document")
         );
+    }
+
+    /// A parked event's retry reads the signer's records again, even inside
+    /// the window the lookup remembers a miss for.
+    #[tokio::test]
+    async fn a_retry_reads_the_signers_records_again() {
+        let did = "did:plc:recordlater";
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let (resolver, pds_hits) = stub_pds_holding(did, records.clone()).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            resolver,
+        );
+
+        fetch_on_miss(
+            &state,
+            PEER,
+            did,
+            &freeq_sdk::sigtag::sign_canonical("{}", &key),
+        );
+        // The first lookup finds no record and remembers the miss.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while pds_hits.load(std::sync::atomic::Ordering::SeqCst) == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(state.key_lookup.key_for(did, &kid).await.unwrap().is_none());
+        assert_eq!(
+            pds_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the miss is remembered"
+        );
+
+        records.lock().push(device_record(did, &key));
+        fetch_again(&state, PEER, did, &kid);
+
+        assert_eq!(
+            wait_for_key(&state, did, &kid).await,
+            Some(*key.verifying_key().as_bytes())
+        );
+        assert_eq!(
+            source_of(&state, did, &kid).as_deref(),
+            Some("identity-record")
+        );
+        assert_eq!(pds_hits.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

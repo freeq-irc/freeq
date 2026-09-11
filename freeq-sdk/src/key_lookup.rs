@@ -35,13 +35,17 @@ pub struct FoundKey {
     pub source: KeySource,
 }
 
-/// Looks keys up by (DID, kid), caching each key found for `ttl`.
+/// Looks keys up by (DID, kid), caching each answer for `ttl`: a key found,
+/// or a miss, when every source answered without the key.
 pub struct KeyLookup<P: ClientProvider> {
     reader: RecordReader<P>,
     origin_base: Option<String>,
     ttl: Duration,
-    cache: Mutex<HashMap<(String, String), (FoundKey, Instant)>>,
+    cache: Mutex<HashMap<(String, String), CachedAnswer>>,
 }
+
+/// A cached answer and when it was found: a key, or `None` for a miss.
+type CachedAnswer = (Option<FoundKey>, Instant);
 
 /// The one field of the origin's answer read here.
 #[derive(serde::Deserialize)]
@@ -64,13 +68,15 @@ impl<P: ClientProvider> KeyLookup<P> {
     /// The key `did` signs with under `kid`, or `None` when no source has it.
     ///
     /// A source that fails is skipped and the next one asked; the first
-    /// failure is returned only if no later source finds the key.
+    /// failure is returned only if no later source finds the key. A miss is
+    /// remembered only when no source failed, since a failed source did not
+    /// say it lacks the key.
     pub async fn key_for(&self, did: &str, kid: &str) -> Result<Option<FoundKey>> {
         let slot = (did.to_string(), kid.to_string());
-        if let Some((found, at)) = self.cache.lock().get(&slot).copied()
+        if let Some((answer, at)) = self.cache.lock().get(&slot).copied()
             && at.elapsed() < self.ttl
         {
-            return Ok(Some(found));
+            return Ok(answer);
         }
 
         let mut failure = None;
@@ -101,11 +107,26 @@ impl<P: ClientProvider> KeyLookup<P> {
 
         match (found, failure) {
             (Some(found), _) => {
-                self.cache.lock().insert(slot, (found, Instant::now()));
+                self.cache
+                    .lock()
+                    .insert(slot, (Some(found), Instant::now()));
                 Ok(Some(found))
             }
             (None, Some(e)) => Err(e),
-            (None, None) => Ok(None),
+            (None, None) => {
+                self.cache.lock().insert(slot, (None, Instant::now()));
+                Ok(None)
+            }
+        }
+    }
+
+    /// Clear a remembered miss for `(did, kid)`, so the next lookup asks the
+    /// sources again. A key found stays cached.
+    pub fn forget(&self, did: &str, kid: &str) {
+        let slot = (did.to_string(), kid.to_string());
+        let mut cache = self.cache.lock();
+        if cache.get(&slot).is_some_and(|(answer, _)| answer.is_none()) {
+            cache.remove(&slot);
         }
     }
 
@@ -250,13 +271,19 @@ mod tests {
 
     /// An origin server whose key store holds `keys` by (did, kid).
     async fn origin(keys: Vec<(&str, String, [u8; 32])>) -> Stub {
+        let keys = keys
+            .into_iter()
+            .map(|(did, kid, key)| ((did.to_string(), kid), key))
+            .collect();
+        origin_holding(Arc::new(parking_lot::Mutex::new(keys))).await
+    }
+
+    type HeldKeys = Arc<parking_lot::Mutex<HashMap<(String, String), [u8; 32]>>>;
+
+    /// An origin server answering from `keys`, which a test can change.
+    async fn origin_holding(keys: HeldKeys) -> Stub {
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = hits.clone();
-        let keys: Arc<HashMap<(String, String), [u8; 32]>> = Arc::new(
-            keys.into_iter()
-                .map(|(did, kid, key)| ((did.to_string(), kid), key))
-                .collect(),
-        );
         let router = axum::Router::new().route(
             "/api/v1/signing-keys/{did}/{kid}",
             get(move |Path((did, kid)): Path<(String, String)>| {
@@ -264,7 +291,9 @@ mod tests {
                 let keys = keys.clone();
                 async move {
                     let key = keys
+                        .lock()
                         .get(&(did.clone(), kid.clone()))
+                        .copied()
                         .ok_or(StatusCode::NOT_FOUND)?;
                     Ok::<_, StatusCode>(axum::Json(json!({
                         "did": did,
@@ -407,6 +436,66 @@ mod tests {
         // With nothing else to ask, the failure is the answer.
         let alone = lookup(vec![alice_on(&pds)], None, HOUR);
         assert!(alone.key_for(ALICE, &kid_of(2)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn two_misses_inside_the_ttl_make_one_round_of_requests() {
+        let pds = pds(vec![device_record(1)]).await;
+        let origin = origin(vec![]).await;
+        let keys = lookup(vec![alice_on(&pds)], Some(&origin), HOUR);
+        assert_eq!(keys.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
+        assert_eq!(keys.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
+        assert_eq!((pds.hits(), origin.hits()), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_key_that_appears_after_a_miss_is_found_once_the_ttl_passes() {
+        let pds = pds(vec![]).await;
+        let held: HeldKeys = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let origin = origin_holding(held.clone()).await;
+        let keys = lookup(
+            vec![alice_on(&pds)],
+            Some(&origin),
+            Duration::from_millis(50),
+        );
+        assert_eq!(keys.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
+
+        held.lock().insert((ALICE.to_string(), kid_of(2)), raw(2));
+        assert_eq!(
+            keys.key_for(ALICE, &kid_of(2)).await.unwrap(),
+            None,
+            "inside the ttl the miss stands"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let found = keys.key_for(ALICE, &kid_of(2)).await.unwrap();
+        assert_eq!(found.map(|f| f.source), Some(KeySource::OriginServer));
+        assert_eq!(origin.hits(), 2);
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_miss_lets_the_next_lookup_ask_again() {
+        let pds = pds(vec![]).await;
+        let held: HeldKeys = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let origin = origin_holding(held.clone()).await;
+        let keys = lookup(vec![alice_on(&pds)], Some(&origin), HOUR);
+        assert_eq!(keys.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
+
+        held.lock().insert((ALICE.to_string(), kid_of(2)), raw(2));
+        keys.forget(ALICE, &kid_of(2));
+        let found = keys.key_for(ALICE, &kid_of(2)).await.unwrap();
+        assert_eq!(found.map(|f| f.source), Some(KeySource::OriginServer));
+        assert_eq!(origin.hits(), 2);
+    }
+
+    /// Only a miss is forgotten: a key found stays cached.
+    #[tokio::test]
+    async fn forgetting_leaves_a_found_key_cached() {
+        let pds = pds(vec![device_record(1)]).await;
+        let keys = lookup(vec![alice_on(&pds)], None, HOUR);
+        keys.key_for(ALICE, &kid_of(1)).await.unwrap().unwrap();
+        keys.forget(ALICE, &kid_of(1));
+        keys.key_for(ALICE, &kid_of(1)).await.unwrap().unwrap();
+        assert_eq!(pds.hits(), 1);
     }
 
     #[tokio::test]
