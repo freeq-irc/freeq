@@ -132,9 +132,44 @@ pub fn verify_canonical(
         .map_err(|_| SigError::Invalid)
 }
 
+/// The millisecond timestamp a ULID msgid embeds in its first 10 characters,
+/// or `None` for anything that is not a well-formed ULID. The same decode the
+/// server uses for its own ids.
+pub fn msgid_timestamp_ms(id: &str) -> Option<u64> {
+    const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    if id.len() != 26 || !id.bytes().all(|b| CROCKFORD.contains(&b)) {
+        return None;
+    }
+    id.bytes().take(10).try_fold(0u64, |ts, b| {
+        let value = CROCKFORD.iter().position(|c| *c == b)? as u64;
+        Some((ts << 5) | value)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_ulid_msgid_gives_its_millisecond_time() {
+        let fresh = crate::chatsig::new_event_id();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let ts = msgid_timestamp_ms(&fresh).unwrap();
+        assert!(now.abs_diff(ts) < 5_000, "{ts} vs {now}");
+        assert_eq!(msgid_timestamp_ms("0000000001ZZZZZZZZZZZZZZZZ"), Some(1));
+        assert_eq!(msgid_timestamp_ms("00000000100000000000000000"), Some(32));
+    }
+
+    #[test]
+    fn anything_but_a_ulid_has_no_time() {
+        assert_eq!(msgid_timestamp_ms(""), None);
+        assert_eq!(msgid_timestamp_ms("01kyvt5z8q0000000000000000"), None);
+        assert_eq!(msgid_timestamp_ms("01KYVT5Z8Q000000000000000"), None);
+        assert_eq!(msgid_timestamp_ms("01KYVT5Z8Q000000000000000U"), None);
+        assert_eq!(msgid_timestamp_ms("0123456789abcdef0123456789abcdef"), None);
+    }
 
     fn test_key(byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[byte; 32])

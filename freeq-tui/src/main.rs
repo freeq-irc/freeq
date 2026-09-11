@@ -1454,6 +1454,9 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
         // The TUI supplies no key store or enrollment yet.
         Event::SigningKeyUnpublished => {}
 
+        // The TUI passes no key lookup, so no verdict arrives.
+        Event::Verdict { .. } => {}
+
         Event::WhoisReply { nick: _, info } => {
             let buf = app.active_buffer.clone();
             app.buffer_mut(&buf).push_system(&format!("*** {info}"));

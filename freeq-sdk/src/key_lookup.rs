@@ -6,15 +6,16 @@
 //! answers, the key must hash to the kid, or it is refused.
 
 use crate::crypto::PublicKey;
-use crate::identity_records::RecordReader;
+use crate::identity_records::{DEVICE_KEY_TYPE, RecordReader, fold_device_records};
 use crate::sigtag::derive_kid_bytes;
 use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use freeq_oauth::ClientProvider;
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Where a key was found.
@@ -33,24 +34,36 @@ pub enum KeySource {
 pub struct FoundKey {
     pub public_key: [u8; 32],
     pub source: KeySource,
+    /// When the origin server says the key was removed, unix seconds.
+    pub retired_at: Option<i64>,
 }
 
 /// Looks keys up by (DID, kid), caching each answer for `ttl`: a key found,
 /// or a miss, when every source answered without the key.
 pub struct KeyLookup<P: ClientProvider> {
-    reader: RecordReader<P>,
+    pub(crate) reader: RecordReader<P>,
     origin_base: Option<String>,
+    default_origin: OnceLock<String>,
     ttl: Duration,
-    cache: Mutex<HashMap<(String, String), CachedAnswer>>,
+    cache: Mutex<HashMap<(String, String), Cached>>,
 }
 
-/// A cached answer and when it was found: a key, or `None` for a miss.
-type CachedAnswer = (Option<FoundKey>, Instant);
+/// One (DID, kid)'s cached answer: the signer's device records as listed,
+/// folded again at whatever time is asked, and what the other sources said,
+/// once they have been asked.
+#[derive(Clone)]
+struct Cached {
+    records: Vec<serde_json::Value>,
+    other: Option<Option<FoundKey>>,
+    at: Instant,
+}
 
-/// The one field of the origin's answer read here.
+/// The fields of the origin's answer read here.
 #[derive(serde::Deserialize)]
 struct OriginKey {
     public_key: String,
+    #[serde(default)]
+    removed_at: Option<i64>,
 }
 
 impl<P: ClientProvider> KeyLookup<P> {
@@ -60,30 +73,78 @@ impl<P: ClientProvider> KeyLookup<P> {
         Self {
             reader,
             origin_base,
+            default_origin: OnceLock::new(),
             ttl,
             cache: Mutex::new(HashMap::new()),
         }
     }
 
-    /// The key `did` signs with under `kid`, or `None` when no source has it.
+    /// The origin to ask when none was given at construction. Set once; a
+    /// client sets it to the server it connected to.
+    pub fn set_default_origin_base(&self, base: String) {
+        let _ = self.default_origin.set(base);
+    }
+
+    /// The origin server this lookup asks: the one given, else the default.
+    pub fn origin_base(&self) -> Option<&str> {
+        self.origin_base
+            .as_deref()
+            .or_else(|| self.default_origin.get().map(String::as_str))
+    }
+
+    /// The key `did` signs with under `kid` now; see [`Self::key_for_at`].
+    pub async fn key_for(&self, did: &str, kid: &str) -> Result<Option<FoundKey>> {
+        self.key_for_at(did, kid, Utc::now()).await
+    }
+
+    /// The key `did` signed with under `kid` at `at`, or `None` when no
+    /// source has it. The signer's records are folded at `at`, so a record
+    /// key counts only if it was live then; the other sources are not dated.
     ///
     /// A source that fails is skipped and the next one asked; the first
     /// failure is returned only if no later source finds the key. A miss is
     /// remembered only when no source failed, since a failed source did not
     /// say it lacks the key.
-    pub async fn key_for(&self, did: &str, kid: &str) -> Result<Option<FoundKey>> {
+    pub async fn key_for_at(
+        &self,
+        did: &str,
+        kid: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Option<FoundKey>> {
         let slot = (did.to_string(), kid.to_string());
-        if let Some((answer, at)) = self.cache.lock().get(&slot).copied()
-            && at.elapsed() < self.ttl
-        {
-            return Ok(answer);
-        }
+        let cached = self
+            .cache
+            .lock()
+            .get(&slot)
+            .filter(|c| c.at.elapsed() < self.ttl)
+            .cloned();
 
         let mut failure = None;
-        let mut take = |answer: Result<Option<[u8; 32]>>, source| match answer {
+        let records = match cached.as_ref() {
+            Some(c) => c.records.clone(),
+            None => match self.reader.list_records(did, DEVICE_KEY_TYPE).await {
+                Ok(records) => records,
+                Err(e) => {
+                    failure = Some(e);
+                    Vec::new()
+                }
+            },
+        };
+        if let Some(found) = in_records(did, kid, &records, at) {
+            if failure.is_none() && cached.is_none() {
+                self.remember(slot, records, None);
+            }
+            return Ok(Some(found));
+        }
+        if let Some(other) = cached.as_ref().and_then(|c| c.other) {
+            return Ok(other);
+        }
+
+        let mut take = |answer: Result<Option<[u8; 32]>>, source, retired_at| match answer {
             Ok(Some(key)) if derive_kid_bytes(&key) == kid => Some(FoundKey {
                 public_key: key,
                 source,
+                retired_at,
             }),
             Ok(_) => None,
             Err(e) => {
@@ -91,30 +152,34 @@ impl<P: ClientProvider> KeyLookup<P> {
                 None
             }
         };
-
-        let mut found = take(self.in_records(did, kid).await, KeySource::IdentityRecord);
-        if found.is_none() && did.starts_with("did:web:") {
-            found = take(self.in_document(did, kid).await, KeySource::DidDocument);
+        let mut found = None;
+        if did.starts_with("did:web:") {
+            found = take(
+                self.in_document(did, kid).await,
+                KeySource::DidDocument,
+                None,
+            );
         }
         if found.is_none()
-            && let Some(base) = &self.origin_base
+            && let Some(base) = self.origin_base()
         {
-            found = take(
-                self.at_origin(base, did, kid).await,
-                KeySource::OriginServer,
-            );
+            let answer = self.at_origin(base, did, kid).await;
+            let (key, removed_at) = match answer {
+                Ok(Some((key, removed_at))) => (Ok(Some(key)), removed_at),
+                Ok(None) => (Ok(None), None),
+                Err(e) => (Err(e), None),
+            };
+            found = take(key, KeySource::OriginServer, removed_at);
         }
 
         match (found, failure) {
             (Some(found), _) => {
-                self.cache
-                    .lock()
-                    .insert(slot, (Some(found), Instant::now()));
+                self.remember(slot, records, Some(Some(found)));
                 Ok(Some(found))
             }
             (None, Some(e)) => Err(e),
             (None, None) => {
-                self.cache.lock().insert(slot, (None, Instant::now()));
+                self.remember(slot, records, Some(None));
                 Ok(None)
             }
         }
@@ -125,17 +190,29 @@ impl<P: ClientProvider> KeyLookup<P> {
     pub fn forget(&self, did: &str, kid: &str) {
         let slot = (did.to_string(), kid.to_string());
         let mut cache = self.cache.lock();
-        if cache.get(&slot).is_some_and(|(answer, _)| answer.is_none()) {
+        let found = cache.get(&slot).is_some_and(|c| {
+            matches!(c.other, Some(Some(_)))
+                || in_records(did, kid, &c.records, Utc::now()).is_some()
+        });
+        if !found {
             cache.remove(&slot);
         }
     }
 
-    async fn in_records(&self, did: &str, kid: &str) -> Result<Option<[u8; 32]>> {
-        let live = self.reader.live_device_keys(did, Utc::now()).await?;
-        Ok(live
-            .iter()
-            .find(|k| k.kid == kid)
-            .and_then(|k| ed25519_raw(&k.public_key_multibase)))
+    fn remember(
+        &self,
+        slot: (String, String),
+        records: Vec<serde_json::Value>,
+        other: Option<Option<FoundKey>>,
+    ) {
+        self.cache.lock().insert(
+            slot,
+            Cached {
+                records,
+                other,
+                at: Instant::now(),
+            },
+        );
     }
 
     async fn in_document(&self, did: &str, kid: &str) -> Result<Option<[u8; 32]>> {
@@ -147,7 +224,13 @@ impl<P: ClientProvider> KeyLookup<P> {
             .find(|key| derive_kid_bytes(key) == kid))
     }
 
-    async fn at_origin(&self, base: &str, did: &str, kid: &str) -> Result<Option<[u8; 32]>> {
+    /// The key the origin holds for `(did, kid)`, and when it was removed.
+    async fn at_origin(
+        &self,
+        base: &str,
+        did: &str,
+        kid: &str,
+    ) -> Result<Option<([u8; 32], Option<i64>)>> {
         let mut url = url::Url::parse(base).context("invalid origin base URL")?;
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("origin base URL cannot take a path"))?
@@ -172,8 +255,28 @@ impl<P: ClientProvider> KeyLookup<P> {
         Ok(URL_SAFE_NO_PAD
             .decode(&answer.public_key)
             .ok()
-            .and_then(|bytes| bytes.try_into().ok()))
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(|key| (key, answer.removed_at)))
     }
+}
+
+/// The key `kid` names among `did`'s device records, if it was live at `at`.
+fn in_records(
+    did: &str,
+    kid: &str,
+    records: &[serde_json::Value],
+    at: DateTime<Utc>,
+) -> Option<FoundKey> {
+    fold_device_records(did, records, at)
+        .iter()
+        .find(|k| k.kid == kid)
+        .and_then(|k| ed25519_raw(&k.public_key_multibase))
+        .filter(|key| derive_kid_bytes(key) == kid)
+        .map(|key| FoundKey {
+            public_key: key,
+            source: KeySource::IdentityRecord,
+            retired_at: None,
+        })
 }
 
 /// The raw bytes of a `z6Mk…` ed25519 key; anything else is not a signing key here.
@@ -344,7 +447,8 @@ mod tests {
             found,
             Some(FoundKey {
                 public_key: raw(1),
-                source: KeySource::IdentityRecord
+                source: KeySource::IdentityRecord,
+                retired_at: None,
             })
         );
         assert_eq!(origin.hits(), 0);
@@ -362,7 +466,8 @@ mod tests {
             found,
             Some(FoundKey {
                 public_key: raw(2),
-                source: KeySource::OriginServer
+                source: KeySource::OriginServer,
+                retired_at: None,
             })
         );
         assert_eq!(origin.hits(), 1);
@@ -415,7 +520,8 @@ mod tests {
             found,
             Some(FoundKey {
                 public_key: raw(4),
-                source: KeySource::DidDocument
+                source: KeySource::DidDocument,
+                retired_at: None,
             })
         );
         assert_eq!(origin.hits(), 0);
@@ -518,5 +624,88 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         keys.key_for(ALICE, &kid_of(1)).await.unwrap().unwrap();
         assert_eq!(pds.hits(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_lookup_at_a_time_folds_the_records_at_that_time() {
+        use crate::identity_records::build_device_retirement;
+        let retirement = serde_json::to_value(
+            build_device_retirement(&key(1), ALICE, &kid_of(1), "2026-03-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        let pds = pds(vec![device_record(1), retirement]).await;
+        let keys = lookup(vec![alice_on(&pds)], None, HOUR);
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let live = keys
+            .key_for_at(ALICE, &kid_of(1), at("2026-02-01T00:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(live.map(|f| f.source), Some(KeySource::IdentityRecord));
+        assert_eq!(
+            keys.key_for_at(ALICE, &kid_of(1), at("2026-04-01T00:00:00Z"))
+                .await
+                .unwrap(),
+            None,
+            "after its retirement the key is not in the records"
+        );
+        assert_eq!(
+            keys.key_for_at(ALICE, &kid_of(1), at("2025-12-01T00:00:00Z"))
+                .await
+                .unwrap(),
+            None,
+            "before its record the key is not in the records"
+        );
+        assert_eq!(pds.hits(), 1, "one listing answers every time asked");
+    }
+
+    #[tokio::test]
+    async fn a_key_the_origin_removed_carries_the_date() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let router = axum::Router::new().route(
+            "/api/v1/signing-keys/{did}/{kid}",
+            get(move |Path((did, kid)): Path<(String, String)>| async move {
+                axum::Json(json!({
+                    "did": did,
+                    "kid": kid,
+                    "public_key": URL_SAFE_NO_PAD.encode(raw(2)),
+                    "registered_at": 1_700_000_000,
+                    "removed_at": 1_780_000_000,
+                }))
+            }),
+        );
+        let origin = serve(router, hits).await;
+        let pds = pds(vec![]).await;
+        let found = lookup(vec![alice_on(&pds)], Some(&origin), HOUR)
+            .key_for(ALICE, &kid_of(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            found,
+            Some(FoundKey {
+                public_key: raw(2),
+                source: KeySource::OriginServer,
+                retired_at: Some(1_780_000_000),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_origin_base_is_used_when_none_was_given() {
+        let pds = pds(vec![]).await;
+        let origin = origin(vec![(ALICE, kid_of(2), raw(2))]).await;
+        let keys = lookup(vec![alice_on(&pds)], None, HOUR);
+        assert_eq!(keys.origin_base(), None);
+        keys.set_default_origin_base(origin.base.clone());
+        assert_eq!(keys.origin_base(), Some(origin.base.as_str()));
+        let found = keys.key_for(ALICE, &kid_of(2)).await.unwrap();
+        assert_eq!(found.map(|f| f.source), Some(KeySource::OriginServer));
+
+        let given = lookup(vec![alice_on(&pds)], Some(&origin), HOUR);
+        given.set_default_origin_base("https://elsewhere.example".to_string());
+        assert_eq!(given.origin_base(), Some(origin.base.as_str()));
     }
 }

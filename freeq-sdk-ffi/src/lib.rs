@@ -802,6 +802,7 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
             text,
             tags,
             dm_key,
+            verdict: _,
         } => {
             let msgid = tags.get("msgid").cloned();
             let reply_to = tags.get("+reply").cloned();
@@ -886,6 +887,7 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
             target,
             tags,
             dm_key,
+            verdict: _,
         } => {
             let tag_entries = tags
                 .iter()
@@ -915,6 +917,7 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
             sig_tag,
             replayed,
             dm_key,
+            verdict: _,
         } => FreeqEvent::Act {
             event: ActEvent {
                 from: from.clone(),
@@ -1076,6 +1079,7 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
         },
         // Not exposed through the UDL yet.
         Event::SigningKeyUnpublished => return None,
+        Event::Verdict { .. } => return None,
     })
 }
 
@@ -2861,6 +2865,7 @@ mod tests {
                 text: "hi".to_string(),
                 tags,
                 dm_key: None,
+                verdict: None,
             };
             let FreeqEvent::Message { msg } = convert_event(&ev).expect("exposed event") else {
                 panic!("expected Message variant");
@@ -2891,6 +2896,7 @@ mod tests {
             text: "hi".to_string(),
             tags,
             dm_key: None,
+            verdict: None,
         };
         let out = convert_event(&ev).expect("exposed event");
         let FreeqEvent::Message { msg } = out else {
@@ -2934,6 +2940,7 @@ mod tests {
             sig_tag: event.sig_tag,
             replayed: event.replayed,
             dm_key: None,
+            verdict: None,
         };
         let FreeqEvent::Act { event } = convert_event(&ev).expect("exposed event") else {
             panic!("expected Act variant");
@@ -2971,6 +2978,7 @@ mod tests {
             text: "cart ok".to_string(),
             tags,
             dm_key: None,
+            verdict: None,
         };
         let FreeqEvent::Message { msg } = convert_event(&ev).expect("event") else {
             panic!("expected Message");
@@ -3000,6 +3008,7 @@ mod tests {
             text: "offered: ship the release".to_string(),
             tags,
             dm_key: None,
+            verdict: None,
         };
         let FreeqEvent::Message { msg } = convert_event(&ev).expect("event") else {
             panic!("expected Message");
@@ -3028,6 +3037,7 @@ mod tests {
             text: "done".to_string(),
             tags,
             dm_key: None,
+            verdict: None,
         };
         let FreeqEvent::Message { msg } = convert_event(&ev).expect("event") else {
             panic!("expected Message");
@@ -3045,6 +3055,7 @@ mod tests {
             text: "plain".to_string(),
             tags,
             dm_key: None,
+            verdict: None,
         };
         let FreeqEvent::Message { msg } = convert_event(&ev).expect("event") else {
             panic!("expected Message");
@@ -3062,6 +3073,7 @@ mod tests {
             text: "no reactions here".to_string(),
             tags,
             dm_key: None,
+            verdict: None,
         };
         let out = convert_event(&ev).expect("exposed event");
         let FreeqEvent::Message { msg } = out else {

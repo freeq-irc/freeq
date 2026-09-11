@@ -79,6 +79,10 @@ pub struct ConnectConfig {
     /// This connect follows a new sign-in, not a saved login or a reconnect.
     /// Only then is a stored key the account has retired replaced.
     pub fresh_sign_in: bool,
+    /// Checks the signature on every received message, act and TAGMSG, and
+    /// puts a verdict on each. Built without an origin base, it asks the
+    /// connected server ([`server_http_origin`]). `None`: no verdicts.
+    pub key_lookup: Option<Arc<crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>>>,
 }
 
 impl std::fmt::Debug for ConnectConfig {
@@ -96,6 +100,7 @@ impl std::fmt::Debug for ConnectConfig {
             .field("enrollment", &self.enrollment.is_some())
             .field("device_label", &self.device_label)
             .field("fresh_sign_in", &self.fresh_sign_in)
+            .field("key_lookup", &self.key_lookup.is_some())
             .finish()
     }
 }
@@ -115,7 +120,20 @@ impl Default for ConnectConfig {
             enrollment: None,
             device_label: None,
             fresh_sign_in: false,
+            key_lookup: None,
         }
+    }
+}
+
+/// Where a server answers HTTP, from the address its IRC port is reached at.
+/// Anything public is https on the default port; a loopback server is a local
+/// build serving its web API in the clear on the port it defaults to.
+pub fn server_http_origin(server_addr: &str) -> String {
+    let host = server_addr.rsplit_once(':').map_or(server_addr, |(h, _)| h);
+    if matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        format!("http://{host}:8080")
+    } else {
+        format!("https://{host}")
     }
 }
 
@@ -2179,6 +2197,274 @@ async fn replace_retired_device_key<P: freeq_oauth::ClientProvider>(
     }
 }
 
+/// Checks received signatures for one connection. Holds the connected
+/// server's own key set, so a signature the server made on a sender's behalf
+/// reads as the server's.
+struct SignatureChecker {
+    lookup: Arc<crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>>,
+    server_keys: parking_lot::Mutex<ServerKeySet>,
+    /// One key-set fetch at a time.
+    fetching: tokio::sync::Mutex<()>,
+}
+
+#[derive(Default)]
+struct ServerKeySet {
+    fetched: bool,
+    keys: HashMap<String, [u8; 32]>,
+    /// Kids the set has been fetched again for, once each per session.
+    refetched: HashSet<String>,
+}
+
+impl SignatureChecker {
+    fn new(lookup: Arc<crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>>) -> Self {
+        Self {
+            lookup,
+            server_keys: parking_lot::Mutex::new(ServerKeySet::default()),
+            fetching: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// The verdict a line is delivered with: final when nothing needs
+    /// fetching, else `Pending`.
+    fn at_delivery(&self, look: &crate::verdict::FirstLook) -> crate::verdict::Verdict {
+        use crate::verdict::{FirstLook, VerdictState};
+        match look {
+            FirstLook::Unsigned => plain_verdict(VerdictState::Unsigned, None),
+            FirstLook::Unverifiable(kid) => plain_verdict(VerdictState::Unverifiable, kid.clone()),
+            FirstLook::Check(signed) => {
+                let server_key = self.server_keys.lock().keys.get(&signed.kid).copied();
+                match server_key {
+                    Some(key) => server_verdict(signed, &key),
+                    None => plain_verdict(VerdictState::Pending, Some(signed.kid.clone())),
+                }
+            }
+        }
+    }
+
+    /// The verdict once the key is found, or found nowhere.
+    async fn resolve(&self, signed: &crate::verdict::Signed) -> crate::verdict::Verdict {
+        use crate::verdict::{KeyLayer, Verdict, VerdictState};
+        self.fetch_server_keys(false).await;
+        if let Some(key) = self.server_key(&signed.kid) {
+            return server_verdict(signed, &key);
+        }
+
+        let at_ms = crate::sigtag::msgid_timestamp_ms(&signed.msgid)
+            .and_then(|ms| i64::try_from(ms).ok())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        let at = chrono::DateTime::from_timestamp_millis(at_ms).unwrap_or_else(chrono::Utc::now);
+        if let Ok(Some(found)) = self.lookup.key_for_at(&signed.did, &signed.kid, at).await {
+            let state = match crate::verdict::check(signed, &found.public_key) {
+                Ok(false) => VerdictState::Invalid,
+                Err(()) => VerdictState::Unverifiable,
+                Ok(true)
+                    if found
+                        .retired_at
+                        .is_some_and(|r| r.saturating_mul(1000) <= at_ms) =>
+                {
+                    VerdictState::Retired
+                }
+                Ok(true) => VerdictState::Device,
+            };
+            let layer = (state == VerdictState::Device).then_some(match found.source {
+                crate::key_lookup::KeySource::IdentityRecord => KeyLayer::Published,
+                _ => KeyLayer::Vouched,
+            });
+            return Verdict {
+                state,
+                layer,
+                kid: Some(signed.kid.clone()),
+                key_source: Some(found.source),
+            };
+        }
+
+        // A kid no source holds may be a key the server rotated to since its
+        // set was read: read it again, once per kid.
+        let first_time = self.server_keys.lock().refetched.insert(signed.kid.clone());
+        if first_time {
+            self.fetch_server_keys(true).await;
+            if let Some(key) = self.server_key(&signed.kid) {
+                return server_verdict(signed, &key);
+            }
+        }
+        plain_verdict(VerdictState::Unverifiable, Some(signed.kid.clone()))
+    }
+
+    fn server_key(&self, kid: &str) -> Option<[u8; 32]> {
+        self.server_keys.lock().keys.get(kid).copied()
+    }
+
+    /// Read the server's key set: `/api/v1/signing-key` names the DID it is
+    /// published under, `/api/v1/signing-keys/{did}` lists every key, current
+    /// and retired. Once, unless `again`.
+    async fn fetch_server_keys(&self, again: bool) {
+        let _one_at_a_time = self.fetching.lock().await;
+        if self.server_keys.lock().fetched && !again {
+            return;
+        }
+        let keys = match self.lookup.origin_base() {
+            Some(origin) => fetch_server_key_set(&self.lookup, origin).await,
+            None => HashMap::new(),
+        };
+        let mut set = self.server_keys.lock();
+        set.fetched = true;
+        set.keys.extend(keys);
+    }
+}
+
+fn plain_verdict(
+    state: crate::verdict::VerdictState,
+    kid: Option<String>,
+) -> crate::verdict::Verdict {
+    crate::verdict::Verdict {
+        state,
+        layer: None,
+        kid,
+        key_source: None,
+    }
+}
+
+/// A signature whose kid is one of the server's own keys.
+fn server_verdict(signed: &crate::verdict::Signed, key: &[u8; 32]) -> crate::verdict::Verdict {
+    use crate::verdict::VerdictState;
+    let state = match crate::verdict::check(signed, key) {
+        Ok(true) => VerdictState::Server,
+        Ok(false) => VerdictState::Invalid,
+        Err(()) => VerdictState::Unverifiable,
+    };
+    plain_verdict(state, Some(signed.kid.clone()))
+}
+
+/// Every key in the server's published key set, by kid. Empty when the
+/// server names no usable DID or publishes no set.
+async fn fetch_server_key_set(
+    lookup: &crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>,
+    origin: &str,
+) -> HashMap<String, [u8; 32]> {
+    use freeq_oauth::ClientProvider;
+    let origin = origin.trim_end_matches('/');
+    let get = |url: String| async move {
+        let client = lookup.reader.clients.client_for(&url).await.ok()?;
+        let resp = client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<serde_json::Value>().await.ok()
+    };
+    let Some(did) = get(format!("{origin}/api/v1/signing-key"))
+        .await
+        .as_ref()
+        .and_then(server_did_from_signing_key)
+    else {
+        return HashMap::new();
+    };
+    let Some(set) = get(format!("{origin}/api/v1/signing-keys/{did}")).await else {
+        return HashMap::new();
+    };
+    let decode = |b64: &str| -> Option<[u8; 32]> {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(b64)
+            .ok()?
+            .try_into()
+            .ok()
+    };
+    let mut keys: HashMap<String, [u8; 32]> = set
+        .get("keys")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|k| decode(k.get("public_key")?.as_str()?))
+        .map(|key| (crate::sigtag::derive_kid_bytes(&key), key))
+        .collect();
+    if let Some(key) = set
+        .get("public_key")
+        .and_then(|v| v.as_str())
+        .and_then(decode)
+    {
+        keys.insert(crate::sigtag::derive_kid_bytes(&key), key);
+    }
+    keys
+}
+
+/// The DID a server publishes its key set under, from its
+/// `/api/v1/signing-key` answer. Only a did:web made of characters a DID may
+/// hold, since it becomes part of a URL.
+fn server_did_from_signing_key(body: &serde_json::Value) -> Option<String> {
+    let did = body.get("did")?.as_str()?;
+    let name = did.strip_prefix("did:web:")?;
+    let usable = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '%'));
+    usable.then(|| did.to_string())
+}
+
+/// Look at a received line's signature, for the verdict it is delivered
+/// with. When that verdict is `Pending`, the check still to run comes back
+/// too; the caller starts it once the line has gone out.
+fn verdict_at_delivery(
+    checker: Option<&Arc<SignatureChecker>>,
+    maps: &DidMaps,
+    tags: &HashMap<String, String>,
+    target: &str,
+    body: Option<&str>,
+) -> (
+    Option<crate::verdict::Verdict>,
+    Option<crate::verdict::Signed>,
+) {
+    let Some(checker) = checker else {
+        return (None, None);
+    };
+    let look = {
+        let maps = maps.lock();
+        let target_did = maps.nick_to_did.get(&target.to_lowercase()).cloned();
+        crate::verdict::first_look(&crate::verdict::Line {
+            tags,
+            target,
+            body,
+            own_did: maps.own_did.as_deref(),
+            target_did: target_did.as_deref(),
+        })
+    };
+    let verdict = checker.at_delivery(&look);
+    let follow_up = match look {
+        crate::verdict::FirstLook::Check(signed)
+            if verdict.state == crate::verdict::VerdictState::Pending =>
+        {
+            Some(signed)
+        }
+        _ => None,
+    };
+    (Some(verdict), follow_up)
+}
+
+/// Finish a pending check off the receive path and send its verdict.
+fn spawn_verdict_check(
+    checker: Option<&Arc<SignatureChecker>>,
+    signed: Option<crate::verdict::Signed>,
+    event_tx: &mpsc::Sender<Event>,
+) {
+    let (Some(checker), Some(signed)) = (checker, signed) else {
+        return;
+    };
+    let checker = checker.clone();
+    let event_tx = event_tx.clone();
+    tokio::spawn(async move {
+        let verdict = checker.resolve(&signed).await;
+        let _ = event_tx
+            .send(Event::Verdict {
+                msgid: signed.msgid,
+                verdict,
+            })
+            .await;
+    });
+}
+
 /// Publish a stored device key through the app's `Enrollment`, off the
 /// connect path. A published key is saved with its record's URI; one that
 /// needs a new sign-in is reported; a failure is tried again next connect.
@@ -2273,6 +2559,13 @@ where
     // A stored device key the account does not have yet, published once
     // `MSGSIG` has gone out.
     let mut pending_enrollment: Option<crate::device_key::StoredDeviceKey> = None;
+    // Signature checks on received lines, when the app asked for them.
+    let checker: Option<Arc<SignatureChecker>> = config.key_lookup.clone().map(|lookup| {
+        if lookup.origin_base().is_none() {
+            lookup.set_default_origin_base(server_http_origin(&config.server_addr));
+        }
+        Arc::new(SignatureChecker::new(lookup))
+    });
     // Open `draft/multiline` batches keyed by batch id. Chunks
     // accumulate here while the batch is open; the BATCH closer drains
     // and emits a single Event::Message with the assembled body.
@@ -2521,7 +2814,14 @@ where
                                             &batch.from,
                                             &batch.target,
                                         );
-                                        dispatch_assembled_multiline(&event_tx, batch, dm_key).await;
+                                        dispatch_assembled_multiline(
+                                            &event_tx,
+                                            batch,
+                                            dm_key,
+                                            checker.as_ref(),
+                                            &did_maps,
+                                        )
+                                        .await;
                                     } else {
                                         let _ = event_tx.send(Event::BatchEnd { id: id.to_string() }).await;
                                     }
@@ -2945,7 +3245,13 @@ where
                                     }
                                     let dm_key =
                                         dm_key_for(&did_maps, &own_nick, &from, &target);
-                                    let _ = event_tx.send(Event::Message { from, target, text, tags, dm_key }).await;
+                                    // Checked over the wire body, before any
+                                    // legacy newline rewrite above.
+                                    let (verdict, follow_up) = verdict_at_delivery(
+                                        checker.as_ref(), &did_maps, &tags, &target, Some(&msg.params[1]),
+                                    );
+                                    let _ = event_tx.send(Event::Message { from, target, text, tags, dm_key, verdict }).await;
+                                    spawn_verdict_check(checker.as_ref(), follow_up, &event_tx);
                                 }
                             }
                         }
@@ -2975,6 +3281,9 @@ where
                                         .await;
                                 }
                                 let dm_key = dm_key_for(&did_maps, &own_nick, &from, &target);
+                                let (verdict, follow_up) = verdict_at_delivery(
+                                    checker.as_ref(), &did_maps, &msg.tags, &target, None,
+                                );
                                 // A task event is handed up as its own event
                                 // as well as the raw TAGMSG, the way a
                                 // coordination TAGMSG is — once per event id.
@@ -2995,10 +3304,12 @@ where
                                             sig_tag: act.sig_tag,
                                             replayed: act.replayed,
                                             dm_key: dm_key.clone(),
+                                            verdict: verdict.clone(),
                                         })
                                         .await;
                                 }
-                                let _ = event_tx.send(Event::TagMsg { from, target, tags: msg.tags.clone(), dm_key }).await;
+                                let _ = event_tx.send(Event::TagMsg { from, target, tags: msg.tags.clone(), dm_key, verdict }).await;
+                                spawn_verdict_check(checker.as_ref(), follow_up, &event_tx);
                             }
                         }
                         "CHATHISTORY" => {
@@ -3131,6 +3442,8 @@ async fn dispatch_assembled_multiline(
     event_tx: &mpsc::Sender<Event>,
     batch: InboundMultilineBatch,
     dm_key: Option<String>,
+    checker: Option<&Arc<SignatureChecker>>,
+    maps: &DidMaps,
 ) {
     let mut text = String::new();
     for (i, line) in batch.lines.iter().enumerate() {
@@ -3140,6 +3453,9 @@ async fn dispatch_assembled_multiline(
         text.push_str(&line.body);
     }
     let mut tags = batch.opener_tags;
+    // The signature covers the assembled body and the opener's tags.
+    let (verdict, follow_up) =
+        verdict_at_delivery(checker, maps, &tags, &batch.target, Some(&text));
     if let Some(parent_batch_id) = batch.parent_batch_id {
         tags.insert("batch".to_string(), parent_batch_id);
     }
@@ -3150,8 +3466,10 @@ async fn dispatch_assembled_multiline(
             text,
             tags,
             dm_key,
+            verdict,
         })
         .await;
+    spawn_verdict_check(checker, follow_up, event_tx);
     // Nested-batch parent (e.g. multiline inside CHATHISTORY) is
     // exposed to the consumer via the `batch` tag so UI layers can
     // attach the assembled message to the outer batch.
@@ -3279,7 +3597,7 @@ fn sign_outgoing(
 /// `None` for every other TAGMSG — typing, AV signalling, presence. Those are
 /// ephemera: nothing durable is asserted under a user's name, so there is
 /// nothing for a signature to be evidence of.
-fn mutation_in(
+pub(crate) fn mutation_in(
     tags: &std::collections::HashMap<String, String>,
 ) -> Option<(crate::chatsig::Mutation, String, Option<String>)> {
     use crate::chatsig::Mutation;
@@ -4490,7 +4808,7 @@ mod multiline_tests {
             ],
             parent_batch_id: None,
         };
-        dispatch_assembled_multiline(&tx, batch, None).await;
+        dispatch_assembled_multiline(&tx, batch, None, None, &DidMaps::default()).await;
         match rx.recv().await.unwrap() {
             Event::Message {
                 from, target, text, ..
@@ -4526,7 +4844,7 @@ mod multiline_tests {
             ],
             parent_batch_id: None,
         };
-        dispatch_assembled_multiline(&tx, batch, None).await;
+        dispatch_assembled_multiline(&tx, batch, None, None, &DidMaps::default()).await;
         match rx.recv().await.unwrap() {
             Event::Message { text, .. } => assert_eq!(text, "alphabeta\ngamma"),
             other => panic!("expected Message, got {other:?}"),
@@ -4559,7 +4877,7 @@ mod multiline_tests {
             ],
             parent_batch_id: None,
         };
-        dispatch_assembled_multiline(&tx, batch, None).await;
+        dispatch_assembled_multiline(&tx, batch, None, None, &DidMaps::default()).await;
         match rx.recv().await.unwrap() {
             Event::Message { tags, .. } => {
                 assert_eq!(tags.get("msgid").map(String::as_str), Some("01XYZ"));
@@ -8749,5 +9067,827 @@ mod device_key_tests {
         assert_ne!(first.msgsig(), second.msgsig());
         assert!(enrollment.calls.lock().is_empty());
         assert_eq!(first.unpublished_events(), 0);
+    }
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use super::*;
+    use crate::verdict::{KeyLayer, Verdict, VerdictState};
+    use axum::extract::Path;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use serde_json::{Value, json};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const OWN_NICK: &str = "me";
+    const OWN_DID: &str = "did:plc:me";
+    const SERVER_DID: &str = "did:web:server.test";
+
+    fn spec(name: &str) -> Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../spec")
+            .join(name);
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn b64(key: &[u8; 32]) -> String {
+        URL_SAFE_NO_PAD.encode(key)
+    }
+
+    fn raw_key(b64url: &str) -> [u8; 32] {
+        URL_SAFE_NO_PAD.decode(b64url).unwrap().try_into().unwrap()
+    }
+
+    fn public(seed: u8) -> [u8; 32] {
+        *ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .as_bytes()
+    }
+
+    // ── the origin server ────────────────────────────────────────────────
+
+    /// What the stub origin server holds: signers' keys by (DID, kid), with
+    /// an optional removal date, and its own key set.
+    #[derive(Default)]
+    struct Origin {
+        keys: parking_lot::Mutex<HashMap<(String, String), ([u8; 32], Option<i64>)>>,
+        server_keys: Vec<[u8; 32]>,
+        /// Held back this long before a signer's key is answered.
+        delay_ms: u64,
+        set_reads: AtomicUsize,
+    }
+
+    impl Origin {
+        fn hold(&self, did: &str, key: [u8; 32], removed_at: Option<i64>) {
+            let kid = crate::sigtag::derive_kid_bytes(&key);
+            self.keys
+                .lock()
+                .insert((did.to_string(), kid), (key, removed_at));
+        }
+    }
+
+    async fn serve(router: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        base
+    }
+
+    async fn serve_origin(origin: Arc<Origin>) -> String {
+        let (o1, o2, o3) = (origin.clone(), origin.clone(), origin);
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/signing-key",
+                get(move || {
+                    let o = o1.clone();
+                    async move {
+                        axum::Json(json!({
+                            "did": SERVER_DID,
+                            "public_key": o.server_keys.first().map(b64),
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/signing-keys/{did}",
+                get(move |Path(did): Path<String>| {
+                    let o = o2.clone();
+                    async move {
+                        o.set_reads.fetch_add(1, Ordering::SeqCst);
+                        if did != SERVER_DID {
+                            return axum::Json(json!({ "did": did, "keys": [] }));
+                        }
+                        let keys: Vec<Value> = o
+                            .server_keys
+                            .iter()
+                            .map(|k| json!({ "kid": crate::sigtag::derive_kid_bytes(k), "public_key": b64(k) }))
+                            .collect();
+                        axum::Json(json!({ "did": did, "keys": keys }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/signing-keys/{did}/{kid}",
+                get(move |Path((did, kid)): Path<(String, String)>| {
+                    let o = o3.clone();
+                    async move {
+                        if o.delay_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(o.delay_ms)).await;
+                        }
+                        let held = o.keys.lock().get(&(did.clone(), kid.clone())).copied();
+                        let (key, removed_at) = held.ok_or(StatusCode::NOT_FOUND)?;
+                        Ok::<_, StatusCode>(axum::Json(json!({
+                            "did": did,
+                            "kid": kid,
+                            "public_key": b64(&key),
+                            "registered_at": 1_700_000_000,
+                            "removed_at": removed_at,
+                        })))
+                    }
+                }),
+            );
+        serve(router).await
+    }
+
+    fn key_lookup(
+        origin: &str,
+        documents: Vec<crate::did::DidDocument>,
+    ) -> Arc<crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>> {
+        let resolver = crate::did::DidResolver::static_map(
+            documents.into_iter().map(|d| (d.id.clone(), d)).collect(),
+        );
+        let reader = crate::identity_records::RecordReader::new(
+            resolver,
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        );
+        Arc::new(crate::key_lookup::KeyLookup::new(
+            reader,
+            Some(origin.to_string()),
+            std::time::Duration::from_secs(3600),
+        ))
+    }
+
+    // ── a session ────────────────────────────────────────────────────────
+
+    struct Session {
+        server: TcpStream,
+        events: mpsc::Receiver<Event>,
+        _handle: ClientHandle,
+    }
+
+    /// What a delivered line said about its signature, and what it came to.
+    struct Seen {
+        delivered: Option<Verdict>,
+        settled: Option<Verdict>,
+        /// The Act event's verdict, when the line was one.
+        act: Option<Option<Verdict>>,
+        msgid: Option<String>,
+    }
+
+    impl Session {
+        async fn open(
+            lookup: Option<Arc<crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>>>,
+            own_did: &str,
+        ) -> Session {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let config = ConnectConfig {
+                nick: OWN_NICK.to_string(),
+                key_lookup: lookup,
+                ..Default::default()
+            };
+            let (handle, events) =
+                connect_with_stream(EstablishedConnection::Plain(client), config, None);
+            let mut session = Session {
+                server,
+                events,
+                _handle: handle,
+            };
+            for line in [
+                ":srv CAP * LS :sasl message-tags".to_string(),
+                ":srv CAP * ACK :sasl message-tags".to_string(),
+                format!(":srv 900 {OWN_NICK} :You are now logged in as {own_did}"),
+                format!(":srv 903 {OWN_NICK} :SASL authentication successful"),
+                format!(":srv 001 {OWN_NICK} :Welcome"),
+            ] {
+                session.send(&line).await;
+            }
+            session
+                .wait(|e| matches!(e, Event::Registered { .. }))
+                .await;
+            session
+        }
+
+        async fn send(&mut self, line: &str) {
+            self.server
+                .write_all(format!("{}\r\n", line.trim_end()).as_bytes())
+                .await
+                .unwrap();
+            // Keep the client's writes drained.
+            let mut sink = [0u8; 4096];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(5),
+                self.server.read(&mut sink),
+            )
+            .await;
+        }
+
+        async fn wait(&mut self, want: impl Fn(&Event) -> bool) -> Event {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let event = self.events.recv().await.expect("the session ended");
+                    if want(&event) {
+                        return event;
+                    }
+                }
+            })
+            .await
+            .expect("no such event in 5s")
+        }
+
+        /// The next message or TAGMSG delivered, and the verdict it settles
+        /// on: its own, or the `Event::Verdict` that follows a pending one.
+        async fn next_line(&mut self) -> Seen {
+            let mut act = None;
+            let (delivered, msgid) = loop {
+                match self
+                    .wait(|e| {
+                        matches!(
+                            e,
+                            Event::Message { .. } | Event::TagMsg { .. } | Event::Act { .. }
+                        )
+                    })
+                    .await
+                {
+                    Event::Act { verdict, .. } => act = Some(verdict),
+                    Event::Message { verdict, tags, .. } | Event::TagMsg { verdict, tags, .. } => {
+                        let id = tags
+                            .get(crate::chatsig::EVENT_ID_TAG)
+                            .or_else(|| tags.get("msgid"))
+                            .cloned();
+                        break (verdict, id);
+                    }
+                    _ => unreachable!(),
+                }
+            };
+            let settled = match &delivered {
+                Some(v) if v.state == VerdictState::Pending => {
+                    match self.wait(|e| matches!(e, Event::Verdict { .. })).await {
+                        Event::Verdict { verdict, .. } => Some(verdict),
+                        _ => unreachable!(),
+                    }
+                }
+                other => other.clone(),
+            };
+            Seen {
+                delivered,
+                settled,
+                act,
+                msgid,
+            }
+        }
+    }
+
+    // ── wire lines ───────────────────────────────────────────────────────
+
+    fn line(
+        tags: HashMap<String, String>,
+        command: &str,
+        target: &str,
+        body: Option<&str>,
+    ) -> String {
+        let mut params = vec![target];
+        params.extend(body);
+        let mut msg = crate::irc::Message::with_tags(tags, command, params);
+        msg.prefix = Some("sender!u@h".to_string());
+        msg.to_string()
+    }
+
+    /// The wire a chat vector's `input` describes: one line, or a
+    /// `draft/multiline` batch for a body with newlines. Returns the lines
+    /// and the DID this session must hold for a DM venue to rebuild.
+    fn chat_wire(input: &Value, sig_tag: &str) -> (Vec<String>, String) {
+        let s = |k: &str| input.get(k).and_then(|v| v.as_str());
+        let from = s("from").unwrap();
+        let msgid = s("msgid").unwrap();
+        let target = s("target").unwrap();
+        let (wire_target, own) = match target.strip_prefix("dm:") {
+            Some(pair) => {
+                let other = pair.split(',').find(|d| *d != from).unwrap();
+                (OWN_NICK.to_string(), other.to_string())
+            }
+            None => (
+                s("rawTarget").unwrap_or(target).to_string(),
+                OWN_DID.to_string(),
+            ),
+        };
+        let mut tags: HashMap<String, String> = HashMap::from([
+            ("account".to_string(), from.to_string()),
+            ("msgid".to_string(), msgid.to_string()),
+            (crate::chatsig::EVENT_ID_TAG.to_string(), msgid.to_string()),
+            (crate::sigtag::SIG_TAG.to_string(), sig_tag.to_string()),
+        ]);
+        let mut put = |k: &str, v: Option<&str>| {
+            if let Some(v) = v {
+                tags.insert(k.to_string(), v.to_string());
+            }
+        };
+        match s("kind").unwrap() {
+            "message" => {
+                put("+reply", s("reply"));
+                put("+draft/edit", s("edit"));
+                for (k, v) in input
+                    .get("tags")
+                    .and_then(|t| t.as_object())
+                    .into_iter()
+                    .flatten()
+                {
+                    put(k, v.as_str());
+                }
+            }
+            "delete" => put("+draft/delete", s("subject")),
+            "react" => {
+                put("+react", s("emoji"));
+                put("+reply", s("subject"));
+            }
+            "unreact" => {
+                put("+freeq.at/unreact", s("emoji"));
+                put("+reply", s("subject"));
+            }
+            "coordination" => {
+                put("+freeq.at/event", s("eventType"));
+                put("+freeq.at/payload", s("payload"));
+                put("+freeq.at/ref", s("ref"));
+                put("+freeq.at/evidence-type", s("evidence"));
+            }
+            other => panic!("no wire for {other}"),
+        }
+        let lines = match s("bodyText") {
+            Some(body) if body.contains('\n') => {
+                let mut out = vec![
+                    line(
+                        tags,
+                        "BATCH",
+                        "+b1",
+                        Some(&format!("draft/multiline {wire_target}")),
+                    )
+                    .replace(":draft/multiline", "draft/multiline"),
+                ];
+                for chunk in body.split('\n') {
+                    out.push(line(
+                        HashMap::from([("batch".to_string(), "b1".to_string())]),
+                        "PRIVMSG",
+                        &wire_target,
+                        Some(chunk),
+                    ));
+                }
+                out.push(":sender!u@h BATCH -b1".to_string());
+                out
+            }
+            Some(body) => vec![line(tags, "PRIVMSG", &wire_target, Some(body))],
+            None => vec![line(tags, "TAGMSG", &wire_target, None)],
+        };
+        (lines, own)
+    }
+
+    /// The canonical a chat input rebuilds to, taken the way the receive
+    /// path takes it.
+    fn rebuilt(input: &Value, sig_tag: &str) -> String {
+        let (lines, own) = chat_wire(input, sig_tag);
+        let first = crate::irc::Message::parse(&lines[0]).unwrap();
+        let body = input.get("bodyText").and_then(|v| v.as_str());
+        let target = if body.is_some_and(|b| b.contains('\n')) {
+            first.params[2].clone()
+        } else {
+            first.params[0].clone()
+        };
+        let look = crate::verdict::first_look(&crate::verdict::Line {
+            tags: &first.tags,
+            target: &target,
+            body: if first.command == "TAGMSG" {
+                None
+            } else {
+                body
+            },
+            own_did: Some(&own),
+            target_did: None,
+        });
+        match look {
+            crate::verdict::FirstLook::Check(signed) => match signed.doc {
+                crate::verdict::SignedDoc::Chat(canonical) => canonical,
+                other => panic!("not a chat document: {other:?}"),
+            },
+            other => panic!("nothing to check: {other:?}"),
+        }
+    }
+
+    /// The wire an act vector describes, with its own id and signature.
+    fn act_wire(tags: &Value, target: &str, id: &str, sig_tag: &str) -> (String, String) {
+        let mut wire: HashMap<String, String> = tags
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
+            .collect();
+        wire.insert(crate::sigtag::SIG_TAG.to_string(), sig_tag.to_string());
+        wire.insert(crate::chatsig::EVENT_ID_TAG.to_string(), id.to_string());
+        let from = wire.get("+freeq.at/from").cloned().unwrap_or_default();
+        let (wire_target, own) = match target.strip_prefix("dm:") {
+            Some(pair) => {
+                let other = pair.split(',').find(|d| *d != from).unwrap();
+                (OWN_NICK.to_string(), other.to_string())
+            }
+            None => (target.to_string(), OWN_DID.to_string()),
+        };
+        (line(wire, "TAGMSG", &wire_target, None), own)
+    }
+
+    /// Send `lines` on a fresh session holding `own`, against an origin that
+    /// holds `keys`, and say what the line came to.
+    async fn through_the_receive_path(
+        lines: &[String],
+        own: &str,
+        keys: &[(&str, [u8; 32])],
+    ) -> Seen {
+        let origin = Origin::default();
+        for (did, key) in keys {
+            origin.hold(did, *key, None);
+        }
+        let base = serve_origin(Arc::new(origin)).await;
+        let mut session = Session::open(Some(key_lookup(&base, vec![])), own).await;
+        for l in lines {
+            session.send(l).await;
+        }
+        session.next_line().await
+    }
+
+    fn state_named(name: &str) -> VerdictState {
+        VerdictState::ALL
+            .into_iter()
+            .find(|s| s.name() == name)
+            .unwrap()
+    }
+
+    // ── the vectors ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn every_chat_vector_reaches_device() {
+        let spec = spec("chat-signing-vectors.json");
+        for vector in spec["vectors"].as_array().unwrap() {
+            let name = vector["name"].as_str().unwrap();
+            let input = &vector["input"];
+            let sig = vector["sigTag"].as_str().unwrap();
+            assert_eq!(
+                rebuilt(input, sig),
+                vector["canonical"].as_str().unwrap(),
+                "{name}: the receive path rebuilds the vector's canonical"
+            );
+            let (lines, own) = chat_wire(input, sig);
+            let from = input["from"].as_str().unwrap();
+            let key = raw_key(vector["publicKey"].as_str().unwrap());
+            let seen = through_the_receive_path(&lines, &own, &[(from, key)]).await;
+            assert_eq!(
+                seen.settled,
+                Some(Verdict {
+                    state: VerdictState::Device,
+                    layer: Some(KeyLayer::Vouched),
+                    kid: Some(vector["kid"].as_str().unwrap().to_string()),
+                    key_source: Some(crate::key_lookup::KeySource::OriginServer),
+                }),
+                "{name}"
+            );
+        }
+    }
+
+    /// The values behind the negatives whose tampered field is hashed in the
+    /// canonical (`freeq-sdk/src/chatsig.rs`, where the negatives are built).
+    const ALTERED_BODY: &str = "ship it tomorrow";
+    const ALTERED_PAYLOAD: &str = "%7B%22summary%22%3A%22not%20done%22%7D";
+
+    /// A chat negative as a wire input: the named vector's input with the
+    /// tampered canonical's changed fields applied.
+    fn tampered_input(base: &Value, name: &str, tampered: &Value) -> Value {
+        let mut input = base.clone();
+        let set = |input: &mut Value, k: &str, v: Option<&Value>| match v {
+            Some(v) => input[k] = v.clone(),
+            None => {
+                input.as_object_mut().unwrap().remove(k);
+            }
+        };
+        match name {
+            "altered-body" => input["bodyText"] = json!(ALTERED_BODY),
+            "altered-coordination-payload" => input["payload"] = json!(ALTERED_PAYLOAD),
+            _ => {}
+        }
+        for field in ["edit", "subject", "emoji", "evidence", "ref"] {
+            set(&mut input, field, tampered.get(field));
+        }
+        if let Some(target) = tampered.get("target") {
+            input["target"] = target.clone();
+            input.as_object_mut().unwrap().remove("rawTarget");
+        }
+        match tampered.get("kind").and_then(|k| k.as_str()) {
+            Some("coordination") | None => {}
+            Some(kind) => input["kind"] = json!(kind),
+        }
+        if let Some(coord) = tampered.get("coord").and_then(|c| c.as_object()) {
+            let mut tags = serde_json::Map::new();
+            for (k, v) in coord {
+                tags.insert(format!("+freeq.at/{k}"), v.clone());
+            }
+            input["tags"] = Value::Object(tags);
+        }
+        input
+    }
+
+    #[tokio::test]
+    async fn every_chat_negative_reaches_its_verdict() {
+        let spec = spec("chat-signing-vectors.json");
+        let vectors = spec["vectors"].as_array().unwrap();
+        for negative in spec["negatives"].as_array().unwrap() {
+            let name = negative["name"].as_str().unwrap();
+            let base = vectors
+                .iter()
+                .find(|v| v["name"] == negative["vector"])
+                .unwrap();
+            let (input, sig) = match negative.get("tamperedCanonical") {
+                Some(tampered) => {
+                    let tampered_doc: Value =
+                        serde_json::from_str(tampered.as_str().unwrap()).unwrap();
+                    let input = tampered_input(&base["input"], name, &tampered_doc);
+                    let sig = base["sigTag"].as_str().unwrap();
+                    assert_eq!(
+                        rebuilt(&input, sig),
+                        tampered.as_str().unwrap(),
+                        "{name}: the wire rebuilds to the tampered document"
+                    );
+                    (input, sig)
+                }
+                None => (base["input"].clone(), negative["sigTag"].as_str().unwrap()),
+            };
+            let (lines, own) = chat_wire(&input, sig);
+            let from = input["from"].as_str().unwrap();
+            let key = raw_key(base["publicKey"].as_str().unwrap());
+            let seen = through_the_receive_path(&lines, &own, &[(from, key)]).await;
+            assert_eq!(
+                seen.settled.map(|v| v.state),
+                Some(state_named(negative["expected"].as_str().unwrap())),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_act_vector_reaches_device() {
+        let spec = spec("act-signing-vectors.json");
+        for vector in spec["vectors"].as_array().unwrap() {
+            let name = vector["name"].as_str().unwrap();
+            let (wire, own) = act_wire(
+                &vector["tags"],
+                vector["target"].as_str().unwrap(),
+                vector["id"].as_str().unwrap(),
+                vector["sigTag"].as_str().unwrap(),
+            );
+            let from = vector["tags"]["+freeq.at/from"].as_str().unwrap();
+            let key = raw_key(vector["publicKey"].as_str().unwrap());
+            let seen = through_the_receive_path(&[wire], &own, &[(from, key)]).await;
+            let expected = Verdict {
+                state: VerdictState::Device,
+                layer: Some(KeyLayer::Vouched),
+                kid: Some(vector["kid"].as_str().unwrap().to_string()),
+                key_source: Some(crate::key_lookup::KeySource::OriginServer),
+            };
+            assert_eq!(seen.settled, Some(expected), "{name}");
+            assert_eq!(
+                seen.act.flatten().map(|v| v.state),
+                seen.delivered.map(|v| v.state),
+                "{name}: the act event and its TAGMSG carry one verdict"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_act_negative_reaches_its_verdict() {
+        let spec = spec("act-signing-vectors.json");
+        let vectors = spec["vectors"].as_array().unwrap();
+        for negative in spec["negatives"].as_array().unwrap() {
+            let name = negative["name"].as_str().unwrap();
+            let base = vectors
+                .iter()
+                .find(|v| v["name"] == negative["vector"])
+                .unwrap();
+            let mut tags = base["tags"].clone();
+            if let Some(swapped) = negative.get("swappedTag") {
+                tags[swapped["name"].as_str().unwrap()] = swapped["value"].clone();
+            }
+            if let Some(stripped) = negative.get("strippedTag").and_then(|t| t.as_str()) {
+                tags.as_object_mut().unwrap().remove(stripped);
+            }
+            let mut sig = base["sigTag"].as_str().unwrap().to_string();
+            if let Some(alg) = negative.get("sigAlgorithm").and_then(|a| a.as_str()) {
+                sig = format!("{alg}:{}", sig.split_once(':').unwrap().1);
+            }
+            let (wire, own) = act_wire(
+                &tags,
+                negative["target"].as_str().unwrap(),
+                negative["id"].as_str().unwrap(),
+                &sig,
+            );
+            let from = base["tags"]["+freeq.at/from"].as_str().unwrap();
+            let key = raw_key(base["publicKey"].as_str().unwrap());
+            let seen = through_the_receive_path(&[wire], &own, &[(from, key)]).await;
+            assert_eq!(
+                seen.settled.map(|v| v.state),
+                Some(state_named(negative["expected"].as_str().unwrap())),
+                "{name}"
+            );
+        }
+    }
+
+    // ── the other states ─────────────────────────────────────────────────
+
+    const SIGNER: &str = "did:plc:signer";
+
+    /// A channel message signed by `seed`, with a fresh ULID msgid.
+    fn signed_message(seed: u8, body: &str) -> (String, String) {
+        let msgid = crate::chatsig::new_event_id();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let sig = crate::chatsig::ChatDoc::message(SIGNER, &msgid, "#room", body).sign(&key);
+        let tags = HashMap::from([
+            ("account".to_string(), SIGNER.to_string()),
+            ("msgid".to_string(), msgid.clone()),
+            (crate::sigtag::SIG_TAG.to_string(), sig),
+        ]);
+        (line(tags, "PRIVMSG", "#room", Some(body)), msgid)
+    }
+
+    #[tokio::test]
+    async fn a_key_no_source_holds_is_unverifiable() {
+        let (wire, _) = signed_message(21, "hello");
+        let seen = through_the_receive_path(&[wire], OWN_DID, &[]).await;
+        assert_eq!(seen.delivered.map(|v| v.state), Some(VerdictState::Pending));
+        assert_eq!(
+            seen.settled.map(|v| v.state),
+            Some(VerdictState::Unverifiable)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_is_delivered_pending_and_its_verdict_follows() {
+        let origin = Origin {
+            delay_ms: 300,
+            ..Default::default()
+        };
+        origin.hold(SIGNER, public(22), None);
+        let base = serve_origin(Arc::new(origin)).await;
+        let mut session = Session::open(Some(key_lookup(&base, vec![])), OWN_DID).await;
+        let (wire, msgid) = signed_message(22, "hello there");
+        session.send(&wire).await;
+        let delivered = session.wait(|e| matches!(e, Event::Message { .. })).await;
+        let Event::Message { verdict, text, .. } = delivered else {
+            unreachable!()
+        };
+        assert_eq!(text, "hello there", "the line is not held for its check");
+        assert_eq!(verdict.map(|v| v.state), Some(VerdictState::Pending));
+        let Event::Verdict {
+            msgid: late,
+            verdict,
+        } = session.wait(|e| matches!(e, Event::Verdict { .. })).await
+        else {
+            unreachable!()
+        };
+        assert_eq!(late, msgid);
+        assert_eq!(verdict.state, VerdictState::Device);
+    }
+
+    #[tokio::test]
+    async fn a_kid_in_the_servers_set_is_the_servers() {
+        let origin = Origin {
+            server_keys: vec![public(23)],
+            ..Default::default()
+        };
+        let base = serve_origin(Arc::new(origin)).await;
+        let mut session = Session::open(Some(key_lookup(&base, vec![])), OWN_DID).await;
+
+        let (first, _) = signed_message(23, "on your behalf");
+        session.send(&first).await;
+        let seen = session.next_line().await;
+        assert_eq!(seen.delivered.map(|v| v.state), Some(VerdictState::Pending));
+        assert_eq!(seen.settled.map(|v| v.state), Some(VerdictState::Server));
+
+        // Once the set is known, the next one is decided as it is delivered.
+        let (second, _) = signed_message(23, "again");
+        session.send(&second).await;
+        let seen = session.next_line().await;
+        assert_eq!(seen.delivered.map(|v| v.state), Some(VerdictState::Server));
+    }
+
+    #[tokio::test]
+    async fn an_unfamiliar_kid_reads_the_servers_set_once_more() {
+        let origin = Arc::new(Origin::default());
+        let base = serve_origin(origin.clone()).await;
+        let mut session = Session::open(Some(key_lookup(&base, vec![])), OWN_DID).await;
+        for body in ["one", "two"] {
+            let (wire, _) = signed_message(24, body);
+            session.send(&wire).await;
+            let seen = session.next_line().await;
+            assert_eq!(
+                seen.settled.map(|v| v.state),
+                Some(VerdictState::Unverifiable)
+            );
+        }
+        assert_eq!(
+            origin.set_reads.load(Ordering::SeqCst),
+            2,
+            "the first read, and one more for the unfamiliar kid"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_with_no_signature_is_unsigned() {
+        let seen = through_the_receive_path(
+            &[":sender!u@h PRIVMSG #room :plain".to_string()],
+            OWN_DID,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            seen.delivered.map(|v| v.state),
+            Some(VerdictState::Unsigned)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_the_origin_removed_before_the_message_is_retired() {
+        let origin = Origin::default();
+        origin.hold(SIGNER, public(25), Some(1_700_000_000));
+        let base = serve_origin(Arc::new(origin)).await;
+        let mut session = Session::open(Some(key_lookup(&base, vec![])), OWN_DID).await;
+        let (wire, _) = signed_message(25, "too late");
+        session.send(&wire).await;
+        let seen = session.next_line().await;
+        assert_eq!(seen.settled.map(|v| v.state), Some(VerdictState::Retired));
+    }
+
+    #[tokio::test]
+    async fn a_key_in_the_signers_records_is_published() {
+        let record = serde_json::to_value(
+            crate::identity_records::build_device_record(
+                &crate::crypto::PrivateKey::ed25519_from_bytes(&[26; 32]).unwrap(),
+                SIGNER,
+                "2026-01-01T00:00:00Z",
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let pds = serve(axum::Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(move || {
+                let record = record.clone();
+                async move {
+                    axum::Json(
+                        json!({ "records": [{ "uri": "at://x", "cid": "bafy", "value": record }] }),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let origin = serve_origin(Arc::new(Origin::default())).await;
+        let document = crate::did::make_test_did_document_with_pds(
+            SIGNER,
+            &crate::crypto::PrivateKey::ed25519_from_bytes(&[99; 32])
+                .unwrap()
+                .public_key_multibase(),
+            Some(&pds),
+        );
+        let mut session = Session::open(Some(key_lookup(&origin, vec![document])), OWN_DID).await;
+        let (wire, _) = signed_message(26, "from my own device");
+        session.send(&wire).await;
+        let seen = session.next_line().await;
+        assert_eq!(
+            seen.settled,
+            Some(Verdict {
+                state: VerdictState::Device,
+                layer: Some(KeyLayer::Published),
+                kid: Some(crate::sigtag::derive_kid_bytes(&public(26))),
+                key_source: Some(crate::key_lookup::KeySource::IdentityRecord),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_key_lookup_there_is_no_verdict() {
+        let mut session = Session::open(None, OWN_DID).await;
+        let (wire, _) = signed_message(27, "hello");
+        session.send(&wire).await;
+        let seen = session.next_line().await;
+        assert_eq!(seen.delivered, None);
+        assert!(seen.msgid.is_some());
+    }
+
+    #[test]
+    fn a_server_address_gives_its_http_origin() {
+        assert_eq!(
+            server_http_origin("irc.freeq.at:6697"),
+            "https://irc.freeq.at"
+        );
+        assert_eq!(server_http_origin("irc.freeq.at"), "https://irc.freeq.at");
+        assert_eq!(
+            server_http_origin("127.0.0.1:6667"),
+            "http://127.0.0.1:8080"
+        );
+        assert_eq!(
+            server_http_origin("localhost:6667"),
+            "http://localhost:8080"
+        );
     }
 }
