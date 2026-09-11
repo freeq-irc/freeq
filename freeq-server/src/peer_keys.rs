@@ -14,17 +14,21 @@
 //! delivery path and fills the store, and the signer's next message — and any
 //! later re-check of this one, such as `/api/v1/verify/{msgid}` — verifies.
 //!
-//! **Where to fetch from is operator configuration, not something a peer
+//! **The signer's own publications come first.** The lookup reads the
+//! signer's identity records from their PDS (and a did:web signer's own
+//! document) through `freeq_sdk::key_lookup`. That address comes from a DID
+//! document anyone can write, so those requests go through the SSRF-checked
+//! client. Only when the signer publishes no such key are peers asked.
+//!
+//! **Which peer to ask is operator configuration, not something a peer
 //! says.** `--s2s-peer-api <endpoint-id>=<base-url>` maps an S2S peer to the
 //! server that vouches for its users. Nothing on the wire names a URL, so no
-//! peer can aim this server's outbound requests. A peer with no entry simply
-//! has no key source: its traffic stays uncheckable, which is honest, and
-//! never becomes invalid.
+//! peer can aim this server's outbound requests. A signer with no records
+//! whose peer has no entry stays uncheckable, which is honest, and never
+//! becomes invalid.
 //!
-//! Known limit, stated rather than hidden: a key vouched for by the signer's
-//! own server cannot survive that server colluding. Keys anchored in the DID
-//! document are the real fix; the key id is already in the signature format,
-//! so moving the lookup there changes nothing on the wire.
+//! Every key is filed with where it came from: `identity-record`,
+//! `did-document`, or `origin-server` for a peer's key server.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,6 +36,10 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+
+use freeq_sdk::did::DidResolver;
+use freeq_sdk::identity_records::RecordReader;
+use freeq_sdk::key_lookup::{KeyLookup, KeySource};
 
 use crate::server::SharedState;
 
@@ -45,6 +53,46 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// that concern belongs to the process rather than to any one server state.
 static LOOKUPS: LazyLock<Mutex<HashMap<(String, String), Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The HTTP clients the record lookup uses: SSRF-checked in the running
+/// server, a plain shared client in tests, whose stub servers are on loopback.
+pub(crate) enum LookupClients {
+    Checked(crate::web::SsrfClients),
+    #[cfg(test)]
+    Plain(freeq_oauth::SharedClient),
+}
+
+impl freeq_oauth::ClientProvider for LookupClients {
+    async fn client_for(&self, url: &str) -> anyhow::Result<reqwest::Client> {
+        match self {
+            LookupClients::Checked(clients) => clients.client_for(url).await,
+            #[cfg(test)]
+            LookupClients::Plain(clients) => clients.client_for(url).await,
+        }
+    }
+}
+
+/// The record-first key lookup a server state holds: no origin base (peers
+/// are asked here, per operator configuration), and found keys cached for
+/// `ttl_secs`.
+pub(crate) fn key_lookup(
+    resolver: DidResolver,
+    clients: LookupClients,
+    ttl_secs: u64,
+) -> KeyLookup<LookupClients> {
+    KeyLookup::new(
+        RecordReader::new(resolver, clients),
+        None,
+        Duration::from_secs(ttl_secs),
+    )
+}
+
+/// The client provider for the running server's record lookups.
+pub(crate) fn checked_clients() -> LookupClients {
+    LookupClients::Checked(crate::web::SsrfClients {
+        timeout: FETCH_TIMEOUT,
+    })
+}
 
 /// Parse `--s2s-peer-api` entries: `<endpoint-id>=<base-url>`.
 ///
@@ -107,13 +155,14 @@ pub fn fetch_on_miss(state: &Arc<SharedState>, origin: &str, did: &str, sig_tag:
     let Ok((kid, _)) = freeq_sdk::sigtag::parse(sig_tag) else {
         return;
     };
-    match base_for_origin(state, origin) {
-        Some(base) => start_lookup(state, vec![base], did, kid),
-        None => tracing::debug!(
+    let bases: Vec<String> = base_for_origin(state, origin).into_iter().collect();
+    if bases.is_empty() {
+        tracing::debug!(
             origin = %origin,
-            "No key server configured for this peer (--s2s-peer-api); its signatures stay uncheckable"
-        ),
+            "No key server configured for this peer (--s2s-peer-api); only the signer's records are asked"
+        );
     }
+    start_lookup(state, bases, did, kid);
 }
 
 /// Ask a peer's key server again for a key that task events are parked on.
@@ -127,15 +176,9 @@ pub fn fetch_on_miss(state: &Arc<SharedState>, origin: &str, did: &str, sig_tag:
 /// a fetch gives up after [`FETCH_TIMEOUT`], well inside the shortest step
 /// the backoff ever asks on.
 pub fn fetch_again(state: &Arc<SharedState>, origin: &str, did: &str, kid: &str) {
-    let Some(base) = base_for_origin(state, origin) else {
-        tracing::debug!(
-            origin = %origin,
-            "No key server configured for this peer (--s2s-peer-api); nothing to ask again"
-        );
-        return;
-    };
+    let bases: Vec<String> = base_for_origin(state, origin).into_iter().collect();
     LOOKUPS.lock().remove(&(did.to_string(), kid.to_string()));
-    start_lookup(state, vec![base], did, kid);
+    start_lookup(state, bases, did, kid);
 }
 
 /// Look up a key without knowing which peer the signer belongs to.
@@ -153,12 +196,10 @@ pub fn fetch_from_any_peer(state: &Arc<SharedState>, did: &str, sig_tag: &str) {
     let bases: Vec<String> = parse_peer_api_config(&state.config.s2s_peer_api)
         .into_values()
         .collect();
-    if !bases.is_empty() {
-        start_lookup(state, bases, did, kid);
-    }
+    start_lookup(state, bases, did, kid);
 }
 
-/// One lookup for `kid`, tried against `bases` in turn.
+/// One lookup for `kid`: the signer's own records first, then `bases` in turn.
 fn start_lookup(state: &Arc<SharedState>, bases: Vec<String>, did: &str, kid: &str) {
     let entry = (did.to_string(), kid.to_string());
     {
@@ -176,21 +217,26 @@ fn start_lookup(state: &Arc<SharedState>, bases: Vec<String>, did: &str, kid: &s
     let state = state.clone();
     tokio::spawn(async move {
         let (did, kid) = entry;
+        match state.key_lookup.key_for(&did, &kid).await {
+            Ok(Some(found)) => {
+                let source = match found.source {
+                    KeySource::IdentityRecord => "identity-record",
+                    KeySource::DidDocument => "did-document",
+                    KeySource::OriginServer => "origin-server",
+                };
+                key_landed(&state, &did, &kid, &found.public_key, source);
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => tracing::debug!(
+                did = %did, kid = %kid, error = %e,
+                "Could not read the signer's own records for this key"
+            ),
+        }
         for base in &bases {
             match fetch_key(base, &did, &kid).await {
                 Ok(pubkey) => {
-                    // Append-only and keyed by (did, kid), the same store a
-                    // local registration writes to. The kid is a hash of the
-                    // key bytes, so a fetched key cannot displace a different
-                    // key already on file under that id.
-                    state.with_db(|db| db.save_signing_key(&did, &pubkey));
-                    LOOKUPS.lock().remove(&(did.clone(), kid.clone()));
-                    tracing::info!(did = %did, kid = %kid, "Fetched a signing key from its home server");
-                    // This lookup was started because something could not be
-                    // checked without the key. Whatever is parked on it can be
-                    // judged now, which is what makes deferring a delay rather
-                    // than a loss.
-                    crate::server::retry_deferred_task_events(&state, &did, &kid);
+                    key_landed(&state, &did, &kid, &pubkey, "origin-server");
                     return;
                 }
                 Err(e) => tracing::debug!(
@@ -204,6 +250,20 @@ fn start_lookup(state: &Arc<SharedState>, bases: Vec<String>, did: &str, kid: &s
             "No configured peer served this key; the sender's messages stay uncheckable"
         );
     });
+}
+
+/// File a key that answered a lookup and release what was waiting on it.
+fn key_landed(state: &Arc<SharedState>, did: &str, kid: &str, pubkey: &[u8; 32], source: &str) {
+    // Append-only and keyed by (did, kid), the same store a local registration
+    // writes to. The kid is a hash of the key bytes, so a fetched key cannot
+    // displace a different key already on file under that id.
+    state.with_db(|db| db.save_signing_key_from(did, pubkey, source));
+    LOOKUPS.lock().remove(&(did.to_string(), kid.to_string()));
+    tracing::info!(did = %did, kid = %kid, source = %source, "Fetched a signing key");
+    // This lookup was started because something could not be checked without
+    // the key. Whatever is parked on it can be judged now, which is what makes
+    // deferring a delay rather than a loss.
+    crate::server::retry_deferred_task_events(state, did, kid);
 }
 
 /// One request to a peer's key server.
@@ -245,6 +305,43 @@ async fn fetch_key(base: &str, did: &str, kid: &str) -> anyhow::Result<[u8; 32]>
     Ok(bytes)
 }
 
+/// A PDS on a loopback port listing `records` as `did`'s device keys, and a
+/// resolver whose document for `did` names it.
+#[cfg(test)]
+pub(crate) async fn stub_pds_resolver(did: &str, records: Vec<serde_json::Value>) -> DidResolver {
+    let records = Arc::new(records);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = axum::Router::new().route(
+        "/xrpc/com.atproto.repo.listRecords",
+        axum::routing::get(
+            move |axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>| {
+                let records = records.clone();
+                async move {
+                    let device = q.get("collection").map(String::as_str)
+                        == Some(freeq_sdk::identity_records::DEVICE_KEY_TYPE);
+                    let listed: Vec<serde_json::Value> = if device {
+                        records
+                            .iter()
+                            .map(|value| serde_json::json!({"uri": "at://x", "cid": "bafy", "value": value}))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    axum::Json(serde_json::json!({ "records": listed }))
+                }
+            },
+        ),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    // Any key works for the document's own `#atproto` entry; it signs nothing here.
+    let atproto = freeq_sdk::crypto::PrivateKey::generate_secp256k1().public_key_multibase();
+    let doc = freeq_sdk::did::make_test_did_document_with_pds(did, &atproto, Some(&base));
+    DidResolver::static_map(HashMap::from([(did.to_string(), doc)]))
+}
+
 /// Whether a `(did, kid)` lookup is currently remembered — in flight, or
 /// recently finished without a key.
 #[cfg(test)]
@@ -282,22 +379,26 @@ mod tests {
         assert_eq!(parsed.len(), 2, "malformed entries must not become peers");
     }
 
-    /// A peer with no configured key server produces no outbound request and
-    /// no remembered lookup — nothing to retry, nothing to leak.
+    /// A peer with no configured key server still has the signer's own
+    /// records to ask. A signer whose DID does not resolve stores nothing, and
+    /// the lookup is remembered so the next message does not ask again.
     #[tokio::test]
-    async fn an_unconfigured_peer_triggers_no_lookup() {
+    async fn an_unconfigured_peer_asks_only_the_signers_records() {
+        let did = "did:plc:unconfiguredpeer";
         let state = crate::server::test_state_with_db();
         let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
         let sig = freeq_sdk::sigtag::sign_canonical("{}", &key);
 
-        fetch_on_miss(
-            &state,
-            "some-unconfigured-peer",
-            "did:plc:unconfiguredpeer",
-            &sig,
+        fetch_on_miss(&state, "some-unconfigured-peer", did, &sig);
+        assert!(lookup_pending(did, &kid));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            state
+                .with_db(|db| db.get_signing_key_by_kid(did, &kid))
+                .flatten()
+                .is_none()
         );
-        assert!(!lookup_pending("did:plc:unconfiguredpeer", &kid));
     }
 
     /// A legacy signature is a bare blob naming no key, so there is nothing to
@@ -585,5 +686,157 @@ mod tests {
                 .is_none(),
             "a key that does not hash to the requested id must be refused"
         );
+    }
+
+    // ── the signer's own records, before any peer ─────────────────
+
+    /// A key server on a loopback port that counts its requests and answers
+    /// every one with `key`, or 404 without one.
+    async fn counting_key_server(
+        key: Option<[u8; 32]>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use base64::Engine;
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/api/v1/signing-keys/{did}/{kid}",
+            axum::routing::get(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    let key = key.ok_or(axum::http::StatusCode::NOT_FOUND)?;
+                    Ok::<_, axum::http::StatusCode>(axum::Json(serde_json::json!({
+                        "public_key": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key),
+                        "algorithm": "ed25519",
+                    })))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// A server that looks to `PEER` at `base` for keys and resolves DIDs
+    /// through `resolver`.
+    fn state_with(base: &str, resolver: freeq_sdk::did::DidResolver) -> Arc<SharedState> {
+        crate::server::test_state_with_resolver(
+            crate::config::ServerConfig {
+                s2s_peer_api: vec![format!("{PEER}={base}")],
+                ..Default::default()
+            },
+            resolver,
+        )
+    }
+
+    fn device_record(did: &str, key: &ed25519_dalek::SigningKey) -> serde_json::Value {
+        let key = freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&key.to_bytes()).unwrap();
+        let record = freeq_sdk::identity_records::build_device_record(
+            &key,
+            did,
+            "2026-01-01T00:00:00Z",
+            None,
+        )
+        .unwrap();
+        serde_json::to_value(record).unwrap()
+    }
+
+    fn source_of(state: &Arc<SharedState>, did: &str, kid: &str) -> Option<String> {
+        state
+            .with_db(|db| db.get_signing_key_row(did, kid))
+            .flatten()
+            .and_then(|row| row.source)
+    }
+
+    #[tokio::test]
+    async fn a_key_in_the_signers_records_is_used_before_any_peer() {
+        let did = "did:plc:recordfirst";
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let resolver = stub_pds_resolver(did, vec![device_record(did, &key)]).await;
+        let (base, peer_hits) = counting_key_server(Some(*key.verifying_key().as_bytes())).await;
+        let state = state_with(&base, resolver);
+
+        fetch_on_miss(
+            &state,
+            PEER,
+            did,
+            &freeq_sdk::sigtag::sign_canonical("{}", &key),
+        );
+
+        assert_eq!(
+            wait_for_key(&state, did, &kid).await,
+            Some(*key.verifying_key().as_bytes())
+        );
+        assert_eq!(
+            source_of(&state, did, &kid).as_deref(),
+            Some("identity-record")
+        );
+        assert_eq!(peer_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_signer_with_no_records_is_looked_up_at_its_peer() {
+        let did = "did:plc:norecords";
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let resolver = stub_pds_resolver(did, vec![]).await;
+        let (base, peer_hits) = counting_key_server(Some(*key.verifying_key().as_bytes())).await;
+        let state = state_with(&base, resolver);
+
+        fetch_on_miss(
+            &state,
+            PEER,
+            did,
+            &freeq_sdk::sigtag::sign_canonical("{}", &key),
+        );
+
+        assert!(wait_for_key(&state, did, &kid).await.is_some());
+        assert_eq!(
+            source_of(&state, did, &kid).as_deref(),
+            Some("origin-server")
+        );
+        assert_eq!(peer_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_record_whose_key_does_not_hash_to_the_kid_is_ignored() {
+        let did = "did:plc:wrongrecord";
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        // A record naming this kid but carrying another key, signed by it.
+        let other = freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&[8u8; 32]).unwrap();
+        let mut record = freeq_sdk::identity_records::build_device_record(
+            &other,
+            did,
+            "2026-01-01T00:00:00Z",
+            None,
+        )
+        .unwrap();
+        record.kid = kid.clone();
+        record.binding_sig =
+            other.sign_base64url(&freeq_sdk::identity_records::record_signed_bytes(&record));
+        let resolver = stub_pds_resolver(did, vec![serde_json::to_value(record).unwrap()]).await;
+        let (base, peer_hits) = counting_key_server(Some(*key.verifying_key().as_bytes())).await;
+        let state = state_with(&base, resolver);
+
+        fetch_on_miss(
+            &state,
+            PEER,
+            did,
+            &freeq_sdk::sigtag::sign_canonical("{}", &key),
+        );
+
+        assert_eq!(
+            wait_for_key(&state, did, &kid).await,
+            Some(*key.verifying_key().as_bytes())
+        );
+        assert_eq!(
+            source_of(&state, did, &kid).as_deref(),
+            Some("origin-server")
+        );
+        assert_eq!(peer_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

@@ -53,6 +53,8 @@ mod m010_channel_media_space;
 mod m011_channel_invites;
 #[path = "012_signing_key_window.rs"]
 mod m012_signing_key_window;
+#[path = "013_signing_key_source.rs"]
+mod m013_signing_key_source;
 
 // db.rs unit tests exercise the backfill directly against hand-built rows.
 // Production reaches it only as a rung of the ladder below.
@@ -75,6 +77,7 @@ fn rungs() -> Vec<rusqlite_migration::M<'static>> {
         m010_channel_media_space::migration(),
         m011_channel_invites::migration(),
         m012_signing_key_window::migration(),
+        m013_signing_key_source::migration(),
     ]
 }
 
@@ -220,6 +223,7 @@ mod tests {
         migration_ladder().to_version(&mut stepped, 10).unwrap();
         migration_ladder().to_version(&mut stepped, 11).unwrap();
         migration_ladder().to_version(&mut stepped, 12).unwrap();
+        migration_ladder().to_version(&mut stepped, 13).unwrap();
 
         let mut direct = Connection::open_in_memory().unwrap();
         migration_ladder().to_latest(&mut direct).unwrap();

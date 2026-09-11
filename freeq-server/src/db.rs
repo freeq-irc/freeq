@@ -122,6 +122,8 @@ pub struct ReactionRow {
 /// `registered_at` is when the key was first seen and never moves;
 /// `last_seen_at` moves every time the key is registered again. `removed_at`
 /// is the owner's retirement of the key, NULL while the key is live.
+/// `source` is where the key came from (`local-session`, `origin-server`,
+/// `identity-record`, `did-document`); NULL for a row older than the column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SigningKeyRow {
     pub kid: String,
@@ -129,6 +131,7 @@ pub struct SigningKeyRow {
     pub registered_at: i64,
     pub last_seen_at: i64,
     pub removed_at: Option<i64>,
+    pub source: Option<String>,
 }
 
 /// Who wrote a message, and where it is filed — the minimum needed to
@@ -524,6 +527,7 @@ impl Db {
                  registered_at  INTEGER NOT NULL,
                  last_seen_at   INTEGER,
                  removed_at     INTEGER,
+                 source         TEXT,
                  PRIMARY KEY (did, kid)
              );",
         )?;
@@ -2742,6 +2746,12 @@ impl Db {
     /// Append-only: re-registering a *different* key adds a row (history);
     /// re-registering the *same* key is idempotent. `pubkey` must be 32 bytes.
     pub fn save_signing_key(&self, did: &str, pubkey: &[u8]) -> SqlResult<()> {
+        self.save_signing_key_from(did, pubkey, "local-session")
+    }
+
+    /// [`Db::save_signing_key`], naming where the key came from. The source is
+    /// set when the key is first filed and never changed after.
+    pub fn save_signing_key_from(&self, did: &str, pubkey: &[u8], source: &str) -> SqlResult<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2753,10 +2763,10 @@ impl Db {
         // registered_at keeps saying when the key was first seen while
         // "latest" (`get_signing_key`) still tracks the most recently used key.
         self.conn.execute(
-            "INSERT INTO signing_keys (did, kid, pubkey, registered_at, last_seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?4)
+            "INSERT INTO signing_keys (did, kid, pubkey, registered_at, last_seen_at, source)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5)
              ON CONFLICT(did, kid) DO UPDATE SET last_seen_at = excluded.last_seen_at",
-            params![did, kid, pubkey, now as i64],
+            params![did, kid, pubkey, now as i64, source],
         )?;
         Ok(())
     }
@@ -2797,7 +2807,7 @@ impl Db {
     pub fn get_signing_key_set(&self, did: &str) -> SqlResult<Vec<SigningKeyRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT kid, pubkey, registered_at,
-                    COALESCE(last_seen_at, registered_at), removed_at
+                    COALESCE(last_seen_at, registered_at), removed_at, source
              FROM signing_keys WHERE did = ?1
              ORDER BY registered_at DESC, rowid DESC",
         )?;
@@ -2815,7 +2825,7 @@ impl Db {
     pub fn get_signing_key_row(&self, did: &str, kid: &str) -> SqlResult<Option<SigningKeyRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT kid, pubkey, registered_at,
-                    COALESCE(last_seen_at, registered_at), removed_at
+                    COALESCE(last_seen_at, registered_at), removed_at, source
              FROM signing_keys WHERE did = ?1 AND kid = ?2",
         )?;
         let mut rows = stmt.query_map(params![did, kid], Self::signing_key_row)?;
@@ -2838,6 +2848,7 @@ impl Db {
             registered_at: row.get(2)?,
             last_seen_at: row.get(3)?,
             removed_at: row.get(4)?,
+            source: row.get(5)?,
         }))
     }
 
@@ -7978,6 +7989,62 @@ mod tests {
             "retiring a key that is not on file changes nothing"
         );
         assert_eq!(db.get_signing_key_row(did, "nosuchkid").unwrap(), None);
+    }
+
+    #[test]
+    fn a_saved_key_records_where_it_came_from_once() {
+        let db = Db::open_memory().unwrap();
+        let did = "did:plc:source";
+        let key = [5u8; 32];
+        let kid = freeq_sdk::act::derive_kid_bytes(&key);
+
+        db.save_signing_key_from(did, &key, "identity-record")
+            .unwrap();
+        let row = db.get_signing_key_row(did, &kid).unwrap().expect("on file");
+        assert_eq!(row.source.as_deref(), Some("identity-record"));
+
+        // The same key seen again, from anywhere: the first source stands.
+        db.save_signing_key_from(did, &key, "origin-server")
+            .unwrap();
+        db.save_signing_key(did, &key).unwrap();
+        let row = db.get_signing_key_row(did, &kid).unwrap().expect("on file");
+        assert_eq!(row.source.as_deref(), Some("identity-record"));
+        assert_eq!(db.get_signing_key_set(did).unwrap()[0].source, row.source);
+    }
+
+    #[test]
+    fn a_key_registered_here_is_a_local_session_key() {
+        let db = Db::open_memory().unwrap();
+        let did = "did:plc:local";
+        let key = [6u8; 32];
+        db.save_signing_key(did, &key).unwrap();
+        let row = db
+            .get_signing_key_row(did, &freeq_sdk::act::derive_kid_bytes(&key))
+            .unwrap()
+            .expect("on file");
+        assert_eq!(row.source.as_deref(), Some("local-session"));
+    }
+
+    #[test]
+    fn a_converted_legacy_key_has_no_source() {
+        // The out-of-ladder kid migration rebuilds the table, so it must carry
+        // the source column too; a row from before it records none.
+        let db = Db::open_memory_with_legacy_signing_keys().unwrap();
+        let cols: Vec<String> = db
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('signing_keys')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<SqlResult<Vec<String>>>()
+            .unwrap();
+        assert!(cols.iter().any(|c| c == "source"), "got {cols:?}");
+        let kid = freeq_sdk::act::derive_kid_bytes(&[7u8; 32]);
+        let row = db
+            .get_signing_key_row("did:plc:legacy", &kid)
+            .unwrap()
+            .expect("the legacy key survives the conversion");
+        assert_eq!(row.source, None);
     }
 
     #[test]

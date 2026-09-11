@@ -704,6 +704,9 @@ pub struct SharedState {
     pub server_name: String,
     pub challenge_store: ChallengeStore,
     pub did_resolver: DidResolver,
+    /// Finds a signer's key by kid in their own published records first;
+    /// `peer_keys` asks configured peers after it.
+    pub(crate) key_lookup: freeq_sdk::key_lookup::KeyLookup<crate::peer_keys::LookupClients>,
     /// Private-media spaces. None = feature off.
     pub media_space: Option<std::sync::Arc<crate::media_space::MediaSpaceManager>>,
     /// session_id -> sender for writing lines to that client
@@ -1815,6 +1818,11 @@ impl Server {
             server_name: self.config.server_name.clone(),
             challenge_store: ChallengeStore::new(self.config.challenge_timeout_secs),
             did_resolver: self.resolver.clone(),
+            key_lookup: crate::peer_keys::key_lookup(
+                self.resolver.clone(),
+                crate::peer_keys::checked_clients(),
+                self.config.peer_key_retry_secs,
+            ),
             media_space,
             connections: Mutex::new(HashMap::new()),
             nick_to_session: Mutex::new(NickMap::new()),
@@ -7928,7 +7936,9 @@ mod nickmap_tests {
 }
 
 #[cfg(test)]
-pub(crate) use s2s_adversarial_tests::{test_state, test_state_with_config, test_state_with_db};
+pub(crate) use s2s_adversarial_tests::{
+    test_state, test_state_with_config, test_state_with_db, test_state_with_resolver,
+};
 
 #[cfg(test)]
 mod s2s_adversarial_tests {
@@ -7985,11 +7995,19 @@ mod s2s_adversarial_tests {
             ..Default::default()
         });
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let resolver =
+            resolver.unwrap_or_else(|| freeq_sdk::did::DidResolver::static_map(HashMap::new()));
         Arc::new(SharedState {
             server_name: config.server_name.clone(),
             challenge_store: crate::sasl::ChallengeStore::new(60),
-            did_resolver: resolver
-                .unwrap_or_else(|| freeq_sdk::did::DidResolver::static_map(HashMap::new())),
+            key_lookup: crate::peer_keys::key_lookup(
+                resolver.clone(),
+                crate::peer_keys::LookupClients::Plain(freeq_oauth::SharedClient(
+                    reqwest::Client::new(),
+                )),
+                config.peer_key_retry_secs,
+            ),
+            did_resolver: resolver,
             media_space: None,
             connections: Mutex::new(HashMap::new()),
             nick_to_session: Mutex::new(NickMap::new()),
@@ -8548,6 +8566,72 @@ mod s2s_adversarial_tests {
             crate::peer_keys::lookup_pending(did, &kid),
             "an unknown signer must start a lookup with its home server"
         );
+    }
+
+    /// A relayed message from a signer who publishes their key in their own
+    /// records, over a link with no peer key server configured. The lookup
+    /// reads the record, and the message then verifies.
+    #[tokio::test]
+    async fn a_relayed_message_verifies_once_the_signers_record_is_read() {
+        let did = "did:plc:relayedrecordsigner";
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let record = freeq_sdk::identity_records::build_device_record(
+            &freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&key.to_bytes()).unwrap(),
+            did,
+            "2026-01-01T00:00:00Z",
+            None,
+        )
+        .unwrap();
+        let resolver =
+            crate::peer_keys::stub_pds_resolver(did, vec![serde_json::to_value(record).unwrap()])
+                .await;
+        let state = test_state_with_resolver(crate::config::ServerConfig::default(), resolver);
+        let mgr = test_manager();
+        setup_authenticated_peer(&state, &mgr).await;
+        setup_channel(&state, "#chat");
+
+        let msgid = "01RECORDSIGNEDMSG";
+        let sig = sign_channel_message(&key, did, msgid, "#chat", "signed at home");
+        process_s2s_message(
+            &state,
+            &mgr,
+            PEER,
+            S2sMessage::Privmsg {
+                event_id: format!("{PEER}:recordsigned"),
+                from: "remote!u@s2s".to_string(),
+                target: "#chat".to_string(),
+                text: "signed at home".to_string(),
+                origin: PEER.to_string(),
+                msgid: Some(msgid.to_string()),
+                sig: Some(sig),
+                account: Some(did.to_string()),
+                recipient_did: None,
+                replaces_msgid: None,
+                tags: HashMap::new(),
+                multiline_lines: None,
+            },
+        )
+        .await;
+
+        // The lookup runs off the delivery path; wait for it to land.
+        for _ in 0..100 {
+            if state
+                .with_db(|db| db.get_signing_key_by_kid(did, &kid))
+                .flatten()
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let out = crate::web::api_verify_message(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(msgid.to_string()),
+        )
+        .await
+        .expect("the relayed message is on file");
+        assert_eq!(out.0["verification"]["verdict"], "valid");
     }
 
     // ── acting on the answer ─────────────────────────────────────
@@ -15112,8 +15196,9 @@ mod catchup_tests {
     /// connection is what the receipt is judged by, when it parks and again
     /// when the key releases it — so it applies. Parked under the claim
     /// instead, it would come back as a stranger's word and move nothing.
-    #[test]
-    fn a_parked_replayed_receipt_is_released_under_the_connection_it_arrived_on() {
+    // A missing key starts a lookup, which is spawned on the runtime.
+    #[tokio::test]
+    async fn a_parked_replayed_receipt_is_released_under_the_connection_it_arrived_on() {
         const ACT: &str = "01ACT00000000000000000073";
         const CLAIMED: &str = "01ACT00000000000000000074";
         const RECEIPT: &str = "01ACT00000000000000000075";
@@ -15154,8 +15239,9 @@ mod catchup_tests {
     /// else's transition is waiting on, and asking again is the round trip a
     /// replayed receipt exists to save — so it waits for the key exactly as a
     /// live one does, and the key's arrival is what applies it.
-    #[test]
-    fn a_replayed_receipt_whose_key_is_missing_waits_instead_of_being_skipped() {
+    // A missing key starts a lookup, which is spawned on the runtime.
+    #[tokio::test]
+    async fn a_replayed_receipt_whose_key_is_missing_waits_instead_of_being_skipped() {
         const HOME: &str = "did:web:peer-b.example";
         const ACT: &str = "01ACT00000000000000000051";
         const CLAIMED: &str = "01ACT00000000000000000052";
@@ -15512,8 +15598,9 @@ mod catchup_tests {
     /// It is not filed and it does not open a task: a replay has nobody
     /// waiting on delivery, and the peer can be asked again on the next
     /// link.
-    #[test]
-    fn a_caught_up_task_event_that_cannot_be_verified_is_skipped() {
+    // A missing key starts a lookup, which is spawned on the runtime.
+    #[tokio::test]
+    async fn a_caught_up_task_event_that_cannot_be_verified_is_skipped() {
         let key = SigningKey::from_bytes(&[3u8; 32]);
         // No key on file for ALICE: the verdict can only be "cannot say".
         let state = test_state_with_db();

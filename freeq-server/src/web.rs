@@ -3725,9 +3725,10 @@ struct OutboundRefused {
 
 /// [`freeq_oauth::ClientProvider`] backed by [`safe_outbound_client`]: SSRF
 /// validation + DNS pinning per URL. Used for OAuth discovery, where every hop
-/// (PDS → auth server) is attacker-influenced.
-struct SsrfClients {
-    timeout: std::time::Duration,
+/// (PDS → auth server) is attacker-influenced, and for reading a signer's
+/// identity records, whose PDS address comes from their DID document.
+pub(crate) struct SsrfClients {
+    pub(crate) timeout: std::time::Duration,
 }
 
 impl freeq_oauth::ClientProvider for SsrfClients {
