@@ -801,6 +801,56 @@ mod tests {
         assert_eq!(peer_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    /// A did:web signer, such as a peer server, whose own document carries its
+    /// key under `#freeq`, the way a freeq server publishes its receipt key.
+    /// Found there with no peer base configured.
+    #[tokio::test]
+    async fn a_did_web_signers_key_comes_from_its_own_document() {
+        let did = "did:web:peer-server.example";
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let key_id = format!("{did}#freeq");
+        let doc = freeq_sdk::did::DidDocument {
+            id: did.to_string(),
+            also_known_as: vec![],
+            verification_method: vec![freeq_sdk::did::VerificationMethod {
+                id: key_id.clone(),
+                method_type: "Multikey".to_string(),
+                controller: did.to_string(),
+                public_key_multibase: Some(
+                    freeq_sdk::crypto::PublicKey::Ed25519(key.verifying_key()).to_multibase(),
+                ),
+            }],
+            authentication: vec![],
+            assertion_method: vec![freeq_sdk::did::StringOrMap::Reference(key_id)],
+            service: vec![],
+        };
+        let resolver =
+            freeq_sdk::did::DidResolver::static_map(HashMap::from([(did.to_string(), doc)]));
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            resolver,
+        );
+
+        // Signed the way a server signs a receipt: a canonical document under its key.
+        let receipt = r#"{"did":"did:web:peer-server.example","kind":"receipt"}"#;
+        fetch_on_miss(
+            &state,
+            "a-peer-server",
+            did,
+            &freeq_sdk::sigtag::sign_canonical(receipt, &key),
+        );
+
+        assert_eq!(
+            wait_for_key(&state, did, &kid).await,
+            Some(*key.verifying_key().as_bytes())
+        );
+        assert_eq!(
+            source_of(&state, did, &kid).as_deref(),
+            Some("did-document")
+        );
+    }
+
     #[tokio::test]
     async fn a_record_whose_key_does_not_hash_to_the_kid_is_ignored() {
         let did = "did:plc:wrongrecord";

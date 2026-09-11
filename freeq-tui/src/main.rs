@@ -3,6 +3,7 @@ mod config;
 mod editor;
 mod ui;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -394,7 +395,7 @@ async fn main() -> Result<()> {
     app.server_addr = resolved.server.clone();
     app.connected_at = Some(std::time::Instant::now());
     app.media_uploader = media_uploader;
-    fetch_server_signing_kid(&app);
+    fetch_server_signing_kids(&app);
     #[cfg(feature = "inline-images")]
     {
         app.picker = picker;
@@ -734,8 +735,8 @@ async fn run_app(
         if let Some(mut bg_rx) = app.bg_result_rx.take() {
             while let Ok(result) = bg_rx.try_recv() {
                 match result {
-                    crate::app::BgResult::ServerSigningKid(kid) => {
-                        app.server_signing_kid = Some(kid);
+                    crate::app::BgResult::ServerSigningKids(kids) => {
+                        app.server_key_set_arrived(kids);
                     }
                     crate::app::BgResult::VerifyLines(buf, lines) => {
                         for line in &lines {
@@ -1011,7 +1012,15 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
                 .get("+reply")
                 .filter(|v| crate::app::is_valid_msgid(v))
                 .cloned();
-            let (_, account) = signature_of(&tags, app.server_signing_kid.as_deref());
+            let (_, account, refetch) = signature_of(
+                &tags,
+                &app.server_signing_kids,
+                &app.server_kids_refetched,
+                &mut app.server_kids_refetch_pending,
+            );
+            if refetch {
+                fetch_server_signing_kids(app);
+            }
             // Join replay collapses an edited message into one row with no
             // `+draft/edit`; the server's `+freeq.at/edited` tag is the only
             // thing that says the text isn't the original.
@@ -1587,7 +1596,7 @@ fn server_kid_from_public_key(public_key_b64url: &str) -> Option<String> {
 /// three conditions have to hold before the marker is earned:
 ///
 /// - the signature names a key id (an older server's is bare base64),
-/// - that key id is not our server's, and
+/// - that key id is none of our server's keys, current or retired, and
 /// - the message did not come from another server.
 ///
 /// The last one is why the first two are not enough. A relayed message was
@@ -1595,34 +1604,93 @@ fn server_kid_from_public_key(public_key_b64url: &str) -> Option<String> {
 /// origin server on their behalf — and nothing on the wire separates those, so
 /// a relayed message is never marked. Everything unmarked here is still
 /// answerable by `/verify`, which asks a server that holds the keys.
+///
+/// A kid the set does not list may be a key the server rotated to since the
+/// set was fetched. Its first sighting asks for the set again (the third
+/// value) and decides nothing; it is the sender's only once that answer is
+/// back without it. An empty set, not yet fetched or published empty,
+/// decides nothing and asks nothing.
 fn signature_of(
     tags: &std::collections::HashMap<String, String>,
-    server_kid: Option<&str>,
-) -> (bool, Option<String>) {
+    server_kids: &HashSet<String>,
+    refetched: &HashSet<String>,
+    refetch_pending: &mut HashSet<String>,
+) -> (bool, Option<String>, bool) {
     let relayed = tags.contains_key("+freeq.at/origin");
-    let by_sender = match (tags.get(freeq_sdk::sigtag::SIG_TAG), server_kid) {
-        (Some(sig), Some(server_kid)) if !relayed => {
-            let mut parts = sig.splitn(3, ':');
-            matches!(
-                (parts.next(), parts.next(), parts.next()),
-                (Some("ed25519"), Some(kid), Some(_)) if kid != server_kid
-            )
+    let kid = tags.get(freeq_sdk::sigtag::SIG_TAG).and_then(|sig| {
+        let mut parts = sig.splitn(3, ':');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some("ed25519"), Some(kid), Some(_)) => Some(kid),
+            _ => None,
         }
-        _ => false,
+    });
+    let (by_sender, refetch) = match kid {
+        Some(kid) if !relayed && !server_kids.is_empty() && !server_kids.contains(kid) => {
+            if refetched.contains(kid) {
+                (true, false)
+            } else {
+                (false, refetch_pending.insert(kid.to_string()))
+            }
+        }
+        _ => (false, false),
     };
-    (by_sender, tags.get("account").cloned())
+    (by_sender, tags.get("account").cloned(), refetch)
 }
 
 /// Where the connected server answers HTTP. Anything public is https on the
 /// default port; a loopback server is a local build serving its web API in the
 /// clear on the port it defaults to.
 fn verify_api_base(server_addr: &str) -> String {
-    let host = server_addr.rsplit_once(':').map_or(server_addr, |(h, _)| h);
+    let host = server_host(server_addr);
     if matches!(host, "localhost" | "127.0.0.1" | "::1") {
         format!("http://{host}:8080")
     } else {
         format!("https://{host}")
     }
+}
+
+/// The host of the connected server's address, without its port.
+fn server_host(server_addr: &str) -> &str {
+    server_addr.rsplit_once(':').map_or(server_addr, |(h, _)| h)
+}
+
+/// The DID the server publishes its key set under, from its
+/// `/api/v1/signing-key` answer. Only a did:web made of characters a DID may
+/// hold is used, since it becomes part of a URL.
+fn server_did_from_signing_key(body: &serde_json::Value) -> Option<String> {
+    let did = body.get("did")?.as_str()?;
+    let name = did.strip_prefix("did:web:")?;
+    let usable = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '%'));
+    usable.then(|| did.to_string())
+}
+
+/// Where the connected server serves the key set of `did`.
+fn key_set_url(server_addr: &str, did: &str) -> String {
+    format!("{}/api/v1/signing-keys/{did}", verify_api_base(server_addr))
+}
+
+/// Every kid in a published key set (`/api/v1/signing-keys/{did}`): each
+/// listed key's `kid`, and the current `public_key`'s, which a server that
+/// predates the list still publishes.
+fn server_kids_from_key_set(body: &serde_json::Value) -> HashSet<String> {
+    let mut kids: HashSet<String> = body
+        .get("keys")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|k| k.get("kid").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    if let Some(kid) = body
+        .get("public_key")
+        .and_then(|v| v.as_str())
+        .and_then(server_kid_from_public_key)
+    {
+        kids.insert(kid);
+    }
+    kids
 }
 
 /// Render the server's answer about one event as a line a person can read.
@@ -1681,27 +1749,37 @@ fn format_verify_verdict(body: &serde_json::Value) -> String {
     format!("Verify: {vouches}{signer}")
 }
 
-/// Learn the connected server's own signing key id, in the background.
+/// Learn every key id the connected server has signed with, current and
+/// retired, in the background: its `/api/v1/signing-key` answer names the DID
+/// its key set is published under, and the set is read from there.
 ///
 /// Until it lands, no message is marked as signed: telling the sender's
-/// signature from the server's requires knowing which key is the server's, and
-/// a marker that might mean either says nothing worth saying.
-fn fetch_server_signing_kid(app: &App) {
-    let url = format!("{}/api/v1/signing-key", verify_api_base(&app.server_addr));
+/// signature from the server's requires knowing which keys are the server's,
+/// and a marker that might mean either says nothing worth saying.
+fn fetch_server_signing_kids(app: &App) {
+    let server_addr = app.server_addr.clone();
     let tx = app.bg_result_tx.clone();
     tokio::spawn(async move {
-        let Ok(body) = fetch_json(&url).await else {
-            tracing::debug!(url, "no server signing key published — nothing gets marked");
-            return;
-        };
-        let Some(kid) = body
-            .get("public_key")
-            .and_then(|v| v.as_str())
-            .and_then(server_kid_from_public_key)
+        let key_url = format!("{}/api/v1/signing-key", verify_api_base(&server_addr));
+        let Some(did) = fetch_json(&key_url)
+            .await
+            .ok()
+            .as_ref()
+            .and_then(server_did_from_signing_key)
         else {
+            tracing::debug!(
+                key_url,
+                "the server names no DID for its keys — nothing gets marked"
+            );
             return;
         };
-        let _ = tx.send(crate::app::BgResult::ServerSigningKid(kid)).await;
+        let url = key_set_url(&server_addr, &did);
+        let Ok(body) = fetch_json(&url).await else {
+            tracing::debug!(url, "no server key set published — nothing gets marked");
+            return;
+        };
+        let kids = server_kids_from_key_set(&body);
+        let _ = tx.send(crate::app::BgResult::ServerSigningKids(kids)).await;
     });
 }
 
@@ -3296,10 +3374,11 @@ fn try_nick_complete(app: &mut App) {
 mod tests {
     use super::parse_join_prefix;
     use super::{
-        answer_for_error_status, ctcp_action, format_verify_verdict, server_kid_from_public_key,
+        answer_for_error_status, ctcp_action, format_verify_verdict, key_set_url,
+        server_did_from_signing_key, server_kid_from_public_key, server_kids_from_key_set,
         signature_of, verify_answer_line, verify_api_base,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     fn tags(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -3309,29 +3388,58 @@ mod tests {
     }
 
     const SERVER_KID: &str = "c2VydmVya2lkMDAwMDAw";
+    const RETIRED_KID: &str = "cmV0aXJlZGtpZDAwMDAw";
+
+    /// The server's key set as a session holds it: the kids fetched, the kids
+    /// whose re-fetch has come back, and the kids waiting on one.
+    struct Keys {
+        kids: HashSet<String>,
+        refetched: HashSet<String>,
+        pending: HashSet<String>,
+    }
+
+    impl Keys {
+        fn of(kids: &[&str]) -> Self {
+            Keys {
+                kids: kids.iter().map(|k| k.to_string()).collect(),
+                refetched: HashSet::new(),
+                pending: HashSet::new(),
+            }
+        }
+
+        /// A re-fetch for `kid` came back, and the set still did not list it.
+        fn refetched(mut self, kid: &str) -> Self {
+            self.refetched.insert(kid.to_string());
+            self
+        }
+
+        fn check(&mut self, tags: &HashMap<String, String>) -> (bool, Option<String>, bool) {
+            signature_of(tags, &self.kids, &self.refetched, &mut self.pending)
+        }
+    }
 
     #[test]
     fn a_signed_message_carries_its_signature_and_the_account_it_binds() {
-        let (signed, account) = signature_of(
-            &tags(&[
+        let (signed, account, _) = Keys::of(&[SERVER_KID])
+            .refetched("senderkid")
+            .check(&tags(&[
                 ("+freeq.at/sig", "ed25519:senderkid:c2ln"),
                 ("account", "did:plc:alice"),
                 ("msgid", "01ABC"),
-            ]),
-            Some(SERVER_KID),
-        );
+            ]));
         assert!(signed);
         assert_eq!(account.as_deref(), Some("did:plc:alice"));
     }
 
     #[test]
     fn an_unsigned_message_claims_nothing() {
-        let (signed, account) =
-            signature_of(&tags(&[("account", "did:plc:alice")]), Some(SERVER_KID));
+        let mut keys = Keys::of(&[SERVER_KID]);
+        let (signed, account, refetch) = keys.check(&tags(&[("account", "did:plc:alice")]));
         assert!(!signed, "an account tag is not a signature");
+        assert!(!refetch);
         assert_eq!(account.as_deref(), Some("did:plc:alice"));
 
-        let (signed, account) = signature_of(&tags(&[]), Some(SERVER_KID));
+        let (signed, account, _) = keys.check(&tags(&[]));
         assert!(!signed);
         assert_eq!(account, None);
     }
@@ -3341,28 +3449,177 @@ mod tests {
     /// credit the sender with a claim they never made.
     #[test]
     fn a_server_signature_is_not_the_senders_signature() {
-        let (signed, _) = signature_of(
-            &tags(&[("+freeq.at/sig", &format!("ed25519:{SERVER_KID}:c2ln"))]),
-            Some(SERVER_KID),
-        );
+        let mut keys = Keys::of(&[SERVER_KID]);
+        let (signed, _, refetch) = keys.check(&tags(&[(
+            "+freeq.at/sig",
+            &format!("ed25519:{SERVER_KID}:c2ln"),
+        )]));
         assert!(!signed, "the server's own key must not earn the marker");
+        assert!(!refetch, "a kid in the set needs no re-fetch");
 
         // An older server signs in a bare-base64 form with no key id at all.
-        let (signed, _) = signature_of(
-            &tags(&[("+freeq.at/sig", "HNKqMdYu9tHikBPgAqjrI3OM3s1wyERKFjGNjKjw")]),
-            Some(SERVER_KID),
-        );
+        let (signed, _, _) = keys.check(&tags(&[(
+            "+freeq.at/sig",
+            "HNKqMdYu9tHikBPgAqjrI3OM3s1wyERKFjGNjKjw",
+        )]));
         assert!(
             !signed,
             "a signature we cannot attribute is not the sender's"
         );
     }
 
-    /// A message relayed from another server was signed under a key that is
-    /// not ours whether its sender signed it or its origin server signed for
-    /// them — and only one of those is the sender's claim. The kid comparison
-    /// cannot separate them, so a relayed message never gets the marker.
-    /// `/verify` still answers for it; the server holds the keys we don't.
+    /// After a rotation the set lists the server's old key too, so a line the
+    /// old key signed is still the server's.
+    #[test]
+    fn a_line_signed_by_a_retired_server_key_is_not_the_senders() {
+        let mut keys = Keys::of(&[SERVER_KID, RETIRED_KID]);
+        let (signed, _, refetch) = keys.check(&tags(&[(
+            "+freeq.at/sig",
+            &format!("ed25519:{RETIRED_KID}:c2ln"),
+        )]));
+        assert!(!signed);
+        assert!(!refetch);
+    }
+
+    /// A kid the set does not list might be a key the server rotated to since
+    /// the set was fetched: it is asked about once, and nothing is decided
+    /// until the answer is back.
+    #[test]
+    fn an_unfamiliar_kid_triggers_exactly_one_refetch() {
+        let mut keys = Keys::of(&[SERVER_KID]);
+        let line = tags(&[("+freeq.at/sig", "ed25519:newkid:c2ln")]);
+        assert_eq!(
+            keys.check(&line),
+            (false, None, true),
+            "the first sighting asks"
+        );
+        assert_eq!(
+            keys.check(&line),
+            (false, None, false),
+            "a second waits, asking nothing"
+        );
+        assert!(keys.pending.contains("newkid"));
+    }
+
+    /// The answer decides: a kid still absent is the sender's, a kid the new
+    /// set lists is the server's.
+    #[test]
+    fn the_refetched_set_decides_an_unfamiliar_kid() {
+        let mut app = crate::app::App::new("me", false);
+        app.server_signing_kids.insert(SERVER_KID.to_string());
+        let sender = tags(&[("+freeq.at/sig", "ed25519:senderkid:c2ln")]);
+        let rotated = tags(&[("+freeq.at/sig", "ed25519:rotatedkid:c2ln")]);
+        for line in [&sender, &rotated] {
+            let (_, _, refetch) = signature_of(
+                line,
+                &app.server_signing_kids,
+                &app.server_kids_refetched,
+                &mut app.server_kids_refetch_pending,
+            );
+            assert!(refetch);
+        }
+
+        app.server_key_set_arrived(
+            [SERVER_KID, "rotatedkid"]
+                .iter()
+                .map(|k| k.to_string())
+                .collect(),
+        );
+        let mut decide = |line: &HashMap<String, String>| {
+            signature_of(
+                line,
+                &app.server_signing_kids,
+                &app.server_kids_refetched,
+                &mut app.server_kids_refetch_pending,
+            )
+        };
+        assert_eq!(
+            decide(&sender),
+            (true, None, false),
+            "still absent: the sender's"
+        );
+        assert_eq!(
+            decide(&rotated),
+            (false, None, false),
+            "now listed: the server's"
+        );
+    }
+
+    /// The server names the DID its key set is published under; a server
+    /// whose name is not the host we connected to still answers.
+    #[test]
+    fn the_key_set_is_asked_for_under_the_did_the_server_names() {
+        let body = serde_json::json!({ "public_key": "x", "did": "did:web:freeq" });
+        let did = server_did_from_signing_key(&body).expect("a did:web");
+        assert_eq!(did, "did:web:freeq");
+        assert_eq!(
+            key_set_url("127.0.0.1:6667", &did),
+            "http://127.0.0.1:8080/api/v1/signing-keys/did:web:freeq"
+        );
+        assert_eq!(
+            key_set_url("irc.example.com:6697", "did:web:chat.example.com"),
+            "https://irc.example.com/api/v1/signing-keys/did:web:chat.example.com"
+        );
+    }
+
+    #[test]
+    fn a_signing_key_answer_without_a_usable_did_names_nothing() {
+        for body in [
+            serde_json::json!({ "public_key": "x" }),
+            serde_json::json!({ "did": "did:plc:notaserver" }),
+            serde_json::json!({ "did": "did:web:x/../../elsewhere" }),
+            serde_json::json!({ "did": 7 }),
+        ] {
+            assert_eq!(server_did_from_signing_key(&body), None, "{body}");
+        }
+    }
+
+    /// An empty key set says nothing about whose a kid is, even after a
+    /// re-fetch came back empty; and while the set is empty nothing is asked.
+    #[test]
+    fn an_empty_key_set_marks_nothing() {
+        let line = tags(&[("+freeq.at/sig", "ed25519:senderkid:c2ln")]);
+        assert_eq!(Keys::of(&[]).check(&line), (false, None, false));
+        assert_eq!(
+            Keys::of(&[]).refetched("senderkid").check(&line),
+            (false, None, false)
+        );
+
+        let mut app = crate::app::App::new("me", false);
+        app.server_key_set_arrived(HashSet::new());
+        let decided = signature_of(
+            &line,
+            &app.server_signing_kids,
+            &app.server_kids_refetched,
+            &mut app.server_kids_refetch_pending,
+        );
+        assert_eq!(decided, (false, None, false));
+    }
+
+    /// A re-fetch that never answers leaves the kid waiting, unmarked.
+    #[test]
+    fn a_failed_refetch_marks_nothing() {
+        let mut keys = Keys::of(&[SERVER_KID]);
+        let line = tags(&[("+freeq.at/sig", "ed25519:newkid:c2ln")]);
+        assert_eq!(keys.check(&line), (false, None, true));
+        for _ in 0..3 {
+            assert_eq!(keys.check(&line), (false, None, false));
+        }
+    }
+
+    #[test]
+    fn the_key_set_lists_every_kid_the_server_published() {
+        let pubkey = "9uyAsw2ckm4rhDIMctwH9Ev0gwQ1S1a9nRfsH0AwlD0";
+        let body = serde_json::json!({
+            "public_key": pubkey,
+            "keys": [{ "kid": SERVER_KID }, { "kid": RETIRED_KID }],
+        });
+        let kids = server_kids_from_key_set(&body);
+        assert!(kids.contains(SERVER_KID) && kids.contains(RETIRED_KID));
+        assert!(kids.contains(&server_kid_from_public_key(pubkey).unwrap()));
+        assert!(server_kids_from_key_set(&serde_json::json!({})).is_empty());
+    }
+
     /// An action to an unnamed peer waits for the WHOIS like any other DM,
     /// and comes out of the wait as the exact bytes it went in as — a CTCP
     /// action that lost its framing on the way through would render as
@@ -3384,6 +3641,11 @@ mod tests {
         assert_eq!(ready, vec![("bob".to_string(), body)]);
     }
 
+    /// A message relayed from another server was signed under a key that is
+    /// not ours whether its sender signed it or its origin server signed for
+    /// them — and only one of those is the sender's claim. The kid comparison
+    /// cannot separate them, so a relayed message never gets the marker.
+    /// `/verify` still answers for it; the server holds the keys we don't.
     #[test]
     fn a_relayed_message_never_wears_the_senders_lock() {
         let foreign = tags(&[
@@ -3391,11 +3653,14 @@ mod tests {
             ("+freeq.at/origin", "other.server"),
             ("account", "did:plc:alice"),
         ]);
-        let (signed, account) = signature_of(&foreign, Some(SERVER_KID));
+        let (signed, account, refetch) = Keys::of(&[SERVER_KID])
+            .refetched("someforeignkid")
+            .check(&foreign);
         assert!(
             !signed,
             "a foreign server's key is not ours either — that is the whole problem"
         );
+        assert!(!refetch, "a relayed line asks nothing");
         assert_eq!(
             account.as_deref(),
             Some("did:plc:alice"),
@@ -3404,7 +3669,7 @@ mod tests {
 
         // And it holds regardless of what we know about our own server: the
         // rule is about provenance, not about the comparison succeeding.
-        let (signed, _) = signature_of(&foreign, None);
+        let (signed, _, _) = Keys::of(&[]).check(&foreign);
         assert!(!signed);
     }
 
@@ -3412,7 +3677,8 @@ mod tests {
     /// apart. Silence is the honest answer; a lock would be a guess.
     #[test]
     fn without_the_servers_key_nothing_is_marked() {
-        let (signed, _) = signature_of(&tags(&[("+freeq.at/sig", "ed25519:senderkid:c2ln")]), None);
+        let (signed, _, _) =
+            Keys::of(&[]).check(&tags(&[("+freeq.at/sig", "ed25519:senderkid:c2ln")]));
         assert!(!signed);
     }
 

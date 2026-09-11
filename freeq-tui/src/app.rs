@@ -661,10 +661,16 @@ pub struct App {
     pub history_requested: HashSet<String>,
     /// DMs held back while we ask the server who the peer is. In send order.
     pub pending_dms: Vec<PendingDm>,
-    /// Key id of the connected server's own signing key, once fetched. Without
-    /// it a signature cannot be attributed to the sender rather than to the
-    /// server, so nothing is marked as signed.
-    pub server_signing_kid: Option<String>,
+    /// Key ids of every signing key the connected server has had, current and
+    /// retired, from its published key set. Until the set lands a signature
+    /// cannot be attributed to the sender rather than to the server.
+    pub server_signing_kids: HashSet<String>,
+    /// Unfamiliar key ids a re-fetch of the set was started for this session,
+    /// not yet answered.
+    pub server_kids_refetch_pending: HashSet<String>,
+    /// Unfamiliar key ids whose re-fetch has come back. One still absent from
+    /// the set after that is the sender's.
+    pub server_kids_refetched: HashSet<String>,
     /// Lowercase nicks we've already asked about this session. A guest has no
     /// DID to find, and asking again before every message to them would buy a
     /// round trip and a delay for an answer that will not change.
@@ -723,11 +729,19 @@ pub enum BgResult {
     ProfileLines(String, Vec<String>, Option<String>),
     /// The server's verdict on one event, for the buffer that asked.
     VerifyLines(String, Vec<String>),
-    /// The key id of the connected server's own signing key.
-    ServerSigningKid(String),
+    /// The kids in the connected server's published key set.
+    ServerSigningKids(HashSet<String>),
 }
 
 impl App {
+    /// A fetch of the server's key set came back: its kids join the set, and
+    /// every kid waiting on a re-fetch now has its answer.
+    pub fn server_key_set_arrived(&mut self, kids: HashSet<String>) {
+        self.server_signing_kids.extend(kids);
+        let answered = std::mem::take(&mut self.server_kids_refetch_pending);
+        self.server_kids_refetched.extend(answered);
+    }
+
     pub fn new(nick: &str, vi_mode: bool) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let mut buffers = BTreeMap::new();
@@ -777,7 +791,9 @@ impl App {
             history_requested: HashSet::new(),
             pending_dms: Vec::new(),
             dm_peers_asked: HashSet::new(),
-            server_signing_kid: None,
+            server_signing_kids: HashSet::new(),
+            server_kids_refetch_pending: HashSet::new(),
+            server_kids_refetched: HashSet::new(),
         }
     }
 
@@ -1678,7 +1694,9 @@ mod tests {
             history_requested: HashSet::new(),
             pending_dms: Vec::new(),
             dm_peers_asked: HashSet::new(),
-            server_signing_kid: None,
+            server_signing_kids: HashSet::new(),
+            server_kids_refetch_pending: HashSet::new(),
+            server_kids_refetched: HashSet::new(),
         };
         app.start_batch("b1", "#test");
         app.end_batch("b1");

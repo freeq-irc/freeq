@@ -790,6 +790,9 @@ async fn api_signing_key(State(state): State<Arc<SharedState>>) -> Json<serde_js
         "public_key": pubkey_b64,
         "kid": kid,
         "registered_at": registered_at,
+        // Where this server's whole key set is published, under the name it
+        // files its own keys by rather than the host a client connected to.
+        "did": crate::server::server_did(&state.server_name),
         "encoding": "base64url",
         "usage": "message-signing",
         "canonical_form": "jcs-per-event-kind",
@@ -6598,6 +6601,7 @@ mod server_signing_key_tests {
         let out = super::api_signing_key(axum::extract::State(state)).await;
         assert_eq!(out.0["kid"], kid);
         assert_eq!(out.0["registered_at"], row.registered_at);
+        assert_eq!(out.0["did"], did, "the DID the key set is published under");
     }
 }
 
