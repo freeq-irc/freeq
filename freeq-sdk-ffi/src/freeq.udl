@@ -62,6 +62,69 @@ dictionary IdentityClaim {
     boolean needs_key_card;
 };
 
+// The verdict on a line's signature: what the check came to, and the
+// sentence to show for it (spec/verdict-model.json).
+enum VerdictState {
+    "Device",
+    "Server",
+    "Unsigned",
+    "Unverifiable",
+    "Invalid",
+    "Retired",
+    "Pending",
+};
+
+// Where a device key's standing comes from.
+enum KeyLayer {
+    "Vouched",
+    "Published",
+};
+
+dictionary SignatureVerdict {
+    VerdictState state;
+    KeyLayer? layer;
+    string? kid;
+    // Where the key was found: identity-record, did-document, origin-server.
+    string? key_source;
+    string sentence;
+};
+
+// This device's signing key, as the app's store keeps it.
+dictionary StoredDeviceKey {
+    bytes seed;
+    string created_at;
+    string? record_uri;
+};
+
+// Where the app keeps this device's signing key between connects.
+callback interface DeviceKeyStore {
+    [Throws=FreeqError]
+    StoredDeviceKey? load();
+
+    [Throws=FreeqError]
+    void save(StoredDeviceKey key);
+};
+
+// What publishing a device key came to.
+enum EnrollOutcome {
+    "Published",
+    "NeedsSignIn",
+    "Failed",
+};
+
+dictionary EnrollResult {
+    EnrollOutcome outcome;
+    string? record_uri;
+    string? detail;
+};
+
+// Writes a device key record to the account. `record_json` is the record
+// itself, posted verbatim.
+callback interface Enrollment {
+    [Throws=FreeqError]
+    EnrollResult publish(string record_json, string signer_public_key);
+};
+
 dictionary IrcMessage {
     string from_nick;
     string target;
@@ -83,6 +146,7 @@ dictionary IrcMessage {
     string? dm_key;
     CoordinationEvent? coordination;
     sequence<TagEntry> tags = [];
+    SignatureVerdict? verdict = null;
 };
 
 dictionary CoordinationEvent {
@@ -106,6 +170,7 @@ dictionary ActEvent {
     string? sig_tag;
     boolean replayed;
     string? dm_key;
+    SignatureVerdict? verdict = null;
 };
 
 dictionary ReactionTally {
@@ -142,6 +207,7 @@ dictionary TagMessage {
     string target;
     sequence<TagEntry> tags;
     string? dm_key;
+    SignatureVerdict? verdict = null;
 };
 
 [Enum]
@@ -180,6 +246,11 @@ interface FreeqEvent {
     // becomes an answer rather than an absence.
     WhoisEnd(string nick);
     Notice(string text);
+    // This device's key is not published to the account and the app's
+    // session cannot publish it: the user has to sign in again.
+    SigningKeyUnpublished();
+    // A verdict that was Pending when its line arrived, now known.
+    Verdict(string msgid, SignatureVerdict verdict);
     Disconnected(string reason);
 };
 
@@ -199,6 +270,28 @@ interface FreeqClient {
 
     [Throws=FreeqError]
     void set_websocket_url(string url);
+
+    // Keeps this device's signing key across connects. Before connect().
+    [Throws=FreeqError]
+    void set_device_key_store(DeviceKeyStore store);
+
+    // Publishes a stored key the account does not have yet. Before connect().
+    [Throws=FreeqError]
+    void set_enrollment(Enrollment enrollment);
+
+    // The published record's label, e.g. the device model. Before connect().
+    [Throws=FreeqError]
+    void set_device_label(string label);
+
+    // The next connect() follows the app's own OAuth sign-in. Cleared by
+    // that connect, so a reconnect passes false.
+    [Throws=FreeqError]
+    void set_fresh_sign_in(boolean fresh);
+
+    // Check the signature on every received line and put a verdict on it.
+    // Before connect().
+    [Throws=FreeqError]
+    void set_verify_signatures(boolean on);
 
     [Throws=FreeqError]
     void connect();

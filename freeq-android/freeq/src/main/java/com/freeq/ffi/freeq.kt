@@ -657,6 +657,15 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 internal interface UniffiCallbackInterfaceAvEventHandlerMethod0 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`event`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
+internal interface UniffiCallbackInterfaceDeviceKeyStoreMethod0 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceDeviceKeyStoreMethod1 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`key`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceEnrollmentMethod0 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`recordJson`: RustBuffer.ByValue,`signerPublicKey`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
+}
 internal interface UniffiCallbackInterfaceEventHandlerMethod0 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`event`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
@@ -675,6 +684,41 @@ internal open class UniffiVTableCallbackInterfaceAvEventHandler(
 
    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceAvEventHandler) {
         `onAvEvent` = other.`onAvEvent`
+        `uniffiFree` = other.`uniffiFree`
+    }
+
+}
+@Structure.FieldOrder("load", "save", "uniffiFree")
+internal open class UniffiVTableCallbackInterfaceDeviceKeyStore(
+    @JvmField internal var `load`: UniffiCallbackInterfaceDeviceKeyStoreMethod0? = null,
+    @JvmField internal var `save`: UniffiCallbackInterfaceDeviceKeyStoreMethod1? = null,
+    @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+) : Structure() {
+    class UniffiByValue(
+        `load`: UniffiCallbackInterfaceDeviceKeyStoreMethod0? = null,
+        `save`: UniffiCallbackInterfaceDeviceKeyStoreMethod1? = null,
+        `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+    ): UniffiVTableCallbackInterfaceDeviceKeyStore(`load`,`save`,`uniffiFree`,), Structure.ByValue
+
+   internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceDeviceKeyStore) {
+        `load` = other.`load`
+        `save` = other.`save`
+        `uniffiFree` = other.`uniffiFree`
+    }
+
+}
+@Structure.FieldOrder("publish", "uniffiFree")
+internal open class UniffiVTableCallbackInterfaceEnrollment(
+    @JvmField internal var `publish`: UniffiCallbackInterfaceEnrollmentMethod0? = null,
+    @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+) : Structure() {
+    class UniffiByValue(
+        `publish`: UniffiCallbackInterfaceEnrollmentMethod0? = null,
+        `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+    ): UniffiVTableCallbackInterfaceEnrollment(`publish`,`uniffiFree`,), Structure.ByValue
+
+   internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceEnrollment) {
+        `publish` = other.`publish`
         `uniffiFree` = other.`uniffiFree`
     }
 
@@ -711,6 +755,19 @@ internal open class UniffiVTableCallbackInterfaceP2pEventHandler(
     }
 
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -968,9 +1025,17 @@ fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_send_raw(
 ): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_send_tagged(
 ): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_device_key_store(
+): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_device_label(
+): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_enrollment(
+): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_platform(
 ): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_topic(
+): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_verify_signatures(
 ): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_web_token(
 ): Short
@@ -1024,6 +1089,12 @@ fun uniffi_freeq_sdk_ffi_checksum_constructor_freeqp2p_new(
 ): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_aveventhandler_on_av_event(
 ): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_devicekeystore_load(
+): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_devicekeystore_save(
+): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_enrollment_publish(
+): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_eventhandler_on_event(
 ): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_p2peventhandler_on_p2p_event(
@@ -1067,6 +1138,8 @@ internal interface UniffiLib : Library {
             // No need to check the contract version and checksums, since 
             // we already did that with `IntegrityCheckingUniffiLib` above.
             uniffiCallbackInterfaceAvEventHandler.register(lib)
+            uniffiCallbackInterfaceDeviceKeyStore.register(lib)
+            uniffiCallbackInterfaceEnrollment.register(lib)
             uniffiCallbackInterfaceEventHandler.register(lib)
             uniffiCallbackInterfaceP2pEventHandler.register(lib)
             // Loading of library with integrity check done.
@@ -1142,9 +1215,17 @@ fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_send_raw(`ptr`: Pointer,`line`: R
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_send_tagged(`ptr`: Pointer,`target`: RustBuffer.ByValue,`text`: RustBuffer.ByValue,`tags`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_device_key_store(`ptr`: Pointer,`store`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_device_label(`ptr`: Pointer,`label`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_enrollment(`ptr`: Pointer,`enrollment`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_platform(`ptr`: Pointer,`platform`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_topic(`ptr`: Pointer,`channel`: RustBuffer.ByValue,`topic`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_verify_signatures(`ptr`: Pointer,`on`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_web_token(`ptr`: Pointer,`token`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1201,6 +1282,10 @@ fun uniffi_freeq_sdk_ffi_fn_method_freeqp2p_send_message(`ptr`: Pointer,`peerId`
 fun uniffi_freeq_sdk_ffi_fn_method_freeqp2p_shutdown(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_init_callback_vtable_aveventhandler(`vtable`: UniffiVTableCallbackInterfaceAvEventHandler,
+): Unit
+fun uniffi_freeq_sdk_ffi_fn_init_callback_vtable_devicekeystore(`vtable`: UniffiVTableCallbackInterfaceDeviceKeyStore,
+): Unit
+fun uniffi_freeq_sdk_ffi_fn_init_callback_vtable_enrollment(`vtable`: UniffiVTableCallbackInterfaceEnrollment,
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_init_callback_vtable_eventhandler(`vtable`: UniffiVTableCallbackInterfaceEventHandler,
 ): Unit
@@ -1427,10 +1512,22 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_send_tagged() != 64231.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_device_key_store() != 37805.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_device_label() != 5878.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_enrollment() != 15684.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_platform() != 50791.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_topic() != 15675.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_verify_signatures() != 22934.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_web_token() != 47149.toShort()) {
@@ -1509,6 +1606,15 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_aveventhandler_on_av_event() != 24538.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_devicekeystore_load() != 50674.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_devicekeystore_save() != 53549.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_enrollment_publish() != 47066.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_eventhandler_on_event() != 8369.toShort()) {
@@ -1883,6 +1989,25 @@ public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
         val byteBuf = toUtf8(value)
         buf.putInt(byteBuf.limit())
         buf.put(byteBuf)
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
+    override fun read(buf: ByteBuffer): ByteArray {
+        val len = buf.getInt()
+        val byteArr = ByteArray(len)
+        buf.get(byteArr)
+        return byteArr
+    }
+    override fun allocationSize(value: ByteArray): ULong {
+        return 4UL + value.size.toULong()
+    }
+    override fun write(value: ByteArray, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        buf.put(value)
     }
 }
 
@@ -2381,9 +2506,17 @@ public interface FreeqClientInterface {
     
     fun `sendTagged`(`target`: kotlin.String, `text`: kotlin.String, `tags`: List<TagEntry>)
     
+    fun `setDeviceKeyStore`(`store`: DeviceKeyStore)
+    
+    fun `setDeviceLabel`(`label`: kotlin.String)
+    
+    fun `setEnrollment`(`enrollment`: Enrollment)
+    
     fun `setPlatform`(`platform`: kotlin.String)
     
     fun `setTopic`(`channel`: kotlin.String, `topic`: kotlin.String)
+    
+    fun `setVerifySignatures`(`on`: kotlin.Boolean)
     
     fun `setWebToken`(`token`: kotlin.String)
     
@@ -2667,6 +2800,42 @@ open class FreeqClient: Disposable, AutoCloseable, FreeqClientInterface
     
 
     
+    @Throws(FreeqException::class)override fun `setDeviceKeyStore`(`store`: DeviceKeyStore)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(FreeqException) { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_device_key_store(
+        it, FfiConverterTypeDeviceKeyStore.lower(`store`),_status)
+}
+    }
+    
+    
+
+    
+    @Throws(FreeqException::class)override fun `setDeviceLabel`(`label`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(FreeqException) { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_device_label(
+        it, FfiConverterString.lower(`label`),_status)
+}
+    }
+    
+    
+
+    
+    @Throws(FreeqException::class)override fun `setEnrollment`(`enrollment`: Enrollment)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(FreeqException) { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_enrollment(
+        it, FfiConverterTypeEnrollment.lower(`enrollment`),_status)
+}
+    }
+    
+    
+
+    
     @Throws(FreeqException::class)override fun `setPlatform`(`platform`: kotlin.String)
         = 
     callWithPointer {
@@ -2685,6 +2854,18 @@ open class FreeqClient: Disposable, AutoCloseable, FreeqClientInterface
     uniffiRustCallWithError(FreeqException) { _status ->
     UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_topic(
         it, FfiConverterString.lower(`channel`),FfiConverterString.lower(`topic`),_status)
+}
+    }
+    
+    
+
+    
+    @Throws(FreeqException::class)override fun `setVerifySignatures`(`on`: kotlin.Boolean)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(FreeqException) { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_verify_signatures(
+        it, FfiConverterBoolean.lower(`on`),_status)
 }
     }
     
@@ -3488,7 +3669,8 @@ data class ActEvent (
     var `fields`: List<TagEntry>, 
     var `sigTag`: kotlin.String?, 
     var `replayed`: kotlin.Boolean, 
-    var `dmKey`: kotlin.String?
+    var `dmKey`: kotlin.String?, 
+    var `verdict`: SignatureVerdict? = null
 ) {
     
     companion object
@@ -3511,6 +3693,7 @@ public object FfiConverterTypeActEvent: FfiConverterRustBuffer<ActEvent> {
             FfiConverterOptionalString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalTypeSignatureVerdict.read(buf),
         )
     }
 
@@ -3525,7 +3708,8 @@ public object FfiConverterTypeActEvent: FfiConverterRustBuffer<ActEvent> {
             FfiConverterSequenceTypeTagEntry.allocationSize(value.`fields`) +
             FfiConverterOptionalString.allocationSize(value.`sigTag`) +
             FfiConverterBoolean.allocationSize(value.`replayed`) +
-            FfiConverterOptionalString.allocationSize(value.`dmKey`)
+            FfiConverterOptionalString.allocationSize(value.`dmKey`) +
+            FfiConverterOptionalTypeSignatureVerdict.allocationSize(value.`verdict`)
     )
 
     override fun write(value: ActEvent, buf: ByteBuffer) {
@@ -3540,6 +3724,7 @@ public object FfiConverterTypeActEvent: FfiConverterRustBuffer<ActEvent> {
             FfiConverterOptionalString.write(value.`sigTag`, buf)
             FfiConverterBoolean.write(value.`replayed`, buf)
             FfiConverterOptionalString.write(value.`dmKey`, buf)
+            FfiConverterOptionalTypeSignatureVerdict.write(value.`verdict`, buf)
     }
 }
 
@@ -3693,6 +3878,42 @@ public object FfiConverterTypeCoordinationEvent: FfiConverterRustBuffer<Coordina
 
 
 
+data class EnrollResult (
+    var `outcome`: EnrollOutcome, 
+    var `recordUri`: kotlin.String?, 
+    var `detail`: kotlin.String?
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEnrollResult: FfiConverterRustBuffer<EnrollResult> {
+    override fun read(buf: ByteBuffer): EnrollResult {
+        return EnrollResult(
+            FfiConverterTypeEnrollOutcome.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: EnrollResult) = (
+            FfiConverterTypeEnrollOutcome.allocationSize(value.`outcome`) +
+            FfiConverterOptionalString.allocationSize(value.`recordUri`) +
+            FfiConverterOptionalString.allocationSize(value.`detail`)
+    )
+
+    override fun write(value: EnrollResult, buf: ByteBuffer) {
+            FfiConverterTypeEnrollOutcome.write(value.`outcome`, buf)
+            FfiConverterOptionalString.write(value.`recordUri`, buf)
+            FfiConverterOptionalString.write(value.`detail`, buf)
+    }
+}
+
+
+
 data class IdentityClaim (
     var `state`: IdentityClaimState, 
     var `did`: kotlin.String?, 
@@ -3813,7 +4034,8 @@ data class IrcMessage (
     var `edited`: kotlin.Boolean, 
     var `dmKey`: kotlin.String?, 
     var `coordination`: CoordinationEvent?, 
-    var `tags`: List<TagEntry> = listOf()
+    var `tags`: List<TagEntry> = listOf(), 
+    var `verdict`: SignatureVerdict? = null
 ) {
     
     companion object
@@ -3845,6 +4067,7 @@ public object FfiConverterTypeIrcMessage: FfiConverterRustBuffer<IrcMessage> {
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalTypeCoordinationEvent.read(buf),
             FfiConverterSequenceTypeTagEntry.read(buf),
+            FfiConverterOptionalTypeSignatureVerdict.read(buf),
         )
     }
 
@@ -3868,7 +4091,8 @@ public object FfiConverterTypeIrcMessage: FfiConverterRustBuffer<IrcMessage> {
             FfiConverterBoolean.allocationSize(value.`edited`) +
             FfiConverterOptionalString.allocationSize(value.`dmKey`) +
             FfiConverterOptionalTypeCoordinationEvent.allocationSize(value.`coordination`) +
-            FfiConverterSequenceTypeTagEntry.allocationSize(value.`tags`)
+            FfiConverterSequenceTypeTagEntry.allocationSize(value.`tags`) +
+            FfiConverterOptionalTypeSignatureVerdict.allocationSize(value.`verdict`)
     )
 
     override fun write(value: IrcMessage, buf: ByteBuffer) {
@@ -3892,6 +4116,7 @@ public object FfiConverterTypeIrcMessage: FfiConverterRustBuffer<IrcMessage> {
             FfiConverterOptionalString.write(value.`dmKey`, buf)
             FfiConverterOptionalTypeCoordinationEvent.write(value.`coordination`, buf)
             FfiConverterSequenceTypeTagEntry.write(value.`tags`, buf)
+            FfiConverterOptionalTypeSignatureVerdict.write(value.`verdict`, buf)
     }
 }
 
@@ -4085,6 +4310,86 @@ public object FfiConverterTypeSafetyNumber: FfiConverterRustBuffer<SafetyNumber>
 
 
 
+data class SignatureVerdict (
+    var `state`: VerdictState, 
+    var `layer`: KeyLayer?, 
+    var `kid`: kotlin.String?, 
+    var `keySource`: kotlin.String?, 
+    var `sentence`: kotlin.String
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSignatureVerdict: FfiConverterRustBuffer<SignatureVerdict> {
+    override fun read(buf: ByteBuffer): SignatureVerdict {
+        return SignatureVerdict(
+            FfiConverterTypeVerdictState.read(buf),
+            FfiConverterOptionalTypeKeyLayer.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: SignatureVerdict) = (
+            FfiConverterTypeVerdictState.allocationSize(value.`state`) +
+            FfiConverterOptionalTypeKeyLayer.allocationSize(value.`layer`) +
+            FfiConverterOptionalString.allocationSize(value.`kid`) +
+            FfiConverterOptionalString.allocationSize(value.`keySource`) +
+            FfiConverterString.allocationSize(value.`sentence`)
+    )
+
+    override fun write(value: SignatureVerdict, buf: ByteBuffer) {
+            FfiConverterTypeVerdictState.write(value.`state`, buf)
+            FfiConverterOptionalTypeKeyLayer.write(value.`layer`, buf)
+            FfiConverterOptionalString.write(value.`kid`, buf)
+            FfiConverterOptionalString.write(value.`keySource`, buf)
+            FfiConverterString.write(value.`sentence`, buf)
+    }
+}
+
+
+
+data class StoredDeviceKey (
+    var `seed`: kotlin.ByteArray, 
+    var `createdAt`: kotlin.String, 
+    var `recordUri`: kotlin.String?
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeStoredDeviceKey: FfiConverterRustBuffer<StoredDeviceKey> {
+    override fun read(buf: ByteBuffer): StoredDeviceKey {
+        return StoredDeviceKey(
+            FfiConverterByteArray.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: StoredDeviceKey) = (
+            FfiConverterByteArray.allocationSize(value.`seed`) +
+            FfiConverterString.allocationSize(value.`createdAt`) +
+            FfiConverterOptionalString.allocationSize(value.`recordUri`)
+    )
+
+    override fun write(value: StoredDeviceKey, buf: ByteBuffer) {
+            FfiConverterByteArray.write(value.`seed`, buf)
+            FfiConverterString.write(value.`createdAt`, buf)
+            FfiConverterOptionalString.write(value.`recordUri`, buf)
+    }
+}
+
+
+
 data class TagEntry (
     var `key`: kotlin.String, 
     var `value`: kotlin.String
@@ -4121,7 +4426,8 @@ data class TagMessage (
     var `from`: kotlin.String, 
     var `target`: kotlin.String, 
     var `tags`: List<TagEntry>, 
-    var `dmKey`: kotlin.String?
+    var `dmKey`: kotlin.String?, 
+    var `verdict`: SignatureVerdict? = null
 ) {
     
     companion object
@@ -4137,6 +4443,7 @@ public object FfiConverterTypeTagMessage: FfiConverterRustBuffer<TagMessage> {
             FfiConverterString.read(buf),
             FfiConverterSequenceTypeTagEntry.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalTypeSignatureVerdict.read(buf),
         )
     }
 
@@ -4144,7 +4451,8 @@ public object FfiConverterTypeTagMessage: FfiConverterRustBuffer<TagMessage> {
             FfiConverterString.allocationSize(value.`from`) +
             FfiConverterString.allocationSize(value.`target`) +
             FfiConverterSequenceTypeTagEntry.allocationSize(value.`tags`) +
-            FfiConverterOptionalString.allocationSize(value.`dmKey`)
+            FfiConverterOptionalString.allocationSize(value.`dmKey`) +
+            FfiConverterOptionalTypeSignatureVerdict.allocationSize(value.`verdict`)
     )
 
     override fun write(value: TagMessage, buf: ByteBuffer) {
@@ -4152,6 +4460,7 @@ public object FfiConverterTypeTagMessage: FfiConverterRustBuffer<TagMessage> {
             FfiConverterString.write(value.`target`, buf)
             FfiConverterSequenceTypeTagEntry.write(value.`tags`, buf)
             FfiConverterOptionalString.write(value.`dmKey`, buf)
+            FfiConverterOptionalTypeSignatureVerdict.write(value.`verdict`, buf)
     }
 }
 
@@ -4532,6 +4841,37 @@ public object FfiConverterTypeAvEvent : FfiConverterRustBuffer<AvEvent>{
 
 
 
+enum class EnrollOutcome {
+    
+    PUBLISHED,
+    NEEDS_SIGN_IN,
+    FAILED;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEnrollOutcome: FfiConverterRustBuffer<EnrollOutcome> {
+    override fun read(buf: ByteBuffer) = try {
+        EnrollOutcome.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: EnrollOutcome) = 4UL
+
+    override fun write(value: EnrollOutcome, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
 
 sealed class FreeqException(message: String): kotlin.Exception(message) {
         
@@ -4748,6 +5088,15 @@ sealed class FreeqEvent {
         companion object
     }
     
+    object SigningKeyUnpublished : FreeqEvent()
+    
+    
+    data class Verdict(
+        val `msgid`: kotlin.String, 
+        val `verdict`: SignatureVerdict) : FreeqEvent() {
+        companion object
+    }
+    
     data class Disconnected(
         val `reason`: kotlin.String) : FreeqEvent() {
         companion object
@@ -4864,7 +5213,12 @@ public object FfiConverterTypeFreeqEvent : FfiConverterRustBuffer<FreeqEvent>{
             26 -> FreeqEvent.Notice(
                 FfiConverterString.read(buf),
                 )
-            27 -> FreeqEvent.Disconnected(
+            27 -> FreeqEvent.SigningKeyUnpublished
+            28 -> FreeqEvent.Verdict(
+                FfiConverterString.read(buf),
+                FfiConverterTypeSignatureVerdict.read(buf),
+                )
+            29 -> FreeqEvent.Disconnected(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
@@ -5077,6 +5431,20 @@ public object FfiConverterTypeFreeqEvent : FfiConverterRustBuffer<FreeqEvent>{
                 + FfiConverterString.allocationSize(value.`text`)
             )
         }
+        is FreeqEvent.SigningKeyUnpublished -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is FreeqEvent.Verdict -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`msgid`)
+                + FfiConverterTypeSignatureVerdict.allocationSize(value.`verdict`)
+            )
+        }
         is FreeqEvent.Disconnected -> {
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
@@ -5241,8 +5609,18 @@ public object FfiConverterTypeFreeqEvent : FfiConverterRustBuffer<FreeqEvent>{
                 FfiConverterString.write(value.`text`, buf)
                 Unit
             }
-            is FreeqEvent.Disconnected -> {
+            is FreeqEvent.SigningKeyUnpublished -> {
                 buf.putInt(27)
+                Unit
+            }
+            is FreeqEvent.Verdict -> {
+                buf.putInt(28)
+                FfiConverterString.write(value.`msgid`, buf)
+                FfiConverterTypeSignatureVerdict.write(value.`verdict`, buf)
+                Unit
+            }
+            is FreeqEvent.Disconnected -> {
+                buf.putInt(29)
                 FfiConverterString.write(value.`reason`, buf)
                 Unit
             }
@@ -5280,6 +5658,36 @@ public object FfiConverterTypeIdentityClaimState: FfiConverterRustBuffer<Identit
     override fun allocationSize(value: IdentityClaimState) = 4UL
 
     override fun write(value: IdentityClaimState, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
+enum class KeyLayer {
+    
+    VOUCHED,
+    PUBLISHED;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeKeyLayer: FfiConverterRustBuffer<KeyLayer> {
+    override fun read(buf: ByteBuffer) = try {
+        KeyLayer.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: KeyLayer) = 4UL
+
+    override fun write(value: KeyLayer, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
@@ -5456,6 +5864,41 @@ public object FfiConverterTypePersonLookup: FfiConverterRustBuffer<PersonLookup>
 
 
 
+enum class VerdictState {
+    
+    DEVICE,
+    SERVER,
+    UNSIGNED,
+    UNVERIFIABLE,
+    INVALID,
+    RETIRED,
+    PENDING;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeVerdictState: FfiConverterRustBuffer<VerdictState> {
+    override fun read(buf: ByteBuffer) = try {
+        VerdictState.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: VerdictState) = 4UL
+
+    override fun write(value: VerdictState, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
 
 public interface AvEventHandler {
     
@@ -5505,6 +5948,142 @@ internal object uniffiCallbackInterfaceAvEventHandler {
  * @suppress
  */
 public object FfiConverterTypeAvEventHandler: FfiConverterCallbackInterface<AvEventHandler>()
+
+
+
+
+
+public interface DeviceKeyStore {
+    
+    fun `load`(): StoredDeviceKey?
+    
+    fun `save`(`key`: StoredDeviceKey)
+    
+    companion object
+}
+
+
+
+// Put the implementation in an object so we don't pollute the top-level namespace
+internal object uniffiCallbackInterfaceDeviceKeyStore {
+    internal object `load`: UniffiCallbackInterfaceDeviceKeyStoreMethod0 {
+        override fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeDeviceKeyStore.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`load`(
+                )
+            }
+            val writeReturn = { value: StoredDeviceKey? -> uniffiOutReturn.setValue(FfiConverterOptionalTypeStoredDeviceKey.lower(value)) }
+            uniffiTraitInterfaceCallWithError(
+                uniffiCallStatus,
+                makeCall,
+                writeReturn,
+                { e: FreeqException -> FfiConverterTypeFreeqError.lower(e) }
+            )
+        }
+    }
+    internal object `save`: UniffiCallbackInterfaceDeviceKeyStoreMethod1 {
+        override fun callback(`uniffiHandle`: Long,`key`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeDeviceKeyStore.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`save`(
+                    FfiConverterTypeStoredDeviceKey.lift(`key`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCallWithError(
+                uniffiCallStatus,
+                makeCall,
+                writeReturn,
+                { e: FreeqException -> FfiConverterTypeFreeqError.lower(e) }
+            )
+        }
+    }
+
+    internal object uniffiFree: UniffiCallbackInterfaceFree {
+        override fun callback(handle: Long) {
+            FfiConverterTypeDeviceKeyStore.handleMap.remove(handle)
+        }
+    }
+
+    internal var vtable = UniffiVTableCallbackInterfaceDeviceKeyStore.UniffiByValue(
+        `load`,
+        `save`,
+        uniffiFree,
+    )
+
+    // Registers the foreign callback with the Rust side.
+    // This method is generated for each callback interface.
+    internal fun register(lib: UniffiLib) {
+        lib.uniffi_freeq_sdk_ffi_fn_init_callback_vtable_devicekeystore(vtable)
+    }
+}
+
+/**
+ * The ffiConverter which transforms the Callbacks in to handles to pass to Rust.
+ *
+ * @suppress
+ */
+public object FfiConverterTypeDeviceKeyStore: FfiConverterCallbackInterface<DeviceKeyStore>()
+
+
+
+
+
+public interface Enrollment {
+    
+    fun `publish`(`recordJson`: kotlin.String, `signerPublicKey`: kotlin.String): EnrollResult
+    
+    companion object
+}
+
+
+
+// Put the implementation in an object so we don't pollute the top-level namespace
+internal object uniffiCallbackInterfaceEnrollment {
+    internal object `publish`: UniffiCallbackInterfaceEnrollmentMethod0 {
+        override fun callback(`uniffiHandle`: Long,`recordJson`: RustBuffer.ByValue,`signerPublicKey`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeEnrollment.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`publish`(
+                    FfiConverterString.lift(`recordJson`),
+                    FfiConverterString.lift(`signerPublicKey`),
+                )
+            }
+            val writeReturn = { value: EnrollResult -> uniffiOutReturn.setValue(FfiConverterTypeEnrollResult.lower(value)) }
+            uniffiTraitInterfaceCallWithError(
+                uniffiCallStatus,
+                makeCall,
+                writeReturn,
+                { e: FreeqException -> FfiConverterTypeFreeqError.lower(e) }
+            )
+        }
+    }
+
+    internal object uniffiFree: UniffiCallbackInterfaceFree {
+        override fun callback(handle: Long) {
+            FfiConverterTypeEnrollment.handleMap.remove(handle)
+        }
+    }
+
+    internal var vtable = UniffiVTableCallbackInterfaceEnrollment.UniffiByValue(
+        `publish`,
+        uniffiFree,
+    )
+
+    // Registers the foreign callback with the Rust side.
+    // This method is generated for each callback interface.
+    internal fun register(lib: UniffiLib) {
+        lib.uniffi_freeq_sdk_ffi_fn_init_callback_vtable_enrollment(vtable)
+    }
+}
+
+/**
+ * The ffiConverter which transforms the Callbacks in to handles to pass to Rust.
+ *
+ * @suppress
+ */
+public object FfiConverterTypeEnrollment: FfiConverterCallbackInterface<Enrollment>()
 
 
 
@@ -5704,6 +6283,102 @@ public object FfiConverterOptionalTypeCoordinationEvent: FfiConverterRustBuffer<
         } else {
             buf.put(1)
             FfiConverterTypeCoordinationEvent.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeSignatureVerdict: FfiConverterRustBuffer<SignatureVerdict?> {
+    override fun read(buf: ByteBuffer): SignatureVerdict? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeSignatureVerdict.read(buf)
+    }
+
+    override fun allocationSize(value: SignatureVerdict?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeSignatureVerdict.allocationSize(value)
+        }
+    }
+
+    override fun write(value: SignatureVerdict?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeSignatureVerdict.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeStoredDeviceKey: FfiConverterRustBuffer<StoredDeviceKey?> {
+    override fun read(buf: ByteBuffer): StoredDeviceKey? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeStoredDeviceKey.read(buf)
+    }
+
+    override fun allocationSize(value: StoredDeviceKey?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeStoredDeviceKey.allocationSize(value)
+        }
+    }
+
+    override fun write(value: StoredDeviceKey?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeStoredDeviceKey.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeKeyLayer: FfiConverterRustBuffer<KeyLayer?> {
+    override fun read(buf: ByteBuffer): KeyLayer? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeKeyLayer.read(buf)
+    }
+
+    override fun allocationSize(value: KeyLayer?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeKeyLayer.allocationSize(value)
+        }
+    }
+
+    override fun write(value: KeyLayer?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeKeyLayer.write(value, buf)
         }
     }
 }

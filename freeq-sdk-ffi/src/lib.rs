@@ -161,6 +161,76 @@ pub fn identity_stamping_epoch_unix() -> u64 {
     freeq_sdk::identity_claim::stamping_epoch_unix()
 }
 
+/// What checking a line's signature came to. The SDK's `VerdictState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictState {
+    Device,
+    Server,
+    Unsigned,
+    Unverifiable,
+    Invalid,
+    Retired,
+    Pending,
+}
+
+/// Where a device key's standing comes from. The SDK's `KeyLayer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyLayer {
+    Vouched,
+    Published,
+}
+
+/// A line's verdict, with the sentence to show for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureVerdict {
+    pub state: VerdictState,
+    pub layer: Option<KeyLayer>,
+    pub kid: Option<String>,
+    /// `identity-record`, `did-document` or `origin-server`.
+    pub key_source: Option<String>,
+    pub sentence: String,
+}
+
+/// This device's signing key, as the app's store keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredDeviceKey {
+    pub seed: Vec<u8>,
+    pub created_at: String,
+    pub record_uri: Option<String>,
+}
+
+/// What publishing a device key came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrollOutcome {
+    Published,
+    NeedsSignIn,
+    Failed,
+}
+
+/// The answer to one `publish`: the outcome, the record's URI when it was
+/// written, and why when it was not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrollResult {
+    pub outcome: EnrollOutcome,
+    pub record_uri: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// Where the app keeps this device's signing key between connects.
+pub trait DeviceKeyStore: Send + Sync + 'static {
+    fn load(&self) -> Result<Option<StoredDeviceKey>, FreeqError>;
+    fn save(&self, key: StoredDeviceKey) -> Result<(), FreeqError>;
+}
+
+/// Writes a device key record to the account.
+pub trait Enrollment: Send + Sync + 'static {
+    fn publish(
+        &self,
+        record_json: String,
+        signer_public_key: String,
+    ) -> Result<EnrollResult, FreeqError>;
+}
+
 pub struct IrcMessage {
     pub from_nick: String,
     pub target: String,
@@ -211,6 +281,10 @@ pub struct IrcMessage {
     /// it straight off the line, and without this a native client cannot tell
     /// a companion from any other message.
     pub tags: Vec<TagEntry>,
+    /// The signature's verdict when the client checks signatures and it is
+    /// known on arrival; `Pending` while the key is looked up, with a
+    /// `Verdict` event to follow. `None` when signatures are not checked.
+    pub verdict: Option<SignatureVerdict>,
 }
 
 /// A parsed agent coordination event (the `+freeq.at/*` task tag family).
@@ -279,6 +353,8 @@ pub struct ActEvent {
     pub sig_tag: Option<String>,
     pub replayed: bool,
     pub dm_key: Option<String>,
+    /// Same as [`IrcMessage::verdict`].
+    pub verdict: Option<SignatureVerdict>,
 }
 
 pub struct TagMessage {
@@ -286,6 +362,8 @@ pub struct TagMessage {
     pub target: String,
     pub tags: Vec<TagEntry>,
     pub dm_key: Option<String>,
+    /// Same as [`IrcMessage::verdict`].
+    pub verdict: Option<SignatureVerdict>,
 }
 
 pub struct IrcMember {
@@ -419,6 +497,14 @@ pub enum FreeqEvent {
     Notice {
         text: String,
     },
+    /// This device's key is not published to the account and the app's
+    /// session cannot publish it: the user has to sign in again.
+    SigningKeyUnpublished,
+    /// A verdict that was `Pending` when its line arrived, now known.
+    Verdict {
+        msgid: String,
+        verdict: SignatureVerdict,
+    },
     Disconnected {
         reason: String,
     },
@@ -440,6 +526,117 @@ pub trait EventHandler: Send + Sync + 'static {
     fn on_event(&self, event: FreeqEvent);
 }
 
+// ── Device key, enrollment and verdict adapters ──
+
+/// The app's store, as the SDK wants it. The SDK's errors are `anyhow`;
+/// the callback's are `FreeqError`.
+struct StoreAdapter(Arc<dyn DeviceKeyStore>);
+
+impl freeq_sdk::device_key::DeviceKeyStore for StoreAdapter {
+    fn load(&self) -> anyhow::Result<Option<freeq_sdk::device_key::StoredDeviceKey>> {
+        let Some(stored) = self.0.load().map_err(|e| anyhow::anyhow!("{e}"))? else {
+            return Ok(None);
+        };
+        let seed: [u8; 32] = stored
+            .seed
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("a device key seed is 32 bytes"))?;
+        Ok(Some(freeq_sdk::device_key::StoredDeviceKey {
+            seed,
+            created_at: stored.created_at,
+            record_uri: stored.record_uri,
+        }))
+    }
+
+    fn save(&self, key: &freeq_sdk::device_key::StoredDeviceKey) -> anyhow::Result<()> {
+        self.0
+            .save(StoredDeviceKey {
+                seed: key.seed.to_vec(),
+                created_at: key.created_at.clone(),
+                record_uri: key.record_uri.clone(),
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
+/// The app's enrollment, as the SDK wants it. The callback is a blocking
+/// call over the FFI, so it runs on a blocking thread rather than in the
+/// async task that awaits it.
+struct EnrollmentAdapter(Arc<dyn Enrollment>);
+
+impl freeq_sdk::device_key::Enrollment for EnrollmentAdapter {
+    fn publish(
+        &self,
+        record: freeq_sdk::identity_records::DeviceKeyRecord,
+        signer_public_key: String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = freeq_sdk::device_key::EnrollOutcome> + Send>,
+    > {
+        let app = self.0.clone();
+        Box::pin(async move {
+            let record_json = match serde_json::to_string(&record) {
+                Ok(json) => json,
+                Err(e) => return freeq_sdk::device_key::EnrollOutcome::Failed(e.to_string()),
+            };
+            let answer =
+                tokio::task::spawn_blocking(move || app.publish(record_json, signer_public_key))
+                    .await;
+            match answer {
+                Ok(Ok(result)) => match result.outcome {
+                    EnrollOutcome::Published => match result.record_uri {
+                        Some(uri) => freeq_sdk::device_key::EnrollOutcome::Published { uri },
+                        None => freeq_sdk::device_key::EnrollOutcome::Failed(
+                            "published with no record uri".to_string(),
+                        ),
+                    },
+                    EnrollOutcome::NeedsSignIn => freeq_sdk::device_key::EnrollOutcome::NeedsSignIn,
+                    EnrollOutcome::Failed => freeq_sdk::device_key::EnrollOutcome::Failed(
+                        result.detail.unwrap_or_default(),
+                    ),
+                },
+                Ok(Err(e)) => freeq_sdk::device_key::EnrollOutcome::Failed(e.to_string()),
+                Err(e) => freeq_sdk::device_key::EnrollOutcome::Failed(e.to_string()),
+            }
+        })
+    }
+}
+
+/// The SDK's verdict, with the sentence for it.
+fn convert_verdict(verdict: &freeq_sdk::verdict::Verdict) -> SignatureVerdict {
+    use freeq_sdk::key_lookup::KeySource;
+    use freeq_sdk::verdict as sdk;
+    let state = match verdict.state {
+        sdk::VerdictState::Device => VerdictState::Device,
+        sdk::VerdictState::Server => VerdictState::Server,
+        sdk::VerdictState::Unsigned => VerdictState::Unsigned,
+        sdk::VerdictState::Unverifiable => VerdictState::Unverifiable,
+        sdk::VerdictState::Invalid => VerdictState::Invalid,
+        sdk::VerdictState::Retired => VerdictState::Retired,
+        sdk::VerdictState::Pending => VerdictState::Pending,
+    };
+    SignatureVerdict {
+        state,
+        layer: verdict.layer.map(|l| match l {
+            sdk::KeyLayer::Vouched => KeyLayer::Vouched,
+            sdk::KeyLayer::Published => KeyLayer::Published,
+        }),
+        kid: verdict.kid.clone(),
+        key_source: verdict.key_source.map(|s| {
+            match s {
+                KeySource::IdentityRecord => "identity-record",
+                KeySource::DidDocument => "did-document",
+                KeySource::OriginServer => "origin-server",
+            }
+            .to_string()
+        }),
+        sentence: sdk::sentence(verdict.state, verdict.layer).to_string(),
+    }
+}
+
+fn convert_verdict_opt(verdict: &Option<freeq_sdk::verdict::Verdict>) -> Option<SignatureVerdict> {
+    verdict.as_ref().map(convert_verdict)
+}
+
 // ── Client ──
 
 pub struct FreeqClient {
@@ -454,6 +651,14 @@ pub struct FreeqClient {
     /// transport over raw TCP — used by iOS so it can reach the server on
     /// networks that block port 6667.
     websocket_url: Arc<Mutex<Option<String>>>,
+    /// Set before connect: the app's key store, its enrollment, the label the
+    /// published record carries, and whether to check received signatures.
+    device_key_store: Arc<Mutex<Option<Arc<dyn DeviceKeyStore>>>>,
+    enrollment: Arc<Mutex<Option<Arc<dyn Enrollment>>>>,
+    device_label: Arc<Mutex<Option<String>>>,
+    /// Set right after the app's own sign-in; taken by the next connect.
+    fresh_sign_in: Arc<Mutex<bool>>,
+    verify_signatures: Arc<Mutex<bool>>,
 }
 
 /// Flatten the FFI's tag list into the map the SDK sends with. UniFFI has no
@@ -476,6 +681,11 @@ impl FreeqClient {
             handle: Arc::new(Mutex::new(None)),
             connected: Arc::new(Mutex::new(false)),
             web_token: Arc::new(Mutex::new(None)),
+            device_key_store: Arc::new(Mutex::new(None)),
+            enrollment: Arc::new(Mutex::new(None)),
+            device_label: Arc::new(Mutex::new(None)),
+            fresh_sign_in: Arc::new(Mutex::new(false)),
+            verify_signatures: Arc::new(Mutex::new(false)),
             platform: Arc::new(Mutex::new("freeq ios".to_string())),
             websocket_url: Arc::new(Mutex::new(None)),
         })
@@ -506,6 +716,45 @@ impl FreeqClient {
         Ok(())
     }
 
+    /// Keep this device's signing key across connects, in the app's store.
+    /// Read at `connect()`.
+    pub fn set_device_key_store(&self, store: Box<dyn DeviceKeyStore>) -> Result<(), FreeqError> {
+        *self.device_key_store.lock().unwrap() = Some(Arc::from(store));
+        Ok(())
+    }
+
+    /// Publish a stored key the account does not have yet, through the app.
+    /// Read at `connect()`.
+    pub fn set_enrollment(&self, enrollment: Box<dyn Enrollment>) -> Result<(), FreeqError> {
+        *self.enrollment.lock().unwrap() = Some(Arc::from(enrollment));
+        Ok(())
+    }
+
+    /// The label the published key record carries, e.g. the device model.
+    pub fn set_device_label(&self, label: String) -> Result<(), FreeqError> {
+        *self.device_label.lock().unwrap() = Some(label);
+        Ok(())
+    }
+
+    /// The next `connect()` follows the app's own OAuth sign-in, so a stored
+    /// key the account has retired is replaced. That connect clears it.
+    pub fn set_fresh_sign_in(&self, fresh: bool) -> Result<(), FreeqError> {
+        *self.fresh_sign_in.lock().unwrap() = fresh;
+        Ok(())
+    }
+
+    /// Whether this connect follows a new sign-in; later connects do not.
+    fn take_fresh_sign_in(&self) -> bool {
+        std::mem::take(&mut *self.fresh_sign_in.lock().unwrap())
+    }
+
+    /// Check the signature on every received line and put a verdict on it.
+    /// Read at `connect()`.
+    pub fn set_verify_signatures(&self, on: bool) -> Result<(), FreeqError> {
+        *self.verify_signatures.lock().unwrap() = on;
+        Ok(())
+    }
+
     pub fn connect(&self) -> Result<(), FreeqError> {
         let nick = self.nick.lock().unwrap().clone();
         let web_token = self.web_token.lock().unwrap().take();
@@ -516,6 +765,26 @@ impl FreeqClient {
             web_token.is_some(),
             websocket_url.is_some()
         );
+        // The app's key store and enrollment, and the lookup that checks
+        // received signatures. The lookup is built without an origin: the
+        // SDK points it at the server this client connects to.
+        let device_key_store = self.device_key_store.lock().unwrap().clone().map(|store| {
+            Arc::new(StoreAdapter(store)) as Arc<dyn freeq_sdk::device_key::DeviceKeyStore>
+        });
+        let enrollment = self.enrollment.lock().unwrap().clone().map(|app| {
+            Arc::new(EnrollmentAdapter(app)) as Arc<dyn freeq_sdk::device_key::Enrollment>
+        });
+        let key_lookup = self.verify_signatures.lock().unwrap().then(|| {
+            let reader = freeq_sdk::identity_records::RecordReader::new(
+                freeq_sdk::did::DidResolver::http(),
+                freeq_oauth::SharedClient(reqwest::Client::new()),
+            );
+            Arc::new(freeq_sdk::key_lookup::KeyLookup::new(
+                reader,
+                None,
+                std::time::Duration::from_secs(3600),
+            ))
+        });
         let config = freeq_sdk::client::ConnectConfig {
             server_addr: self.server.clone(),
             nick: nick.clone(),
@@ -525,7 +794,11 @@ impl FreeqClient {
             tls_insecure: false,
             web_token,
             websocket_url,
-            ..Default::default()
+            device_key_store,
+            enrollment,
+            device_label: self.device_label.lock().unwrap().clone(),
+            fresh_sign_in: self.take_fresh_sign_in(),
+            key_lookup,
         };
 
         // MUST call connect() inside the runtime — it uses tokio::spawn internally.
@@ -802,7 +1075,7 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
             text,
             tags,
             dm_key,
-            verdict: _,
+            verdict,
         } => {
             let msgid = tags.get("msgid").cloned();
             let reply_to = tags.get("+reply").cloned();
@@ -879,6 +1152,7 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
                             value: v.clone(),
                         })
                         .collect(),
+                    verdict: convert_verdict_opt(verdict),
                 },
             }
         }
@@ -887,7 +1161,7 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
             target,
             tags,
             dm_key,
-            verdict: _,
+            verdict,
         } => {
             let tag_entries = tags
                 .iter()
@@ -902,6 +1176,7 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
                     target: target.clone(),
                     tags: tag_entries,
                     dm_key: dm_key.clone(),
+                    verdict: convert_verdict_opt(verdict),
                 },
             }
         }
@@ -917,7 +1192,7 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
             sig_tag,
             replayed,
             dm_key,
-            verdict: _,
+            verdict,
         } => FreeqEvent::Act {
             event: ActEvent {
                 from: from.clone(),
@@ -937,6 +1212,7 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
                 sig_tag: sig_tag.clone(),
                 replayed: *replayed,
                 dm_key: dm_key.clone(),
+                verdict: convert_verdict_opt(verdict),
             },
         },
         Event::Names { channel, nicks } => {
@@ -1077,9 +1353,11 @@ fn convert_event(event: &freeq_sdk::event::Event) -> Option<FreeqEvent> {
         Event::RawLine(_) => FreeqEvent::Notice {
             text: String::new(),
         },
-        // Not exposed through the UDL yet.
-        Event::SigningKeyUnpublished => return None,
-        Event::Verdict { .. } => return None,
+        Event::SigningKeyUnpublished => FreeqEvent::SigningKeyUnpublished,
+        Event::Verdict { msgid, verdict } => FreeqEvent::Verdict {
+            msgid: msgid.clone(),
+            verdict: convert_verdict(verdict),
+        },
     })
 }
 
@@ -3142,6 +3420,17 @@ mod tests {
         .expect("client")
     }
 
+    /// A new sign-in counts for the connect that follows it and no later one,
+    /// so a reconnect never passes it on.
+    #[test]
+    fn fresh_sign_in_is_off_by_default_and_taken_by_one_connect() {
+        let client = unconnected_client();
+        assert!(!client.take_fresh_sign_in());
+        client.set_fresh_sign_in(true).unwrap();
+        assert!(client.take_fresh_sign_in());
+        assert!(!client.take_fresh_sign_in());
+    }
+
     /// Every typed sender refuses before there is a connection to send on,
     /// and says so as `NotConnected` rather than a generic send failure —
     /// the caller distinguishes "not yet" from "it went wrong".
@@ -3210,5 +3499,213 @@ mod tests {
         assert_eq!(pending.line, None);
 
         assert_eq!(identity_stamping_epoch_unix(), 1_785_542_400);
+    }
+
+    // ── the device key store, the enrollment and the verdict ──
+
+    /// A store the app supplies, and what it was asked to save.
+    struct AppStore {
+        key: Mutex<Option<StoredDeviceKey>>,
+        saves: Mutex<Vec<StoredDeviceKey>>,
+    }
+
+    impl DeviceKeyStore for AppStore {
+        fn load(&self) -> Result<Option<StoredDeviceKey>, FreeqError> {
+            Ok(self.key.lock().unwrap().clone())
+        }
+        fn save(&self, key: StoredDeviceKey) -> Result<(), FreeqError> {
+            *self.key.lock().unwrap() = Some(key.clone());
+            self.saves.lock().unwrap().push(key);
+            Ok(())
+        }
+    }
+
+    /// The adapter passes a stored key to the SDK and back to the app in the
+    /// SDK's own shape, seed and all.
+    #[test]
+    fn the_store_adapter_carries_a_key_both_ways() {
+        use freeq_sdk::device_key::DeviceKeyStore as SdkStore;
+        let app = Arc::new(AppStore {
+            key: Mutex::new(Some(StoredDeviceKey {
+                seed: vec![7u8; 32],
+                created_at: "2026-09-11T10:00:00.000Z".to_string(),
+                record_uri: None,
+            })),
+            saves: Mutex::new(Vec::new()),
+        });
+        let adapter = StoreAdapter(app.clone());
+        let loaded = adapter.load().unwrap().expect("the app holds a key");
+        assert_eq!(loaded.seed, [7u8; 32]);
+        assert_eq!(loaded.created_at, "2026-09-11T10:00:00.000Z");
+        assert_eq!(loaded.record_uri, None);
+
+        adapter
+            .save(&freeq_sdk::device_key::StoredDeviceKey {
+                record_uri: Some("at://did:plc:alice/at.freeq.deviceKey/3k".to_string()),
+                ..loaded
+            })
+            .unwrap();
+        let saves = app.saves.lock().unwrap().clone();
+        assert_eq!(saves.len(), 1);
+        assert_eq!(saves[0].seed, vec![7u8; 32]);
+        assert_eq!(
+            saves[0].record_uri.as_deref(),
+            Some("at://did:plc:alice/at.freeq.deviceKey/3k")
+        );
+    }
+
+    /// A seed that is not 32 bytes is an error, not a key.
+    #[test]
+    fn the_store_adapter_refuses_a_seed_of_the_wrong_length() {
+        use freeq_sdk::device_key::DeviceKeyStore as SdkStore;
+        let app = Arc::new(AppStore {
+            key: Mutex::new(Some(StoredDeviceKey {
+                seed: vec![1u8; 31],
+                created_at: "2026-09-11T10:00:00.000Z".to_string(),
+                record_uri: None,
+            })),
+            saves: Mutex::new(Vec::new()),
+        });
+        assert!(StoreAdapter(app).load().is_err());
+    }
+
+    struct AppEnrollment {
+        answer: Mutex<EnrollResult>,
+        calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl Enrollment for AppEnrollment {
+        fn publish(
+            &self,
+            record_json: String,
+            signer_public_key: String,
+        ) -> Result<EnrollResult, FreeqError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((record_json, signer_public_key));
+            Ok(self.answer.lock().unwrap().clone())
+        }
+    }
+
+    /// The adapter hands the app the record as JSON and maps its three
+    /// answers back to the SDK's.
+    #[test]
+    fn the_enrollment_adapter_maps_each_answer() {
+        use freeq_sdk::device_key::{EnrollOutcome as SdkOutcome, Enrollment as SdkEnrollment};
+        let key = freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&[9u8; 32]).unwrap();
+        let record = freeq_sdk::identity_records::build_device_record(
+            &key,
+            "did:plc:alice",
+            "2026-09-11T10:00:00.000Z",
+            Some("phone"),
+        )
+        .unwrap();
+        let app = Arc::new(AppEnrollment {
+            answer: Mutex::new(EnrollResult {
+                outcome: EnrollOutcome::Published,
+                record_uri: Some("at://did:plc:alice/at.freeq.deviceKey/3k".to_string()),
+                detail: None,
+            }),
+            calls: Mutex::new(Vec::new()),
+        });
+        let adapter = EnrollmentAdapter(app.clone());
+        let outcome = RUNTIME.block_on(adapter.publish(record.clone(), key.public_key_multibase()));
+        assert_eq!(
+            outcome,
+            SdkOutcome::Published {
+                uri: "at://did:plc:alice/at.freeq.deviceKey/3k".to_string()
+            }
+        );
+        let calls = app.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, serde_json::to_string(&record).unwrap());
+        assert_eq!(calls[0].1, key.public_key_multibase());
+
+        *app.answer.lock().unwrap() = EnrollResult {
+            outcome: EnrollOutcome::NeedsSignIn,
+            record_uri: None,
+            detail: None,
+        };
+        let outcome = RUNTIME.block_on(adapter.publish(record.clone(), String::new()));
+        assert_eq!(outcome, SdkOutcome::NeedsSignIn);
+
+        *app.answer.lock().unwrap() = EnrollResult {
+            outcome: EnrollOutcome::Failed,
+            record_uri: None,
+            detail: Some("502".to_string()),
+        };
+        let outcome = RUNTIME.block_on(adapter.publish(record, String::new()));
+        assert_eq!(outcome, SdkOutcome::Failed("502".to_string()));
+    }
+
+    /// Every verdict state and layer reaches the app with its sentence.
+    #[test]
+    fn a_verdict_crosses_with_its_sentence() {
+        use freeq_sdk::key_lookup::KeySource;
+        use freeq_sdk::verdict as sdk;
+        for state in sdk::VerdictState::ALL {
+            let crossed = convert_verdict(&sdk::Verdict {
+                state,
+                layer: None,
+                kid: Some("kid".to_string()),
+                key_source: None,
+            });
+            assert_eq!(crossed.sentence, sdk::sentence(state, None));
+            assert_eq!(crossed.kid.as_deref(), Some("kid"));
+            assert_eq!(crossed.layer, None);
+        }
+        let published = convert_verdict(&sdk::Verdict {
+            state: sdk::VerdictState::Device,
+            layer: Some(sdk::KeyLayer::Published),
+            kid: None,
+            key_source: Some(KeySource::IdentityRecord),
+        });
+        assert_eq!(published.state, VerdictState::Device);
+        assert_eq!(published.layer, Some(KeyLayer::Published));
+        assert_eq!(published.key_source.as_deref(), Some("identity-record"));
+        assert_eq!(
+            published.sentence,
+            sdk::sentence(sdk::VerdictState::Device, Some(sdk::KeyLayer::Published))
+        );
+        for (source, name) in [
+            (KeySource::DidDocument, "did-document"),
+            (KeySource::OriginServer, "origin-server"),
+        ] {
+            let crossed = convert_verdict(&sdk::Verdict {
+                state: sdk::VerdictState::Device,
+                layer: Some(sdk::KeyLayer::Vouched),
+                kid: None,
+                key_source: Some(source),
+            });
+            assert_eq!(crossed.key_source.as_deref(), Some(name));
+        }
+    }
+
+    /// The two new events reach the app.
+    #[test]
+    fn the_new_events_cross() {
+        use freeq_sdk::verdict as sdk;
+        assert!(matches!(
+            convert_event(&freeq_sdk::event::Event::SigningKeyUnpublished),
+            Some(FreeqEvent::SigningKeyUnpublished)
+        ));
+        let verdict = sdk::Verdict {
+            state: sdk::VerdictState::Device,
+            layer: Some(sdk::KeyLayer::Vouched),
+            kid: Some("kid".to_string()),
+            key_source: None,
+        };
+        let Some(FreeqEvent::Verdict { msgid, verdict }) =
+            convert_event(&freeq_sdk::event::Event::Verdict {
+                msgid: "01KYVT5Z8Q0000000000000000".to_string(),
+                verdict,
+            })
+        else {
+            panic!("the verdict event is exposed");
+        };
+        assert_eq!(msgid, "01KYVT5Z8Q0000000000000000");
+        assert_eq!(verdict.state, VerdictState::Device);
+        assert_eq!(verdict.layer, Some(KeyLayer::Vouched));
     }
 }

@@ -13,6 +13,10 @@ path = "uniffi-bindgen.rs"
 
 [dependencies]
 freeq-sdk = { path = "../freeq-sdk", default-features = false, features = ["ring", "rustls-tls", "iroh-transport", "websocket"] }
+# The key lookup's client provider, and the errors the SDK's store trait uses.
+freeq-oauth = { path = "../freeq-oauth" }
+reqwest = { workspace = true }
+anyhow = { workspace = true }
 uniffi = { version = "0.29", features = ["cli"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 once_cell = "1"
@@ -48,11 +52,10 @@ moq-lite = { git = "https://github.com/Frando/moq", branch = "deps/iroh-main", o
 iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "edd9bcc530a615f3ab3a6919e96790a077905376", default-features = false, features = ["opus", "h264", "av1", "videotoolbox"], optional = true }
 rustls = { version = "0.23", features = ["aws-lc-rs"], default-features = false, optional = true }
 url = { version = "2", optional = true }
-anyhow = { workspace = true, optional = true }
 
 [features]
 default = []
-av = ["moq-native", "moq-lite", "iroh-live", "rustls", "url", "anyhow"]
+av = ["moq-native", "moq-lite", "iroh-live", "rustls", "url"]
 
 [build-dependencies]
 uniffi = { version = "0.29", features = ["build"] }
