@@ -62,7 +62,7 @@ Returns recent messages. Requires the channel name without `#` prefix.
 GET /api/v1/verify/{msgid}
 ```
 
-Verify a message's cryptographic signature. Returns the signing key, signature, and verification result. A `verified_by` of `key-retired` means the key that signed was retired by its owner before the message was made, and the verdict is `invalid`: the signature is not evidence of anything once the key it names was withdrawn.
+Verify a message's cryptographic signature. Returns the signing key, signature, and verification result. A `verified_by` of `key-retired` means the key that signed was retired by its owner before the message was made, and the verdict is `invalid`: the signature is not evidence of anything once the key it names was withdrawn. `key_source` names where the key that checked the signature came from: `server-key` for this server's own key, otherwise `local-session`, `origin-server`, `identity-record`, `did-document`, or `unknown` for a key filed before sources were recorded; it is absent when no key was found.
 
 ### Server Signing Key
 

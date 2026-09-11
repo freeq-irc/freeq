@@ -1918,7 +1918,10 @@ async fn api_channel_evidence(
     Ok(Json(bundle))
 }
 
-/// Classify a stored message's signature: `(verdict, verified_by, client key)`.
+/// Classify a stored message's signature: `(verdict, verified_by, client key,
+/// key source)`. The key source is where the key that checked it came from:
+/// `server-key`, the store row's `source`, or `unknown` for a row with none;
+/// `None` when no key was found.
 ///
 /// Three verdicts, never two. `invalid` is a statement about the bytes — the
 /// key the signature names was found and the signature does not check out. A
@@ -1936,31 +1939,35 @@ fn classify_message_signature(
     sender_did: Option<&str>,
     canonical: Option<&str>,
     sig_tag: Option<&str>,
-) -> (&'static str, &'static str, Option<String>) {
+) -> (&'static str, &'static str, Option<String>, Option<String>) {
     let Some(sig_tag) = sig_tag else {
-        return ("unverifiable", "unsigned", None);
+        return ("unverifiable", "unsigned", None, None);
     };
     // No sender DID means no document: the signature covers who sent it, and
     // we cannot rebuild a document around an unknown signer.
     let Some(canonical) = canonical else {
-        return ("unverifiable", "unverifiable-unknown-sender", None);
+        return ("unverifiable", "unverifiable-unknown-sender", None, None);
     };
     let kid = match freeq_sdk::sigtag::parse(sig_tag) {
         Ok((kid, _)) => kid,
         // A signer using an algorithm this build doesn't know is a newer
         // client, not a forger.
         Err(freeq_sdk::sigtag::SigError::UnsupportedAlgorithm(_)) => {
-            return ("unverifiable", "unverifiable-unknown-algorithm", None);
+            return ("unverifiable", "unverifiable-unknown-algorithm", None, None);
         }
         // Otherwise: a legacy signature, a bare base64 blob over
         // `did\0target\0text\0timestamp`, whose timestamp the client minted
         // and never transmitted. Never checkable, by anyone.
-        Err(_) => return ("unverifiable", "unverifiable-legacy-format", None),
+        Err(_) => return ("unverifiable", "unverifiable-legacy-format", None, None),
     };
 
     let server_vk = state.msg_signing_key.verifying_key();
-    let (key, removed_at) = if kid == freeq_sdk::sigtag::derive_kid(&server_vk) {
-        (Some((server_vk, "server-key")), None)
+    let (key, removed_at, key_source) = if kid == freeq_sdk::sigtag::derive_kid(&server_vk) {
+        (
+            Some((server_vk, "server-key")),
+            None,
+            "server-key".to_string(),
+        )
     } else {
         let row = sender_did.and_then(|did| {
             state
@@ -1968,14 +1975,19 @@ fn classify_message_signature(
                 .flatten()
         });
         let removed_at = row.as_ref().and_then(|r| r.removed_at);
+        let key_source = row
+            .as_ref()
+            .and_then(|r| r.source.clone())
+            .unwrap_or_else(|| "unknown".to_string());
         let key = row
             .and_then(|r| ed25519_dalek::VerifyingKey::from_bytes(&r.pubkey).ok())
             .map(|vk| (vk, "client-session-key"));
-        (key, removed_at)
+        (key, removed_at, key_source)
     };
     let Some((vk, which)) = key else {
-        return ("unverifiable", "unverifiable-unknown-key", None);
+        return ("unverifiable", "unverifiable-unknown-key", None, None);
     };
+    let key_source = Some(key_source);
 
     use base64::Engine;
     let client_public_key = (which == "client-session-key")
@@ -1988,18 +2000,19 @@ fn classify_message_signature(
     if let Some(removed_at) = removed_at {
         let signed_at = crate::msgid::timestamp_ms(msgid).map(|ms| (ms / 1000) as i64);
         if signed_at.is_some_and(|at| at > removed_at) {
-            return ("invalid", "key-retired", client_public_key);
+            return ("invalid", "key-retired", client_public_key, key_source);
         }
     }
 
     match freeq_sdk::sigtag::verify_canonical(canonical, sig_tag, &vk) {
-        Ok(()) => ("valid", which, client_public_key),
+        Ok(()) => ("valid", which, client_public_key, key_source),
         Err(e) if e.is_unverifiable() => (
             "unverifiable",
             "unverifiable-unusable-signature",
             client_public_key,
+            key_source,
         ),
-        Err(_) => ("invalid", which, client_public_key),
+        Err(_) => ("invalid", which, client_public_key, key_source),
     }
 }
 
@@ -2061,13 +2074,14 @@ pub(crate) async fn api_verify_message(
         None => {
             if let Some(ev) = state.with_db(|db| db.get_event(&msgid)).flatten() {
                 let canonical = (!ev.canonical.is_empty()).then_some(ev.canonical.as_str());
-                let (verdict, verified_by, client_public_key) = classify_message_signature(
-                    &state,
-                    &msgid,
-                    ev.actor_did.as_deref(),
-                    canonical,
-                    ev.signature.as_deref(),
-                );
+                let (verdict, verified_by, client_public_key, key_source) =
+                    classify_message_signature(
+                        &state,
+                        &msgid,
+                        ev.actor_did.as_deref(),
+                        canonical,
+                        ev.signature.as_deref(),
+                    );
                 let server_pubkey = {
                     use base64::Engine;
                     base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -2079,6 +2093,16 @@ pub(crate) async fn api_verify_message(
                         .map(|b| format!("{b:02x}"))
                         .collect::<String>()
                 });
+                let mut verification = serde_json::json!({
+                    "valid": verdict == "valid",
+                    "verdict": verdict,
+                    "verified_by": verified_by,
+                    "server_public_key": server_pubkey,
+                    "client_public_key": client_public_key,
+                });
+                if let Some(key_source) = key_source {
+                    verification["key_source"] = key_source.into();
+                }
                 return Ok(Json(serde_json::json!({
                     "event_id": ev.event_id,
                     "kind": ev.kind,
@@ -2091,13 +2115,7 @@ pub(crate) async fn api_verify_message(
                     "signature": ev.signature,
                     "canonical_form": canonical,
                     "canonical_hex": canonical_hex,
-                    "verification": {
-                        "valid": verdict == "valid",
-                        "verdict": verdict,
-                        "verified_by": verified_by,
-                        "server_public_key": server_pubkey,
-                        "client_public_key": client_public_key,
-                    },
+                    "verification": verification,
                     "how_to_verify": "The canonical_form is JCS over the signed document; the signature tag is ed25519:<kid>:<base64url sig> over its UTF-8 bytes"
                 })));
             }
@@ -2140,7 +2158,7 @@ pub(crate) async fn api_verify_message(
         )
     });
 
-    let (verdict, verified_by, client_public_key) = classify_message_signature(
+    let (verdict, verified_by, client_public_key, key_source) = classify_message_signature(
         &state,
         &msgid,
         sender_did.as_deref(),
@@ -2163,7 +2181,7 @@ pub(crate) async fn api_verify_message(
         use base64::Engine;
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(server_vk.as_bytes())
     };
-    let verification = serde_json::json!({
+    let mut verification = serde_json::json!({
         // `valid` stays for older clients; `verdict` is the honest three-way.
         "valid": verdict == "valid",
         "verdict": verdict,
@@ -2171,6 +2189,9 @@ pub(crate) async fn api_verify_message(
         "server_public_key": server_pubkey,
         "client_public_key": client_public_key,
     });
+    if let Some(key_source) = key_source {
+        verification["key_source"] = key_source.into();
+    }
 
     let canonical_hex = canonical.as_ref().map(|c: &String| {
         c.as_bytes()
@@ -6555,7 +6576,7 @@ mod signature_verdict_tests {
 
         let canonical = doc().canonical();
         let sig = doc().sign(&key);
-        let (verdict, by, client_key) =
+        let (verdict, by, client_key, _) =
             classify_message_signature(&state, MSGID, Some(DID), Some(&canonical), Some(&sig));
         assert_eq!((verdict, by), ("valid", "client-session-key"));
         assert!(client_key.is_some(), "the key that verified is reported");
@@ -6568,7 +6589,7 @@ mod signature_verdict_tests {
         let state = test_state_with_db();
         let canonical = doc().canonical();
         let sig = doc().sign(&state.msg_signing_key);
-        let (verdict, by, client_key) =
+        let (verdict, by, client_key, _) =
             classify_message_signature(&state, MSGID, Some(DID), Some(&canonical), Some(&sig));
         assert_eq!((verdict, by), ("valid", "server-key"));
         assert_eq!(client_key, None);
@@ -6585,7 +6606,7 @@ mod signature_verdict_tests {
 
         let sig = doc().sign(&key);
         let tampered = ChatDoc::message(DID, MSGID, "#freeq", "the edited text").canonical();
-        let (verdict, by, _) =
+        let (verdict, by, _, _) =
             classify_message_signature(&state, MSGID, Some(DID), Some(&tampered), Some(&sig));
         assert_eq!((verdict, by), ("invalid", "client-session-key"));
     }
@@ -6602,7 +6623,7 @@ mod signature_verdict_tests {
 
         let sig = ChatDoc::message(DID, MSGID, "#private-team", "the number is 12").sign(&key);
         let elsewhere = ChatDoc::message(DID, MSGID, "#public", "the number is 12").canonical();
-        let (verdict, _, _) =
+        let (verdict, _, _, _) =
             classify_message_signature(&state, MSGID, Some(DID), Some(&elsewhere), Some(&sig));
         assert_eq!(verdict, "invalid");
     }
@@ -6677,7 +6698,7 @@ mod signature_verdict_tests {
 
         let canonical = doc().canonical();
         let sig = doc().sign(&old);
-        let (verdict, by, _) =
+        let (verdict, by, _, _) =
             classify_message_signature(&state, MSGID, Some(DID), Some(&canonical), Some(&sig));
         assert_eq!(
             (verdict, by),
@@ -6879,7 +6900,8 @@ mod signature_verdict_tests {
             (
                 "unverifiable",
                 "unverifiable-unknown-key",
-                None::<String>.clone()
+                None::<String>.clone(),
+                None
             )
         );
 
@@ -6892,7 +6914,7 @@ mod signature_verdict_tests {
         // And an unsigned message is not a failed one.
         assert_eq!(
             classify_message_signature(&state, MSGID, Some(DID), Some(&canonical), None),
-            ("unverifiable", "unsigned", None)
+            ("unverifiable", "unsigned", None, None)
         );
     }
 
@@ -6902,7 +6924,7 @@ mod signature_verdict_tests {
     fn an_unknown_algorithm_is_unverifiable() {
         let state = test_state_with_db();
         let canonical = doc().canonical();
-        let (verdict, by, _) = classify_message_signature(
+        let (verdict, by, _, _) = classify_message_signature(
             &state,
             MSGID,
             Some(DID),
@@ -6940,7 +6962,7 @@ mod signature_verdict_tests {
 
         let canonical = doc().canonical();
         let sig = doc().sign(&key);
-        let (verdict, by, client_key) =
+        let (verdict, by, client_key, _) =
             classify_message_signature(&state, MSGID, Some(DID), Some(&canonical), Some(&sig));
         assert_eq!((verdict, by), ("invalid", "key-retired"));
         assert!(
@@ -6966,9 +6988,142 @@ mod signature_verdict_tests {
 
         let canonical = doc().canonical();
         let sig = doc().sign(&key);
-        let (verdict, by, _) =
+        let (verdict, by, _, _) =
             classify_message_signature(&state, MSGID, Some(DID), Some(&canonical), Some(&sig));
         assert_eq!((verdict, by), ("valid", "client-session-key"));
+    }
+
+    /// The verdict names where the key that checked it came from: the row's
+    /// source, `server-key` for this server's own, none when no key was found.
+    #[test]
+    fn the_verdict_names_where_the_key_came_from() {
+        let canonical = doc().canonical();
+        for source in [
+            "local-session",
+            "origin-server",
+            "identity-record",
+            "did-document",
+        ] {
+            let state = test_state_with_db();
+            let key = SigningKey::from_bytes(&[9u8; 32]);
+            state
+                .with_db(|db| db.save_signing_key_from(DID, key.verifying_key().as_bytes(), source))
+                .expect("test state has a database");
+            let (verdict, _, _, key_source) = classify_message_signature(
+                &state,
+                MSGID,
+                Some(DID),
+                Some(&canonical),
+                Some(&doc().sign(&key)),
+            );
+            assert_eq!(verdict, "valid");
+            assert_eq!(key_source.as_deref(), Some(source));
+        }
+
+        let state = test_state_with_db();
+        let by_server = doc().sign(&state.msg_signing_key);
+        let (_, by, _, key_source) = classify_message_signature(
+            &state,
+            MSGID,
+            Some(DID),
+            Some(&canonical),
+            Some(&by_server),
+        );
+        assert_eq!(
+            (by, key_source.as_deref()),
+            ("server-key", Some("server-key"))
+        );
+
+        let stranger = doc().sign(&SigningKey::from_bytes(&[11u8; 32]));
+        let (_, by, _, key_source) =
+            classify_message_signature(&state, MSGID, Some(DID), Some(&canonical), Some(&stranger));
+        assert_eq!((by, key_source), ("unverifiable-unknown-key", None));
+    }
+
+    /// A key filed before the store recorded sources reads as `unknown`: a
+    /// database written at the rung before the column, then opened here.
+    #[test]
+    fn a_key_filed_before_sources_were_recorded_is_unknown() {
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let kid = freeq_sdk::act::derive_kid_bytes(key.verifying_key().as_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("before-source.db");
+        {
+            let mut conn = rusqlite::Connection::open(&path).unwrap();
+            crate::migrations::migration_ladder()
+                .to_version(&mut conn, 12)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO signing_keys (did, kid, pubkey, registered_at, last_seen_at)
+                 VALUES (?1, ?2, ?3, 0, 0)",
+                rusqlite::params![DID, kid, &key.verifying_key().as_bytes()[..]],
+            )
+            .unwrap();
+        }
+        let state = test_state_with_db();
+        *state.db.as_ref().expect("a database").lock() = crate::db::Db::open(&path).unwrap();
+
+        let canonical = doc().canonical();
+        let (verdict, _, _, key_source) = classify_message_signature(
+            &state,
+            MSGID,
+            Some(DID),
+            Some(&canonical),
+            Some(&doc().sign(&key)),
+        );
+        assert_eq!(verdict, "valid");
+        assert_eq!(key_source.as_deref(), Some("unknown"));
+    }
+
+    /// The verify endpoint carries the source beside `verified_by`, and leaves
+    /// it out when no key was found.
+    #[tokio::test]
+    async fn the_verify_response_names_the_key_source() {
+        let state = test_state_with_db();
+        let known = SigningKey::from_bytes(&[9u8; 32]);
+        state
+            .with_db(|db| {
+                db.save_signing_key_from(DID, known.verifying_key().as_bytes(), "identity-record")
+            })
+            .expect("test state has a database");
+        let stranger = SigningKey::from_bytes(&[11u8; 32]);
+
+        for (msgid, key) in [
+            ("01KYVT5Z8Q0000000000SOURCE1", &known),
+            ("01KYVT5Z8Q0000000000SOURCE2", &stranger),
+        ] {
+            let sig = ChatDoc::message(DID, msgid, "#freeq", "which key").sign(key);
+            let tags =
+                std::collections::HashMap::from([(freeq_sdk::sigtag::SIG_TAG.to_string(), sig)]);
+            state
+                .with_db(|db| {
+                    db.insert_message(
+                        "#freeq",
+                        "a!u@h",
+                        "which key",
+                        0,
+                        &tags,
+                        Some(msgid),
+                        Some(DID),
+                    )
+                })
+                .expect("test state has a database");
+        }
+
+        let answer = |msgid: &'static str| {
+            api_verify_message(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(msgid.to_string()),
+            )
+        };
+        let known_out = answer("01KYVT5Z8Q0000000000SOURCE1").await.unwrap();
+        assert_eq!(known_out.0["verification"]["key_source"], "identity-record");
+        let stranger_out = answer("01KYVT5Z8Q0000000000SOURCE2").await.unwrap();
+        assert_eq!(
+            stranger_out.0["verification"]["verified_by"],
+            "unverifiable-unknown-key"
+        );
+        assert!(stranger_out.0["verification"].get("key_source").is_none());
     }
 
     /// A live key is untouched by any of this — the same message, the same
@@ -6983,7 +7138,7 @@ mod signature_verdict_tests {
 
         let canonical = doc().canonical();
         let sig = doc().sign(&key);
-        let (verdict, by, _) =
+        let (verdict, by, _, _) =
             classify_message_signature(&state, MSGID, Some(DID), Some(&canonical), Some(&sig));
         assert_eq!((verdict, by), ("valid", "client-session-key"));
     }
