@@ -1445,6 +1445,62 @@ fn load_msg_signing_key(data_dir: &str) -> ed25519_dalek::SigningKey {
     key
 }
 
+/// The seed the media store's keys are derived from, kept in
+/// `{data_dir}/media-key.secret` so it does not change when the signing key
+/// does.
+///
+/// The media keys were once derived from the signing key on every start. When
+/// the file is missing and attachments are already stored, the signing key's
+/// bytes become the seed, so they still decrypt and their links still verify;
+/// with none stored, the seed is random.
+fn load_media_key_seed(data_dir: &str, signing_key: &ed25519_dalek::SigningKey) -> [u8; 32] {
+    let key_path = std::path::Path::new(data_dir).join("media-key.secret");
+    if key_path.exists() {
+        crate::secrets::tighten_permissions(&key_path);
+        if let Ok(data) = std::fs::read(&key_path)
+            && let Ok(bytes) = <[u8; 32]>::try_from(data.as_slice())
+        {
+            tracing::info!("Loaded media key from {}", key_path.display());
+            return bytes;
+        }
+        // Not rewritten: the damaged file is left for the operator to look at.
+        tracing::warn!(
+            "Corrupt media key at {}, deriving media keys from the signing key",
+            key_path.display()
+        );
+        return signing_key.to_bytes();
+    }
+    let media_dir = std::path::Path::new(data_dir).join("media");
+    let (seed, case) = if holds_a_file(&media_dir) {
+        (
+            signing_key.to_bytes(),
+            "from the signing key, so stored attachments still decrypt",
+        )
+    } else {
+        (
+            rand::random::<[u8; 32]>(),
+            "at random; no attachments were stored",
+        )
+    };
+    match crate::secrets::write_secret(&key_path, &seed) {
+        Ok(()) => tracing::info!("Generated media key at {} {case}", key_path.display()),
+        Err(e) => tracing::error!("Failed to persist media key: {e}"),
+    }
+    seed
+}
+
+/// Whether `dir` holds at least one file, at any depth.
+fn holds_a_file(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| match entry.file_type() {
+        Ok(kind) if kind.is_dir() => holds_a_file(&entry.path()),
+        Ok(kind) => kind.is_file(),
+        Err(_) => false,
+    })
+}
+
 /// Load or generate the persistent HMAC key that signs membership
 /// attestations (`{data_dir}/attestation-key.secret`, 0600).
 fn load_attestation_key(data_dir: &str) -> [u8; 32] {
@@ -1649,7 +1705,7 @@ impl Server {
         let media_store = if db.is_some() {
             let data_dir = self.config.data_dir.as_deref().unwrap_or(".");
             let media_dir = std::path::Path::new(data_dir).join("media");
-            let seed = msg_signing_key.to_bytes();
+            let seed = load_media_key_seed(data_dir, &msg_signing_key);
             let enc_key = crate::media_store::derive_enc_key(&seed);
             let cap_key = crate::media_store::derive_cap_key(&seed);
             match crate::media_store::MediaStore::new(media_dir.clone(), enc_key, cap_key) {
@@ -17536,5 +17592,83 @@ mod deprecated_option_tests {
         );
         let unset = crate::config::ServerConfig::default();
         assert_eq!(deprecated_server_did_warning(&unset), None);
+    }
+}
+
+#[cfg(test)]
+mod media_key_tests {
+    use super::*;
+    use crate::media_store::{MediaStore, derive_cap_key, derive_enc_key};
+
+    /// Start a server state on `dir`, the way the binary does at boot.
+    fn start(dir: &std::path::Path) -> Arc<SharedState> {
+        let config = ServerConfig {
+            server_name: "media-key-test".to_string(),
+            data_dir: Some(dir.to_str().unwrap().to_string()),
+            db_path: Some(dir.join("irc.db").to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        Server::new(config).build_state().unwrap()
+    }
+
+    fn media_key_file(dir: &std::path::Path) -> Vec<u8> {
+        std::fs::read(dir.join("media-key.secret")).expect("media-key.secret written")
+    }
+
+    /// Attachments stored before the file existed were encrypted under keys
+    /// derived from the signing key; the file takes those bytes so they still
+    /// decrypt.
+    #[test]
+    fn existing_attachments_keep_the_signing_key_as_the_media_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let signing = [5u8; 32];
+        crate::secrets::write_secret(&dir.path().join("msg-signing-key.secret"), &signing).unwrap();
+        let old = MediaStore::new(
+            dir.path().join("media"),
+            derive_enc_key(&signing),
+            derive_cap_key(&signing),
+        )
+        .unwrap();
+        old.put("abcdefgh", b"an attachment").unwrap();
+        let link_sig = old.sign("abcdefgh");
+
+        let state = start(dir.path());
+        assert_eq!(media_key_file(dir.path()), signing.to_vec());
+        let store = state.media_store.as_ref().expect("media store");
+        assert_eq!(store.get("abcdefgh").unwrap(), b"an attachment");
+        assert!(
+            store.verify("abcdefgh", &link_sig),
+            "an existing link still verifies"
+        );
+    }
+
+    #[test]
+    fn a_new_media_store_gets_a_random_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = start(dir.path());
+        let seed = media_key_file(dir.path());
+        assert_eq!(seed.len(), 32);
+        assert_ne!(seed, state.msg_signing_key.to_bytes().to_vec());
+    }
+
+    #[test]
+    fn a_second_start_reads_the_media_key_and_does_not_rewrite_it() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(start(dir.path()));
+        // A seed only the file could supply.
+        let seed = [8u8; 32];
+        crate::secrets::write_secret(&dir.path().join("media-key.secret"), &seed).unwrap();
+
+        let state = start(dir.path());
+        assert_eq!(media_key_file(dir.path()), seed.to_vec(), "not rewritten");
+        let store = state.media_store.as_ref().expect("media store");
+        store.put("ijklmnop", b"after restart").unwrap();
+        let by_seed = MediaStore::new(
+            dir.path().join("media"),
+            derive_enc_key(&seed),
+            derive_cap_key(&seed),
+        )
+        .unwrap();
+        assert_eq!(by_seed.get("ijklmnop").unwrap(), b"after restart");
     }
 }

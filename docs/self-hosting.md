@@ -265,6 +265,7 @@ WantedBy=multi-user.target
 | `msg-signing-key.secret` | Server message signing key (ed25519) |
 | `verifier-signing-key.secret` | Credential verifier signing key |
 | `db-encryption-key.secret` | Database encryption-at-rest key |
+| `media-key.secret` | Seed for the private media store's encryption and link-signing keys |
 | `iroh-key.secret` | iroh QUIC endpoint identity key |
 
 All key files are generated automatically on first run.
