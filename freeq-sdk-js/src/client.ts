@@ -14,6 +14,8 @@ import * as signing from './signing.js';
 import * as e2ee from './e2ee.js';
 import { dmPeerKey, isDid } from './address.js';
 import { prefetchProfiles } from './profiles.js';
+import { recordKeyOf, type StoredDeviceKey } from './device-key.js';
+import { buildDeviceRecord } from './identity-records.js';
 import type {
   IRCMessage, Message, Member, AvSession, AvParticipant,
   FreeqClientOptions, SaslCredentials, Batch, TransportState,
@@ -178,6 +180,12 @@ export class FreeqClient extends EventEmitter {
   readonly signing = new signing.SessionSigning();
   /** Session signing key waiting on registration before MSGSIG is sent. */
   private pendingMsgSig: Promise<string | null> | null = null;
+  /** A stored device key the account does not have yet, published once
+   *  `MSGSIG` is on the wire. */
+  private pendingEnrollment: StoredDeviceKey | null = null;
+  /** Bumped on every new connection, so a publish answered after a
+   *  reconnect reports nothing for a connection that is gone. */
+  private enrollmentEpoch = 0;
   /** Set when SASL was attempted and 904 was received. Suppresses any
    *  subsequent registration completion as a guest, and blocks outgoing
    *  PRIVMSGs that would silently leak under the guest identity. */
@@ -396,6 +404,7 @@ export class FreeqClient extends EventEmitter {
       this._agentHeartbeatTimer = null;
     }
     this.signing.resetSigning();
+    this.pendingEnrollment = null;
     // Whatever was waiting for a registration on this connection is not
     // getting one. The next session arms the gate again.
     this.msgSigRegistered();
@@ -1121,6 +1130,8 @@ export class FreeqClient extends EventEmitter {
     if (state === 'connected') {
       this.ackedCaps.clear();
       this.clearNickResume();
+      this.enrollmentEpoch++;
+      this.pendingEnrollment = null;
       let registrationSent = false;
 
       const sendRegistration = (token?: string) => {
@@ -1574,6 +1585,75 @@ export class FreeqClient extends EventEmitter {
     });
   }
 
+  /**
+   * The stored device key, or a new one saved into the store when it is
+   * empty; its base64url public key. A store that fails leaves this
+   * connection on a fresh session key.
+   */
+  private async presentDeviceKey(): Promise<string | null> {
+    const store = this.opts.deviceKeyStore!;
+    this.pendingEnrollment = null;
+    try {
+      let stored = await store.load();
+      if (!stored) {
+        const keyPair = (await crypto.subtle.generateKey('Ed25519', false, [
+          'sign',
+          'verify',
+        ])) as CryptoKeyPair;
+        stored = { keyPair, createdAt: new Date().toISOString() };
+        await store.save(stored);
+      }
+      const pubkey = await this.signing.useKeyPair(stored.keyPair);
+      if (!stored.recordUri) this.pendingEnrollment = stored;
+      return pubkey;
+    } catch (e) {
+      log.warn('[freeq-sdk] device key unavailable, signing with a session key:', e);
+      return this.signing.generateSigningKey();
+    }
+  }
+
+  /**
+   * Publish a stored device key through the broker's `/enroll`, off the
+   * connect path. 200 saves the record URI; 401 or 403 means the session
+   * lacks the permission, reported once; anything else waits for the next
+   * connect.
+   */
+  private startEnrollment(): void {
+    const stored = this.pendingEnrollment;
+    this.pendingEnrollment = null;
+    const { brokerUrl, brokerToken, deviceKeyStore: store, deviceLabel } = this.opts;
+    const did = this.sasl?.did;
+    if (!stored || !store || !brokerUrl || !brokerToken || !did) return;
+    const epoch = this.enrollmentEpoch;
+    void (async () => {
+      try {
+        const key = await recordKeyOf(stored.keyPair);
+        const record = await buildDeviceRecord(key, did, stored.createdAt, deviceLabel);
+        const resp = await fetch(`${brokerUrl}/enroll`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            broker_token: brokerToken,
+            record,
+            signer_public_key: key.publicKeyMultibase,
+          }),
+        });
+        if (resp.status === 200) {
+          const answer = (await resp.json()) as { uri?: unknown };
+          if (typeof answer.uri === 'string') {
+            await store.save({ ...stored, recordUri: answer.uri });
+          }
+        } else if (resp.status === 401 || resp.status === 403) {
+          if (epoch === this.enrollmentEpoch) this.emit('signingKeyUnpublished');
+        } else {
+          log.warn(`[freeq-sdk] device key not published (${resp.status}); tried again next connect`);
+        }
+      } catch (e) {
+        log.warn('[freeq-sdk] device key not published; tried again next connect:', e);
+      }
+    })();
+  }
+
   /** Open the gate, whether or not a key actually materialized. */
   private msgSigRegistered(): void {
     this.releaseMsgSigReady?.();
@@ -1956,7 +2036,9 @@ export class FreeqClient extends EventEmitter {
           // completes is discarded by the server (`if !conn.registered`),
           // which left the key unregistered and every "client-signed"
           // message silently server-signed instead.
-          this.pendingMsgSig = this.signing.generateSigningKey();
+          this.pendingMsgSig = this.opts.deviceKeyStore
+            ? this.presentDeviceKey()
+            : this.signing.generateSigningKey();
           // From here until MSGSIG is on the wire, a signing send waits.
           this.awaitMsgSigRegistration();
         }
@@ -2039,6 +2121,7 @@ export class FreeqClient extends EventEmitter {
               // Released either way: a key this platform could not generate
               // is a reason to send unsigned, never a reason to stop sending.
               this.msgSigRegistered();
+              if (pubkey) this.startEnrollment();
             },
             () => this.msgSigRegistered(),
           );

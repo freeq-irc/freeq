@@ -33,6 +33,11 @@ export interface FreeqEvents {
   /** Fired on SASL authentication failure. */
   authError: (error: string) => void;
 
+  /** Fired at most once per connection, after registration, when the
+   *  broker refuses to publish this device's key (401 or 403): the user has
+   *  to sign in again with the permission to publish it. */
+  signingKeyUnpublished: () => void;
+
   /** Fired when a new message arrives in a channel or DM. */
   message: (channel: string, message: Message) => void;
 

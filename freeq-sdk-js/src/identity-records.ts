@@ -96,7 +96,7 @@ export function recordSignedBytes(record: object): Uint8Array {
 
 /** Announce `key` as a signing key of `did`. */
 export async function buildDeviceRecord(
-  key: DidKey,
+  key: Pick<DidKey, 'publicKeyMultibase' | 'signer'>,
   did: string,
   createdAt: string,
   label?: string,
@@ -168,7 +168,7 @@ export async function buildAgentRetirement(
   return { ...unsigned, bindingSig: await ownerKey.signer(recordSignedBytes(unsigned)) };
 }
 
-async function kidOf(key: DidKey): Promise<string> {
+async function kidOf(key: Pick<DidKey, 'publicKeyMultibase'>): Promise<string> {
   return deriveKid(decodeMultibaseEd25519(key.publicKeyMultibase));
 }
 

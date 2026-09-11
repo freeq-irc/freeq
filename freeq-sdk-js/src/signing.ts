@@ -444,6 +444,18 @@ export class SessionSigning {
     }
   }
 
+  /**
+   * Sign with a key pair the caller holds, such as a stored device key, and
+   * return its base64url public key. The private key may be non-extractable.
+   */
+  async useKeyPair(kp: CryptoKeyPair): Promise<string> {
+    const rawPub = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey));
+    this.signingKey = kp;
+    this.publicKeyB64 = b64url(rawPub);
+    this.publicKeyKid = await deriveKid(rawPub);
+    return this.publicKeyB64;
+  }
+
   /** Set the authenticated DID (called after SASL success). */
   setSigningDid(did: string) {
     this.authenticatedDid = did;

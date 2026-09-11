@@ -1,5 +1,7 @@
 /** Core types for the freeq SDK. */
 
+import type { DeviceKeyStore } from './device-key.js';
+
 /** Parsed IRC message with optional IRCv3 tags. */
 export interface IRCMessage {
   tags: Record<string, string>;
@@ -165,6 +167,14 @@ export interface FreeqClientOptions {
    *  compatibility. Useful for agents that hold their own signing key
    *  (e.g. freeqcc using its did:key seed) or for headless tests. */
   autoMsgSig?: boolean;
+
+  /** Keeps this device's signing key across connects, so the same key is
+   *  presented every time and can be published to the account. Without
+   *  one, a fresh session key is made on every connect. */
+  deviceKeyStore?: DeviceKeyStore;
+
+  /** The published key record's `label`, e.g. the browser's name. */
+  deviceLabel?: string;
 
   /** Policy on 433 ERR_NICKNAMEINUSE during registration:
    *   - `'refuse'` (default for new code): emit `authError` and disconnect.

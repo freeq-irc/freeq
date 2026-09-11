@@ -129,6 +129,14 @@ export type {
 export { KeyLookup } from './key-lookup.js';
 export type { FoundKey, KeySource, RecordReader } from './key-lookup.js';
 
+// A device's own signing key, kept across connects
+export {
+  MemoryDeviceKeyStore,
+  IndexedDbDeviceKeyStore,
+  recordKeyOf,
+} from './device-key.js';
+export type { DeviceKeyStore, StoredDeviceKey } from './device-key.js';
+
 // VC-bootstrapped E2E group channels (EG1/EGK1) — passphrase-free, server-blind
 // channel encryption with per-epoch revocation. Interop-compatible with the
 // Rust `freeq-sdk::e2ee_group`. See docs/VC-BOOTSTRAPPED-CHANNEL-E2EE.md.
