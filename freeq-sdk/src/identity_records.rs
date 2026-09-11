@@ -18,14 +18,19 @@
 //! account's repository, or altered in any field, says nothing.
 
 use crate::crypto::{PrivateKey, PublicKey};
-use crate::did::DidResolver;
+use crate::did::{DidDocument, DidResolver};
 use crate::pds::pds_endpoint;
 use crate::sigtag::derive_kid_bytes;
 use anyhow::{Context, Result, bail};
+use atrium_repo::blockstore::{AsyncBlockStoreRead, CarStore, DAG_CBOR, SHA2_256};
+use atrium_repo::{Multihash, Repository};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+pub use atrium_repo::Cid;
 
 /// Record type for a signing key a device publishes, and for retiring one.
 pub const DEVICE_KEY_TYPE: &str = "at.freeq.deviceKey";
@@ -565,6 +570,54 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
         Ok(fold_agent_records(did, &devices, &agents, at))
     }
 
+    /// The `com.atproto.sync.getRecord` proof for one record, a CAR file.
+    pub async fn fetch_proof(&self, did: &str, collection: &str, rkey: &str) -> Result<Vec<u8>> {
+        let doc = self.resolver.resolve(did).await?;
+        let pds = pds_endpoint(&doc).context("DID document names no PDS")?;
+        self.proof_from(&pds, did, collection, rkey).await
+    }
+
+    /// Fetch one record's proof and check it under the account's repository
+    /// key, the `#atproto` entry of its DID document.
+    pub async fn verify_record(
+        &self,
+        did: &str,
+        collection: &str,
+        rkey: &str,
+        expected: &Cid,
+    ) -> Result<ProofOutcome> {
+        let doc = self.resolver.resolve(did).await?;
+        let repo_key = repo_signing_key(&doc)?;
+        let pds = pds_endpoint(&doc).context("DID document names no PDS")?;
+        let car = self.proof_from(&pds, did, collection, rkey).await?;
+        verify_proof(&car, did, collection, rkey, expected, &repo_key).await
+    }
+
+    async fn proof_from(
+        &self,
+        pds: &str,
+        did: &str,
+        collection: &str,
+        rkey: &str,
+    ) -> Result<Vec<u8>> {
+        let endpoint = format!(
+            "{}/xrpc/com.atproto.sync.getRecord",
+            pds.trim_end_matches('/')
+        );
+        let mut url = url::Url::parse(&endpoint).context("invalid PDS endpoint")?;
+        url.query_pairs_mut()
+            .append_pair("did", did)
+            .append_pair("collection", collection)
+            .append_pair("rkey", rkey);
+        let body = self
+            .get(&url)
+            .await?
+            .bytes()
+            .await
+            .context("reading the proof failed")?;
+        Ok(body.to_vec())
+    }
+
     /// GET `url` with the provider's client for it; an HTTP error status is
     /// an error.
     async fn get(&self, url: &url::Url) -> Result<reqwest::Response> {
@@ -577,6 +630,117 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
             .error_for_status()
             .with_context(|| format!("{} answered with an error", url.path()))
     }
+}
+
+// ─── proofs ─────────────────────────────────────────────────────────────
+
+/// What checking a record's proof found. The record is proven only when all
+/// three hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProofOutcome {
+    /// The signed commit names the account asked about.
+    pub commit_did_matches: bool,
+    /// The commit's signature checks under the account's repository key.
+    pub signature_valid: bool,
+    /// The record read through the commit's tree has the expected CID.
+    pub record_present: bool,
+}
+
+impl ProofOutcome {
+    pub fn verified(&self) -> bool {
+        self.commit_did_matches && self.signature_valid && self.record_present
+    }
+}
+
+/// The CID an AT Protocol repository gives `record`: CID v1, dag-cbor codec,
+/// SHA-256 of the record's DAG-CBOR encoding.
+pub fn record_cid(record: &serde_json::Value) -> Result<Cid> {
+    let bytes = serde_ipld_dagcbor::to_vec(record).context("record does not encode as DAG-CBOR")?;
+    let digest = Multihash::wrap(SHA2_256, &Sha256::digest(&bytes))?;
+    Ok(Cid::new_v1(DAG_CBOR, digest))
+}
+
+/// The one field of a signed commit read here directly; the library keeps
+/// its commit type private.
+#[derive(Deserialize)]
+struct CommitAccount {
+    did: String,
+}
+
+/// Check a `com.atproto.sync.getRecord` proof: a CAR whose root is the
+/// repository's signed commit and whose blocks are the tree path from that
+/// commit to the record at `collection/rkey`.
+pub async fn verify_proof(
+    car: &[u8],
+    did: &str,
+    collection: &str,
+    rkey: &str,
+    expected: &Cid,
+    repo_key: &PublicKey,
+) -> Result<ProofOutcome> {
+    // The repository library panics on some malformed trees (a record link
+    // that is not DAG-CBOR, a node that loops); a spawned task turns that
+    // panic into an error for the caller.
+    let car = car.to_vec();
+    let did = did.to_string();
+    let path = format!("{collection}/{rkey}");
+    let expected = *expected;
+    let repo_key = repo_key.clone();
+    let check =
+        tokio::spawn(async move { check_proof(&car, &did, &path, &expected, &repo_key).await });
+    match check.await {
+        Ok(outcome) => outcome,
+        Err(e) if e.is_panic() => bail!("proof tree is malformed"),
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn check_proof(
+    car: &[u8],
+    did: &str,
+    path: &str,
+    expected: &Cid,
+    repo_key: &PublicKey,
+) -> Result<ProofOutcome> {
+    // Opening hashes every block against its CID.
+    let mut store = CarStore::open(std::io::Cursor::new(car))
+        .await
+        .context("proof is not a readable CAR")?;
+    let root = store.roots().next().context("proof CAR names no root")?;
+    let account: CommitAccount = serde_ipld_dagcbor::from_slice(&store.read_block(root).await?)
+        .context("proof root is not a commit")?;
+    let mut repo = Repository::open(store, root).await?;
+
+    // The signature is over the commit's DAG-CBOR bytes without `sig`.
+    let commit = repo.commit();
+    let signature_valid = repo_key.verify(&commit.bytes(), commit.sig()).is_ok();
+
+    let record: Option<serde_json::Value> = repo.get_raw(path).await?;
+    let record_present = match record {
+        Some(record) => record_cid(&record)? == *expected,
+        None => false,
+    };
+    Ok(ProofOutcome {
+        commit_did_matches: account.did == did,
+        signature_valid,
+        record_present,
+    })
+}
+
+/// The account's repository signing key: the `#atproto` entry of its DID
+/// document.
+fn repo_signing_key(doc: &DidDocument) -> Result<PublicKey> {
+    let full_id = format!("{}#atproto", doc.id);
+    let method = doc
+        .verification_method
+        .iter()
+        .find(|m| m.id == full_id || m.id == "#atproto")
+        .context("DID document has no #atproto key")?;
+    let multibase = method
+        .public_key_multibase
+        .as_deref()
+        .context("#atproto key has no publicKeyMultibase")?;
+    PublicKey::from_multibase(multibase)
 }
 
 #[cfg(test)]
@@ -878,6 +1042,7 @@ mod tests {
             "signedBytes": String::from_utf8(signed_bytes).unwrap(),
             "bindingSig": record["bindingSig"].clone(),
             "record": record.clone(),
+            "cid": record_cid(&record).unwrap().to_string(),
         });
         if let Some(label) = record.get("label") {
             entry["label"] = label.clone();
@@ -934,7 +1099,7 @@ mod tests {
 
     fn build_fixtures_json() -> serde_json::Value {
         json!({
-            "description": "Identity records a person publishes in their own AT Protocol repository. `at.freeq.deviceKey` announces a signing key a device holds, or retires one; `at.freeq.agentKey` announces a bot the account claims as its own, or retires that claim. `bindingSig` is an ed25519 signature, base64url without padding, over the UTF-8 bytes of the JCS (RFC 8785) canonical form of the record with its `bindingSig` field removed, and `signedBytes` is that canonical form. This is the recipe every freeq document signature uses: chat documents (freeq-sdk/src/chatsig.rs), task events (freeq-sdk/src/act.rs), the bot certificate (freeq-bot-id/src/main.rs, verified in freeq-server/src/connection/provenance.rs and minted in TypeScript by freeq-bot-kit-js/src/delegation.ts) and policy credentials (freeq-server/src/policy/credentials.rs). Absent fields are absent rather than null, so they are not in the canonical form, and `kid` is base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16]). Every implementation must rebuild each vector's `record`, `signedBytes` and `bindingSig` from its `seed`, and must fold each case's records at its `at` into exactly `liveDeviceKids` and `liveAgentDids`.",
+            "description": "Identity records a person publishes in their own AT Protocol repository. `at.freeq.deviceKey` announces a signing key a device holds, or retires one; `at.freeq.agentKey` announces a bot the account claims as its own, or retires that claim. `bindingSig` is an ed25519 signature, base64url without padding, over the UTF-8 bytes of the JCS (RFC 8785) canonical form of the record with its `bindingSig` field removed, and `signedBytes` is that canonical form. This is the recipe every freeq document signature uses: chat documents (freeq-sdk/src/chatsig.rs), task events (freeq-sdk/src/act.rs), the bot certificate (freeq-bot-id/src/main.rs, verified in freeq-server/src/connection/provenance.rs and minted in TypeScript by freeq-bot-kit-js/src/delegation.ts) and policy credentials (freeq-server/src/policy/credentials.rs). Absent fields are absent rather than null, so they are not in the canonical form, and `kid` is base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16]). `cid` is the record's CID as an AT Protocol repository names it: CID v1, dag-cbor codec, SHA-256 of the record's DAG-CBOR encoding. Every implementation must rebuild each vector's `record`, `signedBytes`, `bindingSig` and `cid` from its `seed`, and must fold each case's records at its `at` into exactly `liveDeviceKids` and `liveAgentDids`.",
             "vectors": vectors(),
             "folds": folds(),
         })
@@ -1159,5 +1324,354 @@ mod tests {
         assert!(reader.list_records(ALICE, DEVICE_KEY_TYPE).await.is_err());
         assert!(reader.live_device_keys(ALICE, instant(T1)).await.is_err());
         assert!(reader.live_agent_links(ALICE, instant(T1)).await.is_err());
+    }
+
+    // ─── proofs ─────────────────────────────────────────────────────────
+
+    /// The account and record the committed proof fixture was fetched for.
+    const PROOF_DID: &str = "did:plc:lc2sd5msatepbr55mhtwgdvy";
+    const PROOF_RKEY: &str = "3mv2l5ebug2ql";
+
+    fn proof_fixture(name: &str) -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../spec/fixtures/identity-record-proof")
+            .join(name);
+        std::fs::read(path).unwrap()
+    }
+
+    fn proof_document() -> crate::did::DidDocument {
+        serde_json::from_slice(&proof_fixture("did.json")).unwrap()
+    }
+
+    /// The `repo.getRecord` answer: `{uri, cid, value}`.
+    fn proof_listing() -> serde_json::Value {
+        serde_json::from_slice(&proof_fixture("record.json")).unwrap()
+    }
+
+    fn proof_cid() -> Cid {
+        proof_listing()["cid"].as_str().unwrap().parse().unwrap()
+    }
+
+    fn proof_repo_key() -> PublicKey {
+        let doc = proof_document();
+        let method = doc
+            .verification_method
+            .iter()
+            .find(|m| m.id.ends_with("#atproto"))
+            .unwrap();
+        PublicKey::from_multibase(method.public_key_multibase.as_deref().unwrap()).unwrap()
+    }
+
+    const ALL_TRUE: ProofOutcome = ProofOutcome {
+        commit_did_matches: true,
+        signature_valid: true,
+        record_present: true,
+    };
+
+    #[test]
+    fn record_cid_matches_the_cid_the_pds_reported() {
+        assert_eq!(record_cid(&proof_listing()["value"]).unwrap(), proof_cid());
+    }
+
+    #[tokio::test]
+    async fn the_fixture_proof_verifies_under_the_account_key() {
+        let car = proof_fixture("proof.car");
+        let outcome = verify_proof(
+            &car,
+            PROOF_DID,
+            DEVICE_KEY_TYPE,
+            PROOF_RKEY,
+            &proof_cid(),
+            &proof_repo_key(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ALL_TRUE);
+        assert!(outcome.verified());
+    }
+
+    #[tokio::test]
+    async fn a_proof_checked_under_another_key_has_no_valid_signature() {
+        let car = proof_fixture("proof.car");
+        let other =
+            PublicKey::from_multibase(&PrivateKey::generate_secp256k1().public_key_multibase())
+                .unwrap();
+        let outcome = verify_proof(
+            &car,
+            PROOF_DID,
+            DEVICE_KEY_TYPE,
+            PROOF_RKEY,
+            &proof_cid(),
+            &other,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            ProofOutcome {
+                signature_valid: false,
+                ..ALL_TRUE
+            }
+        );
+        assert!(!outcome.verified());
+    }
+
+    #[tokio::test]
+    async fn a_proof_does_not_hold_a_record_with_another_cid() {
+        let car = proof_fixture("proof.car");
+        let wrong = record_cid(&json!({ "$type": DEVICE_KEY_TYPE })).unwrap();
+        let outcome = verify_proof(
+            &car,
+            PROOF_DID,
+            DEVICE_KEY_TYPE,
+            PROOF_RKEY,
+            &wrong,
+            &proof_repo_key(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            ProofOutcome {
+                record_present: false,
+                ..ALL_TRUE
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proof_for_another_account_does_not_match_the_commit() {
+        let car = proof_fixture("proof.car");
+        let outcome = verify_proof(
+            &car,
+            ALICE,
+            DEVICE_KEY_TYPE,
+            PROOF_RKEY,
+            &proof_cid(),
+            &proof_repo_key(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            ProofOutcome {
+                commit_did_matches: false,
+                ..ALL_TRUE
+            }
+        );
+    }
+
+    /// The last block in the CAR is changed by one byte. The CAR fails to
+    /// open: every block is hashed on open and this one no longer matches
+    /// its CID, so the tree walk is never reached.
+    #[tokio::test]
+    async fn a_flipped_byte_in_a_block_fails_to_open() {
+        let mut car = proof_fixture("proof.car");
+        *car.last_mut().unwrap() ^= 0x01;
+        let opened = CarStore::open(std::io::Cursor::new(&car[..])).await;
+        assert!(matches!(
+            opened,
+            Err(atrium_repo::blockstore::CarError::InvalidHash)
+        ));
+        let outcome = verify_proof(
+            &car,
+            PROOF_DID,
+            DEVICE_KEY_TYPE,
+            PROOF_RKEY,
+            &proof_cid(),
+            &proof_repo_key(),
+        )
+        .await;
+        assert!(outcome.is_err());
+    }
+
+    #[tokio::test]
+    async fn verify_record_fetches_the_proof_from_the_pds() {
+        let car = proof_fixture("proof.car");
+        let router = axum::Router::new().route(
+            "/xrpc/com.atproto.sync.getRecord",
+            get(move |Query(q): Query<HashMap<String, String>>| {
+                let car = car.clone();
+                async move {
+                    let asked = (
+                        q.get("did").map(String::as_str),
+                        q.get("collection").map(String::as_str),
+                        q.get("rkey").map(String::as_str),
+                    );
+                    if asked != (Some(PROOF_DID), Some(DEVICE_KEY_TYPE), Some(PROOF_RKEY)) {
+                        return Err(StatusCode::NOT_FOUND);
+                    }
+                    Ok(([("content-type", "application/vnd.ipld.car")], car))
+                }
+            }),
+        );
+        let base = spawn_stub(router).await;
+        let mut doc = proof_document();
+        doc.service[0].service_endpoint = base;
+        let resolver = DidResolver::static_map(HashMap::from([(PROOF_DID.to_string(), doc)]));
+        let reader = RecordReader::new(resolver, freeq_oauth::SharedClient(reqwest::Client::new()));
+
+        let fetched = reader
+            .fetch_proof(PROOF_DID, DEVICE_KEY_TYPE, PROOF_RKEY)
+            .await
+            .unwrap();
+        assert_eq!(fetched, proof_fixture("proof.car"));
+        let outcome = reader
+            .verify_record(PROOF_DID, DEVICE_KEY_TYPE, PROOF_RKEY, &proof_cid())
+            .await
+            .unwrap();
+        assert_eq!(outcome, ALL_TRUE);
+    }
+
+    // ─── hostile proofs ─────────────────────────────────────────────────
+
+    fn cbor_head(major: u8, n: usize, out: &mut Vec<u8>) {
+        let major = major << 5;
+        match n {
+            0..24 => out.push(major | n as u8),
+            24..256 => out.extend([major | 24, n as u8]),
+            _ => {
+                out.push(major | 25);
+                out.extend((n as u16).to_be_bytes());
+            }
+        }
+    }
+
+    fn cbor_text(text: &str, out: &mut Vec<u8>) {
+        cbor_head(3, text.len(), out);
+        out.extend(text.as_bytes());
+    }
+
+    fn cbor_bytes(bytes: &[u8], out: &mut Vec<u8>) {
+        cbor_head(2, bytes.len(), out);
+        out.extend(bytes);
+    }
+
+    /// A DAG-CBOR link: tag 42 over a zero byte and the CID's bytes.
+    fn cbor_link(cid: &Cid, out: &mut Vec<u8>) {
+        out.extend([0xd8, 42]);
+        let mut bytes = vec![0];
+        bytes.extend(cid.to_bytes());
+        cbor_bytes(&bytes, out);
+    }
+
+    /// An MST node holding one leaf, and a left subtree if `left` is given.
+    fn mst_node(left: Option<&Cid>, key: &str, value: &Cid) -> Vec<u8> {
+        let mut out = Vec::new();
+        cbor_head(5, 2, &mut out);
+        cbor_text("e", &mut out);
+        cbor_head(4, 1, &mut out);
+        cbor_head(5, 4, &mut out);
+        cbor_text("k", &mut out);
+        cbor_bytes(key.as_bytes(), &mut out);
+        cbor_text("p", &mut out);
+        cbor_head(0, 0, &mut out);
+        cbor_text("t", &mut out);
+        out.push(0xf6);
+        cbor_text("v", &mut out);
+        cbor_link(value, &mut out);
+        cbor_text("l", &mut out);
+        match left {
+            Some(cid) => cbor_link(cid, &mut out),
+            None => out.push(0xf6),
+        }
+        out
+    }
+
+    /// A commit block for `did` whose tree root is `data`, signed with zeros.
+    fn commit_block(did: &str, data: &Cid) -> Vec<u8> {
+        let mut out = Vec::new();
+        cbor_head(5, 6, &mut out);
+        cbor_text("did", &mut out);
+        cbor_text(did, &mut out);
+        cbor_text("rev", &mut out);
+        cbor_text(PROOF_RKEY, &mut out);
+        cbor_text("sig", &mut out);
+        cbor_bytes(&[0; 64], &mut out);
+        cbor_text("data", &mut out);
+        cbor_link(data, &mut out);
+        cbor_text("prev", &mut out);
+        out.push(0xf6);
+        cbor_text("version", &mut out);
+        cbor_head(0, 3, &mut out);
+        out
+    }
+
+    fn sha256_cid(codec: u64, bytes: &[u8]) -> Cid {
+        Cid::new_v1(
+            codec,
+            Multihash::wrap(SHA2_256, &Sha256::digest(bytes)).unwrap(),
+        )
+    }
+
+    fn varint(mut n: usize, out: &mut Vec<u8>) {
+        while n >= 0x80 {
+            out.push((n as u8) | 0x80);
+            n >>= 7;
+        }
+        out.push(n as u8);
+    }
+
+    /// A CAR file rooted at the first block.
+    fn car_file(blocks: &[(Cid, Vec<u8>)]) -> Vec<u8> {
+        let mut header = Vec::new();
+        cbor_head(5, 2, &mut header);
+        cbor_text("roots", &mut header);
+        cbor_head(4, 1, &mut header);
+        cbor_link(&blocks[0].0, &mut header);
+        cbor_text("version", &mut header);
+        cbor_head(0, 1, &mut header);
+        let mut out = Vec::new();
+        varint(header.len(), &mut out);
+        out.extend(header);
+        for (cid, data) in blocks {
+            let cid = cid.to_bytes();
+            varint(cid.len() + data.len(), &mut out);
+            out.extend(cid);
+            out.extend(data);
+        }
+        out
+    }
+
+    async fn verify_hostile(car: &[u8]) -> Result<ProofOutcome> {
+        verify_proof(
+            car,
+            PROOF_DID,
+            DEVICE_KEY_TYPE,
+            PROOF_RKEY,
+            &proof_cid(),
+            &proof_repo_key(),
+        )
+        .await
+    }
+
+    /// The tree's leaf for the record links to a block that is not
+    /// DAG-CBOR. The library asserts on that codec when it reads the record.
+    #[tokio::test]
+    async fn a_proof_whose_record_is_not_dag_cbor_is_refused() {
+        let raw = b"not a record".to_vec();
+        let raw_cid = sha256_cid(0x55, &raw);
+        let node = mst_node(None, &format!("{DEVICE_KEY_TYPE}/{PROOF_RKEY}"), &raw_cid);
+        let node_cid = sha256_cid(DAG_CBOR, &node);
+        let commit = commit_block(PROOF_DID, &node_cid);
+        let car = car_file(&[
+            (sha256_cid(DAG_CBOR, &commit), commit),
+            (node_cid, node),
+            (raw_cid, raw),
+        ]);
+        let outcome = verify_hostile(&car).await;
+        assert!(!outcome.is_ok_and(|o| o.record_present));
+    }
+
+    /// A tree node that names itself as its own left subtree, under a hash
+    /// the CAR reader does not check (SHA-512). The library panics when a
+    /// walk revisits a node.
+    #[tokio::test]
+    async fn a_proof_whose_tree_loops_is_refused() {
+        let node_cid = Cid::new_v1(DAG_CBOR, Multihash::wrap(0x13, &[7; 64]).unwrap());
+        let node = mst_node(Some(&node_cid), "zzz", &proof_cid());
+        let commit = commit_block(PROOF_DID, &node_cid);
+        let car = car_file(&[(sha256_cid(DAG_CBOR, &commit), commit), (node_cid, node)]);
+        assert!(verify_hostile(&car).await.is_err());
     }
 }

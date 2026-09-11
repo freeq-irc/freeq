@@ -40,6 +40,8 @@ open = { workspace = true }
 url = "2"
 dirs = { workspace = true }
 parking_lot = "0.12"
+atrium-repo = "0.1.8"
+serde_ipld_dagcbor = { version = "0.6.0", default-features = false, features = ["std"] }
 
 [features]
 default = ["iroh-transport", "aws-lc-rs", "native-tls"]

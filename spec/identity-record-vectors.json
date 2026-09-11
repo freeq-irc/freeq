@@ -1,5 +1,5 @@
 {
-  "description": "Identity records a person publishes in their own AT Protocol repository. `at.freeq.deviceKey` announces a signing key a device holds, or retires one; `at.freeq.agentKey` announces a bot the account claims as its own, or retires that claim. `bindingSig` is an ed25519 signature, base64url without padding, over the UTF-8 bytes of the JCS (RFC 8785) canonical form of the record with its `bindingSig` field removed, and `signedBytes` is that canonical form. This is the recipe every freeq document signature uses: chat documents (freeq-sdk/src/chatsig.rs), task events (freeq-sdk/src/act.rs), the bot certificate (freeq-bot-id/src/main.rs, verified in freeq-server/src/connection/provenance.rs and minted in TypeScript by freeq-bot-kit-js/src/delegation.ts) and policy credentials (freeq-server/src/policy/credentials.rs). Absent fields are absent rather than null, so they are not in the canonical form, and `kid` is base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16]). Every implementation must rebuild each vector's `record`, `signedBytes` and `bindingSig` from its `seed`, and must fold each case's records at its `at` into exactly `liveDeviceKids` and `liveAgentDids`.",
+  "description": "Identity records a person publishes in their own AT Protocol repository. `at.freeq.deviceKey` announces a signing key a device holds, or retires one; `at.freeq.agentKey` announces a bot the account claims as its own, or retires that claim. `bindingSig` is an ed25519 signature, base64url without padding, over the UTF-8 bytes of the JCS (RFC 8785) canonical form of the record with its `bindingSig` field removed, and `signedBytes` is that canonical form. This is the recipe every freeq document signature uses: chat documents (freeq-sdk/src/chatsig.rs), task events (freeq-sdk/src/act.rs), the bot certificate (freeq-bot-id/src/main.rs, verified in freeq-server/src/connection/provenance.rs and minted in TypeScript by freeq-bot-kit-js/src/delegation.ts) and policy credentials (freeq-server/src/policy/credentials.rs). Absent fields are absent rather than null, so they are not in the canonical form, and `kid` is base64url-nopad(sha256(raw 32-byte ed25519 public key)[0..16]). `cid` is the record's CID as an AT Protocol repository names it: CID v1, dag-cbor codec, SHA-256 of the record's DAG-CBOR encoding. Every implementation must rebuild each vector's `record`, `signedBytes`, `bindingSig` and `cid` from its `seed`, and must fold each case's records at its `at` into exactly `liveDeviceKids` and `liveAgentDids`.",
   "folds": [
     {
       "agentRecords": [],
@@ -229,6 +229,7 @@
   "vectors": [
     {
       "bindingSig": "5jBEtnieaGHEoHYH_rves50_lFeJ7TygOBrP__fZejfdwtpVjR01FGPXOe2L_LNX-8irRvu1iYRA7CHDKm5MDA",
+      "cid": "bafyreicdezns4ac3uic6ywgpjhleduvbvh6vsribkvcunze454k7speymq",
       "createdAt": "2026-01-01T00:00:00Z",
       "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
       "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
@@ -249,6 +250,7 @@
     },
     {
       "bindingSig": "shnHAKFIPLuZs4D25c35_NazHZ6p_YDl7n_kyKIY_Z2XlZfw8yTeQjFyzb6EeBPzgTSS7INEgKA0OoeE_ttZAg",
+      "cid": "bafyreiamv3t2adsqrhb2gznkrac4kq5hj7io6llndj7xjnxubvr5edplnu",
       "createdAt": "2026-02-01T00:00:00Z",
       "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
       "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
@@ -267,6 +269,7 @@
     },
     {
       "bindingSig": "sDWKcfGSsViJsNMSShwJMcwr4f-4YVpHHHZp8RGO7iNwrvXQdEF5ThfczEyVcIUvJ0SM1tL3OsW4mfjKpj1uAg",
+      "cid": "bafyreifk75wraqnss6q74up72omrcizddws7dwpalfe6mt2ju5dldk7dcu",
       "createdAt": "2026-02-01T00:00:00Z",
       "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
       "kid": "ajgD1fBZkCocba-8m6Rykg",
@@ -285,6 +288,7 @@
     },
     {
       "bindingSig": "uQ618o96sytoeXdBlwdtgInOdHmP2fIZedTbDQQciTlrzt_-mAWstknmiDs-b5l_gC7TSIiyStQgaLDhvcpODQ",
+      "cid": "bafyreiaua2istcjwrv2kohj4nzh5qik6xnsdwg2llc5755kwcxjlcqwefi",
       "createdAt": "2026-02-01T00:00:00Z",
       "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
       "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
@@ -305,6 +309,7 @@
     },
     {
       "bindingSig": "HvX8l22nRl1DsLSHmsJsNy_SaoHKSslMP9BXqqW4CwNQISe1jXWGYqdBdzBDv2dUZQf3J06RL42sdDcMcaZzBg",
+      "cid": "bafyreigsgkyrxsfif5j2eduiznlfy3tphi6ln6ei5tym2sapwfq7u6cnba",
       "createdAt": "2026-03-01T00:00:00Z",
       "did": "did:plc:k2n3e2vsihf3farequ44t5j7",
       "kid": "NHUPmL1Z_PyUbaRaqr6TOw",
