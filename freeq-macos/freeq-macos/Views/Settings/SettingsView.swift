@@ -178,9 +178,46 @@ struct ConnectionSettings: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+                // This device's signing key, while it is not on the account.
+                // Messages still send and still carry that key — the row is
+                // here to fix the one thing missing, and it goes away once the
+                // key is published.
+                if appState.signingKeyUnpublished {
+                    HStack {
+                        Text("Key not published · this device")
+                        Spacer()
+                        // The broker's login resolves a handle, so the action
+                        // is offered only where we know one.
+                        if let handle = appState.accountHandle {
+                            Button("Publish key") { publishKey(handle: handle) }
+                        }
+                    }
+                }
             }
         }
         .formStyle(.grouped)
+    }
+
+    /// Start a sign-in that asks the account for permission to write this
+    /// device's key records. The same flow the connect screen runs, whose link
+    /// now carries `intent=enroll`.
+    private func publishKey(handle: String) {
+        Task {
+            do {
+                let (brokerToken, session) = try await BrokerAuth.startOAuth(
+                    brokerBase: appState.authBrokerBase,
+                    handle: handle
+                )
+                appState.brokerToken = brokerToken
+                if let brokerToken {
+                    KeychainHelper.save(key: "brokerToken", value: brokerToken)
+                }
+                appState.pendingWebToken = session.token
+                appState.connect(nick: session.nick)
+            } catch {
+                appState.errorMessage = "Login failed: \(error.localizedDescription)"
+            }
+        }
     }
 
     private func addAutoJoin() {

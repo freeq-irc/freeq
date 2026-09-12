@@ -258,6 +258,27 @@ typedef void (*UniffiCallbackInterfaceAvEventHandlerMethod0)(uint64_t, RustBuffe
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_DEVICE_KEY_STORE_METHOD0
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_DEVICE_KEY_STORE_METHOD0
+typedef void (*UniffiCallbackInterfaceDeviceKeyStoreMethod0)(uint64_t, RustBuffer* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_DEVICE_KEY_STORE_METHOD1
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_DEVICE_KEY_STORE_METHOD1
+typedef void (*UniffiCallbackInterfaceDeviceKeyStoreMethod1)(uint64_t, RustBuffer, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_ENROLLMENT_METHOD0
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_ENROLLMENT_METHOD0
+typedef void (*UniffiCallbackInterfaceEnrollmentMethod0)(uint64_t, RustBuffer, RustBuffer, RustBuffer* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
 #ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_EVENT_HANDLER_METHOD0
 #define UNIFFI_FFIDEF_CALLBACK_INTERFACE_EVENT_HANDLER_METHOD0
 typedef void (*UniffiCallbackInterfaceEventHandlerMethod0)(uint64_t, RustBuffer, void* _Nonnull, 
@@ -278,6 +299,23 @@ typedef struct UniffiVTableCallbackInterfaceAvEventHandler {
     UniffiCallbackInterfaceAvEventHandlerMethod0 _Nonnull onAvEvent;
     UniffiCallbackInterfaceFree _Nonnull uniffiFree;
 } UniffiVTableCallbackInterfaceAvEventHandler;
+
+#endif
+#ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_DEVICE_KEY_STORE
+#define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_DEVICE_KEY_STORE
+typedef struct UniffiVTableCallbackInterfaceDeviceKeyStore {
+    UniffiCallbackInterfaceDeviceKeyStoreMethod0 _Nonnull load;
+    UniffiCallbackInterfaceDeviceKeyStoreMethod1 _Nonnull save;
+    UniffiCallbackInterfaceFree _Nonnull uniffiFree;
+} UniffiVTableCallbackInterfaceDeviceKeyStore;
+
+#endif
+#ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_ENROLLMENT
+#define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_ENROLLMENT
+typedef struct UniffiVTableCallbackInterfaceEnrollment {
+    UniffiCallbackInterfaceEnrollmentMethod0 _Nonnull publish;
+    UniffiCallbackInterfaceFree _Nonnull uniffiFree;
+} UniffiVTableCallbackInterfaceEnrollment;
 
 #endif
 #ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_EVENT_HANDLER
@@ -451,6 +489,21 @@ void uniffi_freeq_sdk_ffi_fn_method_freeqclient_send_raw(void*_Nonnull ptr, Rust
 void uniffi_freeq_sdk_ffi_fn_method_freeqclient_send_tagged(void*_Nonnull ptr, RustBuffer target, RustBuffer text, RustBuffer tags, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_DEVICE_KEY_STORE
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_DEVICE_KEY_STORE
+void uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_device_key_store(void*_Nonnull ptr, uint64_t store, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_DEVICE_LABEL
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_DEVICE_LABEL
+void uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_device_label(void*_Nonnull ptr, RustBuffer label, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_ENROLLMENT
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_ENROLLMENT
+void uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_enrollment(void*_Nonnull ptr, uint64_t enrollment, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_PLATFORM
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_PLATFORM
 void uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_platform(void*_Nonnull ptr, RustBuffer platform, RustCallStatus *_Nonnull out_status
@@ -459,6 +512,11 @@ void uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_platform(void*_Nonnull ptr, 
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_TOPIC
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_TOPIC
 void uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_topic(void*_Nonnull ptr, RustBuffer channel, RustBuffer topic, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_VERIFY_SIGNATURES
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_VERIFY_SIGNATURES
+void uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_verify_signatures(void*_Nonnull ptr, int8_t on, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_WEB_TOKEN
@@ -600,6 +658,16 @@ void uniffi_freeq_sdk_ffi_fn_method_freeqp2p_shutdown(void*_Nonnull ptr, RustCal
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_INIT_CALLBACK_VTABLE_AVEVENTHANDLER
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_INIT_CALLBACK_VTABLE_AVEVENTHANDLER
 void uniffi_freeq_sdk_ffi_fn_init_callback_vtable_aveventhandler(const UniffiVTableCallbackInterfaceAvEventHandler* _Nonnull vtable
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_INIT_CALLBACK_VTABLE_DEVICEKEYSTORE
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_INIT_CALLBACK_VTABLE_DEVICEKEYSTORE
+void uniffi_freeq_sdk_ffi_fn_init_callback_vtable_devicekeystore(const UniffiVTableCallbackInterfaceDeviceKeyStore* _Nonnull vtable
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_INIT_CALLBACK_VTABLE_ENROLLMENT
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_INIT_CALLBACK_VTABLE_ENROLLMENT
+void uniffi_freeq_sdk_ffi_fn_init_callback_vtable_enrollment(const UniffiVTableCallbackInterfaceEnrollment* _Nonnull vtable
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_INIT_CALLBACK_VTABLE_EVENTHANDLER
@@ -1087,6 +1155,24 @@ uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_send_tagged(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_DEVICE_KEY_STORE
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_DEVICE_KEY_STORE
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_device_key_store(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_DEVICE_LABEL
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_DEVICE_LABEL
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_device_label(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_ENROLLMENT
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_ENROLLMENT
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_enrollment(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_PLATFORM
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_PLATFORM
 uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_platform(void
@@ -1096,6 +1182,12 @@ uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_platform(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_TOPIC
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_TOPIC
 uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_topic(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_VERIFY_SIGNATURES
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_VERIFY_SIGNATURES
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_verify_signatures(void
     
 );
 #endif
@@ -1252,6 +1344,24 @@ uint16_t uniffi_freeq_sdk_ffi_checksum_constructor_freeqp2p_new(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_AVEVENTHANDLER_ON_AV_EVENT
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_AVEVENTHANDLER_ON_AV_EVENT
 uint16_t uniffi_freeq_sdk_ffi_checksum_method_aveventhandler_on_av_event(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_DEVICEKEYSTORE_LOAD
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_DEVICEKEYSTORE_LOAD
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_devicekeystore_load(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_DEVICEKEYSTORE_SAVE
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_DEVICEKEYSTORE_SAVE
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_devicekeystore_save(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_ENROLLMENT_PUBLISH
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_ENROLLMENT_PUBLISH
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_enrollment_publish(void
     
 );
 #endif

@@ -356,7 +356,73 @@ class AppState {
     /// Nothing is checked unless someone asks, and only a mismatch shows a
     /// marker on the row — almost every message is signed, so marking all of
     /// them would say nothing.
-    var checkedVerdicts: [String: VerifyAnswer] = [:]
+    var checkedVerdicts: [String: VerdictInfo] = [:]
+
+    /// This device's signing key, kept in the Keychain. One key per device, so
+    /// it outlives a session and a reader can learn it once.
+    let deviceKeyStore = KeychainDeviceKeyStore()
+
+    /// Said once per session, never on a loop.
+    private let signingKeyNotice = SigningKeyNotice()
+
+    /// True while this device's key is not published to the account. Drives
+    /// the dot beside the account; messages keep sending either way.
+    var signingKeyUnpublished = false
+
+    /// The handle this account signed in under, saved at login. The broker's
+    /// login resolves a handle and will not take a DID, so the sign-in that
+    /// Settings starts needs it.
+    var accountHandle: String? {
+        UserDefaults.standard.string(forKey: "freeq.handle")
+    }
+
+    /// The account would not take this device's key. The key stays and keeps
+    /// signing — the room is told once, and Settings keeps the state.
+    func noteSigningKeyUnpublished() {
+        signingKeyUnpublished = true
+        guard let line = signingKeyNotice.next() else { return }
+        // A server notice lands in the buffer the reader is looking at, the
+        // way every other one does. The fixed id keeps it to one line.
+        activeChannelState?.appendIfNew(ChatMessage(
+            id: "signing-key-unpublished",
+            from: "server",
+            text: line,
+            isAction: false,
+            timestamp: Date(),
+            replyTo: nil
+        ))
+    }
+
+    /// File what the SDK said about one line, so the row and the proof sheet
+    /// read one answer and a late verdict replaces it in place.
+    func recordVerdict(msgId: String, verdict: VerdictInfo?) {
+        guard let verdict, !msgId.isEmpty else { return }
+        checkedVerdicts[msgId] = verdict
+    }
+
+    /// The FFI's verdict as the rows carry it. Mirrors what the generated
+    /// bindings hand over, sentence included, so the models stay free of them.
+    static func verdictInfo(from v: SignatureVerdict) -> VerdictInfo {
+        let kind: VerdictKind
+        switch v.state {
+        case .device: kind = .device
+        case .server: kind = .server
+        case .unsigned: kind = .unsigned
+        case .unverifiable: kind = .unverifiable
+        case .invalid: kind = .invalid
+        case .retired: kind = .retired
+        case .pending: kind = .pending
+        }
+        let layer: VerdictLayer?
+        switch v.layer {
+        case .some(.vouched): layer = .vouched
+        case .some(.published): layer = .published
+        case .none: layer = nil
+        }
+        return VerdictInfo(
+            kind: kind, layer: layer, kid: v.kid, keySource: v.keySource, sentence: v.sentence
+        )
+    }
 
     // MARK: - Typing debounce
     private var lastTypingSent: [String: Date] = [:]
@@ -601,6 +667,19 @@ class AppState {
             }
 
             try c.setPlatform(platform: "macOS")
+            // This device's key, and the way it reaches the account. Both are
+            // set before connect and neither blocks it: a key that cannot be
+            // published still signs every message this session sends.
+            try c.setDeviceKeyStore(store: deviceKeyStore)
+            try c.setEnrollment(enrollment: BrokerEnrollment(
+                brokerBase: { [base = authBrokerBase] in base },
+                brokerToken: { [token = brokerToken] in token }
+            ))
+            try c.setDeviceLabel(label: Host.current().localizedName ?? "Mac")
+            try c.setVerifySignatures(on: true)
+            // A key that made it to the account clears the dot; nothing else
+            // does, so a refusal stays visible until it is fixed.
+            if deviceKeyStore.isPublished { signingKeyUnpublished = false }
             try c.connect()
         } catch {
             connectionState = .disconnected
@@ -1743,6 +1822,9 @@ extension AppState {
             // A task event rides as a TAGMSG, so it names its venue the way
             // every other TAGMSG does. The SDK has already read the tags and
             // dropped the repeats a joiner is handed.
+            recordVerdict(
+                msgId: act.eventId, verdict: act.verdict.map(AppState.verdictInfo(from:))
+            )
             let actSelf = isSelfSender(nick: act.from, account: act.did)
             let venue = act.target.hasPrefix("#")
                 ? act.target
@@ -1785,6 +1867,17 @@ extension AppState {
             // store the latest marker (forward-only, enforced server-side)
             // so that work has it. No UI effect yet.
             if let timestamp { readMarkers[target.lowercased()] = timestamp }
+
+        // The account would not take this device's key. Nothing about the
+        // connection changes: the session stays up and keeps signing with that
+        // key, and the room is told once.
+        case .signingKeyUnpublished:
+            noteSigningKeyUnpublished()
+
+        // A signature whose key took a moment to find. The line was delivered
+        // already; this settles what it says.
+        case .verdict(let msgid, let verdict):
+            recordVerdict(msgId: msgid, verdict: AppState.verdictInfo(from: verdict))
 
         case .connected:
             connectionState = .connected
@@ -2008,8 +2101,12 @@ extension AppState {
                 // The task this line was written beside, when it names one.
                 // Its card is drawn once the matching act event arrives.
                 actRef: msg.tags.first(where: { $0.key == "+freeq.at/ref" })?.value,
+                // What the SDK made of this line's signature, checked on this
+                // device when the line landed.
+                verdict: msg.verdict.map(AppState.verdictInfo(from:)),
                 reactions: initialReactions
             )
+            recordVerdict(msgId: message.id, verdict: message.verdict)
 
             // Handle edits
             if let editOf = msg.editOf {

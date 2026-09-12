@@ -108,6 +108,12 @@ struct ConnectView: View {
                 }
                 appState.pendingWebToken = session.token
                 KeychainHelper.save(key: "did", value: session.did)
+                // The handle the account signed in under. Settings needs it to
+                // start a sign-in of its own — the broker's login resolves a
+                // handle, and a DID will not do.
+                if !session.handle.isEmpty {
+                    UserDefaults.standard.set(session.handle, forKey: "freeq.handle")
+                }
                 appState.connect(nick: session.nick)
             } catch {
                 appState.errorMessage = "Login failed: \(error.localizedDescription)"

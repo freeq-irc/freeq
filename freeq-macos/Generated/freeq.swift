@@ -548,6 +548,24 @@ fileprivate struct FfiConverterString: FfiConverter {
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterData: FfiConverterRustBuffer {
+    typealias SwiftType = Data
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Data {
+        let len: Int32 = try readInt(&buf)
+        return Data(try readBytes(&buf, count: Int(len)))
+    }
+
+    public static func write(_ value: Data, into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        writeBytes(&buf, value)
+    }
+}
+
 
 
 
@@ -803,9 +821,17 @@ public protocol FreeqClientProtocol: AnyObject, Sendable {
     
     func sendTagged(target: String, text: String, tags: [TagEntry]) throws 
     
+    func setDeviceKeyStore(store: DeviceKeyStore) throws 
+    
+    func setDeviceLabel(label: String) throws 
+    
+    func setEnrollment(enrollment: Enrollment) throws 
+    
     func setPlatform(platform: String) throws 
     
     func setTopic(channel: String, topic: String) throws 
+    
+    func setVerifySignatures(on: Bool) throws 
     
     func setWebToken(token: String) throws 
     
@@ -993,6 +1019,27 @@ open func sendTagged(target: String, text: String, tags: [TagEntry])throws   {tr
 }
 }
     
+open func setDeviceKeyStore(store: DeviceKeyStore)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
+    uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_device_key_store(self.uniffiClonePointer(),
+        FfiConverterCallbackInterfaceDeviceKeyStore_lower(store),$0
+    )
+}
+}
+    
+open func setDeviceLabel(label: String)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
+    uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_device_label(self.uniffiClonePointer(),
+        FfiConverterString.lower(label),$0
+    )
+}
+}
+    
+open func setEnrollment(enrollment: Enrollment)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
+    uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_enrollment(self.uniffiClonePointer(),
+        FfiConverterCallbackInterfaceEnrollment_lower(enrollment),$0
+    )
+}
+}
+    
 open func setPlatform(platform: String)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
     uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_platform(self.uniffiClonePointer(),
         FfiConverterString.lower(platform),$0
@@ -1004,6 +1051,13 @@ open func setTopic(channel: String, topic: String)throws   {try rustCallWithErro
     uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_topic(self.uniffiClonePointer(),
         FfiConverterString.lower(channel),
         FfiConverterString.lower(topic),$0
+    )
+}
+}
+    
+open func setVerifySignatures(on: Bool)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
+    uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_verify_signatures(self.uniffiClonePointer(),
+        FfiConverterBool.lower(on),$0
     )
 }
 }
@@ -1511,10 +1565,11 @@ public struct ActEvent {
     public var sigTag: String?
     public var replayed: Bool
     public var dmKey: String?
+    public var verdict: SignatureVerdict?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(from: String, target: String, kind: String, verb: String, did: String?, eventId: String, taskId: String, fields: [TagEntry], sigTag: String?, replayed: Bool, dmKey: String?) {
+    public init(from: String, target: String, kind: String, verb: String, did: String?, eventId: String, taskId: String, fields: [TagEntry], sigTag: String?, replayed: Bool, dmKey: String?, verdict: SignatureVerdict? = nil) {
         self.from = from
         self.target = target
         self.kind = kind
@@ -1526,6 +1581,7 @@ public struct ActEvent {
         self.sigTag = sigTag
         self.replayed = replayed
         self.dmKey = dmKey
+        self.verdict = verdict
     }
 }
 
@@ -1569,6 +1625,9 @@ extension ActEvent: Equatable, Hashable {
         if lhs.dmKey != rhs.dmKey {
             return false
         }
+        if lhs.verdict != rhs.verdict {
+            return false
+        }
         return true
     }
 
@@ -1584,6 +1643,7 @@ extension ActEvent: Equatable, Hashable {
         hasher.combine(sigTag)
         hasher.combine(replayed)
         hasher.combine(dmKey)
+        hasher.combine(verdict)
     }
 }
 
@@ -1606,7 +1666,8 @@ public struct FfiConverterTypeActEvent: FfiConverterRustBuffer {
                 fields: FfiConverterSequenceTypeTagEntry.read(from: &buf), 
                 sigTag: FfiConverterOptionString.read(from: &buf), 
                 replayed: FfiConverterBool.read(from: &buf), 
-                dmKey: FfiConverterOptionString.read(from: &buf)
+                dmKey: FfiConverterOptionString.read(from: &buf), 
+                verdict: FfiConverterOptionTypeSignatureVerdict.read(from: &buf)
         )
     }
 
@@ -1622,6 +1683,7 @@ public struct FfiConverterTypeActEvent: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.sigTag, into: &buf)
         FfiConverterBool.write(value.replayed, into: &buf)
         FfiConverterOptionString.write(value.dmKey, into: &buf)
+        FfiConverterOptionTypeSignatureVerdict.write(value.verdict, into: &buf)
     }
 }
 
@@ -1961,6 +2023,84 @@ public func FfiConverterTypeCoordinationEvent_lower(_ value: CoordinationEvent) 
 }
 
 
+public struct EnrollResult {
+    public var outcome: EnrollOutcome
+    public var recordUri: String?
+    public var detail: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(outcome: EnrollOutcome, recordUri: String?, detail: String?) {
+        self.outcome = outcome
+        self.recordUri = recordUri
+        self.detail = detail
+    }
+}
+
+#if compiler(>=6)
+extension EnrollResult: Sendable {}
+#endif
+
+
+extension EnrollResult: Equatable, Hashable {
+    public static func ==(lhs: EnrollResult, rhs: EnrollResult) -> Bool {
+        if lhs.outcome != rhs.outcome {
+            return false
+        }
+        if lhs.recordUri != rhs.recordUri {
+            return false
+        }
+        if lhs.detail != rhs.detail {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(outcome)
+        hasher.combine(recordUri)
+        hasher.combine(detail)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEnrollResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EnrollResult {
+        return
+            try EnrollResult(
+                outcome: FfiConverterTypeEnrollOutcome.read(from: &buf), 
+                recordUri: FfiConverterOptionString.read(from: &buf), 
+                detail: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EnrollResult, into buf: inout [UInt8]) {
+        FfiConverterTypeEnrollOutcome.write(value.outcome, into: &buf)
+        FfiConverterOptionString.write(value.recordUri, into: &buf)
+        FfiConverterOptionString.write(value.detail, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEnrollResult_lift(_ buf: RustBuffer) throws -> EnrollResult {
+    return try FfiConverterTypeEnrollResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEnrollResult_lower(_ value: EnrollResult) -> RustBuffer {
+    return FfiConverterTypeEnrollResult.lower(value)
+}
+
+
 public struct IdentityClaim {
     public var state: IdentityClaimState
     public var did: String?
@@ -2194,10 +2334,11 @@ public struct IrcMessage {
     public var dmKey: String?
     public var coordination: CoordinationEvent?
     public var tags: [TagEntry]
+    public var verdict: SignatureVerdict?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(fromNick: String, target: String, text: String, msgid: String?, replyTo: String?, replacesMsgid: String?, editOf: String?, batchId: String?, pinMsgid: String?, unpinMsgid: String?, isAction: Bool, isSigned: Bool, timestampMs: Int64, account: String?, origin: String?, reactions: [ReactionTally], edited: Bool, dmKey: String?, coordination: CoordinationEvent?, tags: [TagEntry] = []) {
+    public init(fromNick: String, target: String, text: String, msgid: String?, replyTo: String?, replacesMsgid: String?, editOf: String?, batchId: String?, pinMsgid: String?, unpinMsgid: String?, isAction: Bool, isSigned: Bool, timestampMs: Int64, account: String?, origin: String?, reactions: [ReactionTally], edited: Bool, dmKey: String?, coordination: CoordinationEvent?, tags: [TagEntry] = [], verdict: SignatureVerdict? = nil) {
         self.fromNick = fromNick
         self.target = target
         self.text = text
@@ -2218,6 +2359,7 @@ public struct IrcMessage {
         self.dmKey = dmKey
         self.coordination = coordination
         self.tags = tags
+        self.verdict = verdict
     }
 }
 
@@ -2288,6 +2430,9 @@ extension IrcMessage: Equatable, Hashable {
         if lhs.tags != rhs.tags {
             return false
         }
+        if lhs.verdict != rhs.verdict {
+            return false
+        }
         return true
     }
 
@@ -2312,6 +2457,7 @@ extension IrcMessage: Equatable, Hashable {
         hasher.combine(dmKey)
         hasher.combine(coordination)
         hasher.combine(tags)
+        hasher.combine(verdict)
     }
 }
 
@@ -2343,7 +2489,8 @@ public struct FfiConverterTypeIrcMessage: FfiConverterRustBuffer {
                 edited: FfiConverterBool.read(from: &buf), 
                 dmKey: FfiConverterOptionString.read(from: &buf), 
                 coordination: FfiConverterOptionTypeCoordinationEvent.read(from: &buf), 
-                tags: FfiConverterSequenceTypeTagEntry.read(from: &buf)
+                tags: FfiConverterSequenceTypeTagEntry.read(from: &buf), 
+                verdict: FfiConverterOptionTypeSignatureVerdict.read(from: &buf)
         )
     }
 
@@ -2368,6 +2515,7 @@ public struct FfiConverterTypeIrcMessage: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.dmKey, into: &buf)
         FfiConverterOptionTypeCoordinationEvent.write(value.coordination, into: &buf)
         FfiConverterSequenceTypeTagEntry.write(value.tags, into: &buf)
+        FfiConverterOptionTypeSignatureVerdict.write(value.verdict, into: &buf)
     }
 }
 
@@ -2793,6 +2941,178 @@ public func FfiConverterTypeSafetyNumber_lower(_ value: SafetyNumber) -> RustBuf
 }
 
 
+public struct SignatureVerdict {
+    public var state: VerdictState
+    public var layer: KeyLayer?
+    public var kid: String?
+    public var keySource: String?
+    public var sentence: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(state: VerdictState, layer: KeyLayer?, kid: String?, keySource: String?, sentence: String) {
+        self.state = state
+        self.layer = layer
+        self.kid = kid
+        self.keySource = keySource
+        self.sentence = sentence
+    }
+}
+
+#if compiler(>=6)
+extension SignatureVerdict: Sendable {}
+#endif
+
+
+extension SignatureVerdict: Equatable, Hashable {
+    public static func ==(lhs: SignatureVerdict, rhs: SignatureVerdict) -> Bool {
+        if lhs.state != rhs.state {
+            return false
+        }
+        if lhs.layer != rhs.layer {
+            return false
+        }
+        if lhs.kid != rhs.kid {
+            return false
+        }
+        if lhs.keySource != rhs.keySource {
+            return false
+        }
+        if lhs.sentence != rhs.sentence {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(state)
+        hasher.combine(layer)
+        hasher.combine(kid)
+        hasher.combine(keySource)
+        hasher.combine(sentence)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSignatureVerdict: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SignatureVerdict {
+        return
+            try SignatureVerdict(
+                state: FfiConverterTypeVerdictState.read(from: &buf), 
+                layer: FfiConverterOptionTypeKeyLayer.read(from: &buf), 
+                kid: FfiConverterOptionString.read(from: &buf), 
+                keySource: FfiConverterOptionString.read(from: &buf), 
+                sentence: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SignatureVerdict, into buf: inout [UInt8]) {
+        FfiConverterTypeVerdictState.write(value.state, into: &buf)
+        FfiConverterOptionTypeKeyLayer.write(value.layer, into: &buf)
+        FfiConverterOptionString.write(value.kid, into: &buf)
+        FfiConverterOptionString.write(value.keySource, into: &buf)
+        FfiConverterString.write(value.sentence, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSignatureVerdict_lift(_ buf: RustBuffer) throws -> SignatureVerdict {
+    return try FfiConverterTypeSignatureVerdict.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSignatureVerdict_lower(_ value: SignatureVerdict) -> RustBuffer {
+    return FfiConverterTypeSignatureVerdict.lower(value)
+}
+
+
+public struct StoredDeviceKey {
+    public var seed: Data
+    public var createdAt: String
+    public var recordUri: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(seed: Data, createdAt: String, recordUri: String?) {
+        self.seed = seed
+        self.createdAt = createdAt
+        self.recordUri = recordUri
+    }
+}
+
+#if compiler(>=6)
+extension StoredDeviceKey: Sendable {}
+#endif
+
+
+extension StoredDeviceKey: Equatable, Hashable {
+    public static func ==(lhs: StoredDeviceKey, rhs: StoredDeviceKey) -> Bool {
+        if lhs.seed != rhs.seed {
+            return false
+        }
+        if lhs.createdAt != rhs.createdAt {
+            return false
+        }
+        if lhs.recordUri != rhs.recordUri {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(seed)
+        hasher.combine(createdAt)
+        hasher.combine(recordUri)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStoredDeviceKey: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StoredDeviceKey {
+        return
+            try StoredDeviceKey(
+                seed: FfiConverterData.read(from: &buf), 
+                createdAt: FfiConverterString.read(from: &buf), 
+                recordUri: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: StoredDeviceKey, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.seed, into: &buf)
+        FfiConverterString.write(value.createdAt, into: &buf)
+        FfiConverterOptionString.write(value.recordUri, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStoredDeviceKey_lift(_ buf: RustBuffer) throws -> StoredDeviceKey {
+    return try FfiConverterTypeStoredDeviceKey.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStoredDeviceKey_lower(_ value: StoredDeviceKey) -> RustBuffer {
+    return FfiConverterTypeStoredDeviceKey.lower(value)
+}
+
+
 public struct TagEntry {
     public var key: String
     public var value: String
@@ -2868,14 +3188,16 @@ public struct TagMessage {
     public var target: String
     public var tags: [TagEntry]
     public var dmKey: String?
+    public var verdict: SignatureVerdict?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(from: String, target: String, tags: [TagEntry], dmKey: String?) {
+    public init(from: String, target: String, tags: [TagEntry], dmKey: String?, verdict: SignatureVerdict? = nil) {
         self.from = from
         self.target = target
         self.tags = tags
         self.dmKey = dmKey
+        self.verdict = verdict
     }
 }
 
@@ -2898,6 +3220,9 @@ extension TagMessage: Equatable, Hashable {
         if lhs.dmKey != rhs.dmKey {
             return false
         }
+        if lhs.verdict != rhs.verdict {
+            return false
+        }
         return true
     }
 
@@ -2906,6 +3231,7 @@ extension TagMessage: Equatable, Hashable {
         hasher.combine(target)
         hasher.combine(tags)
         hasher.combine(dmKey)
+        hasher.combine(verdict)
     }
 }
 
@@ -2921,7 +3247,8 @@ public struct FfiConverterTypeTagMessage: FfiConverterRustBuffer {
                 from: FfiConverterString.read(from: &buf), 
                 target: FfiConverterString.read(from: &buf), 
                 tags: FfiConverterSequenceTypeTagEntry.read(from: &buf), 
-                dmKey: FfiConverterOptionString.read(from: &buf)
+                dmKey: FfiConverterOptionString.read(from: &buf), 
+                verdict: FfiConverterOptionTypeSignatureVerdict.read(from: &buf)
         )
     }
 
@@ -2930,6 +3257,7 @@ public struct FfiConverterTypeTagMessage: FfiConverterRustBuffer {
         FfiConverterString.write(value.target, into: &buf)
         FfiConverterSequenceTypeTagEntry.write(value.tags, into: &buf)
         FfiConverterOptionString.write(value.dmKey, into: &buf)
+        FfiConverterOptionTypeSignatureVerdict.write(value.verdict, into: &buf)
     }
 }
 
@@ -3167,6 +3495,83 @@ extension AvEvent: Equatable, Hashable {}
 
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum EnrollOutcome {
+    
+    case published
+    case needsSignIn
+    case failed
+}
+
+
+#if compiler(>=6)
+extension EnrollOutcome: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEnrollOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = EnrollOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EnrollOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .published
+        
+        case 2: return .needsSignIn
+        
+        case 3: return .failed
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: EnrollOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .published:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .needsSignIn:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .failed:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEnrollOutcome_lift(_ buf: RustBuffer) throws -> EnrollOutcome {
+    return try FfiConverterTypeEnrollOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEnrollOutcome_lower(_ value: EnrollOutcome) -> RustBuffer {
+    return FfiConverterTypeEnrollOutcome.lower(value)
+}
+
+
+extension EnrollOutcome: Equatable, Hashable {}
+
+
+
+
+
+
 
 public enum FreeqError: Swift.Error {
 
@@ -3323,6 +3728,9 @@ public enum FreeqEvent {
     )
     case notice(text: String
     )
+    case signingKeyUnpublished
+    case verdict(msgid: String, verdict: SignatureVerdict
+    )
     case disconnected(reason: String
     )
 }
@@ -3419,7 +3827,12 @@ public struct FfiConverterTypeFreeqEvent: FfiConverterRustBuffer {
         case 26: return .notice(text: try FfiConverterString.read(from: &buf)
         )
         
-        case 27: return .disconnected(reason: try FfiConverterString.read(from: &buf)
+        case 27: return .signingKeyUnpublished
+        
+        case 28: return .verdict(msgid: try FfiConverterString.read(from: &buf), verdict: try FfiConverterTypeSignatureVerdict.read(from: &buf)
+        )
+        
+        case 29: return .disconnected(reason: try FfiConverterString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -3583,8 +3996,18 @@ public struct FfiConverterTypeFreeqEvent: FfiConverterRustBuffer {
             FfiConverterString.write(text, into: &buf)
             
         
-        case let .disconnected(reason):
+        case .signingKeyUnpublished:
             writeInt(&buf, Int32(27))
+        
+        
+        case let .verdict(msgid,verdict):
+            writeInt(&buf, Int32(28))
+            FfiConverterString.write(msgid, into: &buf)
+            FfiConverterTypeSignatureVerdict.write(verdict, into: &buf)
+            
+        
+        case let .disconnected(reason):
+            writeInt(&buf, Int32(29))
             FfiConverterString.write(reason, into: &buf)
             
         }
@@ -3706,6 +4129,76 @@ public func FfiConverterTypeIdentityClaimState_lower(_ value: IdentityClaimState
 
 
 extension IdentityClaimState: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum KeyLayer {
+    
+    case vouched
+    case published
+}
+
+
+#if compiler(>=6)
+extension KeyLayer: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeKeyLayer: FfiConverterRustBuffer {
+    typealias SwiftType = KeyLayer
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> KeyLayer {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .vouched
+        
+        case 2: return .published
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: KeyLayer, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .vouched:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .published:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeKeyLayer_lift(_ buf: RustBuffer) throws -> KeyLayer {
+    return try FfiConverterTypeKeyLayer.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeKeyLayer_lower(_ value: KeyLayer) -> RustBuffer {
+    return FfiConverterTypeKeyLayer.lower(value)
+}
+
+
+extension KeyLayer: Equatable, Hashable {}
 
 
 
@@ -3910,6 +4403,111 @@ extension PersonLookup: Equatable, Hashable {}
 
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum VerdictState {
+    
+    case device
+    case server
+    case unsigned
+    case unverifiable
+    case invalid
+    case retired
+    case pending
+}
+
+
+#if compiler(>=6)
+extension VerdictState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVerdictState: FfiConverterRustBuffer {
+    typealias SwiftType = VerdictState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VerdictState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .device
+        
+        case 2: return .server
+        
+        case 3: return .unsigned
+        
+        case 4: return .unverifiable
+        
+        case 5: return .invalid
+        
+        case 6: return .retired
+        
+        case 7: return .pending
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: VerdictState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .device:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .server:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .unsigned:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .unverifiable:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .invalid:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .retired:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .pending:
+            writeInt(&buf, Int32(7))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVerdictState_lift(_ buf: RustBuffer) throws -> VerdictState {
+    return try FfiConverterTypeVerdictState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVerdictState_lower(_ value: VerdictState) -> RustBuffer {
+    return FfiConverterTypeVerdictState.lower(value)
+}
+
+
+extension VerdictState: Equatable, Hashable {}
+
+
+
+
+
+
 
 
 
@@ -4024,6 +4622,267 @@ public func FfiConverterCallbackInterfaceAvEventHandler_lift(_ handle: UInt64) t
 #endif
 public func FfiConverterCallbackInterfaceAvEventHandler_lower(_ v: AvEventHandler) -> UInt64 {
     return FfiConverterCallbackInterfaceAvEventHandler.lower(v)
+}
+
+
+
+
+public protocol DeviceKeyStore: AnyObject, Sendable {
+    
+    func load() throws  -> StoredDeviceKey?
+    
+    func save(key: StoredDeviceKey) throws 
+    
+}
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceDeviceKeyStore {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // This creates 1-element array, since this seems to be the only way to construct a const
+    // pointer that we can pass to the Rust code.
+    static let vtable: [UniffiVTableCallbackInterfaceDeviceKeyStore] = [UniffiVTableCallbackInterfaceDeviceKeyStore(
+        load: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> StoredDeviceKey? in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceDeviceKeyStore.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.load(
+                )
+            }
+
+            
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterOptionTypeStoredDeviceKey.lower($0) }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeFreeqError_lower
+            )
+        },
+        save: { (
+            uniffiHandle: UInt64,
+            key: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceDeviceKeyStore.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.save(
+                     key: try FfiConverterTypeStoredDeviceKey_lift(key)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeFreeqError_lower
+            )
+        },
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            let result = try? FfiConverterCallbackInterfaceDeviceKeyStore.handleMap.remove(handle: uniffiHandle)
+            if result == nil {
+                print("Uniffi callback interface DeviceKeyStore: handle missing in uniffiFree")
+            }
+        }
+    )]
+}
+
+private func uniffiCallbackInitDeviceKeyStore() {
+    uniffi_freeq_sdk_ffi_fn_init_callback_vtable_devicekeystore(UniffiCallbackInterfaceDeviceKeyStore.vtable)
+}
+
+// FfiConverter protocol for callback interfaces
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterCallbackInterfaceDeviceKeyStore {
+    fileprivate static let handleMap = UniffiHandleMap<DeviceKeyStore>()
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+extension FfiConverterCallbackInterfaceDeviceKeyStore : FfiConverter {
+    typealias SwiftType = DeviceKeyStore
+    typealias FfiType = UInt64
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lift(_ handle: UInt64) throws -> SwiftType {
+        try handleMap.get(handle: handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lower(_ v: SwiftType) -> UInt64 {
+        return handleMap.insert(obj: v)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func write(_ v: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(v))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceDeviceKeyStore_lift(_ handle: UInt64) throws -> DeviceKeyStore {
+    return try FfiConverterCallbackInterfaceDeviceKeyStore.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceDeviceKeyStore_lower(_ v: DeviceKeyStore) -> UInt64 {
+    return FfiConverterCallbackInterfaceDeviceKeyStore.lower(v)
+}
+
+
+
+
+public protocol Enrollment: AnyObject, Sendable {
+    
+    func publish(recordJson: String, signerPublicKey: String) throws  -> EnrollResult
+    
+}
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceEnrollment {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // This creates 1-element array, since this seems to be the only way to construct a const
+    // pointer that we can pass to the Rust code.
+    static let vtable: [UniffiVTableCallbackInterfaceEnrollment] = [UniffiVTableCallbackInterfaceEnrollment(
+        publish: { (
+            uniffiHandle: UInt64,
+            recordJson: RustBuffer,
+            signerPublicKey: RustBuffer,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> EnrollResult in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceEnrollment.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.publish(
+                     recordJson: try FfiConverterString.lift(recordJson),
+                     signerPublicKey: try FfiConverterString.lift(signerPublicKey)
+                )
+            }
+
+            
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterTypeEnrollResult_lower($0) }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeFreeqError_lower
+            )
+        },
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            let result = try? FfiConverterCallbackInterfaceEnrollment.handleMap.remove(handle: uniffiHandle)
+            if result == nil {
+                print("Uniffi callback interface Enrollment: handle missing in uniffiFree")
+            }
+        }
+    )]
+}
+
+private func uniffiCallbackInitEnrollment() {
+    uniffi_freeq_sdk_ffi_fn_init_callback_vtable_enrollment(UniffiCallbackInterfaceEnrollment.vtable)
+}
+
+// FfiConverter protocol for callback interfaces
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterCallbackInterfaceEnrollment {
+    fileprivate static let handleMap = UniffiHandleMap<Enrollment>()
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+extension FfiConverterCallbackInterfaceEnrollment : FfiConverter {
+    typealias SwiftType = Enrollment
+    typealias FfiType = UInt64
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lift(_ handle: UInt64) throws -> SwiftType {
+        try handleMap.get(handle: handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lower(_ v: SwiftType) -> UInt64 {
+        return handleMap.insert(obj: v)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func write(_ v: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(v))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceEnrollment_lift(_ handle: UInt64) throws -> Enrollment {
+    return try FfiConverterCallbackInterfaceEnrollment.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceEnrollment_lower(_ v: Enrollment) -> UInt64 {
+    return FfiConverterCallbackInterfaceEnrollment.lower(v)
 }
 
 
@@ -4325,6 +5184,78 @@ fileprivate struct FfiConverterOptionTypeCoordinationEvent: FfiConverterRustBuff
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeCoordinationEvent.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSignatureVerdict: FfiConverterRustBuffer {
+    typealias SwiftType = SignatureVerdict?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSignatureVerdict.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSignatureVerdict.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeStoredDeviceKey: FfiConverterRustBuffer {
+    typealias SwiftType = StoredDeviceKey?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeStoredDeviceKey.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeStoredDeviceKey.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeKeyLayer: FfiConverterRustBuffer {
+    typealias SwiftType = KeyLayer?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeKeyLayer.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeKeyLayer.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -4660,10 +5591,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_send_tagged() != 64231) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_device_key_store() != 37805) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_device_label() != 5878) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_enrollment() != 15684) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_platform() != 50791) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_topic() != 15675) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_verify_signatures() != 22934) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_web_token() != 47149) {
@@ -4744,6 +5687,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_freeq_sdk_ffi_checksum_method_aveventhandler_on_av_event() != 24538) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_freeq_sdk_ffi_checksum_method_devicekeystore_load() != 50674) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_method_devicekeystore_save() != 53549) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_method_enrollment_publish() != 47066) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_freeq_sdk_ffi_checksum_method_eventhandler_on_event() != 8369) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4752,6 +5704,8 @@ private let initializationResult: InitializationResult = {
     }
 
     uniffiCallbackInitAvEventHandler()
+    uniffiCallbackInitDeviceKeyStore()
+    uniffiCallbackInitEnrollment()
     uniffiCallbackInitEventHandler()
     uniffiCallbackInitP2pEventHandler()
     return InitializationResult.ok

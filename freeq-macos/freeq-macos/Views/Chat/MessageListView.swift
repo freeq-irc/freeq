@@ -597,8 +597,8 @@ struct MessageRow: View {
     }
 
     /// The answer, if the reader has already asked about this message.
-    private var checkedVerdict: VerifyAnswer? {
-        appState.checkedVerdicts[message.id]
+    private var checkedVerdict: VerdictInfo? {
+        appState.checkedVerdicts[message.id] ?? message.verdict
     }
 
     /// What this row can honestly claim about its sender — computed by the
@@ -708,7 +708,8 @@ struct MessageRow: View {
                             // nothing. Verification is an explicit action in
                             // the context menu, and only a checked mismatch
                             // shows a marker here.
-                            if checkedVerdict?.marksTheRow == true {
+                            if let rowVerdict = checkedVerdict,
+                               VerdictDisplay.marksTheRow(rowVerdict.kind) {
                                 Button { proofRequest = .verify(message.id) } label: {
                                     Image(systemName: "exclamationmark.shield.fill")
                                         .font(.system(size: 9))
