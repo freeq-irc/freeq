@@ -143,10 +143,6 @@ pub struct BufferLine {
     /// set purely as a marker that an edit was applied (and it equals
     /// `msgid` for lines edited in place).
     pub edit_of: Option<String>,
-    /// The message arrived carrying a client signature (`+freeq.at/sig`): its
-    /// sender signed it on their own device, and the server relayed it
-    /// unchanged. False for server-signed and unsigned traffic alike — the
-    /// marker claims only what the wire actually proved.
     /// The DID the sending server attributes this message to (`account`).
     /// A statement about the sender, not proof of one — `/verify` is what
     /// checks whether the signature agrees with it.
@@ -585,6 +581,11 @@ impl Transport {
     }
 }
 
+/// What the room is told when this device's signing key could not be
+/// published to the account. The TUI has no Settings, so it names the
+/// restart with `--reauth` that signs in again.
+pub const KEY_UNPUBLISHED_LINE: &str = "Your signing key is not published to your account yet. Restart freeq-tui with --reauth to sign in again and publish it.";
+
 pub struct App {
     /// Per-channel E2EE keys, keyed by lowercase channel name.
     /// Derived from passphrase via HKDF-SHA256.
@@ -629,6 +630,10 @@ pub struct App {
     pub history_saved: String,
     /// Media uploader (present when authenticated with PDS session).
     pub media_uploader: Option<MediaUploader>,
+    /// Whether this session has already said that the device key is not
+    /// published. The SDK offers the key again on every connect, so the line
+    /// is said once and not per reconnect.
+    pub told_key_unpublished: bool,
     /// Cache of fetched images for inline rendering.
     pub image_cache: ImageCache,
     /// Image protocol picker (detects terminal capabilities).
@@ -777,6 +782,7 @@ impl App {
             history_pos: None,
             history_saved: String::new(),
             media_uploader: None,
+            told_key_unpublished: false,
             image_cache: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "inline-images")]
             picker: None,
@@ -968,6 +974,16 @@ impl App {
     /// Push a system message to the status buffer.
     pub fn status_msg(&mut self, text: &str) {
         self.buffer_mut("status").push_system(text);
+    }
+
+    /// The line to say when this device's key could not be published, the
+    /// first time it is asked for; `None` every time after.
+    pub fn note_key_unpublished(&mut self) -> Option<&'static str> {
+        if self.told_key_unpublished {
+            return None;
+        }
+        self.told_key_unpublished = true;
+        Some(KEY_UNPUBLISHED_LINE)
     }
 
     /// Push a chat message to the appropriate buffer.
@@ -1296,6 +1312,26 @@ pub fn sanitize_text(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── this device's key ───────────────────────────────────────────────
+
+    #[test]
+    fn the_unpublished_key_line_is_said_once() {
+        let mut app = App::new("me", false);
+        assert_eq!(app.note_key_unpublished(), Some(KEY_UNPUBLISHED_LINE));
+        // The SDK offers the key again on every connect, so a line per
+        // reconnect would read as a new fault each time.
+        assert_eq!(app.note_key_unpublished(), None);
+        assert_eq!(app.note_key_unpublished(), None);
+    }
+
+    #[test]
+    fn the_unpublished_key_line_names_the_reauth_restart() {
+        assert_eq!(
+            KEY_UNPUBLISHED_LINE,
+            "Your signing key is not published to your account yet. Restart freeq-tui with --reauth to sign in again and publish it."
+        );
+    }
 
     fn line_with_msgid(text: &str, msgid: Option<&str>) -> BufferLine {
         line(text, "alice", msgid)
@@ -1680,6 +1716,7 @@ mod tests {
             history_pos: None,
             history_saved: String::new(),
             media_uploader: None,
+            told_key_unpublished: false,
             image_cache: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "inline-images")]
             picker: None,

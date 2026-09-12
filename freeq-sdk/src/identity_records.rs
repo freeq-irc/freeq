@@ -688,6 +688,70 @@ pub fn record_cid(record: &serde_json::Value) -> Result<Cid> {
     Ok(Cid::new_v1(DAG_CBOR, digest))
 }
 
+/// What publishing a record to the account came to.
+#[derive(Debug)]
+pub enum PublishError {
+    /// The account would not take this write from this session: the token is
+    /// spent, or its grant does not cover this collection. Nothing about the
+    /// record is wrong — the user signs in again.
+    NeedsSignIn(String),
+    /// Anything else: the network, the PDS, a record it would not parse.
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for PublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NeedsSignIn(detail) => write!(f, "the account needs a fresh sign-in: {detail}"),
+            Self::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for PublishError {}
+
+/// Write one record into the account's own repository, authenticated by
+/// `session`'s DPoP key, and hand back the `at://` uri the PDS answers with.
+///
+/// The collection is the record's own `$type`, so a caller cannot file a
+/// record under a collection it does not claim to be.
+pub async fn publish_record(
+    session: &crate::oauth::OAuthSession,
+    record: &serde_json::Value,
+) -> std::result::Result<String, PublishError> {
+    let collection = record
+        .get("$type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| PublishError::Failed(anyhow::anyhow!("record has no $type")))?;
+    let body = serde_json::json!({
+        "repo": session.did,
+        "collection": collection,
+        "record": record,
+    });
+    let payload = serde_json::to_vec(&body).map_err(|e| PublishError::Failed(e.into()))?;
+    let mut nonce = session.dpop_nonce.clone();
+    let answer = crate::media::dpop_post(
+        &reqwest::Client::new(),
+        session.pds_url.trim_end_matches('/'),
+        "com.atproto.repo.createRecord",
+        Some(&session.dpop_key),
+        &session.access_token,
+        &mut nonce,
+        None,
+        payload,
+    )
+    .await
+    .map_err(|e| match e.downcast_ref::<crate::media::XrpcRefusal>() {
+        Some(refusal) if refusal.needs_sign_in() => PublishError::NeedsSignIn(refusal.to_string()),
+        _ => PublishError::Failed(e),
+    })?;
+    answer
+        .get("uri")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| PublishError::Failed(anyhow::anyhow!("createRecord answered with no uri")))
+}
+
 /// The one field of a signed commit read here directly; the library keeps
 /// its commit type private.
 #[derive(Deserialize)]
@@ -1169,6 +1233,77 @@ mod tests {
             "vectors": vectors(),
             "folds": folds(),
         })
+    }
+
+    // ─── publishing a record to the account ─────────────────────────────
+
+    fn oauth_session(pds_url: &str) -> crate::oauth::OAuthSession {
+        crate::oauth::OAuthSession {
+            did: ALICE.to_string(),
+            handle: "alice.test".to_string(),
+            access_token: "tok".to_string(),
+            pds_url: pds_url.to_string(),
+            dpop_key: crate::oauth::DpopKey::generate(),
+            dpop_nonce: None,
+            scope: "atproto repo:at.freeq.deviceKey?action=create".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_record_sends_the_record_unchanged_and_answers_its_uri() {
+        use axum::Json;
+        use axum::routing::post;
+        use std::sync::Mutex;
+
+        const URI: &str = "at://did:plc:k2n3e2vsihf3farequ44t5j7/at.freeq.deviceKey/3l";
+        let seen: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let captured = seen.clone();
+        let router = axum::Router::new().route(
+            "/xrpc/com.atproto.repo.createRecord",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = captured.clone();
+                async move {
+                    *captured.lock().unwrap() = Some(body);
+                    Json(json!({ "uri": URI }))
+                }
+            }),
+        );
+        let base = spawn_stub(router).await;
+        let record = value(&build_device_record(&key(1), ALICE, T0, Some("laptop")).unwrap());
+
+        let uri = publish_record(&oauth_session(&base), &record)
+            .await
+            .unwrap();
+
+        assert_eq!(uri, URI);
+        let body = seen.lock().unwrap().clone().expect("the stub was called");
+        assert_eq!(body["repo"], ALICE);
+        // The collection is the record's own `$type`, never a caller's claim.
+        assert_eq!(body["collection"], DEVICE_KEY_TYPE);
+        // The record arrives as it was signed — every field, byte for byte.
+        assert_eq!(body["record"], record);
+    }
+
+    #[tokio::test]
+    async fn a_refused_write_asks_for_a_fresh_sign_in() {
+        use axum::routing::post;
+
+        // The account declining the write is the one outcome the user can do
+        // something about, and it must not read as a network failure.
+        let router = axum::Router::new().route(
+            "/xrpc/com.atproto.repo.createRecord",
+            post(|| async { (StatusCode::UNAUTHORIZED, "insufficient_scope") }),
+        );
+        let base = spawn_stub(router).await;
+        let record = value(&build_device_record(&key(1), ALICE, T0, None).unwrap());
+
+        let err = publish_record(&oauth_session(&base), &record)
+            .await
+            .expect_err("a 401 is a refusal");
+        assert!(
+            matches!(err, PublishError::NeedsSignIn(_)),
+            "expected a sign-in error, got: {err}"
+        );
     }
 
     /// Regenerate spec/identity-record-vectors.json. Run manually:

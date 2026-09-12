@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 freeq-sdk = { path = "../freeq-sdk" }
+freeq-oauth = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

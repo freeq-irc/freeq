@@ -2948,6 +2948,7 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs 5.0.1",
+ "freeq-oauth",
  "freeq-sdk",
  "hex",
  "image",
