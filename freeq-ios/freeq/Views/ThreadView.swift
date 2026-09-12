@@ -125,7 +125,8 @@ struct ThreadView: View {
                                             // Only a checked mismatch marks a
                                             // row; verification is asked for
                                             // from the context menu.
-                                            if appState.checkedVerdicts[msg.id]?.marksTheRow == true {
+                                            if let rowVerdict = appState.checkedVerdicts[msg.id] ?? msg.verdict,
+                                               VerdictDisplay.marksTheRow(rowVerdict.kind) {
                                                 Button {
                                                     proofTarget = .verify(msg)
                                                 } label: {

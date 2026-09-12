@@ -38,6 +38,9 @@ struct ChatMessage: Identifiable, Equatable {
     // The task a companion line names (`+freeq.at/ref`). The only thing
     // joining a line to the act event it was written beside.
     var actRef: String? = nil
+    // What the SDK made of this line's signature, checked on this device.
+    // nil until the check settles; a verdict event replaces a pending one.
+    var verdict: VerdictInfo? = nil
     // Whether this row's task card is ready to draw. The card itself lives in
     // ChannelState.actCards; this bit rides on the row so `renderKey` changes
     // when the card arrives — an in-place update of a same-identity row has

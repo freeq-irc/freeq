@@ -1,158 +1,118 @@
 import XCTest
 @testable import FreeqIosCore
 
-/// The proof sheet's data layer: reading `/api/v1/verify/{msgid}` and
-/// `/api/v1/signing-keys/{did}`, and the answers those readings are allowed to
-/// give. The wording is fleet-wide and agreed line by line — these tests pin
-/// the distinctions, not the prose style.
+/// What a verdict is allowed to claim, and the words it wears.
+///
+/// The check itself is the SDK's and its own vectors cover it. What these pin
+/// is the app's side: every state carries the SDK's sentence unaltered, only
+/// sender proof is spoken about in green, and only a signature that was found
+/// and did not hold marks a row. Alongside them, the two decisions about this
+/// device's own key that need neither the Keychain nor the bindings.
 final class SignatureProofTests: XCTestCase {
 
-    private func body(_ json: String) -> Data { Data(json.utf8) }
-
-    // MARK: - Parsing
-
-    func testClientSessionKeyIsDeviceProof() {
-        let a = SignatureVerdict.parse(status: 200, body: body(
-            #"{"verification":{"verdict":"valid","verified_by":"client-session-key"}}"#))
-        XCTAssertEqual(a.outcome, .device)
-        XCTAssertTrue(a.isVerified)
+    private func verdict(
+        _ kind: VerdictKind,
+        sentence: String = "the sentence the SDK gave",
+        layer: VerdictLayer? = nil
+    ) -> VerdictInfo {
+        VerdictInfo(kind: kind, layer: layer, kid: "kid", keySource: nil, sentence: sentence)
     }
 
-    func testServerKeyIsAVouchNotDeviceProof() {
-        let a = SignatureVerdict.parse(status: 200, body: body(
-            #"{"verification":{"verdict":"valid","verified_by":"server-key"}}"#))
-        XCTAssertEqual(a.outcome, .server)
-        XCTAssertFalse(a.isVerified, "the server vouching is not the sender proving")
+    // MARK: - The words
+
+    func testEveryStateShowsTheSentenceTheSdkGaveIt() {
+        // The words live in spec/verdict-model.json and reach this client
+        // through the FFI, so no platform words its own and no state is left
+        // without one.
+        for kind in VerdictKind.allCases {
+            let v = verdict(kind, sentence: "sentence for \(kind.rawValue)")
+            XCTAssertEqual(VerdictDisplay.copy(v).line, "sentence for \(kind.rawValue)")
+        }
     }
 
-    func testInvalidIsItsOwnAnswer() {
-        let a = SignatureVerdict.parse(status: 200, body: body(
-            #"{"verification":{"verdict":"invalid","verified_by":"client-session-key"}}"#))
-        XCTAssertEqual(a.outcome, .invalid)
-        XCTAssertTrue(a.marksTheRow, "only a mismatch marks a row")
+    func testTheLayerADeviceSignatureRestsOnRidesAlong() {
+        let vouched = verdict(
+            .device,
+            sentence: "Signed on the sender’s device. Key vouched for by their server.",
+            layer: .vouched
+        )
+        XCTAssertEqual(vouched.layer, .vouched)
+        XCTAssertEqual(
+            VerdictDisplay.copy(vouched).line,
+            "Signed on the sender’s device. Key vouched for by their server."
+        )
     }
 
-    func testUnsignedIsNotAFailedCheck() {
-        let a = SignatureVerdict.parse(status: 200, body: body(
-            #"{"verification":{"verdict":"unverifiable","verified_by":"unsigned"}}"#))
-        XCTAssertEqual(a.outcome, .unsigned)
-        XCTAssertFalse(a.marksTheRow)
-    }
-
-    func testUnknownKeyIsTransient() {
-        let a = SignatureVerdict.parse(status: 200, body: body(
-            #"{"verification":{"verdict":"unverifiable","verified_by":"unverifiable-unknown-key"}}"#))
-        XCTAssertEqual(a.outcome, .unverifiable)
-        XCTAssertTrue(a.transient, "answering the request is what starts the key fetch")
-        XCTAssertFalse(SignatureVerdict.worthCaching(a))
-    }
-
-    func testOtherUnverifiableIsFinal() {
-        let a = SignatureVerdict.parse(status: 200, body: body(
-            #"{"verification":{"verdict":"unverifiable","verified_by":"retired-format"}}"#))
-        XCTAssertEqual(a.outcome, .unverifiable)
-        XCTAssertFalse(a.transient)
-        XCTAssertTrue(SignatureVerdict.worthCaching(a))
-    }
-
-    /// An older server answers with a boolean only. Its `false` means "could
-    /// not confirm", which is not an accusation.
-    func testLegacyBooleanTrueIsRead() {
-        let a = SignatureVerdict.parse(status: 200, body: body(
-            #"{"verification":{"valid":true,"verified_by":"client-session-key"}}"#))
-        XCTAssertEqual(a.outcome, .device)
-    }
-
-    func testLegacyBooleanFalseIsNotAnAccusation() {
-        let a = SignatureVerdict.parse(status: 200, body: body(
-            #"{"verification":{"valid":false,"verified_by":"server-key"}}"#))
-        XCTAssertEqual(a.outcome, .unverifiable)
-        XCTAssertNotEqual(a.outcome, .invalid)
-    }
-
-    func testNullVerificationIsACantCheck() {
-        let a = SignatureVerdict.parse(status: 200, body: body(#"{"verification":null}"#))
-        XCTAssertEqual(a.outcome, .unverifiable)
-    }
-
-    func testNotFoundIsACantCheck() {
-        XCTAssertEqual(SignatureVerdict.parse(status: 404, body: nil).outcome, .unverifiable)
-    }
-
-    /// A 5xx means the check never happened — saying "could not be checked
-    /// here" would claim the server considered it.
-    func testServerErrorIsUnreachable() {
-        let a = SignatureVerdict.parse(status: 503, body: nil)
-        XCTAssertEqual(a.outcome, .unreachable)
-        XCTAssertFalse(SignatureVerdict.worthCaching(a), "a failed check deserves a fresh try")
-    }
-
-    func testGarbageBodyIsACantCheck() {
-        XCTAssertEqual(SignatureVerdict.parse(status: 200, body: body("not json")).outcome,
-                       .unverifiable)
+    func testEveryAnswerSaysWhatItIsAndWhatItMeans() {
+        for kind in VerdictKind.allCases {
+            let copy = VerdictDisplay.copy(verdict(kind))
+            XCTAssertFalse(copy.heading.isEmpty, "\(kind)")
+            XCTAssertFalse(copy.line.isEmpty, "\(kind)")
+            // The heading is the answer, not a restatement of the line.
+            XCTAssertNotEqual(copy.heading, copy.line, "\(kind)")
+        }
     }
 
     // MARK: - What each answer is allowed to claim
 
-    /// The 2026-08-07 ruling: valid is not verified. A server-key outcome
-    /// never wears the word, and never wears success styling.
-    func testServerVouchNeverClaimsVerified() {
-        let copy = SignatureVerdict.copy(VerifyAnswer(outcome: .server))
-        XCTAssertFalse(copy.heading.contains("Verified"))
-        XCTAssertFalse(copy.line.contains("Verified"))
-        XCTAssertEqual(SignatureVerdict.tone(.server), .quiet)
-    }
-
-    func testOnlyDeviceProofIsGreen() {
-        XCTAssertEqual(SignatureVerdict.tone(.device), .good)
-        XCTAssertEqual(SignatureVerdict.copy(VerifyAnswer(outcome: .device)).heading, "Verified")
-    }
-
-    func testOnlyAMismatchIsRed() {
-        XCTAssertEqual(SignatureVerdict.tone(.invalid), .bad)
-        for outcome: VerifyOutcome in [.server, .unsigned, .unverifiable, .unreachable] {
-            XCTAssertEqual(SignatureVerdict.tone(outcome), .quiet,
-                           "\(outcome) is a fact, never a warning")
+    func testOnlySenderProofGetsTheSuccessTone() {
+        XCTAssertEqual(VerdictDisplay.tone(.device), .good)
+        XCTAssertEqual(VerdictDisplay.heading(.device), "Verified")
+        // Valid is not verified: the server vouching for what it received is
+        // a fact about the server, not proof from the sender.
+        XCTAssertEqual(VerdictDisplay.tone(.server), .quiet)
+        XCTAssertFalse(VerdictDisplay.heading(.server).contains("Verified"))
+        for kind: VerdictKind in [.invalid, .retired] {
+            XCTAssertEqual(VerdictDisplay.tone(kind), .bad, "\(kind)")
+        }
+        for kind: VerdictKind in [.unsigned, .unverifiable, .pending] {
+            XCTAssertEqual(VerdictDisplay.tone(kind), .quiet, "\(kind) is a fact, never a warning")
         }
     }
 
-    func testCantCheckDoesNotReadAsAFault() {
-        let copy = SignatureVerdict.copy(VerifyAnswer(outcome: .unverifiable))
-        XCTAssertEqual(copy.heading, "Signature Not Supported")
-        XCTAssertFalse(copy.line.lowercased().contains("suspicion"))
+    func testOnlyASignatureThatDidNotHoldMarksTheRow() {
+        // Signing is the default state of a message and a default earns no
+        // ink; a signature made after its key was retired is an invalid one.
+        XCTAssertTrue(VerdictDisplay.marksTheRow(.invalid))
+        XCTAssertTrue(VerdictDisplay.marksTheRow(.retired))
+        for kind in VerdictKind.allCases where kind != .invalid && kind != .retired {
+            XCTAssertFalse(VerdictDisplay.marksTheRow(kind), "\(kind) must not mark the row")
+        }
     }
 
-    func testUnreachableBlamesTheNetworkNotTheMessage() {
-        let copy = SignatureVerdict.copy(VerifyAnswer(outcome: .unreachable))
-        XCTAssertEqual(copy.heading, "Unable to Verify")
-        XCTAssertTrue(copy.line.contains("couldn't reach the server"))
+    func testAnUnsignedMessageIsNotAFailedCheck() {
+        XCTAssertEqual(VerdictDisplay.heading(.unsigned), "Unsigned")
+        XCTAssertEqual(VerdictDisplay.tone(.unsigned), .quiet)
     }
 
-    func testUnsignedSaysThereIsNothingToCheck() {
-        let copy = SignatureVerdict.copy(VerifyAnswer(outcome: .unsigned))
-        XCTAssertEqual(copy.heading, "Unsigned")
-        XCTAssertTrue(copy.line.contains("Nothing was signed"))
+    // MARK: - This device's key
+
+    func testARefusalAsksForASignInAndTellsTheRoomOnce() {
+        XCTAssertEqual(EnrollAnswer.kind(status: 401), .needsSignIn)
+        XCTAssertEqual(EnrollAnswer.kind(status: 402), .needsSignIn)
+        XCTAssertEqual(EnrollAnswer.kind(status: 403), .needsSignIn)
+
+        // Nothing here touches the connection: the only thing a refusal
+        // produces is the line, and only the first time.
+        let notice = SigningKeyNotice()
+        XCTAssertEqual(notice.next(), SigningKeyNotice.line)
+        XCTAssertNil(notice.next())
+        XCTAssertNil(notice.next())
     }
 
-    /// The fetching-a-key answer shows only while the surface will actually
-    /// re-ask; once it stops, it decays into the plain can't-check.
-    func testCheckingAnswerOnlyWhileRetrying() {
-        let transient = VerifyAnswer(outcome: .unverifiable, transient: true)
-        XCTAssertEqual(SignatureVerdict.copy(transient, retrying: true).heading,
-                       "Verification in Progress")
-        XCTAssertEqual(SignatureVerdict.copy(transient, retrying: false).heading,
-                       "Signature Not Supported")
+    func testTheLineNamesTheOneThingLeftToDo() {
+        XCTAssertEqual(
+            SigningKeyNotice.line,
+            "Your signing key is not published to your account yet. Open Settings to publish it."
+        )
     }
 
-    // MARK: - SigningKeyInfo
-
-    func testParsesSigningKeyWithDefaults() {
-        let k = SigningKeyInfo.from(json: ["public_key": "z6Mk..."])
-        XCTAssertEqual(k?.publicKey, "z6Mk...")
-        XCTAssertEqual(k?.algorithm, "ed25519")
-    }
-
-    func testMissingPublicKeyYieldsNil() {
-        XCTAssertNil(SigningKeyInfo.from(json: ["algorithm": "ed25519"]))
+    func testAWriteThatLandedIsPublishedAndEveryFaultIsAFailure() {
+        XCTAssertEqual(EnrollAnswer.kind(status: 200), .published)
+        // A fault at the broker or the PDS is not the user's to fix; a network
+        // failure arrives as status 0 and is the same kind of silence.
+        for status in [0, 400, 404, 500, 502, 504] {
+            XCTAssertEqual(EnrollAnswer.kind(status: status), .failed, "\(status)")
+        }
     }
 }

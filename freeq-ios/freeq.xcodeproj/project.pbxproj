@@ -11,6 +11,7 @@
 		01D41E49B028B8FA6868268C /* ChannelCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7F95757B1DFF9633B574E18 /* ChannelCrypto.swift */; };
 		022C97385E4C6E436BF8FA82 /* JoinChannelSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F2B162069D9FEB43A008621 /* JoinChannelSheet.swift */; };
 		02AB33740D36A2AA483B8980 /* NewDMSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22B90ADE5391CABDCBEF6FF3 /* NewDMSheet.swift */; };
+		032C504DA71AE1A17074B587 /* DeviceKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F77023977A184536BD10F2E /* DeviceKey.swift */; };
 		0707953E63730121B32C90F1 /* freeqApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = D10926193239F585762C38F1 /* freeqApp.swift */; };
 		0D90DB6A860ED297CC10A2CF /* CallView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1613B43E3F87D0A8567A57BB /* CallView.swift */; };
 		0DA768C09CA8CC7B361234E4 /* FavoritesSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3E5226D9C982E6895916387C /* FavoritesSync.swift */; };
@@ -33,6 +34,7 @@
 		2ACA35D908CFA2C3F6A1B064 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = CAB74C30074754BEE8F190DE /* PrivacyInfo.xcprivacy */; };
 		2BE87DF57370DD8D23D5857C /* MessageActions.swift in Sources */ = {isa = PBXBuildFile; fileRef = C24850A65B3ED49F5C323EEA /* MessageActions.swift */; };
 		2DAA75F33F0F0DF1E697A19A /* WatchSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 893A3A695627ED14710AD125 /* WatchSession.swift */; };
+		3172C9FCC66BCA2972617E88 /* DeviceKeyNotice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61A5319E5E11AFE2A0A44C43 /* DeviceKeyNotice.swift */; };
 		328A732022FC49EB4D04542C /* ToastView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E434E1E24A88662FBDFFCA35 /* ToastView.swift */; };
 		3388DF50A1619B493BB018C1 /* CallControlIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40EA2E012985430B01C97EBC /* CallControlIntents.swift */; };
 		33F2DF2666D58E3874E4B4C9 /* WatchKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = ED2B936BFFD2FB65A3BBA961 /* WatchKit.framework */; };
@@ -218,6 +220,7 @@
 		5DDE25216F85C26CCEE21C66 /* NetworkMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkMonitor.swift; sourceTree = "<group>"; };
 		5E30BF0C98AC2E9B7A006E95 /* SplitRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SplitRootView.swift; sourceTree = "<group>"; };
 		607BA33EFE4FD90620B86761 /* PresenceDot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceDot.swift; sourceTree = "<group>"; };
+		61A5319E5E11AFE2A0A44C43 /* DeviceKeyNotice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceKeyNotice.swift; sourceTree = "<group>"; };
 		6283782A8FA9C9B10BEE7C3E /* ChannelE2eeState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelE2eeState.swift; sourceTree = "<group>"; };
 		63ACD9737CE3436EDC7981E3 /* ActTasks.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActTasks.swift; sourceTree = "<group>"; };
 		652094AB12E394FEA901DE7E /* AudioToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AudioToolbox.framework; path = System/Library/Frameworks/AudioToolbox.framework; sourceTree = SDKROOT; };
@@ -247,6 +250,7 @@
 		88E010DFF61E21BE28AF989C /* FreeqIntents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FreeqIntents.swift; sourceTree = "<group>"; };
 		88F30B75033F6333978D7F0E /* PeopleView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeopleView.swift; sourceTree = "<group>"; };
 		893A3A695627ED14710AD125 /* WatchSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchSession.swift; sourceTree = "<group>"; };
+		8F77023977A184536BD10F2E /* DeviceKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceKey.swift; sourceTree = "<group>"; };
 		908FF04F8C100160DE7BABD5 /* StatusEditorSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusEditorSheet.swift; sourceTree = "<group>"; };
 		90CFA49BA9803132D1A9979D /* AvMediaFlowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AvMediaFlowTests.swift; sourceTree = "<group>"; };
 		91D4028719D43D3BBF97FA82 /* SpotlightIndexer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpotlightIndexer.swift; sourceTree = "<group>"; };
@@ -475,6 +479,8 @@
 				5CA24DC11B2BF464C7175F93 /* ChannelState.swift */,
 				F48AA8A24FB24A8AC4F30461 /* ChatMessage.swift */,
 				F04E1A3210EB33E4454CE74D /* CoordinationCard.swift */,
+				8F77023977A184536BD10F2E /* DeviceKey.swift */,
+				61A5319E5E11AFE2A0A44C43 /* DeviceKeyNotice.swift */,
 				DA678EF1B2762175E6668C55 /* DidDisplay.swift */,
 				6ED301BD44C5DB63F6430B53 /* DmHistoryOnOpen.swift */,
 				4CDE9B1546F27B7DC72AA1A5 /* DmResolver.swift */,
@@ -797,6 +803,8 @@
 				B198511552ED975806FF24E9 /* ContentView.swift in Sources */,
 				1BD7A46E4BD6D8A4BE35029A /* CoordinationCard.swift in Sources */,
 				B41304C5131C07D3928E5596 /* CoordinationCardView.swift in Sources */,
+				032C504DA71AE1A17074B587 /* DeviceKey.swift in Sources */,
+				3172C9FCC66BCA2972617E88 /* DeviceKeyNotice.swift in Sources */,
 				4047D67A42E04325ACEFECDA /* DidDisplay.swift in Sources */,
 				F5578CDEA68BCCE1C35408EF /* DiscoverTab.swift in Sources */,
 				4D5006848D66CA9FF16B2680 /* DmHistoryOnOpen.swift in Sources */,

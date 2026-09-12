@@ -29,15 +29,7 @@ struct VerifiedProofSheet: View {
 
     @EnvironmentObject var appState: AppState
     @Environment(\.dismiss) var dismiss
-    @State private var key: SigningKeyInfo? = nil
-    @State private var loadingKey = true
     @State private var copied = false
-    @State private var answer: VerifyAnswer? = nil
-    @State private var verifying = false
-    @State private var retriesLeft = VerifiedProofSheet.maxRetries
-
-    private static let maxRetries = 2
-    private static let retryDelay: UInt64 = 1_200_000_000
 
     private var claim: IdentityClaim {
         claimForSender(
@@ -79,15 +71,12 @@ struct VerifiedProofSheet: View {
         .presentationDetents([.medium, .large])
         .presentationBackground(.ultraThinMaterial)
         .task {
-            if msgId == nil {
-                // If we can't name them yet, ask — otherwise this sheet
-                // would answer "unknown" without anyone having asked.
-                if claim.did == nil, origin == nil, let nick {
-                    appState.lookUpIdentity(nick: nick)
-                }
-                await loadKey()
+            // If we can't name them yet, ask — otherwise this sheet would
+            // answer "unknown" without anyone having asked. Nothing else is
+            // fetched: the signature was checked when the line landed.
+            if msgId == nil, claim.did == nil, origin == nil, let nick {
+                appState.lookUpIdentity(nick: nick)
             }
-            if verdictMsgId != nil { await loadVerification() }
         }
     }
 
@@ -111,9 +100,7 @@ struct VerifiedProofSheet: View {
             }
         }
 
-        // The key-naming sentences render only while a key is present or
-        // still loading — a sentence pointing at a missing card is a lie.
-        if !claim.needsKeyCard || key != nil || loadingKey, let line = claim.line {
+        if let line = claim.line {
             Text(line)
                 .font(.fqSubheadline)
                 .foregroundColor(Theme.textSecondary)
@@ -132,19 +119,6 @@ struct VerifiedProofSheet: View {
             )
         }
 
-        if let key {
-            proofCard(
-                label: "Message signing key",
-                icon: "signature",
-                value: key.publicKey,
-                // Algorithm only — trust language belongs to the verdict.
-                detail: key.algorithm.uppercased(),
-                copyable: false
-            )
-        } else if loadingKey && claim.did != nil {
-            ProgressView().tint(Theme.textMuted).padding(.vertical, 8)
-        }
-
         // Opened from a message row: that row's own verdict, beneath the
         // identity it anchors — the verdict is never visually overridden.
         if msgId == nil, verdictMsgId != nil {
@@ -156,37 +130,51 @@ struct VerifiedProofSheet: View {
     // ── Message: one signature's checked answer, and nothing else. ──
 
     @ViewBuilder private var messageProof: some View {
-        let copy = answer.map { SignatureVerdict.copy($0, retrying: retriesLeft > 0) }
+        // Nothing is fetched here. The check was made on this device when the
+        // line landed; a verdict that took a moment to settle replaces it in
+        // place, so the later of the two is the answer.
+        let settled = verdictMsgId.flatMap { appState.checkedVerdicts[$0] }
+        let carriesSignature = msgId == nil ? rowSigned : signed
+        let checking = settled?.kind == .pending || (settled == nil && carriesSignature)
         VStack(spacing: Theme.Space.md) {
-            if verifying || answer == nil {
+            if checking {
                 ProgressView().tint(Theme.textMuted).padding(.top, 8)
             } else {
                 ZStack {
                     Circle()
-                        .fill(verdictColor.opacity(0.14))
+                        .fill(verdictColor(settled).opacity(0.14))
                         .frame(width: 72, height: 72)
                         .blur(radius: 10)
-                    Image(systemName: verdictIcon)
+                    Image(systemName: verdictIcon(settled))
                         .font(.system(size: 44, weight: .semibold))
-                        .foregroundStyle(verdictColor)
+                        .foregroundStyle(verdictColor(settled))
                 }
             }
-            Text(copy?.heading ?? "Checking signature…")
+            Text(heading(settled, carriesSignature: carriesSignature))
                 .font(.fqTitle3.weight(.bold))
                 .foregroundColor(Theme.textPrimary)
                 .multilineTextAlignment(.center)
-            Text(copy?.line ?? "Asking the server whether this message's signature holds up.")
-                .font(.fqSubheadline)
-                .foregroundColor(answer == nil ? Theme.textSecondary : verdictColor)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, 8)
+            // The sentence is the SDK's — the same words every freeq client
+            // shows for this state.
+            if let settled {
+                Text(settled.sentence)
+                    .font(.fqSubheadline)
+                    .foregroundColor(verdictColor(settled))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 8)
+            }
         }
     }
 
-    private var verdictIcon: String {
-        guard let answer else { return "shield" }
-        switch SignatureVerdict.tone(answer.outcome) {
+    private func heading(_ verdict: VerdictInfo?, carriesSignature: Bool) -> String {
+        if let verdict { return VerdictDisplay.heading(verdict.kind) }
+        return carriesSignature ? "Checking signature…" : VerdictDisplay.heading(.unsigned)
+    }
+
+    private func verdictIcon(_ verdict: VerdictInfo?) -> String {
+        guard let verdict else { return "shield" }
+        switch VerdictDisplay.tone(verdict.kind) {
         case .good: return "checkmark.shield.fill"
         case .bad: return "exclamationmark.shield.fill"
         case .quiet: return "shield"
@@ -195,9 +183,9 @@ struct VerifiedProofSheet: View {
 
     /// Colour follows the tone: green is sender-device proof alone, red is a
     /// mismatch alone, every can't-know is quiet — a fact, not a warning.
-    private var verdictColor: Color {
-        guard let answer else { return Theme.textMuted }
-        switch SignatureVerdict.tone(answer.outcome) {
+    private func verdictColor(_ verdict: VerdictInfo?) -> Color {
+        guard let verdict else { return Theme.textMuted }
+        switch VerdictDisplay.tone(verdict.kind) {
         case .good: return Theme.verify
         case .bad: return Theme.warning
         case .quiet: return Theme.textSecondary
@@ -262,58 +250,4 @@ struct VerifiedProofSheet: View {
         .glassCard(.thin)
     }
 
-    /// Ask the server to check this message's signature and report exactly
-    /// what came back. The one can't-check a retry can outrun is a key on
-    /// another server — answering the request is what starts the fetch.
-    private func loadVerification() async {
-        guard let target = verdictMsgId else { return }
-        guard msgId == nil ? rowSigned : signed else {
-            answer = VerifyAnswer(outcome: .unsigned)
-            retriesLeft = 0
-            return
-        }
-        if let remembered = appState.checkedVerdicts[target] {
-            answer = remembered
-            retriesLeft = 0
-            return
-        }
-        while true {
-            verifying = true
-            let result = await Self.check(msgId: target)
-            verifying = false
-            answer = result
-            if SignatureVerdict.worthCaching(result) {
-                appState.checkedVerdicts[target] = result
-            }
-            guard result.transient, retriesLeft > 0 else { break }
-            retriesLeft -= 1
-            try? await Task.sleep(nanoseconds: Self.retryDelay)
-        }
-        retriesLeft = 0
-    }
-
-    private static func check(msgId: String) async -> VerifyAnswer {
-        let base = ServerConfig.apiBaseUrl
-        let enc = msgId.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? msgId
-        guard let url = URL(string: "\(base)/api/v1/verify/\(enc)") else {
-            return VerifyAnswer(outcome: .unreachable)
-        }
-        guard let (data, response) = try? await URLSession.shared.data(from: url),
-              let http = response as? HTTPURLResponse else {
-            return VerifyAnswer(outcome: .unreachable)
-        }
-        return SignatureVerdict.parse(status: http.statusCode, body: data)
-    }
-
-    private func loadKey() async {
-        guard let did = claim.did else { loadingKey = false; return }
-        defer { loadingKey = false }
-        let base = ServerConfig.apiBaseUrl
-        let enc = did.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? did
-        guard let url = URL(string: "\(base)/api/v1/signing-keys/\(enc)") else { return }
-        guard let (data, response) = try? await URLSession.shared.data(from: url),
-              (response as? HTTPURLResponse)?.statusCode == 200,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-        key = SigningKeyInfo.from(json: json)
-    }
 }

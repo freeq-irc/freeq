@@ -743,7 +743,8 @@ struct MessageListView: View {
                             // nothing. Verification is an explicit action in
                             // the context menu; only a checked mismatch marks
                             // the row.
-                            if appState.checkedVerdicts[msg.id]?.marksTheRow == true {
+                            if let rowVerdict = appState.checkedVerdicts[msg.id] ?? msg.verdict,
+                               VerdictDisplay.marksTheRow(rowVerdict.kind) {
                                 Button {
                                     UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
                                     proofTarget = .verify(msg)

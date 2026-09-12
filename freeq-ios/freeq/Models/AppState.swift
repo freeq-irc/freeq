@@ -63,6 +63,11 @@ private struct CachedMessage: Codable {
     // Android's buffer cache stores. Same reason as `actRef`: a cached
     // delegation_notice or status_update that lost it renders as plain text.
     let coordination: CoordinationInfo?
+    // What this device concluded about the signature. Kept whole, sentence
+    // included: dedup on hydrate keeps the cached copy over the one history
+    // replays, so a verdict left behind is one the reader never gets back —
+    // including the mark an invalid signature earned.
+    let verdict: VerdictInfo?
 
     init(_ m: ChatMessage) {
         self.id = m.id
@@ -79,6 +84,7 @@ private struct CachedMessage: Codable {
         self.account = m.account
         self.actRef = m.actRef
         self.coordination = m.coordination
+        self.verdict = m.verdict
     }
 
     func toChatMessage() -> ChatMessage {
@@ -92,6 +98,7 @@ private struct CachedMessage: Codable {
         m.account = account
         m.actRef = actRef
         m.coordination = coordination
+        m.verdict = verdict
         return m
     }
 }
@@ -114,7 +121,10 @@ enum BufferCacheStore {
     // 3: a companion line's task reference and the row's coordination event
     //    joined the cached fields — a cache written without them can never
     //    draw its cards, so the old shape is discarded rather than read.
-    static let version = 3
+    // 4: the signature verdict joined them, for the same reason — a restored
+    //    row shadows the copy history replays, so a verdict left behind is one
+    //    the reader never gets back, mark and all.
+    static let version = 4
     static let maxMessagesPerBuffer = 50
 
     static func cacheURL() -> URL? {
@@ -379,7 +389,7 @@ class AppState: ObservableObject {
     /// Signature answers the reader has already asked for, by message id.
     /// A settled answer is the same every time; only a checked mismatch
     /// marks a row, so this is also what the row marker reads.
-    @Published var checkedVerdicts: [String: VerifyAnswer] = [:]
+    @Published var checkedVerdicts: [String: VerdictInfo] = [:]
 
     /// Nicks the server answered with "no such nick". They are not guests —
     /// nobody is holding the name, so there is nobody to have an account.
@@ -1278,6 +1288,64 @@ class AppState: ObservableObject {
     /// re-evaluate `hasSavedSession` and flip the root UI between
     /// MainTabView and ConnectView.
     @Published var brokerToken: String? = nil
+
+    /// This device's signing key, kept in the Keychain. One key per device, so
+    /// it outlives a session and a reader can learn it once.
+    let deviceKeyStore = KeychainDeviceKeyStore()
+
+    /// Said once per session, never on a loop.
+    private let signingKeyNotice = SigningKeyNotice()
+
+    /// True while this device's key is not published to the account. Drives
+    /// the dot on Settings; messages keep sending either way.
+    @Published var signingKeyUnpublished = false
+
+    /// The handle this account signed in under, saved at login. The broker's
+    /// login resolves a handle and will not take a DID, so the sign-in that
+    /// Settings starts needs it.
+    var accountHandle: String? { UserDefaults.standard.string(forKey: "freeq.handle") }
+
+    /// The account would not take this device's key. The key stays and keeps
+    /// signing — the room is told once, and Settings keeps the state.
+    func noteSigningKeyUnpublished() {
+        signingKeyUnpublished = true
+        if let line = signingKeyNotice.next() {
+            Task { @MainActor in
+                ToastManager.shared.show(line, icon: "key.slash")
+            }
+        }
+    }
+
+    /// File what the SDK said about one line, so the row and the proof sheet
+    /// read one answer and a late verdict replaces it in place.
+    func recordVerdict(msgId: String, verdict: VerdictInfo?) {
+        guard let verdict, !msgId.isEmpty else { return }
+        checkedVerdicts[msgId] = verdict
+    }
+
+    /// The FFI's verdict as the rows carry it. Mirrors what the generated
+    /// bindings hand over, sentence included, so the models stay free of them.
+    static func verdictInfo(from v: SignatureVerdict) -> VerdictInfo {
+        let kind: VerdictKind
+        switch v.state {
+        case .device: kind = .device
+        case .server: kind = .server
+        case .unsigned: kind = .unsigned
+        case .unverifiable: kind = .unverifiable
+        case .invalid: kind = .invalid
+        case .retired: kind = .retired
+        case .pending: kind = .pending
+        }
+        let layer: VerdictLayer?
+        switch v.layer {
+        case .some(.vouched): layer = .vouched
+        case .some(.published): layer = .published
+        case .none: layer = nil
+        }
+        return VerdictInfo(
+            kind: kind, layer: layer, kid: v.kid, keySource: v.keySource, sentence: v.sentence
+        )
+    }
     /// Cached web-token + expiry (reuse across reconnects within TTL)
     fileprivate var cachedWebToken: String? = nil
     fileprivate var cachedWebTokenExpiry: Date = .distantPast
@@ -1497,6 +1565,10 @@ class AppState: ObservableObject {
             for msg in cb.messages.map({ $0.toChatMessage() })
                 .sorted(by: ChatMessage.replayOrder) {
                 buffer.appendIfNew(msg)
+                // The verdict this row was shown with. Dedup on replay keeps
+                // the cached copy, so without this a checked signature — the
+                // mark an invalid one earned included — would be lost.
+                recordVerdict(msgId: msg.id, verdict: msg.verdict)
             }
             // The most recent cached message sets a reasonable lastActivity
             // so the sidebar sort order on cold launch matches what the user
@@ -1717,6 +1789,20 @@ class AppState: ObservableObject {
                 try client?.setWebToken(token: token)
                 pendingWebToken = nil
             }
+
+            // This device's key, and the way it reaches the account. Both are
+            // set before connect and neither blocks it: a key that cannot be
+            // published still signs every message this session sends.
+            try client?.setDeviceKeyStore(store: deviceKeyStore)
+            try client?.setEnrollment(enrollment: BrokerEnrollment(
+                brokerBase: { [base = authBrokerBase] in base },
+                brokerToken: { [token = brokerToken] in token }
+            ))
+            try client?.setDeviceLabel(label: UIDevice.current.model)
+            try client?.setVerifySignatures(on: true)
+            // A key that made it to the account clears the dot; nothing else
+            // does, so a refusal stays visible until it is fixed.
+            if deviceKeyStore.isPublished { signingKeyUnpublished = false }
 
             try client?.connect()
             print("[freeq.connect] client?.connect() returned")
@@ -2700,6 +2786,9 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
             // A task event rides as a TAGMSG, so it names its venue the way
             // every other TAGMSG does. The SDK has already read the tags and
             // dropped the repeats a joiner is handed.
+            state.recordVerdict(
+                msgId: act.eventId, verdict: act.verdict.map(AppState.verdictInfo(from:))
+            )
             let actSelf = state.isSelfSender(nick: act.from, account: act.did)
             let venue = act.target.hasPrefix("#")
                 ? act.target
@@ -2735,6 +2824,17 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                         .map { Date(timeIntervalSince1970: Double($0) / 1000.0) } ?? Date(),
                     replyTo: nil))
             }
+
+        // The account would not take this device's key. Nothing about the
+        // connection changes: the session stays up and keeps signing with that
+        // key, and the room is told once.
+        case .signingKeyUnpublished:
+            state.noteSigningKeyUnpublished()
+
+        // A signature whose key took a moment to find. The line was delivered
+        // already; this settles what it says.
+        case .verdict(let msgid, let verdict):
+            state.recordVerdict(msgId: msgid, verdict: AppState.verdictInfo(from: verdict))
 
         case .connected:
             print("[freeq.event] .connected")
@@ -2952,8 +3052,12 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                 // The task this line was written beside, when it names one.
                 // Its card is drawn once the matching act event arrives.
                 actRef: ircMsg.tags.first(where: { $0.key == "+freeq.at/ref" })?.value,
+                // What the SDK made of this line's signature, checked on this
+                // device when the line landed.
+                verdict: ircMsg.verdict.map(AppState.verdictInfo(from:)),
                 reactions: initialReactions
             )
+            state.recordVerdict(msgId: msg.id, verdict: msg.verdict)
 
             // Handle edits
             if let editOf = ircMsg.editOf {

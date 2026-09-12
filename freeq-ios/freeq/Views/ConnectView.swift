@@ -343,7 +343,9 @@ struct ConnectView: View {
 
         let serverBase = appState.authBrokerBase
         let returnTo = "\(ServerConfig.apiBaseUrl)/auth/mobile".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        let loginURL = "\(serverBase)/auth/login?handle=\(handle.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? handle)&mobile=1&return_to=\(returnTo)"
+        // `intent=enroll` asks the account for permission to write this
+        // device's key records, on top of the identity-only default.
+        let loginURL = "\(serverBase)/auth/login?handle=\(handle.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? handle)&mobile=1&intent=enroll&return_to=\(returnTo)"
 
         guard let url = URL(string: loginURL) else {
             error = "Invalid handle"
