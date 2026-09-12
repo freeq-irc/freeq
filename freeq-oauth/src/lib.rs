@@ -38,7 +38,15 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 /// some PDSes verify the original grant scope is still permitted by current
 /// metadata. Fresh `/authorize` requests never ask for it. Remove once the
 /// PDS ecosystem has fully sunset transitional scopes.
-pub const CLIENT_METADATA_SCOPE: &str = "atproto blob:image/* repo:blue.irc.media?action=create repo:app.bsky.feed.post transition:generic";
+///
+/// The two `repo:at.freeq.*Key` grants let a client publish its signing keys
+/// into the account's own repo, so anyone can verify what that device signed.
+pub const CLIENT_METADATA_SCOPE: &str = "atproto blob:image/* repo:blue.irc.media?action=create repo:app.bsky.feed.post repo:at.freeq.deviceKey?action=create repo:at.freeq.agentKey?action=create transition:generic";
+
+/// What a sign-in requests when the device is to publish its signing key:
+/// identity, plus permission to create the two key records.
+pub const ENROLL_SCOPE: &str =
+    "atproto repo:at.freeq.deviceKey?action=create repo:at.freeq.agentKey?action=create";
 
 /// Generate a PKCE (verifier, S256 challenge) pair.
 pub fn generate_pkce() -> (String, String) {
@@ -118,6 +126,40 @@ mod tests {
         );
         assert!(local.starts_with("http://localhost?redirect_uri="));
         assert!(local.contains("scope="));
+    }
+
+    #[test]
+    fn enroll_scope_is_within_the_metadata_union() {
+        // A scope absent from the metadata union cannot be requested at all.
+        let union: std::collections::HashSet<&str> =
+            CLIENT_METADATA_SCOPE.split_whitespace().collect();
+        for token in ENROLL_SCOPE.split_whitespace() {
+            assert!(
+                union.contains(token),
+                "ENROLL_SCOPE token `{token}` is missing from CLIENT_METADATA_SCOPE"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_client_id_carries_the_key_grants() {
+        let id = build_client_id_with_scopes(
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1:8080/auth/callback",
+            None,
+        );
+        let decoded = percent_encoding::percent_decode_str(&id)
+            .decode_utf8()
+            .unwrap()
+            .into_owned();
+        assert!(
+            decoded.contains("repo:at.freeq.deviceKey?action=create"),
+            "loopback client_id must carry the device-key grant: {decoded}"
+        );
+        assert!(
+            decoded.contains("repo:at.freeq.agentKey?action=create"),
+            "loopback client_id must carry the agent-key grant: {decoded}"
+        );
     }
 
     #[test]

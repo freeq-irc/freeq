@@ -3672,7 +3672,7 @@ async fn client_metadata(
         media_space_scope(&state).as_deref(),
     );
     // Advertise every scope any flow may request in the metadata.
-    let mut scope = "atproto blob:image/* repo:blue.irc.media?action=create repo:app.bsky.feed.post transition:generic".to_string();
+    let mut scope = freeq_oauth::CLIENT_METADATA_SCOPE.to_string();
     if let Some(ref mgr) = state.media_space {
         scope.push(' ');
         scope.push_str(&crate::media_space::space_scope(&mgr.authority_did));
@@ -3692,6 +3692,7 @@ async fn client_metadata(
         //   - Login (default sign-in)        → "atproto" only
         //   - BlobUpload step-up             → "atproto blob:image/*"
         //   - BlueskyPost step-up            → "atproto repo:app.bsky.feed.post"
+        //   - Login with `intent=enroll`     → adds the two at.freeq key grants
         //
         // `transition:generic` is included for the grace-period: existing
         // refresh tokens issued under the old wide grant must still be
@@ -3839,6 +3840,8 @@ fn derive_web_origin_from_config(config: &crate::config::ServerConfig) -> (Strin
 #[derive(Deserialize)]
 struct AuthLoginQuery {
     handle: String,
+    /// If "enroll", also ask for the grants that let this device publish its signing key.
+    intent: Option<String>,
     /// If "1", callback redirects to freeq:// URL scheme for mobile apps.
     mobile: Option<String>,
     /// If set, this is an IRC `/login` command — complete auth on the IRC session.
@@ -3977,12 +3980,12 @@ async fn auth_login(
     .map_err(map_outbound_err)?;
 
     // Build redirect URI and client_id. Default purpose for `/auth/login`
-    // is `Login` — narrow `atproto` scope only. Phase-2 step-up flows
-    // (image upload, Bluesky cross-post) hit `/auth/step-up` instead and
-    // request additional scopes there.
+    // is `Login` — narrow `atproto` scope only, widened by `intent=enroll`
+    // to also create key records. Phase-2 step-up flows (image upload,
+    // Bluesky cross-post) hit `/auth/step-up` instead.
     let redirect_uri = format!("{web_origin}/auth/callback");
     let purpose = crate::server::OauthPurpose::Login;
-    let scope = purpose.requested_scope(None);
+    let scope = crate::server::login_scope(q.intent.as_deref());
     let client_id = build_client_id_with_scopes(
         &web_origin,
         &redirect_uri,
@@ -4005,7 +4008,7 @@ async fn auth_login(
         &code_challenge,
         &oauth_state,
         &handle,
-        &scope,
+        scope,
         &dpop_key,
     )
     .await

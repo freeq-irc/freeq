@@ -701,9 +701,7 @@ async fn auth_login(
     // client publishes. Each scope here must be within the client-metadata union.
     let scope = match q.intent.as_deref() {
         Some("pfp") => "atproto blob:image/* repo:app.bsky.actor.profile repo:app.bsky.feed.post",
-        Some("enroll") => {
-            "atproto repo:at.freeq.deviceKey?action=create repo:at.freeq.agentKey?action=create"
-        }
+        Some("enroll") => freeq_oauth::ENROLL_SCOPE,
         _ => "atproto",
     };
     let client_id = build_client_id(&state.config.public_url, &redirect_uri);

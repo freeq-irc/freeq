@@ -323,6 +323,16 @@ impl OauthPurpose {
     }
 }
 
+/// The OAuth scope a `/auth/login` asks for. The purpose stays
+/// [`OauthPurpose::Login`] either way — only the grant widens, so a device
+/// that signs in to publish its signing key may create the key records.
+pub fn login_scope(intent: Option<&str>) -> &'static str {
+    match intent {
+        Some("enroll") => freeq_oauth::ENROLL_SCOPE,
+        _ => "atproto",
+    }
+}
+
 /// True when the session's actually-granted scope satisfies what the
 /// requested purpose needs at runtime.
 ///
