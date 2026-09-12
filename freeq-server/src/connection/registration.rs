@@ -582,6 +582,7 @@ pub(super) fn try_complete_registration(
             session_id,
             conn.authenticated_did.as_deref(),
             &pubkey_b64,
+            conn.broker_token.as_deref(),
         ) {
             let reply = Message::from_server(server_name, "FAIL", vec!["MSGSIG", code, detail]);
             send(state, session_id, format!("{reply}\r\n"));

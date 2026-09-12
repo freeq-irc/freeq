@@ -792,6 +792,40 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
 
   # ── identity ─────────────────────────────────────────────────────────
+  /api/v1/devices/sign-out:
+    post:
+      tags: [identity]
+      operationId: signOutDevice
+      summary: Sign one of the caller's own devices out.
+      description: >
+        Retires the caller's signing key named by `kid`, closes every
+        connection of theirs signing with it, and ends the login token behind
+        it. A kid with no live key on this server under the caller's DID
+        (never registered here, or already retired) is 200 with nothing
+        closed and nothing revoked.
+      security: [bearerAuth: []]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kid]
+              properties:
+                kid: { type: string }
+      responses:
+        "200":
+          description: Signed out.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  sessions_closed: { type: integer }
+                  tokens_revoked: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
   /api/v1/actors/{did}:
     get:
       tags: [identity]

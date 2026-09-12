@@ -18,9 +18,9 @@ use axum::body::Bytes;
 use axum::http::HeaderMap;
 use base64::Engine;
 use freeq_auth_broker::{
-    BrokerConfig, BrokerSessionRecord, BrokerState, DpopKey, PendingAuth, RemoteWriter,
-    SqliteStore, build_client_id, decrypt_field, derive_encryption_key, encrypt_field,
-    is_valid_return_to, router, sign_body,
+    BrokerConfig, BrokerSessionRecord, BrokerState, DpopKey, InMemoryStore, PendingAuth,
+    RemoteWriter, SessionStore, SqliteStore, build_client_id, decrypt_field, derive_encryption_key,
+    encrypt_field, is_valid_return_to, router, sign_body,
 };
 use tokio::sync::Mutex;
 
@@ -141,7 +141,8 @@ async fn seed_session(
 struct ServerCapture {
     web_token_bodies: Vec<serde_json::Value>,
     session_bodies: Vec<serde_json::Value>,
-    fail_web_token: bool,
+    /// When set, the web-token endpoint answers this instead of a token.
+    web_token_status: Option<axum::http::StatusCode>,
 }
 
 /// Verify the broker's HMAC push signature exactly the way
@@ -192,9 +193,8 @@ fn mock_freeq_server(cap: Arc<std::sync::Mutex<ServerCapture>>) -> axum::Router 
                     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
                     let mut c = cap.lock().unwrap();
                     c.web_token_bodies.push(json);
-                    if c.fail_web_token {
-                        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom")
-                            .into_response();
+                    if let Some(status) = c.web_token_status {
+                        return (status, "refused").into_response();
                     }
                     axum::Json(serde_json::json!({"token": "WEBTOK", "nick": "alice"}))
                         .into_response()
@@ -599,6 +599,9 @@ async fn callback_happy_path_web() {
         let c = server_cap.lock().unwrap();
         assert_eq!(c.web_token_bodies.len(), 1);
         assert_eq!(c.web_token_bodies[0]["did"], "did:plc:alice123");
+        // The token push names the broker token behind it, so the server can
+        // refuse that token when the device is signed out.
+        assert_eq!(c.web_token_bodies[0]["broker_token"], broker_token);
         assert_eq!(c.session_bodies.len(), 1);
         assert_eq!(c.session_bodies[0]["access_token"], "ACCESS1");
         assert_eq!(c.session_bodies[0]["granted_scope"], "atproto");
@@ -896,7 +899,7 @@ async fn callback_degrades_to_identity_only_when_server_push_fails() {
     // secret, server down) must still complete login — verified DID +
     // broker_token are enough for identity-only consumers.
     let server_cap = Arc::new(std::sync::Mutex::new(ServerCapture {
-        fail_web_token: true,
+        web_token_status: Some(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
         ..Default::default()
     }));
     let server_url = spawn(mock_freeq_server(server_cap)).await;
@@ -1049,6 +1052,62 @@ async fn session_concurrent_calls_serialize_on_refresh_lock() {
         refresh.lock().unwrap().seen,
         vec!["R0", "R1", "R2", "R3", "R4"]
     );
+}
+
+/// A `/session` call against a server whose web-token endpoint answers
+/// `web_token_status`, with a refresh that rotates normally.
+async fn session_against_refusing_server(
+    web_token_status: axum::http::StatusCode,
+) -> (reqwest::Response, Arc<BrokerState>) {
+    let server_cap = Arc::new(std::sync::Mutex::new(ServerCapture {
+        web_token_status: Some(web_token_status),
+        ..Default::default()
+    }));
+    let server_url = spawn(mock_freeq_server(server_cap)).await;
+    let token_url = spawn(mock_refresh_endpoint(rotate_state(None))).await;
+
+    let state = broker_state(&server_url);
+    seed_session(
+        &state,
+        "BT1",
+        "R0",
+        &format!("{token_url}/token"),
+        "https://pds.example",
+    )
+    .await;
+    let base = spawn(router(state.clone())).await;
+    (session_call(&base, "BT1").await, state)
+}
+
+#[tokio::test]
+async fn session_is_401_when_the_server_refuses_the_web_token() {
+    // The server answers 401 for a device that was signed out. The device has
+    // to be told: on a 200 with an empty token it reconnects with nothing and
+    // keeps retrying, instead of asking the user to sign in again.
+    let (resp, state) = session_against_refusing_server(axum::http::StatusCode::UNAUTHORIZED).await;
+    assert_eq!(resp.status(), 401);
+    assert!(
+        resp.text()
+            .await
+            .unwrap()
+            .contains("re-authentication required")
+    );
+    // The broker does not also destroy its own row; the server's refusal is
+    // the verdict, and it will refuse the next call the same way.
+    assert!(state.store.get("BT1").await.is_some());
+}
+
+#[tokio::test]
+async fn session_degrades_to_identity_only_when_the_server_is_broken() {
+    // A server that is down or erroring is not a verdict about this device,
+    // so login still completes identity-only, as it did before.
+    let (resp, state) =
+        session_against_refusing_server(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["token"], "");
+    assert_eq!(json["did"], "did:plc:alice123");
+    assert!(state.store.get("BT1").await.is_some());
 }
 
 #[tokio::test]
@@ -1643,4 +1702,56 @@ async fn enroll_allows_a_legacy_session_whose_refresh_names_no_scope() {
     let resp = enroll_call(&base, &serde_json::to_string(&record).unwrap(), &key).await;
     assert_eq!(resp.status(), 200);
     assert_eq!(cap.lock().unwrap().calls.len(), 1);
+}
+
+// ═══ SessionStore::delete ═══════════════════════════════════════════════
+
+/// One record, so a store test has something to delete.
+fn a_record(broker_token: &str) -> BrokerSessionRecord {
+    BrokerSessionRecord {
+        broker_token: broker_token.to_string(),
+        did: "did:plc:alice123".to_string(),
+        handle: "alice.test".to_string(),
+        pds_url: "https://pds.test.example".to_string(),
+        token_endpoint: "https://pds.test.example/token".to_string(),
+        refresh_token: "REFRESH".to_string(),
+        dpop_key_b64: DpopKey::generate().to_base64url(),
+        dpop_nonce: None,
+        client_id: "https://auth.test.example/client-metadata.json".to_string(),
+        created_at: 0,
+        updated_at: 0,
+    }
+}
+
+#[tokio::test]
+async fn sqlite_store_delete_removes_the_record() {
+    let store = SqliteStore::open(":memory:", derive_encryption_key(SECRET)).unwrap();
+    store.insert(&a_record("bt-sqlite")).await.unwrap();
+    assert!(store.get("bt-sqlite").await.is_some());
+
+    store.delete("bt-sqlite").await.unwrap();
+    assert!(store.get("bt-sqlite").await.is_none());
+    // Deleting what is already gone is not an error.
+    store.delete("bt-sqlite").await.unwrap();
+}
+
+#[tokio::test]
+async fn in_memory_store_delete_removes_the_record() {
+    let store = InMemoryStore::new();
+    store.insert(&a_record("bt-mem")).await.unwrap();
+    assert!(store.get("bt-mem").await.is_some());
+
+    store.delete("bt-mem").await.unwrap();
+    assert!(store.get("bt-mem").await.is_none());
+    store.delete("bt-mem").await.unwrap();
+}
+
+#[tokio::test]
+async fn delete_leaves_other_records_alone() {
+    let store = SqliteStore::open(":memory:", derive_encryption_key(SECRET)).unwrap();
+    store.insert(&a_record("bt-one")).await.unwrap();
+    store.insert(&a_record("bt-two")).await.unwrap();
+    store.delete("bt-one").await.unwrap();
+    assert!(store.get("bt-one").await.is_none());
+    assert!(store.get("bt-two").await.is_some());
 }

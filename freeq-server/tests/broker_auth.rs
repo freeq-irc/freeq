@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use freeq_sdk::did::DidResolver;
+use freeq_server::server::SharedState;
 
 const BROKER_SECRET: &str = "test-broker-secret-key-for-adversarial-testing";
 
@@ -26,6 +27,37 @@ async fn start() -> (
     };
     let server = freeq_server::server::Server::with_resolver(config, resolver);
     server.start_with_web().await.unwrap()
+}
+
+/// Same server, with its shared state — for the tests that read what a push
+/// filed.
+async fn start_with_state() -> (std::net::SocketAddr, std::sync::Arc<SharedState>) {
+    let resolver = DidResolver::static_map(HashMap::new());
+    let config = freeq_server::config::ServerConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        server_name: "test-broker".to_string(),
+        challenge_timeout_secs: 60,
+        broker_shared_secret: Some(BROKER_SECRET.to_string()),
+        ..Default::default()
+    };
+    let server = freeq_server::server::Server::with_resolver(config, resolver);
+    let (_irc, http, _h, state) = server.start_with_web_state().await.unwrap();
+    (http, state)
+}
+
+/// POST a signed body to the web-token receiver.
+async fn push_web_token(http: std::net::SocketAddr, body: serde_json::Value) -> reqwest::Response {
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let (sig, ts) = sign_request(&body_bytes);
+    reqwest::Client::new()
+        .post(format!("http://{http}/auth/broker/web-token"))
+        .header("X-Broker-Signature", &sig)
+        .header("X-Broker-Timestamp", &ts)
+        .header("Content-Type", "application/json")
+        .body(body_bytes)
+        .send()
+        .await
+        .unwrap()
 }
 
 /// Compute valid HMAC for a request body with current timestamp.
@@ -531,4 +563,70 @@ async fn missing_did_field_rejected() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400, "Missing 'did' field should return 400");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// BROKER TOKEN BEHIND A WEB TOKEN
+// ═══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn push_with_broker_token_files_it() {
+    // The link a sign-out walks: web token → broker token → that device.
+    let (http, state) = start_with_state().await;
+    let resp = push_web_token(
+        http,
+        serde_json::json!({
+            "did": "did:plc:linked",
+            "handle": "linked.bsky",
+            "broker_token": "BT-LINKED",
+        }),
+    )
+    .await;
+    assert!(resp.status().is_success());
+    let json: serde_json::Value = resp.json().await.unwrap();
+    let token = json["token"].as_str().unwrap().to_string();
+
+    let tokens = state.web_auth_tokens.lock();
+    let filed = tokens.get(&token).expect("web token filed");
+    assert_eq!(filed.3.as_deref(), Some("BT-LINKED"));
+}
+
+#[tokio::test]
+async fn push_without_broker_token_files_none() {
+    // An older broker sends no such field; the token still works, unlinked.
+    let (http, state) = start_with_state().await;
+    let resp = push_web_token(
+        http,
+        serde_json::json!({ "did": "did:plc:old", "handle": "old.bsky" }),
+    )
+    .await;
+    assert!(resp.status().is_success());
+    let json: serde_json::Value = resp.json().await.unwrap();
+    let token = json["token"].as_str().unwrap().to_string();
+
+    let tokens = state.web_auth_tokens.lock();
+    assert_eq!(tokens.get(&token).expect("web token filed").3, None);
+}
+
+#[tokio::test]
+async fn push_naming_a_revoked_broker_token_is_refused() {
+    // Standalone mode: the signed-out device's broker token is refused here,
+    // so its /session refresh stops producing a usable web token.
+    let (http, state) = start_with_state().await;
+    state
+        .revoked_broker_tokens
+        .lock()
+        .insert("BT-DEAD".to_string());
+
+    let resp = push_web_token(
+        http,
+        serde_json::json!({
+            "did": "did:plc:dead",
+            "handle": "dead.bsky",
+            "broker_token": "BT-DEAD",
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), 401);
+    assert!(state.web_auth_tokens.lock().is_empty());
 }

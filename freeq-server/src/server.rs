@@ -710,6 +710,10 @@ impl NickMap {
     }
 }
 
+/// What a one-time web auth token stands for: (DID, handle, minted at, the
+/// login token behind it).
+pub type WebAuthToken = (String, String, std::time::Instant, Option<String>);
+
 pub struct SharedState {
     pub server_name: String,
     pub challenge_store: ChallengeStore,
@@ -805,9 +809,18 @@ pub struct SharedState {
     pub oauth_pending: Mutex<HashMap<String, OAuthPending>>,
     /// Completed OAuth sessions: state → OAuthResult.
     pub oauth_complete: Mutex<HashMap<String, OAuthResult>>,
-    /// One-time web auth tokens: token → (DID, handle, created_at).
-    /// Generated during OAuth callback, consumed during SASL.
-    pub web_auth_tokens: Mutex<HashMap<String, (String, String, std::time::Instant)>>,
+    /// One-time web auth tokens: token → (DID, handle, created_at, broker token).
+    /// Generated during OAuth callback, consumed during SASL. The broker token
+    /// is the device's login token, kept so signing that device out can refuse
+    /// it; absent when an older broker pushed the token without naming it.
+    pub web_auth_tokens: Mutex<HashMap<String, WebAuthToken>>,
+    /// A device's signing key and the login token behind it: (DID, kid) →
+    /// broker token. Filed when a connection registers its `MSGSIG` key.
+    pub device_key_tokens: Mutex<HashMap<(String, String), String>>,
+    /// Broker tokens of signed-out devices. In standalone-broker mode the
+    /// server cannot delete the broker's session, so it refuses to mint a web
+    /// token for one of these instead.
+    pub revoked_broker_tokens: Mutex<HashSet<String>>,
     /// Active web sessions with PDS credentials, keyed by DID.
     /// Used for server-proxied operations like media upload.
     /// Active web sessions keyed by `(DID, purpose)`. Each entry holds an
@@ -1995,6 +2008,8 @@ impl Server {
             oauth_pending: Mutex::new(HashMap::new()),
             oauth_complete: Mutex::new(HashMap::new()),
             web_auth_tokens: Mutex::new(HashMap::new()),
+            device_key_tokens: Mutex::new(HashMap::new()),
+            revoked_broker_tokens: Mutex::new(HashSet::new()),
             web_sessions: Mutex::new(HashMap::new()),
             login_pending: Mutex::new(HashMap::new()),
             linked_identities: Mutex::new(HashMap::new()),
@@ -2392,7 +2407,7 @@ impl Server {
                     reconcile_state
                         .web_auth_tokens
                         .lock()
-                        .retain(|_, (_, _, created)| {
+                        .retain(|_, (_, _, created, _)| {
                             created.elapsed() < std::time::Duration::from_secs(1800)
                         });
                 }
@@ -2589,7 +2604,7 @@ impl Server {
                     {
                         let mut tokens = cleanup_state.web_auth_tokens.lock();
                         let before = tokens.len();
-                        tokens.retain(|_, (_, _, created)| created.elapsed().as_secs() < 1800);
+                        tokens.retain(|_, (_, _, created, _)| created.elapsed().as_secs() < 1800);
                         let pruned = before - tokens.len();
                         if pruned > 0 {
                             tracing::info!("Pruned {pruned} expired web-auth tokens");
@@ -8183,6 +8198,8 @@ mod s2s_adversarial_tests {
             oauth_pending: Mutex::new(HashMap::new()),
             oauth_complete: Mutex::new(HashMap::new()),
             web_auth_tokens: Mutex::new(HashMap::new()),
+            device_key_tokens: Mutex::new(HashMap::new()),
+            revoked_broker_tokens: Mutex::new(HashSet::new()),
             web_sessions: Mutex::new(HashMap::new()),
             login_pending: Mutex::new(HashMap::new()),
             linked_identities: Mutex::new(HashMap::new()),

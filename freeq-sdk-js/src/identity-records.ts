@@ -117,7 +117,7 @@ export async function buildDeviceRecord(
  * retired key itself, or any other key of the same account.
  */
 export async function buildDeviceRetirement(
-  signer: DidKey,
+  signer: Pick<DidKey, 'publicKeyMultibase' | 'signer'>,
   did: string,
   revokesKid: string,
   createdAt: string,

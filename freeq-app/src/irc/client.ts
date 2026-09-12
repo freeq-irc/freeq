@@ -6,13 +6,18 @@
  */
 
 import {
+  DEVICE_KEY_TYPE,
   FreeqClient,
   IndexedDbDeviceKeyStore,
   KeyLookup,
+  buildDeviceRetirement,
   decodeMultibaseEd25519,
+  deviceKeyHistory,
   format,
+  listRecords,
   makeDidResolver,
   recordKeyOf,
+  type DeviceKeyRecord,
   type DeviceKeyStore,
   type StoredDeviceKey,
 } from '@freeq/sdk';
@@ -142,6 +147,190 @@ export function signInToPublishKeys(): void {
     `${broker}/auth/login?handle=${encodeURIComponent(handle)}&intent=enroll` +
     `&return_to=${encodeURIComponent(window.location.origin)}`;
   window.location.href = url;
+}
+
+/** Where the app publishes key records: the broker it signed in through. */
+function brokerFor(): { url: string; token: string } | null {
+  const url = localStorage.getItem('freeq-broker-base');
+  const token = localStorage.getItem('freeq-broker-token');
+  return url && token ? { url, token } : null;
+}
+
+/** The broker's answer to writing `record`, or null with no broker session.
+ *  A 401 or 403 means the session lacks the grant: the user signs in again.
+ *  It raises the upgrade bar only while this device's key is unpublished; a
+ *  device whose key is saved asks through the caller's own prompt. */
+async function postRecord(record: object, signerPublicKey: string): Promise<Response | null> {
+  const broker = brokerFor();
+  if (!broker) return null;
+  const res = await fetch(`${broker.url}/enroll`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      broker_token: broker.token,
+      record,
+      signer_public_key: signerPublicKey,
+    }),
+  });
+  if ((res.status === 401 || res.status === 403) && !deviceKeyState.published) {
+    setDeviceKeyState({ needsSignIn: true });
+  }
+  return res;
+}
+
+/** The written record's URI from a 200 answer; null for anything else. */
+async function uriOf(res: Response): Promise<string | null> {
+  if (res.status !== 200) return null;
+  const answer = (await res.json()) as { uri?: unknown };
+  return typeof answer.uri === 'string' ? answer.uri : null;
+}
+
+// ── The Devices list ───────────────────────────────────────────────────
+
+/** One row of the Devices list: a signing key the account knows about. */
+export interface DeviceRow {
+  kid: string;
+  /** The record's label, or the kid shortened. */
+  name: string;
+  state: 'active' | 'signedOut' | 'unpublished';
+  /** Active: when the key was published. Signed out: when it was retired. */
+  date?: string;
+  thisDevice: boolean;
+}
+
+/** What this browser holds, for the row that names it. */
+export interface ThisDeviceKey {
+  kid?: string;
+  createdAt?: string;
+  published: boolean;
+}
+
+/** A kid, short enough to name a device that never got a label. */
+function shortKid(kid: string): string {
+  return `${kid.slice(0, 8)}\u2026`;
+}
+
+/** How long a signed-out device stays listed after its retirement. */
+const SIGNED_OUT_LISTED_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The rows for `did`'s device key records, newest key first.
+ *
+ * The fold decides which keys are live and when each was retired, so a
+ * retirement every client ignores (wrong signer, dated before the key) never
+ * dates a row. A key record the fold rejects is left out, and so is one not
+ * yet live and never retired, and one retired more than 24 hours ago.
+ */
+export async function deviceRowsFrom(
+  did: string,
+  records: unknown[],
+  here: ThisDeviceKey,
+): Promise<DeviceRow[]> {
+  const now = Date.now();
+  const found: { row: DeviceRow; since: string }[] = [];
+  for (const key of await deviceKeyHistory(did, records)) {
+    const label = (key.record as Partial<DeviceKeyRecord>).label;
+    const retired = key.retiredAt !== null && key.retiredAt.getTime() <= now;
+    const active = key.createdAt.getTime() <= now && !retired;
+    if (!active && !retired) continue;
+    if (retired && now - key.retiredAt!.getTime() > SIGNED_OUT_LISTED_MS) continue;
+    const since = key.createdAt.toISOString();
+    found.push({
+      since,
+      row: {
+        kid: key.kid,
+        name: typeof label === 'string' && label !== '' ? label : shortKid(key.kid),
+        state: active ? 'active' : 'signedOut',
+        date: active ? since : key.retiredAt!.toISOString(),
+        thisDevice: key.kid === here.kid,
+      },
+    });
+  }
+
+  if (!here.published && here.kid !== undefined) {
+    found.push({
+      since: here.createdAt ?? '',
+      row: {
+        kid: here.kid,
+        name: shortKid(here.kid),
+        state: 'unpublished',
+        date: here.createdAt,
+        thisDevice: true,
+      },
+    });
+  }
+
+  found.sort((a, b) => b.since.localeCompare(a.since));
+  return found.map((f) => f.row);
+}
+
+/** Read the account's device key records and lay them out as rows. */
+export async function listDeviceRows(): Promise<DeviceRow[]> {
+  const did = saslState.did;
+  if (!did) return [];
+  const records = await listRecords(
+    (target: string) => fetch(target),
+    makeDidResolver(),
+    did,
+    DEVICE_KEY_TYPE,
+  );
+  return deviceRowsFrom(did, records, {
+    kid: deviceKeyState.kid,
+    createdAt: deviceKeyState.createdAt,
+    published: deviceKeyState.published,
+  });
+}
+
+/** What signing a device out came to, for the panel to word. */
+export type SignOutOutcome =
+  /** Nobody is signed in, or this device's key is not in the account. Every
+   *  client ignores a retirement signed by an unpublished key, so nothing is
+   *  written. */
+  | { kind: 'notReady' }
+  /** This browser holds no key to sign the retirement with. */
+  | { kind: 'noKey' }
+  /** The account provider refused the write for lack of permission. */
+  | { kind: 'needsSignIn' }
+  /** The account provider did not save the retirement, for another reason. */
+  | { kind: 'notSaved' }
+  /** The retirement is in the account. `sessionsClosed` is what this server
+   *  closed, or null when its answer was not OK. */
+  | { kind: 'retired'; sessionsClosed: number | null };
+
+/**
+ * Sign a device out: the account says so in a record signed by this device's
+ * key, then the server drops that device's sessions and refuses its login
+ * token. The record is the durable statement; the server call is the
+ * eviction, so its answer is returned without undoing the record.
+ */
+export async function signOutDevice(kid: string): Promise<SignOutOutcome> {
+  const did = saslState.did;
+  if (!did || !brokerFor()) return { kind: 'notReady' };
+  const stored = await chosenStoreFor(did).load();
+  if (!stored) return { kind: 'noKey' };
+  // Loading the key brought `published` up to date.
+  if (!deviceKeyState.published) return { kind: 'notReady' };
+  const signer = await recordKeyOf(stored.keyPair);
+  const retirement = await buildDeviceRetirement(signer, did, kid, new Date().toISOString());
+  const answer = await postRecord(retirement, signer.publicKeyMultibase);
+  if (answer?.status === 401 || answer?.status === 403) return { kind: 'needsSignIn' };
+  if (!answer || !(await uriOf(answer))) return { kind: 'notSaved' };
+
+  const bearer = client?.apiBearer;
+  const res = await fetch('/api/v1/devices/sign-out', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}),
+    },
+    body: JSON.stringify({ kid }),
+  });
+  if (!res.ok) return { kind: 'retired', sessionsClosed: null };
+  const body = (await res.json().catch(() => ({}))) as { sessions_closed?: unknown };
+  return {
+    kind: 'retired',
+    sessionsClosed: typeof body.sessions_closed === 'number' ? body.sessions_closed : 0,
+  };
 }
 
 /** This browser's name, for the published record's label. */

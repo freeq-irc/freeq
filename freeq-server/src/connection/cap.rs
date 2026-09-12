@@ -222,12 +222,17 @@ pub(super) async fn handle_authenticate(
             let mut web_handle: Option<String> = None;
             let web_token_result = if response.method.as_deref() == Some("web-token") {
                 let mut tokens = state.web_auth_tokens.lock();
-                if let Some((did, handle, created)) = tokens.remove(&response.signature) {
+                if let Some((did, handle, created, broker_token)) =
+                    tokens.remove(&response.signature)
+                {
                     // Single-use: token consumed on first authentication.
                     // 5-minute TTL limits exposure if a token is leaked.
                     // Broker issues fresh tokens on each /session call for reconnects.
                     if created.elapsed() < std::time::Duration::from_secs(300) {
                         web_handle = Some(handle);
+                        // Keep the login token behind this connection, so a
+                        // key it registers can be tied back to it.
+                        conn.broker_token = broker_token;
                         Some(Ok(did.clone()))
                     } else {
                         Some(Err("Web auth token expired".to_string()))

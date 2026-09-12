@@ -305,6 +305,10 @@ pub fn router(state: Arc<SharedState>) -> Router {
             "/api/v1/channels/{name}/groupkeys",
             get(api_get_group_keys).post(api_put_group_keys),
         )
+        .route(
+            "/api/v1/devices/sign-out",
+            axum::routing::post(api_device_sign_out),
+        )
         .route("/api/v1/signing-key", get(api_signing_key))
         .route("/api/v1/signing-keys/{did}", get(api_did_signing_key))
         .route(
@@ -2389,6 +2393,112 @@ async fn api_set_favorites(
     )
 }
 
+#[derive(Deserialize)]
+struct DeviceSignOutRequest {
+    kid: String,
+}
+
+/// POST /api/v1/devices/sign-out {"kid": "..."} — sign one of the caller's own
+/// devices out. Requires a Bearer session.
+///
+/// The account's own retirement record is the durable statement that the key
+/// is stood down; this is the eviction that follows it. Three things end: the
+/// key row is retired, every connection signing with that key is closed, and
+/// the login token behind it stops working — deleted from the embedded session
+/// store, or refused at the broker push receiver when the broker is separate.
+///
+/// A kid this server holds no live row for under the caller's DID — never
+/// registered here, already retired, or registered on another server — is
+/// 200 with nothing closed and nothing revoked. The caller is already that
+/// account and the retirement is public, so the answer reveals nothing.
+async fn api_device_sign_out(
+    State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<DeviceSignOutRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(did) = caller_did_from_bearer(&state, &headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Bearer session required" })),
+        );
+    };
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let retired = state
+        .with_db(|db| db.retire_signing_key(&did, &req.kid, now))
+        .unwrap_or(false);
+    if !retired {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "sessions_closed": 0, "tokens_revoked": 0 })),
+        );
+    }
+
+    // Every connection of this DID whose signing key is the one retired,
+    // including the caller's own if it is signing with it.
+    let doomed: Vec<String> = {
+        let dids = state.session_dids.lock();
+        let keys = state.session_msg_keys.lock();
+        dids.iter()
+            .filter(|(_, d)| *d == &did)
+            .filter(|(sid, _)| {
+                keys.get(*sid)
+                    .is_some_and(|vk| freeq_sdk::sigtag::derive_kid(vk) == req.kid)
+            })
+            .map(|(sid, _)| sid.clone())
+            .collect()
+    };
+    let mut sessions_closed = 0usize;
+    for sid in &doomed {
+        if crate::connection::close_session(&state, sid, "Signed out from another device") {
+            sessions_closed += 1;
+        }
+    }
+
+    // The login token behind that key. Embedded: delete the session, so the
+    // next /session answers 401 as a dead one does. Standalone: remember it,
+    // so the broker's next push for it is refused. The two modes are
+    // exclusive (an embedded store exists only when no broker secret is set),
+    // so both are done unconditionally.
+    let tokens: Vec<String> = {
+        let mut linked = state.device_key_tokens.lock();
+        let mut found = Vec::new();
+        linked.retain(|(d, k), token| {
+            if d == &did && k == &req.kid {
+                found.push(token.clone());
+                false
+            } else {
+                true
+            }
+        });
+        found
+    };
+    for token in &tokens {
+        state.revoked_broker_tokens.lock().insert(token.clone());
+        if let Some(store) = state.embedded_session_store.as_ref()
+            && let Err(e) = store.delete(token).await
+        {
+            tracing::warn!(error = %e, "sign-out: embedded session delete failed");
+        }
+    }
+
+    tracing::info!(
+        %did, kid = %req.kid, sessions_closed, tokens_revoked = tokens.len(),
+        "device signed out"
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "sessions_closed": sessions_closed,
+            "tokens_revoked": tokens.len(),
+        })),
+    )
+}
+
 /// Resolve the authenticated caller DID from a `Bearer <session-id>` header.
 pub(crate) fn caller_did_from_bearer(
     state: &crate::server::SharedState,
@@ -3426,6 +3536,11 @@ async fn api_user_whois(
 struct BrokerTokenRequest {
     did: String,
     handle: String,
+    /// The login token this web token is minted for. Absent from an older
+    /// broker's push — such a token cannot be refused when its device signs
+    /// out, because nothing names it.
+    #[serde(default)]
+    broker_token: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -3469,6 +3584,15 @@ async fn auth_broker_web_token(
     let req: BrokerTokenRequest = serde_json::from_slice(&body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")))?;
 
+    // A device that was signed out gets no more web tokens, so its /session
+    // refresh stops producing one it could authenticate with.
+    if let Some(ref bt) = req.broker_token
+        && state.revoked_broker_tokens.lock().contains(bt)
+    {
+        tracing::info!(did = %req.did, "web-token refused: device signed out");
+        return Err((StatusCode::UNAUTHORIZED, "Device signed out".to_string()));
+    }
+
     let token = generate_random_string(32);
     state.web_auth_tokens.lock().insert(
         token.clone(),
@@ -3476,6 +3600,7 @@ async fn auth_broker_web_token(
             req.did.clone(),
             req.handle.clone(),
             std::time::Instant::now(),
+            req.broker_token.clone(),
         ),
     );
     let nick = mobile_nick_from_handle(&req.handle);
@@ -3500,6 +3625,7 @@ impl freeq_auth_broker::SessionWriter for LocalWriter {
         &self,
         did: &str,
         handle: &str,
+        broker_token: Option<&str>,
     ) -> Result<(String, String), anyhow::Error> {
         let token = generate_random_string(32);
         self.state.web_auth_tokens.lock().insert(
@@ -3508,6 +3634,7 @@ impl freeq_auth_broker::SessionWriter for LocalWriter {
                 did.to_string(),
                 handle.to_string(),
                 std::time::Instant::now(),
+                broker_token.map(str::to_string),
             ),
         );
         Ok((token, mobile_nick_from_handle(handle)))
@@ -4333,25 +4460,6 @@ async fn auth_callback(
 
     let is_step_up = !matches!(pending.purpose, crate::server::OauthPurpose::Login);
 
-    // Mint a one-time SASL web-token only for the primary login flow.
-    // Step-ups produce *additional* PDS grants for the same already-
-    // logged-in user — we don't want to issue a second SASL token and
-    // confuse the IRC layer into thinking the identity changed.
-    let web_token = if is_step_up {
-        None
-    } else {
-        let token = generate_random_string(32);
-        state.web_auth_tokens.lock().insert(
-            token.clone(),
-            (
-                pending.did.clone(),
-                pending.handle.clone(),
-                std::time::Instant::now(),
-            ),
-        );
-        Some(token)
-    };
-
     // Embedded durable session (Login only): persist the broker session
     // (refresh token + client_id) into the in-process store and issue a
     // broker_token, so /session can silently refresh without a re-login.
@@ -4388,6 +4496,28 @@ async fn auth_callback(
             }
         }
         _ => None,
+    };
+
+    // Mint a one-time SASL web-token only for the primary login flow.
+    // Step-ups produce *additional* PDS grants for the same already-
+    // logged-in user — we don't want to issue a second SASL token and
+    // confuse the IRC layer into thinking the identity changed. The broker
+    // token goes in beside it: that is this device's login token, and a
+    // key registered on the connection it opens is tied back to it.
+    let web_token = if is_step_up {
+        None
+    } else {
+        let token = generate_random_string(32);
+        state.web_auth_tokens.lock().insert(
+            token.clone(),
+            (
+                pending.did.clone(),
+                pending.handle.clone(),
+                std::time::Instant::now(),
+                broker_token.clone(),
+            ),
+        );
+        Some(token)
     };
 
     let result = crate::server::OAuthResult {

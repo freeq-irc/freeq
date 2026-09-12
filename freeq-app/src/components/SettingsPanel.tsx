@@ -3,12 +3,16 @@ import { displayNameForKey } from '../lib/display-name';
 import { requestPermission } from '../lib/notifications';
 import { getPreferences, setPreferences } from '../lib/db';
 import { useState, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { AudioTest } from './AudioTest';
 import { useSyncExternalStore } from 'react';
 import {
   getDeviceKeyState,
+  listDeviceRows,
   signInToPublishKeys,
+  signOutDevice,
   subscribeDeviceKey,
+  type DeviceRow,
 } from '../irc/client';
 
 interface SettingsPanelProps {
@@ -68,7 +72,6 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
               return <InfoRow label="Server" value={isProxy && target ? `${target} (via proxy)` : stripped} />;
             })()}
             {authDid && <InfoRow label="DID" value={authDid} mono />}
-            {authDid && <DeviceKeyRows />}
           </Section>
 
           {/* Appearance */}
@@ -185,6 +188,12 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
             </div>
           </Section>
 
+          {authDid && (
+            <Section title="Devices">
+              <DevicesSection />
+            </Section>
+          )}
+
           {/* Keyboard shortcuts */}
           <Section title="Keyboard Shortcuts">
             <ShortcutRow keys="⌘ K" desc="Quick switcher" />
@@ -218,56 +227,210 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
   );
 }
 
-/**
- * This device's signing key: where it is kept, and whether the account knows
- * about it. A key the account does not have yet can be published from here,
- * which means signing in again for the permission to write the record.
- */
-function DeviceKeyRows() {
-  const key = useSyncExternalStore(subscribeDeviceKey, getDeviceKeyState);
-  const [confirm, setConfirm] = useState(false);
+/** A date, the way the app writes one older than a week. */
+function day(iso?: string): string {
+  return iso ? new Date(iso).toLocaleDateString([], { month: 'short', day: 'numeric' }) : '';
+}
 
-  const shortKid = key.kid ? `${key.kid.slice(0, 8)}…` : '';
-  const made = key.createdAt ? new Date(key.createdAt).toLocaleDateString() : '';
+/** The one meta line a row carries. */
+function metaLine(row: DeviceRow): string {
+  if (row.state === 'unpublished') return 'Key not published · this device';
+  if (row.state === 'signedOut') return `Signed out · ${day(row.date)}`;
+  return `Active · since ${day(row.date)}`;
+}
+
+/**
+ * Every signing key the account has published, newest first, and the one
+ * action each offers: sign another device out, publish this device's key, or
+ * nothing at all for a key already signed out.
+ */
+export function DevicesSection() {
+  const key = useSyncExternalStore(subscribeDeviceKey, getDeviceKeyState);
+  const [rows, setRows] = useState<DeviceRow[]>([]);
+  const [ask, setAsk] = useState<DeviceRow | null>(null);
+  const [signIn, setSignIn] = useState(false);
+  const [failed, setFailed] = useState<string | null>(null);
+  // What happened to a sign-out that is not a failure.
+  const [note, setNote] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  // Re-read on mount, and again whenever this device's own key changes —
+  // publishing it is the one thing that lands there rather than here.
+  useEffect(() => {
+    let live = true;
+    listDeviceRows()
+      .then((r) => live && setRows(r))
+      .catch(() => live && setRows([]));
+    return () => {
+      live = false;
+    };
+  }, [key.kid, key.published, busy]);
+
+  async function confirmSignOut(row: DeviceRow) {
+    setBusy(true);
+    setFailed(null);
+    setNote(null);
+    try {
+      const outcome = await signOutDevice(row.kid);
+      switch (outcome.kind) {
+        case 'notReady':
+          setFailed("To sign out other devices, sign in and publish this device's key first.");
+          break;
+        case 'noKey':
+          setFailed(
+            "This browser won't let freeq store its key. Change your browser settings to allow this site to store data, or try another browser.",
+          );
+          break;
+        case 'needsSignIn':
+          // The account provider refuses the write without the publish grant.
+          setSignIn(true);
+          break;
+        case 'notSaved':
+          setFailed(
+            `Couldn't sign out ${row.name} because your account provider didn't respond. Try again in a moment.`,
+          );
+          break;
+        case 'retired':
+          // Not failures: the retirement is in the account either way.
+          if (outcome.sessionsClosed === null) {
+            setNote(
+              `${row.name}'s key has been retired, so anything it sends now is flagged. It may still be signed in, here or somewhere else. To sign it out there too, open freeq on that server and sign it out from Devices.`,
+            );
+          } else if (outcome.sessionsClosed === 0) {
+            setNote(
+              `${row.name}'s key has been retired, so anything it sends now is flagged. It isn't connected to this server, so it may still be signed in somewhere else. To sign it out there too, open freeq on that server and sign it out from Devices.`,
+            );
+          }
+          break;
+      }
+    } catch {
+      setFailed(`Couldn't sign out ${row.name}. Try again.`);
+    } finally {
+      setAsk(null);
+      setBusy(false);
+    }
+  }
 
   return (
     <>
-      <div className="flex items-center justify-between text-sm gap-2">
-        <span className="text-fg-muted">
-          {key.published ? `${shortKid} · ${made}` : 'Key not published · this device'}
-        </span>
-        {!key.published && (
-          <button
-            onClick={() => setConfirm(true)}
-            className="text-accent text-xs font-semibold hover:underline"
-          >
-            {'Publish key'}
-          </button>
-        )}
-      </div>
-      {confirm && (
-        <div className="rounded-lg border border-border bg-bg p-3 space-y-2">
-          <p className="text-sm font-semibold">{'Sign in to continue'}</p>
-          <p className="text-[11px] text-fg-dim leading-relaxed">
-            {'freeq needs permission to publish keys to your account. Continue to your account provider?'}
-          </p>
-          <div className="flex justify-end gap-3 text-xs">
-            <button onClick={() => setConfirm(false)} className="text-fg-dim hover:text-fg">
-              {'Not now'}
-            </button>
-            <button
-              onClick={() => signInToPublishKeys()}
-              className="text-accent font-semibold hover:underline"
-            >
-              {'Continue'}
-            </button>
-          </div>
+      {rows.map((row) => (
+        <div
+          key={row.kid}
+          data-device-row
+          className="flex items-center justify-between text-sm gap-2"
+        >
+          <span className="flex items-center gap-2 min-w-0">
+            <span aria-hidden className={row.state === 'signedOut' ? 'opacity-40' : ''}>
+              {'💻'}
+            </span>
+            <span className="min-w-0">
+              <span data-testid="device-name" className="block truncate text-fg">
+                {row.name}
+              </span>
+              <span data-device-meta className="block text-[11px] text-fg-dim">
+                {metaLine(row)}
+              </span>
+            </span>
+          </span>
+          <span className="shrink-0 text-xs">
+            {row.state === 'active' && row.thisDevice && (
+              <span className="text-fg-dim">{'This device'}</span>
+            )}
+            {row.state === 'active' && !row.thisDevice && (
+              <button
+                disabled={busy}
+                onClick={() => setAsk(row)}
+                className="text-accent font-semibold hover:underline disabled:opacity-50"
+              >
+                {'Sign out'}
+              </button>
+            )}
+            {row.state === 'unpublished' && (
+              <button
+                onClick={() => setSignIn(true)}
+                className="text-accent font-semibold hover:underline"
+              >
+                {'Publish key'}
+              </button>
+            )}
+          </span>
         </div>
+      ))}
+
+      <p className="text-[11px] text-fg-dim leading-relaxed">
+        {'A signed-out device has to sign in again before it can post as you. Messages it already sent stay signed.'}
+      </p>
+
+      {failed && <p className="text-[11px] text-red-400">{failed}</p>}
+      {note && <p className="text-[11px] text-fg-dim leading-relaxed">{note}</p>}
+
+      {ask && (
+        <Modal onClose={() => setAsk(null)}>
+          <div role="dialog" className="p-3 space-y-2">
+            <p className="text-sm font-semibold">{`Sign out ${ask.name}?`}</p>
+            <p className="text-[11px] text-fg-dim leading-relaxed">
+              {'It will be signed out and will need to sign in again. Messages it already sent stay signed.'}
+            </p>
+            <div className="flex justify-end gap-3 text-xs">
+              <button onClick={() => setAsk(null)} className="text-fg-dim hover:text-fg">
+                {'Cancel'}
+              </button>
+              <button
+                disabled={busy}
+                onClick={() => void confirmSignOut(ask)}
+                className="text-accent font-semibold hover:underline disabled:opacity-50"
+              >
+                {'Sign out'}
+              </button>
+            </div>
+          </div>
+        </Modal>
       )}
-      <div className="flex items-center justify-between text-sm gap-2">
-        <span className="text-fg-muted">{'Signing key · kept in this browser'}</span>
-      </div>
+
+      {signIn && (
+        <Modal onClose={() => setSignIn(false)}>
+          <div className="p-3 space-y-2">
+            <p className="text-sm font-semibold">{'Sign in to continue'}</p>
+            <p className="text-[11px] text-fg-dim leading-relaxed">
+              {'Your account needs a fresh sign-in before freeq can change your devices.'}
+            </p>
+            <div className="flex justify-end gap-3 text-xs">
+              <button onClick={() => setSignIn(false)} className="text-fg-dim hover:text-fg">
+                {'Not now'}
+              </button>
+              <button
+                onClick={() => signInToPublishKeys()}
+                className="text-accent font-semibold hover:underline"
+              >
+                {'Sign in'}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </>
+  );
+}
+
+/**
+ * A modal over the whole window. The Settings panel is fixed and animated with
+ * a transform, which would contain a fixed box inside it, so this renders into
+ * document.body; the shell is JoinGateModal's.
+ */
+function Modal({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
+  return createPortal(
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="bg-bg-secondary border border-border rounded-xl shadow-2xl w-full max-w-md"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {children}
+      </div>
+    </div>,
+    document.body,
   );
 }
 

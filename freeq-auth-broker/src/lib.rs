@@ -379,6 +379,10 @@ pub trait SessionStore: Send + Sync {
         refresh_token: &str,
         dpop_nonce: Option<&str>,
     ) -> anyhow::Result<()>;
+    /// Forget a session, so `/session` with its token answers 401. Deleting a
+    /// token the store never had is not an error — a device can only be
+    /// signed out once.
+    async fn delete(&self, broker_token: &str) -> anyhow::Result<()>;
 }
 
 /// Durable SQLite store with AES-GCM field encryption at rest. Owns the key.
@@ -488,6 +492,15 @@ impl SessionStore for SqliteStore {
         )?;
         Ok(())
     }
+
+    async fn delete(&self, broker_token: &str) -> anyhow::Result<()> {
+        let db = self.conn.lock().await;
+        db.execute(
+            "DELETE FROM sessions WHERE broker_token = ?1",
+            rusqlite::params![broker_token],
+        )?;
+        Ok(())
+    }
 }
 
 /// Ephemeral in-memory store — no persistence, no at-rest encryption (never
@@ -529,6 +542,11 @@ impl SessionStore for InMemoryStore {
             r.dpop_nonce = dpop_nonce.map(str::to_string);
             r.updated_at = chrono::Utc::now().timestamp();
         }
+        Ok(())
+    }
+
+    async fn delete(&self, broker_token: &str) -> anyhow::Result<()> {
+        self.sessions.lock().await.remove(broker_token);
         Ok(())
     }
 }
@@ -958,7 +976,7 @@ async fn auth_callback(
     // identity-only consumers, so degrade gracefully instead of failing login.
     let (web_token, nick) = state
         .writer
-        .mint_web_token(&pending.did, &pending.handle)
+        .mint_web_token(&pending.did, &pending.handle, Some(&broker_token))
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, "web-token mint failed — continuing identity-only");
@@ -1104,14 +1122,27 @@ async fn session(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
 
-    let (web_token, nick) = state
+    let (web_token, nick) = match state
         .writer
-        .mint_web_token(&record.did, &record.handle)
+        .mint_web_token(&record.did, &record.handle, Some(&record.broker_token))
         .await
-        .unwrap_or_else(|e| {
+    {
+        Ok(minted) => minted,
+        // The server signed this device out. Say so the way a dead grant
+        // does, so the client drops to sign-in instead of reconnecting with
+        // an empty token forever.
+        Err(e) if e.downcast_ref::<WebTokenRefused>().is_some() => {
+            tracing::info!(did = %record.did, "/session refused: device signed out");
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "Session expired — re-authentication required".to_string(),
+            ));
+        }
+        Err(e) => {
             tracing::warn!(error = %e, "web-token mint failed — continuing identity-only");
             (String::new(), record.handle.clone())
-        });
+        }
+    };
 
     // Forward the actually-granted scope from the refresh response so the
     // server's per-purpose checks see the truth, not a hard-coded assumption.
@@ -1787,14 +1818,33 @@ pub struct SessionPush<'a> {
 #[async_trait::async_trait]
 pub trait SessionWriter: Send + Sync {
     /// Mint a one-time SASL web-token for this identity → `(token, nick)`.
+    ///
+    /// `broker_token` is the login token the web token is minted for. The
+    /// server files it beside the web token, so a device signed out later can
+    /// have its login token refused.
     async fn mint_web_token(
         &self,
         did: &str,
         handle: &str,
+        broker_token: Option<&str>,
     ) -> Result<(String, String), anyhow::Error>;
     /// Install / refresh the server-side web session for proxied PDS ops.
     async fn push_session(&self, push: &SessionPush<'_>) -> Result<(), anyhow::Error>;
 }
+
+/// The freeq-server refused a web token for this identity: the device was
+/// signed out, and must sign in again. Told apart from an unreachable or
+/// broken server, which is transient and leaves login identity-only.
+#[derive(Debug)]
+pub struct WebTokenRefused;
+
+impl std::fmt::Display for WebTokenRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "server refused a web token (device signed out)")
+    }
+}
+
+impl std::error::Error for WebTokenRefused {}
 
 /// [`SessionWriter`] for the standalone broker: HMAC-signed HTTP POSTs to the
 /// freeq-server's `/auth/broker/*` receiver endpoints.
@@ -1809,8 +1859,13 @@ impl SessionWriter for RemoteWriter {
         &self,
         did: &str,
         handle: &str,
+        broker_token: Option<&str>,
     ) -> Result<(String, String), anyhow::Error> {
-        let body = serde_json::json!({"did": did, "handle": handle});
+        let body = serde_json::json!({
+            "did": did,
+            "handle": handle,
+            "broker_token": broker_token,
+        });
         let (sig, ts) = sign_body(&self.shared_secret, &body)?;
         let url = format!(
             "{}/auth/broker/web-token",
@@ -1824,6 +1879,11 @@ impl SessionWriter for RemoteWriter {
             .json(&body)
             .send()
             .await?;
+        // 401 is the server's verdict on this device, not a failure to reach
+        // it: the caller turns it into a 401 for the device.
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(anyhow::Error::new(WebTokenRefused));
+        }
         if !resp.status().is_success() {
             return Err(anyhow::anyhow!(
                 "web-token failed: {}",

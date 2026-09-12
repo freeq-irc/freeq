@@ -147,6 +147,7 @@ pub(crate) fn file_session_signing_key(
     session_id: &str,
     authenticated_did: Option<&str>,
     pubkey_b64: &str,
+    broker_token: Option<&str>,
 ) -> Result<(), (&'static str, &'static str)> {
     use base64::Engine;
     let Some(did) = authenticated_did else {
@@ -182,9 +183,17 @@ pub(crate) fn file_session_signing_key(
         .insert(did.to_string(), pubkey_b64.to_string());
     let did_for_db = did.to_string();
     state.with_db(|db| db.save_signing_key(&did_for_db, &bytes));
+    let kid = freeq_sdk::sigtag::derive_kid(&vk);
+    // The login token behind this key, so signing the device out can end it.
+    if let Some(token) = broker_token {
+        state
+            .device_key_tokens
+            .lock()
+            .insert((did.to_string(), kid.clone()), token.to_string());
+    }
     // Anything a peer relayed under this key was parked for want of it. It can
     // be judged now.
-    crate::server::retry_deferred_task_events(state, did, &freeq_sdk::sigtag::derive_kid(&vk));
+    crate::server::retry_deferred_task_events(state, did, &kid);
     tracing::info!(session = %session_id, %did, "Client registered message signing key");
     Ok(())
 }
@@ -207,6 +216,10 @@ pub struct Connection {
     /// every message it sent came back server-signed. Parking it turns a
     /// silent wrong answer into the right one.
     pub(crate) pending_msg_key: Option<String>,
+    /// The login token this connection authenticated with, when it came in on
+    /// a web token. Kept so a signing key registered here can be tied back to
+    /// the token behind it, and that token refused when the device signs out.
+    pub(crate) broker_token: Option<String>,
     /// Actor class: human (default), agent, or external_agent.
     pub(crate) actor_class: ActorClass,
 
@@ -266,6 +279,7 @@ impl Connection {
             authenticated_did: None,
             registered: false,
             pending_msg_key: None,
+            broker_token: None,
             actor_class: ActorClass::Human,
             iroh_endpoint_id: None,
             cap_negotiating: false,
@@ -1366,6 +1380,7 @@ where
                         &session_id,
                         conn.authenticated_did.as_deref(),
                         pubkey_b64,
+                        conn.broker_token.as_deref(),
                     ) {
                         Ok(()) => {
                             let reply =
@@ -3964,6 +3979,25 @@ fn broadcast_quit_s2s(state: &Arc<SharedState>, nick: &str) {
             origin,
         },
     );
+}
+
+/// Close a connection from outside its own task: write `reason` to it, then
+/// signal its read loop to exit and run the normal disconnect cleanup.
+///
+/// Returns whether a live connection was signalled. The eviction signal is
+/// the same one the liveness reaper and the identity re-verify loop use.
+pub(crate) fn close_session(state: &Arc<SharedState>, session_id: &str, reason: &str) -> bool {
+    if let Some(tx) = state.connections.lock().get(session_id) {
+        let _ = tx.try_send(format!("ERROR :{reason}\r\n"));
+    }
+    let kill = state.session_kill.lock().get(session_id).cloned();
+    match kill {
+        Some(kill) => {
+            kill.notify_one();
+            true
+        }
+        None => false,
+    }
 }
 
 /// Clean up per-session state (connections, caps, etc.) but NOT channel membership.
