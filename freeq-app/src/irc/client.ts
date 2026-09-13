@@ -1344,6 +1344,13 @@ function wireEvents(c: FreeqClient) {
   });
 
   c.on('serverFail', (text) => {
+    // The server refused this device's key: the account signed it out. Sign
+    // out here too, then say why, since the teardown clears the auth error.
+    if (/^MSGSIG KEY_RETIRED\b/.test(text)) {
+      disconnect();
+      s().setAuthError('This device was signed out from another device. Sign in again to continue.');
+      return;
+    }
     // A refusal is an answer. Resolving it here rather than waiting out the
     // timer is what turns an old server's ACCOUNT_REQUIRED, or an anchor it
     // does not know, into the button at once instead of ten seconds of
