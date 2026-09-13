@@ -20,7 +20,8 @@ import {
   type Fetch,
   type ResolveDid,
   deviceKeyHistory,
-  listRecords,
+  listRecordEntries,
+  provenRecords,
 } from './identity-records.js';
 import { deriveKid } from './signing.js';
 
@@ -59,6 +60,8 @@ interface Cached {
  */
 export class KeyLookup {
   private readonly cache = new Map<string, Cached>();
+  /** CIDs of records whose repository proof has checked, so each is fetched once. */
+  private readonly proven = new Set<string>();
   private defaultOrigin: string | null = null;
 
   /** `originBase` is the origin server's base URL; the reader's `fetch` serves its requests. */
@@ -105,7 +108,8 @@ export class KeyLookup {
       records = cached.records;
     } else {
       try {
-        records = await listRecords(this.reader.fetch, this.reader.resolveDid, did, DEVICE_KEY_TYPE);
+        // A listed record counts only once its repository proof checks.
+        records = await this.provenDeviceRecords(did);
       } catch (e) {
         [failed, failure] = [true, e];
       }
@@ -141,6 +145,15 @@ export class KeyLookup {
     if (failed) throw failure;
     this.remember(slot, records, null);
     return null;
+  }
+
+  /**
+   * `did`'s device key records whose repository proof checks, through this
+   * lookup's cache of proven records, so each record's proof is fetched once.
+   */
+  async provenDeviceRecords(did: string): Promise<unknown[]> {
+    const listed = await listRecordEntries(this.reader.fetch, this.reader.resolveDid, did, DEVICE_KEY_TYPE);
+    return provenRecords(this.reader.fetch, this.reader.resolveDid, did, DEVICE_KEY_TYPE, listed, this.proven);
   }
 
   /** Clear a remembered miss for `(did, kid)`, so the next lookup asks again. A key found stays cached. */

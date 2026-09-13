@@ -46,21 +46,36 @@ function b64url(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString('base64url');
 }
 
+type RepoKeypair = Awaited<ReturnType<typeof import('../test/repo-proofs.js')['repoKeypair']>>;
+
+/** ALICE's repository key, and her DID document naming it and the PDS. */
+let repoKey: RepoKeypair;
+let alice: DidDocument;
+
+beforeAll(async () => {
+  const { repoKeypair, stubRepo } = await import('../test/repo-proofs.js');
+  repoKey = await repoKeypair();
+  alice = await (await stubRepo(ALICE, repoKey)).document(PDS);
+});
+
 /**
- * A stubbed network: a PDS listing `records` as ALICE's device keys, and an
- * origin key store holding `originKeys` by `${did} ${kid}`. Counts requests
- * per host.
+ * A stubbed network: a PDS listing `records` as ALICE's device keys, each with
+ * a proof signed by her repository key, and an origin key store holding
+ * `originKeys` by `${did} ${kid}`. Counts listings and origin requests per
+ * host, and proof requests on their own.
  */
-function network(records: unknown[], originKeys: Record<string, Uint8Array> = {}) {
-  const hits = { pds: 0, origin: 0 };
+async function network(records: unknown[], originKeys: Record<string, Uint8Array> = {}) {
+  const { stubRepo } = await import('../test/repo-proofs.js');
+  const repo = await stubRepo(ALICE, repoKey);
+  const entries = [];
+  for (const record of records) entries.push(await repo.add('at.freeq.deviceKey', record));
+  const hits = { pds: 0, origin: 0, proofs: 0 };
   const fetch = vi.fn(async (input: string): Promise<Response> => {
     const url = new URL(input);
-    if (url.origin === PDS && url.pathname === '/xrpc/com.atproto.repo.listRecords') {
-      hits.pds++;
-      const device = url.searchParams.get('collection') === 'at.freeq.deviceKey';
-      return Response.json({
-        records: (device ? records : []).map((value) => ({ uri: 'at://x', cid: 'bafy', value })),
-      });
+    if (url.origin === PDS) {
+      if (url.pathname === '/xrpc/com.atproto.sync.getRecord') hits.proofs++;
+      else if (url.pathname === '/xrpc/com.atproto.repo.listRecords') hits.pds++;
+      return (await repo.respond(url)) ?? new Response('unexpected', { status: 500 });
     }
     const prefix = '/api/v1/signing-keys/';
     if (url.origin === ORIGIN && url.pathname.startsWith(prefix)) {
@@ -83,14 +98,9 @@ function resolver(docs: DidDocument[]) {
   };
 }
 
-const alice: DidDocument = {
-  id: ALICE,
-  service: [{ id: '#atproto_pds', type: 'AtprotoPersonalDataServer', serviceEndpoint: PDS }],
-};
-
 describe('KeyLookup', () => {
   it('finds a kid in the records without asking the origin', async () => {
-    const { fetch, hits } = network(
+    const { fetch, hits } = await network(
       [await buildDeviceRecord(await key(1), ALICE, T0)],
       { [`${ALICE} ${await kidOf(1)}`]: await raw(1) },
     );
@@ -104,7 +114,7 @@ describe('KeyLookup', () => {
   });
 
   it('asks the origin for a kid absent from the records', async () => {
-    const { fetch, hits } = network(
+    const { fetch, hits } = await network(
       [await buildDeviceRecord(await key(1), ALICE, T0)],
       { [`${ALICE} ${await kidOf(2)}`]: await raw(2) },
     );
@@ -118,7 +128,7 @@ describe('KeyLookup', () => {
   });
 
   it('refuses a key from the origin that does not hash to the kid', async () => {
-    const { fetch, hits } = network([], { [`${ALICE} ${await kidOf(2)}`]: await raw(3) });
+    const { fetch, hits } = await network([], { [`${ALICE} ${await kidOf(2)}`]: await raw(3) });
     const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR);
     expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
     expect(hits.origin).toBe(1);
@@ -127,13 +137,13 @@ describe('KeyLookup', () => {
   it('refuses a key from the records that does not hash to the kid', async () => {
     // The record names kid 2 but carries key 1, signed by key 1.
     const record = { ...(await buildDeviceRecord(await key(1), ALICE, T0)), kid: await kidOf(2) };
-    const { fetch } = network([record]);
+    const { fetch } = await network([record]);
     const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR);
     expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
   });
 
   it('finds a did:web signer in its own document', async () => {
-    const { fetch, hits } = network([]);
+    const { fetch, hits } = await network([]);
     const doc: DidDocument = {
       id: WEB_SIGNER,
       verificationMethod: [
@@ -155,7 +165,7 @@ describe('KeyLookup', () => {
   });
 
   it('still asks the origin when the PDS fails, and fails when nothing else can answer', async () => {
-    const { fetch: working } = network([], { [`${ALICE} ${await kidOf(2)}`]: await raw(2) });
+    const { fetch: working } = await network([], { [`${ALICE} ${await kidOf(2)}`]: await raw(2) });
     const fetch = vi.fn(async (input: string): Promise<Response> =>
       new URL(input).origin === PDS ? new Response('down', { status: 500 }) : working(input),
     );
@@ -166,18 +176,19 @@ describe('KeyLookup', () => {
   });
 
   it('makes one round of requests for two misses inside the ttl', async () => {
-    const { fetch, hits } = network([await buildDeviceRecord(await key(1), ALICE, T0)]);
+    const { fetch, hits } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
     const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR);
     expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
     expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
-    expect(hits).toEqual({ pds: 1, origin: 1 });
+    // The listed record's proof is part of the one round.
+    expect(hits).toEqual({ pds: 1, origin: 1, proofs: 1 });
   });
 
   it('finds a key that appears after a miss once the ttl passes', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
     const originKeys: Record<string, Uint8Array> = {};
-    const { fetch, hits } = network([], originKeys);
+    const { fetch, hits } = await network([], originKeys);
     const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR);
     expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
 
@@ -191,7 +202,7 @@ describe('KeyLookup', () => {
 
   it('asks again after a remembered miss is forgotten', async () => {
     const originKeys: Record<string, Uint8Array> = {};
-    const { fetch, hits } = network([], originKeys);
+    const { fetch, hits } = await network([], originKeys);
     const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR);
     expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
 
@@ -202,7 +213,7 @@ describe('KeyLookup', () => {
   });
 
   it('keeps a found key cached when asked to forget', async () => {
-    const { fetch, hits } = network([await buildDeviceRecord(await key(1), ALICE, T0)]);
+    const { fetch, hits } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
     const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR);
     expect(await lookup.keyFor(ALICE, await kidOf(1))).not.toBeNull();
     lookup.forget(ALICE, await kidOf(1));
@@ -213,7 +224,7 @@ describe('KeyLookup', () => {
   it('makes no request for a second lookup inside the ttl, and asks again after it', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
-    const { fetch, hits } = network([await buildDeviceRecord(await key(1), ALICE, T0)]);
+    const { fetch, hits } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
     const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR);
     const first = await lookup.keyFor(ALICE, await kidOf(1));
     expect(hits.pds).toBe(1);
@@ -226,7 +237,7 @@ describe('KeyLookup', () => {
   });
 
   it('folds the records at the time asked, from one listing', async () => {
-    const { fetch, hits } = network([
+    const { fetch, hits } = await network([
       await buildDeviceRecord(await key(1), ALICE, T0),
       await buildDeviceRetirement(await key(1), ALICE, await kidOf(1), '2026-03-01T00:00:00Z'),
     ]);
@@ -248,7 +259,7 @@ describe('KeyLookup', () => {
   it('reads a key the records retire from the records, with its date, and never asks the origin', async () => {
     const kid = await kidOf(1);
     // The origin still holds the same key and knows nothing of the retirement.
-    const { fetch, hits } = network(
+    const { fetch, hits } = await network(
       [
         await buildDeviceRecord(await key(1), ALICE, T0),
         await buildDeviceRetirement(await key(1), ALICE, kid, '2026-03-01T00:00:00Z'),
@@ -262,6 +273,27 @@ describe('KeyLookup', () => {
       retiredAt: Date.parse('2026-03-01T00:00:00Z') / 1000,
     });
     expect(hits.origin).toBe(0);
+  });
+
+  it('ignores a listed record its repository does not hold, and checks a record once', async () => {
+    const { stubRepo } = await import('../test/repo-proofs.js');
+    const repo = await stubRepo(ALICE, repoKey);
+    const genuine = await buildDeviceRecord(await key(1), ALICE, T0);
+    // Signed by its own key, so it passes every record check but the proof.
+    const forged = await buildDeviceRecord(await key(2), ALICE, T0);
+    const genuineEntry = await repo.add('at.freeq.deviceKey', genuine);
+    await repo.addForged('at.freeq.deviceKey', forged, genuine);
+    const fetch = vi.fn(
+      async (input: string): Promise<Response> =>
+        (await repo.respond(new URL(input))) ?? new Response('not found', { status: 404 }),
+    );
+    // A ttl of zero lists the records afresh on every lookup.
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, 0);
+    expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
+    for (let i = 0; i < 3; i++) {
+      expect((await lookup.keyFor(ALICE, await kidOf(1)))?.source).toBe('IdentityRecord');
+    }
+    expect(repo.proofReads(genuineEntry)).toBe(1);
   });
 
   it('carries the date the origin removed a key', async () => {
@@ -280,7 +312,7 @@ describe('KeyLookup', () => {
   });
 
   it('asks a default origin only when none was given', async () => {
-    const { fetch } = network([], { [`${ALICE} ${await kidOf(2)}`]: await raw(2) });
+    const { fetch } = await network([], { [`${ALICE} ${await kidOf(2)}`]: await raw(2) });
     const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR);
     expect(lookup.originBase()).toBeNull();
     lookup.setDefaultOriginBase(ORIGIN);

@@ -14,8 +14,9 @@ import {
   decodeMultibaseEd25519,
   deviceKeyHistory,
   format,
-  listRecords,
+  listRecordEntries,
   makeDidResolver,
+  provenRecords,
   recordKeyOf,
   type DeviceKeyRecord,
   type DeviceKeyStore,
@@ -264,15 +265,26 @@ export async function deviceRowsFrom(
   return found.map((f) => f.row);
 }
 
-/** Read the account's device key records and lay them out as rows. */
+/** CIDs of device records whose repository proof has checked, for the life of the page. */
+const provenDeviceRecords = new Set<string>();
+
+/**
+ * Read the account's device key records and lay them out as rows. A record
+ * counts only once its repository proof checks.
+ */
 export async function listDeviceRows(): Promise<DeviceRow[]> {
   const did = saslState.did;
   if (!did) return [];
-  const records = await listRecords(
-    (target: string) => fetch(target),
-    makeDidResolver(),
+  const read = (target: string) => fetch(target);
+  const resolveDid = makeDidResolver();
+  const listed = await listRecordEntries(read, resolveDid, did, DEVICE_KEY_TYPE);
+  const records = await provenRecords(
+    read,
+    resolveDid,
     did,
     DEVICE_KEY_TYPE,
+    listed,
+    provenDeviceRecords,
   );
   return deviceRowsFrom(did, records, {
     kid: deviceKeyState.kid,

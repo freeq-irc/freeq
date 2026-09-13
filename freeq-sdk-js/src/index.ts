@@ -106,6 +106,8 @@ export {
   foldDeviceRecords,
   foldAgentRecords,
   listRecords,
+  listRecordEntries,
+  provenRecords,
   liveDeviceKeys,
   liveAgentLinks,
   recordCid,
@@ -115,6 +117,7 @@ export {
   deviceKeyHistory,
 } from './identity-records.js';
 export type {
+  ListedRecord,
   DeviceKeyHistory,
   DeviceKeyRecord,
   AgentKeyRecord,

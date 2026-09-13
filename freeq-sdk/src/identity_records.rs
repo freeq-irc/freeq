@@ -519,13 +519,19 @@ pub struct RecordReader<P: freeq_oauth::ClientProvider> {
 /// One page of a `com.atproto.repo.listRecords` answer.
 #[derive(Deserialize)]
 struct ListRecordsPage {
-    records: Vec<ListedRecord>,
+    records: Vec<RecordEntry>,
     cursor: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct ListedRecord {
-    value: serde_json::Value,
+/// One `listRecords` entry: where the record sits, the CID the PDS gives it,
+/// and the record.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RecordEntry {
+    #[serde(default)]
+    pub uri: String,
+    #[serde(default)]
+    pub cid: String,
+    pub value: serde_json::Value,
 }
 
 impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
@@ -540,6 +546,59 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
         did: &str,
         collection: &str,
     ) -> Result<Vec<serde_json::Value>> {
+        Ok(self
+            .list_record_entries(did, collection)
+            .await?
+            .into_iter()
+            .map(|entry| entry.value)
+            .collect())
+    }
+
+    /// The records among `entries` whose repository proof checks: the signed
+    /// commit names `did`, verifies under the account's `#atproto` key, and
+    /// holds the record at the path its uri names in `collection`. Any other
+    /// record is left out, as if absent. A passed check is remembered in
+    /// `proven` by record CID, so a record's proof is fetched once.
+    pub async fn proven_records(
+        &self,
+        did: &str,
+        collection: &str,
+        entries: Vec<RecordEntry>,
+        proven: &parking_lot::Mutex<std::collections::HashSet<Cid>>,
+    ) -> Vec<serde_json::Value> {
+        let prefix = format!("at://{did}/{collection}/");
+        let mut out = Vec::new();
+        for entry in entries {
+            let Ok(cid) = record_cid(&entry.value) else {
+                continue;
+            };
+            if !proven.lock().contains(&cid) {
+                let Some(rkey) = entry
+                    .uri
+                    .strip_prefix(&prefix)
+                    .filter(|rkey| !rkey.is_empty() && !rkey.contains('/'))
+                else {
+                    continue;
+                };
+                match self.verify_record(did, collection, rkey, &cid).await {
+                    Ok(outcome) if outcome.verified() => {
+                        proven.lock().insert(cid);
+                    }
+                    _ => continue,
+                }
+            }
+            out.push(entry.value);
+        }
+        out
+    }
+
+    /// `list_records`, keeping each record's uri and CID as the PDS listed
+    /// them.
+    pub async fn list_record_entries(
+        &self,
+        did: &str,
+        collection: &str,
+    ) -> Result<Vec<RecordEntry>> {
         let doc = self.resolver.resolve(did).await?;
         let Some(pds) = pds_endpoint(&doc) else {
             return Ok(Vec::new());
@@ -568,7 +627,7 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
             // An empty page ends the listing even if it carries a cursor, so a
             // PDS cannot keep the reader asking forever for nothing.
             let empty = page.records.is_empty();
-            records.extend(page.records.into_iter().map(|r| r.value));
+            records.extend(page.records);
             match page.cursor {
                 Some(next) if !empty => cursor = Some(next),
                 _ => break,
@@ -1512,6 +1571,62 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A PDS on a loopback port answering from `repo`.
+    async fn serve_repo(repo: Arc<parking_lot::Mutex<crate::test_support::StubRepo>>) -> String {
+        use axum::response::IntoResponse;
+        let router = axum::Router::new().fallback(
+            move |uri: axum::http::Uri, Query(q): Query<HashMap<String, String>>| {
+                let answer = repo.lock().respond(uri.path(), &q);
+                async move {
+                    match answer {
+                        Some((status, content_type, body)) => (
+                            StatusCode::from_u16(status).unwrap(),
+                            [("content-type", content_type)],
+                            body,
+                        )
+                            .into_response(),
+                        None => StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            },
+        );
+        spawn_stub(router).await
+    }
+
+    #[tokio::test]
+    async fn only_records_the_repository_proves_count_and_a_passed_proof_is_fetched_once() {
+        let mut repo = crate::test_support::StubRepo::new(ALICE);
+        let genuine = value(&build_device_record(&key(1), ALICE, T0, Some("laptop")).unwrap());
+        // Signed by its own key, so it passes every record check but the proof.
+        let forged = value(&build_device_record(&key(2), ALICE, T0, Some("forged")).unwrap());
+        let genuine_uri = repo.add(DEVICE_KEY_TYPE, &genuine);
+        let forged_uri = repo.add_forged(DEVICE_KEY_TYPE, &forged, &genuine);
+        let repo = Arc::new(parking_lot::Mutex::new(repo));
+        let base = serve_repo(repo.clone()).await;
+        let doc = repo.lock().document(&base);
+        let reader = RecordReader::new(
+            DidResolver::static_map(HashMap::from([(ALICE.to_string(), doc)])),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        );
+
+        let proven = parking_lot::Mutex::new(std::collections::HashSet::new());
+        for _ in 0..3 {
+            let entries = reader
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .await
+                .unwrap();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(
+                reader
+                    .proven_records(ALICE, DEVICE_KEY_TYPE, entries, &proven)
+                    .await,
+                vec![genuine.clone()]
+            );
+        }
+        assert_eq!(repo.lock().proof_reads(&genuine_uri), 1);
+        assert_eq!(repo.lock().proof_reads(&forged_uri), 3);
     }
 
     #[tokio::test]

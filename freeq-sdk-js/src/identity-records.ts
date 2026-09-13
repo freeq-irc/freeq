@@ -505,6 +505,13 @@ export type ResolveDid = (did: string) => Promise<DidDocument>;
  */
 export type Fetch = (url: string) => Promise<Response>;
 
+/** One `listRecords` entry: where the record sits, the CID the PDS gives it, and the record. */
+export interface ListedRecord {
+  uri: string;
+  cid: string;
+  value: unknown;
+}
+
 /**
  * Every record of `collection` in `did`'s repository, as its PDS lists them,
  * unauthenticated. A DID whose document names no PDS has none.
@@ -515,9 +522,19 @@ export async function listRecords(
   did: string,
   collection: string,
 ): Promise<unknown[]> {
+  return (await listRecordEntries(fetch, resolveDid, did, collection)).map((e) => e.value);
+}
+
+/** `listRecords`, keeping each record's uri and CID as the PDS listed them. */
+export async function listRecordEntries(
+  fetch: Fetch,
+  resolveDid: ResolveDid,
+  did: string,
+  collection: string,
+): Promise<ListedRecord[]> {
   const pds = pdsEndpoint(await resolveDid(did));
   if (pds === undefined) return [];
-  const records: unknown[] = [];
+  const records: ListedRecord[] = [];
   let cursor: string | undefined;
   for (;;) {
     const params: Record<string, string> = { repo: did, collection, limit: '100' };
@@ -526,11 +543,15 @@ export async function listRecords(
       await get(fetch, xrpcUrl(pds, 'com.atproto.repo.listRecords', params))
     ).json()) as { records?: unknown; cursor?: unknown };
     if (!Array.isArray(page.records)) throw new Error('listRecords answer is not a record list');
-    for (const listed of page.records as { value?: unknown }[]) {
+    for (const listed of page.records as { uri?: unknown; cid?: unknown; value?: unknown }[]) {
       if (typeof listed !== 'object' || listed === null || !('value' in listed)) {
         throw new Error('listRecords answer has a record with no value');
       }
-      records.push(listed.value);
+      records.push({
+        uri: typeof listed.uri === 'string' ? listed.uri : '',
+        cid: typeof listed.cid === 'string' ? listed.cid : '',
+        value: listed.value,
+      });
     }
     // An empty page ends the listing even if it carries a cursor, so a PDS
     // cannot keep the reader asking forever for nothing.
@@ -538,6 +559,46 @@ export async function listRecords(
     cursor = page.cursor;
   }
   return records;
+}
+
+/**
+ * The records among `entries` whose repository proof checks: the signed
+ * commit names `did`, verifies under the account's `#atproto` key, and holds
+ * the record at the path its uri names in `collection`. Any other record is
+ * left out, as if absent. A passed check is remembered in `proven` by record
+ * CID, so a record's proof is fetched once.
+ */
+export async function provenRecords(
+  fetch: Fetch,
+  resolveDid: ResolveDid,
+  did: string,
+  collection: string,
+  entries: ListedRecord[],
+  proven: Set<string>,
+): Promise<unknown[]> {
+  const prefix = `at://${did}/${collection}/`;
+  const out: unknown[] = [];
+  for (const entry of entries) {
+    let cid: string;
+    try {
+      cid = await recordCid(entry.value);
+    } catch {
+      continue;
+    }
+    if (!proven.has(cid)) {
+      const rkey = entry.uri.startsWith(prefix) ? entry.uri.slice(prefix.length) : '';
+      if (rkey === '' || rkey.includes('/')) continue;
+      try {
+        const outcome = await verifyRecord(fetch, resolveDid, did, collection, rkey, cid);
+        if (!outcome.commitDidMatches || !outcome.signatureValid || !outcome.recordPresent) continue;
+      } catch {
+        continue;
+      }
+      proven.add(cid);
+    }
+    out.push(entry.value);
+  }
+  return out;
 }
 
 /** The device keys of `did` that are live at `at`. */

@@ -235,6 +235,34 @@ describe('device key history', () => {
   });
 });
 
+describe('checking listed records against the repository', () => {
+  it('keeps a genuine record, ignores a forged one, and fetches a passed proof once', async () => {
+    const { listRecordEntries, provenRecords } = await import('./identity-records.js');
+    const { stubRepo } = await import('../test/repo-proofs.js');
+    const repo = await stubRepo(ALICE);
+    const genuine = await buildDeviceRecord(await key(1), ALICE, T0, 'laptop');
+    // Signed by its own key, so it passes every record check but the proof.
+    const forged = await buildDeviceRecord(await key(2), ALICE, T0, 'forged');
+    const genuineEntry = await repo.add(DEVICE_KEY_TYPE, genuine);
+    const forgedEntry = await repo.addForged(DEVICE_KEY_TYPE, forged, genuine);
+    const doc = await repo.document(PDS);
+    const fetch = async (input: string): Promise<Response> =>
+      (await repo.respond(new URL(input))) ?? new Response('unexpected', { status: 500 });
+    const resolveDid = async (): Promise<DidDocument> => doc;
+
+    const proven = new Set<string>();
+    for (let i = 0; i < 3; i++) {
+      const entries = await listRecordEntries(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE);
+      expect(entries).toHaveLength(2);
+      expect(await provenRecords(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE, entries, proven)).toEqual([
+        genuine,
+      ]);
+    }
+    expect(repo.proofReads(genuineEntry)).toBe(1);
+    expect(repo.proofReads(forgedEntry)).toBe(3);
+  });
+});
+
 describe('reading records from a PDS', () => {
   it('reads every page until the PDS stops sending a cursor', async () => {
     const [k1, k2] = [await key(1), await key(2)];

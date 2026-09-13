@@ -306,40 +306,41 @@ describe('publishing the device key through the broker', () => {
 describe('a stored key the account has retired', () => {
   const RETIRED = '2026-09-12T10:00:00.000Z';
 
-  /** The account's device records for `stored`: its record, and a
-   *  retirement signed by the key itself when `retired`. */
-  async function accountRecords(stored: StoredDeviceKey, retired: boolean): Promise<unknown[]> {
+  const KEY_TYPE = 'at.freeq.deviceKey';
+  type StubRepo = Awaited<ReturnType<typeof import('../test/repo-proofs.js')['stubRepo']>>;
+
+  /** `stored`'s own record, and a retirement of it signed by the key itself. */
+  async function recordsOf(stored: StoredDeviceKey): Promise<{ record: unknown; retirement: unknown }> {
     const { buildDeviceRecord, buildDeviceRetirement } = await import('./identity-records.js');
     const { recordKeyOf } = await import('./device-key.js');
     const key = await recordKeyOf(stored.keyPair);
     const record = await buildDeviceRecord(key, DID, stored.createdAt);
-    if (!retired) return [record];
     const kid = await deriveKid(decodeMultibaseEd25519(key.publicKeyMultibase));
-    return [record, await buildDeviceRetirement(key, DID, kid, RETIRED)];
+    return { record, retirement: await buildDeviceRetirement(key, DID, kid, RETIRED) };
   }
 
-  /** A client whose record reader lists `records` for the account; how many
+  /** The account's repository holding `records`, each with its proof. */
+  async function repoHolding(...records: unknown[]): Promise<StubRepo> {
+    const { stubRepo } = await import('../test/repo-proofs.js');
+    const repo = await stubRepo(DID);
+    for (const record of records) await repo.add(KEY_TYPE, record);
+    return repo;
+  }
+
+  /** A client whose key lookup reads the account from `repo`; how many
    *  listings it served. */
-  async function clientReading(
-    store: MemoryDeviceKeyStore,
-    records: () => unknown[],
-    freshSignIn?: boolean,
-  ) {
+  async function clientReading(store: MemoryDeviceKeyStore, repo: StubRepo, freshSignIn?: boolean) {
     const { FreeqClient } = await import('./client.js');
     const { KeyLookup } = await import('./key-lookup.js');
     let listings = 0;
+    const doc = await repo.document('https://pds.test.example');
     const reader = {
       fetch: async (url: string): Promise<Response> => {
-        if (!url.includes('com.atproto.repo.listRecords')) return new Response('{}', { status: 404 });
-        listings++;
-        return Response.json({
-          records: records().map((value) => ({ uri: 'at://x', cid: 'bafy', value })),
-        });
+        const parsed = new URL(url);
+        if (parsed.pathname === '/xrpc/com.atproto.repo.listRecords') listings++;
+        return (await repo.respond(parsed)) ?? new Response('{}', { status: 404 });
       },
-      resolveDid: async (did: string) => ({
-        id: did,
-        service: [{ type: 'AtprotoPersonalDataServer', serviceEndpoint: 'https://pds.test.example' }],
-      }),
+      resolveDid: async () => doc,
     };
     const client = new FreeqClient({
       url: 'wss://test/irc',
@@ -358,9 +359,9 @@ describe('a stored key the account has retired', () => {
 
   it('is replaced right after a new sign-in, and the new key is published', async () => {
     const old = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3old');
-    const records = await accountRecords(old, true);
+    const { record, retirement } = await recordsOf(old);
     const store = new MemoryDeviceKeyStore(old);
-    const { client } = await clientReading(store, () => records, true);
+    const { client } = await clientReading(store, await repoHolding(record, retirement), true);
     const ws = await login(client);
 
     expect(msgsigOf(ws)).not.toBe(await rawPublicB64(old.keyPair));
@@ -374,19 +375,46 @@ describe('a stored key the account has retired', () => {
 
   it('is not replaced when it is still live', async () => {
     const live = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3live');
-    const records = await accountRecords(live, false);
+    const { record } = await recordsOf(live);
     const store = new MemoryDeviceKeyStore(live);
-    const { client } = await clientReading(store, () => records, true);
+    const { client } = await clientReading(store, await repoHolding(record), true);
     const ws = await login(client);
     expect(msgsigOf(ws)).toBe(await rawPublicB64(live.keyPair));
     expect((await store.load())!.keyPair).toBe(live.keyPair);
   });
 
+  it('is not replaced by a retirement the repository does not hold, and is by one it does', async () => {
+    const forgedKey = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
+    const forged = await recordsOf(forgedKey);
+    const forgedRepo = await repoHolding(forged.record);
+    // Signed by the key itself, so it passes every record check but the
+    // proof, which commits to a different record at its path.
+    await forgedRepo.addForged(KEY_TYPE, forged.retirement, forged.record);
+    const kept = new MemoryDeviceKeyStore(forgedKey);
+    const first = await clientReading(kept, forgedRepo, true);
+    const ws = await login(first.client);
+    expect(msgsigOf(ws)).toBe(await rawPublicB64(forgedKey.keyPair));
+    expect((await kept.load())!.keyPair).toBe(forgedKey.keyPair);
+
+    MockWebSocket.instances = [];
+    const genuineKey = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
+    const genuine = await recordsOf(genuineKey);
+    const replaced = new MemoryDeviceKeyStore(genuineKey);
+    const second = await clientReading(
+      replaced,
+      await repoHolding(genuine.record, genuine.retirement),
+      true,
+    );
+    const ws2 = await login(second.client);
+    expect(msgsigOf(ws2)).not.toBe(await rawPublicB64(genuineKey.keyPair));
+    expect((await replaced.load())!.keyPair).not.toBe(genuineKey.keyPair);
+  });
+
   it('is kept on a connect that does not follow a new sign-in', async () => {
     const old = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3old');
-    const records = await accountRecords(old, true);
+    const { record, retirement } = await recordsOf(old);
     const store = new MemoryDeviceKeyStore(old);
-    const { client, listings } = await clientReading(store, () => records);
+    const { client, listings } = await clientReading(store, await repoHolding(record, retirement));
     const ws = await login(client);
     expect(msgsigOf(ws)).toBe(await rawPublicB64(old.keyPair));
     expect(listings()).toBe(0);
@@ -394,13 +422,14 @@ describe('a stored key the account has retired', () => {
 
   it('is kept on a reconnect after the sign-in connect', async () => {
     const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
-    let records = await accountRecords(stored, false);
+    const { record, retirement } = await recordsOf(stored);
+    const repo = await repoHolding(record);
     const store = new MemoryDeviceKeyStore(stored);
-    const { client } = await clientReading(store, () => records, true);
+    const { client } = await clientReading(store, repo, true);
     const ws = await login(client);
     expect(msgsigOf(ws)).toBe(await rawPublicB64(stored.keyPair));
 
-    records = await accountRecords(stored, true);
+    await repo.add(KEY_TYPE, retirement);
     ws.close();
     await flushAsync();
     const ws2 = await login(client);

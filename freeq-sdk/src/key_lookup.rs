@@ -14,7 +14,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use freeq_oauth::ClientProvider;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -47,6 +47,9 @@ pub struct KeyLookup<P: ClientProvider> {
     default_origin: OnceLock<String>,
     ttl: Duration,
     cache: Mutex<HashMap<(String, String), Cached>>,
+    /// CIDs of records whose repository proof has checked, so each is fetched
+    /// once however often the records are listed.
+    proven: Mutex<HashSet<crate::identity_records::Cid>>,
 }
 
 /// One (DID, kid)'s cached answer: the signer's device records as listed,
@@ -77,6 +80,7 @@ impl<P: ClientProvider> KeyLookup<P> {
             default_origin: OnceLock::new(),
             ttl,
             cache: Mutex::new(HashMap::new()),
+            proven: Mutex::new(HashSet::new()),
         }
     }
 
@@ -123,7 +127,7 @@ impl<P: ClientProvider> KeyLookup<P> {
         let mut failure = None;
         let records = match cached.as_ref() {
             Some(c) => c.records.clone(),
-            None => match self.reader.list_records(did, DEVICE_KEY_TYPE).await {
+            None => match self.proven_device_records(did).await {
                 Ok(records) => records,
                 Err(e) => {
                     failure = Some(e);
@@ -184,6 +188,19 @@ impl<P: ClientProvider> KeyLookup<P> {
                 Ok(None)
             }
         }
+    }
+
+    /// `did`'s device key records whose repository proof checks, through this
+    /// lookup's cache of proven records, so each record's proof is fetched once.
+    pub async fn proven_device_records(&self, did: &str) -> Result<Vec<serde_json::Value>> {
+        let entries = self
+            .reader
+            .list_record_entries(did, DEVICE_KEY_TYPE)
+            .await?;
+        Ok(self
+            .reader
+            .proven_records(did, DEVICE_KEY_TYPE, entries, &self.proven)
+            .await)
     }
 
     /// Clear a remembered miss for `(did, kid)`, so the next lookup asks the
@@ -335,6 +352,8 @@ mod tests {
     struct Stub {
         base: String,
         hits: Arc<AtomicUsize>,
+        /// A PDS stub's account repository, whose key signs its proofs.
+        repo: Option<Arc<parking_lot::Mutex<crate::test_support::StubRepo>>>,
     }
 
     impl Stub {
@@ -349,34 +368,52 @@ mod tests {
         tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
-        Stub { base, hits }
+        Stub {
+            base,
+            hits,
+            repo: None,
+        }
     }
 
-    /// A PDS listing `records` as the account's device keys, in one page.
+    /// A PDS for ALICE listing `records` as her device keys, in one page, each
+    /// with a repository proof. `hits` counts listings, not proofs.
     async fn pds(records: Vec<serde_json::Value>) -> Stub {
+        let mut repo = crate::test_support::StubRepo::new(ALICE);
+        for record in &records {
+            repo.add(DEVICE_KEY_TYPE, record);
+        }
+        pds_holding(repo).await
+    }
+
+    /// A PDS answering from `repo`.
+    async fn pds_holding(repo: crate::test_support::StubRepo) -> Stub {
+        use axum::response::IntoResponse;
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = hits.clone();
-        let records = Arc::new(records);
-        let router = axum::Router::new().route(
-            "/xrpc/com.atproto.repo.listRecords",
-            get(move |Query(q): Query<HashMap<String, String>>| {
-                counter.fetch_add(1, Ordering::SeqCst);
-                let records = records.clone();
-                async move {
-                    let listed: Vec<serde_json::Value> =
-                        if q.get("collection").map(String::as_str) == Some(DEVICE_KEY_TYPE) {
-                            records
-                                .iter()
-                                .map(|value| json!({"uri": "at://x", "cid": "bafyreistub", "value": value}))
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
-                    axum::Json(json!({ "records": listed }))
+        let repo = Arc::new(parking_lot::Mutex::new(repo));
+        let answering = repo.clone();
+        let router = axum::Router::new().fallback(
+            move |uri: axum::http::Uri, Query(q): Query<HashMap<String, String>>| {
+                if uri.path() == "/xrpc/com.atproto.repo.listRecords" {
+                    counter.fetch_add(1, Ordering::SeqCst);
                 }
-            }),
+                let answer = answering.lock().respond(uri.path(), &q);
+                async move {
+                    match answer {
+                        Some((status, content_type, body)) => (
+                            StatusCode::from_u16(status).unwrap(),
+                            [("content-type", content_type)],
+                            body,
+                        )
+                            .into_response(),
+                        None => StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            },
         );
-        serve(router, hits).await
+        let mut stub = serve(router, hits).await;
+        stub.repo = Some(repo);
+        stub
     }
 
     /// An origin server whose key store holds `keys` by (did, kid).
@@ -434,8 +471,17 @@ mod tests {
         KeyLookup::new(reader, origin.map(|o| o.base.clone()), ttl)
     }
 
+    /// ALICE's DID document on `pds`, naming the key that signs its proofs. A
+    /// stub with no repository signs nothing, so any key will do.
     fn alice_on(pds: &Stub) -> DidDocument {
-        make_test_did_document_with_pds(ALICE, &key(50).public_key_multibase(), Some(&pds.base))
+        match pds.repo.as_ref() {
+            Some(repo) => repo.lock().document(&pds.base),
+            None => make_test_did_document_with_pds(
+                ALICE,
+                &key(50).public_key_multibase(),
+                Some(&pds.base),
+            ),
+        }
     }
 
     fn device_record(seed: u8) -> serde_json::Value {
@@ -708,6 +754,31 @@ mod tests {
             })
         );
         assert_eq!(origin.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_listed_record_the_repository_does_not_hold_is_ignored_and_a_proof_is_fetched_once() {
+        let mut repo = crate::test_support::StubRepo::new(ALICE);
+        let genuine_uri = repo.add(DEVICE_KEY_TYPE, &device_record(1));
+        // Signed by its own key, so it passes every record check but the proof.
+        repo.add_forged(DEVICE_KEY_TYPE, &device_record(2), &device_record(1));
+        let pds = pds_holding(repo).await;
+        // A ttl of zero lists the records afresh on every lookup.
+        let keys = lookup(vec![alice_on(&pds)], None, Duration::ZERO);
+        assert_eq!(keys.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
+        for _ in 0..3 {
+            assert_eq!(
+                keys.key_for(ALICE, &kid_of(1))
+                    .await
+                    .unwrap()
+                    .map(|f| f.source),
+                Some(KeySource::IdentityRecord)
+            );
+        }
+        assert_eq!(
+            pds.repo.as_ref().unwrap().lock().proof_reads(&genuine_uri),
+            1
+        );
     }
 
     #[tokio::test]

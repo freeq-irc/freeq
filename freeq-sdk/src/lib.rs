@@ -47,6 +47,8 @@ pub mod p2p;
 pub mod pds;
 pub mod ratchet;
 pub mod sigtag;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 // SSRF-safe outbound HTTP now lives in its own single-purpose crate; re-export
 // so the `freeq_sdk::ssrf::` path stays stable for existing consumers.
 pub use freeq_ssrf as ssrf;

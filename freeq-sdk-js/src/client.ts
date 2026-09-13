@@ -15,13 +15,8 @@ import * as e2ee from './e2ee.js';
 import { dmPeerKey, isDid } from './address.js';
 import { prefetchProfiles } from './profiles.js';
 import { recordKeyOf, type DeviceKeyStore, type StoredDeviceKey } from './device-key.js';
-import {
-  DEVICE_KEY_TYPE,
-  buildDeviceRecord,
-  deviceKeyHistory,
-  listRecords,
-} from './identity-records.js';
-import { makeDidResolver } from './key-lookup.js';
+import { buildDeviceRecord, deviceKeyHistory } from './identity-records.js';
+import { KeyLookup, makeDidResolver } from './key-lookup.js';
 import { SignatureChecker, firstLook, sigTagKid, type Verdict } from './verdict.js';
 import type {
   IRCMessage, Message, Member, AvSession, AvParticipant,
@@ -1745,12 +1740,13 @@ export class FreeqClient extends EventEmitter {
   ): Promise<StoredDeviceKey> {
     const did = this.sasl?.did;
     if (!did) return stored;
-    const reader = this.opts.keyLookup?.reader ?? {
-      fetch: (target: string) => fetch(target),
-      resolveDid: makeDidResolver(),
-    };
+    // Records count only once their repository proof checks, through the
+    // key lookup's cache.
+    const lookup =
+      this.opts.keyLookup ??
+      new KeyLookup({ fetch: (target: string) => fetch(target), resolveDid: makeDidResolver() }, null, 0);
     const check = async (): Promise<StoredDeviceKey> => {
-      const records = await listRecords(reader.fetch, reader.resolveDid, did, DEVICE_KEY_TYPE);
+      const records = await lookup.provenDeviceRecords(did);
       const raw = new Uint8Array(await crypto.subtle.exportKey('raw', stored.keyPair.publicKey));
       const kid = await signing.deriveKid(raw);
       const now = Date.now();

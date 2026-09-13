@@ -71,7 +71,7 @@ default = []
 av-native = ["iroh-live", "moq-relay", "moq-native", "moq-lite", "moq-token", "qmux", "futures", "rustls"]  # Enable iroh-live + SFU (QUIC + WebSocket)
 
 [dev-dependencies]
-freeq-sdk = { path = "../freeq-sdk" }
+freeq-sdk = { path = "../freeq-sdk", features = ["test-support"] }
 iroh = { workspace = true }
 serde_urlencoded = "0.7"
 rcgen = "0.13"

@@ -332,44 +332,55 @@ pub(crate) async fn stub_pds_resolver(did: &str, records: Vec<serde_json::Value>
 }
 
 /// [`stub_pds_resolver`] over records a test can change, with a count of the
-/// listing requests the stub has answered.
+/// listing requests the stub has answered. Each record is listed with a
+/// repository proof signed by the key the document names under `#atproto`;
+/// a record pushed after the stub starts is listed from the next request on.
 #[cfg(test)]
 pub(crate) async fn stub_pds_holding(
     did: &str,
     records: Arc<Mutex<Vec<serde_json::Value>>>,
 ) -> (DidResolver, Arc<std::sync::atomic::AtomicUsize>) {
+    use axum::response::IntoResponse;
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = hits.clone();
+    let repo = Arc::new(Mutex::new(freeq_sdk::test_support::StubRepo::new(did)));
+    let answering = repo.clone();
+    let added = Arc::new(Mutex::new(0usize));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let app = axum::Router::new().route(
-        "/xrpc/com.atproto.repo.listRecords",
-        axum::routing::get(
-            move |axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>| {
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let records = records.lock().clone();
-                async move {
-                    let device = q.get("collection").map(String::as_str)
-                        == Some(freeq_sdk::identity_records::DEVICE_KEY_TYPE);
-                    let listed: Vec<serde_json::Value> = if device {
-                        records
-                            .iter()
-                            .map(|value| serde_json::json!({"uri": "at://x", "cid": "bafy", "value": value}))
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    axum::Json(serde_json::json!({ "records": listed }))
+    let app = axum::Router::new().fallback(
+        move |uri: axum::http::Uri,
+              axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>| {
+            {
+                let records = records.lock();
+                let mut added = added.lock();
+                let mut repo = answering.lock();
+                for record in &records[*added..] {
+                    repo.add(freeq_sdk::identity_records::DEVICE_KEY_TYPE, record);
                 }
-            },
-        ),
+                *added = records.len();
+            }
+            if uri.path() == "/xrpc/com.atproto.repo.listRecords" {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            let answer = answering.lock().respond(uri.path(), &q);
+            async move {
+                match answer {
+                    Some((status, content_type, body)) => (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        [("content-type", content_type)],
+                        body,
+                    )
+                        .into_response(),
+                    None => axum::http::StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+        },
     );
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    // Any key works for the document's own `#atproto` entry; it signs nothing here.
-    let atproto = freeq_sdk::crypto::PrivateKey::generate_secp256k1().public_key_multibase();
-    let doc = freeq_sdk::did::make_test_did_document_with_pds(did, &atproto, Some(&base));
+    let doc = repo.lock().document(&base);
     (
         DidResolver::static_map(HashMap::from([(did.to_string(), doc)])),
         hits,

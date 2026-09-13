@@ -2176,11 +2176,12 @@ fn session_signing_key(
 
 /// Right after a new sign-in, replace a stored key the account's records have
 /// retired with a new one, saved with no record URI so this connect publishes
-/// it. A saved login or a reconnect reads and changes nothing.
+/// it. A saved login or a reconnect reads and changes nothing. Records count
+/// only once their repository proof checks, through `lookup`'s cache.
 async fn replace_retired_device_key<P: freeq_oauth::ClientProvider>(
     fresh_sign_in: bool,
     store: Option<&dyn crate::device_key::DeviceKeyStore>,
-    reader: &crate::identity_records::RecordReader<P>,
+    lookup: &crate::key_lookup::KeyLookup<P>,
     did: &str,
 ) {
     let (true, Some(store)) = (fresh_sign_in, store) else {
@@ -2192,10 +2193,7 @@ async fn replace_retired_device_key<P: freeq_oauth::ClientProvider>(
     let kid = crate::sigtag::derive_kid(
         &ed25519_dalek::SigningKey::from_bytes(&stored.seed).verifying_key(),
     );
-    let records = match reader
-        .list_records(did, crate::identity_records::DEVICE_KEY_TYPE)
-        .await
-    {
+    let records = match lookup.proven_device_records(did).await {
         Ok(records) => records,
         Err(e) => {
             tracing::warn!(error = %e, "device key records not read; keeping the stored key");
@@ -2767,20 +2765,41 @@ where
                                 // Bounded: a slow account provider must not
                                 // hold up registration.
                                 if config.fresh_sign_in {
-                                    let reader = crate::identity_records::RecordReader::new(
-                                        crate::did::DidResolver::http(),
-                                        freeq_oauth::SharedClient(reqwest::Client::new()),
-                                    );
-                                    let _ = tokio::time::timeout(
-                                        std::time::Duration::from_secs(10),
+                                    // The configured key lookup, so its cache of
+                                    // proven records serves both.
+                                    let default_lookup;
+                                    let lookup = match config.key_lookup.as_deref() {
+                                        Some(lookup) => lookup,
+                                        None => {
+                                            default_lookup = crate::key_lookup::KeyLookup::new(
+                                                crate::identity_records::RecordReader::new(
+                                                    crate::did::DidResolver::http(),
+                                                    freeq_oauth::SharedClient(
+                                                        reqwest::Client::new(),
+                                                    ),
+                                                ),
+                                                None,
+                                                std::time::Duration::from_secs(3600),
+                                            );
+                                            &default_lookup
+                                        }
+                                    };
+                                    if tokio::time::timeout(
+                                        std::time::Duration::from_secs(60),
                                         replace_retired_device_key(
                                             true,
                                             config.device_key_store.as_deref(),
-                                            &reader,
+                                            lookup,
                                             &did,
                                         ),
                                     )
-                                    .await;
+                                    .await
+                                    .is_err()
+                                    {
+                                        tracing::warn!(
+                                            "the account read outlasted sixty seconds; keeping the stored key"
+                                        );
+                                    }
                                 }
                                 let (key, unpublished) =
                                     session_signing_key(config.device_key_store.as_deref());
@@ -9103,55 +9122,108 @@ mod device_key_tests {
         .unwrap()
     }
 
-    /// A reader whose PDS, on a loopback port, lists `records` as the
-    /// account's device keys, and a count of the listings it answered.
-    async fn reader_listing(
-        records: Vec<serde_json::Value>,
+    /// The tester's repository holding `records`, each with its proof.
+    fn repo_holding(records: &[serde_json::Value]) -> crate::test_support::StubRepo {
+        let mut repo = crate::test_support::StubRepo::new("did:plc:tester");
+        for record in records {
+            repo.add(crate::identity_records::DEVICE_KEY_TYPE, record);
+        }
+        repo
+    }
+
+    /// A key lookup whose PDS, on a loopback port, answers from `repo`, and a
+    /// count of the listings it answered.
+    async fn lookup_listing(
+        repo: crate::test_support::StubRepo,
     ) -> (
-        crate::identity_records::RecordReader<freeq_oauth::SharedClient>,
+        crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>,
         Arc<std::sync::atomic::AtomicUsize>,
     ) {
+        use axum::response::IntoResponse;
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = hits.clone();
-        let router = axum::Router::new().route(
-            "/xrpc/com.atproto.repo.listRecords",
-            axum::routing::get(move || {
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let listed: Vec<serde_json::Value> = records
-                    .iter()
-                    .map(
-                        |value| serde_json::json!({"uri": "at://x", "cid": "bafy", "value": value}),
-                    )
-                    .collect();
-                async move { axum::Json(serde_json::json!({ "records": listed })) }
-            }),
+        let repo = Arc::new(parking_lot::Mutex::new(repo));
+        let answering = repo.clone();
+        let router = axum::Router::new().fallback(
+            move |uri: axum::http::Uri,
+                  axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>| {
+                if uri.path() == "/xrpc/com.atproto.repo.listRecords" {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                let answer = answering.lock().respond(uri.path(), &q);
+                async move {
+                    match answer {
+                        Some((status, content_type, body)) => (
+                            axum::http::StatusCode::from_u16(status).unwrap(),
+                            [("content-type", content_type)],
+                            body,
+                        )
+                            .into_response(),
+                        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            },
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
-        let atproto = crate::crypto::PrivateKey::generate_secp256k1().public_key_multibase();
-        let doc =
-            crate::did::make_test_did_document_with_pds("did:plc:tester", &atproto, Some(&base));
+        let doc = repo.lock().document(&base);
         let resolver = crate::did::DidResolver::static_map(HashMap::from([(
             "did:plc:tester".to_string(),
             doc,
         )]));
-        let reader = crate::identity_records::RecordReader::new(
-            resolver,
-            freeq_oauth::SharedClient(reqwest::Client::new()),
+        let lookup = crate::key_lookup::KeyLookup::new(
+            crate::identity_records::RecordReader::new(
+                resolver,
+                freeq_oauth::SharedClient(reqwest::Client::new()),
+            ),
+            None,
+            std::time::Duration::from_secs(3600),
         );
-        (reader, hits)
+        (lookup, hits)
+    }
+
+    #[tokio::test]
+    async fn a_forged_retirement_does_not_replace_the_key_and_a_genuine_one_does() {
+        // Signed by the key itself, so it passes every record check but the
+        // proof, which commits to a different record at its path.
+        let mut forged = repo_holding(&[record_for(13)]);
+        forged.add_forged(
+            crate::identity_records::DEVICE_KEY_TYPE,
+            &retirement_of(13),
+            &record_for(13),
+        );
+        let (lookup, _) = lookup_listing(forged).await;
+        let store = MemoryStore::holding(13, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
+        replace_retired_device_key(true, Some(store.as_ref()), &lookup, "did:plc:tester").await;
+        assert!(
+            store.saves.lock().is_empty(),
+            "a retirement the repository does not hold changes nothing"
+        );
+
+        let (lookup, _) = lookup_listing(repo_holding(&[record_for(13), retirement_of(13)])).await;
+        let store = MemoryStore::holding(13, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
+        replace_retired_device_key(true, Some(store.as_ref()), &lookup, "did:plc:tester").await;
+        assert_eq!(
+            store.saves.lock().len(),
+            1,
+            "a genuine retirement replaces the key"
+        );
     }
 
     #[tokio::test]
     async fn after_a_new_sign_in_a_retired_key_is_replaced_and_a_live_one_kept() {
-        let (reader, _) =
-            reader_listing(vec![record_for(11), retirement_of(11), record_for(12)]).await;
+        let (lookup, _) = lookup_listing(repo_holding(&[
+            record_for(11),
+            retirement_of(11),
+            record_for(12),
+        ]))
+        .await;
 
         let retired = MemoryStore::holding(11, Some("at://did:plc:tester/at.freeq.deviceKey/3old"));
-        replace_retired_device_key(true, Some(retired.as_ref()), &reader, "did:plc:tester").await;
+        replace_retired_device_key(true, Some(retired.as_ref()), &lookup, "did:plc:tester").await;
         let saved = retired.saves.lock().clone();
         assert_eq!(saved.len(), 1, "the retired key is replaced");
         assert_ne!(saved[0].seed, [11; 32]);
@@ -9162,16 +9234,17 @@ mod device_key_tests {
         assert!(chrono::DateTime::parse_from_rfc3339(&saved[0].created_at).is_ok());
 
         let live = MemoryStore::holding(12, Some("at://did:plc:tester/at.freeq.deviceKey/3live"));
-        replace_retired_device_key(true, Some(live.as_ref()), &reader, "did:plc:tester").await;
+        replace_retired_device_key(true, Some(live.as_ref()), &lookup, "did:plc:tester").await;
         assert!(live.saves.lock().is_empty(), "a live key is kept");
     }
 
     #[tokio::test]
     async fn without_a_new_sign_in_a_retired_key_is_kept() {
         assert!(!ConnectConfig::default().fresh_sign_in);
-        let (reader, hits) = reader_listing(vec![record_for(11), retirement_of(11)]).await;
+        let (lookup, hits) =
+            lookup_listing(repo_holding(&[record_for(11), retirement_of(11)])).await;
         let store = MemoryStore::holding(11, Some("at://did:plc:tester/at.freeq.deviceKey/3old"));
-        replace_retired_device_key(false, Some(store.as_ref()), &reader, "did:plc:tester").await;
+        replace_retired_device_key(false, Some(store.as_ref()), &lookup, "did:plc:tester").await;
         assert!(store.saves.lock().is_empty());
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
@@ -9937,6 +10010,42 @@ mod verdict_tests {
         assert_eq!(seen.settled.map(|v| v.state), Some(VerdictState::Retired));
     }
 
+    /// A PDS for SIGNER listing `records` with repository proofs, and SIGNER's
+    /// DID document naming the key that signs them.
+    async fn signer_pds(records: &[Value]) -> crate::did::DidDocument {
+        use axum::response::IntoResponse;
+        let mut repo = crate::test_support::StubRepo::new(SIGNER);
+        for record in records {
+            repo.add(crate::identity_records::DEVICE_KEY_TYPE, record);
+        }
+        let repo = Arc::new(parking_lot::Mutex::new(repo));
+        let answering = repo.clone();
+        let base =
+            serve(
+                axum::Router::new().fallback(
+                    move |uri: axum::http::Uri,
+                          axum::extract::Query(q): axum::extract::Query<
+                        HashMap<String, String>,
+                    >| {
+                        let answer = answering.lock().respond(uri.path(), &q);
+                        async move {
+                            match answer {
+                                Some((status, content_type, body)) => (
+                                    StatusCode::from_u16(status).unwrap(),
+                                    [("content-type", content_type)],
+                                    body,
+                                )
+                                    .into_response(),
+                                None => StatusCode::NOT_FOUND.into_response(),
+                            }
+                        }
+                    },
+                ),
+            )
+            .await;
+        repo.lock().document(&base)
+    }
+
     #[tokio::test]
     async fn a_key_in_the_signers_records_is_published() {
         let record = serde_json::to_value(
@@ -9949,26 +10058,8 @@ mod verdict_tests {
             .unwrap(),
         )
         .unwrap();
-        let pds = serve(axum::Router::new().route(
-            "/xrpc/com.atproto.repo.listRecords",
-            get(move || {
-                let record = record.clone();
-                async move {
-                    axum::Json(
-                        json!({ "records": [{ "uri": "at://x", "cid": "bafy", "value": record }] }),
-                    )
-                }
-            }),
-        ))
-        .await;
         let origin = serve_origin(Arc::new(Origin::default())).await;
-        let document = crate::did::make_test_did_document_with_pds(
-            SIGNER,
-            &crate::crypto::PrivateKey::ed25519_from_bytes(&[99; 32])
-                .unwrap()
-                .public_key_multibase(),
-            Some(&pds),
-        );
+        let document = signer_pds(&[record]).await;
         let mut session = Session::open(Some(key_lookup(&origin, vec![document])), OWN_DID).await;
         let (wire, _) = signed_message(26, "from my own device");
         session.send(&wire).await;
@@ -10010,28 +10101,11 @@ mod verdict_tests {
             )
             .unwrap(),
         ];
-        let pds = serve(axum::Router::new().route(
-            "/xrpc/com.atproto.repo.listRecords",
-            get(move || {
-                let listed: Vec<Value> = records
-                    .iter()
-                    .map(|value| json!({ "uri": "at://x", "cid": "bafy", "value": value }))
-                    .collect();
-                async move { axum::Json(json!({ "records": listed })) }
-            }),
-        ))
-        .await;
+        let document = signer_pds(&records).await;
         // The origin still serves the same key, with no removal date.
         let origin = Arc::new(Origin::default());
         origin.hold(SIGNER, public(30), None);
         let base = serve_origin(origin.clone()).await;
-        let document = crate::did::make_test_did_document_with_pds(
-            SIGNER,
-            &crate::crypto::PrivateKey::ed25519_from_bytes(&[99; 32])
-                .unwrap()
-                .public_key_multibase(),
-            Some(&pds),
-        );
         let mut session = Session::open(Some(key_lookup(&base, vec![document])), OWN_DID).await;
         // Dated now, after the retirement.
         let (wire, _) = signed_message(30, "sent after I signed it out");
