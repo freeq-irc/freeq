@@ -42,6 +42,22 @@ provenance as verified rather than "declarative only".
 - freeq `#chad-compute` shows `pi-chad-boxd` joined
 - the VM's connection log contains `Provenance verified`
 
+## Reusable form
+
+The one-off is now a skill shipped with `@freeq/pi`, so any pi session with the
+package installed can do this without rediscovering the identity rules:
+
+- `freeq-pi/skills/boxd-migrate/SKILL.md` — when to use it, why the VM mints
+  its own key, and the manual `MSGSIG` step
+- `freeq-pi/scripts/boxd-migrate.sh` — the whole move, idempotent
+- `freeq-pi/scripts/mint-identity.mjs` — mint an identity without connecting
+  (on the machine being provisioned)
+- `freeq-pi/scripts/sign-delegation.mjs` — sign a cert with the owner's
+  creator key (on the owner's machine)
+
+Validated end to end on a throwaway VM (`pi-migrate-test`, since destroyed),
+which is how the settings/`pi install` ordering bug was found.
+
 ## Status
 
 DONE — 2026-09-13. VM `chad-compute`, agent nick `pi-chad-boxd`,
