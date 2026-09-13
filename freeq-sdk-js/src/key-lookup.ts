@@ -19,7 +19,7 @@ import {
   type DidDocument,
   type Fetch,
   type ResolveDid,
-  foldDeviceRecords,
+  deviceKeyHistory,
   listRecords,
 } from './identity-records.js';
 import { deriveKid } from './signing.js';
@@ -31,7 +31,8 @@ export type KeySource = 'IdentityRecord' | 'DidDocument' | 'OriginServer';
 export interface FoundKey {
   publicKey: Uint8Array;
   source: KeySource;
-  /** When the origin server says the key was removed, unix seconds. */
+  /** When the key was retired, unix seconds: by a retirement in the signer's
+   *  records, or the date the origin server says it was removed. */
   retiredAt: number | null;
 }
 
@@ -179,18 +180,29 @@ export class KeyLookup {
   }
 }
 
-/** The key `kid` names among `did`'s device records, if it was live at `at`. */
+/**
+ * The key `kid` names among `did`'s device records at `at`: live then, or
+ * retired at or before then, carrying the retirement the fold accepted. A key
+ * the records retire is answered here, so no other source is asked for it.
+ */
 async function fromRecords(
   did: string,
   kid: string,
   records: unknown[],
   at: Date,
 ): Promise<FoundKey | null> {
-  const live = await foldDeviceRecords(did, records, at);
-  const match = live.find((k) => k.kid === kid);
-  const key = match === undefined ? null : ed25519Raw(match.publicKeyMultibase);
+  const when = at.getTime();
+  const match = (await deviceKeyHistory(did, records)).find((k) => k.kid === kid);
+  if (match === undefined || match.createdAt.getTime() > when) return null;
+  const key = ed25519Raw(match.publicKeyMultibase);
   if (key === null || (await deriveKid(key)) !== kid) return null;
-  return { publicKey: key, source: 'IdentityRecord', retiredAt: null };
+  const retired = match.retiredAt !== null && match.retiredAt.getTime() <= when;
+  return {
+    publicKey: key,
+    source: 'IdentityRecord',
+    // Unix seconds, like the origin's removal date.
+    retiredAt: retired ? Math.floor(match.retiredAt!.getTime() / 1000) : null,
+  };
 }
 
 /**

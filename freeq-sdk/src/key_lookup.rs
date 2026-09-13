@@ -6,7 +6,7 @@
 //! answers, the key must hash to the kid, or it is refused.
 
 use crate::crypto::PublicKey;
-use crate::identity_records::{DEVICE_KEY_TYPE, RecordReader, fold_device_records};
+use crate::identity_records::{DEVICE_KEY_TYPE, RecordReader, device_key_history};
 use crate::sigtag::derive_kid_bytes;
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -34,7 +34,8 @@ pub enum KeySource {
 pub struct FoundKey {
     pub public_key: [u8; 32],
     pub source: KeySource,
-    /// When the origin server says the key was removed, unix seconds.
+    /// When the key was retired, unix seconds: by a retirement in the signer's
+    /// records, or the date the origin server says it was removed.
     pub retired_at: Option<i64>,
 }
 
@@ -260,23 +261,29 @@ impl<P: ClientProvider> KeyLookup<P> {
     }
 }
 
-/// The key `kid` names among `did`'s device records, if it was live at `at`.
+/// The key `kid` names among `did`'s device records at `at`: live then, or
+/// retired at or before then, carrying the retirement the fold accepted. A key
+/// the records retire is answered here, so no other source is asked for it.
 fn in_records(
     did: &str,
     kid: &str,
     records: &[serde_json::Value],
     at: DateTime<Utc>,
 ) -> Option<FoundKey> {
-    fold_device_records(did, records, at)
-        .iter()
-        .find(|k| k.kid == kid)
-        .and_then(|k| ed25519_raw(&k.public_key_multibase))
-        .filter(|key| derive_kid_bytes(key) == kid)
-        .map(|key| FoundKey {
-            public_key: key,
-            source: KeySource::IdentityRecord,
-            retired_at: None,
-        })
+    let key = device_key_history(did, records)
+        .into_iter()
+        .find(|k| k.kid == kid)?;
+    if key.created_at > at {
+        return None;
+    }
+    let public_key =
+        ed25519_raw(&key.public_key_multibase).filter(|raw| derive_kid_bytes(raw) == kid)?;
+    Some(FoundKey {
+        public_key,
+        source: KeySource::IdentityRecord,
+        // Unix seconds, like the origin's removal date.
+        retired_at: key.retired_at.filter(|r| *r <= at).map(|r| r.timestamp()),
+    })
 }
 
 /// The raw bytes of a `z6Mk…` ed25519 key; anything else is not a signing key here.
@@ -644,13 +651,24 @@ mod tests {
             .key_for_at(ALICE, &kid_of(1), at("2026-02-01T00:00:00Z"))
             .await
             .unwrap();
-        assert_eq!(live.map(|f| f.source), Some(KeySource::IdentityRecord));
+        assert_eq!(
+            live,
+            Some(FoundKey {
+                public_key: raw(1),
+                source: KeySource::IdentityRecord,
+                retired_at: None,
+            })
+        );
         assert_eq!(
             keys.key_for_at(ALICE, &kid_of(1), at("2026-04-01T00:00:00Z"))
                 .await
                 .unwrap(),
-            None,
-            "after its retirement the key is not in the records"
+            Some(FoundKey {
+                public_key: raw(1),
+                source: KeySource::IdentityRecord,
+                retired_at: Some(at("2026-03-01T00:00:00Z").timestamp()),
+            }),
+            "after its retirement the records still name the key, with the date"
         );
         assert_eq!(
             keys.key_for_at(ALICE, &kid_of(1), at("2025-12-01T00:00:00Z"))
@@ -660,6 +678,36 @@ mod tests {
             "before its record the key is not in the records"
         );
         assert_eq!(pds.hits(), 1, "one listing answers every time asked");
+    }
+
+    #[tokio::test]
+    async fn a_key_the_records_retire_is_retired_and_the_origin_is_not_asked() {
+        use crate::identity_records::build_device_retirement;
+        let retirement = serde_json::to_value(
+            build_device_retirement(&key(1), ALICE, &kid_of(1), "2026-03-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        let pds = pds(vec![device_record(1), retirement]).await;
+        // The origin still holds the same key and knows nothing of the retirement.
+        let origin = origin(vec![(ALICE, kid_of(1), raw(1))]).await;
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let found = lookup(vec![alice_on(&pds)], Some(&origin), HOUR)
+            .key_for_at(ALICE, &kid_of(1), at("2026-04-01T00:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(
+            found,
+            Some(FoundKey {
+                public_key: raw(1),
+                source: KeySource::IdentityRecord,
+                retired_at: Some(at("2026-03-01T00:00:00Z").timestamp()),
+            })
+        );
+        assert_eq!(origin.hits(), 0);
     }
 
     #[tokio::test]

@@ -462,6 +462,38 @@ describe('checking received signatures', () => {
     });
   });
 
+  it('is retired for a key the signer’s records retire, without asking the origin', async () => {
+    const { buildDeviceRetirement } = await import('./identity-records.js');
+    const m = await signedMessage(27, 'sent after I signed it out');
+    origin.records = [
+      await buildDeviceRecord(m.key, SIGNER, '2026-01-01T00:00:00Z'),
+      await buildDeviceRetirement(m.key, SIGNER, m.kid, '2026-03-01T00:00:00Z'),
+    ];
+    // The origin still serves the same key, with no removal date.
+    await hold(SIGNER, m.pub);
+    let keyReads = 0;
+    const counting = async (input: string): Promise<Response> => {
+      const parts = new URL(input).pathname.split('/');
+      if (parts[3] === 'signing-keys' && parts.length === 6) keyReads++;
+      return stubFetch(input);
+    };
+    const doc: DidDocument = {
+      id: SIGNER,
+      service: [{ id: '#atproto_pds', type: 'AtprotoPersonalDataServer', serviceEndpoint: PDS }],
+    };
+    const resolveDid = async (did: string): Promise<DidDocument> => {
+      if (did !== SIGNER) throw new Error(`unknown DID ${did}`);
+      return doc;
+    };
+    const s = await session(OWN_DID, new KeyLookup({ fetch: counting, resolveDid }, ORIGIN, 3_600_000));
+    expect((await s.lineFor([m.wire], m.msgid)).settled).toEqual({
+      state: 'retired',
+      kid: m.kid,
+      keySource: 'IdentityRecord',
+    });
+    expect(keyReads).toBe(0);
+  });
+
   it('puts no verdict on anything without a key lookup', async () => {
     const m = await signedMessage(27, 'hello');
     const s = await session(OWN_DID, null);

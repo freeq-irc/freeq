@@ -235,9 +235,33 @@ describe('KeyLookup', () => {
     expect((await lookup.keyForAt(ALICE, kid, new Date('2026-02-01T00:00:00Z')))?.source).toBe(
       'IdentityRecord',
     );
-    expect(await lookup.keyForAt(ALICE, kid, new Date('2026-04-01T00:00:00Z'))).toBeNull();
+    // After its retirement the records still name the key, with the date.
+    expect(await lookup.keyForAt(ALICE, kid, new Date('2026-04-01T00:00:00Z'))).toEqual({
+      publicKey: await raw(1),
+      source: 'IdentityRecord',
+      retiredAt: Date.parse('2026-03-01T00:00:00Z') / 1000,
+    });
     expect(await lookup.keyForAt(ALICE, kid, new Date('2025-12-01T00:00:00Z'))).toBeNull();
     expect(hits.pds).toBe(1);
+  });
+
+  it('reads a key the records retire from the records, with its date, and never asks the origin', async () => {
+    const kid = await kidOf(1);
+    // The origin still holds the same key and knows nothing of the retirement.
+    const { fetch, hits } = network(
+      [
+        await buildDeviceRecord(await key(1), ALICE, T0),
+        await buildDeviceRetirement(await key(1), ALICE, kid, '2026-03-01T00:00:00Z'),
+      ],
+      { [`${ALICE} ${kid}`]: await raw(1) },
+    );
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR);
+    expect(await lookup.keyForAt(ALICE, kid, new Date('2026-04-01T00:00:00Z'))).toEqual({
+      publicKey: await raw(1),
+      source: 'IdentityRecord',
+      retiredAt: Date.parse('2026-03-01T00:00:00Z') / 1000,
+    });
+    expect(hits.origin).toBe(0);
   });
 
   it('carries the date the origin removed a key', async () => {

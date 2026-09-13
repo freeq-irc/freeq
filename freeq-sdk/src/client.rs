@@ -9235,6 +9235,8 @@ mod verdict_tests {
         /// Held back this long before a signer's key is answered.
         delay_ms: u64,
         set_reads: AtomicUsize,
+        /// Requests for one signer's key.
+        key_reads: AtomicUsize,
     }
 
     impl Origin {
@@ -9293,6 +9295,7 @@ mod verdict_tests {
                 get(move |Path((did, kid)): Path<(String, String)>| {
                     let o = o3.clone();
                     async move {
+                        o.key_reads.fetch_add(1, Ordering::SeqCst);
                         if o.delay_ms > 0 {
                             tokio::time::sleep(std::time::Duration::from_millis(o.delay_ms)).await;
                         }
@@ -9979,6 +9982,63 @@ mod verdict_tests {
                 key_source: Some(crate::key_lookup::KeySource::IdentityRecord),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn a_key_the_signers_records_retire_is_retired_without_asking_the_origin() {
+        let signer_key = crate::crypto::PrivateKey::ed25519_from_bytes(&[30; 32]).unwrap();
+        let kid = crate::sigtag::derive_kid_bytes(&public(30));
+        let records = vec![
+            serde_json::to_value(
+                crate::identity_records::build_device_record(
+                    &signer_key,
+                    SIGNER,
+                    "2026-01-01T00:00:00Z",
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            serde_json::to_value(
+                crate::identity_records::build_device_retirement(
+                    &signer_key,
+                    SIGNER,
+                    &kid,
+                    "2026-03-01T00:00:00Z",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ];
+        let pds = serve(axum::Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(move || {
+                let listed: Vec<Value> = records
+                    .iter()
+                    .map(|value| json!({ "uri": "at://x", "cid": "bafy", "value": value }))
+                    .collect();
+                async move { axum::Json(json!({ "records": listed })) }
+            }),
+        ))
+        .await;
+        // The origin still serves the same key, with no removal date.
+        let origin = Arc::new(Origin::default());
+        origin.hold(SIGNER, public(30), None);
+        let base = serve_origin(origin.clone()).await;
+        let document = crate::did::make_test_did_document_with_pds(
+            SIGNER,
+            &crate::crypto::PrivateKey::ed25519_from_bytes(&[99; 32])
+                .unwrap()
+                .public_key_multibase(),
+            Some(&pds),
+        );
+        let mut session = Session::open(Some(key_lookup(&base, vec![document])), OWN_DID).await;
+        // Dated now, after the retirement.
+        let (wire, _) = signed_message(30, "sent after I signed it out");
+        session.send(&wire).await;
+        let seen = session.next_line().await;
+        assert_eq!(seen.settled.map(|v| v.state), Some(VerdictState::Retired));
+        assert_eq!(origin.key_reads.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
