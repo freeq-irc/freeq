@@ -586,6 +586,10 @@ impl Transport {
 /// restart with `--reauth` that signs in again.
 pub const KEY_UNPUBLISHED_LINE: &str = "Your signing key is not published to your account yet. Restart freeq-tui with --reauth to sign in again and publish it.";
 
+/// What the TUI shows when the server refuses this device's key because the
+/// account signed the device out.
+pub const KEY_RETIRED_LINE: &str = "This device was signed out from another device. Restart freeq-tui with --reauth to sign in again.";
+
 pub struct App {
     /// Per-channel E2EE keys, keyed by lowercase channel name.
     /// Derived from passphrase via HKDF-SHA256.
@@ -634,6 +638,9 @@ pub struct App {
     /// published. The SDK offers the key again on every connect, so the line
     /// is said once and not per reconnect.
     pub told_key_unpublished: bool,
+    /// The server refused this device's key: the account signed the device
+    /// out, and a disconnect no longer schedules a reconnect.
+    pub signed_out: bool,
     /// Cache of fetched images for inline rendering.
     pub image_cache: ImageCache,
     /// Image protocol picker (detects terminal capabilities).
@@ -783,6 +790,7 @@ impl App {
             history_saved: String::new(),
             media_uploader: None,
             told_key_unpublished: false,
+            signed_out: false,
             image_cache: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "inline-images")]
             picker: None,
@@ -1717,6 +1725,7 @@ mod tests {
             history_saved: String::new(),
             media_uploader: None,
             told_key_unpublished: false,
+            signed_out: false,
             image_cache: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "inline-images")]
             picker: None,

@@ -1518,6 +1518,15 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
             }
         }
         Event::ServerNotice { text } => {
+            // The server refused this device's key. A reconnect would offer
+            // the same key, so the next disconnect stays down.
+            if text.starts_with("MSGSIG KEY_RETIRED") {
+                app.signed_out = true;
+                let active = app.active_buffer.clone();
+                app.buffer_mut(&active)
+                    .push_system(crate::app::KEY_RETIRED_LINE);
+                return;
+            }
             // Swallow the failure of a speculative "fetch history on view"
             // (maybe_fetch_history): a DM with a guest peer, or a not-yet-
             // persisted conversation, answers CHATHISTORY with INVALID_TARGET/
@@ -1542,8 +1551,9 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
         Event::Disconnected { reason } => {
             app.connection_state = "disconnected".to_string();
             app.status_msg(&format!("Disconnected: {reason}"));
-            // Don't quit — reconnection is handled by the main loop
-            app.reconnect_pending = true;
+            // Don't quit — reconnection is handled by the main loop, unless
+            // the device was signed out.
+            app.reconnect_pending = !app.signed_out;
         }
         // The TUI prints WHOIS lines as they arrive and has nothing waiting on
         // the answer being complete, so the end of one is not news here.
@@ -3517,6 +3527,53 @@ mod tests {
             ..Default::default()
         };
         assert!(!super::reconnect_config(&config).fresh_sign_in);
+    }
+
+    /// A refused key reaches the TUI after registration as the notice
+    /// `MSGSIG KEY_RETIRED <reason>`. The TUI says the device was signed out,
+    /// and the disconnect that follows schedules no reconnect.
+    #[tokio::test]
+    async fn a_refused_key_shows_the_signed_out_line_and_does_not_reconnect() {
+        use freeq_sdk::event::Event;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (handle, _events) = freeq_sdk::client::connect_with_stream(
+            freeq_sdk::client::EstablishedConnection::Plain(stream),
+            freeq_sdk::client::ConnectConfig::default(),
+            None,
+        );
+        let mut app = crate::app::App::new("me", false);
+        app.buffer_mut("#room");
+        app.active_buffer = "#room".to_string();
+        for event in [
+            Event::Registered { nick: "me".into() },
+            Event::ServerNotice {
+                text: "MSGSIG KEY_RETIRED This device was signed out from another device. Sign in again to continue.".into(),
+            },
+            Event::Disconnected {
+                reason: "Signing key retired".into(),
+            },
+        ] {
+            super::process_irc_event(&mut app, event, &handle);
+        }
+
+        assert!(!app.reconnect_pending, "no reconnect is scheduled");
+        let room = &app.buffers["#room"];
+        assert_eq!(
+            room.messages.back().map(|l| l.text.as_str()),
+            Some(
+                "This device was signed out from another device. Restart freeq-tui with --reauth to sign in again."
+            )
+        );
+        assert!(
+            app.buffers
+                .values()
+                .flat_map(|b| b.messages.iter())
+                .all(|l| !l.text.contains("KEY_RETIRED")),
+            "the raw notice is not shown"
+        );
     }
 
     fn tags(pairs: &[(&str, &str)]) -> HashMap<String, String> {
