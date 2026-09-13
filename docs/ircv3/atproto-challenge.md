@@ -541,12 +541,10 @@ draft and from its own in-repo documentation in the following ways. Where
 this draft and the implementation differ, the draft text above states the
 intended behavior; this section records reality.
 
-1. **No payload chunking.** Neither the reference server nor its clients
-   split `AUTHENTICATE` payloads into 400-byte chunks, and the server does
-   not reassemble chunked client responses or recognize a client-sent
-   `AUTHENTICATE +`. Payloads are sent as single oversized parameters
-   (which `pds-oauth` responses routinely are). This draft makes base-spec
-   chunking normative.
+1. **Partial payload chunking.** The reference server reassembles a chunked
+   client response and honors a client-sent `AUTHENTICATE +`. The TypeScript
+   client chunks its responses; the Rust and Swift clients send a single
+   oversized parameter. Server challenges are not chunked.
 2. **No server-identity binding in the challenge.** The implemented
    challenge contains only `session_id`, `nonce`, and `timestamp`. The
    relay consideration in Security considerations is mitigated there by

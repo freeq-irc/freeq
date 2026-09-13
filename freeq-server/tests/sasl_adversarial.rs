@@ -362,6 +362,40 @@ async fn sasl_valid_after_one_failure() {
     .await;
 }
 
+/// A client that chunks its response may send the terminator whether or not
+/// the last chunk already ended it, and released clients do exactly that. The
+/// terminator arrives after 903, when no exchange is in progress.
+#[tokio::test]
+async fn sasl_trailing_terminator_after_success_is_ignored() {
+    let key = PrivateKey::generate_ed25519();
+    let resolver = make_resolver(vec![(DID_A, &key)]);
+    let (addr, _h) = start(resolver).await;
+    run(addr, move |addr| {
+        let mut c = C::raw(addr);
+        let challenge_str = c.start_sasl("plustail");
+        let challenge_bytes = auth::decode_challenge_bytes(&challenge_str).unwrap();
+        let signer = KeySigner::new(DID_A.to_string(), key);
+        let response = signer.respond(&challenge_bytes).unwrap();
+        c.tx(&format!(
+            "AUTHENTICATE {}",
+            auth::encode_response(&response)
+        ));
+        c.num("903");
+
+        c.tx("AUTHENTICATE +");
+        assert!(
+            c.maybe(|l| l.split_whitespace().nth(1) == Some("904"), 300)
+                .is_none(),
+            "a trailing terminator must not fail an authentication that succeeded"
+        );
+
+        // The connection is still usable.
+        c.tx("CAP END");
+        c.num("001");
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn sasl_challenge_expired() {
     let key = PrivateKey::generate_ed25519();

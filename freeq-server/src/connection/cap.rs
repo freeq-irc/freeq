@@ -9,6 +9,15 @@ use crate::sasl;
 use crate::server::SharedState;
 use std::sync::Arc;
 
+/// One SASL chunk, per IRCv3. A chunk of exactly this length means more is
+/// coming; anything shorter ends the response.
+const SASL_CHUNK_LEN: usize = 400;
+
+/// Ceiling on a reassembled response. Well above a challenge response
+/// carrying a delegation cert, and far below anything worth buffering for a
+/// connection that has not authenticated yet.
+const MAX_SASL_RESPONSE_LEN: usize = 8192;
+
 pub(super) fn handle_cap(
     conn: &mut Connection,
     msg: &Message,
@@ -183,6 +192,34 @@ pub(super) fn handle_cap(
     }
 }
 
+/// What a single `AUTHENTICATE` line contributed to the response.
+enum Reassembly {
+    /// A piece landed and the rest is still coming.
+    Partial,
+    /// The whole response, ready to decode.
+    Complete(String),
+    /// More than any real response could need.
+    TooLong,
+}
+
+/// IRCv3 splits a SASL response into SASL_CHUNK_LEN-byte pieces, and a response carrying
+/// a delegation certificate is routinely longer than one piece.
+///
+/// The response ends on a piece shorter than SASL_CHUNK_LEN bytes, or on `+` when
+/// the last full piece landed exactly on the boundary.
+fn accumulate_response(conn: &mut Connection, param: &str) -> Reassembly {
+    let chunk = if param == "+" { "" } else { param };
+    if conn.sasl_response_buf.len() + chunk.len() > MAX_SASL_RESPONSE_LEN {
+        conn.sasl_response_buf.clear();
+        return Reassembly::TooLong;
+    }
+    conn.sasl_response_buf.push_str(chunk);
+    if chunk.len() == SASL_CHUNK_LEN {
+        return Reassembly::Partial;
+    }
+    Reassembly::Complete(std::mem::take(&mut conn.sasl_response_buf))
+}
+
 pub(super) async fn handle_authenticate(
     conn: &mut Connection,
     msg: &Message,
@@ -201,6 +238,7 @@ pub(super) async fn handle_authenticate(
     if param == "*" {
         // SASL abort — client is cancelling the authentication attempt
         conn.sasl_in_progress = false;
+        conn.sasl_response_buf.clear();
         let fail = Message::from_server(
             server_name,
             irc::ERR_SASLFAIL,
@@ -210,13 +248,40 @@ pub(super) async fn handle_authenticate(
         return;
     }
 
+    // A client that chunked its response may send the terminator even when the
+    // last chunk was short and already ended it. By then the exchange is over,
+    // and answering "unsupported mechanism" would fail an authentication that
+    // has already succeeded.
+    if param == "+" && !conn.sasl_in_progress {
+        return;
+    }
+
     if param.eq_ignore_ascii_case("ATPROTO-CHALLENGE") {
         conn.sasl_in_progress = true;
         conn.dpop_retries = 0; // Reset DPoP retry counter on new SASL attempt
+        conn.sasl_response_buf.clear();
         let encoded = state.challenge_store.create(session_id);
         let reply = Message::new("AUTHENTICATE", vec![&encoded]);
         send(state, session_id, format!("{reply}\r\n"));
     } else if conn.sasl_in_progress {
+        let full = match accumulate_response(conn, param) {
+            Reassembly::Partial => return,
+            Reassembly::TooLong => {
+                conn.sasl_in_progress = false;
+                conn.sasl_failures += 1;
+                crate::server::Metrics::bump(&state.metrics.sasl_failure_total);
+                let fail = Message::from_server(
+                    server_name,
+                    irc::ERR_SASLFAIL,
+                    vec![conn.nick_or_star(), "SASL response too long"],
+                );
+                send(state, session_id, format!("{fail}\r\n"));
+                tracing::warn!(%session_id, "SASL response exceeded the reassembly limit");
+                return;
+            }
+            Reassembly::Complete(full) => full,
+        };
+        let param = full.as_str();
         if let Some(response) = sasl::decode_response(param) {
             // Check for web-token method first (server-side OAuth pre-verified)
             let mut web_handle: Option<String> = None;
@@ -527,5 +592,80 @@ pub(super) async fn handle_authenticate(
             vec![conn.nick_or_star(), "Unsupported SASL mechanism"],
         );
         send(state, session_id, format!("{fail}\r\n"));
+    }
+}
+
+#[cfg(test)]
+mod sasl_reassembly_tests {
+    use super::*;
+
+    fn conn() -> Connection {
+        Connection::new("sess-1".to_string())
+    }
+
+    fn complete(r: Reassembly) -> Option<String> {
+        match r {
+            Reassembly::Complete(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_response_shorter_than_a_chunk_arrives_whole() {
+        let mut c = conn();
+        assert_eq!(
+            complete(accumulate_response(&mut c, "abc")),
+            Some("abc".to_string())
+        );
+        assert!(c.sasl_response_buf.is_empty());
+    }
+
+    /// A full chunk says nothing about whether the response ended there, so
+    /// the server has to keep waiting.
+    #[test]
+    fn a_full_chunk_waits_for_more() {
+        let mut c = conn();
+        let chunk = "x".repeat(SASL_CHUNK_LEN);
+        assert!(matches!(
+            accumulate_response(&mut c, &chunk),
+            Reassembly::Partial
+        ));
+        assert_eq!(c.sasl_response_buf.len(), SASL_CHUNK_LEN);
+    }
+
+    #[test]
+    fn pieces_are_joined_in_order() {
+        let mut c = conn();
+        let first = "a".repeat(SASL_CHUNK_LEN);
+        accumulate_response(&mut c, &first);
+        let joined = complete(accumulate_response(&mut c, "bbb")).unwrap();
+        assert_eq!(joined, format!("{first}bbb"));
+        assert!(c.sasl_response_buf.is_empty());
+    }
+
+    /// The case the terminator exists for: the response is a whole number of
+    /// chunks, so nothing shorter ever arrives to end it.
+    #[test]
+    fn a_bare_plus_ends_a_response_that_fills_its_last_chunk() {
+        let mut c = conn();
+        let chunk = "y".repeat(SASL_CHUNK_LEN);
+        accumulate_response(&mut c, &chunk);
+        assert_eq!(complete(accumulate_response(&mut c, "+")), Some(chunk));
+    }
+
+    #[test]
+    fn an_endless_stream_is_refused_and_dropped() {
+        let mut c = conn();
+        let chunk = "z".repeat(SASL_CHUNK_LEN);
+        let mut refused = false;
+        for _ in 0..(MAX_SASL_RESPONSE_LEN / SASL_CHUNK_LEN + 2) {
+            if matches!(accumulate_response(&mut c, &chunk), Reassembly::TooLong) {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "an unbounded stream of chunks must be refused");
+        // Nothing is held for a connection that has not authenticated.
+        assert!(c.sasl_response_buf.is_empty());
     }
 }

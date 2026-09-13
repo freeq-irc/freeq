@@ -139,6 +139,15 @@ const ACT_ANSWER_WINDOW_MS = 5_000;
  */
 const GUEST_NICK_RESUME_DELAYS_MS = [500, 1000, 2000];
 
+/** One SASL chunk, per IRCv3. A chunk of exactly this length tells the server
+ *  more is coming. */
+const SASL_CHUNK_CHARS = 400;
+
+/** Ceiling on a response, mirroring `MAX_SASL_RESPONSE_LEN` in the server's
+ *  connection/cap.rs so an oversized response fails here rather than part way
+ *  through sending. */
+const MAX_SASL_RESPONSE_CHARS = 8192;
+
 /** CHATHISTORY subcommands, which sit where a target could and are all legal
  *  nicks. */
 const HISTORY_SUBCOMMANDS = new Set([
@@ -3224,14 +3233,22 @@ export class FreeqClient extends EventEmitter {
       .replace(/\//g, '_')
       .replace(/=+$/, '');
 
-    if (encoded.length <= 400) {
-      this.raw(`AUTHENTICATE ${encoded}`);
-    } else {
-      for (let i = 0; i < encoded.length; i += 400) {
-        this.raw(`AUTHENTICATE ${encoded.slice(i, i + 400)}`);
-      }
-      this.raw('AUTHENTICATE +');
+    if (encoded.length > MAX_SASL_RESPONSE_CHARS) {
+      log.error(
+        `[freeq-sdk] SASL response is ${encoded.length} chars, over the ${MAX_SASL_RESPONSE_CHARS} the server will reassemble; aborting`,
+      );
+      this.raw('AUTHENTICATE *');
+      return;
     }
+
+    if (encoded.length < SASL_CHUNK_CHARS) {
+      this.raw(`AUTHENTICATE ${encoded}`);
+      return;
+    }
+    for (let i = 0; i < encoded.length; i += SASL_CHUNK_CHARS) {
+      this.raw(`AUTHENTICATE ${encoded.slice(i, i + SASL_CHUNK_CHARS)}`);
+    }
+    if (encoded.length % SASL_CHUNK_CHARS === 0) this.raw('AUTHENTICATE +');
   }
 
   private handleAvSessionState(

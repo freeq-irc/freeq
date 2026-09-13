@@ -9,6 +9,7 @@ From `v0.9.0-beta.1` onward this project follows [Keep a Changelog](https://keep
 June 2026.
 
 ### Added
+- SASL payload reassembly: the server now joins an `AUTHENTICATE` response split into 400-byte chunks and honours a client-sent `AUTHENTICATE +`, per the IRCv3 base spec.
 - FTS5 full-text history search: `SEARCH` command plus REST endpoint backed by SQLite FTS5.
 - ATPROTO-CHALLENGE IRCv3 draft specification document.
 - `SECURITY.md` security disclosure policy.
