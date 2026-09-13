@@ -543,7 +543,7 @@ intended behavior; this section records reality.
 
 1. **Partial payload chunking.** The reference server reassembles a chunked
    client response and honors a client-sent `AUTHENTICATE +`. The TypeScript
-   client chunks its responses; the Rust and Swift clients send a single
+   and Rust clients chunk their responses; the Swift client sends a single
    oversized parameter. Server challenges are not chunked.
 2. **No server-identity binding in the challenge.** The implemented
    challenge contains only `session_id`, `nonce`, and `timestamp`. The

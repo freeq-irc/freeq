@@ -2211,7 +2211,7 @@ where
                                     use base64::Engine;
                                     let json_bytes = response.to_string();
                                     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json_bytes.as_bytes());
-                                    writer.write_all(format!("AUTHENTICATE {encoded}\r\n").as_bytes()).await?;
+                                    write_sasl_response(&mut writer, &encoded).await?;
                                 }
                             } else if let Some(ref signer) = signer {
                                 handle_authenticate_challenge(&msg, signer.as_ref(), &mut writer).await?;
@@ -3959,6 +3959,43 @@ fn parse_multiline_cap(caps_str: &str) -> Option<(usize, usize)> {
     Some((max_bytes, max_lines))
 }
 
+/// One SASL chunk, per IRCv3. A chunk of exactly this length tells the server
+/// more is coming.
+const SASL_CHUNK_LEN: usize = 400;
+
+/// Ceiling on a response, matching what the server will reassemble.
+const MAX_SASL_RESPONSE_LEN: usize = 8192;
+
+/// Write an encoded SASL response as `AUTHENTICATE` lines.
+///
+/// A response that fills its last chunk needs a bare `+` after it, or the
+/// server is still waiting for a piece that never comes. Sending a full chunk
+/// on its own says "more follows", so a 400-byte response is not a line the
+/// server can act on.
+async fn write_sasl_response<W: AsyncWrite + Unpin>(writer: &mut W, encoded: &str) -> Result<()> {
+    if encoded.len() > MAX_SASL_RESPONSE_LEN {
+        anyhow::bail!(
+            "SASL response is {} bytes, over the {MAX_SASL_RESPONSE_LEN} the server will reassemble",
+            encoded.len()
+        );
+    }
+    if encoded.len() < SASL_CHUNK_LEN {
+        writer
+            .write_all(format!("AUTHENTICATE {encoded}\r\n").as_bytes())
+            .await?;
+        return Ok(());
+    }
+    for chunk in encoded.as_bytes().chunks(SASL_CHUNK_LEN) {
+        writer.write_all(b"AUTHENTICATE ").await?;
+        writer.write_all(chunk).await?;
+        writer.write_all(b"\r\n").await?;
+    }
+    if encoded.len().is_multiple_of(SASL_CHUNK_LEN) {
+        writer.write_all(b"AUTHENTICATE +\r\n").await?;
+    }
+    Ok(())
+}
+
 async fn handle_authenticate_challenge<W: AsyncWrite + Unpin>(
     msg: &Message,
     signer: &dyn ChallengeSigner,
@@ -3976,11 +4013,7 @@ async fn handle_authenticate_challenge<W: AsyncWrite + Unpin>(
     let encoded = auth::encode_response(&response);
     // eprintln!("  Sending AUTHENTICATE response ({} bytes)", encoded.len());
 
-    writer
-        .write_all(format!("AUTHENTICATE {encoded}\r\n").as_bytes())
-        .await?;
-
-    Ok(())
+    write_sasl_response(writer, &encoded).await
 }
 
 // ── Reconnect helper ──
@@ -8169,5 +8202,67 @@ mod did_maps_tests {
             );
             assert!(notice.contains("deprecated"), "{notice}");
         }
+    }
+}
+
+#[cfg(test)]
+mod sasl_chunking_tests {
+    use super::*;
+
+    async fn lines(encoded: &str) -> Vec<String> {
+        let mut buf: Vec<u8> = Vec::new();
+        write_sasl_response(&mut buf, encoded).await.unwrap();
+        String::from_utf8(buf)
+            .unwrap()
+            .split("\r\n")
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_short_response_goes_out_whole() {
+        let out = lines("abc").await;
+        assert_eq!(out, vec!["AUTHENTICATE abc"]);
+    }
+
+    /// The regression this exists for: a full chunk on its own says "more
+    /// follows", so without the terminator the server waits forever.
+    #[tokio::test]
+    async fn a_response_of_exactly_one_chunk_is_terminated() {
+        let payload = "x".repeat(SASL_CHUNK_LEN);
+        let out = lines(&payload).await;
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], format!("AUTHENTICATE {payload}"));
+        assert_eq!(out[1], "AUTHENTICATE +");
+    }
+
+    #[tokio::test]
+    async fn a_response_ending_mid_chunk_needs_no_terminator() {
+        let out = lines(&"y".repeat(SASL_CHUNK_LEN + 1)).await;
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1], "AUTHENTICATE y");
+    }
+
+    #[tokio::test]
+    async fn every_whole_multiple_of_a_chunk_is_terminated() {
+        let out = lines(&"z".repeat(SASL_CHUNK_LEN * 2)).await;
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[2], "AUTHENTICATE +");
+    }
+
+    /// Refused here rather than part way through sending, since the server
+    /// drops the buffer and fails the exchange at the same ceiling.
+    #[tokio::test]
+    async fn a_response_the_server_will_not_reassemble_is_refused() {
+        let mut buf: Vec<u8> = Vec::new();
+        let err = write_sasl_response(&mut buf, &"w".repeat(MAX_SASL_RESPONSE_LEN + 1))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("over the 8192"));
+        assert!(
+            buf.is_empty(),
+            "nothing goes out when the response is refused"
+        );
     }
 }

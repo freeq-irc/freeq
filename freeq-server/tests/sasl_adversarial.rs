@@ -362,6 +362,49 @@ async fn sasl_valid_after_one_failure() {
     .await;
 }
 
+/// Reassembly end to end: a response too long for one line is split, and the
+/// server joins the pieces into an authentication that works.
+#[tokio::test]
+async fn sasl_response_split_across_chunks_authenticates() {
+    let key = PrivateKey::generate_ed25519();
+    let resolver = make_resolver(vec![(DID_A, &key)]);
+    let (addr, _h) = start(resolver).await;
+    run(addr, move |addr| {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let mut c = C::raw(addr);
+        let challenge_str = c.start_sasl("chunked");
+        let challenge_bytes = auth::decode_challenge_bytes(&challenge_str).unwrap();
+        let signer = KeySigner::new(DID_A.to_string(), key);
+        let encoded = auth::encode_response(&signer.respond(&challenge_bytes).unwrap());
+
+        // Pad past one chunk. Unknown fields are ignored, and the signature
+        // covers the challenge bytes rather than this document, so the
+        // response stays valid.
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&b64.decode(encoded.as_bytes()).unwrap()).unwrap();
+        doc["padding"] = serde_json::Value::String("p".repeat(500));
+        let padded = b64.encode(serde_json::to_vec(&doc).unwrap());
+        assert!(padded.len() > 400, "fixture must need more than one chunk");
+
+        for chunk in padded.as_bytes().chunks(400) {
+            c.tx(&format!(
+                "AUTHENTICATE {}",
+                std::str::from_utf8(chunk).unwrap()
+            ));
+        }
+        if padded.len() % 400 == 0 {
+            c.tx("AUTHENTICATE +");
+        }
+
+        c.num("903");
+        c.tx("CAP END");
+        c.num("001");
+    })
+    .await;
+}
+
 /// A client that chunks its response may send the terminator whether or not
 /// the last chunk already ended it, and released clients do exactly that. The
 /// terminator arrives after 903, when no exchange is in progress.
