@@ -24,7 +24,8 @@
   ],
   "scripts": {
     "prebuild": "node scripts/build-deps.mjs",
-    "build": "tsc",
+    "build": "tsc && tsc -p tsconfig.extensions.json",
+    "typecheck": "tsc -p tsconfig.extensions.json",
     "dev": "tsc --watch",
     "test": "vitest run",
     "test:watch": "vitest",

@@ -941,7 +941,10 @@ export default function (pi: ExtensionAPI): void {
       // Somebody in a room is now waiting. pi narrates every step of this in
       // the terminal; without this the room gets one line, whenever the turn
       // happens to end. A DM answers to the sender, a channel to the channel.
-      startUpdates(cfg, ev.channel);
+      // `config` is the connection's loaded config; if we somehow got here
+      // before it loaded there is no interval to honour, so stay quiet rather
+      // than crash the host.
+      if (config) startUpdates(config, ev.channel);
     }
     const framed = frameInbound(ev, { expectsReply });
 

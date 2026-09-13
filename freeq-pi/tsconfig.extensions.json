@@ -1,0 +1,18 @@
+// The extension is loaded as TypeScript by pi itself and is never compiled by
+// `npm run build` (which only emits `src/` to `dist/`). That means a plain
+// reference error in `extensions/freeq.ts` ships green and takes the whole
+// host down at runtime — `cfg is not defined` crashed pi on first inbound
+// message. This config typechecks the extension without emitting, so the
+// build catches what the runtime otherwise finds for us.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false
+  },
+  "include": ["extensions", "src"],
+  "exclude": ["node_modules", "dist", "spike", "**/*.test.ts"]
+}
