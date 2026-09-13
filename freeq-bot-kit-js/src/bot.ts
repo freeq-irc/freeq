@@ -220,6 +220,7 @@ export class FreeqBot {
         signer: identity.didKey.signer,
         token: "",
         pdsUrl: "",
+        delegation,
       },
       // The SDK's default per-session MSGSIG key stays on: a bot signs its
       // messages and mutations like every other client. (The did:key the bot

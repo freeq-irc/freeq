@@ -220,6 +220,36 @@ fn accumulate_response(conn: &mut Connection, param: &str) -> Reassembly {
     Reassembly::Complete(std::mem::take(&mut conn.sasl_response_buf))
 }
 
+/// Handles the case where the allowlist has never heard of an agent's own
+/// `did:key` but the person it acts for is allowed.
+async fn delegated_admit(
+    state: &Arc<SharedState>,
+    agent_did: &str,
+    delegation: Option<&serde_json::Value>,
+) -> bool {
+    if !state.config.allow_delegated_agents {
+        return false;
+    }
+    let Some(cert) = delegation else {
+        return false;
+    };
+    let Some(owner) = super::provenance::verified_owner_from_cert(state, agent_did, cert) else {
+        return false;
+    };
+    if !state.did_is_allowed_resolved(&owner, None).await {
+        tracing::warn!(
+            agent = %agent_did, %owner,
+            "delegation verified, but the owner is not on the connect allowlist"
+        );
+        return false;
+    }
+    tracing::info!(
+        agent = %agent_did, %owner,
+        "admitting an agent on a verified delegation from an allowed owner"
+    );
+    true
+}
+
 pub(super) async fn handle_authenticate(
     conn: &mut Connection,
     msg: &Message,
@@ -325,6 +355,7 @@ pub(super) async fn handle_authenticate(
                             state
                                 .did_is_allowed_resolved(did, web_handle.as_deref())
                                 .await
+                                || delegated_admit(state, did, response.delegation.as_ref()).await
                         }
                         Err(_) => true,
                     };
@@ -592,6 +623,109 @@ pub(super) async fn handle_authenticate(
             vec![conn.nick_or_star(), "Unsupported SASL mechanism"],
         );
         send(state, session_id, format!("{fail}\r\n"));
+    }
+}
+
+#[cfg(test)]
+mod delegated_admit_tests {
+    use super::*;
+    use base64::Engine;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    const AGENT: &str = "did:key:zAgent";
+    const OWNER: &str = "did:plc:owner";
+    const STRANGER: &str = "did:plc:stranger";
+
+    fn signed_cert(bot_did: &str, creator_did: &str, key: &SigningKey) -> serde_json::Value {
+        let mut cert = unsigned_cert(bot_did, creator_did);
+        let canonical = freeq_sdk::canonical::canonicalize(&cert).unwrap();
+        let sig = key.sign(canonical.as_bytes());
+        cert["signature"] = serde_json::Value::String(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes()),
+        );
+        cert
+    }
+
+    fn unsigned_cert(bot_did: &str, creator_did: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "FreeqBotDelegation/v1",
+            "bot_did": bot_did,
+            "bot_public_key": bot_did.strip_prefix("did:key:").unwrap_or(""),
+            "creator_did": creator_did,
+            "created_at": "2026-09-07T00:00:00Z",
+            "revocation_authority": creator_did,
+        })
+    }
+
+    /// An instance that allows OWNER and nobody else, with the owner's key on
+    /// file as if they had already sent MSGSIG.
+    fn state_allowing_owner(allow_delegated: bool) -> (Arc<SharedState>, SigningKey) {
+        let state = crate::server::test_state_with_config(crate::config::ServerConfig {
+            listen_addr: "127.0.0.1:0".to_string(),
+            server_name: "test-delegation".to_string(),
+            challenge_timeout_secs: 60,
+            allowed_dids: vec![OWNER.to_string()],
+            allow_delegated_agents: allow_delegated,
+            ..Default::default()
+        });
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        state.with_db(|db| db.save_signing_key(OWNER, key.verifying_key().as_bytes()));
+        (state, key)
+    }
+
+    #[tokio::test]
+    async fn an_agent_is_admitted_when_its_owner_is_allowed() {
+        let (state, key) = state_allowing_owner(true);
+        let cert = signed_cert(AGENT, OWNER, &key);
+        assert!(delegated_admit(&state, AGENT, Some(&cert)).await);
+    }
+
+    /// The attack this exists to stop: naming an allowed owner without being
+    /// able to sign for them.
+    #[tokio::test]
+    async fn an_unsigned_claim_admits_nobody() {
+        let (state, _key) = state_allowing_owner(true);
+        let cert = unsigned_cert(AGENT, OWNER);
+        assert!(!delegated_admit(&state, AGENT, Some(&cert)).await);
+    }
+
+    #[tokio::test]
+    async fn a_signature_from_the_wrong_key_admits_nobody() {
+        let (state, _key) = state_allowing_owner(true);
+        let impostor = SigningKey::generate(&mut rand::rngs::OsRng);
+        let cert = signed_cert(AGENT, OWNER, &impostor);
+        assert!(!delegated_admit(&state, AGENT, Some(&cert)).await);
+    }
+
+    /// A cert about a different agent proves nothing about the presenter.
+    #[tokio::test]
+    async fn a_certificate_about_another_agent_admits_nobody() {
+        let (state, key) = state_allowing_owner(true);
+        let cert = signed_cert("did:key:zSomeoneElse", OWNER, &key);
+        assert!(!delegated_admit(&state, AGENT, Some(&cert)).await);
+    }
+
+    /// Delegation carries the owner's authority, so it cannot exceed it.
+    #[tokio::test]
+    async fn a_delegation_from_an_owner_who_is_not_allowed_admits_nobody() {
+        let (state, _key) = state_allowing_owner(true);
+        let stranger_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        state.with_db(|db| db.save_signing_key(STRANGER, stranger_key.verifying_key().as_bytes()));
+        let cert = signed_cert(AGENT, STRANGER, &stranger_key);
+        assert!(!delegated_admit(&state, AGENT, Some(&cert)).await);
+    }
+
+    #[tokio::test]
+    async fn the_instance_must_opt_in() {
+        let (state, key) = state_allowing_owner(false);
+        let cert = signed_cert(AGENT, OWNER, &key);
+        assert!(!delegated_admit(&state, AGENT, Some(&cert)).await);
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_no_certificate_admits_nobody() {
+        let (state, _key) = state_allowing_owner(true);
+        assert!(!delegated_admit(&state, AGENT, None).await);
     }
 }
 

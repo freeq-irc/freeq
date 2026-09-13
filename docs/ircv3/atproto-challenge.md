@@ -565,11 +565,16 @@ intended behavior; this section records reality.
    or verify the PLC audit log (`/log/audit`). Audit-log verification is
    mentioned in Security considerations as an option for higher-assurance
    deployments, not as implemented behavior.
-7. **Response fields undocumented in protocol notes.** The project's
+7. **An extra response member.** On the `crypto` method the reference
+   server also reads a `delegation` member: a certificate naming the DID
+   that the authenticating agent acts for. It lets a server admit an agent
+   by its owner. This draft does not define the member; servers that do not
+   implement it ignore it.
+8. **Response fields undocumented in protocol notes.** The project's
    protocol notes omit the `challenge_nonce` and `dpop_proof` response
    fields (both required by the PDS methods of Appendix A) and the
    `web-token` method entirely; the implementation defines all three.
-8. **Key rotation.** Sessions are not revalidated on DID-document key
+9. **Key rotation.** Sessions are not revalidated on DID-document key
    changes; the SHOULD in Security considerations is aspirational and
    noted there as an open consideration.
 

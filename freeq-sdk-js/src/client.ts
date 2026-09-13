@@ -3227,6 +3227,7 @@ export class FreeqClient extends EventEmitter {
       signature,
       pds_url: this.sasl?.pdsUrl,
       challenge_nonce: challengeNonce,
+      delegation: this.sasl?.delegation,
     });
     const encoded = btoa(response)
       .replace(/\+/g, '-')

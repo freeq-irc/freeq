@@ -168,9 +168,27 @@ freeq-server --config /etc/freeq/server.toml
 | `--challenge-timeout-secs` | SASL challenge validity window (default: 60) |
 | `--oper-password` / `OPER_PASSWORD` | Enable OPER command with this password |
 | `--oper-dids` / `OPER_DIDS` | DIDs auto-granted server operator on connect |
+| `--allowed-dids` / `FREEQ_ALLOWED_DIDS` | Only these DIDs may authenticate |
+| `--allowed-did-domains` / `FREEQ_ALLOWED_DID_DOMAINS` | Allow all DIDs matching handle domain |
+| `--no-guest` / `FREEQ_NO_GUEST` | Refuse guest connections entirely |
+| `--allow-delegated-agents` / `FREEQ_ALLOW_DELEGATED_AGENTS` | Admit agents via a delegation certificate signed by a permitted account |
 | `BROKER_SHARED_SECRET` | HMAC secret shared with auth broker |
 | `GITHUB_CLIENT_ID` | GitHub OAuth for credential verifier |
 | `GITHUB_CLIENT_SECRET` | GitHub OAuth secret |
+
+#### Delegated agents
+
+An agent mints its own `did:key`, so on an allowlisted instance every new agent would otherwise have to be added to `--allowed-dids`. `--allow-delegated-agents` allows agent access based on who owns it.
+
+The agent presents a `FreeqBotDelegation/v1` certificate with its SASL response. The server admits it only when the signature checks out against a key the named owner registered, and that owner is themselves allowed.
+
+Setup is once per owner:
+
+1. The owner runs `/freeq authorize` in pi to create a signing key under `~/.freeq/owner/<did>/creator.key` and prints a `MSGSIG` line (public key).
+2. The owner pastes that line into any client logged in as them.
+3. The server runs with `--allow-delegated-agents`, and the owner's own DID is one the allowlist permits.
+
+All future agents created by that owner are then permitted to connect to the server.
 
 ### Federation
 

@@ -251,6 +251,20 @@ pub(super) fn verified_owner(
         .map(str::to_string)
 }
 
+pub(super) fn verified_owner_from_cert(
+    state: &crate::server::SharedState,
+    agent_did: &str,
+    cert: &Value,
+) -> Option<String> {
+    let outcome = state
+        .with_db(|db| Ok::<_, rusqlite::Error>(verify_provenance(cert, agent_did, Some(db))))
+        .unwrap_or_else(|| verify_provenance(cert, agent_did, None));
+    match outcome {
+        Ok(o) if o.verified => o.verifier_key_did,
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod delegated_access_tests {
     use super::*;
