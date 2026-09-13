@@ -147,20 +147,10 @@ if git -C "$REPO" rev-parse --verify --quiet "$UPSTREAM" >/dev/null && \
   vmexec "cd ~/src/'$PROJECT' && git am --3way < ~/.pi-migrate.patch 2>/dev/null || git am --abort 2>/dev/null || true"
 fi
 
-# ── 4. @freeq/pi ────────────────────────────────────────────────────────────
-# If we are migrating the freeq repo itself, install the checkout so the VM
-# runs the same code as this session — including anything not yet published.
-if [ -f "$REPO/freeq-pi/package.json" ]; then
-  say "building @freeq/pi from the checkout"
-  vmexec "cd ~/src/'$PROJECT'/freeq-pi && npm install --silent && npm run build --silent && pi install \"\$(pwd)\" >/dev/null"
-  PKG_DIR="$REMOTE_HOME/src/$PROJECT/freeq-pi"
-else
-  say "installing @freeq/pi from npm"
-  vmexec 'pi install npm:@freeq/pi >/dev/null'
-  PKG_DIR="$REMOTE_HOME/.pi/agent/npm/node_modules/@freeq/pi"
-fi
-
-# ── 5. credentials, skills, settings, session ───────────────────────────────
+# ── 4. credentials, skills, settings, session ───────────────────────────────
+# Before installing @freeq/pi, not after: `pi install` records the package in
+# settings.json, and writing settings afterwards would erase the entry and
+# leave the VM with no extension loaded.
 if [ -n "$KEY_ENV" ] && [ -n "${!KEY_ENV:-}" ]; then
   say "transferring the $PROVIDER API key (stdin, never in argv)"
   printf '%s' "${!KEY_ENV}" | vmput "$REMOTE_HOME/.pi-model-key"
@@ -205,6 +195,19 @@ cfg.pop("install", None)
 cfg.pop("projects", None)
 print(json.dumps(cfg, indent=2))
 PY
+
+# ── 5. @freeq/pi ────────────────────────────────────────────────────────────
+# If we are migrating the freeq repo itself, install the checkout so the VM
+# runs the same code as this session — including anything not yet published.
+if [ -f "$REPO/freeq-pi/package.json" ]; then
+  say "building @freeq/pi from the checkout"
+  vmexec "cd ~/src/'$PROJECT'/freeq-pi && npm install --silent && npm run build --silent && pi install \"\$(pwd)\" >/dev/null"
+  PKG_DIR="$REMOTE_HOME/src/$PROJECT/freeq-pi"
+else
+  say "installing @freeq/pi from npm"
+  vmexec 'pi install npm:@freeq/pi >/dev/null'
+  PKG_DIR="$REMOTE_HOME/.pi/agent/npm/node_modules/@freeq/pi"
+fi
 
 if [ -n "$SESSION" ] && [ "$SESSION" != "none" ] && [ -f "$SESSION" ]; then
   say "carrying the session history ($(wc -l < "$SESSION" | tr -d ' ') entries)"

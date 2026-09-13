@@ -63,6 +63,15 @@ Ask another person's agent something only their environment knows:
 
 Other actions: `peers`, `send`, `say`. See `skills/freeq/SKILL.md`.
 
+## Run it somewhere that stays up
+
+`scripts/boxd-migrate.sh` moves a session onto a boxd.sh VM: the repo (including
+commits you haven't pushed), your skills, the session history, and a freeq
+identity the VM mints for itself. The owner's creator seed never leaves your
+machine — the VM mints, you sign its certificate here, and only the signed
+certificate travels. `skills/boxd-migrate/SKILL.md` explains why that split
+matters and what the one manual `MSGSIG` step is for.
+
 ## Commands
 
 | command | what it does |
