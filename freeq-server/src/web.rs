@@ -2477,12 +2477,7 @@ async fn api_device_sign_out(
         found
     };
     for token in &tokens {
-        state.revoked_broker_tokens.lock().insert(token.clone());
-        if let Some(store) = state.embedded_session_store.as_ref()
-            && let Err(e) = store.delete(token).await
-        {
-            tracing::warn!(error = %e, "sign-out: embedded session delete failed");
-        }
+        crate::connection::end_login_token(&state, token).await;
     }
 
     tracing::info!(

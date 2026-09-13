@@ -227,7 +227,12 @@ fn start_lookup(state: &Arc<SharedState>, bases: Vec<String>, did: &str, kid: &s
                     KeySource::DidDocument => "did-document",
                     KeySource::OriginServer => "origin-server",
                 };
-                key_landed(&state, &did, &kid, &found.public_key, source);
+                // A key the signer's records retire is filed retired, and no
+                // peer is then asked for a live copy.
+                let retired_at = found
+                    .retired_at
+                    .filter(|_| found.source == KeySource::IdentityRecord);
+                key_landed(&state, &did, &kid, &found.public_key, source, retired_at);
                 return;
             }
             Ok(None) => {}
@@ -239,7 +244,7 @@ fn start_lookup(state: &Arc<SharedState>, bases: Vec<String>, did: &str, kid: &s
         for base in &bases {
             match fetch_key(base, &did, &kid).await {
                 Ok(pubkey) => {
-                    key_landed(&state, &did, &kid, &pubkey, "origin-server");
+                    key_landed(&state, &did, &kid, &pubkey, "origin-server", None);
                     return;
                 }
                 Err(e) => tracing::debug!(
@@ -256,11 +261,22 @@ fn start_lookup(state: &Arc<SharedState>, bases: Vec<String>, did: &str, kid: &s
 }
 
 /// File a key that answered a lookup and release what was waiting on it.
-fn key_landed(state: &Arc<SharedState>, did: &str, kid: &str, pubkey: &[u8; 32], source: &str) {
+fn key_landed(
+    state: &Arc<SharedState>,
+    did: &str,
+    kid: &str,
+    pubkey: &[u8; 32],
+    source: &str,
+    retired_at: Option<i64>,
+) {
     // Append-only and keyed by (did, kid), the same store a local registration
     // writes to. The kid is a hash of the key bytes, so a fetched key cannot
     // displace a different key already on file under that id.
     state.with_db(|db| db.save_signing_key_from(did, pubkey, source));
+    // Stamped before anything parked on the key is judged against it.
+    if let Some(retired_at) = retired_at {
+        state.with_db(|db| db.retire_signing_key(did, kid, retired_at));
+    }
     LOOKUPS.lock().remove(&(did.to_string(), kid.to_string()));
     tracing::info!(did = %did, kid = %kid, source = %source, "Fetched a signing key");
     // This lookup was started because something could not be checked without
@@ -792,6 +808,53 @@ mod tests {
             source_of(&state, did, &kid).as_deref(),
             Some("identity-record")
         );
+        assert_eq!(peer_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_key_the_signers_records_retire_is_filed_retired_and_no_peer_is_asked() {
+        let did = "did:plc:recordretired";
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let signer = freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&key.to_bytes()).unwrap();
+        let retirement = serde_json::to_value(
+            freeq_sdk::identity_records::build_device_retirement(
+                &signer,
+                did,
+                &kid,
+                "2026-03-01T00:00:00Z",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let resolver = stub_pds_resolver(did, vec![device_record(did, &key), retirement]).await;
+        // A peer that still serves the key, knowing nothing of the retirement.
+        let (base, peer_hits) = counting_key_server(Some(*key.verifying_key().as_bytes())).await;
+        let state = state_with(&base, resolver);
+
+        fetch_on_miss(
+            &state,
+            PEER,
+            did,
+            &freeq_sdk::sigtag::sign_canonical("{}", &key),
+        );
+
+        assert!(wait_for_key(&state, did, &kid).await.is_some());
+        let retired_at = chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        let mut removed_at = None;
+        for _ in 0..100 {
+            removed_at = state
+                .with_db(|db| db.get_signing_key_row(did, &kid))
+                .flatten()
+                .and_then(|row| row.removed_at);
+            if removed_at.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(removed_at, Some(retired_at), "the key is filed retired");
         assert_eq!(peer_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 

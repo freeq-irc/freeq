@@ -195,7 +195,76 @@ pub(crate) fn file_session_signing_key(
     // be judged now.
     crate::server::retry_deferred_task_events(state, did, &kid);
     tracing::info!(session = %session_id, %did, "Client registered message signing key");
+    // A key the account's records retire is refused. The records are read off
+    // the connection's task, so registration is not held up.
+    let check_state = Arc::clone(state);
+    let (session_id, did, token) = (
+        session_id.to_string(),
+        did.to_string(),
+        broker_token.map(str::to_string),
+    );
+    tokio::spawn(async move {
+        refuse_if_retired(&check_state, &session_id, &did, &kid, token.as_deref()).await;
+    });
     Ok(())
+}
+
+/// Refuse a just-registered key that the account's records retire: say so,
+/// stamp the retirement on the key row, end the login token this connection
+/// came in on, and close the connection, so the device signs in again and
+/// makes a new key.
+async fn refuse_if_retired(
+    state: &Arc<SharedState>,
+    session_id: &str,
+    did: &str,
+    kid: &str,
+    broker_token: Option<&str>,
+) {
+    let found = match state.key_lookup.key_for(did, kid).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::debug!(%did, %kid, error = %e, "Could not read the account's records for a registered key");
+            return;
+        }
+    };
+    let (freeq_sdk::key_lookup::KeySource::IdentityRecord, Some(retired_at)) =
+        (found.source, found.retired_at)
+    else {
+        return;
+    };
+    let reply = irc::Message::from_server(
+        &state.server_name,
+        "FAIL",
+        vec![
+            "MSGSIG",
+            "KEY_RETIRED",
+            "This device was signed out from another device. Sign in again to continue.",
+        ],
+    );
+    if let Some(tx) = state.connections.lock().get(session_id) {
+        let _ = tx.try_send(format!("{reply}\r\n"));
+    }
+    state.session_msg_keys.lock().remove(session_id);
+    state.with_db(|db| db.retire_signing_key(did, kid, retired_at));
+    if let Some(token) = broker_token {
+        end_login_token(state, token).await;
+    }
+    close_session(state, session_id, "Signing key retired");
+    tracing::info!(session = %session_id, %did, %kid, "Refused a retired signing key");
+}
+
+/// End a login token: refused at the broker push receiver from now on, and
+/// its session deleted from the embedded store. The two modes are exclusive
+/// (an embedded store exists only when no broker secret is set), so both are
+/// done.
+pub(crate) async fn end_login_token(state: &Arc<SharedState>, token: &str) {
+    state.revoked_broker_tokens.lock().insert(token.to_string());
+    if let Some(store) = state.embedded_session_store.as_ref()
+        && let Err(e) = store.delete(token).await
+    {
+        tracing::warn!(error = %e, "embedded session delete failed");
+    }
 }
 
 pub struct Connection {
@@ -3997,6 +4066,210 @@ pub(crate) fn close_session(state: &Arc<SharedState>, session_id: &str, reason: 
             true
         }
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod retired_key_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    const DID: &str = "did:plc:retiredkeytest";
+
+    /// A connection to `state` over an in-memory stream, signed in with a web
+    /// token carrying `broker_token`.
+    struct Client {
+        reader: BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    }
+
+    impl Client {
+        async fn signed_in(state: &Arc<SharedState>, broker_token: &str) -> Client {
+            state.web_auth_tokens.lock().insert(
+                "WT-RETIRED-KEY".to_string(),
+                (
+                    DID.to_string(),
+                    "alice.test".to_string(),
+                    std::time::Instant::now(),
+                    Some(broker_token.to_string()),
+                ),
+            );
+            let (client_side, server_side) = tokio::io::duplex(16384);
+            let served = state.clone();
+            tokio::spawn(async move {
+                let _ = handle_generic(server_side, served).await;
+            });
+            let (reader, writer) = tokio::io::split(client_side);
+            let mut c = Client {
+                reader: BufReader::new(reader),
+                writer,
+            };
+            c.tx("CAP LS 302").await;
+            c.tx("NICK alice").await;
+            c.tx("USER alice 0 * :test").await;
+            c.tx("CAP REQ :sasl message-tags").await;
+            c.rx(|l| l.contains("ACK")).await.expect("CAP ACK");
+            c.tx("AUTHENTICATE ATPROTO-CHALLENGE").await;
+            c.rx(|l| l.starts_with("AUTHENTICATE "))
+                .await
+                .expect("challenge");
+            use base64::Engine;
+            let payload = serde_json::json!({
+                "did": "",
+                "method": "web-token",
+                "signature": "WT-RETIRED-KEY",
+            });
+            let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(payload.to_string().as_bytes());
+            c.tx(&format!("AUTHENTICATE {encoded}")).await;
+            c.rx(|l| l.split_whitespace().nth(1) == Some("903"))
+                .await
+                .expect("903");
+            c.tx("CAP END").await;
+            c.rx(|l| l.split_whitespace().nth(1) == Some("001"))
+                .await
+                .expect("001");
+            c
+        }
+
+        async fn tx(&mut self, line: &str) {
+            self.writer
+                .write_all(format!("{line}\r\n").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        /// The next line `want` accepts, or None once the server has closed
+        /// the connection.
+        async fn rx(&mut self, want: impl Fn(&str) -> bool) -> Option<String> {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let mut buf = String::new();
+                    if self.reader.read_line(&mut buf).await.unwrap_or(0) == 0 {
+                        return None;
+                    }
+                    let line = buf.trim_end().to_string();
+                    if let Some(token) = line.strip_prefix("PING ") {
+                        self.tx(&format!("PONG {token}")).await;
+                        continue;
+                    }
+                    if want(&line) {
+                        return Some(line);
+                    }
+                }
+            })
+            .await
+            .expect("no such line, and no close, within 5s")
+        }
+    }
+
+    fn device_records(key: &ed25519_dalek::SigningKey, retired: bool) -> Vec<serde_json::Value> {
+        let signer = freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&key.to_bytes()).unwrap();
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let mut records = vec![
+            serde_json::to_value(
+                freeq_sdk::identity_records::build_device_record(
+                    &signer,
+                    DID,
+                    "2026-01-01T00:00:00Z",
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ];
+        if retired {
+            records.push(
+                serde_json::to_value(
+                    freeq_sdk::identity_records::build_device_retirement(
+                        &signer,
+                        DID,
+                        &kid,
+                        "2026-03-01T00:00:00Z",
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
+        }
+        records
+    }
+
+    fn msgsig_line(key: &ed25519_dalek::SigningKey) -> String {
+        use base64::Engine;
+        let public =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
+        format!("MSGSIG {public}")
+    }
+
+    #[tokio::test]
+    async fn a_key_the_records_retire_is_refused_its_token_ended_and_the_connection_closed() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+        let kid = freeq_sdk::sigtag::derive_kid(&key.verifying_key());
+        let resolver = crate::peer_keys::stub_pds_resolver(DID, device_records(&key, true)).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            resolver,
+        );
+
+        let mut client = Client::signed_in(&state, "BT-RETIRED-DEVICE").await;
+        client.tx(&msgsig_line(&key)).await;
+
+        let refused = client
+            .rx(|l| l.contains("KEY_RETIRED"))
+            .await
+            .expect("the key is refused");
+        assert!(refused.contains("FAIL MSGSIG KEY_RETIRED"), "{refused}");
+        assert!(
+            refused.contains(
+                "This device was signed out from another device. Sign in again to continue."
+            ),
+            "{refused}"
+        );
+        assert_eq!(client.rx(|_| false).await, None, "the connection is closed");
+        assert!(
+            state
+                .revoked_broker_tokens
+                .lock()
+                .contains("BT-RETIRED-DEVICE"),
+            "the login token behind the connection is refused from now on"
+        );
+        let row = state
+            .with_db(|db| db.get_signing_key_row(DID, &kid))
+            .flatten()
+            .expect("the key row");
+        let retired_at = chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert_eq!(row.removed_at, Some(retired_at));
+    }
+
+    #[tokio::test]
+    async fn a_live_key_registers_as_before() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let resolver = crate::peer_keys::stub_pds_resolver(DID, device_records(&key, false)).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            resolver,
+        );
+
+        let mut client = Client::signed_in(&state, "BT-LIVE-DEVICE").await;
+        client.tx(&msgsig_line(&key)).await;
+        client
+            .rx(|l| l.contains("MSGSIG OK"))
+            .await
+            .expect("the key is registered");
+        // Give a record check time to land, then show the session still answers.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        client.tx("PING :still-here").await;
+        let pong = client
+            .rx(|l| l.contains("PONG") || l.contains("KEY_RETIRED"))
+            .await;
+        assert!(
+            pong.as_deref().is_some_and(|l| l.contains("PONG")),
+            "{pong:?}"
+        );
+        assert!(state.revoked_broker_tokens.lock().is_empty());
     }
 }
 
