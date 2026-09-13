@@ -144,7 +144,22 @@ if git -C "$REPO" rev-parse --verify --quiet "$UPSTREAM" >/dev/null && \
    [ -n "$(git -C "$REPO" log --oneline "$UPSTREAM..HEAD" 2>/dev/null)" ]; then
   say "carrying $(git -C "$REPO" rev-list --count "$UPSTREAM..HEAD") unpushed commit(s) as patches (nothing is pushed)"
   git -C "$REPO" format-patch "$UPSTREAM..HEAD" --stdout | vmput "$REMOTE_HOME/.pi-migrate.patch"
-  vmexec "cd ~/src/'$PROJECT' && git am --3way < ~/.pi-migrate.patch 2>/dev/null || git am --abort 2>/dev/null || true"
+  # Re-runs replay the same patches, and `git am` refuses one that is already
+  # applied. Rewinding to the upstream first makes the operation idempotent:
+  # the VM ends up at exactly this checkout's HEAD whether it is the first run
+  # or the fifth. A dirty tree means someone is working there, so leave it be
+  # and say so rather than throwing their work away.
+  vmexec "cd ~/src/'$PROJECT'
+          git am --abort 2>/dev/null || true
+          # Our own 'npm install' rewrites lockfiles; that is not someone's
+          # unsaved work, so it does not count as dirty (and is discarded).
+          if [ -n \"\$(git status --porcelain | grep -v 'package-lock.json')\" ]; then
+            echo 'MIGRATE-SKIP-PATCH: working tree is dirty on the VM, leaving the checkout alone'
+            exit 0
+          fi
+          git reset --hard --quiet 'origin/$BRANCH'
+          git am --3way < ~/.pi-migrate.patch >/dev/null
+          git log --oneline -1" | grep -v '^$' || true
 fi
 
 # ── 4. credentials, skills, settings, session ───────────────────────────────
@@ -210,12 +225,25 @@ else
 fi
 
 if [ -n "$SESSION" ] && [ "$SESSION" != "none" ] && [ -f "$SESSION" ]; then
-  say "carrying the session history ($(wc -l < "$SESSION" | tr -d ' ') entries)"
   SDIR="--$(printf '%s' "$REMOTE_HOME/src/$PROJECT" | sed 's#/#-#g; s#^-##')--"
+  SDEST="$REMOTE_HOME/.pi/agent/sessions/$SDIR/$(basename "$SESSION")"
   vmexec "mkdir -p '$REMOTE_HOME/.pi/agent/sessions/$SDIR'"
+  # On a re-run the VM's copy has usually moved on — the agent has been
+  # talking to people there. Overwriting it with the laptop's older copy would
+  # delete that, so the longer history wins.
+  LOCAL_LINES=$(wc -l < "$SESSION" | tr -d ' ')
+  REMOTE_LINES=$(vmexec "wc -l < '$SDEST' 2>/dev/null || echo 0" | tr -dc '0-9')
+  if [ "${REMOTE_LINES:-0}" -gt "$LOCAL_LINES" ]; then
+    say "leaving the VM's session alone — it has $REMOTE_LINES entries to this machine's $LOCAL_LINES"
+    SESSION_SKIP=1
+  else
+    say "carrying the session history ($LOCAL_LINES entries)"
+  fi
+fi
+if [ -n "$SESSION" ] && [ "$SESSION" != "none" ] && [ -f "$SESSION" ] && [ -z "${SESSION_SKIP:-}" ]; then
   # The session header records the cwd it was created in; rewrite it so the
   # VM's copy belongs to the VM's checkout and `pi -c` finds it.
-  python3 - "$SESSION" "$REMOTE_HOME/src/$PROJECT" <<'PY' | vmput "$REMOTE_HOME/.pi/agent/sessions/$SDIR/$(basename "$SESSION")"
+  python3 - "$SESSION" "$REMOTE_HOME/src/$PROJECT" <<'PY' | vmput "$SDEST"
 import json, sys
 lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
 if lines:
