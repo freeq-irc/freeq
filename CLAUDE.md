@@ -242,6 +242,7 @@ When modifying a high-gamma file, write tests FIRST.
 
 ### P1 — High priority
 
+- [ ] **JOIN races PROVENANCE on connect** — the pi extension joins its configured channels as soon as the socket is ready, which can arrive before the server has verified the delegation cert. A `+i` channel that delegated access *should* admit comes back `ERR_INVITEONLYCHAN`, and the agent stays out until something re-issues the JOIN. Either hold configured joins until the `Provenance …` NOTICE lands, or retry a `+i` refusal once after it.
 - [ ] **AV: web call grid auto-layout** — web CallPanel must auto-adjust tile layout for participant counts from 1 to ~30 (macOS already does this via `CallGridLayout.tileSize`; port the same policy to web).
 - [ ] **AV: click-to-focus a call tile (ALL clients)** — clicking a participant chip/card focuses it (large tile, others shrink to strip). Web + macOS + iOS.
 - [x] **Message editing** — ✅ DONE. `+draft/edit=<msgid>` on PRIVMSG. Server verifies authorship, stores with `replaces_msgid`, updates in-memory history, broadcasts to channel.
