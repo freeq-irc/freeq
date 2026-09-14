@@ -46,7 +46,17 @@ export function recordVerdict(msgid: string, verdict: Verdict | undefined): void
   const known = verdicts.get(msgid);
   if (known && known.state === verdict.state && known.layer === verdict.layer) return;
   verdicts.set(msgid, verdict);
+  lookup = (id) => verdicts.get(id);
   for (const fn of listeners) fn();
+}
+
+/** `cachedVerdict`, as a function that is replaced on every change. */
+let lookup: (msgid: string) => Verdict | undefined = (id) => verdicts.get(id);
+
+/** Reactive lookup for a view that reads many rows at once: a new function
+ *  after any verdict changes. */
+export function useVerdictLookup(): (msgid: string) => Verdict | undefined {
+  return useSyncExternalStore(subscribeVerdicts, () => lookup);
 }
 
 /** The verdict on file for a message, if the SDK has given one. */
@@ -62,6 +72,7 @@ export function useCachedVerdict(msgid: string): Verdict | undefined {
 /** Test-only: forget every verdict. */
 export function __resetVerifyCacheForTests(): void {
   verdicts.clear();
+  lookup = (id) => verdicts.get(id);
 }
 
 /** One answer: what it is, what it means for the reader, and the colour it

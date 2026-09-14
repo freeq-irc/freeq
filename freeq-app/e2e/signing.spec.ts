@@ -6,8 +6,8 @@
  *
  * The check runs on this device as the line arrives: the SDK rebuilds what
  * was signed and looks the signer's key up. A row wears the mark its verdict
- * earns — the sender's own device, the server on their behalf, or the ⚠ after
- * a check that did not hold — and the panel behind "Verify Signature…" says
+ * earns — the lock when the sender's own device signed, or the ⚠ after a
+ * check that did not hold — and the panel behind "Verify Signature…" says
  * what the check established, asking the server nothing.
  */
 import { test, expect, type Page } from '@playwright/test';
@@ -109,10 +109,10 @@ test.describe('signature verification', () => {
       'title',
       verdictCopy('device', 'message', 'published').line,
     );
-    // The server's own signature is not the sender's, and says so.
-    const server = page.getByTestId('sig-server-mark');
-    await expect(server).toHaveCount(1);
-    await expect(server).toHaveAttribute('title', verdictCopy('server').line);
+    // The lock alone, with no word beside it.
+    await expect(marks.first()).toHaveText('🔒');
+    // A signature the server made on the sender's behalf wears nothing.
+    await expect(page.getByTestId('sig-server-mark')).toHaveCount(0);
   });
 
   test('an unsigned message answers with a fact, not a warning', async ({ page }) => {
@@ -298,6 +298,66 @@ test.describe('signature verification', () => {
     await requestVerify(page, 'second thing said');
     await expect(page.getByTestId('verify-panel')).toHaveCount(1);
     await page.getByTestId('verify-panel').getByRole('button', { name: 'Dismiss' }).click();
+  });
+
+  test('a run from one nick breaks wherever the row mark changes', async ({ page }, testInfo) => {
+    const channel = uniqueChannel();
+    await connectGuest(page, uniqueNick(), channel);
+    const published = { state: 'device', layer: 'published', kid: 'kidpub', keySource: 'IdentityRecord' };
+    const lines = [
+      { id: '01JBADGEMARKRUN00000000001', text: 'run line one, published key', verdict: published },
+      { id: '01JBADGEMARKRUN00000000002', text: 'run line two, published key', verdict: published },
+      {
+        id: '01JBADGEMARKRUN00000000003',
+        text: 'run line three, vouched key',
+        verdict: { state: 'device', layer: 'vouched', kid: 'kidvouch', keySource: 'OriginServer' },
+      },
+      {
+        id: '01JBADGEMARKRUN00000000004',
+        text: 'run line four, retired key',
+        verdict: { state: 'retired', kid: 'kidpub', keySource: 'IdentityRecord' },
+      },
+      { id: '01JBADGEMARKRUN00000000005', text: 'run line five, published key again', verdict: published },
+    ];
+    for (const l of lines) {
+      await receiveSignedMessage(page, channel, { id: l.id, from: 'someone', text: l.text }, l.verdict);
+    }
+    await expectMessage(page, lines[4].text);
+
+    const list = page.getByTestId('message-list');
+    const header = (text: string) => list.locator('.msg-full', { hasText: text });
+    const followUp = (text: string) => list.locator('div.group:not(.msg-full)', { hasText: text });
+
+    // Lines one and two share a header, which wears the full lock once.
+    const first = header(lines[0].text);
+    await expect(first).toHaveCount(1);
+    await expect(first).not.toContainText(lines[1].text);
+    await expect(first.getByTestId('sig-device-mark')).toHaveAttribute('data-layer', 'published');
+    await expect(header(lines[1].text)).toHaveCount(0);
+    const second = followUp(lines[1].text);
+    await expect(second).toHaveCount(1);
+    await expect(second.getByTestId('sig-device-mark')).toHaveCount(0);
+    await expect(second.getByTestId('sig-invalid-mark')).toHaveCount(0);
+
+    // Each change of mark starts its own header, carrying the new mark.
+    const third = header(lines[2].text);
+    await expect(third).toHaveCount(1);
+    await expect(third.getByTestId('sig-device-mark')).toHaveAttribute('data-layer', 'vouched');
+    await expect(third.getByTestId('sig-device-mark')).toHaveClass(/opacity-30/);
+
+    const fourth = header(lines[3].text);
+    await expect(fourth).toHaveCount(1);
+    await expect(fourth.getByTestId('sig-invalid-mark')).toHaveCount(1);
+    await expect(fourth.getByTestId('sig-device-mark')).toHaveCount(0);
+
+    const fifth = header(lines[4].text);
+    await expect(fifth).toHaveCount(1);
+    await expect(fifth.getByTestId('sig-device-mark')).toHaveAttribute('data-layer', 'published');
+    await expect(fifth.getByTestId('sig-device-mark')).not.toHaveClass(/opacity-30/);
+
+    const shot = testInfo.outputPath('grouping-by-mark.png');
+    await list.screenshot({ path: shot });
+    await testInfo.attach('grouping-by-mark', { path: shot, contentType: 'image/png' });
   });
 
   test('an encrypted message still shows what it is', async ({ page }) => {
