@@ -272,6 +272,34 @@ pub fn router(
     Some((app, state))
 }
 
+/// Serve the verifier's DID document with Ed25519 public key.
+async fn did_document(
+    axum::extract::State(state): axum::extract::State<Arc<VerifierState>>,
+) -> impl axum::response::IntoResponse {
+    let public_key = state.signing_key.verifying_key();
+    let public_key_multibase = format!(
+        "z{}",
+        bs58::encode([&[0xed, 0x01], public_key.as_bytes().as_slice()].concat()).into_string()
+    );
+    let key_id = format!("{}#key-1", state.issuer_did);
+
+    axum::Json(serde_json::json!({
+        "@context": [
+            "https://www.w3.org/ns/did/v1",
+            "https://w3id.org/security/multikey/v1"
+        ],
+        "id": state.issuer_did,
+        "verificationMethod": [{
+            "id": key_id,
+            "type": "Multikey",
+            "controller": state.issuer_did,
+            "publicKeyMultibase": public_key_multibase,
+        }],
+        "assertionMethod": [key_id],
+        "authentication": [key_id],
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,32 +414,4 @@ mod tests {
     fn script_nonces_are_single_use() {
         assert_ne!(script_nonce(), script_nonce());
     }
-}
-
-/// Serve the verifier's DID document with Ed25519 public key.
-async fn did_document(
-    axum::extract::State(state): axum::extract::State<Arc<VerifierState>>,
-) -> impl axum::response::IntoResponse {
-    let public_key = state.signing_key.verifying_key();
-    let public_key_multibase = format!(
-        "z{}",
-        bs58::encode([&[0xed, 0x01], public_key.as_bytes().as_slice()].concat()).into_string()
-    );
-    let key_id = format!("{}#key-1", state.issuer_did);
-
-    axum::Json(serde_json::json!({
-        "@context": [
-            "https://www.w3.org/ns/did/v1",
-            "https://w3id.org/security/multikey/v1"
-        ],
-        "id": state.issuer_did,
-        "verificationMethod": [{
-            "id": key_id,
-            "type": "Multikey",
-            "controller": state.issuer_did,
-            "publicKeyMultibase": public_key_multibase,
-        }],
-        "assertionMethod": [key_id],
-        "authentication": [key_id],
-    }))
 }

@@ -948,7 +948,7 @@ mod tests {
     fn the_approval_kind_is_not_in_the_file() {
         // Deferred: it gets added as its own table if and when something needs
         // it. Until then an approval event is refused, not half-handled.
-        assert!(spec().kinds.get("approval").is_none());
+        assert!(!spec().kinds.contains_key("approval"));
         assert_eq!(spec().kinds.len(), 2, "handoff and bounty");
     }
 

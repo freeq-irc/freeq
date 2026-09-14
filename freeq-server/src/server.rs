@@ -9930,15 +9930,13 @@ mod s2s_adversarial_tests {
             .await;
 
             // Check what the local member received
-            if let Ok(line) =
+            if let Ok(Some(line)) =
                 tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
             {
-                if let Some(line) = line {
-                    assert!(
-                        !line.contains("\r\nQUIT"),
-                        "BUG: CRLF injection in S2S privmsg text: {line}"
-                    );
-                }
+                assert!(
+                    !line.contains("\r\nQUIT"),
+                    "BUG: CRLF injection in S2S privmsg text: {line}"
+                );
             }
         }
     }

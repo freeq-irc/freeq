@@ -457,9 +457,7 @@ async fn chathistory_multiline_capable_receiver_gets_nested_batch() {
         let inner_open = lines
             .iter()
             .find(|l| l.contains("BATCH +") && l.contains("draft/multiline"))
-            .expect(&format!(
-                "expected nested multiline BATCH +, lines: {lines:#?}"
-            ));
+            .unwrap_or_else(|| panic!("expected nested multiline BATCH +, lines: {lines:#?}"));
         // Inner opener should carry the chathistory batch tag for
         // nesting (batch=<outer_id>) AND the msgid for the logical
         // message.
@@ -727,11 +725,11 @@ async fn chathistory_after_part_denied() {
         // Try CHATHISTORY after parting — should fail (not a member)
         alice.tx("CHATHISTORY LATEST #partcheck * 50");
         let result = alice.maybe(|l| l.contains("FAIL") || l.contains("BATCH"), 2000);
-        if let Some(line) = result {
-            if line.contains("BATCH") {
-                // Got history despite not being a member — document this
-                eprintln!("NOTE: CHATHISTORY allowed after PART (implementation choice)");
-            }
+        if let Some(line) = result
+            && line.contains("BATCH")
+        {
+            // Got history despite not being a member — document this
+            eprintln!("NOTE: CHATHISTORY allowed after PART (implementation choice)");
         }
     })
     .await;
@@ -860,24 +858,24 @@ async fn dm_chathistory_between_authenticated_users() {
         alice.tx(&format!("CHATHISTORY LATEST {DID_B} * 50"));
         let result = alice.maybe(|l| l.contains("BATCH") || l.contains("FAIL"), 2000);
         // Should get batch with the DM message
-        if let Some(line) = &result {
-            if line.contains("BATCH") {
-                // Collect messages
-                let mut msgs = Vec::new();
-                loop {
-                    let l = alice.rx(|_| true, "batch");
-                    if l.contains("BATCH -") {
-                        break;
-                    }
-                    if l.contains("PRIVMSG") {
-                        msgs.push(l);
-                    }
+        if let Some(line) = &result
+            && line.contains("BATCH")
+        {
+            // Collect messages
+            let mut msgs = Vec::new();
+            loop {
+                let l = alice.rx(|_| true, "batch");
+                if l.contains("BATCH -") {
+                    break;
                 }
-                assert!(
-                    msgs.iter().any(|m| m.contains("private dm")),
-                    "DM history should contain the message"
-                );
+                if l.contains("PRIVMSG") {
+                    msgs.push(l);
+                }
             }
+            assert!(
+                msgs.iter().any(|m| m.contains("private dm")),
+                "DM history should contain the message"
+            );
         }
     })
     .await;
@@ -956,23 +954,23 @@ async fn dm_chathistory_third_party_cannot_read() {
         // Eve requests CHATHISTORY with Bob's DID
         eve.tx(&format!("CHATHISTORY LATEST {DID_B} * 50"));
         let result = eve.maybe(|l| l.contains("BATCH") || l.contains("FAIL"), 2000);
-        if let Some(line) = &result {
-            if line.contains("BATCH") {
-                let mut msgs = Vec::new();
-                loop {
-                    let l = eve.rx(|_| true, "batch");
-                    if l.contains("BATCH -") {
-                        break;
-                    }
-                    if l.contains("PRIVMSG") {
-                        msgs.push(l);
-                    }
+        if let Some(line) = &result
+            && line.contains("BATCH")
+        {
+            let mut msgs = Vec::new();
+            loop {
+                let l = eve.rx(|_| true, "batch");
+                if l.contains("BATCH -") {
+                    break;
                 }
-                // Eve's query creates canonical_dm_key(eve_did, bob_did) — different from alice↔bob
-                // So she should NOT see alice's messages
-                if msgs.iter().any(|m| m.contains("super secret")) {
-                    panic!("BUG: Eve can read Alice↔Bob DM via CHATHISTORY!");
+                if l.contains("PRIVMSG") {
+                    msgs.push(l);
                 }
+            }
+            // Eve's query creates canonical_dm_key(eve_did, bob_did) — different from alice↔bob
+            // So she should NOT see alice's messages
+            if msgs.iter().any(|m| m.contains("super secret")) {
+                panic!("BUG: Eve can read Alice↔Bob DM via CHATHISTORY!");
             }
         }
     })
@@ -1518,11 +1516,11 @@ async fn chathistory_after_kick_denied() {
         // Victim tries CHATHISTORY after being kicked
         victim.tx("CHATHISTORY LATEST #kickhist * 50");
         let result = victim.maybe(|l| l.contains("FAIL") || l.contains("BATCH"), 2000);
-        if let Some(line) = result {
-            if line.contains("BATCH") {
-                // Kicked user can still get history — document this behavior
-                eprintln!("NOTE: Kicked user can still CHATHISTORY (implementation choice)");
-            }
+        if let Some(line) = result
+            && line.contains("BATCH")
+        {
+            // Kicked user can still get history — document this behavior
+            eprintln!("NOTE: Kicked user can still CHATHISTORY (implementation choice)");
         }
     })
     .await;

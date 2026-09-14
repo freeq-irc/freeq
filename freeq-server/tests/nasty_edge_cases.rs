@@ -571,7 +571,7 @@ async fn race_two_create_same_channel() {
         a.tx("NAMES #racechan");
         let names = a.num("353");
         // Extract nick list (after the trailing colon in IRC format)
-        let nick_part = names.splitn(2, " :").nth(1).unwrap_or("");
+        let nick_part = names.split_once(" :").map(|x| x.1).unwrap_or("");
         let ops: Vec<&str> = nick_part
             .split_whitespace()
             .filter(|w| w.starts_with('@'))

@@ -541,16 +541,16 @@ mod tests {
 
     // ── Pagination driver ────────────────────────────────────────────────
 
+    /// One page fetch, as the driver awaits it.
+    type PageFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Page, String>> + Send>>;
+
     /// Build a scripted page source: pages of DIDs, erroring on `fail_on_page`
     /// if given (0-indexed).
     fn scripted_source(
         pages: Vec<Vec<String>>,
         fail_on_page: Option<usize>,
-    ) -> impl FnMut(
-        Option<String>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Page, String>> + Send>,
-    > {
+    ) -> impl FnMut(Option<String>) -> PageFuture {
         let state = Arc::new(Mutex::new((pages, 0usize)));
         move |_cursor| {
             let state = Arc::clone(&state);
@@ -723,11 +723,7 @@ mod tests {
 
     #[test]
     fn pds_page_url_encodes_params() {
-        let url = pds_page_url(
-            "https://pds.example.com/",
-            "did:plc:me",
-            Some("cur/sor+x".into()),
-        );
+        let url = pds_page_url("https://pds.example.com/", "did:plc:me", Some("cur/sor+x"));
         assert_eq!(
             url,
             "https://pds.example.com/xrpc/com.atproto.repo.listRecords?repo=did%3Aplc%3Ame&collection=app.bsky.graph.follow&limit=100&cursor=cur%2Fsor%2Bx"

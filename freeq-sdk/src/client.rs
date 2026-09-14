@@ -6039,7 +6039,7 @@ mod multiline_tests {
             .collect();
 
         assert!(
-            assembled.iter().any(|t| *t == "first line\nsecond line"),
+            assembled.contains(&"first line\nsecond line"),
             "assembled multi-line message not found. messages dispatched: {assembled:#?}\nall events: {events:#?}",
         );
         assert!(
@@ -6164,37 +6164,50 @@ mod connect_config_tests {
 
     #[test]
     fn rejects_empty_and_oversized_nick() {
-        let mut c = ConnectConfig::default();
-        c.nick = String::new();
+        let c = ConnectConfig {
+            nick: String::new(),
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
-        c.nick = "x".repeat(65);
+        let c = ConnectConfig {
+            nick: "x".repeat(65),
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn rejects_nick_with_protocol_characters() {
         for bad in ["a b", "a,b", "a*b", "a?b", "a!b", "a@b", "a#b", "a\rb"] {
-            let mut c = ConnectConfig::default();
-            c.nick = bad.to_string();
+            let c = ConnectConfig {
+                nick: bad.to_string(),
+                ..Default::default()
+            };
             assert!(c.validate().is_err(), "nick {bad:?} should be rejected");
         }
     }
 
     #[test]
     fn rejects_empty_server_addr_and_user() {
-        let mut c = ConnectConfig::default();
-        c.server_addr = String::new();
+        let c = ConnectConfig {
+            server_addr: String::new(),
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
 
-        let mut c = ConnectConfig::default();
-        c.user = String::new();
+        let c = ConnectConfig {
+            user: String::new(),
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
     }
 
     #[tokio::test]
     async fn establish_connection_enforces_validation() {
-        let mut c = ConnectConfig::default();
-        c.nick = "bad nick".to_string();
+        let c = ConnectConfig {
+            nick: "bad nick".to_string(),
+            ..Default::default()
+        };
         let err = match establish_connection(&c).await {
             Ok(_) => panic!("invalid config must not connect"),
             Err(e) => e,
@@ -9299,11 +9312,14 @@ mod verdict_tests {
 
     // ── the origin server ────────────────────────────────────────────────
 
+    /// Signers' keys by (DID, kid), each with an optional removal date.
+    type HeldKeys = HashMap<(String, String), ([u8; 32], Option<i64>)>;
+
     /// What the stub origin server holds: signers' keys by (DID, kid), with
     /// an optional removal date, and its own key set.
     #[derive(Default)]
     struct Origin {
-        keys: parking_lot::Mutex<HashMap<(String, String), ([u8; 32], Option<i64>)>>,
+        keys: parking_lot::Mutex<HeldKeys>,
         server_keys: Vec<[u8; 32]>,
         /// Held back this long before a signer's key is answered.
         delay_ms: u64,

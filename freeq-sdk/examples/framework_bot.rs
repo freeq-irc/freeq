@@ -92,17 +92,12 @@ async fn main() -> Result<()> {
     });
 
     println!("Bot running. Commands: !ping !echo !whoami !secret !help");
-    loop {
-        match events.recv().await {
-            Some(event) => {
-                if let Event::Disconnected { reason } = &event {
-                    println!("Disconnected: {reason}");
-                    break;
-                }
-                bot.handle_event(&handle, &event).await;
-            }
-            None => break,
+    while let Some(event) = events.recv().await {
+        if let Event::Disconnected { reason } = &event {
+            println!("Disconnected: {reason}");
+            break;
         }
+        bot.handle_event(&handle, &event).await;
     }
     Ok(())
 }

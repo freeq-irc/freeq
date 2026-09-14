@@ -490,7 +490,7 @@ async fn mutual_deop_war() {
         // Check final state: at least the founder should be op
         a.tx("NAMES #war");
         let names = a.num("353");
-        let nick_part = names.splitn(2, " :").nth(1).unwrap_or("");
+        let nick_part = names.split_once(" :").map(|x| x.1).unwrap_or("");
         // At minimum, the channel shouldn't be in a broken state
         assert!(
             nick_part.contains("war_a"),
@@ -583,7 +583,7 @@ async fn hundred_users_channel() {
         // NAMES should show all users
         clients[0].tx("NAMES #big");
         let names = clients[0].num("353");
-        let nick_part = names.splitn(2, " :").nth(1).unwrap_or("");
+        let nick_part = names.split_once(" :").map(|x| x.1).unwrap_or("");
         let count = nick_part.split_whitespace().count();
         assert!(
             count >= 50,
@@ -844,13 +844,11 @@ async fn per_ip_connection_limit() {
             }
         });
 
-        match result {
-            Ok(rejected) => {
-                // Connection might still succeed if some previous ones were cleaned up
-                // by the time we connect. This test is inherently racy.
-                let _ = rejected;
-            }
-            Err(_) => {} // Panic in catch_unwind is fine
+        // A panic in catch_unwind is fine.
+        if let Ok(rejected) = result {
+            // Connection might still succeed if some previous ones were cleaned up
+            // by the time we connect. This test is inherently racy.
+            let _ = rejected;
         }
 
         // Clean up — drop all clients
@@ -919,7 +917,7 @@ async fn compound_mode_changes() {
         own.tx("NAMES #cmode");
         let names = own.num("353");
         // User should have op (at minimum)
-        let nick_part = names.splitn(2, " :").nth(1).unwrap_or("");
+        let nick_part = names.split_once(" :").map(|x| x.1).unwrap_or("");
         // @ takes priority over + in display
         assert!(
             nick_part.contains("@cmode_usr") || nick_part.contains("+cmode_usr"),

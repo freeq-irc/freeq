@@ -154,7 +154,7 @@ impl C {
         self.tx(&format!("NAMES {ch}"));
         let n = self.num("353");
         self.num("366");
-        n.splitn(2, " :").nth(1).unwrap_or("").to_string()
+        n.split_once(" :").map(|x| x.1).unwrap_or("").to_string()
     }
 }
 
@@ -537,10 +537,10 @@ async fn halfop_invite_plus_i() {
             },
             1000,
         );
-        if let Some(ref line) = r {
-            if line.contains("341") {
-                // BUG: Halfop can INVITE on +i channel (should be ops only)
-            }
+        if let Some(ref line) = r
+            && line.contains("341")
+        {
+            // BUG: Halfop can INVITE on +i channel (should be ops only)
         }
     })
     .await;

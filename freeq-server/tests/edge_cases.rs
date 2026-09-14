@@ -89,10 +89,7 @@ impl C {
     }
 
     fn num(&mut self, code: &str) -> String {
-        self.expect(
-            |l| l.split_whitespace().nth(1) == Some(code),
-            &format!("{code}"),
-        )
+        self.expect(|l| l.split_whitespace().nth(1) == Some(code), code)
     }
 
     fn reg(&mut self) -> String {

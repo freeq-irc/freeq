@@ -6581,22 +6581,17 @@ async fn single_server_hist2_deleted_messages_excluded() {
 
     // Collect the msgid of "delete-this" from echo-message
     let mut delete_msgid = String::new();
-    loop {
-        match maybe_wait(
-            &mut ea,
-            |e| matches!(e, Event::Message { .. }),
-            Duration::from_secs(2),
-        )
-        .await
+    while let Some(Event::Message { text, tags, .. }) = maybe_wait(
+        &mut ea,
+        |e| matches!(e, Event::Message { .. }),
+        Duration::from_secs(2),
+    )
+    .await
+    {
+        if text == "delete-this"
+            && let Some(mid) = tags.get("msgid")
         {
-            Some(Event::Message { text, tags, .. }) => {
-                if text == "delete-this" {
-                    if let Some(mid) = tags.get("msgid") {
-                        delete_msgid = mid.clone();
-                    }
-                }
-            }
-            _ => break,
+            delete_msgid = mid.clone();
         }
     }
 
@@ -6672,22 +6667,17 @@ async fn single_server_hist3_edited_messages_in_history() {
 
     // Capture msgid
     let mut orig_msgid = String::new();
-    loop {
-        match maybe_wait(
-            &mut ea,
-            |e| matches!(e, Event::Message { .. }),
-            Duration::from_secs(2),
-        )
-        .await
+    while let Some(Event::Message { text, tags, .. }) = maybe_wait(
+        &mut ea,
+        |e| matches!(e, Event::Message { .. }),
+        Duration::from_secs(2),
+    )
+    .await
+    {
+        if text == "original-text"
+            && let Some(mid) = tags.get("msgid")
         {
-            Some(Event::Message { text, tags, .. }) => {
-                if text == "original-text" {
-                    if let Some(mid) = tags.get("msgid") {
-                        orig_msgid = mid.clone();
-                    }
-                }
-            }
-            _ => break,
+            orig_msgid = mid.clone();
         }
     }
 
@@ -7293,19 +7283,14 @@ async fn single_server_edge18_simultaneous_senders() {
 
     // C should see messages from A and B (and possibly echo)
     let mut seen = std::collections::HashSet::new();
-    loop {
-        match maybe_wait(
-            &mut ec,
-            |e| matches!(e, Event::Message { text, .. } if text.starts_with("from-")),
-            Duration::from_secs(3),
-        )
-        .await
-        {
-            Some(Event::Message { text, .. }) => {
-                seen.insert(text);
-            }
-            _ => break,
-        }
+    while let Some(Event::Message { text, .. }) = maybe_wait(
+        &mut ec,
+        |e| matches!(e, Event::Message { text, .. } if text.starts_with("from-")),
+        Duration::from_secs(3),
+    )
+    .await
+    {
+        seen.insert(text);
     }
 
     assert!(

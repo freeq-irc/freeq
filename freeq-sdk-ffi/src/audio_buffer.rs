@@ -142,7 +142,7 @@ mod tests {
         let mut q = VecDeque::new();
         push_capped(
             &mut q,
-            std::iter::repeat(0.2).take(PUSH_AUDIO_RATE as usize * 5),
+            std::iter::repeat_n(0.2, PUSH_AUDIO_RATE as usize * 5),
             MAX_BACKLOG_SAMPLES,
         );
         let latency_ms = q.len() as f64 / PUSH_AUDIO_RATE as f64 * 1000.0;

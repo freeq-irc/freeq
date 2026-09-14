@@ -3172,7 +3172,7 @@ mod tests {
         db.add_invite("#room", "did:plc:guest", "did:plc:host")
             .unwrap();
         db.remove_invite("#room", "did:plc:guest").unwrap();
-        assert!(db.load_invites().unwrap().get("#room").is_none());
+        assert!(!db.load_invites().unwrap().contains_key("#room"));
     }
 
     /// Dropping `+i` opens the room, so the outstanding grants are moot and
@@ -3187,7 +3187,7 @@ mod tests {
 
         db.clear_invites("#room").unwrap();
         let loaded = db.load_invites().unwrap();
-        assert!(loaded.get("#room").is_none());
+        assert!(!loaded.contains_key("#room"));
         assert_eq!(loaded.get("#other").map(Vec::len), Some(1));
     }
 
@@ -6728,15 +6728,17 @@ mod tests {
     fn roundtrip_channel_state() {
         let db = Db::open_memory().unwrap();
 
-        let mut ch = ChannelState::default();
-        ch.topic = Some(TopicInfo {
-            text: "Hello world".to_string(),
-            set_by: "alice!a@host".to_string(),
-            set_at: 1700000000,
-        });
-        ch.topic_locked = true;
-        ch.invite_only = false;
-        ch.key = Some("secret".to_string());
+        let ch = ChannelState {
+            topic: Some(TopicInfo {
+                text: "Hello world".to_string(),
+                set_by: "alice!a@host".to_string(),
+                set_at: 1700000000,
+            }),
+            topic_locked: true,
+            invite_only: false,
+            key: Some("secret".to_string()),
+            ..Default::default()
+        };
 
         db.save_channel("#test", &ch).unwrap();
 
@@ -10711,7 +10713,7 @@ mod event_log_tests {
         let root = "01KYVT1W2P0000000000000000";
         let dm = freeq_sdk::chatsig::dm_venue(ALICE, "did:plc:bob");
 
-        let docs = vec![
+        let docs = [
             ChatDoc::message(ALICE, "01AAAA0000000000000000000A", "#room", "plain").canonical(),
             ChatDoc::message(ALICE, "01AAAA0000000000000000000B", "#room", "a reply")
                 .with_reply(root)

@@ -810,7 +810,8 @@ mod tests {
     /// and one character, which is why this is measured and not assumed.
     #[test]
     fn a_marker_and_its_blank_are_the_same_width() {
-        for marker in [PIN_MARKER] {
+        {
+            let marker = PIN_MARKER;
             let blank = blank_marker(marker);
             assert_eq!(
                 Span::raw(marker).width(),

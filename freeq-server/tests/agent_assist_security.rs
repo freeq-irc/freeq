@@ -335,7 +335,7 @@ async fn ctf_04_explain_message_routing_caps_wire_line_size() {
     // IRC's own line limit is 512 bytes (RFC 1459 §2.3). Anything
     // over that is invalid IRC. The tool should refuse outright
     // rather than spend cycles on the SDK parser.
-    let huge: String = std::iter::repeat("PRIVMSG #ch :x").take(50_000).collect();
+    let huge: String = "PRIVMSG #ch :x".repeat(50_000);
     assert!(huge.len() > 8192, "test input must exceed our intended cap");
 
     let body = admin_post(

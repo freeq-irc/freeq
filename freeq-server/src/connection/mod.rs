@@ -4069,6 +4069,114 @@ pub(crate) fn close_session(state: &Arc<SharedState>, session_id: &str, reason: 
     }
 }
 
+/// Clean up per-session state (connections, caps, etc.) but NOT channel membership.
+fn cleanup_session_state(state: &Arc<SharedState>, session_id: &str) {
+    state.connections.lock().remove(session_id);
+    state.session_kill.lock().remove(session_id);
+    state.liveness_probes.lock().remove(session_id);
+    state.session_dids.lock().remove(session_id);
+    state.session_handles.lock().remove(session_id);
+    state.session_iroh_ids.lock().remove(session_id);
+    state.session_away.lock().remove(session_id);
+    state.msg_timestamps.lock().remove(session_id);
+    state.session_msg_keys.lock().remove(session_id);
+    state.session_client_info.lock().remove(session_id);
+    state.cap_message_tags.lock().remove(session_id);
+    state.cap_multi_prefix.lock().remove(session_id);
+    state.cap_echo_message.lock().remove(session_id);
+    state.cap_server_time.lock().remove(session_id);
+    state.cap_batch.lock().remove(session_id);
+    state.cap_draft_multiline.lock().remove(session_id);
+    // Drop any open BATCH state for this session — the client is gone,
+    // those batches will never be closed.
+    state
+        .open_batches
+        .lock()
+        .retain(|(sid, _bid), _| sid != session_id);
+    state.cap_account_notify.lock().remove(session_id);
+    state.cap_extended_join.lock().remove(session_id);
+    state.cap_away_notify.lock().remove(session_id);
+    state.cap_act.lock().remove(session_id);
+    state.cap_account_tag.lock().remove(session_id);
+    state.cap_read_marker.lock().remove(session_id);
+    state.session_read_markers.lock().remove(session_id);
+    state.server_opers.lock().remove(session_id);
+    state.session_actor_class.lock().remove(session_id);
+    state.agent_presence.lock().remove(session_id);
+    state.agent_heartbeats.lock().remove(session_id);
+
+    // Clean up any spawned (virtual) child agents owned by this session
+    let mut spawned = state.spawned_agents.lock();
+    let children: Vec<crate::server::SpawnedAgent> = spawned
+        .values()
+        .filter(|sa| sa.parent_session == session_id)
+        .cloned()
+        .collect();
+    for child in &children {
+        spawned.remove(&child.child_did);
+    }
+    drop(spawned);
+
+    // Broadcast QUIT for each orphaned child
+    for child in children {
+        let quit_line = format!(
+            ":{}!spawn@freeq/spawn QUIT :Parent disconnected\r\n",
+            child.nick
+        );
+        helpers::broadcast_to_channel(state, &child.channel, &quit_line);
+        state.with_db(|db| db.record_despawn(&child.child_did));
+        tracing::info!(child = %child.nick, parent_session = %session_id, "Despawned orphaned child agent");
+    }
+}
+
+/// Remove a session from all channels. Retains channels that still have content.
+fn cleanup_channel_membership(state: &Arc<SharedState>, session_id: &str) {
+    let mut channels = state.channels.lock();
+    for ch in channels.values_mut() {
+        ch.members.remove(session_id);
+        ch.ops.remove(session_id);
+        ch.voiced.remove(session_id);
+        ch.halfops.remove(session_id);
+    }
+    channels.retain(|_, ch| {
+        !ch.members.is_empty()
+            || !ch.remote_members.is_empty()
+            || ch.founder_did.is_some()
+            || ch.topic.is_some()
+            || !ch.bans.is_empty()
+    });
+}
+
+/// Compute the start timestamp for a budget period.
+pub fn budget_period_start(period: &crate::policy::types::BudgetPeriod) -> i64 {
+    use crate::policy::types::BudgetPeriod;
+    let now = chrono::Utc::now();
+    match period {
+        BudgetPeriod::PerHour => now
+            .date_naive()
+            .and_hms_opt(now.time().hour(), 0, 0)
+            .map(|dt| dt.and_utc().timestamp())
+            .unwrap_or(0),
+        BudgetPeriod::PerDay => now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .map(|dt| dt.and_utc().timestamp())
+            .unwrap_or(0),
+        BudgetPeriod::PerWeek => {
+            use chrono::Datelike;
+            let days_since_monday = now.weekday().num_days_from_monday();
+            let monday = now.date_naive() - chrono::Duration::days(days_since_monday as i64);
+            monday
+                .and_hms_opt(0, 0, 0)
+                .map(|dt| dt.and_utc().timestamp())
+                .unwrap_or(0)
+        }
+        BudgetPeriod::PerTask => 0, // per-task tracks from task creation, not calendar
+    }
+}
+
+use chrono::Timelike;
+
 #[cfg(test)]
 mod retired_key_tests {
     use super::*;
@@ -4272,111 +4380,3 @@ mod retired_key_tests {
         assert!(state.revoked_broker_tokens.lock().is_empty());
     }
 }
-
-/// Clean up per-session state (connections, caps, etc.) but NOT channel membership.
-fn cleanup_session_state(state: &Arc<SharedState>, session_id: &str) {
-    state.connections.lock().remove(session_id);
-    state.session_kill.lock().remove(session_id);
-    state.liveness_probes.lock().remove(session_id);
-    state.session_dids.lock().remove(session_id);
-    state.session_handles.lock().remove(session_id);
-    state.session_iroh_ids.lock().remove(session_id);
-    state.session_away.lock().remove(session_id);
-    state.msg_timestamps.lock().remove(session_id);
-    state.session_msg_keys.lock().remove(session_id);
-    state.session_client_info.lock().remove(session_id);
-    state.cap_message_tags.lock().remove(session_id);
-    state.cap_multi_prefix.lock().remove(session_id);
-    state.cap_echo_message.lock().remove(session_id);
-    state.cap_server_time.lock().remove(session_id);
-    state.cap_batch.lock().remove(session_id);
-    state.cap_draft_multiline.lock().remove(session_id);
-    // Drop any open BATCH state for this session — the client is gone,
-    // those batches will never be closed.
-    state
-        .open_batches
-        .lock()
-        .retain(|(sid, _bid), _| sid != session_id);
-    state.cap_account_notify.lock().remove(session_id);
-    state.cap_extended_join.lock().remove(session_id);
-    state.cap_away_notify.lock().remove(session_id);
-    state.cap_act.lock().remove(session_id);
-    state.cap_account_tag.lock().remove(session_id);
-    state.cap_read_marker.lock().remove(session_id);
-    state.session_read_markers.lock().remove(session_id);
-    state.server_opers.lock().remove(session_id);
-    state.session_actor_class.lock().remove(session_id);
-    state.agent_presence.lock().remove(session_id);
-    state.agent_heartbeats.lock().remove(session_id);
-
-    // Clean up any spawned (virtual) child agents owned by this session
-    let mut spawned = state.spawned_agents.lock();
-    let children: Vec<crate::server::SpawnedAgent> = spawned
-        .values()
-        .filter(|sa| sa.parent_session == session_id)
-        .cloned()
-        .collect();
-    for child in &children {
-        spawned.remove(&child.child_did);
-    }
-    drop(spawned);
-
-    // Broadcast QUIT for each orphaned child
-    for child in children {
-        let quit_line = format!(
-            ":{}!spawn@freeq/spawn QUIT :Parent disconnected\r\n",
-            child.nick
-        );
-        helpers::broadcast_to_channel(state, &child.channel, &quit_line);
-        state.with_db(|db| db.record_despawn(&child.child_did));
-        tracing::info!(child = %child.nick, parent_session = %session_id, "Despawned orphaned child agent");
-    }
-}
-
-/// Remove a session from all channels. Retains channels that still have content.
-fn cleanup_channel_membership(state: &Arc<SharedState>, session_id: &str) {
-    let mut channels = state.channels.lock();
-    for ch in channels.values_mut() {
-        ch.members.remove(session_id);
-        ch.ops.remove(session_id);
-        ch.voiced.remove(session_id);
-        ch.halfops.remove(session_id);
-    }
-    channels.retain(|_, ch| {
-        !ch.members.is_empty()
-            || !ch.remote_members.is_empty()
-            || ch.founder_did.is_some()
-            || ch.topic.is_some()
-            || !ch.bans.is_empty()
-    });
-}
-
-/// Compute the start timestamp for a budget period.
-pub fn budget_period_start(period: &crate::policy::types::BudgetPeriod) -> i64 {
-    use crate::policy::types::BudgetPeriod;
-    let now = chrono::Utc::now();
-    match period {
-        BudgetPeriod::PerHour => now
-            .date_naive()
-            .and_hms_opt(now.time().hour(), 0, 0)
-            .map(|dt| dt.and_utc().timestamp())
-            .unwrap_or(0),
-        BudgetPeriod::PerDay => now
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .map(|dt| dt.and_utc().timestamp())
-            .unwrap_or(0),
-        BudgetPeriod::PerWeek => {
-            use chrono::Datelike;
-            let days_since_monday = now.weekday().num_days_from_monday();
-            let monday = now.date_naive() - chrono::Duration::days(days_since_monday as i64);
-            monday
-                .and_hms_opt(0, 0, 0)
-                .map(|dt| dt.and_utc().timestamp())
-                .unwrap_or(0)
-        }
-        BudgetPeriod::PerTask => 0, // per-task tracks from task creation, not calendar
-    }
-}
-
-use chrono::Timelike;

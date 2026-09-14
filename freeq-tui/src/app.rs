@@ -2066,6 +2066,7 @@ mod tests {
     /// - reverse the visual order of text after them (RTL OVERRIDE — the
     ///   classic "RIGHT-TO-LEFT spoofing" attack),
     /// - be invisible (zero-width joiner, BOM, byte-order mark).
+    ///
     /// Reject them in msgids — there's no legitimate reason for any of
     /// these to appear in a server-assigned identifier.
     #[test]
