@@ -13,6 +13,9 @@ export const TOP_BAR_TEXT = 'min-w-0';
 /** A button beside the sentence: never shrinks, never breaks onto two lines. */
 export const TOP_BAR_BUTTON = 'shrink-0 whitespace-nowrap font-semibold hover:underline';
 
+/** A second, quieter button beside the sentence. */
+export const TOP_BAR_QUIET_BUTTON = 'shrink-0 whitespace-nowrap hover:underline';
+
 /** A button inside the sentence: stays on one line. */
 export const TOP_BAR_INLINE_BUTTON = 'whitespace-nowrap font-semibold hover:underline';
 
