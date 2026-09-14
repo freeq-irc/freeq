@@ -89,7 +89,7 @@ async function network(records: unknown[], originKeys: Record<string, Uint8Array
     }
     return new Response('unexpected', { status: 500 });
   });
-  return { fetch, hits };
+  return { fetch, hits, repo };
 }
 
 function resolver(docs: DidDocument[]) {
@@ -247,6 +247,35 @@ describe('KeyLookup', () => {
     const answers = await Promise.all(Array.from({ length: 10 }, () => lookup.keyFor(ALICE, kid)));
     expect(answers).toEqual(Array(10).fill(null));
     expect([hits.pds, hits.origin], 'one lookup and its retries').toEqual([4, 4]);
+  });
+
+  it('makes one listing and one proof per record for fifty concurrent asks for fifty kids of one signer', async () => {
+    const records = [];
+    for (let seed = 1; seed <= 5; seed++) records.push(await buildDeviceRecord(await key(seed), ALICE, T0));
+    const { fetch, hits } = await network(records);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES);
+    const kids = await Promise.all(Array.from({ length: 51 }, (_, i) => kidOf(101 + i)));
+    const answers = await Promise.all(kids.slice(0, 50).map((kid) => lookup.keyFor(ALICE, kid)));
+    expect(answers).toEqual(Array(50).fill(null));
+    expect([hits.pds, hits.proofs], 'one listing, one proof per record').toEqual([1, 5]);
+
+    expect(await lookup.keyFor(ALICE, kids[50]!)).toBeNull();
+    expect([hits.pds, hits.proofs], 'a kid the cached records lack lists once more, proving nothing').toEqual([2, 5]);
+  });
+
+  it('lists once more for a kid the cached records lack, and finds a key published since', async () => {
+    const { fetch, hits, repo } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES);
+    expect((await lookup.keyFor(ALICE, await kidOf(1)))?.source).toBe('IdentityRecord');
+    expect([hits.pds, hits.proofs]).toEqual([1, 1]);
+
+    await repo.add('at.freeq.deviceKey', await buildDeviceRecord(await key(2), ALICE, T0));
+    expect(await lookup.keyFor(ALICE, await kidOf(2))).toEqual({
+      publicKey: await raw(2),
+      source: 'IdentityRecord',
+      retiredAt: null,
+    });
+    expect([hits.pds, hits.proofs, hits.origin], 'one more listing, the new record proven').toEqual([2, 2, 0]);
   });
 
   it('asks again after a remembered miss is forgotten', async () => {

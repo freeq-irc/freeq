@@ -73,13 +73,21 @@ export const MISS_RETRY_AFTER_MS: readonly number[] = [2_000, 6_000, 15_000];
  * Looks keys up by (DID, kid), caching each answer for `ttlMs`: a key found,
  * or a miss, when every source answered without the key. A miss the origin
  * answered is asked again at each of `retryAfterMs` before it is remembered.
+ * A signer's device records are listed and proven per DID, shared by the
+ * lookups for every kid of that DID.
  */
 export class KeyLookup {
   private readonly cache = new Map<string, Cached>();
   /** One lookup in flight per (DID, kid). */
   private readonly inFlight = new Map<string, Promise<Settled>>();
+  /** Each DID's proven device records as last listed, kept for `ttlMs`. */
+  private readonly records = new Map<string, { records: unknown[]; at: number }>();
+  /** One listing, with its proofs, in flight per DID. */
+  private readonly listing = new Map<string, Promise<unknown[]>>();
   /** CIDs of records whose repository proof has checked, so each is fetched once. */
   private readonly proven = new Set<string>();
+  /** Proofs in flight by record CID, so listings racing on a record share one fetch. */
+  private readonly proving = new Map<string, Promise<boolean>>();
   private defaultOrigin: string | null = null;
 
   /** `originBase` is the origin server's base URL; the reader's `fetch` serves its requests. */
@@ -176,7 +184,7 @@ export class KeyLookup {
     return settled;
   }
 
-  /** One round: the records (from `cached` when given), then the other sources. */
+  /** One round: the records (from `cached` when given, else the DID's records), then the other sources. */
   private async ask(did: string, kid: string, at: Date, cached: Cached | undefined): Promise<Settled> {
     let failure: unknown;
     let failed = false;
@@ -186,7 +194,7 @@ export class KeyLookup {
     } else {
       try {
         // A listed record counts only once its repository proof checks.
-        records = await this.provenDeviceRecords(did);
+        records = await this.deviceRecords(did, kid);
       } catch (e) {
         [failed, failure] = [true, e];
       }
@@ -218,12 +226,52 @@ export class KeyLookup {
   }
 
   /**
-   * `did`'s device key records whose repository proof checks, through this
-   * lookup's cache of proven records, so each record's proof is fetched once.
+   * `did`'s device key records whose repository proof checks, listed afresh
+   * or by a listing already in flight, through this lookup's cache of proven
+   * records, so each record's proof is fetched once.
    */
   async provenDeviceRecords(did: string): Promise<unknown[]> {
-    const listed = await listRecordEntries(this.reader.fetch, this.reader.resolveDid, did, DEVICE_KEY_TYPE);
-    return provenRecords(this.reader.fetch, this.reader.resolveDid, did, DEVICE_KEY_TYPE, listed, this.proven);
+    return this.listDeviceRecords(did);
+  }
+
+  /**
+   * `did`'s proven device records: the last listing while inside the ttl, if
+   * it names `kid`; else a listing, so a key published since the last one is
+   * found in the records.
+   */
+  private async deviceRecords(did: string, kid: string): Promise<unknown[]> {
+    const last = this.records.get(did);
+    if (last !== undefined && Date.now() - last.at < this.ttlMs) {
+      if ((await deviceKeyHistory(did, last.records)).some((k) => k.kid === kid)) return last.records;
+    }
+    return this.listDeviceRecords(did);
+  }
+
+  /** `did`'s proven device records from the listing in flight, else a new one. A listing that fails is not kept. */
+  private listDeviceRecords(did: string): Promise<unknown[]> {
+    let pending = this.listing.get(did);
+    if (pending === undefined) {
+      const started: Promise<unknown[]> = (async () => {
+        const { fetch, resolveDid } = this.reader;
+        const listed = await listRecordEntries(fetch, resolveDid, did, DEVICE_KEY_TYPE);
+        const records = await provenRecords(
+          fetch,
+          resolveDid,
+          did,
+          DEVICE_KEY_TYPE,
+          listed,
+          this.proven,
+          this.proving,
+        );
+        this.records.set(did, { records, at: Date.now() });
+        return records;
+      })().finally(() => {
+        if (this.listing.get(did) === started) this.listing.delete(did);
+      });
+      this.listing.set(did, started);
+      pending = started;
+    }
+    return pending;
   }
 
   /** Clear a remembered miss for `(did, kid)`, so the next lookup asks again. A key found stays cached. */

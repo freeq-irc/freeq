@@ -41,7 +41,9 @@ pub struct FoundKey {
 
 /// Looks keys up by (DID, kid), caching each answer for `ttl`: a key found,
 /// or a miss, when every source answered without the key. A miss the origin
-/// answered is asked again at each retry delay before it is remembered.
+/// answered is asked again at each retry delay before it is remembered. A
+/// signer's device records are listed and proven per DID, shared by the
+/// lookups for every kid of that DID.
 pub struct KeyLookup<P: ClientProvider> {
     pub(crate) reader: RecordReader<P>,
     origin_base: Option<String>,
@@ -50,9 +52,15 @@ pub struct KeyLookup<P: ClientProvider> {
     cache: Mutex<HashMap<(String, String), Cached>>,
     /// One lookup in flight per (DID, kid).
     in_flight: Mutex<HashMap<(String, String), InFlight>>,
+    /// Each DID's proven device records as last listed, kept for `ttl`.
+    records: Mutex<HashMap<String, (Vec<serde_json::Value>, Instant)>>,
+    /// One listing, with its proofs, in flight per DID.
+    listing: Mutex<HashMap<String, Listing>>,
     /// CIDs of records whose repository proof has checked, so each is fetched
     /// once however often the records are listed.
     proven: Mutex<HashSet<crate::identity_records::Cid>>,
+    /// Proofs in flight, so listings racing on a record share one fetch.
+    proving: crate::identity_records::ProofsInFlight,
     retry_after: Vec<Duration>,
 }
 
@@ -86,6 +94,10 @@ struct Settled {
 /// A lookup in flight, which every ask for its (DID, kid) awaits.
 type InFlight = Arc<tokio::sync::OnceCell<Settled>>;
 
+/// A listing of one DID's proven device records in flight, which every
+/// lookup for that DID awaits.
+type Listing = Arc<tokio::sync::OnceCell<Result<Vec<serde_json::Value>, Arc<anyhow::Error>>>>;
+
 /// The fields of the origin's answer read here.
 #[derive(serde::Deserialize)]
 struct OriginKey {
@@ -105,7 +117,10 @@ impl<P: ClientProvider> KeyLookup<P> {
             ttl,
             cache: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
+            records: Mutex::new(HashMap::new()),
+            listing: Mutex::new(HashMap::new()),
             proven: Mutex::new(HashSet::new()),
+            proving: Default::default(),
             retry_after: MISS_RETRY_AFTER.to_vec(),
         }
     }
@@ -233,7 +248,8 @@ impl<P: ClientProvider> KeyLookup<P> {
         settled
     }
 
-    /// One round: the records (from `cached` when given), then the other sources.
+    /// One round: the records (from `cached` when given, else the DID's
+    /// records), then the other sources.
     async fn ask(
         &self,
         did: &str,
@@ -244,7 +260,7 @@ impl<P: ClientProvider> KeyLookup<P> {
         let mut failure = None;
         let records = match cached {
             Some(c) => c.records,
-            None => match self.proven_device_records(did).await {
+            None => match self.device_records(did, kid).await {
                 Ok(records) => records,
                 Err(e) => {
                     failure = Some(e);
@@ -298,17 +314,67 @@ impl<P: ClientProvider> KeyLookup<P> {
         }
     }
 
-    /// `did`'s device key records whose repository proof checks, through this
-    /// lookup's cache of proven records, so each record's proof is fetched once.
+    /// `did`'s device key records whose repository proof checks, listed afresh
+    /// or by a listing already in flight, through this lookup's cache of
+    /// proven records, so each record's proof is fetched once.
     pub async fn proven_device_records(&self, did: &str) -> Result<Vec<serde_json::Value>> {
-        let entries = self
-            .reader
-            .list_record_entries(did, DEVICE_KEY_TYPE)
-            .await?;
-        Ok(self
-            .reader
-            .proven_records(did, DEVICE_KEY_TYPE, entries, &self.proven)
-            .await)
+        self.list_device_records(did).await
+    }
+
+    /// `did`'s proven device records: the last listing while inside the ttl,
+    /// if it names `kid`; else a listing, so a key published since the last
+    /// one is found in the records.
+    async fn device_records(&self, did: &str, kid: &str) -> Result<Vec<serde_json::Value>> {
+        let kept = self
+            .records
+            .lock()
+            .get(did)
+            .filter(|(_, at)| at.elapsed() < self.ttl)
+            .map(|(records, _)| records.clone());
+        if let Some(records) = kept
+            && device_key_history(did, &records)
+                .iter()
+                .any(|k| k.kid == kid)
+        {
+            return Ok(records);
+        }
+        self.list_device_records(did).await
+    }
+
+    /// `did`'s proven device records from the listing in flight, else a new
+    /// one. A listing that fails is not kept.
+    async fn list_device_records(&self, did: &str) -> Result<Vec<serde_json::Value>> {
+        let cell = self
+            .listing
+            .lock()
+            .entry(did.to_string())
+            .or_default()
+            .clone();
+        let listed = cell
+            .get_or_init(|| async {
+                let listed = match self.reader.list_record_entries(did, DEVICE_KEY_TYPE).await {
+                    Ok(entries) => Ok(self
+                        .reader
+                        .proven_records(did, DEVICE_KEY_TYPE, entries, &self.proven, &self.proving)
+                        .await),
+                    Err(e) => Err(Arc::new(e)),
+                };
+                if let Ok(records) = &listed {
+                    self.records
+                        .lock()
+                        .insert(did.to_string(), (records.clone(), Instant::now()));
+                }
+                listed
+            })
+            .await
+            .clone();
+        {
+            let mut listing = self.listing.lock();
+            if listing.get(did).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
+                listing.remove(did);
+            }
+        }
+        listed.map_err(|e| anyhow::anyhow!("{e:#}"))
     }
 
     /// Clear a remembered miss for `(did, kid)`, so the next lookup asks the
@@ -835,6 +901,79 @@ mod tests {
             (pds.hits(), origin.hits()),
             (4, 4),
             "one lookup and its retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn fifty_concurrent_asks_for_fifty_kids_of_one_signer_make_one_listing_and_one_proof_per_record()
+     {
+        let mut repo = crate::test_support::StubRepo::new(ALICE);
+        let uris: Vec<String> = (1..=5)
+            .map(|seed| repo.add(DEVICE_KEY_TYPE, &device_record(seed)))
+            .collect();
+        let pds = pds_holding(repo).await;
+        let origin = origin(vec![]).await;
+        let keys = Arc::new(lookup(vec![alice_on(&pds)], Some(&origin), HOUR));
+        let proofs = || {
+            let repo = pds.repo.as_ref().unwrap().lock();
+            uris.iter().map(|uri| repo.proof_reads(uri)).sum::<usize>()
+        };
+        let asks: Vec<_> = (101..151)
+            .map(|seed| {
+                let keys = keys.clone();
+                tokio::spawn(async move { keys.key_for(ALICE, &kid_of(seed)).await.unwrap() })
+            })
+            .collect();
+        for ask in asks {
+            assert_eq!(ask.await.unwrap(), None);
+        }
+        assert_eq!(
+            (pds.hits(), proofs()),
+            (1, 5),
+            "one listing, one proof per record"
+        );
+
+        assert_eq!(keys.key_for(ALICE, &kid_of(151)).await.unwrap(), None);
+        assert_eq!(
+            (pds.hits(), proofs()),
+            (2, 5),
+            "a kid the cached records lack lists once more, proving nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kid_the_cached_records_lack_lists_once_more_and_finds_a_key_published_since() {
+        let mut repo = crate::test_support::StubRepo::new(ALICE);
+        let first = repo.add(DEVICE_KEY_TYPE, &device_record(1));
+        let pds = pds_holding(repo).await;
+        let origin = origin(vec![]).await;
+        let keys = lookup(vec![alice_on(&pds)], Some(&origin), HOUR);
+        let found = keys.key_for(ALICE, &kid_of(1)).await.unwrap();
+        assert_eq!(found.map(|f| f.source), Some(KeySource::IdentityRecord));
+        assert_eq!(pds.hits(), 1);
+
+        let second = pds
+            .repo
+            .as_ref()
+            .unwrap()
+            .lock()
+            .add(DEVICE_KEY_TYPE, &device_record(2));
+        assert_eq!(
+            keys.key_for(ALICE, &kid_of(2)).await.unwrap(),
+            Some(FoundKey {
+                public_key: raw(2),
+                source: KeySource::IdentityRecord,
+                retired_at: None,
+            })
+        );
+        let proofs = {
+            let repo = pds.repo.as_ref().unwrap().lock();
+            (repo.proof_reads(&first), repo.proof_reads(&second))
+        };
+        assert_eq!(
+            (pds.hits(), proofs, origin.hits()),
+            (2, (1, 1), 0),
+            "one more listing, the new record proven"
         );
     }
 

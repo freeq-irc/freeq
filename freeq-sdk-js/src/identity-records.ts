@@ -566,7 +566,9 @@ export async function listRecordEntries(
  * commit names `did`, verifies under the account's `#atproto` key, and holds
  * the record at the path its uri names in `collection`. Any other record is
  * left out, as if absent. A passed check is remembered in `proven` by record
- * CID, so a record's proof is fetched once.
+ * CID, so a record's proof is fetched once. A check in flight is shared
+ * through `proving`, so listings racing on one record fetch its proof once; a
+ * failed check is not kept, and the next listing fetches it again.
  */
 export async function provenRecords(
   fetch: Fetch,
@@ -575,6 +577,7 @@ export async function provenRecords(
   collection: string,
   entries: ListedRecord[],
   proven: Set<string>,
+  proving: Map<string, Promise<boolean>> = new Map(),
 ): Promise<unknown[]> {
   const prefix = `at://${did}/${collection}/`;
   const out: unknown[] = [];
@@ -588,13 +591,22 @@ export async function provenRecords(
     if (!proven.has(cid)) {
       const rkey = entry.uri.startsWith(prefix) ? entry.uri.slice(prefix.length) : '';
       if (rkey === '' || rkey.includes('/')) continue;
-      try {
-        const outcome = await verifyRecord(fetch, resolveDid, did, collection, rkey, cid);
-        if (!outcome.commitDidMatches || !outcome.signatureValid || !outcome.recordPresent) continue;
-      } catch {
-        continue;
+      let pending = proving.get(cid);
+      if (pending === undefined) {
+        const started: Promise<boolean> = verifyRecord(fetch, resolveDid, did, collection, rkey, cid)
+          .then(
+            (o) => o.commitDidMatches && o.signatureValid && o.recordPresent,
+            () => false,
+          )
+          .then((verified) => {
+            if (verified) proven.add(cid);
+            if (proving.get(cid) === started) proving.delete(cid);
+            return verified;
+          });
+        proving.set(cid, started);
+        pending = started;
       }
-      proven.add(cid);
+      if (!(await pending)) continue;
     }
     out.push(entry.value);
   }

@@ -523,6 +523,11 @@ struct ListRecordsPage {
     cursor: Option<String>,
 }
 
+/// Repository proofs in flight by record CID, which every listing that meets
+/// the record while its proof is being fetched awaits.
+pub type ProofsInFlight =
+    parking_lot::Mutex<std::collections::HashMap<Cid, std::sync::Arc<tokio::sync::OnceCell<bool>>>>;
+
 /// One `listRecords` entry: where the record sits, the CID the PDS gives it,
 /// and the record.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -558,13 +563,17 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
     /// commit names `did`, verifies under the account's `#atproto` key, and
     /// holds the record at the path its uri names in `collection`. Any other
     /// record is left out, as if absent. A passed check is remembered in
-    /// `proven` by record CID, so a record's proof is fetched once.
+    /// `proven` by record CID, so a record's proof is fetched once. A check in
+    /// flight is shared through `proving`, so listings racing on one record
+    /// fetch its proof once; a failed check is not kept, and the next listing
+    /// fetches it again.
     pub async fn proven_records(
         &self,
         did: &str,
         collection: &str,
         entries: Vec<RecordEntry>,
         proven: &parking_lot::Mutex<std::collections::HashSet<Cid>>,
+        proving: &ProofsInFlight,
     ) -> Vec<serde_json::Value> {
         let prefix = format!("at://{did}/{collection}/");
         let mut out = Vec::new();
@@ -572,19 +581,43 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
             let Ok(cid) = record_cid(&entry.value) else {
                 continue;
             };
-            if !proven.lock().contains(&cid) {
-                let Some(rkey) = entry
-                    .uri
-                    .strip_prefix(&prefix)
-                    .filter(|rkey| !rkey.is_empty() && !rkey.contains('/'))
-                else {
+            let rkey = entry
+                .uri
+                .strip_prefix(&prefix)
+                .filter(|rkey| !rkey.is_empty() && !rkey.contains('/'));
+            // Under the in-flight lock, a proof finishing meanwhile is seen
+            // either as proven or as still in flight.
+            let cell = {
+                let mut in_flight = proving.lock();
+                match rkey {
+                    _ if proven.lock().contains(&cid) => None,
+                    Some(_) => Some(in_flight.entry(cid).or_default().clone()),
+                    None => continue,
+                }
+            };
+            if let (Some(cell), Some(rkey)) = (cell, rkey) {
+                let verified = *cell
+                    .get_or_init(|| async {
+                        let verified = matches!(
+                            self.verify_record(did, collection, rkey, &cid).await,
+                            Ok(outcome) if outcome.verified()
+                        );
+                        if verified {
+                            proven.lock().insert(cid);
+                        }
+                        verified
+                    })
+                    .await;
+                let mut in_flight = proving.lock();
+                if in_flight
+                    .get(&cid)
+                    .is_some_and(|c| std::sync::Arc::ptr_eq(c, &cell))
+                {
+                    in_flight.remove(&cid);
+                }
+                drop(in_flight);
+                if !verified {
                     continue;
-                };
-                match self.verify_record(did, collection, rkey, &cid).await {
-                    Ok(outcome) if outcome.verified() => {
-                        proven.lock().insert(cid);
-                    }
-                    _ => continue,
                 }
             }
             out.push(entry.value);
@@ -1612,6 +1645,7 @@ mod tests {
         );
 
         let proven = parking_lot::Mutex::new(std::collections::HashSet::new());
+        let proving = ProofsInFlight::default();
         for _ in 0..3 {
             let entries = reader
                 .list_record_entries(ALICE, DEVICE_KEY_TYPE)
@@ -1620,13 +1654,59 @@ mod tests {
             assert_eq!(entries.len(), 2);
             assert_eq!(
                 reader
-                    .proven_records(ALICE, DEVICE_KEY_TYPE, entries, &proven)
+                    .proven_records(ALICE, DEVICE_KEY_TYPE, entries, &proven, &proving)
                     .await,
                 vec![genuine.clone()]
             );
         }
         assert_eq!(repo.lock().proof_reads(&genuine_uri), 1);
         assert_eq!(repo.lock().proof_reads(&forged_uri), 3);
+    }
+
+    #[tokio::test]
+    async fn two_listings_racing_on_a_record_await_one_proof_and_a_failed_one_is_fetched_again() {
+        let mut repo = crate::test_support::StubRepo::new(ALICE);
+        let genuine = value(&build_device_record(&key(1), ALICE, T0, Some("laptop")).unwrap());
+        // Signed by its own key, so it passes every record check but the proof.
+        let forged = value(&build_device_record(&key(2), ALICE, T0, Some("forged")).unwrap());
+        let genuine_uri = repo.add(DEVICE_KEY_TYPE, &genuine);
+        let forged_uri = repo.add_forged(DEVICE_KEY_TYPE, &forged, &genuine);
+        let repo = Arc::new(parking_lot::Mutex::new(repo));
+        let base = serve_repo(repo.clone()).await;
+        let doc = repo.lock().document(&base);
+        let reader = RecordReader::new(
+            DidResolver::static_map(HashMap::from([(ALICE.to_string(), doc)])),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        );
+        let reads = || {
+            let repo = repo.lock();
+            (
+                repo.proof_reads(&genuine_uri),
+                repo.proof_reads(&forged_uri),
+            )
+        };
+
+        let proven = parking_lot::Mutex::new(std::collections::HashSet::new());
+        let proving = ProofsInFlight::default();
+        let entries = reader
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .await
+            .unwrap();
+        let (first, second) = tokio::join!(
+            reader.proven_records(ALICE, DEVICE_KEY_TYPE, entries.clone(), &proven, &proving),
+            reader.proven_records(ALICE, DEVICE_KEY_TYPE, entries.clone(), &proven, &proving),
+        );
+        assert_eq!(first, vec![genuine.clone()]);
+        assert_eq!(second, vec![genuine.clone()]);
+        assert_eq!(reads(), (1, 1), "racing listings share each proof");
+
+        assert_eq!(
+            reader
+                .proven_records(ALICE, DEVICE_KEY_TYPE, entries, &proven, &proving)
+                .await,
+            vec![genuine.clone()]
+        );
+        assert_eq!(reads(), (1, 2), "a failed proof is not kept");
     }
 
     #[tokio::test]
