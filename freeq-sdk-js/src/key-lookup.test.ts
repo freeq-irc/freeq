@@ -8,7 +8,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { type DidKey, decodeMultibaseEd25519, importDidKey } from './did-key.js';
 import { type DidDocument, buildDeviceRecord, buildDeviceRetirement } from './identity-records.js';
-import { KeyLookup, makeDidResolver } from './key-lookup.js';
+import { KeyLookup, MemoryKeyLookupStore, makeDidResolver } from './key-lookup.js';
 import { deriveKid } from './signing.js';
 
 const ALICE = 'did:plc:k2n3e2vsihf3farequ44t5j7';
@@ -400,6 +400,78 @@ describe('KeyLookup', () => {
     const given = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR);
     given.setDefaultOriginBase('https://elsewhere.example');
     expect(given.originBase()).toBe(ORIGIN);
+  });
+});
+
+describe('KeyLookup with a store', () => {
+  it('answers a key another lookup on the same store found, with no request', async () => {
+    const { fetch } = await network(
+      [await buildDeviceRecord(await key(1), ALICE, T0)],
+      { [`${ALICE} ${await kidOf(2)}`]: await raw(2) },
+    );
+    const store = new MemoryKeyLookupStore();
+    const first = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
+    const inRecords = await first.keyFor(ALICE, await kidOf(1));
+    const atOrigin = await first.keyFor(ALICE, await kidOf(2));
+    expect([inRecords?.source, atOrigin?.source]).toEqual(['IdentityRecord', 'OriginServer']);
+    const requests = fetch.mock.calls.length;
+
+    const second = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
+    expect(await second.keyFor(ALICE, await kidOf(1))).toEqual(inRecords);
+    expect(await second.keyFor(ALICE, await kidOf(2))).toEqual(atOrigin);
+    expect(fetch.mock.calls.length).toBe(requests);
+  });
+
+  it('does not fetch a proof another lookup on the same store checked', async () => {
+    const { fetch, hits, repo } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
+    const store = new MemoryKeyLookupStore();
+    const first = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR, NO_RETRIES, store);
+    expect((await first.keyFor(ALICE, await kidOf(1)))?.source).toBe('IdentityRecord');
+    expect([hits.pds, hits.proofs]).toEqual([1, 1]);
+
+    await repo.add('at.freeq.deviceKey', await buildDeviceRecord(await key(2), ALICE, T0));
+    const second = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR, NO_RETRIES, store);
+    expect((await second.keyFor(ALICE, await kidOf(2)))?.source).toBe('IdentityRecord');
+    expect([hits.pds, hits.proofs], 'one more listing, only the new record proven').toEqual([2, 2]);
+  });
+
+  it('lists again after the ttl and carries a retirement onto a stored key', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
+    const kid = await kidOf(1);
+    const { fetch, hits, repo } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
+    const store = new MemoryKeyLookupStore();
+    const first = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR, NO_RETRIES, store);
+    expect((await first.keyFor(ALICE, kid))?.retiredAt).toBeNull();
+
+    await repo.add(
+      'at.freeq.deviceKey',
+      await buildDeviceRetirement(await key(1), ALICE, kid, '2026-09-11T00:30:00Z'),
+    );
+    const second = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR, NO_RETRIES, store);
+    vi.setSystemTime(new Date('2026-09-11T00:59:00Z'));
+    expect((await second.keyFor(ALICE, kid))?.retiredAt, 'inside the ttl the stored listing stands').toBeNull();
+    expect(hits.pds).toBe(1);
+    vi.setSystemTime(new Date('2026-09-11T01:01:00Z'));
+    expect(await second.keyFor(ALICE, kid)).toEqual({
+      publicKey: await raw(1),
+      source: 'IdentityRecord',
+      retiredAt: Date.parse('2026-09-11T00:30:00Z') / 1000,
+    });
+    expect(hits.pds).toBe(2);
+  });
+
+  it('keeps no miss in the store', async () => {
+    const originKeys: Record<string, Uint8Array> = {};
+    const { fetch, hits } = await network([], originKeys);
+    const store = new MemoryKeyLookupStore();
+    const first = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
+    expect(await first.keyFor(ALICE, await kidOf(2))).toBeNull();
+
+    originKeys[`${ALICE} ${await kidOf(2)}`] = await raw(2);
+    const second = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
+    expect((await second.keyFor(ALICE, await kidOf(2)))?.source).toBe('OriginServer');
+    expect(hits.origin).toBe(2);
   });
 });
 

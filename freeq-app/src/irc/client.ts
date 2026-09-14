@@ -23,6 +23,7 @@ import {
   type StoredDeviceKey,
 } from '@freeq/sdk';
 import { recordVerdict } from '../lib/verify-signature';
+import { IndexedDbKeyLookupStore } from '../lib/key-lookup-store';
 import { useStore } from '../store';
 import { notify } from '../lib/notifications';
 import { prefetchProfiles } from '@freeq/sdk';
@@ -520,10 +521,13 @@ export function connect(url: string, desiredNick: string, channels?: string[], f
   // send. A guest signs nothing and publishes nothing, so neither is set up
   // for one.
   const deviceKeyStore = saslState.did ? chosenStoreFor(saslState.did) : undefined;
+  // A signed-in account's lookup keeps what it found across page loads.
   const keyLookup = new KeyLookup(
     { fetch: (target: string) => fetch(target), resolveDid: makeDidResolver() },
     window.location.origin,
     60 * 60 * 1000,
+    undefined,
+    saslState.did ? new IndexedDbKeyLookupStore(saslState.did) : undefined,
   );
 
   client = new FreeqClient({

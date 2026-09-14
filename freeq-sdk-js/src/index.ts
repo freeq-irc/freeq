@@ -131,8 +131,14 @@ export type {
 
 // Finding a signer's key by kid: their records, a did:web document, then the
 // origin server. Twin of the Rust `freeq_sdk::key_lookup`.
-export { KeyLookup, makeDidResolver } from './key-lookup.js';
-export type { FoundKey, KeySource, RecordReader } from './key-lookup.js';
+export { KeyLookup, MemoryKeyLookupStore, makeDidResolver } from './key-lookup.js';
+export type {
+  FoundKey,
+  KeyLookupSnapshot,
+  KeyLookupStore,
+  KeySource,
+  RecordReader,
+} from './key-lookup.js';
 
 // A device's own signing key, kept across connects
 export {

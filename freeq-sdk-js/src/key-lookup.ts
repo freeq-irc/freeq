@@ -48,10 +48,41 @@ export interface RecordReader {
  * folded again at whatever time is asked, and what the other sources said
  * once they have been asked (`undefined` until then).
  */
-interface Cached {
+export interface Cached {
   records: unknown[];
   other: FoundKey | null | undefined;
   at: number;
+}
+
+/**
+ * What a lookup keeps between page loads: each (DID, kid) answer that found a
+ * key, each DID's proven device records with their listing time, and the CIDs
+ * of records whose proof checked. Misses, failures and lookups in flight are
+ * not kept.
+ */
+export interface KeyLookupSnapshot {
+  keys: [string, Cached][];
+  records: [string, { records: unknown[]; at: number }][];
+  proven: string[];
+}
+
+/** Where a key lookup keeps its snapshot. */
+export interface KeyLookupStore {
+  load(): Promise<KeyLookupSnapshot | null>;
+  save(snapshot: KeyLookupSnapshot): Promise<void>;
+}
+
+/** A store that forgets on reload; the default. */
+export class MemoryKeyLookupStore implements KeyLookupStore {
+  private snapshot: KeyLookupSnapshot | null = null;
+
+  async load(): Promise<KeyLookupSnapshot | null> {
+    return this.snapshot;
+  }
+
+  async save(snapshot: KeyLookupSnapshot): Promise<void> {
+    this.snapshot = snapshot;
+  }
 }
 
 /** What one lookup settled on, shared by every ask that awaited it. */
@@ -70,11 +101,14 @@ interface Settled {
 export const MISS_RETRY_AFTER_MS: readonly number[] = [2_000, 6_000, 15_000];
 
 /**
- * Looks keys up by (DID, kid), caching each answer for `ttlMs`: a key found,
- * or a miss, when every source answered without the key. A miss the origin
- * answered is asked again at each of `retryAfterMs` before it is remembered.
- * A signer's device records are listed and proven per DID, shared by the
- * lookups for every kid of that DID.
+ * Looks keys up by (DID, kid). A miss, when every source answered without the
+ * key, is cached for `ttlMs`; a key found is cached without expiry, and one
+ * found in the records takes the DID's listing again once that is older than
+ * `ttlMs`, so a retirement since lands on it. A miss the origin answered is
+ * asked again at each of `retryAfterMs` before it is remembered. A signer's
+ * device records are listed and proven per DID, shared by the lookups for
+ * every kid of that DID. Found keys, proven records and proven CIDs are
+ * kept in `store`, so a lookup built on the same store starts with them.
  */
 export class KeyLookup {
   private readonly cache = new Map<string, Cached>();
@@ -89,6 +123,10 @@ export class KeyLookup {
   /** Proofs in flight by record CID, so listings racing on a record share one fetch. */
   private readonly proving = new Map<string, Promise<boolean>>();
   private defaultOrigin: string | null = null;
+  /** The store's snapshot, taken in once before the first lookup. */
+  private loaded: Promise<void> | null = null;
+  /** Writes to the store, one after another. */
+  private saving: Promise<void> = Promise.resolve();
 
   /** `originBase` is the origin server's base URL; the reader's `fetch` serves its requests. */
   constructor(
@@ -96,7 +134,39 @@ export class KeyLookup {
     private readonly givenOrigin: string | null,
     private readonly ttlMs: number,
     private readonly retryAfterMs: readonly number[] = MISS_RETRY_AFTER_MS,
+    private readonly store: KeyLookupStore = new MemoryKeyLookupStore(),
   ) {}
+
+  /** Take in what the store holds, once; a store that cannot be read leaves the cache as it is. */
+  private load(): Promise<void> {
+    if (this.loaded === null) {
+      this.loaded = this.store.load().then(
+        (snapshot) => {
+          if (snapshot === null) return;
+          for (const [slot, cached] of snapshot.keys) {
+            if (!this.cache.has(slot)) this.cache.set(slot, cached);
+          }
+          for (const [did, listed] of snapshot.records) {
+            if (!this.records.has(did)) this.records.set(did, listed);
+          }
+          for (const cid of snapshot.proven) this.proven.add(cid);
+        },
+        () => undefined,
+      );
+    }
+    return this.loaded;
+  }
+
+  /** Write the found keys, proven records and proven CIDs to the store; a write that fails is dropped. */
+  private save(): Promise<void> {
+    const snapshot: KeyLookupSnapshot = {
+      keys: [...this.cache].filter(([, cached]) => cached.other !== null),
+      records: [...this.records],
+      proven: [...this.proven],
+    };
+    this.saving = this.saving.then(() => this.store.save(snapshot)).catch(() => undefined);
+    return this.saving;
+  }
 
   /** The origin to ask when none was given at construction. Set once; a
    *  client sets it to the server it connected to. */
@@ -125,10 +195,16 @@ export class KeyLookup {
    * Asks for one (did, kid) while a lookup for it runs await that lookup.
    */
   async keyForAt(did: string, kid: string, at: Date): Promise<FoundKey | null> {
+    await this.load();
     const slot = JSON.stringify([did, kid]);
     for (;;) {
       const hit = this.cache.get(slot);
-      const cached = hit !== undefined && Date.now() - hit.at < this.ttlMs ? hit : undefined;
+      let cached = hit !== undefined && Date.now() - hit.at < this.ttlMs ? hit : undefined;
+      // A found key does not expire; one found in the records takes the DID's
+      // listing again past the ttl, so a retirement since lands on it.
+      if (cached === undefined && hit !== undefined && hit.other !== null) {
+        cached = hit.other === undefined ? await this.relisted(slot, did, kid, hit) : hit;
+      }
       if (cached !== undefined) {
         const inRecords = await fromRecords(did, kid, cached.records, at);
         if (inRecords !== null) return inRecords;
@@ -181,7 +257,25 @@ export class KeyLookup {
     } else if (settled.other !== null || !settled.failed) {
       this.remember(slot, settled.records, settled.other);
     }
+    await this.save();
     return settled;
+  }
+
+  /**
+   * A found key's cached answer with the DID's current proven records: the
+   * last listing while inside the ttl, else a new one. A listing that fails
+   * leaves `hit` as it was.
+   */
+  private async relisted(slot: string, did: string, kid: string, hit: Cached): Promise<Cached> {
+    let records: unknown[];
+    try {
+      records = await this.deviceRecords(did, kid);
+    } catch {
+      return hit;
+    }
+    this.remember(slot, records, undefined);
+    await this.save();
+    return this.cache.get(slot)!;
   }
 
   /** One round: the records (from `cached` when given, else the DID's records), then the other sources. */
@@ -231,6 +325,7 @@ export class KeyLookup {
    * records, so each record's proof is fetched once.
    */
   async provenDeviceRecords(did: string): Promise<unknown[]> {
+    await this.load();
     return this.listDeviceRecords(did);
   }
 
@@ -264,6 +359,7 @@ export class KeyLookup {
           this.proving,
         );
         this.records.set(did, { records, at: Date.now() });
+        await this.save();
         return records;
       })().finally(() => {
         if (this.listing.get(did) === started) this.listing.delete(did);
