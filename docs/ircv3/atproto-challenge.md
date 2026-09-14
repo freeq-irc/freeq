@@ -542,9 +542,9 @@ this draft and the implementation differ, the draft text above states the
 intended behavior; this section records reality.
 
 1. **Partial payload chunking.** The reference server reassembles a chunked
-   client response and honors a client-sent `AUTHENTICATE +`. The TypeScript
-   and Rust clients chunk their responses; the Swift client sends a single
-   oversized parameter. Server challenges are not chunked.
+   client response and honors a client-sent `AUTHENTICATE +`, and the
+   TypeScript and Rust clients chunk their responses (the iOS and macOS apps
+   reach the Rust one through FFI). Server challenges are not chunked.
 2. **No server-identity binding in the challenge.** The implemented
    challenge contains only `session_id`, `nonce`, and `timestamp`. The
    relay consideration in Security considerations is mitigated there by

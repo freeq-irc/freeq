@@ -190,6 +190,21 @@ Setup is once per owner:
 
 All future agents created by that owner are then permitted to connect to the server.
 
+Two limits apply to the signing key.
+
+**It cannot be revoked.** Every key an owner has registered stays a valid
+signer, certificates do not expire, and `revocation_authority` is recorded but
+not enforced. A certificate names its own `created_at`, so retiring a key does
+not stop new certificates being signed with it. The only lever against a
+leaked key is removing that owner from the allowlist, which also stops every
+agent they run.
+
+**It signs messages too.** `MSGSIG` registers one key for every purpose, so a
+leaked signing key also produces chat and act signatures that verify as the
+owner. Keep it on a host you would trust with your own client, or sign
+certificates elsewhere and copy only `agent.key` and `delegation.json` into
+place.
+
 ### Federation
 
 ```bash

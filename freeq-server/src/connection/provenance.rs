@@ -122,6 +122,16 @@ pub(super) fn verify_provenance(
         }
     };
 
+    let own: Vec<&crate::db::SigningKeyRow> = registered
+        .iter()
+        .filter(|row| row.source.as_deref() != Some("origin-server"))
+        .collect();
+    if own.is_empty() {
+        return Ok(VerificationOutcome::unverified(format!(
+            "Every key on file for {creator_did} came from a federation peer; the owner must register one here"
+        )));
+    }
+
     // The cert says when it was made, so a key retired before that date is not
     // a candidate — its owner had withdrawn it by then. A key retired later
     // still is: the cert was made while it was live, and retiring a key does
@@ -137,7 +147,7 @@ pub(super) fn verify_provenance(
             "Cert created_at is not RFC 3339",
         ));
     };
-    let candidate_keys: Vec<[u8; 32]> = registered
+    let candidate_keys: Vec<[u8; 32]> = own
         .iter()
         .filter(|row| row.removed_at.is_none_or(|removed| removed > created_at))
         .map(|row| row.pubkey)
@@ -251,8 +261,7 @@ pub(super) fn verified_owner(
         .map(str::to_string)
 }
 
-/// `Err` carries why the certificate was refused. There is no registered
-/// session to answer with a NOTICE yet, so it goes to the log instead.
+/// `Err` names why the certificate was refused.
 pub(super) fn verified_owner_from_cert(
     state: &crate::server::SharedState,
     agent_did: &str,

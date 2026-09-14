@@ -3968,10 +3968,7 @@ const MAX_SASL_RESPONSE_LEN: usize = 8192;
 
 /// Write an encoded SASL response as `AUTHENTICATE` lines.
 ///
-/// A response that fills its last chunk needs a bare `+` after it, or the
-/// server is still waiting for a piece that never comes. Sending a full chunk
-/// on its own says "more follows", so a 400-byte response is not a line the
-/// server can act on.
+/// A response that fills its last chunk is followed by a bare `+`.
 async fn write_sasl_response<W: AsyncWrite + Unpin>(writer: &mut W, encoded: &str) -> Result<()> {
     if encoded.len() > MAX_SASL_RESPONSE_LEN {
         anyhow::bail!(
@@ -8226,8 +8223,8 @@ mod sasl_chunking_tests {
         assert_eq!(out, vec!["AUTHENTICATE abc"]);
     }
 
-    /// The regression this exists for: a full chunk on its own says "more
-    /// follows", so without the terminator the server waits forever.
+    /// A full chunk says more follows, so without the terminator the server
+    /// waits for a piece that never comes.
     #[tokio::test]
     async fn a_response_of_exactly_one_chunk_is_terminated() {
         let payload = "x".repeat(SASL_CHUNK_LEN);
@@ -8251,8 +8248,8 @@ mod sasl_chunking_tests {
         assert_eq!(out[2], "AUTHENTICATE +");
     }
 
-    /// Refused here rather than part way through sending, since the server
-    /// drops the buffer and fails the exchange at the same ceiling.
+    /// Nothing goes out when the response is past the ceiling the server
+    /// reassembles to.
     #[tokio::test]
     async fn a_response_the_server_will_not_reassemble_is_refused() {
         let mut buf: Vec<u8> = Vec::new();

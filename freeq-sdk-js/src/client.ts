@@ -143,9 +143,8 @@ const GUEST_NICK_RESUME_DELAYS_MS = [500, 1000, 2000];
  *  more is coming. */
 const SASL_CHUNK_CHARS = 400;
 
-/** Ceiling on a response, mirroring `MAX_SASL_RESPONSE_LEN` in the server's
- *  connection/cap.rs so an oversized response fails here rather than part way
- *  through sending. */
+/** Ceiling on a response, matching `MAX_SASL_RESPONSE_LEN` in the server's
+ *  connection/cap.rs. */
 const MAX_SASL_RESPONSE_CHARS = 8192;
 
 /** CHATHISTORY subcommands, which sit where a target could and are all legal

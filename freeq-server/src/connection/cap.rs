@@ -13,9 +13,8 @@ use std::sync::Arc;
 /// coming; anything shorter ends the response.
 const SASL_CHUNK_LEN: usize = 400;
 
-/// Ceiling on a reassembled response. Well above a challenge response
-/// carrying a delegation cert, and far below anything worth buffering for a
-/// connection that has not authenticated yet.
+/// Ceiling on a response reassembled for a connection that has not yet
+/// authenticated.
 const MAX_SASL_RESPONSE_LEN: usize = 8192;
 
 pub(super) fn handle_cap(
@@ -202,11 +201,9 @@ enum Reassembly {
     TooLong,
 }
 
-/// IRCv3 splits a SASL response into SASL_CHUNK_LEN-byte pieces, and a response carrying
-/// a delegation certificate is routinely longer than one piece.
-///
-/// The response ends on a piece shorter than SASL_CHUNK_LEN bytes, or on `+` when
-/// the last full piece landed exactly on the boundary.
+/// Join the pieces of a SASL response, which IRCv3 splits at
+/// `SASL_CHUNK_LEN`. The response ends on a shorter piece, or on `+` when the
+/// last one landed exactly on the boundary.
 fn accumulate_response(conn: &mut Connection, param: &str) -> Reassembly {
     let chunk = if param == "+" { "" } else { param };
     if conn.sasl_response_buf.len() + chunk.len() > MAX_SASL_RESPONSE_LEN {
@@ -286,10 +283,8 @@ pub(super) async fn handle_authenticate(
         return;
     }
 
-    // A client that chunked its response may send the terminator even when the
-    // last chunk was short and already ended it. By then the exchange is over,
-    // and answering "unsupported mechanism" would fail an authentication that
-    // has already succeeded.
+    // A client that chunked its response may send the terminator after a short
+    // chunk has already ended it. The exchange is over; there is nothing to do.
     if param == "+" && !conn.sasl_in_progress {
         return;
     }
@@ -721,6 +716,33 @@ mod delegated_admit_tests {
         state.with_db(|db| db.save_signing_key(STRANGER, stranger_key.verifying_key().as_bytes()));
         let cert = signed_cert(AGENT, STRANGER, &stranger_key);
         assert!(!delegated_admit(&state, AGENT, Some(&cert)).await);
+    }
+
+    /// The attack this closes: a federation peer chooses which DID it names
+    /// when it asks for a key, so a key it served proves nothing about who may
+    /// act for that DID.
+    #[tokio::test]
+    async fn a_key_a_peer_supplied_cannot_sign_a_delegation() {
+        let (state, _key) = state_allowing_owner(true);
+        let peer_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        state.with_db(|db| {
+            db.save_signing_key_from(OWNER, peer_key.verifying_key().as_bytes(), "origin-server")
+        });
+        let cert = signed_cert(AGENT, OWNER, &peer_key);
+        assert!(!delegated_admit(&state, AGENT, Some(&cert)).await);
+    }
+
+    /// Anything the owner did register here still counts. A row with no source
+    /// predates the column and takes the same path as this one.
+    #[tokio::test]
+    async fn a_key_from_the_owners_own_records_still_signs() {
+        let (state, _key) = state_allowing_owner(true);
+        let own_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        state.with_db(|db| {
+            db.save_signing_key_from(OWNER, own_key.verifying_key().as_bytes(), "identity-record")
+        });
+        let cert = signed_cert(AGENT, OWNER, &own_key);
+        assert!(delegated_admit(&state, AGENT, Some(&cert)).await);
     }
 
     #[tokio::test]

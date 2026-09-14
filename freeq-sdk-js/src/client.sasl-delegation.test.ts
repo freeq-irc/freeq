@@ -1,10 +1,9 @@
 /**
- * Delegated connects: the agent's certificate rides the SASL response.
+ * Tests for the SASL challenge response in client.ts.
  *
- * An instance whose connect allowlist names the owner rather than the agent
- * refuses the agent's own did:key before it is registered, so PROVENANCE is
- * too late to say who it acts for. These tests pin the wire shape that gets
- * it there, and the refusal when the response is too large to send whole.
+ * The agent's delegation certificate rides the response, which puts a typical
+ * one past a single chunk. These cover the wire shape, the chunk boundaries,
+ * and the ceiling.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -159,8 +158,7 @@ describe('SASL delegation', () => {
     expect('delegation' in response).toBe(false);
   });
 
-  // A cert pushes a typical response past one chunk, so this is the ordinary
-  // case rather than an edge one.
+  // A cert puts a typical response past one chunk.
   it('splits a response that outgrows a single chunk', async () => {
     const cert = { ...signedCert(), padding: 'x'.repeat(600) };
     const lines = await runSasl(cert);
@@ -172,8 +170,7 @@ describe('SASL delegation', () => {
     expect(decodeResponse(lines).delegation).toEqual(cert);
   });
 
-  // Without the terminator the server is still waiting for a piece that
-  // never comes.
+  // The terminator is what ends a response that fills its last chunk.
   it('terminates a response that lands exactly on a chunk boundary', async () => {
     // Pad until the encoded length is a whole number of chunks.
     let lines: string[] = [];
