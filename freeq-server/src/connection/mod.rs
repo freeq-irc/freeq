@@ -3945,7 +3945,16 @@ where
         "Connection closed"
     );
 
-    write_handle.abort();
+    // Cleanup removed this session's only Sender, so the writer ends once it
+    // has written what was queued (a FAIL and ERROR before a close); abort
+    // as before if it stalls.
+    let mut write_handle = write_handle;
+    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut write_handle)
+        .await
+        .is_err()
+    {
+        write_handle.abort();
+    }
     Ok(())
 }
 
