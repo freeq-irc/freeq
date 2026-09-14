@@ -546,8 +546,9 @@ export function connect(url: string, desiredNick: string, channels?: string[], f
     keyLookup,
   });
 
-  // Set SASL credentials if we have them
-  if (saslState.token) {
+  // Set SASL credentials if we have them. An account with no token still
+  // names its DID, which is what makes the SDK refresh the session first.
+  if (saslState.token || saslState.did) {
     client.setSaslCredentials({
       token: saslState.token,
       did: saslState.did,
@@ -592,6 +593,7 @@ export function disconnect() {
   client = null;
   dmSendGate = null;
   saslState = { token: '', did: '', pdsUrl: '', method: '', skipBrokerRefresh: false };
+  hadSignedInSession = false;
   // Clear persistent-login material so ConnectScreen doesn't immediately
   // re-auth the user via broker session refresh after a deliberate logout.
   try {
@@ -626,6 +628,21 @@ export function reconnect() {
 
 // SASL state (set before connect)
 let saslState = { token: '', did: '', pdsUrl: '', method: '', skipBrokerRefresh: false };
+
+/** Whether this page has registered as the signed-in account, so a later
+ *  connection that loses the account is a reconnect refused its token. */
+let hadSignedInSession = false;
+
+/** What the connect screen says when a signed-in session has ended. */
+export const SESSION_EXPIRED_LINE =
+  'Your session expired. Sign in with AT Protocol again, or connect as guest.';
+
+/** A signed-in session's token was refused on reconnect: sign out as the
+ *  load-time /session 401 does, rather than continue as a guest. */
+function endExpiredSession(): void {
+  disconnect();
+  useStore.getState().setAuthError(SESSION_EXPIRED_LINE);
+}
 
 export function setSaslCredentials(token: string, did: string, pdsUrl: string, method: string) {
   saslState = { token, did, pdsUrl, method, skipBrokerRefresh: !!token };
@@ -1135,6 +1152,16 @@ function wireEvents(c: FreeqClient) {
   });
 
   c.on('registered', (nick) => {
+    if (c !== client) return;
+    // Registered without the account it was signed in as: a guest nick.
+    if (saslState.did && !c.authDid) {
+      if (hadSignedInSession) {
+        endExpiredSession();
+        return;
+      }
+    } else if (saslState.did) {
+      hadSignedInSession = true;
+    }
     s().setNick(nick);
     s().setRegistered(true);
     s().setConnectedServer(c['opts'].url);
@@ -1160,11 +1187,19 @@ function wireEvents(c: FreeqClient) {
   });
 
   c.on('authenticated', (did, message) => {
+    // A client already signed out still reports its teardown.
+    if (c !== client) return;
     s().setAuth(did, message);
     if (did) prefetchProfiles([did]);
   });
 
   c.on('authError', (error) => {
+    if (c !== client) return;
+    // Refused credentials clear the SDK's DID; a nick collision leaves it.
+    if (hadSignedInSession && saslState.did && !c.authDid) {
+      endExpiredSession();
+      return;
+    }
     s().setAuthError(error);
   });
 

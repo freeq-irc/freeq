@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { connect, setSaslCredentials } from '../irc/client';
+import { connect, setSaslCredentials, SESSION_EXPIRED_LINE } from '../irc/client';
 import { useStore } from '../store';
 
 type LoginMode = 'at-proto' | 'guest';
@@ -325,7 +325,7 @@ export function ConnectScreen() {
         // user has nothing to report.
         if (e?.name === 'SessionExpired') {
           brokerAutoAttempts = MAX_BROKER_AUTO_ATTEMPTS;
-          setError('Your session expired. Sign in with AT Protocol again, or connect as guest.');
+          setError(SESSION_EXPIRED_LINE);
           return;
         }
         if (brokerAutoAttempts < MAX_BROKER_AUTO_ATTEMPTS) {
