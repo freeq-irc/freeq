@@ -504,6 +504,11 @@ void uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_device_label(void*_Nonnull p
 void uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_enrollment(void*_Nonnull ptr, uint64_t enrollment, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_FRESH_SIGN_IN
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_FRESH_SIGN_IN
+void uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_fresh_sign_in(void*_Nonnull ptr, int8_t fresh, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_PLATFORM
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_PLATFORM
 void uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_platform(void*_Nonnull ptr, RustBuffer platform, RustCallStatus *_Nonnull out_status
@@ -1170,6 +1175,12 @@ uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_device_label(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_ENROLLMENT
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_ENROLLMENT
 uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_enrollment(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_FRESH_SIGN_IN
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_FRESH_SIGN_IN
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_fresh_sign_in(void
     
 );
 #endif

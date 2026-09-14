@@ -43,7 +43,9 @@ struct MessageListView: View {
             // separators + sender-header decisions baked in). Cheap array work
             // — the expensive part (view layout) is what the AppKit list now
             // controls per-row instead of re-diffing the whole world.
-            let rows = MessageListTimeline.build(from: messages)
+            let rows = MessageListTimeline.build(from: messages) {
+                appState.checkedVerdicts[$0.id] ?? $0.verdict
+            }
 
             if useLegacy {
                 LegacyMessageListView(channel: channel, rows: rows)
@@ -163,10 +165,16 @@ struct RowModel: Equatable, Identifiable {
 /// Grouping/separator policy lives here (one place), so both the legacy and
 /// AppKit lists render identically.
 enum MessageListTimeline {
-    static func build(from messages: [ChatMessage]) -> [RowModel] {
+    /// `verdictOf` is the verdict each row resolves: a row that would group
+    /// also starts a header when its settled mark differs from its header's.
+    static func build(
+        from messages: [ChatMessage],
+        verdictOf: (ChatMessage) -> VerdictInfo?
+    ) -> [RowModel] {
         var out: [RowModel] = []
         out.reserveCapacity(messages.count)
         var prev: ChatMessage?
+        var headerMark: RowSignatureMark.Settled?
         var i = 0
         while i < messages.count {
             let msg = messages[i]
@@ -192,11 +200,15 @@ enum MessageListTimeline {
                 prev = run.last
                 i = j
             } else {
+                let mark = RowSignatureMark.settled(verdictOf(msg))
+                let header = showsHeader(prev: prev, current: msg)
+                    || RowSignatureMark.startsHeader(header: headerMark, row: mark)
+                if header { headerMark = mark }
                 out.append(RowModel(
                     message: msg,
                     showsDateSeparator: MessageTimeline.showsDateSeparator(
                         before: msg.timestamp, previous: prev?.timestamp),
-                    showHeader: showsHeader(prev: prev, current: msg)))
+                    showHeader: header))
                 prev = msg
                 i += 1
             }
@@ -703,20 +715,28 @@ struct MessageRow: View {
                                 .help("AT Protocol identity — click for proof")
                             }
 
-                            // No badge for a signed message: almost every
-                            // message is signed, so a badge on every row says
-                            // nothing. Verification is an explicit action in
-                            // the context menu, and only a checked mismatch
-                            // shows a marker here.
+                            // The mark the verdict earns (RowSignatureMark);
+                            // clicking it opens the proof. The help sits on the
+                            // button, outside the faded lock.
                             if let rowVerdict = checkedVerdict,
-                               VerdictDisplay.marksTheRow(rowVerdict.kind) {
+                               let mark = RowSignatureMark.of(rowVerdict) {
                                 Button { proofRequest = .verify(message.id) } label: {
-                                    Image(systemName: "exclamationmark.shield.fill")
-                                        .font(.system(size: 9))
-                                        .foregroundStyle(Theme.danger)
+                                    switch mark {
+                                    case .lock(let opacity):
+                                        Image(systemName: "lock.fill")
+                                            .font(.system(size: 9))
+                                            .foregroundStyle(Theme.success)
+                                            .opacity(opacity)
+                                    case .warning:
+                                        Image(systemName: "exclamationmark.shield.fill")
+                                            .font(.system(size: 9))
+                                            .foregroundStyle(Theme.danger)
+                                    }
                                 }
                                 .buttonStyle(.plain)
-                                .help("This message's signature did not check out — click for detail")
+                                .help(mark == .warning
+                                    ? "This message's signature did not check out — click for detail"
+                                    : rowVerdict.sentence)
                             }
 
                             if message.isEncrypted {

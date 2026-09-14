@@ -81,6 +81,8 @@ let package = Package(
                 "SelfStatus.swift",
                 "SignatureProof.swift",
                 "DeviceKeyNotice.swift",
+                "RefusedKeyNotice.swift",
+                "RowSignatureMark.swift",
                 "ComposeTextExtraction.swift",
                 "ShareURL.swift",
                 "Logger.swift",

@@ -114,7 +114,7 @@ struct ConnectView: View {
                 if !session.handle.isEmpty {
                     UserDefaults.standard.set(session.handle, forKey: "freeq.handle")
                 }
-                appState.connect(nick: session.nick)
+                appState.connect(nick: session.nick, freshSignIn: true)
             } catch {
                 appState.errorMessage = "Login failed: \(error.localizedDescription)"
             }

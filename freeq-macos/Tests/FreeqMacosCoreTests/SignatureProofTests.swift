@@ -57,26 +57,16 @@ final class SignatureProofTests: XCTestCase {
 
     func testOnlySenderProofGetsTheSuccessTone() {
         XCTAssertEqual(VerdictDisplay.tone(.device), .good)
-        XCTAssertEqual(VerdictDisplay.heading(.device), "Verified")
+        XCTAssertEqual(VerdictDisplay.heading(.device), "Signed")
         // Valid is not verified: the server vouching for what it received is
         // a fact about the server, not proof from the sender.
         XCTAssertEqual(VerdictDisplay.tone(.server), .quiet)
-        XCTAssertFalse(VerdictDisplay.heading(.server).contains("Verified"))
+        XCTAssertNotEqual(VerdictDisplay.heading(.server), "Signed")
         for kind: VerdictKind in [.invalid, .retired] {
             XCTAssertEqual(VerdictDisplay.tone(kind), .bad, "\(kind)")
         }
         for kind: VerdictKind in [.unsigned, .unverifiable, .pending] {
             XCTAssertEqual(VerdictDisplay.tone(kind), .quiet, "\(kind) is a fact, never a warning")
-        }
-    }
-
-    func testOnlyASignatureThatDidNotHoldMarksTheRow() {
-        // Signing is the default state of a message and a default earns no
-        // ink; a signature made after its key was retired is an invalid one.
-        XCTAssertTrue(VerdictDisplay.marksTheRow(.invalid))
-        XCTAssertTrue(VerdictDisplay.marksTheRow(.retired))
-        for kind in VerdictKind.allCases where kind != .invalid && kind != .retired {
-            XCTAssertFalse(VerdictDisplay.marksTheRow(kind), "\(kind) must not mark the row")
         }
     }
 
@@ -103,7 +93,7 @@ final class SignatureProofTests: XCTestCase {
     func testTheLineNamesTheOneThingLeftToDo() {
         XCTAssertEqual(
             SigningKeyNotice.line,
-            "Your signing key is not published to your account yet. Open Settings to publish it."
+            "Security upgrade available: publish your key so others can verify messages from this device. Open Settings to publish it."
         )
     }
 

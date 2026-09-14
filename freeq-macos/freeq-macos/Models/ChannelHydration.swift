@@ -184,12 +184,15 @@ enum ServerNoticeRoute: Equatable {
     case apiBearer(String)
     case channelAccessDenied(channel: String, reason: String)
     case whoisDiagnostic(nick: String, text: String)
+    /// The server refused this device's signing key (FAIL MSGSIG KEY_RETIRED).
+    case keyRetired(RefusedKeyNotice.Refusal)
     case display(String)
 }
 
 enum ServerNoticeRouter {
     static func route(_ text: String) -> ServerNoticeRoute {
         if text.isEmpty { return .ignore }
+        if let refusal = RefusedKeyNotice.parse(text) { return .keyRetired(refusal) }
         // Speculative-history failures: the client requests DM history on its
         // own when a conversation opens; a guest (or a DM with a guest peer)
         // gets `CHATHISTORY <CODE> <target> …` back for a request the user

@@ -393,6 +393,18 @@ class AppState {
         ))
     }
 
+    /// Set by a refusal whose disconnect may not reconnect, until the next
+    /// connect.
+    private var keyRefused = false
+
+    /// Apply a refusal of this device's signing key, as `RefusedKeyNotice`
+    /// decided it.
+    func signOutRefusedKey(_ refusal: RefusedKeyNotice.Refusal) {
+        keyRefused = !refusal.schedulesReconnect
+        if refusal.clearsSavedLogin { endLogin() }
+        errorMessage = refusal.line
+    }
+
     /// File what the SDK said about one line, so the row and the proof sheet
     /// read one answer and a late verdict replaces it in place.
     func recordVerdict(msgId: String, verdict: VerdictInfo?) {
@@ -631,13 +643,16 @@ class AppState {
 
     // MARK: - Connection
 
-    func connect(nick: String, webToken: String? = nil) {
+    /// `freshSignIn`: this connect follows this app's own OAuth sign-in
+    /// completing. Never true for a restored session or a reconnect.
+    func connect(nick: String, webToken: String? = nil, freshSignIn: Bool = false) {
         Perf.event("connect.start")
         Log.irc.info("Connecting as \(nick, privacy: .public)")
         self.nick = nick
         connectionState = .connecting
         authenticatedDID = nil
         didRequestDmTargets = false
+        keyRefused = false
         // A new connection may be a new server, whose answers are its own.
         dmResolver.reset()
         UserDefaults.standard.set(nick, forKey: "freeq.nick")
@@ -677,6 +692,7 @@ class AppState {
             ))
             try c.setDeviceLabel(label: Host.current().localizedName ?? "Mac")
             try c.setVerifySignatures(on: true)
+            if freshSignIn { try c.setFreshSignIn(fresh: true) }
             // A key that made it to the account clears the dot; nothing else
             // does, so a refusal stays visible until it is fixed.
             if deviceKeyStore.isPublished { signingKeyUnpublished = false }
@@ -706,6 +722,16 @@ class AppState {
         apiBearerSessionId = nil
         selfAwayReason = nil
         shutdownP2p()
+    }
+
+    /// End a login the server ended: clear what the session-expired path
+    /// clears, and keep the channel, DM and auto-join lists so signing in
+    /// again returns to them. Sign out is `logout()`.
+    func endLogin() {
+        disconnect()
+        brokerToken = nil
+        authenticatedDID = nil
+        KeychainHelper.delete(key: "brokerToken")
     }
 
     func logout() {
@@ -2555,6 +2581,9 @@ extension AppState {
                 }
                 requestHistory(channel: channel)
                 return
+            case .keyRetired(let refusal):
+                signOutRefusedKey(refusal)
+                return
             case .apiBearer(let sessionId):
                 apiBearerSessionId = sessionId
                 // Bearer is now available — pull roaming favorites for this DID.
@@ -2608,7 +2637,7 @@ extension AppState {
             if isInCall {
                 tearDownCallLocallyOnDisconnect()
             }
-            if !reason.contains("intentional") && hasSavedSession {
+            if !reason.contains("intentional") && hasSavedSession && !keyRefused {
                 scheduleReconnect()
             }
         }

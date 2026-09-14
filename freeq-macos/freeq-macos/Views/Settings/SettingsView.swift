@@ -213,7 +213,7 @@ struct ConnectionSettings: View {
                     KeychainHelper.save(key: "brokerToken", value: brokerToken)
                 }
                 appState.pendingWebToken = session.token
-                appState.connect(nick: session.nick)
+                appState.connect(nick: session.nick, freshSignIn: true)
             } catch {
                 appState.errorMessage = "Login failed: \(error.localizedDescription)"
             }
