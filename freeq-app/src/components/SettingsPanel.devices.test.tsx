@@ -19,11 +19,22 @@ const seam = vi.hoisted(() => ({
   rows: null as unknown,
   pair: null as CryptoKeyPair | null,
   published: true,
+  /** The options of each read of the list, in order. */
+  reads: [] as unknown[],
+  /** While set, a read waits for it before answering. */
+  hold: null as Promise<void> | null,
 }));
 
 vi.mock('../irc/client', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../irc/client')>();
-  return { ...actual, listDeviceRows: async () => seam.rows };
+  return {
+    ...actual,
+    listDeviceRows: async (options?: unknown) => {
+      seam.reads.push(options);
+      if (seam.hold) await seam.hold;
+      return seam.rows;
+    },
+  };
 });
 
 // The panel reads notification preferences from IndexedDB on mount, which
@@ -95,6 +106,8 @@ beforeEach(async () => {
   records = [thisDevice.record, otherDevice.record, goneDevice.record, retirement];
   seam.pair = thisDevice.pair;
   seam.published = true;
+  seam.reads = [];
+  seam.hold = null;
   localStorage.setItem('freeq-broker-base', BROKER);
   localStorage.setItem('freeq-broker-token', 'BT-TEST');
 
@@ -154,6 +167,25 @@ describe('the Devices list', () => {
         'A signed-out device has to sign in again before it can post as you. Messages it already sent stay signed.',
       ),
     ).toBeTruthy();
+  });
+
+  it('says the list is loading until its rows arrive', async () => {
+    seam.rows = await client.deviceRowsFrom(DID, records, {
+      kid: thisDevice.kid,
+      createdAt: THIS_CREATED,
+      published: true,
+    });
+    let release!: () => void;
+    seam.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    panel();
+    expect(await screen.findByText('Loading devices…')).toBeTruthy();
+    expect(screen.queryByText('Work laptop')).toBeNull();
+
+    release();
+    await waitFor(() => screen.getByText('Work laptop'));
+    expect(screen.queryByText('Loading devices…')).toBeNull();
   });
 
   it('offers Publish key on this device until its key is in the account', async () => {
@@ -270,6 +302,11 @@ describe('the Devices list', () => {
     // Then the server, so the device's sessions and login token end.
     expect(calls[1].url).toBe('/api/v1/devices/sign-out');
     expect(calls[1].body).toEqual({ kid: otherDevice.kid });
+
+    // The list opened from the key cache, and is read afresh after the
+    // sign-out so the retirement just written shows.
+    expect(seam.reads[0]).toEqual({ refresh: false });
+    await waitFor(() => expect(seam.reads.at(-1)).toEqual({ refresh: true }));
   });
 
   it('opens the sign-out confirmation outside the Settings panel', async () => {

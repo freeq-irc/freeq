@@ -2,7 +2,7 @@ import { useStore } from '../store';
 import { displayNameForKey } from '../lib/display-name';
 import { requestPermission } from '../lib/notifications';
 import { getPreferences, setPreferences } from '../lib/db';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { AudioTest } from './AudioTest';
 import { useSyncExternalStore } from 'react';
@@ -247,6 +247,10 @@ function metaLine(row: DeviceRow): string {
 export function DevicesSection() {
   const key = useSyncExternalStore(subscribeDeviceKey, getDeviceKeyState);
   const [rows, setRows] = useState<DeviceRow[]>([]);
+  // Until the first read settles.
+  const [loading, setLoading] = useState(true);
+  // Set by a sign-out, so the next read lists the account afresh.
+  const refreshNext = useRef(false);
   const [ask, setAsk] = useState<DeviceRow | null>(null);
   const [signIn, setSignIn] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
@@ -258,9 +262,12 @@ export function DevicesSection() {
   // publishing it is the one thing that lands there rather than here.
   useEffect(() => {
     let live = true;
-    listDeviceRows()
+    const refresh = refreshNext.current;
+    refreshNext.current = false;
+    listDeviceRows({ refresh })
       .then((r) => live && setRows(r))
-      .catch(() => live && setRows([]));
+      .catch(() => live && setRows([]))
+      .finally(() => live && setLoading(false));
     return () => {
       live = false;
     };
@@ -307,12 +314,14 @@ export function DevicesSection() {
       setFailed(`Couldn't sign out ${row.name}. Try again.`);
     } finally {
       setAsk(null);
+      refreshNext.current = true;
       setBusy(false);
     }
   }
 
   return (
     <>
+      {loading && <p className="text-[11px] text-fg-dim leading-relaxed">{'Loading devices…'}</p>}
       {rows.map((row) => (
         <div
           key={row.kid}

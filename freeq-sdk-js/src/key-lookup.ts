@@ -340,12 +340,24 @@ export class KeyLookup {
   }
 
   /**
-   * `did`'s device key records whose repository proof checks, listed afresh
-   * or by a listing already in flight, through this lookup's cache of proven
-   * records, so each record's proof is fetched once.
+   * `did`'s device key records whose repository proof checks: the held
+   * listing while inside the ttl, else a listing, through this lookup's cache
+   * of proven records, so each record's proof is fetched once.
    */
   async provenDeviceRecords(did: string): Promise<unknown[]> {
     await this.load();
+    const last = this.records.get(did);
+    if (last !== undefined && Date.now() - last.at < this.ttlMs) return last.records;
+    return this.refreshDeviceRecords(did);
+  }
+
+  /**
+   * `did`'s proven device records listed afresh (or by a listing already in
+   * flight), for a caller that must see a record written since the last one.
+   */
+  async refreshDeviceRecords(did: string): Promise<unknown[]> {
+    await this.load();
+    this.refreshed.set(did, Date.now());
     return this.listDeviceRecords(did);
   }
 

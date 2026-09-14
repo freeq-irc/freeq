@@ -6,7 +6,6 @@
  */
 
 import {
-  DEVICE_KEY_TYPE,
   FreeqClient,
   IndexedDbDeviceKeyStore,
   KeyLookup,
@@ -14,9 +13,7 @@ import {
   decodeMultibaseEd25519,
   deviceKeyHistory,
   format,
-  listRecordEntries,
   makeDidResolver,
-  provenRecords,
   recordKeyOf,
   type DeviceKeyRecord,
   type DeviceKeyStore,
@@ -266,27 +263,39 @@ export async function deviceRowsFrom(
   return found.map((f) => f.row);
 }
 
-/** CIDs of device records whose repository proof has checked, for the life of the page. */
-const provenDeviceRecords = new Set<string>();
+/** A key lookup asking this page's origin; for a signed-in account (`did`
+ *  set) it keeps what it found in IndexedDB across page loads. */
+function newKeyLookup(did: string): KeyLookup {
+  return new KeyLookup(
+    { fetch: (target: string) => fetch(target), resolveDid: makeDidResolver() },
+    window.location.origin,
+    60 * 60 * 1000,
+    undefined,
+    did ? new IndexedDbKeyLookupStore(did) : undefined,
+  );
+}
+
+/** The key lookup the latest connection for this account was built with. */
+let accountKeyLookup: { did: string; lookup: KeyLookup } | null = null;
+
+function keyLookupFor(did: string): KeyLookup {
+  if (accountKeyLookup?.did !== did) accountKeyLookup = { did, lookup: newKeyLookup(did) };
+  return accountKeyLookup.lookup;
+}
 
 /**
- * Read the account's device key records and lay them out as rows. A record
- * counts only once its repository proof checks.
+ * Read the account's device key records and lay them out as rows. The records
+ * come through the connection's key lookup, which holds the listing and its
+ * proofs for the hour; `refresh` lists the account again, for a read that must
+ * show a record just written.
  */
-export async function listDeviceRows(): Promise<DeviceRow[]> {
+export async function listDeviceRows(options: { refresh?: boolean } = {}): Promise<DeviceRow[]> {
   const did = saslState.did;
   if (!did) return [];
-  const read = (target: string) => fetch(target);
-  const resolveDid = makeDidResolver();
-  const listed = await listRecordEntries(read, resolveDid, did, DEVICE_KEY_TYPE);
-  const records = await provenRecords(
-    read,
-    resolveDid,
-    did,
-    DEVICE_KEY_TYPE,
-    listed,
-    provenDeviceRecords,
-  );
+  const lookup = keyLookupFor(did);
+  const records = options.refresh
+    ? await lookup.refreshDeviceRecords(did)
+    : await lookup.provenDeviceRecords(did);
   return deviceRowsFrom(did, records, {
     kid: deviceKeyState.kid,
     createdAt: deviceKeyState.createdAt,
@@ -522,13 +531,8 @@ export function connect(url: string, desiredNick: string, channels?: string[], f
   // for one.
   const deviceKeyStore = saslState.did ? chosenStoreFor(saslState.did) : undefined;
   // A signed-in account's lookup keeps what it found across page loads.
-  const keyLookup = new KeyLookup(
-    { fetch: (target: string) => fetch(target), resolveDid: makeDidResolver() },
-    window.location.origin,
-    60 * 60 * 1000,
-    undefined,
-    saslState.did ? new IndexedDbKeyLookupStore(saslState.did) : undefined,
-  );
+  const keyLookup = newKeyLookup(saslState.did);
+  if (saslState.did) accountKeyLookup = { did: saslState.did, lookup: keyLookup };
 
   client = new FreeqClient({
     url,

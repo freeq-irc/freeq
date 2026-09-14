@@ -330,6 +330,29 @@ describe('KeyLookup', () => {
     expect(hits.pds).toBe(2);
   });
 
+  it('gives the held listing as proven device records inside the ttl, and lists afresh on a refresh', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
+    const { fetch, hits, repo } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR, NO_RETRIES);
+    expect(await lookup.provenDeviceRecords(ALICE)).toHaveLength(1);
+    expect([hits.pds, hits.proofs]).toEqual([1, 1]);
+
+    await repo.add(
+      'at.freeq.deviceKey',
+      await buildDeviceRetirement(await key(1), ALICE, await kidOf(1), '2026-09-11T00:10:00Z'),
+    );
+    vi.setSystemTime(new Date('2026-09-11T00:30:00Z'));
+    expect(await lookup.provenDeviceRecords(ALICE), 'inside the ttl the held listing stands').toHaveLength(1);
+    expect([hits.pds, hits.proofs]).toEqual([1, 1]);
+    expect(await lookup.refreshDeviceRecords(ALICE), 'a refresh lists afresh').toHaveLength(2);
+    expect([hits.pds, hits.proofs]).toEqual([2, 2]);
+
+    vi.setSystemTime(new Date('2026-09-11T01:31:00Z'));
+    expect(await lookup.provenDeviceRecords(ALICE)).toHaveLength(2);
+    expect(hits.pds, 'past the ttl, a listing').toBe(3);
+  });
+
   it('folds the records at the time asked, from one listing', async () => {
     const { fetch, hits } = await network([
       await buildDeviceRecord(await key(1), ALICE, T0),

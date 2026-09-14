@@ -1746,7 +1746,8 @@ export class FreeqClient extends EventEmitter {
       this.opts.keyLookup ??
       new KeyLookup({ fetch: (target: string) => fetch(target), resolveDid: makeDidResolver() }, null, 0);
     const check = async (): Promise<StoredDeviceKey> => {
-      const records = await lookup.provenDeviceRecords(did);
+      // Listed afresh: the retirement may be newer than the listing held.
+      const records = await lookup.refreshDeviceRecords(did);
       const raw = new Uint8Array(await crypto.subtle.exportKey('raw', stored.keyPair.publicKey));
       const kid = await signing.deriveKid(raw);
       const now = Date.now();

@@ -342,6 +342,7 @@ describe('a stored key the account has retired', () => {
       },
       resolveDid: async () => doc,
     };
+    const lookup = new KeyLookup(reader, null, 60_000);
     const client = new FreeqClient({
       url: 'wss://test/irc',
       nick: 'alice',
@@ -350,12 +351,27 @@ describe('a stored key the account has retired', () => {
       brokerToken: 'BT1',
       deviceKeyStore: store,
       deviceLabel: 'Chrome',
-      keyLookup: new KeyLookup(reader, null, 60_000),
+      keyLookup: lookup,
       ...(freshSignIn === undefined ? {} : { freshSignIn }),
     });
     client.setSaslCredentials({ token: 't', did: DID, pdsUrl: 'https://pds.example', method: 'oauth' });
-    return { client, listings: () => listings };
+    return { client, lookup, listings: () => listings };
   }
+
+  it('is replaced right after a new sign-in when the key lookup holds a listing from before the retirement', async () => {
+    const old = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3old');
+    const { record, retirement } = await recordsOf(old);
+    const repo = await repoHolding(record);
+    const store = new MemoryDeviceKeyStore(old);
+    const { client, lookup } = await clientReading(store, repo, true);
+    // Listed before the retirement, and still inside the lookup's ttl.
+    expect(await lookup.provenDeviceRecords(DID)).toHaveLength(1);
+    await repo.add(KEY_TYPE, retirement);
+
+    const ws = await login(client);
+    expect(msgsigOf(ws)).not.toBe(await rawPublicB64(old.keyPair));
+    expect((await store.load())!.keyPair).not.toBe(old.keyPair);
+  });
 
   it('is replaced right after a new sign-in, and the new key is published', async () => {
     const old = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3old');
