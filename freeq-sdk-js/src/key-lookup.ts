@@ -56,13 +56,15 @@ export interface Cached {
 
 /**
  * What a lookup keeps between page loads: each (DID, kid) answer that found a
- * key, each DID's proven device records with their listing time, and the CIDs
- * of records whose proof checked. Misses, failures and lookups in flight are
- * not kept.
+ * key, each DID's proven device records with their listing time, when each
+ * DID was last listed for a key lookup, and the CIDs of records whose proof
+ * checked. Misses, failures and lookups in flight are not kept.
  */
 export interface KeyLookupSnapshot {
   keys: [string, Cached][];
   records: [string, { records: unknown[]; at: number }][];
+  /** Absent from a snapshot saved before it was kept. */
+  refreshed?: [string, number][];
   proven: string[];
 }
 
@@ -97,6 +99,7 @@ interface Settled {
 /**
  * When a miss the origin answered is asked again, in ms after the first ask:
  * the origin may still be fetching the key from the signer's home server.
+ * Only the origin is asked again; the first ask listed the records.
  */
 export const MISS_RETRY_AFTER_MS: readonly number[] = [2_000, 6_000, 15_000];
 
@@ -105,10 +108,12 @@ export const MISS_RETRY_AFTER_MS: readonly number[] = [2_000, 6_000, 15_000];
  * key, is cached for `ttlMs`; a key found is cached without expiry, and one
  * found in the records takes the DID's listing again once that is older than
  * `ttlMs`, so a retirement since lands on it. A miss the origin answered is
- * asked again at each of `retryAfterMs` before it is remembered. A signer's
- * device records are listed and proven per DID, shared by the lookups for
- * every kid of that DID. Found keys, proven records and proven CIDs are
- * kept in `store`, so a lookup built on the same store starts with them.
+ * asked again at the origin at each of `retryAfterMs` before it is
+ * remembered. A signer's device records are listed and proven per DID, shared
+ * by the lookups for every kid of that DID; a kid the held listing lacks lists
+ * the DID again at most once per `ttlMs`. Found keys, proven records, listing
+ * times and proven CIDs are kept in `store`, so a lookup built on the same
+ * store starts with them.
  */
 export class KeyLookup {
   private readonly cache = new Map<string, Cached>();
@@ -116,6 +121,9 @@ export class KeyLookup {
   private readonly inFlight = new Map<string, Promise<Settled>>();
   /** Each DID's proven device records as last listed, kept for `ttlMs`. */
   private readonly records = new Map<string, { records: unknown[]; at: number }>();
+  /** When each DID was last listed for a key lookup, so a kid the held
+   *  listing lacks lists it again at most once per `ttlMs`. */
+  private readonly refreshed = new Map<string, number>();
   /** One listing, with its proofs, in flight per DID. */
   private readonly listing = new Map<string, Promise<unknown[]>>();
   /** CIDs of records whose repository proof has checked, so each is fetched once. */
@@ -149,6 +157,9 @@ export class KeyLookup {
           for (const [did, listed] of snapshot.records) {
             if (!this.records.has(did)) this.records.set(did, listed);
           }
+          for (const [did, at] of snapshot.refreshed ?? []) {
+            if (!this.refreshed.has(did)) this.refreshed.set(did, at);
+          }
           for (const cid of snapshot.proven) this.proven.add(cid);
         },
         () => undefined,
@@ -162,6 +173,7 @@ export class KeyLookup {
     const snapshot: KeyLookupSnapshot = {
       keys: [...this.cache].filter(([, cached]) => cached.other !== null),
       records: [...this.records],
+      refreshed: [...this.refreshed],
       proven: [...this.proven],
     };
     this.saving = this.saving.then(() => this.store.save(snapshot)).catch(() => undefined);
@@ -243,14 +255,13 @@ export class KeyLookup {
     cached: Cached | undefined,
   ): Promise<Settled> {
     const started = performance.now();
-    let listed = cached === undefined;
-    let settled = await this.ask(did, kid, at, cached);
+    const listed = cached === undefined;
+    let settled = await this.ask(did, kid, at, cached?.records);
     for (const after of this.retryAfterMs) {
       const missed = settled.other === null && !settled.failed && this.originBase() !== null;
       if (!missed) break;
       await new Promise((resolve) => setTimeout(resolve, Math.max(0, started + after - performance.now())));
-      settled = await this.ask(did, kid, at, undefined);
-      listed = true;
+      settled = await this.ask(did, kid, at, settled.records, true);
     }
     if (settled.other === undefined) {
       if (listed && !settled.failed) this.remember(slot, settled.records, undefined);
@@ -278,13 +289,22 @@ export class KeyLookup {
     return this.cache.get(slot)!;
   }
 
-  /** One round: the records (from `cached` when given, else the DID's records), then the other sources. */
-  private async ask(did: string, kid: string, at: Date, cached: Cached | undefined): Promise<Settled> {
+  /**
+   * One round: the records (`held` when given, else the DID's records), then
+   * the other sources, or the origin alone when `originOnly`.
+   */
+  private async ask(
+    did: string,
+    kid: string,
+    at: Date,
+    held: unknown[] | undefined,
+    originOnly = false,
+  ): Promise<Settled> {
     let failure: unknown;
     let failed = false;
     let records: unknown[] = [];
-    if (cached !== undefined) {
-      records = cached.records;
+    if (held !== undefined) {
+      records = held;
     } else {
       try {
         // A listed record counts only once its repository proof checks.
@@ -298,7 +318,7 @@ export class KeyLookup {
     }
 
     const sources: [KeySource, () => Promise<[Uint8Array | null, number | null]>][] = [];
-    if (did.startsWith('did:web:')) {
+    if (!originOnly && did.startsWith('did:web:')) {
       sources.push(['DidDocument', async () => [await this.fromDocument(did, kid), null]]);
     }
     const origin = this.originBase();
@@ -331,14 +351,18 @@ export class KeyLookup {
 
   /**
    * `did`'s proven device records: the last listing while inside the ttl, if
-   * it names `kid`; else a listing, so a key published since the last one is
-   * found in the records.
+   * it names `kid` or the DID was already listed for a lookup inside the ttl;
+   * else a listing, so a key published since is found within the ttl.
    */
   private async deviceRecords(did: string, kid: string): Promise<unknown[]> {
     const last = this.records.get(did);
-    if (last !== undefined && Date.now() - last.at < this.ttlMs) {
+    const now = Date.now();
+    if (last !== undefined && now - last.at < this.ttlMs) {
       if ((await deviceKeyHistory(did, last.records)).some((k) => k.kid === kid)) return last.records;
+      const refreshed = this.refreshed.get(did);
+      if (refreshed !== undefined && now - refreshed < this.ttlMs) return last.records;
     }
+    this.refreshed.set(did, now);
     return this.listDeviceRecords(did);
   }
 

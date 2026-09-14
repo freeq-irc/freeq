@@ -230,14 +230,23 @@ describe('KeyLookup', () => {
     const started = performance.now();
     expect(await lookup.keyFor(ALICE, kid)).toBeNull();
     expect(performance.now() - started).toBeGreaterThanOrEqual(145);
-    expect([hits.pds, hits.origin], 'records included').toEqual([4, 4]);
+    expect([hits.pds, hits.origin], 'one listing, the retries at the origin only').toEqual([1, 4]);
 
     vi.setSystemTime(new Date('2026-09-11T00:59:00Z'));
     expect(await lookup.keyFor(ALICE, kid)).toBeNull();
-    expect([hits.pds, hits.origin], 'inside the ttl the miss stands').toEqual([4, 4]);
+    expect([hits.pds, hits.origin], 'inside the ttl the miss stands').toEqual([1, 4]);
     vi.setSystemTime(new Date('2026-09-11T01:01:00Z'));
     expect(await lookup.keyFor(ALICE, kid)).toBeNull();
-    expect([hits.pds, hits.origin], 'after the ttl, a new lookup with its retries').toEqual([8, 8]);
+    expect([hits.pds, hits.origin], 'after the ttl, a new lookup: one listing and its retries').toEqual([2, 8]);
+  });
+
+  it('lists an account once for two misses, and retries each at the origin only', async () => {
+    const { fetch, hits } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, [20, 60, 150]);
+    expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
+    expect([hits.pds, hits.origin], 'one listing, one ask and three retries at the origin').toEqual([1, 4]);
+    expect(await lookup.keyFor(ALICE, await kidOf(3))).toBeNull();
+    expect([hits.pds, hits.origin], 'the second miss lists nothing').toEqual([1, 8]);
   });
 
   it('makes one round of requests for ten concurrent asks for one absent kid', async () => {
@@ -246,7 +255,7 @@ describe('KeyLookup', () => {
     const kid = await kidOf(2);
     const answers = await Promise.all(Array.from({ length: 10 }, () => lookup.keyFor(ALICE, kid)));
     expect(answers).toEqual(Array(10).fill(null));
-    expect([hits.pds, hits.origin], 'one lookup and its retries').toEqual([4, 4]);
+    expect([hits.pds, hits.origin], 'one lookup and its retries').toEqual([1, 4]);
   });
 
   it('makes one listing and one proof per record for fifty concurrent asks for fifty kids of one signer', async () => {
@@ -260,22 +269,29 @@ describe('KeyLookup', () => {
     expect([hits.pds, hits.proofs], 'one listing, one proof per record').toEqual([1, 5]);
 
     expect(await lookup.keyFor(ALICE, kids[50]!)).toBeNull();
-    expect([hits.pds, hits.proofs], 'a kid the cached records lack lists once more, proving nothing').toEqual([2, 5]);
+    expect([hits.pds, hits.proofs], 'a kid the held listing lacks is answered from it inside the ttl').toEqual([1, 5]);
   });
 
-  it('lists once more for a kid the cached records lack, and finds a key published since', async () => {
+  it('answers a kid the held listing lacks from it inside the ttl, and finds a key published since after it', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
     const { fetch, hits, repo } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
     const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES);
     expect((await lookup.keyFor(ALICE, await kidOf(1)))?.source).toBe('IdentityRecord');
     expect([hits.pds, hits.proofs]).toEqual([1, 1]);
 
     await repo.add('at.freeq.deviceKey', await buildDeviceRecord(await key(2), ALICE, T0));
+    vi.setSystemTime(new Date('2026-09-11T00:10:00Z'));
+    expect(await lookup.keyFor(ALICE, await kidOf(2)), 'inside the ttl the held listing stands').toBeNull();
+    expect([hits.pds, hits.proofs, hits.origin]).toEqual([1, 1, 1]);
+
+    vi.setSystemTime(new Date('2026-09-11T01:11:00Z'));
     expect(await lookup.keyFor(ALICE, await kidOf(2))).toEqual({
       publicKey: await raw(2),
       source: 'IdentityRecord',
       retiredAt: null,
     });
-    expect([hits.pds, hits.proofs, hits.origin], 'one more listing, the new record proven').toEqual([2, 2, 0]);
+    expect([hits.pds, hits.proofs, hits.origin], 'one more listing, the new record proven').toEqual([2, 2, 1]);
   });
 
   it('asks again after a remembered miss is forgotten', async () => {
@@ -423,6 +439,8 @@ describe('KeyLookup with a store', () => {
   });
 
   it('does not fetch a proof another lookup on the same store checked', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
     const { fetch, hits, repo } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
     const store = new MemoryKeyLookupStore();
     const first = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR, NO_RETRIES, store);
@@ -431,8 +449,30 @@ describe('KeyLookup with a store', () => {
 
     await repo.add('at.freeq.deviceKey', await buildDeviceRecord(await key(2), ALICE, T0));
     const second = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR, NO_RETRIES, store);
+    vi.setSystemTime(new Date('2026-09-11T01:01:00Z'));
     expect((await second.keyFor(ALICE, await kidOf(2)))?.source).toBe('IdentityRecord');
-    expect([hits.pds, hits.proofs], 'one more listing, only the new record proven').toEqual([2, 2]);
+    expect([hits.pds, hits.proofs], 'one more listing past the ttl, only the new record proven').toEqual([2, 2]);
+  });
+
+  it('answers an unknown key from the stored listing inside the ttl, and lists once past it', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
+    const { fetch, hits } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
+    const store = new MemoryKeyLookupStore();
+    const first = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
+    expect(await first.keyFor(ALICE, await kidOf(2))).toBeNull();
+    expect(hits.pds).toBe(1);
+
+    // A reload: a new lookup on the same store.
+    const second = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES, store);
+    vi.setSystemTime(new Date('2026-09-11T00:30:00Z'));
+    expect(await second.keyFor(ALICE, await kidOf(3))).toBeNull();
+    expect(hits.pds, 'inside the ttl, no listing').toBe(1);
+
+    vi.setSystemTime(new Date('2026-09-11T01:01:00Z'));
+    expect(await second.keyFor(ALICE, await kidOf(4))).toBeNull();
+    expect(await second.keyFor(ALICE, await kidOf(5))).toBeNull();
+    expect(hits.pds, 'past the ttl, one listing').toBe(2);
   });
 
   it('lists again after the ttl and carries a retirement onto a stored key', async () => {
