@@ -251,17 +251,22 @@ pub(super) fn verified_owner(
         .map(str::to_string)
 }
 
+/// `Err` carries why the certificate was refused. There is no registered
+/// session to answer with a NOTICE yet, so it goes to the log instead.
 pub(super) fn verified_owner_from_cert(
     state: &crate::server::SharedState,
     agent_did: &str,
     cert: &Value,
-) -> Option<String> {
+) -> Result<String, String> {
     let outcome = state
         .with_db(|db| Ok::<_, rusqlite::Error>(verify_provenance(cert, agent_did, Some(db))))
         .unwrap_or_else(|| verify_provenance(cert, agent_did, None));
     match outcome {
-        Ok(o) if o.verified => o.verifier_key_did,
-        _ => None,
+        Ok(o) if o.verified => o
+            .verifier_key_did
+            .ok_or_else(|| "the certificate verified but named no creator".to_string()),
+        Ok(o) => Err(o.reason),
+        Err(reason) => Err(reason),
     }
 }
 

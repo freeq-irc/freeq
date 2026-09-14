@@ -227,14 +227,22 @@ async fn delegated_admit(
     agent_did: &str,
     delegation: Option<&serde_json::Value>,
 ) -> bool {
-    if !state.config.allow_delegated_agents {
-        return false;
-    }
     let Some(cert) = delegation else {
         return false;
     };
-    let Some(owner) = super::provenance::verified_owner_from_cert(state, agent_did, cert) else {
+    if !state.config.allow_delegated_agents {
+        tracing::warn!(
+            agent = %agent_did,
+            "an agent presented a delegation, but --allow-delegated-agents is off"
+        );
         return false;
+    }
+    let owner = match super::provenance::verified_owner_from_cert(state, agent_did, cert) {
+        Ok(owner) => owner,
+        Err(reason) => {
+            tracing::warn!(agent = %agent_did, %reason, "delegation rejected");
+            return false;
+        }
     };
     if !state.did_is_allowed_resolved(&owner, None).await {
         tracing::warn!(
