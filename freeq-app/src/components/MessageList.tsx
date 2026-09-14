@@ -42,8 +42,8 @@ function nickInitial(nick: string): string {
 
 // ── Time formatting ──
 
-function formatTime(d: Date): string {
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+export function formatTime(d: Date): string {
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
 }
 
 function formatDateSeparator(d: Date): string {
