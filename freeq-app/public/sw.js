@@ -29,6 +29,8 @@ self.addEventListener('fetch', (event) => {
   if (url.pathname.startsWith('/irc') || url.pathname.startsWith('/api') || url.pathname.startsWith('/auth')) {
     return;
   }
+  // Other origins (account providers, DID documents) go straight to the network.
+  if (url.origin !== self.location.origin) return;
 
   // Hashed assets (/assets/*) — cache-first (immutable, filename changes on content change)
   if (url.pathname.startsWith('/assets/')) {
