@@ -112,7 +112,8 @@ class MainActivity : ComponentActivity() {
                     state.prefs.edit().putString("handle", it).apply()
                 }
                 state.serverAddress.value = ServerConfig.ircServer
-                state.connect(nick)
+                // This connect follows the app's own OAuth sign-in.
+                state.connect(nick, freshSignIn = true)
             }
         }
     }

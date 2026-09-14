@@ -46,13 +46,6 @@ object SignatureVerdict {
     /** The verdict on file for a message, if the SDK has given one. */
     fun of(msgId: String): FfiVerdict? = checked[msgId]
 
-    /** Whether a verdict leaves a mark on the message row. Signing is the
-     *  default state of a message and a default earns no ink, so only a
-     *  signature that was found and did not hold marks it. A signature made
-     *  after its key was retired is an invalid one. */
-    fun marksTheRow(state: VerdictState): Boolean =
-        state == VerdictState.INVALID || state == VerdictState.RETIRED
-
     fun tone(state: VerdictState): VerdictTone = when (state) {
         VerdictState.DEVICE -> VerdictTone.GOOD
         VerdictState.INVALID, VerdictState.RETIRED -> VerdictTone.BAD
@@ -66,7 +59,7 @@ object SignatureVerdict {
      *  vouches for this message — so the heading answers it and the sentence
      *  says what that means for them. */
     fun heading(state: VerdictState): String = when (state) {
-        VerdictState.DEVICE -> "Verified"
+        VerdictState.DEVICE -> "Signed"
         VerdictState.SERVER -> "Server Signed"
         VerdictState.UNSIGNED -> "Unsigned"
         VerdictState.UNVERIFIABLE -> "Signature Not Supported"

@@ -205,7 +205,7 @@ class BufferCacheTest {
         assertEquals("kid-1", back.kid)
         assertEquals("identity-record", back.keySource)
         assertEquals("This message is signed, but the signature doesn’t check out.", back.sentence)
-        assertTrue(SignatureVerdict.marksTheRow(back.state))
+        assertEquals(RowSignatureMark.Warning, RowSignatureMark.of(back))
     }
 
     @Test fun a_cached_row_with_a_layer_keeps_it() {

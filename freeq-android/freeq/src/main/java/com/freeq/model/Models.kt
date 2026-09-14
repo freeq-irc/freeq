@@ -384,7 +384,24 @@ class AppState(application: Application) : AndroidViewModel(application) {
      */
     fun noteSigningKeyUnpublished() {
         signingKeyUnpublished.value = true
-        signingKeyNotice.line()?.let { errorMessage.value = it }
+        val line = signingKeyNotice.line() ?: return
+        // Android has no server buffer, so a server notice lands in the buffer
+        // the reader is looking at, as on macOS. The fixed id keeps it to one
+        // line.
+        activeChannelState?.appendIfNew(ChatMessage(
+            id = "signing-key-unpublished",
+            from = "server",
+            text = line,
+            isAction = false,
+            timestamp = Date(),
+        ))
+    }
+
+    /** Apply a refusal of this device's signing key, as [RefusedKeyNotice] decided it. */
+    internal fun signOutRefusedKey(refusal: RefusedKeyNotice.Refusal) {
+        if (refusal.clearsSavedLogin) logout()
+        if (!refusal.schedulesReconnect) intentionalDisconnect = true
+        errorMessage.value = refusal.line
     }
 
     // Keep users logged in for at least 14 days unless they explicitly log out
@@ -586,13 +603,15 @@ class AppState(application: Application) : AndroidViewModel(application) {
 
     // ── Connection ──
 
-    fun connect(nickName: String) {
+    /** [freshSignIn]: this connect follows this app's own OAuth sign-in
+     *  completing. Never true for a restored session or a reconnect. */
+    fun connect(nickName: String, freshSignIn: Boolean = false) {
         // Fresh user-initiated connect — start by preferring WebSocket again.
         transportFallbackUsed = false
-        connect(nickName, useWebSocket = true)
+        connect(nickName, useWebSocket = true, freshSignIn = freshSignIn)
     }
 
-    private fun connect(nickName: String, useWebSocket: Boolean) {
+    private fun connect(nickName: String, useWebSocket: Boolean, freshSignIn: Boolean = false) {
         intentionalDisconnect = false
         loggedOut.value = false
         nick.value = nickName
@@ -631,6 +650,7 @@ class AppState(application: Application) : AndroidViewModel(application) {
             client?.setEnrollment(BrokerEnrollment({ authBrokerBase }, { brokerToken }))
             client?.setDeviceLabel(android.os.Build.MODEL)
             client?.setVerifySignatures(true)
+            if (freshSignIn) client?.setFreshSignIn(true)
             // A key that made it to the account clears the dot; nothing else
             // does, so a refusal stays visible until it is fixed.
             if (deviceKeyStore.isPublished()) signingKeyUnpublished.value = false
@@ -1772,7 +1792,10 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
 
             is FreeqEvent.Notice -> {
                 val text = event.text
-                if (text == "MOTD:START") {
+                val refusal = RefusedKeyNotice.parse(text)
+                if (refusal != null) {
+                    state.signOutRefusedKey(refusal)
+                } else if (text == "MOTD:START") {
                     state.collectingMotd = true
                     state.motdLines.clear()
                 } else if (text == "MOTD:END") {

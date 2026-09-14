@@ -952,6 +952,8 @@ internal open class UniffiVTableCallbackInterfaceP2pEventHandler(
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -1030,6 +1032,8 @@ fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_device_key_store(
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_device_label(
 ): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_enrollment(
+): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_fresh_sign_in(
 ): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_platform(
 ): Short
@@ -1220,6 +1224,8 @@ fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_device_key_store(`ptr`: Point
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_device_label(`ptr`: Pointer,`label`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_enrollment(`ptr`: Pointer,`enrollment`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_fresh_sign_in(`ptr`: Pointer,`fresh`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_platform(`ptr`: Pointer,`platform`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1519,6 +1525,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_enrollment() != 15684.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_fresh_sign_in() != 56485.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_platform() != 50791.toShort()) {
@@ -2512,6 +2521,8 @@ public interface FreeqClientInterface {
     
     fun `setEnrollment`(`enrollment`: Enrollment)
     
+    fun `setFreshSignIn`(`fresh`: kotlin.Boolean)
+    
     fun `setPlatform`(`platform`: kotlin.String)
     
     fun `setTopic`(`channel`: kotlin.String, `topic`: kotlin.String)
@@ -2830,6 +2841,18 @@ open class FreeqClient: Disposable, AutoCloseable, FreeqClientInterface
     uniffiRustCallWithError(FreeqException) { _status ->
     UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_enrollment(
         it, FfiConverterTypeEnrollment.lower(`enrollment`),_status)
+}
+    }
+    
+    
+
+    
+    @Throws(FreeqException::class)override fun `setFreshSignIn`(`fresh`: kotlin.Boolean)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(FreeqException) { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_fresh_sign_in(
+        it, FfiConverterBoolean.lower(`fresh`),_status)
 }
     }
     

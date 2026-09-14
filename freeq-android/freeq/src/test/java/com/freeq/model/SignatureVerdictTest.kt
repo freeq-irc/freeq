@@ -61,11 +61,11 @@ class SignatureVerdictTest {
 
     @Test fun only_sender_proof_gets_the_success_tone() {
         assertEquals(VerdictTone.GOOD, SignatureVerdict.tone(VerdictState.DEVICE))
-        assertEquals("Verified", SignatureVerdict.heading(VerdictState.DEVICE))
+        assertEquals("Signed", SignatureVerdict.heading(VerdictState.DEVICE))
         // Valid is not verified: the server vouching for what it received is a
         // fact about the server, not proof from the sender.
         assertEquals(VerdictTone.QUIET, SignatureVerdict.tone(VerdictState.SERVER))
-        assertFalse(SignatureVerdict.heading(VerdictState.SERVER).contains("Verified"))
+        assertFalse(SignatureVerdict.heading(VerdictState.SERVER) == "Signed")
         for (state in listOf(VerdictState.INVALID, VerdictState.RETIRED)) {
             assertEquals("$state", VerdictTone.BAD, SignatureVerdict.tone(state))
         }
@@ -73,18 +73,6 @@ class SignatureVerdictTest {
             VerdictState.UNSIGNED, VerdictState.UNVERIFIABLE, VerdictState.PENDING,
         )) {
             assertEquals("$state", VerdictTone.QUIET, SignatureVerdict.tone(state))
-        }
-    }
-
-    @Test fun only_a_signature_that_did_not_hold_marks_the_row() {
-        // Signing is the default state of a message and a default earns no
-        // ink; a signature made after its key was retired is an invalid one.
-        assertTrue(SignatureVerdict.marksTheRow(VerdictState.INVALID))
-        assertTrue(SignatureVerdict.marksTheRow(VerdictState.RETIRED))
-        val quiet = VerdictState.entries
-            .filter { it != VerdictState.INVALID && it != VerdictState.RETIRED }
-        for (state in quiet) {
-            assertFalse("$state must not mark the row", SignatureVerdict.marksTheRow(state))
         }
     }
 
