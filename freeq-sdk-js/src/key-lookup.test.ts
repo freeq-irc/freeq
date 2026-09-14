@@ -17,6 +17,8 @@ const T0 = '2026-01-01T00:00:00Z';
 const PDS = 'https://pds.example';
 const ORIGIN = 'https://origin.example';
 const HOUR = 3_600_000;
+/** Retry delays for tests that are not about retries. */
+const NO_RETRIES: number[] = [];
 
 beforeAll(() => {
   Object.defineProperty(globalThis, 'crypto', {
@@ -129,7 +131,7 @@ describe('KeyLookup', () => {
 
   it('refuses a key from the origin that does not hash to the kid', async () => {
     const { fetch, hits } = await network([], { [`${ALICE} ${await kidOf(2)}`]: await raw(3) });
-    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES);
     expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
     expect(hits.origin).toBe(1);
   });
@@ -177,7 +179,7 @@ describe('KeyLookup', () => {
 
   it('makes one round of requests for two misses inside the ttl', async () => {
     const { fetch, hits } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
-    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES);
     expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
     expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
     // The listed record's proof is part of the one round.
@@ -189,7 +191,7 @@ describe('KeyLookup', () => {
     vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
     const originKeys: Record<string, Uint8Array> = {};
     const { fetch, hits } = await network([], originKeys);
-    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES);
     expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
 
     originKeys[`${ALICE} ${await kidOf(2)}`] = await raw(2);
@@ -200,10 +202,57 @@ describe('KeyLookup', () => {
     expect(hits.origin).toBe(2);
   });
 
+  it('finds a key that appears at the origin after the first ask, before the ttl', async () => {
+    const originKeys: Record<string, Uint8Array> = {};
+    const { fetch, hits } = await network([], originKeys);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, [200, 600, 1500]);
+    const [kid, key2] = [await kidOf(2), await raw(2)];
+    const asked = lookup.keyFor(ALICE, kid);
+    while (hits.origin === 0) await new Promise((r) => setTimeout(r, 1));
+    // Past the first answer, well before the first retry.
+    await new Promise((r) => setTimeout(r, 50));
+    originKeys[`${ALICE} ${kid}`] = key2;
+    expect((await asked)?.source).toBe('OriginServer');
+    expect(hits.origin, 'found on the first retry').toBe(2);
+
+    // The miss was not remembered: the cache holds the key found.
+    delete originKeys[`${ALICE} ${kid}`];
+    expect((await lookup.keyFor(ALICE, kid))?.source).toBe('OriginServer');
+    expect(hits.origin).toBe(2);
+  });
+
+  it('asks for a key absent on every ask four times, then again only after the ttl', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
+    const { fetch, hits } = await network([]);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, [20, 60, 150]);
+    const kid = await kidOf(2);
+    const started = performance.now();
+    expect(await lookup.keyFor(ALICE, kid)).toBeNull();
+    expect(performance.now() - started).toBeGreaterThanOrEqual(145);
+    expect([hits.pds, hits.origin], 'records included').toEqual([4, 4]);
+
+    vi.setSystemTime(new Date('2026-09-11T00:59:00Z'));
+    expect(await lookup.keyFor(ALICE, kid)).toBeNull();
+    expect([hits.pds, hits.origin], 'inside the ttl the miss stands').toEqual([4, 4]);
+    vi.setSystemTime(new Date('2026-09-11T01:01:00Z'));
+    expect(await lookup.keyFor(ALICE, kid)).toBeNull();
+    expect([hits.pds, hits.origin], 'after the ttl, a new lookup with its retries').toEqual([8, 8]);
+  });
+
+  it('makes one round of requests for ten concurrent asks for one absent kid', async () => {
+    const { fetch, hits } = await network([]);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, [20, 60, 150]);
+    const kid = await kidOf(2);
+    const answers = await Promise.all(Array.from({ length: 10 }, () => lookup.keyFor(ALICE, kid)));
+    expect(answers).toEqual(Array(10).fill(null));
+    expect([hits.pds, hits.origin], 'one lookup and its retries').toEqual([4, 4]);
+  });
+
   it('asks again after a remembered miss is forgotten', async () => {
     const originKeys: Record<string, Uint8Array> = {};
     const { fetch, hits } = await network([], originKeys);
-    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES);
     expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
 
     originKeys[`${ALICE} ${await kidOf(2)}`] = await raw(2);

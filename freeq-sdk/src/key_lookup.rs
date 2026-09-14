@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use freeq_oauth::ClientProvider;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Where a key was found.
@@ -40,17 +40,29 @@ pub struct FoundKey {
 }
 
 /// Looks keys up by (DID, kid), caching each answer for `ttl`: a key found,
-/// or a miss, when every source answered without the key.
+/// or a miss, when every source answered without the key. A miss the origin
+/// answered is asked again at each retry delay before it is remembered.
 pub struct KeyLookup<P: ClientProvider> {
     pub(crate) reader: RecordReader<P>,
     origin_base: Option<String>,
     default_origin: OnceLock<String>,
     ttl: Duration,
     cache: Mutex<HashMap<(String, String), Cached>>,
+    /// One lookup in flight per (DID, kid).
+    in_flight: Mutex<HashMap<(String, String), InFlight>>,
     /// CIDs of records whose repository proof has checked, so each is fetched
     /// once however often the records are listed.
     proven: Mutex<HashSet<crate::identity_records::Cid>>,
+    retry_after: Vec<Duration>,
 }
+
+/// When a miss the origin answered is asked again, counted from the first
+/// ask: the origin may still be fetching the key from the signer's home server.
+pub const MISS_RETRY_AFTER: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(6),
+    Duration::from_secs(15),
+];
 
 /// One (DID, kid)'s cached answer: the signer's device records as listed,
 /// folded again at whatever time is asked, and what the other sources said,
@@ -61,6 +73,18 @@ struct Cached {
     other: Option<Option<FoundKey>>,
     at: Instant,
 }
+
+/// What one lookup settled on, shared by every ask that awaited it.
+#[derive(Clone)]
+struct Settled {
+    records: Vec<serde_json::Value>,
+    /// What the other sources said; `None` when they were not asked.
+    other: Option<Option<FoundKey>>,
+    failure: Option<Arc<anyhow::Error>>,
+}
+
+/// A lookup in flight, which every ask for its (DID, kid) awaits.
+type InFlight = Arc<tokio::sync::OnceCell<Settled>>;
 
 /// The fields of the origin's answer read here.
 #[derive(serde::Deserialize)]
@@ -80,8 +104,17 @@ impl<P: ClientProvider> KeyLookup<P> {
             default_origin: OnceLock::new(),
             ttl,
             cache: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
             proven: Mutex::new(HashSet::new()),
+            retry_after: MISS_RETRY_AFTER.to_vec(),
         }
+    }
+
+    /// When a miss the origin answered is asked again, counted from the first
+    /// ask; [`MISS_RETRY_AFTER`] unless set here.
+    pub fn with_retry_delays(mut self, after_first_ask: Vec<Duration>) -> Self {
+        self.retry_after = after_first_ask;
+        self
     }
 
     /// The origin to ask when none was given at construction. Set once; a
@@ -109,7 +142,8 @@ impl<P: ClientProvider> KeyLookup<P> {
     /// A source that fails is skipped and the next one asked; the first
     /// failure is returned only if no later source finds the key. A miss is
     /// remembered only when no source failed, since a failed source did not
-    /// say it lacks the key.
+    /// say it lacks the key. Asks for one (did, kid) while a lookup for it
+    /// runs await that lookup.
     pub async fn key_for_at(
         &self,
         did: &str,
@@ -117,16 +151,99 @@ impl<P: ClientProvider> KeyLookup<P> {
         at: DateTime<Utc>,
     ) -> Result<Option<FoundKey>> {
         let slot = (did.to_string(), kid.to_string());
-        let cached = self
-            .cache
-            .lock()
-            .get(&slot)
-            .filter(|c| c.at.elapsed() < self.ttl)
-            .cloned();
+        loop {
+            let cached = self
+                .cache
+                .lock()
+                .get(&slot)
+                .filter(|c| c.at.elapsed() < self.ttl)
+                .cloned();
+            if let Some(c) = cached.as_ref() {
+                if let Some(found) = in_records(did, kid, &c.records, at) {
+                    return Ok(Some(found));
+                }
+                if let Some(other) = c.other {
+                    return Ok(other);
+                }
+            }
 
+            let cell = self
+                .in_flight
+                .lock()
+                .entry(slot.clone())
+                .or_default()
+                .clone();
+            let settled = cell
+                .get_or_init(|| self.settle(&slot, did, kid, at, cached))
+                .await
+                .clone();
+            {
+                let mut in_flight = self.in_flight.lock();
+                if in_flight.get(&slot).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
+                    in_flight.remove(&slot);
+                }
+            }
+
+            // Each ask folds the records at its own time.
+            if let Some(found) = in_records(did, kid, &settled.records, at) {
+                return Ok(Some(found));
+            }
+            match (settled.other, settled.failure) {
+                (Some(Some(found)), _) => return Ok(Some(found)),
+                (_, Some(e)) => return Err(anyhow::anyhow!("{e:#}")),
+                (Some(None), None) => return Ok(None),
+                // The other sources were not asked, since the lookup found the
+                // key in the records at its own time: ask them now.
+                (None, None) => {}
+            }
+        }
+    }
+
+    /// Ask every source, and again at each retry delay while the origin
+    /// answers with a miss; then remember what was settled.
+    async fn settle(
+        &self,
+        slot: &(String, String),
+        did: &str,
+        kid: &str,
+        at: DateTime<Utc>,
+        cached: Option<Cached>,
+    ) -> Settled {
+        let started = tokio::time::Instant::now();
+        let mut listed = cached.is_none();
+        let mut settled = self.ask(did, kid, at, cached).await;
+        for after in &self.retry_after {
+            let missed = matches!(settled.other, Some(None))
+                && settled.failure.is_none()
+                && self.origin_base().is_some();
+            if !missed {
+                break;
+            }
+            tokio::time::sleep_until(started + *after).await;
+            settled = self.ask(did, kid, at, None).await;
+            listed = true;
+        }
+        match (&settled.other, &settled.failure) {
+            (None, None) if listed => self.remember(slot.clone(), settled.records.clone(), None),
+            (Some(Some(_)), _) | (Some(None), None) => {
+                self.remember(slot.clone(), settled.records.clone(), settled.other)
+            }
+            _ => {}
+        }
+        settled
+    }
+
+    /// One round: the records (from `cached` when given), then the other sources.
+    async fn ask(
+        &self,
+        did: &str,
+        kid: &str,
+        at: DateTime<Utc>,
+        cached: Option<Cached>,
+    ) -> Settled {
         let mut failure = None;
-        let records = match cached.as_ref() {
-            Some(c) => c.records.clone(),
+        let records = match cached {
+            Some(c) => c.records,
             None => match self.proven_device_records(did).await {
                 Ok(records) => records,
                 Err(e) => {
@@ -135,14 +252,12 @@ impl<P: ClientProvider> KeyLookup<P> {
                 }
             },
         };
-        if let Some(found) = in_records(did, kid, &records, at) {
-            if failure.is_none() && cached.is_none() {
-                self.remember(slot, records, None);
-            }
-            return Ok(Some(found));
-        }
-        if let Some(other) = cached.as_ref().and_then(|c| c.other) {
-            return Ok(other);
+        if in_records(did, kid, &records, at).is_some() {
+            return Settled {
+                records,
+                other: None,
+                failure: failure.map(Arc::new),
+            };
         }
 
         let mut take = |answer: Result<Option<[u8; 32]>>, source, retired_at| match answer {
@@ -176,17 +291,10 @@ impl<P: ClientProvider> KeyLookup<P> {
             };
             found = take(key, KeySource::OriginServer, removed_at);
         }
-
-        match (found, failure) {
-            (Some(found), _) => {
-                self.remember(slot, records, Some(Some(found)));
-                Ok(Some(found))
-            }
-            (None, Some(e)) => Err(e),
-            (None, None) => {
-                self.remember(slot, records, Some(None));
-                Ok(None)
-            }
+        Settled {
+            records,
+            other: Some(found),
+            failure: failure.map(Arc::new),
         }
     }
 
@@ -468,7 +576,19 @@ mod tests {
                 .collect(),
         );
         let reader = RecordReader::new(resolver, freeq_oauth::SharedClient(reqwest::Client::new()));
-        KeyLookup::new(reader, origin.map(|o| o.base.clone()), ttl)
+        // No retries, unless a test turns them on.
+        KeyLookup::new(reader, origin.map(|o| o.base.clone()), ttl).with_retry_delays(Vec::new())
+    }
+
+    /// Retries 20, 60 and 150 ms after the first ask.
+    fn retrying(
+        lookup: KeyLookup<freeq_oauth::SharedClient>,
+    ) -> KeyLookup<freeq_oauth::SharedClient> {
+        lookup.with_retry_delays(vec![
+            Duration::from_millis(20),
+            Duration::from_millis(60),
+            Duration::from_millis(150),
+        ])
     }
 
     /// ALICE's DID document on `pds`, naming the key that signs its proofs. A
@@ -629,6 +749,93 @@ mod tests {
         let found = keys.key_for(ALICE, &kid_of(2)).await.unwrap();
         assert_eq!(found.map(|f| f.source), Some(KeySource::OriginServer));
         assert_eq!(origin.hits(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_key_that_appears_at_the_origin_after_the_first_ask_is_found_before_the_ttl() {
+        let pds = pds(vec![]).await;
+        let held: HeldKeys = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let origin = origin_holding(held.clone()).await;
+        let keys = lookup(vec![alice_on(&pds)], Some(&origin), HOUR).with_retry_delays(vec![
+            Duration::from_millis(200),
+            Duration::from_millis(600),
+            Duration::from_millis(1500),
+        ]);
+        let kid = kid_of(2);
+        let (found, ()) = tokio::join!(keys.key_for(ALICE, &kid), async {
+            while origin.hits() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            // Past the first answer, well before the first retry.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            held.lock().insert((ALICE.to_string(), kid_of(2)), raw(2));
+        });
+        assert_eq!(
+            found.unwrap().map(|f| f.source),
+            Some(KeySource::OriginServer)
+        );
+        assert_eq!(origin.hits(), 2, "found on the first retry");
+
+        // The miss was not remembered: the cache holds the key found.
+        held.lock().clear();
+        assert_eq!(
+            keys.key_for(ALICE, &kid_of(2))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::OriginServer)
+        );
+        assert_eq!(origin.hits(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_key_absent_on_every_ask_is_asked_four_times_then_again_only_after_the_ttl() {
+        let pds = pds(vec![]).await;
+        let origin = origin(vec![]).await;
+        let keys = retrying(lookup(
+            vec![alice_on(&pds)],
+            Some(&origin),
+            Duration::from_millis(500),
+        ));
+        let started = Instant::now();
+        assert_eq!(keys.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert_eq!((pds.hits(), origin.hits()), (4, 4), "records included");
+
+        assert_eq!(keys.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
+        assert_eq!(
+            (pds.hits(), origin.hits()),
+            (4, 4),
+            "inside the ttl the miss stands"
+        );
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(keys.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
+        assert_eq!(
+            (pds.hits(), origin.hits()),
+            (8, 8),
+            "after the ttl, a new lookup with its retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn ten_concurrent_asks_for_one_absent_kid_make_one_round_of_requests() {
+        let pds = pds(vec![]).await;
+        let origin = origin(vec![]).await;
+        let keys = Arc::new(retrying(lookup(vec![alice_on(&pds)], Some(&origin), HOUR)));
+        let asks: Vec<_> = (0..10)
+            .map(|_| {
+                let keys = keys.clone();
+                tokio::spawn(async move { keys.key_for(ALICE, &kid_of(2)).await.unwrap() })
+            })
+            .collect();
+        for ask in asks {
+            assert_eq!(ask.await.unwrap(), None);
+        }
+        assert_eq!(
+            (pds.hits(), origin.hits()),
+            (4, 4),
+            "one lookup and its retries"
+        );
     }
 
     #[tokio::test]

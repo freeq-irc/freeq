@@ -54,12 +54,30 @@ interface Cached {
   at: number;
 }
 
+/** What one lookup settled on, shared by every ask that awaited it. */
+interface Settled {
+  records: unknown[];
+  /** What the other sources said; `undefined` when they were not asked. */
+  other: FoundKey | null | undefined;
+  failed: boolean;
+  failure: unknown;
+}
+
+/**
+ * When a miss the origin answered is asked again, in ms after the first ask:
+ * the origin may still be fetching the key from the signer's home server.
+ */
+export const MISS_RETRY_AFTER_MS: readonly number[] = [2_000, 6_000, 15_000];
+
 /**
  * Looks keys up by (DID, kid), caching each answer for `ttlMs`: a key found,
- * or a miss, when every source answered without the key.
+ * or a miss, when every source answered without the key. A miss the origin
+ * answered is asked again at each of `retryAfterMs` before it is remembered.
  */
 export class KeyLookup {
   private readonly cache = new Map<string, Cached>();
+  /** One lookup in flight per (DID, kid). */
+  private readonly inFlight = new Map<string, Promise<Settled>>();
   /** CIDs of records whose repository proof has checked, so each is fetched once. */
   private readonly proven = new Set<string>();
   private defaultOrigin: string | null = null;
@@ -69,6 +87,7 @@ export class KeyLookup {
     readonly reader: RecordReader,
     private readonly givenOrigin: string | null,
     private readonly ttlMs: number,
+    private readonly retryAfterMs: readonly number[] = MISS_RETRY_AFTER_MS,
   ) {}
 
   /** The origin to ask when none was given at construction. Set once; a
@@ -95,12 +114,70 @@ export class KeyLookup {
    * A source that fails is skipped and the next one asked; the first failure
    * is thrown only if no later source finds the key. A miss is remembered only
    * when no source failed, since a failed source did not say it lacks the key.
+   * Asks for one (did, kid) while a lookup for it runs await that lookup.
    */
   async keyForAt(did: string, kid: string, at: Date): Promise<FoundKey | null> {
     const slot = JSON.stringify([did, kid]);
-    const hit = this.cache.get(slot);
-    const cached = hit !== undefined && Date.now() - hit.at < this.ttlMs ? hit : undefined;
+    for (;;) {
+      const hit = this.cache.get(slot);
+      const cached = hit !== undefined && Date.now() - hit.at < this.ttlMs ? hit : undefined;
+      if (cached !== undefined) {
+        const inRecords = await fromRecords(did, kid, cached.records, at);
+        if (inRecords !== null) return inRecords;
+        if (cached.other !== undefined) return cached.other;
+      }
 
+      let pending = this.inFlight.get(slot);
+      if (pending === undefined) {
+        const started: Promise<Settled> = this.settle(slot, did, kid, at, cached).finally(() => {
+          if (this.inFlight.get(slot) === started) this.inFlight.delete(slot);
+        });
+        this.inFlight.set(slot, started);
+        pending = started;
+      }
+      const settled = await pending;
+      // Each ask folds the records at its own time.
+      const inRecords = await fromRecords(did, kid, settled.records, at);
+      if (inRecords !== null) return inRecords;
+      if (settled.other) return settled.other;
+      if (settled.failed) throw settled.failure;
+      if (settled.other === null) return null;
+      // The other sources were not asked, since the lookup found the key in
+      // the records at its own time: ask them now.
+    }
+  }
+
+  /**
+   * Ask every source, and again at each retry delay while the origin answers
+   * with a miss; then remember what was settled.
+   */
+  private async settle(
+    slot: string,
+    did: string,
+    kid: string,
+    at: Date,
+    cached: Cached | undefined,
+  ): Promise<Settled> {
+    const started = performance.now();
+    let listed = cached === undefined;
+    let settled = await this.ask(did, kid, at, cached);
+    for (const after of this.retryAfterMs) {
+      const missed = settled.other === null && !settled.failed && this.originBase() !== null;
+      if (!missed) break;
+      await new Promise((resolve) => setTimeout(resolve, Math.max(0, started + after - performance.now())));
+      settled = await this.ask(did, kid, at, undefined);
+      listed = true;
+    }
+    if (settled.other === undefined) {
+      if (listed && !settled.failed) this.remember(slot, settled.records, undefined);
+    } else if (settled.other !== null || !settled.failed) {
+      this.remember(slot, settled.records, settled.other);
+    }
+    return settled;
+  }
+
+  /** One round: the records (from `cached` when given), then the other sources. */
+  private async ask(did: string, kid: string, at: Date, cached: Cached | undefined): Promise<Settled> {
     let failure: unknown;
     let failed = false;
     let records: unknown[] = [];
@@ -114,12 +191,9 @@ export class KeyLookup {
         [failed, failure] = [true, e];
       }
     }
-    const inRecords = await fromRecords(did, kid, records, at);
-    if (inRecords !== null) {
-      if (!failed && cached === undefined) this.remember(slot, records, undefined);
-      return inRecords;
+    if ((await fromRecords(did, kid, records, at)) !== null) {
+      return { records, other: undefined, failed, failure };
     }
-    if (cached !== undefined && cached.other !== undefined) return cached.other;
 
     const sources: [KeySource, () => Promise<[Uint8Array | null, number | null]>][] = [];
     if (did.startsWith('did:web:')) {
@@ -138,13 +212,9 @@ export class KeyLookup {
         continue;
       }
       if (key === null || key.length !== 32 || (await deriveKid(key)) !== kid) continue;
-      const found: FoundKey = { publicKey: key, source, retiredAt };
-      this.remember(slot, records, found);
-      return found;
+      return { records, other: { publicKey: key, source, retiredAt }, failed, failure };
     }
-    if (failed) throw failure;
-    this.remember(slot, records, null);
-    return null;
+    return { records, other: null, failed, failure };
   }
 
   /**
