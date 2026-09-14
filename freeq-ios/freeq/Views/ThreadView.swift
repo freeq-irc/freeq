@@ -122,17 +122,25 @@ struct ThreadView: View {
                                                 .font(.fqCaption2)
                                                 .foregroundColor(Theme.textMuted)
 
-                                            // Only a checked mismatch marks a
-                                            // row; verification is asked for
-                                            // from the context menu.
+                                            // The mark the verdict earns
+                                            // (RowSignatureMark); tapping it
+                                            // opens the proof.
                                             if let rowVerdict = appState.checkedVerdicts[msg.id] ?? msg.verdict,
-                                               VerdictDisplay.marksTheRow(rowVerdict.kind) {
+                                               let mark = RowSignatureMark.of(rowVerdict) {
                                                 Button {
                                                     proofTarget = .verify(msg)
                                                 } label: {
-                                                    Image(systemName: "exclamationmark.shield.fill")
-                                                        .font(.system(size: 9, weight: .semibold))
-                                                        .foregroundColor(Theme.danger)
+                                                    switch mark {
+                                                    case .lock(let opacity):
+                                                        Image(systemName: "lock.fill")
+                                                            .font(.system(size: 9, weight: .semibold))
+                                                            .foregroundColor(Theme.success)
+                                                            .opacity(opacity)
+                                                    case .warning:
+                                                        Image(systemName: "exclamationmark.shield.fill")
+                                                            .font(.system(size: 9, weight: .semibold))
+                                                            .foregroundColor(Theme.danger)
+                                                    }
                                                 }
                                                 .buttonStyle(.plain)
                                             }

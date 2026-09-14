@@ -52,7 +52,13 @@ class NetworkMonitor: ObservableObject {
         // Delay slightly to let the network stabilize
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak state] in
             guard let state = state, state.connectionState == .disconnected else { return }
-            state.connect(nick: state.nick)
+            // A saved session runs its one reconnect sequence now, through the
+            // broker; a guest connects as before.
+            if state.hasSavedSession {
+                state.reconnectSavedSession(viaBroker: true)
+            } else {
+                state.connect(nick: state.nick)
+            }
         }
     }
 

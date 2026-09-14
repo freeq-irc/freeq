@@ -827,6 +827,8 @@ public protocol FreeqClientProtocol: AnyObject, Sendable {
     
     func setEnrollment(enrollment: Enrollment) throws 
     
+    func setFreshSignIn(fresh: Bool) throws 
+    
     func setPlatform(platform: String) throws 
     
     func setTopic(channel: String, topic: String) throws 
@@ -1036,6 +1038,13 @@ open func setDeviceLabel(label: String)throws   {try rustCallWithError(FfiConver
 open func setEnrollment(enrollment: Enrollment)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
     uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_enrollment(self.uniffiClonePointer(),
         FfiConverterCallbackInterfaceEnrollment_lower(enrollment),$0
+    )
+}
+}
+    
+open func setFreshSignIn(fresh: Bool)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
+    uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_fresh_sign_in(self.uniffiClonePointer(),
+        FfiConverterBool.lower(fresh),$0
     )
 }
 }
@@ -5598,6 +5607,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_enrollment() != 15684) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_fresh_sign_in() != 56485) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_platform() != 50791) {

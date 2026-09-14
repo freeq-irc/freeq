@@ -99,7 +99,7 @@ enum VerdictDisplay {
     /// the heading answers it and the sentence says what that means.
     static func heading(_ kind: VerdictKind) -> String {
         switch kind {
-        case .device: "Verified"
+        case .device: "Signed"
         case .server: "Server Signed"
         case .unsigned: "Unsigned"
         case .unverifiable: "Signature Not Supported"
@@ -107,13 +107,6 @@ enum VerdictDisplay {
         case .invalid, .retired: "Signature Invalid"
         case .pending: "Verification in Progress"
         }
-    }
-
-    /// Whether a verdict leaves a mark on the row. Signing is the default
-    /// state of a message and a default earns no ink, so only a signature that
-    /// was found and did not hold marks it.
-    static func marksTheRow(_ kind: VerdictKind) -> Bool {
-        kind == .invalid || kind == .retired
     }
 
     static func copy(_ verdict: VerdictInfo) -> VerdictCopy {

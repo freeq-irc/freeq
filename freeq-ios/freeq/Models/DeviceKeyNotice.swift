@@ -34,7 +34,7 @@ enum EnrollAnswer {
 final class SigningKeyNotice {
 
     static let line =
-        "Your signing key is not published to your account yet. Open Settings to publish it."
+        "Security upgrade available: publish your key so others can verify messages from this device. Open Settings to publish it."
 
     private var told = false
 

@@ -60,6 +60,8 @@ let package = Package(
                 "ChannelCrypto.swift",
                 "ChannelE2eeState.swift",
                 "ChannelAccessNotice.swift",
+                "RefusedKeyNotice.swift",
+                "RowSignatureMark.swift",
                 "SelfPartResolve.swift",
                 "ChannelState.swift",
                 "DidDisplay.swift",
