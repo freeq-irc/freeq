@@ -1002,7 +1002,7 @@ function wireEvents(c: FreeqClient) {
     s().addSystemMessage(target, text);
   });
 
-  c.on('historyBatch', (channel, messages, info) => {
+  c.on('historyBatch', (channel, messages, info, rows) => {
     // Prefetch avatars by DID for history messages
     const dids = messages.map((m: any) => m.tags?.account).filter(Boolean);
     if (dids.length) prefetchProfiles(dids);
@@ -1013,8 +1013,11 @@ function wireEvents(c: FreeqClient) {
     const waiting = useStore.getState().channels.get(key);
     // Whether this is the page the channel is waiting on, rather than one
     // that outlived its request or one the server sent of its own accord.
+    // A batch no request is on record for — the history a server replays on
+    // JOIN — answers nothing: taken as the answer, its few rows read as a
+    // short page and end the channel's history.
     const answersPending = !!waiting?.historyFetching
-      && (!info || info.mode === waiting.historyFetchMode);
+      && !!info && info.mode === waiting.historyFetchMode;
 
     // A window away from the live end holds a contiguous run of the channel.
     // Nothing shows that a page it did not ask for adjoins that run — an
@@ -1055,13 +1058,13 @@ function wireEvents(c: FreeqClient) {
     if (answersPending) {
       clearHistoryTimer(key);
       useStore.getState().historyPageReceived(
-        channel, messages.length, info?.count ?? HISTORY_PAGE, added,
+        channel, rows, info?.count ?? HISTORY_PAGE, added,
       );
     } else if (info?.mode === 'latest') {
       // The opening page, which the SDK asks for on join without telling the
       // app. Its size is what lets a channel shorter than one page know its
       // history is complete before anyone scrolls.
-      useStore.getState().historyOpeningPage(channel, messages.length, info.count);
+      useStore.getState().historyOpeningPage(channel, rows, info.count);
     }
   });
 

@@ -200,6 +200,13 @@ export interface Batch {
    */
   parentBatchId?: string;
   /**
+   * History batches only: the rows the server sent — one per PRIVMSG
+   * directly in the batch, one per `draft/multiline` batch nested in it.
+   * Task-event TAGMSGs are not rows of the page. Counted off the wire
+   * because merging replayed edits leaves `messages` shorter than the page.
+   */
+  rows?: number;
+  /**
    * Act TAGMSGs read inside this batch, in wire order, held so `actEvent`
    * fires after the batch's companion lines are delivered. `buffer` is the
    * thread key the handler resolved when it read the line — a channel name,

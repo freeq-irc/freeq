@@ -1192,6 +1192,120 @@ describe('what a history batch answers', () => {
     expect(seen).toEqual([{ mode: 'around', count: 60 }]);
   });
 
+  it('counts the rows the server sent, not what is left once a replayed edit merges', async () => {
+    // The server's page is cut by row, and an edit is a row. Merging it into
+    // its original leaves fewer messages than the server sent, so a caller
+    // reading `messages.length` as the page size takes a full page for the
+    // start of the channel and stops paging.
+    const { client, ws } = await makeRegistered();
+    const seen: Array<[number, number | undefined]> = [];
+    client.on('historyBatch', (_c, m, _i, rows) => seen.push([m.length, rows]));
+
+    client.requestHistory({ target: '#foo', mode: 'before', msgid: 'abc', count: 3 });
+    ws.recv(':srv BATCH +b1 chathistory #foo');
+    ws.recv('@batch=b1;msgid=m1 :bob!b@h PRIVMSG #foo :first');
+    ws.recv('@batch=b1;msgid=m2;+draft/edit=m1 :bob!b@h PRIVMSG #foo :first, fixed');
+    ws.recv('@batch=b1;msgid=m3 :bob!b@h PRIVMSG #foo :second');
+    ws.recv(':srv BATCH -b1');
+    for (let i = 0; i < 4; i++) await flushAsync();
+
+    expect(seen).toEqual([[2, 3]]);
+  });
+
+  it('counts an edit whose original is not in the batch as one row', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: Array<[number, number | undefined]> = [];
+    client.on('historyBatch', (_c, m, _i, rows) => seen.push([m.length, rows]));
+
+    ws.recv(':srv BATCH +b1 chathistory #foo');
+    ws.recv('@batch=b1;msgid=m2;+draft/edit=elsewhere :bob!b@h PRIVMSG #foo :fixed');
+    ws.recv(':srv BATCH -b1');
+    for (let i = 0; i < 4; i++) await flushAsync();
+
+    expect(seen).toEqual([[1, 1]]);
+  });
+
+  it('counts a nested multiline message once, not once per line', async () => {
+    const { client, ws } = await makeMultilineRegistered();
+    const seen: Array<[number, number | undefined]> = [];
+    client.on('historyBatch', (_c, m, _i, rows) => seen.push([m.length, rows]));
+
+    ws.recv(':srv BATCH +b1 chathistory #foo');
+    ws.recv('@batch=b1;msgid=m1 :bob!b@h BATCH +ml1 draft/multiline #foo');
+    ws.recv('@batch=ml1 :bob!b@h PRIVMSG #foo :line one');
+    ws.recv('@batch=ml1 :bob!b@h PRIVMSG #foo :line two');
+    ws.recv(':srv BATCH -ml1');
+    ws.recv('@batch=b1;msgid=m2 :bob!b@h PRIVMSG #foo :plain');
+    ws.recv(':srv BATCH -b1');
+    await vi.waitFor(() => expect(seen).toEqual([[2, 2]]));
+  });
+
+  it('counts a replayed multiline edit, which never joins the batch messages', async () => {
+    const { client, ws } = await makeMultilineRegistered();
+    const seen: Array<[number, number | undefined]> = [];
+    client.on('historyBatch', (_c, m, _i, rows) => seen.push([m.length, rows]));
+
+    ws.recv(':srv BATCH +b1 chathistory #foo');
+    ws.recv('@batch=b1;msgid=m1 :bob!b@h PRIVMSG #foo :first');
+    ws.recv('@batch=b1;msgid=m2;+draft/edit=m1 :bob!b@h BATCH +ml1 draft/multiline #foo');
+    ws.recv('@batch=ml1 :bob!b@h PRIVMSG #foo :first');
+    ws.recv('@batch=ml1 :bob!b@h PRIVMSG #foo :fixed');
+    ws.recv(':srv BATCH -ml1');
+    ws.recv(':srv BATCH -b1');
+    await vi.waitFor(() => expect(seen).toEqual([[1, 2]]));
+  });
+
+  it('does not count a task event replayed inside the batch', async () => {
+    // Task events come from their own query with their own limit; they are
+    // not rows of the page the server cut.
+    const { client, ws } = await makeRegistered();
+    const seen: Array<[number, number | undefined]> = [];
+    client.on('historyBatch', (_c, m, _i, rows) => seen.push([m.length, rows]));
+
+    ws.recv(':srv BATCH +b1 chathistory #foo');
+    ws.recv('@batch=b1;+freeq.at/act=task :bob!b@h TAGMSG #foo');
+    ws.recv('@batch=b1;msgid=m1 :bob!b@h PRIVMSG #foo :row');
+    ws.recv(':srv BATCH -b1');
+    for (let i = 0; i < 4; i++) await flushAsync();
+
+    expect(seen).toEqual([[1, 1]]);
+  });
+
+  it('counts a row it could not decrypt', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: Array<[number, number | undefined]> = [];
+    client.on('historyBatch', (_c, m, _i, rows) => seen.push([m.length, rows]));
+
+    ws.recv(':srv BATCH +b1 chathistory #foo');
+    ws.recv('@batch=b1;msgid=m1 :bob!b@h PRIVMSG #foo :ENC1:nokey:garbage');
+    ws.recv(':srv BATCH -b1');
+    for (let i = 0; i < 4; i++) await flushAsync();
+
+    expect(seen).toEqual([[1, 1]]);
+  });
+
+  it('reports the count for a batch no request is on record for', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: Array<[unknown, number | undefined]> = [];
+    client.on('historyBatch', (_c, _m, info, rows) => seen.push([info, rows]));
+
+    batch(ws, 'b1', '#foo', 2);
+    for (let i = 0; i < 4; i++) await flushAsync();
+
+    expect(seen).toEqual([[undefined, 2]]);
+  });
+
+  it('counts a line naming a batch it never saw opened as one row', async () => {
+    const { client, ws } = await makeRegistered();
+    const seen: Array<[number, number | undefined]> = [];
+    client.on('historyBatch', (_c, m, _i, rows) => seen.push([m.length, rows]));
+
+    ws.recv('@batch=gone;msgid=m1 :bob!b@h PRIVMSG #foo :old news');
+    for (let i = 0; i < 4; i++) await flushAsync();
+
+    expect(seen).toEqual([[1, 1]]);
+  });
+
   it('keeps the queue straight when a request is refused instead of answered', async () => {
     // A refused CHATHISTORY is answered by the FAIL and by no batch. If the
     // request it refuses stays queued, the next batch is labelled with it and

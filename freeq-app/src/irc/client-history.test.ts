@@ -98,7 +98,7 @@ describe('a page of history the bridge asked for', () => {
     seed('#batch');
     bridge.requestHistory('#batch', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
 
-    client.emit('historyBatch', '#batch', []);
+    client.emit('historyBatch', '#batch', [], { mode: 'before', count: 50 }, 0);
 
     expect(ch('#batch')!.historyFetching).toBe(false);
     expect(ch('#batch')!.historyEdge).toBe('start');
@@ -106,6 +106,68 @@ describe('a page of history the bridge asked for', () => {
     vi.advanceTimersByTime(60_000);
     expect(ch('#batch')!.historyFetching).toBe(false);
     expect(ch('#batch')!.historyEdge).toBe('start');
+  });
+
+  it('reads the edge off the rows the server sent, not the messages that reached it', () => {
+    // A full page whose edits merged into their originals arrives with fewer
+    // messages than the server sent. Read as the page size, that shortfall
+    // says the channel has no more history, and paging stops.
+    const client = connected();
+    seed('#merged');
+    bridge.requestHistory('#merged', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    client.emit('historyBatch', '#merged', [{
+      id: '01L0AAAAAAAAAAAAAAAAAAAA01', from: 'bob', text: 'older',
+      timestamp: new Date(1_600_000_000_000), tags: {},
+    }], { mode: 'before', count: 50 }, 50);
+
+    expect(ch('#merged')!.historyFetching).toBe(false);
+    expect(ch('#merged')!.historyEdge).toBe('more');
+  });
+
+  it('does not let a batch no request is on record for answer the page being waited on', () => {
+    // The history a server replays on JOIN, or a line naming a batch never
+    // opened, answers no request. Taken as the answer, its few rows read as
+    // a short page and the channel is marked as having no older history.
+    const client = connected();
+    seed('#unasked');
+    bridge.requestHistory('#unasked', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' });
+
+    client.emit('historyBatch', '#unasked', [{
+      id: '01M0ZZZZZZZZZZZZZZZZZZZZ01', from: 'bob', text: 'replayed',
+      timestamp: new Date(1_700_000_001_000), tags: {},
+    }], undefined, 1);
+
+    expect(ch('#unasked')!.historyFetching).toBe(true);
+    expect(ch('#unasked')!.historyEdge).not.toBe('start');
+  });
+
+  it('reads the newer edge of a page after off the rows the server sent', () => {
+    const client = connected();
+    s().openWindow('#fwdrows', [{
+      id: '01M0AAAAAAAAAAAAAAAAAAAA01', from: 'alice', text: 'old',
+      timestamp: new Date(1_700_000_000_000), tags: {},
+    }], false);
+    bridge.requestHistory('#fwdrows', { msgid: '01M0AAAAAAAAAAAAAAAAAAAA01' }, 'after');
+
+    client.emit('historyBatch', '#fwdrows', [{
+      id: '01M0ZZZZZZZZZZZZZZZZZZZZ01', from: 'carol', text: 'newer',
+      timestamp: new Date(1_800_000_000_000), tags: {},
+    }], { mode: 'after', count: 50 }, 50);
+
+    expect(ch('#fwdrows')!.newerEdge).toBe('more');
+  });
+
+  it('reads the opening page\'s edge off the rows the server sent', () => {
+    const client = connected();
+    seed('#opening');
+
+    client.emit('historyBatch', '#opening', [{
+      id: '01L0AAAAAAAAAAAAAAAAAAAA01', from: 'bob', text: 'older',
+      timestamp: new Date(1_600_000_000_000), tags: {},
+    }], { mode: 'latest', count: 50 }, 50);
+
+    expect(ch('#opening')!.historyEdge).toBe('more');
   });
 
   it('goes out as an around request when one is asked for', () => {
@@ -155,7 +217,7 @@ describe('a page of history the bridge asked for', () => {
     client.emit('historyBatch', '#fwdmerge', [{
       id: '01M0ZZZZZZZZZZZZZZZZZZZZ01', from: 'carol', text: 'newer',
       timestamp: new Date(1_800_000_000_000), tags: {},
-    }], { mode: 'after', count: 50 });
+    }], { mode: 'after', count: 50 }, 1);
 
     expect(ch('#fwdmerge')!.messages.map((m) => m.id))
       .toEqual(['01M0AAAAAAAAAAAAAAAAAAAA01', '01M0ZZZZZZZZZZZZZZZZZZZZ01']);
@@ -555,7 +617,7 @@ describe('a page that never comes back', () => {
     client.emit('historyBatch', '#landed', Array.from({ length: 50 }, (_, i) => ({
       id: `01M0BBBBBBBBBBBBBBBBBBBB${String(i).padStart(2, '0')}`, from: 'bob',
       text: `old ${i}`, timestamp: new Date(1_600_000_000_000 + i), tags: {},
-    })));
+    })), { mode: 'before', count: 50 }, 50);
     expect(ch('#landed')!.historyEdge).toBe('more');
     expect(ch('#landed')!.historyAutoPaused).toBe(false);
 

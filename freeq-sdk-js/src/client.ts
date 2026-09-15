@@ -968,6 +968,14 @@ export class FreeqClient extends EventEmitter {
     }
   }
 
+  /** Count one row of a history page against the batch `batchId` names: a
+   *  line directly in it, or a multiline batch opened inside it. Chunks of a
+   *  multiline batch name that batch and are not counted. */
+  private countHistoryRow(batchId: string | undefined): void {
+    const batch = batchId ? this.batches.get(batchId) : undefined;
+    if (batch && batch.type !== 'draft/multiline') batch.rows = (batch.rows ?? 0) + 1;
+  }
+
   /** What the closing batch for `target` answers, consuming it. */
   private takeHistoryRequest(target: string): HistoryBatchInfo | undefined {
     const key = target.toLowerCase();
@@ -2206,6 +2214,8 @@ export class FreeqClient extends EventEmitter {
       }
 
       case 'PRIVMSG': {
+        // Counted before anything below can merge, drop or throw.
+        this.countHistoryRow(msg.tags['batch']);
         const target = msg.params[0];
         const text = msg.params[1] || '';
         const isAction = text.startsWith('\x01ACTION ') && text.endsWith('\x01');
@@ -2399,7 +2409,7 @@ export class FreeqClient extends EventEmitter {
           // A line naming a batch we never saw opened is still a replay: the
           // envelope was missed, not the line. It goes over as history, which
           // the app files by time, rather than as something just said.
-          this.emit('historyBatch', bufName, [message]);
+          this.emit('historyBatch', bufName, [message], undefined, 1);
           break;
         }
 
@@ -2801,6 +2811,8 @@ export class FreeqClient extends EventEmitter {
               if (k !== 'batch') openerTags[k] = v;
             }
             const parentBatchId = msg.tags['batch']; // nesting (e.g. inside chathistory)
+            // One row of the parent's page, however many lines it carries.
+            this.countHistoryRow(parentBatchId);
             this.batches.set(id, {
               type,
               target,
@@ -2852,6 +2864,7 @@ export class FreeqClient extends EventEmitter {
               this.emit(
                 'historyBatch', key, batch.messages,
                 this.takeHistoryRequest(batch.target),
+                batch.rows ?? 0,
               );
             }
             // Held task events ride out with the batch, in wire order,

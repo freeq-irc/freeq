@@ -127,8 +127,11 @@ export interface FreeqEvents {
    *  it answers — the mode and the page size asked for — so a caller can
    *  tell an answer to its own paging request from the opening page, and
    *  can compare the rows returned against the size requested. Absent when
-   *  no request for that target is on record. */
-  historyBatch: (channel: string, messages: Message[], info?: HistoryBatchInfo) => void;
+   *  no request for that target is on record. `rows` is how many rows the
+   *  server sent, which is what to compare against the size requested:
+   *  `messages` has replayed edits merged into their originals, so it can
+   *  be shorter than a full page. */
+  historyBatch: (channel: string, messages: Message[], info: HistoryBatchInfo | undefined, rows: number) => void;
 
   /** Fired when a DM target is discovered (CHATHISTORY TARGETS). */
   dmTarget: (nick: string) => void;
