@@ -220,16 +220,22 @@ async fn refuse_if_retired(
     kid: &str,
     broker_token: Option<&str>,
 ) {
-    let found = match state.key_lookup.key_for(did, kid).await {
-        Ok(Some(found)) => found,
-        Ok(None) => return,
+    // Only the records that decide the key's retirement are proven, from a
+    // listing made now, so a retirement published since the last check counts.
+    let records = match state.key_lookup.proven_retirement_closure(did, kid).await {
+        Ok(records) => records,
         Err(e) => {
             tracing::debug!(%did, %kid, error = %e, "Could not read the account's records for a registered key");
             return;
         }
     };
-    let (freeq_sdk::key_lookup::KeySource::IdentityRecord, Some(retired_at)) =
-        (found.source, found.retired_at)
+    let now = chrono::Utc::now();
+    let Some(retired_at) = freeq_sdk::identity_records::device_key_history(did, &records)
+        .into_iter()
+        .find(|k| k.kid == kid)
+        .and_then(|k| k.retired_at)
+        .filter(|at| *at <= now)
+        .map(|at| at.timestamp())
     else {
         return;
     };
@@ -4387,5 +4393,198 @@ mod retired_key_tests {
             "{pong:?}"
         );
         assert!(state.revoked_broker_tokens.lock().is_empty());
+    }
+
+    fn signing_key(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn record_for(seed: u8) -> serde_json::Value {
+        device_records(&signing_key(seed), false).remove(0)
+    }
+
+    /// A retirement of `target`'s key signed by `signer`'s.
+    fn retirement_by(signer: u8, target: u8) -> serde_json::Value {
+        let key = freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&[signer; 32]).unwrap();
+        let kid = freeq_sdk::sigtag::derive_kid(&signing_key(target).verifying_key());
+        serde_json::to_value(
+            freeq_sdk::identity_records::build_device_retirement(
+                &key,
+                DID,
+                &kid,
+                "2026-03-01T00:00:00Z",
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// `seed`'s key record and 49 other keys' records.
+    fn fifty_keys(seed: u8) -> Vec<serde_json::Value> {
+        std::iter::once(seed)
+            .chain(100..149)
+            .map(record_for)
+            .collect()
+    }
+
+    fn count(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait up to five seconds for `counter` to reach `n`.
+    async fn wait_for_count(counter: &std::sync::atomic::AtomicUsize, n: usize) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while count(counter) < n && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A state whose stub PDS lists `records` for `DID`, with its listing and
+    /// proof counts.
+    async fn state_counting(
+        records: Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
+    ) -> (
+        Arc<SharedState>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let (resolver, listings, proofs) = crate::peer_keys::stub_pds_counting(DID, records).await;
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            resolver,
+        );
+        (state, listings, proofs)
+    }
+
+    /// Whether the session still answers, rather than being refused.
+    async fn still_answers(client: &mut Client) -> bool {
+        client.tx("PING :still-here").await;
+        client
+            .rx(|l| l.contains("PONG") || l.contains("KEY_RETIRED"))
+            .await
+            .is_some_and(|l| l.contains("PONG"))
+    }
+
+    #[tokio::test]
+    async fn a_live_key_among_fifty_registers_without_a_proof() {
+        let (state, listings, proofs) =
+            state_counting(Arc::new(parking_lot::Mutex::new(fifty_keys(43)))).await;
+
+        let mut client = Client::signed_in(&state, "BT-FIFTY-LIVE").await;
+        client.tx(&msgsig_line(&signing_key(43))).await;
+        client
+            .rx(|l| l.contains("MSGSIG OK"))
+            .await
+            .expect("the key is registered");
+        wait_for_count(&listings, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert!(still_answers(&mut client).await);
+        assert_eq!(
+            count(&proofs),
+            0,
+            "no retirement names the key, so no proof can change the answer"
+        );
+        assert!(state.revoked_broker_tokens.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_key_another_live_key_retired_is_refused_proving_only_what_decides_it() {
+        let mut records = fifty_keys(44);
+        records.push(retirement_by(107, 44));
+        let (state, _, proofs) = state_counting(Arc::new(parking_lot::Mutex::new(records))).await;
+        let kid = freeq_sdk::sigtag::derive_kid(&signing_key(44).verifying_key());
+
+        let mut client = Client::signed_in(&state, "BT-FIFTY-RETIRED").await;
+        client.tx(&msgsig_line(&signing_key(44))).await;
+        client
+            .rx(|l| l.contains("KEY_RETIRED"))
+            .await
+            .expect("the key is refused");
+        assert_eq!(client.rx(|_| false).await, None, "the connection is closed");
+
+        assert_eq!(
+            count(&proofs),
+            3,
+            "the retirement, the key's record and the signer's record"
+        );
+        let row = state
+            .with_db(|db| db.get_signing_key_row(DID, &kid))
+            .flatten()
+            .expect("the key row");
+        let retired_at = chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert_eq!(row.removed_at, Some(retired_at));
+    }
+
+    #[tokio::test]
+    async fn a_key_retired_after_it_registered_is_refused_when_it_registers_again() {
+        let records = Arc::new(parking_lot::Mutex::new(fifty_keys(45)));
+        let (state, listings, _) = state_counting(records.clone()).await;
+
+        let mut first = Client::signed_in(&state, "BT-BEFORE-RETIREMENT").await;
+        first.tx(&msgsig_line(&signing_key(45))).await;
+        first
+            .rx(|l| l.contains("MSGSIG OK"))
+            .await
+            .expect("the key is registered");
+        wait_for_count(&listings, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(still_answers(&mut first).await, "the key is live");
+        first.tx("QUIT").await;
+        assert_eq!(first.rx(|_| false).await, None);
+
+        records.lock().push(retirement_by(107, 45));
+
+        let mut second = Client::signed_in(&state, "BT-AFTER-RETIREMENT").await;
+        second.tx(&msgsig_line(&signing_key(45))).await;
+        second
+            .rx(|l| l.contains("KEY_RETIRED"))
+            .await
+            .expect("the key is refused");
+        assert!(
+            state
+                .revoked_broker_tokens
+                .lock()
+                .contains("BT-AFTER-RETIREMENT")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_whose_records_cannot_be_listed_is_kept() {
+        // A port nothing is listening on: bind it, learn the number, drop it.
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let doc = freeq_sdk::test_support::StubRepo::new(DID)
+            .document(&format!("http://127.0.0.1:{dead}"));
+        let resolver =
+            freeq_sdk::did::DidResolver::static_map(std::collections::HashMap::from([(
+                DID.to_string(),
+                doc,
+            )]));
+        let state = crate::server::test_state_with_resolver(
+            crate::config::ServerConfig::default(),
+            resolver,
+        );
+        let kid = freeq_sdk::sigtag::derive_kid(&signing_key(46).verifying_key());
+
+        let mut client = Client::signed_in(&state, "BT-UNLISTED").await;
+        client.tx(&msgsig_line(&signing_key(46))).await;
+        client
+            .rx(|l| l.contains("MSGSIG OK"))
+            .await
+            .expect("the key is registered");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        assert!(still_answers(&mut client).await);
+        assert!(state.revoked_broker_tokens.lock().is_empty());
+        let row = state
+            .with_db(|db| db.get_signing_key_row(DID, &kid))
+            .flatten()
+            .expect("the key row");
+        assert_eq!(row.removed_at, None);
     }
 }

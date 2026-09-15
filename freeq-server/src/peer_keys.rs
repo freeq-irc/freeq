@@ -340,9 +340,25 @@ pub(crate) async fn stub_pds_holding(
     did: &str,
     records: Arc<Mutex<Vec<serde_json::Value>>>,
 ) -> (DidResolver, Arc<std::sync::atomic::AtomicUsize>) {
+    let (resolver, hits, _) = stub_pds_counting(did, records).await;
+    (resolver, hits)
+}
+
+/// [`stub_pds_holding`], with a count of the record proofs it answered as well.
+#[cfg(test)]
+pub(crate) async fn stub_pds_counting(
+    did: &str,
+    records: Arc<Mutex<Vec<serde_json::Value>>>,
+) -> (
+    DidResolver,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
     use axum::response::IntoResponse;
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = hits.clone();
+    let proofs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let proof_counter = proofs.clone();
     let repo = Arc::new(Mutex::new(freeq_sdk::test_support::StubRepo::new(did)));
     let answering = repo.clone();
     let added = Arc::new(Mutex::new(0usize));
@@ -362,6 +378,9 @@ pub(crate) async fn stub_pds_holding(
             }
             if uri.path() == "/xrpc/com.atproto.repo.listRecords" {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            if uri.path() == "/xrpc/com.atproto.sync.getRecord" {
+                proof_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
             let answer = answering.lock().respond(uri.path(), &q);
             async move {
@@ -384,6 +403,7 @@ pub(crate) async fn stub_pds_holding(
     (
         DidResolver::static_map(HashMap::from([(did.to_string(), doc)])),
         hits,
+        proofs,
     )
 }
 
