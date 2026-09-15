@@ -2177,7 +2177,8 @@ fn session_signing_key(
 /// Right after a new sign-in, replace a stored key the account's records have
 /// retired with a new one, saved with no record URI so this connect publishes
 /// it. A saved login or a reconnect reads and changes nothing. Records count
-/// only once their repository proof checks, through `lookup`'s cache.
+/// only once their repository proof checks, through `lookup`'s cache, and only
+/// the records that can retire the key are proven.
 async fn replace_retired_device_key<P: freeq_oauth::ClientProvider>(
     fresh_sign_in: bool,
     store: Option<&dyn crate::device_key::DeviceKeyStore>,
@@ -2193,7 +2194,7 @@ async fn replace_retired_device_key<P: freeq_oauth::ClientProvider>(
     let kid = crate::sigtag::derive_kid(
         &ed25519_dalek::SigningKey::from_bytes(&stored.seed).verifying_key(),
     );
-    let records = match lookup.proven_device_records(did).await {
+    let records = match lookup.proven_retirement_closure(did, &kid).await {
         Ok(records) => records,
         Err(e) => {
             tracing::warn!(error = %e, "device key records not read; keeping the stored key");
@@ -9152,9 +9153,23 @@ mod device_key_tests {
         crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>,
         Arc<std::sync::atomic::AtomicUsize>,
     ) {
+        let (lookup, hits, _) = lookup_counting(repo).await;
+        (lookup, hits)
+    }
+
+    /// `lookup_listing`, with a count of the proofs it answered as well.
+    async fn lookup_counting(
+        repo: crate::test_support::StubRepo,
+    ) -> (
+        crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         use axum::response::IntoResponse;
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = hits.clone();
+        let proofs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let proof_counter = proofs.clone();
         let repo = Arc::new(parking_lot::Mutex::new(repo));
         let answering = repo.clone();
         let router = axum::Router::new().fallback(
@@ -9162,6 +9177,9 @@ mod device_key_tests {
                   axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>| {
                 if uri.path() == "/xrpc/com.atproto.repo.listRecords" {
                     counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                if uri.path() == "/xrpc/com.atproto.sync.getRecord" {
+                    proof_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 let answer = answering.lock().respond(uri.path(), &q);
                 async move {
@@ -9195,7 +9213,7 @@ mod device_key_tests {
             None,
             std::time::Duration::from_secs(3600),
         );
-        (lookup, hits)
+        (lookup, hits, proofs)
     }
 
     #[tokio::test]
@@ -9249,6 +9267,115 @@ mod device_key_tests {
         let live = MemoryStore::holding(12, Some("at://did:plc:tester/at.freeq.deviceKey/3live"));
         replace_retired_device_key(true, Some(live.as_ref()), &lookup, "did:plc:tester").await;
         assert!(live.saves.lock().is_empty(), "a live key is kept");
+    }
+
+    /// A retirement of `target`'s key signed by `signer`'s, dated `at`.
+    fn retirement_by(signer: u8, target: u8, at: &str) -> serde_json::Value {
+        let key = crate::crypto::PrivateKey::ed25519_from_bytes(&[signer; 32]).unwrap();
+        let kid = crate::sigtag::derive_kid(
+            &ed25519_dalek::SigningKey::from_bytes(&[target; 32]).verifying_key(),
+        );
+        serde_json::to_value(
+            crate::identity_records::build_device_retirement(&key, "did:plc:tester", &kid, at)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Key 11's record and 49 other keys' records.
+    fn fifty_keys() -> Vec<serde_json::Value> {
+        std::iter::once(11)
+            .chain(100..149)
+            .map(record_for)
+            .collect()
+    }
+
+    fn count(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn checked_cold_a_key_nothing_retires_is_kept_without_a_proof() {
+        let (lookup, _, proofs) = lookup_counting(repo_holding(&fifty_keys())).await;
+        let store = MemoryStore::holding(11, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
+        replace_retired_device_key(true, Some(store.as_ref()), &lookup, "did:plc:tester").await;
+        assert!(store.saves.lock().is_empty());
+        assert_eq!(
+            count(&proofs),
+            0,
+            "no retirement names the key, so no proof can change the answer"
+        );
+        assert_eq!(
+            lookup
+                .proven_device_records("did:plc:tester")
+                .await
+                .unwrap()
+                .len(),
+            50,
+            "the check kept no partial listing"
+        );
+    }
+
+    #[tokio::test]
+    async fn checked_cold_a_key_another_live_key_retired_is_replaced_proving_only_what_decides_it()
+    {
+        let mut repo = repo_holding(&fifty_keys());
+        repo.add(
+            crate::identity_records::DEVICE_KEY_TYPE,
+            &retirement_by(107, 11, RETIRED),
+        );
+        let (lookup, _, proofs) = lookup_counting(repo).await;
+        let store = MemoryStore::holding(11, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
+        replace_retired_device_key(true, Some(store.as_ref()), &lookup, "did:plc:tester").await;
+        assert_eq!(store.saves.lock().len(), 1, "the retired key is replaced");
+        assert_eq!(
+            count(&proofs),
+            3,
+            "the retirement, the key's record and the signer's record"
+        );
+        assert_eq!(
+            lookup
+                .proven_device_records("did:plc:tester")
+                .await
+                .unwrap()
+                .len(),
+            51
+        );
+    }
+
+    #[tokio::test]
+    async fn checked_cold_a_retirement_whose_proof_fails_keeps_the_key() {
+        let mut repo = repo_holding(&fifty_keys());
+        repo.add_forged(
+            crate::identity_records::DEVICE_KEY_TYPE,
+            &retirement_by(103, 11, RETIRED),
+            &record_for(11),
+        );
+        let (lookup, _, proofs) = lookup_counting(repo).await;
+        let store = MemoryStore::holding(11, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
+        replace_retired_device_key(true, Some(store.as_ref()), &lookup, "did:plc:tester").await;
+        assert!(store.saves.lock().is_empty());
+        assert_eq!(count(&proofs), 3);
+    }
+
+    #[tokio::test]
+    async fn checked_cold_a_retirement_signed_by_a_key_already_retired_keeps_the_key_as_the_full_fold_does()
+     {
+        let signer_gone = retirement_by(111, 111, "2026-09-11T12:00:00.000Z");
+        let late = retirement_by(111, 11, RETIRED);
+        let mut all = fifty_keys();
+        all.extend([signer_gone.clone(), late.clone()]);
+        let kid = crate::sigtag::derive_kid(
+            &ed25519_dalek::SigningKey::from_bytes(&[11; 32]).verifying_key(),
+        );
+        let full = crate::identity_records::device_key_history("did:plc:tester", &all);
+        assert_eq!(full.iter().find(|k| k.kid == kid).unwrap().retired_at, None);
+
+        let (lookup, _, proofs) = lookup_counting(repo_holding(&all)).await;
+        let store = MemoryStore::holding(11, Some("at://did:plc:tester/at.freeq.deviceKey/3k"));
+        replace_retired_device_key(true, Some(store.as_ref()), &lookup, "did:plc:tester").await;
+        assert!(store.saves.lock().is_empty());
+        assert_eq!(count(&proofs), 4);
     }
 
     #[tokio::test]

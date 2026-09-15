@@ -277,6 +277,66 @@ pub fn device_key_history(did: &str, records: &[serde_json::Value]) -> Vec<Devic
         .collect()
 }
 
+/// The entries of `did`'s device key records that decide whether key `kid` is
+/// retired: none when no entry retires `kid`; otherwise the retirements of
+/// `kid`, and, repeatedly, of each key that signed one of those, with the key
+/// records of every such key. `device_key_history` over these gives `kid` the
+/// `retired_at` it gives over all of `entries`, and over any subset of them
+/// holding these, so a caller need prove only these to decide it.
+pub fn retirement_closure<T>(
+    did: &str,
+    kid: &str,
+    entries: Vec<T>,
+    value_of: impl Fn(&T) -> &serde_json::Value,
+) -> Vec<T> {
+    let named: Vec<Option<(Option<String>, Option<String>)>> = entries
+        .iter()
+        .map(|entry| {
+            let value = value_of(entry);
+            let text = |field: &str| value.get(field).and_then(|v| v.as_str());
+            (text("$type") == Some(DEVICE_KEY_TYPE) && text("did") == Some(did)).then(|| {
+                (
+                    text("kid").map(str::to_string),
+                    text("revokes").map(str::to_string),
+                )
+            })
+        })
+        .collect();
+    if !named
+        .iter()
+        .flatten()
+        .any(|(_, revokes)| revokes.as_deref() == Some(kid))
+    {
+        return Vec::new();
+    }
+    let mut kids = std::collections::HashSet::from([kid]);
+    loop {
+        let before = kids.len();
+        for (signer, revokes) in named.iter().flatten() {
+            if let (Some(signer), Some(revokes)) = (signer, revokes)
+                && kids.contains(revokes.as_str())
+            {
+                kids.insert(signer.as_str());
+            }
+        }
+        if kids.len() == before {
+            break;
+        }
+    }
+    entries
+        .into_iter()
+        .zip(&named)
+        .filter_map(|(entry, named)| {
+            let (signer, revokes) = named.as_ref()?;
+            let keep = match revokes {
+                Some(revokes) => kids.contains(revokes.as_str()),
+                None => signer.as_deref().is_some_and(|s| kids.contains(s)),
+            };
+            keep.then_some(entry)
+        })
+        .collect()
+}
+
 /// The bots `did` claims at `at`, earliest first. A claim counts only if the
 /// owner key that signed it was itself live under the device fold when the
 /// claim was written.
@@ -1451,6 +1511,73 @@ mod tests {
                 "{name}: live agent links"
             );
         }
+    }
+
+    /// The date the history gives `kid`'s retirement, if any.
+    fn retired_at(records: &[serde_json::Value], kid: &str) -> Option<DateTime<Utc>> {
+        device_key_history(ALICE, records)
+            .into_iter()
+            .find(|k| k.kid == kid)
+            .and_then(|k| k.retired_at)
+    }
+
+    #[test]
+    fn each_key_in_the_committed_fold_cases_is_decided_by_its_retirement_closure() {
+        let spec: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixtures_path()).unwrap()).unwrap();
+        for case in spec["folds"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let records = case["deviceRecords"].as_array().unwrap();
+            let kids: std::collections::BTreeSet<&str> = records
+                .iter()
+                .flat_map(|r| ["kid", "revokes"].map(|f| r.get(f).and_then(|v| v.as_str())))
+                .flatten()
+                .collect();
+            assert!(!kids.is_empty(), "{name}: no keys");
+            for kid in kids {
+                let closure = retirement_closure(ALICE, kid, records.clone(), |r| r);
+                assert_eq!(
+                    retired_at(&closure, kid),
+                    retired_at(records, kid),
+                    "{name}: {kid}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_retirement_closure_holds_only_the_records_that_can_retire_the_key() {
+        let device = |seed| value(&build_device_record(&key(seed), ALICE, T0, None).unwrap());
+        let retire = |signer, target, at| {
+            value(&build_device_retirement(&key(signer), ALICE, &kid_of(target), at).unwrap())
+        };
+        let unrelated = vec![device(1), device(2), device(3), device(4), retire(4, 4, T1)];
+        assert!(
+            retirement_closure(ALICE, &kid_of(1), unrelated.clone(), |r| r).is_empty(),
+            "nothing retires key 1"
+        );
+
+        let mut by_live = unrelated.clone();
+        by_live.push(retire(2, 1, T2));
+        let closure = retirement_closure(ALICE, &kid_of(1), by_live.clone(), |r| r);
+        assert_eq!(closure, vec![device(1), device(2), retire(2, 1, T2)]);
+        assert_eq!(retired_at(&closure, &kid_of(1)), Some(instant(T2)));
+
+        let mut by_retired = by_live.clone();
+        by_retired.push(retire(3, 2, T1));
+        let closure = retirement_closure(ALICE, &kid_of(1), by_retired.clone(), |r| r);
+        assert_eq!(
+            closure,
+            vec![
+                device(1),
+                device(2),
+                device(3),
+                retire(2, 1, T2),
+                retire(3, 2, T1)
+            ]
+        );
+        assert_eq!(retired_at(&closure, &kid_of(1)), None);
+        assert_eq!(retired_at(&by_retired, &kid_of(1)), None);
     }
 
     // ─── reading from a PDS ─────────────────────────────────────────────

@@ -6,7 +6,9 @@
 //! answers, the key must hash to the kid, or it is refused.
 
 use crate::crypto::PublicKey;
-use crate::identity_records::{DEVICE_KEY_TYPE, RecordReader, device_key_history};
+use crate::identity_records::{
+    DEVICE_KEY_TYPE, RecordReader, device_key_history, retirement_closure,
+};
 use crate::sigtag::derive_kid_bytes;
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -319,6 +321,29 @@ impl<P: ClientProvider> KeyLookup<P> {
     /// proven records, so each record's proof is fetched once.
     pub async fn proven_device_records(&self, did: &str) -> Result<Vec<serde_json::Value>> {
         self.list_device_records(did).await
+    }
+
+    /// The proven records that decide whether `did`'s device key `kid` is
+    /// retired (`retirement_closure`), from a new listing. Only those records
+    /// are proven, through this lookup's proven set; the listing is not kept
+    /// as the account's records, since it holds only part of them.
+    pub async fn proven_retirement_closure(
+        &self,
+        did: &str,
+        kid: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        let listed = self
+            .reader
+            .list_record_entries(did, DEVICE_KEY_TYPE)
+            .await?;
+        let closure = retirement_closure(did, kid, listed, |entry| &entry.value);
+        if closure.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .reader
+            .proven_records(did, DEVICE_KEY_TYPE, closure, &self.proven, &self.proving)
+            .await)
     }
 
     /// `did`'s proven device records: the last listing while inside the ttl,
