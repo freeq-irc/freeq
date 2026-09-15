@@ -212,13 +212,17 @@ function shortKid(kid: string): string {
 /** How long a signed-out device stays listed after its retirement. */
 const SIGNED_OUT_LISTED_MS = 24 * 60 * 60 * 1000;
 
+/** How many signed-out devices the list shows at most. */
+const SIGNED_OUT_LISTED_MAX = 5;
+
 /**
  * The rows for `did`'s device key records, newest key first.
  *
  * The fold decides which keys are live and when each was retired, so a
  * retirement every client ignores (wrong signer, dated before the key) never
  * dates a row. A key record the fold rejects is left out, and so is one not
- * yet live and never retired, and one retired more than 24 hours ago.
+ * yet live and never retired, and one retired more than 24 hours ago. Of the
+ * signed-out rows left, only the five most recently retired are kept.
  */
 export async function deviceRowsFrom(
   did: string,
@@ -227,6 +231,7 @@ export async function deviceRowsFrom(
 ): Promise<DeviceRow[]> {
   const now = Date.now();
   const found: { row: DeviceRow; since: string }[] = [];
+  const signedOut: { row: DeviceRow; since: string }[] = [];
   for (const key of await deviceKeyHistory(did, records)) {
     const label = (key.record as Partial<DeviceKeyRecord>).label;
     const retired = key.retiredAt !== null && key.retiredAt.getTime() <= now;
@@ -234,7 +239,7 @@ export async function deviceRowsFrom(
     if (!active && !retired) continue;
     if (retired && now - key.retiredAt!.getTime() > SIGNED_OUT_LISTED_MS) continue;
     const since = key.createdAt.toISOString();
-    found.push({
+    (active ? found : signedOut).push({
       since,
       row: {
         kid: key.kid,
@@ -245,6 +250,10 @@ export async function deviceRowsFrom(
       },
     });
   }
+
+  // A signed-out row's date is its retirement.
+  signedOut.sort((a, b) => b.row.date!.localeCompare(a.row.date!));
+  found.push(...signedOut.slice(0, SIGNED_OUT_LISTED_MAX));
 
   if (!here.published && here.kid !== undefined) {
     found.push({

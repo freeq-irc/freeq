@@ -42,7 +42,7 @@ vi.mock('@freeq/sdk', async (importOriginal) => ({
 const bridge = await import('./client');
 const { useStore } = await import('../store');
 const { IndexedDbKeyLookupStore } = await import('../lib/key-lookup-store');
-const { buildDeviceRecord, recordKeyOf } = await import('@freeq/sdk');
+const { buildDeviceRecord, buildDeviceRetirement, recordKeyOf } = await import('@freeq/sdk');
 
 const DID = 'did:plc:k2n3e2vsihf3farequ44t5j7';
 const PDS = 'https://pds.example';
@@ -107,5 +107,34 @@ describe('the Devices rows', () => {
 
     await bridge.listDeviceRows({ refresh: true });
     expect(requests.some((url) => url.includes('com.atproto.repo.listRecords'))).toBe(true);
+  });
+
+  it('list the five most recently signed-out keys and every active one', async () => {
+    const HOUR_MS = 60 * 60 * 1000;
+    const device = async (label: string, createdAt: string) => {
+      const pair = (await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])) as CryptoKeyPair;
+      const key = await recordKeyOf(pair);
+      return { key, record: await buildDeviceRecord(key, DID, createdAt, label) };
+    };
+    // The active key is the oldest, so a cap on the whole list would drop it.
+    const active = await device('Desktop', '2026-01-01T00:00:00.000Z');
+    const records: unknown[] = [active.record];
+    for (let i = 1; i <= 6; i++) {
+      const gone = await device(`Phone ${i}`, `2026-01-0${i + 1}T00:00:00.000Z`);
+      // Phone 6 is the newest key and the most recently signed out.
+      const retiredAt = new Date(Date.now() - (7 - i) * HOUR_MS).toISOString();
+      records.push(gone.record, await buildDeviceRetirement(gone.key, DID, gone.record.kid, retiredAt));
+    }
+
+    const rows = await bridge.deviceRowsFrom(DID, records, { published: true });
+    expect(rows.map((row) => row.name)).toEqual([
+      'Phone 6',
+      'Phone 5',
+      'Phone 4',
+      'Phone 3',
+      'Phone 2',
+      'Desktop',
+    ]);
+    expect(rows.find((row) => row.name === 'Desktop')?.state).toBe('active');
   });
 });

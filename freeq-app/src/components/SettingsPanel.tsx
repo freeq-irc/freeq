@@ -5,6 +5,7 @@ import { getPreferences, setPreferences } from '../lib/db';
 import { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { AudioTest } from './AudioTest';
+import { formatTime } from './MessageList';
 import { useSyncExternalStore } from 'react';
 import {
   getDeviceKeyState,
@@ -227,9 +228,11 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
   );
 }
 
-/** A date, the way the app writes one older than a week. */
+/** A date, the way the app writes one older than a week, and its time. */
 function day(iso?: string): string {
-  return iso ? new Date(iso).toLocaleDateString([], { month: 'short', day: 'numeric' }) : '';
+  if (!iso) return '';
+  const d = new Date(iso);
+  return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })}, ${formatTime(d)}`;
 }
 
 /** The one meta line a row carries. */

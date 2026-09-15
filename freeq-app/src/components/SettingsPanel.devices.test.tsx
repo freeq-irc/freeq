@@ -72,6 +72,7 @@ import {
   type DeviceKeyRecord,
 } from '@freeq/sdk';
 import { SettingsPanel } from './SettingsPanel';
+import { formatTime } from './MessageList';
 import * as client from '../irc/client';
 import { useStore } from '../store';
 
@@ -122,7 +123,8 @@ afterEach(() => {
 });
 
 /** How the panel writes a date, so the expectations read the same recipe. */
-const day = (iso: string) => new Date(iso).toLocaleDateString([], { month: 'short', day: 'numeric' });
+const day = (iso: string) =>
+  `${new Date(iso).toLocaleDateString([], { month: 'short', day: 'numeric' })}, ${formatTime(new Date(iso))}`;
 
 function panel() {
   return render(<SettingsPanel open onClose={() => {}} />);
@@ -224,18 +226,23 @@ describe('the Devices list', () => {
     expect(screen.queryByText('Old tablet')).toBeNull();
   });
 
-  it('writes a date as a short month and day', async () => {
-    seam.rows = await client.deviceRowsFrom(DID, records, {
-      kid: thisDevice.kid,
-      createdAt: THIS_CREATED,
-      published: true,
-    });
+  it('writes a date as a short month and day and the 24-hour time', async () => {
+    const created = '2026-03-04T20:22:00';
+    const laptop = await aDevice('Late laptop', new Date(created).toISOString());
+    seam.rows = await client.deviceRowsFrom(
+      DID,
+      [...records, laptop.record],
+      { kid: thisDevice.kid, createdAt: THIS_CREATED, published: true },
+    );
     panel();
-    await waitFor(() => screen.getByText('Work laptop'));
+    await waitFor(() => screen.getByText('Late laptop'));
 
-    const short = new Date(OTHER_CREATED).toLocaleDateString([], { month: 'short', day: 'numeric' });
-    expect(rowMeta('Work laptop')).toBe(`Active · since ${short}`);
-    expect(rowMeta('Work laptop')).not.toContain(new Date(OTHER_CREATED).toLocaleDateString());
+    // Local time, so the expectation holds in any timezone the test runs in.
+    const short = new Date(created).toLocaleDateString([], { month: 'short', day: 'numeric' });
+    expect(rowMeta('Late laptop')).toBe(`Active · since ${short}, 20:22`);
+    expect(rowMeta('Late laptop')).not.toContain(new Date(created).toLocaleDateString());
+
+    expect(rowMeta('Old phone')).toMatch(new RegExp(`^Signed out · [^,]+, ${formatTime(new Date(GONE_RETIRED))}$`));
   });
 
   it('dates a signed-out device by the retirement that counts, not an ignored earlier one', async () => {
