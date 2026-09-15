@@ -20,7 +20,7 @@ use base64::Engine;
 use freeq_auth_broker::{
     BrokerConfig, BrokerSessionRecord, BrokerState, DpopKey, InMemoryStore, PendingAuth,
     RemoteWriter, SessionStore, SqliteStore, build_client_id, decrypt_field, derive_encryption_key,
-    encrypt_field, is_valid_return_to, router, sign_body,
+    encrypt_field, is_valid_return_to, router, session_router, sign_body, token_hash,
 };
 use tokio::sync::Mutex;
 
@@ -1092,9 +1092,9 @@ async fn session_is_401_when_the_server_refuses_the_web_token() {
             .unwrap()
             .contains("re-authentication required")
     );
-    // The broker does not also destroy its own row; the server's refusal is
-    // the verdict, and it will refuse the next call the same way.
-    assert!(state.store.get("BT1").await.is_some());
+    // The server's refusal is a sign-out, and the broker ends the session on
+    // it: the server's own memory of the refusal does not survive a restart.
+    assert!(state.store.get("BT1").await.is_none());
 }
 
 #[tokio::test]
@@ -1754,4 +1754,223 @@ async fn delete_leaves_other_records_alone() {
     store.delete("bt-one").await.unwrap();
     assert!(store.get("bt-one").await.is_none());
     assert!(store.get("bt-two").await.is_some());
+}
+
+#[test]
+fn token_hash_is_lowercase_hex_sha256() {
+    assert_eq!(
+        token_hash("abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_store_delete_by_token_hash_removes_only_the_match() {
+    let store = SqliteStore::open(":memory:", derive_encryption_key(SECRET)).unwrap();
+    store.insert(&a_record("bt-one")).await.unwrap();
+    store.insert(&a_record("bt-two")).await.unwrap();
+
+    store
+        .delete_by_token_hash(&token_hash("bt-one"))
+        .await
+        .unwrap();
+    assert!(store.get("bt-one").await.is_none());
+    assert!(store.get("bt-two").await.is_some());
+    // No match is not an error.
+    store
+        .delete_by_token_hash(&token_hash("bt-one"))
+        .await
+        .unwrap();
+    store.delete_by_token_hash("not-a-hash").await.unwrap();
+    assert!(store.get("bt-two").await.is_some());
+}
+
+#[tokio::test]
+async fn in_memory_store_delete_by_token_hash_removes_only_the_match() {
+    let store = InMemoryStore::new();
+    store.insert(&a_record("bt-one")).await.unwrap();
+    store.insert(&a_record("bt-two")).await.unwrap();
+
+    store
+        .delete_by_token_hash(&token_hash("bt-one"))
+        .await
+        .unwrap();
+    assert!(store.get("bt-one").await.is_none());
+    assert!(store.get("bt-two").await.is_some());
+    store
+        .delete_by_token_hash(&token_hash("bt-one"))
+        .await
+        .unwrap();
+    assert!(store.get("bt-two").await.is_some());
+}
+
+// ═══ POST /session/delete ══════════════════════════════════════════════
+
+/// A broker whose session BT1 refreshes and can enroll, as `enroll_setup`,
+/// with its state kept for reading the store.
+async fn delete_setup() -> (String, Arc<BrokerState>) {
+    let server_url = spawn(mock_freeq_server(Default::default())).await;
+    let token_url = spawn(mock_refresh_endpoint(rotate_state(Some(ENROLL_SCOPE)))).await;
+    let pds_url = spawn(mock_pds_raw(Default::default())).await;
+    let state = broker_state(&server_url);
+    seed_session(&state, "BT1", "R0", &format!("{token_url}/token"), &pds_url).await;
+    (spawn(router(state.clone())).await, state)
+}
+
+/// POST /session/delete with `body` as sent and the given signature headers.
+async fn delete_call(base: &str, body: Vec<u8>, sig: &str, ts: &str) -> reqwest::Response {
+    http()
+        .post(format!("{base}/session/delete"))
+        .header("content-type", "application/json")
+        .header("X-Broker-Signature", sig)
+        .header("X-Broker-Timestamp", ts)
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A delete naming `broker_token` by its hash, signed the way the server
+/// signs it.
+async fn signed_delete(base: &str, broker_token: &str) -> reqwest::Response {
+    let body = serde_json::json!({ "token_hash": token_hash(broker_token) });
+    let (sig, ts) = sign_body(SECRET, &body).unwrap();
+    delete_call(base, serde_json::to_vec(&body).unwrap(), &sig, &ts).await
+}
+
+/// HMAC over `ts={ts}\n` then `body` under `secret`, for signatures
+/// `sign_body` will not make: another secret, an old timestamp.
+fn sign_with(secret: &str, body: &[u8], ts: u64) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(format!("ts={ts}\n").as_bytes());
+    mac.update(body);
+    b64url(&mac.finalize().into_bytes())
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+async fn enroll_with_device_key(base: &str) -> reqwest::Response {
+    let key = device_key(1);
+    let record =
+        build_device_record(&key, "did:plc:alice123", "2026-09-11T00:00:00Z", None).unwrap();
+    enroll_call(base, &serde_json::to_string(&record).unwrap(), &key).await
+}
+
+#[tokio::test]
+async fn session_delete_with_a_good_signature_ends_the_session() {
+    let (base, state) = delete_setup().await;
+
+    let resp = signed_delete(&base, "BT1").await;
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json, serde_json::json!({ "ok": true }));
+
+    assert!(state.store.get("BT1").await.is_none());
+    assert_eq!(session_call(&base, "BT1").await.status(), 401);
+    assert_eq!(enroll_with_device_key(&base).await.status(), 401);
+}
+
+#[tokio::test]
+async fn session_delete_twice_or_for_an_unknown_token_is_200() {
+    let (base, _state) = delete_setup().await;
+    assert_eq!(signed_delete(&base, "BT1").await.status(), 200);
+    assert_eq!(signed_delete(&base, "BT1").await.status(), 200);
+    assert_eq!(signed_delete(&base, "BT-NEVER-ISSUED").await.status(), 200);
+}
+
+#[tokio::test]
+async fn session_delete_with_a_bad_signature_deletes_nothing() {
+    let (base, state) = delete_setup().await;
+    let body = serde_json::to_vec(&serde_json::json!({ "token_hash": token_hash("BT1") })).unwrap();
+    let now = now_secs();
+
+    let wrong_secret = sign_with("not-the-shared-secret", &body, now);
+    let resp = delete_call(&base, body.clone(), &wrong_secret, &now.to_string()).await;
+    assert_eq!(resp.status(), 401);
+
+    let resp = http()
+        .post(format!("{base}/session/delete"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "unsigned");
+
+    assert!(state.store.get("BT1").await.is_some());
+}
+
+#[tokio::test]
+async fn session_delete_with_a_timestamp_61s_old_deletes_nothing() {
+    let (base, state) = delete_setup().await;
+    let body = serde_json::to_vec(&serde_json::json!({ "token_hash": token_hash("BT1") })).unwrap();
+    let stale = now_secs() - 61;
+    let sig = sign_with(SECRET, &body, stale);
+
+    let resp = delete_call(&base, body, &sig, &stale.to_string()).await;
+    assert_eq!(resp.status(), 401);
+    assert!(state.store.get("BT1").await.is_some());
+}
+
+#[tokio::test]
+async fn session_delete_with_no_body_is_400() {
+    let (base, state) = delete_setup().await;
+    let now = now_secs();
+    let sig = sign_with(SECRET, b"", now);
+
+    let resp = delete_call(&base, Vec::new(), &sig, &now.to_string()).await;
+    assert_eq!(resp.status(), 400);
+    assert!(state.store.get("BT1").await.is_some());
+}
+
+#[tokio::test]
+async fn session_delete_is_refused_where_no_secret_is_configured() {
+    // An embedding server mounts these routes with an empty secret; a
+    // signature under an empty key proves nothing.
+    let state = Arc::new(BrokerState {
+        config: BrokerConfig {
+            public_url: String::new(),
+            freeq_server_url: String::new(),
+            shared_secret: String::new(),
+        },
+        writer: Arc::new(RemoteWriter {
+            freeq_server_url: String::new(),
+            shared_secret: String::new(),
+        }),
+        store: Arc::new(InMemoryStore::new()),
+        pending: Mutex::new(std::collections::HashMap::new()),
+        completed: Mutex::new(std::collections::HashMap::new()),
+        callback_locks: Mutex::new(std::collections::HashMap::new()),
+        refresh_locks: Mutex::new(std::collections::HashMap::new()),
+    });
+    seed_session(
+        &state,
+        "BT1",
+        "R0",
+        "https://pds.example/token",
+        "https://pds.example",
+    )
+    .await;
+    let base = spawn(session_router(state.clone())).await;
+
+    let body = serde_json::to_vec(&serde_json::json!({ "token_hash": token_hash("BT1") })).unwrap();
+    let now = now_secs();
+    let sig = sign_with("", &body, now);
+    let resp = delete_call(&base, body, &sig, &now.to_string()).await;
+    assert_eq!(resp.status(), 403);
+    assert!(state.store.get("BT1").await.is_some());
+}
+
+#[tokio::test]
+async fn a_refused_web_token_also_closes_enroll() {
+    let (resp, state) = session_against_refusing_server(axum::http::StatusCode::UNAUTHORIZED).await;
+    assert_eq!(resp.status(), 401);
+    let base = spawn(router(state)).await;
+    assert_eq!(enroll_with_device_key(&base).await.status(), 401);
 }

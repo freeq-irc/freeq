@@ -383,6 +383,9 @@ pub trait SessionStore: Send + Sync {
     /// token the store never had is not an error — a device can only be
     /// signed out once.
     async fn delete(&self, broker_token: &str) -> anyhow::Result<()>;
+    /// Forget the session whose token hashes to `hash` (see [`token_hash`]),
+    /// for a caller that keeps only the hash. No match is not an error.
+    async fn delete_by_token_hash(&self, hash: &str) -> anyhow::Result<()>;
 }
 
 /// Durable SQLite store with AES-GCM field encryption at rest. Owns the key.
@@ -501,6 +504,23 @@ impl SessionStore for SqliteStore {
         )?;
         Ok(())
     }
+
+    async fn delete_by_token_hash(&self, hash: &str) -> anyhow::Result<()> {
+        // Sessions are few, so the tokens are hashed here rather than a hash
+        // column added to a table with no migrations.
+        let db = self.conn.lock().await;
+        let tokens: Vec<String> = db
+            .prepare("SELECT broker_token FROM sessions")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        for token in tokens.iter().filter(|t| token_hash(t) == hash) {
+            db.execute(
+                "DELETE FROM sessions WHERE broker_token = ?1",
+                rusqlite::params![token],
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// Ephemeral in-memory store — no persistence, no at-rest encryption (never
@@ -549,6 +569,14 @@ impl SessionStore for InMemoryStore {
         self.sessions.lock().await.remove(broker_token);
         Ok(())
     }
+
+    async fn delete_by_token_hash(&self, hash: &str) -> anyhow::Result<()> {
+        self.sessions
+            .lock()
+            .await
+            .retain(|token, _| token_hash(token) != hash);
+        Ok(())
+    }
 }
 
 /// Build the broker's axum router over shared state. Used by the
@@ -561,6 +589,7 @@ impl SessionStore for InMemoryStore {
 fn session_routes() -> Router<Arc<BrokerState>> {
     Router::new()
         .route("/session", post(session))
+        .route("/session/delete", post(session_delete))
         .route("/api/graph/follow", post(graph_follow))
         .route("/api/graph/unfollow", post(graph_unfollow))
         .route("/api/pfp/set-avatar", post(pfp_set_avatar))
@@ -1133,6 +1162,11 @@ async fn session(
         // an empty token forever.
         Err(e) if e.downcast_ref::<WebTokenRefused>().is_some() => {
             tracing::info!(did = %record.did, "/session refused: device signed out");
+            // The refusal is a sign-out; end the session here too, so /enroll
+            // is closed and a server restart does not bring the login back.
+            if let Err(e) = state.store.delete(&record.broker_token).await {
+                tracing::warn!(error = %e, "could not delete a signed-out session");
+            }
             return Err((
                 StatusCode::UNAUTHORIZED,
                 "Session expired — re-authentication required".to_string(),
@@ -1168,6 +1202,55 @@ async fn session(
         did: record.did,
         handle: record.handle,
     }))
+}
+
+#[derive(Deserialize)]
+struct SessionDeleteRequest {
+    /// [`token_hash`] of the session's broker token; the server keeps no more.
+    token_hash: String,
+}
+
+/// POST /session/delete {token_hash} — the freeq-server ending a signed-out
+/// device's session. Signed as the broker's own pushes are, with the same
+/// secret. A session already gone, or never issued, is still 200.
+async fn session_delete(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // An embedding server mounts this with no secret, and a signature under
+    // an empty key proves nothing.
+    if state.config.shared_secret.is_empty() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Broker auth not configured".to_string(),
+        ));
+    }
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    verify_signed_body(
+        &state.config.shared_secret,
+        header("x-broker-timestamp"),
+        header("x-broker-signature"),
+        &body,
+    )
+    .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+    let req: SessionDeleteRequest = serde_json::from_slice(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")))?;
+
+    state
+        .store
+        .delete_by_token_hash(&req.token_hash)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+    // A refresh already holding the lock finds no row to update, and the
+    // server refuses its web token.
+    state
+        .refresh_locks
+        .lock()
+        .await
+        .retain(|token, _| token_hash(token) != req.token_hash);
+    tracing::info!("session deleted: device signed out at the server");
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 // ── Graph delegation: follow / unfollow ────────────────────────────────────
@@ -2024,6 +2107,48 @@ pub fn sign_body(
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()),
         timestamp,
     ))
+}
+
+/// Lowercase hex SHA-256 of a broker token: the name the server keeps for a
+/// signed-out token, and the name it gives the broker to delete one.
+pub fn token_hash(token: &str) -> String {
+    use sha2::Digest;
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Check a body signed with [`sign_body`]: both headers present, the
+/// timestamp within 60 s of now, and the MAC over `ts={timestamp}\n` then the
+/// body bytes as received.
+pub fn verify_signed_body(
+    secret: &str,
+    timestamp_header: Option<&str>,
+    signature_header: Option<&str>,
+    body_bytes: &[u8],
+) -> Result<(), &'static str> {
+    use hmac::{Hmac, Mac};
+    let sig = signature_header.ok_or("Missing broker signature")?;
+    let ts_str = timestamp_header.ok_or("Missing X-Broker-Timestamp header")?;
+    let ts: u64 = ts_str.parse().map_err(|_| "Invalid X-Broker-Timestamp")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now.abs_diff(ts) > 60 {
+        return Err("Broker request expired (timestamp > 60s)");
+    }
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).map_err(|_| "HMAC init failed")?;
+    mac.update(format!("ts={ts_str}\n").as_bytes());
+    mac.update(body_bytes);
+    let expected =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    if expected != sig {
+        return Err("Invalid broker signature");
+    }
+    Ok(())
 }
 
 pub fn init_db(db: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
