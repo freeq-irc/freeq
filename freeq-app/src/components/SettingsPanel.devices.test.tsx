@@ -23,15 +23,23 @@ const seam = vi.hoisted(() => ({
   reads: [] as unknown[],
   /** While set, a read waits for it before answering. */
   hold: null as Promise<void> | null,
+  /** While set, what a refresh read answers instead of `rows`. */
+  refreshed: null as unknown,
+  /** While set, a refresh read waits for it before answering. */
+  holdRefresh: null as Promise<void> | null,
 }));
 
 vi.mock('../irc/client', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../irc/client')>();
   return {
     ...actual,
-    listDeviceRows: async (options?: unknown) => {
+    listDeviceRows: async (options?: { refresh?: boolean }) => {
       seam.reads.push(options);
       if (seam.hold) await seam.hold;
+      if (options?.refresh) {
+        if (seam.holdRefresh) await seam.holdRefresh;
+        if (seam.refreshed !== null) return seam.refreshed;
+      }
       return seam.rows;
     },
   };
@@ -109,6 +117,8 @@ beforeEach(async () => {
   seam.published = true;
   seam.reads = [];
   seam.hold = null;
+  seam.refreshed = null;
+  seam.holdRefresh = null;
   localStorage.setItem('freeq-broker-base', BROKER);
   localStorage.setItem('freeq-broker-token', 'BT-TEST');
 
@@ -188,6 +198,28 @@ describe('the Devices list', () => {
     release();
     await waitFor(() => screen.getByText('Work laptop'));
     expect(screen.queryByText('Loading devices…')).toBeNull();
+  });
+
+  it('shows the cached rows on open, then the account listed afresh', async () => {
+    const here = { kid: thisDevice.kid, createdAt: THIS_CREATED, published: true };
+    seam.rows = await client.deviceRowsFrom(DID, records, here);
+    // A device that signed in after the cached listing was taken.
+    const late = await aDevice('Private window', '2026-03-01T00:00:00.000Z');
+    seam.refreshed = await client.deviceRowsFrom(DID, [...records, late.record], here);
+    let release!: () => void;
+    seam.holdRefresh = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    panel();
+
+    // The cached rows at once, with no loading line over them.
+    await waitFor(() => screen.getByText('Work laptop'));
+    expect(screen.queryByText('Private window')).toBeNull();
+    expect(screen.queryByText('Loading devices…')).toBeNull();
+
+    release();
+    await waitFor(() => screen.getByText('Private window'));
+    expect(seam.reads).toEqual([{ refresh: false }, { refresh: true }]);
   });
 
   it('offers Publish key on this device until its key is in the account', async () => {
@@ -295,6 +327,8 @@ describe('the Devices list', () => {
     expect(screen.queryByRole('dialog')).toBeNull();
 
     fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    await waitFor(() => expect(seam.reads).toHaveLength(2));
+    const readsBeforeSignOut = seam.reads.length;
     fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Sign out' }));
 
     await waitFor(() => expect(calls).toHaveLength(2));
@@ -313,7 +347,9 @@ describe('the Devices list', () => {
     // The list opened from the key cache, and is read afresh after the
     // sign-out so the retirement just written shows.
     expect(seam.reads[0]).toEqual({ refresh: false });
-    await waitFor(() => expect(seam.reads.at(-1)).toEqual({ refresh: true }));
+    await waitFor(() =>
+      expect(seam.reads.slice(readsBeforeSignOut)).toContainEqual({ refresh: true }),
+    );
   });
 
   it('opens the sign-out confirmation outside the Settings panel', async () => {

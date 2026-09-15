@@ -254,6 +254,8 @@ export function DevicesSection() {
   const [loading, setLoading] = useState(true);
   // Set by a sign-out, so the next read lists the account afresh.
   const refreshNext = useRef(false);
+  // Set once this open has listed the account afresh.
+  const listedOnOpen = useRef(false);
   const [ask, setAsk] = useState<DeviceRow | null>(null);
   const [signIn, setSignIn] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
@@ -262,15 +264,34 @@ export function DevicesSection() {
   const [busy, setBusy] = useState(false);
 
   // Re-read on mount, and again whenever this device's own key changes —
-  // publishing it is the one thing that lands there rather than here.
+  // publishing it is the one thing that lands there rather than here. On open
+  // the cached rows show at once, then the account is listed afresh so a
+  // device that signed in since the cached listing appears.
   useEffect(() => {
     let live = true;
     const refresh = refreshNext.current;
     refreshNext.current = false;
-    listDeviceRows({ refresh })
-      .then((r) => live && setRows(r))
-      .catch(() => live && setRows([]))
-      .finally(() => live && setLoading(false));
+    const thenRefresh = !refresh && !listedOnOpen.current;
+    (async () => {
+      let cached: DeviceRow[] = [];
+      try {
+        cached = await listDeviceRows({ refresh });
+      } catch {
+        // Left empty; the refresh below may still fill it.
+      }
+      if (!live) return;
+      setRows(cached);
+      if (!thenRefresh || cached.length > 0) setLoading(false);
+      if (!thenRefresh) return;
+      listedOnOpen.current = true;
+      try {
+        const fresh = await listDeviceRows({ refresh: true });
+        if (live) setRows(fresh);
+      } catch {
+        // Keep the cached rows.
+      }
+      if (live) setLoading(false);
+    })();
     return () => {
       live = false;
     };
