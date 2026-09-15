@@ -61,7 +61,7 @@ If the creator key's public half is not registered under the owner's DID, the
 script prints one line and waits:
 
 ```
-/raw MSGSIG <base64url-public-key>
+/raw MSGSIG <base64url-public-key> delegation
 ```
 
 The user pastes it into any freeq client already authenticated as them (web

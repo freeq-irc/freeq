@@ -5403,3 +5403,121 @@ mod dm_fallback_tests {
         assert!(!dm_fallback_row_is_addressable(key, Some(ALICE)));
     }
 }
+
+#[cfg(test)]
+mod scoped_key_tests {
+    //! Which keys `verifying_key_for` will answer with. A key scoped to
+    //! delegation is not one of them.
+
+    use super::*;
+    use crate::connection::{PURPOSE_DELEGATION, parse_msgsig_purpose};
+    use base64::Engine as _;
+
+    const DID: &str = "did:plc:owner";
+
+    fn state_with_key(purpose: Option<&str>) -> (Arc<SharedState>, String) {
+        let state = crate::server::test_state_with_db();
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let vk = key.verifying_key();
+        state
+            .with_db(|db| db.save_signing_key_scoped(DID, vk.as_bytes(), "local-session", purpose));
+        (state, freeq_sdk::sigtag::derive_kid(&vk))
+    }
+
+    #[test]
+    fn a_delegation_key_does_not_verify_a_message() {
+        let (state, kid) = state_with_key(Some(PURPOSE_DELEGATION));
+        assert!(verifying_key_for(DID, &kid, None, &state).is_none());
+    }
+
+    /// An unscoped key verifies everything.
+    #[test]
+    fn an_unscoped_key_still_verifies_a_message() {
+        let (state, kid) = state_with_key(None);
+        assert!(verifying_key_for(DID, &kid, None, &state).is_some());
+    }
+
+    #[test]
+    fn a_delegation_key_is_still_on_file_for_its_own_purpose() {
+        let (state, kid) = state_with_key(Some(PURPOSE_DELEGATION));
+        let row = state
+            .with_db(|db| db.get_signing_key_row(DID, &kid))
+            .flatten()
+            .expect("the key is stored, just not for messages");
+        assert_eq!(row.purpose.as_deref(), Some(PURPOSE_DELEGATION));
+    }
+
+    /// The upgrade path: the creator seed is reused, so re-authorizing pastes
+    /// the same key. Naming a scope is what applies it.
+    #[test]
+    fn re_registering_an_unscoped_key_with_a_scope_narrows_it() {
+        let (state, kid) = state_with_key(None);
+        assert!(verifying_key_for(DID, &kid, None, &state).is_some());
+
+        let pubkey = state
+            .with_db(|db| db.get_signing_key_row(DID, &kid))
+            .flatten()
+            .unwrap()
+            .pubkey;
+        state.with_db(|db| {
+            db.save_signing_key_scoped(DID, &pubkey, "local-session", Some(PURPOSE_DELEGATION))
+        });
+
+        assert!(verifying_key_for(DID, &kid, None, &state).is_none());
+    }
+
+    /// A scope only ever narrows what a key verifies.
+    #[test]
+    fn re_registering_a_scoped_key_without_one_leaves_it_scoped() {
+        let (state, kid) = state_with_key(Some(PURPOSE_DELEGATION));
+        let pubkey = state
+            .with_db(|db| db.get_signing_key_row(DID, &kid))
+            .flatten()
+            .unwrap()
+            .pubkey;
+        state.with_db(|db| db.save_signing_key_scoped(DID, &pubkey, "local-session", None));
+
+        assert!(verifying_key_for(DID, &kid, None, &state).is_none());
+    }
+
+    /// The bypass this closes: re-sending the old unscoped paste line would
+    /// otherwise put a scoped key back in the map the verifier reads first.
+    #[test]
+    fn a_bare_registration_cannot_widen_a_scoped_key() {
+        let state = crate::server::test_state_with_db();
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let vk = key.verifying_key();
+        let pubkey_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.as_bytes());
+        let kid = freeq_sdk::sigtag::derive_kid(&vk);
+        state.session_dids.lock().insert("s1".into(), DID.into());
+
+        crate::connection::file_session_signing_key(
+            &state,
+            "s1",
+            Some(DID),
+            &pubkey_b64,
+            Some(PURPOSE_DELEGATION),
+        )
+        .unwrap();
+
+        // The old ceremony line: same key, no scope named.
+        crate::connection::file_session_signing_key(&state, "s1", Some(DID), &pubkey_b64, None)
+            .unwrap();
+
+        assert!(
+            verifying_key_for(DID, &kid, Some("s1"), &state).is_none(),
+            "a scoped key must not be reinstated by a bare registration"
+        );
+    }
+
+    #[test]
+    fn the_wire_takes_one_scope_or_none() {
+        assert_eq!(parse_msgsig_purpose(None), Ok(None));
+        assert_eq!(
+            parse_msgsig_purpose(Some(PURPOSE_DELEGATION)),
+            Ok(Some(PURPOSE_DELEGATION))
+        );
+        assert!(parse_msgsig_purpose(Some("message")).is_err());
+        assert!(parse_msgsig_purpose(Some("")).is_err());
+    }
+}
