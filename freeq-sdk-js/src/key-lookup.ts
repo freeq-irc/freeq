@@ -22,6 +22,7 @@ import {
   deviceKeyHistory,
   listRecordEntries,
   provenRecords,
+  retirementClosure,
 } from './identity-records.js';
 import { deriveKid } from './signing.js';
 
@@ -359,6 +360,31 @@ export class KeyLookup {
     await this.load();
     this.refreshed.set(did, Date.now());
     return this.listDeviceRecords(did);
+  }
+
+  /**
+   * The proven records that decide whether `did`'s device key `kid` is
+   * retired (`retirementClosure`), from a new listing. Only those records are
+   * proven, through this lookup's proven set; the listing is not kept as the
+   * account's records, since it holds only part of them.
+   */
+  async provenRetirementClosure(did: string, kid: string): Promise<unknown[]> {
+    await this.load();
+    const { fetch, resolveDid } = this.reader;
+    const listed = await listRecordEntries(fetch, resolveDid, did, DEVICE_KEY_TYPE);
+    const closure = retirementClosure(did, kid, listed, (entry) => entry.value);
+    if (closure.length === 0) return [];
+    const records = await provenRecords(
+      fetch,
+      resolveDid,
+      did,
+      DEVICE_KEY_TYPE,
+      closure,
+      this.proven,
+      this.proving,
+    );
+    await this.save();
+    return records;
   }
 
   /**

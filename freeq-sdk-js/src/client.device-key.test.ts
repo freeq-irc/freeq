@@ -9,6 +9,7 @@ import { MemoryDeviceKeyStore, type StoredDeviceKey } from './device-key.js';
 import { decodeMultibaseEd25519, verifyEd25519 } from './did-key.js';
 import { recordSignedBytes } from './identity-records.js';
 import { deriveKid } from './signing.js';
+import type { ListedEntry } from '../test/repo-proofs.js';
 
 // ── WebSocket mock ────────────────────────────────────────────────
 
@@ -327,17 +328,19 @@ describe('a stored key the account has retired', () => {
     return repo;
   }
 
-  /** A client whose key lookup reads the account from `repo`; how many
-   *  listings it served. */
+  /** A client whose key lookup reads the account from `repo`, with an empty
+   *  proven set; how many listings and proofs it served. */
   async function clientReading(store: MemoryDeviceKeyStore, repo: StubRepo, freshSignIn?: boolean) {
     const { FreeqClient } = await import('./client.js');
     const { KeyLookup } = await import('./key-lookup.js');
     let listings = 0;
+    let proofs = 0;
     const doc = await repo.document('https://pds.test.example');
     const reader = {
       fetch: async (url: string): Promise<Response> => {
         const parsed = new URL(url);
         if (parsed.pathname === '/xrpc/com.atproto.repo.listRecords') listings++;
+        if (parsed.pathname === '/xrpc/com.atproto.sync.getRecord') proofs++;
         return (await repo.respond(parsed)) ?? new Response('{}', { status: 404 });
       },
       resolveDid: async () => doc,
@@ -355,7 +358,7 @@ describe('a stored key the account has retired', () => {
       ...(freshSignIn === undefined ? {} : { freshSignIn }),
     });
     client.setSaslCredentials({ token: 't', did: DID, pdsUrl: 'https://pds.example', method: 'oauth' });
-    return { client, lookup, listings: () => listings };
+    return { client, lookup, listings: () => listings, proofs: () => proofs };
   }
 
   it('is replaced right after a new sign-in when the key lookup holds a listing from before the retirement', async () => {
@@ -450,5 +453,99 @@ describe('a stored key the account has retired', () => {
     await flushAsync();
     const ws2 = await login(client);
     expect(msgsigOf(ws2)).toBe(await rawPublicB64(stored.keyPair));
+  });
+
+  describe('checked cold against an account of fifty device keys', () => {
+    /** `stored`'s own record and 49 other keys' records, in one repository. */
+    async function account(stored: StoredDeviceKey) {
+      const { buildDeviceRecord } = await import('./identity-records.js');
+      const { recordKeyOf } = await import('./device-key.js');
+      const repo = await repoHolding();
+      const values: unknown[] = [];
+      const own = (await recordsOf(stored)).record;
+      const ownEntry = await repo.add(KEY_TYPE, own);
+      values.push(own);
+      const others: { key: Awaited<ReturnType<typeof recordKeyOf>>; kid: string; entry: ListedEntry }[] = [];
+      for (let i = 0; i < 49; i++) {
+        const key = await recordKeyOf((await storedKey()).keyPair);
+        const record = await buildDeviceRecord(key, DID, stored.createdAt);
+        values.push(record);
+        const entry = await repo.add(KEY_TYPE, record);
+        others.push({ key, kid: await deriveKid(decodeMultibaseEd25519(key.publicKeyMultibase)), entry });
+      }
+      const storedKid = await deriveKid(new Uint8Array(await crypto.subtle.exportKey('raw', stored.keyPair.publicKey)));
+      return { repo, values, ownEntry, others, storedKid };
+    }
+
+    it('presents the stored key and fetches no proof when nothing retires it', async () => {
+      const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
+      const { repo } = await account(stored);
+      const store = new MemoryDeviceKeyStore(stored);
+      const { client, lookup, proofs } = await clientReading(store, repo, true);
+      const ws = await login(client);
+      expect(msgsigOf(ws)).toBe(await rawPublicB64(stored.keyPair));
+      expect(proofs(), 'no retirement names the key, so no proof can change the answer').toBe(0);
+
+      // The check stored nothing as the account's listing.
+      expect(await lookup.provenDeviceRecords(DID)).toHaveLength(50);
+    });
+
+    it('replaces a key another live key retired, proving only the records that decide it', async () => {
+      const { buildDeviceRetirement } = await import('./identity-records.js');
+      const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
+      const { repo, ownEntry, others, storedKid } = await account(stored);
+      const signer = others[7]!;
+      const retirementEntry = await repo.add(
+        KEY_TYPE,
+        await buildDeviceRetirement(signer.key, DID, storedKid, RETIRED),
+      );
+      const store = new MemoryDeviceKeyStore(stored);
+      const { client, lookup, proofs } = await clientReading(store, repo, true);
+      const ws = await login(client);
+
+      expect(msgsigOf(ws)).not.toBe(await rawPublicB64(stored.keyPair));
+      expect((await store.load())!.keyPair).not.toBe(stored.keyPair);
+      expect(proofs()).toBe(3);
+      for (const entry of [ownEntry, signer.entry, retirementEntry]) {
+        expect(repo.proofReads(entry)).toBe(1);
+      }
+      expect(await lookup.provenDeviceRecords(DID)).toHaveLength(51);
+    });
+
+    it('keeps the key when the retirement proof fails', async () => {
+      const { buildDeviceRetirement } = await import('./identity-records.js');
+      const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
+      const { repo, others, storedKid } = await account(stored);
+      const signer = others[3]!;
+      const retirement = await buildDeviceRetirement(signer.key, DID, storedKid, RETIRED);
+      await repo.addForged(KEY_TYPE, retirement, (await recordsOf(stored)).record);
+      const store = new MemoryDeviceKeyStore(stored);
+      const { client, proofs } = await clientReading(store, repo, true);
+      const ws = await login(client);
+
+      expect(msgsigOf(ws)).toBe(await rawPublicB64(stored.keyPair));
+      expect((await store.load())!.keyPair).toBe(stored.keyPair);
+      expect(proofs()).toBe(3);
+    });
+
+    it('keeps the key when its retirement was signed by a key already retired, as the full fold does', async () => {
+      const { buildDeviceRetirement, deviceKeyHistory } = await import('./identity-records.js');
+      const stored = await storedKey('at://did:plc:alice/at.freeq.deviceKey/3k');
+      const { repo, values, others, storedKid } = await account(stored);
+      const signer = others[11]!;
+      const signerGone = await buildDeviceRetirement(signer.key, DID, signer.kid, '2026-09-11T12:00:00.000Z');
+      const late = await buildDeviceRetirement(signer.key, DID, storedKid, RETIRED);
+      await repo.add(KEY_TYPE, signerGone);
+      await repo.add(KEY_TYPE, late);
+      const store = new MemoryDeviceKeyStore(stored);
+      const { client, proofs } = await clientReading(store, repo, true);
+      const ws = await login(client);
+
+      const full = (await deviceKeyHistory(DID, [...values, signerGone, late])).find((k) => k.kid === storedKid);
+      expect(full?.retiredAt).toBeNull();
+      expect(msgsigOf(ws)).toBe(await rawPublicB64(stored.keyPair));
+      expect((await store.load())!.keyPair).toBe(stored.keyPair);
+      expect(proofs()).toBe(4);
+    });
   });
 });

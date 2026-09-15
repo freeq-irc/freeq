@@ -243,6 +243,49 @@ export async function deviceKeyHistory(
 }
 
 /**
+ * The entries of `did`'s device key records that decide whether key `kid` is
+ * retired: none when no entry retires `kid`; otherwise the retirements of
+ * `kid`, and, repeatedly, of each key that signed one of those, with the key
+ * records of every such key. `deviceKeyHistory` over these gives `kid` the
+ * `retiredAt` it gives over all of `entries`, and over any subset of them
+ * holding these, so a caller need prove only these to decide it.
+ */
+export function retirementClosure<T>(
+  did: string,
+  kid: string,
+  entries: T[],
+  valueOf: (entry: T) => unknown,
+): T[] {
+  const named = entries.map((entry) => {
+    const value = valueOf(entry);
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+    const raw = value as Record<string, unknown>;
+    if (raw.$type !== DEVICE_KEY_TYPE || raw.did !== did) return null;
+    return {
+      kid: typeof raw.kid === 'string' ? raw.kid : undefined,
+      revokes: typeof raw.revokes === 'string' ? raw.revokes : undefined,
+    };
+  });
+  if (!named.some((n) => n?.revokes === kid)) return [];
+  const kids = new Set([kid]);
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const n of named) {
+      if (n?.revokes === undefined || n.kid === undefined) continue;
+      if (kids.has(n.revokes) && !kids.has(n.kid)) {
+        kids.add(n.kid);
+        grew = true;
+      }
+    }
+  }
+  return entries.filter((_, i) => {
+    const n = named[i];
+    if (!n) return false;
+    return n.revokes !== undefined ? kids.has(n.revokes) : n.kid !== undefined && kids.has(n.kid);
+  });
+}
+
+/**
  * The bots `did` claims at `at`, earliest first. A claim counts only if the
  * owner key that signed it was itself live under the device fold when the
  * claim was written.

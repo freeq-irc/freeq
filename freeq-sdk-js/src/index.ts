@@ -115,6 +115,7 @@ export {
   verifyProof,
   verifyRecord,
   deviceKeyHistory,
+  retirementClosure,
 } from './identity-records.js';
 export type {
   ListedRecord,
