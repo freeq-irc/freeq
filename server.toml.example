@@ -74,6 +74,7 @@
 # no_guest = false
 # allowed_dids = ["did:plc:abc..."]
 # allowed_did_domains = ["example.com"]
+# allow_delegated_agents = false
 # oper_password = "change-me"
 # oper_dids = ["did:plc:abc..."]
 # reverify_identity_mins = 0

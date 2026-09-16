@@ -44,6 +44,9 @@ pub struct ChallengeResponse {
     /// bind the response to the specific challenge that was issued.
     #[serde(default)]
     pub challenge_nonce: Option<String>,
+    /// A `FreeqBotDelegation/v1` cert naming the person this agent acts for.
+    #[serde(default)]
+    pub delegation: Option<serde_json::Value>,
 }
 
 /// Stored challenge data: the struct for validation + raw bytes for signature verification.
@@ -501,6 +504,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            delegation: None,
         };
         let json = serde_json::to_vec(&resp).unwrap();
         assert!(json.len() % 3 != 0, "fixture must exercise padding");
@@ -543,11 +547,35 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            delegation: None,
         };
         let json = serde_json::to_vec(&resp).unwrap();
         let encoded = URL_SAFE_NO_PAD.encode(&json);
         let decoded = decode_response(&encoded).unwrap();
         assert_eq!(decoded.did, "did:plc:abc123");
+    }
+
+    /// The wire contract for delegated connects.
+    #[test]
+    fn decode_response_carries_a_delegation_cert() {
+        let raw = serde_json::json!({
+            "did": "did:key:zAgent",
+            "signature": "sig",
+            "delegation": {"type": "FreeqBotDelegation/v1", "creator_did": "did:plc:owner"},
+        });
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&raw).unwrap());
+        let decoded = decode_response(&encoded).unwrap();
+        assert_eq!(
+            decoded.delegation.as_ref().unwrap()["creator_did"],
+            "did:plc:owner"
+        );
+    }
+
+    #[test]
+    fn a_response_without_a_delegation_still_decodes() {
+        let raw = serde_json::json!({"did": "did:plc:abc", "signature": "sig"});
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&raw).unwrap());
+        assert!(decode_response(&encoded).unwrap().delegation.is_none());
     }
 
     #[test]
@@ -559,6 +587,7 @@ mod tests {
             pds_url: Some("https://pds.example.com".to_string()),
             dpop_proof: None,
             challenge_nonce: Some("test-nonce".to_string()),
+            delegation: None,
         };
         let json = serde_json::to_vec(&resp).unwrap();
         let encoded = URL_SAFE_NO_PAD.encode(&json);
@@ -594,6 +623,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            delegation: None,
         };
 
         let result = verify_response(&challenge, &challenge_bytes, &response, &resolver).await;
@@ -628,6 +658,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            delegation: None,
         };
 
         let result = verify_response(&challenge, &challenge_bytes, &response, &resolver).await;
@@ -660,6 +691,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            delegation: None,
         };
 
         let result = verify_response(&challenge, &challenge_bytes, &response, &resolver).await;
@@ -692,6 +724,7 @@ mod tests {
             pds_url: None,
             dpop_proof: None,
             challenge_nonce: None,
+            delegation: None,
         };
 
         let result = verify_response(&challenge, &challenge_bytes, &response, &resolver).await;

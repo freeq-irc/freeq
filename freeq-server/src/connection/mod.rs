@@ -254,6 +254,7 @@ pub struct Connection {
     pub(crate) sasl_in_progress: bool,
     pub(crate) sasl_failures: u8,
     pub(crate) dpop_retries: u8,
+    pub(crate) sasl_response_buf: String,
 }
 
 impl Connection {
@@ -290,6 +291,7 @@ impl Connection {
             sasl_in_progress: false,
             sasl_failures: 0,
             dpop_retries: 0,
+            sasl_response_buf: String::new(),
         }
     }
 

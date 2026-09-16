@@ -287,6 +287,11 @@ pub struct ServerConfig {
     #[arg(long, env = "FREEQ_NO_GUEST", default_value_t = false)]
     pub no_guest: bool,
 
+    /// Let an agent through the connect allowlist when it presents a signed
+    /// delegation certificate from an owner who is allowed.
+    #[arg(long, env = "FREEQ_ALLOW_DELEGATED_AGENTS", default_value_t = false)]
+    pub allow_delegated_agents: bool,
+
     /// Periodically re-verify connected users' DIDs and disconnect any whose DID
     /// document no longer contains a valid authentication key (offboarding /
     /// key removal). Value is the interval in minutes; 0 = disabled (default).
@@ -412,6 +417,7 @@ impl Default for ServerConfig {
             allowed_dids: vec![],
             allowed_did_domains: vec![],
             no_guest: false,
+            allow_delegated_agents: false,
             reverify_identity_mins: 0,
             message_retention_days: 0,
             event_retention_days: 0,
@@ -557,6 +563,7 @@ struct FileConfig {
     allowed_dids: Option<Vec<String>>,
     allowed_did_domains: Option<Vec<String>>,
     no_guest: Option<bool>,
+    allow_delegated_agents: Option<bool>,
     reverify_identity_mins: Option<u64>,
     message_retention_days: Option<u64>,
     event_retention_days: Option<u64>,
@@ -674,6 +681,7 @@ fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConf
         allowed_did_domains,
         no_guest,
         rotate_signing_key,
+        allow_delegated_agents,
         reverify_identity_mins,
         message_retention_days,
         event_retention_days,

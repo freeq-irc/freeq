@@ -9,6 +9,14 @@ use crate::sasl;
 use crate::server::SharedState;
 use std::sync::Arc;
 
+/// One SASL chunk, per IRCv3. A chunk of exactly this length means more is
+/// coming; anything shorter ends the response.
+const SASL_CHUNK_LEN: usize = 400;
+
+/// Ceiling on a response reassembled for a connection that has not yet
+/// authenticated.
+const MAX_SASL_RESPONSE_LEN: usize = 8192;
+
 pub(super) fn handle_cap(
     conn: &mut Connection,
     msg: &Message,
@@ -183,6 +191,70 @@ pub(super) fn handle_cap(
     }
 }
 
+/// What a single `AUTHENTICATE` line contributed to the response.
+enum Reassembly {
+    /// A piece landed and the rest is still coming.
+    Partial,
+    /// The whole response, ready to decode.
+    Complete(String),
+    /// More than any real response could need.
+    TooLong,
+}
+
+/// Join the pieces of a SASL response, which IRCv3 splits at
+/// `SASL_CHUNK_LEN`. The response ends on a shorter piece, or on `+` when the
+/// last one landed exactly on the boundary.
+fn accumulate_response(conn: &mut Connection, param: &str) -> Reassembly {
+    let chunk = if param == "+" { "" } else { param };
+    if conn.sasl_response_buf.len() + chunk.len() > MAX_SASL_RESPONSE_LEN {
+        conn.sasl_response_buf.clear();
+        return Reassembly::TooLong;
+    }
+    conn.sasl_response_buf.push_str(chunk);
+    if chunk.len() == SASL_CHUNK_LEN {
+        return Reassembly::Partial;
+    }
+    Reassembly::Complete(std::mem::take(&mut conn.sasl_response_buf))
+}
+
+/// Handles the case where the allowlist has never heard of an agent's own
+/// `did:key` but the person it acts for is allowed.
+async fn delegated_admit(
+    state: &Arc<SharedState>,
+    agent_did: &str,
+    delegation: Option<&serde_json::Value>,
+) -> bool {
+    let Some(cert) = delegation else {
+        return false;
+    };
+    if !state.config.allow_delegated_agents {
+        tracing::warn!(
+            agent = %agent_did,
+            "an agent presented a delegation, but --allow-delegated-agents is off"
+        );
+        return false;
+    }
+    let owner = match super::provenance::verified_owner_from_cert(state, agent_did, cert) {
+        Ok(owner) => owner,
+        Err(reason) => {
+            tracing::warn!(agent = %agent_did, %reason, "delegation rejected");
+            return false;
+        }
+    };
+    if !state.did_is_allowed_resolved(&owner, None).await {
+        tracing::warn!(
+            agent = %agent_did, %owner,
+            "delegation verified, but the owner is not on the connect allowlist"
+        );
+        return false;
+    }
+    tracing::info!(
+        agent = %agent_did, %owner,
+        "admitting an agent on a verified delegation from an allowed owner"
+    );
+    true
+}
+
 pub(super) async fn handle_authenticate(
     conn: &mut Connection,
     msg: &Message,
@@ -201,6 +273,7 @@ pub(super) async fn handle_authenticate(
     if param == "*" {
         // SASL abort — client is cancelling the authentication attempt
         conn.sasl_in_progress = false;
+        conn.sasl_response_buf.clear();
         let fail = Message::from_server(
             server_name,
             irc::ERR_SASLFAIL,
@@ -210,13 +283,38 @@ pub(super) async fn handle_authenticate(
         return;
     }
 
+    // A client that chunked its response may send the terminator after a short
+    // chunk has already ended it. The exchange is over; there is nothing to do.
+    if param == "+" && !conn.sasl_in_progress {
+        return;
+    }
+
     if param.eq_ignore_ascii_case("ATPROTO-CHALLENGE") {
         conn.sasl_in_progress = true;
         conn.dpop_retries = 0; // Reset DPoP retry counter on new SASL attempt
+        conn.sasl_response_buf.clear();
         let encoded = state.challenge_store.create(session_id);
         let reply = Message::new("AUTHENTICATE", vec![&encoded]);
         send(state, session_id, format!("{reply}\r\n"));
     } else if conn.sasl_in_progress {
+        let full = match accumulate_response(conn, param) {
+            Reassembly::Partial => return,
+            Reassembly::TooLong => {
+                conn.sasl_in_progress = false;
+                conn.sasl_failures += 1;
+                crate::server::Metrics::bump(&state.metrics.sasl_failure_total);
+                let fail = Message::from_server(
+                    server_name,
+                    irc::ERR_SASLFAIL,
+                    vec![conn.nick_or_star(), "SASL response too long"],
+                );
+                send(state, session_id, format!("{fail}\r\n"));
+                tracing::warn!(%session_id, "SASL response exceeded the reassembly limit");
+                return;
+            }
+            Reassembly::Complete(full) => full,
+        };
+        let param = full.as_str();
         if let Some(response) = sasl::decode_response(param) {
             // Check for web-token method first (server-side OAuth pre-verified)
             let mut web_handle: Option<String> = None;
@@ -260,6 +358,7 @@ pub(super) async fn handle_authenticate(
                             state
                                 .did_is_allowed_resolved(did, web_handle.as_deref())
                                 .await
+                                || delegated_admit(state, did, response.delegation.as_ref()).await
                         }
                         Err(_) => true,
                     };
@@ -527,5 +626,210 @@ pub(super) async fn handle_authenticate(
             vec![conn.nick_or_star(), "Unsupported SASL mechanism"],
         );
         send(state, session_id, format!("{fail}\r\n"));
+    }
+}
+
+#[cfg(test)]
+mod delegated_admit_tests {
+    use super::*;
+    use base64::Engine;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    const AGENT: &str = "did:key:zAgent";
+    const OWNER: &str = "did:plc:owner";
+    const STRANGER: &str = "did:plc:stranger";
+
+    fn signed_cert(bot_did: &str, creator_did: &str, key: &SigningKey) -> serde_json::Value {
+        let mut cert = unsigned_cert(bot_did, creator_did);
+        let canonical = freeq_sdk::canonical::canonicalize(&cert).unwrap();
+        let sig = key.sign(canonical.as_bytes());
+        cert["signature"] = serde_json::Value::String(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes()),
+        );
+        cert
+    }
+
+    fn unsigned_cert(bot_did: &str, creator_did: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "FreeqBotDelegation/v1",
+            "bot_did": bot_did,
+            "bot_public_key": bot_did.strip_prefix("did:key:").unwrap_or(""),
+            "creator_did": creator_did,
+            "created_at": "2026-09-07T00:00:00Z",
+            "revocation_authority": creator_did,
+        })
+    }
+
+    /// An instance that allows OWNER and nobody else, with the owner's key on
+    /// file as if they had already sent MSGSIG.
+    fn state_allowing_owner(allow_delegated: bool) -> (Arc<SharedState>, SigningKey) {
+        let state = crate::server::test_state_with_config(crate::config::ServerConfig {
+            listen_addr: "127.0.0.1:0".to_string(),
+            server_name: "test-delegation".to_string(),
+            challenge_timeout_secs: 60,
+            allowed_dids: vec![OWNER.to_string()],
+            allow_delegated_agents: allow_delegated,
+            ..Default::default()
+        });
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        state.with_db(|db| db.save_signing_key(OWNER, key.verifying_key().as_bytes()));
+        (state, key)
+    }
+
+    #[tokio::test]
+    async fn an_agent_is_admitted_when_its_owner_is_allowed() {
+        let (state, key) = state_allowing_owner(true);
+        let cert = signed_cert(AGENT, OWNER, &key);
+        assert!(delegated_admit(&state, AGENT, Some(&cert)).await);
+    }
+
+    /// The attack this exists to stop: naming an allowed owner without being
+    /// able to sign for them.
+    #[tokio::test]
+    async fn an_unsigned_claim_admits_nobody() {
+        let (state, _key) = state_allowing_owner(true);
+        let cert = unsigned_cert(AGENT, OWNER);
+        assert!(!delegated_admit(&state, AGENT, Some(&cert)).await);
+    }
+
+    #[tokio::test]
+    async fn a_signature_from_the_wrong_key_admits_nobody() {
+        let (state, _key) = state_allowing_owner(true);
+        let impostor = SigningKey::generate(&mut rand::rngs::OsRng);
+        let cert = signed_cert(AGENT, OWNER, &impostor);
+        assert!(!delegated_admit(&state, AGENT, Some(&cert)).await);
+    }
+
+    /// A cert about a different agent proves nothing about the presenter.
+    #[tokio::test]
+    async fn a_certificate_about_another_agent_admits_nobody() {
+        let (state, key) = state_allowing_owner(true);
+        let cert = signed_cert("did:key:zSomeoneElse", OWNER, &key);
+        assert!(!delegated_admit(&state, AGENT, Some(&cert)).await);
+    }
+
+    /// Delegation carries the owner's authority, so it cannot exceed it.
+    #[tokio::test]
+    async fn a_delegation_from_an_owner_who_is_not_allowed_admits_nobody() {
+        let (state, _key) = state_allowing_owner(true);
+        let stranger_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        state.with_db(|db| db.save_signing_key(STRANGER, stranger_key.verifying_key().as_bytes()));
+        let cert = signed_cert(AGENT, STRANGER, &stranger_key);
+        assert!(!delegated_admit(&state, AGENT, Some(&cert)).await);
+    }
+
+    /// The attack this closes: a federation peer chooses which DID it names
+    /// when it asks for a key, so a key it served proves nothing about who may
+    /// act for that DID.
+    #[tokio::test]
+    async fn a_key_a_peer_supplied_cannot_sign_a_delegation() {
+        let (state, _key) = state_allowing_owner(true);
+        let peer_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        state.with_db(|db| {
+            db.save_signing_key_from(OWNER, peer_key.verifying_key().as_bytes(), "origin-server")
+        });
+        let cert = signed_cert(AGENT, OWNER, &peer_key);
+        assert!(!delegated_admit(&state, AGENT, Some(&cert)).await);
+    }
+
+    /// Anything the owner did register here still counts. A row with no source
+    /// predates the column and takes the same path as this one.
+    #[tokio::test]
+    async fn a_key_from_the_owners_own_records_still_signs() {
+        let (state, _key) = state_allowing_owner(true);
+        let own_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        state.with_db(|db| {
+            db.save_signing_key_from(OWNER, own_key.verifying_key().as_bytes(), "identity-record")
+        });
+        let cert = signed_cert(AGENT, OWNER, &own_key);
+        assert!(delegated_admit(&state, AGENT, Some(&cert)).await);
+    }
+
+    #[tokio::test]
+    async fn the_instance_must_opt_in() {
+        let (state, key) = state_allowing_owner(false);
+        let cert = signed_cert(AGENT, OWNER, &key);
+        assert!(!delegated_admit(&state, AGENT, Some(&cert)).await);
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_no_certificate_admits_nobody() {
+        let (state, _key) = state_allowing_owner(true);
+        assert!(!delegated_admit(&state, AGENT, None).await);
+    }
+}
+
+#[cfg(test)]
+mod sasl_reassembly_tests {
+    use super::*;
+
+    fn conn() -> Connection {
+        Connection::new("sess-1".to_string())
+    }
+
+    fn complete(r: Reassembly) -> Option<String> {
+        match r {
+            Reassembly::Complete(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_response_shorter_than_a_chunk_arrives_whole() {
+        let mut c = conn();
+        assert_eq!(
+            complete(accumulate_response(&mut c, "abc")),
+            Some("abc".to_string())
+        );
+        assert!(c.sasl_response_buf.is_empty());
+    }
+
+    /// A full chunk says nothing about whether the response ended there, so
+    /// the server has to keep waiting.
+    #[test]
+    fn a_full_chunk_waits_for_more() {
+        let mut c = conn();
+        let chunk = "x".repeat(SASL_CHUNK_LEN);
+        assert!(matches!(
+            accumulate_response(&mut c, &chunk),
+            Reassembly::Partial
+        ));
+        assert_eq!(c.sasl_response_buf.len(), SASL_CHUNK_LEN);
+    }
+
+    #[test]
+    fn pieces_are_joined_in_order() {
+        let mut c = conn();
+        let first = "a".repeat(SASL_CHUNK_LEN);
+        accumulate_response(&mut c, &first);
+        let joined = complete(accumulate_response(&mut c, "bbb")).unwrap();
+        assert_eq!(joined, format!("{first}bbb"));
+        assert!(c.sasl_response_buf.is_empty());
+    }
+
+    /// The case the terminator exists for: the response is a whole number of
+    /// chunks, so nothing shorter ever arrives to end it.
+    #[test]
+    fn a_bare_plus_ends_a_response_that_fills_its_last_chunk() {
+        let mut c = conn();
+        let chunk = "y".repeat(SASL_CHUNK_LEN);
+        accumulate_response(&mut c, &chunk);
+        assert_eq!(complete(accumulate_response(&mut c, "+")), Some(chunk));
+    }
+
+    #[test]
+    fn an_endless_stream_is_refused_and_dropped() {
+        let mut c = conn();
+        let chunk = "z".repeat(SASL_CHUNK_LEN);
+        let mut refused = false;
+        for _ in 0..(MAX_SASL_RESPONSE_LEN / SASL_CHUNK_LEN + 2) {
+            if matches!(accumulate_response(&mut c, &chunk), Reassembly::TooLong) {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "an unbounded stream of chunks must be refused");
+        // Nothing is held for a connection that has not authenticated.
+        assert!(c.sasl_response_buf.is_empty());
     }
 }

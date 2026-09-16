@@ -128,6 +128,9 @@ export interface SaslCredentials {
   /** Required when `method === "crypto"`. Called on the raw challenge
    *  bytes the server emits in AUTHENTICATE. Returns base64url(sig). */
   signer?: (challengeBytes: Uint8Array) => Promise<string>;
+  /** A signed `FreeqBotDelegation/v1` cert, sent with the response so this agent
+   *  can be admitted if a valid owner is named. */
+  delegation?: unknown;
 }
 
 /** Options for creating a FreeqClient. */

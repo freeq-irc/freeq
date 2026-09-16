@@ -122,6 +122,20 @@ describe("FreeqBot.create", () => {
     expect(cert.type).toBe("FreeqBotDelegation/v1");
   });
 
+  it("hands the delegation cert to the connect, not only to PROVENANCE", async () => {
+    const { FreeqBot } = await import("./bot.js");
+    const bot = await FreeqBot.create({
+      name: "delegating-bot",
+      ownerDid: "did:plc:owner",
+      nick: "delegating-bot",
+      url: "wss://test/irc",
+      root,
+    });
+
+    const { sasl } = bot.client as unknown as { sasl: { delegation?: unknown } };
+    expect(sasl.delegation).toEqual(bot.delegation);
+  });
+
   it("rederives the same DID across runs", async () => {
     const { FreeqBot } = await import("./bot.js");
     const a = await FreeqBot.create({
