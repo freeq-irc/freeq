@@ -260,16 +260,31 @@ async fn refuse_if_retired(
     tracing::info!(session = %session_id, %did, %kid, "Refused a retired signing key");
 }
 
-/// End a login token: refused at the broker push receiver from now on, and
-/// its session deleted from the embedded store. The two modes are exclusive
-/// (an embedded store exists only when no broker secret is set), so both are
-/// done.
+/// End a login token, in two steps that cover each other.
+///
+/// The token's hash is filed first — in the database when there is one, and
+/// in the refusal cache — so this server mints no more web tokens for it even
+/// if everything after this fails, and still refuses it after a restart.
+///
+/// Then the session itself is ended where it lives: deleted from the embedded
+/// store, or deleted at the standalone broker, which is retried until the
+/// broker takes it. That second step is what closes the broker's own
+/// endpoints (`/session`, `/enroll`), which never ask this server.
 pub(crate) async fn end_login_token(state: &Arc<SharedState>, token: &str) {
-    state.revoked_broker_tokens.lock().insert(token.to_string());
-    if let Some(store) = state.embedded_session_store.as_ref()
-        && let Err(e) = store.delete(token).await
-    {
-        tracing::warn!(error = %e, "embedded session delete failed");
+    let hash = freeq_auth_broker::token_hash(token);
+    let now = chrono::Utc::now().timestamp();
+    state.with_db(|db| db.record_broker_token_revocation(&hash, now));
+    state.revoked_token_hashes.lock().insert(hash.clone());
+
+    if let Some(store) = state.embedded_session_store.as_ref() {
+        match store.delete(token).await {
+            Ok(()) => {
+                state.with_db(|db| db.mark_broker_token_revocation_delivered(&hash, now));
+            }
+            Err(e) => tracing::warn!(error = %e, "embedded session delete failed"),
+        }
+    } else {
+        crate::broker_signout::queue_delete(state, hash);
     }
 }
 
@@ -4352,9 +4367,9 @@ mod retired_key_tests {
         assert_eq!(client.rx(|_| false).await, None, "the connection is closed");
         assert!(
             state
-                .revoked_broker_tokens
+                .revoked_token_hashes
                 .lock()
-                .contains("BT-RETIRED-DEVICE"),
+                .contains(&freeq_auth_broker::token_hash("BT-RETIRED-DEVICE")),
             "the login token behind the connection is refused from now on"
         );
         let row = state
@@ -4392,7 +4407,7 @@ mod retired_key_tests {
             pong.as_deref().is_some_and(|l| l.contains("PONG")),
             "{pong:?}"
         );
-        assert!(state.revoked_broker_tokens.lock().is_empty());
+        assert!(state.revoked_token_hashes.lock().is_empty());
     }
 
     fn signing_key(seed: u8) -> ed25519_dalek::SigningKey {
@@ -4485,7 +4500,7 @@ mod retired_key_tests {
             0,
             "no retirement names the key, so no proof can change the answer"
         );
-        assert!(state.revoked_broker_tokens.lock().is_empty());
+        assert!(state.revoked_token_hashes.lock().is_empty());
     }
 
     #[tokio::test]
@@ -4545,9 +4560,9 @@ mod retired_key_tests {
             .expect("the key is refused");
         assert!(
             state
-                .revoked_broker_tokens
+                .revoked_token_hashes
                 .lock()
-                .contains("BT-AFTER-RETIREMENT")
+                .contains(&freeq_auth_broker::token_hash("BT-AFTER-RETIREMENT"))
         );
     }
 
@@ -4580,7 +4595,7 @@ mod retired_key_tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         assert!(still_answers(&mut client).await);
-        assert!(state.revoked_broker_tokens.lock().is_empty());
+        assert!(state.revoked_token_hashes.lock().is_empty());
         let row = state
             .with_db(|db| db.get_signing_key_row(DID, &kid))
             .flatten()

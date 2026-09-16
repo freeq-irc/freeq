@@ -2866,6 +2866,80 @@ impl Db {
         Ok(changed > 0)
     }
 
+    // ── Signed-out broker tokens ──────────────────────────────────────────
+    //
+    // A signed-out device's login token, kept as its hash so the database
+    // never holds a usable one. `delivered_at` is null until the session
+    // behind it was ended where it lives.
+
+    /// File a signed-out token by its hash. Filing one already filed changes
+    /// nothing, including its revocation time.
+    pub fn record_broker_token_revocation(
+        &self,
+        token_hash: &str,
+        revoked_at: i64,
+    ) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO revoked_broker_tokens (token_hash, revoked_at)
+             VALUES (?1, ?2)",
+            params![token_hash, revoked_at],
+        )?;
+        Ok(())
+    }
+
+    /// Stamp the moment the session behind `token_hash` was ended.
+    pub fn mark_broker_token_revocation_delivered(
+        &self,
+        token_hash: &str,
+        delivered_at: i64,
+    ) -> SqlResult<()> {
+        self.conn.execute(
+            "UPDATE revoked_broker_tokens SET delivered_at = ?2 WHERE token_hash = ?1",
+            params![token_hash, delivered_at],
+        )?;
+        Ok(())
+    }
+
+    /// `(revoked_at, delivered_at)` for one hash, or None if it is not filed.
+    pub fn broker_token_revocation(
+        &self,
+        token_hash: &str,
+    ) -> SqlResult<Option<(i64, Option<i64>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT revoked_at, delivered_at FROM revoked_broker_tokens WHERE token_hash = ?1",
+        )?;
+        let mut rows = stmt.query(params![token_hash])?;
+        match rows.next()? {
+            Some(row) => Ok(Some((row.get(0)?, row.get(1)?))),
+            None => Ok(None),
+        }
+    }
+
+    /// Every filed hash — the refusal cache a restart rebuilds from.
+    pub fn revoked_broker_token_hashes(&self) -> SqlResult<Vec<String>> {
+        self.conn
+            .prepare("SELECT token_hash FROM revoked_broker_tokens")?
+            .query_map([], |row| row.get(0))?
+            .collect()
+    }
+
+    /// The hashes whose session has not been ended yet, for the retry.
+    pub fn undelivered_broker_token_revocations(&self) -> SqlResult<Vec<String>> {
+        self.conn
+            .prepare("SELECT token_hash FROM revoked_broker_tokens WHERE delivered_at IS NULL")?
+            .query_map([], |row| row.get(0))?
+            .collect()
+    }
+
+    /// Forget rows revoked before `cutoff`, delivered or not. Returns how
+    /// many were forgotten.
+    pub fn prune_broker_token_revocations(&self, cutoff: i64) -> SqlResult<usize> {
+        self.conn.execute(
+            "DELETE FROM revoked_broker_tokens WHERE revoked_at < ?1",
+            params![cutoff],
+        )
+    }
+
     /// The exact key a DID registered under `kid`, or None. This is the lookup
     /// a verifier uses when a signature names its kid — the key stays available
     /// after the signer reconnects (unlike the old overwrite-on-reregister).
@@ -3132,6 +3206,59 @@ mod tests {
             Some("did:plc:alice"),
         )
         .unwrap();
+    }
+
+    // ── Signed-out broker tokens ──────────────────────────────────────────
+
+    #[test]
+    fn a_revoked_broker_token_is_filed_by_hash_and_read_back() {
+        let db = Db::open_memory().unwrap();
+        db.record_broker_token_revocation("HASH-1", 100).unwrap();
+
+        assert_eq!(db.revoked_broker_token_hashes().unwrap(), vec!["HASH-1"]);
+        assert_eq!(
+            db.broker_token_revocation("HASH-1").unwrap(),
+            Some((100, None))
+        );
+        // Signing the same device out twice keeps the first revocation.
+        db.record_broker_token_revocation("HASH-1", 200).unwrap();
+        assert_eq!(
+            db.broker_token_revocation("HASH-1").unwrap(),
+            Some((100, None))
+        );
+        assert_eq!(db.revoked_broker_token_hashes().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_undelivered_revocation_is_listed_until_it_is_stamped() {
+        let db = Db::open_memory().unwrap();
+        db.record_broker_token_revocation("HASH-1", 100).unwrap();
+        db.record_broker_token_revocation("HASH-2", 100).unwrap();
+
+        db.mark_broker_token_revocation_delivered("HASH-1", 150)
+            .unwrap();
+        assert_eq!(
+            db.undelivered_broker_token_revocations().unwrap(),
+            vec!["HASH-2"]
+        );
+        assert_eq!(
+            db.broker_token_revocation("HASH-1").unwrap(),
+            Some((100, Some(150)))
+        );
+        // A delivered sign-out still refuses the token.
+        let mut hashes = db.revoked_broker_token_hashes().unwrap();
+        hashes.sort();
+        assert_eq!(hashes, vec!["HASH-1", "HASH-2"]);
+    }
+
+    #[test]
+    fn pruning_forgets_rows_revoked_before_the_cutoff() {
+        let db = Db::open_memory().unwrap();
+        db.record_broker_token_revocation("OLD", 100).unwrap();
+        db.record_broker_token_revocation("NEW", 300).unwrap();
+
+        assert_eq!(db.prune_broker_token_revocations(200).unwrap(), 1);
+        assert_eq!(db.revoked_broker_token_hashes().unwrap(), vec!["NEW"]);
     }
 
     // ── One-shot invites ──────────────────────────────────────────────────

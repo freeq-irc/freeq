@@ -2404,8 +2404,10 @@ struct DeviceSignOutRequest {
 /// The account's own retirement record is the durable statement that the key
 /// is stood down; this is the eviction that follows it. Three things end: the
 /// key row is retired, every connection signing with that key is closed, and
-/// the login token behind it stops working — deleted from the embedded session
-/// store, or refused at the broker push receiver when the broker is separate.
+/// the login token behind it stops working — refused here from now on, and
+/// its session deleted where it lives: the embedded session store, or the
+/// standalone broker, which is asked over a signed call and retried until it
+/// takes it.
 ///
 /// A kid this server holds no live row for under the caller's DID — never
 /// registered here, already retired, or registered on another server — is
@@ -2458,11 +2460,8 @@ async fn api_device_sign_out(
         }
     }
 
-    // The login token behind that key. Embedded: delete the session, so the
-    // next /session answers 401 as a dead one does. Standalone: remember it,
-    // so the broker's next push for it is refused. The two modes are
-    // exclusive (an embedded store exists only when no broker secret is set),
-    // so both are done unconditionally.
+    // The login token behind that key: filed as signed out, then its session
+    // ended where it lives — the embedded store, or the standalone broker.
     let tokens: Vec<String> = {
         let mut linked = state.device_key_tokens.lock();
         let mut found = Vec::new();
@@ -3580,9 +3579,13 @@ async fn auth_broker_web_token(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")))?;
 
     // A device that was signed out gets no more web tokens, so its /session
-    // refresh stops producing one it could authenticate with.
+    // refresh stops producing one it could authenticate with. Signed-out
+    // tokens are known by their hash, which is also what survives a restart.
     if let Some(ref bt) = req.broker_token
-        && state.revoked_broker_tokens.lock().contains(bt)
+        && state
+            .revoked_token_hashes
+            .lock()
+            .contains(&freeq_auth_broker::token_hash(bt))
     {
         tracing::info!(did = %req.did, "web-token refused: device signed out");
         return Err((StatusCode::UNAUTHORIZED, "Device signed out".to_string()));
@@ -3707,67 +3710,23 @@ async fn auth_broker_session(
 /// Verify HMAC-SHA256 signature over raw request bytes with replay protection.
 /// The broker must include X-Broker-Timestamp (unix seconds). Requests older
 /// than 60 seconds are rejected.
+///
+/// The rule lives in the broker crate, which signs with it and now verifies
+/// the server's own signed deletes with it, so there is one scheme and one
+/// clock window in both directions.
 fn verify_broker_signature_raw(
     secret: &str,
     headers: &axum::http::HeaderMap,
     body_bytes: &[u8],
 ) -> Result<(), (StatusCode, String)> {
-    use base64::Engine;
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    let sig = headers
-        .get("x-broker-signature")
-        .and_then(|v| v.to_str().ok())
-        .ok_or((
-            StatusCode::UNAUTHORIZED,
-            "Missing broker signature".to_string(),
-        ))?;
-
-    // Replay protection: require timestamp and enforce ≤60s skew.
-    let ts_str = headers
-        .get("x-broker-timestamp")
-        .and_then(|v| v.to_str().ok())
-        .ok_or((
-            StatusCode::UNAUTHORIZED,
-            "Missing X-Broker-Timestamp header".to_string(),
-        ))?;
-    let ts: u64 = ts_str.parse().map_err(|_| {
-        (
-            StatusCode::UNAUTHORIZED,
-            "Invalid X-Broker-Timestamp".to_string(),
-        )
-    })?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if now.abs_diff(ts) > 60 {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "Broker request expired (timestamp > 60s)".to_string(),
-        ));
-    }
-
-    // MAC covers ts={timestamp}\n || body to bind the timestamp to the signature.
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "HMAC init failed".to_string(),
-        )
-    })?;
-    mac.update(format!("ts={ts_str}\n").as_bytes());
-    mac.update(body_bytes);
-    let expected =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
-
-    if expected != sig {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "Invalid broker signature".to_string(),
-        ));
-    }
-    Ok(())
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    freeq_auth_broker::verify_signed_body(
+        secret,
+        header("x-broker-timestamp"),
+        header("x-broker-signature"),
+        body_bytes,
+    )
+    .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))
 }
 
 // ── OAuth client metadata ──────────────────────────────────────────────

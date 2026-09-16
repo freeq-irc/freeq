@@ -614,9 +614,9 @@ async fn push_naming_a_revoked_broker_token_is_refused() {
     // so its /session refresh stops producing a usable web token.
     let (http, state) = start_with_state().await;
     state
-        .revoked_broker_tokens
+        .revoked_token_hashes
         .lock()
-        .insert("BT-DEAD".to_string());
+        .insert(freeq_auth_broker::token_hash("BT-DEAD"));
 
     let resp = push_web_token(
         http,

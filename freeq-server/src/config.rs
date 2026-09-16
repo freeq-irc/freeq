@@ -246,6 +246,14 @@ pub struct ServerConfig {
     #[arg(long, env = "BROKER_SHARED_SECRET")]
     pub broker_shared_secret: Option<String>,
 
+    /// Base URL of the standalone auth broker, e.g. https://auth.example.
+    /// Signing a device out deletes its session there, so the device cannot
+    /// enroll a new key or refresh a login. Read only alongside
+    /// --broker-shared-secret; without it the sign-out is still refused here,
+    /// but the broker session lives until it expires.
+    #[arg(long, env = "AUTH_BROKER_URL")]
+    pub auth_broker_url: Option<String>,
+
     /// DID of the private-media space authority. The account must be on a
     /// spaces-capable PDS. Enables private media via AT Protocol spaces.
     #[arg(long, env = "FREEQ_MEDIA_SPACE_DID")]
@@ -404,6 +412,7 @@ impl Default for ServerConfig {
             github_client_id: None,
             github_client_secret: None,
             broker_shared_secret: None,
+            auth_broker_url: None,
             media_space_did: None,
             media_space_password: None,
             media_space_pds: None,
@@ -549,6 +558,7 @@ struct FileConfig {
     github_client_id: Option<String>,
     github_client_secret: Option<String>,
     broker_shared_secret: Option<String>,
+    auth_broker_url: Option<String>,
     media_space_did: Option<String>,
     media_space_password: Option<String>,
     media_space_pds: Option<String>,
@@ -695,6 +705,7 @@ fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConf
         github_client_id,
         github_client_secret,
         broker_shared_secret,
+        auth_broker_url,
         media_space_did,
         media_space_password,
         media_space_pds,
