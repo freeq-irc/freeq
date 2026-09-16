@@ -65,6 +65,6 @@ console.error(`signed ${cert.bot_did} for ${ownerDid}`);
 console.error(`creator public key: ${pub}`);
 console.error(
   `if the server has never seen it, paste this into a client logged in as ${ownerDid}:\n` +
-    `    /raw MSGSIG ${pub}`,
+    `    /raw MSGSIG ${pub} delegation`,
 );
 console.log(JSON.stringify({ botDid: cert.bot_did, ownerDid, creatorPublicKey: pub }));

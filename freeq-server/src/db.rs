@@ -132,6 +132,9 @@ pub struct SigningKeyRow {
     pub last_seen_at: i64,
     pub removed_at: Option<i64>,
     pub source: Option<String>,
+    /// What the key may verify. `None` is unscoped: chat, acts and
+    /// certificates alike. `Some("delegation")` is certificates only.
+    pub purpose: Option<String>,
 }
 
 /// Who wrote a message, and where it is filed — the minimum needed to
@@ -528,6 +531,7 @@ impl Db {
                  last_seen_at   INTEGER,
                  removed_at     INTEGER,
                  source         TEXT,
+                 purpose        TEXT,
                  PRIMARY KEY (did, kid)
              );",
         )?;
@@ -2752,6 +2756,18 @@ impl Db {
     /// [`Db::save_signing_key`], naming where the key came from. The source is
     /// set when the key is first filed and never changed after.
     pub fn save_signing_key_from(&self, did: &str, pubkey: &[u8], source: &str) -> SqlResult<()> {
+        self.save_signing_key_scoped(did, pubkey, source, None)
+    }
+
+    /// [`Db::save_signing_key_from`], naming what the key may verify. A
+    /// `purpose` of `None` leaves the key unscoped.
+    pub fn save_signing_key_scoped(
+        &self,
+        did: &str,
+        pubkey: &[u8],
+        source: &str,
+        purpose: Option<&str>,
+    ) -> SqlResult<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2759,14 +2775,19 @@ impl Db {
         let kid = freeq_sdk::act::derive_kid_bytes(pubkey);
         // Append-only: a new (did, kid) is inserted, never overwriting a
         // different key, and both edges of its window start at now.
+        // A scope only ever narrows: a key already on file can take one, never
+        // lose it.
         // Re-registering an *existing* kid moves only last_seen_at, so
         // registered_at keeps saying when the key was first seen while
         // "latest" (`get_signing_key`) still tracks the most recently used key.
         self.conn.execute(
-            "INSERT INTO signing_keys (did, kid, pubkey, registered_at, last_seen_at, source)
-             VALUES (?1, ?2, ?3, ?4, ?4, ?5)
-             ON CONFLICT(did, kid) DO UPDATE SET last_seen_at = excluded.last_seen_at",
-            params![did, kid, pubkey, now as i64, source],
+            "INSERT INTO signing_keys
+                 (did, kid, pubkey, registered_at, last_seen_at, source, purpose)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6)
+             ON CONFLICT(did, kid) DO UPDATE SET
+                 last_seen_at = excluded.last_seen_at,
+                 purpose = COALESCE(signing_keys.purpose, excluded.purpose)",
+            params![did, kid, pubkey, now as i64, source, purpose],
         )?;
         Ok(())
     }
@@ -2792,7 +2813,8 @@ impl Db {
         // rowid DESC breaks ties: last_seen_at is second-granularity, so two
         // keys last used in the same second must fall back to insertion order.
         self.query_signing_key(
-            "SELECT pubkey FROM signing_keys WHERE did = ?1
+            "SELECT pubkey FROM signing_keys
+             WHERE did = ?1 AND (purpose IS NULL OR purpose <> 'delegation')
              ORDER BY last_seen_at DESC, rowid DESC LIMIT 1",
             params![did],
         )
@@ -2807,7 +2829,7 @@ impl Db {
     pub fn get_signing_key_set(&self, did: &str) -> SqlResult<Vec<SigningKeyRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT kid, pubkey, registered_at,
-                    COALESCE(last_seen_at, registered_at), removed_at, source
+                    COALESCE(last_seen_at, registered_at), removed_at, source, purpose
              FROM signing_keys WHERE did = ?1
              ORDER BY registered_at DESC, rowid DESC",
         )?;
@@ -2821,11 +2843,12 @@ impl Db {
             .collect())
     }
 
-    /// One key's row by kid, or None.
+    /// One key's row by kid, or None. Unlike [`Db::get_signing_key_by_kid`]
+    /// this answers for a key of any scope.
     pub fn get_signing_key_row(&self, did: &str, kid: &str) -> SqlResult<Option<SigningKeyRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT kid, pubkey, registered_at,
-                    COALESCE(last_seen_at, registered_at), removed_at, source
+                    COALESCE(last_seen_at, registered_at), removed_at, source, purpose
              FROM signing_keys WHERE did = ?1 AND kid = ?2",
         )?;
         let mut rows = stmt.query_map(params![did, kid], Self::signing_key_row)?;
@@ -2849,6 +2872,7 @@ impl Db {
             last_seen_at: row.get(3)?,
             removed_at: row.get(4)?,
             source: row.get(5)?,
+            purpose: row.get(6)?,
         }))
     }
 
@@ -2869,9 +2893,15 @@ impl Db {
     /// The exact key a DID registered under `kid`, or None. This is the lookup
     /// a verifier uses when a signature names its kid — the key stays available
     /// after the signer reconnects (unlike the old overwrite-on-reregister).
+    ///
+    /// A key scoped to delegation is not one this DID speaks with, so it is
+    /// never answered here. That keeps the scope on every verifying path
+    /// rather than at each caller.
     pub fn get_signing_key_by_kid(&self, did: &str, kid: &str) -> SqlResult<Option<[u8; 32]>> {
         self.query_signing_key(
-            "SELECT pubkey FROM signing_keys WHERE did = ?1 AND kid = ?2",
+            "SELECT pubkey FROM signing_keys
+             WHERE did = ?1 AND kid = ?2
+               AND (purpose IS NULL OR purpose <> 'delegation')",
             params![did, kid],
         )
     }

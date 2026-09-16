@@ -13,17 +13,19 @@
  * owner's DID.
  *
  * REGISTERING THE KEY — WHY THERE IS NO PASSWORD PROMPT. Putting a key on
- * file under your DID takes exactly one `MSGSIG <pubkey>` on a session that is
- * already authenticated as you. You have one of those open whenever the web
- * client is logged in, and it has a `/raw` command. So the ceremony is:
+ * file under your DID takes exactly one `MSGSIG <pubkey> delegation` on a
+ * session that is already authenticated as you. You have one of those open
+ * whenever the web client is logged in, and it has a `/raw` command. So the
+ * ceremony is:
  *
- *     pi prints:   /raw MSGSIG <your-public-key>
+ *     pi prints:   /raw MSGSIG <your-public-key> delegation
  *     you paste it into the web client, in any channel
  *     pi reconnects, presents the signed cert, and the server says verified
  *
  * Nothing secret moves. The line you paste is a public key. pi never sees a
- * password, never talks to your PDS, and never holds anything that could act
- * as you — only the creator seed, which signs certificates and nothing else.
+ * password and never talks to your PDS. The `delegation` scope on that line
+ * holds the creator seed to signing certificates: a key registered with it
+ * never verifies a message.
  *
  * The earlier design asked for an AT Protocol app password to do this
  * through `pds-session` SASL. That was a second credential to protect for a
@@ -97,7 +99,7 @@ export async function authorizeInstructions(opts: {
   const keyPath = creatorKeyPath(opts.root, opts.ownerDid);
   const seed = await loadOrCreateCreatorSeed(keyPath);
   const publicKey = creatorPublicKeyB64(seed);
-  const pasteLine = `/raw MSGSIG ${publicKey}`;
+  const pasteLine = `/raw MSGSIG ${publicKey} delegation`;
   return {
     ownerDid: opts.ownerDid,
     creatorKeyPath: keyPath,

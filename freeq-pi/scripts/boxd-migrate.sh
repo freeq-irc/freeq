@@ -294,7 +294,7 @@ if [ "$REGISTERED" != "$PUB" ]; then
   │ The server must know the key that signed this delegation. Paste this
   │ into any freeq client logged in as $OWNER_DID:
   │
-  │     /raw MSGSIG $PUB
+  │     /raw MSGSIG $PUB delegation
   │
   │ It is an ed25519 PUBLIC key — nothing secret. Until it is registered,
   │ the cert is "stored (unverified)" and grants the agent nothing.

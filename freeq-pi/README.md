@@ -297,11 +297,12 @@ feature that trusts delegation (joining an invite-only room you are in,
 provenance badges) correctly refuses it.
 
 `/freeq authorize` fixes that with no password and no PDS login. Registering a
-key under your DID takes one `MSGSIG <pubkey>` on a session that is already
+key under your DID takes one `MSGSIG <pubkey> delegation` on a session that
+is already
 authenticated as you — and the web client is one of those. So:
 
 1. `/freeq authorize` mints a signing key on this machine and prints one line:
-   `/raw MSGSIG <public-key>`.
+   `/raw MSGSIG <public-key> delegation`.
 2. Paste that line into the freeq web client (any channel). It is a public key;
    nothing secret moves.
 3. `/freeq authorize verify` reconnects with the signed certificate and reports

@@ -252,6 +252,59 @@ pub(super) fn verified_owner(
 }
 
 #[cfg(test)]
+mod scoped_key_tests {
+    //! Which keys verify a certificate.
+
+    use super::*;
+    use ed25519_dalek::Signer;
+
+    const AGENT: &str = "did:key:zAgent";
+    const OWNER: &str = "did:plc:owner";
+
+    fn cert_signed_by(key: &ed25519_dalek::SigningKey) -> Value {
+        let mut cert = serde_json::json!({
+            "type": "FreeqBotDelegation/v1",
+            "bot_did": AGENT,
+            "bot_public_key": "zAgent",
+            "creator_did": OWNER,
+            "created_at": "2026-09-14T00:00:00Z",
+            "revocation_authority": OWNER,
+        });
+        let canonical = freeq_sdk::canonical::canonicalize(&cert).unwrap();
+        cert["signature"] =
+            Value::String(URL_SAFE_NO_PAD.encode(key.sign(canonical.as_bytes()).to_bytes()));
+        cert
+    }
+
+    fn db_with_key(purpose: Option<&str>) -> (Db, ed25519_dalek::SigningKey) {
+        let db = Db::open_memory().unwrap();
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        db.save_signing_key_scoped(
+            OWNER,
+            key.verifying_key().as_bytes(),
+            "local-session",
+            purpose,
+        )
+        .unwrap();
+        (db, key)
+    }
+
+    #[test]
+    fn a_delegation_key_verifies_a_certificate() {
+        let (db, key) = db_with_key(Some(crate::connection::PURPOSE_DELEGATION));
+        let outcome = verify_provenance(&cert_signed_by(&key), AGENT, Some(&db)).unwrap();
+        assert!(outcome.verified, "{}", outcome.reason);
+    }
+
+    #[test]
+    fn an_unscoped_key_still_verifies_a_certificate() {
+        let (db, key) = db_with_key(None);
+        let outcome = verify_provenance(&cert_signed_by(&key), AGENT, Some(&db)).unwrap();
+        assert!(outcome.verified, "{}", outcome.reason);
+    }
+}
+
+#[cfg(test)]
 mod delegated_access_tests {
     use super::*;
     use serde_json::json;

@@ -44,7 +44,7 @@ describe("the ceremony", () => {
     const seed = new Uint8Array(await readFile(ins.creatorKeyPath));
     const pub = creatorPublicKeyB64(seed);
     expect(ins.publicKey).toBe(pub);
-    expect(ins.pasteLine).toBe(`/raw MSGSIG ${pub}`);
+    expect(ins.pasteLine).toBe(`/raw MSGSIG ${pub} delegation`);
 
     // What the user is shown must never contain the private half.
     const shown = ins.steps.join("\n");

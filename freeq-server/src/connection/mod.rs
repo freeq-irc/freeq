@@ -136,6 +136,24 @@ impl std::str::FromStr for ActorClass {
     }
 }
 
+/// The scope a client may name on `MSGSIG`. A key registered with it signs
+/// delegation certificates and never verifies a message.
+pub(crate) const PURPOSE_DELEGATION: &str = "delegation";
+
+/// The scope named on a `MSGSIG`, or the FAIL code for one that is not a scope.
+pub(crate) fn parse_msgsig_purpose(
+    raw: Option<&str>,
+) -> Result<Option<&'static str>, (&'static str, &'static str)> {
+    match raw {
+        None => Ok(None),
+        Some(p) if p == PURPOSE_DELEGATION => Ok(Some(PURPOSE_DELEGATION)),
+        Some(_) => Err((
+            "INVALID_PURPOSE",
+            "Unknown key purpose; expected `delegation` or none",
+        )),
+    }
+}
+
 /// File a client's session message-signing public key.
 ///
 /// Shared by the `MSGSIG` command and by registration completion, which
@@ -147,6 +165,7 @@ pub(crate) fn file_session_signing_key(
     session_id: &str,
     authenticated_did: Option<&str>,
     pubkey_b64: &str,
+    purpose: Option<&str>,
 ) -> Result<(), (&'static str, &'static str)> {
     use base64::Engine;
     let Some(did) = authenticated_did else {
@@ -172,6 +191,46 @@ pub(crate) fn file_session_signing_key(
     let vk = ed25519_dalek::VerifyingKey::from_bytes(bytes.as_slice().try_into().unwrap())
         .map_err(|_| ("INVALID_KEY", "Invalid ed25519 public key"))?;
 
+    let did_for_db = did.to_string();
+    // A key already on file as a delegation key stays one, whatever this
+    // registration names. In memory as in the table, a scope only narrows.
+    let scoped = purpose == Some(PURPOSE_DELEGATION)
+        || state
+            .with_db(|db| db.get_signing_key_row(did, &freeq_sdk::sigtag::derive_kid(&vk)))
+            .flatten()
+            .is_some_and(|row| row.purpose.as_deref() == Some(PURPOSE_DELEGATION));
+
+    // A delegation key never verifies a message, so it is not filed in the
+    // maps a message is checked against — and this DID's sessions holding it
+    // drop it, or it would keep verifying for them until they reconnected.
+    if scoped {
+        let own_sessions: Vec<String> = state
+            .session_dids
+            .lock()
+            .iter()
+            .filter(|(_, d)| *d == did)
+            .map(|(s, _)| s.clone())
+            .collect();
+        state
+            .session_msg_keys
+            .lock()
+            .retain(|s, k| *k != vk || !own_sessions.contains(s));
+        state
+            .did_msg_keys
+            .lock()
+            .retain(|d, k| d != did || k != pubkey_b64);
+        state.with_db(|db| {
+            db.save_signing_key_scoped(
+                &did_for_db,
+                &bytes,
+                "local-session",
+                Some(PURPOSE_DELEGATION),
+            )
+        });
+        tracing::info!(session = %session_id, %did, "Client registered delegation signing key");
+        return Ok(());
+    }
+
     state
         .session_msg_keys
         .lock()
@@ -180,7 +239,6 @@ pub(crate) fn file_session_signing_key(
         .did_msg_keys
         .lock()
         .insert(did.to_string(), pubkey_b64.to_string());
-    let did_for_db = did.to_string();
     state.with_db(|db| db.save_signing_key(&did_for_db, &bytes));
     // Anything a peer relayed under this key was parked for want of it. It can
     // be judged now.
@@ -206,7 +264,7 @@ pub struct Connection {
     /// was dropped in silence, the client believed it had a session key, and
     /// every message it sent came back server-signed. Parking it turns a
     /// silent wrong answer into the right one.
-    pub(crate) pending_msg_key: Option<String>,
+    pub(crate) pending_msg_key: Option<(String, Option<String>)>,
     /// Actor class: human (default), agent, or external_agent.
     pub(crate) actor_class: ActorClass,
 
@@ -1351,12 +1409,25 @@ where
                 }
             }
             "MSGSIG" => {
-                // Client registers its session message-signing public key.
-                // Usage: MSGSIG <base64url-ed25519-pubkey>
+                // Client registers a signing public key for this session.
+                // Usage: MSGSIG <base64url-ed25519-pubkey> [delegation]
+                let purpose = match parse_msgsig_purpose(msg.params.get(1).map(|s| s.as_str())) {
+                    Ok(p) => p,
+                    Err((code, detail)) => {
+                        let reply = Message::from_server(
+                            &server_name,
+                            "FAIL",
+                            vec!["MSGSIG", code, detail],
+                        );
+                        send(&state, &session_id, format!("{reply}\r\n"));
+                        continue;
+                    }
+                };
                 if !conn.registered {
                     // Park it; `complete_registration` files it at 001.
                     if let Some(pubkey_b64) = msg.params.first() {
-                        conn.pending_msg_key = Some(pubkey_b64.clone());
+                        conn.pending_msg_key =
+                            Some((pubkey_b64.clone(), purpose.map(str::to_string)));
                     }
                     continue;
                 }
@@ -1366,6 +1437,7 @@ where
                         &session_id,
                         conn.authenticated_did.as_deref(),
                         pubkey_b64,
+                        purpose,
                     ) {
                         Ok(()) => {
                             let reply =

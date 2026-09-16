@@ -576,12 +576,13 @@ pub(super) fn try_complete_registration(
 
     // A signing key offered between 903 and 001 was parked rather than
     // dropped; file it now, before the client can send anything that needs it.
-    if let Some(pubkey_b64) = conn.pending_msg_key.take() {
+    if let Some((pubkey_b64, purpose)) = conn.pending_msg_key.take() {
         if let Err((code, detail)) = super::file_session_signing_key(
             state,
             session_id,
             conn.authenticated_did.as_deref(),
             &pubkey_b64,
+            purpose.as_deref(),
         ) {
             let reply = Message::from_server(server_name, "FAIL", vec!["MSGSIG", code, detail]);
             send(state, session_id, format!("{reply}\r\n"));
