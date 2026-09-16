@@ -59,7 +59,7 @@ chrono = { workspace = true }
 
 # MCP server — only consumed by `bin/mcp_server.rs`. Stdio transport
 # over JSON-RPC, talks straight to Claude Code over its stdin/stdout.
-rmcp = { version = "1.4", features = ["server", "transport-io", "macros", "schemars"] }
+rmcp = { version = "2.0", features = ["server", "transport-io", "macros", "schemars"] }
 schemars = "1"
 
 [lints]
