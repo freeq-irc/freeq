@@ -1534,6 +1534,9 @@ fn enroll_refusal(record: &serde_json::Value, did: &str, signer: &str) -> Option
 
 /// POST /enroll {broker_token, record, signer_public_key} — write an
 /// at.freeq.deviceKey or at.freeq.agentKey record to the user's own repo.
+// The Err is a ready axum Response, as clippy 1.98 notes; this route runs
+// once per connect, so the size is not worth an error enum.
+#[allow(clippy::result_large_err)]
 async fn enroll(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
