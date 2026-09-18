@@ -574,7 +574,7 @@ export class FreeqClient extends EventEmitter {
           });
         }
       });
-      this.maybeLocalEcho(bufKey, text, willEncrypt);
+      this.maybeLocalEcho(bufKey, text, willEncrypt, extraOpenerTags);
       return null; // Async; can't return batch id meaningfully here
     }
 
@@ -605,7 +605,7 @@ export class FreeqClient extends EventEmitter {
           const sigTags = await this.signatureTags(wireTarget, body, extraOpenerTags);
           this.emitMultilineBatch(wireTarget, group, { ...extraOpenerTags, ...sigTags });
         });
-        this.maybeLocalEcho(bufKey, body, willEncrypt);
+        this.maybeLocalEcho(bufKey, body, willEncrypt, extraOpenerTags);
       }
       // Async signing — batch id isn't synchronously available.
       return null;
@@ -614,7 +614,7 @@ export class FreeqClient extends EventEmitter {
     // Fits in one PRIVMSG (or no multiline cap) → single PRIVMSG. Legacy path
     // preserves \n escaping + +freeq.at/multiline for receivers that decode it.
     this.sendLegacyPlaintext(wireTarget, text, extraOpenerTags);
-    this.maybeLocalEcho(bufKey, text, willEncrypt);
+    this.maybeLocalEcho(bufKey, text, willEncrypt, extraOpenerTags);
     return null;
   }
 
@@ -638,16 +638,23 @@ export class FreeqClient extends EventEmitter {
 
   /**
    * Emit local echo if `echo-message` wasn't acked, so the sender's UI
-   * still sees its own outbound message immediately.
+   * still sees its own outbound message immediately. Carries the opener
+   * tags, so the sender's copy of a markdown, reply or edit renders as
+   * what it is rather than as a plain message.
    */
-  private maybeLocalEcho(target: string, text: string, willEncrypt: boolean): void {
+  private maybeLocalEcho(
+    target: string,
+    text: string,
+    willEncrypt: boolean,
+    tags: Record<string, string> = {},
+  ): void {
     if (this.ackedCaps.has('echo-message')) return;
     const msg: Message = {
       id: crypto.randomUUID(),
       from: this._nick,
       text,
       timestamp: new Date(),
-      tags: {},
+      tags: { ...tags },
       isSelf: true,
       encrypted: willEncrypt,
     };
@@ -693,26 +700,9 @@ export class FreeqClient extends EventEmitter {
 
   /** Send a message with Markdown formatting. */
   sendMarkdown(target: string, text: string): void {
-    const isMultiline = text.includes('\n');
-    const wireText = isMultiline ? text.replace(/\n/g, '\\n') : text;
-    const tags: Record<string, string> = { '+freeq.at/mime': 'text/markdown' };
-    if (isMultiline) tags['+freeq.at/multiline'] = '';
-    // Same target discipline as sendMessageInternal: strict DID resolution
-    // for the wire, canonical (loose) key for the local echo.
-    const isChannel = target.startsWith('#') || target.startsWith('&');
-    const bufKey = isChannel ? target : this.dmKey(target);
-    this.signedPrivmsg(this.wireTargetFor(target), wireText, tags);
-
-    if (!this.ackedCaps.has('echo-message')) {
-      this.emit('message', bufKey, {
-        id: crypto.randomUUID(),
-        from: this._nick,
-        text: wireText,
-        timestamp: new Date(),
-        tags,
-        isSelf: true,
-      });
-    }
+    this.sendMessageInternal(target, text, {
+      '+freeq.at/mime': 'text/markdown',
+    });
   }
 
   /**
