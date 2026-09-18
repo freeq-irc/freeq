@@ -666,11 +666,22 @@ export class FreeqClient extends EventEmitter {
     return 6400;
   }
 
-  /** Send a reply to a specific message. Multi-line replies use the
-   *  same wire shape as `sendMessage`. */
-  sendReply(target: string, replyToMsgId: string, text: string, multiline = false): void {
-    void multiline;
-    this.sendMessageInternal(target, text, { '+reply': replyToMsgId });
+  /** Send a reply to a specific message. Multi-line replies use the same
+   *  wire shape as `sendMessage`. `options.tags` ride the PRIVMSG next to
+   *  `+reply`, so a reply can declare its own content type (e.g.
+   *  `+freeq.at/mime`). The legacy positional `multiline` boolean is still
+   *  accepted and ignored. */
+  sendReply(
+    target: string,
+    replyToMsgId: string,
+    text: string,
+    options: boolean | { tags?: Record<string, string> } = false,
+  ): void {
+    const extraTags = typeof options === 'object' ? (options.tags ?? {}) : {};
+    this.sendMessageInternal(target, text, {
+      ...extraTags,
+      '+reply': replyToMsgId,
+    });
   }
 
   /** Edit a message. Multi-line edits use the same wire shape as

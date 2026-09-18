@@ -476,6 +476,28 @@ describe('messaging methods', () => {
     expect(line).toContain('+reply=msg123');
   });
 
+  it('sendReply() carries caller tags alongside +reply', async () => {
+    const { client, ws } = await makeRegistered();
+    client.sendReply('#foo', 'msg123', '# heading', {
+      tags: { '+freeq.at/mime': 'text/markdown' },
+    });
+    await flushAsync();
+    const line = ws.sent.find((l) => l.includes('PRIVMSG #foo'));
+    expect(line).toContain('+reply=msg123');
+    expect(line).toContain('+freeq.at/mime=text/markdown');
+  });
+
+  it('sendReply() keeps +reply when a caller tag tries to displace it', async () => {
+    const { client, ws } = await makeRegistered();
+    client.sendReply('#foo', 'msg123', 'replying', {
+      tags: { '+reply': 'bogus' },
+    });
+    await flushAsync();
+    const line = ws.sent.find((l) => l.includes('PRIVMSG #foo'));
+    expect(line).toContain('+reply=msg123');
+    expect(line).not.toContain('bogus');
+  });
+
   it('sendReplyInThread() sets +reply tag', async () => {
     const { client, ws } = await makeRegistered();
     client.sendReplyInThread('#foo', 'msg123', 'replying');
