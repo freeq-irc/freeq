@@ -565,6 +565,51 @@ describe('messaging methods', () => {
     expect(ws.sent[0]).toContain('+freeq.at/mime=text/markdown');
   });
 
+  it('sendMarkdown() routes multi-line text to a BATCH, not an escaped line', async () => {
+    const { client, ws } = await makeMultilineRegistered();
+    client.sendMarkdown('#foo', '# heading\n\n- one\n- two');
+    for (let i = 0; i < 4; i++) await flushAsync();
+    const opener = ws.sent.find((l) => l.includes('BATCH +') && l.includes('draft/multiline'));
+    expect(opener).toBeDefined();
+    expect(opener).toContain('+freeq.at/mime=text/markdown');
+    expect(ws.sent.some((l) => l.includes('\\n'))).toBe(false);
+  });
+
+  it('sendMarkdown() sends a paste past max-lines as several batches', async () => {
+    const { client, ws } = await makeMultilineRegistered();
+    const long = Array.from({ length: 200 }, (_, i) => `- item ${i}`).join('\n');
+    client.sendMarkdown('#foo', long);
+    for (let i = 0; i < 8; i++) await flushAsync();
+    // max-lines=100, so 200 lines need more than one batch to get there.
+    const openers = ws.sent.filter((l) => l.includes('BATCH +') && l.includes('draft/multiline'));
+    expect(openers.length).toBeGreaterThan(1);
+    expect(ws.sent.some((l) => l.includes('\\n'))).toBe(false);
+  });
+
+  it('sendMarkdown() length-splits a single line past the chunk budget', async () => {
+    const { client, ws } = await makeMultilineRegistered();
+    client.sendMarkdown('#foo', 'x'.repeat(20000));
+    for (let i = 0; i < 8; i++) await flushAsync();
+    const bodyLines = ws.sent.filter((l) => l.includes('PRIVMSG #foo'));
+    expect(bodyLines.length).toBeGreaterThan(1);
+    // The chunker budgets 6400 bytes of body to stay under the SDK's own
+    // 7000-byte oversize warning. Hold the assembled line to that.
+    for (const line of bodyLines) {
+      expect(new TextEncoder().encode(line).length).toBeLessThan(7000);
+    }
+  });
+
+  it('sendMarkdown() echoes the text as written, tagged as markdown', async () => {
+    const { client } = await makeMultilineRegistered();
+    const seen: import('./client.js').Message[] = [];
+    client.on('message', (_ch, msg) => seen.push(msg));
+    client.sendMarkdown('#foo', 'line one\nline two');
+    for (let i = 0; i < 4; i++) await flushAsync();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.text).toBe('line one\nline two');
+    expect(seen[0]!.tags?.['+freeq.at/mime']).toBe('text/markdown');
+  });
+
   it('sendTagged() emits PRIVMSG with custom tags', async () => {
     const { client, ws } = await makeRegistered();
     client.sendTagged('#foo', 'hello world', { '+freeq.at/streaming': '1' });
