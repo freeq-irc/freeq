@@ -88,8 +88,9 @@ struct MessageListView: View {
                     .buttonStyle(.plain)
 
                     LazyVStack(alignment: .leading, spacing: 0) {
+                        let headers = headerFlags()
                         ForEach(Array(channel.messages.enumerated()), id: \.element.renderKey) { idx, msg in
-                            let showHeader = shouldShowHeader(at: idx)
+                            let showHeader = headers[idx]
                             let showDate = shouldShowDateSeparator(at: idx)
 
                             if showDate {
@@ -147,7 +148,7 @@ struct MessageListView: View {
                 .scrollDismissesKeyboard(.interactively)
                 .refreshable {
                     if appState.connectionState == .disconnected {
-                        appState.reconnectSavedSession()
+                        appState.reconnectSavedSession(viaBroker: true)
                         // Give it a moment so the spinner doesn't vanish instantly
                         try? await Task.sleep(nanoseconds: 1_500_000_000)
                     } else {
@@ -575,7 +576,21 @@ struct MessageListView: View {
 
     // MARK: - Message Grouping
 
-    private func shouldShowHeader(at idx: Int) -> Bool {
+    /// Every row's header flag, worked out once per render: checking row by
+    /// row re-walked the sender's run for every row (`RowSignatureMark.headers`).
+    private func headerFlags() -> [Bool] {
+        let indices = channel.messages.indices
+        return RowSignatureMark.headers(
+            breaksRun: indices.map { breaksRun(at: $0) },
+            marks: indices.map { settledMark(at: $0) })
+    }
+
+    private func settledMark(at idx: Int) -> RowSignatureMark.Settled? {
+        let msg = channel.messages[idx]
+        return RowSignatureMark.settled(appState.checkedVerdicts[msg.id] ?? msg.verdict)
+    }
+
+    private func breaksRun(at idx: Int) -> Bool {
         guard idx > 0 else { return true }
         let prev = channel.messages[idx - 1]
         let curr = channel.messages[idx]
@@ -738,19 +753,25 @@ struct MessageListView: View {
                                 .font(.fqCaption2)
                                 .foregroundColor(Theme.textMuted)
 
-                            // No badge for a signed message: almost every
-                            // message is signed, so a badge on every row says
-                            // nothing. Verification is an explicit action in
-                            // the context menu; only a checked mismatch marks
-                            // the row.
-                            if appState.checkedVerdicts[msg.id]?.marksTheRow == true {
+                            // The mark the verdict earns (RowSignatureMark);
+                            // tapping it opens the proof.
+                            if let rowVerdict = appState.checkedVerdicts[msg.id] ?? msg.verdict,
+                               let mark = RowSignatureMark.of(rowVerdict) {
                                 Button {
                                     UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
                                     proofTarget = .verify(msg)
                                 } label: {
-                                    Image(systemName: "exclamationmark.shield.fill")
-                                        .font(.system(size: 9, weight: .semibold))
-                                        .foregroundColor(Theme.danger)
+                                    switch mark {
+                                    case .lock(let opacity):
+                                        Image(systemName: "lock.fill")
+                                            .font(.system(size: 9, weight: .semibold))
+                                            .foregroundColor(Theme.success)
+                                            .opacity(opacity)
+                                    case .warning:
+                                        Image(systemName: "exclamationmark.shield.fill")
+                                            .font(.system(size: 9, weight: .semibold))
+                                            .foregroundColor(Theme.danger)
+                                    }
                                 }
                                 .buttonStyle(.plain)
                             }

@@ -5,13 +5,375 @@
  * Internally, all protocol handling is delegated to the SDK's FreeqClient.
  */
 
-import { FreeqClient, format } from '@freeq/sdk';
+import {
+  FreeqClient,
+  IndexedDbDeviceKeyStore,
+  KeyLookup,
+  buildDeviceRetirement,
+  decodeMultibaseEd25519,
+  deviceKeyHistory,
+  format,
+  makeDidResolver,
+  recordKeyOf,
+  type DeviceKeyRecord,
+  type DeviceKeyStore,
+  type StoredDeviceKey,
+} from '@freeq/sdk';
+import { recordVerdict } from '../lib/verify-signature';
+import { IndexedDbKeyLookupStore } from '../lib/key-lookup-store';
 import { useStore } from '../store';
 import { notify } from '../lib/notifications';
 import { prefetchProfiles } from '@freeq/sdk';
 import { shouldRejoinCall, AV_REJOIN_WINDOW_MS, type PendingCallRejoin } from '../lib/av-mesh';
 import { fetchFavorites, pushFavorites, mergeFavorites, favoritesEqual } from '../lib/favorites-sync';
 import { createDmSendGate, dmThreadKey } from './dm-resolve';
+
+// ── This device's signing key ──────────────────────────────────────────
+//
+// The key is kept in this browser's IndexedDB, where the page cannot read it
+// out, and published to the account once.
+
+/** What this device's key is, for the settings row and the banner. */
+export interface DeviceKeyState {
+  /** Where the key is kept. */
+  store: 'browser' | null;
+  /** Set once the key's record is in the account. */
+  published: boolean;
+  /** The key's id, short form, and when it was made. */
+  kid?: string;
+  createdAt?: string;
+  /** The broker refused to publish it: the user has to sign in again. */
+  needsSignIn: boolean;
+}
+
+let deviceKeyState: DeviceKeyState = {
+  store: null,
+  published: false,
+  needsSignIn: false,
+};
+const deviceKeyListeners = new Set<() => void>();
+
+export function subscribeDeviceKey(fn: () => void): () => void {
+  deviceKeyListeners.add(fn);
+  return () => deviceKeyListeners.delete(fn);
+}
+
+export function getDeviceKeyState(): DeviceKeyState {
+  return deviceKeyState;
+}
+
+function setDeviceKeyState(patch: Partial<DeviceKeyState>): void {
+  deviceKeyState = { ...deviceKeyState, ...patch };
+  for (const fn of deviceKeyListeners) fn();
+}
+
+/**
+ * The store this browser keeps the device key in: its IndexedDB. One per
+ * account for the life of the page.
+ */
+const chosenStores = new Map<string, ChosenDeviceKeyStore>();
+
+function chosenStoreFor(did: string): ChosenDeviceKeyStore {
+  let store = chosenStores.get(did);
+  if (!store) {
+    store = new ChosenDeviceKeyStore(did);
+    chosenStores.set(did, store);
+  }
+  return store;
+}
+
+class ChosenDeviceKeyStore implements DeviceKeyStore {
+  private inner: Promise<DeviceKeyStore> | null = null;
+  private readonly did: string;
+
+  constructor(did: string) {
+    this.did = did;
+  }
+
+  private resolve(): Promise<DeviceKeyStore> {
+    return (this.inner ??= (async () => {
+      setDeviceKeyState({ store: 'browser' });
+      return new IndexedDbDeviceKeyStore(this.did);
+    })());
+  }
+
+  async load(): Promise<StoredDeviceKey | null> {
+    const stored = await (await this.resolve()).load();
+    if (stored) await noteDeviceKey(stored);
+    return stored;
+  }
+
+  async save(key: StoredDeviceKey): Promise<void> {
+    await (await this.resolve()).save(key);
+    await noteDeviceKey(key);
+  }
+}
+
+/** What the settings row shows about the key this device holds. */
+async function noteDeviceKey(key: StoredDeviceKey): Promise<void> {
+  setDeviceKeyState({
+    published: !!key.recordUri,
+    createdAt: key.createdAt,
+    kid: await kidOfKeyPair(key.keyPair),
+    needsSignIn: key.recordUri ? false : deviceKeyState.needsSignIn,
+  });
+}
+
+/** The key's id, by the recipe every freeq signer uses: base64url of the
+ *  first 16 bytes of SHA-256 over the raw public key. */
+async function kidOfKeyPair(keyPair: CryptoKeyPair): Promise<string> {
+  const raw = decodeMultibaseEd25519((await recordKeyOf(keyPair)).publicKeyMultibase);
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', raw as BufferSource));
+  return bytesToBase64Url(digest.slice(0, 16));
+}
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/**
+ * Start the sign-in that grants permission to publish keys. The same link the
+ * connect screen builds, with `intent=enroll` — what the account provider asks
+ * the user to allow.
+ */
+export function signInToPublishKeys(): void {
+  const broker = localStorage.getItem('freeq-broker-base');
+  const handle = localStorage.getItem('freeq-handle');
+  if (!broker || !handle) return;
+  const url =
+    `${broker}/auth/login?handle=${encodeURIComponent(handle)}&intent=enroll` +
+    `&return_to=${encodeURIComponent(window.location.origin)}`;
+  window.location.href = url;
+}
+
+/** Where the app publishes key records: the broker it signed in through. */
+function brokerFor(): { url: string; token: string } | null {
+  const url = localStorage.getItem('freeq-broker-base');
+  const token = localStorage.getItem('freeq-broker-token');
+  return url && token ? { url, token } : null;
+}
+
+/** The broker's answer to writing `record`, or null with no broker session.
+ *  A 401 or 403 means the session lacks the grant: the user signs in again.
+ *  It raises the upgrade bar only while this device's key is unpublished; a
+ *  device whose key is saved asks through the caller's own prompt. */
+async function postRecord(record: object, signerPublicKey: string): Promise<Response | null> {
+  const broker = brokerFor();
+  if (!broker) return null;
+  const res = await fetch(`${broker.url}/enroll`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      broker_token: broker.token,
+      record,
+      signer_public_key: signerPublicKey,
+    }),
+  });
+  if ((res.status === 401 || res.status === 403) && !deviceKeyState.published) {
+    setDeviceKeyState({ needsSignIn: true });
+  }
+  return res;
+}
+
+/** The written record's URI from a 200 answer; null for anything else. */
+async function uriOf(res: Response): Promise<string | null> {
+  if (res.status !== 200) return null;
+  const answer = (await res.json()) as { uri?: unknown };
+  return typeof answer.uri === 'string' ? answer.uri : null;
+}
+
+// ── The Devices list ───────────────────────────────────────────────────
+
+/** One row of the Devices list: a signing key the account knows about. */
+export interface DeviceRow {
+  kid: string;
+  /** The record's label, or the kid shortened. */
+  name: string;
+  state: 'active' | 'signedOut' | 'unpublished';
+  /** Active: when the key was published. Signed out: when it was retired. */
+  date?: string;
+  thisDevice: boolean;
+}
+
+/** What this browser holds, for the row that names it. */
+export interface ThisDeviceKey {
+  kid?: string;
+  createdAt?: string;
+  published: boolean;
+}
+
+/** A kid, short enough to name a device that never got a label. */
+function shortKid(kid: string): string {
+  return `${kid.slice(0, 8)}\u2026`;
+}
+
+/** How long a signed-out device stays listed after its retirement. */
+const SIGNED_OUT_LISTED_MS = 24 * 60 * 60 * 1000;
+
+/** How many signed-out devices the list shows at most. */
+const SIGNED_OUT_LISTED_MAX = 5;
+
+/**
+ * The rows for `did`'s device key records, newest key first.
+ *
+ * The fold decides which keys are live and when each was retired, so a
+ * retirement every client ignores (wrong signer, dated before the key) never
+ * dates a row. A key record the fold rejects is left out, and so is one not
+ * yet live and never retired, and one retired more than 24 hours ago. Of the
+ * signed-out rows left, only the five most recently retired are kept.
+ */
+export async function deviceRowsFrom(
+  did: string,
+  records: unknown[],
+  here: ThisDeviceKey,
+): Promise<DeviceRow[]> {
+  const now = Date.now();
+  const found: { row: DeviceRow; since: string }[] = [];
+  const signedOut: { row: DeviceRow; since: string }[] = [];
+  for (const key of await deviceKeyHistory(did, records)) {
+    const label = (key.record as Partial<DeviceKeyRecord>).label;
+    const retired = key.retiredAt !== null && key.retiredAt.getTime() <= now;
+    const active = key.createdAt.getTime() <= now && !retired;
+    if (!active && !retired) continue;
+    if (retired && now - key.retiredAt!.getTime() > SIGNED_OUT_LISTED_MS) continue;
+    const since = key.createdAt.toISOString();
+    (active ? found : signedOut).push({
+      since,
+      row: {
+        kid: key.kid,
+        name: typeof label === 'string' && label !== '' ? label : shortKid(key.kid),
+        state: active ? 'active' : 'signedOut',
+        date: active ? since : key.retiredAt!.toISOString(),
+        thisDevice: key.kid === here.kid,
+      },
+    });
+  }
+
+  // A signed-out row's date is its retirement.
+  signedOut.sort((a, b) => b.row.date!.localeCompare(a.row.date!));
+  found.push(...signedOut.slice(0, SIGNED_OUT_LISTED_MAX));
+
+  if (!here.published && here.kid !== undefined) {
+    found.push({
+      since: here.createdAt ?? '',
+      row: {
+        kid: here.kid,
+        name: shortKid(here.kid),
+        state: 'unpublished',
+        date: here.createdAt,
+        thisDevice: true,
+      },
+    });
+  }
+
+  found.sort((a, b) => b.since.localeCompare(a.since));
+  return found.map((f) => f.row);
+}
+
+/** A key lookup asking this page's origin; for a signed-in account (`did`
+ *  set) it keeps what it found in IndexedDB across page loads. */
+function newKeyLookup(did: string): KeyLookup {
+  return new KeyLookup(
+    { fetch: (target: string) => fetch(target), resolveDid: makeDidResolver() },
+    window.location.origin,
+    60 * 60 * 1000,
+    undefined,
+    did ? new IndexedDbKeyLookupStore(did) : undefined,
+  );
+}
+
+/** The key lookup the latest connection for this account was built with. */
+let accountKeyLookup: { did: string; lookup: KeyLookup } | null = null;
+
+function keyLookupFor(did: string): KeyLookup {
+  if (accountKeyLookup?.did !== did) accountKeyLookup = { did, lookup: newKeyLookup(did) };
+  return accountKeyLookup.lookup;
+}
+
+/**
+ * Read the account's device key records and lay them out as rows. The records
+ * come through the connection's key lookup, which holds the listing and its
+ * proofs for the hour; `refresh` lists the account again, for a read that must
+ * show a record just written.
+ */
+export async function listDeviceRows(options: { refresh?: boolean } = {}): Promise<DeviceRow[]> {
+  const did = saslState.did;
+  if (!did) return [];
+  const lookup = keyLookupFor(did);
+  const records = options.refresh
+    ? await lookup.refreshDeviceRecords(did)
+    : await lookup.provenDeviceRecords(did);
+  return deviceRowsFrom(did, records, {
+    kid: deviceKeyState.kid,
+    createdAt: deviceKeyState.createdAt,
+    published: deviceKeyState.published,
+  });
+}
+
+/** What signing a device out came to, for the panel to word. */
+export type SignOutOutcome =
+  /** Nobody is signed in, or this device's key is not in the account. Every
+   *  client ignores a retirement signed by an unpublished key, so nothing is
+   *  written. */
+  | { kind: 'notReady' }
+  /** This browser holds no key to sign the retirement with. */
+  | { kind: 'noKey' }
+  /** The account provider refused the write for lack of permission. */
+  | { kind: 'needsSignIn' }
+  /** The account provider did not save the retirement, for another reason. */
+  | { kind: 'notSaved' }
+  /** The retirement is in the account. `sessionsClosed` is what this server
+   *  closed, or null when its answer was not OK. */
+  | { kind: 'retired'; sessionsClosed: number | null };
+
+/**
+ * Sign a device out: the account says so in a record signed by this device's
+ * key, then the server drops that device's sessions and refuses its login
+ * token. The record is the durable statement; the server call is the
+ * eviction, so its answer is returned without undoing the record.
+ */
+export async function signOutDevice(kid: string): Promise<SignOutOutcome> {
+  const did = saslState.did;
+  if (!did || !brokerFor()) return { kind: 'notReady' };
+  const stored = await chosenStoreFor(did).load();
+  if (!stored) return { kind: 'noKey' };
+  // Loading the key brought `published` up to date.
+  if (!deviceKeyState.published) return { kind: 'notReady' };
+  const signer = await recordKeyOf(stored.keyPair);
+  const retirement = await buildDeviceRetirement(signer, did, kid, new Date().toISOString());
+  const answer = await postRecord(retirement, signer.publicKeyMultibase);
+  if (answer?.status === 401 || answer?.status === 403) return { kind: 'needsSignIn' };
+  if (!answer || !(await uriOf(answer))) return { kind: 'notSaved' };
+
+  const bearer = client?.apiBearer;
+  const res = await fetch('/api/v1/devices/sign-out', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}),
+    },
+    body: JSON.stringify({ kid }),
+  });
+  if (!res.ok) return { kind: 'retired', sessionsClosed: null };
+  const body = (await res.json().catch(() => ({}))) as { sessions_closed?: unknown };
+  return {
+    kind: 'retired',
+    sessionsClosed: typeof body.sessions_closed === 'number' ? body.sessions_closed : 0,
+  };
+}
+
+/** This browser's name, for the published record's label. */
+function browserLabel(): string {
+  const ua = navigator.userAgent;
+  if (/Edg\//.test(ua)) return 'Edge';
+  if (/OPR\//.test(ua)) return 'Opera';
+  if (/Firefox\//.test(ua)) return 'Firefox';
+  if (/Chrome\//.test(ua)) return 'Chrome';
+  if (/Safari\//.test(ua)) return 'Safari';
+  return 'Browser';
+}
 
 // Roaming-favorites state (module scope so it survives reconnects).
 let favoritesSynced = false;
@@ -151,9 +513,20 @@ export function __getPendingCallRejoinForTests(): PendingCallRejoin | null {
   return pendingCallRejoin;
 }
 
+/** Test-only: the state a broker that refused to publish the key leaves
+ *  behind, without a broker to refuse it. */
+export function __setKeyUnpublishedForTests(): void {
+  setDeviceKeyState({ needsSignIn: true, published: false, store: 'browser' });
+}
+
 // ── Public API (same signatures as before) ──
 
-export function connect(url: string, desiredNick: string, channels?: string[]) {
+/**
+ * `freshSignIn`: this connect is made from a returned sign-in, the only one
+ * allowed to replace a device key the account has retired. A saved session
+ * and every reconnect leave it false.
+ */
+export function connect(url: string, desiredNick: string, channels?: string[], freshSignIn = false) {
   if (client) {
     try { client.disconnect(); } catch { /* ignore */ }
     client = null;
@@ -162,6 +535,14 @@ export function connect(url: string, desiredNick: string, channels?: string[]) {
   const store = useStore.getState();
   store.reset();
 
+  // The key this device signs with, and the lookup that checks what others
+  // send. A guest signs nothing and publishes nothing, so neither is set up
+  // for one.
+  const deviceKeyStore = saslState.did ? chosenStoreFor(saslState.did) : undefined;
+  // A signed-in account's lookup keeps what it found across page loads.
+  const keyLookup = newKeyLookup(saslState.did);
+  if (saslState.did) accountKeyLookup = { did: saslState.did, lookup: keyLookup };
+
   client = new FreeqClient({
     url,
     nick: desiredNick,
@@ -169,10 +550,14 @@ export function connect(url: string, desiredNick: string, channels?: string[]) {
     brokerUrl: localStorage.getItem('freeq-broker-base') || undefined,
     brokerToken: localStorage.getItem('freeq-broker-token') || undefined,
     skipInitialBrokerRefresh: !!saslState.skipBrokerRefresh,
+    ...(deviceKeyStore ? { deviceKeyStore, deviceLabel: browserLabel() } : {}),
+    freshSignIn,
+    keyLookup,
   });
 
-  // Set SASL credentials if we have them
-  if (saslState.token) {
+  // Set SASL credentials if we have them. An account with no token still
+  // names its DID, which is what makes the SDK refresh the session first.
+  if (saslState.token || saslState.did) {
     client.setSaslCredentials({
       token: saslState.token,
       did: saslState.did,
@@ -217,6 +602,7 @@ export function disconnect() {
   client = null;
   dmSendGate = null;
   saslState = { token: '', did: '', pdsUrl: '', method: '', skipBrokerRefresh: false };
+  hadSignedInSession = false;
   // Clear persistent-login material so ConnectScreen doesn't immediately
   // re-auth the user via broker session refresh after a deliberate logout.
   try {
@@ -251,6 +637,21 @@ export function reconnect() {
 
 // SASL state (set before connect)
 let saslState = { token: '', did: '', pdsUrl: '', method: '', skipBrokerRefresh: false };
+
+/** Whether this page has registered as the signed-in account, so a later
+ *  connection that loses the account is a reconnect refused its token. */
+let hadSignedInSession = false;
+
+/** What the connect screen says when a signed-in session has ended. */
+export const SESSION_EXPIRED_LINE =
+  'Your session expired. Sign in with AT Protocol again, or connect as guest.';
+
+/** A signed-in session's token was refused on reconnect: sign out as the
+ *  load-time /session 401 does, rather than continue as a guest. */
+function endExpiredSession(): void {
+  disconnect();
+  useStore.getState().setAuthError(SESSION_EXPIRED_LINE);
+}
 
 export function setSaslCredentials(token: string, did: string, pdsUrl: string, method: string) {
   saslState = { token, did, pdsUrl, method, skipBrokerRefresh: !!token };
@@ -760,6 +1161,16 @@ function wireEvents(c: FreeqClient) {
   });
 
   c.on('registered', (nick) => {
+    if (c !== client) return;
+    // Registered without the account it was signed in as: a guest nick.
+    if (saslState.did && !c.authDid) {
+      if (hadSignedInSession) {
+        endExpiredSession();
+        return;
+      }
+    } else if (saslState.did) {
+      hadSignedInSession = true;
+    }
     s().setNick(nick);
     s().setRegistered(true);
     s().setConnectedServer(c['opts'].url);
@@ -785,11 +1196,19 @@ function wireEvents(c: FreeqClient) {
   });
 
   c.on('authenticated', (did, message) => {
+    // A client already signed out still reports its teardown.
+    if (c !== client) return;
     s().setAuth(did, message);
     if (did) prefetchProfiles([did]);
   });
 
   c.on('authError', (error) => {
+    if (c !== client) return;
+    // Refused credentials clear the SDK's DID; a nick collision leaves it.
+    if (hadSignedInSession && saslState.did && !c.authDid) {
+      endExpiredSession();
+      return;
+    }
     s().setAuthError(error);
   });
 
@@ -917,7 +1336,14 @@ function wireEvents(c: FreeqClient) {
     }
   }
 
+  // What the SDK said about each line's signature. A verdict that settles
+  // after the line was drawn arrives as its own event.
+  c.on('verdict', (msgid, verdict) => recordVerdict(msgid, verdict));
+
+  c.on('signingKeyUnpublished', () => setDeviceKeyState({ needsSignIn: true }));
+
   c.on('message', (channel, message) => {
+    recordVerdict(message.id, message.verdict);
     // Prefetch avatar by DID if available (from account-tag)
     if (message.tags?.account) prefetchProfiles([message.tags.account]);
 
@@ -944,6 +1370,7 @@ function wireEvents(c: FreeqClient) {
   });
 
   c.on('actEvent', (ev) => {
+    recordVerdict(ev.eventId, ev.verdict);
     // The TAGMSG is the event; its companion prose line arrives separately as
     // a `message`. The store joins the two and keeps the task they describe.
     const buffer = actEventBuffer(ev);
@@ -969,6 +1396,13 @@ function wireEvents(c: FreeqClient) {
   });
 
   c.on('serverFail', (text) => {
+    // The server refused this device's key: the account signed it out. Sign
+    // out here too, then say why, since the teardown clears the auth error.
+    if (/^MSGSIG KEY_RETIRED\b/.test(text)) {
+      disconnect();
+      s().setAuthError('This device was signed out from another device. Sign in again to continue.');
+      return;
+    }
     // A refusal is an answer. Resolving it here rather than waiting out the
     // timer is what turns an old server's ACCOUNT_REQUIRED, or an anchor it
     // does not know, into the button at once instead of ten seconds of
@@ -1003,6 +1437,7 @@ function wireEvents(c: FreeqClient) {
   });
 
   c.on('historyBatch', (channel, messages, info, rows) => {
+    for (const m of messages) recordVerdict(m.id, m.verdict);
     // Prefetch avatars by DID for history messages
     const dids = messages.map((m: any) => m.tags?.account).filter(Boolean);
     if (dids.length) prefetchProfiles(dids);

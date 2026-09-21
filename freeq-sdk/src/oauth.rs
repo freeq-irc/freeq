@@ -41,6 +41,9 @@ pub struct OAuthSession {
     pub dpop_key: DpopKey,
     /// DPoP nonce for the PDS (discovered during token exchange or pre-flight).
     pub dpop_nonce: Option<String>,
+    /// The scope this session was granted. A session is only reusable for the
+    /// scope it was asked for, so the cache records it.
+    pub scope: String,
 }
 
 /// Serializable form of an OAuth session for disk caching.
@@ -52,6 +55,10 @@ struct CachedSession {
     pds_url: String,
     dpop_key: String,
     dpop_nonce: Option<String>,
+    /// Absent in a file written before the scope was recorded, which reads as
+    /// "not the scope you asked for" and costs one fresh sign-in.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 impl OAuthSession {
@@ -67,6 +74,7 @@ impl OAuthSession {
             pds_url: self.pds_url.clone(),
             dpop_key: self.dpop_key.to_base64url(),
             dpop_nonce: self.dpop_nonce.clone(),
+            scope: Some(self.scope.clone()),
         };
         let json = serde_json::to_string_pretty(&cached)?;
 
@@ -100,6 +108,7 @@ impl OAuthSession {
             pds_url: self.pds_url.clone(),
             dpop_key: self.dpop_key.to_base64url(),
             dpop_nonce: self.dpop_nonce.clone(),
+            scope: Some(self.scope.clone()),
         };
         let plaintext = serde_json::to_vec(&cached)?;
 
@@ -133,9 +142,17 @@ impl OAuthSession {
     ///
     /// **Deprecated**: Reads plaintext JSON. Use
     /// [`load_encrypted`](Self::load_encrypted) instead.
-    pub fn load(path: &std::path::Path) -> Result<Self> {
+    pub fn load(path: &std::path::Path, scope: &str) -> Result<Self> {
         let json = std::fs::read_to_string(path)?;
         let cached: CachedSession = serde_json::from_str(&json)?;
+        // A session is only reusable for the scope it was granted. A file
+        // written before the scope was recorded carries none, which is not
+        // the scope being asked for either: one fresh sign-in settles it.
+        anyhow::ensure!(
+            cached.scope.as_deref() == Some(scope),
+            "cached session was granted {}, not {scope}",
+            cached.scope.as_deref().unwrap_or("no recorded scope")
+        );
         let dpop_key = DpopKey::from_base64url(&cached.dpop_key)?;
         Ok(Self {
             did: cached.did,
@@ -144,6 +161,7 @@ impl OAuthSession {
             pds_url: cached.pds_url,
             dpop_key,
             dpop_nonce: cached.dpop_nonce,
+            scope: scope.to_string(),
         })
     }
 
@@ -151,7 +169,7 @@ impl OAuthSession {
     ///
     /// Expects the format produced by [`save_encrypted`](Self::save_encrypted):
     /// `nonce (12 bytes) || ciphertext+tag`.
-    pub fn load_encrypted(path: &std::path::Path, key: &[u8; 32]) -> Result<Self> {
+    pub fn load_encrypted(path: &std::path::Path, key: &[u8; 32], scope: &str) -> Result<Self> {
         let data = std::fs::read(path)?;
         anyhow::ensure!(data.len() >= 12, "encrypted session file too short");
 
@@ -164,6 +182,12 @@ impl OAuthSession {
             .map_err(|_| anyhow::anyhow!("decryption failed (wrong key or tampered file)"))?;
 
         let cached: CachedSession = serde_json::from_slice(&plaintext)?;
+        // The same rule as `load`: a session is reusable only for its scope.
+        anyhow::ensure!(
+            cached.scope.as_deref() == Some(scope),
+            "cached session was granted {}, not {scope}",
+            cached.scope.as_deref().unwrap_or("no recorded scope")
+        );
         let dpop_key = DpopKey::from_base64url(&cached.dpop_key)?;
         Ok(Self {
             did: cached.did,
@@ -172,6 +196,7 @@ impl OAuthSession {
             pds_url: cached.pds_url,
             dpop_key,
             dpop_nonce: cached.dpop_nonce,
+            scope: scope.to_string(),
         })
     }
 
@@ -252,7 +277,7 @@ pub use freeq_oauth::DpopKey;
 ///
 /// Opens the user's browser for authorization. Returns an OAuthSession
 /// that can be used to create a PdsSessionSigner.
-pub async fn login(handle: &str) -> Result<OAuthSession> {
+pub async fn login(handle: &str, scope: &str) -> Result<OAuthSession> {
     let resolver = DidResolver::http();
 
     // 1. Resolve handle → DID → PDS
@@ -280,11 +305,10 @@ pub async fn login(handle: &str) -> Result<OAuthSession> {
     // client_id = http://localhost with query params declaring scopes and redirect_uri
     // The auth server infers metadata from these params for loopback clients.
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
-    // Identity-only scope. Matches the freeq-server's `Login` purpose.
-    // Programs that need broader PDS permissions (e.g. blob upload) call
-    // their own `step_up()` with a wider scope; this default keeps the
-    // CLI consent screen narrow for the common case.
-    let scope = "atproto";
+    // The scope the caller asked for. `atproto` is identity-only and matches
+    // the freeq-server's `Login` purpose; a caller that needs to write to the
+    // account — publishing a device key — asks for the repo scope it needs,
+    // and the consent screen names it.
     let client_id = format!(
         "http://localhost?redirect_uri={}&scope={}",
         urlencod(&redirect_uri),
@@ -310,6 +334,7 @@ pub async fn login(handle: &str) -> Result<OAuthSession> {
         &code_challenge,
         &state,
         handle,
+        scope,
         &dpop_key,
     )
     .await?;
@@ -349,6 +374,7 @@ pub async fn login(handle: &str) -> Result<OAuthSession> {
         pds_url,
         dpop_key,
         dpop_nonce,
+        scope: scope.to_string(),
     })
 }
 
@@ -386,6 +412,7 @@ async fn push_authorization_request(
     code_challenge: &str,
     state: &str,
     login_hint: &str,
+    scope: &str,
     dpop_key: &DpopKey,
 ) -> Result<String> {
     let par = freeq_oauth::discovery::pushed_authorization_request(
@@ -396,9 +423,7 @@ async fn push_authorization_request(
         code_challenge,
         state,
         login_hint,
-        // Narrow scope; SDK callers that need PDS write access do a separate
-        // wider-scope auth round rather than asking for it on every login.
-        "atproto",
+        scope,
         dpop_key,
     )
     .await?;
@@ -658,6 +683,7 @@ mod tests {
             pds_url,
             dpop_key: DpopKey::generate(),
             dpop_nonce: None,
+            scope: "atproto".to_string(),
         }
     }
 
@@ -797,7 +823,7 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600, "session file must be 0600");
         }
 
-        let loaded = OAuthSession::load(&path).unwrap();
+        let loaded = OAuthSession::load(&path, "atproto").unwrap();
         assert_eq!(loaded.did, session.did);
         assert_eq!(loaded.handle, session.handle);
         assert_eq!(loaded.access_token, session.access_token);
@@ -824,9 +850,26 @@ mod tests {
             "access token must not appear in plaintext on disk"
         );
 
-        let loaded = OAuthSession::load_encrypted(&path, &key).unwrap();
+        let loaded = OAuthSession::load_encrypted(&path, &key, "atproto").unwrap();
         assert_eq!(loaded.access_token, "tok-2");
         assert_eq!(loaded.dpop_nonce.as_deref(), Some("cached-nonce"));
+        assert_eq!(loaded.scope, "atproto");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn session_load_encrypted_refuses_a_session_granted_another_scope() {
+        let path = temp_path("otherscope.session.bin");
+        let key = derive_session_key(b"machine-secret", "did:plc:test");
+        test_session("https://pds.example".into(), "tok-4")
+            .save_encrypted(&path, &key)
+            .unwrap();
+        let err = OAuthSession::load_encrypted(&path, &key, freeq_oauth::ENROLL_SCOPE).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cached session was granted atproto"),
+            "got: {err}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -838,7 +881,7 @@ mod tests {
         test_session("https://pds.example".into(), "tok-3")
             .save_encrypted(&path, &key)
             .unwrap();
-        let err = OAuthSession::load_encrypted(&path, &wrong).unwrap_err();
+        let err = OAuthSession::load_encrypted(&path, &wrong, "atproto").unwrap_err();
         assert!(err.to_string().contains("decryption failed"), "got: {err}");
         let _ = std::fs::remove_file(&path);
     }
@@ -848,7 +891,7 @@ mod tests {
         let path = temp_path("truncated.session.bin");
         std::fs::write(&path, [0u8; 7]).unwrap();
         let key = derive_session_key(b"machine-secret", "did:plc:test");
-        let err = OAuthSession::load_encrypted(&path, &key).unwrap_err();
+        let err = OAuthSession::load_encrypted(&path, &key, "atproto").unwrap_err();
         assert!(err.to_string().contains("too short"), "got: {err}");
         let _ = std::fs::remove_file(&path);
     }
@@ -1240,6 +1283,7 @@ mod tests {
             "challenge",
             "state-1",
             "alice.test",
+            "atproto repo:at.freeq.deviceKey?action=create",
             &key,
         )
         .await
@@ -1268,6 +1312,7 @@ mod tests {
             "challenge",
             "state-1",
             "alice.test",
+            "atproto",
             &key,
         )
         .await
@@ -1292,6 +1337,7 @@ mod tests {
             "challenge",
             "state-1",
             "alice.test",
+            "atproto",
             &key,
         )
         .await

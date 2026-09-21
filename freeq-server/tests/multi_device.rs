@@ -907,20 +907,17 @@ where
     F: Fn(&Event) -> bool,
 {
     use tokio::time::{Duration, timeout};
-    match timeout(Duration::from_millis(timeout_ms), async {
+    timeout(Duration::from_millis(timeout_ms), async {
         loop {
-            if let Some(e) = rx.recv().await {
-                if pred(&e) {
-                    return e;
-                }
+            if let Some(e) = rx.recv().await
+                && pred(&e)
+            {
+                return e;
             }
         }
     })
     .await
-    {
-        Ok(e) => Some(e),
-        Err(_) => None,
-    }
+    .ok()
 }
 
 // ═══════════════════════════════════════════════════════════════

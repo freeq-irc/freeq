@@ -331,6 +331,14 @@ pub fn convert_event(event: &freeq_sdk::event::Event) -> DomainEvent {
         Event::Act { .. } => DomainEvent::Notice {
             text: String::new(),
         },
+        // Windows supplies no key store or enrollment, so this never fires.
+        Event::SigningKeyUnpublished => DomainEvent::Notice {
+            text: String::new(),
+        },
+        // Windows passes no key lookup, so this never fires.
+        Event::Verdict { .. } => DomainEvent::Notice {
+            text: String::new(),
+        },
     }
 }
 
@@ -351,6 +359,7 @@ mod tests {
             text: "hello world".to_string(),
             tags,
             dm_key: None,
+            verdict: None,
         };
 
         let domain = convert_event(&event);
@@ -372,6 +381,7 @@ mod tests {
             text: "\x01ACTION waves\x01".to_string(),
             tags: HashMap::new(),
             dm_key: None,
+            verdict: None,
         };
 
         let domain = convert_event(&event);
@@ -438,6 +448,7 @@ mod tests {
             text: "edited text".to_string(),
             tags,
             dm_key: None,
+            verdict: None,
         };
 
         let domain = convert_event(&event);

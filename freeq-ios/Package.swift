@@ -36,6 +36,8 @@ let package = Package(
                 "CallCameraCapture.swift",
                 "CallKitManager.swift",
                 "CallMicCapture.swift",
+                // Keychain + the generated FFI protocols.
+                "DeviceKey.swift",
                 "IntelligenceService.swift",
                 "KeychainHelper.swift",
                 "NetworkMonitor.swift",
@@ -58,6 +60,8 @@ let package = Package(
                 "ChannelCrypto.swift",
                 "ChannelE2eeState.swift",
                 "ChannelAccessNotice.swift",
+                "RefusedKeyNotice.swift",
+                "RowSignatureMark.swift",
                 "SelfPartResolve.swift",
                 "ChannelState.swift",
                 "DidDisplay.swift",
@@ -70,6 +74,7 @@ let package = Package(
                 "DmResolver.swift",
                 "IdentityClaim.swift",
                 "SignatureProof.swift",
+                "DeviceKeyNotice.swift",
             ],
             resources: [
                 // The seal panel's words, bundled byte-identical from

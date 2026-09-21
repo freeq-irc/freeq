@@ -4,6 +4,23 @@ struct SettingsTab: View {
     @EnvironmentObject var appState: AppState
     @State private var showStatusEditor = false
 
+    /// Start a sign-in that asks the account for permission to write this
+    /// device's key records. The same link and the same in-app sheet the
+    /// connect screen uses.
+    private func publishKey(handle: String) {
+        let encoded = handle.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? handle
+        let returnTo = "\(ServerConfig.apiBaseUrl)/auth/mobile"
+            .addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        guard let url = URL(string:
+            "\(appState.authBrokerBase)/auth/login?handle=\(encoded)&mobile=1&intent=enroll"
+                + "&return_to=\(returnTo)") else { return }
+        AuthSession.shared.start(loginURL: url) { callbackURL, _ in
+            DispatchQueue.main.async {
+                if let callbackURL { appState.handleAuthCallback(callbackURL) }
+            }
+        }
+    }
+
     var body: some View {
         NavigationStack {
             ZStack {
@@ -58,6 +75,30 @@ struct SettingsTab: View {
                             }
                         }
                         .listRowBackground(Theme.bgSecondary)
+                        // This device's signing key, while it is not on the
+                        // account. Messages still send and still carry that
+                        // key — the row is here to fix the one thing missing,
+                        // and it goes away once the key is published.
+                        if appState.signingKeyUnpublished {
+                            HStack(spacing: 12) {
+                                Image(systemName: "key.slash")
+                                    .font(.system(size: 16))
+                                    .foregroundColor(Theme.textMuted)
+                                    .frame(width: 24)
+                                Text("Key not published · this device")
+                                    .font(.fqSubheadline)
+                                    .foregroundColor(Theme.textPrimary)
+                                Spacer()
+                                // The broker's login resolves a handle, so the
+                                // action is offered only where we know one.
+                                if let handle = appState.accountHandle {
+                                    Button("Publish key") { publishKey(handle: handle) }
+                                        .font(.fqSubheadline.weight(.semibold))
+                                        .foregroundColor(Theme.accent)
+                                }
+                            }
+                            .listRowBackground(Theme.bgSecondary)
+                        }
                     } header: {
                         Text("Account")
                             .foregroundColor(Theme.textMuted)

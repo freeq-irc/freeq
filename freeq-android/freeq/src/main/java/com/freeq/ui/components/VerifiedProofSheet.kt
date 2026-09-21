@@ -20,14 +20,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.freeq.ffi.VerdictState
 import com.freeq.model.AppState
+import com.freeq.model.FfiVerdict
 import com.freeq.model.SenderIdentity
 import com.freeq.model.SignatureVerdict
-import com.freeq.model.SigningKeyInfo
 import com.freeq.model.VerdictTone
-import com.freeq.model.VerificationService
-import com.freeq.model.VerifyAnswer
-import com.freeq.model.VerifyOutcome
 import com.freeq.ui.theme.FreeqColors
 import kotlinx.coroutines.delay
 
@@ -57,16 +55,19 @@ sealed interface ProofRequest {
          *  the message. */
         val msgId: String? = null,
         val signed: Boolean = false,
+        /** That message's verdict, as the SDK settled it. */
+        val verdict: FfiVerdict? = null,
     ) : ProofRequest
 
     /** Whether this one message's signature holds up. Says nothing about who
      *  the sender is — that question has its own surface. */
     data class Message(
         val msgId: String,
-        /** A signature was on the wire. Without one there is nothing to ask
-         *  the server, and asking anyway returns a can't-check that reads
-         *  like a fault where there is none. */
+        /** A signature was on the wire. Without one there was nothing to
+         *  check, which is a fact and not a fault. */
         val signed: Boolean,
+        /** What the SDK made of it, checked on this device. */
+        val verdict: FfiVerdict? = null,
     ) : ProofRequest
 }
 
@@ -101,7 +102,8 @@ fun VerifiedProofSheet(
         ) {
             when (request) {
                 is ProofRequest.Identity -> IdentityProof(request, appState)
-                is ProofRequest.Message -> MessageProof(request.msgId, request.signed)
+                is ProofRequest.Message ->
+                    MessageProof(request.msgId, request.signed, request.verdict)
             }
         }
     }
@@ -131,8 +133,6 @@ private fun IdentityProof(request: ProofRequest.Identity, appState: AppState?) {
         lookup,
     )
     val did = claim.did
-    var key by remember { mutableStateOf<SigningKeyInfo?>(null) }
-    var keyLoading by remember { mutableStateOf(did != null) }
 
     // If we can't name them yet, ask — otherwise this sheet would answer
     // "unknown" without anyone having asked anything.
@@ -140,13 +140,6 @@ private fun IdentityProof(request: ProofRequest.Identity, appState: AppState?) {
         if (did == null && request.origin == null) {
             request.nick?.let { appState?.lookUpIdentity(it) }
         }
-    }
-
-    LaunchedEffect(did) {
-        val d = did ?: return@LaunchedEffect
-        keyLoading = true
-        key = VerificationService.fetchSigningKey(d)
-        keyLoading = false
     }
 
     val name = SenderIdentity.title(request.displayName, request.handle, request.nick)
@@ -187,15 +180,13 @@ private fun IdentityProof(request: ProofRequest.Identity, appState: AppState?) {
             else MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
-    if (!claim.needsKeyCard || key != null || keyLoading) {
-        claim.line?.let { line ->
-            Spacer(Modifier.height(16.dp))
-            Text(
-                text = line,
-                fontSize = 14.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
+    claim.line?.let { line ->
+        Spacer(Modifier.height(16.dp))
+        Text(
+            text = line,
+            fontSize = 14.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 
     if (did != null) {
@@ -206,25 +197,6 @@ private fun IdentityProof(request: ProofRequest.Identity, appState: AppState?) {
             detail = request.handle?.let { "resolves to @$it" },
             copyable = true,
         )
-        Spacer(Modifier.height(12.dp))
-        if (key != null) {
-            ProofCard(
-                label = "MESSAGE SIGNING KEY",
-                value = key!!.publicKey,
-                // Algorithm only. The old source suffix read "server-attested"
-                // for every key (the endpoint labels them all "key-store"),
-                // contradicting a device-signed verdict one card up. Trust
-                // language belongs to the verdict, which carries it already.
-                detail = key!!.algorithm.uppercase(),
-                copyable = false,
-            )
-        } else if (keyLoading) {
-            CircularProgressIndicator(
-                modifier = Modifier.size(20.dp),
-                strokeWidth = 2.dp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
     } else {
         Spacer(Modifier.height(8.dp))
     }
@@ -233,7 +205,7 @@ private fun IdentityProof(request: ProofRequest.Identity, appState: AppState?) {
     // identity it anchors.
     if (request.msgId != null) {
         Spacer(Modifier.height(20.dp))
-        MessageProof(request.msgId, request.signed)
+        MessageProof(request.msgId, request.signed, request.verdict)
     }
 }
 
@@ -243,49 +215,23 @@ private fun IdentityProof(request: ProofRequest.Identity, appState: AppState?) {
  * this client knows perfectly well is neither claimed nor disowned.
  */
 @Composable
-private fun MessageProof(msgId: String, signed: Boolean) {
-    var verify by remember { mutableStateOf<VerifyAnswer?>(null) }
-    var retrying by remember { mutableStateOf(false) }
-
-    LaunchedEffect(msgId) {
-        if (!signed) return@LaunchedEffect
-        var answer = VerificationService.verifyMessage(msgId)
-        // The server starts fetching the signer's key by answering, so this
-        // one flavour of can't-check is worth waiting out — briefly. It reads
-        // as in-progress only while we are actually going to ask again; after
-        // that it is an ordinary can't-check.
-        var attempts = 0
-        while (answer.transient && attempts < 2) {
-            attempts++
-            retrying = true
-            verify = answer
-            delay(1200)
-            answer = VerificationService.verifyMessage(msgId)
-        }
-        retrying = false
-        verify = answer
-    }
-
-    val answer = verify
+private fun MessageProof(msgId: String, signed: Boolean, verdict: FfiVerdict?) {
+    // Nothing is fetched here. The check was made on this device when the line
+    // landed; a verdict that took a moment to settle replaces it in place, so
+    // the later of the two is the answer.
+    val settled = SignatureVerdict.checked[msgId] ?: verdict
     val quiet = MaterialTheme.colorScheme.onSurfaceVariant
-    val copy = when {
-        !signed -> SignatureVerdict.UNSIGNED
-        answer == null -> null
-        else -> SignatureVerdict.copy(answer, retrying)
-    }
-    val tint = when {
-        answer == null || retrying -> quiet
-        else -> when (SignatureVerdict.tone(answer.outcome)) {
-            VerdictTone.GOOD -> FreeqColors.success
-            VerdictTone.BAD -> FreeqColors.danger
-            VerdictTone.QUIET -> quiet
-        }
+    val checking = settled?.state == VerdictState.PENDING || (settled == null && signed)
+    val tint = when (settled?.let { SignatureVerdict.tone(it.state) }) {
+        VerdictTone.GOOD -> FreeqColors.success
+        VerdictTone.BAD -> FreeqColors.danger
+        else -> quiet
     }
 
     // The same shape the identity side uses, so the two read as one family:
     // the glyph carries the answer, the heading names it, one line says what
     // it means.
-    if (signed && (answer == null || retrying)) {
+    if (checking) {
         CircularProgressIndicator(
             modifier = Modifier.size(48.dp),
             strokeWidth = 4.dp,
@@ -293,10 +239,9 @@ private fun MessageProof(msgId: String, signed: Boolean) {
         )
     } else {
         Icon(
-            when {
-                !signed -> Icons.Default.Info
-                answer?.outcome == VerifyOutcome.DEVICE -> Icons.Default.CheckCircle
-                answer?.outcome == VerifyOutcome.INVALID -> Icons.Default.Warning
+            when (settled?.state) {
+                VerdictState.DEVICE -> Icons.Default.CheckCircle
+                VerdictState.INVALID, VerdictState.RETIRED -> Icons.Default.Warning
                 else -> Icons.Default.Info
             },
             contentDescription = null,
@@ -306,15 +251,21 @@ private fun MessageProof(msgId: String, signed: Boolean) {
     }
     Spacer(Modifier.height(12.dp))
     Text(
-        text = copy?.heading ?: "Checking signature…",
+        text = when {
+            settled != null -> SignatureVerdict.heading(settled.state)
+            signed -> "Checking signature…"
+            else -> SignatureVerdict.heading(VerdictState.UNSIGNED)
+        },
         fontSize = 20.sp,
         fontWeight = FontWeight.Bold,
         color = MaterialTheme.colorScheme.onSurface,
     )
-    if (copy != null) {
+    // The sentence is the SDK's — the same words every freeq client shows for
+    // this state.
+    if (settled != null) {
         Spacer(Modifier.height(16.dp))
         Text(
-            text = copy.line,
+            text = settled.sentence,
             fontSize = 14.sp,
             color = tint,
         )

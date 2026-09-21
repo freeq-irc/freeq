@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { connect, setSaslCredentials } from '../irc/client';
+import { connect, setSaslCredentials, SESSION_EXPIRED_LINE } from '../irc/client';
 import { useStore } from '../store';
 
 type LoginMode = 'at-proto' | 'guest';
@@ -245,7 +245,8 @@ export function ConnectScreen() {
         const loc = window.location;
         const proto = loc.protocol === 'https:' ? 'wss:' : 'ws:';
         const host = loc.host.replace('localhost', '127.0.0.1');
-        connect(`${proto}//${host}/irc`, finalNick, ch);
+        // A returned sign-in: the one connect that may replace a retired key.
+        connect(`${proto}//${host}/irc`, finalNick, ch, true);
       }
     } catch { /* ignore parse errors */ }
   }, [brokerOrigin]);
@@ -324,7 +325,7 @@ export function ConnectScreen() {
         // user has nothing to report.
         if (e?.name === 'SessionExpired') {
           brokerAutoAttempts = MAX_BROKER_AUTO_ATTEMPTS;
-          setError('Your session expired. Sign in with AT Protocol again, or connect as guest.');
+          setError(SESSION_EXPIRED_LINE);
           return;
         }
         if (brokerAutoAttempts < MAX_BROKER_AUTO_ATTEMPTS) {
@@ -389,7 +390,9 @@ export function ConnectScreen() {
       try { localStorage.removeItem('freeq-oauth-result'); } catch { /* ignore */ }
 
       // Use webOrigin for auth URLs (same-origin in browser, explicit server in Tauri)
-      const baseAuthUrl = `${brokerOrigin}/auth/login?handle=${encodeURIComponent(h)}`;
+      // `intent=enroll` asks for the grant that lets this device publish its
+      // signing key to the account; every other sign-in stays identity-only.
+      const baseAuthUrl = `${brokerOrigin}/auth/login?handle=${encodeURIComponent(h)}&intent=enroll`;
       const authUrl = `${baseAuthUrl}&return_to=${encodeURIComponent(window.location.origin)}`;
 
       // Pre-flight check: verify broker is reachable before redirecting

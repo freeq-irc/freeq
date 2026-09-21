@@ -184,10 +184,10 @@ async fn sasl_ed25519_happy_path() {
     let (_handle, mut events) = client::connect(config, Some(signer));
     let auth = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(e) = events.recv().await {
-                if matches!(e, Event::Authenticated { .. }) {
-                    return e;
-                }
+            if let Some(e) = events.recv().await
+                && matches!(e, Event::Authenticated { .. })
+            {
+                return e;
             }
         }
     })
@@ -213,10 +213,10 @@ async fn sasl_secp256k1_happy_path() {
     let (_handle, mut events) = client::connect(config, Some(signer));
     let auth = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(e) = events.recv().await {
-                if matches!(e, Event::Authenticated { .. }) {
-                    return e;
-                }
+            if let Some(e) = events.recv().await
+                && matches!(e, Event::Authenticated { .. })
+            {
+                return e;
             }
         }
     })
@@ -452,19 +452,19 @@ async fn sasl_authenticate_before_cap_req() {
             |l| l.starts_with("AUTHENTICATE ") || l.split_whitespace().nth(1) == Some("904"),
             2000,
         );
-        if let Some(line) = result {
-            if line.starts_with("AUTHENTICATE ") {
-                // Got challenge — sign it
-                let challenge = line.strip_prefix("AUTHENTICATE ").unwrap();
-                let challenge_bytes = auth::decode_challenge_bytes(challenge).unwrap();
-                let signer = KeySigner::new(DID_A.to_string(), key);
-                let response = signer.respond(&challenge_bytes).unwrap();
-                c.tx(&format!(
-                    "AUTHENTICATE {}",
-                    auth::encode_response(&response)
-                ));
-                c.num("903"); // Should succeed even without CAP REQ
-            }
+        if let Some(line) = result
+            && line.starts_with("AUTHENTICATE ")
+        {
+            // Got challenge — sign it
+            let challenge = line.strip_prefix("AUTHENTICATE ").unwrap();
+            let challenge_bytes = auth::decode_challenge_bytes(challenge).unwrap();
+            let signer = KeySigner::new(DID_A.to_string(), key);
+            let response = signer.respond(&challenge_bytes).unwrap();
+            c.tx(&format!(
+                "AUTHENTICATE {}",
+                auth::encode_response(&response)
+            ));
+            c.num("903"); // Should succeed even without CAP REQ
         }
     })
     .await;

@@ -17,7 +17,7 @@ use freeq_sdk::auth::KeySigner;
 use freeq_sdk::client::{self, ClientHandle, ConnectConfig};
 use freeq_sdk::crypto::PrivateKey;
 use freeq_sdk::event::Event;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -58,9 +58,8 @@ async fn send_output(h: &ClientHandle, target: &str, output: &str) {
     let lines: Vec<&str> = output.lines().collect();
     let total = lines.len();
     let mut sent_bytes = 0;
-    let mut sent_lines = 0;
 
-    for line in &lines {
+    for (sent_lines, line) in lines.iter().enumerate() {
         if sent_lines >= MAX_LINES || sent_bytes > MAX_BYTES {
             let _ = h
                 .privmsg(
@@ -78,7 +77,6 @@ async fn send_output(h: &ClientHandle, target: &str, output: &str) {
         };
         let _ = h.privmsg(target, &display).await;
         sent_bytes += display.len();
-        sent_lines += 1;
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -119,7 +117,7 @@ async fn run_cmd(cmd: &str, cwd: &PathBuf) -> String {
 }
 
 /// Read a file, return first N lines.
-async fn read_file(path: &str, cwd: &PathBuf) -> String {
+async fn read_file(path: &str, cwd: &Path) -> String {
     let full_path = if path.starts_with('/') {
         PathBuf::from(path)
     } else {
@@ -234,6 +232,7 @@ async fn main() -> Result<()> {
         tls_insecure: false,
         web_token: None,
         websocket_url: None,
+        ..Default::default()
     };
     let conn = client::establish_connection(&config).await?;
     let (handle, mut events) =
@@ -318,9 +317,11 @@ async fn main() -> Result<()> {
                     // Channel message — needs "pi:" prefix
                     let trimmed = text.trim();
                     let lower = trimmed.to_lowercase();
-                    let rest = if lower.starts_with("pi: ") || lower.starts_with("pi:") {
-                        Some(&trimmed[3..])
-                    } else if lower.starts_with("pi, ") || lower.starts_with("pi,") {
+                    let rest = if lower.starts_with("pi: ")
+                        || lower.starts_with("pi:")
+                        || lower.starts_with("pi, ")
+                        || lower.starts_with("pi,")
+                    {
                         Some(&trimmed[3..])
                     } else if lower.starts_with("@pi ") {
                         Some(&trimmed[4..])

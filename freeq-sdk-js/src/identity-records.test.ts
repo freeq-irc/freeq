@@ -217,6 +217,78 @@ function resolverFor(did: string, pds: string | undefined) {
   return async (): Promise<DidDocument> => doc;
 }
 
+describe('device key history', () => {
+  it('carries the retirement the fold accepted', async () => {
+    // An earlier retirement signed by a key the account never published is
+    // ignored; the later one, signed by the key itself, counts.
+    const { deviceKeyHistory } = await import('./identity-records.js');
+    const [k1, k2] = [await key(1), await key(2)];
+    const records = [
+      await buildDeviceRecord(k1, ALICE, T0),
+      await buildDeviceRetirement(k2, ALICE, await kidOf(k1), T1),
+      await buildDeviceRetirement(k1, ALICE, await kidOf(k1), T2),
+    ];
+    const history = await deviceKeyHistory(ALICE, records);
+    expect(history.map((k) => k.kid)).toEqual([await kidOf(k1)]);
+    expect(history[0]!.createdAt).toEqual(new Date(T0));
+    expect(history[0]!.retiredAt).toEqual(new Date(T2));
+  });
+});
+
+describe('checking listed records against the repository', () => {
+  it('keeps a genuine record, ignores a forged one, and fetches a passed proof once', async () => {
+    const { listRecordEntries, provenRecords } = await import('./identity-records.js');
+    const { stubRepo } = await import('../test/repo-proofs.js');
+    const repo = await stubRepo(ALICE);
+    const genuine = await buildDeviceRecord(await key(1), ALICE, T0, 'laptop');
+    // Signed by its own key, so it passes every record check but the proof.
+    const forged = await buildDeviceRecord(await key(2), ALICE, T0, 'forged');
+    const genuineEntry = await repo.add(DEVICE_KEY_TYPE, genuine);
+    const forgedEntry = await repo.addForged(DEVICE_KEY_TYPE, forged, genuine);
+    const doc = await repo.document(PDS);
+    const fetch = async (input: string): Promise<Response> =>
+      (await repo.respond(new URL(input))) ?? new Response('unexpected', { status: 500 });
+    const resolveDid = async (): Promise<DidDocument> => doc;
+
+    const proven = new Set<string>();
+    for (let i = 0; i < 3; i++) {
+      const entries = await listRecordEntries(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE);
+      expect(entries).toHaveLength(2);
+      expect(await provenRecords(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE, entries, proven)).toEqual([
+        genuine,
+      ]);
+    }
+    expect(repo.proofReads(genuineEntry)).toBe(1);
+    expect(repo.proofReads(forgedEntry)).toBe(3);
+  });
+
+  it('shares one proof between two listings racing on a record, and fetches a failed one again', async () => {
+    const { listRecordEntries, provenRecords } = await import('./identity-records.js');
+    const { stubRepo } = await import('../test/repo-proofs.js');
+    const repo = await stubRepo(ALICE);
+    const genuine = await buildDeviceRecord(await key(1), ALICE, T0, 'laptop');
+    // Signed by its own key, so it passes every record check but the proof.
+    const forged = await buildDeviceRecord(await key(2), ALICE, T0, 'forged');
+    const genuineEntry = await repo.add(DEVICE_KEY_TYPE, genuine);
+    const forgedEntry = await repo.addForged(DEVICE_KEY_TYPE, forged, genuine);
+    const doc = await repo.document(PDS);
+    const fetch = async (input: string): Promise<Response> =>
+      (await repo.respond(new URL(input))) ?? new Response('unexpected', { status: 500 });
+    const resolveDid = async (): Promise<DidDocument> => doc;
+    const reads = () => [repo.proofReads(genuineEntry), repo.proofReads(forgedEntry)];
+
+    const proven = new Set<string>();
+    const proving = new Map<string, Promise<boolean>>();
+    const entries = await listRecordEntries(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE);
+    const prove = () => provenRecords(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE, entries, proven, proving);
+    expect(await Promise.all([prove(), prove()])).toEqual([[genuine], [genuine]]);
+    expect(reads(), 'racing listings share each proof').toEqual([1, 1]);
+
+    expect(await prove()).toEqual([genuine]);
+    expect(reads(), 'a failed proof is not kept').toEqual([1, 2]);
+  });
+});
+
 describe('reading records from a PDS', () => {
   it('reads every page until the PDS stops sending a cursor', async () => {
     const [k1, k2] = [await key(1), await key(2)];

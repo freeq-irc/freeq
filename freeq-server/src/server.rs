@@ -323,6 +323,16 @@ impl OauthPurpose {
     }
 }
 
+/// The OAuth scope a `/auth/login` asks for. The purpose stays
+/// [`OauthPurpose::Login`] either way — only the grant widens, so a device
+/// that signs in to publish its signing key may create the key records.
+pub fn login_scope(intent: Option<&str>) -> &'static str {
+    match intent {
+        Some("enroll") => freeq_oauth::ENROLL_SCOPE,
+        _ => "atproto",
+    }
+}
+
 /// True when the session's actually-granted scope satisfies what the
 /// requested purpose needs at runtime.
 ///
@@ -700,6 +710,10 @@ impl NickMap {
     }
 }
 
+/// What a one-time web auth token stands for: (DID, handle, minted at, the
+/// login token behind it).
+pub type WebAuthToken = (String, String, std::time::Instant, Option<String>);
+
 pub struct SharedState {
     pub server_name: String,
     pub challenge_store: ChallengeStore,
@@ -795,9 +809,23 @@ pub struct SharedState {
     pub oauth_pending: Mutex<HashMap<String, OAuthPending>>,
     /// Completed OAuth sessions: state → OAuthResult.
     pub oauth_complete: Mutex<HashMap<String, OAuthResult>>,
-    /// One-time web auth tokens: token → (DID, handle, created_at).
-    /// Generated during OAuth callback, consumed during SASL.
-    pub web_auth_tokens: Mutex<HashMap<String, (String, String, std::time::Instant)>>,
+    /// One-time web auth tokens: token → (DID, handle, created_at, broker token).
+    /// Generated during OAuth callback, consumed during SASL. The broker token
+    /// is the device's login token, kept so signing that device out can refuse
+    /// it; absent when an older broker pushed the token without naming it.
+    pub web_auth_tokens: Mutex<HashMap<String, WebAuthToken>>,
+    /// A device's signing key and the login token behind it: (DID, kid) →
+    /// broker token. Filed when a connection registers its `MSGSIG` key.
+    pub device_key_tokens: Mutex<HashMap<(String, String), String>>,
+    /// Hashes ([`freeq_auth_broker::token_hash`]) of signed-out devices'
+    /// login tokens: the web-token push refuses these. It is the cache of the
+    /// `revoked_broker_tokens` table, which a restart reloads, so a sign-out
+    /// outlives this process.
+    pub revoked_token_hashes: Mutex<HashSet<String>>,
+    /// Sign-outs waiting to reach a standalone broker, by token hash.
+    pub broker_deletes: Mutex<HashMap<String, crate::broker_signout::PendingDelete>>,
+    /// Wakes the delivery task when a sign-out is queued.
+    pub broker_delete_wake: tokio::sync::Notify,
     /// Active web sessions with PDS credentials, keyed by DID.
     /// Used for server-proxied operations like media upload.
     /// Active web sessions keyed by `(DID, purpose)`. Each entry holds an
@@ -1745,6 +1773,18 @@ impl Server {
             None => None,
         };
 
+        // Devices signed out before this process started are still signed out.
+        let revoked_hashes: HashSet<String> = db
+            .as_ref()
+            .and_then(|db| {
+                db.revoked_broker_token_hashes()
+                    .map_err(|e| tracing::error!("Failed to load signed-out tokens: {e}"))
+                    .ok()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
         // Private media store: encrypted blobs on disk under {data_dir}/media.
         // Metadata lives in the DB, so the store is only meaningful when
         // persistence is enabled — gate on `db` to avoid creating a stray
@@ -1985,6 +2025,10 @@ impl Server {
             oauth_pending: Mutex::new(HashMap::new()),
             oauth_complete: Mutex::new(HashMap::new()),
             web_auth_tokens: Mutex::new(HashMap::new()),
+            device_key_tokens: Mutex::new(HashMap::new()),
+            revoked_token_hashes: Mutex::new(revoked_hashes),
+            broker_deletes: Mutex::new(HashMap::new()),
+            broker_delete_wake: tokio::sync::Notify::new(),
             web_sessions: Mutex::new(HashMap::new()),
             login_pending: Mutex::new(HashMap::new()),
             linked_identities: Mutex::new(HashMap::new()),
@@ -2382,7 +2426,7 @@ impl Server {
                     reconcile_state
                         .web_auth_tokens
                         .lock()
-                        .retain(|_, (_, _, created)| {
+                        .retain(|_, (_, _, created, _)| {
                             created.elapsed() < std::time::Duration::from_secs(1800)
                         });
                 }
@@ -2493,6 +2537,7 @@ impl Server {
 
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
         spawn_act_defer_retry_sweep(Arc::clone(&state));
+        crate::broker_signout::spawn(Arc::clone(&state));
         spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
 
         // Heartbeat expiry: check agent liveness every 15 seconds.
@@ -2579,7 +2624,7 @@ impl Server {
                     {
                         let mut tokens = cleanup_state.web_auth_tokens.lock();
                         let before = tokens.len();
-                        tokens.retain(|_, (_, _, created)| created.elapsed().as_secs() < 1800);
+                        tokens.retain(|_, (_, _, created, _)| created.elapsed().as_secs() < 1800);
                         let pruned = before - tokens.len();
                         if pruned > 0 {
                             tracing::info!("Pruned {pruned} expired web-auth tokens");
@@ -2833,6 +2878,7 @@ impl Server {
         spawn_phantom_sweeper(Arc::clone(&state));
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
         spawn_act_defer_retry_sweep(Arc::clone(&state));
+        crate::broker_signout::spawn(Arc::clone(&state));
         spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
 
         let handle = tokio::spawn(async move {
@@ -2882,6 +2928,7 @@ impl Server {
         spawn_phantom_sweeper(Arc::clone(&state));
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
         spawn_act_defer_retry_sweep(Arc::clone(&state));
+        crate::broker_signout::spawn(Arc::clone(&state));
         spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
 
         let web_state = Arc::clone(&state);
@@ -8070,6 +8117,7 @@ mod nickmap_tests {
 #[cfg(test)]
 pub(crate) use s2s_adversarial_tests::{
     test_state, test_state_with_config, test_state_with_db, test_state_with_resolver,
+    test_state_without_db,
 };
 
 #[cfg(test)]
@@ -8102,6 +8150,12 @@ mod s2s_adversarial_tests {
         )
     }
 
+    /// Like `test_state_with_config` with no database at all — the
+    /// configuration an operator can run, where nothing is persisted.
+    pub(crate) fn test_state_without_db(config: crate::config::ServerConfig) -> Arc<SharedState> {
+        test_state_inner(None, Some(config), None)
+    }
+
     /// Like `test_state_with_config`, for tests where the resolver actually
     /// needs to answer.
     pub(crate) fn test_state_with_resolver(
@@ -8127,6 +8181,12 @@ mod s2s_adversarial_tests {
             ..Default::default()
         });
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let revoked_hashes: HashSet<String> = db
+            .as_ref()
+            .and_then(|db| db.revoked_broker_token_hashes().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         let resolver =
             resolver.unwrap_or_else(|| freeq_sdk::did::DidResolver::static_map(HashMap::new()));
         Arc::new(SharedState {
@@ -8173,6 +8233,10 @@ mod s2s_adversarial_tests {
             oauth_pending: Mutex::new(HashMap::new()),
             oauth_complete: Mutex::new(HashMap::new()),
             web_auth_tokens: Mutex::new(HashMap::new()),
+            device_key_tokens: Mutex::new(HashMap::new()),
+            revoked_token_hashes: Mutex::new(revoked_hashes),
+            broker_deletes: Mutex::new(HashMap::new()),
+            broker_delete_wake: tokio::sync::Notify::new(),
             web_sessions: Mutex::new(HashMap::new()),
             login_pending: Mutex::new(HashMap::new()),
             linked_identities: Mutex::new(HashMap::new()),
@@ -9903,15 +9967,13 @@ mod s2s_adversarial_tests {
             .await;
 
             // Check what the local member received
-            if let Ok(line) =
+            if let Ok(Some(line)) =
                 tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
             {
-                if let Some(line) = line {
-                    assert!(
-                        !line.contains("\r\nQUIT"),
-                        "BUG: CRLF injection in S2S privmsg text: {line}"
-                    );
-                }
+                assert!(
+                    !line.contains("\r\nQUIT"),
+                    "BUG: CRLF injection in S2S privmsg text: {line}"
+                );
             }
         }
     }

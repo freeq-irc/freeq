@@ -227,7 +227,7 @@ async fn main() -> Result<()> {
         save_config: false,
     };
 
-    let (signer, media_uploader) = build_signer(&effective_cli).await?;
+    let (signer, media_uploader, device_key) = build_signer(&effective_cli).await?;
 
     let auth_status = if signer.is_some() {
         "authenticating"
@@ -281,6 +281,7 @@ async fn main() -> Result<()> {
             tls_insecure: resolved.tls_insecure,
             web_token: None,
             websocket_url: None,
+            ..Default::default()
         })
         .await?
     };
@@ -294,6 +295,15 @@ async fn main() -> Result<()> {
         tls_insecure: resolved.tls_insecure,
         web_token: None,
         websocket_url: None,
+        // This device's key, and the way it reaches the account, for a
+        // session that can publish one. Enrollment runs off the connect path
+        // and a refusal never keeps the client out of the room. No
+        // `key_lookup`: the TUI shows no mark and asks the server as before.
+        device_key_store: device_key.as_ref().map(|d| d.store.clone()),
+        enrollment: device_key.as_ref().map(|d| d.enrollment.clone()),
+        device_label: device_key.as_ref().and_then(|d| d.label.clone()),
+        fresh_sign_in: device_key.as_ref().is_some_and(|d| d.fresh_sign_in),
+        ..Default::default()
     };
 
     let (mut handle, mut events) =
@@ -402,7 +412,7 @@ async fn main() -> Result<()> {
     }
 
     let mut reconnect_info = Some(ReconnectInfo {
-        config: connect_config,
+        config: reconnect_config(&connect_config),
         signer: signer.clone(),
         channels: resolved.channels.clone(),
         _iroh_addr: iroh_addr.clone(),
@@ -439,7 +449,80 @@ async fn main() -> Result<()> {
     result
 }
 
-type SignerResult = (Option<Arc<dyn ChallengeSigner>>, Option<app::MediaUploader>);
+type SignerResult = (
+    Option<Arc<dyn ChallengeSigner>>,
+    Option<app::MediaUploader>,
+    Option<DeviceKeySetup>,
+);
+
+// The scope the TUI signs in with: identity, plus permission to write the
+// account's device and agent key records. Shared with every other client.
+use freeq_oauth::ENROLL_SCOPE;
+
+/// Where this device's key lives, and how it reaches the account. Only an
+/// OAuth session can publish, so only that path fills this in.
+struct DeviceKeySetup {
+    store: Arc<dyn freeq_sdk::device_key::DeviceKeyStore>,
+    enrollment: Arc<dyn freeq_sdk::device_key::Enrollment>,
+    label: Option<String>,
+    /// The session came from a sign-in just now, not from the cache.
+    fresh_sign_in: bool,
+}
+
+/// This device's key file, beside the session cache it belongs to.
+fn device_key_path(handle: &str) -> std::path::PathBuf {
+    let config_dir = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    config_dir
+        .join("freeq-tui")
+        .join(format!("{handle}.device-key.json"))
+}
+
+/// Publishes this device's key record with the signed-in session's own DPoP
+/// key. A refusal from the account is `NeedsSignIn`; everything else is a
+/// failure the SDK retries on the next connect.
+struct SessionEnrollment {
+    session: oauth::OAuthSession,
+}
+
+impl freeq_sdk::device_key::Enrollment for SessionEnrollment {
+    fn publish(
+        &self,
+        record: freeq_sdk::identity_records::DeviceKeyRecord,
+        _signer_public_key: String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = freeq_sdk::device_key::EnrollOutcome> + Send>,
+    > {
+        let session = self.session.clone();
+        Box::pin(async move {
+            use freeq_sdk::device_key::EnrollOutcome;
+            use freeq_sdk::identity_records::{PublishError, publish_record};
+            let value = match serde_json::to_value(&record) {
+                Ok(value) => value,
+                Err(e) => return EnrollOutcome::Failed(e.to_string()),
+            };
+            match publish_record(&session, &value).await {
+                Ok(uri) => EnrollOutcome::Published { uri },
+                Err(PublishError::NeedsSignIn(_)) => EnrollOutcome::NeedsSignIn,
+                Err(PublishError::Failed(e)) => EnrollOutcome::Failed(e.to_string()),
+            }
+        })
+    }
+}
+
+/// The store, the enrollment and the label for a signed-in session.
+/// `fresh_sign_in`: the session came from `oauth::login` just now.
+fn device_key_setup(session: &oauth::OAuthSession, fresh_sign_in: bool) -> DeviceKeySetup {
+    DeviceKeySetup {
+        store: Arc::new(freeq_sdk::device_key::FileDeviceKeyStore::new(
+            device_key_path(&session.handle),
+        )),
+        enrollment: Arc::new(SessionEnrollment {
+            session: session.clone(),
+        }),
+        label: whoami::fallible::hostname().ok(),
+        fresh_sign_in,
+    }
+}
 
 fn make_oauth_uploader(session: &oauth::OAuthSession) -> app::MediaUploader {
     app::MediaUploader {
@@ -477,6 +560,9 @@ async fn build_signer(cli: &Cli) -> Result<SignerResult> {
                     pds_url,
                 ))),
                 Some(uploader),
+                // An app-password session cannot write records, so this path
+                // keeps its per-connection key and publishes nothing.
+                None,
             ));
         } else {
             // Try cached session first (unless --reauth)
@@ -487,12 +573,13 @@ async fn build_signer(cli: &Cli) -> Result<SignerResult> {
             }
             if cache_path.exists() {
                 eprintln!("Found cached session, validating...");
-                match oauth::OAuthSession::load(&cache_path) {
+                match oauth::OAuthSession::load(&cache_path, ENROLL_SCOPE) {
                     Ok(cached) => match cached.validate().await {
                         Ok(session) => {
                             eprintln!("  Cached session valid for {}", session.did);
                             let _ = session.save(&cache_path);
                             let uploader = make_oauth_uploader(&session);
+                            let device_key = device_key_setup(&session, false);
                             return Ok((
                                 Some(Arc::new(PdsSessionSigner::new_oauth(
                                     session.did,
@@ -502,6 +589,7 @@ async fn build_signer(cli: &Cli) -> Result<SignerResult> {
                                     session.dpop_nonce,
                                 ))),
                                 Some(uploader),
+                                Some(device_key),
                             ));
                         }
                         Err(e) => {
@@ -518,7 +606,7 @@ async fn build_signer(cli: &Cli) -> Result<SignerResult> {
 
             // OAuth flow — opens browser, no password needed
             eprintln!("Logging in as {handle} via OAuth...");
-            let session = oauth::login(handle).await?;
+            let session = oauth::login(handle, ENROLL_SCOPE).await?;
             eprintln!("  DID: {}", session.did);
             eprintln!("  Handle: {}", session.handle);
             eprintln!("  PDS: {}", session.pds_url);
@@ -537,6 +625,7 @@ async fn build_signer(cli: &Cli) -> Result<SignerResult> {
             }
 
             let uploader = make_oauth_uploader(&session);
+            let device_key = device_key_setup(&session, true);
             return Ok((
                 Some(Arc::new(PdsSessionSigner::new_oauth(
                     session.did,
@@ -546,6 +635,7 @@ async fn build_signer(cli: &Cli) -> Result<SignerResult> {
                     session.dpop_nonce,
                 ))),
                 Some(uploader),
+                Some(device_key),
             ));
         }
     }
@@ -564,7 +654,7 @@ async fn build_signer(cli: &Cli) -> Result<SignerResult> {
         eprintln!("Generated {} keypair:", cli.key_type);
         eprintln!("  DID: {did}");
         eprintln!("  Public key (multibase): {multibase}");
-        return Ok((Some(Arc::new(KeySigner::new(did, private_key))), None));
+        return Ok((Some(Arc::new(KeySigner::new(did, private_key))), None, None));
     }
 
     // Option 3: Crypto auth with DID + key file
@@ -587,11 +677,21 @@ async fn build_signer(cli: &Cli) -> Result<SignerResult> {
         return Ok((
             Some(Arc::new(KeySigner::new(did.clone(), private_key))),
             None,
+            None,
         ));
     }
 
     // No auth — guest mode
-    Ok((None, None))
+    Ok((None, None, None))
+}
+
+/// The config a reconnect uses: the first connect's, minus the new sign-in,
+/// which only that connect follows.
+fn reconnect_config(config: &ConnectConfig) -> ConnectConfig {
+    ConnectConfig {
+        fresh_sign_in: false,
+        ..config.clone()
+    }
 }
 
 /// State needed to reconnect after a disconnect.
@@ -1418,6 +1518,15 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
             }
         }
         Event::ServerNotice { text } => {
+            // The server refused this device's key. A reconnect would offer
+            // the same key, so the next disconnect stays down.
+            if text.starts_with("MSGSIG KEY_RETIRED") {
+                app.signed_out = true;
+                let active = app.active_buffer.clone();
+                app.buffer_mut(&active)
+                    .push_system(crate::app::KEY_RETIRED_LINE);
+                return;
+            }
             // Swallow the failure of a speculative "fetch history on view"
             // (maybe_fetch_history): a DM with a guest peer, or a not-yet-
             // persisted conversation, answers CHATHISTORY with INVALID_TARGET/
@@ -1442,12 +1551,25 @@ fn process_irc_event(app: &mut App, event: Event, _handle: &client::ClientHandle
         Event::Disconnected { reason } => {
             app.connection_state = "disconnected".to_string();
             app.status_msg(&format!("Disconnected: {reason}"));
-            // Don't quit — reconnection is handled by the main loop
-            app.reconnect_pending = true;
+            // Don't quit — reconnection is handled by the main loop, unless
+            // the device was signed out.
+            app.reconnect_pending = !app.signed_out;
         }
         // The TUI prints WHOIS lines as they arrive and has nothing waiting on
         // the answer being complete, so the end of one is not news here.
         Event::WhoisEnd { nick: _ } => {}
+
+        // The key this device signs with is not on the account, and this
+        // session may not put it there. Messages keep sending and keep
+        // carrying that key; the room hears it once.
+        Event::SigningKeyUnpublished => {
+            if let Some(line) = app.note_key_unpublished() {
+                app.status_msg(line);
+            }
+        }
+
+        // The TUI passes no key lookup, so no verdict arrives.
+        Event::Verdict { .. } => {}
 
         Event::WhoisReply { nick: _, info } => {
             let buf = app.active_buffer.clone();
@@ -3379,6 +3501,80 @@ mod tests {
         signature_of, verify_answer_line, verify_api_base,
     };
     use std::collections::{HashMap, HashSet};
+
+    fn session() -> freeq_sdk::oauth::OAuthSession {
+        freeq_sdk::oauth::OAuthSession {
+            did: "did:plc:alice".to_string(),
+            handle: "alice.test".to_string(),
+            access_token: "AT".to_string(),
+            pds_url: "https://pds.test".to_string(),
+            dpop_key: freeq_sdk::oauth::DpopKey::generate(),
+            dpop_nonce: None,
+            scope: "atproto".to_string(),
+        }
+    }
+
+    #[test]
+    fn only_the_oauth_sign_in_marks_the_connect_as_a_new_sign_in() {
+        assert!(super::device_key_setup(&session(), true).fresh_sign_in);
+        assert!(!super::device_key_setup(&session(), false).fresh_sign_in);
+    }
+
+    #[test]
+    fn a_reconnect_is_never_a_new_sign_in() {
+        let config = freeq_sdk::client::ConnectConfig {
+            fresh_sign_in: true,
+            ..Default::default()
+        };
+        assert!(!super::reconnect_config(&config).fresh_sign_in);
+    }
+
+    /// A refused key reaches the TUI after registration as the notice
+    /// `MSGSIG KEY_RETIRED <reason>`. The TUI says the device was signed out,
+    /// and the disconnect that follows schedules no reconnect.
+    #[tokio::test]
+    async fn a_refused_key_shows_the_signed_out_line_and_does_not_reconnect() {
+        use freeq_sdk::event::Event;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (handle, _events) = freeq_sdk::client::connect_with_stream(
+            freeq_sdk::client::EstablishedConnection::Plain(stream),
+            freeq_sdk::client::ConnectConfig::default(),
+            None,
+        );
+        let mut app = crate::app::App::new("me", false);
+        app.buffer_mut("#room");
+        app.active_buffer = "#room".to_string();
+        for event in [
+            Event::Registered { nick: "me".into() },
+            Event::ServerNotice {
+                text: "MSGSIG KEY_RETIRED This device was signed out from another device. Sign in again to continue.".into(),
+            },
+            Event::Disconnected {
+                reason: "Signing key retired".into(),
+            },
+        ] {
+            super::process_irc_event(&mut app, event, &handle);
+        }
+
+        assert!(!app.reconnect_pending, "no reconnect is scheduled");
+        let room = &app.buffers["#room"];
+        assert_eq!(
+            room.messages.back().map(|l| l.text.as_str()),
+            Some(
+                "This device was signed out from another device. Restart freeq-tui with --reauth to sign in again."
+            )
+        );
+        assert!(
+            app.buffers
+                .values()
+                .flat_map(|b| b.messages.iter())
+                .all(|l| !l.text.contains("KEY_RETIRED")),
+            "the raw notice is not shown"
+        );
+    }
 
     fn tags(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs

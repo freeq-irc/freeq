@@ -182,6 +182,56 @@ class BufferCacheTest {
         assertEquals(mapOf("🎉" to setOf("bob", "carol")), m.reactions)
     }
 
+    @Test fun a_cached_row_keeps_the_verdict_it_was_shown_with() {
+        // Dedup on replay keeps the cached copy, so a verdict left behind is
+        // one the reader never gets back — including the mark an invalid
+        // signature earns.
+        val checked = msg("01SIGNED").copy(
+            isSigned = true,
+            verdict = FfiVerdict(
+                state = com.freeq.ffi.VerdictState.INVALID,
+                layer = null,
+                kid = "kid-1",
+                keySource = "identity-record",
+                sentence = "This message is signed, but the signature doesn’t check out.",
+            ),
+        )
+        val restored = BufferCache.decode(
+            BufferCache.encode(BufferCache.snapshot(listOf(channel("#freeq", checked))))
+        )!!
+
+        val back = restored.single().messages.single().verdict!!
+        assertEquals(com.freeq.ffi.VerdictState.INVALID, back.state)
+        assertEquals("kid-1", back.kid)
+        assertEquals("identity-record", back.keySource)
+        assertEquals("This message is signed, but the signature doesn’t check out.", back.sentence)
+        assertEquals(RowSignatureMark.Warning, RowSignatureMark.of(back))
+    }
+
+    @Test fun a_cached_row_with_a_layer_keeps_it() {
+        val vouched = msg("01OK").copy(
+            isSigned = true,
+            verdict = FfiVerdict(
+                state = com.freeq.ffi.VerdictState.DEVICE,
+                layer = com.freeq.ffi.KeyLayer.VOUCHED,
+                kid = null,
+                keySource = null,
+                sentence = "Signed on the sender’s device. Key vouched for by their server.",
+            ),
+        )
+        val restored = BufferCache.decode(
+            BufferCache.encode(BufferCache.snapshot(listOf(channel("#freeq", vouched))))
+        )!!
+        assertEquals(com.freeq.ffi.KeyLayer.VOUCHED, restored.single().messages.single().verdict?.layer)
+    }
+
+    @Test fun an_unchecked_row_caches_no_verdict() {
+        val restored = BufferCache.decode(
+            BufferCache.encode(BufferCache.snapshot(listOf(channel("#freeq", msg("01PLAIN")))))
+        )!!
+        assertNull(restored.single().messages.single().verdict)
+    }
+
     @Test fun round_trip_preserves_a_deleted_message() {
         val ch = channel("#freeq", msg("01A").copy(isDeleted = true, text = ""))
         val restored = BufferCache.decode(BufferCache.encode(BufferCache.snapshot(listOf(ch))))!!

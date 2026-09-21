@@ -114,10 +114,7 @@ async fn prompt(h: &ClientHandle, rx: &mut mpsc::Receiver<Event>, ch: &str) -> b
         &["", "👉 Say 'next' to continue (or 'quit' to stop)."],
     )
     .await;
-    match wait_owner(rx, ch, 600, h).await {
-        Some(OwnerCmd::Next) => true,
-        _ => false,
-    }
+    matches!(wait_owner(rx, ch, 600, h).await, Some(OwnerCmd::Next))
 }
 
 fn b64(data: &[u8]) -> String {
@@ -203,6 +200,7 @@ async fn main() -> Result<()> {
         tls_insecure: false,
         web_token: None,
         websocket_url: None,
+        ..Default::default()
     };
     let conn = client::establish_connection(&config).await?;
     let (handle, mut events) =
@@ -802,9 +800,8 @@ async fn main() -> Result<()> {
     )
     .await;
 
-    match wait_owner(&mut events, ch, 120, &handle).await {
-        Some(OwnerCmd::Quit) => return shutdown(handle).await,
-        _ => {}
+    if let Some(OwnerCmd::Quit) = wait_owner(&mut events, ch, 120, &handle).await {
+        return shutdown(handle).await;
     }
 
     handle
@@ -833,7 +830,7 @@ async fn main() -> Result<()> {
         Some(&task_id),
         &[
             ("note", "deploy_log: Deployed successfully in 8s"),
-            ("ctx", &deploy_url),
+            ("ctx", deploy_url),
             ("ctx-h", &ctx_hash(deploy_url.as_bytes())),
         ],
         &format!("📎 Evidence attached: deploy_log -- {deploy_url}"),
@@ -847,7 +844,7 @@ async fn main() -> Result<()> {
         &did,
         "complete",
         Some(&task_id),
-        &[("note", "Todo app deployed"), ("ctx", &deploy_url)],
+        &[("note", "Todo app deployed"), ("ctx", deploy_url)],
         &format!(
             "🎉 Task complete: Todo app deployed at {deploy_url} (6 phases, 6 evidence items)"
         ),

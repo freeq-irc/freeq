@@ -1,11 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef } from 'react';
 import {
-  verifySignature,
-  verdictCopy,
   CHECKING_COPY,
+  copyForVerdict,
   unsignedCopy,
+  useCachedVerdict,
   type VerdictCopy,
-  type VerifyAnswer,
 } from '../lib/verify-signature';
 
 interface Props {
@@ -13,10 +12,18 @@ interface Props {
   signed: boolean;
   position: { x: number; y: number };
   onClose: () => void;
-  /** What the id names — adjusts the panel wording. Coordination events
-   *  verify through the same endpoint as messages. */
+  /** What the id names — adjusts the panel wording. Coordination events are
+   *  checked the same way messages are. */
   noun?: 'message' | 'event';
 }
+
+/** Where a key was found, named as the server's verify answer names it
+ *  (`key_source`), so one vocabulary covers both. */
+const KEY_SOURCES: Record<string, string> = {
+  IdentityRecord: 'identity-record',
+  DidDocument: 'did-document',
+  OriginServer: 'origin-server',
+};
 
 const PANEL_W = 288;
 const PANEL_H_ESTIMATE = 210;
@@ -32,10 +39,10 @@ const PANEL_H_ESTIMATE = 210;
  */
 export function VerifySignaturePanel({ msgid, signed, position, onClose, noun = 'message' }: Props) {
   const ref = useRef<HTMLDivElement>(null);
-  const [answer, setAnswer] = useState<VerifyAnswer | null>(null);
-  const [checking, setChecking] = useState(signed);
-  const retriesLeft = useRef(2);
-  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The verdict this client reached for the line. Nothing is asked of the
+  // server here: the check already ran when the line arrived, and a verdict
+  // that settles while the panel is open lands through this subscription.
+  const verdict = useCachedVerdict(msgid);
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -50,45 +57,16 @@ export function VerifySignaturePanel({ msgid, signed, position, onClose, noun = 
     };
   }, [onClose]);
 
-  useEffect(() => {
-    if (!signed) return;
-    let alive = true;
-    const runCheck = () => {
-      setChecking(true);
-      verifySignature(msgid).then((a) => {
-        if (!alive) return;
-        setAnswer(a);
-        setChecking(false);
-        // The one retryable flavour: the server is fetching the signer's key
-        // as a side effect of having been asked — re-ask a couple of times.
-        if (a.transient && retriesLeft.current > 0) {
-          retriesLeft.current -= 1;
-          retryTimer.current = setTimeout(runCheck, 2000);
-        }
-      });
-    };
-    runCheck();
-    return () => {
-      alive = false;
-      if (retryTimer.current) clearTimeout(retryTimer.current);
-    };
-  }, [msgid, signed]);
+  const state = signed ? (verdict?.state ?? 'pending') : 'unsigned';
+  const checking = state === 'pending';
 
-  const outcome = answer?.outcome ?? null;
-  const stillFetchingKey = !checking && answer?.transient && retriesLeft.current > 0;
-
-  // Which of the seven answers this panel is showing. Nothing signed is its
-  // own answer, not a failed check; the fetching-a-key answer holds only
-  // while we will actually re-ask, and decays into the plain can't-check once
-  // the retries are gone — a panel still promising to check after it stopped
-  // would be lying.
-  const copy: VerdictCopy | null = !signed
+  // Nothing signed is its own answer, not a failed check. A key still being
+  // looked up says so, and the answer replaces it when it lands.
+  const copy: VerdictCopy = !signed
     ? unsignedCopy(noun)
-    : stillFetchingKey
-      ? CHECKING_COPY
-      : outcome
-        ? verdictCopy(outcome, noun)
-        : null;
+    : verdict && !checking
+      ? copyForVerdict(verdict, noun)
+      : CHECKING_COPY;
 
   const style: React.CSSProperties = {
     position: 'fixed',
@@ -103,26 +81,32 @@ export function VerifySignaturePanel({ msgid, signed, position, onClose, noun = 
       ref={ref}
       style={style}
       data-testid="verify-panel"
-      data-verdict={signed ? (checking ? 'checking' : outcome) : 'unsigned'}
+      data-msgid={msgid}
+      data-verdict={state}
+      data-key-source={verdict?.keySource ?? ''}
       className="bg-bg-secondary border border-border rounded-xl shadow-2xl p-3 animate-fadeIn"
       onClick={(e) => e.stopPropagation()}
     >
-      <div className={`text-xs font-semibold mb-1 ${copy?.tone ?? 'text-fg-muted'}`}>
-        {copy ? copy.heading : 'Checking signature…'}
-      </div>
+      <div className={`text-xs font-semibold mb-1 ${copy.tone}`}>{copy.heading}</div>
 
-      {signed && (checking || stillFetchingKey) && (
+      {checking && (
         <svg className="animate-spin w-3 h-3 shrink-0 text-fg-dim mb-1" viewBox="0 0 24 24">
           <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
           <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
         </svg>
       )}
 
-      {copy && (
-        <p className={`text-[11px] leading-relaxed mb-1 ${copy.tone}`}>
-          {outcome === 'device' && signed && !stillFetchingKey && '✓ '}
-          {outcome === 'invalid' && signed && !stillFetchingKey && '⚠ '}
-          {copy.line}
+      <p className={`text-[11px] leading-relaxed mb-1 ${copy.tone}`}>
+        {state === 'device' && '✓ '}
+        {(state === 'invalid' || state === 'retired') && '⚠ '}
+        {copy.line}
+      </p>
+
+      {/* The key the check used, and where it was found. */}
+      {verdict?.kid && (
+        <p className="text-[10px] text-fg-dim font-mono break-all" data-testid="verify-key">
+          {verdict.kid}
+          {verdict.keySource ? ` · ${KEY_SOURCES[verdict.keySource]}` : ''}
         </p>
       )}
 

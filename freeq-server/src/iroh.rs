@@ -93,6 +93,9 @@ pub async fn handle_connection(conn: Connection, state: Arc<SharedState>) {
             }
         }
         let _ = send.finish();
+        // Wait for the peer to acknowledge everything sent, so the
+        // connection close below cannot discard unacknowledged lines.
+        let _ = send.stopped().await;
     });
 
     // The IRC handler sees a normal AsyncRead + AsyncWrite stream.
@@ -110,7 +113,15 @@ pub async fn handle_connection(conn: Connection, state: Arc<SharedState>) {
     // Clean up bridge tasks — the IRC handler has already run session cleanup
     // (QUIT broadcast, channel removal, nick release, etc.).
     rx_handle.abort();
-    tx_handle.abort();
+    // Let the send side deliver what the handler queued last (a FAIL and
+    // ERROR before a server-side close); abort as before if it stalls.
+    let mut tx_handle = tx_handle;
+    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut tx_handle)
+        .await
+        .is_err()
+    {
+        tx_handle.abort();
+    }
 
     // Explicitly close the QUIC connection so the remote side gets
     // a CONNECTION_CLOSE frame instead of a silent timeout.

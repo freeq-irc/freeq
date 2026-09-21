@@ -115,10 +115,7 @@ async fn prompt(h: &ClientHandle, rx: &mut mpsc::Receiver<Event>, ch: &str) -> b
         &["", "👉 Say 'next' to continue (or 'quit' to stop)."],
     )
     .await;
-    match wait_owner(rx, ch, 600, h).await {
-        Some(OwnerCmd::Next) => true,
-        _ => false,
-    }
+    matches!(wait_owner(rx, ch, 600, h).await, Some(OwnerCmd::Next))
 }
 
 fn b64(data: &[u8]) -> String {
@@ -166,6 +163,7 @@ async fn main() -> Result<()> {
         tls_insecure: false,
         web_token: None,
         websocket_url: None,
+        ..Default::default()
     };
     let conn = client::establish_connection(&config).await?;
     let (handle, mut events) =
@@ -258,9 +256,9 @@ async fn main() -> Result<()> {
     .await;
 
     // Wait for either a real pause signal or "next"
-    match wait_owner(&mut events, ch, 120, &handle).await {
-        Some(OwnerCmd::Quit) => return shutdown(handle).await,
-        _ => {} // next or timeout -- simulate
+    // Next or timeout -- simulate
+    if let Some(OwnerCmd::Quit) = wait_owner(&mut events, ch, 120, &handle).await {
+        return shutdown(handle).await;
     }
 
     // Simulate pause/resume
@@ -343,9 +341,8 @@ async fn main() -> Result<()> {
     )
     .await;
 
-    match wait_owner(&mut events, ch, 120, &handle).await {
-        Some(OwnerCmd::Quit) => return shutdown(handle).await,
-        _ => {}
+    if let Some(OwnerCmd::Quit) = wait_owner(&mut events, ch, 120, &handle).await {
+        return shutdown(handle).await;
     }
 
     handle
@@ -567,9 +564,8 @@ async fn main() -> Result<()> {
     )
     .await;
 
-    match wait_owner(&mut events, ch, 120, &handle).await {
-        Some(OwnerCmd::Quit) => return shutdown(handle).await,
-        _ => {}
+    if let Some(OwnerCmd::Quit) = wait_owner(&mut events, ch, 120, &handle).await {
+        return shutdown(handle).await;
     }
 
     // Deploy

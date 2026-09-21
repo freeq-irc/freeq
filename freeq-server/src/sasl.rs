@@ -503,7 +503,10 @@ mod tests {
             challenge_nonce: None,
         };
         let json = serde_json::to_vec(&resp).unwrap();
-        assert!(json.len() % 3 != 0, "fixture must exercise padding");
+        assert!(
+            !json.len().is_multiple_of(3),
+            "fixture must exercise padding"
+        );
 
         for (label, encoded) in [
             ("url-safe no pad", URL_SAFE_NO_PAD.encode(&json)),

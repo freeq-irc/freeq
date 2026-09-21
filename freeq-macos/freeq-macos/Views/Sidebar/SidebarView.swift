@@ -272,6 +272,14 @@ struct SidebarView: View {
                     : "Signed in as \(did). Click to set a status.")
                 .contentShape(Rectangle())
                 .onTapGesture { showStatusEditor = true }
+                // A dot while this device's key is not published to the
+                // account. Settings is a system scene here, so the account
+                // row is the only always-visible place to say so.
+                if appState.signingKeyUnpublished {
+                    Circle()
+                        .fill(Theme.warning)
+                        .frame(width: 6, height: 6)
+                }
             } else if appState.connectionState == .registered {
                 Circle()
                     .fill(Theme.warning)

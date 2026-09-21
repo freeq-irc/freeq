@@ -438,10 +438,10 @@ async fn op_can_delete_others_message_in_channel() {
         // Should NOT get AUTHOR_MISMATCH (ops can delete in channels)
         let fail = alice.maybe(|l| l.contains("FAIL"), 1000);
         // If no FAIL, the delete was accepted
-        if let Some(f) = &fail {
-            if f.contains("AUTHOR_MISMATCH") {
-                panic!("BUG: Op should be able to delete others' messages in channels");
-            }
+        if let Some(f) = &fail
+            && f.contains("AUTHOR_MISMATCH")
+        {
+            panic!("BUG: Op should be able to delete others' messages in channels");
         }
     })
     .await;

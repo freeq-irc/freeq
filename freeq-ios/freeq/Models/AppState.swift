@@ -63,6 +63,11 @@ private struct CachedMessage: Codable {
     // Android's buffer cache stores. Same reason as `actRef`: a cached
     // delegation_notice or status_update that lost it renders as plain text.
     let coordination: CoordinationInfo?
+    // What this device concluded about the signature. Kept whole, sentence
+    // included: dedup on hydrate keeps the cached copy over the one history
+    // replays, so a verdict left behind is one the reader never gets back —
+    // including the mark an invalid signature earned.
+    let verdict: VerdictInfo?
 
     init(_ m: ChatMessage) {
         self.id = m.id
@@ -79,6 +84,7 @@ private struct CachedMessage: Codable {
         self.account = m.account
         self.actRef = m.actRef
         self.coordination = m.coordination
+        self.verdict = m.verdict
     }
 
     func toChatMessage() -> ChatMessage {
@@ -92,6 +98,7 @@ private struct CachedMessage: Codable {
         m.account = account
         m.actRef = actRef
         m.coordination = coordination
+        m.verdict = verdict
         return m
     }
 }
@@ -114,7 +121,10 @@ enum BufferCacheStore {
     // 3: a companion line's task reference and the row's coordination event
     //    joined the cached fields — a cache written without them can never
     //    draw its cards, so the old shape is discarded rather than read.
-    static let version = 3
+    // 4: the signature verdict joined them, for the same reason — a restored
+    //    row shadows the copy history replays, so a verdict left behind is one
+    //    the reader never gets back, mark and all.
+    static let version = 4
     static let maxMessagesPerBuffer = 50
 
     static func cacheURL() -> URL? {
@@ -231,7 +241,6 @@ enum ActiveSessionProbe {
 
 /// Main application state — bridges the Rust SDK to SwiftUI.
 class AppState: ObservableObject {
-    private static let minimumPersistentSessionDuration: TimeInterval = 14 * 24 * 60 * 60  // 14 days
     struct BatchBuffer {
         let target: String
         var messages: [ChatMessage]
@@ -379,7 +388,7 @@ class AppState: ObservableObject {
     /// Signature answers the reader has already asked for, by message id.
     /// A settled answer is the same every time; only a checked mismatch
     /// marks a row, so this is also what the row marker reads.
-    @Published var checkedVerdicts: [String: VerifyAnswer] = [:]
+    @Published var checkedVerdicts: [String: VerdictInfo] = [:]
 
     /// Nicks the server answered with "no such nick". They are not guests —
     /// nobody is holding the name, so there is nobody to have an account.
@@ -1278,6 +1287,98 @@ class AppState: ObservableObject {
     /// re-evaluate `hasSavedSession` and flip the root UI between
     /// MainTabView and ConnectView.
     @Published var brokerToken: String? = nil
+
+    /// This device's signing key, kept in the Keychain. One key per device, so
+    /// it outlives a session and a reader can learn it once.
+    let deviceKeyStore = KeychainDeviceKeyStore()
+
+    /// Said once per session, never on a loop.
+    private let signingKeyNotice = SigningKeyNotice()
+
+    /// True while this device's key is not published to the account. Drives
+    /// the dot on Settings; messages keep sending either way.
+    @Published var signingKeyUnpublished = false
+
+    /// The handle this account signed in under, saved at login. The broker's
+    /// login resolves a handle and will not take a DID, so the sign-in that
+    /// Settings starts needs it.
+    var accountHandle: String? { UserDefaults.standard.string(forKey: "freeq.handle") }
+
+    /// The account would not take this device's key. The key stays and keeps
+    /// signing — the room is told once, and Settings keeps the state.
+    func noteSigningKeyUnpublished() {
+        signingKeyUnpublished = true
+        guard let line = signingKeyNotice.next() else { return }
+        // iOS has no server buffer, so a server notice lands in the buffer the
+        // reader is looking at, as on macOS. The fixed id keeps it to one line.
+        activeChannelState?.appendIfNew(ChatMessage(
+            id: "signing-key-unpublished",
+            from: "server",
+            text: line,
+            isAction: false,
+            timestamp: Date(),
+            replyTo: nil
+        ))
+    }
+
+    /// Set by a refusal whose disconnect may not reconnect, until the next
+    /// connect; that disconnect also leaves the reason shown.
+    fileprivate var keyRefused = false
+
+    /// Apply a refusal of this device's signing key, as `RefusedKeyNotice`
+    /// decided it.
+    func signOutRefusedKey(_ refusal: RefusedKeyNotice.Refusal) {
+        keyRefused = !refusal.schedulesReconnect
+        // On a connect whose token followed a refused one, the session-expired line.
+        var line = refusal.line
+        if case .signIn(let expired, _) = RefusedLogin.afterConnectRefused(tokenFollowsRefusal: tokenFollowsRefusal) {
+            line = expired
+        }
+        if refusal.clearsSavedLogin { endLogin() }
+        // Queued after endLogin's own reset, which clears the error.
+        DispatchQueue.main.async {
+            self.errorMessage = line
+        }
+    }
+
+    /// End the login after a refusal that must not reconnect, showing `line`.
+    func endRefusedLogin(line: String) {
+        keyRefused = true
+        endLogin()
+        // Queued after endLogin's own reset, which clears the error.
+        DispatchQueue.main.async { self.errorMessage = line }
+    }
+
+    /// File what the SDK said about one line, so the row and the proof sheet
+    /// read one answer and a late verdict replaces it in place.
+    func recordVerdict(msgId: String, verdict: VerdictInfo?) {
+        guard let verdict, !msgId.isEmpty else { return }
+        checkedVerdicts[msgId] = verdict
+    }
+
+    /// The FFI's verdict as the rows carry it. Mirrors what the generated
+    /// bindings hand over, sentence included, so the models stay free of them.
+    static func verdictInfo(from v: SignatureVerdict) -> VerdictInfo {
+        let kind: VerdictKind
+        switch v.state {
+        case .device: kind = .device
+        case .server: kind = .server
+        case .unsigned: kind = .unsigned
+        case .unverifiable: kind = .unverifiable
+        case .invalid: kind = .invalid
+        case .retired: kind = .retired
+        case .pending: kind = .pending
+        }
+        let layer: VerdictLayer?
+        switch v.layer {
+        case .some(.vouched): layer = .vouched
+        case .some(.published): layer = .published
+        case .none: layer = nil
+        }
+        return VerdictInfo(
+            kind: kind, layer: layer, kid: v.kid, keySource: v.keySource, sentence: v.sentence
+        )
+    }
     /// Cached web-token + expiry (reuse across reconnects within TTL)
     fileprivate var cachedWebToken: String? = nil
     fileprivate var cachedWebTokenExpiry: Date = .distantPast
@@ -1497,6 +1598,10 @@ class AppState: ObservableObject {
             for msg in cb.messages.map({ $0.toChatMessage() })
                 .sorted(by: ChatMessage.replayOrder) {
                 buffer.appendIfNew(msg)
+                // The verdict this row was shown with. Dedup on replay keeps
+                // the cached copy, so without this a checked signature — the
+                // mark an invalid one earned included — would be lost.
+                recordVerdict(msgId: msg.id, verdict: msg.verdict)
             }
             // The most recent cached message sets a reasonable lastActivity
             // so the sidebar sort order on cold launch matches what the user
@@ -1548,9 +1653,8 @@ class AppState: ObservableObject {
                     authLog.info("proactive web-token refresh succeeded")
                 }
             } catch {
-                // Genuine 401 may have wiped credentials inside fetchBrokerSession;
-                // that already flips the UI via @Published. Otherwise stay quiet —
-                // the existing token is still valid for several more minutes.
+                // Stay quiet: the existing token is still valid for several more
+                // minutes, and a 401 ends the login on the next reconnect.
                 await MainActor.run {
                     authLog.notice("proactive web-token refresh failed: \(String(describing: error), privacy: .public)")
                 }
@@ -1586,18 +1690,45 @@ class AppState: ObservableObject {
     /// attempt instead of running it continuously from first appearance.
     @Published var reconnectAttempt: Int = 0
 
-    func reconnectSavedSession() {
+    /// True from a saved session's drop (or a reconnect's start) until it
+    /// registers again or the login ends: the bar reads "Reconnecting…"
+    /// throughout and offers no Reconnect.
+    @Published var reconnecting = false
+
+    /// The one retry waiting to run. Every trigger joins it or runs it now;
+    /// none schedules a second.
+    private var reconnectWork: DispatchWorkItem?
+
+    /// Set when the server refuses the web token a connect carried; cleared by
+    /// an authenticated connect or a broker answer with a fresh token.
+    fileprivate var webTokenRefused = false
+
+    /// Set when the broker answers with a token right after a refused one;
+    /// cleared by a join on the connect it made. A refusal meanwhile ends the login.
+    fileprivate var tokenFollowsRefusal = false
+
+    /// `viaBroker`: skip the cached tokens and ask the broker, whose answer
+    /// decides (a token connects; a 401 ends the saved login, see `RefusedLogin`).
+    /// A press, the foreground, a returning network and every retry do; it also
+    /// runs a waiting retry now, where an unasked call joins it.
+    func reconnectSavedSession(viaBroker: Bool = false) {
         guard hasSavedSession, connectionState == .disconnected else { return }
+        if let pending = reconnectWork {
+            guard viaBroker else { return }
+            pending.cancel()
+            reconnectWork = nil
+        }
         reconnectAttempt &+= 1
+        reconnecting = true
 
         // 1. Already have a pending token (e.g., from initial login)
-        if pendingWebToken != nil && !nick.isEmpty {
+        if !viaBroker, pendingWebToken != nil && !nick.isEmpty {
             connect(nick: nick)
             return
         }
 
         // 2. Reuse cached web-token if still valid (25 min window — token TTL is 30 min)
-        if let cached = cachedWebToken, Date() < cachedWebTokenExpiry, !nick.isEmpty {
+        if !viaBroker, let cached = cachedWebToken, Date() < cachedWebTokenExpiry, !nick.isEmpty {
             pendingWebToken = cached
             connect(nick: nick)
             return
@@ -1615,12 +1746,17 @@ class AppState: ObservableObject {
         // rotating refresh token and brick the session.
         guard !brokerFetchInFlight else { return }
         brokerFetchInFlight = true
+        let afterRefusedToken = webTokenRefused
         Task {
             do {
                 let session = try await fetchBrokerSession(brokerToken: brokerToken)
                 await MainActor.run {
                     self.brokerFetchInFlight = false
+                    // A login that ended while this answer was on its way stays ended.
+                    guard self.brokerToken != nil else { return }
                     self.brokerRetryCount = 0
+                    self.tokenFollowsRefusal = afterRefusedToken
+                    self.webTokenRefused = false
                     self.pendingWebToken = session.token
                     self.cachedWebToken = session.token
                     let expiry = Date().addingTimeInterval(Self.webTokenCacheLifetime)
@@ -1634,9 +1770,13 @@ class AppState: ObservableObject {
             } catch let error as NSError {
                 await MainActor.run {
                     self.brokerFetchInFlight = false
-                    // If broker token was cleared (genuinely expired), stop retrying
-                    if error.code == 401 && self.brokerToken == nil {
-                        // Credentials cleared — show login screen
+                    // A 401 ends the saved login and shows the sign-in screen.
+                    if case .signIn(let line, let clearsSavedLogin) = RefusedLogin.afterBrokerFailure(
+                        status: error.code, savedLoginCleared: self.brokerToken == nil
+                    ) {
+                        if clearsSavedLogin { self.endLogin() }
+                        // Queued after endLogin's own reset, which clears the error.
+                        DispatchQueue.main.async { self.errorMessage = line }
                         return
                     }
 
@@ -1654,6 +1794,7 @@ class AppState: ObservableObject {
                         KeychainHelper.delete(key: "brokerToken")
                         KeychainHelper.delete(key: "webToken")
                         KeychainHelper.delete(key: "webTokenExpiry")
+                        self.finishReconnect()
                         self.errorMessage = "Couldn't restore your session — please sign in again."
                         return
                     }
@@ -1666,15 +1807,34 @@ class AppState: ObservableObject {
                     } else {
                         delay = 60.0 // After 10 failures, try once per minute
                     }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                        if self.connectionState == .disconnected && self.hasSavedSession {
-                            self.reconnectSavedSession()
-                        }
-                    }
+                    self.scheduleReconnect(after: delay)
                     // Don't set errorMessage — let it keep trying silently
                 }
             }
         }
+    }
+
+    /// Queue the sequence's next attempt, unless one is already waiting or a
+    /// broker answer is on its way. It asks the broker: the connect that
+    /// dropped spent the cached web token.
+    func scheduleReconnect(after delay: Double) {
+        guard hasSavedSession, !keyRefused else { return }
+        reconnecting = true
+        guard reconnectWork == nil, !brokerFetchInFlight else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.reconnectWork = nil
+            self.reconnectSavedSession(viaBroker: true)
+        }
+        reconnectWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + RefusedLogin.reconnectDelay(delay), execute: work)
+    }
+
+    /// End the sequence: the session registered, or the login ended.
+    func finishReconnect() {
+        reconnectWork?.cancel()
+        reconnectWork = nil
+        reconnecting = false
     }
 
     /// Tracks whether the current session has already fallen back from
@@ -1682,16 +1842,19 @@ class AppState: ObservableObject {
     /// call to avoid an infinite loop if both transports fail.
     fileprivate var transportFallbackUsed = false
 
-    func connect(nick: String) {
+    /// `freshSignIn`: this connect follows this app's own OAuth sign-in
+    /// completing. Never true for a restored session or a reconnect.
+    func connect(nick: String, freshSignIn: Bool = false) {
         // Fresh connect attempt — start by preferring WebSocket again.
         transportFallbackUsed = false
-        connect(nick: nick, useWebSocket: true)
+        connect(nick: nick, useWebSocket: true, freshSignIn: freshSignIn)
     }
 
-    fileprivate func connect(nick: String, useWebSocket: Bool) {
+    fileprivate func connect(nick: String, useWebSocket: Bool, freshSignIn: Bool = false) {
         self.nick = nick
         self.connectionState = .connecting
         self.errorMessage = nil
+        keyRefused = false
 
         UserDefaults.standard.set(nick, forKey: "freeq.nick")
         UserDefaults.standard.set(serverAddress, forKey: "freeq.server")
@@ -1717,6 +1880,21 @@ class AppState: ObservableObject {
                 try client?.setWebToken(token: token)
                 pendingWebToken = nil
             }
+
+            // This device's key, and the way it reaches the account. Both are
+            // set before connect and neither blocks it: a key that cannot be
+            // published still signs every message this session sends.
+            try client?.setDeviceKeyStore(store: deviceKeyStore)
+            try client?.setEnrollment(enrollment: BrokerEnrollment(
+                brokerBase: { [base = authBrokerBase] in base },
+                brokerToken: { [token = brokerToken] in token }
+            ))
+            try client?.setDeviceLabel(label: UIDevice.current.model)
+            try client?.setVerifySignatures(on: true)
+            if freshSignIn { try client?.setFreshSignIn(fresh: true) }
+            // A key that made it to the account clears the dot; nothing else
+            // does, so a refusal stays visible until it is fixed.
+            if deviceKeyStore.isPublished { signingKeyUnpublished = false }
 
             try client?.connect()
             print("[freeq.connect] client?.connect() returned")
@@ -1786,6 +1964,9 @@ class AppState: ObservableObject {
         // removed above.
         cachedWebToken = nil
         cachedWebTokenExpiry = .distantPast
+        webTokenRefused = false
+        reconnectWork?.cancel()
+        reconnectWork = nil
         SpotlightIndexer.clear()
         // Drop the on-disk buffer cache — never leak the previous user's
         // messages into a fresh sign-in.
@@ -1795,6 +1976,7 @@ class AppState: ObservableObject {
             // reads `brokerToken != nil`; without this, ContentView keeps
             // routing to MainTabView and `reconnectSavedSession` keeps
             // firing even after the keychain is empty.
+            self.finishReconnect()
             self.brokerToken = nil
             self.pendingWebToken = nil
             self.authenticatedDID = nil
@@ -1803,6 +1985,38 @@ class AppState: ObservableObject {
             self.channels = []
             self.dmBuffers = []
             self.activeChannel = nil
+            self.reconnectAttempt = 0
+            self.brokerRetryCount = 0
+            self.connectionState = .disconnected
+            self.errorMessage = nil
+        }
+    }
+
+    /// End a login the server or broker ended: clear the broker token, the web
+    /// tokens, the DID and the login timestamp, and keep the channel, DM and
+    /// auto-join lists so signing in again returns to them. Sign out is `logout()`.
+    func endLogin() {
+        // Closes the connection without `disconnect()`, which empties the lists.
+        flushBuffersToCache()
+        client?.disconnect()
+        UserDefaults.standard.removeObject(forKey: "freeq.lastLogin")
+        KeychainHelper.delete(key: "did")
+        KeychainHelper.delete(key: "brokerToken")
+        KeychainHelper.delete(key: "webToken")
+        KeychainHelper.delete(key: "webTokenExpiry")
+        UserDefaults.standard.removeObject(forKey: "freeq.webTokenExpiry")
+        cachedWebToken = nil
+        cachedWebTokenExpiry = .distantPast
+        webTokenRefused = false
+        tokenFollowsRefusal = false
+        reconnectWork?.cancel()
+        reconnectWork = nil
+        DispatchQueue.main.async {
+            // With brokerToken, so sign-in replaces "Reconnecting…" in one update.
+            self.finishReconnect()
+            self.brokerToken = nil
+            self.pendingWebToken = nil
+            self.authenticatedDID = nil
             self.reconnectAttempt = 0
             self.brokerRetryCount = 0
             self.connectionState = .disconnected
@@ -2077,21 +2291,6 @@ class AppState: ObservableObject {
         let handle: String
     }
 
-    /// Track consecutive 401s — only clear broker token after multiple failures
-    private var consecutive401Count = 0
-    private var lastLoginDate: Date? {
-        let ts = UserDefaults.standard.double(forKey: "freeq.lastLogin")
-        guard ts > 0 else { return nil }
-        return Date(timeIntervalSince1970: ts)
-    }
-
-    /// Keep users logged in for at least two weeks unless they explicitly log out.
-    /// During this window, never clear broker credentials automatically.
-    private var canAutoClearBrokerCredentials: Bool {
-        guard let lastLoginDate else { return false }
-        return Date().timeIntervalSince(lastLoginDate) >= Self.minimumPersistentSessionDuration
-    }
-
     private func fetchBrokerSession(brokerToken: String) async throws -> BrokerSessionResponse {
         // Retry up to 4 times with backoff — DPoP nonce rotation and transient errors
         for attempt in 0..<4 {
@@ -2135,8 +2334,8 @@ class AppState: ObservableObject {
             // the broker as a structured discriminator (a specific status
             // code or JSON field), not inferred from English text. Until
             // the broker exposes that, treat 5xx as recoverable; if the
-            // refresh truly is dead the broker will surface it as a 401
-            // and the 3-strikes-past-grace path will eventually wipe.
+            // refresh truly is dead the broker will surface it as a 401,
+            // which ends the login on its first answer.
             if status == 502 || status == 503 || status == 504 {
                 authLog.notice("broker \(status, privacy: .public) attempt=\(attempt, privacy: .public) — treating as transient")
                 if attempt < 3 {
@@ -2146,54 +2345,13 @@ class AppState: ObservableObject {
                 throw NSError(domain: "Broker", code: status, userInfo: [NSLocalizedDescriptionKey: "Broker temporarily unavailable"])
             }
 
-            // 401 = broker token might be invalid, but could also be transient
-            // (broker DB recreated, broker restarting, deploy in flight, etc.).
-            // Within the 14-day grace window we NEVER auto-clear credentials —
-            // the user signs in often enough that 14 days of nothing-but-401
-            // means something is genuinely wrong with their PDS, and that
-            // case is better surfaced as a banner than by silently dropping
-            // them onto ConnectScreen mid-flight.
-            //
-            // Past grace: 3 consecutive 401s (across reconnect cycles) is our
-            // only auto-wipe path. There is intentionally no "escalated"
-            // bypass — burst 401s during a broker hiccup should not nuke a
-            // logged-in user.
+            // 401: the login has ended (a web sign-out ends it before this
+            // device offers any token). The first answer is final: no retries.
             if status == 401 {
-                await MainActor.run { self.consecutive401Count += 1 }
-                if attempt < 3 {
-                    // Retry — the broker might recover (e.g., DB migration, restart)
-                    try? await Task.sleep(nanoseconds: UInt64(1_000_000_000 * (attempt + 1)))
-                    continue
-                }
-                let count = await MainActor.run { self.consecutive401Count }
-                let lastLogin = await MainActor.run { self.lastLoginDate }
-                let withinGrace = !canAutoClearBrokerCredentials
-                let shouldClear = count >= 3 && !withinGrace
-                if shouldClear {
-                    // Genuinely invalid — clear credentials.
-                    let sinceLoginHours = lastLogin.map { Date().timeIntervalSince($0) / 3600 } ?? -1
-                    authLog.error(
-                        "Clearing broker credentials: consecutive401=\(count, privacy: .public) sinceLoginHours=\(sinceLoginHours, privacy: .public) lastStatus=401"
-                    )
-                    await MainActor.run {
-                        self.brokerToken = nil
-                        self.cachedWebToken = nil
-                        self.cachedWebTokenExpiry = .distantPast
-                        KeychainHelper.delete(key: "brokerToken")
-                        KeychainHelper.delete(key: "webToken")
-                        KeychainHelper.delete(key: "webTokenExpiry")
-                        UserDefaults.standard.removeObject(forKey: "freeq.webTokenExpiry")
-                    }
-                } else {
-                    authLog.notice(
-                        "Broker 401 NOT clearing creds: consecutive401=\(count, privacy: .public) withinGraceWindow=\(withinGrace, privacy: .public)"
-                    )
-                }
-                throw NSError(domain: "Broker", code: 401, userInfo: [NSLocalizedDescriptionKey: "Session expired — please sign in again"])
+                authLog.notice("broker 401 — the saved login has ended")
+                throw NSError(domain: "Broker", code: 401, userInfo: [NSLocalizedDescriptionKey: RefusedLogin.line])
             }
             guard status == 200 else { throw NSError(domain: "Broker", code: status) }
-            // Success — reset 401 counter.
-            await MainActor.run { self.consecutive401Count = 0 }
             return try JSONDecoder().decode(BrokerSessionResponse.self, from: data)
         }
         throw NSError(domain: "Broker", code: 502)
@@ -2331,7 +2489,8 @@ class AppState: ObservableObject {
             }
             if connectionState == .disconnected && hasSavedSession {
                 brokerRetryCount = 0  // Reset retries on foreground
-                reconnectSavedSession()
+                // Runs a waiting retry now rather than adding another.
+                reconnectSavedSession(viaBroker: true)
             }
         case .background:
             // Going to background — WebSocket dies naturally. Persist the
@@ -2623,7 +2782,8 @@ class AppState: ObservableObject {
         brokerToken = brokerTok
         authenticatedDID = did
         serverAddress = ServerConfig.ircServer
-        connect(nick: nick)
+        // This connect follows the app's own OAuth sign-in.
+        connect(nick: nick, freshSignIn: true)
     }
 
     func awayMessage(for nick: String) -> String? {
@@ -2700,6 +2860,9 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
             // A task event rides as a TAGMSG, so it names its venue the way
             // every other TAGMSG does. The SDK has already read the tags and
             // dropped the repeats a joiner is handed.
+            state.recordVerdict(
+                msgId: act.eventId, verdict: act.verdict.map(AppState.verdictInfo(from:))
+            )
             let actSelf = state.isSelfSender(nick: act.from, account: act.did)
             let venue = act.target.hasPrefix("#")
                 ? act.target
@@ -2736,13 +2899,39 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                     replyTo: nil))
             }
 
+        // The account would not take this device's key. Nothing about the
+        // connection changes: the session stays up and keeps signing with that
+        // key, and the room is told once.
+        case .signingKeyUnpublished:
+            state.noteSigningKeyUnpublished()
+
+        // A signature whose key took a moment to find. The line was delivered
+        // already; this settles what it says.
+        case .verdict(let msgid, let verdict):
+            state.recordVerdict(msgId: msgid, verdict: AppState.verdictInfo(from: verdict))
+
         case .connected:
             print("[freeq.event] .connected")
             state.connectionState = .connected
 
         case .registered(let nick):
             print("[freeq.event] .registered nick=\(nick)")
-            // (continue to existing handler)
+            // If we expected an authenticated session but got Guest, retry
+            // instead of showing login screen. Token may have been stale.
+            // Checked before `.registered` is set, so the bar never blinks away.
+            if state.authenticatedDID != nil && nick.lowercased().hasPrefix("guest") {
+                // A refusal already ended the login: keep the lists, ask nothing.
+                if state.keyRefused { return }
+                state.disconnect()
+                // Invalidate cached token — it was stale
+                state.cachedWebToken = nil
+                state.cachedWebTokenExpiry = .distantPast
+                state.pendingWebToken = nil
+                state.brokerRetryCount = 0
+                // Retry via broker; the disconnect's own event joins this retry.
+                state.scheduleReconnect(after: 1)
+                return
+            }
             state.connectionState = .registered
             state.reconnectAttempts = 0
             UINotificationFeedbackGenerator().notificationOccurred(.success)
@@ -2756,23 +2945,7 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                     AvatarCache.shared.prefetch(nick, did: did)
                 }
             }
-            // If we expected an authenticated session but got Guest, retry
-            // instead of showing login screen. Token may have been stale.
-            if state.authenticatedDID != nil && nick.lowercased().hasPrefix("guest") {
-                state.disconnect()
-                // Invalidate cached token — it was stale
-                state.cachedWebToken = nil
-                state.cachedWebTokenExpiry = .distantPast
-                state.brokerRetryCount = 0
-                // Retry via broker — will get a fresh token
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                    if state.connectionState == .disconnected && state.hasSavedSession {
-                        state.pendingWebToken = nil  // Force broker refresh
-                        state.reconnectSavedSession()
-                    }
-                }
-                return
-            }
+            state.finishReconnect()
             state.nick = nick
             // Auto-join saved channels
             for channel in state.autoJoinChannels {
@@ -2786,6 +2959,7 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
             state.reapplyStatusIfNeeded()
 
         case .authenticated(let did):
+            state.webTokenRefused = false
             state.authenticatedDID = did
             KeychainHelper.save(key: "did", value: did)
             // Refresh login timestamp so hasSavedSession stays valid
@@ -2800,13 +2974,27 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
             }
 
         case .authFailed(let reason):
+            if case .signIn(let line, _) = RefusedLogin.afterConnectRefused(tokenFollowsRefusal: state.tokenFollowsRefusal) {
+                state.endRefusedLogin(line: line)
+                return
+            }
             state.errorMessage = "Auth failed: \(reason)"
+            // The server refused the web token this connect carried. Drop it
+            // and any copy held for the next reconnect, so that one asks the
+            // broker instead of offering the same token again.
+            state.webTokenRefused = true
+            state.pendingWebToken = nil
+            state.cachedWebToken = nil
+            state.cachedWebTokenExpiry = .distantPast
+            KeychainHelper.delete(key: "webToken")
+            KeychainHelper.delete(key: "webTokenExpiry")
 
         case .joined(let channel, let nick):
             let ch = state.getOrCreateChannel(channel)
             ch.lastActivity = Date()
             if nick.lowercased() == state.nick.lowercased() {
                 ch.accessDeniedReason = nil  // a real join clears any prior denial
+                state.tokenFollowsRefusal = false  // the connect after a refused token held
                 // Rehydrate a saved channel E2EE key so encrypted history
                 // decrypts on rejoin (parity with macOS).
                 state.restoreChannelKeyIfSaved(channel)
@@ -2952,8 +3140,12 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                 // The task this line was written beside, when it names one.
                 // Its card is drawn once the matching act event arrives.
                 actRef: ircMsg.tags.first(where: { $0.key == "+freeq.at/ref" })?.value,
+                // What the SDK made of this line's signature, checked on this
+                // device when the line landed.
+                verdict: ircMsg.verdict.map(AppState.verdictInfo(from:)),
                 reactions: initialReactions
             )
+            state.recordVerdict(msgId: msg.id, verdict: msg.verdict)
 
             // Handle edits
             if let editOf = ircMsg.editOf {
@@ -3344,8 +3536,10 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
             }
 
         case .notice(let text):
-            // MOTD collection
-            if text == "MOTD:START" {
+            if let refusal = RefusedKeyNotice.parse(text) {
+                state.signOutRefusedKey(refusal)
+            } else if text == "MOTD:START" {
+                // MOTD collection
                 state.collectingMotd = true
                 state.motdLines = []
             } else if text == "MOTD:END" {
@@ -3422,7 +3616,7 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
 
             print("[freeq.event] .disconnected reason=\(reason)")
             state.connectionState = .disconnected
-            if !reason.isEmpty && !reason.contains("EOF") {
+            if !state.keyRefused && !reason.isEmpty && !reason.contains("EOF") {
                 state.errorMessage = "Disconnected: \(reason)"
             }
             // If we were in a call when the IRC connection dropped, tear it
@@ -3435,6 +3629,10 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
             if state.isInCall {
                 state.tearDownCallLocallyOnDisconnect()
             }
+            // A refused key signed this device out: nothing to reconnect to.
+            if state.keyRefused { return }
+            // One steady "Reconnecting…" from the drop on, in this same update.
+            if state.hasSavedSession { state.reconnecting = true }
             // FEAT-003: a WebSocket-named failure on this very attempt means
             // the network is hostile to WS — try plain TCP once before going
             // through the broker / showing the user any error UI.
@@ -3446,12 +3644,8 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
             if state.hasSavedSession {
                 state.reconnectAttempts += 1
                 // Fast first retry (1s), then 2, 4, 8, 15, 15...
-                let delay = state.reconnectAttempts <= 1 ? 1.0 : min(Double(1 << min(state.reconnectAttempts - 1, 4)), 15.0)
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                    if state.connectionState == .disconnected && state.hasSavedSession {
-                        state.reconnectSavedSession()
-                    }
-                }
+                state.scheduleReconnect(
+                    after: state.reconnectAttempts <= 1 ? 1.0 : min(Double(1 << min(state.reconnectAttempts - 1, 4)), 15.0))
             }
 
         case .readMarker(let target, let timestamp):

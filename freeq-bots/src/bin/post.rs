@@ -46,6 +46,7 @@ async fn main() -> Result<()> {
         tls_insecure: args.tls_insecure,
         web_token: None,
         websocket_url: None,
+        ..Default::default()
     };
 
     let conn = client::establish_connection(&config)

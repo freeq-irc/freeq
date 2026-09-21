@@ -528,9 +528,33 @@ pub async fn upload_media_to_pds(
     })
 }
 
+/// What an XRPC call answered when it refused. Carried on the error so a
+/// caller can tell a refusal apart from a network failure — the sign-in
+/// errors (401, `insufficient_scope`) are the ones worth acting on.
+#[derive(Debug, Clone)]
+pub(crate) struct XrpcRefusal {
+    pub status: u16,
+    pub body: String,
+}
+
+impl std::fmt::Display for XrpcRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for XrpcRefusal {}
+
+impl XrpcRefusal {
+    /// Whether the account would not take this write from this session.
+    pub(crate) fn needs_sign_in(&self) -> bool {
+        self.status == 401 || self.status == 403 || self.body.contains("insufficient_scope")
+    }
+}
+
 /// POST to an XRPC endpoint with DPoP nonce retry logic.
 #[allow(clippy::too_many_arguments)]
-async fn dpop_post(
+pub(crate) async fn dpop_post(
     client: &reqwest::Client,
     base: &str,
     method: &str,
@@ -573,12 +597,18 @@ async fn dpop_post(
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            // The refusal travels as a typed error so a caller can tell it
+            // from a network failure; the message keeps the words it had.
+            let refusal = XrpcRefusal {
+                status: status.as_u16(),
+                body: body.clone(),
+            };
             if status.as_u16() == 401 {
-                anyhow::bail!(
+                return Err(anyhow::Error::new(refusal).context(format!(
                     "Authentication expired ({status}). Please re-authenticate. PDS response: {body}"
-                );
+                )));
             }
-            anyhow::bail!("{status}: {body}");
+            return Err(anyhow::Error::new(refusal).context(format!("{status}: {body}")));
         }
 
         return Ok(resp.json().await?);

@@ -551,6 +551,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         tls_insecure: false,
         web_token: None,
         websocket_url,
+        ..Default::default()
     };
 
     let signer = Arc::new(KeySigner::new(did, private_key));

@@ -405,6 +405,19 @@ fn bad_args_bundle(tool: &str, reason: &str) -> FactBundle {
     }
 }
 
+// Small extension trait used in the unit test below so it doesn't have
+// to import serde::Deserialize at the call site.
+#[cfg(test)]
+trait DeserializeViaValue: Sized {
+    fn deserialize_via_value(v: serde_json::Value) -> Result<Self, serde_json::Error>;
+}
+#[cfg(test)]
+impl<T: for<'de> serde::Deserialize<'de>> DeserializeViaValue for T {
+    fn deserialize_via_value(v: serde_json::Value) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(v)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,18 +490,5 @@ mod tests {
             );
             assert!(known, "no dispatch arm for advertised tool `{name}`");
         }
-    }
-}
-
-// Small extension trait used in the unit test above so it doesn't have
-// to import serde::Deserialize at the call site.
-#[cfg(test)]
-trait DeserializeViaValue: Sized {
-    fn deserialize_via_value(v: serde_json::Value) -> Result<Self, serde_json::Error>;
-}
-#[cfg(test)]
-impl<T: for<'de> serde::Deserialize<'de>> DeserializeViaValue for T {
-    fn deserialize_via_value(v: serde_json::Value) -> Result<Self, serde_json::Error> {
-        serde_json::from_value(v)
     }
 }

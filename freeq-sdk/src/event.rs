@@ -49,6 +49,11 @@ pub enum Event {
         /// one authenticated identity per client session (a multi-account
         /// consumer must namespace its stores per account).
         dm_key: Option<String>,
+        /// The signature's verdict when the client checks signatures and it
+        /// is known at delivery; `Pending` while the key is looked up, with
+        /// an [`Event::Verdict`] to follow. `None` when the client does not
+        /// check signatures.
+        verdict: Option<crate::verdict::Verdict>,
     },
 
     /// A TAGMSG (tags only, no body) — used for reactions, typing indicators, etc.
@@ -59,6 +64,8 @@ pub enum Event {
         /// Same as [`Event::Message::dm_key`]: the DM conversation key,
         /// `None` for channels.
         dm_key: Option<String>,
+        /// Same as [`Event::Message::verdict`].
+        verdict: Option<crate::verdict::Verdict>,
     },
 
     /// A task event: a TAGMSG carrying `act` tags, already read.
@@ -95,6 +102,8 @@ pub enum Event {
         /// Same as [`Event::Message::dm_key`]: the DM conversation key,
         /// `None` for channels.
         dm_key: Option<String>,
+        /// Same as [`Event::Message::verdict`].
+        verdict: Option<crate::verdict::Verdict>,
     },
 
     /// BATCH start (e.g., chathistory)
@@ -252,6 +261,21 @@ pub enum Event {
     /// Connection was closed.
     Disconnected {
         reason: String,
+    },
+
+    /// This device's signing key is not published to the account, and the
+    /// app's session lacks the permission to publish it: the user has to sign
+    /// in again. Sent at most once per connection, after registration, when
+    /// the app's `Enrollment` answers `NeedsSignIn`.
+    SigningKeyUnpublished,
+
+    /// A signature's verdict that was `Pending` when its line was delivered,
+    /// now known. `msgid` is the id the signature covers — a message's
+    /// `msgid` tag, a TAGMSG's `+freeq.at/eventid` — so the line can be
+    /// updated in place.
+    Verdict {
+        msgid: String,
+        verdict: crate::verdict::Verdict,
     },
 
     /// Raw server line (for debugging).

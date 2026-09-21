@@ -2,8 +2,19 @@ import { useStore } from '../store';
 import { displayNameForKey } from '../lib/display-name';
 import { requestPermission } from '../lib/notifications';
 import { getPreferences, setPreferences } from '../lib/db';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { AudioTest } from './AudioTest';
+import { formatTime } from './MessageList';
+import { useSyncExternalStore } from 'react';
+import {
+  getDeviceKeyState,
+  listDeviceRows,
+  signInToPublishKeys,
+  signOutDevice,
+  subscribeDeviceKey,
+  type DeviceRow,
+} from '../irc/client';
 
 interface SettingsPanelProps {
   open: boolean;
@@ -178,6 +189,12 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
             </div>
           </Section>
 
+          {authDid && (
+            <Section title="Devices">
+              <DevicesSection />
+            </Section>
+          )}
+
           {/* Keyboard shortcuts */}
           <Section title="Keyboard Shortcuts">
             <ShortcutRow keys="⌘ K" desc="Quick switcher" />
@@ -208,6 +225,245 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
         </div>
       </div>
     </>
+  );
+}
+
+/** A date, the way the app writes one older than a week, and its time. */
+function day(iso?: string): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })}, ${formatTime(d)}`;
+}
+
+/** The one meta line a row carries. */
+function metaLine(row: DeviceRow): string {
+  if (row.state === 'unpublished') return 'Key not published · this device';
+  if (row.state === 'signedOut') return `Signed out · ${day(row.date)}`;
+  return `Active · since ${day(row.date)}`;
+}
+
+/**
+ * Every signing key the account has published, newest first, and the one
+ * action each offers: sign another device out, publish this device's key, or
+ * nothing at all for a key already signed out.
+ */
+export function DevicesSection() {
+  const key = useSyncExternalStore(subscribeDeviceKey, getDeviceKeyState);
+  const [rows, setRows] = useState<DeviceRow[]>([]);
+  // Until the first read settles.
+  const [loading, setLoading] = useState(true);
+  // Set by a sign-out, so the next read lists the account afresh.
+  const refreshNext = useRef(false);
+  // Set once this open has listed the account afresh.
+  const listedOnOpen = useRef(false);
+  const [ask, setAsk] = useState<DeviceRow | null>(null);
+  const [signIn, setSignIn] = useState(false);
+  const [failed, setFailed] = useState<string | null>(null);
+  // What happened to a sign-out that is not a failure.
+  const [note, setNote] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  // Re-read on mount, and again whenever this device's own key changes —
+  // publishing it is the one thing that lands there rather than here. On open
+  // the cached rows show at once, then the account is listed afresh so a
+  // device that signed in since the cached listing appears.
+  useEffect(() => {
+    let live = true;
+    const refresh = refreshNext.current;
+    refreshNext.current = false;
+    const thenRefresh = !refresh && !listedOnOpen.current;
+    (async () => {
+      let cached: DeviceRow[] = [];
+      try {
+        cached = await listDeviceRows({ refresh });
+      } catch {
+        // Left empty; the refresh below may still fill it.
+      }
+      if (!live) return;
+      setRows(cached);
+      if (!thenRefresh || cached.length > 0) setLoading(false);
+      if (!thenRefresh) return;
+      listedOnOpen.current = true;
+      try {
+        const fresh = await listDeviceRows({ refresh: true });
+        if (live) setRows(fresh);
+      } catch {
+        // Keep the cached rows.
+      }
+      if (live) setLoading(false);
+    })();
+    return () => {
+      live = false;
+    };
+  }, [key.kid, key.published, busy]);
+
+  async function confirmSignOut(row: DeviceRow) {
+    setBusy(true);
+    setFailed(null);
+    setNote(null);
+    try {
+      const outcome = await signOutDevice(row.kid);
+      switch (outcome.kind) {
+        case 'notReady':
+          setFailed("To sign out other devices, sign in and publish this device's key first.");
+          break;
+        case 'noKey':
+          setFailed(
+            "This browser won't let freeq store its key. Change your browser settings to allow this site to store data, or try another browser.",
+          );
+          break;
+        case 'needsSignIn':
+          // The account provider refuses the write without the publish grant.
+          setSignIn(true);
+          break;
+        case 'notSaved':
+          setFailed(
+            `Couldn't sign out ${row.name} because your account provider didn't respond. Try again in a moment.`,
+          );
+          break;
+        case 'retired':
+          // Not failures: the retirement is in the account either way.
+          if (outcome.sessionsClosed === null) {
+            setNote(
+              `${row.name}'s key has been retired, so anything it sends now is flagged. It may still be signed in, here or somewhere else. To sign it out there too, open freeq on that server and sign it out from Devices.`,
+            );
+          } else if (outcome.sessionsClosed === 0) {
+            setNote(
+              `${row.name}'s key has been retired, so anything it sends now is flagged. It isn't connected to this server, so it may still be signed in somewhere else. To sign it out there too, open freeq on that server and sign it out from Devices.`,
+            );
+          }
+          break;
+      }
+    } catch {
+      setFailed(`Couldn't sign out ${row.name}. Try again.`);
+    } finally {
+      setAsk(null);
+      refreshNext.current = true;
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      {loading && <p className="text-[11px] text-fg-dim leading-relaxed">{'Loading devices…'}</p>}
+      {rows.map((row) => (
+        <div
+          key={row.kid}
+          data-device-row
+          className="flex items-center justify-between text-sm gap-2"
+        >
+          <span className="flex items-center gap-2 min-w-0">
+            <span aria-hidden className={row.state === 'signedOut' ? 'opacity-40' : ''}>
+              {'💻'}
+            </span>
+            <span className="min-w-0">
+              <span data-testid="device-name" className="block truncate text-fg">
+                {row.name}
+              </span>
+              <span data-device-meta className="block text-[11px] text-fg-dim">
+                {metaLine(row)}
+              </span>
+            </span>
+          </span>
+          <span className="shrink-0 text-xs">
+            {row.state === 'active' && row.thisDevice && (
+              <span className="text-fg-dim">{'This device'}</span>
+            )}
+            {row.state === 'active' && !row.thisDevice && (
+              <button
+                disabled={busy}
+                onClick={() => setAsk(row)}
+                className="text-accent font-semibold hover:underline disabled:opacity-50"
+              >
+                {'Sign out'}
+              </button>
+            )}
+            {row.state === 'unpublished' && (
+              <button
+                onClick={() => setSignIn(true)}
+                className="text-accent font-semibold hover:underline"
+              >
+                {'Publish key'}
+              </button>
+            )}
+          </span>
+        </div>
+      ))}
+
+      <p className="text-[11px] text-fg-dim leading-relaxed">
+        {'A signed-out device has to sign in again before it can post as you. Messages it already sent stay signed.'}
+      </p>
+
+      {failed && <p className="text-[11px] text-red-400">{failed}</p>}
+      {note && <p className="text-[11px] text-fg-dim leading-relaxed">{note}</p>}
+
+      {ask && (
+        <Modal onClose={() => setAsk(null)}>
+          <div role="dialog" className="p-3 space-y-2">
+            <p className="text-sm font-semibold">{`Sign out ${ask.name}?`}</p>
+            <p className="text-[11px] text-fg-dim leading-relaxed">
+              {'It will be signed out and will need to sign in again. Messages it already sent stay signed.'}
+            </p>
+            <div className="flex justify-end gap-3 text-xs">
+              <button onClick={() => setAsk(null)} className="text-fg-dim hover:text-fg">
+                {'Cancel'}
+              </button>
+              <button
+                disabled={busy}
+                onClick={() => void confirmSignOut(ask)}
+                className="text-accent font-semibold hover:underline disabled:opacity-50"
+              >
+                {'Sign out'}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {signIn && (
+        <Modal onClose={() => setSignIn(false)}>
+          <div className="p-3 space-y-2">
+            <p className="text-sm font-semibold">{'Sign in to continue'}</p>
+            <p className="text-[11px] text-fg-dim leading-relaxed">
+              {'Your account needs a fresh sign-in before freeq can change your devices.'}
+            </p>
+            <div className="flex justify-end gap-3 text-xs">
+              <button onClick={() => setSignIn(false)} className="text-fg-dim hover:text-fg">
+                {'Not now'}
+              </button>
+              <button
+                onClick={() => signInToPublishKeys()}
+                className="text-accent font-semibold hover:underline"
+              >
+                {'Sign in'}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </>
+  );
+}
+
+/**
+ * A modal over the whole window. The Settings panel is fixed and animated with
+ * a transform, which would contain a fixed box inside it, so this renders into
+ * document.body; the shell is JoinGateModal's.
+ */
+function Modal({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
+  return createPortal(
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="bg-bg-secondary border border-border rounded-xl shadow-2xl w-full max-w-md"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {children}
+      </div>
+    </div>,
+    document.body,
   );
 }
 

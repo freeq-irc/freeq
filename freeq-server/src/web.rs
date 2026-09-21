@@ -305,6 +305,10 @@ pub fn router(state: Arc<SharedState>) -> Router {
             "/api/v1/channels/{name}/groupkeys",
             get(api_get_group_keys).post(api_put_group_keys),
         )
+        .route(
+            "/api/v1/devices/sign-out",
+            axum::routing::post(api_device_sign_out),
+        )
         .route("/api/v1/signing-key", get(api_signing_key))
         .route("/api/v1/signing-keys/{did}", get(api_did_signing_key))
         .route(
@@ -2389,6 +2393,106 @@ async fn api_set_favorites(
     )
 }
 
+#[derive(Deserialize)]
+struct DeviceSignOutRequest {
+    kid: String,
+}
+
+/// POST /api/v1/devices/sign-out {"kid": "..."} — sign one of the caller's own
+/// devices out. Requires a Bearer session.
+///
+/// The account's own retirement record is the durable statement that the key
+/// is stood down; this is the eviction that follows it. Three things end: the
+/// key row is retired, every connection signing with that key is closed, and
+/// the login token behind it stops working — refused here from now on, and
+/// its session deleted where it lives: the embedded session store, or the
+/// standalone broker, which is asked over a signed call and retried until it
+/// takes it.
+///
+/// A kid this server holds no live row for under the caller's DID — never
+/// registered here, already retired, or registered on another server — is
+/// 200 with nothing closed and nothing revoked. The caller is already that
+/// account and the retirement is public, so the answer reveals nothing.
+async fn api_device_sign_out(
+    State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<DeviceSignOutRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(did) = caller_did_from_bearer(&state, &headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Bearer session required" })),
+        );
+    };
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let retired = state
+        .with_db(|db| db.retire_signing_key(&did, &req.kid, now))
+        .unwrap_or(false);
+    if !retired {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "sessions_closed": 0, "tokens_revoked": 0 })),
+        );
+    }
+
+    // Every connection of this DID whose signing key is the one retired,
+    // including the caller's own if it is signing with it.
+    let doomed: Vec<String> = {
+        let dids = state.session_dids.lock();
+        let keys = state.session_msg_keys.lock();
+        dids.iter()
+            .filter(|(_, d)| *d == &did)
+            .filter(|(sid, _)| {
+                keys.get(*sid)
+                    .is_some_and(|vk| freeq_sdk::sigtag::derive_kid(vk) == req.kid)
+            })
+            .map(|(sid, _)| sid.clone())
+            .collect()
+    };
+    let mut sessions_closed = 0usize;
+    for sid in &doomed {
+        if crate::connection::close_session(&state, sid, "Signed out from another device") {
+            sessions_closed += 1;
+        }
+    }
+
+    // The login token behind that key: filed as signed out, then its session
+    // ended where it lives — the embedded store, or the standalone broker.
+    let tokens: Vec<String> = {
+        let mut linked = state.device_key_tokens.lock();
+        let mut found = Vec::new();
+        linked.retain(|(d, k), token| {
+            if d == &did && k == &req.kid {
+                found.push(token.clone());
+                false
+            } else {
+                true
+            }
+        });
+        found
+    };
+    for token in &tokens {
+        crate::connection::end_login_token(&state, token).await;
+    }
+
+    tracing::info!(
+        %did, kid = %req.kid, sessions_closed, tokens_revoked = tokens.len(),
+        "device signed out"
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "sessions_closed": sessions_closed,
+            "tokens_revoked": tokens.len(),
+        })),
+    )
+}
+
 /// Resolve the authenticated caller DID from a `Bearer <session-id>` header.
 pub(crate) fn caller_did_from_bearer(
     state: &crate::server::SharedState,
@@ -3426,6 +3530,11 @@ async fn api_user_whois(
 struct BrokerTokenRequest {
     did: String,
     handle: String,
+    /// The login token this web token is minted for. Absent from an older
+    /// broker's push — such a token cannot be refused when its device signs
+    /// out, because nothing names it.
+    #[serde(default)]
+    broker_token: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -3469,6 +3578,19 @@ async fn auth_broker_web_token(
     let req: BrokerTokenRequest = serde_json::from_slice(&body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")))?;
 
+    // A device that was signed out gets no more web tokens, so its /session
+    // refresh stops producing one it could authenticate with. Signed-out
+    // tokens are known by their hash, which is also what survives a restart.
+    if let Some(ref bt) = req.broker_token
+        && state
+            .revoked_token_hashes
+            .lock()
+            .contains(&freeq_auth_broker::token_hash(bt))
+    {
+        tracing::info!(did = %req.did, "web-token refused: device signed out");
+        return Err((StatusCode::UNAUTHORIZED, "Device signed out".to_string()));
+    }
+
     let token = generate_random_string(32);
     state.web_auth_tokens.lock().insert(
         token.clone(),
@@ -3476,6 +3598,7 @@ async fn auth_broker_web_token(
             req.did.clone(),
             req.handle.clone(),
             std::time::Instant::now(),
+            req.broker_token.clone(),
         ),
     );
     let nick = mobile_nick_from_handle(&req.handle);
@@ -3500,6 +3623,7 @@ impl freeq_auth_broker::SessionWriter for LocalWriter {
         &self,
         did: &str,
         handle: &str,
+        broker_token: Option<&str>,
     ) -> Result<(String, String), anyhow::Error> {
         let token = generate_random_string(32);
         self.state.web_auth_tokens.lock().insert(
@@ -3508,6 +3632,7 @@ impl freeq_auth_broker::SessionWriter for LocalWriter {
                 did.to_string(),
                 handle.to_string(),
                 std::time::Instant::now(),
+                broker_token.map(str::to_string),
             ),
         );
         Ok((token, mobile_nick_from_handle(handle)))
@@ -3585,67 +3710,23 @@ async fn auth_broker_session(
 /// Verify HMAC-SHA256 signature over raw request bytes with replay protection.
 /// The broker must include X-Broker-Timestamp (unix seconds). Requests older
 /// than 60 seconds are rejected.
+///
+/// The rule lives in the broker crate, which signs with it and now verifies
+/// the server's own signed deletes with it, so there is one scheme and one
+/// clock window in both directions.
 fn verify_broker_signature_raw(
     secret: &str,
     headers: &axum::http::HeaderMap,
     body_bytes: &[u8],
 ) -> Result<(), (StatusCode, String)> {
-    use base64::Engine;
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    let sig = headers
-        .get("x-broker-signature")
-        .and_then(|v| v.to_str().ok())
-        .ok_or((
-            StatusCode::UNAUTHORIZED,
-            "Missing broker signature".to_string(),
-        ))?;
-
-    // Replay protection: require timestamp and enforce ≤60s skew.
-    let ts_str = headers
-        .get("x-broker-timestamp")
-        .and_then(|v| v.to_str().ok())
-        .ok_or((
-            StatusCode::UNAUTHORIZED,
-            "Missing X-Broker-Timestamp header".to_string(),
-        ))?;
-    let ts: u64 = ts_str.parse().map_err(|_| {
-        (
-            StatusCode::UNAUTHORIZED,
-            "Invalid X-Broker-Timestamp".to_string(),
-        )
-    })?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if now.abs_diff(ts) > 60 {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "Broker request expired (timestamp > 60s)".to_string(),
-        ));
-    }
-
-    // MAC covers ts={timestamp}\n || body to bind the timestamp to the signature.
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "HMAC init failed".to_string(),
-        )
-    })?;
-    mac.update(format!("ts={ts_str}\n").as_bytes());
-    mac.update(body_bytes);
-    let expected =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
-
-    if expected != sig {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "Invalid broker signature".to_string(),
-        ));
-    }
-    Ok(())
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    freeq_auth_broker::verify_signed_body(
+        secret,
+        header("x-broker-timestamp"),
+        header("x-broker-signature"),
+        body_bytes,
+    )
+    .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))
 }
 
 // ── OAuth client metadata ──────────────────────────────────────────────
@@ -3672,7 +3753,7 @@ async fn client_metadata(
         media_space_scope(&state).as_deref(),
     );
     // Advertise every scope any flow may request in the metadata.
-    let mut scope = "atproto blob:image/* repo:blue.irc.media?action=create repo:app.bsky.feed.post transition:generic".to_string();
+    let mut scope = freeq_oauth::CLIENT_METADATA_SCOPE.to_string();
     if let Some(ref mgr) = state.media_space {
         scope.push(' ');
         scope.push_str(&crate::media_space::space_scope(&mgr.authority_did));
@@ -3692,6 +3773,7 @@ async fn client_metadata(
         //   - Login (default sign-in)        → "atproto" only
         //   - BlobUpload step-up             → "atproto blob:image/*"
         //   - BlueskyPost step-up            → "atproto repo:app.bsky.feed.post"
+        //   - Login with `intent=enroll`     → adds the two at.freeq key grants
         //
         // `transition:generic` is included for the grace-period: existing
         // refresh tokens issued under the old wide grant must still be
@@ -3839,6 +3921,8 @@ fn derive_web_origin_from_config(config: &crate::config::ServerConfig) -> (Strin
 #[derive(Deserialize)]
 struct AuthLoginQuery {
     handle: String,
+    /// If "enroll", also ask for the grants that let this device publish its signing key.
+    intent: Option<String>,
     /// If "1", callback redirects to freeq:// URL scheme for mobile apps.
     mobile: Option<String>,
     /// If set, this is an IRC `/login` command — complete auth on the IRC session.
@@ -3977,12 +4061,12 @@ async fn auth_login(
     .map_err(map_outbound_err)?;
 
     // Build redirect URI and client_id. Default purpose for `/auth/login`
-    // is `Login` — narrow `atproto` scope only. Phase-2 step-up flows
-    // (image upload, Bluesky cross-post) hit `/auth/step-up` instead and
-    // request additional scopes there.
+    // is `Login` — narrow `atproto` scope only, widened by `intent=enroll`
+    // to also create key records. Phase-2 step-up flows (image upload,
+    // Bluesky cross-post) hit `/auth/step-up` instead.
     let redirect_uri = format!("{web_origin}/auth/callback");
     let purpose = crate::server::OauthPurpose::Login;
-    let scope = purpose.requested_scope(None);
+    let scope = crate::server::login_scope(q.intent.as_deref());
     let client_id = build_client_id_with_scopes(
         &web_origin,
         &redirect_uri,
@@ -4005,7 +4089,7 @@ async fn auth_login(
         &code_challenge,
         &oauth_state,
         &handle,
-        &scope,
+        scope,
         &dpop_key,
     )
     .await
@@ -4330,25 +4414,6 @@ async fn auth_callback(
 
     let is_step_up = !matches!(pending.purpose, crate::server::OauthPurpose::Login);
 
-    // Mint a one-time SASL web-token only for the primary login flow.
-    // Step-ups produce *additional* PDS grants for the same already-
-    // logged-in user — we don't want to issue a second SASL token and
-    // confuse the IRC layer into thinking the identity changed.
-    let web_token = if is_step_up {
-        None
-    } else {
-        let token = generate_random_string(32);
-        state.web_auth_tokens.lock().insert(
-            token.clone(),
-            (
-                pending.did.clone(),
-                pending.handle.clone(),
-                std::time::Instant::now(),
-            ),
-        );
-        Some(token)
-    };
-
     // Embedded durable session (Login only): persist the broker session
     // (refresh token + client_id) into the in-process store and issue a
     // broker_token, so /session can silently refresh without a re-login.
@@ -4385,6 +4450,28 @@ async fn auth_callback(
             }
         }
         _ => None,
+    };
+
+    // Mint a one-time SASL web-token only for the primary login flow.
+    // Step-ups produce *additional* PDS grants for the same already-
+    // logged-in user — we don't want to issue a second SASL token and
+    // confuse the IRC layer into thinking the identity changed. The broker
+    // token goes in beside it: that is this device's login token, and a
+    // key registered on the connection it opens is tied back to it.
+    let web_token = if is_step_up {
+        None
+    } else {
+        let token = generate_random_string(32);
+        state.web_auth_tokens.lock().insert(
+            token.clone(),
+            (
+                pending.did.clone(),
+                pending.handle.clone(),
+                std::time::Instant::now(),
+                broker_token.clone(),
+            ),
+        );
+        Some(token)
     };
 
     let result = crate::server::OAuthResult {

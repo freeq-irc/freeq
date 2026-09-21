@@ -45,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
         tls: true,
         tls_insecure: false,
         web_token: None,
+        ..Default::default()
     };
 
     let signer = Arc::new(KeySigner::new(did.clone(), private_key));

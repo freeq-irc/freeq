@@ -106,14 +106,20 @@ export {
   foldDeviceRecords,
   foldAgentRecords,
   listRecords,
+  listRecordEntries,
+  provenRecords,
   liveDeviceKeys,
   liveAgentLinks,
   recordCid,
   fetchProof,
   verifyProof,
   verifyRecord,
+  deviceKeyHistory,
+  retirementClosure,
 } from './identity-records.js';
 export type {
+  ListedRecord,
+  DeviceKeyHistory,
   DeviceKeyRecord,
   AgentKeyRecord,
   LiveDeviceKey,
@@ -126,8 +132,26 @@ export type {
 
 // Finding a signer's key by kid: their records, a did:web document, then the
 // origin server. Twin of the Rust `freeq_sdk::key_lookup`.
-export { KeyLookup } from './key-lookup.js';
-export type { FoundKey, KeySource, RecordReader } from './key-lookup.js';
+export { KeyLookup, MemoryKeyLookupStore, makeDidResolver } from './key-lookup.js';
+export type {
+  FoundKey,
+  KeyLookupSnapshot,
+  KeyLookupStore,
+  KeySource,
+  RecordReader,
+} from './key-lookup.js';
+
+// A device's own signing key, kept across connects
+export {
+  MemoryDeviceKeyStore,
+  IndexedDbDeviceKeyStore,
+  recordKeyOf,
+} from './device-key.js';
+export type { DeviceKeyStore, StoredDeviceKey } from './device-key.js';
+
+// What a client shows for a message's signature; words from spec/verdict-model.json
+export { mark, sentence, VERDICT_STATES, KEY_LAYERS } from './verdict.js';
+export type { Verdict, VerdictState, KeyLayer } from './verdict.js';
 
 // VC-bootstrapped E2E group channels (EG1/EGK1) — passphrase-free, server-blind
 // channel encryption with per-epoch revocation. Interop-compatible with the

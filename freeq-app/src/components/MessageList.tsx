@@ -20,7 +20,7 @@ import { CoordinationEventCard } from './CoordinationCards';
 import { ActEventCard, useActCompanion } from './ActCards';
 import { jumbomojiSize } from '../lib/jumbomoji';
 import { buildTranscript, rowsInSelection } from '../lib/transcript';
-import { useCachedVerdict, VERIFY_LABELS } from '../lib/verify-signature';
+import { useCachedVerdict, useVerdictLookup, copyForVerdict, verdictCopy, type Verdict } from '../lib/verify-signature';
 import { VerifySignaturePanel } from './VerifySignaturePanel';
 
 // ── Colors ──
@@ -42,8 +42,8 @@ function nickInitial(nick: string): string {
 
 // ── Time formatting ──
 
-function formatTime(d: Date): string {
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+export function formatTime(d: Date): string {
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
 }
 
 function formatDateSeparator(d: Date): string {
@@ -774,10 +774,31 @@ function ReplyBadge({ msgId }: { msgId: string }) {
 
 // ── Message grouping ──
 
-function isGrouped(msgs: Message[], i: number): boolean {
-  if (i === 0) return false;
-  const prev = msgs[i - 1];
-  const curr = msgs[i];
+/** A row's signature mark, for grouping; null while its check is still out. */
+type RowMarkKind = 'lock' | 'dim-lock' | 'warning' | 'none';
+
+function rowMarkKind(verdict: Verdict | undefined): RowMarkKind | null {
+  if (!verdict || verdict.state === 'pending') return null;
+  if (verdict.state === 'invalid' || verdict.state === 'retired') return 'warning';
+  if (verdict.state === 'device') return verdict.layer === 'published' ? 'lock' : 'dim-lock';
+  return 'none';
+}
+
+/** Which rows group under the row above. A row whose settled mark differs
+ *  from its header's starts a header of its own; a pending mark matches. */
+function groupedRows(msgs: Message[], markOf: (msgid: string) => RowMarkKind | null): boolean[] {
+  const grouped: boolean[] = [];
+  let headerMark: RowMarkKind | null = null;
+  for (let i = 0; i < msgs.length; i++) {
+    const mark = markOf(msgs[i].id);
+    grouped[i] = i > 0 && continuesRun(msgs[i - 1], msgs[i])
+      && (headerMark === null || mark === null || mark === headerMark);
+    if (!grouped[i]) headerMark = mark;
+  }
+  return grouped;
+}
+
+function continuesRun(prev: Message, curr: Message): boolean {
   if (prev.isSystem || curr.isSystem || prev.deleted || curr.deleted) return false;
   if (prev.from !== curr.from) return false;
   // Don't group across a provenance boundary: a federated message (carrying
@@ -869,7 +890,7 @@ function FullMessageImpl({ msg, channel, onNickClick }: MessageProps) {
   const [verifyPanel, setVerifyPanel] = useState<{ x: number; y: number } | null>(null);
   // The only signature state a resting row ever shows: a check that already
   // answered "invalid". Everything short of that answer is silent.
-  const sigInvalid = useCachedVerdict(msg.id)?.outcome === 'invalid';
+  const verdict = useCachedVerdict(msg.id);
   const color = msg.isSelf ? '#b18cff' : nickColor(msg.from);
   const currentNick = getNick();
   const isMention = !msg.isSelf && msg.text.toLowerCase().includes(currentNick.toLowerCase());
@@ -932,9 +953,11 @@ function FullMessageImpl({ msg, channel, onNickClick }: MessageProps) {
           >
             {displayNameForKey(msg.from)}
           </button>
-          {rowClaim.showsMark && <VerifiedBadge />}
+          {rowClaim.showsMark && (
+            <VerifiedBadge onOpen={(e) => onNickClick(msg.from, member?.did, origin, e, rowEvidence)} />
+          )}
           {isFederated && <ViaBadge origin={origin!} line={rowClaim.line} />}
-          {sigInvalid && <InvalidSigMark />}
+          {rowMark(verdict, (e) => setVerifyPanel({ x: e.clientX, y: e.clientY }))}
           {member?.away != null && (
             <span className="text-xs text-fg-dim bg-warning/10 text-warning px-1.5 py-0.5 rounded">away</span>
           )}
@@ -1017,7 +1040,6 @@ function GroupedMessageImpl({ msg, channel, onNickClick }: MessageProps) {
   const [pickerPos, setPickerPos] = useState<{ x: number; y: number } | undefined>();
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
   const [verifyPanel, setVerifyPanel] = useState<{ x: number; y: number } | null>(null);
-  const sigInvalid = useCachedVerdict(msg.id)?.outcome === 'invalid';
   const currentNick = getNick();
   const isMention = !msg.isSelf && msg.text.toLowerCase().includes(currentNick.toLowerCase());
   const isPinned = useStore((s) => s.channels.get(channel.toLowerCase())?.pins?.some(p => p.msgid === msg.id) ?? false);
@@ -1039,12 +1061,11 @@ function GroupedMessageImpl({ msg, channel, onNickClick }: MessageProps) {
         {formatTime(msg.timestamp)}
       </span>
       {/* A follow-up line aligns with the full rows above it — no reserved
-          slot. The rare badges (E2EE, or the ⚠ after a check answered
-          "invalid") take their space only on the lines that carry them. */}
-      {(msg.encrypted || sigInvalid) && (
+          slot. The E2EE badge takes its space only on the lines that carry
+          it. A grouped line wears no signature mark: its mark is its header's. */}
+      {msg.encrypted && (
         <span className="shrink-0 flex items-start gap-1 leading-[24px]">
-          {msg.encrypted && <EncryptedBadge />}
-          {sigInvalid && <InvalidSigMark />}
+          <EncryptedBadge />
         </span>
       )}
 
@@ -1121,14 +1142,15 @@ const SystemMessage = memo(SystemMessageImpl);
 const FullMessage = memo(FullMessageImpl);
 const GroupedMessage = memo(GroupedMessageImpl);
 
-/** The mark for an AT Protocol identity — the one claim that earns one. */
-function VerifiedBadge() {
+/** The mark for an AT Protocol identity — the one claim that earns one. Opens
+ *  what the name beside it opens. */
+function VerifiedBadge({ onOpen }: { onOpen: (e: React.MouseEvent) => void }) {
   return (
-    <span className="text-accent text-xs" title="AT Protocol identity">
+    <button type="button" className="text-accent text-xs" title="AT Protocol identity — click for proof" onClick={onOpen}>
       <svg className="w-3.5 h-3.5 inline -mt-0.5" viewBox="0 0 16 16" fill="currentColor">
         <path d="M8 0a8 8 0 100 16A8 8 0 008 0zm3.78 5.97l-4.5 5a.75.75 0 01-1.06.02l-2-1.86a.75.75 0 011.02-1.1l1.45 1.35 3.98-4.43a.75.75 0 011.11 1.02z"/>
       </svg>
-    </span>
+    </button>
   );
 }
 
@@ -1145,18 +1167,60 @@ function ViaBadge({ origin, line }: { origin: string; line: string | null }) {
   );
 }
 
-/** The one signature mark a resting row can wear: a check that actually
- *  answered "invalid". Never speculative — it exists only after evidence. */
-function InvalidSigMark() {
+/** Opens the proof panel at the click. */
+type OpenProof = (e: React.MouseEvent) => void;
+
+/** The one signature mark a resting row can wear when the check failed: a
+ *  signature that did not hold, or one made after its key was retired. */
+function InvalidSigMark({ verdict, onOpen }: { verdict?: Verdict; onOpen: OpenProof }) {
   return (
-    <span
+    <button
+      type="button"
       data-testid="sig-invalid-mark"
-      className="text-danger text-xs cursor-default"
-      title={VERIFY_LABELS.invalid.line}
+      className="text-danger text-xs"
+      title={verdict ? copyForVerdict(verdict).line : verdictCopy('invalid').line}
+      onClick={onOpen}
     >
       ⚠
-    </span>
+    </button>
   );
+}
+
+/**
+ * The lock, when the sender's own device signed: at full strength once their
+ * account publishes the key, at 30% while only their server vouches for it.
+ * The title sits on the faded element itself, so the hover text is not faded.
+ */
+function SignedMark({ verdict, onOpen }: { verdict: Verdict; onOpen: OpenProof }) {
+  const published = verdict.layer === 'published';
+  return (
+    <button
+      type="button"
+      data-testid="sig-device-mark"
+      data-layer={verdict.layer ?? ''}
+      className={`text-success text-xs ${published ? '' : 'opacity-30'}`}
+      title={copyForVerdict(verdict).line}
+      onClick={onOpen}
+    >
+      🔒
+    </button>
+  );
+}
+
+/**
+ * The mark a verdict earns on a resting row, if any: the lock for the
+ * sender's device, ⚠ for a failed or retired signature, and nothing for
+ * every other state, including a server signature on the sender's behalf.
+ */
+function rowMark(verdict: Verdict | undefined, onOpen: OpenProof) {
+  if (!verdict) return null;
+  if (verdict.state === 'invalid' || verdict.state === 'retired') {
+    return <InvalidSigMark verdict={verdict} onOpen={onOpen} />;
+  }
+  if (verdict.state === 'device') {
+    return <SignedMark verdict={verdict} onOpen={onOpen} />;
+  }
+  return null;
 }
 
 function EncryptedBadge() {
@@ -1541,6 +1605,13 @@ export function MessageList() {
    *  is mounted at a time, so an index is the only handle on a row that works
    *  whether or not it is on screen. */
   const { rows, indexOfId } = useMemo(() => buildRenderRows(messages), [messages]);
+  /** Regrouped when a verdict settles, so a row whose mark differs from its
+   *  header's moves out then. */
+  const verdictOf = useVerdictLookup();
+  const grouped = useMemo(
+    () => groupedRows(messages, (msgid) => rowMarkKind(verdictOf(msgid))),
+    [messages, verdictOf],
+  );
   const virtualizer = useRef<VirtualizerHandle>(null);
   const rowCount = useRef(0);
   rowCount.current = rows.length;
@@ -2097,7 +2168,7 @@ export function MessageList() {
                 </div>
               ) : row.msg.isSystem ? (
                 <SystemMessage msg={row.msg} />
-              ) : isGrouped(messages, row.at) ? (
+              ) : grouped[row.at] ? (
                 <GroupedMessage msg={row.msg} channel={activeChannel} onNickClick={onNickClick} />
               ) : (
                 <FullMessage msg={row.msg} channel={activeChannel} onNickClick={onNickClick} />

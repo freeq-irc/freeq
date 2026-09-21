@@ -1,218 +1,143 @@
 /**
- * Asking the server whether a message's signature holds up.
+ * What this client can say about a message's signature.
  *
- * Verification is an explicit request — the UI asks only when the user does.
- * The answer says only what it can support: what the server actually
- * answered, that the answer was bad, that nobody could tell — or that the
- * question never got through at all, which is a fact about the network, not
- * about the message.
+ * The check is the SDK's own, made here on the device: it rebuilds the signed
+ * document from the line and looks the signer's key up in their identity
+ * records, their DID document, or the server's key store. The verdict arrives
+ * on the message, or shortly after it as a `verdict` event, and this module
+ * holds it so a row and the proof panel read the same answer.
+ *
+ * The sentences come from `spec/verdict-model.json` through the SDK, so every
+ * freeq client says the same words for the same state.
  */
 import { useSyncExternalStore } from 'react';
+import { sentence, type KeyLayer, type Verdict, type VerdictState } from '@freeq/sdk';
 
-/** Result of checking a signature against `GET /api/v1/verify/{msgid}`.
+export type { KeyLayer, Verdict };
+
+/** What checking a signature came to.
  *
  *  "We couldn't check this" and "this doesn't check out" are different facts
  *  and only one of them is an accusation: `unverifiable` covers a signature
- *  from before the current canonical, or one made with a key the server does
- *  not hold; `invalid` means the key the signature names was found and the
- *  signature does not match. `unsigned` is a third thing again — there was
- *  never a signature, so nothing was checked and nothing failed. `unreachable`
- *  means the check itself failed — network down, proxy fault, server error. It
- *  is not a verdict about the message and must never be dressed up as one. */
-export type VerifyOutcome =
-  | 'device'
-  | 'server'
-  | 'unsigned'
-  | 'unverifiable'
-  | 'invalid'
-  | 'unreachable';
+ *  whose key no source holds, or a format this build cannot read; `invalid`
+ *  means the key the signature names was found and the signature does not
+ *  match; `retired` means it was made with a key its owner had already
+ *  retired. `unsigned` is a third thing again — there was never a signature,
+ *  so nothing was checked and nothing failed. `pending` means the key is
+ *  still being fetched. */
+export type VerifyOutcome = VerdictState;
 
-/** A checked answer, with the one distinction inside `unverifiable` that
- *  changes what happens next: a signature naming a key this server simply
- *  hasn't fetched yet is `transient` — the server starts fetching the key the
- *  moment it answers, so asking again shortly usually resolves. Every other
- *  flavour (a retired format, an unknown algorithm, no record) is final. */
-export interface VerifyAnswer {
-  outcome: VerifyOutcome;
-  transient: boolean;
-}
+/** Verdicts by msgid, as the SDK settles them. A row and the panel read the
+ *  same entry, and a late verdict replaces the `pending` one in place. */
+const verdicts = new Map<string, Verdict>();
 
-/**
- * Checked verdicts by msgid. Definitive server answers are cached — the same
- * message is answered the same way every time. Transient can't-check answers
- * and failed checks are NOT cached, so asking again can land a real verdict.
- */
-const verifyCache = new Map<string, VerifyAnswer>();
-
-/** Rows subscribe so a cached verdict (the ⚠ after an `invalid` answer) can
+/** Rows subscribe so a verdict that settles after the line was drawn can
  *  appear without anything else forcing a re-render. */
 const listeners = new Set<() => void>();
-
-function notifyVerdictListeners(): void {
-  for (const fn of listeners) fn();
-}
 
 export function subscribeVerdicts(fn: () => void): () => void {
   listeners.add(fn);
   return () => listeners.delete(fn);
 }
 
-/** The verdict already on file for a message, if it has been checked. */
-export function cachedVerdict(msgid: string): VerifyAnswer | undefined {
-  return verifyCache.get(msgid);
+/** File what the SDK said about one line. */
+export function recordVerdict(msgid: string, verdict: Verdict | undefined): void {
+  if (!msgid || !verdict) return;
+  const known = verdicts.get(msgid);
+  if (known && known.state === verdict.state && known.layer === verdict.layer) return;
+  verdicts.set(msgid, verdict);
+  lookup = (id) => verdicts.get(id);
+  for (const fn of listeners) fn();
+}
+
+/** `cachedVerdict`, as a function that is replaced on every change. */
+let lookup: (msgid: string) => Verdict | undefined = (id) => verdicts.get(id);
+
+/** Reactive lookup for a view that reads many rows at once: a new function
+ *  after any verdict changes. */
+export function useVerdictLookup(): (msgid: string) => Verdict | undefined {
+  return useSyncExternalStore(subscribeVerdicts, () => lookup);
+}
+
+/** The verdict on file for a message, if the SDK has given one. */
+export function cachedVerdict(msgid: string): Verdict | undefined {
+  return verdicts.get(msgid);
 }
 
 /** Reactive form of `cachedVerdict` for message rows. */
-export function useCachedVerdict(msgid: string): VerifyAnswer | undefined {
-  return useSyncExternalStore(subscribeVerdicts, () => verifyCache.get(msgid));
+export function useCachedVerdict(msgid: string): Verdict | undefined {
+  return useSyncExternalStore(subscribeVerdicts, () => verdicts.get(msgid));
 }
 
-/** Test-only: forget every checked verdict. */
+/** Test-only: forget every verdict. */
 export function __resetVerifyCacheForTests(): void {
-  verifyCache.clear();
-}
-
-export async function verifySignature(msgid: string): Promise<VerifyAnswer> {
-  const cached = verifyCache.get(msgid);
-  if (cached) return cached;
-  try {
-    const r = await fetch(`/api/v1/verify/${encodeURIComponent(msgid)}`);
-    if (!r.ok) {
-      // A 4xx is the server answering "no record of that id" — a can't-check.
-      // A 5xx (from the server or anything between) means the check never
-      // happened; saying "could not be checked here" would claim the server
-      // considered it. Neither is cached: a later ask deserves a fresh try.
-      return { outcome: r.status < 500 ? 'unverifiable' : 'unreachable', transient: false };
-    }
-    const j = await r.json();
-    const v = j?.verification;
-    // `verdict` is the server's three-way answer; fall back to the older
-    // boolean for a server that predates it. An old server's `false` means
-    // "could not confirm", which is not the same as "forged" — reading it as
-    // an accusation would put a warning on messages nobody impugned.
-    const verdict: string = v?.verdict ?? (v?.valid ? 'valid' : 'unverifiable');
-    let answer: VerifyAnswer;
-    if (verdict === 'valid') {
-      answer = {
-        outcome: v.verified_by === 'client-session-key' ? 'device' : 'server',
-        transient: false,
-      };
-    } else if (verdict === 'invalid') {
-      answer = { outcome: 'invalid', transient: false };
-    } else if (v?.verified_by === 'unsigned') {
-      // Nothing was signed, so nothing was checked. Reading this as a
-      // can't-check would put a fault on a message that has none — and would
-      // answer differently from every other client for the same server reply.
-      answer = { outcome: 'unsigned', transient: false };
-    } else {
-      // The server names its reason; a key it hasn't fetched yet is the one
-      // reason a retry can outrun, because answering the request is what
-      // starts the fetch.
-      answer = {
-        outcome: 'unverifiable',
-        transient: v?.verified_by === 'unverifiable-unknown-key',
-      };
-    }
-    if (!answer.transient) {
-      verifyCache.set(msgid, answer);
-      notifyVerdictListeners();
-    }
-    return answer;
-  } catch {
-    // A network failure says nothing about the signature.
-    return { outcome: 'unreachable', transient: false };
-  }
+  verdicts.clear();
+  lookup = (id) => verdicts.get(id);
 }
 
 /** One answer: what it is, what it means for the reader, and the colour it
  *  wears. The reader is asking a single question — who vouches for this
  *  message — so the heading answers it and the line says what that means for
- *  them. Every client says these same words for these same states; they were
- *  agreed line by line and are not to be paraphrased or "improved" per
- *  platform. Green means the SENDER proved it: a server signature is the
- *  server vouching for what it received, a fact worth stating and not a
- *  verification of the sender, so it stays quiet (ruled 2026-08-07: valid is
- *  not verified). Red only after a mismatch; every can't-know is quiet — a
- *  fact, never a warning. */
+ *  them. The line is the SDK's sentence for the state, which every client
+ *  shows; the heading and the tone are this client's. Green means the SENDER
+ *  proved it: a server signature is the server vouching for what it received,
+ *  a fact worth stating and not a verification of the sender, so it stays
+ *  quiet (ruled 2026-08-07: valid is not verified). Red only after a mismatch
+ *  or a retired key; every can't-know is quiet — a fact, never a warning. */
 export interface VerdictCopy {
   heading: string;
   line: string;
   tone: string;
 }
 
-export const VERIFY_LABELS: Record<VerifyOutcome, VerdictCopy> = {
-  device: {
-    heading: 'Verified',
-    line: 'Signed on the sender’s device.',
-    tone: 'text-success',
-  },
-  server: {
-    heading: 'Server Signed',
-    line: 'The server confirms it arrived from the sender’s account, but they didn’t sign it themselves — so you’re taking the server’s word for it.',
-    tone: 'text-fg-muted',
-  },
-  unsigned: {
-    heading: 'Unsigned',
-    line: 'Nothing was signed — there is no signature to check. Typical for guest accounts and messages from legacy servers.',
-    tone: 'text-fg-muted',
-  },
-  unverifiable: {
-    heading: 'Signature Not Supported',
-    line: 'The server can’t check this signature — usually an older message, sometimes a newer app.',
-    tone: 'text-fg-muted',
-  },
-  invalid: {
-    heading: 'Signature Invalid',
-    line: 'This message is signed, but the signature doesn’t check out. Treat it with suspicion.',
-    tone: 'text-danger',
-  },
-  unreachable: {
-    heading: 'Unable to Verify',
-    line: 'The app couldn’t reach the server, so this signature hasn’t been checked yet.',
-    tone: 'text-fg-muted',
-  },
+/** The heading and tone each state wears. A signature made after its key was
+ *  retired reads as an invalid one, which is what the verdict is (`PHASE6-PLAN`,
+ *  "Ruled", item 2). */
+const HEADINGS: Record<VerdictState, { heading: string; tone: string }> = {
+  device: { heading: 'Signed', tone: 'text-success' },
+  server: { heading: 'Server Signed', tone: 'text-fg-muted' },
+  unsigned: { heading: 'Unsigned', tone: 'text-fg-muted' },
+  unverifiable: { heading: 'Signature Not Supported', tone: 'text-fg-muted' },
+  invalid: { heading: 'Signature Invalid', tone: 'text-danger' },
+  retired: { heading: 'Signature Invalid', tone: 'text-danger' },
+  pending: { heading: 'Verification in Progress', tone: 'text-fg-muted' },
 };
 
-/** Four of the seven answers never name what was signed, so they read the
- *  same over a message and over a coordination event. These three do. Kept as
- *  whole sentences rather than an interpolated noun: copy that is assembled
- *  is copy nobody reads before it ships. */
-const EVENT_LINES: Partial<Record<VerifyOutcome, string>> = {
+/** Four of the states never name what was signed, so they read the same over
+ *  a message and over a coordination event. These three do. Kept as whole
+ *  sentences rather than an interpolated noun: copy that is assembled is copy
+ *  nobody reads before it ships. */
+const EVENT_LINES: Partial<Record<VerdictState, string>> = {
   unsigned: 'Nothing was signed — there is no signature to check. Typical for events emitted before event signing.',
-  unverifiable: 'The server can’t check this signature — usually an older event, sometimes a newer app.',
+  unverifiable: 'This device can’t check this signature — usually an older event, sometimes a newer app.',
   invalid: 'This event is signed, but the signature doesn’t check out. Treat it with suspicion.',
 };
 
-/** The answer for one outcome, worded for what the id actually names. */
+/** The answer for one verdict, worded for what the id actually names. */
 export function verdictCopy(
   outcome: VerifyOutcome,
   noun: 'message' | 'event' = 'message',
+  layer?: KeyLayer,
 ): VerdictCopy {
-  const base = VERIFY_LABELS[outcome];
-  const line = noun === 'event' ? EVENT_LINES[outcome] : undefined;
-  return line ? { ...base, line } : base;
+  const { heading, tone } = HEADINGS[outcome];
+  const line = (noun === 'event' ? EVENT_LINES[outcome] : undefined) ?? sentence(outcome, layer);
+  return { heading, line, tone };
 }
 
-/** Nothing was signed, so there is nothing to ask the server about. Not a
- *  failed check — asking anyway would return a can't-check that reads like a
- *  fault where there is none.
- *
- *  The server reaches the same conclusion from the stored message and says so,
- *  so this is one answer with two ways in — the caller that already knows
- *  there is no signature, and the verdict that came back. One set of words for
- *  both, or the same fact reads two ways depending on which door it came
- *  through. */
+/** The copy for a verdict the SDK gave, layer and all. */
+export function copyForVerdict(
+  verdict: Verdict,
+  noun: 'message' | 'event' = 'message',
+): VerdictCopy {
+  return verdictCopy(verdict.state, noun, verdict.layer);
+}
+
+/** Nothing was signed, so there was nothing to check. Not a failed check —
+ *  treating it as one would put a fault on a message that has none. */
 export function unsignedCopy(noun: 'message' | 'event' = 'message'): VerdictCopy {
   return verdictCopy('unsigned', noun);
 }
 
-/** The one can't-check a retry can outrun: the key belongs to someone on
- *  another server and answering the request is what starts the fetch. Shown
- *  only while retries remain — once they run out this state decays into
- *  `unverifiable`, because a panel that promises it is still checking after
- *  it has stopped is lying. */
-export const CHECKING_COPY: VerdictCopy = {
-  heading: 'Verification in Progress',
-  line: 'The sender’s key is on another server. We’re fetching it now — this will answer in a moment.',
-  tone: 'text-fg-muted',
-};
+/** The key is still being looked up. The row shows nothing yet and the panel
+ *  says so, rather than claiming an answer it does not have. */
+export const CHECKING_COPY: VerdictCopy = verdictCopy('pending');

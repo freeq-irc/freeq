@@ -251,6 +251,92 @@ pub fn fold_device_records(
         .collect()
 }
 
+/// A device key of the account, with the retirement the fold accepted for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceKeyHistory {
+    pub kid: String,
+    pub public_key_multibase: String,
+    pub created_at: DateTime<Utc>,
+    pub retired_at: Option<DateTime<Utc>>,
+    pub record: serde_json::Value,
+}
+
+/// Every checked device key of `did`, earliest first, each with the date of
+/// the retirement that counts for it, if any. Retirements the fold ignores
+/// (wrong signer, dated before the key) are not reflected.
+pub fn device_key_history(did: &str, records: &[serde_json::Value]) -> Vec<DeviceKeyHistory> {
+    device_state(did, records)
+        .into_iter()
+        .map(|k| DeviceKeyHistory {
+            kid: k.kid,
+            public_key_multibase: k.public_key_multibase,
+            created_at: k.created_at,
+            retired_at: k.retired_at,
+            record: k.record,
+        })
+        .collect()
+}
+
+/// The entries of `did`'s device key records that decide whether key `kid` is
+/// retired: none when no entry retires `kid`; otherwise the retirements of
+/// `kid`, and, repeatedly, of each key that signed one of those, with the key
+/// records of every such key. `device_key_history` over these gives `kid` the
+/// `retired_at` it gives over all of `entries`, and over any subset of them
+/// holding these, so a caller need prove only these to decide it.
+pub fn retirement_closure<T>(
+    did: &str,
+    kid: &str,
+    entries: Vec<T>,
+    value_of: impl Fn(&T) -> &serde_json::Value,
+) -> Vec<T> {
+    let named: Vec<Option<(Option<String>, Option<String>)>> = entries
+        .iter()
+        .map(|entry| {
+            let value = value_of(entry);
+            let text = |field: &str| value.get(field).and_then(|v| v.as_str());
+            (text("$type") == Some(DEVICE_KEY_TYPE) && text("did") == Some(did)).then(|| {
+                (
+                    text("kid").map(str::to_string),
+                    text("revokes").map(str::to_string),
+                )
+            })
+        })
+        .collect();
+    if !named
+        .iter()
+        .flatten()
+        .any(|(_, revokes)| revokes.as_deref() == Some(kid))
+    {
+        return Vec::new();
+    }
+    let mut kids = std::collections::HashSet::from([kid]);
+    loop {
+        let before = kids.len();
+        for (signer, revokes) in named.iter().flatten() {
+            if let (Some(signer), Some(revokes)) = (signer, revokes)
+                && kids.contains(revokes.as_str())
+            {
+                kids.insert(signer.as_str());
+            }
+        }
+        if kids.len() == before {
+            break;
+        }
+    }
+    entries
+        .into_iter()
+        .zip(&named)
+        .filter_map(|(entry, named)| {
+            let (signer, revokes) = named.as_ref()?;
+            let keep = match revokes {
+                Some(revokes) => kids.contains(revokes.as_str()),
+                None => signer.as_deref().is_some_and(|s| kids.contains(s)),
+            };
+            keep.then_some(entry)
+        })
+        .collect()
+}
+
 /// The bots `did` claims at `at`, earliest first. A claim counts only if the
 /// owner key that signed it was itself live under the device fold when the
 /// claim was written.
@@ -273,7 +359,7 @@ pub fn fold_agent_records(
                 let Some(public_key) = signer_live_at(&devices, &record.kid, created_at) else {
                     continue;
                 };
-                if !verify_binding(public_key, &record_signed_bytes(value), &record.binding_sig) {
+                if !verify_record_binding(value, public_key) {
                     continue;
                 }
                 links.push(LinkCandidate {
@@ -306,7 +392,7 @@ pub fn fold_agent_records(
         let Some(public_key) = signer_live_at(&devices, &record.kid, created_at) else {
             continue;
         };
-        if !verify_binding(public_key, &record_signed_bytes(value), &record.binding_sig) {
+        if !verify_record_binding(value, public_key) {
             continue;
         }
         let retired = &mut links[target].retired_at;
@@ -352,11 +438,7 @@ fn device_state(did: &str, records: &[serde_json::Value]) -> Vec<Candidate> {
                 if record.kid != derive_kid_bytes(&raw) {
                     continue;
                 }
-                if !verify_binding(
-                    &public_key,
-                    &record_signed_bytes(value),
-                    &record.binding_sig,
-                ) {
+                if !verify_record_binding(value, &public_key) {
                     continue;
                 }
                 keys.push(Candidate {
@@ -400,8 +482,7 @@ fn device_state(did: &str, records: &[serde_json::Value]) -> Vec<Candidate> {
         if signer != target && keys[signer].retired_at.is_some_and(|r| r <= created_at) {
             continue;
         }
-        let message = record_signed_bytes(value);
-        if !verify_binding(&keys[signer].public_key, &message, &record.binding_sig) {
+        if !verify_record_binding(value, &keys[signer].public_key) {
             continue;
         }
         let retired = &mut keys[target].retired_at;
@@ -469,11 +550,18 @@ fn ed25519_from_multibase(multibase: &str) -> Option<(PublicKey, [u8; 32])> {
     }
 }
 
-fn verify_binding(public_key: &PublicKey, message: &[u8], binding_sig: &str) -> bool {
+/// Whether `record`'s `bindingSig` checks under `signer` over the record's
+/// signed bytes. Pass the record exactly as received.
+pub fn verify_record_binding(record: &serde_json::Value, signer: &PublicKey) -> bool {
+    let Some(binding_sig) = record.get("bindingSig").and_then(|s| s.as_str()) else {
+        return false;
+    };
     let Ok(signature) = URL_SAFE_NO_PAD.decode(binding_sig) else {
         return false;
     };
-    public_key.verify(message, &signature).is_ok()
+    signer
+        .verify(&record_signed_bytes(record), &signature)
+        .is_ok()
 }
 
 // ─── reading from the account's PDS ─────────────────────────────────────
@@ -491,13 +579,24 @@ pub struct RecordReader<P: freeq_oauth::ClientProvider> {
 /// One page of a `com.atproto.repo.listRecords` answer.
 #[derive(Deserialize)]
 struct ListRecordsPage {
-    records: Vec<ListedRecord>,
+    records: Vec<RecordEntry>,
     cursor: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct ListedRecord {
-    value: serde_json::Value,
+/// Repository proofs in flight by record CID, which every listing that meets
+/// the record while its proof is being fetched awaits.
+pub type ProofsInFlight =
+    parking_lot::Mutex<std::collections::HashMap<Cid, std::sync::Arc<tokio::sync::OnceCell<bool>>>>;
+
+/// One `listRecords` entry: where the record sits, the CID the PDS gives it,
+/// and the record.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RecordEntry {
+    #[serde(default)]
+    pub uri: String,
+    #[serde(default)]
+    pub cid: String,
+    pub value: serde_json::Value,
 }
 
 impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
@@ -512,6 +611,87 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
         did: &str,
         collection: &str,
     ) -> Result<Vec<serde_json::Value>> {
+        Ok(self
+            .list_record_entries(did, collection)
+            .await?
+            .into_iter()
+            .map(|entry| entry.value)
+            .collect())
+    }
+
+    /// The records among `entries` whose repository proof checks: the signed
+    /// commit names `did`, verifies under the account's `#atproto` key, and
+    /// holds the record at the path its uri names in `collection`. Any other
+    /// record is left out, as if absent. A passed check is remembered in
+    /// `proven` by record CID, so a record's proof is fetched once. A check in
+    /// flight is shared through `proving`, so listings racing on one record
+    /// fetch its proof once; a failed check is not kept, and the next listing
+    /// fetches it again.
+    pub async fn proven_records(
+        &self,
+        did: &str,
+        collection: &str,
+        entries: Vec<RecordEntry>,
+        proven: &parking_lot::Mutex<std::collections::HashSet<Cid>>,
+        proving: &ProofsInFlight,
+    ) -> Vec<serde_json::Value> {
+        let prefix = format!("at://{did}/{collection}/");
+        let mut out = Vec::new();
+        for entry in entries {
+            let Ok(cid) = record_cid(&entry.value) else {
+                continue;
+            };
+            let rkey = entry
+                .uri
+                .strip_prefix(&prefix)
+                .filter(|rkey| !rkey.is_empty() && !rkey.contains('/'));
+            // Under the in-flight lock, a proof finishing meanwhile is seen
+            // either as proven or as still in flight.
+            let cell = {
+                let mut in_flight = proving.lock();
+                match rkey {
+                    _ if proven.lock().contains(&cid) => None,
+                    Some(_) => Some(in_flight.entry(cid).or_default().clone()),
+                    None => continue,
+                }
+            };
+            if let (Some(cell), Some(rkey)) = (cell, rkey) {
+                let verified = *cell
+                    .get_or_init(|| async {
+                        let verified = matches!(
+                            self.verify_record(did, collection, rkey, &cid).await,
+                            Ok(outcome) if outcome.verified()
+                        );
+                        if verified {
+                            proven.lock().insert(cid);
+                        }
+                        verified
+                    })
+                    .await;
+                let mut in_flight = proving.lock();
+                if in_flight
+                    .get(&cid)
+                    .is_some_and(|c| std::sync::Arc::ptr_eq(c, &cell))
+                {
+                    in_flight.remove(&cid);
+                }
+                drop(in_flight);
+                if !verified {
+                    continue;
+                }
+            }
+            out.push(entry.value);
+        }
+        out
+    }
+
+    /// `list_records`, keeping each record's uri and CID as the PDS listed
+    /// them.
+    pub async fn list_record_entries(
+        &self,
+        did: &str,
+        collection: &str,
+    ) -> Result<Vec<RecordEntry>> {
         let doc = self.resolver.resolve(did).await?;
         let Some(pds) = pds_endpoint(&doc) else {
             return Ok(Vec::new());
@@ -540,7 +720,7 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
             // An empty page ends the listing even if it carries a cursor, so a
             // PDS cannot keep the reader asking forever for nothing.
             let empty = page.records.is_empty();
-            records.extend(page.records.into_iter().map(|r| r.value));
+            records.extend(page.records);
             match page.cursor {
                 Some(next) if !empty => cursor = Some(next),
                 _ => break,
@@ -660,6 +840,70 @@ pub fn record_cid(record: &serde_json::Value) -> Result<Cid> {
     Ok(Cid::new_v1(DAG_CBOR, digest))
 }
 
+/// What publishing a record to the account came to.
+#[derive(Debug)]
+pub enum PublishError {
+    /// The account would not take this write from this session: the token is
+    /// spent, or its grant does not cover this collection. Nothing about the
+    /// record is wrong — the user signs in again.
+    NeedsSignIn(String),
+    /// Anything else: the network, the PDS, a record it would not parse.
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for PublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NeedsSignIn(detail) => write!(f, "the account needs a fresh sign-in: {detail}"),
+            Self::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for PublishError {}
+
+/// Write one record into the account's own repository, authenticated by
+/// `session`'s DPoP key, and hand back the `at://` uri the PDS answers with.
+///
+/// The collection is the record's own `$type`, so a caller cannot file a
+/// record under a collection it does not claim to be.
+pub async fn publish_record(
+    session: &crate::oauth::OAuthSession,
+    record: &serde_json::Value,
+) -> std::result::Result<String, PublishError> {
+    let collection = record
+        .get("$type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| PublishError::Failed(anyhow::anyhow!("record has no $type")))?;
+    let body = serde_json::json!({
+        "repo": session.did,
+        "collection": collection,
+        "record": record,
+    });
+    let payload = serde_json::to_vec(&body).map_err(|e| PublishError::Failed(e.into()))?;
+    let mut nonce = session.dpop_nonce.clone();
+    let answer = crate::media::dpop_post(
+        &reqwest::Client::new(),
+        session.pds_url.trim_end_matches('/'),
+        "com.atproto.repo.createRecord",
+        Some(&session.dpop_key),
+        &session.access_token,
+        &mut nonce,
+        None,
+        payload,
+    )
+    .await
+    .map_err(|e| match e.downcast_ref::<crate::media::XrpcRefusal>() {
+        Some(refusal) if refusal.needs_sign_in() => PublishError::NeedsSignIn(refusal.to_string()),
+        _ => PublishError::Failed(e),
+    })?;
+    answer
+        .get("uri")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| PublishError::Failed(anyhow::anyhow!("createRecord answered with no uri")))
+}
+
 /// The one field of a signed commit read here directly; the library keeps
 /// its commit type private.
 #[derive(Deserialize)]
@@ -775,6 +1019,22 @@ mod tests {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
 
+    #[test]
+    fn the_history_carries_the_retirement_the_fold_accepted() {
+        // An earlier retirement signed by a key the account never published is
+        // ignored; the later one, signed by the key itself, counts.
+        let records = [
+            value(&build_device_record(&key(1), ALICE, T0, None).unwrap()),
+            value(&build_device_retirement(&key(2), ALICE, &kid_of(1), T1).unwrap()),
+            value(&build_device_retirement(&key(1), ALICE, &kid_of(1), T2).unwrap()),
+        ];
+        let history = device_key_history(ALICE, &records);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].kid, kid_of(1));
+        assert_eq!(history[0].created_at, instant(T0));
+        assert_eq!(history[0].retired_at, Some(instant(T2)));
+    }
+
     fn hex_seed(byte: u8) -> String {
         (0..32).map(|_| format!("{byte:02x}")).collect()
     }
@@ -823,6 +1083,28 @@ mod tests {
         let sig = record["bindingSig"].as_str().unwrap().to_string();
         record["bindingSig"] = json!(format!("A{}", &sig[1..]));
         assert!(fold_device_records(ALICE, &[record], instant(T1)).is_empty());
+    }
+
+    #[test]
+    fn verify_record_binding_checks_the_signer_over_every_field() {
+        let signer = PublicKey::from_multibase(&key(1).public_key_multibase()).unwrap();
+        let other = PublicKey::from_multibase(&key(2).public_key_multibase()).unwrap();
+        let record = value(&build_device_record(&key(1), ALICE, T0, Some("laptop")).unwrap());
+        assert!(verify_record_binding(&record, &signer));
+        assert!(!verify_record_binding(&record, &other));
+
+        let mut altered = record.clone();
+        altered["label"] = json!("phone");
+        assert!(!verify_record_binding(&altered, &signer));
+
+        let mut unsigned = record.clone();
+        unsigned.as_object_mut().unwrap().remove("bindingSig");
+        assert!(!verify_record_binding(&unsigned, &signer));
+
+        let retirement = value(&build_device_retirement(&key(2), ALICE, &kid_of(1), T1).unwrap());
+        assert!(verify_record_binding(&retirement, &other));
+        let link = value(&build_agent_record(&key(1), ALICE, &agent_did(), T1, None).unwrap());
+        assert!(verify_record_binding(&link, &signer));
     }
 
     #[test]
@@ -1105,6 +1387,77 @@ mod tests {
         })
     }
 
+    // ─── publishing a record to the account ─────────────────────────────
+
+    fn oauth_session(pds_url: &str) -> crate::oauth::OAuthSession {
+        crate::oauth::OAuthSession {
+            did: ALICE.to_string(),
+            handle: "alice.test".to_string(),
+            access_token: "tok".to_string(),
+            pds_url: pds_url.to_string(),
+            dpop_key: crate::oauth::DpopKey::generate(),
+            dpop_nonce: None,
+            scope: "atproto repo:at.freeq.deviceKey?action=create".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_record_sends_the_record_unchanged_and_answers_its_uri() {
+        use axum::Json;
+        use axum::routing::post;
+        use std::sync::Mutex;
+
+        const URI: &str = "at://did:plc:k2n3e2vsihf3farequ44t5j7/at.freeq.deviceKey/3l";
+        let seen: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let captured = seen.clone();
+        let router = axum::Router::new().route(
+            "/xrpc/com.atproto.repo.createRecord",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = captured.clone();
+                async move {
+                    *captured.lock().unwrap() = Some(body);
+                    Json(json!({ "uri": URI }))
+                }
+            }),
+        );
+        let base = spawn_stub(router).await;
+        let record = value(&build_device_record(&key(1), ALICE, T0, Some("laptop")).unwrap());
+
+        let uri = publish_record(&oauth_session(&base), &record)
+            .await
+            .unwrap();
+
+        assert_eq!(uri, URI);
+        let body = seen.lock().unwrap().clone().expect("the stub was called");
+        assert_eq!(body["repo"], ALICE);
+        // The collection is the record's own `$type`, never a caller's claim.
+        assert_eq!(body["collection"], DEVICE_KEY_TYPE);
+        // The record arrives as it was signed — every field, byte for byte.
+        assert_eq!(body["record"], record);
+    }
+
+    #[tokio::test]
+    async fn a_refused_write_asks_for_a_fresh_sign_in() {
+        use axum::routing::post;
+
+        // The account declining the write is the one outcome the user can do
+        // something about, and it must not read as a network failure.
+        let router = axum::Router::new().route(
+            "/xrpc/com.atproto.repo.createRecord",
+            post(|| async { (StatusCode::UNAUTHORIZED, "insufficient_scope") }),
+        );
+        let base = spawn_stub(router).await;
+        let record = value(&build_device_record(&key(1), ALICE, T0, None).unwrap());
+
+        let err = publish_record(&oauth_session(&base), &record)
+            .await
+            .expect_err("a 401 is a refusal");
+        assert!(
+            matches!(err, PublishError::NeedsSignIn(_)),
+            "expected a sign-in error, got: {err}"
+        );
+    }
+
     /// Regenerate spec/identity-record-vectors.json. Run manually:
     /// `cargo test -p freeq-sdk generate_identity_record_vectors -- --ignored`
     #[test]
@@ -1158,6 +1511,73 @@ mod tests {
                 "{name}: live agent links"
             );
         }
+    }
+
+    /// The date the history gives `kid`'s retirement, if any.
+    fn retired_at(records: &[serde_json::Value], kid: &str) -> Option<DateTime<Utc>> {
+        device_key_history(ALICE, records)
+            .into_iter()
+            .find(|k| k.kid == kid)
+            .and_then(|k| k.retired_at)
+    }
+
+    #[test]
+    fn each_key_in_the_committed_fold_cases_is_decided_by_its_retirement_closure() {
+        let spec: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixtures_path()).unwrap()).unwrap();
+        for case in spec["folds"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let records = case["deviceRecords"].as_array().unwrap();
+            let kids: std::collections::BTreeSet<&str> = records
+                .iter()
+                .flat_map(|r| ["kid", "revokes"].map(|f| r.get(f).and_then(|v| v.as_str())))
+                .flatten()
+                .collect();
+            assert!(!kids.is_empty(), "{name}: no keys");
+            for kid in kids {
+                let closure = retirement_closure(ALICE, kid, records.clone(), |r| r);
+                assert_eq!(
+                    retired_at(&closure, kid),
+                    retired_at(records, kid),
+                    "{name}: {kid}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_retirement_closure_holds_only_the_records_that_can_retire_the_key() {
+        let device = |seed| value(&build_device_record(&key(seed), ALICE, T0, None).unwrap());
+        let retire = |signer, target, at| {
+            value(&build_device_retirement(&key(signer), ALICE, &kid_of(target), at).unwrap())
+        };
+        let unrelated = vec![device(1), device(2), device(3), device(4), retire(4, 4, T1)];
+        assert!(
+            retirement_closure(ALICE, &kid_of(1), unrelated.clone(), |r| r).is_empty(),
+            "nothing retires key 1"
+        );
+
+        let mut by_live = unrelated.clone();
+        by_live.push(retire(2, 1, T2));
+        let closure = retirement_closure(ALICE, &kid_of(1), by_live.clone(), |r| r);
+        assert_eq!(closure, vec![device(1), device(2), retire(2, 1, T2)]);
+        assert_eq!(retired_at(&closure, &kid_of(1)), Some(instant(T2)));
+
+        let mut by_retired = by_live.clone();
+        by_retired.push(retire(3, 2, T1));
+        let closure = retirement_closure(ALICE, &kid_of(1), by_retired.clone(), |r| r);
+        assert_eq!(
+            closure,
+            vec![
+                device(1),
+                device(2),
+                device(3),
+                retire(2, 1, T2),
+                retire(3, 2, T1)
+            ]
+        );
+        assert_eq!(retired_at(&closure, &kid_of(1)), None);
+        assert_eq!(retired_at(&by_retired, &kid_of(1)), None);
     }
 
     // ─── reading from a PDS ─────────────────────────────────────────────
@@ -1311,6 +1731,109 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A PDS on a loopback port answering from `repo`.
+    async fn serve_repo(repo: Arc<parking_lot::Mutex<crate::test_support::StubRepo>>) -> String {
+        use axum::response::IntoResponse;
+        let router = axum::Router::new().fallback(
+            move |uri: axum::http::Uri, Query(q): Query<HashMap<String, String>>| {
+                let answer = repo.lock().respond(uri.path(), &q);
+                async move {
+                    match answer {
+                        Some((status, content_type, body)) => (
+                            StatusCode::from_u16(status).unwrap(),
+                            [("content-type", content_type)],
+                            body,
+                        )
+                            .into_response(),
+                        None => StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            },
+        );
+        spawn_stub(router).await
+    }
+
+    #[tokio::test]
+    async fn only_records_the_repository_proves_count_and_a_passed_proof_is_fetched_once() {
+        let mut repo = crate::test_support::StubRepo::new(ALICE);
+        let genuine = value(&build_device_record(&key(1), ALICE, T0, Some("laptop")).unwrap());
+        // Signed by its own key, so it passes every record check but the proof.
+        let forged = value(&build_device_record(&key(2), ALICE, T0, Some("forged")).unwrap());
+        let genuine_uri = repo.add(DEVICE_KEY_TYPE, &genuine);
+        let forged_uri = repo.add_forged(DEVICE_KEY_TYPE, &forged, &genuine);
+        let repo = Arc::new(parking_lot::Mutex::new(repo));
+        let base = serve_repo(repo.clone()).await;
+        let doc = repo.lock().document(&base);
+        let reader = RecordReader::new(
+            DidResolver::static_map(HashMap::from([(ALICE.to_string(), doc)])),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        );
+
+        let proven = parking_lot::Mutex::new(std::collections::HashSet::new());
+        let proving = ProofsInFlight::default();
+        for _ in 0..3 {
+            let entries = reader
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .await
+                .unwrap();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(
+                reader
+                    .proven_records(ALICE, DEVICE_KEY_TYPE, entries, &proven, &proving)
+                    .await,
+                vec![genuine.clone()]
+            );
+        }
+        assert_eq!(repo.lock().proof_reads(&genuine_uri), 1);
+        assert_eq!(repo.lock().proof_reads(&forged_uri), 3);
+    }
+
+    #[tokio::test]
+    async fn two_listings_racing_on_a_record_await_one_proof_and_a_failed_one_is_fetched_again() {
+        let mut repo = crate::test_support::StubRepo::new(ALICE);
+        let genuine = value(&build_device_record(&key(1), ALICE, T0, Some("laptop")).unwrap());
+        // Signed by its own key, so it passes every record check but the proof.
+        let forged = value(&build_device_record(&key(2), ALICE, T0, Some("forged")).unwrap());
+        let genuine_uri = repo.add(DEVICE_KEY_TYPE, &genuine);
+        let forged_uri = repo.add_forged(DEVICE_KEY_TYPE, &forged, &genuine);
+        let repo = Arc::new(parking_lot::Mutex::new(repo));
+        let base = serve_repo(repo.clone()).await;
+        let doc = repo.lock().document(&base);
+        let reader = RecordReader::new(
+            DidResolver::static_map(HashMap::from([(ALICE.to_string(), doc)])),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        );
+        let reads = || {
+            let repo = repo.lock();
+            (
+                repo.proof_reads(&genuine_uri),
+                repo.proof_reads(&forged_uri),
+            )
+        };
+
+        let proven = parking_lot::Mutex::new(std::collections::HashSet::new());
+        let proving = ProofsInFlight::default();
+        let entries = reader
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .await
+            .unwrap();
+        let (first, second) = tokio::join!(
+            reader.proven_records(ALICE, DEVICE_KEY_TYPE, entries.clone(), &proven, &proving),
+            reader.proven_records(ALICE, DEVICE_KEY_TYPE, entries.clone(), &proven, &proving),
+        );
+        assert_eq!(first, vec![genuine.clone()]);
+        assert_eq!(second, vec![genuine.clone()]);
+        assert_eq!(reads(), (1, 1), "racing listings share each proof");
+
+        assert_eq!(
+            reader
+                .proven_records(ALICE, DEVICE_KEY_TYPE, entries, &proven, &proving)
+                .await,
+            vec![genuine.clone()]
+        );
+        assert_eq!(reads(), (1, 2), "a failed proof is not kept");
     }
 
     #[tokio::test]

@@ -51,6 +51,8 @@ aws-lc-rs = ["rustls/aws_lc_rs", "tokio-rustls/aws_lc_rs"]
 ring = ["rustls/ring", "tokio-rustls/ring"]
 native-tls = ["reqwest/native-tls"]
 rustls-tls = ["reqwest/rustls-tls"]
+# A stub account repository with record proofs, for other crates' tests.
+test-support = []
 
 [dev-dependencies]
 clap = { workspace = true }

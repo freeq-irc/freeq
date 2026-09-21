@@ -379,6 +379,13 @@ pub trait SessionStore: Send + Sync {
         refresh_token: &str,
         dpop_nonce: Option<&str>,
     ) -> anyhow::Result<()>;
+    /// Forget a session, so `/session` with its token answers 401. Deleting a
+    /// token the store never had is not an error — a device can only be
+    /// signed out once.
+    async fn delete(&self, broker_token: &str) -> anyhow::Result<()>;
+    /// Forget the session whose token hashes to `hash` (see [`token_hash`]),
+    /// for a caller that keeps only the hash. No match is not an error.
+    async fn delete_by_token_hash(&self, hash: &str) -> anyhow::Result<()>;
 }
 
 /// Durable SQLite store with AES-GCM field encryption at rest. Owns the key.
@@ -488,6 +495,32 @@ impl SessionStore for SqliteStore {
         )?;
         Ok(())
     }
+
+    async fn delete(&self, broker_token: &str) -> anyhow::Result<()> {
+        let db = self.conn.lock().await;
+        db.execute(
+            "DELETE FROM sessions WHERE broker_token = ?1",
+            rusqlite::params![broker_token],
+        )?;
+        Ok(())
+    }
+
+    async fn delete_by_token_hash(&self, hash: &str) -> anyhow::Result<()> {
+        // Sessions are few, so the tokens are hashed here rather than a hash
+        // column added to a table with no migrations.
+        let db = self.conn.lock().await;
+        let tokens: Vec<String> = db
+            .prepare("SELECT broker_token FROM sessions")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        for token in tokens.iter().filter(|t| token_hash(t) == hash) {
+            db.execute(
+                "DELETE FROM sessions WHERE broker_token = ?1",
+                rusqlite::params![token],
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// Ephemeral in-memory store — no persistence, no at-rest encryption (never
@@ -531,6 +564,19 @@ impl SessionStore for InMemoryStore {
         }
         Ok(())
     }
+
+    async fn delete(&self, broker_token: &str) -> anyhow::Result<()> {
+        self.sessions.lock().await.remove(broker_token);
+        Ok(())
+    }
+
+    async fn delete_by_token_hash(&self, hash: &str) -> anyhow::Result<()> {
+        self.sessions
+            .lock()
+            .await
+            .retain(|token, _| token_hash(token) != hash);
+        Ok(())
+    }
 }
 
 /// Build the broker's axum router over shared state. Used by the
@@ -543,9 +589,11 @@ impl SessionStore for InMemoryStore {
 fn session_routes() -> Router<Arc<BrokerState>> {
     Router::new()
         .route("/session", post(session))
+        .route("/session/delete", post(session_delete))
         .route("/api/graph/follow", post(graph_follow))
         .route("/api/graph/unfollow", post(graph_unfollow))
         .route("/api/pfp/set-avatar", post(pfp_set_avatar))
+        .route("/enroll", post(enroll))
 }
 
 /// Ready-to-mount `/session` + `/api/graph/*` router for an embedding server.
@@ -633,12 +681,10 @@ async fn client_metadata(State(state): State<Arc<BrokerState>>) -> Json<serde_js
         "tos_uri": state.config.public_url,
         "policy_uri": state.config.public_url,
         "redirect_uris": [redirect_uri],
-        // Union of scopes the broker may ever request, plus
-        // `transition:generic` for backward compat with refresh tokens
-        // issued before this change. We never request it at /authorize
-        // — the broker only asks for `atproto`. Remove transition:generic
-        // once the PDS grace period closes.
-        "scope": "atproto blob:image/* repo:app.bsky.actor.profile repo:blue.irc.media?action=create repo:app.bsky.feed.post transition:generic",
+        // The shared scope union, plus the profile grant the broker's avatar
+        // routes need, in the position the metadata has always carried it.
+        "scope": freeq_oauth::CLIENT_METADATA_SCOPE
+            .replacen("blob:image/*", "blob:image/* repo:app.bsky.actor.profile", 1),
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
@@ -698,11 +744,12 @@ async fn auth_login(
     // touches, nothing more: upload image blobs, write the profile record, and
     // create a post. No `transition:generic` (that's full-account access). Only
     // this opt-in flow gets that consent screen; every other sign-in stays
-    // identity-only. Each scope here must be within the client-metadata union.
-    let scope = if q.intent.as_deref() == Some("pfp") {
-        "atproto blob:image/* repo:app.bsky.actor.profile repo:app.bsky.feed.post"
-    } else {
-        "atproto"
+    // identity-only. `intent=enroll` asks to create the two key records a
+    // client publishes. Each scope here must be within the client-metadata union.
+    let scope = match q.intent.as_deref() {
+        Some("pfp") => "atproto blob:image/* repo:app.bsky.actor.profile repo:app.bsky.feed.post",
+        Some("enroll") => freeq_oauth::ENROLL_SCOPE,
+        _ => "atproto",
     };
     let client_id = build_client_id(&state.config.public_url, &redirect_uri);
 
@@ -958,7 +1005,7 @@ async fn auth_callback(
     // identity-only consumers, so degrade gracefully instead of failing login.
     let (web_token, nick) = state
         .writer
-        .mint_web_token(&pending.did, &pending.handle)
+        .mint_web_token(&pending.did, &pending.handle, Some(&broker_token))
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, "web-token mint failed — continuing identity-only");
@@ -1104,14 +1151,32 @@ async fn session(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
 
-    let (web_token, nick) = state
+    let (web_token, nick) = match state
         .writer
-        .mint_web_token(&record.did, &record.handle)
+        .mint_web_token(&record.did, &record.handle, Some(&record.broker_token))
         .await
-        .unwrap_or_else(|e| {
+    {
+        Ok(minted) => minted,
+        // The server signed this device out. Say so the way a dead grant
+        // does, so the client drops to sign-in instead of reconnecting with
+        // an empty token forever.
+        Err(e) if e.downcast_ref::<WebTokenRefused>().is_some() => {
+            tracing::info!(did = %record.did, "/session refused: device signed out");
+            // The refusal is a sign-out; end the session here too, so /enroll
+            // is closed and a server restart does not bring the login back.
+            if let Err(e) = state.store.delete(&record.broker_token).await {
+                tracing::warn!(error = %e, "could not delete a signed-out session");
+            }
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "Session expired — re-authentication required".to_string(),
+            ));
+        }
+        Err(e) => {
             tracing::warn!(error = %e, "web-token mint failed — continuing identity-only");
             (String::new(), record.handle.clone())
-        });
+        }
+    };
 
     // Forward the actually-granted scope from the refresh response so the
     // server's per-purpose checks see the truth, not a hard-coded assumption.
@@ -1139,6 +1204,55 @@ async fn session(
     }))
 }
 
+#[derive(Deserialize)]
+struct SessionDeleteRequest {
+    /// [`token_hash`] of the session's broker token; the server keeps no more.
+    token_hash: String,
+}
+
+/// POST /session/delete {token_hash} — the freeq-server ending a signed-out
+/// device's session. Signed as the broker's own pushes are, with the same
+/// secret. A session already gone, or never issued, is still 200.
+async fn session_delete(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // An embedding server mounts this with no secret, and a signature under
+    // an empty key proves nothing.
+    if state.config.shared_secret.is_empty() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Broker auth not configured".to_string(),
+        ));
+    }
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    verify_signed_body(
+        &state.config.shared_secret,
+        header("x-broker-timestamp"),
+        header("x-broker-signature"),
+        &body,
+    )
+    .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+    let req: SessionDeleteRequest = serde_json::from_slice(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")))?;
+
+    state
+        .store
+        .delete_by_token_hash(&req.token_hash)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+    // A refresh already holding the lock finds no row to update, and the
+    // server refuses its web token.
+    state
+        .refresh_locks
+        .lock()
+        .await
+        .retain(|token, _| token_hash(token) != req.token_hash);
+    tracing::info!("session deleted: device signed out at the server");
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 // ── Graph delegation: follow / unfollow ────────────────────────────────────
 //
 // The client never holds the AT access token (it's DPoP-bound to the broker's
@@ -1159,11 +1273,12 @@ struct GraphFollowRequest {
 
 /// Authenticate a broker token and produce a fresh access token, persisting
 /// the rotated refresh token — the same discipline as `/session` (shared
-/// per-token lock, read-inside-lock, encrypt-before-store).
+/// per-token lock, read-inside-lock, encrypt-before-store). Also returns the
+/// scope the refresh reported as granted.
 async fn authed_access_token(
     state: &Arc<BrokerState>,
     broker_token: &str,
-) -> Result<(BrokerSessionRecord, String, Option<String>), (StatusCode, String)> {
+) -> Result<(BrokerSessionRecord, String, Option<String>, String), (StatusCode, String)> {
     let token_lock = {
         let mut locks = state.refresh_locks.lock().await;
         locks
@@ -1179,7 +1294,7 @@ async fn authed_access_token(
         .await
         .ok_or((StatusCode::UNAUTHORIZED, "Invalid broker token".to_string()))?;
 
-    let (access_token, refresh_token, dpop_nonce, _scope) =
+    let (access_token, refresh_token, dpop_nonce, granted_scope) =
         refresh_access_token(&state.config, &record)
             .await
             .map_err(|e| match e {
@@ -1198,7 +1313,7 @@ async fn authed_access_token(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
 
-    Ok((record, access_token, dpop_nonce))
+    Ok((record, access_token, dpop_nonce, granted_scope))
 }
 
 /// DPoP-authenticated POST to the user's PDS, with the standard
@@ -1208,7 +1323,7 @@ async fn pds_dpop_post(
     access_token: &str,
     nonce: Option<String>,
     url: &str,
-    body: serde_json::Value,
+    body: impl Serialize,
 ) -> Result<(reqwest::StatusCode, String), anyhow::Error> {
     let dpop_key = DpopKey::from_base64url(&record.dpop_key_b64)?;
     let client = upstream_client()?;
@@ -1266,7 +1381,7 @@ async fn graph_follow(
         .filter(|d| d.starts_with("did:"))
         .ok_or((StatusCode::BAD_REQUEST, "subject_did required".to_string()))?;
 
-    let (record, access_token, nonce) = authed_access_token(&state, &req.broker_token).await?;
+    let (record, access_token, nonce, _) = authed_access_token(&state, &req.broker_token).await?;
     if subject == record.did {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1316,7 +1431,7 @@ async fn graph_unfollow(
         .as_deref()
         .ok_or((StatusCode::BAD_REQUEST, "follow_uri required".to_string()))?;
 
-    let (record, access_token, nonce) = authed_access_token(&state, &req.broker_token).await?;
+    let (record, access_token, nonce, _) = authed_access_token(&state, &req.broker_token).await?;
 
     // at://did:plc:xxx/app.bsky.graph.follow/rkey — the repo DID must be the
     // caller's own (you can only delete your own follow records).
@@ -1352,6 +1467,130 @@ async fn graph_unfollow(
             "follow_uri must be an app.bsky.graph.follow record in your own repo".to_string(),
         )),
     }
+}
+
+// ── Key enrollment ──────────────────────────────────────────────────────────
+//
+// A client publishes its signing key (or a bot claim) as a record in the
+// user's own repo. The client builds and signs the record; the broker checks
+// it belongs to this session and is signed by the key it names, then writes
+// it with createRecord, exactly as received.
+
+#[derive(Deserialize)]
+struct EnrollRequest {
+    broker_token: String,
+    record: Box<serde_json::value::RawValue>,
+    /// Multibase public key of the key that signed `record`.
+    signer_public_key: String,
+}
+
+#[derive(Serialize)]
+struct CreateRecordBody<'a> {
+    repo: &'a str,
+    collection: &'a str,
+    record: &'a serde_json::value::RawValue,
+}
+
+/// Why a record may not be written for this session, or `None` when it may.
+fn enroll_refusal(record: &serde_json::Value, did: &str, signer: &str) -> Option<&'static str> {
+    use freeq_sdk::identity_records::{AGENT_KEY_TYPE, DEVICE_KEY_TYPE, verify_record_binding};
+    let record_type = record.get("$type").and_then(|v| v.as_str());
+    if record_type != Some(DEVICE_KEY_TYPE) && record_type != Some(AGENT_KEY_TYPE) {
+        return Some("record $type must be at.freeq.deviceKey or at.freeq.agentKey");
+    }
+    if record.get("did").and_then(|v| v.as_str()) != Some(did) {
+        return Some("record did is not the signed-in account");
+    }
+    let Ok(freeq_sdk::crypto::PublicKey::Ed25519(key)) =
+        freeq_sdk::crypto::PublicKey::from_multibase(signer)
+    else {
+        return Some("signer_public_key must be an ed25519 multibase key");
+    };
+    if record.get("kid").and_then(|v| v.as_str()) != Some(&freeq_sdk::sigtag::derive_kid(&key)) {
+        return Some("record kid is not the signer's key id");
+    }
+    if record_type == Some(DEVICE_KEY_TYPE)
+        && let Some(announced) = record.get("publicKeyMultibase")
+        && announced.as_str() != Some(signer)
+    {
+        return Some("record publicKeyMultibase is not the signer's key");
+    }
+    if !verify_record_binding(record, &freeq_sdk::crypto::PublicKey::Ed25519(key)) {
+        return Some("record bindingSig does not verify under signer_public_key");
+    }
+    // A retirement takes effect from its date, so it may only say "now".
+    if record.get("revokes").is_some() {
+        let current = record
+            .get("createdAt")
+            .and_then(|v| v.as_str())
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .is_some_and(|t| (chrono::Utc::now() - t.to_utc()).num_seconds().abs() <= 300);
+        if !current {
+            return Some("retirement createdAt must be the current time");
+        }
+    }
+    None
+}
+
+/// POST /enroll {broker_token, record, signer_public_key} — write an
+/// at.freeq.deviceKey or at.freeq.agentKey record to the user's own repo.
+// The Err is a ready axum Response, as clippy 1.98 notes; this route runs
+// once per connect, so the size is not worth an error enum.
+#[allow(clippy::result_large_err)]
+async fn enroll(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<EnrollRequest>,
+) -> Result<Json<serde_json::Value>, Response> {
+    if !origin_allowed(&headers) {
+        return Err((StatusCode::FORBIDDEN, "Origin not allowed").into_response());
+    }
+    let (session, access_token, nonce, granted_scope) =
+        authed_access_token(&state, &req.broker_token)
+            .await
+            .map_err(IntoResponse::into_response)?;
+
+    let record: serde_json::Value = serde_json::from_str(req.record.get())
+        .map_err(|_| (StatusCode::BAD_REQUEST, "record must be JSON").into_response())?;
+    if let Some(reason) = enroll_refusal(&record, &session.did, &req.signer_public_key) {
+        return Err((StatusCode::BAD_REQUEST, reason).into_response());
+    }
+    let collection = record["$type"].as_str().unwrap_or_default();
+    let needed = format!("repo:{collection}?action=create");
+    let granted = granted_scope
+        .split_whitespace()
+        .any(|s| s == needed || s == "transition:generic");
+    if !granted {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "insufficient_scope" })),
+        )
+            .into_response());
+    }
+
+    let url = format!("{}/xrpc/com.atproto.repo.createRecord", session.pds_url);
+    let body = CreateRecordBody {
+        repo: &session.did,
+        collection,
+        record: &req.record,
+    };
+    let (status, text) = pds_dpop_post(&session, &access_token, nonce, &url, body)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("PDS call failed: {e}")).into_response())?;
+    if !status.is_success() {
+        tracing::warn!(did = %session.did, status = %status, "enroll createRecord failed");
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("PDS rejected record: {text}"),
+        )
+            .into_response());
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::json!({}));
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "uri": parsed.get("uri"),
+        "cid": parsed.get("cid"),
+    })))
 }
 
 // ── PFP avatar delegation ──────────────────────────────────────────────────
@@ -1472,7 +1711,7 @@ async fn pfp_set_avatar(
         ));
     }
 
-    let (record, access_token, nonce) = authed_access_token(&state, &req.broker_token).await?;
+    let (record, access_token, nonce, _) = authed_access_token(&state, &req.broker_token).await?;
 
     // 1. uploadBlob (avatar)
     let upload_url = format!("{}/xrpc/com.atproto.repo.uploadBlob", record.pds_url);
@@ -1665,14 +1904,33 @@ pub struct SessionPush<'a> {
 #[async_trait::async_trait]
 pub trait SessionWriter: Send + Sync {
     /// Mint a one-time SASL web-token for this identity → `(token, nick)`.
+    ///
+    /// `broker_token` is the login token the web token is minted for. The
+    /// server files it beside the web token, so a device signed out later can
+    /// have its login token refused.
     async fn mint_web_token(
         &self,
         did: &str,
         handle: &str,
+        broker_token: Option<&str>,
     ) -> Result<(String, String), anyhow::Error>;
     /// Install / refresh the server-side web session for proxied PDS ops.
     async fn push_session(&self, push: &SessionPush<'_>) -> Result<(), anyhow::Error>;
 }
+
+/// The freeq-server refused a web token for this identity: the device was
+/// signed out, and must sign in again. Told apart from an unreachable or
+/// broken server, which is transient and leaves login identity-only.
+#[derive(Debug)]
+pub struct WebTokenRefused;
+
+impl std::fmt::Display for WebTokenRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "server refused a web token (device signed out)")
+    }
+}
+
+impl std::error::Error for WebTokenRefused {}
 
 /// [`SessionWriter`] for the standalone broker: HMAC-signed HTTP POSTs to the
 /// freeq-server's `/auth/broker/*` receiver endpoints.
@@ -1687,8 +1945,13 @@ impl SessionWriter for RemoteWriter {
         &self,
         did: &str,
         handle: &str,
+        broker_token: Option<&str>,
     ) -> Result<(String, String), anyhow::Error> {
-        let body = serde_json::json!({"did": did, "handle": handle});
+        let body = serde_json::json!({
+            "did": did,
+            "handle": handle,
+            "broker_token": broker_token,
+        });
         let (sig, ts) = sign_body(&self.shared_secret, &body)?;
         let url = format!(
             "{}/auth/broker/web-token",
@@ -1702,6 +1965,11 @@ impl SessionWriter for RemoteWriter {
             .json(&body)
             .send()
             .await?;
+        // 401 is the server's verdict on this device, not a failure to reach
+        // it: the caller turns it into a 401 for the device.
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(anyhow::Error::new(WebTokenRefused));
+        }
         if !resp.status().is_success() {
             return Err(anyhow::anyhow!(
                 "web-token failed: {}",
@@ -1842,6 +2110,48 @@ pub fn sign_body(
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()),
         timestamp,
     ))
+}
+
+/// Lowercase hex SHA-256 of a broker token: the name the server keeps for a
+/// signed-out token, and the name it gives the broker to delete one.
+pub fn token_hash(token: &str) -> String {
+    use sha2::Digest;
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Check a body signed with [`sign_body`]: both headers present, the
+/// timestamp within 60 s of now, and the MAC over `ts={timestamp}\n` then the
+/// body bytes as received.
+pub fn verify_signed_body(
+    secret: &str,
+    timestamp_header: Option<&str>,
+    signature_header: Option<&str>,
+    body_bytes: &[u8],
+) -> Result<(), &'static str> {
+    use hmac::{Hmac, Mac};
+    let sig = signature_header.ok_or("Missing broker signature")?;
+    let ts_str = timestamp_header.ok_or("Missing X-Broker-Timestamp header")?;
+    let ts: u64 = ts_str.parse().map_err(|_| "Invalid X-Broker-Timestamp")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now.abs_diff(ts) > 60 {
+        return Err("Broker request expired (timestamp > 60s)");
+    }
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).map_err(|_| "HMAC init failed")?;
+    mac.update(format!("ts={ts_str}\n").as_bytes());
+    mac.update(body_bytes);
+    let expected =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    if expected != sig {
+        return Err("Invalid broker signature");
+    }
+    Ok(())
 }
 
 pub fn init_db(db: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
@@ -2009,6 +2319,60 @@ mod tests {
             ("host", "irc.zerosum.org"),
             ("origin", "https://evil.example"),
         ])));
+    }
+
+    fn enroll_key() -> freeq_sdk::crypto::PrivateKey {
+        freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&[3; 32]).unwrap()
+    }
+
+    fn retirement_dated(created_at: &str) -> serde_json::Value {
+        let key = enroll_key();
+        serde_json::to_value(
+            freeq_sdk::identity_records::build_device_retirement(
+                &key,
+                "did:plc:x",
+                "some-other-kid",
+                created_at,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_retirement_must_be_dated_now() {
+        let signer = enroll_key().public_key_multibase();
+        let now = chrono::Utc::now();
+        let dated = |t: chrono::DateTime<chrono::Utc>| t.to_rfc3339();
+
+        assert_eq!(
+            enroll_refusal(&retirement_dated(&dated(now)), "did:plc:x", &signer),
+            None
+        );
+        for stale in [
+            now - chrono::Duration::days(1),
+            now + chrono::Duration::days(1),
+        ] {
+            assert_eq!(
+                enroll_refusal(&retirement_dated(&dated(stale)), "did:plc:x", &signer),
+                Some("retirement createdAt must be the current time")
+            );
+        }
+    }
+
+    #[test]
+    fn a_device_record_may_carry_an_old_date() {
+        let key = enroll_key();
+        let day_ago = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let record = serde_json::to_value(
+            freeq_sdk::identity_records::build_device_record(&key, "did:plc:x", &day_ago, None)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            enroll_refusal(&record, "did:plc:x", &key.public_key_multibase()),
+            None
+        );
     }
 
     #[tokio::test]

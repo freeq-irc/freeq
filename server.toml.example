@@ -88,6 +88,9 @@
 # github_client_id = "Iv1.abc..."
 # github_client_secret = "..."
 # broker_shared_secret = "..."
+# Public URL of the standalone broker; with it a device sign-out deletes the
+# session at the broker. Read only with broker_shared_secret.
+# auth_broker_url = "https://auth.example.com"
 
 ## ── Private media space ────────────────────────────────────────────
 ## Leave this unset to keep the private media feature off.

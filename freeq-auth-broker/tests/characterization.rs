@@ -18,9 +18,9 @@ use axum::body::Bytes;
 use axum::http::HeaderMap;
 use base64::Engine;
 use freeq_auth_broker::{
-    BrokerConfig, BrokerSessionRecord, BrokerState, DpopKey, PendingAuth, RemoteWriter,
-    SqliteStore, build_client_id, decrypt_field, derive_encryption_key, encrypt_field,
-    is_valid_return_to, router, sign_body,
+    BrokerConfig, BrokerSessionRecord, BrokerState, DpopKey, InMemoryStore, PendingAuth,
+    RemoteWriter, SessionStore, SqliteStore, build_client_id, decrypt_field, derive_encryption_key,
+    encrypt_field, is_valid_return_to, router, session_router, sign_body, token_hash,
 };
 use tokio::sync::Mutex;
 
@@ -141,7 +141,8 @@ async fn seed_session(
 struct ServerCapture {
     web_token_bodies: Vec<serde_json::Value>,
     session_bodies: Vec<serde_json::Value>,
-    fail_web_token: bool,
+    /// When set, the web-token endpoint answers this instead of a token.
+    web_token_status: Option<axum::http::StatusCode>,
 }
 
 /// Verify the broker's HMAC push signature exactly the way
@@ -192,9 +193,8 @@ fn mock_freeq_server(cap: Arc<std::sync::Mutex<ServerCapture>>) -> axum::Router 
                     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
                     let mut c = cap.lock().unwrap();
                     c.web_token_bodies.push(json);
-                    if c.fail_web_token {
-                        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom")
-                            .into_response();
+                    if let Some(status) = c.web_token_status {
+                        return (status, "refused").into_response();
                     }
                     axum::Json(serde_json::json!({"token": "WEBTOK", "nick": "alice"}))
                         .into_response()
@@ -528,7 +528,7 @@ async fn client_metadata_document() {
     // The advertised scope union (incl. transition:generic grace period).
     assert_eq!(
         json["scope"],
-        "atproto blob:image/* repo:app.bsky.actor.profile repo:blue.irc.media?action=create repo:app.bsky.feed.post transition:generic"
+        "atproto blob:image/* repo:app.bsky.actor.profile repo:blue.irc.media?action=create repo:app.bsky.feed.post repo:at.freeq.deviceKey?action=create repo:at.freeq.agentKey?action=create transition:generic"
     );
     assert_eq!(
         json["grant_types"],
@@ -599,6 +599,9 @@ async fn callback_happy_path_web() {
         let c = server_cap.lock().unwrap();
         assert_eq!(c.web_token_bodies.len(), 1);
         assert_eq!(c.web_token_bodies[0]["did"], "did:plc:alice123");
+        // The token push names the broker token behind it, so the server can
+        // refuse that token when the device is signed out.
+        assert_eq!(c.web_token_bodies[0]["broker_token"], broker_token);
         assert_eq!(c.session_bodies.len(), 1);
         assert_eq!(c.session_bodies[0]["access_token"], "ACCESS1");
         assert_eq!(c.session_bodies[0]["granted_scope"], "atproto");
@@ -896,7 +899,7 @@ async fn callback_degrades_to_identity_only_when_server_push_fails() {
     // secret, server down) must still complete login — verified DID +
     // broker_token are enough for identity-only consumers.
     let server_cap = Arc::new(std::sync::Mutex::new(ServerCapture {
-        fail_web_token: true,
+        web_token_status: Some(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
         ..Default::default()
     }));
     let server_url = spawn(mock_freeq_server(server_cap)).await;
@@ -1049,6 +1052,62 @@ async fn session_concurrent_calls_serialize_on_refresh_lock() {
         refresh.lock().unwrap().seen,
         vec!["R0", "R1", "R2", "R3", "R4"]
     );
+}
+
+/// A `/session` call against a server whose web-token endpoint answers
+/// `web_token_status`, with a refresh that rotates normally.
+async fn session_against_refusing_server(
+    web_token_status: axum::http::StatusCode,
+) -> (reqwest::Response, Arc<BrokerState>) {
+    let server_cap = Arc::new(std::sync::Mutex::new(ServerCapture {
+        web_token_status: Some(web_token_status),
+        ..Default::default()
+    }));
+    let server_url = spawn(mock_freeq_server(server_cap)).await;
+    let token_url = spawn(mock_refresh_endpoint(rotate_state(None))).await;
+
+    let state = broker_state(&server_url);
+    seed_session(
+        &state,
+        "BT1",
+        "R0",
+        &format!("{token_url}/token"),
+        "https://pds.example",
+    )
+    .await;
+    let base = spawn(router(state.clone())).await;
+    (session_call(&base, "BT1").await, state)
+}
+
+#[tokio::test]
+async fn session_is_401_when_the_server_refuses_the_web_token() {
+    // The server answers 401 for a device that was signed out. The device has
+    // to be told: on a 200 with an empty token it reconnects with nothing and
+    // keeps retrying, instead of asking the user to sign in again.
+    let (resp, state) = session_against_refusing_server(axum::http::StatusCode::UNAUTHORIZED).await;
+    assert_eq!(resp.status(), 401);
+    assert!(
+        resp.text()
+            .await
+            .unwrap()
+            .contains("re-authentication required")
+    );
+    // The server's refusal is a sign-out, and the broker ends the session on
+    // it: the server's own memory of the refusal does not survive a restart.
+    assert!(state.store.get("BT1").await.is_none());
+}
+
+#[tokio::test]
+async fn session_degrades_to_identity_only_when_the_server_is_broken() {
+    // A server that is down or erroring is not a verdict about this device,
+    // so login still completes identity-only, as it did before.
+    let (resp, state) =
+        session_against_refusing_server(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["token"], "");
+    assert_eq!(json["did"], "did:plc:alice123");
+    assert!(state.store.get("BT1").await.is_some());
 }
 
 #[tokio::test]
@@ -1441,4 +1500,477 @@ async fn graph_unfollow_only_own_repo_records() {
     assert_eq!(method, "com.atproto.repo.deleteRecord");
     assert_eq!(body["rkey"], "3kabc");
     assert_eq!(body["repo"], "did:plc:alice123");
+}
+
+// ═══ POST /enroll ═══════════════════════════════════════════════════════
+
+use freeq_sdk::crypto::PrivateKey;
+use freeq_sdk::identity_records::{build_device_record, record_signed_bytes};
+
+/// The scope a sign-in with `intent=enroll` asks for.
+const ENROLL_SCOPE: &str =
+    "atproto repo:at.freeq.deviceKey?action=create repo:at.freeq.agentKey?action=create";
+
+#[derive(Default)]
+struct RawPdsCapture {
+    /// (xrpc method, raw request body) per request, in order.
+    calls: Vec<(String, String)>,
+}
+
+/// A PDS that keeps each request body as it arrived on the wire.
+fn mock_pds_raw(cap: Arc<std::sync::Mutex<RawPdsCapture>>) -> axum::Router {
+    use axum::extract::Path;
+    use axum::routing::post;
+    axum::Router::new().route(
+        "/xrpc/{method}",
+        post(move |Path(method): Path<String>, body: Bytes| {
+            let cap = cap.clone();
+            async move {
+                let text = String::from_utf8(body.to_vec()).unwrap();
+                cap.lock().unwrap().calls.push((method, text));
+                axum::Json(serde_json::json!({
+                    "uri": "at://did:plc:alice123/at.freeq.deviceKey/3kdevice",
+                    "cid": "bafydevice",
+                }))
+            }
+        }),
+    )
+}
+
+/// A broker whose session BT1 refreshes to `scope` (None: the field is
+/// absent), writing to a PDS that records what it receives.
+async fn enroll_setup(scope: Option<&str>) -> (String, Arc<std::sync::Mutex<RawPdsCapture>>) {
+    let server_url = spawn(mock_freeq_server(Default::default())).await;
+    let token_url = spawn(mock_refresh_endpoint(rotate_state(scope))).await;
+    let pds_cap = Arc::new(std::sync::Mutex::new(RawPdsCapture::default()));
+    let pds_url = spawn(mock_pds_raw(pds_cap.clone())).await;
+    let state = broker_state(&server_url);
+    seed_session(&state, "BT1", "R0", &format!("{token_url}/token"), &pds_url).await;
+    (spawn(router(state)).await, pds_cap)
+}
+
+fn device_key(seed: u8) -> PrivateKey {
+    PrivateKey::ed25519_from_bytes(&[seed; 32]).unwrap()
+}
+
+/// Re-sign `record` with `key` after a field was changed, so only the
+/// changed field is wrong.
+fn resigned(mut record: serde_json::Value, key: &PrivateKey) -> serde_json::Value {
+    record["bindingSig"] = serde_json::json!(key.sign_base64url(&record_signed_bytes(&record)));
+    record
+}
+
+/// POST /enroll with the record written out as `record_text`, verbatim.
+async fn enroll_call(base: &str, record_text: &str, signer: &PrivateKey) -> reqwest::Response {
+    let body = format!(
+        r#"{{"broker_token":"BT1","record":{record_text},"signer_public_key":"{}"}}"#,
+        signer.public_key_multibase()
+    );
+    http()
+        .post(format!("{base}/enroll"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn enroll_writes_the_device_record_as_sent() {
+    let (base, cap) = enroll_setup(Some(ENROLL_SCOPE)).await;
+    let key = device_key(1);
+    let record = build_device_record(
+        &key,
+        "did:plc:alice123",
+        "2026-09-11T00:00:00Z",
+        Some("laptop"),
+    )
+    .unwrap();
+    // Field order as the struct writes it, which is not sorted: a record
+    // that went through a map on the way would arrive reordered.
+    let record_text = serde_json::to_string(&record).unwrap();
+    assert!(record_text.starts_with(r#"{"$type":"at.freeq.deviceKey","did":"#));
+
+    let resp = enroll_call(&base, &record_text, &key).await;
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(
+        json["uri"],
+        "at://did:plc:alice123/at.freeq.deviceKey/3kdevice"
+    );
+    assert_eq!(json["cid"], "bafydevice");
+
+    let c = cap.lock().unwrap();
+    assert_eq!(c.calls.len(), 1);
+    let (method, body) = &c.calls[0];
+    assert_eq!(method, "com.atproto.repo.createRecord");
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(parsed["repo"], "did:plc:alice123");
+    assert_eq!(parsed["collection"], "at.freeq.deviceKey");
+    assert!(
+        body.contains(&format!(r#""record":{record_text}"#)),
+        "the record was not forwarded byte for byte: {body}"
+    );
+}
+
+#[tokio::test]
+async fn enroll_refuses_a_bad_binding_signature_before_the_pds() {
+    let (base, cap) = enroll_setup(Some(ENROLL_SCOPE)).await;
+    let key = device_key(1);
+    let mut record = serde_json::to_value(
+        build_device_record(&key, "did:plc:alice123", "2026-09-11T00:00:00Z", None).unwrap(),
+    )
+    .unwrap();
+    let sig = record["bindingSig"].as_str().unwrap().to_string();
+    let flipped = if sig.starts_with('A') { 'B' } else { 'A' };
+    record["bindingSig"] = serde_json::json!(format!("{flipped}{}", &sig[1..]));
+
+    let resp = enroll_call(&base, &record.to_string(), &key).await;
+    assert_eq!(resp.status(), 400);
+    assert!(cap.lock().unwrap().calls.is_empty());
+}
+
+#[tokio::test]
+async fn enroll_refuses_a_record_that_is_not_the_sessions_own_key() {
+    let (base, cap) = enroll_setup(Some(ENROLL_SCOPE)).await;
+    let key = device_key(1);
+    let good = serde_json::to_value(
+        build_device_record(&key, "did:plc:alice123", "2026-09-11T00:00:00Z", None).unwrap(),
+    )
+    .unwrap();
+
+    let mut wrong_type = good.clone();
+    wrong_type["$type"] = serde_json::json!("app.bsky.feed.post");
+    let wrong_type = resigned(wrong_type, &key);
+
+    let other_did = serde_json::to_value(
+        build_device_record(&key, "did:plc:someoneelse", "2026-09-11T00:00:00Z", None).unwrap(),
+    )
+    .unwrap();
+
+    let mut wrong_kid = good.clone();
+    wrong_kid["kid"] = serde_json::json!(
+        build_device_record(
+            &device_key(3),
+            "did:plc:alice123",
+            "2026-09-11T00:00:00Z",
+            None
+        )
+        .unwrap()
+        .kid
+    );
+    let wrong_kid = resigned(wrong_kid, &key);
+
+    let mut other_key = good.clone();
+    other_key["publicKeyMultibase"] = serde_json::json!(device_key(2).public_key_multibase());
+    let other_key = resigned(other_key, &key);
+
+    for (name, record) in [
+        ("wrong $type", wrong_type),
+        ("another account's DID", other_did),
+        ("kid of another key", wrong_kid),
+        ("announces another key", other_key),
+    ] {
+        let resp = enroll_call(&base, &record.to_string(), &key).await;
+        assert_eq!(resp.status(), 400, "{name}");
+    }
+    assert!(cap.lock().unwrap().calls.is_empty());
+}
+
+#[tokio::test]
+async fn enroll_needs_the_grant() {
+    let (base, cap) = enroll_setup(Some("atproto")).await;
+    let key = device_key(1);
+    let record =
+        build_device_record(&key, "did:plc:alice123", "2026-09-11T00:00:00Z", None).unwrap();
+
+    let resp = enroll_call(&base, &serde_json::to_string(&record).unwrap(), &key).await;
+    assert_eq!(resp.status(), 403);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json, serde_json::json!({ "error": "insufficient_scope" }));
+    assert!(cap.lock().unwrap().calls.is_empty());
+}
+
+#[tokio::test]
+async fn enroll_allows_a_legacy_session_whose_refresh_names_no_scope() {
+    let (base, cap) = enroll_setup(None).await;
+    let key = device_key(1);
+    let record =
+        build_device_record(&key, "did:plc:alice123", "2026-09-11T00:00:00Z", None).unwrap();
+
+    let resp = enroll_call(&base, &serde_json::to_string(&record).unwrap(), &key).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(cap.lock().unwrap().calls.len(), 1);
+}
+
+// ═══ SessionStore::delete ═══════════════════════════════════════════════
+
+/// One record, so a store test has something to delete.
+fn a_record(broker_token: &str) -> BrokerSessionRecord {
+    BrokerSessionRecord {
+        broker_token: broker_token.to_string(),
+        did: "did:plc:alice123".to_string(),
+        handle: "alice.test".to_string(),
+        pds_url: "https://pds.test.example".to_string(),
+        token_endpoint: "https://pds.test.example/token".to_string(),
+        refresh_token: "REFRESH".to_string(),
+        dpop_key_b64: DpopKey::generate().to_base64url(),
+        dpop_nonce: None,
+        client_id: "https://auth.test.example/client-metadata.json".to_string(),
+        created_at: 0,
+        updated_at: 0,
+    }
+}
+
+#[tokio::test]
+async fn sqlite_store_delete_removes_the_record() {
+    let store = SqliteStore::open(":memory:", derive_encryption_key(SECRET)).unwrap();
+    store.insert(&a_record("bt-sqlite")).await.unwrap();
+    assert!(store.get("bt-sqlite").await.is_some());
+
+    store.delete("bt-sqlite").await.unwrap();
+    assert!(store.get("bt-sqlite").await.is_none());
+    // Deleting what is already gone is not an error.
+    store.delete("bt-sqlite").await.unwrap();
+}
+
+#[tokio::test]
+async fn in_memory_store_delete_removes_the_record() {
+    let store = InMemoryStore::new();
+    store.insert(&a_record("bt-mem")).await.unwrap();
+    assert!(store.get("bt-mem").await.is_some());
+
+    store.delete("bt-mem").await.unwrap();
+    assert!(store.get("bt-mem").await.is_none());
+    store.delete("bt-mem").await.unwrap();
+}
+
+#[tokio::test]
+async fn delete_leaves_other_records_alone() {
+    let store = SqliteStore::open(":memory:", derive_encryption_key(SECRET)).unwrap();
+    store.insert(&a_record("bt-one")).await.unwrap();
+    store.insert(&a_record("bt-two")).await.unwrap();
+    store.delete("bt-one").await.unwrap();
+    assert!(store.get("bt-one").await.is_none());
+    assert!(store.get("bt-two").await.is_some());
+}
+
+#[test]
+fn token_hash_is_lowercase_hex_sha256() {
+    assert_eq!(
+        token_hash("abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_store_delete_by_token_hash_removes_only_the_match() {
+    let store = SqliteStore::open(":memory:", derive_encryption_key(SECRET)).unwrap();
+    store.insert(&a_record("bt-one")).await.unwrap();
+    store.insert(&a_record("bt-two")).await.unwrap();
+
+    store
+        .delete_by_token_hash(&token_hash("bt-one"))
+        .await
+        .unwrap();
+    assert!(store.get("bt-one").await.is_none());
+    assert!(store.get("bt-two").await.is_some());
+    // No match is not an error.
+    store
+        .delete_by_token_hash(&token_hash("bt-one"))
+        .await
+        .unwrap();
+    store.delete_by_token_hash("not-a-hash").await.unwrap();
+    assert!(store.get("bt-two").await.is_some());
+}
+
+#[tokio::test]
+async fn in_memory_store_delete_by_token_hash_removes_only_the_match() {
+    let store = InMemoryStore::new();
+    store.insert(&a_record("bt-one")).await.unwrap();
+    store.insert(&a_record("bt-two")).await.unwrap();
+
+    store
+        .delete_by_token_hash(&token_hash("bt-one"))
+        .await
+        .unwrap();
+    assert!(store.get("bt-one").await.is_none());
+    assert!(store.get("bt-two").await.is_some());
+    store
+        .delete_by_token_hash(&token_hash("bt-one"))
+        .await
+        .unwrap();
+    assert!(store.get("bt-two").await.is_some());
+}
+
+// ═══ POST /session/delete ══════════════════════════════════════════════
+
+/// A broker whose session BT1 refreshes and can enroll, as `enroll_setup`,
+/// with its state kept for reading the store.
+async fn delete_setup() -> (String, Arc<BrokerState>) {
+    let server_url = spawn(mock_freeq_server(Default::default())).await;
+    let token_url = spawn(mock_refresh_endpoint(rotate_state(Some(ENROLL_SCOPE)))).await;
+    let pds_url = spawn(mock_pds_raw(Default::default())).await;
+    let state = broker_state(&server_url);
+    seed_session(&state, "BT1", "R0", &format!("{token_url}/token"), &pds_url).await;
+    (spawn(router(state.clone())).await, state)
+}
+
+/// POST /session/delete with `body` as sent and the given signature headers.
+async fn delete_call(base: &str, body: Vec<u8>, sig: &str, ts: &str) -> reqwest::Response {
+    http()
+        .post(format!("{base}/session/delete"))
+        .header("content-type", "application/json")
+        .header("X-Broker-Signature", sig)
+        .header("X-Broker-Timestamp", ts)
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A delete naming `broker_token` by its hash, signed the way the server
+/// signs it.
+async fn signed_delete(base: &str, broker_token: &str) -> reqwest::Response {
+    let body = serde_json::json!({ "token_hash": token_hash(broker_token) });
+    let (sig, ts) = sign_body(SECRET, &body).unwrap();
+    delete_call(base, serde_json::to_vec(&body).unwrap(), &sig, &ts).await
+}
+
+/// HMAC over `ts={ts}\n` then `body` under `secret`, for signatures
+/// `sign_body` will not make: another secret, an old timestamp.
+fn sign_with(secret: &str, body: &[u8], ts: u64) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(format!("ts={ts}\n").as_bytes());
+    mac.update(body);
+    b64url(&mac.finalize().into_bytes())
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+async fn enroll_with_device_key(base: &str) -> reqwest::Response {
+    let key = device_key(1);
+    let record =
+        build_device_record(&key, "did:plc:alice123", "2026-09-11T00:00:00Z", None).unwrap();
+    enroll_call(base, &serde_json::to_string(&record).unwrap(), &key).await
+}
+
+#[tokio::test]
+async fn session_delete_with_a_good_signature_ends_the_session() {
+    let (base, state) = delete_setup().await;
+
+    let resp = signed_delete(&base, "BT1").await;
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json, serde_json::json!({ "ok": true }));
+
+    assert!(state.store.get("BT1").await.is_none());
+    assert_eq!(session_call(&base, "BT1").await.status(), 401);
+    assert_eq!(enroll_with_device_key(&base).await.status(), 401);
+}
+
+#[tokio::test]
+async fn session_delete_twice_or_for_an_unknown_token_is_200() {
+    let (base, _state) = delete_setup().await;
+    assert_eq!(signed_delete(&base, "BT1").await.status(), 200);
+    assert_eq!(signed_delete(&base, "BT1").await.status(), 200);
+    assert_eq!(signed_delete(&base, "BT-NEVER-ISSUED").await.status(), 200);
+}
+
+#[tokio::test]
+async fn session_delete_with_a_bad_signature_deletes_nothing() {
+    let (base, state) = delete_setup().await;
+    let body = serde_json::to_vec(&serde_json::json!({ "token_hash": token_hash("BT1") })).unwrap();
+    let now = now_secs();
+
+    let wrong_secret = sign_with("not-the-shared-secret", &body, now);
+    let resp = delete_call(&base, body.clone(), &wrong_secret, &now.to_string()).await;
+    assert_eq!(resp.status(), 401);
+
+    let resp = http()
+        .post(format!("{base}/session/delete"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "unsigned");
+
+    assert!(state.store.get("BT1").await.is_some());
+}
+
+#[tokio::test]
+async fn session_delete_with_a_timestamp_61s_old_deletes_nothing() {
+    let (base, state) = delete_setup().await;
+    let body = serde_json::to_vec(&serde_json::json!({ "token_hash": token_hash("BT1") })).unwrap();
+    let stale = now_secs() - 61;
+    let sig = sign_with(SECRET, &body, stale);
+
+    let resp = delete_call(&base, body, &sig, &stale.to_string()).await;
+    assert_eq!(resp.status(), 401);
+    assert!(state.store.get("BT1").await.is_some());
+}
+
+#[tokio::test]
+async fn session_delete_with_no_body_is_400() {
+    let (base, state) = delete_setup().await;
+    let now = now_secs();
+    let sig = sign_with(SECRET, b"", now);
+
+    let resp = delete_call(&base, Vec::new(), &sig, &now.to_string()).await;
+    assert_eq!(resp.status(), 400);
+    assert!(state.store.get("BT1").await.is_some());
+}
+
+#[tokio::test]
+async fn session_delete_is_refused_where_no_secret_is_configured() {
+    // An embedding server mounts these routes with an empty secret; a
+    // signature under an empty key proves nothing.
+    let state = Arc::new(BrokerState {
+        config: BrokerConfig {
+            public_url: String::new(),
+            freeq_server_url: String::new(),
+            shared_secret: String::new(),
+        },
+        writer: Arc::new(RemoteWriter {
+            freeq_server_url: String::new(),
+            shared_secret: String::new(),
+        }),
+        store: Arc::new(InMemoryStore::new()),
+        pending: Mutex::new(std::collections::HashMap::new()),
+        completed: Mutex::new(std::collections::HashMap::new()),
+        callback_locks: Mutex::new(std::collections::HashMap::new()),
+        refresh_locks: Mutex::new(std::collections::HashMap::new()),
+    });
+    seed_session(
+        &state,
+        "BT1",
+        "R0",
+        "https://pds.example/token",
+        "https://pds.example",
+    )
+    .await;
+    let base = spawn(session_router(state.clone())).await;
+
+    let body = serde_json::to_vec(&serde_json::json!({ "token_hash": token_hash("BT1") })).unwrap();
+    let now = now_secs();
+    let sig = sign_with("", &body, now);
+    let resp = delete_call(&base, body, &sig, &now.to_string()).await;
+    assert_eq!(resp.status(), 403);
+    assert!(state.store.get("BT1").await.is_some());
+}
+
+#[tokio::test]
+async fn a_refused_web_token_also_closes_enroll() {
+    let (resp, state) = session_against_refusing_server(axum::http::StatusCode::UNAUTHORIZED).await;
+    assert_eq!(resp.status(), 401);
+    let base = spawn(router(state)).await;
+    assert_eq!(enroll_with_device_key(&base).await.status(), 401);
 }

@@ -22,6 +22,7 @@ import {
   buildAgentRetirement,
   buildDeviceRecord,
   buildDeviceRetirement,
+  deviceKeyHistory,
   fetchProof,
   foldAgentRecords,
   foldDeviceRecords,
@@ -30,6 +31,7 @@ import {
   liveDeviceKeys,
   recordCid,
   recordSignedBytes,
+  retirementClosure,
   verifyProof,
   verifyRecord,
 } from './identity-records.js';
@@ -132,6 +134,18 @@ describe('identity record vectors', () => {
         (l) => l.agentDid,
       );
       expect(agents).toEqual(f.liveAgentDids);
+    });
+
+    it(`decides each key's retirement in ${f.name} from its closure as the full fold does`, async () => {
+      const did = f.deviceRecords[0]!.did!;
+      const retiredAt = async (records: unknown[], kid: string) =>
+        (await deviceKeyHistory(did, records)).find((k) => k.kid === kid)?.retiredAt?.getTime() ?? null;
+      const kids = new Set(f.deviceRecords.flatMap((r) => [r.kid, r.revokes].filter((k) => k !== undefined)));
+      expect(kids.size).toBeGreaterThan(0);
+      for (const kid of kids) {
+        const closure = retirementClosure(did, kid!, f.deviceRecords, (r) => r);
+        expect(await retiredAt(closure, kid!), kid).toBe(await retiredAt(f.deviceRecords, kid!));
+      }
     });
 
     it(`reads ${f.name} from a PDS across two pages`, async () => {

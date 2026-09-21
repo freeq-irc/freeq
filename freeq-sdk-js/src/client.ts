@@ -14,6 +14,10 @@ import * as signing from './signing.js';
 import * as e2ee from './e2ee.js';
 import { dmPeerKey, isDid } from './address.js';
 import { prefetchProfiles } from './profiles.js';
+import { recordKeyOf, type DeviceKeyStore, type StoredDeviceKey } from './device-key.js';
+import { buildDeviceRecord, deviceKeyHistory } from './identity-records.js';
+import { KeyLookup, makeDidResolver } from './key-lookup.js';
+import { SignatureChecker, firstLook, sigTagKid, type Verdict } from './verdict.js';
 import type {
   IRCMessage, Message, Member, AvSession, AvParticipant,
   FreeqClientOptions, SaslCredentials, Batch, TransportState,
@@ -178,6 +182,19 @@ export class FreeqClient extends EventEmitter {
   readonly signing = new signing.SessionSigning();
   /** Session signing key waiting on registration before MSGSIG is sent. */
   private pendingMsgSig: Promise<string | null> | null = null;
+  /** A stored device key the account does not have yet, published once
+   *  `MSGSIG` is on the wire. */
+  private pendingEnrollment: StoredDeviceKey | null = null;
+  /** Set once a connect has used `freshSignIn`, so a reconnect does not. */
+  private freshSignInUsed = false;
+  /** Bumped on every new connection, so a publish answered after a
+   *  reconnect reports nothing for a connection that is gone. */
+  private enrollmentEpoch = 0;
+  /** Checks received signatures for this connection, when `keyLookup` is set. */
+  private checker: SignatureChecker | null = null;
+  /** Lowercase nicks whose pairing came from a message that checked out on
+   *  the sender's device. */
+  private readonly _verifiedNicks = new Set<string>();
   /** Set when SASL was attempted and 904 was received. Suppresses any
    *  subsequent registration completion as a guest, and blocks outgoing
    *  PRIVMSGs that would silently leak under the guest identity. */
@@ -396,6 +413,7 @@ export class FreeqClient extends EventEmitter {
       this._agentHeartbeatTimer = null;
     }
     this.signing.resetSigning();
+    this.pendingEnrollment = null;
     // Whatever was waiting for a registration on this connection is not
     // getting one. The next session arms the gate again.
     this.msgSigRegistered();
@@ -1111,6 +1129,11 @@ export class FreeqClient extends EventEmitter {
     if (state === 'connected') {
       this.ackedCaps.clear();
       this.clearNickResume();
+      this.enrollmentEpoch++;
+      this.pendingEnrollment = null;
+      const lookup = this.opts.keyLookup;
+      if (lookup && lookup.originBase() === null) lookup.setDefaultOriginBase(this.serverOrigin);
+      this.checker = lookup ? new SignatureChecker(lookup) : null;
       let registrationSent = false;
 
       const sendRegistration = (token?: string) => {
@@ -1297,17 +1320,43 @@ export class FreeqClient extends EventEmitter {
    * `from` is always a sender, never a target; the channel guard below is
    * belt and braces against a caller that confuses the two.
    */
-  private rememberSenderDid(from: string, tags?: Record<string, string>): void {
+  private rememberSenderDid(
+    from: string,
+    tags?: Record<string, string>,
+    verdict?: Verdict,
+  ): void {
     const did = tags?.['+freeq.at/account'] ?? tags?.['account'];
     if (!did || !isDid(did) || !from || from.startsWith('#') || from.startsWith('&')) return;
-    const lc = from.toLowerCase();
-    const isNews = this._nickToDid.get(lc) !== did || this._didToNick.get(did) !== lc;
-    this._nickToDid.set(lc, did);
-    this._didToNick.set(did, lc);
     // Whatever is already on screen resolved this peer's name before we knew
     // it. Say so, or a thread keyed by the DID wears the raw DID until
     // something unrelated happens to re-render it.
-    if (isNews) this.emit('memberDid', from, did);
+    if (this.learn(from, did, verdict?.state === 'device')) this.emit('memberDid', from, did);
+  }
+
+  /**
+   * Learn a nick↔DID pairing. Returns true when it is new or changed — the
+   * caller emits `memberDid` exactly then.
+   *
+   * `verified`: the message that taught it carried a device verdict. A
+   * verified pairing replaces any other; an unverified one replaces nothing
+   * that was learned verified. Twin of the Rust `DidMapsState::learn`.
+   */
+  private learn(nick: string, did: string, verified: boolean): boolean {
+    const lc = nick.toLowerCase();
+    const current = this._nickToDid.get(lc);
+    if (!verified && current !== did && this._verifiedNicks.has(lc)) return false;
+    const isNews = current !== did || this._didToNick.get(did) !== lc;
+    if (verified) this._verifiedNicks.add(lc);
+    else if (current !== did) this._verifiedNicks.delete(lc);
+    // A DID keeps one nick: drop the pairing this one replaces.
+    const previous = this._didToNick.get(did);
+    if (previous !== undefined && previous !== lc) {
+      this._nickToDid.delete(previous);
+      this._verifiedNicks.delete(previous);
+    }
+    this._nickToDid.set(lc, did);
+    this._didToNick.set(did, lc);
+    return isNews;
   }
 
   /** Resolve nick to DID — set by the app layer for E2EE support. */
@@ -1319,7 +1368,12 @@ export class FreeqClient extends EventEmitter {
    *  event tags is a rendering of the event (the human-readable companion),
    *  so it fires `message`, never `coordinationEvent`. De-dupes by eventId
    *  against echo and multi-path delivery. */
-  private emitCoordinationEvent(channel: string, from: string, tags: Record<string, string>): void {
+  private emitCoordinationEvent(
+    channel: string,
+    from: string,
+    tags: Record<string, string>,
+    verdict?: Verdict,
+  ): CoordinationEventPayload | undefined {
     const eventType = tags['+freeq.at/event'];
     if (!eventType) return;
     // A signed event through an adopting server arrives with the id in
@@ -1376,8 +1430,10 @@ export class FreeqClient extends EventEmitter {
       payload,
       payloadRaw,
       tags,
+      ...(verdict ? { verdict } : {}),
     };
     this.emit('coordinationEvent', eventPayload);
+    return eventPayload;
   }
 
   /**
@@ -1395,7 +1451,12 @@ export class FreeqClient extends EventEmitter {
    * `act-events-replay-twice-to-a-joiner`, and dropping the second sighting
    * here is where it closes.
    */
-  private emitActEvent(buffer: string, from: string, tags: Record<string, string>): void {
+  private emitActEvent(
+    buffer: string,
+    from: string,
+    tags: Record<string, string>,
+    verdict?: Verdict,
+  ): ActEventPayload | undefined {
     const fields: Record<string, string> = {};
     for (const [name, value] of Object.entries(tags)) {
       if (signing.isActTag(name)) fields[signing.strippedTagName(name)] = value;
@@ -1420,7 +1481,7 @@ export class FreeqClient extends EventEmitter {
 
     // An opener carries no `act-id`: its own event id is the task's, for the
     // rest of the task's life. Every later move names that id.
-    this.emit('actEvent', {
+    const payload: ActEventPayload = {
       channel: buffer,
       from,
       did: tags['+freeq.at/from'] || tags['account'] || undefined,
@@ -1432,7 +1493,10 @@ export class FreeqClient extends EventEmitter {
       tags,
       sigTag: tags[signing.SIG_TAG] || undefined,
       replayed: tags['time'] !== undefined,
-    } satisfies ActEventPayload);
+      ...(verdict ? { verdict } : {}),
+    };
+    this.emit('actEvent', payload);
+    return payload;
   }
 
   /**
@@ -1562,6 +1626,191 @@ export class FreeqClient extends EventEmitter {
     this.msgSigReady = new Promise<void>((resolve) => {
       this.releaseMsgSigReady = resolve;
     });
+  }
+
+  /** The id a line's signature covers: a message's `msgid`, a TAGMSG's event id. */
+  private signedLineId(tags: Record<string, string>, isTagmsg: boolean): string | undefined {
+    const eventId = tags[signing.EVENT_ID_TAG] ?? tags['freeq.at/eventid'];
+    return (isTagmsg ? eventId || tags['msgid'] : tags['msgid'] || eventId) || undefined;
+  }
+
+  /**
+   * The verdict a received line is delivered with, when this client checks
+   * signatures: final when nothing needs fetching, else `pending`, with the
+   * check started by `checkLater`.
+   */
+  private deliveredVerdict(tags: Record<string, string>, isTagmsg: boolean): Verdict | undefined {
+    if (!this.checker) return undefined;
+    const sigTag = tags[signing.SIG_TAG] ?? tags['freeq.at/sig'];
+    if (sigTag === undefined) return { state: 'unsigned' };
+    const kid = sigTagKid(sigTag);
+    if (kid === null) return { state: 'unverifiable' };
+    if (!this.signedLineId(tags, isTagmsg)) return { state: 'unverifiable', kid };
+    return { state: 'pending', kid };
+  }
+
+  /**
+   * Finish a pending check off the receive path: `onSettled` gets the verdict
+   * first, then `verdict` is emitted. Never awaited by the caller.
+   */
+  private checkLater(
+    delivered: Verdict | undefined,
+    line: { tags: Record<string, string>; target: string; body?: string; from?: string },
+    onSettled?: (verdict: Verdict) => void,
+  ): void {
+    const checker = this.checker;
+    if (!checker || delivered?.state !== 'pending') return;
+    const id = this.signedLineId(line.tags, line.body === undefined)!;
+    const ownDid = this.sasl?.did ?? this._authDid ?? undefined;
+    const targetDid = this.didForNick(line.target);
+    void (async () => {
+      let verdict: Verdict;
+      try {
+        const look = await firstLook({ ...line, ownDid, targetDid });
+        verdict =
+          look.kind === 'check'
+            ? await checker.resolve(look.signed)
+            : look.kind === 'unsigned'
+              ? { state: 'unsigned' }
+              : { state: 'unverifiable', kid: look.kid };
+      } catch {
+        verdict = { state: 'unverifiable', kid: delivered.kid };
+      }
+      // Learned before the verdict goes out, so a consumer that has the
+      // verdict can rely on the pairing.
+      const did = line.tags['account'];
+      if (verdict.state === 'device' && line.from && did && isDid(did) && this.learn(line.from, did, true)) {
+        this.emit('memberDid', line.from, did);
+      }
+      onSettled?.(verdict);
+      if (this.checker === checker) this.emit('verdict', id, verdict);
+    })();
+  }
+
+  /**
+   * The stored device key, or a new one saved into the store when it is
+   * empty; its base64url public key. A store that fails leaves this
+   * connection on a fresh session key.
+   */
+  private async presentDeviceKey(): Promise<string | null> {
+    const store = this.opts.deviceKeyStore!;
+    this.pendingEnrollment = null;
+    // Only the first connect of a client made right after a sign-in.
+    const freshSignIn = this.opts.freshSignIn === true && !this.freshSignInUsed;
+    this.freshSignInUsed = true;
+    try {
+      let stored = await store.load();
+      if (stored && freshSignIn) stored = await this.replaceRetiredKey(store, stored);
+      if (!stored) {
+        const keyPair = (await crypto.subtle.generateKey('Ed25519', false, [
+          'sign',
+          'verify',
+        ])) as CryptoKeyPair;
+        stored = { keyPair, createdAt: new Date().toISOString() };
+        await store.save(stored);
+      }
+      const pubkey = await this.signing.useKeyPair(stored.keyPair);
+      if (!stored.recordUri) this.pendingEnrollment = stored;
+      return pubkey;
+    } catch (e) {
+      log.warn('[freeq-sdk] device key unavailable, signing with a session key:', e);
+      return this.signing.generateSigningKey();
+    }
+  }
+
+  /**
+   * Right after a new sign-in, replace a stored key the account's records have
+   * retired with a new one, saved with no record URI so this connect publishes
+   * it. Bounded, so a slow account provider cannot hold up signing; a failed
+   * read keeps the stored key.
+   */
+  private async replaceRetiredKey(
+    store: DeviceKeyStore,
+    stored: StoredDeviceKey,
+  ): Promise<StoredDeviceKey> {
+    const did = this.sasl?.did;
+    if (!did) return stored;
+    // Records count only once their repository proof checks, through the
+    // key lookup's cache.
+    const lookup =
+      this.opts.keyLookup ??
+      new KeyLookup({ fetch: (target: string) => fetch(target), resolveDid: makeDidResolver() }, null, 0);
+    const check = async (): Promise<StoredDeviceKey> => {
+      const raw = new Uint8Array(await crypto.subtle.exportKey('raw', stored.keyPair.publicKey));
+      const kid = await signing.deriveKid(raw);
+      // Listed afresh: the retirement may be newer than the listing held. Only
+      // the records that can retire this key are proven.
+      const records = await lookup.provenRetirementClosure(did, kid);
+      const now = Date.now();
+      const retired = (await deviceKeyHistory(did, records)).some(
+        (k) => k.kid === kid && k.retiredAt !== null && k.retiredAt.getTime() <= now,
+      );
+      if (!retired) return stored;
+      const keyPair = (await crypto.subtle.generateKey('Ed25519', false, [
+        'sign',
+        'verify',
+      ])) as CryptoKeyPair;
+      const replacement: StoredDeviceKey = { keyPair, createdAt: new Date().toISOString() };
+      await store.save(replacement);
+      return replacement;
+    };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const giveUp = new Promise<StoredDeviceKey>((resolve) => {
+      timer = setTimeout(() => {
+        log.warn('[freeq-sdk] the account read outlasted sixty seconds; keeping the stored key');
+        resolve(stored);
+      }, 60_000);
+    });
+    try {
+      return await Promise.race([check(), giveUp]);
+    } catch (e) {
+      log.warn('[freeq-sdk] device key records not read; keeping the stored key:', e);
+      return stored;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Publish a stored device key through the broker's `/enroll`, off the
+   * connect path. 200 saves the record URI; 401 or 403 means the session
+   * lacks the permission, reported once; anything else waits for the next
+   * connect.
+   */
+  private startEnrollment(): void {
+    const stored = this.pendingEnrollment;
+    this.pendingEnrollment = null;
+    const { brokerUrl, brokerToken, deviceKeyStore: store, deviceLabel } = this.opts;
+    const did = this.sasl?.did;
+    if (!stored || !store || !brokerUrl || !brokerToken || !did) return;
+    const epoch = this.enrollmentEpoch;
+    void (async () => {
+      try {
+        const key = await recordKeyOf(stored.keyPair);
+        const record = await buildDeviceRecord(key, did, stored.createdAt, deviceLabel);
+        const resp = await fetch(`${brokerUrl}/enroll`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            broker_token: brokerToken,
+            record,
+            signer_public_key: key.publicKeyMultibase,
+          }),
+        });
+        if (resp.status === 200) {
+          const answer = (await resp.json()) as { uri?: unknown };
+          if (typeof answer.uri === 'string') {
+            await store.save({ ...stored, recordUri: answer.uri });
+          }
+        } else if (resp.status === 401 || resp.status === 403) {
+          if (epoch === this.enrollmentEpoch) this.emit('signingKeyUnpublished');
+        } else {
+          log.warn(`[freeq-sdk] device key not published (${resp.status}); tried again next connect`);
+        }
+      } catch (e) {
+        log.warn('[freeq-sdk] device key not published; tried again next connect:', e);
+      }
+    })();
   }
 
   /** Open the gate, whether or not a key actually materialized. */
@@ -1695,13 +1944,17 @@ export class FreeqClient extends EventEmitter {
     const target = batch.target;
     const isChannel = target.startsWith('#') || target.startsWith('&');
     const isSelf = this.isSelfSender(from, openerTags);
-    if (!isSelf) this.rememberSenderDid(from, openerTags);
+    const openerVerdict = this.deliveredVerdict(openerTags, false);
+    if (!isSelf) this.rememberSenderDid(from, openerTags, openerVerdict);
     // DM thread key = the peer's canonical DID when known (else the nick):
     // our own echo is keyed by the wire target, an incoming DM by the sender,
     // and both collapse to the same DID so a conversation is never split.
     const bufName = isChannel ? target : this.dmKey(isSelf ? target : from);
 
     const wireText = this.assembleMultiline(lines);
+    // The signature covers the assembled wire body and the opener's tags.
+    const verdict = openerVerdict;
+    const wireLine = { tags: openerTags, target, body: wireText, from: isSelf ? undefined : from };
 
     // Decryption — match the single-PRIVMSG path's logic exactly,
     // but applied to the assembled body so ciphertext-chunked E2EE
@@ -1746,7 +1999,11 @@ export class FreeqClient extends EventEmitter {
       replyTo: openerTags['+reply'],
       encrypted: isEncryptedMsg,
       isStreaming: openerTags['+freeq.at/streaming'] === '1',
+      ...(verdict ? { verdict } : {}),
     };
+    this.checkLater(verdict, wireLine, (settled) => {
+      message.verdict = settled;
+    });
 
     // Persisted reactions from CHATHISTORY replay (multiline-nested case)
     const reactionsTag = openerTags['+freeq.at/reactions'];
@@ -1946,7 +2203,9 @@ export class FreeqClient extends EventEmitter {
           // completes is discarded by the server (`if !conn.registered`),
           // which left the key unregistered and every "client-signed"
           // message silently server-signed instead.
-          this.pendingMsgSig = this.signing.generateSigningKey();
+          this.pendingMsgSig = this.opts.deviceKeyStore
+            ? this.presentDeviceKey()
+            : this.signing.generateSigningKey();
           // From here until MSGSIG is on the wire, a signing send waits.
           this.awaitMsgSigRegistration();
         }
@@ -2029,6 +2288,7 @@ export class FreeqClient extends EventEmitter {
               // Released either way: a key this platform could not generate
               // is a reason to send unsigned, never a reason to stop sending.
               this.msgSigRegistered();
+              if (pubkey) this.startEnrollment();
             },
             () => this.msgSigRegistered(),
           );
@@ -2136,9 +2396,8 @@ export class FreeqClient extends EventEmitter {
         if (joinDid) {
           prefetchProfiles([joinDid]);
           // Populate internal nick↔DID cache (account-notify tag carries DID).
-          const lc = from.toLowerCase();
-          this._nickToDid.set(lc, joinDid);
-          this._didToNick.set(joinDid, lc);
+          // The server's word, not a signature: unverified.
+          this.learn(from, joinDid, false);
         }
         // Spawned-agent broadcast (`+freeq.at/parent=<nick>` indicates
         // a child agent joining the channel; see server connection/mod.rs
@@ -2211,7 +2470,8 @@ export class FreeqClient extends EventEmitter {
         const isAction = text.startsWith('\x01ACTION ') && text.endsWith('\x01');
         const isChannel = target.startsWith('#') || target.startsWith('&');
         const isSelf = this.isSelfSender(from, msg.tags);
-        if (!isSelf) this.rememberSenderDid(from, msg.tags);
+        const privmsgVerdict = this.deliveredVerdict(msg.tags, false);
+        if (!isSelf) this.rememberSenderDid(from, msg.tags, privmsgVerdict);
         // DM thread key = the peer's canonical DID when known (else the nick):
         // our own echo is keyed by the wire target, an incoming DM by the
         // sender, and both collapse to the same DID so a conversation is
@@ -2245,6 +2505,11 @@ export class FreeqClient extends EventEmitter {
         // companion — a rendering, not the event. The TAGMSG is the event
         // and the only thing that fires `coordinationEvent`; this fires the
         // regular `message` event below so the text renders normally.
+
+        // Checked over the wire body, before decryption or the legacy
+        // newline rewrite.
+        const verdict = privmsgVerdict;
+        const wireLine = { tags: msg.tags, target, body: text, from: isSelf ? undefined : from };
 
         let displayText = isAction ? text.slice(8, -1) : text;
         let isEncryptedMsg = false;
@@ -2348,6 +2613,7 @@ export class FreeqClient extends EventEmitter {
           }
           const isStreaming = msg.tags['+freeq.at/streaming'] === '1';
           this.emit('messageEdited', bufName, editOf, displayText, msg.tags['msgid'], isStreaming, from, msg.tags['account'], msg.tags);
+          this.checkLater(verdict, wireLine);
           break;
         }
 
@@ -2362,7 +2628,12 @@ export class FreeqClient extends EventEmitter {
           replyTo: msg.tags['+reply'],
           encrypted: isEncryptedMsg,
           isStreaming: msg.tags['+freeq.at/streaming'] === '1',
+          ...(verdict ? { verdict } : {}),
         };
+        // Settles after this line is out: the check only resolves after an await.
+        this.checkLater(verdict, wireLine, (settled) => {
+          message.verdict = settled;
+        });
 
         // Parse persisted reactions from CHATHISTORY
         const reactionsTag = msg.tags['+freeq.at/reactions'];
@@ -2486,12 +2757,18 @@ export class FreeqClient extends EventEmitter {
         const target = msg.params[0];
         const isChannel = target.startsWith('#') || target.startsWith('&');
         const isSelf = this.isSelfSender(from, msg.tags);
-        if (!isSelf) this.rememberSenderDid(from, msg.tags);
+        const verdict = this.deliveredVerdict(msg.tags, true);
+        if (!isSelf) this.rememberSenderDid(from, msg.tags, verdict);
         // DM thread key = the peer's canonical DID when known (else the nick):
         // our own echo is keyed by the wire target, an incoming DM by the
         // sender, and both collapse to the same DID so a conversation is
         // never split.
         const bufName = isChannel ? target : this.dmKey(isSelf ? target : from);
+        // Payloads this line produced, given the verdict when it settles.
+        const carriers: { verdict?: Verdict }[] = [];
+        this.checkLater(verdict, { tags: msg.tags, target, from: isSelf ? undefined : from }, (settled) => {
+          for (const carrier of carriers) carrier.verdict = settled;
+        });
 
         const deleteOf = msg.tags['+draft/delete'];
         if (deleteOf) { this.emit('messageDeleted', bufName, deleteOf, from, msg.tags['account']); break; }
@@ -2536,7 +2813,8 @@ export class FreeqClient extends EventEmitter {
         // `coordinationEvent` fires. De-dupe by eventId against echo.
         const eventType = msg.tags['+freeq.at/event'];
         if (eventType) {
-          this.emitCoordinationEvent(target, from, msg.tags);
+          const payload = this.emitCoordinationEvent(target, from, msg.tags, verdict);
+          if (payload) carriers.push(payload);
         }
 
         // Task event (`act-` tags). Same rule as the coordination branch: the
@@ -2555,9 +2833,12 @@ export class FreeqClient extends EventEmitter {
           // TAGMSG feature files under puts the event in the same thread as
           // the line that renders it. Resolved here because the flush below
           // no longer has the sender in hand.
-          (actBatch.actEvents ??= []).push({ buffer: bufName, from, tags: msg.tags });
+          const held = { buffer: bufName, from, tags: msg.tags, verdict };
+          (actBatch.actEvents ??= []).push(held);
+          carriers.push(held);
         } else {
-          this.emitActEvent(bufName, from, msg.tags);
+          const payload = this.emitActEvent(bufName, from, msg.tags, verdict);
+          if (payload) carriers.push(payload);
         }
 
         const avState = msg.tags['+freeq.at/av-state'];
@@ -2860,7 +3141,7 @@ export class FreeqClient extends EventEmitter {
             // Held task events ride out with the batch, in wire order,
             // after the lines they refer to.
             for (const held of batch.actEvents ?? []) {
-              this.emitActEvent(held.buffer, held.from, held.tags);
+              this.emitActEvent(held.buffer, held.from, held.tags, held.verdict);
             }
           }
         }
@@ -3037,10 +3318,7 @@ export class FreeqClient extends EventEmitter {
           const lc = whoisNick.toLowerCase();
           const prevDid = this._nickToDid.get(lc);
           if (prevDid && prevDid !== did) this._didToNick.delete(prevDid);
-          const prevNick = this._didToNick.get(did);
-          if (prevNick && prevNick !== lc) this._nickToDid.delete(prevNick);
-          this._nickToDid.set(lc, did);
-          this._didToNick.set(did, lc);
+          this.learn(whoisNick, did, false);
           // Accumulate for the requestWhois() Promise.
           const buf = this._whoisBuffer.get(lc) ?? { nick: whoisNick, fetchedAt: 0 };
           buf.did = did;

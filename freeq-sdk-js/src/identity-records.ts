@@ -96,7 +96,7 @@ export function recordSignedBytes(record: object): Uint8Array {
 
 /** Announce `key` as a signing key of `did`. */
 export async function buildDeviceRecord(
-  key: DidKey,
+  key: Pick<DidKey, 'publicKeyMultibase' | 'signer'>,
   did: string,
   createdAt: string,
   label?: string,
@@ -117,7 +117,7 @@ export async function buildDeviceRecord(
  * retired key itself, or any other key of the same account.
  */
 export async function buildDeviceRetirement(
-  signer: DidKey,
+  signer: Pick<DidKey, 'publicKeyMultibase' | 'signer'>,
   did: string,
   revokesKid: string,
   createdAt: string,
@@ -168,7 +168,7 @@ export async function buildAgentRetirement(
   return { ...unsigned, bindingSig: await ownerKey.signer(recordSignedBytes(unsigned)) };
 }
 
-async function kidOf(key: DidKey): Promise<string> {
+async function kidOf(key: Pick<DidKey, 'publicKeyMultibase'>): Promise<string> {
   return deriveKid(decodeMultibaseEd25519(key.publicKeyMultibase));
 }
 
@@ -213,6 +213,76 @@ export async function foldDeviceRecords(
       createdAt: new Date(k.createdAt),
       record: k.record,
     }));
+}
+
+/** A device key of the account, with the retirement the fold accepted for it. */
+export interface DeviceKeyHistory {
+  kid: string;
+  publicKeyMultibase: string;
+  createdAt: Date;
+  retiredAt: Date | null;
+  record: unknown;
+}
+
+/**
+ * Every checked device key of `did`, earliest first, each with the date of
+ * the retirement that counts for it, if any. Retirements the fold ignores
+ * (wrong signer, dated before the key) are not reflected.
+ */
+export async function deviceKeyHistory(
+  did: string,
+  records: unknown[],
+): Promise<DeviceKeyHistory[]> {
+  return (await deviceState(did, records)).map((k) => ({
+    kid: k.kid,
+    publicKeyMultibase: k.publicKeyMultibase,
+    createdAt: new Date(k.createdAt),
+    retiredAt: k.retiredAt === null ? null : new Date(k.retiredAt),
+    record: k.record,
+  }));
+}
+
+/**
+ * The entries of `did`'s device key records that decide whether key `kid` is
+ * retired: none when no entry retires `kid`; otherwise the retirements of
+ * `kid`, and, repeatedly, of each key that signed one of those, with the key
+ * records of every such key. `deviceKeyHistory` over these gives `kid` the
+ * `retiredAt` it gives over all of `entries`, and over any subset of them
+ * holding these, so a caller need prove only these to decide it.
+ */
+export function retirementClosure<T>(
+  did: string,
+  kid: string,
+  entries: T[],
+  valueOf: (entry: T) => unknown,
+): T[] {
+  const named = entries.map((entry) => {
+    const value = valueOf(entry);
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+    const raw = value as Record<string, unknown>;
+    if (raw.$type !== DEVICE_KEY_TYPE || raw.did !== did) return null;
+    return {
+      kid: typeof raw.kid === 'string' ? raw.kid : undefined,
+      revokes: typeof raw.revokes === 'string' ? raw.revokes : undefined,
+    };
+  });
+  if (!named.some((n) => n?.revokes === kid)) return [];
+  const kids = new Set([kid]);
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const n of named) {
+      if (n?.revokes === undefined || n.kid === undefined) continue;
+      if (kids.has(n.revokes) && !kids.has(n.kid)) {
+        kids.add(n.kid);
+        grew = true;
+      }
+    }
+  }
+  return entries.filter((_, i) => {
+    const n = named[i];
+    if (!n) return false;
+    return n.revokes !== undefined ? kids.has(n.revokes) : n.kid !== undefined && kids.has(n.kid);
+  });
 }
 
 /**
@@ -478,6 +548,13 @@ export type ResolveDid = (did: string) => Promise<DidDocument>;
  */
 export type Fetch = (url: string) => Promise<Response>;
 
+/** One `listRecords` entry: where the record sits, the CID the PDS gives it, and the record. */
+export interface ListedRecord {
+  uri: string;
+  cid: string;
+  value: unknown;
+}
+
 /**
  * Every record of `collection` in `did`'s repository, as its PDS lists them,
  * unauthenticated. A DID whose document names no PDS has none.
@@ -488,9 +565,19 @@ export async function listRecords(
   did: string,
   collection: string,
 ): Promise<unknown[]> {
+  return (await listRecordEntries(fetch, resolveDid, did, collection)).map((e) => e.value);
+}
+
+/** `listRecords`, keeping each record's uri and CID as the PDS listed them. */
+export async function listRecordEntries(
+  fetch: Fetch,
+  resolveDid: ResolveDid,
+  did: string,
+  collection: string,
+): Promise<ListedRecord[]> {
   const pds = pdsEndpoint(await resolveDid(did));
   if (pds === undefined) return [];
-  const records: unknown[] = [];
+  const records: ListedRecord[] = [];
   let cursor: string | undefined;
   for (;;) {
     const params: Record<string, string> = { repo: did, collection, limit: '100' };
@@ -499,11 +586,15 @@ export async function listRecords(
       await get(fetch, xrpcUrl(pds, 'com.atproto.repo.listRecords', params))
     ).json()) as { records?: unknown; cursor?: unknown };
     if (!Array.isArray(page.records)) throw new Error('listRecords answer is not a record list');
-    for (const listed of page.records as { value?: unknown }[]) {
+    for (const listed of page.records as { uri?: unknown; cid?: unknown; value?: unknown }[]) {
       if (typeof listed !== 'object' || listed === null || !('value' in listed)) {
         throw new Error('listRecords answer has a record with no value');
       }
-      records.push(listed.value);
+      records.push({
+        uri: typeof listed.uri === 'string' ? listed.uri : '',
+        cid: typeof listed.cid === 'string' ? listed.cid : '',
+        value: listed.value,
+      });
     }
     // An empty page ends the listing even if it carries a cursor, so a PDS
     // cannot keep the reader asking forever for nothing.
@@ -511,6 +602,58 @@ export async function listRecords(
     cursor = page.cursor;
   }
   return records;
+}
+
+/**
+ * The records among `entries` whose repository proof checks: the signed
+ * commit names `did`, verifies under the account's `#atproto` key, and holds
+ * the record at the path its uri names in `collection`. Any other record is
+ * left out, as if absent. A passed check is remembered in `proven` by record
+ * CID, so a record's proof is fetched once. A check in flight is shared
+ * through `proving`, so listings racing on one record fetch its proof once; a
+ * failed check is not kept, and the next listing fetches it again.
+ */
+export async function provenRecords(
+  fetch: Fetch,
+  resolveDid: ResolveDid,
+  did: string,
+  collection: string,
+  entries: ListedRecord[],
+  proven: Set<string>,
+  proving: Map<string, Promise<boolean>> = new Map(),
+): Promise<unknown[]> {
+  const prefix = `at://${did}/${collection}/`;
+  const out: unknown[] = [];
+  for (const entry of entries) {
+    let cid: string;
+    try {
+      cid = await recordCid(entry.value);
+    } catch {
+      continue;
+    }
+    if (!proven.has(cid)) {
+      const rkey = entry.uri.startsWith(prefix) ? entry.uri.slice(prefix.length) : '';
+      if (rkey === '' || rkey.includes('/')) continue;
+      let pending = proving.get(cid);
+      if (pending === undefined) {
+        const started: Promise<boolean> = verifyRecord(fetch, resolveDid, did, collection, rkey, cid)
+          .then(
+            (o) => o.commitDidMatches && o.signatureValid && o.recordPresent,
+            () => false,
+          )
+          .then((verified) => {
+            if (verified) proven.add(cid);
+            if (proving.get(cid) === started) proving.delete(cid);
+            return verified;
+          });
+        proving.set(cid, started);
+        pending = started;
+      }
+      if (!(await pending)) continue;
+    }
+    out.push(entry.value);
+  }
+  return out;
 }
 
 /** The device keys of `did` that are live at `at`. */

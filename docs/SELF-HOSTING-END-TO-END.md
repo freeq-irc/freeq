@@ -382,6 +382,7 @@ Flags marked *(env)* can also be set via the named environment variable.
 | `RUST_LOG` | Log level, e.g. `info`, or `freeq_server::s2s=debug,info`. |
 | `FREEQ_LOG_JSON=1` | Emit structured JSON logs (for aggregation). |
 | `BROKER_SHARED_SECRET` | **Leave unset for single-host.** Only needed if you run a *separate* auth-broker subdomain; enables the server's `/auth/broker/*` push endpoints. |
+| `AUTH_BROKER_URL` | **Leave unset for single-host.** With a separate broker, its public URL; a device sign-out deletes the session at the broker. |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | Optional — only for the GitHub credential verifier feature. |
 
 ### Federation (leave OFF for a private instance)
@@ -536,7 +537,8 @@ These are real limitations discovered in the code — plan around them:
    silently fail to start TLS while the web app still works.
 4. **The separate `freeq-auth-broker` is only for split-origin login.** You can
    ignore it entirely on a single domain. If you *do* split login onto a subdomain,
-   both the broker and server need the same `BROKER_SHARED_SECRET`, the broker needs
+   both the broker and server need the same `BROKER_SHARED_SECRET`, the server needs
+   `AUTH_BROKER_URL` pointing at the broker, the broker needs
    `FREEQ_SERVER_URL`/`BROKER_PUBLIC_URL`/`BROKER_DB_PATH` env vars, and its CORS
    allow-list is currently **hardcoded** in `freeq-auth-broker/src/main.rs` (you'd
    have to edit + rebuild it to add your origin). This is why single-origin is simpler.
@@ -557,7 +559,8 @@ For a private company instance, **skip this**.
 Only if login must live on a different subdomain than the web app (production does
 this: `auth.freeq.at` vs `irc.freeq.at`). Run the `freeq-auth-broker` binary with
 `BROKER_SHARED_SECRET`, `FREEQ_SERVER_URL`, `BROKER_PUBLIC_URL`, and `BROKER_DB_PATH`,
-set the same `BROKER_SHARED_SECRET` on the server, and edit the broker's hardcoded
+set the same `BROKER_SHARED_SECRET` and `AUTH_BROKER_URL` (the broker's public URL)
+on the server, and edit the broker's hardcoded
 CORS list. **Not needed** for the single-domain setup in this guide.
 
 ### Docker Compose (alternative to bare-metal)

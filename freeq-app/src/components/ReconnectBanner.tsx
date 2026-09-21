@@ -1,6 +1,7 @@
 import { useStore } from '../store';
 import { disconnect, reconnect } from '../irc/client';
 import { useState, useEffect } from 'react';
+import { TOP_BAR, TOP_BAR_BUTTON, TOP_BAR_QUIET_BUTTON, TOP_BAR_TEXT } from './topBar';
 
 export function ReconnectBanner() {
   const connectionState = useStore((s) => s.connectionState);
@@ -30,11 +31,11 @@ export function ReconnectBanner() {
 
   if (identityLost) {
     return (
-      <div className="flex items-center justify-center gap-3 py-1.5 text-xs font-medium shrink-0 bg-warning/10 text-warning">
-        <span>Signed in as guest — AT Protocol session expired</span>
+      <div className={`${TOP_BAR} bg-warning/10 text-warning border-warning/10`}>
+        <span className={TOP_BAR_TEXT}>Signed in as guest — AT Protocol session expired</span>
         <button
           onClick={() => disconnect()}
-          className="underline hover:no-underline"
+          className={TOP_BAR_BUTTON}
         >
           Sign in again
         </button>
@@ -43,10 +44,10 @@ export function ReconnectBanner() {
   }
 
   return (
-    <div className={`flex items-center justify-center gap-2 py-1.5 text-xs font-medium shrink-0 ${
+    <div className={`${TOP_BAR} ${
       connectionState === 'connecting'
-        ? 'bg-warning/5 text-warning'
-        : 'bg-danger/10 text-danger'
+        ? 'bg-warning/5 text-warning border-warning/10'
+        : 'bg-danger/10 text-danger border-danger/10'
     }`}>
       {connectionState === 'connecting' ? (
         <>
@@ -62,14 +63,14 @@ export function ReconnectBanner() {
           {disconnectedSecs < 5 ? 'Reconnecting...' : 'Connection lost'}
           <button
             onClick={() => reconnect()}
-            className="ml-2 px-2 py-0.5 rounded bg-danger/20 hover:bg-danger/30 text-danger font-medium transition-colors"
+            className={TOP_BAR_BUTTON}
           >
             Reconnect now
           </button>
           {disconnectedSecs >= 10 && (
             <button
               onClick={() => disconnect()}
-              className="px-2 py-0.5 rounded hover:bg-danger/10 text-danger/60 transition-colors"
+              className={`${TOP_BAR_QUIET_BUTTON} text-danger/60`}
             >
               Sign out
             </button>

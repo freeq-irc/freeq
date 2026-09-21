@@ -88,6 +88,9 @@ public enum Validation {
         comps.queryItems = [
             URLQueryItem(name: "handle", value: handle),
             URLQueryItem(name: "mobile", value: "1"),
+            // `intent=enroll` asks the account for permission to write this
+            // device's key records, on top of the identity-only default.
+            URLQueryItem(name: "intent", value: "enroll"),
             URLQueryItem(name: "return_to", value: returnTo),
         ]
         return comps.url

@@ -81,6 +81,7 @@ The server reads these from its environment:
 | `OPER_PASSWORD` | Enables the `OPER` command |
 | `OPER_DIDS` | DIDs auto-granted server operator (comma-separated) |
 | `BROKER_SHARED_SECRET` | HMAC secret shared with a standalone auth broker — **leave unset** to use the embedded broker (setting it disables embedded mode) |
+| `AUTH_BROKER_URL` | Public URL of the standalone auth broker, if you run one; a device sign-out deletes the session there |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | GitHub OAuth for the credential verifier |
 
 Set them with `miren env set` — `-s` marks a value sensitive (masked in CLI
@@ -198,6 +199,8 @@ as a second Miren app with its own disk and:
 | `BROKER_PUBLIC_URL` | `https://auth.example.com` |
 | `FREEQ_SERVER_URL` | `https://irc.example.com` |
 | `BROKER_DB_PATH` | `/data/broker.db` |
+
+On the server, also set `AUTH_BROKER_URL` to the broker's public URL.
 
 ## Federation
 

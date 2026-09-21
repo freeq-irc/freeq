@@ -31,6 +31,8 @@ let package = Package(
                 "CallMicCapture.swift",
                 "ComposeCommands.swift",
                 "DebugBridge.swift",
+                // Keychain + the generated FFI protocols.
+                "DeviceKey.swift",
                 "E2eeManager.swift",
             ],
             sources: [
@@ -78,6 +80,9 @@ let package = Package(
                 "Safety.swift",
                 "SelfStatus.swift",
                 "SignatureProof.swift",
+                "DeviceKeyNotice.swift",
+                "RefusedKeyNotice.swift",
+                "RowSignatureMark.swift",
                 "ComposeTextExtraction.swift",
                 "ShareURL.swift",
                 "Logger.swift",

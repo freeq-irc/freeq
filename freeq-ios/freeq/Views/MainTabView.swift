@@ -38,6 +38,9 @@ struct MainTabView: View {
                         Text("Settings")
                     }
                     .tag(3)
+                    // A dot while this device's key is not published to the
+                    // account — Settings is where it gets fixed.
+                    .badge(appState.signingKeyUnpublished ? Text("●") : nil)
             }
             .tint(Theme.accent)
             .onChange(of: selectedTab) {

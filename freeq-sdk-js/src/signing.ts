@@ -405,6 +405,18 @@ export async function deriveKid(rawPublicKey: Uint8Array): Promise<string> {
   return b64url(new Uint8Array(digest).slice(0, 16));
 }
 
+/**
+ * The millisecond timestamp a ULID msgid embeds in its first 10 characters,
+ * or null for anything that is not a well-formed ULID. The same decode the
+ * server uses for its own ids.
+ */
+export function msgidTimestampMs(id: string): number | null {
+  if (!/^[0-9A-HJKMNP-TV-Z]{26}$/.test(id)) return null;
+  let ts = 0;
+  for (const c of id.slice(0, 10)) ts = ts * 32 + CROCKFORD.indexOf(c);
+  return ts;
+}
+
 /** A signed event: the id the signature covers, and the signature tag value. */
 export interface SignedEvent {
   eventId: string;
@@ -442,6 +454,18 @@ export class SessionSigning {
       log.warn('Ed25519 not available in Web Crypto, falling back to server signing:', e);
       return null;
     }
+  }
+
+  /**
+   * Sign with a key pair the caller holds, such as a stored device key, and
+   * return its base64url public key. The private key may be non-extractable.
+   */
+  async useKeyPair(kp: CryptoKeyPair): Promise<string> {
+    const rawPub = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey));
+    this.signingKey = kp;
+    this.publicKeyB64 = b64url(rawPub);
+    this.publicKeyKid = await deriveKid(rawPub);
+    return this.publicKeyB64;
   }
 
   /** Set the authenticated DID (called after SASL success). */

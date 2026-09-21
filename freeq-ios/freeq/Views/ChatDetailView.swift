@@ -45,7 +45,7 @@ struct ChatDetailView: View {
                 // broker token, revoked refresh, etc.) doesn't trap the user.
                 if appState.connectionState != .registered {
                     HStack(spacing: 8) {
-                        if appState.connectionState == .connecting || appState.connectionState == .connected {
+                        if appState.connectionState == .connecting || appState.connectionState == .connected || appState.reconnecting {
                             ProgressView()
                                 .progressViewStyle(CircularProgressViewStyle(tint: .white))
                                 .scaleEffect(0.7)
@@ -53,7 +53,9 @@ struct ChatDetailView: View {
                             Image(systemName: "wifi.slash")
                                 .font(.system(size: 12))
                         }
-                        Text(appState.connectionState == .disconnected ? "Disconnected" :
+                        // Steady for the whole sequence, not per attempt.
+                        Text(appState.reconnecting ? "Reconnecting…" :
+                             appState.connectionState == .disconnected ? "Disconnected" :
                              appState.connectionState == .connecting ? "Connecting..." : "Registering...")
                             .font(.fqFootnote.weight(.medium))
                         Spacer()
@@ -69,8 +71,8 @@ struct ChatDetailView: View {
                         // no-ops without a broker token, and a button that
                         // silently does nothing is the same bug wearing a
                         // different hat. A guest's escape hatch is Sign out.
-                        if appState.connectionState == .disconnected, appState.hasSavedSession {
-                            Button("Reconnect") { appState.reconnectSavedSession() }
+                        if appState.connectionState == .disconnected, appState.hasSavedSession, !appState.reconnecting {
+                            Button("Reconnect") { appState.reconnectSavedSession(viaBroker: true) }
                                 .font(.fqFootnote.weight(.semibold))
                                 .foregroundColor(.white)
                                 .padding(.horizontal, 8)

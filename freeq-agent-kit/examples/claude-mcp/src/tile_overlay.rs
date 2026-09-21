@@ -299,168 +299,6 @@ fn agenda_svg(title: &str, items: &[(String, String)], w: u32, h: u32) -> String
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn renders(o: &TileOverlay) -> String {
-        overlay_svg(o, 640, 360).expect("overlay should render")
-    }
-
-    #[test]
-    fn status_grid_colors_by_state() {
-        let svg = renders(&TileOverlay::StatusGrid {
-            title: "fleet".into(),
-            items: vec![
-                ("freeq".into(), "up".into()),
-                ("reth".into(), "warn".into()),
-                ("ci".into(), "failed".into()),
-            ],
-        });
-        assert!(svg.contains("fleet") && svg.contains("freeq"));
-        assert!(svg.contains("#7cf3a0")); // up → green
-        assert!(svg.contains("#ffd34d")); // warn → amber
-        assert!(svg.contains("#ff6b6b")); // failed → red
-    }
-
-    #[test]
-    fn chart_tints_by_direction_and_calls_out_last() {
-        let up = renders(&TileOverlay::Chart {
-            title: "BTC".into(),
-            points: vec![100.0, 105.0, 110.0],
-            caption: Some("+10%".into()),
-        });
-        assert!(up.contains("BTC") && up.contains("110.00") && up.contains("+10%"));
-        assert!(up.contains("#7cf3a0")); // rising → green
-        let down = renders(&TileOverlay::Chart {
-            title: "x".into(),
-            points: vec![10.0, 5.0],
-            caption: None,
-        });
-        assert!(down.contains("#ff6b6b")); // falling → red
-        // Degenerate inputs don't panic.
-        let _ = renders(&TileOverlay::Chart {
-            title: "f".into(),
-            points: vec![1.0],
-            caption: None,
-        });
-    }
-
-    #[test]
-    fn diff_colors_added_and_removed() {
-        let svg = renders(&TileOverlay::Diff {
-            path: "src/x.rs".into(),
-            lines: vec!["+ added".into(), "- removed".into(), "  context".into()],
-        });
-        assert!(svg.contains("src/x.rs"));
-        assert!(svg.contains("#7cf3a0")); // + green
-        assert!(svg.contains("#ff8a8a")); // - red
-    }
-
-    #[test]
-    fn agenda_lists_time_and_event() {
-        let svg = renders(&TileOverlay::Agenda {
-            title: "Today".into(),
-            items: vec![
-                ("09:00".into(), "Standup".into()),
-                ("11:30".into(), "1:1".into()),
-            ],
-        });
-        assert!(svg.contains("Today") && svg.contains("09:00") && svg.contains("Standup"));
-    }
-
-    /// Dev helper: render each role overlay to /tmp/overlay-*.png on a
-    /// dark backdrop. `cargo test -p freeq-claude-mcp render_sample_pngs
-    /// -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn render_sample_pngs() {
-        use resvg::tiny_skia::Pixmap;
-        use resvg::usvg;
-        let mut opt = usvg::Options::default();
-        opt.fontdb_mut().load_system_fonts();
-        let mut scratch = Pixmap::new(640, 360).unwrap();
-        let samples: Vec<(&str, TileOverlay)> = vec![
-            (
-                "statusgrid",
-                TileOverlay::StatusGrid {
-                    title: "fleet".into(),
-                    items: vec![
-                        ("freeq".into(), "up".into()),
-                        ("reth".into(), "warn".into()),
-                        ("ci".into(), "pass".into()),
-                        ("bettina".into(), "asleep".into()),
-                        ("golden".into(), "up".into()),
-                        ("watch".into(), "up".into()),
-                    ],
-                },
-            ),
-            (
-                "chart",
-                TileOverlay::Chart {
-                    title: "BTC".into(),
-                    points: vec![100.0, 102.0, 101.5, 105.0, 104.0, 108.0, 107.0, 112.0],
-                    caption: Some("+4.2% · 24h".into()),
-                },
-            ),
-            (
-                "diff",
-                TileOverlay::Diff {
-                    path: "src/auth.rs".into(),
-                    lines: vec![
-                        "  fn login(user: &str) -> Result<Session> {".into(),
-                        "-     accept(user)".into(),
-                        "+     if user.len() > 128 {".into(),
-                        "+         return Err(Error::TooLong);".into(),
-                        "+     }".into(),
-                        "+     accept(user)".into(),
-                        "  }".into(),
-                    ],
-                },
-            ),
-            (
-                "agenda",
-                TileOverlay::Agenda {
-                    title: "Today".into(),
-                    items: vec![
-                        ("09:00".into(), "Standup".into()),
-                        ("11:30".into(), "1:1 w/ Nap".into()),
-                        ("14:00".into(), "Board prep".into()),
-                        ("16:30".into(), "Ada code review".into()),
-                    ],
-                },
-            ),
-        ];
-        for (name, ov) in &samples {
-            let mut px = Pixmap::new(640, 360).unwrap();
-            for p in px.data_mut().chunks_mut(4) {
-                p[0] = 8;
-                p[1] = 10;
-                p[2] = 18;
-                p[3] = 255;
-            }
-            composite_overlay(ov, &mut px, &opt, &mut scratch);
-            px.save_png(format!("/tmp/overlay-{name}.png")).unwrap();
-        }
-    }
-
-    #[test]
-    fn empty_collections_dont_panic() {
-        let _ = renders(&TileOverlay::StatusGrid {
-            title: "e".into(),
-            items: vec![],
-        });
-        let _ = renders(&TileOverlay::Agenda {
-            title: "e".into(),
-            items: vec![],
-        });
-        let _ = renders(&TileOverlay::Diff {
-            path: "e".into(),
-            lines: vec![],
-        });
-    }
-}
-
 fn status_svg(label: &str, w: u32, _h: u32) -> String {
     let label = escape(label);
     format!(
@@ -664,4 +502,166 @@ fn escape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn renders(o: &TileOverlay) -> String {
+        overlay_svg(o, 640, 360).expect("overlay should render")
+    }
+
+    #[test]
+    fn status_grid_colors_by_state() {
+        let svg = renders(&TileOverlay::StatusGrid {
+            title: "fleet".into(),
+            items: vec![
+                ("freeq".into(), "up".into()),
+                ("reth".into(), "warn".into()),
+                ("ci".into(), "failed".into()),
+            ],
+        });
+        assert!(svg.contains("fleet") && svg.contains("freeq"));
+        assert!(svg.contains("#7cf3a0")); // up → green
+        assert!(svg.contains("#ffd34d")); // warn → amber
+        assert!(svg.contains("#ff6b6b")); // failed → red
+    }
+
+    #[test]
+    fn chart_tints_by_direction_and_calls_out_last() {
+        let up = renders(&TileOverlay::Chart {
+            title: "BTC".into(),
+            points: vec![100.0, 105.0, 110.0],
+            caption: Some("+10%".into()),
+        });
+        assert!(up.contains("BTC") && up.contains("110.00") && up.contains("+10%"));
+        assert!(up.contains("#7cf3a0")); // rising → green
+        let down = renders(&TileOverlay::Chart {
+            title: "x".into(),
+            points: vec![10.0, 5.0],
+            caption: None,
+        });
+        assert!(down.contains("#ff6b6b")); // falling → red
+        // Degenerate inputs don't panic.
+        let _ = renders(&TileOverlay::Chart {
+            title: "f".into(),
+            points: vec![1.0],
+            caption: None,
+        });
+    }
+
+    #[test]
+    fn diff_colors_added_and_removed() {
+        let svg = renders(&TileOverlay::Diff {
+            path: "src/x.rs".into(),
+            lines: vec!["+ added".into(), "- removed".into(), "  context".into()],
+        });
+        assert!(svg.contains("src/x.rs"));
+        assert!(svg.contains("#7cf3a0")); // + green
+        assert!(svg.contains("#ff8a8a")); // - red
+    }
+
+    #[test]
+    fn agenda_lists_time_and_event() {
+        let svg = renders(&TileOverlay::Agenda {
+            title: "Today".into(),
+            items: vec![
+                ("09:00".into(), "Standup".into()),
+                ("11:30".into(), "1:1".into()),
+            ],
+        });
+        assert!(svg.contains("Today") && svg.contains("09:00") && svg.contains("Standup"));
+    }
+
+    /// Dev helper: render each role overlay to /tmp/overlay-*.png on a
+    /// dark backdrop. `cargo test -p freeq-claude-mcp render_sample_pngs
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn render_sample_pngs() {
+        use resvg::tiny_skia::Pixmap;
+        use resvg::usvg;
+        let mut opt = usvg::Options::default();
+        opt.fontdb_mut().load_system_fonts();
+        let mut scratch = Pixmap::new(640, 360).unwrap();
+        let samples: Vec<(&str, TileOverlay)> = vec![
+            (
+                "statusgrid",
+                TileOverlay::StatusGrid {
+                    title: "fleet".into(),
+                    items: vec![
+                        ("freeq".into(), "up".into()),
+                        ("reth".into(), "warn".into()),
+                        ("ci".into(), "pass".into()),
+                        ("bettina".into(), "asleep".into()),
+                        ("golden".into(), "up".into()),
+                        ("watch".into(), "up".into()),
+                    ],
+                },
+            ),
+            (
+                "chart",
+                TileOverlay::Chart {
+                    title: "BTC".into(),
+                    points: vec![100.0, 102.0, 101.5, 105.0, 104.0, 108.0, 107.0, 112.0],
+                    caption: Some("+4.2% · 24h".into()),
+                },
+            ),
+            (
+                "diff",
+                TileOverlay::Diff {
+                    path: "src/auth.rs".into(),
+                    lines: vec![
+                        "  fn login(user: &str) -> Result<Session> {".into(),
+                        "-     accept(user)".into(),
+                        "+     if user.len() > 128 {".into(),
+                        "+         return Err(Error::TooLong);".into(),
+                        "+     }".into(),
+                        "+     accept(user)".into(),
+                        "  }".into(),
+                    ],
+                },
+            ),
+            (
+                "agenda",
+                TileOverlay::Agenda {
+                    title: "Today".into(),
+                    items: vec![
+                        ("09:00".into(), "Standup".into()),
+                        ("11:30".into(), "1:1 w/ Nap".into()),
+                        ("14:00".into(), "Board prep".into()),
+                        ("16:30".into(), "Ada code review".into()),
+                    ],
+                },
+            ),
+        ];
+        for (name, ov) in &samples {
+            let mut px = Pixmap::new(640, 360).unwrap();
+            for p in px.data_mut().chunks_mut(4) {
+                p[0] = 8;
+                p[1] = 10;
+                p[2] = 18;
+                p[3] = 255;
+            }
+            composite_overlay(ov, &mut px, &opt, &mut scratch);
+            px.save_png(format!("/tmp/overlay-{name}.png")).unwrap();
+        }
+    }
+
+    #[test]
+    fn empty_collections_dont_panic() {
+        let _ = renders(&TileOverlay::StatusGrid {
+            title: "e".into(),
+            items: vec![],
+        });
+        let _ = renders(&TileOverlay::Agenda {
+            title: "e".into(),
+            items: vec![],
+        });
+        let _ = renders(&TileOverlay::Diff {
+            path: "e".into(),
+            lines: vec![],
+        });
+    }
 }

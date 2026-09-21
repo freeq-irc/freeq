@@ -164,11 +164,15 @@ struct ConnectionStatusBanner: View {
     }
 
     private var showEscapeHatch: Bool {
-        appState.connectionState == .disconnected && elapsed >= Self.escapeHatchSeconds
+        (appState.reconnecting || appState.connectionState == .disconnected) && elapsed >= Self.escapeHatchSeconds
     }
 
     private var statusIcon: some View {
         Group {
+            // One steady spinner for a whole reconnect sequence, as in the chat bar.
+            if appState.reconnecting {
+                ProgressView().controlSize(.mini).tint(Theme.accent)
+            } else {
             switch appState.connectionState {
             case .disconnected:
                 if !networkMonitor.isConnected {
@@ -183,12 +187,14 @@ struct ConnectionStatusBanner: View {
             case .registered:
                 EmptyView()
             }
+            }
         }
         .frame(width: 14, height: 14)
     }
 
     private var statusText: String {
-        switch appState.connectionState {
+        // A reconnect sequence reads as one state, not one per attempt.
+        switch appState.reconnecting ? .disconnected : appState.connectionState {
         case .disconnected:
             if !networkMonitor.isConnected { return "Offline — messages will sync when you reconnect" }
             return elapsed < 12 ? "Signing in…" : "Still trying — network looks slow"

@@ -4,17 +4,18 @@
  * Runs against a local freeq-server (see playwright.config.ts). Point
  * FREEQ_WEB at a real deployment to run the same flows there.
  *
- * Signing is the default state of a message, so it earns no resting ink —
- * there is no marker to click. Verification is an explicit request: the
- * message context menu offers "Verify Signature…", and the panel it opens
- * says only what the check actually established. The one mark a row can ever
- * wear is the ⚠ after a check answered "invalid".
+ * The check runs on this device as the line arrives: the SDK rebuilds what
+ * was signed and looks the signer's key up. A row wears the mark its verdict
+ * earns — the lock when the sender's own device signed, or the ⚠ after a
+ * check that did not hold — and the panel behind "Verify Signature…" says
+ * what the check established, asking the server nothing.
  */
 import { test, expect, type Page } from '@playwright/test';
 import { uniqueNick, uniqueChannel, connectGuest, sendMessage, expectMessage } from './helpers';
-// The verdict wording lives in one table every client shares. Assert from
-// that table, not from a copy of it: rewording a verdict is not a regression.
-import { VERIFY_LABELS } from '../src/lib/verify-signature';
+// The verdict wording lives in one model every client shares (the SDK reads
+// spec/verdict-model.json). Assert from it, not from a copy: rewording a
+// verdict is not a regression.
+import { verdictCopy } from '../src/lib/verify-signature';
 
 /**
  * Put a signed message into the open conversation, as if it had arrived.
@@ -28,17 +29,22 @@ async function receiveSignedMessage(
   page: Page,
   channel: string,
   msg: { id: string; from: string; text: string; encrypted?: boolean },
+  verdict?: { state: string; layer?: string; kid?: string; keySource?: string },
 ) {
   await page.evaluate(
-    async ({ channel, msg }) => {
+    async ({ channel, msg, verdict }) => {
       const { useStore } = await import('/src/store.ts');
+      const { recordVerdict } = await import('/src/lib/verify-signature.ts');
       useStore.getState().addMessage(channel, {
         ...msg,
         timestamp: new Date(),
         tags: { '+freeq.at/sig': 'ed25519:kid:signature', msgid: msg.id },
       });
+      // The SDK settles a verdict for a line that came off the wire; this one
+      // was put straight into the store, so its verdict is put there too.
+      if (verdict) recordVerdict(msg.id, verdict);
     },
-    { channel, msg },
+    { channel, msg, verdict },
   );
 }
 
@@ -49,21 +55,64 @@ async function requestVerify(page: Page, text: string) {
 }
 
 test.describe('signature verification', () => {
-  test('nothing signature-related rests on a message', async ({ page }) => {
+  test('a line whose key is still being looked up wears nothing', async ({ page }) => {
     const channel = uniqueChannel();
     await connectGuest(page, uniqueNick(), channel);
-    await receiveSignedMessage(page, channel, {
-      id: '01JBADGERESTINGSILENT000001',
-      from: 'someone',
-      text: 'a signed message wearing nothing',
-    });
+    await receiveSignedMessage(
+      page,
+      channel,
+      {
+        id: '01JBADGERESTINGSILENT000001',
+        from: 'someone',
+        text: 'a signed message wearing nothing',
+      },
+      { state: 'pending', kid: 'kid' },
+    );
     await expectMessage(page, 'a signed message wearing nothing');
 
     await expect(page.getByTestId('verify-panel')).toHaveCount(0);
+    await expect(page.getByTestId('sig-device-mark')).toHaveCount(0);
     await expect(
       page.getByTestId('sig-invalid-mark'),
-      'the ⚠ exists only after a check answered invalid',
+      'the ⚠ exists only after a check that did not hold',
     ).toHaveCount(0);
+  });
+
+  test('the mark a row wears is the verdict the check reached', async ({ page }) => {
+    const channel = uniqueChannel();
+    await connectGuest(page, uniqueNick(), channel);
+    await receiveSignedMessage(
+      page,
+      channel,
+      { id: '01JBADGEPUBLISHEDKEY000001', from: 'someone', text: 'signed on their own device' },
+      { state: 'device', layer: 'published', kid: 'kid1', keySource: 'IdentityRecord' },
+    );
+    await receiveSignedMessage(
+      page,
+      channel,
+      { id: '01JBADGEVOUCHEDKEY00000001', from: 'someone', text: 'signed under a vouched key' },
+      { state: 'device', layer: 'vouched', kid: 'kid2', keySource: 'OriginServer' },
+    );
+    await receiveSignedMessage(
+      page,
+      channel,
+      { id: '01JBADGESERVERSIGNED000001', from: 'someone', text: 'signed by the server' },
+      { state: 'server', kid: 'kid3' },
+    );
+    await expectMessage(page, 'signed by the server');
+
+    const marks = page.getByTestId('sig-device-mark');
+    await expect(marks).toHaveCount(2);
+    await expect(marks.first()).toHaveAttribute('data-layer', 'published');
+    await expect(marks.nth(1)).toHaveAttribute('data-layer', 'vouched');
+    await expect(marks.first()).toHaveAttribute(
+      'title',
+      verdictCopy('device', 'message', 'published').line,
+    );
+    // The lock alone, with no word beside it.
+    await expect(marks.first()).toHaveText('🔒');
+    // A signature the server made on the sender's behalf wears nothing.
+    await expect(page.getByTestId('sig-server-mark')).toHaveCount(0);
   });
 
   test('an unsigned message answers with a fact, not a warning', async ({ page }) => {
@@ -84,23 +133,27 @@ test.describe('signature verification', () => {
     await expect(page.getByTestId('verify-panel')).toHaveCount(0);
   });
 
-  test('a signed message shows what the server actually answered', async ({ page }) => {
+  test('a signed message shows what the check found', async ({ page }) => {
     const channel = uniqueChannel();
     await connectGuest(page, uniqueNick(), channel);
-    await receiveSignedMessage(page, channel, {
-      id: '01JBADGEUNCHECKED0000000001',
-      from: 'someone',
-      text: 'a message with a signature on it',
-    });
+    await receiveSignedMessage(
+      page,
+      channel,
+      {
+        id: '01JBADGEUNCHECKED0000000001',
+        from: 'someone',
+        text: 'a message with a signature on it',
+      },
+      { state: 'unverifiable', kid: 'kid' },
+    );
     await expectMessage(page, 'a message with a signature on it');
 
     await requestVerify(page, 'a message with a signature on it');
     const panel = page.getByTestId('verify-panel');
-    await expect(panel).not.toHaveAttribute('data-verdict', 'checking', { timeout: 10_000 });
-    // Nothing on this server ever signed that id, so the honest answer is
-    // that it cannot be checked — and it must not read as verified.
+    // No source held the key, so the honest answer is that it cannot be
+    // checked — and it must not read as verified.
     await expect(panel).toHaveAttribute('data-verdict', 'unverifiable');
-    await expect(panel.getByText(VERIFY_LABELS.unverifiable.heading)).toBeVisible();
+    await expect(panel.getByText(verdictCopy('unverifiable').heading)).toBeVisible();
     await panel.getByRole('button', { name: 'Dismiss' }).click();
     await expect(page.getByTestId('verify-panel')).toHaveCount(0);
   });
@@ -174,29 +227,57 @@ test.describe('signature verification', () => {
   test('a check that answers invalid marks the row — and only that answer does', async ({ page }) => {
     const channel = uniqueChannel();
     await connectGuest(page, uniqueNick(), channel);
-    await receiveSignedMessage(page, channel, {
-      id: '01JBADGEINVALIDMARK0000001',
-      from: 'someone',
-      text: 'a signature that will not hold up',
-    });
-    await expectMessage(page, 'a signature that will not hold up');
-
-    // The server-side "invalid" answer essentially never occurs in the wild,
-    // so it is staged: the endpoint is mocked, everything downstream is real.
-    await page.route('**/api/v1/verify/**', (route) =>
-      route.fulfill({ json: { verification: { verdict: 'invalid', verified_by: 'client-session-key' } } }),
+    // A signature that does not hold essentially never occurs in the wild, so
+    // the verdict is staged; everything downstream of it is real.
+    await receiveSignedMessage(
+      page,
+      channel,
+      {
+        id: '01JBADGEINVALIDMARK0000001',
+        from: 'someone',
+        text: 'a signature that will not hold up',
+      },
+      { state: 'invalid', kid: 'kid' },
     );
+    await expectMessage(page, 'a signature that will not hold up');
 
     await requestVerify(page, 'a signature that will not hold up');
     const panel = page.getByTestId('verify-panel');
-    await expect(panel).toHaveAttribute('data-verdict', 'invalid', { timeout: 10_000 });
-    await expect(panel.getByText(VERIFY_LABELS.invalid.heading)).toBeVisible();
+    await expect(panel).toHaveAttribute('data-verdict', 'invalid');
+    await expect(panel.getByText(verdictCopy('invalid').heading)).toBeVisible();
     await panel.getByRole('button', { name: 'Dismiss' }).click();
 
     await expect(
       page.getByTestId('sig-invalid-mark'),
       'the row wears the verdict after the panel is gone',
     ).toHaveCount(1);
+  });
+
+  test('a key the account has not got leaves the room working and says so', async ({ page }) => {
+    const channel = uniqueChannel();
+    await connectGuest(page, uniqueNick(), channel);
+    // What a broker that refuses to publish the key leaves behind. The
+    // refusal itself is the SDK's (client.device-key.test.ts): this rig has
+    // no broker and no identity to publish for.
+    await page.evaluate(async () => {
+      const client = await import('/src/irc/client.ts');
+      client.__setKeyUnpublishedForTests();
+    });
+
+    // The bar holding the sentence and its buttons: the innermost div with
+    // that text.
+    const banner = page.locator('div', { hasText: 'Security upgrade available:' }).last();
+    await expect(banner).toBeVisible();
+    await expect(page.getByText('so others can verify messages from this device')).toBeVisible();
+
+    // The session keeps working, which is the whole point of not blocking on
+    // enrollment.
+    await sendMessage(page, 'still talking with an unpublished key');
+    await expectMessage(page, 'still talking with an unpublished key');
+
+    // Dismissable, and dismissed for this session only.
+    await banner.getByRole('button', { name: '✕' }).click();
+    await expect(banner).toHaveCount(0);
   });
 
   test('a follow-up row offers the same request', async ({ page }) => {
@@ -217,6 +298,66 @@ test.describe('signature verification', () => {
     await requestVerify(page, 'second thing said');
     await expect(page.getByTestId('verify-panel')).toHaveCount(1);
     await page.getByTestId('verify-panel').getByRole('button', { name: 'Dismiss' }).click();
+  });
+
+  test('a run from one nick breaks wherever the row mark changes', async ({ page }, testInfo) => {
+    const channel = uniqueChannel();
+    await connectGuest(page, uniqueNick(), channel);
+    const published = { state: 'device', layer: 'published', kid: 'kidpub', keySource: 'IdentityRecord' };
+    const lines = [
+      { id: '01JBADGEMARKRUN00000000001', text: 'run line one, published key', verdict: published },
+      { id: '01JBADGEMARKRUN00000000002', text: 'run line two, published key', verdict: published },
+      {
+        id: '01JBADGEMARKRUN00000000003',
+        text: 'run line three, vouched key',
+        verdict: { state: 'device', layer: 'vouched', kid: 'kidvouch', keySource: 'OriginServer' },
+      },
+      {
+        id: '01JBADGEMARKRUN00000000004',
+        text: 'run line four, retired key',
+        verdict: { state: 'retired', kid: 'kidpub', keySource: 'IdentityRecord' },
+      },
+      { id: '01JBADGEMARKRUN00000000005', text: 'run line five, published key again', verdict: published },
+    ];
+    for (const l of lines) {
+      await receiveSignedMessage(page, channel, { id: l.id, from: 'someone', text: l.text }, l.verdict);
+    }
+    await expectMessage(page, lines[4].text);
+
+    const list = page.getByTestId('message-list');
+    const header = (text: string) => list.locator('.msg-full', { hasText: text });
+    const followUp = (text: string) => list.locator('div.group:not(.msg-full)', { hasText: text });
+
+    // Lines one and two share a header, which wears the full lock once.
+    const first = header(lines[0].text);
+    await expect(first).toHaveCount(1);
+    await expect(first).not.toContainText(lines[1].text);
+    await expect(first.getByTestId('sig-device-mark')).toHaveAttribute('data-layer', 'published');
+    await expect(header(lines[1].text)).toHaveCount(0);
+    const second = followUp(lines[1].text);
+    await expect(second).toHaveCount(1);
+    await expect(second.getByTestId('sig-device-mark')).toHaveCount(0);
+    await expect(second.getByTestId('sig-invalid-mark')).toHaveCount(0);
+
+    // Each change of mark starts its own header, carrying the new mark.
+    const third = header(lines[2].text);
+    await expect(third).toHaveCount(1);
+    await expect(third.getByTestId('sig-device-mark')).toHaveAttribute('data-layer', 'vouched');
+    await expect(third.getByTestId('sig-device-mark')).toHaveClass(/opacity-30/);
+
+    const fourth = header(lines[3].text);
+    await expect(fourth).toHaveCount(1);
+    await expect(fourth.getByTestId('sig-invalid-mark')).toHaveCount(1);
+    await expect(fourth.getByTestId('sig-device-mark')).toHaveCount(0);
+
+    const fifth = header(lines[4].text);
+    await expect(fifth).toHaveCount(1);
+    await expect(fifth.getByTestId('sig-device-mark')).toHaveAttribute('data-layer', 'published');
+    await expect(fifth.getByTestId('sig-device-mark')).not.toHaveClass(/opacity-30/);
+
+    const shot = testInfo.outputPath('grouping-by-mark.png');
+    await list.screenshot({ path: shot });
+    await testInfo.attach('grouping-by-mark', { path: shot, contentType: 'image/png' });
   });
 
   test('an encrypted message still shows what it is', async ({ page }) => {

@@ -54,6 +54,7 @@ import com.freeq.model.ChannelState
 import com.freeq.model.UnreadBoundary
 import com.freeq.model.PinCache
 import com.freeq.model.SenderIdentity
+import com.freeq.model.RowSignatureMark
 import com.freeq.model.SignatureVerdict
 import com.freeq.model.ChatMessage
 import com.freeq.model.MemberInfo
@@ -77,6 +78,37 @@ fun MessageList(
     // `from`) always render.
     val messages = channelState.messages.filter { msg ->
         msg.from.isEmpty() || !appState.isBlocked(msg.from, appState.didForNick(msg.from))
+    }
+
+    // Show header if sender changes, >5 min gap, or after date/system/deleted boundary.
+    // Also break across a provenance boundary: a federated message (msg.origin
+    // set) must not collapse under a local sender's header, or it loses its
+    // "via {origin}" and inherits the local verified/signed context.
+    val runBreaks = remember(messages) {
+        messages.mapIndexed { index, msg ->
+            val prevMsg = messages.getOrNull(index - 1)
+            prevMsg == null
+                || msg.from != prevMsg.from
+                || prevMsg.from.isEmpty()
+                || prevMsg.isDeleted
+                || msg.origin != prevMsg.origin
+                || msg.timestamp.time - prevMsg.timestamp.time > 5 * 60 * 1000
+                || formatDate(msg.timestamp) != formatDate(prevMsg.timestamp)
+        }
+    }
+    // A row that would group also starts a header when its settled mark differs
+    // from its header's. Derived from the checked verdicts, so it regroups when
+    // one settles.
+    val showHeaders by remember(messages, runBreaks) {
+        derivedStateOf {
+            var headerMark: RowSignatureMark.Settled? = null
+            messages.mapIndexed { index, msg ->
+                val mark = RowSignatureMark.settled(SignatureVerdict.checked[msg.id] ?: msg.verdict)
+                val show = runBreaks[index] || RowSignatureMark.startsHeader(headerMark, mark)
+                if (show) headerMark = mark
+                show
+            }
+        }
     }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
@@ -235,7 +267,6 @@ fun MessageList(
                 val prevMsg = if (index > 0) messages[index - 1] else null
                 val currentDate = formatDate(msg.timestamp)
                 val prevDate = prevMsg?.let { formatDate(it.timestamp) }
-                val timeDiff = if (prevMsg != null) msg.timestamp.time - prevMsg.timestamp.time else Long.MAX_VALUE
 
                 // Unread separator — show before the first unread message
                 val showingUnread = msg.id == unreadSeparatorMsgId
@@ -262,17 +293,7 @@ fun MessageList(
                     return@itemsIndexed
                 }
 
-                // Show header if sender changes, >5 min gap, or after date/system/deleted boundary.
-                // Also break across a provenance boundary: a federated message (msg.origin
-                // set) must not collapse under a local sender's header, or it loses its
-                // "via {origin}" and inherits the local verified/signed context.
-                val showHeader = prevMsg == null
-                    || msg.from != prevMsg.from
-                    || prevMsg.from.isEmpty()
-                    || prevMsg.isDeleted
-                    || msg.origin != prevMsg.origin
-                    || timeDiff > 5 * 60 * 1000
-                    || currentDate != prevDate
+                val showHeader = showHeaders[index]
 
                 MessageBubble(
                     msg = msg,
@@ -631,14 +652,20 @@ private fun MessageBubble(
                             fontSize = 11.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
                         )
-                        // Signing is the default state of a message, so a
-                        // signed row wears nothing. The one mark a signature
-                        // ever leaves here is this: a check the user asked for
-                        // came back saying the signature does not match the
-                        // key it names. Never speculative — only after
-                        // evidence.
-                        if (SignatureVerdict.checked[msg.id]?.marksTheRow == true) {
-                            Icon(
+                        // The mark the verdict earns (RowSignatureMark);
+                        // tapping it opens the proof.
+                        val rowVerdict = SignatureVerdict.checked[msg.id] ?: msg.verdict
+                        when (val mark = RowSignatureMark.of(rowVerdict)) {
+                            is RowSignatureMark.Lock -> Icon(
+                                Icons.Default.Lock,
+                                contentDescription = rowVerdict?.sentence,
+                                tint = FreeqColors.success,
+                                modifier = Modifier
+                                    .size(12.dp)
+                                    .alpha(mark.alpha)
+                                    .clickable { showMessageProof = true }
+                            )
+                            RowSignatureMark.Warning -> Icon(
                                 Icons.Default.Warning,
                                 contentDescription = "Signature does not match its key",
                                 tint = FreeqColors.danger,
@@ -646,6 +673,7 @@ private fun MessageBubble(
                                     .size(12.dp)
                                     .clickable { showMessageProof = true }
                             )
+                            null -> {}
                         }
                         if (msg.isEdited) {
                             Text(
@@ -884,7 +912,7 @@ private fun MessageBubble(
         // neither claims nor disowns an identity.
         if (showMessageProof) {
             VerifiedProofSheet(
-                request = ProofRequest.Message(msg.id, signed = msg.isSigned),
+                request = ProofRequest.Message(msg.id, signed = msg.isSigned, verdict = msg.verdict),
                 onDismiss = { showMessageProof = false }
             )
         }
@@ -904,6 +932,7 @@ private fun MessageBubble(
                     senderLiveDid = senderMember?.did,
                     msgId = msg.id,
                     signed = msg.isSigned,
+                    verdict = msg.verdict,
                 ),
                 onDismiss = { showIdentityProof = false },
                 appState = appState

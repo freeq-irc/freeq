@@ -202,6 +202,7 @@ impl Orchestrator {
             tls_insecure: false,
             web_token: None,
             websocket_url,
+            ..Default::default()
         };
         let signer = Arc::new(KeySigner::new(ident.did.clone(), ident.private_key));
         let (handle, mut events) = client::connect(conn_config, Some(signer));
@@ -1265,6 +1266,113 @@ fn heartbeat_due(now: i64, delivered: i64, said: i64, last_beat: i64, beats: u32
         && beats < HEARTBEAT_MAX_BEATS
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn is_peer(peers: &[String], nick: &str) -> bool {
+    let prefix = nick.split('-').next().unwrap_or(nick).to_lowercase();
+    peers.iter().any(|p| {
+        let p = p.to_lowercase();
+        p == nick.to_lowercase() || p == prefix
+    })
+}
+
+async fn wait_for_registration(events: &mut mpsc::Receiver<Event>) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, events.recv()).await {
+            Ok(Some(Event::Registered { .. })) => return Ok(()),
+            Ok(Some(Event::AuthFailed { reason })) => {
+                return Err(anyhow!("SASL auth failed: {reason}"));
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => return Err(anyhow!("event stream closed during registration")),
+            Err(_) => return Err(anyhow!("registration timeout")),
+        }
+    }
+    Err(anyhow!("registration timeout"))
+}
+
+/// Watch for a `+freeq.at/av-state=started` TAGMSG on the channel and
+/// return its session id.
+async fn wait_for_av_started(events: &mut mpsc::Receiver<Event>, channel: &str) -> Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, events.recv()).await {
+            Ok(Some(Event::TagMsg { target, tags, .. })) if target == channel => {
+                if let Some(state) = parse_av_state(&tags)
+                    && state.action == AvAction::Started
+                {
+                    return Ok(state.session_id);
+                }
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => return Err(anyhow!("event stream closed waiting for av-state")),
+            Err(_) => return Err(anyhow!("timed out waiting for av-state=started")),
+        }
+    }
+    Err(anyhow!("timed out waiting for av-state=started"))
+}
+
+fn derive_transport(server: &str) -> Result<(Option<String>, String)> {
+    if server.starts_with("ws://") || server.starts_with("wss://") {
+        let u: url::Url = server.parse().context("parsing server URL")?;
+        let host = u.host_str().unwrap_or("localhost");
+        let port = u
+            .port()
+            .unwrap_or(if server.starts_with("wss") { 443 } else { 80 });
+        Ok((Some(server.to_string()), format!("{host}:{port}")))
+    } else if server.starts_with("https://") || server.starts_with("http://") {
+        let u: url::Url = server.parse().context("parsing server URL")?;
+        let host = u.host_str().unwrap_or("localhost");
+        let port = u
+            .port()
+            .unwrap_or(if server.starts_with("https") { 443 } else { 80 });
+        let ws_scheme = if server.starts_with("https") {
+            "wss"
+        } else {
+            "ws"
+        };
+        let path = u.path();
+        let ws = format!("{ws_scheme}://{host}:{port}{path}");
+        Ok((Some(ws), format!("{host}:{port}")))
+    } else {
+        Ok((None, server.to_string()))
+    }
+}
+
+fn build_stt(cfg: &OrcConfig) -> Result<SttEngine> {
+    if let Some(key) = cfg.groq_api_key.clone()
+        && !key.trim().is_empty()
+    {
+        // Vocabulary prompt: our own nick AND the peer agents' — every
+        // name in the room that Whisper must not render as a phonetic
+        // neighbour ("Clyde" → "Lighthouse").
+        let mut vocab = vec![cfg.nick.clone()];
+        vocab.extend(cfg.peer_agents.iter().cloned());
+        return Ok(SttEngine::groq(
+            key,
+            "whisper-large-v3-turbo".to_string(),
+            &vocab,
+        ));
+    }
+    tracing::warn!(
+        "no GROQ_API_KEY in config — transcription is a no-op. \
+         Set GROQ_API_KEY before connecting."
+    );
+    Ok(SttEngine::noop())
+}
+
+/// Re-export for the binaries that need to look up an Identity
+/// independently (e.g. for printing on startup).
+pub use freeq_eliza::identity as eliza_identity;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1446,110 +1554,3 @@ mod tests {
         let _ = level.load(O::Relaxed);
     }
 }
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-fn is_peer(peers: &[String], nick: &str) -> bool {
-    let prefix = nick.split('-').next().unwrap_or(nick).to_lowercase();
-    peers.iter().any(|p| {
-        let p = p.to_lowercase();
-        p == nick.to_lowercase() || p == prefix
-    })
-}
-
-async fn wait_for_registration(events: &mut mpsc::Receiver<Event>) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(remaining, events.recv()).await {
-            Ok(Some(Event::Registered { .. })) => return Ok(()),
-            Ok(Some(Event::AuthFailed { reason })) => {
-                return Err(anyhow!("SASL auth failed: {reason}"));
-            }
-            Ok(Some(_)) => continue,
-            Ok(None) => return Err(anyhow!("event stream closed during registration")),
-            Err(_) => return Err(anyhow!("registration timeout")),
-        }
-    }
-    Err(anyhow!("registration timeout"))
-}
-
-/// Watch for a `+freeq.at/av-state=started` TAGMSG on the channel and
-/// return its session id.
-async fn wait_for_av_started(events: &mut mpsc::Receiver<Event>, channel: &str) -> Result<String> {
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(remaining, events.recv()).await {
-            Ok(Some(Event::TagMsg { target, tags, .. })) if target == channel => {
-                if let Some(state) = parse_av_state(&tags)
-                    && state.action == AvAction::Started
-                {
-                    return Ok(state.session_id);
-                }
-            }
-            Ok(Some(_)) => continue,
-            Ok(None) => return Err(anyhow!("event stream closed waiting for av-state")),
-            Err(_) => return Err(anyhow!("timed out waiting for av-state=started")),
-        }
-    }
-    Err(anyhow!("timed out waiting for av-state=started"))
-}
-
-fn derive_transport(server: &str) -> Result<(Option<String>, String)> {
-    if server.starts_with("ws://") || server.starts_with("wss://") {
-        let u: url::Url = server.parse().context("parsing server URL")?;
-        let host = u.host_str().unwrap_or("localhost");
-        let port = u
-            .port()
-            .unwrap_or(if server.starts_with("wss") { 443 } else { 80 });
-        Ok((Some(server.to_string()), format!("{host}:{port}")))
-    } else if server.starts_with("https://") || server.starts_with("http://") {
-        let u: url::Url = server.parse().context("parsing server URL")?;
-        let host = u.host_str().unwrap_or("localhost");
-        let port = u
-            .port()
-            .unwrap_or(if server.starts_with("https") { 443 } else { 80 });
-        let ws_scheme = if server.starts_with("https") {
-            "wss"
-        } else {
-            "ws"
-        };
-        let path = u.path();
-        let ws = format!("{ws_scheme}://{host}:{port}{path}");
-        Ok((Some(ws), format!("{host}:{port}")))
-    } else {
-        Ok((None, server.to_string()))
-    }
-}
-
-fn build_stt(cfg: &OrcConfig) -> Result<SttEngine> {
-    if let Some(key) = cfg.groq_api_key.clone()
-        && !key.trim().is_empty()
-    {
-        // Vocabulary prompt: our own nick AND the peer agents' — every
-        // name in the room that Whisper must not render as a phonetic
-        // neighbour ("Clyde" → "Lighthouse").
-        let mut vocab = vec![cfg.nick.clone()];
-        vocab.extend(cfg.peer_agents.iter().cloned());
-        return Ok(SttEngine::groq(
-            key,
-            "whisper-large-v3-turbo".to_string(),
-            &vocab,
-        ));
-    }
-    tracing::warn!(
-        "no GROQ_API_KEY in config — transcription is a no-op. \
-         Set GROQ_API_KEY before connecting."
-    );
-    Ok(SttEngine::noop())
-}
-
-/// Re-export for the binaries that need to look up an Identity
-/// independently (e.g. for printing on startup).
-pub use freeq_eliza::identity as eliza_identity;

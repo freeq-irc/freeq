@@ -17,7 +17,7 @@ use freeq_sdk::did::DidResolver;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use freeq_server::server::{OauthPurpose, scope_satisfies_purpose};
+use freeq_server::server::{OauthPurpose, login_scope, scope_satisfies_purpose};
 
 async fn start_server() -> (
     SocketAddr,
@@ -66,6 +66,14 @@ async fn client_metadata_advertises_narrow_scopes() {
     assert!(
         tokens.contains("repo:app.bsky.feed.post"),
         "metadata must include the granular Bluesky cross-post scope; got: {scope}"
+    );
+    assert!(
+        tokens.contains("repo:at.freeq.deviceKey?action=create"),
+        "metadata must include the device-key grant so enroll can request it; got: {scope}"
+    );
+    assert!(
+        tokens.contains("repo:at.freeq.agentKey?action=create"),
+        "metadata must include the agent-key grant so enroll can request it; got: {scope}"
     );
     // (transition:generic remains until the grace period closes — see
     // `metadata_keeps_transition_generic_for_refresh_grace_period`.)
@@ -306,6 +314,30 @@ fn requested_scopes_are_narrow_not_transition_generic() {
     }
 }
 
+#[test]
+fn login_scope_is_identity_only_unless_enrolling() {
+    assert_eq!(login_scope(None), "atproto");
+    assert_eq!(login_scope(Some("pfp")), "atproto");
+    assert_eq!(login_scope(Some("")), "atproto");
+
+    let enroll = login_scope(Some("enroll"));
+    assert_eq!(enroll, freeq_oauth::ENROLL_SCOPE);
+    let tokens: std::collections::HashSet<&str> = enroll.split_whitespace().collect();
+    assert!(tokens.contains("atproto"), "enroll scope: {enroll}");
+    assert!(
+        tokens.contains("repo:at.freeq.deviceKey?action=create"),
+        "enroll scope must ask to create device keys; got: {enroll}"
+    );
+    assert!(
+        tokens.contains("repo:at.freeq.agentKey?action=create"),
+        "enroll scope must ask to create agent keys; got: {enroll}"
+    );
+    assert!(
+        !enroll.contains("transition:generic"),
+        "enroll must not request the legacy wide scope; got: {enroll}"
+    );
+}
+
 // ─── Adversarial: scope predicate edge cases ─────────────────────────────
 
 #[test]
@@ -507,6 +539,29 @@ async fn metadata_scope_contains_every_requested_purpose_scope() {
                 p,
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn metadata_scope_contains_every_enroll_scope_token() {
+    // The enroll sign-in requests these at /authorize; a PDS that checks the
+    // metadata superset rejects the call if any is missing here.
+    let (_irc, http, _h) = start_server().await;
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(url(http, "/client-metadata.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let metadata_scope: std::collections::HashSet<&str> =
+        body["scope"].as_str().unwrap().split_whitespace().collect();
+    for token in login_scope(Some("enroll")).split_whitespace() {
+        assert!(
+            metadata_scope.contains(token),
+            "client-metadata.json scope ({metadata_scope:?}) is missing enroll token `{token}`"
+        );
     }
 }
 

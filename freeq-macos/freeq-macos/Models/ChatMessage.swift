@@ -34,6 +34,9 @@ struct ChatMessage: Identifiable, Equatable {
     // joining a line to the act event it was written beside; the row renders
     // as a task card once its event has arrived.
     var actRef: String? = nil
+    // What the SDK made of this line's signature, checked on this device.
+    // nil until the check settles; a verdict event replaces a pending one.
+    var verdict: VerdictInfo? = nil
     var reactions: [String: Set<String>] = [:]  // emoji -> set of nicks
 
     /// Replay order for a history batch. The server's replay `time` tag is
@@ -59,6 +62,7 @@ struct ChatMessage: Identifiable, Equatable {
             && lhs.editOf == rhs.editOf
             && lhs.coordination == rhs.coordination
             && lhs.actRef == rhs.actRef
+            && lhs.verdict == rhs.verdict
             && lhs.reactions == rhs.reactions
     }
 }

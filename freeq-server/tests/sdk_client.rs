@@ -80,78 +80,100 @@ fn config_default_valid() {
 
 #[test]
 fn config_empty_addr_invalid() {
-    let mut c = ConnectConfig::default();
-    c.server_addr = String::new();
+    let c = ConnectConfig {
+        server_addr: String::new(),
+        ..Default::default()
+    };
     assert!(c.validate().is_err());
 }
 
 #[test]
 fn config_empty_nick_invalid() {
-    let mut c = ConnectConfig::default();
-    c.nick = String::new();
+    let c = ConnectConfig {
+        nick: String::new(),
+        ..Default::default()
+    };
     assert!(c.validate().is_err());
 }
 
 #[test]
 fn config_long_nick_invalid() {
-    let mut c = ConnectConfig::default();
-    c.nick = "a".repeat(65);
+    let c = ConnectConfig {
+        nick: "a".repeat(65),
+        ..Default::default()
+    };
     assert!(c.validate().is_err());
 }
 
 #[test]
 fn config_nick_with_space_invalid() {
-    let mut c = ConnectConfig::default();
-    c.nick = "has space".to_string();
+    let c = ConnectConfig {
+        nick: "has space".to_string(),
+        ..Default::default()
+    };
     assert!(c.validate().is_err());
 }
 
 #[test]
 fn config_nick_with_comma_invalid() {
-    let mut c = ConnectConfig::default();
-    c.nick = "has,comma".to_string();
+    let c = ConnectConfig {
+        nick: "has,comma".to_string(),
+        ..Default::default()
+    };
     assert!(c.validate().is_err());
 }
 
 #[test]
 fn config_nick_with_at_invalid() {
-    let mut c = ConnectConfig::default();
-    c.nick = "has@at".to_string();
+    let c = ConnectConfig {
+        nick: "has@at".to_string(),
+        ..Default::default()
+    };
     assert!(c.validate().is_err());
 }
 
 #[test]
 fn config_nick_with_hash_invalid() {
-    let mut c = ConnectConfig::default();
-    c.nick = "#channel".to_string();
+    let c = ConnectConfig {
+        nick: "#channel".to_string(),
+        ..Default::default()
+    };
     assert!(c.validate().is_err());
 }
 
 #[test]
 fn config_empty_user_invalid() {
-    let mut c = ConnectConfig::default();
-    c.user = String::new();
+    let c = ConnectConfig {
+        user: String::new(),
+        ..Default::default()
+    };
     assert!(c.validate().is_err());
 }
 
 #[test]
 fn config_valid_nick() {
-    let mut c = ConnectConfig::default();
-    c.nick = "valid-nick_123".to_string();
+    let c = ConnectConfig {
+        nick: "valid-nick_123".to_string(),
+        ..Default::default()
+    };
     assert!(c.validate().is_ok());
 }
 
 #[test]
 fn config_unicode_nick_valid() {
-    let mut c = ConnectConfig::default();
-    c.nick = "café".to_string();
+    let c = ConnectConfig {
+        nick: "café".to_string(),
+        ..Default::default()
+    };
     assert!(c.validate().is_ok());
 }
 
 #[test]
 fn config_64_char_nick_valid() {
-    let mut c = ConnectConfig::default();
-    c.nick = "a".repeat(64);
+    let c = ConnectConfig {
+        nick: "a".repeat(64),
+        ..Default::default()
+    };
     assert!(c.validate().is_ok());
 }
 
