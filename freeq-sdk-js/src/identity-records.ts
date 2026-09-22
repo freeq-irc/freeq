@@ -568,13 +568,30 @@ export async function listRecords(
   return (await listRecordEntries(fetch, resolveDid, did, collection)).map((e) => e.value);
 }
 
-/** `listRecords`, keeping each record's uri and CID as the PDS listed them. */
+/**
+ * `listRecords`, keeping each record's uri and CID as the PDS listed them.
+ * With `homeBase`, the home server's copy of the listing is asked first; any
+ * answer but a listing sends the read to the PDS.
+ */
 export async function listRecordEntries(
   fetch: Fetch,
   resolveDid: ResolveDid,
   did: string,
   collection: string,
+  homeBase?: string | null,
 ): Promise<ListedRecord[]> {
+  if (homeBase) {
+    const path = `/api/v1/records/${encodeURIComponent(did)}/${encodeURIComponent(collection)}`;
+    try {
+      const answer = (await (await get(fetch, homeUrl(homeBase, path), true)).json()) as {
+        records?: unknown;
+      };
+      const records = listedRecords(answer.records);
+      if (records !== null) return records;
+    } catch {
+      // The PDS, as without a home server.
+    }
+  }
   const pds = pdsEndpoint(await resolveDid(did));
   if (pds === undefined) return [];
   const records: ListedRecord[] = [];
@@ -611,7 +628,9 @@ export async function listRecordEntries(
  * left out, as if absent. A passed check is remembered in `proven` by record
  * CID, so a record's proof is fetched once. A check in flight is shared
  * through `proving`, so listings racing on one record fetch its proof once; a
- * failed check is not kept, and the next listing fetches it again.
+ * failed check is not kept, and the next listing fetches it again. A proof
+ * in `proofs` (by rkey) is checked before any is fetched; `homeBase` is
+ * passed on to `verifyRecord`.
  */
 export async function provenRecords(
   fetch: Fetch,
@@ -621,6 +640,8 @@ export async function provenRecords(
   entries: ListedRecord[],
   proven: Set<string>,
   proving: Map<string, Promise<boolean>> = new Map(),
+  proofs?: Map<string, Uint8Array>,
+  homeBase?: string | null,
 ): Promise<unknown[]> {
   const prefix = `at://${did}/${collection}/`;
   const out: unknown[] = [];
@@ -636,7 +657,16 @@ export async function provenRecords(
       if (rkey === '' || rkey.includes('/')) continue;
       let pending = proving.get(cid);
       if (pending === undefined) {
-        const started: Promise<boolean> = verifyRecord(fetch, resolveDid, did, collection, rkey, cid)
+        const started: Promise<boolean> = verifyRecord(
+          fetch,
+          resolveDid,
+          did,
+          collection,
+          rkey,
+          cid,
+          homeBase,
+          proofs?.get(rkey),
+        )
           .then(
             (o) => o.commitDidMatches && o.signatureValid && o.recordPresent,
             () => false,
@@ -688,11 +718,157 @@ function xrpcUrl(pds: string, method: string, params: Record<string, string>): s
   return url.toString();
 }
 
-/** GET `url`; an HTTP error status is an error. */
-async function get(fetch: Fetch, url: string): Promise<Response> {
+/**
+ * When each host that answered 429 may be asked again, in ms, by origin
+ * (scheme, host and port). Held for the page load only.
+ */
+const pausedUntil = new Map<string, number>();
+let clock: () => number = () => Date.now();
+
+/** How long a 429 that names no time pauses the home server, and a PDS. */
+const HOME_PAUSE_MS = 60_000;
+const PDS_PAUSE_MS = 5 * 60_000;
+
+/** The clock host pauses are read against; the default is `Date.now`. For tests. */
+export function setPauseClock(now: () => number = () => Date.now()): void {
+  clock = now;
+}
+
+/** Forget every host pause. For tests. */
+export function clearHostPauses(): void {
+  pausedUntil.clear();
+}
+
+/**
+ * When a host that answered `res` (a 429) may be asked again: `Retry-After`
+ * seconds, else for a PDS `RateLimit-Reset` (unix seconds), else a minute for
+ * the home server and five minutes for a PDS. As the Rust reader does.
+ */
+function pauseEnd(res: Response, home: boolean): number {
+  const seconds = (name: string): number | null => {
+    const value = res.headers.get(name)?.trim();
+    return value !== undefined && /^\d+$/.test(value) ? Number(value) : null;
+  };
+  const retryAfter = seconds('retry-after');
+  if (retryAfter !== null) return clock() + retryAfter * 1000;
+  const reset = home ? null : seconds('ratelimit-reset');
+  if (reset !== null) return reset * 1000;
+  return clock() + (home ? HOME_PAUSE_MS : PDS_PAUSE_MS);
+}
+
+/**
+ * GET `url`; an HTTP error status is an error. A host that answered 429 is
+ * not sent to until its pause ends; `home` marks a request to the home server.
+ */
+async function get(fetch: Fetch, url: string, home = false): Promise<Response> {
+  const host = new URL(url).origin;
+  const until = pausedUntil.get(host);
+  if (until !== undefined) {
+    if (clock() < until) throw new Error(`${host} is paused until ${new Date(until).toISOString()}`);
+    pausedUntil.delete(host);
+  }
   const res = await fetch(url);
+  if (res.status === 429) pausedUntil.set(host, pauseEnd(res, home));
   if (!res.ok) throw new Error(`${new URL(url).pathname} answered ${res.status}`);
   return res;
+}
+
+// ─── the home server ────────────────────────────────────────────────────
+
+/** Most accounts one `/api/v1/records` request may name. */
+export const MAX_ACCOUNTS_PER_REQUEST = 50;
+
+/**
+ * One account's collection as the home server keeps it: the listing, the
+ * proofs it could serve by rkey, whether the PDS could not be read when last
+ * asked, and when it was listed, unix seconds.
+ */
+export interface HomeAccount {
+  entries: ListedRecord[];
+  proofs: Map<string, Uint8Array>;
+  stale: boolean;
+  fetchedAt: number;
+}
+
+/**
+ * `collection` of each of `dids` as the home server at `homeBase` keeps it,
+ * one request per 50 DIDs. A DID the server leaves out, or whose answer does
+ * not parse, is absent, and so is every DID of a request that fails; the
+ * caller reads those from the PDS. The proofs are not checked here.
+ */
+export async function fetchAccounts(
+  fetch: Fetch,
+  homeBase: string,
+  dids: string[],
+  collection: string,
+): Promise<Map<string, HomeAccount>> {
+  const out = new Map<string, HomeAccount>();
+  const unique = [...new Set(dids)];
+  for (let i = 0; i < unique.length; i += MAX_ACCOUNTS_PER_REQUEST) {
+    const chunk = unique.slice(i, i + MAX_ACCOUNTS_PER_REQUEST);
+    const query = new URLSearchParams({ dids: chunk.join(','), collection });
+    let answer: { accounts?: unknown };
+    try {
+      answer = (await (await get(fetch, homeUrl(homeBase, `/api/v1/records?${query}`), true)).json()) as {
+        accounts?: unknown;
+      };
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(answer.accounts)) continue;
+    for (const account of answer.accounts as { did?: unknown; collections?: unknown }[]) {
+      if (typeof account !== 'object' || account === null) continue;
+      if (typeof account.did !== 'string' || !chunk.includes(account.did)) continue;
+      const held = homeAccount((account.collections as Record<string, unknown> | undefined)?.[collection]);
+      if (held !== null) out.set(account.did, held);
+    }
+  }
+  return out;
+}
+
+/** One collection of a `/api/v1/records` account, or null when it does not parse. */
+function homeAccount(value: unknown): HomeAccount | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const { records, proofs, stale, fetched_at } = value as Record<string, unknown>;
+  const entries = listedRecords(records);
+  if (entries === null || typeof fetched_at !== 'number') return null;
+  const cars = new Map<string, Uint8Array>();
+  for (const proof of Array.isArray(proofs) ? (proofs as { rkey?: unknown; car?: unknown }[]) : []) {
+    if (typeof proof !== 'object' || proof === null) continue;
+    if (typeof proof.rkey !== 'string' || typeof proof.car !== 'string') continue;
+    const car = base64Decode(proof.car);
+    if (car !== null) cars.set(proof.rkey, car);
+  }
+  return { entries, proofs: cars, stale: stale === true, fetchedAt: fetched_at };
+}
+
+/** A home server's `records` array as listed records, or null when it is not one. */
+function listedRecords(value: unknown): ListedRecord[] | null {
+  if (!Array.isArray(value)) return null;
+  const out: ListedRecord[] = [];
+  for (const listed of value as { uri?: unknown; cid?: unknown; value?: unknown }[]) {
+    if (typeof listed !== 'object' || listed === null || !('value' in listed)) return null;
+    out.push({
+      uri: typeof listed.uri === 'string' ? listed.uri : '',
+      cid: typeof listed.cid === 'string' ? listed.cid : '',
+      value: listed.value,
+    });
+  }
+  return out;
+}
+
+function homeUrl(homeBase: string, path: string): string {
+  return `${homeBase.replace(/\/+$/, '')}${path}`;
+}
+
+/** Standard padded base64, as the home server encodes a CAR; anything else is null. */
+function base64Decode(text: string): Uint8Array | null {
+  try {
+    const bin = atob(text);
+    return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  } catch {
+    return null;
+  }
 }
 
 
@@ -730,7 +906,9 @@ export async function fetchProof(
 
 /**
  * Fetch one record's proof and check it under the account's repository key,
- * the `#atproto` entry of its DID document.
+ * the `#atproto` entry of its DID document. A `car` given is checked first,
+ * else with `homeBase` the home server's copy; when that one does not check,
+ * or cannot be had, the proof is fetched from the PDS and that one decides.
  */
 export async function verifyRecord(
   fetch: Fetch,
@@ -739,14 +917,31 @@ export async function verifyRecord(
   collection: string,
   rkey: string,
   expectedCid: string,
+  homeBase?: string | null,
+  car?: Uint8Array,
 ): Promise<ProofOutcome> {
   const doc = await resolveDid(did);
   const repoKey = repoSigningKey(doc);
   if (repoKey === undefined) throw new Error('DID document has no #atproto key');
+  let held = car;
+  if (held === undefined && homeBase) {
+    const path =
+      `/api/v1/records/${encodeURIComponent(did)}/${encodeURIComponent(collection)}` +
+      `/${encodeURIComponent(rkey)}/proof`;
+    try {
+      held = new Uint8Array(await (await get(fetch, homeUrl(homeBase, path), true)).arrayBuffer());
+    } catch {
+      held = undefined;
+    }
+  }
+  if (held !== undefined) {
+    const outcome = await verifyProof(held, did, collection, rkey, expectedCid, repoKey);
+    if (outcome.commitDidMatches && outcome.signatureValid && outcome.recordPresent) return outcome;
+  }
   const pds = pdsEndpoint(doc);
   if (pds === undefined) throw new Error('DID document names no PDS');
-  const car = await fetchProof(fetch, pds, did, collection, rkey);
-  return verifyProof(car, did, collection, rkey, expectedCid, repoKey);
+  const fetched = await fetchProof(fetch, pds, did, collection, rkey);
+  return verifyProof(fetched, did, collection, rkey, expectedCid, repoKey);
 }
 
 /**

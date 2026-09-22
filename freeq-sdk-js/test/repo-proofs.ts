@@ -22,12 +22,18 @@ export interface ListedEntry {
 }
 
 export interface StubRepo {
+  /** The account this repository is for. */
+  did: string;
   /** A DID document naming the repository key and the PDS at `pds`. */
   document(pds: string): Promise<DidDocument>;
   /** List `record` at a fresh rkey, with a proof that holds it. */
   add(collection: string, record: unknown): Promise<ListedEntry>;
   /** List `record` at a fresh rkey, served with a proof that holds `held` there instead. */
   addForged(collection: string, record: unknown, held: unknown): Promise<ListedEntry>;
+  /** What `listRecords` lists for `collection`. */
+  entries(collection: string): ListedEntry[];
+  /** The proof served for `collection/rkey`, without counting a read. */
+  car(collection: string, rkey: string): Uint8Array | undefined;
   /** How many times the proof at `collection/rkey` of `entry` was asked for. */
   proofReads(entry: ListedEntry): number;
   /** Answer a `listRecords` or `getRecord` request for this account; undefined for anything else. */
@@ -100,6 +106,7 @@ export async function stubRepo(did: string, keypair?: RepoKeypair): Promise<Stub
   };
 
   return {
+    did,
     async document(pds: string): Promise<DidDocument> {
       return {
         id: did,
@@ -116,6 +123,8 @@ export async function stubRepo(did: string, keypair?: RepoKeypair): Promise<Stub
     },
     add: (collection, record) => list(collection, record, record),
     addForged: (collection, record, held) => list(collection, record, held),
+    entries: (collection) => listed.get(collection) ?? [],
+    car: (collection, rkey) => proofs.get(`${collection}/${rkey}`),
     proofReads(entry: ListedEntry): number {
       return reads.get(entry.uri.split('/').slice(3).join('/')) ?? 0;
     },
@@ -137,4 +146,99 @@ export async function stubRepo(did: string, keypair?: RepoKeypair): Promise<Stub
       return undefined;
     },
   };
+}
+
+/**
+ * A home server's record routes (`/api/v1/records…`), answered from `repos`'
+ * listings and proofs. Counts requests per route. `status` answers every
+ * route with that status and `headers`; `left` names accounts the server has
+ * not seen (left out of a batch, 404 alone); `withheld` names `collection/rkey`
+ * proofs the server cannot serve (left out of `proofs`, 502 alone); `served`
+ * replaces the CAR served for a `collection/rkey`.
+ */
+export interface StubHome {
+  hits: { batch: number; account: number; listing: number; proof: number };
+  /** The `dids` of each batch request, in order. */
+  batches: string[][];
+  status: number | null;
+  headers: Record<string, string>;
+  left: Set<string>;
+  withheld: Set<string>;
+  served: Map<string, Uint8Array>;
+  /** Answer a record route; undefined for any other path. */
+  respond(url: URL): Promise<Response | undefined>;
+}
+
+export function stubHome(repos: StubRepo[]): StubHome {
+  const prefix = '/api/v1/records';
+  const home: StubHome = {
+    hits: { batch: 0, account: 0, listing: 0, proof: 0 },
+    batches: [],
+    status: null,
+    headers: {},
+    left: new Set(),
+    withheld: new Set(),
+    served: new Map(),
+    async respond(url: URL): Promise<Response | undefined> {
+      if (url.pathname !== prefix && !url.pathname.startsWith(`${prefix}/`)) return undefined;
+      const parts = url.pathname.slice(prefix.length).split('/').filter(Boolean).map(decodeURIComponent);
+      const route = parts.length === 0 ? 'batch' : parts.length === 1 ? 'account' : parts.length === 2 ? 'listing' : 'proof';
+      home.hits[route]++;
+      if (route === 'batch') home.batches.push((url.searchParams.get('dids') ?? '').split(','));
+      if (home.status !== null) return new Response('refused', { status: home.status, headers: home.headers });
+      const seen = (did: string) => (home.left.has(did) ? undefined : repos.find((r) => r.did === did));
+      const carFor = (repo: StubRepo, collection: string, rkey: string) =>
+        home.withheld.has(`${collection}/${rkey}`)
+          ? undefined
+          : (home.served.get(`${collection}/${rkey}`) ?? repo.car(collection, rkey));
+      const rkeyOf = (entry: ListedEntry) => entry.uri.split('/').pop()!;
+      const account = (repo: StubRepo, collection: string) => ({
+        did: repo.did,
+        collections: {
+          [collection]: {
+            fetched_at: 1_790_000_000,
+            stale: false,
+            records: repo.entries(collection),
+            proofs: repo.entries(collection).flatMap((entry) => {
+              const car = carFor(repo, collection, rkeyOf(entry));
+              return car === undefined
+                ? []
+                : [{ rkey: rkeyOf(entry), cid: entry.cid, fetched_at: 1_790_000_000, car: Buffer.from(car).toString('base64') }];
+            }),
+          },
+        },
+      });
+      const collection = url.searchParams.get('collection') ?? 'at.freeq.deviceKey';
+      if (route === 'batch') {
+        const dids = (url.searchParams.get('dids') ?? '').split(',').filter(Boolean);
+        if (dids.length === 0 || dids.length > 50) return new Response('bad', { status: 400 });
+        const accounts = dids.flatMap((did) => {
+          const repo = seen(did);
+          return repo === undefined ? [] : [account(repo, collection)];
+        });
+        return Response.json({ accounts });
+      }
+      const repo = seen(parts[0]!);
+      if (repo === undefined) return new Response('not found', { status: 404 });
+      if (route === 'account') return Response.json(account(repo, collection));
+      if (route === 'listing') {
+        return Response.json({
+          did: repo.did,
+          collection: parts[1],
+          fetched_at: 1_790_000_000,
+          stale: false,
+          records: repo.entries(parts[1]!),
+        });
+      }
+      if (!repo.entries(parts[1]!).some((e) => rkeyOf(e) === parts[2])) {
+        return new Response('not found', { status: 404 });
+      }
+      const car = carFor(repo, parts[1]!, parts[2]!);
+      if (car === undefined) return new Response('no proof', { status: 502 });
+      return new Response(car, {
+        headers: { 'content-type': 'application/vnd.ipld.car', 'x-freeq-fetched-at': '1790000000' },
+      });
+    },
+  };
+  return home;
 }

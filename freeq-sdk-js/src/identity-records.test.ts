@@ -10,7 +10,7 @@ import { writeCarStream } from '@atcute/car';
 import { BytesWrapper, encode, toCidLink } from '@atcute/cbor';
 import { CODEC_DCBOR, CODEC_RAW, type Cid, create } from '@atcute/cid';
 import { Secp256k1PrivateKeyExportable } from '@atcute/crypto';
-import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { type DidKey, decodeMultibaseEd25519, importDidKey } from './did-key.js';
 import {
@@ -20,13 +20,19 @@ import {
   buildAgentRetirement,
   buildDeviceRecord,
   buildDeviceRetirement,
+  clearHostPauses,
+  fetchAccounts,
   foldAgentRecords,
   foldDeviceRecords,
   listRecords,
   liveAgentLinks,
+  listRecordEntries,
   liveDeviceKeys,
+  provenRecords,
   recordCid,
+  setPauseClock,
   verifyProof,
+  verifyRecord,
 } from './identity-records.js';
 import { deriveKid } from './signing.js';
 
@@ -418,5 +424,275 @@ describe('a proof built here', () => {
       signatureValid: true,
       recordPresent: false,
     });
+  });
+});
+
+// ─── through the home server ────────────────────────────────────────────
+
+const HOME = 'https://home.example';
+const BOB = 'did:plc:bobbobbobbobbobbobbobbob';
+
+afterEach(() => {
+  clearHostPauses();
+  setPauseClock();
+});
+
+/**
+ * ALICE and BOB, each with one device record, served by a PDS and a home
+ * server that answer from the same repositories. Counts PDS requests.
+ */
+async function homeNetwork() {
+  const { stubRepo, stubHome } = await import('../test/repo-proofs.js');
+  const alice = await stubRepo(ALICE);
+  const bob = await stubRepo(BOB);
+  const aliceRecord = await buildDeviceRecord(await key(1), ALICE, T0, 'laptop');
+  const bobRecord = await buildDeviceRecord(await key(2), BOB, T0, 'phone');
+  const aliceEntry = await alice.add(DEVICE_KEY_TYPE, aliceRecord);
+  const bobEntry = await bob.add(DEVICE_KEY_TYPE, bobRecord);
+  const home = stubHome([alice, bob]);
+  const docs = [await alice.document(PDS), await bob.document(PDS)];
+  const pds = { listings: 0, proofs: 0 };
+  const fetch = vi.fn(async (input: string): Promise<Response> => {
+    const url = new URL(input);
+    if (url.origin === HOME) return (await home.respond(url)) ?? new Response('unexpected', { status: 500 });
+    if (url.origin === PDS) {
+      if (url.pathname.endsWith('listRecords')) pds.listings++;
+      if (url.pathname.endsWith('getRecord')) pds.proofs++;
+      for (const repo of [alice, bob]) {
+        const answer = await repo.respond(url);
+        if (answer !== undefined) return answer;
+      }
+    }
+    return new Response('unexpected', { status: 500 });
+  });
+  const resolveDid = async (did: string): Promise<DidDocument> => {
+    const doc = docs.find((d) => d.id === did);
+    if (doc === undefined) throw new Error(`unknown DID ${did}`);
+    return doc;
+  };
+  return { alice, bob, aliceRecord, bobRecord, aliceEntry, bobEntry, home, pds, fetch, resolveDid };
+}
+
+const rkeyOf = (entry: { uri: string }) => entry.uri.split('/').pop()!;
+
+describe('fetchAccounts', () => {
+  it('decodes a two-account answer and leaves an absent DID out', async () => {
+    const { alice, aliceEntry, bobEntry, home, fetch } = await homeNetwork();
+    const carol = 'did:plc:carolcarolcarolcarolcaro';
+    const got = await fetchAccounts(fetch, HOME, [ALICE, BOB, carol], DEVICE_KEY_TYPE);
+    expect([...got.keys()]).toEqual([ALICE, BOB]);
+    expect(got.get(ALICE)!.entries).toEqual([aliceEntry]);
+    expect(got.get(BOB)!.entries).toEqual([bobEntry]);
+    expect(got.get(ALICE)!.proofs.get(rkeyOf(aliceEntry))).toEqual(alice.car(DEVICE_KEY_TYPE, rkeyOf(aliceEntry)));
+    expect(got.get(ALICE)!.stale).toBe(false);
+    expect(got.get(ALICE)!.fetchedAt).toBe(1_790_000_000);
+    expect(home.hits.batch).toBe(1);
+    expect(home.batches).toEqual([[ALICE, BOB, carol]]);
+  });
+
+  it('asks for 51 DIDs in two requests of at most 50', async () => {
+    const { home, fetch } = await homeNetwork();
+    const dids = [ALICE, ...Array.from({ length: 50 }, (_, i) => `did:plc:unseen${i}`)];
+    const got = await fetchAccounts(fetch, HOME, dids, DEVICE_KEY_TYPE);
+    expect([...got.keys()]).toEqual([ALICE]);
+    expect(home.batches.map((b) => b.length)).toEqual([50, 1]);
+  });
+
+  it('gives nothing on a 404, 502, 400 or 500, and asks again next time', async () => {
+    const { home, fetch } = await homeNetwork();
+    for (const status of [404, 502, 400, 500]) {
+      home.status = status;
+      expect((await fetchAccounts(fetch, HOME, [ALICE], DEVICE_KEY_TYPE)).size, `${status}`).toBe(0);
+    }
+    home.status = null;
+    expect((await fetchAccounts(fetch, HOME, [ALICE], DEVICE_KEY_TYPE)).size).toBe(1);
+    expect(home.hits.batch).toBe(5);
+  });
+
+  it('gives nothing on a network error', async () => {
+    const fetch = vi.fn(async (): Promise<Response> => {
+      throw new TypeError('network down');
+    });
+    expect((await fetchAccounts(fetch, HOME, [ALICE], DEVICE_KEY_TYPE)).size).toBe(0);
+  });
+
+  it('gives nothing on a 429 and asks the home server nothing for the 60 s that follow', async () => {
+    let now = 1_000_000;
+    setPauseClock(() => now);
+    const { home, fetch, resolveDid } = await homeNetwork();
+    home.status = 429;
+    expect((await fetchAccounts(fetch, HOME, [ALICE], DEVICE_KEY_TYPE)).size).toBe(0);
+    home.status = null;
+    now += 59_000;
+    expect((await fetchAccounts(fetch, HOME, [ALICE], DEVICE_KEY_TYPE)).size).toBe(0);
+    expect(await listRecordEntries(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE, HOME)).toHaveLength(1);
+    expect(home.hits, 'no home route asked inside the cooldown').toEqual({ batch: 1, account: 0, listing: 0, proof: 0 });
+    now += 2_000;
+    expect((await fetchAccounts(fetch, HOME, [ALICE], DEVICE_KEY_TYPE)).size).toBe(1);
+    expect(home.hits.batch).toBe(2);
+  });
+
+  it('holds the home server off for the Retry-After a 429 names', async () => {
+    let now = 1_000_000;
+    setPauseClock(() => now);
+    const { home, fetch } = await homeNetwork();
+    home.status = 429;
+    home.headers = { 'retry-after': '5' };
+    await fetchAccounts(fetch, HOME, [ALICE], DEVICE_KEY_TYPE);
+    home.status = null;
+    now += 4_000;
+    expect((await fetchAccounts(fetch, HOME, [ALICE], DEVICE_KEY_TYPE)).size).toBe(0);
+    now += 2_000;
+    expect((await fetchAccounts(fetch, HOME, [ALICE], DEVICE_KEY_TYPE)).size).toBe(1);
+    expect(home.hits.batch).toBe(2);
+  });
+});
+
+describe('listRecordEntries through the home server', () => {
+  it('takes the home listing and never asks the PDS', async () => {
+    const { aliceEntry, home, pds, fetch, resolveDid } = await homeNetwork();
+    expect(await listRecordEntries(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE, HOME)).toEqual([aliceEntry]);
+    expect(home.hits.listing).toBe(1);
+    expect(pds.listings).toBe(0);
+  });
+
+  it('lists at the PDS when the home server answers 404', async () => {
+    const { aliceEntry, home, pds, fetch, resolveDid } = await homeNetwork();
+    home.left.add(ALICE);
+    expect(await listRecordEntries(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE, HOME)).toEqual([aliceEntry]);
+    expect([home.hits.listing, pds.listings]).toEqual([1, 1]);
+  });
+
+  it('lists at the PDS alone with no home server', async () => {
+    const { home, pds, fetch, resolveDid } = await homeNetwork();
+    expect(await listRecordEntries(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE)).toHaveLength(1);
+    expect([home.hits.listing, pds.listings]).toEqual([0, 1]);
+  });
+});
+
+describe('verifyRecord through the home server', () => {
+  const holds = { commitDidMatches: true, signatureValid: true, recordPresent: true };
+
+  it('checks a CAR it is given without fetching one', async () => {
+    const { alice, aliceEntry, home, pds, fetch, resolveDid } = await homeNetwork();
+    const car = alice.car(DEVICE_KEY_TYPE, rkeyOf(aliceEntry))!;
+    expect(
+      await verifyRecord(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE, rkeyOf(aliceEntry), aliceEntry.cid, HOME, car),
+    ).toEqual(holds);
+    expect([home.hits.proof, pds.proofs]).toEqual([0, 0]);
+  });
+
+  it('takes the home proof and never asks the PDS', async () => {
+    const { aliceEntry, home, pds, fetch, resolveDid } = await homeNetwork();
+    expect(
+      await verifyRecord(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE, rkeyOf(aliceEntry), aliceEntry.cid, HOME),
+    ).toEqual(holds);
+    expect([home.hits.proof, pds.proofs]).toEqual([1, 0]);
+  });
+
+  it('fetches from the PDS when the home proof does not check, and the PDS proof decides', async () => {
+    const { stubRepo } = await import('../test/repo-proofs.js');
+    const { aliceRecord, aliceEntry, home, pds, fetch, resolveDid } = await homeNetwork();
+    // The same record at the same rkey, committed under a key that is not ALICE's.
+    const impostor = await stubRepo(ALICE);
+    const forged = await impostor.add(DEVICE_KEY_TYPE, aliceRecord);
+    expect(forged.uri).toBe(aliceEntry.uri);
+    const forgedCar = impostor.car(DEVICE_KEY_TYPE, rkeyOf(forged))!;
+    home.served.set(`${DEVICE_KEY_TYPE}/${rkeyOf(aliceEntry)}`, forgedCar);
+    const rkey = rkeyOf(aliceEntry);
+    const repoKey = (await resolveDid(ALICE)).verificationMethod![0]!.publicKeyMultibase!;
+    expect((await verifyProof(forgedCar, ALICE, DEVICE_KEY_TYPE, rkey, aliceEntry.cid, repoKey)).signatureValid).toBe(false);
+    expect(await verifyRecord(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE, rkey, aliceEntry.cid, HOME)).toEqual(holds);
+    expect([home.hits.proof, pds.proofs]).toEqual([1, 1]);
+  });
+
+  it('fetches from the PDS when a CAR it is given does not check', async () => {
+    const { stubRepo } = await import('../test/repo-proofs.js');
+    const { aliceRecord, aliceEntry, home, pds, fetch, resolveDid } = await homeNetwork();
+    const impostor = await stubRepo(ALICE);
+    const forgedCar = impostor.car(DEVICE_KEY_TYPE, rkeyOf(await impostor.add(DEVICE_KEY_TYPE, aliceRecord)))!;
+    expect(
+      await verifyRecord(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE, rkeyOf(aliceEntry), aliceEntry.cid, HOME, forgedCar),
+    ).toEqual(holds);
+    expect([home.hits.proof, pds.proofs], 'the home server gave its proof already').toEqual([0, 1]);
+  });
+
+  it('fetches from the PDS when the home server has no proof', async () => {
+    const { aliceEntry, home, pds, fetch, resolveDid } = await homeNetwork();
+    home.withheld.add(`${DEVICE_KEY_TYPE}/${rkeyOf(aliceEntry)}`);
+    expect(
+      await verifyRecord(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE, rkeyOf(aliceEntry), aliceEntry.cid, HOME),
+    ).toEqual(holds);
+    expect([home.hits.proof, pds.proofs]).toEqual([1, 1]);
+  });
+
+  it('proves listed records from given proofs, and fetches a proof absent from them at the PDS', async () => {
+    const { alice, aliceRecord, aliceEntry, pds, fetch, resolveDid } = await homeNetwork();
+    const second = await buildDeviceRecord(await key(3), ALICE, T0, 'tablet');
+    const secondEntry = await alice.add(DEVICE_KEY_TYPE, second);
+    const proofs = new Map([[rkeyOf(aliceEntry), alice.car(DEVICE_KEY_TYPE, rkeyOf(aliceEntry))!]]);
+    const proven = new Set<string>();
+    expect(
+      await provenRecords(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE, [aliceEntry, secondEntry], proven, new Map(), proofs),
+    ).toEqual([aliceRecord, second]);
+    expect(pds.proofs, 'only the record with no proof given').toBe(1);
+    expect(alice.proofReads(secondEntry)).toBe(1);
+  });
+});
+
+describe('a host that answered 429', () => {
+  it('is not sent to while paused, for Retry-After seconds, then is asked again', async () => {
+    let now = 1_000_000;
+    setPauseClock(() => now);
+    let limited = true;
+    const inner = await homeNetwork();
+    const fetch = vi.fn(async (input: string): Promise<Response> =>
+      limited && new URL(input).origin === PDS
+        ? new Response('slow down', { status: 429, headers: { 'retry-after': '30' } })
+        : inner.fetch(input),
+    );
+    await expect(listRecords(fetch, inner.resolveDid, ALICE, DEVICE_KEY_TYPE)).rejects.toThrow();
+    limited = false;
+    const sent = fetch.mock.calls.length;
+    now += 29_000;
+    await expect(listRecords(fetch, inner.resolveDid, BOB, DEVICE_KEY_TYPE)).rejects.toThrow(/paused/);
+    expect(fetch.mock.calls.length, 'a paused host is not sent to').toBe(sent);
+    now += 2_000;
+    expect(await listRecords(fetch, inner.resolveDid, BOB, DEVICE_KEY_TYPE)).toHaveLength(1);
+  });
+
+  it('pauses a PDS until RateLimit-Reset when no Retry-After is given, else five minutes', async () => {
+    let now = 1_000_000_000;
+    setPauseClock(() => now);
+    const inner = await homeNetwork();
+    let headers: Record<string, string> | null = { 'ratelimit-reset': String(1_000_000 + 100) };
+    const fetch = vi.fn(async (input: string): Promise<Response> =>
+      headers !== null && new URL(input).origin === PDS
+        ? new Response('slow down', { status: 429, headers })
+        : inner.fetch(input),
+    );
+    await expect(listRecords(fetch, inner.resolveDid, ALICE, DEVICE_KEY_TYPE)).rejects.toThrow();
+    now += 99_000;
+    await expect(listRecords(fetch, inner.resolveDid, ALICE, DEVICE_KEY_TYPE)).rejects.toThrow(/paused/);
+    now += 2_000;
+    headers = {};
+    const sent = fetch.mock.calls.length;
+    await expect(listRecords(fetch, inner.resolveDid, ALICE, DEVICE_KEY_TYPE)).rejects.toThrow();
+    expect(fetch.mock.calls.length, 'the pause ended: sent, and answered 429 again').toBe(sent + 1);
+    headers = null;
+    now += 299_000;
+    await expect(listRecords(fetch, inner.resolveDid, ALICE, DEVICE_KEY_TYPE)).rejects.toThrow(/paused/);
+    now += 2_000;
+    expect(await listRecords(fetch, inner.resolveDid, ALICE, DEVICE_KEY_TYPE)).toHaveLength(1);
+  });
+
+  it('pauses the home server without pausing the PDS', async () => {
+    let now = 1_000_000;
+    setPauseClock(() => now);
+    const { home, pds, fetch, resolveDid } = await homeNetwork();
+    home.status = 429;
+    expect(await listRecordEntries(fetch, resolveDid, ALICE, DEVICE_KEY_TYPE, HOME)).toHaveLength(1);
+    expect(await listRecordEntries(fetch, resolveDid, BOB, DEVICE_KEY_TYPE, HOME)).toHaveLength(1);
+    expect([home.hits.listing, pds.listings]).toEqual([1, 2]);
   });
 });
