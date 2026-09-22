@@ -18,7 +18,7 @@ use freeq_oauth::ClientProvider;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Where a key was found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,11 +49,16 @@ pub struct FoundKey {
     pub expires_at: Option<i64>,
 }
 
-/// Looks keys up by (DID, kid), caching each answer for `ttl`: a key found,
-/// or a miss, when every source answered without the key. A miss the origin
-/// answered is asked again at each retry delay before it is remembered. A
-/// signer's device records are listed and proven per DID, shared by the
-/// lookups for every kid of that DID.
+/// Looks keys up by (DID, kid). A miss, when every source answered without
+/// the key, is cached for `ttl`; a key found is cached without expiry, and
+/// one found in the records takes the DID's listing again once that is older
+/// than `ttl`, so a retirement since lands on it. A miss the origin answered
+/// is asked again at the origin at each retry delay before it is remembered.
+/// A signer's device records are listed and proven per DID, shared by the
+/// lookups for every kid of that DID; a kid the held listing lacks lists the
+/// DID again at most once per `ttl`.
+///
+/// Twin of the JS `KeyLookup`.
 pub struct KeyLookup<P: ClientProvider> {
     pub(crate) reader: RecordReader<P>,
     origin_base: Option<String>,
@@ -63,7 +68,10 @@ pub struct KeyLookup<P: ClientProvider> {
     /// One lookup in flight per (DID, kid).
     in_flight: Mutex<HashMap<(String, String), InFlight>>,
     /// Each DID's proven device records as last listed, kept for `ttl`.
-    records: Mutex<HashMap<String, (Vec<serde_json::Value>, Instant)>>,
+    records: Mutex<HashMap<String, ListedRecords>>,
+    /// When each DID was last listed for a key lookup, so a kid the held
+    /// listing lacks lists it again at most once per `ttl`.
+    refreshed: Mutex<HashMap<String, DateTime<Utc>>>,
     /// One listing, with its proofs, in flight per DID.
     listing: Mutex<HashMap<String, Listing>>,
     /// CIDs of records whose repository proof has checked, so each is fetched
@@ -75,7 +83,8 @@ pub struct KeyLookup<P: ClientProvider> {
 }
 
 /// When a miss the origin answered is asked again, counted from the first
-/// ask: the origin may still be fetching the key from the signer's home server.
+/// ask: the origin may still be fetching the key from the signer's home
+/// server. Only the origin is asked again; the first ask listed the records.
 pub const MISS_RETRY_AFTER: [Duration; 3] = [
     Duration::from_secs(2),
     Duration::from_secs(6),
@@ -89,7 +98,8 @@ pub const MISS_RETRY_AFTER: [Duration; 3] = [
 struct Cached {
     records: Vec<serde_json::Value>,
     other: Option<Option<FoundKey>>,
-    at: Instant,
+    /// Wall clock, so a snapshot of the cache can carry it.
+    at: DateTime<Utc>,
 }
 
 /// What one lookup settled on, shared by every ask that awaited it.
@@ -103,6 +113,9 @@ struct Settled {
 
 /// A lookup in flight, which every ask for its (DID, kid) awaits.
 type InFlight = Arc<tokio::sync::OnceCell<Settled>>;
+
+/// One DID's proven device records, and when they were listed.
+type ListedRecords = (Vec<serde_json::Value>, DateTime<Utc>);
 
 /// A listing of one DID's proven device records in flight, which every
 /// lookup for that DID awaits.
@@ -128,6 +141,7 @@ impl<P: ClientProvider> KeyLookup<P> {
             cache: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
             records: Mutex::new(HashMap::new()),
+            refreshed: Mutex::new(HashMap::new()),
             listing: Mutex::new(HashMap::new()),
             proven: Mutex::new(HashSet::new()),
             proving: Default::default(),
@@ -183,12 +197,20 @@ impl<P: ClientProvider> KeyLookup<P> {
     ) -> Result<Option<FoundKey>> {
         let slot = (did.to_string(), kid.to_string());
         loop {
-            let cached = self
-                .cache
-                .lock()
-                .get(&slot)
-                .filter(|c| c.at.elapsed() < self.ttl)
-                .cloned();
+            let hit = self.cache.lock().get(&slot).cloned();
+            let mut cached = hit.clone().filter(|c| self.inside_ttl(c.at));
+            // A found key does not expire; one found in the records takes the
+            // DID's listing again past the ttl, so a retirement since lands
+            // on it. A remembered miss (`Some(None)`) stands until the ttl.
+            if cached.is_none()
+                && let Some(hit) = hit
+                && hit.other != Some(None)
+            {
+                cached = Some(match hit.other {
+                    None => self.relisted(&slot, did, kid, hit).await,
+                    Some(_) => hit,
+                });
+            }
             if let Some(c) = cached.as_ref() {
                 if let Some(found) = in_records(did, kid, &c.records, at) {
                     return Ok(Some(found));
@@ -241,8 +263,10 @@ impl<P: ClientProvider> KeyLookup<P> {
         cached: Option<Cached>,
     ) -> Settled {
         let started = tokio::time::Instant::now();
-        let mut listed = cached.is_none();
-        let mut settled = self.ask(did, kid, at, cached).await;
+        let listed = cached.is_none();
+        let mut settled = self
+            .ask(did, kid, at, cached.map(|c| c.records), false)
+            .await;
         for after in &self.retry_after {
             let missed = matches!(settled.other, Some(None))
                 && settled.failure.is_none()
@@ -251,8 +275,8 @@ impl<P: ClientProvider> KeyLookup<P> {
                 break;
             }
             tokio::time::sleep_until(started + *after).await;
-            settled = self.ask(did, kid, at, None).await;
-            listed = true;
+            // The first ask listed the records; a retry asks the origin only.
+            settled = self.ask(did, kid, at, Some(settled.records), true).await;
         }
         match (&settled.other, &settled.failure) {
             (None, None) if listed => self.remember(slot.clone(), settled.records.clone(), None),
@@ -264,18 +288,19 @@ impl<P: ClientProvider> KeyLookup<P> {
         settled
     }
 
-    /// One round: the records (from `cached` when given, else the DID's
-    /// records), then the other sources.
+    /// One round: the records (`held` when given, else the DID's records),
+    /// then the other sources, or the origin alone when `origin_only`.
     async fn ask(
         &self,
         did: &str,
         kid: &str,
         at: DateTime<Utc>,
-        cached: Option<Cached>,
+        held: Option<Vec<serde_json::Value>>,
+        origin_only: bool,
     ) -> Settled {
         let mut failure = None;
-        let records = match cached {
-            Some(c) => c.records,
+        let records = match held {
+            Some(records) => records,
             None => match self.device_records(did, kid).await {
                 Ok(records) => records,
                 Err(e) => {
@@ -307,7 +332,7 @@ impl<P: ClientProvider> KeyLookup<P> {
             }
         };
         let mut found = None;
-        if did.starts_with("did:web:") {
+        if !origin_only && did.starts_with("did:web:") {
             found = take(
                 self.in_document(did, kid).await,
                 KeySource::DidDocument,
@@ -363,23 +388,40 @@ impl<P: ClientProvider> KeyLookup<P> {
     }
 
     /// `did`'s proven device records: the last listing while inside the ttl,
-    /// if it names `kid`; else a listing, so a key published since the last
-    /// one is found in the records.
+    /// if it names `kid` or the DID was already listed for a lookup inside
+    /// the ttl; else a listing, so a key published since is found within the
+    /// ttl.
     async fn device_records(&self, did: &str, kid: &str) -> Result<Vec<serde_json::Value>> {
         let kept = self
             .records
             .lock()
             .get(did)
-            .filter(|(_, at)| at.elapsed() < self.ttl)
+            .filter(|(_, at)| self.inside_ttl(*at))
             .map(|(records, _)| records.clone());
-        if let Some(records) = kept
-            && device_key_history(did, &records)
+        if let Some(records) = kept {
+            if device_key_history(did, &records)
                 .iter()
                 .any(|k| k.kid == kid)
-        {
-            return Ok(records);
+            {
+                return Ok(records);
+            }
+            let refreshed = self.refreshed.lock().get(did).copied();
+            if refreshed.is_some_and(|at| self.inside_ttl(at)) {
+                return Ok(records);
+            }
         }
+        self.refreshed.lock().insert(did.to_string(), Utc::now());
         self.list_device_records(did).await
+    }
+
+    /// Whether `at` is less than the ttl ago. A time in the future, from a
+    /// snapshot written under a clock ahead of this one, counts as now.
+    fn inside_ttl(&self, at: DateTime<Utc>) -> bool {
+        match (Utc::now() - at).to_std() {
+            Ok(since) => since < self.ttl,
+            // `at` is in the future.
+            Err(_) => true,
+        }
     }
 
     /// `did`'s proven device records from the listing in flight, else a new
@@ -403,7 +445,7 @@ impl<P: ClientProvider> KeyLookup<P> {
                 if let Ok(records) = &listed {
                     self.records
                         .lock()
-                        .insert(did.to_string(), (records.clone(), Instant::now()));
+                        .insert(did.to_string(), (records.clone(), Utc::now()));
                 }
                 listed
             })
@@ -420,6 +462,11 @@ impl<P: ClientProvider> KeyLookup<P> {
 
     /// Clear a remembered miss for `(did, kid)`, so the next lookup asks the
     /// sources again. A key found stays cached.
+    ///
+    /// The DID's refresh time goes too, or the next lookup would answer a kid
+    /// the held listing lacks from that listing and never see a record
+    /// published since — which is the whole point of the caller's retry
+    /// (`freeq-server/src/peer_keys.rs:184`).
     pub fn forget(&self, did: &str, kid: &str) {
         let slot = (did.to_string(), kid.to_string());
         let mut cache = self.cache.lock();
@@ -429,7 +476,41 @@ impl<P: ClientProvider> KeyLookup<P> {
         });
         if !found {
             cache.remove(&slot);
+            self.refreshed.lock().remove(did);
         }
+    }
+
+    /// Re-check `did`'s account on the next lookup, however recently it was
+    /// listed: this client has just published a device key record of its own,
+    /// so the listing taken at connect is behind. Clears the DID's refresh
+    /// stamp and its held listing, and drops the cached answers a new record
+    /// can change — a remembered miss, and one the origin server answered. An
+    /// answer found in the records stands.
+    pub fn refresh_account(&self, did: &str) {
+        self.refreshed.lock().remove(did);
+        self.records.lock().remove(did);
+        self.cache.lock().retain(|(held, _), cached| {
+            held != did
+                || !matches!(
+                    cached.other,
+                    Some(None)
+                        | Some(Some(FoundKey {
+                            source: KeySource::OriginServer,
+                            ..
+                        }))
+                )
+        });
+    }
+
+    /// A found key's cached answer with the DID's current proven records: the
+    /// last listing while inside the ttl, else a new one. A listing that
+    /// fails leaves `hit` as it was.
+    async fn relisted(&self, slot: &(String, String), did: &str, kid: &str, hit: Cached) -> Cached {
+        let Ok(records) = self.device_records(did, kid).await else {
+            return hit;
+        };
+        self.remember(slot.clone(), records, None);
+        self.cache.lock().get(slot).cloned().unwrap_or(hit)
     }
 
     fn remember(
@@ -443,7 +524,7 @@ impl<P: ClientProvider> KeyLookup<P> {
             Cached {
                 records,
                 other,
-                at: Instant::now(),
+                at: Utc::now(),
             },
         );
     }
@@ -545,6 +626,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
 
     const ALICE: &str = "did:plc:k2n3e2vsihf3farequ44t5j7";
     const WEB_SIGNER: &str = "did:web:bot.example.com";
@@ -890,6 +972,41 @@ mod tests {
         assert_eq!((pds.hits(), origin.hits()), (1, 1));
     }
 
+    /// The client's own account right after it publishes a device key: the
+    /// listing was taken before the record existed, and the hourly rule would
+    /// otherwise hold the miss for an hour.
+    #[tokio::test]
+    async fn refresh_account_lists_again_and_finds_a_record_published_since() {
+        let pds = pds(vec![device_record(1)]).await;
+        let origin = origin(vec![]).await;
+        let keys = lookup(vec![alice_on(&pds)], Some(&origin), HOUR);
+        assert_eq!(keys.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
+        assert_eq!(pds.hits(), 1);
+
+        // The record is published while the listing is held.
+        pds.repo
+            .as_ref()
+            .unwrap()
+            .lock()
+            .add(DEVICE_KEY_TYPE, &device_record(2));
+        assert_eq!(
+            keys.key_for(ALICE, &kid_of(2)).await.unwrap(),
+            None,
+            "inside the ttl the miss stands"
+        );
+        assert_eq!(pds.hits(), 1, "and nothing is listed again");
+
+        keys.refresh_account(ALICE);
+        assert_eq!(
+            keys.key_for(ALICE, &kid_of(2))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::IdentityRecord)
+        );
+        assert_eq!(pds.hits(), 2, "one more listing");
+    }
+
     #[tokio::test]
     async fn a_key_that_appears_after_a_miss_is_found_once_the_ttl_passes() {
         let pds = pds(vec![]).await;
@@ -963,19 +1080,23 @@ mod tests {
         let started = Instant::now();
         assert_eq!(keys.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
         assert!(started.elapsed() >= Duration::from_millis(150));
-        assert_eq!((pds.hits(), origin.hits()), (4, 4), "records included");
+        assert_eq!(
+            (pds.hits(), origin.hits()),
+            (1, 4),
+            "one listing; the retries ask the origin only"
+        );
 
         assert_eq!(keys.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
         assert_eq!(
             (pds.hits(), origin.hits()),
-            (4, 4),
+            (1, 4),
             "inside the ttl the miss stands"
         );
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(keys.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
         assert_eq!(
             (pds.hits(), origin.hits()),
-            (8, 8),
+            (2, 8),
             "after the ttl, a new lookup with its retries"
         );
     }
@@ -996,7 +1117,7 @@ mod tests {
         }
         assert_eq!(
             (pds.hits(), origin.hits()),
-            (4, 4),
+            (1, 4),
             "one lookup and its retries"
         );
     }
@@ -1033,18 +1154,22 @@ mod tests {
         assert_eq!(keys.key_for(ALICE, &kid_of(151)).await.unwrap(), None);
         assert_eq!(
             (pds.hits(), proofs()),
-            (2, 5),
-            "a kid the cached records lack lists once more, proving nothing"
+            (1, 5),
+            "a kid the held listing lacks is answered from it inside the ttl"
         );
     }
 
     #[tokio::test]
-    async fn a_kid_the_cached_records_lack_lists_once_more_and_finds_a_key_published_since() {
+    async fn a_kid_the_held_listing_lacks_is_answered_from_it_inside_the_ttl_and_relisted_after() {
         let mut repo = crate::test_support::StubRepo::new(ALICE);
         let first = repo.add(DEVICE_KEY_TYPE, &device_record(1));
         let pds = pds_holding(repo).await;
         let origin = origin(vec![]).await;
-        let keys = lookup(vec![alice_on(&pds)], Some(&origin), HOUR);
+        let keys = lookup(
+            vec![alice_on(&pds)],
+            Some(&origin),
+            Duration::from_millis(80),
+        );
         let found = keys.key_for(ALICE, &kid_of(1)).await.unwrap();
         assert_eq!(found.map(|f| f.source), Some(KeySource::IdentityRecord));
         assert_eq!(pds.hits(), 1);
@@ -1055,6 +1180,18 @@ mod tests {
             .unwrap()
             .lock()
             .add(DEVICE_KEY_TYPE, &device_record(2));
+        assert_eq!(
+            keys.key_for(ALICE, &kid_of(2)).await.unwrap(),
+            None,
+            "inside the ttl the held listing stands"
+        );
+        assert_eq!(
+            (pds.hits(), origin.hits()),
+            (1, 1),
+            "the kid the listing lacks was not listed again"
+        );
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
         assert_eq!(
             keys.key_for(ALICE, &kid_of(2)).await.unwrap(),
             Some(FoundKey {
@@ -1070,9 +1207,105 @@ mod tests {
         };
         assert_eq!(
             (pds.hits(), proofs, origin.hits()),
-            (2, (1, 1), 0),
-            "one more listing, the new record proven"
+            (2, (1, 1), 1),
+            "one more listing past the ttl, the new record proven"
         );
+    }
+
+    #[tokio::test]
+    async fn a_kid_the_held_listing_lacks_lists_the_did_again_at_most_once_per_ttl() {
+        let mut repo = crate::test_support::StubRepo::new(ALICE);
+        repo.add(DEVICE_KEY_TYPE, &device_record(1));
+        let pds = pds_holding(repo).await;
+        let origin = origin(vec![]).await;
+        let keys = lookup(vec![alice_on(&pds)], Some(&origin), HOUR);
+        // The first lookup lists, and that listing is the refresh for the ttl.
+        assert!(keys.key_for(ALICE, &kid_of(1)).await.unwrap().is_some());
+        assert_eq!(pds.hits(), 1);
+        assert_eq!(keys.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
+        assert_eq!(keys.key_for(ALICE, &kid_of(3)).await.unwrap(), None);
+        assert_eq!(pds.hits(), 1, "neither kid listed the account again");
+    }
+
+    #[tokio::test]
+    async fn a_found_key_is_answered_after_the_ttl_with_no_request() {
+        let pds = pds(vec![]).await;
+        let origin = origin(vec![(ALICE, kid_of(2), raw(2))]).await;
+        let keys = lookup(
+            vec![alice_on(&pds)],
+            Some(&origin),
+            Duration::from_millis(50),
+        );
+        let found = keys.key_for(ALICE, &kid_of(2)).await.unwrap();
+        assert_eq!(found.map(|f| f.source), Some(KeySource::OriginServer));
+        let asked = (pds.hits(), origin.hits());
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            keys.key_for(ALICE, &kid_of(2))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::OriginServer)
+        );
+        assert_eq!(
+            (pds.hits(), origin.hits()),
+            asked,
+            "a found key does not expire"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_keys_account_is_relisted_after_the_ttl_and_a_retirement_lands() {
+        use crate::identity_records::build_device_retirement;
+        let mut repo = crate::test_support::StubRepo::new(ALICE);
+        repo.add(DEVICE_KEY_TYPE, &device_record(1));
+        let pds = pds_holding(repo).await;
+        let keys = lookup(vec![alice_on(&pds)], None, Duration::from_millis(80));
+        assert_eq!(
+            keys.key_for(ALICE, &kid_of(1)).await.unwrap().unwrap(),
+            FoundKey {
+                public_key: raw(1),
+                source: KeySource::IdentityRecord,
+                retired_at: None,
+                ..dates_of(&recent())
+            }
+        );
+        assert_eq!(pds.hits(), 1);
+
+        // Every date from the record's, so the key is live for the whole run.
+        let made = DateTime::parse_from_rfc3339(&recent())
+            .unwrap()
+            .with_timezone(&Utc);
+        let retired_at = made + chrono::TimeDelta::hours(12);
+        let retirement = serde_json::to_value(
+            build_device_retirement(
+                &key(1),
+                ALICE,
+                &kid_of(1),
+                &retired_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        pds.repo
+            .as_ref()
+            .unwrap()
+            .lock()
+            .add(DEVICE_KEY_TYPE, &retirement);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let at = made + chrono::TimeDelta::hours(20);
+        assert_eq!(
+            keys.key_for_at(ALICE, &kid_of(1), at).await.unwrap(),
+            Some(FoundKey {
+                public_key: raw(1),
+                source: KeySource::IdentityRecord,
+                retired_at: Some(retired_at.timestamp()),
+                ..dates_of(&recent())
+            }),
+            "the relisting past the ttl brings the retirement"
+        );
+        assert_eq!(pds.hits(), 2, "one more listing");
     }
 
     #[tokio::test]
@@ -1088,6 +1321,36 @@ mod tests {
         let found = keys.key_for(ALICE, &kid_of(2)).await.unwrap();
         assert_eq!(found.map(|f| f.source), Some(KeySource::OriginServer));
         assert_eq!(origin.hits(), 2);
+    }
+
+    /// The defer queue's retry (`freeq-server/src/peer_keys.rs:184`) turns on
+    /// this: a forgotten miss must read the records again, not answer from
+    /// the listing already held.
+    #[tokio::test]
+    async fn forgetting_a_miss_lists_the_account_again() {
+        let mut repo = crate::test_support::StubRepo::new(ALICE);
+        repo.add(DEVICE_KEY_TYPE, &device_record(1));
+        let pds = pds_holding(repo).await;
+        let origin = origin(vec![]).await;
+        let keys = lookup(vec![alice_on(&pds)], Some(&origin), HOUR);
+        assert_eq!(keys.key_for(ALICE, &kid_of(2)).await.unwrap(), None);
+        assert_eq!(pds.hits(), 1);
+
+        // Published after the listing the lookup holds.
+        pds.repo
+            .as_ref()
+            .unwrap()
+            .lock()
+            .add(DEVICE_KEY_TYPE, &device_record(2));
+        keys.forget(ALICE, &kid_of(2));
+        assert_eq!(
+            keys.key_for(ALICE, &kid_of(2))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::IdentityRecord)
+        );
+        assert_eq!(pds.hits(), 2, "the forgotten miss listed the account again");
     }
 
     /// Only a miss is forgotten: a key found stays cached.

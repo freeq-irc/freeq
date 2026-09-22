@@ -2510,8 +2510,10 @@ fn spawn_verdict_check(
 }
 
 /// Publish a stored device key through the app's `Enrollment`, off the
-/// connect path. A published key is saved with its record's URI; one that
-/// needs a new sign-in is reported; a failure is tried again next connect.
+/// connect path. A published key is saved with its record's URI, and the
+/// account is re-listed so this client's own lines see the new record; one
+/// that needs a new sign-in is reported; a failure is tried again next
+/// connect.
 fn spawn_enrollment(
     store: Arc<dyn crate::device_key::DeviceKeyStore>,
     enrollment: Arc<dyn crate::device_key::Enrollment>,
@@ -2520,6 +2522,7 @@ fn spawn_enrollment(
     did: String,
     label: Option<String>,
     event_tx: mpsc::Sender<Event>,
+    key_lookup: Option<Arc<crate::key_lookup::KeyLookup<freeq_oauth::SharedClient>>>,
 ) {
     use crate::device_key::EnrollOutcome;
     tokio::spawn(async move {
@@ -2544,6 +2547,12 @@ fn spawn_enrollment(
                 };
                 if let Err(e) = store.save(&published) {
                     tracing::warn!(error = %e, "published device key not saved");
+                }
+                // The listing taken at connect predates this record, and the
+                // hourly rule would hold it. Our own lines are checked
+                // against it, so it is re-listed now rather than in an hour.
+                if let Some(lookup) = key_lookup {
+                    lookup.refresh_account(&did);
                 }
             }
             EnrollOutcome::NeedsSignIn => {
@@ -2929,6 +2938,7 @@ where
                                         did,
                                         config.device_label.clone(),
                                         event_tx.clone(),
+                                        config.key_lookup.clone(),
                                     );
                                 }
                             }
@@ -9040,6 +9050,52 @@ mod device_key_tests {
             store.saves.lock().len(),
             1,
             "a loaded key is not saved again"
+        );
+    }
+
+    /// Publishing a device key makes the client's own account stale: the
+    /// listing was taken at connect, before the record existed, so without
+    /// this the client's own lines wear the origin's verdict for an hour.
+    #[tokio::test]
+    async fn a_published_enrollment_re_lists_the_clients_own_account() {
+        let (lookup, listings, _proofs) = lookup_counting(repo_holding(&[])).await;
+        let lookup = Arc::new(lookup);
+        let kid = crate::sigtag::derive_kid(
+            &ed25519_dalek::SigningKey::from_bytes(&[6; 32]).verifying_key(),
+        );
+
+        // The listing this connect would have taken: a miss, held for the ttl.
+        assert_eq!(lookup.key_for("did:plc:tester", &kid).await.unwrap(), None);
+        assert_eq!(listings.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(lookup.key_for("did:plc:tester", &kid).await.unwrap(), None);
+        assert_eq!(
+            listings.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the hourly rule holds the miss"
+        );
+
+        let store = MemoryStore::holding(6, None);
+        let enrollment = StubEnrollment::answering(EnrollOutcome::Published {
+            uri: "at://did:plc:tester/at.freeq.deviceKey/3kdevice".to_string(),
+        });
+        let config = ConnectConfig {
+            key_lookup: Some(lookup.clone()),
+            ..config_with(Some(store), Some(enrollment.clone()))
+        };
+        let _conn = connect_once(config).await;
+        for _ in 0..100 {
+            if enrollment.calls.lock().len() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(enrollment.calls.lock().len(), 1, "the key was published");
+
+        assert_eq!(lookup.key_for("did:plc:tester", &kid).await.unwrap(), None);
+        assert_eq!(
+            listings.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the account is listed again once its key is published"
         );
     }
 
