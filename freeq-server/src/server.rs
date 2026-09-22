@@ -924,6 +924,10 @@ pub struct SharedState {
     pub spawned_agents: Mutex<HashMap<String, SpawnedAgent>>,
     /// Per-IP rate limiter for expensive REST endpoints (OG preview, blob proxy, upload).
     pub rest_rate_limiter: crate::web::IpRateLimiter,
+    /// Per-IP limit for the record-cache routes, apart from
+    /// `rest_rate_limiter`: a cold client asks for one listing and one proof
+    /// per record per account.
+    pub record_rate_limiter: crate::web::IpRateLimiter,
     /// Private media store: encrypted-at-rest blobs on local disk served via
     /// signed capability URLs. None only in lightweight test harnesses.
     pub media_store: Option<crate::media_store::MediaStore>,
@@ -2113,6 +2117,8 @@ impl Server {
             spawned_agents: Mutex::new(HashMap::new()),
             // 30 requests per 60-second window per IP for expensive REST endpoints
             rest_rate_limiter: crate::web::IpRateLimiter::new(30, 60),
+            // 600 requests per 60-second window per IP for the record routes
+            record_rate_limiter: crate::web::IpRateLimiter::new(600, 60),
             media_store,
             liveness_probes: Mutex::new(HashMap::new()),
             session_kill: Mutex::new(HashMap::new()),
@@ -2790,6 +2796,7 @@ impl Server {
                             .unwrap_or_default()
                             .as_secs();
                         cleanup_state.rest_rate_limiter.prune(now);
+                        cleanup_state.record_rate_limiter.prune(now);
                     }
                 }
             });
@@ -8301,6 +8308,8 @@ mod s2s_adversarial_tests {
             ghost_sessions: Mutex::new(HashMap::new()),
             spawned_agents: Mutex::new(HashMap::new()),
             rest_rate_limiter: crate::web::IpRateLimiter::new(30, 60),
+            // 600 requests per 60-second window per IP for the record routes
+            record_rate_limiter: crate::web::IpRateLimiter::new(600, 60),
             media_store: None,
             liveness_probes: Mutex::new(HashMap::new()),
             session_kill: Mutex::new(HashMap::new()),

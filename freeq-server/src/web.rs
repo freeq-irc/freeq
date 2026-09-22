@@ -315,6 +315,14 @@ pub fn router(state: Arc<SharedState>) -> Router {
             "/api/v1/signing-keys/{did}/{kid}",
             get(api_did_signing_key_by_kid),
         )
+        .route(
+            "/api/v1/records/{did}/{collection}",
+            get(api_record_listing),
+        )
+        .route(
+            "/api/v1/records/{did}/{collection}/{rkey}/proof",
+            get(api_record_proof),
+        )
         .route("/api/v1/verify/{msgid}", get(api_verify_message))
         .route(
             "/api/v1/channels/{name}/evidence",
@@ -928,6 +936,97 @@ async fn api_did_signing_key_by_kid(
             "removed_at": row.removed_at
         }))),
         None => Err(axum::http::StatusCode::NOT_FOUND),
+    }
+}
+
+/// GET /api/v1/records/{did}/{collection} — an account's identity records as
+/// its PDS listed them, from this server's cache (`record_cache`). Public,
+/// like the signing-key routes; a client still checks every record's proof
+/// itself, so this can withhold or be stale but not forge.
+///
+/// 404 for an account that has not appeared here, or a collection other than
+/// `at.freeq.deviceKey` and `at.freeq.agentKey`: the client reads the PDS
+/// itself. An account has appeared when it is signed in now, has a signing
+/// key on file, or has a stored message; a server with no database knows
+/// only live sessions and keys registered since it started. `stale` is true
+/// when the PDS could not be read and the last copy is served; 502 when
+/// there is no copy to serve.
+async fn api_record_listing(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<Arc<SharedState>>,
+    axum::extract::Path((did, collection)): axum::extract::Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // A seen account can be asked for over and over, and a miss costs a
+    // request to its PDS; the record routes have their own budget.
+    if !state.record_rate_limiter.check(addr.ip()) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let did = urlencoding::decode(&did).unwrap_or(std::borrow::Cow::Borrowed(&did));
+    let collection =
+        urlencoding::decode(&collection).unwrap_or(std::borrow::Cow::Borrowed(&collection));
+    let served = crate::record_cache::listing(&state, &did, &collection)
+        .await
+        .map_err(record_refusal_status)?;
+    let records: Vec<serde_json::Value> = served
+        .listing
+        .entries
+        .iter()
+        .map(|e| serde_json::json!({ "uri": e.uri, "cid": e.cid, "value": e.value }))
+        .collect();
+    Ok(Json(serde_json::json!({
+        "did": did.as_ref(),
+        "collection": collection.as_ref(),
+        "fetched_at": served.listing.fetched_at,
+        "stale": served.stale,
+        "records": records,
+    })))
+}
+
+/// GET /api/v1/records/{did}/{collection}/{rkey}/proof — the record's
+/// `com.atproto.sync.getRecord` CAR as the PDS gave it, from this server's
+/// cache, with `X-Freeq-Fetched-At`. Only proofs this server checked itself
+/// are served, and only for a record the current listing names (404
+/// otherwise, or as for the listing route); 502 when the proof cannot be
+/// fetched or does not check.
+async fn api_record_proof(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<Arc<SharedState>>,
+    axum::extract::Path((did, collection, rkey)): axum::extract::Path<(String, String, String)>,
+) -> Result<axum::response::Response, StatusCode> {
+    use axum::response::IntoResponse;
+    if !state.record_rate_limiter.check(addr.ip()) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let did = urlencoding::decode(&did).unwrap_or(std::borrow::Cow::Borrowed(&did));
+    let collection =
+        urlencoding::decode(&collection).unwrap_or(std::borrow::Cow::Borrowed(&collection));
+    let rkey = urlencoding::decode(&rkey).unwrap_or(std::borrow::Cow::Borrowed(&rkey));
+    let proof = crate::record_cache::proof(&state, &did, &collection, &rkey)
+        .await
+        .map_err(record_refusal_status)?;
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/vnd.ipld.car".to_string(),
+            ),
+            (
+                axum::http::HeaderName::from_static("x-freeq-fetched-at"),
+                proof.fetched_at.to_string(),
+            ),
+        ],
+        proof.car,
+    )
+        .into_response())
+}
+
+fn record_refusal_status(refusal: crate::record_cache::Refusal) -> StatusCode {
+    match refusal {
+        crate::record_cache::Refusal::NotHere => StatusCode::NOT_FOUND,
+        crate::record_cache::Refusal::Unreadable(reason) => {
+            tracing::debug!(%reason, "record cache has nothing to serve");
+            StatusCode::BAD_GATEWAY
+        }
     }
 }
 
@@ -6535,6 +6634,268 @@ mod orphan_view_tests {
         assert!(
             gone.is_empty(),
             "zero is the operator switching the annotation off, federation or no federation"
+        );
+    }
+}
+
+#[cfg(test)]
+mod record_route_tests {
+    use super::{api_record_listing, api_record_proof};
+    use axum::extract::{ConnectInfo, Path, State};
+    use axum::http::StatusCode;
+    use freeq_sdk::identity_records::{DEVICE_KEY_TYPE, record_cid, verify_proof};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    const DID: &str = "did:plc:recordroutetest";
+
+    fn caller() -> ConnectInfo<std::net::SocketAddr> {
+        ConnectInfo("127.0.0.1:1".parse().unwrap())
+    }
+
+    fn device_record(seed: u8) -> serde_json::Value {
+        let key = freeq_sdk::crypto::PrivateKey::ed25519_from_bytes(&[seed; 32]).unwrap();
+        serde_json::to_value(
+            freeq_sdk::identity_records::build_device_record(
+                &key,
+                DID,
+                "2026-01-01T00:00:00Z",
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A state whose reader reaches a stub PDS listing `records` for DID,
+    /// where DID is signed in.
+    async fn state_for(records: Vec<serde_json::Value>) -> Arc<crate::server::SharedState> {
+        let (resolver, _, _) =
+            crate::peer_keys::stub_pds_counting(DID, Arc::new(parking_lot::Mutex::new(records)))
+                .await;
+        let state = crate::server::test_state_on(
+            Some(crate::db::Db::open_memory().unwrap()),
+            crate::config::ServerConfig::default(),
+            resolver,
+        );
+        state.did_sessions.lock().insert(
+            DID.to_string(),
+            std::collections::HashSet::from(["s".to_string()]),
+        );
+        state
+    }
+
+    /// A state where DID is signed in and its document names a PDS nothing
+    /// answers at.
+    async fn state_with_dead_pds() -> Arc<crate::server::SharedState> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let key = freeq_sdk::crypto::PrivateKey::generate_secp256k1();
+        let doc = freeq_sdk::did::make_test_did_document_with_pds(
+            DID,
+            &key.public_key_multibase(),
+            Some(&base),
+        );
+        let state = crate::server::test_state_on(
+            None,
+            crate::config::ServerConfig::default(),
+            freeq_sdk::did::DidResolver::static_map(HashMap::from([(DID.to_string(), doc)])),
+        );
+        state.did_sessions.lock().insert(
+            DID.to_string(),
+            std::collections::HashSet::from(["s".to_string()]),
+        );
+        state
+    }
+
+    async fn list(
+        state: &Arc<crate::server::SharedState>,
+        did: &str,
+        collection: &str,
+    ) -> Result<serde_json::Value, StatusCode> {
+        api_record_listing(
+            caller(),
+            State(state.clone()),
+            Path((did.to_string(), collection.to_string())),
+        )
+        .await
+        .map(|json| json.0)
+    }
+
+    async fn prove(
+        state: &Arc<crate::server::SharedState>,
+        did: &str,
+        rkey: &str,
+    ) -> Result<axum::response::Response, StatusCode> {
+        api_record_proof(
+            caller(),
+            State(state.clone()),
+            Path((
+                did.to_string(),
+                DEVICE_KEY_TYPE.to_string(),
+                rkey.to_string(),
+            )),
+        )
+        .await
+    }
+
+    fn rkey_of(record: &serde_json::Value) -> String {
+        record["uri"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn the_listing_is_served_with_each_value_as_listed() {
+        let records = vec![device_record(1), device_record(2)];
+        let state = state_for(records.clone()).await;
+
+        let body = list(&state, DID, DEVICE_KEY_TYPE).await.unwrap();
+        assert_eq!(body["did"], DID);
+        assert_eq!(body["collection"], DEVICE_KEY_TYPE);
+        assert_eq!(body["stale"], false);
+        assert!(body["fetched_at"].is_i64());
+        let listed: Vec<&serde_json::Value> = body["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| &r["value"])
+            .collect();
+        assert_eq!(listed, records.iter().collect::<Vec<_>>());
+        for record in body["records"].as_array().unwrap() {
+            assert!(
+                record["uri"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("at://{DID}/{DEVICE_KEY_TYPE}/"))
+            );
+            assert!(record["cid"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_proof_served_is_the_car_and_verifies_under_the_repo_key() {
+        let state = state_for(vec![device_record(1)]).await;
+        let body = list(&state, DID, DEVICE_KEY_TYPE).await.unwrap();
+        let record = &body["records"][0];
+        let rkey = rkey_of(record);
+
+        let response = prove(&state, DID, &rkey).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "application/vnd.ipld.car"
+        );
+        let fetched_at: i64 = response.headers()["x-freeq-fetched-at"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(fetched_at > 0);
+        let car = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let doc = state.did_resolver.resolve(DID).await.unwrap();
+        let multibase = doc
+            .verification_method
+            .iter()
+            .find(|m| m.id.ends_with("#atproto"))
+            .and_then(|m| m.public_key_multibase.clone())
+            .unwrap();
+        let key = freeq_sdk::crypto::PublicKey::from_multibase(&multibase).unwrap();
+        let cid = record_cid(&record["value"]).unwrap();
+        let outcome = verify_proof(&car, DID, DEVICE_KEY_TYPE, &rkey, &cid, &key)
+            .await
+            .unwrap();
+        assert!(outcome.verified());
+    }
+
+    #[tokio::test]
+    async fn an_account_not_seen_here_is_not_found() {
+        let state = state_for(vec![device_record(1)]).await;
+        let stranger = "did:plc:neverappearedhere";
+        assert_eq!(
+            list(&state, stranger, DEVICE_KEY_TYPE).await.unwrap_err(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            prove(&state, stranger, "anything").await.unwrap_err(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn a_collection_outside_the_identity_records_is_not_found() {
+        let state = state_for(vec![device_record(1)]).await;
+        assert_eq!(
+            list(&state, DID, "app.bsky.feed.post").await.unwrap_err(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_the_listing_does_not_name_is_not_found() {
+        let state = state_for(vec![device_record(1)]).await;
+        assert_eq!(
+            prove(&state, DID, "notlisted").await.unwrap_err(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn no_copy_and_no_pds_is_a_bad_gateway() {
+        let state = state_with_dead_pds().await;
+        assert_eq!(
+            list(&state, DID, DEVICE_KEY_TYPE).await.unwrap_err(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            prove(&state, DID, "anything").await.unwrap_err(),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proof_that_cannot_be_fetched_or_does_not_check_is_a_bad_gateway() {
+        let state = state_for(vec![device_record(1)]).await;
+        let body = list(&state, DID, DEVICE_KEY_TYPE).await.unwrap();
+        let listed = &body["records"][0];
+        let repo_key = state
+            .record_cache
+            .stored_listing(DID, DEVICE_KEY_TYPE)
+            .unwrap()
+            .repo_key;
+        // A newer listing naming a record the PDS has no proof for, and one
+        // whose value is not the record the PDS's proof holds.
+        let entries = vec![
+            freeq_sdk::identity_records::RecordEntry {
+                uri: format!("at://{DID}/{DEVICE_KEY_TYPE}/absent"),
+                cid: String::new(),
+                value: device_record(2),
+            },
+            freeq_sdk::identity_records::RecordEntry {
+                uri: listed["uri"].as_str().unwrap().to_string(),
+                cid: String::new(),
+                value: device_record(3),
+            },
+        ];
+        state
+            .record_cache
+            .keep_listing(DID, DEVICE_KEY_TYPE, &repo_key, &entries);
+
+        assert_eq!(
+            prove(&state, DID, "absent").await.unwrap_err(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            prove(&state, DID, &rkey_of(listed)).await.unwrap_err(),
+            StatusCode::BAD_GATEWAY
         );
     }
 }
