@@ -10,6 +10,8 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::crypto::PublicKey;
 
@@ -163,6 +165,7 @@ impl DidResolver {
         DidResolver::Static(StaticResolver {
             documents,
             handles: HashMap::new(),
+            resolutions: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -173,7 +176,25 @@ impl DidResolver {
         documents: HashMap<String, DidDocument>,
         handles: HashMap<String, String>,
     ) -> Self {
-        DidResolver::Static(StaticResolver { documents, handles })
+        DidResolver::Static(StaticResolver {
+            documents,
+            handles,
+            resolutions: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    /// Like `static_map`, plus a count of the resolutions it is asked for
+    /// (for testing a caller that caches documents).
+    pub fn static_map_counting(
+        documents: HashMap<String, DidDocument>,
+    ) -> (Self, Arc<AtomicUsize>) {
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolver = DidResolver::Static(StaticResolver {
+            documents,
+            handles: HashMap::new(),
+            resolutions: resolutions.clone(),
+        });
+        (resolver, resolutions)
     }
 
     /// Resolve a DID to its DID document.
@@ -335,10 +356,13 @@ impl HttpResolver {
 pub struct StaticResolver {
     documents: HashMap<String, DidDocument>,
     handles: HashMap<String, String>,
+    /// How often `resolve` has been called, for tests that count them.
+    resolutions: Arc<AtomicUsize>,
 }
 
 impl StaticResolver {
     fn resolve(&self, did: &str) -> Result<DidDocument> {
+        self.resolutions.fetch_add(1, Ordering::SeqCst);
         // did:key can always be resolved from the DID itself
         if did.starts_with("did:key:") {
             return resolve_did_key(did);
@@ -558,6 +582,7 @@ mod tests {
         let resolver = StaticResolver {
             documents: HashMap::new(),
             handles: HashMap::new(),
+            resolutions: Arc::new(AtomicUsize::new(0)),
         };
         let key = PrivateKey::generate_ed25519();
         let did = format!("did:key:{}", key.public_key_multibase());

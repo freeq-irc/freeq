@@ -449,7 +449,7 @@ impl<P: ClientProvider> KeyLookup<P> {
     }
 
     async fn in_document(&self, did: &str, kid: &str) -> Result<Option<[u8; 32]>> {
-        let doc = self.reader.resolver.resolve(did).await?;
+        let doc = self.reader.resolve_document(did).await?;
         Ok(doc
             .verification_method
             .iter()

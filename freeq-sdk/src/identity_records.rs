@@ -29,6 +29,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::time::Instant;
 
 pub use atrium_repo::Cid;
 
@@ -626,7 +627,19 @@ pub struct RecordReader<P: freeq_oauth::ClientProvider> {
     /// Per host (scheme, host and port), the time until which it is not
     /// asked again, set by a 429.
     paused: parking_lot::Mutex<std::collections::HashMap<String, DateTime<Utc>>>,
+    /// Each DID's document as last resolved, kept for `document_ttl`.
+    documents: parking_lot::Mutex<std::collections::HashMap<String, (DidDocument, Instant)>>,
+    /// One resolution in flight per DID, which every caller for it awaits.
+    resolving: parking_lot::Mutex<std::collections::HashMap<String, DocumentInFlight>>,
+    document_ttl: std::time::Duration,
 }
+
+/// A DID document being resolved, which every caller for that DID awaits.
+type DocumentInFlight =
+    std::sync::Arc<tokio::sync::OnceCell<Result<DidDocument, std::sync::Arc<anyhow::Error>>>>;
+
+/// How long a resolved DID document is used before it is resolved again.
+pub const DOCUMENT_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// A request not sent, or refused, because the host answered 429: the host
 /// and the time it said to retry at.
@@ -690,7 +703,64 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
             on_listing: None,
             on_checked_proof: None,
             paused: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            documents: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            resolving: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            document_ttl: DOCUMENT_TTL,
         }
+    }
+
+    /// How long a resolved DID document is used before it is resolved again;
+    /// [`DOCUMENT_TTL`] unless set here.
+    pub fn with_document_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.document_ttl = ttl;
+        self
+    }
+
+    /// `did`'s document, as last resolved while inside the ttl, else
+    /// resolved. Callers racing on one DID share the resolution; a
+    /// resolution that fails is not kept.
+    pub(crate) async fn resolve_document(&self, did: &str) -> Result<DidDocument> {
+        let kept = self
+            .documents
+            .lock()
+            .get(did)
+            .filter(|(_, at)| at.elapsed() < self.document_ttl)
+            .map(|(doc, _)| doc.clone());
+        if let Some(doc) = kept {
+            return Ok(doc);
+        }
+        let cell = self
+            .resolving
+            .lock()
+            .entry(did.to_string())
+            .or_default()
+            .clone();
+        let resolved = cell
+            .get_or_init(|| async {
+                match self.resolver.resolve(did).await {
+                    Ok(doc) => {
+                        if !self.document_ttl.is_zero() {
+                            self.documents
+                                .lock()
+                                .insert(did.to_string(), (doc.clone(), Instant::now()));
+                        }
+                        Ok(doc)
+                    }
+                    Err(e) => Err(std::sync::Arc::new(e)),
+                }
+            })
+            .await
+            .clone();
+        {
+            let mut resolving = self.resolving.lock();
+            if resolving
+                .get(did)
+                .is_some_and(|c| std::sync::Arc::ptr_eq(c, &cell))
+            {
+                resolving.remove(did);
+            }
+        }
+        resolved.map_err(|e| anyhow::anyhow!("{e:#}"))
     }
 
     /// Until when the host of `url` is paused by a 429, if it is.
@@ -808,7 +878,7 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
         did: &str,
         collection: &str,
     ) -> Result<Vec<RecordEntry>> {
-        let doc = self.resolver.resolve(did).await?;
+        let doc = self.resolve_document(did).await?;
         let repo_key = repo_key_multibase(&doc).unwrap_or_default();
         let Some(pds) = pds_endpoint(&doc) else {
             if let Some(hook) = &self.on_listing {
@@ -875,7 +945,7 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
 
     /// The `com.atproto.sync.getRecord` proof for one record, a CAR file.
     pub async fn fetch_proof(&self, did: &str, collection: &str, rkey: &str) -> Result<Vec<u8>> {
-        let doc = self.resolver.resolve(did).await?;
+        let doc = self.resolve_document(did).await?;
         let pds = pds_endpoint(&doc).context("DID document names no PDS")?;
         self.proof_from(&pds, did, collection, rkey).await
     }
@@ -889,7 +959,7 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
         rkey: &str,
         expected: &Cid,
     ) -> Result<ProofOutcome> {
-        let doc = self.resolver.resolve(did).await?;
+        let doc = self.resolve_document(did).await?;
         let multibase = repo_key_multibase(&doc)?;
         let repo_key = PublicKey::from_multibase(multibase)?;
         let pds = pds_endpoint(&doc).context("DID document names no PDS")?;
@@ -2819,5 +2889,135 @@ mod tests {
         let commit = commit_block(PROOF_DID, &node_cid);
         let car = car_file(&[(sha256_cid(DAG_CBOR, &commit), commit), (node_cid, node)]);
         assert!(verify_hostile(&car).await.is_err());
+    }
+
+    // ─── the reader's DID document cache ────────────────────────────────
+
+    /// A stub repository of `n` device key records, served, with a counting
+    /// resolver for the account's document.
+    async fn counting_reader(
+        n: usize,
+    ) -> (
+        RecordReader<freeq_oauth::SharedClient>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Vec<serde_json::Value>,
+    ) {
+        let mut repo = crate::test_support::StubRepo::new(ALICE);
+        let records: Vec<serde_json::Value> = (1..=n)
+            .map(|seed| value(&build_device_record(&key(seed as u8), ALICE, T0, None).unwrap()))
+            .collect();
+        for record in &records {
+            repo.add(DEVICE_KEY_TYPE, record);
+        }
+        let repo = Arc::new(parking_lot::Mutex::new(repo));
+        let base = serve_repo(repo.clone()).await;
+        let doc = repo.lock().document(&base);
+        let (resolver, resolutions) =
+            DidResolver::static_map_counting(HashMap::from([(ALICE.to_string(), doc)]));
+        let reader = RecordReader::new(resolver, freeq_oauth::SharedClient(reqwest::Client::new()));
+        (reader, resolutions, records)
+    }
+
+    async fn prove_all(reader: &RecordReader<freeq_oauth::SharedClient>) -> usize {
+        let proven = parking_lot::Mutex::new(std::collections::HashSet::new());
+        let proving = ProofsInFlight::default();
+        let entries = reader
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .await
+            .unwrap();
+        reader
+            .proven_records(ALICE, DEVICE_KEY_TYPE, entries, &proven, &proving)
+            .await
+            .len()
+    }
+
+    #[tokio::test]
+    async fn proving_three_records_of_one_account_resolves_its_document_once() {
+        let (reader, resolutions, records) = counting_reader(3).await;
+        assert_eq!(prove_all(&reader).await, records.len());
+        assert_eq!(
+            hits(&resolutions),
+            1,
+            "one listing and three proofs share one resolution"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_document_is_resolved_again_past_the_ttl() {
+        let (reader, resolutions, _) = counting_reader(1).await;
+        let reader = reader.with_document_ttl(std::time::Duration::from_millis(50));
+        prove_all(&reader).await;
+        assert_eq!(hits(&resolutions), 1);
+        prove_all(&reader).await;
+        assert_eq!(hits(&resolutions), 1, "inside the ttl the copy is used");
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        prove_all(&reader).await;
+        assert_eq!(hits(&resolutions), 2);
+    }
+
+    #[tokio::test]
+    async fn a_resolution_that_fails_is_not_kept() {
+        let (reader, resolutions, _) = counting_reader(1).await;
+        // BOB is not in the resolver's map, so every resolution of it fails.
+        const BOB: &str = "did:plc:bobbobbobbobbobbobbobbob";
+        assert!(
+            reader
+                .list_record_entries(BOB, DEVICE_KEY_TYPE)
+                .await
+                .is_err()
+        );
+        assert!(
+            reader
+                .list_record_entries(BOB, DEVICE_KEY_TYPE)
+                .await
+                .is_err()
+        );
+        assert_eq!(hits(&resolutions), 2, "a failed resolution is asked again");
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_proofs_resolve_the_document_once() {
+        let (reader, resolutions, records) = counting_reader(2).await;
+        let rkey = |record: &serde_json::Value| {
+            let cid = record_cid(record).unwrap();
+            let prefix = format!("at://{ALICE}/{DEVICE_KEY_TYPE}/");
+            (cid, prefix)
+        };
+        let entries = reader
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), records.len());
+        let before = hits(&resolutions);
+        let (first, second) = (entries[0].clone(), entries[1].clone());
+        let one = async {
+            let (cid, prefix) = rkey(&first.value);
+            reader
+                .verify_record(
+                    ALICE,
+                    DEVICE_KEY_TYPE,
+                    first.uri.strip_prefix(&prefix).unwrap(),
+                    &cid,
+                )
+                .await
+        };
+        let two = async {
+            let (cid, prefix) = rkey(&second.value);
+            reader
+                .verify_record(
+                    ALICE,
+                    DEVICE_KEY_TYPE,
+                    second.uri.strip_prefix(&prefix).unwrap(),
+                    &cid,
+                )
+                .await
+        };
+        let (a, b) = tokio::join!(one, two);
+        assert!(a.unwrap().verified() && b.unwrap().verified());
+        assert_eq!(
+            hits(&resolutions) - before,
+            0,
+            "the listing's copy serves both"
+        );
     }
 }
