@@ -591,9 +591,15 @@ async function fromRecords(
 /**
  * A `ResolveDid` for did:plc (the PLC directory) and did:web, built on
  * `@atcute/identity-resolver`. Anything else is refused.
+ *
+ * The document is kept for `ttlMs` (an hour by default) per DID, so the
+ * readers and lookups built on one resolver resolve an account once an hour
+ * rather than once per proof. The library keeps no cache of its own. A
+ * rotation is learned at most a ttl late; a proof that then fails its check
+ * already falls through to a fresh one, the same bound the records take.
  */
 export function makeDidResolver(
-  options: { fetch?: typeof globalThis.fetch; plcUrl?: string } = {},
+  options: { fetch?: typeof globalThis.fetch; plcUrl?: string; ttlMs?: number } = {},
 ): ResolveDid {
   const resolver = new CompositeDidDocumentResolver({
     methods: {
@@ -601,12 +607,30 @@ export function makeDidResolver(
       web: new WebDidDocumentResolver({ fetch: options.fetch }),
     },
   });
+  const ttlMs = options.ttlMs ?? 3_600_000;
+  const held = new Map<string, { doc: DidDocument; at: number }>();
+  const resolving = new Map<string, Promise<DidDocument>>();
   return async (did: string): Promise<DidDocument> => {
     if (!did.startsWith('did:plc:') && !did.startsWith('did:web:')) {
       throw new Error(`no resolver for ${did}`);
     }
-    const doc = await resolver.resolve(did as `did:plc:${string}` | `did:web:${string}`);
-    return doc as unknown as DidDocument;
+    const last = held.get(did);
+    if (last !== undefined && Date.now() - last.at < ttlMs) return last.doc;
+    const inFlight = resolving.get(did);
+    if (inFlight !== undefined) return inFlight;
+    const started: Promise<DidDocument> = resolver
+      .resolve(did as `did:plc:${string}` | `did:web:${string}`)
+      .then((doc) => {
+        const document = doc as unknown as DidDocument;
+        // A failed resolve throws instead, and nothing is kept.
+        if (ttlMs > 0) held.set(did, { doc: document, at: Date.now() });
+        return document;
+      })
+      .finally(() => {
+        if (resolving.get(did) === started) resolving.delete(did);
+      });
+    resolving.set(did, started);
+    return started;
   };
 }
 

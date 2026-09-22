@@ -590,6 +590,80 @@ describe('makeDidResolver', () => {
     ]);
     await expect(resolve('did:key:z6Mkabc')).rejects.toThrow();
   });
+
+  /** A `fetch` answering the PLC directory for ALICE, counting the calls. */
+  async function plcNetwork(): Promise<{ fetch: typeof globalThis.fetch; hits: { plc: number } }> {
+    const doc = {
+      '@context': ['https://www.w3.org/ns/did/v1'],
+      id: ALICE,
+      verificationMethod: [
+        {
+          id: `${ALICE}#atproto`,
+          type: 'Multikey',
+          controller: ALICE,
+          publicKeyMultibase: (await key(1)).publicKeyMultibase,
+        },
+      ],
+      service: [{ id: '#atproto_pds', type: 'AtprotoPersonalDataServer', serviceEndpoint: PDS }],
+    };
+    const hits = { plc: 0 };
+    const fetch = vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = decodeURIComponent(String(input instanceof Request ? input.url : input));
+      if (url === `https://plc.directory/${ALICE}`) {
+        hits.plc += 1;
+        return Response.json(doc);
+      }
+      return new Response('not found', { status: 404 });
+    });
+    return { fetch: fetch as unknown as typeof globalThis.fetch, hits };
+  }
+
+  it('resolves a did once inside the ttl and again past it', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-11T00:00:00Z'));
+    const { fetch, hits } = await plcNetwork();
+    const resolve = makeDidResolver({ fetch });
+    expect((await resolve(ALICE)).id).toBe(ALICE);
+    vi.setSystemTime(new Date('2026-09-11T00:59:00Z'));
+    expect((await resolve(ALICE)).id).toBe(ALICE);
+    expect(hits.plc, 'inside the ttl the copy is used').toBe(1);
+    vi.setSystemTime(new Date('2026-09-11T01:01:00Z'));
+    expect((await resolve(ALICE)).id).toBe(ALICE);
+    expect(hits.plc).toBe(2);
+  });
+
+  it('shares one fetch between concurrent resolves of one did', async () => {
+    const { fetch, hits } = await plcNetwork();
+    const resolve = makeDidResolver({ fetch });
+    const [a, b] = await Promise.all([resolve(ALICE), resolve(ALICE)]);
+    expect(a.id).toBe(ALICE);
+    expect(b.id).toBe(ALICE);
+    expect(hits.plc).toBe(1);
+  });
+
+  it('does not keep a failed resolve', async () => {
+    let down = true;
+    let hits = 0;
+    const doc = { '@context': ['https://www.w3.org/ns/did/v1'], id: ALICE };
+    const fetch = vi.fn(async (): Promise<Response> => {
+      hits += 1;
+      if (down) return new Response('nope', { status: 500 });
+      return Response.json(doc);
+    }) as unknown as typeof globalThis.fetch;
+    const resolve = makeDidResolver({ fetch });
+    await expect(resolve(ALICE)).rejects.toThrow();
+    down = false;
+    expect((await resolve(ALICE)).id).toBe(ALICE);
+    expect(hits).toBe(2);
+  });
+
+  it('fetches every time when the ttl is zero', async () => {
+    const { fetch, hits } = await plcNetwork();
+    const resolve = makeDidResolver({ fetch, ttlMs: 0 });
+    await resolve(ALICE);
+    await resolve(ALICE);
+    expect(hits.plc).toBe(2);
+  });
 });
 
 // ─── through the home server ────────────────────────────────────────────
