@@ -312,6 +312,19 @@ describe('KeyLookup', () => {
     expect(hits.origin).toBe(2);
   });
 
+  it('lists the account again after a remembered miss is forgotten', async () => {
+    const { fetch, hits, repo } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
+    const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, ORIGIN, HOUR, NO_RETRIES);
+    expect(await lookup.keyFor(ALICE, await kidOf(2))).toBeNull();
+    expect(hits.pds).toBe(1);
+
+    // Published after the listing the lookup holds.
+    await repo.add('at.freeq.deviceKey', await buildDeviceRecord(await key(2), ALICE, T0));
+    lookup.forget(ALICE, await kidOf(2));
+    expect((await lookup.keyFor(ALICE, await kidOf(2)))?.source).toBe('IdentityRecord');
+    expect(hits.pds, 'the forgotten miss listed the account again').toBe(2);
+  });
+
   it('keeps a found key cached when asked to forget', async () => {
     const { fetch, hits } = await network([await buildDeviceRecord(await key(1), ALICE, T0)]);
     const lookup = new KeyLookup({ fetch, resolveDid: resolver([alice]) }, null, HOUR);

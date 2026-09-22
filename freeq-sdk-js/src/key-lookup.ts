@@ -526,10 +526,19 @@ export class KeyLookup {
     return pending;
   }
 
-  /** Clear a remembered miss for `(did, kid)`, so the next lookup asks again. A key found stays cached. */
+  /**
+   * Clear a remembered miss for `(did, kid)`, so the next lookup asks again.
+   * A key found stays cached.
+   *
+   * The DID's refresh time goes too, or the next lookup would answer a kid
+   * the held listing lacks from that listing and never see a record
+   * published since — which is what a caller forgetting a miss is after.
+   */
   forget(did: string, kid: string): void {
     const slot = JSON.stringify([did, kid]);
-    if (this.cache.get(slot)?.other === null) this.cache.delete(slot);
+    if (this.cache.get(slot)?.other !== null) return;
+    this.cache.delete(slot);
+    this.refreshed.delete(did);
   }
 
   private remember(slot: string, records: unknown[], other: FoundKey | null | undefined): void {
