@@ -134,6 +134,12 @@ impl<P: ClientProvider> KeyLookup<P> {
         self
     }
 
+    /// The record reader this lookup lists and proves through, with whatever
+    /// callbacks it was built with.
+    pub fn reader(&self) -> &RecordReader<P> {
+        &self.reader
+    }
+
     /// The origin to ask when none was given at construction. Set once; a
     /// client sets it to the server it connected to.
     pub fn set_default_origin_base(&self, base: String) {
@@ -697,6 +703,27 @@ mod tests {
 
     fn device_record(seed: u8) -> serde_json::Value {
         serde_json::to_value(build_device_record(&key(seed), ALICE, T0, None).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_reader_is_the_one_the_lookup_was_built_with() {
+        let doc = make_test_did_document_with_pds(ALICE, &key(1).public_key_multibase(), None);
+        let listings = Arc::new(AtomicUsize::new(0));
+        let counted = listings.clone();
+        let reader = RecordReader::new(
+            DidResolver::static_map(HashMap::from([(ALICE.to_string(), doc)])),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        )
+        .on_listing(move |_, _, _, _| {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        let lookup = KeyLookup::new(reader, None, HOUR);
+        lookup
+            .reader()
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .await
+            .unwrap();
+        assert_eq!(listings.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -574,7 +574,19 @@ pub fn verify_record_binding(record: &serde_json::Value, signer: &PublicKey) -> 
 pub struct RecordReader<P: freeq_oauth::ClientProvider> {
     pub(crate) resolver: DidResolver,
     pub(crate) clients: P,
+    on_listing: Option<ListingHook>,
+    on_checked_proof: Option<CheckedProofHook>,
 }
+
+/// Told of every listing a reader makes: `(did, collection, repo_key,
+/// entries)`, `repo_key` being the `#atproto` publicKeyMultibase of the DID
+/// document the listing resolved, empty when it has none.
+pub type ListingHook = Box<dyn Fn(&str, &str, &str, &[RecordEntry]) + Send + Sync>;
+
+/// Told of every proof a reader checks and finds good: `(did, collection,
+/// rkey, cid, repo_key, car)`, `repo_key` being the publicKeyMultibase it
+/// checked under and `car` the proof as the PDS gave it.
+pub type CheckedProofHook = Box<dyn Fn(&str, &str, &str, &Cid, &str, &[u8]) + Send + Sync>;
 
 /// One page of a `com.atproto.repo.listRecords` answer.
 #[derive(Deserialize)]
@@ -601,7 +613,32 @@ pub struct RecordEntry {
 
 impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
     pub fn new(resolver: DidResolver, clients: P) -> Self {
-        Self { resolver, clients }
+        Self {
+            resolver,
+            clients,
+            on_listing: None,
+            on_checked_proof: None,
+        }
+    }
+
+    /// Call `hook` after every listing that succeeds, so a caller can keep
+    /// what the PDS listed.
+    pub fn on_listing(
+        mut self,
+        hook: impl Fn(&str, &str, &str, &[RecordEntry]) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_listing = Some(Box::new(hook));
+        self
+    }
+
+    /// Call `hook` after every proof `verify_record` fetches and finds good,
+    /// so a caller can keep the proof's bytes.
+    pub fn on_checked_proof(
+        mut self,
+        hook: impl Fn(&str, &str, &str, &Cid, &str, &[u8]) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_checked_proof = Some(Box::new(hook));
+        self
     }
 
     /// Every record of `collection` in `did`'s repository, as the PDS lists
@@ -693,7 +730,11 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
         collection: &str,
     ) -> Result<Vec<RecordEntry>> {
         let doc = self.resolver.resolve(did).await?;
+        let repo_key = repo_key_multibase(&doc).unwrap_or_default();
         let Some(pds) = pds_endpoint(&doc) else {
+            if let Some(hook) = &self.on_listing {
+                hook(did, collection, repo_key, &[]);
+            }
             return Ok(Vec::new());
         };
         let endpoint = format!(
@@ -725,6 +766,9 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
                 Some(next) if !empty => cursor = Some(next),
                 _ => break,
             }
+        }
+        if let Some(hook) = &self.on_listing {
+            hook(did, collection, repo_key, &records);
         }
         Ok(records)
     }
@@ -767,10 +811,17 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
         expected: &Cid,
     ) -> Result<ProofOutcome> {
         let doc = self.resolver.resolve(did).await?;
-        let repo_key = repo_signing_key(&doc)?;
+        let multibase = repo_key_multibase(&doc)?;
+        let repo_key = PublicKey::from_multibase(multibase)?;
         let pds = pds_endpoint(&doc).context("DID document names no PDS")?;
         let car = self.proof_from(&pds, did, collection, rkey).await?;
-        verify_proof(&car, did, collection, rkey, expected, &repo_key).await
+        let outcome = verify_proof(&car, did, collection, rkey, expected, &repo_key).await?;
+        if outcome.verified()
+            && let Some(hook) = &self.on_checked_proof
+        {
+            hook(did, collection, rkey, expected, multibase, &car);
+        }
+        Ok(outcome)
     }
 
     async fn proof_from(
@@ -971,20 +1022,19 @@ async fn check_proof(
     })
 }
 
-/// The account's repository signing key: the `#atproto` entry of its DID
-/// document.
-fn repo_signing_key(doc: &DidDocument) -> Result<PublicKey> {
+/// The account's repository signing key as its DID document writes it: the
+/// publicKeyMultibase of the `#atproto` entry.
+fn repo_key_multibase(doc: &DidDocument) -> Result<&str> {
     let full_id = format!("{}#atproto", doc.id);
     let method = doc
         .verification_method
         .iter()
         .find(|m| m.id == full_id || m.id == "#atproto")
         .context("DID document has no #atproto key")?;
-    let multibase = method
+    method
         .public_key_multibase
         .as_deref()
-        .context("#atproto key has no publicKeyMultibase")?;
-    PublicKey::from_multibase(multibase)
+        .context("#atproto key has no publicKeyMultibase")
 }
 
 #[cfg(test)]
@@ -1834,6 +1884,187 @@ mod tests {
             vec![genuine.clone()]
         );
         assert_eq!(reads(), (1, 2), "a failed proof is not kept");
+    }
+
+    /// The `#atproto` publicKeyMultibase `doc` names.
+    fn atproto_multibase(doc: &crate::did::DidDocument) -> String {
+        doc.verification_method
+            .iter()
+            .find(|m| m.id.ends_with("#atproto"))
+            .and_then(|m| m.public_key_multibase.clone())
+            .unwrap()
+    }
+
+    type Listed = Arc<parking_lot::Mutex<Vec<(String, String, String, Vec<RecordEntry>)>>>;
+
+    fn record_listings<P: freeq_oauth::ClientProvider>(
+        reader: RecordReader<P>,
+    ) -> (RecordReader<P>, Listed) {
+        let listed = Listed::default();
+        let sink = listed.clone();
+        let reader = reader.on_listing(move |did, collection, repo_key, entries| {
+            sink.lock().push((
+                did.to_string(),
+                collection.to_string(),
+                repo_key.to_string(),
+                entries.to_vec(),
+            ));
+        });
+        (reader, listed)
+    }
+
+    #[tokio::test]
+    async fn each_listing_is_reported_with_the_repo_key_and_the_entries_as_listed() {
+        let mut repo = crate::test_support::StubRepo::new(ALICE);
+        repo.add(
+            DEVICE_KEY_TYPE,
+            &value(&build_device_record(&key(1), ALICE, T0, Some("laptop")).unwrap()),
+        );
+        let repo = Arc::new(parking_lot::Mutex::new(repo));
+        let base = serve_repo(repo.clone()).await;
+        let doc = repo.lock().document(&base);
+        let repo_key = atproto_multibase(&doc);
+        let (reader, listed) = record_listings(RecordReader::new(
+            DidResolver::static_map(HashMap::from([(ALICE.to_string(), doc)])),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        ));
+
+        let first = reader
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .await
+            .unwrap();
+        let second = reader
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        let expect = |entries: Vec<RecordEntry>| {
+            (
+                ALICE.to_string(),
+                DEVICE_KEY_TYPE.to_string(),
+                repo_key.clone(),
+                entries,
+            )
+        };
+        assert_eq!(*listed.lock(), vec![expect(first), expect(second)]);
+    }
+
+    #[tokio::test]
+    async fn the_empty_listing_of_a_did_with_no_pds_is_reported() {
+        let (reader, listed) = record_listings(reader_for(ALICE, None));
+        assert!(
+            reader
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            *listed.lock(),
+            vec![(
+                ALICE.to_string(),
+                DEVICE_KEY_TYPE.to_string(),
+                key(1).public_key_multibase(),
+                Vec::new(),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_is_not_reported() {
+        let router = axum::Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+        let base = spawn_stub(router).await;
+        let (reader, listed) = record_listings(reader_for(ALICE, Some(&base)));
+        assert!(
+            reader
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .await
+                .is_err()
+        );
+        assert!(listed.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_a_proof_that_checks_is_reported_with_its_bytes() {
+        let mut repo = crate::test_support::StubRepo::new(ALICE);
+        let genuine = value(&build_device_record(&key(1), ALICE, T0, Some("laptop")).unwrap());
+        // Signed by its own key, so it passes every record check but the proof.
+        let forged = value(&build_device_record(&key(2), ALICE, T0, Some("forged")).unwrap());
+        let genuine_uri = repo.add(DEVICE_KEY_TYPE, &genuine);
+        repo.add_forged(DEVICE_KEY_TYPE, &forged, &genuine);
+        let repo = Arc::new(parking_lot::Mutex::new(repo));
+        let base = serve_repo(repo.clone()).await;
+        let doc = repo.lock().document(&base);
+        let repo_key = atproto_multibase(&doc);
+        type Checked = Vec<(String, String, String, Cid, String, Vec<u8>)>;
+        let checked = Arc::new(parking_lot::Mutex::new(Checked::new()));
+        let sink = checked.clone();
+        let reader = RecordReader::new(
+            DidResolver::static_map(HashMap::from([(ALICE.to_string(), doc)])),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        )
+        .on_checked_proof(move |did, collection, rkey, cid, repo_key, car| {
+            sink.lock().push((
+                did.to_string(),
+                collection.to_string(),
+                rkey.to_string(),
+                *cid,
+                repo_key.to_string(),
+                car.to_vec(),
+            ));
+        });
+
+        let proven = parking_lot::Mutex::new(std::collections::HashSet::new());
+        let proving = ProofsInFlight::default();
+        for _ in 0..3 {
+            let entries = reader
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .await
+                .unwrap();
+            reader
+                .proven_records(ALICE, DEVICE_KEY_TYPE, entries, &proven, &proving)
+                .await;
+        }
+        // A proof the PDS will not give is not reported either.
+        assert!(
+            reader
+                .verify_record(
+                    ALICE,
+                    DEVICE_KEY_TYPE,
+                    "absent",
+                    &record_cid(&genuine).unwrap()
+                )
+                .await
+                .is_err()
+        );
+
+        let checked = checked.lock();
+        assert_eq!(
+            checked.len(),
+            1,
+            "the genuine proof, once; never the forged"
+        );
+        let (did, collection, rkey, cid, key, car) = &checked[0];
+        let genuine_rkey = genuine_uri.rsplit('/').next().unwrap();
+        assert_eq!(
+            (did.as_str(), collection.as_str(), rkey.as_str(), key),
+            (ALICE, DEVICE_KEY_TYPE, genuine_rkey, &repo_key)
+        );
+        assert_eq!(*cid, record_cid(&genuine).unwrap());
+        let outcome = verify_proof(
+            car,
+            ALICE,
+            DEVICE_KEY_TYPE,
+            genuine_rkey,
+            cid,
+            &PublicKey::from_multibase(key).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.verified(), "the reported bytes are the proof");
     }
 
     #[tokio::test]
