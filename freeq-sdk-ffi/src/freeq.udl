@@ -105,6 +105,16 @@ callback interface DeviceKeyStore {
     void save(StoredDeviceKey key);
 };
 
+// Where the app keeps the key lookup's cache between launches, one JSON
+// string shared by every session on the device. Public data only.
+callback interface KeyLookupStore {
+    [Throws=FreeqError]
+    string? load();
+
+    [Throws=FreeqError]
+    void save(string snapshot);
+};
+
 // What publishing a device key came to.
 enum EnrollOutcome {
     "Published",
@@ -274,6 +284,12 @@ interface FreeqClient {
     // Keeps this device's signing key across connects. Before connect().
     [Throws=FreeqError]
     void set_device_key_store(DeviceKeyStore store);
+
+    // Keeps the key lookup's cache across launches. Before connect(); the
+    // apps set it on every connect, which drops the lookup the last one
+    // built, and the next starts from the store's shared file.
+    [Throws=FreeqError]
+    void set_key_lookup_store(KeyLookupStore store);
 
     // Publishes a stored key the account does not have yet. Before connect().
     [Throws=FreeqError]

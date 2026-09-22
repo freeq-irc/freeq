@@ -286,6 +286,20 @@ typedef void (*UniffiCallbackInterfaceEventHandlerMethod0)(uint64_t, RustBuffer,
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_KEY_LOOKUP_STORE_METHOD0
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_KEY_LOOKUP_STORE_METHOD0
+typedef void (*UniffiCallbackInterfaceKeyLookupStoreMethod0)(uint64_t, RustBuffer* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_KEY_LOOKUP_STORE_METHOD1
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_KEY_LOOKUP_STORE_METHOD1
+typedef void (*UniffiCallbackInterfaceKeyLookupStoreMethod1)(uint64_t, RustBuffer, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
 #ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_P2P_EVENT_HANDLER_METHOD0
 #define UNIFFI_FFIDEF_CALLBACK_INTERFACE_P2P_EVENT_HANDLER_METHOD0
 typedef void (*UniffiCallbackInterfaceP2pEventHandlerMethod0)(uint64_t, RustBuffer, void* _Nonnull, 
@@ -324,6 +338,15 @@ typedef struct UniffiVTableCallbackInterfaceEventHandler {
     UniffiCallbackInterfaceEventHandlerMethod0 _Nonnull onEvent;
     UniffiCallbackInterfaceFree _Nonnull uniffiFree;
 } UniffiVTableCallbackInterfaceEventHandler;
+
+#endif
+#ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_KEY_LOOKUP_STORE
+#define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_KEY_LOOKUP_STORE
+typedef struct UniffiVTableCallbackInterfaceKeyLookupStore {
+    UniffiCallbackInterfaceKeyLookupStoreMethod0 _Nonnull load;
+    UniffiCallbackInterfaceKeyLookupStoreMethod1 _Nonnull save;
+    UniffiCallbackInterfaceFree _Nonnull uniffiFree;
+} UniffiVTableCallbackInterfaceKeyLookupStore;
 
 #endif
 #ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_P2P_EVENT_HANDLER
@@ -509,6 +532,11 @@ void uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_enrollment(void*_Nonnull ptr
 void uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_fresh_sign_in(void*_Nonnull ptr, int8_t fresh, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_KEY_LOOKUP_STORE
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_KEY_LOOKUP_STORE
+void uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_key_lookup_store(void*_Nonnull ptr, uint64_t store, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_PLATFORM
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQCLIENT_SET_PLATFORM
 void uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_platform(void*_Nonnull ptr, RustBuffer platform, RustCallStatus *_Nonnull out_status
@@ -678,6 +706,11 @@ void uniffi_freeq_sdk_ffi_fn_init_callback_vtable_enrollment(const UniffiVTableC
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_INIT_CALLBACK_VTABLE_EVENTHANDLER
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_INIT_CALLBACK_VTABLE_EVENTHANDLER
 void uniffi_freeq_sdk_ffi_fn_init_callback_vtable_eventhandler(const UniffiVTableCallbackInterfaceEventHandler* _Nonnull vtable
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_INIT_CALLBACK_VTABLE_KEYLOOKUPSTORE
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_INIT_CALLBACK_VTABLE_KEYLOOKUPSTORE
+void uniffi_freeq_sdk_ffi_fn_init_callback_vtable_keylookupstore(const UniffiVTableCallbackInterfaceKeyLookupStore* _Nonnull vtable
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_INIT_CALLBACK_VTABLE_P2PEVENTHANDLER
@@ -1184,6 +1217,12 @@ uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_fresh_sign_in(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_KEY_LOOKUP_STORE
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_KEY_LOOKUP_STORE
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_key_lookup_store(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_PLATFORM
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQCLIENT_SET_PLATFORM
 uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_platform(void
@@ -1379,6 +1418,18 @@ uint16_t uniffi_freeq_sdk_ffi_checksum_method_enrollment_publish(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_EVENTHANDLER_ON_EVENT
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_EVENTHANDLER_ON_EVENT
 uint16_t uniffi_freeq_sdk_ffi_checksum_method_eventhandler_on_event(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_KEYLOOKUPSTORE_LOAD
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_KEYLOOKUPSTORE_LOAD
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_keylookupstore_load(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_KEYLOOKUPSTORE_SAVE
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_KEYLOOKUPSTORE_SAVE
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_keylookupstore_save(void
     
 );
 #endif

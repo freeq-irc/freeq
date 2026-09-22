@@ -829,6 +829,8 @@ public protocol FreeqClientProtocol: AnyObject, Sendable {
     
     func setFreshSignIn(fresh: Bool) throws 
     
+    func setKeyLookupStore(store: KeyLookupStore) throws 
+    
     func setPlatform(platform: String) throws 
     
     func setTopic(channel: String, topic: String) throws 
@@ -1045,6 +1047,13 @@ open func setEnrollment(enrollment: Enrollment)throws   {try rustCallWithError(F
 open func setFreshSignIn(fresh: Bool)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
     uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_fresh_sign_in(self.uniffiClonePointer(),
         FfiConverterBool.lower(fresh),$0
+    )
+}
+}
+    
+open func setKeyLookupStore(store: KeyLookupStore)throws   {try rustCallWithError(FfiConverterTypeFreeqError_lift) {
+    uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_key_lookup_store(self.uniffiClonePointer(),
+        FfiConverterCallbackInterfaceKeyLookupStore_lower(store),$0
     )
 }
 }
@@ -5013,6 +5022,148 @@ public func FfiConverterCallbackInterfaceEventHandler_lower(_ v: EventHandler) -
 
 
 
+public protocol KeyLookupStore: AnyObject, Sendable {
+    
+    func load() throws  -> String?
+    
+    func save(snapshot: String) throws 
+    
+}
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceKeyLookupStore {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // This creates 1-element array, since this seems to be the only way to construct a const
+    // pointer that we can pass to the Rust code.
+    static let vtable: [UniffiVTableCallbackInterfaceKeyLookupStore] = [UniffiVTableCallbackInterfaceKeyLookupStore(
+        load: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> String? in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceKeyLookupStore.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.load(
+                )
+            }
+
+            
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterOptionString.lower($0) }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeFreeqError_lower
+            )
+        },
+        save: { (
+            uniffiHandle: UInt64,
+            snapshot: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceKeyLookupStore.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.save(
+                     snapshot: try FfiConverterString.lift(snapshot)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeFreeqError_lower
+            )
+        },
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            let result = try? FfiConverterCallbackInterfaceKeyLookupStore.handleMap.remove(handle: uniffiHandle)
+            if result == nil {
+                print("Uniffi callback interface KeyLookupStore: handle missing in uniffiFree")
+            }
+        }
+    )]
+}
+
+private func uniffiCallbackInitKeyLookupStore() {
+    uniffi_freeq_sdk_ffi_fn_init_callback_vtable_keylookupstore(UniffiCallbackInterfaceKeyLookupStore.vtable)
+}
+
+// FfiConverter protocol for callback interfaces
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterCallbackInterfaceKeyLookupStore {
+    fileprivate static let handleMap = UniffiHandleMap<KeyLookupStore>()
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+extension FfiConverterCallbackInterfaceKeyLookupStore : FfiConverter {
+    typealias SwiftType = KeyLookupStore
+    typealias FfiType = UInt64
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lift(_ handle: UInt64) throws -> SwiftType {
+        try handleMap.get(handle: handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lower(_ v: SwiftType) -> UInt64 {
+        return handleMap.insert(obj: v)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func write(_ v: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(v))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceKeyLookupStore_lift(_ handle: UInt64) throws -> KeyLookupStore {
+    return try FfiConverterCallbackInterfaceKeyLookupStore.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceKeyLookupStore_lower(_ v: KeyLookupStore) -> UInt64 {
+    return FfiConverterCallbackInterfaceKeyLookupStore.lower(v)
+}
+
+
+
+
 public protocol P2pEventHandler: AnyObject, Sendable {
     
     func onP2pEvent(event: P2pEvent) 
@@ -5612,6 +5763,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_fresh_sign_in() != 56485) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_key_lookup_store() != 60957) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_platform() != 50791) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5711,6 +5865,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_freeq_sdk_ffi_checksum_method_eventhandler_on_event() != 8369) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_freeq_sdk_ffi_checksum_method_keylookupstore_load() != 1866) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_method_keylookupstore_save() != 52646) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_freeq_sdk_ffi_checksum_method_p2peventhandler_on_p2p_event() != 37677) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5719,6 +5879,7 @@ private let initializationResult: InitializationResult = {
     uniffiCallbackInitDeviceKeyStore()
     uniffiCallbackInitEnrollment()
     uniffiCallbackInitEventHandler()
+    uniffiCallbackInitKeyLookupStore()
     uniffiCallbackInitP2pEventHandler()
     return InitializationResult.ok
 }()

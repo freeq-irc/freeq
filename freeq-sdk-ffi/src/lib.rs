@@ -3,6 +3,9 @@
 use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex};
 
+/// The key lookup the SDK client takes, as this crate builds it.
+type SdkKeyLookup = freeq_sdk::key_lookup::KeyLookup<freeq_oauth::SharedClient>;
+
 /// Install a tracing subscriber that writes to stderr the first time anyone
 /// touches the SDK. iOS captures this in the Xcode console pane while
 /// debugging — invaluable for triaging connect-path hangs. Idempotent: a
@@ -623,6 +626,28 @@ impl freeq_sdk::device_key::DeviceKeyStore for StoreAdapter {
     }
 }
 
+/// Where the app keeps the key lookup's cache between launches.
+pub trait KeyLookupStore: Send + Sync + 'static {
+    fn load(&self) -> Result<Option<String>, FreeqError>;
+    fn save(&self, snapshot: String) -> Result<(), FreeqError>;
+}
+
+/// The app's lookup store, as the SDK wants it, on the `StoreAdapter`
+/// pattern: the SDK's errors are `anyhow`; the callback's are `FreeqError`.
+struct LookupStoreAdapter(Arc<dyn KeyLookupStore>);
+
+impl freeq_sdk::key_lookup::KeyLookupStore for LookupStoreAdapter {
+    fn load(&self) -> anyhow::Result<Option<String>> {
+        self.0.load().map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    fn save(&self, snapshot: &str) -> anyhow::Result<()> {
+        self.0
+            .save(snapshot.to_string())
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
 /// The app's enrollment, as the SDK wants it. The callback is a blocking
 /// call over the FFI, so it runs on a blocking thread rather than in the
 /// async task that awaits it.
@@ -718,6 +743,14 @@ pub struct FreeqClient {
     /// Set before connect: the app's key store, its enrollment, the label the
     /// published record carries, and whether to check received signatures.
     device_key_store: Arc<Mutex<Option<Arc<dyn DeviceKeyStore>>>>,
+    key_lookup_store: Arc<Mutex<Option<Arc<dyn KeyLookupStore>>>>,
+    /// Built once and reused by every connect, so the cache it holds — and
+    /// the snapshot behind it — survives a reconnect. Set aside when the
+    /// store is set again, which the apps do on every connect; the next
+    /// lookup starts from the snapshot in the store's file, shared by every
+    /// session on the device, once the one set aside has flushed.
+    key_lookup: Arc<Mutex<Option<Arc<SdkKeyLookup>>>>,
+    previous_key_lookup: Arc<Mutex<Option<Arc<SdkKeyLookup>>>>,
     enrollment: Arc<Mutex<Option<Arc<dyn Enrollment>>>>,
     device_label: Arc<Mutex<Option<String>>>,
     /// Set right after the app's own sign-in; taken by the next connect.
@@ -746,6 +779,9 @@ impl FreeqClient {
             connected: Arc::new(Mutex::new(false)),
             web_token: Arc::new(Mutex::new(None)),
             device_key_store: Arc::new(Mutex::new(None)),
+            key_lookup_store: Arc::new(Mutex::new(None)),
+            key_lookup: Arc::new(Mutex::new(None)),
+            previous_key_lookup: Arc::new(Mutex::new(None)),
             enrollment: Arc::new(Mutex::new(None)),
             device_label: Arc::new(Mutex::new(None)),
             fresh_sign_in: Arc::new(Mutex::new(false)),
@@ -787,11 +823,54 @@ impl FreeqClient {
         Ok(())
     }
 
+    /// Keep the key lookup's cache across launches, in the app's store.
+    /// Setting it sets aside the lookup built on the last one, and the next
+    /// starts from the store's snapshot once that one has written what it
+    /// holds and stopped. The apps set it on every connect; the file behind
+    /// it is shared by every session on the device and holds only public
+    /// data.
+    pub fn set_key_lookup_store(&self, store: Box<dyn KeyLookupStore>) -> Result<(), FreeqError> {
+        *self.key_lookup_store.lock().unwrap() = Some(Arc::from(store));
+        if let Some(old) = self.key_lookup.lock().unwrap().take() {
+            *self.previous_key_lookup.lock().unwrap() = Some(old);
+        }
+        Ok(())
+    }
+
     /// Publish a stored key the account does not have yet, through the app.
     /// Read at `connect()`.
     pub fn set_enrollment(&self, enrollment: Box<dyn Enrollment>) -> Result<(), FreeqError> {
         *self.enrollment.lock().unwrap() = Some(Arc::from(enrollment));
         Ok(())
+    }
+
+    /// The lookup every connect shares: built on the first connect that
+    /// wants one, with the app's store behind it when it set one.
+    fn shared_key_lookup(&self) -> Arc<SdkKeyLookup> {
+        let mut held = self.key_lookup.lock().unwrap();
+        if let Some(lookup) = held.as_ref() {
+            return lookup.clone();
+        }
+        let reader = freeq_sdk::identity_records::RecordReader::new(
+            freeq_sdk::did::DidResolver::http(),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        );
+        let mut lookup = freeq_sdk::key_lookup::KeyLookup::new(
+            reader,
+            None,
+            std::time::Duration::from_secs(3600),
+        );
+        if let Some(store) = self.key_lookup_store.lock().unwrap().clone() {
+            lookup = lookup.with_store(Arc::new(LookupStoreAdapter(store)));
+        }
+        // The lookup set aside writes what it holds and stops before this one
+        // reads the shared snapshot, so neither overwrites the other.
+        if let Some(old) = self.previous_key_lookup.lock().unwrap().take() {
+            lookup = lookup.with_load_after(async move { old.flush().await });
+        }
+        let lookup = Arc::new(lookup);
+        *held = Some(lookup.clone());
+        lookup
     }
 
     /// The label the published key record carries, e.g. the device model.
@@ -838,17 +917,11 @@ impl FreeqClient {
         let enrollment = self.enrollment.lock().unwrap().clone().map(|app| {
             Arc::new(EnrollmentAdapter(app)) as Arc<dyn freeq_sdk::device_key::Enrollment>
         });
-        let key_lookup = self.verify_signatures.lock().unwrap().then(|| {
-            let reader = freeq_sdk::identity_records::RecordReader::new(
-                freeq_sdk::did::DidResolver::http(),
-                freeq_oauth::SharedClient(reqwest::Client::new()),
-            );
-            Arc::new(freeq_sdk::key_lookup::KeyLookup::new(
-                reader,
-                None,
-                std::time::Duration::from_secs(3600),
-            ))
-        });
+        let key_lookup = self
+            .verify_signatures
+            .lock()
+            .unwrap()
+            .then(|| self.shared_key_lookup());
         let config = freeq_sdk::client::ConnectConfig {
             server_addr: self.server.clone(),
             nick: nick.clone(),
@@ -3771,5 +3844,160 @@ mod tests {
         assert_eq!(msgid, "01KYVT5Z8Q0000000000000000");
         assert_eq!(verdict.state, VerdictState::Device);
         assert_eq!(verdict.layer, Some(KeyLayer::Vouched));
+    }
+
+    /// An app's store over a file, as the three apps implement it.
+    struct FileStore {
+        path: std::path::PathBuf,
+        saves: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl KeyLookupStore for FileStore {
+        fn load(&self) -> Result<Option<String>, FreeqError> {
+            match std::fs::read_to_string(&self.path) {
+                Ok(text) => Ok(Some(text)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(_) => Err(FreeqError::InvalidArgument),
+            }
+        }
+
+        fn save(&self, snapshot: String) -> Result<(), FreeqError> {
+            self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::fs::create_dir_all(self.path.parent().unwrap()).ok();
+            std::fs::write(&self.path, snapshot).map_err(|_| FreeqError::InvalidArgument)
+        }
+    }
+
+    /// The adapter carries a snapshot both ways, and the app's errors come
+    /// back as the SDK's.
+    #[test]
+    fn a_lookup_snapshot_round_trips_through_the_store_adapter() {
+        use freeq_sdk::key_lookup::KeyLookupStore as SdkStore;
+        let dir = std::env::temp_dir().join(format!("freeq-ffi-lookup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let saves = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let adapter = LookupStoreAdapter(Arc::new(FileStore {
+            path: dir.join("key-lookup.json"),
+            saves: saves.clone(),
+        }));
+
+        assert!(adapter.load().unwrap().is_none(), "nothing held yet");
+        adapter
+            .save(r#"{"keys":[],"records":[],"refreshed":[],"proven":[]}"#)
+            .unwrap();
+        assert_eq!(saves.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            adapter.load().unwrap().as_deref(),
+            Some(r#"{"keys":[],"records":[],"refreshed":[],"proven":[]}"#)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The lookup is built once and reused, so its cache survives a
+    /// reconnect; setting the store again drops it, and the next lookup
+    /// starts from that store's snapshot.
+    #[test]
+    fn the_key_lookup_is_reused_across_connects_and_dropped_with_a_new_store() {
+        struct Silent;
+        impl EventHandler for Silent {
+            fn on_event(&self, _event: FreeqEvent) {}
+        }
+        let client =
+            FreeqClient::new("127.0.0.1:6667".into(), "nick".into(), Box::new(Silent)).unwrap();
+        let first = client.shared_key_lookup();
+        assert!(
+            Arc::ptr_eq(&first, &client.shared_key_lookup()),
+            "every connect shares one lookup"
+        );
+
+        let saves = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dir = std::env::temp_dir().join(format!("freeq-ffi-lookup-2-{}", std::process::id()));
+        client
+            .set_key_lookup_store(Box::new(FileStore {
+                path: dir.join("key-lookup.json"),
+                saves,
+            }))
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &client.shared_key_lookup()),
+            "a new store starts a new lookup"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store over one snapshot in memory, noting what each load read.
+    #[derive(Default)]
+    struct NotingStore {
+        held: Mutex<Option<String>>,
+        loads: Mutex<Vec<Option<String>>>,
+        saves: std::sync::atomic::AtomicUsize,
+    }
+
+    impl KeyLookupStore for Arc<NotingStore> {
+        fn load(&self) -> Result<Option<String>, FreeqError> {
+            let held = self.held.lock().unwrap().clone();
+            self.loads.lock().unwrap().push(held.clone());
+            Ok(held)
+        }
+
+        fn save(&self, snapshot: String) -> Result<(), FreeqError> {
+            self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.held.lock().unwrap() = Some(snapshot);
+            Ok(())
+        }
+    }
+
+    /// Setting the store again keeps the old lookup until the next one reads:
+    /// that read waits for the old lookup's held write, and the old lookup
+    /// writes nothing after.
+    #[tokio::test]
+    async fn a_new_lookups_first_read_waits_for_the_old_lookups_held_write() {
+        struct Silent;
+        impl EventHandler for Silent {
+            fn on_event(&self, _event: FreeqEvent) {}
+        }
+        // A did:key has no records and there is no origin, so each ask is a
+        // miss settled with no request, and each settle saves.
+        const BOT: &str = "did:key:z6MkExampleBotSigner";
+        let at = chrono::Utc::now() - chrono::TimeDelta::hours(10);
+        let store = Arc::new(NotingStore::default());
+        let client =
+            FreeqClient::new("127.0.0.1:6667".into(), "nick".into(), Box::new(Silent)).unwrap();
+        client
+            .set_key_lookup_store(Box::new(store.clone()))
+            .unwrap();
+        let old = client.shared_key_lookup();
+        assert_eq!(old.key_for_at(BOT, "first", at).await.unwrap(), None);
+        assert_eq!(old.key_for_at(BOT, "held", at).await.unwrap(), None);
+        let saves = || store.saves.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(saves(), 1, "the second write is held");
+
+        client
+            .set_key_lookup_store(Box::new(store.clone()))
+            .unwrap();
+        let next = client.shared_key_lookup();
+        assert_eq!(next.key_for_at(BOT, "other", at).await.unwrap(), None);
+        let read = store.loads.lock().unwrap().last().cloned().flatten();
+        assert!(
+            read.is_some_and(|text| text.contains("held")),
+            "the new lookup read the old one's held write"
+        );
+
+        let written = saves();
+        assert_eq!(old.key_for_at(BOT, "late", at).await.unwrap(), None);
+        tokio::time::sleep(
+            freeq_sdk::key_lookup::SAVE_EVERY + std::time::Duration::from_millis(300),
+        )
+        .await;
+        assert!(
+            !store
+                .held
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|text| text.contains("late")),
+            "nothing from the old lookup after the new one took over"
+        );
+        assert!(saves() >= written, "the new lookup may still write");
     }
 }

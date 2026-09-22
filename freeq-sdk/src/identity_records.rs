@@ -730,6 +730,9 @@ struct HomeProofAnswer {
 #[derive(Deserialize)]
 struct HomeListingAnswer {
     records: Vec<RecordEntry>,
+    /// When the server listed the PDS, unix seconds.
+    #[serde(default)]
+    fetched_at: Option<i64>,
 }
 
 /// One page of a `com.atproto.repo.listRecords` answer.
@@ -956,10 +959,25 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
         collection: &str,
         home_base: Option<&str>,
     ) -> Result<Vec<RecordEntry>> {
+        Ok(self
+            .list_record_entries_dated(did, collection, home_base)
+            .await?
+            .0)
+    }
+
+    /// `list_record_entries`, with the home server's listing time (its
+    /// `fetched_at`, unix seconds) when the home server served the listing;
+    /// `None` when it was read from the PDS.
+    pub async fn list_record_entries_dated(
+        &self,
+        did: &str,
+        collection: &str,
+        home_base: Option<&str>,
+    ) -> Result<(Vec<RecordEntry>, Option<i64>)> {
         // The home server's copy first; any answer but a listing reads the
         // PDS, as without a home server.
         if let Some(home) = home_base
-            && let Ok(records) = self.home_listing(home, did, collection).await
+            && let Ok((records, fetched_at)) = self.home_listing(home, did, collection).await
         {
             if let Some(hook) = &self.on_listing {
                 // The repo key the hook wants comes from the document, which
@@ -970,7 +988,7 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
                 };
                 hook(did, collection, &repo_key, &records);
             }
-            return Ok(records);
+            return Ok((records, fetched_at));
         }
         let doc = self.resolve_document(did).await?;
         let repo_key = repo_key_multibase(&doc).unwrap_or_default();
@@ -978,7 +996,7 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
             if let Some(hook) = &self.on_listing {
                 hook(did, collection, repo_key, &[]);
             }
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         };
         let endpoint = format!(
             "{}/xrpc/com.atproto.repo.listRecords",
@@ -1013,7 +1031,7 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
         if let Some(hook) = &self.on_listing {
             hook(did, collection, repo_key, &records);
         }
-        Ok(records)
+        Ok((records, None))
     }
 
     /// The device keys of `did` that are live at `at`.
@@ -1089,13 +1107,14 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
         Ok(outcome)
     }
 
-    /// `collection` of `did` as the home server at `home` lists it.
+    /// `collection` of `did` as the home server at `home` lists it, and when
+    /// the server listed it, if it said.
     async fn home_listing(
         &self,
         home: &str,
         did: &str,
         collection: &str,
-    ) -> Result<Vec<RecordEntry>> {
+    ) -> Result<(Vec<RecordEntry>, Option<i64>)> {
         let url = home_url(home, ["api", "v1", "records", did, collection])?;
         let answer: HomeListingAnswer = self
             .get(&url)
@@ -1103,7 +1122,7 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
             .json()
             .await
             .context("the home server's listing is not a record list")?;
-        Ok(answer.records)
+        Ok((answer.records, answer.fetched_at))
     }
 
     /// One record's proof as the home server at `home` holds it.

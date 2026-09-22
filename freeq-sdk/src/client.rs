@@ -2656,11 +2656,11 @@ fn spawn_enrollment(
                 if let Err(e) = store.save(&published) {
                     tracing::warn!(error = %e, "published device key not saved");
                 }
-                // The listing taken at connect predates this record, and the
-                // hourly rule would hold it. Our own lines are checked
-                // against it, so it is re-listed now rather than in an hour.
+                // The listing taken at connect predates this record, and so
+                // may the home server's copy. Our own lines are checked
+                // against it, so the account is listed at the PDS now.
                 if let Some(lookup) = key_lookup {
-                    lookup.refresh_account(&did);
+                    lookup.refresh_account(&did).await;
                 }
             }
             EnrollOutcome::NeedsSignIn => {
@@ -9276,11 +9276,23 @@ mod device_key_tests {
         }
         assert_eq!(enrollment.calls.lock().len(), 1, "the key was published");
 
-        assert_eq!(lookup.key_for("did:plc:tester", &kid).await.unwrap(), None);
+        // The spawned enrollment lists the account at once.
+        for _ in 0..100 {
+            if listings.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert_eq!(
             listings.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "the account is listed again once its key is published"
+        );
+        assert_eq!(lookup.key_for("did:plc:tester", &kid).await.unwrap(), None);
+        assert_eq!(
+            listings.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the lookup lists nothing more"
         );
     }
 

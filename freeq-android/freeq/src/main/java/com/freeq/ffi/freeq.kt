@@ -669,6 +669,12 @@ internal interface UniffiCallbackInterfaceEnrollmentMethod0 : com.sun.jna.Callba
 internal interface UniffiCallbackInterfaceEventHandlerMethod0 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`event`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
+internal interface UniffiCallbackInterfaceKeyLookupStoreMethod0 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceKeyLookupStoreMethod1 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`snapshot`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
 internal interface UniffiCallbackInterfaceP2pEventHandlerMethod0 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`event`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
@@ -739,6 +745,25 @@ internal open class UniffiVTableCallbackInterfaceEventHandler(
     }
 
 }
+@Structure.FieldOrder("load", "save", "uniffiFree")
+internal open class UniffiVTableCallbackInterfaceKeyLookupStore(
+    @JvmField internal var `load`: UniffiCallbackInterfaceKeyLookupStoreMethod0? = null,
+    @JvmField internal var `save`: UniffiCallbackInterfaceKeyLookupStoreMethod1? = null,
+    @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+) : Structure() {
+    class UniffiByValue(
+        `load`: UniffiCallbackInterfaceKeyLookupStoreMethod0? = null,
+        `save`: UniffiCallbackInterfaceKeyLookupStoreMethod1? = null,
+        `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+    ): UniffiVTableCallbackInterfaceKeyLookupStore(`load`,`save`,`uniffiFree`,), Structure.ByValue
+
+   internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceKeyLookupStore) {
+        `load` = other.`load`
+        `save` = other.`save`
+        `uniffiFree` = other.`uniffiFree`
+    }
+
+}
 @Structure.FieldOrder("onP2pEvent", "uniffiFree")
 internal open class UniffiVTableCallbackInterfaceP2pEventHandler(
     @JvmField internal var `onP2pEvent`: UniffiCallbackInterfaceP2pEventHandlerMethod0? = null,
@@ -755,6 +780,11 @@ internal open class UniffiVTableCallbackInterfaceP2pEventHandler(
     }
 
 }
+
+
+
+
+
 
 
 
@@ -1035,6 +1065,8 @@ fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_enrollment(
 ): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_fresh_sign_in(
 ): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_key_lookup_store(
+): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_platform(
 ): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_topic(
@@ -1101,6 +1133,10 @@ fun uniffi_freeq_sdk_ffi_checksum_method_enrollment_publish(
 ): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_eventhandler_on_event(
 ): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_keylookupstore_load(
+): Short
+fun uniffi_freeq_sdk_ffi_checksum_method_keylookupstore_save(
+): Short
 fun uniffi_freeq_sdk_ffi_checksum_method_p2peventhandler_on_p2p_event(
 ): Short
 fun ffi_freeq_sdk_ffi_uniffi_contract_version(
@@ -1145,6 +1181,7 @@ internal interface UniffiLib : Library {
             uniffiCallbackInterfaceDeviceKeyStore.register(lib)
             uniffiCallbackInterfaceEnrollment.register(lib)
             uniffiCallbackInterfaceEventHandler.register(lib)
+            uniffiCallbackInterfaceKeyLookupStore.register(lib)
             uniffiCallbackInterfaceP2pEventHandler.register(lib)
             // Loading of library with integrity check done.
             lib
@@ -1227,6 +1264,8 @@ fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_enrollment(`ptr`: Pointer,`en
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_fresh_sign_in(`ptr`: Pointer,`fresh`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_key_lookup_store(`ptr`: Pointer,`store`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_platform(`ptr`: Pointer,`platform`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_topic(`ptr`: Pointer,`channel`: RustBuffer.ByValue,`topic`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1294,6 +1333,8 @@ fun uniffi_freeq_sdk_ffi_fn_init_callback_vtable_devicekeystore(`vtable`: Uniffi
 fun uniffi_freeq_sdk_ffi_fn_init_callback_vtable_enrollment(`vtable`: UniffiVTableCallbackInterfaceEnrollment,
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_init_callback_vtable_eventhandler(`vtable`: UniffiVTableCallbackInterfaceEventHandler,
+): Unit
+fun uniffi_freeq_sdk_ffi_fn_init_callback_vtable_keylookupstore(`vtable`: UniffiVTableCallbackInterfaceKeyLookupStore,
 ): Unit
 fun uniffi_freeq_sdk_ffi_fn_init_callback_vtable_p2peventhandler(`vtable`: UniffiVTableCallbackInterfaceP2pEventHandler,
 ): Unit
@@ -1530,6 +1571,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_fresh_sign_in() != 56485.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_key_lookup_store() != 60957.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_freeqclient_set_platform() != 50791.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1627,6 +1671,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_eventhandler_on_event() != 8369.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_keylookupstore_load() != 1866.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freeq_sdk_ffi_checksum_method_keylookupstore_save() != 52646.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freeq_sdk_ffi_checksum_method_p2peventhandler_on_p2p_event() != 37677.toShort()) {
@@ -2523,6 +2573,8 @@ public interface FreeqClientInterface {
     
     fun `setFreshSignIn`(`fresh`: kotlin.Boolean)
     
+    fun `setKeyLookupStore`(`store`: KeyLookupStore)
+    
     fun `setPlatform`(`platform`: kotlin.String)
     
     fun `setTopic`(`channel`: kotlin.String, `topic`: kotlin.String)
@@ -2853,6 +2905,18 @@ open class FreeqClient: Disposable, AutoCloseable, FreeqClientInterface
     uniffiRustCallWithError(FreeqException) { _status ->
     UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_fresh_sign_in(
         it, FfiConverterBoolean.lower(`fresh`),_status)
+}
+    }
+    
+    
+
+    
+    @Throws(FreeqException::class)override fun `setKeyLookupStore`(`store`: KeyLookupStore)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(FreeqException) { _status ->
+    UniffiLib.INSTANCE.uniffi_freeq_sdk_ffi_fn_method_freeqclient_set_key_lookup_store(
+        it, FfiConverterTypeKeyLookupStore.lower(`store`),_status)
 }
     }
     
@@ -6160,6 +6224,83 @@ internal object uniffiCallbackInterfaceEventHandler {
  * @suppress
  */
 public object FfiConverterTypeEventHandler: FfiConverterCallbackInterface<EventHandler>()
+
+
+
+
+
+public interface KeyLookupStore {
+    
+    fun `load`(): kotlin.String?
+    
+    fun `save`(`snapshot`: kotlin.String)
+    
+    companion object
+}
+
+
+
+// Put the implementation in an object so we don't pollute the top-level namespace
+internal object uniffiCallbackInterfaceKeyLookupStore {
+    internal object `load`: UniffiCallbackInterfaceKeyLookupStoreMethod0 {
+        override fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeKeyLookupStore.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`load`(
+                )
+            }
+            val writeReturn = { value: kotlin.String? -> uniffiOutReturn.setValue(FfiConverterOptionalString.lower(value)) }
+            uniffiTraitInterfaceCallWithError(
+                uniffiCallStatus,
+                makeCall,
+                writeReturn,
+                { e: FreeqException -> FfiConverterTypeFreeqError.lower(e) }
+            )
+        }
+    }
+    internal object `save`: UniffiCallbackInterfaceKeyLookupStoreMethod1 {
+        override fun callback(`uniffiHandle`: Long,`snapshot`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeKeyLookupStore.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`save`(
+                    FfiConverterString.lift(`snapshot`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCallWithError(
+                uniffiCallStatus,
+                makeCall,
+                writeReturn,
+                { e: FreeqException -> FfiConverterTypeFreeqError.lower(e) }
+            )
+        }
+    }
+
+    internal object uniffiFree: UniffiCallbackInterfaceFree {
+        override fun callback(handle: Long) {
+            FfiConverterTypeKeyLookupStore.handleMap.remove(handle)
+        }
+    }
+
+    internal var vtable = UniffiVTableCallbackInterfaceKeyLookupStore.UniffiByValue(
+        `load`,
+        `save`,
+        uniffiFree,
+    )
+
+    // Registers the foreign callback with the Rust side.
+    // This method is generated for each callback interface.
+    internal fun register(lib: UniffiLib) {
+        lib.uniffi_freeq_sdk_ffi_fn_init_callback_vtable_keylookupstore(vtable)
+    }
+}
+
+/**
+ * The ffiConverter which transforms the Callbacks in to handles to pass to Rust.
+ *
+ * @suppress
+ */
+public object FfiConverterTypeKeyLookupStore: FfiConverterCallbackInterface<KeyLookupStore>()
 
 
 

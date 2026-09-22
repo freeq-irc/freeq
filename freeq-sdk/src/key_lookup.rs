@@ -16,7 +16,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use freeq_oauth::ClientProvider;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -64,14 +67,14 @@ pub struct KeyLookup<P: ClientProvider> {
     origin_base: Option<String>,
     default_origin: OnceLock<String>,
     ttl: Duration,
-    cache: Mutex<HashMap<(String, String), Cached>>,
+    cache: Arc<Mutex<HashMap<(String, String), Cached>>>,
     /// One lookup in flight per (DID, kid).
     in_flight: Mutex<HashMap<(String, String), InFlight>>,
     /// Each DID's proven device records as last listed, kept for `ttl`.
-    records: Mutex<HashMap<String, ListedRecords>>,
+    records: Arc<Mutex<HashMap<String, ListedRecords>>>,
     /// When each DID was last listed for a key lookup, so a kid the held
     /// listing lacks lists it again at most once per `ttl`.
-    refreshed: Mutex<HashMap<String, DateTime<Utc>>>,
+    refreshed: Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
     /// One listing, with its proofs, in flight per DID.
     listing: Mutex<HashMap<String, Listing>>,
     /// The prefetch in flight for each DID, so two batches closing together
@@ -79,10 +82,132 @@ pub struct KeyLookup<P: ClientProvider> {
     prefetching: Mutex<HashMap<String, Arc<Prefetch>>>,
     /// CIDs of records whose repository proof has checked, so each is fetched
     /// once however often the records are listed.
-    proven: Mutex<HashSet<crate::identity_records::Cid>>,
+    proven: Arc<Mutex<HashSet<crate::identity_records::Cid>>>,
     /// Proofs in flight, so listings racing on a record share one fetch.
     proving: crate::identity_records::ProofsInFlight,
+    /// Per DID, how many times `refresh_account` has dropped its answers.
+    refreshes: Mutex<HashMap<String, u64>>,
+    /// Test only: run once where `settle` has checked the refresh count and
+    /// is about to remember an answer from the other sources, with the count
+    /// still locked.
+    #[cfg(test)]
+    before_remember: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     retry_after: Vec<Duration>,
+    /// Where the cache is kept between launches, and whether it has been
+    /// taken in yet. The snapshot is read once, before the first lookup,
+    /// once `after` (another lookup's flush) has settled.
+    writer: Arc<Writer>,
+    loaded: tokio::sync::OnceCell<()>,
+    after: Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send>>>>,
+}
+
+/// The least time between two writes of a lookup's snapshot.
+pub const SAVE_EVERY: Duration = Duration::from_secs(2);
+
+/// A lookup's store, and when it was written.
+struct Writer {
+    store: Arc<dyn KeyLookupStore>,
+    /// Held across each write, so writes land one after another.
+    writing: tokio::sync::Mutex<()>,
+    timing: Mutex<Timing>,
+}
+
+#[derive(Default)]
+struct Timing {
+    /// When the last write was begun.
+    last: Option<tokio::time::Instant>,
+    /// A save asked for and not written yet.
+    owed: bool,
+    /// A write is held until [`SAVE_EVERY`] after the last.
+    held: bool,
+    /// Set by `flush`: nothing is written after it.
+    flushed: bool,
+}
+
+impl Writer {
+    fn new(store: Arc<dyn KeyLookupStore>) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            writing: tokio::sync::Mutex::new(()),
+            timing: Mutex::new(Timing::default()),
+        })
+    }
+
+    /// Write the snapshot of `held` as it is now, if a save is owed; a write
+    /// that fails is logged and dropped.
+    async fn write_owed(&self, held: &Held) {
+        let _writing = self.writing.lock().await;
+        if !std::mem::take(&mut self.timing.lock().owed) {
+            return;
+        }
+        let Ok(text) = serde_json::to_string(&held.snapshot()) else {
+            return;
+        };
+        if let Err(e) = self.store.save(&text) {
+            tracing::debug!("keeping the key lookup snapshot failed: {e:#}");
+        }
+    }
+}
+
+/// What a snapshot is taken from, shared with a write held for later.
+struct Held {
+    cache: Arc<Mutex<HashMap<(String, String), Cached>>>,
+    records: Arc<Mutex<HashMap<String, ListedRecords>>>,
+    refreshed: Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
+    proven: Arc<Mutex<HashSet<crate::identity_records::Cid>>>,
+}
+
+impl Held {
+    /// Each account's records once: the DID's held listing where there is
+    /// one, else the records its first answer holds.
+    fn snapshot(&self) -> KeyLookupSnapshot {
+        let mut accounts: HashMap<String, Vec<serde_json::Value>> = self
+            .records
+            .lock()
+            .iter()
+            .map(|(did, (records, _))| (did.clone(), records.clone()))
+            .collect();
+        let keys = self
+            .cache
+            .lock()
+            .iter()
+            .map(|(slot, c)| {
+                accounts
+                    .entry(slot.0.clone())
+                    .or_insert_with(|| c.records.clone());
+                (
+                    slot.clone(),
+                    CachedKey {
+                        other: c.other.map(|o| o.map(FoundKeySnapshot::of)),
+                        at: c.at.timestamp_millis(),
+                    },
+                )
+            })
+            .collect();
+        KeyLookupSnapshot {
+            version: SNAPSHOT_VERSION,
+            accounts: accounts.into_iter().collect(),
+            keys,
+            records: self
+                .records
+                .lock()
+                .iter()
+                .map(|(did, (_, at))| (did.clone(), at.timestamp_millis()))
+                .collect(),
+            refreshed: self
+                .refreshed
+                .lock()
+                .iter()
+                .map(|(did, at)| (did.clone(), at.timestamp_millis()))
+                .collect(),
+            proven: self
+                .proven
+                .lock()
+                .iter()
+                .map(|cid| cid.to_string())
+                .collect(),
+        }
+    }
 }
 
 /// When a miss the origin answered is asked again, counted from the first
@@ -120,6 +245,158 @@ type InFlight = Arc<tokio::sync::OnceCell<Settled>>;
 /// One DID's proven device records, and when they were listed.
 type ListedRecords = (Vec<serde_json::Value>, DateTime<Utc>);
 
+/// What a lookup keeps between launches: each account's proven device
+/// records once (`accounts`); each (DID, kid) answer, a key found or a miss
+/// with the time it was settled (a miss answers for the ttl), reading its
+/// DID's records from `accounts`; when each DID's held listing was taken and
+/// when it was last listed for a key lookup; and the CIDs of records whose
+/// proof checked. Failures and lookups in flight are not kept. A snapshot of
+/// another `version` is not read. Times are unix milliseconds.
+///
+/// Twin of the JS `KeyLookupSnapshot` in shape; the JSON differs (a Rust slot
+/// is a two-element array where the JS slot is a string, and the key is
+/// base64url here), and neither side reads the other's file.
+#[derive(Default, Serialize, Deserialize)]
+pub struct KeyLookupSnapshot {
+    pub version: u32,
+    pub accounts: Vec<(String, Vec<serde_json::Value>)>,
+    pub keys: Vec<((String, String), CachedKey)>,
+    pub records: Vec<(String, i64)>,
+    pub refreshed: Vec<(String, i64)>,
+    pub proven: Vec<String>,
+}
+
+/// The snapshot shape this code reads and writes.
+pub const SNAPSHOT_VERSION: u32 = 2;
+
+/// A cached answer as a snapshot carries it: what the other sources said
+/// (absent when they were not asked, `null` for a miss), and when.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CachedKey {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub other: Option<Option<FoundKeySnapshot>>,
+    pub at: i64,
+}
+
+/// A field that is present, `null` included, is `Some`; serde's default
+/// reads `null` as absent.
+fn present<'de, D, T>(de: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(de).map(Some)
+}
+
+/// A found key as a snapshot carries it; the key is base64url, as the origin
+/// route writes it. The JS snapshot holds a `Uint8Array` there instead, so
+/// neither side reads the other's file.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct FoundKeySnapshot {
+    #[serde(rename = "publicKey")]
+    pub public_key: String,
+    pub source: String,
+    #[serde(rename = "retiredAt")]
+    pub retired_at: Option<i64>,
+}
+
+impl FoundKeySnapshot {
+    fn of(found: FoundKey) -> Self {
+        Self {
+            public_key: URL_SAFE_NO_PAD.encode(found.public_key),
+            source: match found.source {
+                KeySource::IdentityRecord => "IdentityRecord",
+                KeySource::DidDocument => "DidDocument",
+                KeySource::OriginServer => "OriginServer",
+            }
+            .to_string(),
+            retired_at: found.retired_at,
+        }
+    }
+
+    fn into_found(self) -> Option<FoundKey> {
+        let public_key: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(&self.public_key)
+            .ok()?
+            .try_into()
+            .ok()?;
+        Some(FoundKey {
+            public_key,
+            source: match self.source.as_str() {
+                "IdentityRecord" => KeySource::IdentityRecord,
+                "DidDocument" => KeySource::DidDocument,
+                "OriginServer" => KeySource::OriginServer,
+                _ => return None,
+            },
+            retired_at: self.retired_at,
+            // A snapshot's answer is a document's or the origin's, and
+            // neither gives these; a records answer is folded from the
+            // records again.
+            created_at: None,
+            expires_at: None,
+        })
+    }
+}
+
+/// Where a key lookup keeps its snapshot, one JSON string.
+pub trait KeyLookupStore: Send + Sync {
+    /// The snapshot held, or `None` when there is none.
+    fn load(&self) -> Result<Option<String>>;
+    /// Replace the snapshot held.
+    fn save(&self, snapshot: &str) -> Result<()>;
+}
+
+/// A store that forgets when the process ends; the default.
+#[derive(Default)]
+pub struct MemoryKeyLookupStore(Mutex<Option<String>>);
+
+impl KeyLookupStore for MemoryKeyLookupStore {
+    fn load(&self) -> Result<Option<String>> {
+        Ok(self.0.lock().clone())
+    }
+
+    fn save(&self, snapshot: &str) -> Result<()> {
+        *self.0.lock() = Some(snapshot.to_string());
+        Ok(())
+    }
+}
+
+/// A [`KeyLookupStore`] in one JSON file, beside [`crate::device_key::FileDeviceKeyStore`].
+pub struct FileKeyLookupStore {
+    path: std::path::PathBuf,
+}
+
+impl FileKeyLookupStore {
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl KeyLookupStore for FileKeyLookupStore {
+    fn load(&self) -> Result<Option<String>> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).context("reading the key lookup snapshot"),
+        }
+    }
+
+    fn save(&self, snapshot: &str) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Through a temp file, so a crash mid-write leaves the last snapshot.
+        let temp = self.path.with_extension("tmp");
+        std::fs::write(&temp, snapshot)?;
+        std::fs::rename(&temp, &self.path)?;
+        Ok(())
+    }
+}
+
 /// A listing of one DID's proven device records in flight, which every
 /// lookup for that DID awaits.
 type Listing = Arc<tokio::sync::OnceCell<Result<Vec<serde_json::Value>, Arc<anyhow::Error>>>>;
@@ -154,16 +431,186 @@ impl<P: ClientProvider> KeyLookup<P> {
             origin_base,
             default_origin: OnceLock::new(),
             ttl,
-            cache: Mutex::new(HashMap::new()),
+            cache: Default::default(),
             in_flight: Mutex::new(HashMap::new()),
-            records: Mutex::new(HashMap::new()),
-            refreshed: Mutex::new(HashMap::new()),
+            records: Default::default(),
+            refreshed: Default::default(),
             listing: Mutex::new(HashMap::new()),
             prefetching: Mutex::new(HashMap::new()),
-            proven: Mutex::new(HashSet::new()),
+            proven: Default::default(),
             proving: Default::default(),
+            refreshes: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            before_remember: Mutex::new(None),
             retry_after: MISS_RETRY_AFTER.to_vec(),
+            writer: Writer::new(Arc::new(MemoryKeyLookupStore::default())),
+            loaded: tokio::sync::OnceCell::new(),
+            after: Mutex::new(None),
         }
+    }
+
+    /// Keep the cache in `store`, so a lookup built on the same store starts
+    /// with the found keys, proven records, listing times and proven CIDs it
+    /// last held.
+    pub fn with_store(mut self, store: Arc<dyn KeyLookupStore>) -> Self {
+        self.writer = Writer::new(store);
+        self
+    }
+
+    /// Read the store only once `after` has settled: the flush of the lookup
+    /// that used the same store before, so its last write lands before this
+    /// one reads.
+    pub fn with_load_after(self, after: impl Future<Output = ()> + Send + 'static) -> Self {
+        *self.after.lock() = Some(Box::pin(after));
+        self
+    }
+
+    /// Take in what the store holds, once; a store that cannot be read, or a
+    /// snapshot that does not parse or is of another version, leaves the
+    /// cache as it is.
+    async fn load(&self) {
+        self.loaded
+            .get_or_init(|| async {
+                let after = self.after.lock().take();
+                if let Some(after) = after {
+                    after.await;
+                }
+                let Ok(Some(text)) = self.writer.store.load() else {
+                    return;
+                };
+                #[derive(Deserialize)]
+                struct Version {
+                    #[serde(default)]
+                    version: u32,
+                }
+                if !serde_json::from_str::<Version>(&text)
+                    .is_ok_and(|v| v.version == SNAPSHOT_VERSION)
+                {
+                    tracing::debug!("the key lookup snapshot is of another shape; starting empty");
+                    return;
+                }
+                let Ok(snapshot) = serde_json::from_str::<KeyLookupSnapshot>(&text) else {
+                    tracing::debug!("the key lookup snapshot does not parse; starting empty");
+                    return;
+                };
+                let at = |ms: i64| DateTime::from_timestamp_millis(ms).unwrap_or_else(Utc::now);
+                let accounts: HashMap<String, Vec<serde_json::Value>> =
+                    snapshot.accounts.into_iter().collect();
+                let records_of = |did: &str| accounts.get(did).cloned().unwrap_or_default();
+                {
+                    let mut cache = self.cache.lock();
+                    for (slot, held) in snapshot.keys {
+                        let other = match held.other {
+                            None => None,
+                            Some(None) => Some(None),
+                            Some(Some(found)) => match found.into_found() {
+                                Some(found) => Some(Some(found)),
+                                // A key that does not decode is not a key.
+                                None => continue,
+                            },
+                        };
+                        let records = records_of(&slot.0);
+                        cache.entry(slot).or_insert(Cached {
+                            records,
+                            other,
+                            at: at(held.at),
+                        });
+                    }
+                }
+                {
+                    let mut records = self.records.lock();
+                    for (did, ms) in snapshot.records {
+                        let listed = records_of(&did);
+                        records.entry(did).or_insert((listed, at(ms)));
+                    }
+                }
+                {
+                    let mut refreshed = self.refreshed.lock();
+                    for (did, ms) in snapshot.refreshed {
+                        refreshed.entry(did).or_insert(at(ms));
+                    }
+                }
+                {
+                    let mut proven = self.proven.lock();
+                    for cid in snapshot.proven {
+                        if let Ok(cid) = cid.parse() {
+                            proven.insert(cid);
+                        }
+                    }
+                }
+            })
+            .await;
+    }
+
+    /// What a snapshot is taken from.
+    fn held(&self) -> Held {
+        Held {
+            cache: self.cache.clone(),
+            records: self.records.clone(),
+            refreshed: self.refreshed.clone(),
+            proven: self.proven.clone(),
+        }
+    }
+
+    /// Write the snapshot to the store, at most once every [`SAVE_EVERY`]: a
+    /// save inside that time is held and written when it ends, with whatever
+    /// is held then. Nothing is written after `flush`.
+    async fn save(&self) {
+        let now = tokio::time::Instant::now();
+        let wait = {
+            let mut timing = self.writer.timing.lock();
+            if timing.flushed {
+                return;
+            }
+            timing.owed = true;
+            if timing.held {
+                return;
+            }
+            let wait = timing
+                .last
+                .map(|last| (last + SAVE_EVERY).saturating_duration_since(now))
+                .unwrap_or_default();
+            if wait.is_zero() {
+                timing.last = Some(now);
+            } else {
+                timing.held = true;
+            }
+            wait
+        };
+        if wait.is_zero() {
+            self.writer.write_owed(&self.held()).await;
+            return;
+        }
+        let (writer, held) = (self.writer.clone(), self.held());
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            {
+                let mut timing = writer.timing.lock();
+                timing.held = false;
+                if timing.flushed {
+                    return;
+                }
+                timing.last = Some(tokio::time::Instant::now());
+            }
+            writer.write_owed(&held).await;
+        });
+    }
+
+    /// Write a held save now, wait for every write to land, and write nothing
+    /// after. Called before another lookup on the same store loads it, so
+    /// that load sees this lookup's last answers and no later write of this
+    /// one replaces what the other writes.
+    ///
+    /// A lookup set aside before it ever loaded still holds the flush it was
+    /// given (`with_load_after`): that runs first, so flushes chain however
+    /// many lookups were set aside unloaded.
+    pub async fn flush(&self) {
+        let after = self.after.lock().take();
+        if let Some(after) = after {
+            after.await;
+        }
+        self.writer.timing.lock().flushed = true;
+        self.writer.write_owed(&self.held()).await;
     }
 
     /// When a miss the origin answered is asked again, counted from the first
@@ -213,6 +660,7 @@ impl<P: ClientProvider> KeyLookup<P> {
         kid: &str,
         at: DateTime<Utc>,
     ) -> Result<Option<FoundKey>> {
+        self.load().await;
         let slot = (did.to_string(), kid.to_string());
         loop {
             let hit = self.cache.lock().get(&slot).cloned();
@@ -281,6 +729,7 @@ impl<P: ClientProvider> KeyLookup<P> {
         cached: Option<Cached>,
     ) -> Settled {
         let started = tokio::time::Instant::now();
+        let refreshes = self.refresh_count(did);
         let listed = cached.is_none();
         let mut settled = self
             .ask(did, kid, at, cached.map(|c| c.records), false)
@@ -299,10 +748,22 @@ impl<P: ClientProvider> KeyLookup<P> {
         match (&settled.other, &settled.failure) {
             (None, None) if listed => self.remember(slot.clone(), settled.records.clone(), None),
             (Some(Some(_)), _) | (Some(None), None) => {
-                self.remember(slot.clone(), settled.records.clone(), settled.other)
+                // An account refreshed since this lookup began has dropped
+                // the answers its new records can change; one from before
+                // stays dropped. The count is held while the answer is
+                // written, so a refresh cannot drop answers in between.
+                let counts = self.refreshes.lock();
+                if counts.get(did).copied().unwrap_or(0) == refreshes {
+                    #[cfg(test)]
+                    if let Some(hook) = self.before_remember.lock().take() {
+                        hook();
+                    }
+                    self.remember(slot.clone(), settled.records.clone(), settled.other);
+                }
             }
             _ => {}
         }
+        self.save().await;
         settled
     }
 
@@ -379,7 +840,8 @@ impl<P: ClientProvider> KeyLookup<P> {
     /// or by a listing already in flight, through this lookup's cache of
     /// proven records, so each record's proof is fetched once.
     pub async fn proven_device_records(&self, did: &str) -> Result<Vec<serde_json::Value>> {
-        self.list_device_records(did).await
+        self.load().await;
+        self.list_device_records(did, false).await
     }
 
     /// Take the device records of `dids` from the origin, the home server, in
@@ -393,6 +855,7 @@ impl<P: ClientProvider> KeyLookup<P> {
     /// awaited rather than asked for again. Nothing is asked without an
     /// origin. Never fails.
     pub async fn prefetch(&self, dids: &[String]) {
+        self.load().await;
         let Some(home) = self.origin_base() else {
             return;
         };
@@ -451,8 +914,12 @@ impl<P: ClientProvider> KeyLookup<P> {
                         .reader
                         .fetch_accounts(home, &flight.asked, DEVICE_KEY_TYPE)
                         .await;
+                    let served = !accounts.is_empty();
                     for (did, account) in accounts {
                         self.proven_from_home(&did, &account).await;
+                    }
+                    if served {
+                        self.save().await;
                     }
                 })
                 .await;
@@ -491,12 +958,18 @@ impl<P: ClientProvider> KeyLookup<P> {
         let at = DateTime::from_timestamp(account.fetched_at, 0)
             .filter(|at| *at <= Utc::now())
             .unwrap_or_else(Utc::now);
-        self.records
+        let kept = self.keep_listing(did, records, at);
+        // A listing for key lookups, like the one `device_records` makes,
+        // unless a newer one is held.
+        if self
+            .records
             .lock()
-            .insert(did.to_string(), (records.clone(), at));
-        // A listing for key lookups, like the one `device_records` makes.
-        self.refreshed.lock().insert(did.to_string(), at);
-        records
+            .get(did)
+            .is_some_and(|(_, held)| *held == at)
+        {
+            self.refreshed.lock().insert(did.to_string(), at);
+        }
+        kept
     }
 
     /// The proven records that decide whether `did`'s device key `kid` is
@@ -508,6 +981,7 @@ impl<P: ClientProvider> KeyLookup<P> {
         did: &str,
         kid: &str,
     ) -> Result<Vec<serde_json::Value>> {
+        self.load().await;
         let home = self.origin_base();
         let listed = self
             .reader
@@ -517,7 +991,7 @@ impl<P: ClientProvider> KeyLookup<P> {
         if closure.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(self
+        let records = self
             .reader
             .proven_records(
                 did,
@@ -528,7 +1002,9 @@ impl<P: ClientProvider> KeyLookup<P> {
                 None,
                 home,
             )
-            .await)
+            .await;
+        self.save().await;
+        Ok(records)
     }
 
     /// `did`'s proven device records: the last listing while inside the ttl,
@@ -561,7 +1037,7 @@ impl<P: ClientProvider> KeyLookup<P> {
             }
         }
         self.refreshed.lock().insert(did.to_string(), Utc::now());
-        self.list_device_records(did).await
+        self.list_device_records(did, false).await
     }
 
     /// Whether `at` is less than the ttl ago. A time in the future, from a
@@ -576,16 +1052,26 @@ impl<P: ClientProvider> KeyLookup<P> {
 
     /// `did`'s proven device records from the listing in flight, else a new
     /// one. A listing that fails is not kept.
-    async fn list_device_records(&self, did: &str) -> Result<Vec<serde_json::Value>> {
-        let cell = self
-            .listing
-            .lock()
-            .entry(did.to_string())
-            .or_default()
-            .clone();
+    ///
+    /// `direct` lists at the PDS, the home server skipped, and always starts
+    /// a new listing, which lookups starting meanwhile join. Either way a
+    /// listing is kept only if none newer is held (`keep_listing`), and is
+    /// dated from before its request.
+    async fn list_device_records(&self, did: &str, direct: bool) -> Result<Vec<serde_json::Value>> {
+        let cell = if direct {
+            let cell = Listing::default();
+            self.listing.lock().insert(did.to_string(), cell.clone());
+            cell
+        } else {
+            self.listing
+                .lock()
+                .entry(did.to_string())
+                .or_default()
+                .clone()
+        };
         let listed = cell
             .get_or_init(|| async {
-                let home = self.origin_base();
+                let home = if direct { None } else { self.origin_base() };
                 // Nothing held for this account: its records and proofs
                 // together, in one request.
                 if let Some(home) = home
@@ -599,31 +1085,39 @@ impl<P: ClientProvider> KeyLookup<P> {
                     let records = self.proven_from_home(did, &account).await;
                     return Ok(records);
                 }
-                let listed = match self
+                let at = Utc::now();
+                match self
                     .reader
-                    .list_record_entries(did, DEVICE_KEY_TYPE, home)
+                    .list_record_entries_dated(did, DEVICE_KEY_TYPE, home)
                     .await
                 {
-                    Ok(entries) => Ok(self
-                        .reader
-                        .proven_records(
-                            did,
-                            DEVICE_KEY_TYPE,
-                            entries,
-                            &self.proven,
-                            &self.proving,
-                            None,
-                            home,
-                        )
-                        .await),
+                    Ok((entries, fetched_at)) => {
+                        // What the home server hands over is dated with its
+                        // own listing time, never later than now, as the
+                        // batch route's is; a PDS listing with this client's
+                        // time from before the request.
+                        let at = match fetched_at {
+                            Some(secs) => DateTime::from_timestamp(secs, 0)
+                                .filter(|t| *t <= Utc::now())
+                                .unwrap_or_else(Utc::now),
+                            None => at,
+                        };
+                        let records = self
+                            .reader
+                            .proven_records(
+                                did,
+                                DEVICE_KEY_TYPE,
+                                entries,
+                                &self.proven,
+                                &self.proving,
+                                None,
+                                home,
+                            )
+                            .await;
+                        Ok(self.keep_listing(did, records, at))
+                    }
                     Err(e) => Err(Arc::new(e)),
-                };
-                if let Ok(records) = &listed {
-                    self.records
-                        .lock()
-                        .insert(did.to_string(), (records.clone(), Utc::now()));
                 }
-                listed
             })
             .await
             .clone();
@@ -656,26 +1150,64 @@ impl<P: ClientProvider> KeyLookup<P> {
         }
     }
 
-    /// Re-check `did`'s account on the next lookup, however recently it was
-    /// listed: this client has just published a device key record of its own,
-    /// so the listing taken at connect is behind. Clears the DID's refresh
-    /// stamp and its held listing, and drops the cached answers a new record
-    /// can change — a remembered miss, and one the origin server answered. An
-    /// answer found in the records stands.
-    pub fn refresh_account(&self, did: &str) {
-        self.refreshed.lock().remove(did);
-        self.records.lock().remove(did);
-        self.cache.lock().retain(|(held, _), cached| {
-            held != did
-                || !matches!(
-                    cached.other,
-                    Some(None)
-                        | Some(Some(FoundKey {
-                            source: KeySource::OriginServer,
-                            ..
-                        }))
-                )
-        });
+    /// List `did`'s account at the PDS now, however recently it was listed:
+    /// this client has just published a device key record of its own, and
+    /// the home server's copy may predate it. Then drops the cached answers a
+    /// new record can change — a remembered miss, and one the origin server
+    /// answered — including any a lookup already running would keep. An
+    /// answer found in the records stands. A listing that fails changes
+    /// nothing. Never fails.
+    pub async fn refresh_account(&self, did: &str) {
+        self.load().await;
+        if did.starts_with("did:key:") {
+            return;
+        }
+        if let Err(e) = self.list_device_records(did, true).await {
+            tracing::debug!(%did, error = %e, "account not listed again");
+            return;
+        }
+        self.refreshed.lock().insert(did.to_string(), Utc::now());
+        {
+            // Bumped and dropped under one lock, which `settle` holds while
+            // it checks the count and writes an answer.
+            let mut counts = self.refreshes.lock();
+            *counts.entry(did.to_string()).or_default() += 1;
+            self.cache.lock().retain(|(held, _), cached| {
+                held != did
+                    || !matches!(
+                        cached.other,
+                        Some(None)
+                            | Some(Some(FoundKey {
+                                source: KeySource::OriginServer,
+                                ..
+                            }))
+                    )
+            });
+        }
+        self.save().await;
+    }
+
+    /// How many times `refresh_account` has dropped `did`'s answers.
+    fn refresh_count(&self, did: &str) -> u64 {
+        self.refreshes.lock().get(did).copied().unwrap_or(0)
+    }
+
+    /// Hold `records`, listed at `at`, as `did`'s listing unless a newer one
+    /// is held; the listing held after, for a lookup to use.
+    fn keep_listing(
+        &self,
+        did: &str,
+        records: Vec<serde_json::Value>,
+        at: DateTime<Utc>,
+    ) -> Vec<serde_json::Value> {
+        let mut held = self.records.lock();
+        if let Some((kept, held_at)) = held.get(did)
+            && *held_at > at
+        {
+            return kept.clone();
+        }
+        held.insert(did.to_string(), (records.clone(), at));
+        records
     }
 
     /// A found key's cached answer with the DID's current proven records: the
@@ -686,6 +1218,7 @@ impl<P: ClientProvider> KeyLookup<P> {
             return hit;
         };
         self.remember(slot.clone(), records, None);
+        self.save().await;
         self.cache.lock().get(slot).cloned().unwrap_or(hit)
     }
 
@@ -801,7 +1334,7 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Instant;
 
     const ALICE: &str = "did:plc:k2n3e2vsihf3farequ44t5j7";
@@ -961,6 +1494,16 @@ mod tests {
         /// The signing keys this server hands out, as the origin route does;
         /// the home server and the origin are one server in production.
         keys: HeldKeys,
+        /// Set to serve the first listing (and its `fetched_at`) of each
+        /// (DID, collection) again on the batch and listing routes, as a
+        /// server cache not yet refreshed does. Proofs still come from the
+        /// repository.
+        frozen: Arc<std::sync::atomic::AtomicBool>,
+        /// How long the batch route waits before answering, in milliseconds.
+        batch_delay_ms: Arc<AtomicU64>,
+        /// How long the signing-key route waits before answering, in
+        /// milliseconds.
+        keys_delay_ms: Arc<AtomicU64>,
     }
 
     impl Home {
@@ -1012,6 +1555,29 @@ mod tests {
         )
     }
 
+    /// The first listings served per (DID, collection), for a frozen server.
+    type FrozenCopies = Arc<parking_lot::Mutex<HashMap<(String, String), serde_json::Value>>>;
+
+    /// `home_collection`, or while `frozen` is set, the first answer it gave
+    /// for this (DID, collection).
+    fn served_collection(
+        repo: &mut crate::test_support::StubRepo,
+        collection: &str,
+        frozen: &std::sync::atomic::AtomicBool,
+        copies: &FrozenCopies,
+    ) -> Option<serde_json::Value> {
+        if !frozen.load(Ordering::SeqCst) {
+            return home_collection(repo, collection);
+        }
+        let slot = (repo.did().to_string(), collection.to_string());
+        if let Some(copy) = copies.lock().get(&slot) {
+            return Some(copy.clone());
+        }
+        let served = home_collection(repo, collection)?;
+        copies.lock().insert(slot, served.clone());
+        Some(served)
+    }
+
     /// A home server holding `repos` by DID.
     async fn home(repos: HomeRepos) -> Home {
         use axum::response::IntoResponse;
@@ -1024,6 +1590,10 @@ mod tests {
         let forged: HomeRepos = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let not_found = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let keys: HeldKeys = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let frozen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let copies: FrozenCopies = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let batch_delay_ms = Arc::new(AtomicU64::new(0));
+        let keys_delay_ms = Arc::new(AtomicU64::new(0));
         let router = axum::Router::new()
             .route(
                 "/api/v1/records",
@@ -1037,6 +1607,8 @@ mod tests {
                         forged.clone(),
                         not_found.clone(),
                     );
+                    let (frozen, copies, delay) =
+                        (frozen.clone(), copies.clone(), batch_delay_ms.clone());
                     move |Query(q): Query<HashMap<String, String>>| {
                         hits.batch.fetch_add(1, Ordering::SeqCst);
                         let (repos, down, unseen, batches, forged, not_found) = (
@@ -1047,7 +1619,12 @@ mod tests {
                             forged.clone(),
                             not_found.clone(),
                         );
+                        let (frozen, copies, delay) = (frozen.clone(), copies.clone(), delay.clone());
                         async move {
+                            let wait = delay.load(Ordering::SeqCst);
+                            if wait > 0 {
+                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                            }
                             let collection = q.get("collection").cloned().unwrap_or_default();
                             let named: Vec<String> = q
                                 .get("dids")
@@ -1077,7 +1654,8 @@ mod tests {
                                         Some(repo) => repo,
                                         None => held.get_mut(did)?,
                                     };
-                                    let served = home_collection(repo, &collection)?;
+                                    let served =
+                                        served_collection(repo, &collection, &frozen, &copies)?;
                                     Some(json!({ "did": did, "collections": { &collection: served } }))
                                 })
                                 .collect();
@@ -1096,10 +1674,12 @@ mod tests {
                         unseen.clone(),
                         not_found.clone(),
                     );
+                    let (frozen, copies) = (frozen.clone(), copies.clone());
                     move |Path((did, collection)): Path<(String, String)>| {
                         hits.listing.fetch_add(1, Ordering::SeqCst);
                         let (repos, down, unseen, not_found) =
                             (repos.clone(), down.clone(), unseen.clone(), not_found.clone());
+                        let (frozen, copies) = (frozen.clone(), copies.clone());
                         async move {
                             if not_found.load(Ordering::SeqCst) {
                                 return StatusCode::NOT_FOUND.into_response();
@@ -1114,7 +1694,9 @@ mod tests {
                             let Some(repo) = held.get_mut(&did) else {
                                 return StatusCode::NOT_FOUND.into_response();
                             };
-                            let Some(served) = home_collection(repo, &collection) else {
+                            let Some(served) =
+                                served_collection(repo, &collection, &frozen, &copies)
+                            else {
                                 return StatusCode::BAD_GATEWAY.into_response();
                             };
                             axum::Json(json!({
@@ -1177,10 +1759,14 @@ mod tests {
             .route(
                 "/api/v1/signing-keys/{did}/{kid}",
                 get({
-                    let keys = keys.clone();
+                    let (keys, delay) = (keys.clone(), keys_delay_ms.clone());
                     move |Path((did, kid)): Path<(String, String)>| {
-                        let keys = keys.clone();
+                        let (keys, delay) = (keys.clone(), delay.clone());
                         async move {
+                            let wait = delay.load(Ordering::SeqCst);
+                            if wait > 0 {
+                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                            }
                             let key = keys
                                 .lock()
                                 .get(&(did.clone(), kid.clone()))
@@ -1212,6 +1798,9 @@ mod tests {
             forged,
             not_found,
             keys,
+            frozen,
+            batch_delay_ms,
+            keys_delay_ms,
         }
     }
 
@@ -1455,7 +2044,8 @@ mod tests {
         );
         assert_eq!(pds.hits(), 1, "and nothing is listed again");
 
-        keys.refresh_account(ALICE);
+        keys.refresh_account(ALICE).await;
+        assert_eq!(pds.hits(), 2, "the refresh lists the account");
         assert_eq!(
             keys.key_for(ALICE, &kid_of(2))
                 .await
@@ -1463,7 +2053,7 @@ mod tests {
                 .map(|f| f.source),
             Some(KeySource::IdentityRecord)
         );
-        assert_eq!(pds.hits(), 2, "one more listing");
+        assert_eq!(pds.hits(), 2, "and the lookup lists nothing more");
     }
 
     #[tokio::test]
@@ -1624,10 +2214,12 @@ mod tests {
         let first = repo.add(DEVICE_KEY_TYPE, &device_record(1));
         let pds = pds_holding(repo).await;
         let origin = origin(vec![]).await;
+        // Room for the first lookup's listing and proof on a loaded machine:
+        // the held listing has to still be inside the ttl below.
         let keys = lookup(
             vec![alice_on(&pds)],
             Some(&origin),
-            Duration::from_millis(80),
+            Duration::from_millis(400),
         );
         let found = keys.key_for(ALICE, &kid_of(1)).await.unwrap();
         assert_eq!(found.map(|f| f.source), Some(KeySource::IdentityRecord));
@@ -1650,7 +2242,7 @@ mod tests {
             "the kid the listing lacks was not listed again"
         );
 
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(
             keys.key_for(ALICE, &kid_of(2)).await.unwrap(),
             Some(FoundKey {
@@ -1693,13 +2285,13 @@ mod tests {
         let keys = lookup(
             vec![alice_on(&pds)],
             Some(&origin),
-            Duration::from_millis(50),
+            Duration::from_millis(400),
         );
         let found = keys.key_for(ALICE, &kid_of(2)).await.unwrap();
         assert_eq!(found.map(|f| f.source), Some(KeySource::OriginServer));
         let asked = (pds.hits(), origin.hits());
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(
             keys.key_for(ALICE, &kid_of(2))
                 .await
@@ -1720,7 +2312,7 @@ mod tests {
         let mut repo = crate::test_support::StubRepo::new(ALICE);
         repo.add(DEVICE_KEY_TYPE, &device_record(1));
         let pds = pds_holding(repo).await;
-        let keys = lookup(vec![alice_on(&pds)], None, Duration::from_millis(80));
+        let keys = lookup(vec![alice_on(&pds)], None, Duration::from_millis(400));
         assert_eq!(
             keys.key_for(ALICE, &kid_of(1)).await.unwrap().unwrap(),
             FoundKey {
@@ -1752,7 +2344,7 @@ mod tests {
             .unwrap()
             .lock()
             .add(DEVICE_KEY_TYPE, &retirement);
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
         let at = made + chrono::TimeDelta::hours(20);
         assert_eq!(
             keys.key_for_at(ALICE, &kid_of(1), at).await.unwrap(),
@@ -2100,6 +2692,183 @@ mod tests {
         assert_eq!(pds.hits(), 0, "the PDS was not asked");
     }
 
+    /// The key ALICE publishes after the home server's copy was taken.
+    fn publish_alice_4(repos: &HomeRepos) {
+        repos
+            .lock()
+            .get_mut(ALICE)
+            .unwrap()
+            .add(DEVICE_KEY_TYPE, &record_for(ALICE, 4));
+    }
+
+    async fn source_of(keys: &KeyLookup<freeq_oauth::SharedClient>, seed: u8) -> Option<KeySource> {
+        keys.key_for(ALICE, &kid_of(seed))
+            .await
+            .unwrap()
+            .map(|f| f.source)
+    }
+
+    #[tokio::test]
+    async fn refresh_account_lists_the_pds_while_the_home_server_serves_an_older_copy() {
+        let (home_server, pds, repos, docs) = three_signers().await;
+        let keys = lookup_at_home(docs, &home_server);
+        home_server.frozen.store(true, Ordering::SeqCst);
+        keys.prefetch(&[ALICE.to_string()]).await;
+
+        publish_alice_4(&repos);
+        keys.refresh_account(ALICE).await;
+        assert_eq!(source_of(&keys, 4).await, Some(KeySource::IdentityRecord));
+        assert_eq!(pds.hits(), 1, "one listing, at the PDS");
+    }
+
+    #[tokio::test]
+    async fn refresh_account_replaces_an_origin_answer_in_memory_and_in_the_store() {
+        let (home_server, _pds, repos, docs) = three_signers().await;
+        home_server
+            .keys
+            .lock()
+            .insert((ALICE.to_string(), kid_of(4)), raw(4));
+        let store = Arc::new(MemoryKeyLookupStore::default());
+        let keys = lookup_at_home(docs.clone(), &home_server).with_store(store.clone());
+        home_server.frozen.store(true, Ordering::SeqCst);
+        keys.prefetch(&[ALICE.to_string()]).await;
+        assert_eq!(source_of(&keys, 4).await, Some(KeySource::OriginServer));
+
+        publish_alice_4(&repos);
+        keys.refresh_account(ALICE).await;
+        assert_eq!(source_of(&keys, 4).await, Some(KeySource::IdentityRecord));
+
+        keys.flush().await;
+        let second = lookup_at_home(docs, &home_server).with_store(store);
+        assert_eq!(
+            source_of(&second, 4).await,
+            Some(KeySource::IdentityRecord),
+            "the store holds the new answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_listing_is_kept_when_an_older_listing_through_the_home_server_lands_after_it()
+    {
+        let (home_server, _pds, repos, docs) = three_signers().await;
+        home_server.frozen.store(true, Ordering::SeqCst);
+        // The server's copy is taken before the publish.
+        lookup_at_home(docs.clone(), &home_server)
+            .prefetch(&[ALICE.to_string()])
+            .await;
+        home_server.batch_delay_ms.store(300, Ordering::SeqCst);
+
+        let keys = lookup_at_home(docs, &home_server);
+        let alice = [ALICE.to_string()];
+        tokio::join!(keys.prefetch(&alice), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            publish_alice_4(&repos);
+            keys.refresh_account(ALICE).await;
+        });
+        assert_eq!(source_of(&keys, 4).await, Some(KeySource::IdentityRecord));
+    }
+
+    #[tokio::test]
+    async fn an_origin_answer_from_a_lookup_begun_before_refresh_account_is_not_kept() {
+        let (home_server, _pds, repos, docs) = three_signers().await;
+        home_server
+            .keys
+            .lock()
+            .insert((ALICE.to_string(), kid_of(4)), raw(4));
+        let keys = lookup_at_home(docs, &home_server);
+        home_server.frozen.store(true, Ordering::SeqCst);
+        keys.prefetch(&[ALICE.to_string()]).await;
+        home_server.keys_delay_ms.store(300, Ordering::SeqCst);
+
+        let kid = kid_of(4);
+        let (first, ()) = tokio::join!(keys.key_for(ALICE, &kid), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            publish_alice_4(&repos);
+            keys.refresh_account(ALICE).await;
+        });
+        first.unwrap();
+        assert_eq!(source_of(&keys, 4).await, Some(KeySource::IdentityRecord));
+    }
+
+    /// The count check and the write in `settle` are one step: a refresh on
+    /// another thread cannot drop the answers between them, so an origin
+    /// answer from before the refresh is never kept after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refresh_on_another_thread_cannot_run_between_the_count_check_and_the_write() {
+        let (home_server, _pds, repos, docs) = three_signers().await;
+        home_server
+            .keys
+            .lock()
+            .insert((ALICE.to_string(), kid_of(4)), raw(4));
+        let keys = Arc::new(lookup_at_home(docs, &home_server));
+        home_server.frozen.store(true, Ordering::SeqCst);
+        keys.prefetch(&[ALICE.to_string()]).await;
+
+        // Park the lookup where it has checked the count, until the refresh
+        // is done or two seconds pass.
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        *keys.before_remember.lock() = Some(Box::new(move || {
+            parked_tx.send(()).unwrap();
+            tokio::task::block_in_place(|| {
+                let _ = done_rx.recv_timeout(Duration::from_secs(2));
+            });
+        }));
+        let first = tokio::spawn({
+            let keys = keys.clone();
+            async move { keys.key_for(ALICE, &kid_of(4)).await }
+        });
+        tokio::task::spawn_blocking(move || parked_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        publish_alice_4(&repos);
+        let refresh = tokio::spawn({
+            let keys = keys.clone();
+            async move {
+                keys.refresh_account(ALICE).await;
+                let _ = done_tx.send(());
+            }
+        });
+        first.await.unwrap().unwrap();
+        refresh.await.unwrap();
+
+        let kept = keys
+            .cache
+            .lock()
+            .get(&(ALICE.to_string(), kid_of(4)))
+            .and_then(|c| c.other)
+            .flatten()
+            .map(|f| f.source);
+        assert_ne!(
+            kept,
+            Some(KeySource::OriginServer),
+            "the origin answer is not kept"
+        );
+        assert_eq!(source_of(&keys, 4).await, Some(KeySource::IdentityRecord));
+    }
+
+    /// A listing the home server's per-DID route serves is dated with the
+    /// server's `fetched_at`, so its older copy loses to a PDS listing the
+    /// client made since.
+    #[tokio::test]
+    async fn a_home_listing_after_a_refresh_is_dated_by_the_server_and_does_not_replace_it() {
+        let (home_server, _pds, repos, docs) = three_signers().await;
+        let keys = lookup_at_home(docs, &home_server);
+        home_server.frozen.store(true, Ordering::SeqCst);
+        keys.prefetch(&[ALICE.to_string()]).await;
+
+        publish_alice_4(&repos);
+        keys.refresh_account(ALICE).await;
+        let listings = home_server.counts().1;
+        // A listing held, so this one goes through the per-DID route.
+        let listed = keys.proven_device_records(ALICE).await.unwrap();
+        assert_eq!(home_server.counts().1, listings + 1, "the per-DID route");
+        assert_eq!(listed.len(), 2, "the PDS listing is kept");
+        assert_eq!(source_of(&keys, 4).await, Some(KeySource::IdentityRecord));
+    }
+
     #[tokio::test]
     async fn a_did_key_signer_is_left_out_of_the_batch_and_a_did_web_one_is_asked_for() {
         let (home_server, _pds, _repos, docs) = three_signers().await;
@@ -2313,9 +3082,8 @@ mod tests {
             asked,
             "the paused home server was not asked again"
         );
-        assert_eq!(
+        assert!(
             keys.reader().paused_until(&home_server.base).is_some(),
-            true,
             "the home server is paused"
         );
     }
@@ -2375,5 +3143,475 @@ mod tests {
         );
         assert!(proof > 0, "the closure's proofs came from the home server");
         assert_eq!(pds.hits(), 0);
+    }
+
+    // ─── the store ──────────────────────────────────────────────────────
+
+    fn snapshot_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "freeq-key-lookup-{}-{}-{}",
+            std::process::id(),
+            name,
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("nested").join("key-lookup.json")
+    }
+
+    #[tokio::test]
+    async fn a_second_lookup_on_the_same_store_answers_a_found_key_with_no_request() {
+        let pds = pds(vec![device_record(1)]).await;
+        let origin = origin(vec![(ALICE, kid_of(2), raw(2))]).await;
+        let store: Arc<dyn KeyLookupStore> =
+            Arc::new(FileKeyLookupStore::new(snapshot_path("found")));
+        let doc = alice_on(&pds);
+
+        let first = lookup(vec![doc.clone()], Some(&origin), HOUR).with_store(store.clone());
+        assert_eq!(
+            first
+                .key_for(ALICE, &kid_of(1))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::IdentityRecord),
+            "found in the records"
+        );
+        assert_eq!(
+            first
+                .key_for(ALICE, &kid_of(2))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::OriginServer),
+            "found at the origin"
+        );
+        let asked = (pds.hits(), origin.hits());
+
+        first.flush().await;
+        let second = lookup(vec![doc], Some(&origin), HOUR).with_store(store);
+        assert_eq!(
+            second
+                .key_for(ALICE, &kid_of(1))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::IdentityRecord)
+        );
+        assert_eq!(
+            second
+                .key_for(ALICE, &kid_of(2))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::OriginServer)
+        );
+        assert_eq!(
+            (pds.hits(), origin.hits()),
+            asked,
+            "the snapshot answered both"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_that_does_not_parse_leaves_the_cache_empty_and_is_overwritten() {
+        let path = snapshot_path("garbage");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not json at all").unwrap();
+        let pds = pds(vec![device_record(1)]).await;
+        let store: Arc<dyn KeyLookupStore> = Arc::new(FileKeyLookupStore::new(path.clone()));
+
+        let keys = lookup(vec![alice_on(&pds)], None, HOUR).with_store(store);
+        assert_eq!(
+            keys.key_for(ALICE, &kid_of(1))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::IdentityRecord),
+            "the lookup starts empty and reads the PDS"
+        );
+        assert_eq!(pds.hits(), 1);
+        keys.flush().await;
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            serde_json::from_str::<KeyLookupSnapshot>(&written).is_ok(),
+            "the next save overwrote it: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_carries_the_proven_records_so_no_proof_is_fetched_again() {
+        let mut repo = crate::test_support::StubRepo::new(ALICE);
+        let uri = repo.add(DEVICE_KEY_TYPE, &device_record(1));
+        let pds = pds_holding(repo).await;
+        let store: Arc<dyn KeyLookupStore> =
+            Arc::new(FileKeyLookupStore::new(snapshot_path("proofs")));
+        let doc = alice_on(&pds);
+
+        let first = lookup(vec![doc.clone()], None, HOUR).with_store(store.clone());
+        assert!(first.key_for(ALICE, &kid_of(1)).await.unwrap().is_some());
+        let proofs = || pds.repo.as_ref().unwrap().lock().proof_reads(&uri);
+        assert_eq!((pds.hits(), proofs()), (1, 1));
+
+        first.flush().await;
+        let second = lookup(vec![doc], None, HOUR).with_store(store);
+        assert!(second.key_for(ALICE, &kid_of(1)).await.unwrap().is_some());
+        assert_eq!(
+            (pds.hits(), proofs()),
+            (1, 1),
+            "neither the listing nor the proof was asked for again"
+        );
+    }
+
+    /// A store that counts its writes and keeps each one.
+    #[derive(Default)]
+    struct CountingStore {
+        held: MemoryKeyLookupStore,
+        writes: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl KeyLookupStore for CountingStore {
+        fn load(&self) -> Result<Option<String>> {
+            self.held.load()
+        }
+
+        fn save(&self, snapshot: &str) -> Result<()> {
+            self.writes.lock().push(snapshot.to_string());
+            self.held.save(snapshot)
+        }
+    }
+
+    impl CountingStore {
+        fn writes(&self) -> usize {
+            self.writes.lock().len()
+        }
+
+        fn last(&self) -> KeyLookupSnapshot {
+            serde_json::from_str(self.writes.lock().last().expect("a write")).unwrap()
+        }
+    }
+
+    /// An instant long past, so no miss for a line signed then is retried.
+    fn long_ago() -> DateTime<Utc> {
+        Utc::now() - chrono::TimeDelta::hours(10)
+    }
+
+    #[tokio::test]
+    async fn gives_back_the_accounts_answers_listing_times_and_proven_cids_it_saved() {
+        let snapshot = KeyLookupSnapshot {
+            version: SNAPSHOT_VERSION,
+            accounts: vec![
+                (ALICE.to_string(), vec![device_record(1)]),
+                (BOB.to_string(), vec![]),
+            ],
+            keys: vec![
+                (
+                    (ALICE.to_string(), kid_of(1)),
+                    CachedKey {
+                        other: None,
+                        at: 1_000,
+                    },
+                ),
+                (
+                    (BOB.to_string(), kid_of(2)),
+                    CachedKey {
+                        other: Some(Some(FoundKeySnapshot::of(FoundKey {
+                            public_key: raw(2),
+                            source: KeySource::OriginServer,
+                            retired_at: Some(1_780_000_000),
+                            created_at: None,
+                            expires_at: None,
+                        }))),
+                        at: 2_000,
+                    },
+                ),
+                (
+                    (BOB.to_string(), kid_of(3)),
+                    CachedKey {
+                        other: Some(None),
+                        at: 3_000,
+                    },
+                ),
+            ],
+            records: vec![(ALICE.to_string(), 1_000)],
+            refreshed: vec![(ALICE.to_string(), 1_000)],
+            proven: vec!["bafyreiproven".to_string()],
+        };
+        let store = FileKeyLookupStore::new(snapshot_path("round-trip"));
+        let text = serde_json::to_string(&snapshot).unwrap();
+        store.save(&text).unwrap();
+        let loaded: KeyLookupSnapshot =
+            serde_json::from_str(&store.load().unwrap().unwrap()).unwrap();
+        assert_eq!(serde_json::to_string(&loaded).unwrap(), text);
+        let others: Vec<_> = loaded.keys.iter().map(|(_, k)| k.other.is_some()).collect();
+        assert_eq!(
+            others,
+            vec![false, true, true],
+            "a miss comes back a miss, not unasked"
+        );
+        assert!(matches!(loaded.keys[2].1.other, Some(None)));
+    }
+
+    #[tokio::test]
+    async fn reads_only_once_a_given_wait_has_settled() {
+        let pds = pds(vec![]).await;
+        let origin = origin(vec![]).await;
+        let store = Arc::new(MemoryKeyLookupStore::default());
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let keys = Arc::new(
+            lookup(vec![alice_on(&pds)], Some(&origin), HOUR)
+                .with_store(store.clone())
+                .with_load_after(async move {
+                    let _ = wait.await;
+                }),
+        );
+        let asking = tokio::spawn({
+            let keys = keys.clone();
+            async move { keys.key_for(ALICE, &kid_of(2)).await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !asking.is_finished(),
+            "nothing is read before the wait settles"
+        );
+
+        // What lands meanwhile is what the lookup reads.
+        let found = FoundKey {
+            public_key: raw(2),
+            source: KeySource::OriginServer,
+            retired_at: None,
+            created_at: None,
+            expires_at: None,
+        };
+        let later = KeyLookupSnapshot {
+            version: SNAPSHOT_VERSION,
+            keys: vec![(
+                (ALICE.to_string(), kid_of(2)),
+                CachedKey {
+                    other: Some(Some(FoundKeySnapshot::of(found))),
+                    at: Utc::now().timestamp_millis(),
+                },
+            )],
+            ..Default::default()
+        };
+        store.save(&serde_json::to_string(&later).unwrap()).unwrap();
+        release.send(()).unwrap();
+        assert_eq!(asking.await.unwrap(), Some(found));
+        assert_eq!((pds.hits(), origin.hits()), (0, 0), "read from the store");
+    }
+
+    #[tokio::test]
+    async fn keeps_an_accounts_records_once_however_many_of_its_keys_are_held() {
+        let records = vec![device_record(1), device_record(2), device_record(3)];
+        let signature = records[0]["bindingSig"].as_str().unwrap().to_string();
+        let pds = pds(records).await;
+        let store = Arc::new(CountingStore::default());
+        let keys = lookup(vec![alice_on(&pds)], None, HOUR).with_store(store.clone());
+        for seed in [1, 2, 3] {
+            assert_eq!(
+                keys.key_for(ALICE, &kid_of(seed))
+                    .await
+                    .unwrap()
+                    .map(|f| f.source),
+                Some(KeySource::IdentityRecord)
+            );
+        }
+        keys.flush().await;
+        let saved = store.writes.lock().last().unwrap().clone();
+        assert_eq!(
+            saved.matches(&signature).count(),
+            1,
+            "the first record, once"
+        );
+    }
+
+    #[tokio::test]
+    async fn writes_the_store_at_most_once_every_two_seconds() {
+        let pds = pds(vec![]).await;
+        let origin = origin(vec![]).await;
+        let store = Arc::new(CountingStore::default());
+        let keys = lookup(vec![alice_on(&pds)], Some(&origin), HOUR).with_store(store.clone());
+        for i in 0..10 {
+            assert_eq!(
+                keys.key_for_at(ALICE, &format!("gone{i}"), long_ago())
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+        assert_eq!(store.writes(), 1, "ten settles, one write");
+        tokio::time::sleep(SAVE_EVERY + Duration::from_millis(300)).await;
+        assert_eq!(
+            store.writes(),
+            2,
+            "and one more once two seconds have passed"
+        );
+        assert_eq!(store.last().keys.len(), 10, "holding all ten");
+    }
+
+    #[tokio::test]
+    async fn starts_empty_from_a_snapshot_of_the_old_shape() {
+        let pds = pds(vec![]).await;
+        let origin = origin(vec![(ALICE, kid_of(2), raw(2))]).await;
+        let store = Arc::new(MemoryKeyLookupStore::default());
+        // Records copied into every key's slot, and no version.
+        let old = json!({
+            "keys": [[[ALICE, kid_of(2)], {
+                "records": [],
+                "other": {
+                    "publicKey": URL_SAFE_NO_PAD.encode(raw(2)),
+                    "source": "OriginServer",
+                    "retiredAt": null,
+                },
+                "at": Utc::now().timestamp_millis(),
+            }]],
+            "records": [],
+            "refreshed": [],
+            "proven": [],
+        });
+        store.save(&old.to_string()).unwrap();
+        let keys = lookup(vec![alice_on(&pds)], Some(&origin), HOUR).with_store(store);
+        assert_eq!(
+            keys.key_for(ALICE, &kid_of(2))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::OriginServer)
+        );
+        assert_eq!(origin.hits(), 1, "asked, not read from the old snapshot");
+    }
+
+    #[tokio::test]
+    async fn lands_an_old_lookups_held_write_before_a_new_lookups_load_once_flushed_and_writes_nothing_after()
+     {
+        let pds = pds(vec![]).await;
+        let origin = origin(vec![]).await;
+        let store = Arc::new(CountingStore::default());
+        let old = lookup(vec![alice_on(&pds)], Some(&origin), HOUR).with_store(store.clone());
+        assert_eq!(
+            old.key_for_at(ALICE, "first", long_ago()).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            old.key_for_at(ALICE, &kid_of(2), long_ago()).await.unwrap(),
+            None
+        );
+        assert_eq!(store.writes(), 1, "the second write is held");
+        old.flush().await;
+        assert_eq!(store.writes(), 2);
+
+        let next = lookup(vec![alice_on(&pds)], Some(&origin), HOUR).with_store(store.clone());
+        let asked = origin.hits();
+        assert_eq!(
+            next.key_for_at(ALICE, &kid_of(2), long_ago())
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(origin.hits(), asked, "the held miss came through");
+
+        assert_eq!(
+            old.key_for_at(ALICE, "late", long_ago()).await.unwrap(),
+            None
+        );
+        tokio::time::sleep(SAVE_EVERY + Duration::from_millis(300)).await;
+        assert_eq!(
+            store.writes(),
+            2,
+            "nothing from the old lookup after its flush"
+        );
+    }
+
+    /// A lookup set aside without ever loading still holds the flush of the
+    /// one before it: flushing it must run that flush too, or the older
+    /// lookup's held write lands on its own timer, after the next one read.
+    #[tokio::test]
+    async fn a_lookup_set_aside_unloaded_passes_on_the_flush_it_was_given() {
+        let pds = pds(vec![]).await;
+        let origin = origin(vec![]).await;
+        let store = Arc::new(CountingStore::default());
+        let first =
+            Arc::new(lookup(vec![alice_on(&pds)], Some(&origin), HOUR).with_store(store.clone()));
+        assert_eq!(
+            first.key_for_at(ALICE, "first", long_ago()).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            first
+                .key_for_at(ALICE, &kid_of(2), long_ago())
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.writes(), 1, "the second write is held");
+
+        // Set aside at once, never loaded.
+        let second = Arc::new(
+            lookup(vec![alice_on(&pds)], Some(&origin), HOUR)
+                .with_store(store.clone())
+                .with_load_after({
+                    let first = first.clone();
+                    async move { first.flush().await }
+                }),
+        );
+        let third = lookup(vec![alice_on(&pds)], Some(&origin), HOUR)
+            .with_store(store.clone())
+            .with_load_after({
+                let second = second.clone();
+                async move { second.flush().await }
+            });
+        let asked = origin.hits();
+        assert_eq!(
+            third
+                .key_for_at(ALICE, &kid_of(2), long_ago())
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            origin.hits(),
+            asked,
+            "the first lookup's held miss was written before the third read"
+        );
+
+        assert_eq!(
+            first.key_for_at(ALICE, "late", long_ago()).await.unwrap(),
+            None
+        );
+        tokio::time::sleep(SAVE_EVERY + Duration::from_millis(300)).await;
+        assert!(
+            store.writes.lock().iter().all(|w| !w.contains("late")),
+            "nothing from the first lookup after its flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_a_miss_in_the_store_for_the_ttl_across_a_new_lookup_then_asks_once_more() {
+        let pds = pds(vec![]).await;
+        let origin = origin(vec![]).await;
+        let store = Arc::new(MemoryKeyLookupStore::default());
+        let ttl = Duration::from_millis(400);
+        let first = lookup(vec![alice_on(&pds)], Some(&origin), ttl).with_store(store.clone());
+        assert_eq!(
+            first.key_for_at(ALICE, "gone", long_ago()).await.unwrap(),
+            None
+        );
+        assert_eq!(origin.hits(), 1);
+
+        first.flush().await;
+        let second = lookup(vec![alice_on(&pds)], Some(&origin), ttl).with_store(store.clone());
+        assert_eq!(
+            second.key_for_at(ALICE, "gone", long_ago()).await.unwrap(),
+            None
+        );
+        assert_eq!(origin.hits(), 1, "the saved miss answers");
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        second.flush().await;
+        let third = lookup(vec![alice_on(&pds)], Some(&origin), ttl).with_store(store);
+        assert_eq!(
+            third.key_for_at(ALICE, "gone", long_ago()).await.unwrap(),
+            None
+        );
+        assert_eq!(origin.hits(), 2, "past the ttl, asked once");
     }
 }
