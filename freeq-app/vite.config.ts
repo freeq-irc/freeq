@@ -49,6 +49,17 @@ export default defineConfig({
         ws: true,
         changeOrigin: REMOTE_TARGET,
       },
+      // The app calls these on its own origin; in production the server
+      // serves the app and answers them. Without the forward a reload
+      // cannot restore the session and shows the sign-in form.
+      '/session': {
+        target: FREEQ_WEB,
+        changeOrigin: REMOTE_TARGET,
+      },
+      '/enroll': {
+        target: FREEQ_WEB,
+        changeOrigin: REMOTE_TARGET,
+      },
     },
   },
 })
