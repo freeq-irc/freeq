@@ -148,6 +148,17 @@ fn proof_path(did: &str, rkey: &str) -> String {
     format!("{}/{rkey}/proof", listing_path(did, DEVICE_KEY_TYPE))
 }
 
+fn account_path(did: &str) -> String {
+    format!("/api/v1/records/{}", urlencoding::encode(did))
+}
+
+fn batch_path(dids: &[&str]) -> String {
+    format!(
+        "/api/v1/records?dids={}",
+        urlencoding::encode(&dids.join(","))
+    )
+}
+
 /// The listing served is the PDS's, each value exactly as listed.
 async fn assert_listing(http: std::net::SocketAddr, served: &Served) {
     let response = get(http, &listing_path(DID, DEVICE_KEY_TYPE)).await;
@@ -198,6 +209,44 @@ async fn the_listing_and_its_proofs_are_served_as_the_pds_gave_them() {
 
     assert_listing(http, &served).await;
     assert_proofs(http, &served).await;
+}
+
+#[tokio::test]
+async fn a_batch_serves_each_account_it_can_with_its_proofs() {
+    use base64::Engine;
+    let served = stub_repo(&[device_record(1), device_record(2)]);
+    let (http, state) = start(config(), served.resolver.clone()).await;
+    sign_in(&state);
+    fill(&state, &served);
+
+    let response = get(http, &batch_path(&["did:plc:neverappearedhere", DID])).await;
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 1, "the account not seen here is left out");
+    assert_eq!(accounts[0]["did"], DID);
+    let devices = &accounts[0]["collections"][DEVICE_KEY_TYPE];
+    assert_eq!(devices["stale"], false);
+    let records: Vec<RecordEntry> = serde_json::from_value(devices["records"].clone()).unwrap();
+    assert_eq!(records, served.entries);
+
+    let key = freeq_sdk::crypto::PublicKey::from_multibase(&served.repo_key).unwrap();
+    let proofs = devices["proofs"].as_array().unwrap();
+    assert_eq!(proofs.len(), served.entries.len());
+    for (proof, entry) in proofs.iter().zip(&served.entries) {
+        let rkey = rkey_of(&entry.uri);
+        assert_eq!(proof["rkey"], rkey);
+        let car = base64::engine::general_purpose::STANDARD
+            .decode(proof["car"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(car, served.proofs[&rkey]);
+        let cid = record_cid(&entry.value).unwrap();
+        assert_eq!(proof["cid"], cid.to_string());
+        let outcome = verify_proof(&car, DID, DEVICE_KEY_TYPE, &rkey, &cid, &key)
+            .await
+            .unwrap();
+        assert!(outcome.verified(), "{rkey}");
+    }
 }
 
 #[tokio::test]
@@ -256,16 +305,26 @@ async fn the_record_routes_share_their_own_limiter_of_600_a_minute() {
     let served = stub_repo(&[device_record(1)]);
     let (http, state) = start(config(), served.resolver.clone()).await;
     let stranger = "did:plc:neverappearedhere";
-    let listing = listing_path(stranger, DEVICE_KEY_TYPE);
-    let proof = proof_path(stranger, "r");
+    // Each record route, with what it answers for an account not seen here.
+    let routes = [
+        (listing_path(stranger, DEVICE_KEY_TYPE), 404),
+        (proof_path(stranger, "r"), 404),
+        (account_path(stranger), 404),
+        (batch_path(&[stranger]), 200),
+    ];
 
     for i in 0..RECORD_LIMIT {
-        // Alternating: the two routes draw on one budget.
-        let path = if i % 2 == 0 { &listing } else { &proof };
-        assert_eq!(get(http, path).await.status(), 404, "request {i} to {path}");
+        // In turn: the routes draw on one budget.
+        let (path, status) = &routes[i % routes.len()];
+        assert_eq!(
+            get(http, path).await.status(),
+            *status,
+            "request {i} to {path}"
+        );
     }
-    assert_eq!(get(http, &listing).await.status(), 429);
-    assert_eq!(get(http, &proof).await.status(), 429);
+    for (path, _) in &routes {
+        assert_eq!(get(http, path).await.status(), 429, "{path}");
+    }
 
     // The limiter the other REST routes share was not drawn on.
     assert!(state.rest_rate_limiter.check("127.0.0.1".parse().unwrap()));

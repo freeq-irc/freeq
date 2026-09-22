@@ -366,26 +366,133 @@ pub async fn proof(
         .find(|entry| entry.uri == uri)
         .and_then(|entry| record_cid(&entry.value).ok())
         .ok_or(Refusal::NotHere)?;
-    let cache = &state.record_cache;
-    if let Some(proof) = cache
-        .stored_proof(&cid.to_string())
-        .filter(|p| p.repo_key == listing.repo_key)
-    {
+    if let Some(proof) = kept_proof(state, &cid, &listing.repo_key) {
         return Ok(proof);
     }
+    fetched_proof(state, did, collection, rkey, &cid).await
+}
+
+/// The kept proof of the record with `cid`, if it checked under `repo_key`.
+fn kept_proof(state: &SharedState, cid: &Cid, repo_key: &str) -> Option<RecordProofRow> {
+    state
+        .record_cache
+        .stored_proof(&cid.to_string())
+        .filter(|p| p.repo_key == repo_key)
+}
+
+/// A fresh proof of the record through the lookup's reader, kept by its
+/// callback when it checks.
+async fn fetched_proof(
+    state: &SharedState,
+    did: &str,
+    collection: &str,
+    rkey: &str,
+    cid: &Cid,
+) -> Result<RecordProofRow, Refusal> {
     let outcome = state
         .key_lookup
         .reader()
-        .verify_record(did, collection, rkey, &cid)
+        .verify_record(did, collection, rkey, cid)
         .await
         .map_err(|e| Refusal::Unreadable(format!("{e:#}")))?;
     if !outcome.verified() {
         return Err(Refusal::Unreadable("the proof does not check".to_string()));
     }
-    // A proof that checked was kept by the reader's callback.
-    cache
+    state
+        .record_cache
         .stored_proof(&cid.to_string())
         .ok_or_else(|| Refusal::Unreadable("the proof was not kept".to_string()))
+}
+
+/// One collection of an account as [`account`] serves it: the listing, and
+/// the proof of each listed record that could be served, in listing order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountCollection {
+    pub collection: String,
+    pub served: ServedListing,
+    pub proofs: Vec<RecordProofRow>,
+}
+
+/// Everything served for one account: each of `collections` whose listing
+/// `listing` serves, in the order asked, with the proof of each listed record
+/// as `proof` would serve it. A record whose proof cannot be served is left
+/// out of `proofs`. With no collection served, the refusal: `Unreadable` if
+/// any listing could not be read, else `NotHere`.
+pub async fn account(
+    state: &Arc<SharedState>,
+    did: &str,
+    collections: &[&str],
+) -> Result<Vec<AccountCollection>, Refusal> {
+    let mut served = Vec::new();
+    let mut unreadable = None;
+    for collection in collections {
+        match listing(state, did, collection).await {
+            Ok(listing) => {
+                let proofs = listed_proofs(state, did, collection, &listing.listing).await;
+                served.push(AccountCollection {
+                    collection: collection.to_string(),
+                    served: listing,
+                    proofs,
+                });
+            }
+            Err(Refusal::Unreadable(reason)) => unreadable = Some(reason),
+            Err(Refusal::NotHere) => {}
+        }
+    }
+    match (served.is_empty(), unreadable) {
+        (false, _) => Ok(served),
+        (true, Some(reason)) => Err(Refusal::Unreadable(reason)),
+        (true, None) => Err(Refusal::NotHere),
+    }
+}
+
+/// The proof of each record `listing` names that can be served, in listing
+/// order: kept proofs at once, the rest fetched concurrently.
+async fn listed_proofs(
+    state: &Arc<SharedState>,
+    did: &str,
+    collection: &str,
+    listing: &CachedListing,
+) -> Vec<RecordProofRow> {
+    let prefix = format!("at://{did}/{collection}/");
+    let mut proofs: Vec<Option<RecordProofRow>> = vec![None; listing.entries.len()];
+    let mut fetching = tokio::task::JoinSet::new();
+    for (i, entry) in listing.entries.iter().enumerate() {
+        let Some(rkey) = entry
+            .uri
+            .strip_prefix(&prefix)
+            .filter(|rkey| !rkey.is_empty() && !rkey.contains('/'))
+        else {
+            continue;
+        };
+        let Ok(cid) = record_cid(&entry.value) else {
+            continue;
+        };
+        if let Some(proof) = kept_proof(state, &cid, &listing.repo_key) {
+            proofs[i] = Some(proof);
+            continue;
+        }
+        let (state, did, collection, rkey) = (
+            Arc::clone(state),
+            did.to_string(),
+            collection.to_string(),
+            rkey.to_string(),
+        );
+        fetching.spawn(async move {
+            (
+                i,
+                fetched_proof(&state, &did, &collection, &rkey, &cid)
+                    .await
+                    .ok(),
+            )
+        });
+    }
+    while let Some(done) = fetching.join_next().await {
+        if let Ok((i, proof)) = done {
+            proofs[i] = proof;
+        }
+    }
+    proofs.into_iter().flatten().collect()
 }
 
 /// How often kept accounts are checked against the pruning period.

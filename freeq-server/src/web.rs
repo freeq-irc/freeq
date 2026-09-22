@@ -315,6 +315,8 @@ pub fn router(state: Arc<SharedState>) -> Router {
             "/api/v1/signing-keys/{did}/{kid}",
             get(api_did_signing_key_by_kid),
         )
+        .route("/api/v1/records", get(api_records_batch))
+        .route("/api/v1/records/{did}", get(api_records_account))
         .route(
             "/api/v1/records/{did}/{collection}",
             get(api_record_listing),
@@ -1018,6 +1020,126 @@ async fn api_record_proof(
         proof.car,
     )
         .into_response())
+}
+
+/// `?dids=` and `?collection=` on the account routes.
+#[derive(Debug, Default, serde::Deserialize)]
+struct RecordsQuery {
+    dids: Option<String>,
+    collection: Option<String>,
+}
+
+/// GET /api/v1/records/{did} — everything this server's record cache serves
+/// for one account: per collection, the listing as the listing route gives
+/// it and the proof of each listed record it can serve, the CAR in base64.
+/// `?collection=` narrows it to one collection; without it both identity
+/// record collections are answered. A record whose proof cannot be served is
+/// left out of `proofs`, and the client reads that one from the PDS. 404 and
+/// 502 as the listing route.
+async fn api_records_account(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<Arc<SharedState>>,
+    axum::extract::Path(did): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<RecordsQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !state.record_rate_limiter.check(addr.ip()) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let did = urlencoding::decode(&did).unwrap_or(std::borrow::Cow::Borrowed(&did));
+    let collections = asked_collections(&query);
+    let served = crate::record_cache::account(&state, &did, &collections)
+        .await
+        .map_err(record_refusal_status)?;
+    Ok(Json(account_json(&did, &served)))
+}
+
+/// Most accounts one batch request may name.
+const MAX_BATCH_DIDS: usize = 50;
+
+/// GET /api/v1/records?dids=a,b,… — the account answer once per DID under
+/// `accounts`, in the order asked, for up to 50 DIDs, with the same optional
+/// `?collection=`. An account with nothing served (not seen here, or no copy
+/// and an unreadable PDS) is left out. 400 for no DIDs or more than 50.
+async fn api_records_batch(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<Arc<SharedState>>,
+    axum::extract::Query(query): axum::extract::Query<RecordsQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !state.record_rate_limiter.check(addr.ip()) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let named: Vec<&str> = query
+        .dids
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|did| !did.is_empty())
+        .collect();
+    if named.is_empty() || named.len() > MAX_BATCH_DIDS {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut dids: Vec<&str> = Vec::with_capacity(named.len());
+    for did in named {
+        if !dids.contains(&did) {
+            dids.push(did);
+        }
+    }
+    let collections = asked_collections(&query);
+    let mut accounts = Vec::new();
+    for did in dids {
+        if let Ok(served) = crate::record_cache::account(&state, did, &collections).await {
+            accounts.push(account_json(did, &served));
+        }
+    }
+    Ok(Json(serde_json::json!({ "accounts": accounts })))
+}
+
+/// The collections `?collection=` asks for: the one named, else both.
+fn asked_collections(query: &RecordsQuery) -> Vec<&str> {
+    match query.collection.as_deref() {
+        Some(collection) => vec![collection],
+        None => crate::record_cache::CACHED_COLLECTIONS.to_vec(),
+    }
+}
+
+/// `{did, collections: {<collection>: {fetched_at, stale, records, proofs}}}`.
+fn account_json(did: &str, served: &[crate::record_cache::AccountCollection]) -> serde_json::Value {
+    use base64::Engine;
+    let collections: serde_json::Map<String, serde_json::Value> = served
+        .iter()
+        .map(|c| {
+            let records: Vec<serde_json::Value> = c
+                .served
+                .listing
+                .entries
+                .iter()
+                .map(|e| serde_json::json!({ "uri": e.uri, "cid": e.cid, "value": e.value }))
+                .collect();
+            let proofs: Vec<serde_json::Value> = c
+                .proofs
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "rkey": p.rkey,
+                        "cid": p.cid,
+                        "fetched_at": p.fetched_at,
+                        "car": base64::engine::general_purpose::STANDARD.encode(&p.car),
+                    })
+                })
+                .collect();
+            (
+                c.collection.clone(),
+                serde_json::json!({
+                    "fetched_at": c.served.listing.fetched_at,
+                    "stale": c.served.stale,
+                    "records": records,
+                    "proofs": proofs,
+                }),
+            )
+        })
+        .collect();
+    serde_json::json!({ "did": did, "collections": collections })
 }
 
 fn record_refusal_status(refusal: crate::record_cache::Refusal) -> StatusCode {
@@ -6640,7 +6762,9 @@ mod orphan_view_tests {
 
 #[cfg(test)]
 mod record_route_tests {
-    use super::{api_record_listing, api_record_proof};
+    use super::{
+        RecordsQuery, api_record_listing, api_record_proof, api_records_account, api_records_batch,
+    };
     use axum::extract::{ConnectInfo, Path, State};
     use axum::http::StatusCode;
     use freeq_sdk::identity_records::{DEVICE_KEY_TYPE, record_cid, verify_proof};
@@ -6896,6 +7020,301 @@ mod record_route_tests {
         assert_eq!(
             prove(&state, DID, &rkey_of(listed)).await.unwrap_err(),
             StatusCode::BAD_GATEWAY
+        );
+    }
+
+    // ─── the account routes ─────────────────────────────────────────────
+
+    use freeq_sdk::identity_records::AGENT_KEY_TYPE;
+
+    fn query(dids: Option<&str>, collection: Option<&str>) -> axum::extract::Query<RecordsQuery> {
+        axum::extract::Query(RecordsQuery {
+            dids: dids.map(str::to_string),
+            collection: collection.map(str::to_string),
+        })
+    }
+
+    async fn account_of(
+        state: &Arc<crate::server::SharedState>,
+        did: &str,
+        collection: Option<&str>,
+    ) -> Result<serde_json::Value, StatusCode> {
+        api_records_account(
+            caller(),
+            State(state.clone()),
+            Path(did.to_string()),
+            query(None, collection),
+        )
+        .await
+        .map(|json| json.0)
+    }
+
+    async fn batch(
+        state: &Arc<crate::server::SharedState>,
+        dids: Option<&str>,
+    ) -> Result<serde_json::Value, StatusCode> {
+        api_records_batch(caller(), State(state.clone()), query(dids, None))
+            .await
+            .map(|json| json.0)
+    }
+
+    /// The rkeys of `collection`'s proofs in `answer`, each checked: its CAR
+    /// decodes, its CID is its listed record's, and it verifies under the
+    /// listing's repo key.
+    async fn proven_rkeys(
+        state: &Arc<crate::server::SharedState>,
+        answer: &serde_json::Value,
+        collection: &str,
+    ) -> Vec<String> {
+        use base64::Engine;
+        let repo_key = state
+            .record_cache
+            .stored_listing(DID, collection)
+            .unwrap()
+            .repo_key;
+        let key = freeq_sdk::crypto::PublicKey::from_multibase(&repo_key).unwrap();
+        let served = &answer["collections"][collection];
+        let mut rkeys = Vec::new();
+        for proof in served["proofs"].as_array().unwrap() {
+            let rkey = proof["rkey"].as_str().unwrap();
+            let record = served["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| rkey_of(r) == rkey)
+                .expect("a proof is for a listed record");
+            let cid = record_cid(&record["value"]).unwrap();
+            assert_eq!(proof["cid"], cid.to_string());
+            assert!(proof["fetched_at"].is_i64());
+            let car = base64::engine::general_purpose::STANDARD
+                .decode(proof["car"].as_str().unwrap())
+                .unwrap();
+            let outcome = verify_proof(&car, DID, collection, rkey, &cid, &key)
+                .await
+                .unwrap();
+            assert!(outcome.verified(), "{rkey}");
+            rkeys.push(rkey.to_string());
+        }
+        rkeys
+    }
+
+    fn listed_rkeys(answer: &serde_json::Value, collection: &str) -> Vec<String> {
+        answer["collections"][collection]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(rkey_of)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn one_account_answers_both_collections_with_every_proof() {
+        let state = state_for(vec![device_record(1), device_record(2)]).await;
+
+        let answer = account_of(&state, DID, None).await.unwrap();
+        assert_eq!(answer["did"], DID);
+        let collections = answer["collections"].as_object().unwrap();
+        assert_eq!(collections.len(), 2);
+        let devices = &collections[DEVICE_KEY_TYPE];
+        assert_eq!(devices["stale"], false);
+        assert!(devices["fetched_at"].is_i64());
+        assert_eq!(devices["records"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            proven_rkeys(&state, &answer, DEVICE_KEY_TYPE).await,
+            listed_rkeys(&answer, DEVICE_KEY_TYPE)
+        );
+        let agents = &collections[AGENT_KEY_TYPE];
+        assert!(agents["records"].as_array().unwrap().is_empty());
+        assert!(agents["proofs"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_collection_query_narrows_the_account_to_one() {
+        let state = state_for(vec![device_record(1)]).await;
+        let answer = account_of(&state, DID, Some(DEVICE_KEY_TYPE))
+            .await
+            .unwrap();
+        let collections = answer["collections"].as_object().unwrap();
+        assert_eq!(
+            collections.keys().collect::<Vec<_>>(),
+            vec![DEVICE_KEY_TYPE]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_with_nothing_served_is_not_found() {
+        let state = state_for(vec![device_record(1)]).await;
+        assert_eq!(
+            account_of(&state, "did:plc:neverappearedhere", None)
+                .await
+                .unwrap_err(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            account_of(&state, DID, Some("app.bsky.feed.post"))
+                .await
+                .unwrap_err(),
+            StatusCode::NOT_FOUND
+        );
+        let dead = state_with_dead_pds().await;
+        assert_eq!(
+            account_of(&dead, DID, None).await.unwrap_err(),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_answers_the_accounts_it_can_in_the_order_asked() {
+        let state = state_for(vec![device_record(1)]).await;
+        let dids = format!("did:plc:neverappearedhere,{DID}");
+        let answer = batch(&state, Some(&dids)).await.unwrap();
+        let accounts = answer["accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0]["did"], DID);
+        assert_eq!(
+            proven_rkeys(&state, &accounts[0], DEVICE_KEY_TYPE).await,
+            listed_rkeys(&accounts[0], DEVICE_KEY_TYPE)
+        );
+
+        // An account with no copy and an unreadable PDS is left out too.
+        let dead = state_with_dead_pds().await;
+        let answer = batch(&dead, Some(DID)).await.unwrap();
+        assert!(answer["accounts"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_batch_of_more_than_fifty_or_of_none_is_a_bad_request() {
+        let state = state_for(vec![device_record(1)]).await;
+        let fifty_one: Vec<String> = (0..51).map(|i| format!("did:plc:account{i}")).collect();
+        assert_eq!(
+            batch(&state, Some(&fifty_one.join(","))).await.unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+        let fifty = fifty_one[..50].join(",");
+        assert!(batch(&state, Some(&fifty)).await.is_ok());
+        for dids in [None, Some(""), Some(",")] {
+            assert_eq!(
+                batch(&state, dids).await.unwrap_err(),
+                StatusCode::BAD_REQUEST,
+                "{dids:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_record_whose_proof_cannot_be_served_is_left_out() {
+        let state = state_for(vec![device_record(1)]).await;
+        let listed = list(&state, DID, DEVICE_KEY_TYPE).await.unwrap();
+        let genuine: freeq_sdk::identity_records::RecordEntry =
+            serde_json::from_value(listed["records"][0].clone()).unwrap();
+        let repo_key = state
+            .record_cache
+            .stored_listing(DID, DEVICE_KEY_TYPE)
+            .unwrap()
+            .repo_key;
+        // A newer listing that also names a record the PDS has no proof for.
+        let absent = freeq_sdk::identity_records::RecordEntry {
+            uri: format!("at://{DID}/{DEVICE_KEY_TYPE}/absent"),
+            cid: String::new(),
+            value: device_record(2),
+        };
+        state.record_cache.keep_listing(
+            DID,
+            DEVICE_KEY_TYPE,
+            &repo_key,
+            &[genuine.clone(), absent],
+        );
+
+        let answer = account_of(&state, DID, Some(DEVICE_KEY_TYPE))
+            .await
+            .unwrap();
+        assert_eq!(listed_rkeys(&answer, DEVICE_KEY_TYPE).len(), 2);
+        assert_eq!(
+            proven_rkeys(&state, &answer, DEVICE_KEY_TYPE).await,
+            vec![genuine.uri.rsplit('/').next().unwrap().to_string()]
+        );
+    }
+
+    /// A PDS for DID that holds each proof request for `delay`, and the most
+    /// proof requests it has held at once.
+    async fn slow_pds(
+        records: Vec<serde_json::Value>,
+        delay: std::time::Duration,
+    ) -> (
+        freeq_sdk::did::DidResolver,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use axum::response::IntoResponse;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut repo = freeq_sdk::test_support::StubRepo::new(DID);
+        for record in &records {
+            repo.add(DEVICE_KEY_TYPE, record);
+        }
+        let repo = Arc::new(parking_lot::Mutex::new(repo));
+        let answering = repo.clone();
+        let (held, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let most_held = most.clone();
+        let router = axum::Router::new().fallback(
+            move |uri: axum::http::Uri,
+                  axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>| {
+                let answer = answering.lock().respond(uri.path(), &q);
+                let is_proof = uri.path() == "/xrpc/com.atproto.sync.getRecord";
+                let (held, most) = (held.clone(), most_held.clone());
+                async move {
+                    if is_proof {
+                        let now = held.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(delay).await;
+                        held.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    match answer {
+                        Some((status, content_type, body)) => (
+                            StatusCode::from_u16(status).unwrap(),
+                            [("content-type", content_type)],
+                            body,
+                        )
+                            .into_response(),
+                        None => StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let doc = repo.lock().document(&base);
+        (
+            freeq_sdk::did::DidResolver::static_map(HashMap::from([(DID.to_string(), doc)])),
+            most,
+        )
+    }
+
+    #[tokio::test]
+    async fn an_accounts_proofs_are_fetched_concurrently() {
+        let records: Vec<serde_json::Value> = (1..=4).map(device_record).collect();
+        let (resolver, most_held) = slow_pds(records, std::time::Duration::from_millis(200)).await;
+        let state =
+            crate::server::test_state_on(None, crate::config::ServerConfig::default(), resolver);
+        state.did_sessions.lock().insert(
+            DID.to_string(),
+            std::collections::HashSet::from(["s".to_string()]),
+        );
+
+        let answer = account_of(&state, DID, Some(DEVICE_KEY_TYPE))
+            .await
+            .unwrap();
+        assert_eq!(
+            answer["collections"][DEVICE_KEY_TYPE]["proofs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(
+            most_held.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "the proofs were fetched one after another"
         );
     }
 }
