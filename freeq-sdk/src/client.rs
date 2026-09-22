@@ -2472,6 +2472,114 @@ fn is_device(verdict: &Option<crate::verdict::Verdict>) -> bool {
         .is_some_and(|v| v.state == crate::verdict::VerdictState::Device)
 }
 
+/// A signed line inside an open batch whose check waits for the batch to
+/// close, so every signer the batch names is looked up in one request.
+struct HeldCheck {
+    signed: crate::verdict::Signed,
+    taught: Option<(String, String)>,
+}
+
+/// Open batches other than `draft/multiline`, by batch id, with the checks
+/// held on each. A replayed batch can carry hundreds of lines by a handful of
+/// signers; holding the checks until it closes turns one lookup per line into
+/// one batch request for the lot. As the JS client does (`checkLater` and
+/// `startDeferredChecks`).
+type DeferredBatches = HashMap<String, Vec<HeldCheck>>;
+
+/// The open batches and the checks they hold, with what it takes to start
+/// them. Dropped when the read loop ends, however it ends — a `break`, an
+/// error returned through `?`, or the task itself being dropped — and every
+/// held check is started then. Without this a connection that ended with a
+/// batch still open dropped its held checks, and a client that persists the
+/// settled verdict kept those lines pending for good.
+struct HeldChecksOnExit {
+    batches: DeferredBatches,
+    checker: Option<Arc<SignatureChecker>>,
+    maps: DidMaps,
+    event_tx: mpsc::Sender<Event>,
+}
+
+impl Drop for HeldChecksOnExit {
+    fn drop(&mut self) {
+        start_every_held_check(
+            &mut self.batches,
+            self.checker.as_ref(),
+            &self.maps,
+            &self.event_tx,
+        );
+    }
+}
+
+/// Start the checks every open batch holds, and leave the batches empty.
+fn start_every_held_check(
+    batches: &mut DeferredBatches,
+    checker: Option<&Arc<SignatureChecker>>,
+    maps: &DidMaps,
+    event_tx: &mpsc::Sender<Event>,
+) {
+    for (_, held) in batches.drain() {
+        start_deferred_checks(held, checker, maps, event_tx);
+    }
+}
+
+/// Start a pending check, or hold it on the open batch the line names.
+fn check_now_or_hold(
+    batches: &mut DeferredBatches,
+    batch_id: Option<&String>,
+    checker: Option<&Arc<SignatureChecker>>,
+    signed: Option<crate::verdict::Signed>,
+    taught: Option<(String, String)>,
+    maps: &DidMaps,
+    event_tx: &mpsc::Sender<Event>,
+) {
+    if let (Some(_), Some(signed)) = (checker, &signed)
+        && let Some(id) = batch_id
+        && let Some(held) = batches.get_mut(id)
+    {
+        held.push(HeldCheck {
+            signed: signed.clone(),
+            taught,
+        });
+        return;
+    }
+    spawn_verdict_check(checker, signed, taught, maps, event_tx);
+}
+
+/// Start the checks held on a closed batch, once its signers' records are
+/// prefetched in one request. Off the receive path.
+fn start_deferred_checks(
+    held: Vec<HeldCheck>,
+    checker: Option<&Arc<SignatureChecker>>,
+    maps: &DidMaps,
+    event_tx: &mpsc::Sender<Event>,
+) {
+    let Some(checker) = checker else { return };
+    if held.is_empty() {
+        return;
+    }
+    let checker = checker.clone();
+    let maps = maps.clone();
+    let event_tx = event_tx.clone();
+    tokio::spawn(async move {
+        let mut dids: Vec<String> = Vec::new();
+        for check in &held {
+            if crate::address::is_did(&check.signed.did) && !dids.contains(&check.signed.did) {
+                dids.push(check.signed.did.clone());
+            }
+        }
+        checker.lookup.prefetch(&dids).await;
+        for check in held {
+            spawn_verdict_check(
+                Some(&checker),
+                Some(check.signed),
+                check.taught,
+                &maps,
+                &event_tx,
+            );
+        }
+    });
+}
+
 /// Finish a pending check off the receive path and send its verdict.
 ///
 /// `taught` is the (nick, DID) pairing the line's account tag taught; a
@@ -2622,6 +2730,14 @@ where
     // Open `draft/multiline` batches keyed by batch id. Chunks
     // accumulate here while the batch is open; the BATCH closer drains
     // and emits a single Event::Message with the assembled body.
+    // Checks held on open batches other than `draft/multiline`, by batch id.
+    // The guard starts whatever is still held when this loop ends.
+    let mut deferred = HeldChecksOnExit {
+        batches: std::collections::HashMap::new(),
+        checker: checker.clone(),
+        maps: did_maps.clone(),
+        event_tx: event_tx.clone(),
+    };
     let mut multiline_batches: std::collections::HashMap<String, InboundMultilineBatch> =
         std::collections::HashMap::new();
     let mut line_buf = String::new();
@@ -2874,6 +2990,11 @@ where
                                         // — the consumer gets a single
                                         // Message at close time instead.
                                     } else {
+                                        // A replayed batch's signed lines are
+                                        // checked together when it closes.
+                                        deferred.batches
+                                            .entry(id.to_string())
+                                            .or_default();
                                         let _ = event_tx.send(Event::BatchStart {
                                             id: id.to_string(),
                                             batch_type,
@@ -2903,9 +3024,18 @@ where
                                             checker.as_ref(),
                                             &did_maps,
                                             taught,
+                                            &mut deferred.batches,
                                         )
                                         .await;
                                     } else {
+                                        if let Some(held) = deferred.batches.remove(id) {
+                                            start_deferred_checks(
+                                                held,
+                                                checker.as_ref(),
+                                                &did_maps,
+                                                &event_tx,
+                                            );
+                                        }
                                         let _ = event_tx.send(Event::BatchEnd { id: id.to_string() }).await;
                                     }
                                 }
@@ -3339,8 +3469,17 @@ where
                                     }
                                     let dm_key =
                                         dm_key_for(&did_maps, &own_nick, &from, &target);
+                                    let in_batch = tags.get("batch").cloned();
                                     let _ = event_tx.send(Event::Message { from, target, text, tags, dm_key, verdict }).await;
-                                    spawn_verdict_check(checker.as_ref(), follow_up, taught, &did_maps, &event_tx);
+                                    check_now_or_hold(
+                                        &mut deferred.batches,
+                                        in_batch.as_ref(),
+                                        checker.as_ref(),
+                                        follow_up,
+                                        taught,
+                                        &did_maps,
+                                        &event_tx,
+                                    );
                                 }
                             }
                         }
@@ -3404,7 +3543,15 @@ where
                                         .await;
                                 }
                                 let _ = event_tx.send(Event::TagMsg { from, target, tags: msg.tags.clone(), dm_key, verdict }).await;
-                                spawn_verdict_check(checker.as_ref(), follow_up, taught, &did_maps, &event_tx);
+                                check_now_or_hold(
+                                        &mut deferred.batches,
+                                        msg.tags.get("batch"),
+                                        checker.as_ref(),
+                                        follow_up,
+                                        taught,
+                                        &did_maps,
+                                        &event_tx,
+                                    );
                             }
                         }
                         "CHATHISTORY" => {
@@ -3542,6 +3689,7 @@ async fn dispatch_assembled_multiline(
     checker: Option<&Arc<SignatureChecker>>,
     maps: &DidMaps,
     taught: Option<(String, String)>,
+    batches: &mut DeferredBatches,
 ) {
     let mut text = String::new();
     for (i, line) in batch.lines.iter().enumerate() {
@@ -3554,8 +3702,9 @@ async fn dispatch_assembled_multiline(
     // The signature covers the assembled body and the opener's tags.
     let (verdict, follow_up) =
         verdict_at_delivery(checker, maps, &tags, &batch.target, Some(&text));
-    if let Some(parent_batch_id) = batch.parent_batch_id {
-        tags.insert("batch".to_string(), parent_batch_id);
+    let parent_batch_id = batch.parent_batch_id;
+    if let Some(parent) = &parent_batch_id {
+        tags.insert("batch".to_string(), parent.clone());
     }
     let _ = event_tx
         .send(Event::Message {
@@ -3567,7 +3716,16 @@ async fn dispatch_assembled_multiline(
             verdict,
         })
         .await;
-    spawn_verdict_check(checker, follow_up, taught, maps, event_tx);
+    // A multiline batch inside a replayed one waits with the rest of it.
+    check_now_or_hold(
+        batches,
+        parent_batch_id.as_ref(),
+        checker,
+        follow_up,
+        taught,
+        maps,
+        event_tx,
+    );
     // Nested-batch parent (e.g. multiline inside CHATHISTORY) is
     // exposed to the consumer via the `batch` tag so UI layers can
     // attach the assembled message to the outer batch.
@@ -4906,7 +5064,16 @@ mod multiline_tests {
             ],
             parent_batch_id: None,
         };
-        dispatch_assembled_multiline(&tx, batch, None, None, &DidMaps::default(), None).await;
+        dispatch_assembled_multiline(
+            &tx,
+            batch,
+            None,
+            None,
+            &DidMaps::default(),
+            None,
+            &mut DeferredBatches::new(),
+        )
+        .await;
         match rx.recv().await.unwrap() {
             Event::Message {
                 from, target, text, ..
@@ -4942,7 +5109,16 @@ mod multiline_tests {
             ],
             parent_batch_id: None,
         };
-        dispatch_assembled_multiline(&tx, batch, None, None, &DidMaps::default(), None).await;
+        dispatch_assembled_multiline(
+            &tx,
+            batch,
+            None,
+            None,
+            &DidMaps::default(),
+            None,
+            &mut DeferredBatches::new(),
+        )
+        .await;
         match rx.recv().await.unwrap() {
             Event::Message { text, .. } => assert_eq!(text, "alphabeta\ngamma"),
             other => panic!("expected Message, got {other:?}"),
@@ -4975,7 +5151,16 @@ mod multiline_tests {
             ],
             parent_batch_id: None,
         };
-        dispatch_assembled_multiline(&tx, batch, None, None, &DidMaps::default(), None).await;
+        dispatch_assembled_multiline(
+            &tx,
+            batch,
+            None,
+            None,
+            &DidMaps::default(),
+            None,
+            &mut DeferredBatches::new(),
+        )
+        .await;
         match rx.recv().await.unwrap() {
             Event::Message { tags, .. } => {
                 assert_eq!(tags.get("msgid").map(String::as_str), Some("01XYZ"));
@@ -10449,5 +10634,201 @@ mod verdict_tests {
             server_http_origin("localhost:6667"),
             "http://localhost:8080"
         );
+    }
+
+    /// A signed line as the receive path rebuilds it, for the deferral tests.
+    fn signed_line(did: &str, msgid: &str) -> crate::verdict::Signed {
+        crate::verdict::Signed {
+            did: did.to_string(),
+            kid: "kid".to_string(),
+            sig_tag: "kid:sig".to_string(),
+            msgid: msgid.to_string(),
+            doc: crate::verdict::SignedDoc::Chat("{}".to_string()),
+        }
+    }
+
+    fn checker_for(origin: Option<String>) -> Arc<SignatureChecker> {
+        let reader = crate::identity_records::RecordReader::new(
+            crate::did::DidResolver::static_map(HashMap::new()),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        );
+        Arc::new(SignatureChecker::new(Arc::new(
+            crate::key_lookup::KeyLookup::new(reader, origin, std::time::Duration::from_secs(3600))
+                .with_retry_delays(Vec::new()),
+        )))
+    }
+
+    /// A line inside an open batch waits for the batch; one outside, and one
+    /// naming a batch that is not open, is checked at once.
+    #[tokio::test]
+    async fn a_line_in_an_open_batch_holds_its_check_until_the_batch_closes() {
+        let (tx, _rx) = mpsc::channel(8);
+        let checker = checker_for(None);
+        let maps = DidMaps::default();
+        let mut batches: DeferredBatches = HashMap::new();
+        batches.insert("b1".to_string(), Vec::new());
+
+        let in_batch = "b1".to_string();
+        check_now_or_hold(
+            &mut batches,
+            Some(&in_batch),
+            Some(&checker),
+            Some(signed_line("did:plc:alice", "m1")),
+            None,
+            &maps,
+            &tx,
+        );
+        assert_eq!(batches["b1"].len(), 1, "held on the open batch");
+
+        check_now_or_hold(
+            &mut batches,
+            None,
+            Some(&checker),
+            Some(signed_line("did:plc:alice", "m2")),
+            None,
+            &maps,
+            &tx,
+        );
+        let unopened = "b2".to_string();
+        check_now_or_hold(
+            &mut batches,
+            Some(&unopened),
+            Some(&checker),
+            Some(signed_line("did:plc:alice", "m3")),
+            None,
+            &maps,
+            &tx,
+        );
+        assert_eq!(
+            batches["b1"].len(),
+            1,
+            "a line outside the batch, and one naming no open batch, are not held"
+        );
+        assert!(!batches.contains_key("b2"));
+    }
+
+    /// A connection that ends with a batch still open starts what it held:
+    /// the guard the read loop keeps its batches in does it on drop, so a
+    /// `break`, an error returned through `?` and the task being dropped are
+    /// all covered. Without it those lines stayed pending for good.
+    #[tokio::test]
+    async fn dropping_the_read_loops_batches_starts_every_held_check() {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let named = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let (counter, seen) = (asked.clone(), named.clone());
+        let router = axum::Router::new().route(
+            "/api/v1/records",
+            axum::routing::get(
+                move |axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>| {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(dids) = q.get("dids") {
+                        seen.lock().push(dids.clone());
+                    }
+                    async move { axum::Json(serde_json::json!({ "accounts": [] })) }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let (tx, _rx) = mpsc::channel(64);
+        let checker = checker_for(Some(base));
+        let mut deferred = HeldChecksOnExit {
+            batches: HashMap::new(),
+            checker: Some(checker.clone()),
+            maps: DidMaps::default(),
+            event_tx: tx.clone(),
+        };
+        // A line held on a batch that never closes.
+        deferred.batches.insert("b1".to_string(), Vec::new());
+        let open = "b1".to_string();
+        check_now_or_hold(
+            &mut deferred.batches,
+            Some(&open),
+            Some(&checker),
+            Some(signed_line("did:plc:alice", "m1")),
+            None,
+            &DidMaps::default(),
+            &tx,
+        );
+        assert_eq!(deferred.batches["b1"].len(), 1, "held on the open batch");
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing started while the batch is open"
+        );
+
+        // The read loop ends: the guard goes out of scope.
+        drop(deferred);
+
+        for _ in 0..200 {
+            if asked.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            named.lock().first().cloned().unwrap_or_default(),
+            "did:plc:alice",
+            "the held check was started, prefetching its signer first"
+        );
+        // This stub serves no account, so the check then falls through on
+        // its own, as it would without a home server.
+    }
+
+    /// The whole point of holding them: the batch's signers are taken from
+    /// the home server in one request, not one per line.
+    #[tokio::test]
+    async fn a_closed_batch_prefetches_its_signers_in_one_request() {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let named = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let (counter, seen) = (asked.clone(), named.clone());
+        let router = axum::Router::new().route(
+            "/api/v1/records",
+            axum::routing::get(
+                move |axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>| {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(dids) = q.get("dids") {
+                        seen.lock().push(dids.clone());
+                    }
+                    async move { axum::Json(serde_json::json!({ "accounts": [] })) }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let (tx, _rx) = mpsc::channel(64);
+        let checker = checker_for(Some(base));
+        let held: Vec<HeldCheck> = ["did:plc:alice", "did:plc:bob", "did:plc:alice"]
+            .iter()
+            .enumerate()
+            .map(|(i, did)| HeldCheck {
+                signed: signed_line(did, &format!("m{i}")),
+                taught: None,
+            })
+            .collect();
+        start_deferred_checks(held, Some(&checker), &DidMaps::default(), &tx);
+
+        for _ in 0..100 {
+            if asked.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let first = named.lock().first().cloned().unwrap_or_default();
+        assert_eq!(
+            first, "did:plc:alice,did:plc:bob",
+            "the batch's signers go in one request, each named once"
+        );
+        // This stub serves no account, so each check then falls through on
+        // its own, as it would without a home server. A server that serves
+        // them answers all of it in the one request above.
     }
 }

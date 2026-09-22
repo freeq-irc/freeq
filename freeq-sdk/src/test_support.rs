@@ -40,6 +40,11 @@ impl StubRepo {
         }
     }
 
+    /// The account this repository belongs to.
+    pub fn did(&self) -> &str {
+        &self.did
+    }
+
     /// A DID document naming the repository key and the PDS at `pds`.
     pub fn document(&self, pds: &str) -> DidDocument {
         crate::did::make_test_did_document_with_pds(

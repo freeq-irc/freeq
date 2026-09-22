@@ -632,6 +632,9 @@ pub struct RecordReader<P: freeq_oauth::ClientProvider> {
     /// One resolution in flight per DID, which every caller for it awaits.
     resolving: parking_lot::Mutex<std::collections::HashMap<String, DocumentInFlight>>,
     document_ttl: std::time::Duration,
+    /// The home server's origin, told once by the lookup, so a 429 from it
+    /// pauses for a minute rather than the five a PDS gets.
+    home_origin: parking_lot::Mutex<Option<String>>,
 }
 
 /// A DID document being resolved, which every caller for that DID awaits.
@@ -672,6 +675,63 @@ pub type ListingHook = Box<dyn Fn(&str, &str, &str, &[RecordEntry]) + Send + Syn
 /// checked under and `car` the proof as the PDS gave it.
 pub type CheckedProofHook = Box<dyn Fn(&str, &str, &str, &Cid, &str, &[u8]) + Send + Sync>;
 
+// ─── the home server ────────────────────────────────────────────────────
+
+/// Most accounts one `/api/v1/records` request may name.
+pub const MAX_ACCOUNTS_PER_REQUEST: usize = 50;
+
+/// One account's collection as the home server keeps it: the listing, the
+/// proofs it could serve by rkey, whether the PDS could not be read when
+/// last asked, and when it was listed, unix seconds.
+#[derive(Debug, Clone, Default)]
+pub struct HomeAccount {
+    pub entries: Vec<RecordEntry>,
+    pub proofs: std::collections::HashMap<String, Vec<u8>>,
+    pub stale: bool,
+    pub fetched_at: i64,
+}
+
+/// `/api/v1/records` as it comes off the wire.
+#[derive(Deserialize)]
+struct HomeBatchAnswer {
+    #[serde(default)]
+    accounts: Vec<HomeAccountAnswer>,
+}
+
+#[derive(Deserialize)]
+struct HomeAccountAnswer {
+    #[serde(default)]
+    did: String,
+    #[serde(default)]
+    collections: std::collections::HashMap<String, HomeCollectionAnswer>,
+}
+
+#[derive(Deserialize)]
+struct HomeCollectionAnswer {
+    #[serde(default)]
+    records: Vec<RecordEntry>,
+    #[serde(default)]
+    proofs: Vec<HomeProofAnswer>,
+    #[serde(default)]
+    stale: bool,
+    fetched_at: i64,
+}
+
+#[derive(Deserialize)]
+struct HomeProofAnswer {
+    #[serde(default)]
+    rkey: String,
+    /// Standard padded base64, as the home server encodes a CAR.
+    #[serde(default)]
+    car: String,
+}
+
+/// `/api/v1/records/{did}/{collection}` as it comes off the wire.
+#[derive(Deserialize)]
+struct HomeListingAnswer {
+    records: Vec<RecordEntry>,
+}
+
 /// One page of a `com.atproto.repo.listRecords` answer.
 #[derive(Deserialize)]
 struct ListRecordsPage {
@@ -706,6 +766,19 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
             documents: parking_lot::Mutex::new(std::collections::HashMap::new()),
             resolving: parking_lot::Mutex::new(std::collections::HashMap::new()),
             document_ttl: DOCUMENT_TTL,
+            home_origin: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Tell the reader which base URL is the home server, so a 429 from it
+    /// pauses for [`HOME_PAUSE`] rather than [`PDS_PAUSE`]. The lookup knows
+    /// it; the reader does not.
+    pub fn set_home_base(&self, base: &str) {
+        let origin = url::Url::parse(base)
+            .ok()
+            .map(|url| url.origin().ascii_serialization());
+        if origin.is_some() {
+            *self.home_origin.lock() = origin;
         }
     }
 
@@ -798,7 +871,7 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
         collection: &str,
     ) -> Result<Vec<serde_json::Value>> {
         Ok(self
-            .list_record_entries(did, collection)
+            .list_record_entries(did, collection, None)
             .await?
             .into_iter()
             .map(|entry| entry.value)
@@ -813,6 +886,7 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
     /// flight is shared through `proving`, so listings racing on one record
     /// fetch its proof once; a failed check is not kept, and the next listing
     /// fetches it again.
+    #[allow(clippy::too_many_arguments)]
     pub async fn proven_records(
         &self,
         did: &str,
@@ -820,6 +894,8 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
         entries: Vec<RecordEntry>,
         proven: &parking_lot::Mutex<std::collections::HashSet<Cid>>,
         proving: &ProofsInFlight,
+        proofs: Option<&std::collections::HashMap<String, Vec<u8>>>,
+        home_base: Option<&str>,
     ) -> Vec<serde_json::Value> {
         let prefix = format!("at://{did}/{collection}/");
         let mut out = Vec::new();
@@ -844,8 +920,9 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
             if let (Some(cell), Some(rkey)) = (cell, rkey) {
                 let verified = *cell
                     .get_or_init(|| async {
+                        let held = proofs.and_then(|p| p.get(rkey)).map(Vec::as_slice);
                         let verified = matches!(
-                            self.verify_record(did, collection, rkey, &cid).await,
+                            self.verify_record(did, collection, rkey, &cid, home_base, held).await,
                             Ok(outcome) if outcome.verified()
                         );
                         if verified {
@@ -877,7 +954,24 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
         &self,
         did: &str,
         collection: &str,
+        home_base: Option<&str>,
     ) -> Result<Vec<RecordEntry>> {
+        // The home server's copy first; any answer but a listing reads the
+        // PDS, as without a home server.
+        if let Some(home) = home_base
+            && let Ok(records) = self.home_listing(home, did, collection).await
+        {
+            if let Some(hook) = &self.on_listing {
+                // The repo key the hook wants comes from the document, which
+                // the reader has cached.
+                let repo_key = match self.resolve_document(did).await {
+                    Ok(doc) => repo_key_multibase(&doc).unwrap_or_default().to_string(),
+                    Err(_) => String::new(),
+                };
+                hook(did, collection, &repo_key, &records);
+            }
+            return Ok(records);
+        }
         let doc = self.resolve_document(did).await?;
         let repo_key = repo_key_multibase(&doc).unwrap_or_default();
         let Some(pds) = pds_endpoint(&doc) else {
@@ -958,10 +1052,32 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
         collection: &str,
         rkey: &str,
         expected: &Cid,
+        home_base: Option<&str>,
+        held: Option<&[u8]>,
     ) -> Result<ProofOutcome> {
         let doc = self.resolve_document(did).await?;
         let multibase = repo_key_multibase(&doc)?;
         let repo_key = PublicKey::from_multibase(multibase)?;
+
+        // A proof the caller already holds, else the home server's copy.
+        // Either is used only if it checks; anything else reads the PDS.
+        let mut copy = held.map(|car| car.to_vec());
+        if copy.is_none()
+            && let Some(home) = home_base
+        {
+            copy = self.home_proof(home, did, collection, rkey).await.ok();
+        }
+        if let Some(car) = copy
+            && let Ok(outcome) =
+                verify_proof(&car, did, collection, rkey, expected, &repo_key).await
+            && outcome.verified()
+        {
+            if let Some(hook) = &self.on_checked_proof {
+                hook(did, collection, rkey, expected, multibase, &car);
+            }
+            return Ok(outcome);
+        }
+
         let pds = pds_endpoint(&doc).context("DID document names no PDS")?;
         let car = self.proof_from(&pds, did, collection, rkey).await?;
         let outcome = verify_proof(&car, did, collection, rkey, expected, &repo_key).await?;
@@ -971,6 +1087,104 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
             hook(did, collection, rkey, expected, multibase, &car);
         }
         Ok(outcome)
+    }
+
+    /// `collection` of `did` as the home server at `home` lists it.
+    async fn home_listing(
+        &self,
+        home: &str,
+        did: &str,
+        collection: &str,
+    ) -> Result<Vec<RecordEntry>> {
+        let url = home_url(home, ["api", "v1", "records", did, collection])?;
+        let answer: HomeListingAnswer = self
+            .get(&url)
+            .await?
+            .json()
+            .await
+            .context("the home server's listing is not a record list")?;
+        Ok(answer.records)
+    }
+
+    /// One record's proof as the home server at `home` holds it.
+    async fn home_proof(
+        &self,
+        home: &str,
+        did: &str,
+        collection: &str,
+        rkey: &str,
+    ) -> Result<Vec<u8>> {
+        let url = home_url(
+            home,
+            ["api", "v1", "records", did, collection, rkey, "proof"],
+        )?;
+        Ok(self
+            .get(&url)
+            .await?
+            .bytes()
+            .await
+            .context("reading the home server's proof failed")?
+            .to_vec())
+    }
+
+    /// `collection` of each of `dids` as the home server at `home` keeps it,
+    /// one request per [`MAX_ACCOUNTS_PER_REQUEST`] DIDs. A DID the server
+    /// leaves out, or whose answer does not parse, is absent, and so is every
+    /// DID of a request that fails; the caller reads those from the PDS. The
+    /// proofs are not checked here.
+    pub async fn fetch_accounts(
+        &self,
+        home: &str,
+        dids: &[String],
+        collection: &str,
+    ) -> std::collections::HashMap<String, HomeAccount> {
+        use base64::engine::general_purpose::STANDARD;
+        let mut unique: Vec<&String> = Vec::new();
+        for did in dids {
+            if !unique.contains(&did) {
+                unique.push(did);
+            }
+        }
+        let mut out = std::collections::HashMap::new();
+        for chunk in unique.chunks(MAX_ACCOUNTS_PER_REQUEST) {
+            let named: Vec<&str> = chunk.iter().map(|d| d.as_str()).collect();
+            let Ok(mut url) = home_url(home, ["api", "v1", "records"]) else {
+                continue;
+            };
+            url.query_pairs_mut()
+                .append_pair("dids", &named.join(","))
+                .append_pair("collection", collection);
+            let answer: HomeBatchAnswer = match self.get(&url).await {
+                Ok(response) => match response.json().await {
+                    Ok(answer) => answer,
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+            for account in answer.accounts {
+                if !named.contains(&account.did.as_str()) {
+                    continue;
+                }
+                let Some(held) = account.collections.get(collection) else {
+                    continue;
+                };
+                let proofs = held
+                    .proofs
+                    .iter()
+                    .filter_map(|p| Some((p.rkey.clone(), STANDARD.decode(&p.car).ok()?)))
+                    .collect();
+                out.insert(
+                    account.did.clone(),
+                    HomeAccount {
+                        entries: held.records.clone(),
+                        proofs,
+                        stale: held.stale,
+                        fetched_at: held.fetched_at,
+                    },
+                );
+            }
+        }
+        out
     }
 
     async fn proof_from(
@@ -1016,7 +1230,8 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
             .with_context(|| format!("request to {} failed", url.path()))?;
         // Before error_for_status, which would make a 429 a generic error.
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let until = retry_at(response.headers(), Utc::now());
+            let home = self.home_origin.lock().as_deref() == Some(host.as_str());
+            let until = retry_at(response.headers(), Utc::now(), home);
             let started = self
                 .paused
                 .lock()
@@ -1033,18 +1248,35 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
     }
 }
 
-/// When a host that answered 429 at `now` may be asked again:
-/// `Retry-After` (seconds) if given, else `RateLimit-Reset` (unix seconds),
-/// else five minutes.
-fn retry_at(headers: &reqwest::header::HeaderMap, now: DateTime<Utc>) -> DateTime<Utc> {
+/// `segments` under the home server at `base`, each segment encoded.
+fn home_url<'a>(base: &str, segments: impl IntoIterator<Item = &'a str>) -> Result<url::Url> {
+    let mut url = url::Url::parse(base).context("invalid home server base URL")?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("home server base URL cannot take a path"))?
+        .pop_if_empty()
+        .extend(segments);
+    Ok(url)
+}
+
+/// How long a 429 that names no time pauses the home server, and a PDS.
+pub const HOME_PAUSE: std::time::Duration = std::time::Duration::from_secs(60);
+pub const PDS_PAUSE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// When a host that answered 429 at `now` may be asked again: `Retry-After`
+/// (seconds) if given, else, for a PDS, `RateLimit-Reset` (unix seconds),
+/// else a minute for the home server and five for a PDS. As the JS reader.
+fn retry_at(headers: &reqwest::header::HeaderMap, now: DateTime<Utc>, home: bool) -> DateTime<Utc> {
     let number = |name: &str| headers.get(name)?.to_str().ok()?.trim().parse::<i64>().ok();
     if let Some(secs) = number("retry-after").filter(|s| *s >= 0) {
         return now + chrono::Duration::seconds(secs);
     }
-    if let Some(reset) = number("ratelimit-reset").and_then(|t| DateTime::from_timestamp(t, 0)) {
+    if !home
+        && let Some(reset) = number("ratelimit-reset").and_then(|t| DateTime::from_timestamp(t, 0))
+    {
         return reset;
     }
-    now + chrono::Duration::minutes(5)
+    let pause = if home { HOME_PAUSE } else { PDS_PAUSE };
+    now + chrono::Duration::from_std(pause).unwrap_or_else(|_| chrono::Duration::minutes(5))
 }
 
 // ─── proofs ─────────────────────────────────────────────────────────────
@@ -2131,13 +2363,21 @@ mod tests {
         let proving = ProofsInFlight::default();
         for _ in 0..3 {
             let entries = reader
-                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE, None)
                 .await
                 .unwrap();
             assert_eq!(entries.len(), 2);
             assert_eq!(
                 reader
-                    .proven_records(ALICE, DEVICE_KEY_TYPE, entries, &proven, &proving)
+                    .proven_records(
+                        ALICE,
+                        DEVICE_KEY_TYPE,
+                        entries,
+                        &proven,
+                        &proving,
+                        None,
+                        None
+                    )
                     .await,
                 vec![genuine.clone()]
             );
@@ -2172,12 +2412,28 @@ mod tests {
         let proven = parking_lot::Mutex::new(std::collections::HashSet::new());
         let proving = ProofsInFlight::default();
         let entries = reader
-            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE, None)
             .await
             .unwrap();
         let (first, second) = tokio::join!(
-            reader.proven_records(ALICE, DEVICE_KEY_TYPE, entries.clone(), &proven, &proving),
-            reader.proven_records(ALICE, DEVICE_KEY_TYPE, entries.clone(), &proven, &proving),
+            reader.proven_records(
+                ALICE,
+                DEVICE_KEY_TYPE,
+                entries.clone(),
+                &proven,
+                &proving,
+                None,
+                None
+            ),
+            reader.proven_records(
+                ALICE,
+                DEVICE_KEY_TYPE,
+                entries.clone(),
+                &proven,
+                &proving,
+                None,
+                None
+            ),
         );
         assert_eq!(first, vec![genuine.clone()]);
         assert_eq!(second, vec![genuine.clone()]);
@@ -2185,7 +2441,15 @@ mod tests {
 
         assert_eq!(
             reader
-                .proven_records(ALICE, DEVICE_KEY_TYPE, entries, &proven, &proving)
+                .proven_records(
+                    ALICE,
+                    DEVICE_KEY_TYPE,
+                    entries,
+                    &proven,
+                    &proving,
+                    None,
+                    None
+                )
                 .await,
             vec![genuine.clone()]
         );
@@ -2236,11 +2500,11 @@ mod tests {
         ));
 
         let first = reader
-            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE, None)
             .await
             .unwrap();
         let second = reader
-            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE, None)
             .await
             .unwrap();
         assert_eq!(first.len(), 1);
@@ -2260,7 +2524,7 @@ mod tests {
         let (reader, listed) = record_listings(reader_for(ALICE, None));
         assert!(
             reader
-                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE, None)
                 .await
                 .unwrap()
                 .is_empty()
@@ -2286,7 +2550,7 @@ mod tests {
         let (reader, listed) = record_listings(reader_for(ALICE, Some(&base)));
         assert!(
             reader
-                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE, None)
                 .await
                 .is_err()
         );
@@ -2327,11 +2591,19 @@ mod tests {
         let proving = ProofsInFlight::default();
         for _ in 0..3 {
             let entries = reader
-                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE, None)
                 .await
                 .unwrap();
             reader
-                .proven_records(ALICE, DEVICE_KEY_TYPE, entries, &proven, &proving)
+                .proven_records(
+                    ALICE,
+                    DEVICE_KEY_TYPE,
+                    entries,
+                    &proven,
+                    &proving,
+                    None,
+                    None,
+                )
                 .await;
         }
         // A proof the PDS will not give is not reported either.
@@ -2341,7 +2613,9 @@ mod tests {
                     ALICE,
                     DEVICE_KEY_TYPE,
                     "absent",
-                    &record_cid(&genuine).unwrap()
+                    &record_cid(&genuine).unwrap(),
+                    None,
+                    None
                 )
                 .await
                 .is_err()
@@ -2449,7 +2723,7 @@ mod tests {
 
         let before = Utc::now();
         let refused = reader
-            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE, None)
             .await
             .unwrap_err();
         let paused = refused
@@ -2464,7 +2738,7 @@ mod tests {
         assert_eq!(reader.paused_until(&limited), Some(paused.until));
 
         let again = reader
-            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE, None)
             .await
             .unwrap_err();
         assert_eq!(again.downcast_ref::<HostPaused>(), Some(&paused));
@@ -2472,7 +2746,7 @@ mod tests {
 
         assert!(
             reader
-                .list_record_entries(BOB, DEVICE_KEY_TYPE)
+                .list_record_entries(BOB, DEVICE_KEY_TYPE, None)
                 .await
                 .is_ok(),
             "another host is still asked"
@@ -2480,7 +2754,9 @@ mod tests {
 
         let left = (paused.until - Utc::now()).to_std().unwrap_or_default();
         tokio::time::sleep(left + std::time::Duration::from_millis(100)).await;
-        let _ = reader.list_record_entries(ALICE, DEVICE_KEY_TYPE).await;
+        let _ = reader
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE, None)
+            .await;
         assert_eq!(
             hits(&listings),
             2,
@@ -2499,7 +2775,7 @@ mod tests {
         let reader = reader_for_hosts(&[(ALICE, &limited)]);
         assert!(
             reader
-                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE, None)
                 .await
                 .is_err()
         );
@@ -2516,7 +2792,7 @@ mod tests {
         let before = Utc::now();
         assert!(
             reader
-                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE, None)
                 .await
                 .is_err()
         );
@@ -2533,7 +2809,7 @@ mod tests {
         let reader = reader_for_hosts(&[(ALICE, &failing)]);
         for _ in 0..2 {
             let failed = reader
-                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE, None)
                 .await
                 .unwrap_err();
             assert!(failed.downcast_ref::<HostPaused>().is_none());
@@ -2733,7 +3009,14 @@ mod tests {
             .unwrap();
         assert_eq!(fetched, proof_fixture("proof.car"));
         let outcome = reader
-            .verify_record(PROOF_DID, DEVICE_KEY_TYPE, PROOF_RKEY, &proof_cid())
+            .verify_record(
+                PROOF_DID,
+                DEVICE_KEY_TYPE,
+                PROOF_RKEY,
+                &proof_cid(),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(outcome, ALL_TRUE);
@@ -2902,6 +3185,18 @@ mod tests {
         Arc<std::sync::atomic::AtomicUsize>,
         Vec<serde_json::Value>,
     ) {
+        counting_reader_after(n, None).await
+    }
+
+    /// `counting_reader`, whose resolver waits `delay` before each answer.
+    async fn counting_reader_after(
+        n: usize,
+        delay: Option<std::time::Duration>,
+    ) -> (
+        RecordReader<freeq_oauth::SharedClient>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Vec<serde_json::Value>,
+    ) {
         let mut repo = crate::test_support::StubRepo::new(ALICE);
         let records: Vec<serde_json::Value> = (1..=n)
             .map(|seed| value(&build_device_record(&key(seed as u8), ALICE, T0, None).unwrap()))
@@ -2912,8 +3207,11 @@ mod tests {
         let repo = Arc::new(parking_lot::Mutex::new(repo));
         let base = serve_repo(repo.clone()).await;
         let doc = repo.lock().document(&base);
-        let (resolver, resolutions) =
-            DidResolver::static_map_counting(HashMap::from([(ALICE.to_string(), doc)]));
+        let documents = HashMap::from([(ALICE.to_string(), doc)]);
+        let (resolver, resolutions) = match delay {
+            Some(delay) => DidResolver::static_map_counting_after(documents, delay),
+            None => DidResolver::static_map_counting(documents),
+        };
         let reader = RecordReader::new(resolver, freeq_oauth::SharedClient(reqwest::Client::new()));
         (reader, resolutions, records)
     }
@@ -2922,11 +3220,19 @@ mod tests {
         let proven = parking_lot::Mutex::new(std::collections::HashSet::new());
         let proving = ProofsInFlight::default();
         let entries = reader
-            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE, None)
             .await
             .unwrap();
         reader
-            .proven_records(ALICE, DEVICE_KEY_TYPE, entries, &proven, &proving)
+            .proven_records(
+                ALICE,
+                DEVICE_KEY_TYPE,
+                entries,
+                &proven,
+                &proving,
+                None,
+                None,
+            )
             .await
             .len()
     }
@@ -2962,13 +3268,13 @@ mod tests {
         const BOB: &str = "did:plc:bobbobbobbobbobbobbobbob";
         assert!(
             reader
-                .list_record_entries(BOB, DEVICE_KEY_TYPE)
+                .list_record_entries(BOB, DEVICE_KEY_TYPE, None)
                 .await
                 .is_err()
         );
         assert!(
             reader
-                .list_record_entries(BOB, DEVICE_KEY_TYPE)
+                .list_record_entries(BOB, DEVICE_KEY_TYPE, None)
                 .await
                 .is_err()
         );
@@ -2977,17 +3283,23 @@ mod tests {
 
     #[tokio::test]
     async fn two_concurrent_proofs_resolve_the_document_once() {
-        let (reader, resolutions, records) = counting_reader(2).await;
+        // The resolver takes a while, so both proofs are waiting on it at
+        // once rather than the first caching the document for the second.
+        let (reader, resolutions, records) =
+            counting_reader_after(2, Some(std::time::Duration::from_millis(100))).await;
         let rkey = |record: &serde_json::Value| {
             let cid = record_cid(record).unwrap();
             let prefix = format!("at://{ALICE}/{DEVICE_KEY_TYPE}/");
             (cid, prefix)
         };
         let entries = reader
-            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE, None)
             .await
             .unwrap();
         assert_eq!(entries.len(), records.len());
+        // The listing resolved the document; drop it, so the two proofs
+        // start on a cold reader.
+        reader.documents.lock().clear();
         let before = hits(&resolutions);
         let (first, second) = (entries[0].clone(), entries[1].clone());
         let one = async {
@@ -2998,6 +3310,8 @@ mod tests {
                     DEVICE_KEY_TYPE,
                     first.uri.strip_prefix(&prefix).unwrap(),
                     &cid,
+                    None,
+                    None,
                 )
                 .await
         };
@@ -3009,6 +3323,8 @@ mod tests {
                     DEVICE_KEY_TYPE,
                     second.uri.strip_prefix(&prefix).unwrap(),
                     &cid,
+                    None,
+                    None,
                 )
                 .await
         };
@@ -3016,8 +3332,8 @@ mod tests {
         assert!(a.unwrap().verified() && b.unwrap().verified());
         assert_eq!(
             hits(&resolutions) - before,
-            0,
-            "the listing's copy serves both"
+            1,
+            "the two proofs share one resolution in flight"
         );
     }
 }

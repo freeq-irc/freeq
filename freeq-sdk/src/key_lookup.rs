@@ -74,6 +74,9 @@ pub struct KeyLookup<P: ClientProvider> {
     refreshed: Mutex<HashMap<String, DateTime<Utc>>>,
     /// One listing, with its proofs, in flight per DID.
     listing: Mutex<HashMap<String, Listing>>,
+    /// The prefetch in flight for each DID, so two batches closing together
+    /// make one request. Several DIDs share one entry.
+    prefetching: Mutex<HashMap<String, Arc<Prefetch>>>,
     /// CIDs of records whose repository proof has checked, so each is fetched
     /// once however often the records are listed.
     proven: Mutex<HashSet<crate::identity_records::Cid>>,
@@ -121,6 +124,16 @@ type ListedRecords = (Vec<serde_json::Value>, DateTime<Utc>);
 /// lookup for that DID awaits.
 type Listing = Arc<tokio::sync::OnceCell<Result<Vec<serde_json::Value>, Arc<anyhow::Error>>>>;
 
+/// One prefetch in flight, shared by every DID it asked for. Setting the
+/// entry and running the request are two steps, so the caller that runs it
+/// need not be the one that set it: the list of DIDs travels with the cell.
+struct Prefetch {
+    /// The DIDs this request names, whoever ends up making it.
+    asked: Vec<String>,
+    /// Set once the request has settled, whatever it served.
+    cell: tokio::sync::OnceCell<()>,
+}
+
 /// The fields of the origin's answer read here.
 #[derive(serde::Deserialize)]
 struct OriginKey {
@@ -133,6 +146,9 @@ impl<P: ClientProvider> KeyLookup<P> {
     /// `origin_base` is the origin server's base URL; the same client
     /// provider as the reader's serves its requests.
     pub fn new(reader: RecordReader<P>, origin_base: Option<String>, ttl: Duration) -> Self {
+        if let Some(base) = &origin_base {
+            reader.set_home_base(base);
+        }
         Self {
             reader,
             origin_base,
@@ -143,6 +159,7 @@ impl<P: ClientProvider> KeyLookup<P> {
             records: Mutex::new(HashMap::new()),
             refreshed: Mutex::new(HashMap::new()),
             listing: Mutex::new(HashMap::new()),
+            prefetching: Mutex::new(HashMap::new()),
             proven: Mutex::new(HashSet::new()),
             proving: Default::default(),
             retry_after: MISS_RETRY_AFTER.to_vec(),
@@ -165,6 +182,7 @@ impl<P: ClientProvider> KeyLookup<P> {
     /// The origin to ask when none was given at construction. Set once; a
     /// client sets it to the server it connected to.
     pub fn set_default_origin_base(&self, base: String) {
+        self.reader.set_home_base(&base);
         let _ = self.default_origin.set(base);
     }
 
@@ -364,6 +382,123 @@ impl<P: ClientProvider> KeyLookup<P> {
         self.list_device_records(did).await
     }
 
+    /// Take the device records of `dids` from the origin, the home server, in
+    /// one request per [`MAX_ACCOUNTS_PER_REQUEST`] accounts, for the DIDs
+    /// whose listing is not held inside the ttl, and that can have one at all
+    /// (a `did:key` is the key, so it is never asked for): each account the server
+    /// returns is proven from the proofs it carries (a record whose proof is
+    /// missing or fails is proven at the PDS) and kept with the server's
+    /// listing time. An account the server leaves out is not read here; its
+    /// first lookup lists it. A DID with a prefetch already in flight is
+    /// awaited rather than asked for again. Nothing is asked without an
+    /// origin. Never fails.
+    pub async fn prefetch(&self, dids: &[String]) {
+        let Some(home) = self.origin_base() else {
+            return;
+        };
+        // The prefetches to await: the one this call starts, if any, and the
+        // ones already in flight for DIDs it was given.
+        let mut flights: Vec<Arc<Prefetch>> = Vec::new();
+        {
+            let mut asked: Vec<String> = Vec::new();
+            let held = self.records.lock();
+            let listing = self.listing.lock();
+            let mut prefetching = self.prefetching.lock();
+            for did in dids {
+                // A did:key has no repository to list: the DID is the key.
+                if did.starts_with("did:key:") {
+                    continue;
+                }
+                if asked.contains(did) {
+                    continue;
+                }
+                if let Some(flight) = prefetching.get(did) {
+                    if !flights.iter().any(|f| Arc::ptr_eq(f, flight)) {
+                        flights.push(flight.clone());
+                    }
+                    continue;
+                }
+                if listing.contains_key(did) {
+                    continue;
+                }
+                if held.get(did).is_some_and(|(_, at)| self.inside_ttl(*at)) {
+                    continue;
+                }
+                asked.push(did.clone());
+            }
+            if !asked.is_empty() {
+                let flight = Arc::new(Prefetch {
+                    asked: asked.clone(),
+                    cell: tokio::sync::OnceCell::new(),
+                });
+                for did in &asked {
+                    prefetching.insert(did.clone(), flight.clone());
+                }
+                flights.push(flight);
+            }
+        }
+        if flights.is_empty() {
+            return;
+        }
+        for flight in &flights {
+            // Whichever caller reaches the cell first makes the request; the
+            // rest await it. A request that served nothing sets the cell too,
+            // so nothing is left in flight for the next prefetch to await.
+            flight
+                .cell
+                .get_or_init(|| async {
+                    let accounts = self
+                        .reader
+                        .fetch_accounts(home, &flight.asked, DEVICE_KEY_TYPE)
+                        .await;
+                    for (did, account) in accounts {
+                        self.proven_from_home(&did, &account).await;
+                    }
+                })
+                .await;
+        }
+        let mut prefetching = self.prefetching.lock();
+        for flight in &flights {
+            for did in &flight.asked {
+                if prefetching.get(did).is_some_and(|f| Arc::ptr_eq(f, flight)) {
+                    prefetching.remove(did);
+                }
+            }
+        }
+    }
+
+    /// Prove one account the home server served, and keep it as that DID's
+    /// listing at the server's listing time. A record whose proof the server
+    /// did not carry, or whose proof does not check, is proven at the PDS.
+    async fn proven_from_home(
+        &self,
+        did: &str,
+        account: &crate::identity_records::HomeAccount,
+    ) -> Vec<serde_json::Value> {
+        let records = self
+            .reader
+            .proven_records(
+                did,
+                DEVICE_KEY_TYPE,
+                account.entries.clone(),
+                &self.proven,
+                &self.proving,
+                Some(&account.proofs),
+                self.origin_base(),
+            )
+            .await;
+        // The server's listing time, never later than now.
+        let at = DateTime::from_timestamp(account.fetched_at, 0)
+            .filter(|at| *at <= Utc::now())
+            .unwrap_or_else(Utc::now);
+        self.records
+            .lock()
+            .insert(did.to_string(), (records.clone(), at));
+        // A listing for key lookups, like the one `device_records` makes.
+        self.refreshed.lock().insert(did.to_string(), at);
+        records
+    }
+
     /// The proven records that decide whether `did`'s device key `kid` is
     /// retired (`retirement_closure`), from a new listing. Only those records
     /// are proven, through this lookup's proven set; the listing is not kept
@@ -373,9 +508,10 @@ impl<P: ClientProvider> KeyLookup<P> {
         did: &str,
         kid: &str,
     ) -> Result<Vec<serde_json::Value>> {
+        let home = self.origin_base();
         let listed = self
             .reader
-            .list_record_entries(did, DEVICE_KEY_TYPE)
+            .list_record_entries(did, DEVICE_KEY_TYPE, home)
             .await?;
         let closure = retirement_closure(did, kid, listed, |entry| &entry.value);
         if closure.is_empty() {
@@ -383,15 +519,29 @@ impl<P: ClientProvider> KeyLookup<P> {
         }
         Ok(self
             .reader
-            .proven_records(did, DEVICE_KEY_TYPE, closure, &self.proven, &self.proving)
+            .proven_records(
+                did,
+                DEVICE_KEY_TYPE,
+                closure,
+                &self.proven,
+                &self.proving,
+                None,
+                home,
+            )
             .await)
     }
 
     /// `did`'s proven device records: the last listing while inside the ttl,
     /// if it names `kid` or the DID was already listed for a lookup inside
     /// the ttl; else a listing, so a key published since is found within the
-    /// ttl.
+    /// ttl. A `did:key` has none, and is answered without a request.
     async fn device_records(&self, did: &str, kid: &str) -> Result<Vec<serde_json::Value>> {
+        // A did:key has no repository to list: the DID is the key. Answering
+        // before anything is looked up or asked for keeps the records step
+        // from making a request the server can only answer empty.
+        if did.starts_with("did:key:") {
+            return Ok(Vec::new());
+        }
         let kept = self
             .records
             .lock()
@@ -435,10 +585,36 @@ impl<P: ClientProvider> KeyLookup<P> {
             .clone();
         let listed = cell
             .get_or_init(|| async {
-                let listed = match self.reader.list_record_entries(did, DEVICE_KEY_TYPE).await {
+                let home = self.origin_base();
+                // Nothing held for this account: its records and proofs
+                // together, in one request.
+                if let Some(home) = home
+                    && !self.records.lock().contains_key(did)
+                    && let Some(account) = self
+                        .reader
+                        .fetch_accounts(home, &[did.to_string()], DEVICE_KEY_TYPE)
+                        .await
+                        .remove(did)
+                {
+                    let records = self.proven_from_home(did, &account).await;
+                    return Ok(records);
+                }
+                let listed = match self
+                    .reader
+                    .list_record_entries(did, DEVICE_KEY_TYPE, home)
+                    .await
+                {
                     Ok(entries) => Ok(self
                         .reader
-                        .proven_records(did, DEVICE_KEY_TYPE, entries, &self.proven, &self.proving)
+                        .proven_records(
+                            did,
+                            DEVICE_KEY_TYPE,
+                            entries,
+                            &self.proven,
+                            &self.proving,
+                            None,
+                            home,
+                        )
                         .await),
                     Err(e) => Err(Arc::new(e)),
                 };
@@ -756,6 +932,289 @@ mod tests {
         serve(router, hits).await
     }
 
+    /// What a fake home server answers with, per route.
+    #[derive(Default)]
+    struct HomeHits {
+        batch: AtomicUsize,
+        listing: AtomicUsize,
+        proof: AtomicUsize,
+    }
+
+    /// A fake home server serving the four record routes from stub
+    /// repositories, one per account, counting the requests per route. `down`
+    /// makes every route answer 429.
+    struct Home {
+        base: String,
+        hits: Arc<HomeHits>,
+        down: Arc<std::sync::atomic::AtomicBool>,
+        /// Accounts this server has not seen, so it leaves them out.
+        unseen: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+        /// The DIDs each batch request named, in the order they arrived.
+        batches: Arc<parking_lot::Mutex<Vec<Vec<String>>>>,
+        /// Accounts whose proofs this server serves from another repository
+        /// for the same DID, so the CAR does not check under the repository
+        /// key the account's document names.
+        forged: HomeRepos,
+        /// Set to answer 404 on every route, as a server with no record cache
+        /// does.
+        not_found: Arc<std::sync::atomic::AtomicBool>,
+        /// The signing keys this server hands out, as the origin route does;
+        /// the home server and the origin are one server in production.
+        keys: HeldKeys,
+    }
+
+    impl Home {
+        fn counts(&self) -> (usize, usize, usize) {
+            (
+                self.hits.batch.load(Ordering::SeqCst),
+                self.hits.listing.load(Ordering::SeqCst),
+                self.hits.proof.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    type HomeRepos = Arc<parking_lot::Mutex<HashMap<String, crate::test_support::StubRepo>>>;
+
+    /// The listing and the proofs a home server holds for one account, in the
+    /// shape `/api/v1/records` answers with.
+    fn home_collection(
+        repo: &mut crate::test_support::StubRepo,
+        collection: &str,
+    ) -> Option<serde_json::Value> {
+        use base64::engine::general_purpose::STANDARD;
+        let query = HashMap::from([
+            ("repo".to_string(), repo.did().to_string()),
+            ("collection".to_string(), collection.to_string()),
+        ]);
+        let (_, _, body) = repo.respond("/xrpc/com.atproto.repo.listRecords", &query)?;
+        let listed: serde_json::Value = serde_json::from_slice(&body).ok()?;
+        let records = listed.get("records")?.as_array()?.clone();
+        let mut proofs = Vec::new();
+        for entry in &records {
+            let uri = entry.get("uri")?.as_str()?;
+            let rkey = uri.rsplit('/').next()?.to_string();
+            let query = HashMap::from([
+                ("did".to_string(), repo.did().to_string()),
+                ("collection".to_string(), collection.to_string()),
+                ("rkey".to_string(), rkey.clone()),
+            ]);
+            // The home server serves proofs it checked itself; a stub that
+            // cannot serve one just leaves it out, as the server does.
+            if let Some((200, _, car)) = repo.respond("/xrpc/com.atproto.sync.getRecord", &query) {
+                proofs.push(json!({ "rkey": rkey, "cid": "", "fetched_at": 0, "car": STANDARD.encode(&car) }));
+            }
+        }
+        // A real listing time, as the server sends: a listing dated 1970 is
+        // stale the moment it arrives.
+        let fetched_at = Utc::now().timestamp();
+        Some(
+            json!({ "fetched_at": fetched_at, "stale": false, "records": records, "proofs": proofs }),
+        )
+    }
+
+    /// A home server holding `repos` by DID.
+    async fn home(repos: HomeRepos) -> Home {
+        use axum::response::IntoResponse;
+        let hits = Arc::new(HomeHits::default());
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let unseen: Arc<parking_lot::Mutex<std::collections::HashSet<String>>> =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+        let batches: Arc<parking_lot::Mutex<Vec<Vec<String>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let forged: HomeRepos = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let not_found = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let keys: HeldKeys = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/records",
+                get({
+                    let (repos, hits, down, unseen, batches, forged, not_found) = (
+                        repos.clone(),
+                        hits.clone(),
+                        down.clone(),
+                        unseen.clone(),
+                        batches.clone(),
+                        forged.clone(),
+                        not_found.clone(),
+                    );
+                    move |Query(q): Query<HashMap<String, String>>| {
+                        hits.batch.fetch_add(1, Ordering::SeqCst);
+                        let (repos, down, unseen, batches, forged, not_found) = (
+                            repos.clone(),
+                            down.clone(),
+                            unseen.clone(),
+                            batches.clone(),
+                            forged.clone(),
+                            not_found.clone(),
+                        );
+                        async move {
+                            let collection = q.get("collection").cloned().unwrap_or_default();
+                            let named: Vec<String> = q
+                                .get("dids")
+                                .map(|d| d.split(',').map(str::to_string).collect())
+                                .unwrap_or_default();
+                            batches.lock().push(named.clone());
+                            if not_found.load(Ordering::SeqCst) {
+                                return StatusCode::NOT_FOUND.into_response();
+                            }
+                            if down.load(Ordering::SeqCst) {
+                                return StatusCode::TOO_MANY_REQUESTS.into_response();
+                            }
+                            if named.is_empty() || named.len() > 50 {
+                                return StatusCode::BAD_REQUEST.into_response();
+                            }
+                            let mut held = repos.lock();
+                            let mut forged = forged.lock();
+                            let withheld = unseen.lock().clone();
+                            let accounts: Vec<serde_json::Value> = named
+                                .iter()
+                                .filter(|did| !withheld.contains(*did))
+                                .filter_map(|did| {
+                                    // A forged copy stands in for the whole
+                                    // account: same records, proofs signed by
+                                    // another repository key.
+                                    let repo = match forged.get_mut(did) {
+                                        Some(repo) => repo,
+                                        None => held.get_mut(did)?,
+                                    };
+                                    let served = home_collection(repo, &collection)?;
+                                    Some(json!({ "did": did, "collections": { &collection: served } }))
+                                })
+                                .collect();
+                            axum::Json(json!({ "accounts": accounts })).into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/records/{did}/{collection}",
+                get({
+                    let (repos, hits, down, unseen, not_found) = (
+                        repos.clone(),
+                        hits.clone(),
+                        down.clone(),
+                        unseen.clone(),
+                        not_found.clone(),
+                    );
+                    move |Path((did, collection)): Path<(String, String)>| {
+                        hits.listing.fetch_add(1, Ordering::SeqCst);
+                        let (repos, down, unseen, not_found) =
+                            (repos.clone(), down.clone(), unseen.clone(), not_found.clone());
+                        async move {
+                            if not_found.load(Ordering::SeqCst) {
+                                return StatusCode::NOT_FOUND.into_response();
+                            }
+                            if down.load(Ordering::SeqCst) {
+                                return StatusCode::TOO_MANY_REQUESTS.into_response();
+                            }
+                            if unseen.lock().contains(&did) {
+                                return StatusCode::NOT_FOUND.into_response();
+                            }
+                            let mut held = repos.lock();
+                            let Some(repo) = held.get_mut(&did) else {
+                                return StatusCode::NOT_FOUND.into_response();
+                            };
+                            let Some(served) = home_collection(repo, &collection) else {
+                                return StatusCode::BAD_GATEWAY.into_response();
+                            };
+                            axum::Json(json!({
+                                "did": did,
+                                "collection": collection,
+                                "fetched_at": served["fetched_at"],
+                                "stale": false,
+                                "records": served["records"],
+                            }))
+                            .into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/records/{did}/{collection}/{rkey}/proof",
+                get({
+                    let (repos, hits, down, unseen, not_found) = (
+                        repos.clone(),
+                        hits.clone(),
+                        down.clone(),
+                        unseen.clone(),
+                        not_found.clone(),
+                    );
+                    move |Path((did, collection, rkey)): Path<(String, String, String)>| {
+                        hits.proof.fetch_add(1, Ordering::SeqCst);
+                        let (repos, down, unseen, not_found) =
+                            (repos.clone(), down.clone(), unseen.clone(), not_found.clone());
+                        async move {
+                            if not_found.load(Ordering::SeqCst) {
+                                return StatusCode::NOT_FOUND.into_response();
+                            }
+                            if down.load(Ordering::SeqCst) {
+                                return StatusCode::TOO_MANY_REQUESTS.into_response();
+                            }
+                            if unseen.lock().contains(&did) {
+                                return StatusCode::NOT_FOUND.into_response();
+                            }
+                            let mut held = repos.lock();
+                            let Some(repo) = held.get_mut(&did) else {
+                                return StatusCode::NOT_FOUND.into_response();
+                            };
+                            let query = HashMap::from([
+                                ("did".to_string(), did.clone()),
+                                ("collection".to_string(), collection),
+                                ("rkey".to_string(), rkey),
+                            ]);
+                            match repo.respond("/xrpc/com.atproto.sync.getRecord", &query) {
+                                Some((200, _, car)) => {
+                                    ([("content-type", "application/vnd.ipld.car")], car)
+                                        .into_response()
+                                }
+                                _ => StatusCode::NOT_FOUND.into_response(),
+                            }
+                        }
+                    }
+                }),
+            )
+            // The origin's key route: one server answers both in production.
+            .route(
+                "/api/v1/signing-keys/{did}/{kid}",
+                get({
+                    let keys = keys.clone();
+                    move |Path((did, kid)): Path<(String, String)>| {
+                        let keys = keys.clone();
+                        async move {
+                            let key = keys
+                                .lock()
+                                .get(&(did.clone(), kid.clone()))
+                                .copied()
+                                .ok_or(StatusCode::NOT_FOUND)?;
+                            Ok::<_, StatusCode>(axum::Json(json!({
+                                "did": did,
+                                "kid": kid,
+                                "algorithm": "ed25519",
+                                "public_key": URL_SAFE_NO_PAD.encode(key),
+                                "encoding": "base64url",
+                                "source": "key-store",
+                            })))
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        Home {
+            base,
+            hits,
+            down,
+            unseen,
+            batches,
+            forged,
+            not_found,
+            keys,
+        }
+    }
+
     fn lookup(
         documents: Vec<DidDocument>,
         origin: Option<&Stub>,
@@ -842,7 +1301,7 @@ mod tests {
         let lookup = KeyLookup::new(reader, None, HOUR);
         lookup
             .reader()
-            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE, None)
             .await
             .unwrap();
         assert_eq!(listings.load(Ordering::SeqCst), 1);
@@ -1538,5 +1997,383 @@ mod tests {
         let given = lookup(vec![alice_on(&pds)], Some(&origin), HOUR);
         given.set_default_origin_base("https://elsewhere.example".to_string());
         assert_eq!(given.origin_base(), Some(origin.base.as_str()));
+    }
+
+    // ─── through the home server ────────────────────────────────────────
+
+    const BOB: &str = "did:plc:bobbobbobbobbobbobbobbob";
+    const CAROL: &str = "did:plc:carolcarolcarolcarolcaro";
+
+    /// A device key record for `did`, signed by `seed`'s key.
+    fn record_for(did: &str, seed: u8) -> serde_json::Value {
+        serde_json::to_value(build_device_record(&key(seed), did, T0, None).unwrap()).unwrap()
+    }
+
+    /// Three accounts, each with one device key record, on one PDS stub and
+    /// one home server holding copies of all three.
+    async fn three_signers() -> (Home, Stub, HomeRepos, Vec<DidDocument>) {
+        let pds_hits = Arc::new(AtomicUsize::new(0));
+        // One set of repositories behind both stubs: the home server serves a
+        // copy of the same repository, so its proofs check under the same
+        // repository key the account's document names.
+        let repos: HomeRepos = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        for (i, did) in [ALICE, BOB, CAROL].iter().enumerate() {
+            let mut repo = crate::test_support::StubRepo::new(did);
+            repo.add(DEVICE_KEY_TYPE, &record_for(did, i as u8 + 1));
+            repos.lock().insert((*did).to_string(), repo);
+        }
+        let pds = serve_repos(repos.clone(), pds_hits.clone()).await;
+        let docs = [ALICE, BOB, CAROL]
+            .iter()
+            .map(|did| repos.lock().get(*did).unwrap().document(&pds.base))
+            .collect();
+        let home = home(repos.clone()).await;
+        (home, pds, repos, docs)
+    }
+
+    /// A PDS answering for several accounts from `repos`, counting listings.
+    async fn serve_repos(repos: HomeRepos, hits: Arc<AtomicUsize>) -> Stub {
+        use axum::response::IntoResponse;
+        let counter = hits.clone();
+        let router = axum::Router::new().fallback(
+            move |uri: axum::http::Uri, Query(q): Query<HashMap<String, String>>| {
+                if uri.path() == "/xrpc/com.atproto.repo.listRecords" {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                let repos = repos.clone();
+                let path = uri.path().to_string();
+                async move {
+                    let did = q.get("repo").or(q.get("did")).cloned().unwrap_or_default();
+                    let answer = repos
+                        .lock()
+                        .get_mut(&did)
+                        .and_then(|r| r.respond(&path, &q));
+                    match answer {
+                        Some((status, content_type, body)) => (
+                            StatusCode::from_u16(status).unwrap(),
+                            [("content-type", content_type)],
+                            body,
+                        )
+                            .into_response(),
+                        None => StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            },
+        );
+        Stub {
+            repo: None,
+            ..serve(router, hits).await
+        }
+    }
+
+    fn lookup_at_home(
+        documents: Vec<DidDocument>,
+        home: &Home,
+    ) -> KeyLookup<freeq_oauth::SharedClient> {
+        let resolver = DidResolver::static_map(
+            documents
+                .into_iter()
+                .map(|doc| (doc.id.clone(), doc))
+                .collect(),
+        );
+        let reader = RecordReader::new(resolver, freeq_oauth::SharedClient(reqwest::Client::new()));
+        KeyLookup::new(reader, Some(home.base.clone()), HOUR).with_retry_delays(Vec::new())
+    }
+
+    #[tokio::test]
+    async fn a_cold_lookup_for_three_signers_makes_one_batch_request_and_no_pds_request() {
+        let (home_server, pds, _repos, docs) = three_signers().await;
+        let keys = lookup_at_home(docs, &home_server);
+        keys.prefetch(&[ALICE.to_string(), BOB.to_string(), CAROL.to_string()])
+            .await;
+        for (i, did) in [ALICE, BOB, CAROL].iter().enumerate() {
+            assert_eq!(
+                keys.key_for(did, &kid_of(i as u8 + 1))
+                    .await
+                    .unwrap()
+                    .map(|f| f.source),
+                Some(KeySource::IdentityRecord),
+                "{did}"
+            );
+        }
+        assert_eq!(home_server.counts(), (1, 0, 0), "one batch request");
+        assert_eq!(pds.hits(), 0, "the PDS was not asked");
+    }
+
+    #[tokio::test]
+    async fn a_did_key_signer_is_left_out_of_the_batch_and_a_did_web_one_is_asked_for() {
+        let (home_server, _pds, _repos, docs) = three_signers().await;
+        let keys = lookup_at_home(docs, &home_server);
+        keys.prefetch(&[
+            ALICE.to_string(),
+            "did:key:z6MkExample".to_string(),
+            "did:web:irc.example.com".to_string(),
+        ])
+        .await;
+        assert_eq!(
+            *home_server.batches.lock(),
+            vec![vec![
+                ALICE.to_string(),
+                "did:web:irc.example.com".to_string()
+            ]]
+        );
+    }
+
+    /// A did:key bot signs with the key its DID names: there is no
+    /// repository to list, so the records step must ask nothing anywhere —
+    /// the lookup goes straight to the origin.
+    #[tokio::test]
+    async fn a_did_key_signer_reads_no_records_anywhere() {
+        const BOT: &str = "did:key:z6MkExampleBotSigner";
+        let (home_server, pds, _repos, docs) = three_signers().await;
+        home_server
+            .keys
+            .lock()
+            .insert((BOT.to_string(), kid_of(7)), raw(7));
+        let keys = lookup_at_home(docs, &home_server);
+        assert_eq!(
+            keys.key_for(BOT, &kid_of(7))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::OriginServer)
+        );
+        assert_eq!(
+            home_server.counts(),
+            (0, 0, 0),
+            "no batch, listing or proof request"
+        );
+        assert_eq!(pds.hits(), 0, "the PDS was not asked");
+    }
+
+    #[tokio::test]
+    async fn a_batch_of_did_key_signers_alone_asks_nothing() {
+        let (home_server, _pds, _repos, docs) = three_signers().await;
+        let keys = lookup_at_home(docs, &home_server);
+        keys.prefetch(&["did:key:z6MkExample".to_string()]).await;
+        assert_eq!(home_server.counts().0, 0, "no batch request");
+    }
+
+    #[tokio::test]
+    async fn two_prefetches_for_the_same_signers_share_one_batch_request() {
+        let (home_server, _pds, _repos, docs) = three_signers().await;
+        let keys = lookup_at_home(docs, &home_server);
+        let first = [ALICE.to_string(), BOB.to_string()];
+        let second = [BOB.to_string(), ALICE.to_string()];
+        tokio::join!(keys.prefetch(&first), keys.prefetch(&second));
+        keys.prefetch(&[ALICE.to_string()]).await;
+        assert_eq!(home_server.counts().0, 1, "one batch request for the lot");
+    }
+
+    #[tokio::test]
+    async fn a_prefetch_that_fails_leaves_nothing_in_flight() {
+        let (home_server, _pds, _repos, docs) = three_signers().await;
+        let keys = lookup_at_home(docs, &home_server);
+        home_server.down.store(true, Ordering::SeqCst);
+        keys.prefetch(&[ALICE.to_string(), BOB.to_string()]).await;
+        assert_eq!(
+            home_server.counts().0,
+            1,
+            "the request was made and refused"
+        );
+        assert_eq!(
+            keys.prefetching.lock().len(),
+            0,
+            "a prefetch that served nothing leaves nothing in flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_home_proof_that_does_not_check_is_fetched_from_the_pds() {
+        let (home_server, _pds, repos, docs) = three_signers().await;
+        // The same record under a fresh repository key: same rkey, same CID,
+        // a commit signature the account's document does not name. Only the
+        // home server serves it, so a proof read on the real repository can
+        // only have come from the PDS.
+        let mut forged = crate::test_support::StubRepo::new(ALICE);
+        forged.add(DEVICE_KEY_TYPE, &record_for(ALICE, 1));
+        home_server.forged.lock().insert(ALICE.to_string(), forged);
+        let uri = alice_record_uri(&repos);
+        assert_eq!(proof_reads(&repos, &uri), 0, "nothing read yet");
+
+        let keys = lookup_at_home(docs, &home_server);
+        keys.prefetch(&[ALICE.to_string()]).await;
+        assert_eq!(
+            keys.key_for(ALICE, &kid_of(1))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::IdentityRecord),
+            "the key is found"
+        );
+        assert_eq!(home_server.counts().0, 1, "one batch request");
+        assert_eq!(
+            proof_reads(&repos, &uri),
+            1,
+            "the home proof did not check, so the PDS was asked for it"
+        );
+    }
+
+    /// The `at://` uri of ALICE's one device key record.
+    fn alice_record_uri(repos: &HomeRepos) -> String {
+        let query = HashMap::from([
+            ("repo".to_string(), ALICE.to_string()),
+            ("collection".to_string(), DEVICE_KEY_TYPE.to_string()),
+        ]);
+        let mut held = repos.lock();
+        let repo = held.get_mut(ALICE).expect("ALICE is in the repositories");
+        let (_, _, body) = repo
+            .respond("/xrpc/com.atproto.repo.listRecords", &query)
+            .expect("the stub lists records");
+        let listed: serde_json::Value = serde_json::from_slice(&body).expect("a listing");
+        listed["records"][0]["uri"]
+            .as_str()
+            .expect("one record with a uri")
+            .to_string()
+    }
+
+    /// How often the proof for `uri` was asked for on the real repository.
+    fn proof_reads(repos: &HomeRepos, uri: &str) -> usize {
+        repos
+            .lock()
+            .get(ALICE)
+            .expect("ALICE is in the repositories")
+            .proof_reads(uri)
+    }
+
+    #[tokio::test]
+    async fn a_home_server_answering_404_everywhere_falls_through_to_the_pds() {
+        let (home_server, pds, _repos, docs) = three_signers().await;
+        home_server.not_found.store(true, Ordering::SeqCst);
+        let keys = lookup_at_home(docs, &home_server);
+        keys.prefetch(&[ALICE.to_string()]).await;
+        assert_eq!(
+            keys.key_for(ALICE, &kid_of(1))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::IdentityRecord)
+        );
+        assert_eq!(pds.hits(), 1, "the listing came from the PDS");
+    }
+
+    #[tokio::test]
+    async fn fifty_one_signers_go_in_two_batch_requests() {
+        let (home_server, _pds, _repos, docs) = three_signers().await;
+        let keys = lookup_at_home(docs, &home_server);
+        let dids: Vec<String> = (0..51)
+            .map(|i| format!("did:plc:batchfill{i:036}"))
+            .collect();
+        keys.prefetch(&dids).await;
+        let batches = home_server.batches.lock().clone();
+        assert_eq!(batches.len(), 2, "two requests");
+        assert_eq!(batches[0].len(), 50, "the first names fifty");
+        assert_eq!(batches[1].len(), 1, "the second names the fifty-first");
+    }
+
+    #[tokio::test]
+    async fn a_signer_the_home_server_leaves_out_is_listed_at_the_pds() {
+        let (home_server, pds, _repos, docs) = three_signers().await;
+        home_server.unseen.lock().insert(CAROL.to_string());
+        let keys = lookup_at_home(docs, &home_server);
+        keys.prefetch(&[ALICE.to_string(), BOB.to_string(), CAROL.to_string()])
+            .await;
+        assert_eq!(
+            keys.key_for(CAROL, &kid_of(3))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::IdentityRecord)
+        );
+        assert_eq!(pds.hits(), 1, "only the account left out was listed");
+    }
+
+    #[tokio::test]
+    async fn a_home_429_sends_the_lookup_to_the_pds_and_pauses_the_home_server() {
+        let (home_server, pds, _repos, docs) = three_signers().await;
+        home_server.down.store(true, Ordering::SeqCst);
+        let keys = lookup_at_home(docs, &home_server);
+        assert_eq!(
+            keys.key_for(ALICE, &kid_of(1))
+                .await
+                .unwrap()
+                .map(|f| f.source),
+            Some(KeySource::IdentityRecord),
+            "the PDS answered"
+        );
+        let asked = home_server.counts();
+        assert_eq!(pds.hits(), 1);
+
+        // Inside the minute the home server is not asked again.
+        home_server.down.store(false, Ordering::SeqCst);
+        keys.forget(BOB, &kid_of(2));
+        let _ = keys.key_for(BOB, &kid_of(2)).await;
+        assert_eq!(
+            home_server.counts(),
+            asked,
+            "the paused home server was not asked again"
+        );
+        assert_eq!(
+            keys.reader().paused_until(&home_server.base).is_some(),
+            true,
+            "the home server is paused"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_hourly_relist_is_one_listing_request() {
+        let (home_server, pds, _repos, docs) = three_signers().await;
+        let resolver =
+            DidResolver::static_map(docs.into_iter().map(|doc| (doc.id.clone(), doc)).collect());
+        let reader = RecordReader::new(resolver, freeq_oauth::SharedClient(reqwest::Client::new()));
+        // The server's listing time is whole seconds, so a listing arrives
+        // looking up to a second old; the ttl has to clear that.
+        let keys = KeyLookup::new(
+            reader,
+            Some(home_server.base.clone()),
+            Duration::from_millis(1500),
+        )
+        .with_retry_delays(Vec::new());
+        keys.prefetch(&[ALICE.to_string()]).await;
+        assert!(keys.key_for(ALICE, &kid_of(1)).await.unwrap().is_some());
+        assert_eq!(home_server.counts(), (1, 0, 0));
+
+        tokio::time::sleep(Duration::from_millis(1800)).await;
+        assert!(keys.key_for(ALICE, &kid_of(1)).await.unwrap().is_some());
+        assert_eq!(
+            home_server.counts(),
+            (1, 1, 0),
+            "the re-list is the listing route, and its proofs are proven already"
+        );
+        assert_eq!(pds.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_retirement_closure_check_reads_the_home_routes() {
+        use crate::identity_records::build_device_retirement;
+        let (home_server, pds, repos, docs) = three_signers().await;
+        let retirement = serde_json::to_value(
+            build_device_retirement(&key(1), ALICE, &kid_of(1), "2026-03-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        repos
+            .lock()
+            .get_mut(ALICE)
+            .unwrap()
+            .add(DEVICE_KEY_TYPE, &retirement);
+        let keys = lookup_at_home(docs, &home_server);
+        let closure = keys
+            .proven_retirement_closure(ALICE, &kid_of(1))
+            .await
+            .unwrap();
+        assert_eq!(closure.len(), 2, "the record and the retirement");
+        let (batch, listing, proof) = home_server.counts();
+        assert_eq!(
+            (batch, listing),
+            (0, 1),
+            "one listing through the home route"
+        );
+        assert!(proof > 0, "the closure's proofs came from the home server");
+        assert_eq!(pds.hits(), 0);
     }
 }

@@ -282,7 +282,8 @@ impl RecordCache {
         let listed = cell
             .get_or_init(|| async {
                 reader
-                    .list_record_entries(did, collection)
+                    // The server is the home; it reads the PDS itself.
+                    .list_record_entries(did, collection, None)
                     .await
                     .map(|_| ())
                     .map_err(|e| format!("{e:#}"))
@@ -392,7 +393,7 @@ async fn fetched_proof(
     let outcome = state
         .key_lookup
         .reader()
-        .verify_record(did, collection, rkey, cid)
+        .verify_record(did, collection, rkey, cid, None, None)
         .await
         .map_err(|e| Refusal::Unreadable(format!("{e:#}")))?;
     if !outcome.verified() {

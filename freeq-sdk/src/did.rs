@@ -166,6 +166,7 @@ impl DidResolver {
             documents,
             handles: HashMap::new(),
             resolutions: Arc::new(AtomicUsize::new(0)),
+            delay: None,
         })
     }
 
@@ -180,6 +181,7 @@ impl DidResolver {
             documents,
             handles,
             resolutions: Arc::new(AtomicUsize::new(0)),
+            delay: None,
         })
     }
 
@@ -193,6 +195,25 @@ impl DidResolver {
             documents,
             handles: HashMap::new(),
             resolutions: resolutions.clone(),
+            delay: None,
+        });
+        (resolver, resolutions)
+    }
+
+    /// Like `static_map_counting`, answering each resolution only after
+    /// `delay`, so callers racing on one DID are in flight together (for
+    /// testing a caller that shares resolutions).
+    pub fn static_map_counting_after(
+        documents: HashMap<String, DidDocument>,
+        delay: std::time::Duration,
+    ) -> (Self, Arc<AtomicUsize>) {
+        let (resolver, resolutions) = Self::static_map_counting(documents);
+        let DidResolver::Static(inner) = resolver else {
+            unreachable!("static_map_counting builds a static resolver")
+        };
+        let resolver = DidResolver::Static(StaticResolver {
+            delay: Some(delay),
+            ..inner
         });
         (resolver, resolutions)
     }
@@ -201,7 +222,12 @@ impl DidResolver {
     pub async fn resolve(&self, did: &str) -> Result<DidDocument> {
         match self {
             DidResolver::Http(r) => r.resolve(did).await,
-            DidResolver::Static(r) => r.resolve(did),
+            DidResolver::Static(r) => {
+                if let Some(delay) = r.delay {
+                    tokio::time::sleep(delay).await;
+                }
+                r.resolve(did)
+            }
         }
     }
 
@@ -358,6 +384,8 @@ pub struct StaticResolver {
     handles: HashMap<String, String>,
     /// How often `resolve` has been called, for tests that count them.
     resolutions: Arc<AtomicUsize>,
+    /// How long each resolution waits before answering, for tests.
+    delay: Option<std::time::Duration>,
 }
 
 impl StaticResolver {
@@ -583,6 +611,7 @@ mod tests {
             documents: HashMap::new(),
             handles: HashMap::new(),
             resolutions: Arc::new(AtomicUsize::new(0)),
+            delay: None,
         };
         let key = PrivateKey::generate_ed25519();
         let did = format!("did:key:{}", key.public_key_multibase());
