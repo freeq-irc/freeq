@@ -7,7 +7,12 @@ import { webcrypto } from 'node:crypto';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { type DidKey, decodeMultibaseEd25519, importDidKey } from './did-key.js';
-import { type DidDocument, buildDeviceRecord, buildDeviceRetirement } from './identity-records.js';
+import {
+  type DidDocument,
+  buildDeviceRecord,
+  buildDeviceRetirement,
+  clearHostPauses,
+} from './identity-records.js';
 import { KeyLookup, MemoryKeyLookupStore, makeDidResolver } from './key-lookup.js';
 import { deriveKid } from './signing.js';
 
@@ -30,6 +35,7 @@ beforeAll(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  clearHostPauses();
 });
 
 async function key(seed: number): Promise<DidKey> {
@@ -583,5 +589,183 @@ describe('makeDidResolver', () => {
       'https://bot.example.com/.well-known/did.json',
     ]);
     await expect(resolve('did:key:z6Mkabc')).rejects.toThrow();
+  });
+});
+
+// ─── through the home server ────────────────────────────────────────────
+
+const BOB = 'did:plc:bobbobbobbobbobbobbobbob';
+const CAROL = 'did:plc:carolcarolcarolcarolcaro';
+
+/**
+ * ALICE, BOB and CAROL with device keys 1, 2 and 3, their PDS, and the origin
+ * as their home server answering the record routes from the same
+ * repositories. Counts PDS listings and proofs, and origin key requests.
+ */
+async function homeNetwork() {
+  const { stubRepo, stubHome } = await import('../test/repo-proofs.js');
+  const repos = [await stubRepo(ALICE, repoKey), await stubRepo(BOB), await stubRepo(CAROL)];
+  for (const [i, repo] of repos.entries()) {
+    await repo.add('at.freeq.deviceKey', await buildDeviceRecord(await key(i + 1), repo.did, T0));
+  }
+  const home = stubHome(repos);
+  const docs = await Promise.all(repos.map((r) => r.document(PDS)));
+  const pds = { listings: 0, proofs: 0 };
+  const hits = { origin: 0 };
+  const fetch = vi.fn(async (input: string): Promise<Response> => {
+    const url = new URL(input);
+    if (url.origin === PDS) {
+      if (url.pathname.endsWith('listRecords')) pds.listings++;
+      if (url.pathname.endsWith('getRecord')) pds.proofs++;
+      for (const repo of repos) {
+        const answer = await repo.respond(url);
+        if (answer !== undefined) return answer;
+      }
+      return new Response('unexpected', { status: 500 });
+    }
+    if (url.origin === ORIGIN) {
+      const answer = await home.respond(url);
+      if (answer !== undefined) return answer;
+      hits.origin++;
+      return new Response('not found', { status: 404 });
+    }
+    return new Response('unexpected', { status: 500 });
+  });
+  const [alice, bob, carol] = repos as [typeof repos[0], typeof repos[0], typeof repos[0]];
+  return { alice, bob, carol, home, pds, hits, fetch, resolveDid: resolver(docs) };
+}
+
+const noHome = { batch: 0, account: 0, listing: 0, proof: 0 };
+
+describe('KeyLookup through the home server', () => {
+  it('prefetches a channel of three signers in one batch request, and finds every key in the records with no PDS request', async () => {
+    const { home, pds, hits, fetch, resolveDid } = await homeNetwork();
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    await lookup.prefetch([ALICE, BOB, CAROL, ALICE]);
+    for (const [did, seed] of [[ALICE, 1], [BOB, 2], [CAROL, 3]] as const) {
+      expect((await lookup.keyFor(did, await kidOf(seed)))?.source, did).toBe('IdentityRecord');
+    }
+    expect(home.hits).toEqual({ ...noHome, batch: 1 });
+    expect(home.batches).toEqual([[ALICE, BOB, CAROL]]);
+    expect(pds).toEqual({ listings: 0, proofs: 0 });
+    expect(hits.origin).toBe(0);
+  });
+
+  it('shares one batch request between two prefetches for the same signers', async () => {
+    const { home, fetch, resolveDid } = await homeNetwork();
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    await Promise.all([lookup.prefetch([ALICE, BOB]), lookup.prefetch([BOB, ALICE])]);
+    await lookup.prefetch([ALICE]);
+    expect(home.hits.batch).toBe(1);
+  });
+
+  it('lists a signer the home server left out at the PDS', async () => {
+    const { home, pds, fetch, resolveDid } = await homeNetwork();
+    home.left.add(CAROL);
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    await lookup.prefetch([ALICE, BOB, CAROL]);
+    expect(pds, 'the prefetch reads no PDS').toEqual({ listings: 0, proofs: 0 });
+    expect((await lookup.keyFor(CAROL, await kidOf(3)))?.source).toBe('IdentityRecord');
+    expect((await lookup.keyFor(ALICE, await kidOf(1)))?.source).toBe('IdentityRecord');
+    expect(pds, 'only the signer left out').toEqual({ listings: 1, proofs: 1 });
+  });
+
+  it('proves a record whose proof the batch left out at the PDS', async () => {
+    const { alice, home, pds, fetch, resolveDid } = await homeNetwork();
+    const rkey = alice.entries('at.freeq.deviceKey')[0]!.uri.split('/').pop()!;
+    home.withheld.add(`at.freeq.deviceKey/${rkey}`);
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    await lookup.prefetch([ALICE]);
+    expect((await lookup.keyFor(ALICE, await kidOf(1)))?.source).toBe('IdentityRecord');
+    expect(pds).toEqual({ listings: 0, proofs: 1 });
+  });
+
+  it('reads the PDS on a 429 from the home server, and asks the home server nothing inside the cooldown', async () => {
+    const { home, pds, fetch, resolveDid } = await homeNetwork();
+    home.status = 429;
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    expect((await lookup.keyFor(ALICE, await kidOf(1)))?.source).toBe('IdentityRecord');
+    expect(home.hits).toEqual({ ...noHome, batch: 1 });
+    expect(pds).toEqual({ listings: 1, proofs: 1 });
+
+    home.status = null;
+    await lookup.prefetch([BOB]);
+    expect((await lookup.keyFor(BOB, await kidOf(2)))?.source).toBe('IdentityRecord');
+    expect(home.hits, 'inside the cooldown').toEqual({ ...noHome, batch: 1 });
+    expect(pds).toEqual({ listings: 2, proofs: 2 });
+  });
+
+  it('re-lists a held account past the hour with one home listing request and no proof request', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-22T00:00:00Z'));
+    const { home, pds, fetch, resolveDid } = await homeNetwork();
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    await lookup.prefetch([ALICE]);
+    expect((await lookup.keyFor(ALICE, await kidOf(1)))?.source).toBe('IdentityRecord');
+    expect(home.hits).toEqual({ ...noHome, batch: 1 });
+
+    vi.setSystemTime(new Date('2026-09-22T01:01:00Z'));
+    expect((await lookup.keyFor(ALICE, await kidOf(1)))?.source).toBe('IdentityRecord');
+    expect(home.hits).toEqual({ ...noHome, batch: 1, listing: 1 });
+    expect(pds).toEqual({ listings: 0, proofs: 0 });
+  });
+
+  it('keeps the server listing time, so a copy an hour old is listed again at once', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-22T01:00:00Z'));
+    const { home, fetch, resolveDid } = await homeNetwork();
+    home.fetchedAt = Date.parse('2026-09-21T23:59:00Z') / 1000;
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    await lookup.prefetch([ALICE]);
+    await lookup.prefetch([ALICE]);
+    expect(home.hits.batch, 'a listing older than the hour is not held').toBe(2);
+  });
+
+  it('proves the retirement closure through one home listing and the single-proof route', async () => {
+    const { alice, home, pds, fetch, resolveDid } = await homeNetwork();
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    expect(await lookup.provenRetirementClosure(ALICE, await kidOf(1))).toEqual([]);
+    expect(home.hits).toEqual({ ...noHome, listing: 1 });
+
+    await alice.add(
+      'at.freeq.deviceKey',
+      await buildDeviceRetirement(await key(1), ALICE, await kidOf(1), '2026-09-01T00:00:00Z'),
+    );
+    expect(await lookup.provenRetirementClosure(ALICE, await kidOf(1))).toHaveLength(2);
+    expect(home.hits).toEqual({ ...noHome, listing: 2, proof: 2 });
+    expect(pds).toEqual({ listings: 0, proofs: 0 });
+  });
+
+  it('lists the Devices of a cold account with one home request and no PDS request', async () => {
+    const { home, pds, fetch, resolveDid } = await homeNetwork();
+    const lookup = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES);
+    expect(await lookup.provenDeviceRecords(ALICE)).toHaveLength(1);
+    expect(home.hits).toEqual({ ...noHome, batch: 1 });
+    expect(pds).toEqual({ listings: 0, proofs: 0 });
+  });
+
+  it('makes no request for a lookup built on the same store', async () => {
+    const { fetch, resolveDid } = await homeNetwork();
+    const store = new MemoryKeyLookupStore();
+    const first = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES, store);
+    await first.prefetch([ALICE, BOB, CAROL]);
+    for (const [did, seed] of [[ALICE, 1], [BOB, 2], [CAROL, 3]] as const) await first.keyFor(did, await kidOf(seed));
+    const requests = fetch.mock.calls.length;
+
+    const second = new KeyLookup({ fetch, resolveDid }, ORIGIN, HOUR, NO_RETRIES, store);
+    await second.prefetch([ALICE, BOB, CAROL]);
+    for (const [did, seed] of [[ALICE, 1], [BOB, 2], [CAROL, 3]] as const) {
+      expect((await second.keyFor(did, await kidOf(seed)))?.source).toBe('IdentityRecord');
+    }
+    expect(fetch.mock.calls.length).toBe(requests);
+  });
+
+  it('asks no home server with no origin', async () => {
+    const { home, pds, fetch, resolveDid } = await homeNetwork();
+    const lookup = new KeyLookup({ fetch, resolveDid }, null, HOUR, NO_RETRIES);
+    await lookup.prefetch([ALICE]);
+    expect((await lookup.keyFor(ALICE, await kidOf(1)))?.source).toBe('IdentityRecord');
+    expect(home.hits).toEqual(noHome);
+    expect(pds).toEqual({ listings: 1, proofs: 1 });
   });
 });

@@ -479,6 +479,7 @@ describe('fetchAccounts', () => {
   it('decodes a two-account answer and leaves an absent DID out', async () => {
     const { alice, aliceEntry, bobEntry, home, fetch } = await homeNetwork();
     const carol = 'did:plc:carolcarolcarolcarolcaro';
+    home.fetchedAt = 1_790_000_000;
     const got = await fetchAccounts(fetch, HOME, [ALICE, BOB, carol], DEVICE_KEY_TYPE);
     expect([...got.keys()]).toEqual([ALICE, BOB]);
     expect(got.get(ALICE)!.entries).toEqual([aliceEntry]);

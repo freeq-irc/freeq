@@ -154,7 +154,8 @@ export async function stubRepo(did: string, keypair?: RepoKeypair): Promise<Stub
  * route with that status and `headers`; `left` names accounts the server has
  * not seen (left out of a batch, 404 alone); `withheld` names `collection/rkey`
  * proofs the server cannot serve (left out of `proofs`, 502 alone); `served`
- * replaces the CAR served for a `collection/rkey`.
+ * replaces the CAR served for a `collection/rkey`. `fetchedAt` is the listing
+ * time served, unix seconds; null serves the time of the answer.
  */
 export interface StubHome {
   hits: { batch: number; account: number; listing: number; proof: number };
@@ -165,6 +166,7 @@ export interface StubHome {
   left: Set<string>;
   withheld: Set<string>;
   served: Map<string, Uint8Array>;
+  fetchedAt: number | null;
   /** Answer a record route; undefined for any other path. */
   respond(url: URL): Promise<Response | undefined>;
 }
@@ -179,6 +181,7 @@ export function stubHome(repos: StubRepo[]): StubHome {
     left: new Set(),
     withheld: new Set(),
     served: new Map(),
+    fetchedAt: null,
     async respond(url: URL): Promise<Response | undefined> {
       if (url.pathname !== prefix && !url.pathname.startsWith(`${prefix}/`)) return undefined;
       const parts = url.pathname.slice(prefix.length).split('/').filter(Boolean).map(decodeURIComponent);
@@ -192,18 +195,19 @@ export function stubHome(repos: StubRepo[]): StubHome {
           ? undefined
           : (home.served.get(`${collection}/${rkey}`) ?? repo.car(collection, rkey));
       const rkeyOf = (entry: ListedEntry) => entry.uri.split('/').pop()!;
+      const fetchedAt = home.fetchedAt ?? Math.floor(Date.now() / 1000);
       const account = (repo: StubRepo, collection: string) => ({
         did: repo.did,
         collections: {
           [collection]: {
-            fetched_at: 1_790_000_000,
+            fetched_at: fetchedAt,
             stale: false,
             records: repo.entries(collection),
             proofs: repo.entries(collection).flatMap((entry) => {
               const car = carFor(repo, collection, rkeyOf(entry));
               return car === undefined
                 ? []
-                : [{ rkey: rkeyOf(entry), cid: entry.cid, fetched_at: 1_790_000_000, car: Buffer.from(car).toString('base64') }];
+                : [{ rkey: rkeyOf(entry), cid: entry.cid, fetched_at: fetchedAt, car: Buffer.from(car).toString('base64') }];
             }),
           },
         },
@@ -225,7 +229,7 @@ export function stubHome(repos: StubRepo[]): StubHome {
         return Response.json({
           did: repo.did,
           collection: parts[1],
-          fetched_at: 1_790_000_000,
+          fetched_at: fetchedAt,
           stale: false,
           records: repo.entries(parts[1]!),
         });
@@ -236,7 +240,7 @@ export function stubHome(repos: StubRepo[]): StubHome {
       const car = carFor(repo, parts[1]!, parts[2]!);
       if (car === undefined) return new Response('no proof', { status: 502 });
       return new Response(car, {
-        headers: { 'content-type': 'application/vnd.ipld.car', 'x-freeq-fetched-at': '1790000000' },
+        headers: { 'content-type': 'application/vnd.ipld.car', 'x-freeq-fetched-at': String(fetchedAt) },
       });
     },
   };
