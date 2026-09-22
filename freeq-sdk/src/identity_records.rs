@@ -576,7 +576,31 @@ pub struct RecordReader<P: freeq_oauth::ClientProvider> {
     pub(crate) clients: P,
     on_listing: Option<ListingHook>,
     on_checked_proof: Option<CheckedProofHook>,
+    /// Per host (scheme, host and port), the time until which it is not
+    /// asked again, set by a 429.
+    paused: parking_lot::Mutex<std::collections::HashMap<String, DateTime<Utc>>>,
 }
+
+/// A request not sent, or refused, because the host answered 429: the host
+/// and the time it said to retry at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPaused {
+    pub host: String,
+    pub until: DateTime<Utc>,
+}
+
+impl std::fmt::Display for HostPaused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is rate limiting this reader until {}",
+            self.host,
+            self.until.to_rfc3339()
+        )
+    }
+}
+
+impl std::error::Error for HostPaused {}
 
 /// Told of every listing a reader makes: `(did, collection, repo_key,
 /// entries)`, `repo_key` being the `#atproto` publicKeyMultibase of the DID
@@ -618,7 +642,15 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
             clients,
             on_listing: None,
             on_checked_proof: None,
+            paused: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Until when the host of `url` is paused by a 429, if it is.
+    #[cfg(test)]
+    pub(crate) fn paused_until(&self, url: &str) -> Option<DateTime<Utc>> {
+        let host = url::Url::parse(url).ok()?.origin().ascii_serialization();
+        self.paused.lock().get(&host).copied()
     }
 
     /// Call `hook` after every listing that succeeds, so a caller can keep
@@ -850,17 +882,52 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
     }
 
     /// GET `url` with the provider's client for it; an HTTP error status is
-    /// an error.
+    /// an error. A host that answered 429 is not asked again until the time
+    /// it gave, and until then the answer is [`HostPaused`] without a request.
     async fn get(&self, url: &url::Url) -> Result<reqwest::Response> {
+        let host = url.origin().ascii_serialization();
+        if let Some(until) = self.paused.lock().get(&host).copied()
+            && until > Utc::now()
+        {
+            return Err(HostPaused { host, until }.into());
+        }
         let client = self.clients.client_for(url.as_str()).await?;
-        client
+        let response = client
             .get(url.clone())
             .send()
             .await
-            .with_context(|| format!("request to {} failed", url.path()))?
+            .with_context(|| format!("request to {} failed", url.path()))?;
+        // Before error_for_status, which would make a 429 a generic error.
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let until = retry_at(response.headers(), Utc::now());
+            let started = self
+                .paused
+                .lock()
+                .insert(host.clone(), until)
+                .is_none_or(|was| was <= Utc::now());
+            if started {
+                tracing::info!(%host, until = %until.to_rfc3339(), "PDS host rate limited this reader; pausing requests to it");
+            }
+            return Err(HostPaused { host, until }.into());
+        }
+        response
             .error_for_status()
             .with_context(|| format!("{} answered with an error", url.path()))
     }
+}
+
+/// When a host that answered 429 at `now` may be asked again:
+/// `Retry-After` (seconds) if given, else `RateLimit-Reset` (unix seconds),
+/// else five minutes.
+fn retry_at(headers: &reqwest::header::HeaderMap, now: DateTime<Utc>) -> DateTime<Utc> {
+    let number = |name: &str| headers.get(name)?.to_str().ok()?.trim().parse::<i64>().ok();
+    if let Some(secs) = number("retry-after").filter(|s| *s >= 0) {
+        return now + chrono::Duration::seconds(secs);
+    }
+    if let Some(reset) = number("ratelimit-reset").and_then(|t| DateTime::from_timestamp(t, 0)) {
+        return reset;
+    }
+    now + chrono::Duration::minutes(5)
 }
 
 // ─── proofs ─────────────────────────────────────────────────────────────
@@ -2078,6 +2145,162 @@ mod tests {
         assert!(reader.list_records(ALICE, DEVICE_KEY_TYPE).await.is_err());
         assert!(reader.live_device_keys(ALICE, instant(T1)).await.is_err());
         assert!(reader.live_agent_links(ALICE, instant(T1)).await.is_err());
+    }
+
+    // ─── a host that answers 429 ────────────────────────────────────────
+
+    const BOB: &str = "did:plc:hostpausetestbob";
+
+    /// A PDS whose `listRecords` answers `status` with `headers`, and the
+    /// listing requests it has answered.
+    async fn answering(
+        status: StatusCode,
+        headers: Vec<(&'static str, String)>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hits.clone();
+        let router = axum::Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut map = axum::http::HeaderMap::new();
+                for (name, value) in &headers {
+                    map.insert(*name, value.parse().unwrap());
+                }
+                async move { (status, map, "{}") }
+            }),
+        );
+        (spawn_stub(router).await, hits)
+    }
+
+    /// A reader whose resolver sends each DID to its PDS.
+    fn reader_for_hosts(hosts: &[(&str, &str)]) -> RecordReader<freeq_oauth::SharedClient> {
+        let docs = hosts
+            .iter()
+            .map(|(did, pds)| {
+                (
+                    did.to_string(),
+                    crate::did::make_test_did_document_with_pds(
+                        did,
+                        &key(1).public_key_multibase(),
+                        Some(pds),
+                    ),
+                )
+            })
+            .collect();
+        RecordReader::new(
+            DidResolver::static_map(docs),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        )
+    }
+
+    fn hits(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn a_429_with_retry_after_pauses_its_host_and_only_its_host() {
+        let (limited, listings) = answering(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![("retry-after", "2".to_string())],
+        )
+        .await;
+        let healthy = spawn_stub(list_records_router(BOB, HashMap::new())).await;
+        let reader = reader_for_hosts(&[(ALICE, &limited), (BOB, &healthy)]);
+
+        let before = Utc::now();
+        let refused = reader
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .await
+            .unwrap_err();
+        let paused = refused
+            .downcast_ref::<HostPaused>()
+            .expect("the 429 names the pause")
+            .clone();
+        let waits = paused.until - before;
+        assert!(
+            waits > chrono::Duration::seconds(1) && waits <= chrono::Duration::seconds(3),
+            "Retry-After: 2 pauses about two seconds, got {waits}"
+        );
+        assert_eq!(reader.paused_until(&limited), Some(paused.until));
+
+        let again = reader
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .await
+            .unwrap_err();
+        assert_eq!(again.downcast_ref::<HostPaused>(), Some(&paused));
+        assert_eq!(hits(&listings), 1, "a paused host is not asked");
+
+        assert!(
+            reader
+                .list_record_entries(BOB, DEVICE_KEY_TYPE)
+                .await
+                .is_ok(),
+            "another host is still asked"
+        );
+
+        let left = (paused.until - Utc::now()).to_std().unwrap_or_default();
+        tokio::time::sleep(left + std::time::Duration::from_millis(100)).await;
+        let _ = reader.list_record_entries(ALICE, DEVICE_KEY_TYPE).await;
+        assert_eq!(
+            hits(&listings),
+            2,
+            "after the pause the host is asked again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_429_with_only_ratelimit_reset_pauses_until_that_time() {
+        let reset = Utc::now().timestamp() + 120;
+        let (limited, _) = answering(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![("ratelimit-reset", reset.to_string())],
+        )
+        .await;
+        let reader = reader_for_hosts(&[(ALICE, &limited)]);
+        assert!(
+            reader
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            reader.paused_until(&limited),
+            DateTime::from_timestamp(reset, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_429_without_either_header_pauses_five_minutes() {
+        let (limited, _) = answering(StatusCode::TOO_MANY_REQUESTS, Vec::new()).await;
+        let reader = reader_for_hosts(&[(ALICE, &limited)]);
+        let before = Utc::now();
+        assert!(
+            reader
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .await
+                .is_err()
+        );
+        let waits = reader.paused_until(&limited).expect("a pause") - before;
+        assert!(
+            waits >= chrono::Duration::seconds(299) && waits <= chrono::Duration::seconds(301),
+            "five minutes, got {waits}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_500_sets_no_pause() {
+        let (failing, listings) = answering(StatusCode::INTERNAL_SERVER_ERROR, Vec::new()).await;
+        let reader = reader_for_hosts(&[(ALICE, &failing)]);
+        for _ in 0..2 {
+            let failed = reader
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .await
+                .unwrap_err();
+            assert!(failed.downcast_ref::<HostPaused>().is_none());
+        }
+        assert_eq!(reader.paused_until(&failing), None);
+        assert_eq!(hits(&listings), 2);
     }
 
     // ─── proofs ─────────────────────────────────────────────────────────
