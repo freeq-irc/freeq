@@ -119,6 +119,16 @@ pub struct ServerConfig {
     #[arg(long, default_value = "60")]
     pub peer_key_retry_secs: u64,
 
+    /// How long a signer's identity-record listing is served from this
+    /// server's cache before the signer's PDS is listed again, in seconds.
+    #[arg(long, env = "RECORD_CACHE_SECS", default_value = "3600")]
+    pub record_cache_secs: u64,
+
+    /// How long a signer's cached records and proofs are kept once nobody
+    /// has asked about them, in days.
+    #[arg(long, env = "RECORD_CACHE_PRUNE_DAYS", default_value = "30")]
+    pub record_cache_prune_days: u64,
+
     /// S2S peer trust levels. Format: "endpoint_id:level" where level is
     /// "full" (default), "relay" (messages only), or "readonly" (observe only).
     /// Peers not listed here default to "full" if in --s2s-allowed-peers.
@@ -392,6 +402,8 @@ impl Default for ServerConfig {
             s2s_undeclared_capabilities: vec![],
             s2s_peer_api: vec![],
             peer_key_retry_secs: 60,
+            record_cache_secs: 3600,
+            record_cache_prune_days: 30,
             s2s_peer_trust: vec![],
             server_did: None,
             data_dir: None,
@@ -538,6 +550,8 @@ struct FileConfig {
     s2s_undeclared_capabilities: Option<Vec<String>>,
     s2s_peer_api: Option<MapOrPairs>,
     peer_key_retry_secs: Option<u64>,
+    record_cache_secs: Option<u64>,
+    record_cache_prune_days: Option<u64>,
     s2s_peer_trust: Option<MapOrPairs>,
     server_did: Option<String>,
     data_dir: Option<String>,
@@ -672,6 +686,8 @@ fn apply_file(cfg: &mut ServerConfig, matches: &clap::ArgMatches, file: FileConf
         s2s_undeclared_capabilities,
         max_messages_per_channel,
         peer_key_retry_secs,
+        record_cache_secs,
+        record_cache_prune_days,
         act_expiry_secs,
         act_review_secs,
         act_defer_max_per_origin,
@@ -742,6 +758,8 @@ mod tests {
                 act_defer_max_total = 21
                 act_orphan_secs = 5
                 peer_key_retry_secs = 3
+                record_cache_secs = 600
+                record_cache_prune_days = 7
                 s2s_peer_api = ["abcd=https://irc.example.com"]
                 "#,
             ),
@@ -757,6 +775,8 @@ mod tests {
         assert_eq!(c.act_defer_max_total, 21);
         assert_eq!(c.act_orphan_secs, 5);
         assert_eq!(c.peer_key_retry_secs, 3);
+        assert_eq!(c.record_cache_secs, 600);
+        assert_eq!(c.record_cache_prune_days, 7);
         assert_eq!(c.s2s_peer_api, vec!["abcd=https://irc.example.com"]);
     }
 
@@ -779,6 +799,8 @@ mod tests {
         assert_eq!(c.act_defer_max_per_origin, 256);
         assert_eq!(c.act_defer_max_total, 4096);
         assert_eq!(c.peer_key_retry_secs, 60);
+        assert_eq!(c.record_cache_secs, 3600);
+        assert_eq!(c.record_cache_prune_days, 30);
     }
 
     #[test]

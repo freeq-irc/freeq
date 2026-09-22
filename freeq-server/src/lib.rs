@@ -29,6 +29,7 @@ pub mod peer_keys;
 pub mod plugin;
 pub mod policy;
 pub mod receipt;
+pub mod record_cache;
 pub mod s2s;
 pub mod sasl;
 pub mod secrets;
