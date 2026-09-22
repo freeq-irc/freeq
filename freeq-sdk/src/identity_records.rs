@@ -574,7 +574,43 @@ pub fn verify_record_binding(record: &serde_json::Value, signer: &PublicKey) -> 
 pub struct RecordReader<P: freeq_oauth::ClientProvider> {
     pub(crate) resolver: DidResolver,
     pub(crate) clients: P,
+    on_listing: Option<ListingHook>,
+    on_checked_proof: Option<CheckedProofHook>,
+    /// Per host (scheme, host and port), the time until which it is not
+    /// asked again, set by a 429.
+    paused: parking_lot::Mutex<std::collections::HashMap<String, DateTime<Utc>>>,
 }
+
+/// A request not sent, or refused, because the host answered 429: the host
+/// and the time it said to retry at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPaused {
+    pub host: String,
+    pub until: DateTime<Utc>,
+}
+
+impl std::fmt::Display for HostPaused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is rate limiting this reader until {}",
+            self.host,
+            self.until.to_rfc3339()
+        )
+    }
+}
+
+impl std::error::Error for HostPaused {}
+
+/// Told of every listing a reader makes: `(did, collection, repo_key,
+/// entries)`, `repo_key` being the `#atproto` publicKeyMultibase of the DID
+/// document the listing resolved, empty when it has none.
+pub type ListingHook = Box<dyn Fn(&str, &str, &str, &[RecordEntry]) + Send + Sync>;
+
+/// Told of every proof a reader checks and finds good: `(did, collection,
+/// rkey, cid, repo_key, car)`, `repo_key` being the publicKeyMultibase it
+/// checked under and `car` the proof as the PDS gave it.
+pub type CheckedProofHook = Box<dyn Fn(&str, &str, &str, &Cid, &str, &[u8]) + Send + Sync>;
 
 /// One page of a `com.atproto.repo.listRecords` answer.
 #[derive(Deserialize)]
@@ -601,7 +637,40 @@ pub struct RecordEntry {
 
 impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
     pub fn new(resolver: DidResolver, clients: P) -> Self {
-        Self { resolver, clients }
+        Self {
+            resolver,
+            clients,
+            on_listing: None,
+            on_checked_proof: None,
+            paused: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Until when the host of `url` is paused by a 429, if it is.
+    #[cfg(test)]
+    pub(crate) fn paused_until(&self, url: &str) -> Option<DateTime<Utc>> {
+        let host = url::Url::parse(url).ok()?.origin().ascii_serialization();
+        self.paused.lock().get(&host).copied()
+    }
+
+    /// Call `hook` after every listing that succeeds, so a caller can keep
+    /// what the PDS listed.
+    pub fn on_listing(
+        mut self,
+        hook: impl Fn(&str, &str, &str, &[RecordEntry]) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_listing = Some(Box::new(hook));
+        self
+    }
+
+    /// Call `hook` after every proof `verify_record` fetches and finds good,
+    /// so a caller can keep the proof's bytes.
+    pub fn on_checked_proof(
+        mut self,
+        hook: impl Fn(&str, &str, &str, &Cid, &str, &[u8]) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_checked_proof = Some(Box::new(hook));
+        self
     }
 
     /// Every record of `collection` in `did`'s repository, as the PDS lists
@@ -693,7 +762,11 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
         collection: &str,
     ) -> Result<Vec<RecordEntry>> {
         let doc = self.resolver.resolve(did).await?;
+        let repo_key = repo_key_multibase(&doc).unwrap_or_default();
         let Some(pds) = pds_endpoint(&doc) else {
+            if let Some(hook) = &self.on_listing {
+                hook(did, collection, repo_key, &[]);
+            }
             return Ok(Vec::new());
         };
         let endpoint = format!(
@@ -725,6 +798,9 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
                 Some(next) if !empty => cursor = Some(next),
                 _ => break,
             }
+        }
+        if let Some(hook) = &self.on_listing {
+            hook(did, collection, repo_key, &records);
         }
         Ok(records)
     }
@@ -767,10 +843,17 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
         expected: &Cid,
     ) -> Result<ProofOutcome> {
         let doc = self.resolver.resolve(did).await?;
-        let repo_key = repo_signing_key(&doc)?;
+        let multibase = repo_key_multibase(&doc)?;
+        let repo_key = PublicKey::from_multibase(multibase)?;
         let pds = pds_endpoint(&doc).context("DID document names no PDS")?;
         let car = self.proof_from(&pds, did, collection, rkey).await?;
-        verify_proof(&car, did, collection, rkey, expected, &repo_key).await
+        let outcome = verify_proof(&car, did, collection, rkey, expected, &repo_key).await?;
+        if outcome.verified()
+            && let Some(hook) = &self.on_checked_proof
+        {
+            hook(did, collection, rkey, expected, multibase, &car);
+        }
+        Ok(outcome)
     }
 
     async fn proof_from(
@@ -799,17 +882,52 @@ impl<P: freeq_oauth::ClientProvider> RecordReader<P> {
     }
 
     /// GET `url` with the provider's client for it; an HTTP error status is
-    /// an error.
+    /// an error. A host that answered 429 is not asked again until the time
+    /// it gave, and until then the answer is [`HostPaused`] without a request.
     async fn get(&self, url: &url::Url) -> Result<reqwest::Response> {
+        let host = url.origin().ascii_serialization();
+        if let Some(until) = self.paused.lock().get(&host).copied()
+            && until > Utc::now()
+        {
+            return Err(HostPaused { host, until }.into());
+        }
         let client = self.clients.client_for(url.as_str()).await?;
-        client
+        let response = client
             .get(url.clone())
             .send()
             .await
-            .with_context(|| format!("request to {} failed", url.path()))?
+            .with_context(|| format!("request to {} failed", url.path()))?;
+        // Before error_for_status, which would make a 429 a generic error.
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let until = retry_at(response.headers(), Utc::now());
+            let started = self
+                .paused
+                .lock()
+                .insert(host.clone(), until)
+                .is_none_or(|was| was <= Utc::now());
+            if started {
+                tracing::info!(%host, until = %until.to_rfc3339(), "PDS host rate limited this reader; pausing requests to it");
+            }
+            return Err(HostPaused { host, until }.into());
+        }
+        response
             .error_for_status()
             .with_context(|| format!("{} answered with an error", url.path()))
     }
+}
+
+/// When a host that answered 429 at `now` may be asked again:
+/// `Retry-After` (seconds) if given, else `RateLimit-Reset` (unix seconds),
+/// else five minutes.
+fn retry_at(headers: &reqwest::header::HeaderMap, now: DateTime<Utc>) -> DateTime<Utc> {
+    let number = |name: &str| headers.get(name)?.to_str().ok()?.trim().parse::<i64>().ok();
+    if let Some(secs) = number("retry-after").filter(|s| *s >= 0) {
+        return now + chrono::Duration::seconds(secs);
+    }
+    if let Some(reset) = number("ratelimit-reset").and_then(|t| DateTime::from_timestamp(t, 0)) {
+        return reset;
+    }
+    now + chrono::Duration::minutes(5)
 }
 
 // ─── proofs ─────────────────────────────────────────────────────────────
@@ -971,20 +1089,19 @@ async fn check_proof(
     })
 }
 
-/// The account's repository signing key: the `#atproto` entry of its DID
-/// document.
-fn repo_signing_key(doc: &DidDocument) -> Result<PublicKey> {
+/// The account's repository signing key as its DID document writes it: the
+/// publicKeyMultibase of the `#atproto` entry.
+fn repo_key_multibase(doc: &DidDocument) -> Result<&str> {
     let full_id = format!("{}#atproto", doc.id);
     let method = doc
         .verification_method
         .iter()
         .find(|m| m.id == full_id || m.id == "#atproto")
         .context("DID document has no #atproto key")?;
-    let multibase = method
+    method
         .public_key_multibase
         .as_deref()
-        .context("#atproto key has no publicKeyMultibase")?;
-    PublicKey::from_multibase(multibase)
+        .context("#atproto key has no publicKeyMultibase")
 }
 
 #[cfg(test)]
@@ -1836,6 +1953,187 @@ mod tests {
         assert_eq!(reads(), (1, 2), "a failed proof is not kept");
     }
 
+    /// The `#atproto` publicKeyMultibase `doc` names.
+    fn atproto_multibase(doc: &crate::did::DidDocument) -> String {
+        doc.verification_method
+            .iter()
+            .find(|m| m.id.ends_with("#atproto"))
+            .and_then(|m| m.public_key_multibase.clone())
+            .unwrap()
+    }
+
+    type Listed = Arc<parking_lot::Mutex<Vec<(String, String, String, Vec<RecordEntry>)>>>;
+
+    fn record_listings<P: freeq_oauth::ClientProvider>(
+        reader: RecordReader<P>,
+    ) -> (RecordReader<P>, Listed) {
+        let listed = Listed::default();
+        let sink = listed.clone();
+        let reader = reader.on_listing(move |did, collection, repo_key, entries| {
+            sink.lock().push((
+                did.to_string(),
+                collection.to_string(),
+                repo_key.to_string(),
+                entries.to_vec(),
+            ));
+        });
+        (reader, listed)
+    }
+
+    #[tokio::test]
+    async fn each_listing_is_reported_with_the_repo_key_and_the_entries_as_listed() {
+        let mut repo = crate::test_support::StubRepo::new(ALICE);
+        repo.add(
+            DEVICE_KEY_TYPE,
+            &value(&build_device_record(&key(1), ALICE, T0, Some("laptop")).unwrap()),
+        );
+        let repo = Arc::new(parking_lot::Mutex::new(repo));
+        let base = serve_repo(repo.clone()).await;
+        let doc = repo.lock().document(&base);
+        let repo_key = atproto_multibase(&doc);
+        let (reader, listed) = record_listings(RecordReader::new(
+            DidResolver::static_map(HashMap::from([(ALICE.to_string(), doc)])),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        ));
+
+        let first = reader
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .await
+            .unwrap();
+        let second = reader
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        let expect = |entries: Vec<RecordEntry>| {
+            (
+                ALICE.to_string(),
+                DEVICE_KEY_TYPE.to_string(),
+                repo_key.clone(),
+                entries,
+            )
+        };
+        assert_eq!(*listed.lock(), vec![expect(first), expect(second)]);
+    }
+
+    #[tokio::test]
+    async fn the_empty_listing_of_a_did_with_no_pds_is_reported() {
+        let (reader, listed) = record_listings(reader_for(ALICE, None));
+        assert!(
+            reader
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            *listed.lock(),
+            vec![(
+                ALICE.to_string(),
+                DEVICE_KEY_TYPE.to_string(),
+                key(1).public_key_multibase(),
+                Vec::new(),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_is_not_reported() {
+        let router = axum::Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+        let base = spawn_stub(router).await;
+        let (reader, listed) = record_listings(reader_for(ALICE, Some(&base)));
+        assert!(
+            reader
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .await
+                .is_err()
+        );
+        assert!(listed.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_a_proof_that_checks_is_reported_with_its_bytes() {
+        let mut repo = crate::test_support::StubRepo::new(ALICE);
+        let genuine = value(&build_device_record(&key(1), ALICE, T0, Some("laptop")).unwrap());
+        // Signed by its own key, so it passes every record check but the proof.
+        let forged = value(&build_device_record(&key(2), ALICE, T0, Some("forged")).unwrap());
+        let genuine_uri = repo.add(DEVICE_KEY_TYPE, &genuine);
+        repo.add_forged(DEVICE_KEY_TYPE, &forged, &genuine);
+        let repo = Arc::new(parking_lot::Mutex::new(repo));
+        let base = serve_repo(repo.clone()).await;
+        let doc = repo.lock().document(&base);
+        let repo_key = atproto_multibase(&doc);
+        type Checked = Vec<(String, String, String, Cid, String, Vec<u8>)>;
+        let checked = Arc::new(parking_lot::Mutex::new(Checked::new()));
+        let sink = checked.clone();
+        let reader = RecordReader::new(
+            DidResolver::static_map(HashMap::from([(ALICE.to_string(), doc)])),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        )
+        .on_checked_proof(move |did, collection, rkey, cid, repo_key, car| {
+            sink.lock().push((
+                did.to_string(),
+                collection.to_string(),
+                rkey.to_string(),
+                *cid,
+                repo_key.to_string(),
+                car.to_vec(),
+            ));
+        });
+
+        let proven = parking_lot::Mutex::new(std::collections::HashSet::new());
+        let proving = ProofsInFlight::default();
+        for _ in 0..3 {
+            let entries = reader
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .await
+                .unwrap();
+            reader
+                .proven_records(ALICE, DEVICE_KEY_TYPE, entries, &proven, &proving)
+                .await;
+        }
+        // A proof the PDS will not give is not reported either.
+        assert!(
+            reader
+                .verify_record(
+                    ALICE,
+                    DEVICE_KEY_TYPE,
+                    "absent",
+                    &record_cid(&genuine).unwrap()
+                )
+                .await
+                .is_err()
+        );
+
+        let checked = checked.lock();
+        assert_eq!(
+            checked.len(),
+            1,
+            "the genuine proof, once; never the forged"
+        );
+        let (did, collection, rkey, cid, key, car) = &checked[0];
+        let genuine_rkey = genuine_uri.rsplit('/').next().unwrap();
+        assert_eq!(
+            (did.as_str(), collection.as_str(), rkey.as_str(), key),
+            (ALICE, DEVICE_KEY_TYPE, genuine_rkey, &repo_key)
+        );
+        assert_eq!(*cid, record_cid(&genuine).unwrap());
+        let outcome = verify_proof(
+            car,
+            ALICE,
+            DEVICE_KEY_TYPE,
+            genuine_rkey,
+            cid,
+            &PublicKey::from_multibase(key).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.verified(), "the reported bytes are the proof");
+    }
+
     #[tokio::test]
     async fn a_pds_answering_500_is_an_error() {
         let router = axum::Router::new().route(
@@ -1847,6 +2145,162 @@ mod tests {
         assert!(reader.list_records(ALICE, DEVICE_KEY_TYPE).await.is_err());
         assert!(reader.live_device_keys(ALICE, instant(T1)).await.is_err());
         assert!(reader.live_agent_links(ALICE, instant(T1)).await.is_err());
+    }
+
+    // ─── a host that answers 429 ────────────────────────────────────────
+
+    const BOB: &str = "did:plc:hostpausetestbob";
+
+    /// A PDS whose `listRecords` answers `status` with `headers`, and the
+    /// listing requests it has answered.
+    async fn answering(
+        status: StatusCode,
+        headers: Vec<(&'static str, String)>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hits.clone();
+        let router = axum::Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut map = axum::http::HeaderMap::new();
+                for (name, value) in &headers {
+                    map.insert(*name, value.parse().unwrap());
+                }
+                async move { (status, map, "{}") }
+            }),
+        );
+        (spawn_stub(router).await, hits)
+    }
+
+    /// A reader whose resolver sends each DID to its PDS.
+    fn reader_for_hosts(hosts: &[(&str, &str)]) -> RecordReader<freeq_oauth::SharedClient> {
+        let docs = hosts
+            .iter()
+            .map(|(did, pds)| {
+                (
+                    did.to_string(),
+                    crate::did::make_test_did_document_with_pds(
+                        did,
+                        &key(1).public_key_multibase(),
+                        Some(pds),
+                    ),
+                )
+            })
+            .collect();
+        RecordReader::new(
+            DidResolver::static_map(docs),
+            freeq_oauth::SharedClient(reqwest::Client::new()),
+        )
+    }
+
+    fn hits(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn a_429_with_retry_after_pauses_its_host_and_only_its_host() {
+        let (limited, listings) = answering(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![("retry-after", "2".to_string())],
+        )
+        .await;
+        let healthy = spawn_stub(list_records_router(BOB, HashMap::new())).await;
+        let reader = reader_for_hosts(&[(ALICE, &limited), (BOB, &healthy)]);
+
+        let before = Utc::now();
+        let refused = reader
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .await
+            .unwrap_err();
+        let paused = refused
+            .downcast_ref::<HostPaused>()
+            .expect("the 429 names the pause")
+            .clone();
+        let waits = paused.until - before;
+        assert!(
+            waits > chrono::Duration::seconds(1) && waits <= chrono::Duration::seconds(3),
+            "Retry-After: 2 pauses about two seconds, got {waits}"
+        );
+        assert_eq!(reader.paused_until(&limited), Some(paused.until));
+
+        let again = reader
+            .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+            .await
+            .unwrap_err();
+        assert_eq!(again.downcast_ref::<HostPaused>(), Some(&paused));
+        assert_eq!(hits(&listings), 1, "a paused host is not asked");
+
+        assert!(
+            reader
+                .list_record_entries(BOB, DEVICE_KEY_TYPE)
+                .await
+                .is_ok(),
+            "another host is still asked"
+        );
+
+        let left = (paused.until - Utc::now()).to_std().unwrap_or_default();
+        tokio::time::sleep(left + std::time::Duration::from_millis(100)).await;
+        let _ = reader.list_record_entries(ALICE, DEVICE_KEY_TYPE).await;
+        assert_eq!(
+            hits(&listings),
+            2,
+            "after the pause the host is asked again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_429_with_only_ratelimit_reset_pauses_until_that_time() {
+        let reset = Utc::now().timestamp() + 120;
+        let (limited, _) = answering(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![("ratelimit-reset", reset.to_string())],
+        )
+        .await;
+        let reader = reader_for_hosts(&[(ALICE, &limited)]);
+        assert!(
+            reader
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            reader.paused_until(&limited),
+            DateTime::from_timestamp(reset, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_429_without_either_header_pauses_five_minutes() {
+        let (limited, _) = answering(StatusCode::TOO_MANY_REQUESTS, Vec::new()).await;
+        let reader = reader_for_hosts(&[(ALICE, &limited)]);
+        let before = Utc::now();
+        assert!(
+            reader
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .await
+                .is_err()
+        );
+        let waits = reader.paused_until(&limited).expect("a pause") - before;
+        assert!(
+            waits >= chrono::Duration::seconds(299) && waits <= chrono::Duration::seconds(301),
+            "five minutes, got {waits}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_500_sets_no_pause() {
+        let (failing, listings) = answering(StatusCode::INTERNAL_SERVER_ERROR, Vec::new()).await;
+        let reader = reader_for_hosts(&[(ALICE, &failing)]);
+        for _ in 0..2 {
+            let failed = reader
+                .list_record_entries(ALICE, DEVICE_KEY_TYPE)
+                .await
+                .unwrap_err();
+            assert!(failed.downcast_ref::<HostPaused>().is_none());
+        }
+        assert_eq!(reader.paused_until(&failing), None);
+        assert_eq!(hits(&listings), 2);
     }
 
     // ─── proofs ─────────────────────────────────────────────────────────

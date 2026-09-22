@@ -878,6 +878,139 @@ paths:
               schema:
                 $ref: "#/components/schemas/SigningKey"
         "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/records:
+    get:
+      tags: [identity]
+      operationId: getCachedAccountsBatch
+      summary: The account answer of `/api/v1/records/{did}` for up to 50 accounts.
+      description: |
+        Each account once under `accounts`, in the order asked. An account
+        with nothing served (not seen on this server, or no copy kept and its
+        PDS unreadable) is left out, not an error.
+      parameters:
+        - name: dids
+          in: query
+          required: true
+          description: Comma-separated DIDs, at most 50.
+          schema: { type: string }
+        - $ref: "#/components/parameters/RecordCollection"
+      security: [{}]
+      responses:
+        "200":
+          description: The accounts served.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [accounts]
+                properties:
+                  accounts:
+                    type: array
+                    items: { $ref: "#/components/schemas/CachedAccount" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v1/records/{did}:
+    get:
+      tags: [identity]
+      operationId: getCachedAccount
+      summary: Everything this server's cache serves for one account, listing plus proofs per collection.
+      description: |
+        Per collection, the listing as `/api/v1/records/{did}/{collection}`
+        gives it and the proof of each listed record the server can serve.
+        A record whose proof cannot be served is left out of `proofs`, and
+        the client reads it from the PDS. Clients check every proof against
+        the DID document they resolve.
+      parameters:
+        - $ref: "#/components/parameters/Did"
+        - $ref: "#/components/parameters/RecordCollection"
+      security: [{}]
+      responses:
+        "200":
+          description: The account.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CachedAccount" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { description: No copy is kept and the PDS cannot be read. }
+  /api/v1/records/{did}/{collection}:
+    get:
+      tags: [identity]
+      operationId: getCachedRecords
+      summary: An account's identity records as its PDS listed them, from this server's cache.
+      description: |
+        Served only for an account that has appeared on this server (signed
+        in, a signing key on file, or a stored message) and only for
+        `at.freeq.deviceKey` and `at.freeq.agentKey`; anything else is 404
+        and the client reads the PDS itself. Clients still check each
+        record's proof against the DID document they resolve.
+      parameters:
+        - $ref: "#/components/parameters/Did"
+        - name: collection
+          in: path
+          required: true
+          schema: { type: string, enum: [at.freeq.deviceKey, at.freeq.agentKey] }
+      security: [{}]
+      responses:
+        "200":
+          description: The listing; `stale` when the PDS could not be read and the last copy is served.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [did, collection, fetched_at, stale, records]
+                properties:
+                  did: { type: string }
+                  collection: { type: string }
+                  fetched_at: { type: integer, description: Unix seconds the PDS was listed. }
+                  stale: { type: boolean }
+                  records:
+                    type: array
+                    items:
+                      type: object
+                      required: [uri, cid, value]
+                      properties:
+                        uri: { type: string }
+                        cid: { type: string }
+                        value: { type: object, description: The record exactly as listed. }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { description: No copy is kept and the PDS cannot be read. }
+  /api/v1/records/{did}/{collection}/{rkey}/proof:
+    get:
+      tags: [identity]
+      operationId: getCachedRecordProof
+      summary: A record's repository proof as its PDS gave it, from this server's cache.
+      description: |
+        The `com.atproto.sync.getRecord` CAR for a record the cached listing
+        names, served only if this server checked it under the account's
+        current repo key. Clients check it again.
+      parameters:
+        - $ref: "#/components/parameters/Did"
+        - name: collection
+          in: path
+          required: true
+          schema: { type: string, enum: [at.freeq.deviceKey, at.freeq.agentKey] }
+        - name: rkey
+          in: path
+          required: true
+          schema: { type: string }
+      security: [{}]
+      responses:
+        "200":
+          description: The CAR bytes.
+          headers:
+            X-Freeq-Fetched-At:
+              description: Unix seconds the proof was fetched from the PDS.
+              schema: { type: integer }
+          content:
+            application/vnd.ipld.car:
+              schema:
+                type: string
+                format: binary
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { description: The proof cannot be fetched or does not check. }
   /api/v1/keys/{did}:
     get:
       tags: [identity]
@@ -1926,6 +2059,12 @@ components:
       description: HMAC over the raw request body, using the broker shared secret.
 
   parameters:
+    RecordCollection:
+      name: collection
+      in: query
+      required: false
+      description: One identity-record collection; without it both are answered.
+      schema: { type: string, enum: [at.freeq.deviceKey, at.freeq.agentKey] }
     ChannelName:
       name: name
       in: path
@@ -2037,6 +2176,42 @@ components:
       description: This server runs without persistence, so history is unavailable.
 
   schemas:
+    CachedAccount:
+      type: object
+      description: |
+        One account as the record cache serves it: each collection whose
+        listing could be served, with the listing and the proofs of its
+        records that could be served.
+      required: [did, collections]
+      properties:
+        did: { type: string }
+        collections:
+          type: object
+          additionalProperties:
+            type: object
+            required: [fetched_at, stale, records, proofs]
+            properties:
+              fetched_at: { type: integer, description: Unix seconds the PDS was listed. }
+              stale: { type: boolean, description: The PDS could not be read and the last copy is served. }
+              records:
+                type: array
+                items:
+                  type: object
+                  required: [uri, cid, value]
+                  properties:
+                    uri: { type: string }
+                    cid: { type: string }
+                    value: { type: object, description: The record exactly as listed. }
+              proofs:
+                type: array
+                items:
+                  type: object
+                  required: [rkey, cid, fetched_at, car]
+                  properties:
+                    rkey: { type: string }
+                    cid: { type: string }
+                    fetched_at: { type: integer, description: Unix seconds the proof was fetched. }
+                    car: { type: string, description: "The `com.atproto.sync.getRecord` CAR, base64, standard alphabet, padded." }
     Error:
       type: object
       description: |

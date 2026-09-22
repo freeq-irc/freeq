@@ -1651,15 +1651,26 @@ export class FreeqClient extends EventEmitter {
 
   /**
    * Finish a pending check off the receive path: `onSettled` gets the verdict
-   * first, then `verdict` is emitted. Never awaited by the caller.
+   * first, then `verdict` is emitted. Never awaited by the caller. A line in
+   * an open batch other than `draft/multiline` (`batchId`, by default its
+   * `batch` tag) is held on the batch and checked when it closes.
    */
   private checkLater(
     delivered: Verdict | undefined,
     line: { tags: Record<string, string>; target: string; body?: string; from?: string },
     onSettled?: (verdict: Verdict) => void,
+    batchId: string | undefined = line.tags['batch'],
   ): void {
     const checker = this.checker;
     if (!checker || delivered?.state !== 'pending') return;
+    const batch = batchId ? this.batches.get(batchId) : undefined;
+    if (batch && batch.type !== 'draft/multiline') {
+      (batch.deferredChecks ??= []).push({
+        did: line.tags['account'],
+        start: () => this.checkLater(delivered, line, onSettled, ''),
+      });
+      return;
+    }
     const id = this.signedLineId(line.tags, line.body === undefined)!;
     const ownDid = this.sasl?.did ?? this._authDid ?? undefined;
     const targetDid = this.didForNick(line.target);
@@ -1684,6 +1695,21 @@ export class FreeqClient extends EventEmitter {
       }
       onSettled?.(verdict);
       if (this.checker === checker) this.emit('verdict', id, verdict);
+    })();
+  }
+
+  /**
+   * Start the checks held on a closed batch, once its signers' records are
+   * prefetched in one request (see `KeyLookup.prefetch`). Off the receive path.
+   */
+  private startDeferredChecks(batch: Batch): void {
+    const held = batch.deferredChecks;
+    if (!held?.length) return;
+    const dids = [...new Set(held.map((h) => h.did).filter((d): d is string => !!d && isDid(d)))];
+    const lookup = this.opts.keyLookup;
+    void (async () => {
+      if (lookup && dids.length > 0) await lookup.prefetch(dids).catch(() => undefined);
+      for (const h of held) h.start();
     })();
   }
 
@@ -2001,9 +2027,10 @@ export class FreeqClient extends EventEmitter {
       isStreaming: openerTags['+freeq.at/streaming'] === '1',
       ...(verdict ? { verdict } : {}),
     };
+    // The opener's tags carry no `batch`; a nested message is checked with its parent batch.
     this.checkLater(verdict, wireLine, (settled) => {
       message.verdict = settled;
-    });
+    }, batch.parentBatchId);
 
     // Persisted reactions from CHATHISTORY replay (multiline-nested case)
     const reactionsTag = openerTags['+freeq.at/reactions'];
@@ -3143,6 +3170,7 @@ export class FreeqClient extends EventEmitter {
             for (const held of batch.actEvents ?? []) {
               this.emitActEvent(held.buffer, held.from, held.tags, held.verdict);
             }
+            this.startDeferredChecks(batch);
           }
         }
         break;

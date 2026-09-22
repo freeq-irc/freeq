@@ -4504,6 +4504,44 @@ mod retired_key_tests {
     }
 
     #[tokio::test]
+    async fn a_registration_listing_lands_in_the_record_cache() {
+        let (state, listings, _) =
+            state_counting(Arc::new(parking_lot::Mutex::new(fifty_keys(45)))).await;
+
+        let mut client = Client::signed_in(&state, "BT-RECORD-CACHE").await;
+        client.tx(&msgsig_line(&signing_key(45))).await;
+        client
+            .rx(|l| l.contains("MSGSIG OK"))
+            .await
+            .expect("the key is registered");
+        wait_for_count(&listings, 1).await;
+        // The listing is kept once its last page is read, after the request
+        // the stub counts.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let row = loop {
+            let row = state
+                .with_db(|db| db.record_listing(DID, freeq_sdk::identity_records::DEVICE_KEY_TYPE))
+                .flatten();
+            if row.is_some() || tokio::time::Instant::now() >= deadline {
+                break row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+
+        let row = row.expect("the listing is in the table");
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&row.entries_json).unwrap();
+        assert_eq!(entries.len(), 50);
+        assert!(!row.repo_key.is_empty());
+        let kept = state
+            .record_cache
+            .stored_listing(DID, freeq_sdk::identity_records::DEVICE_KEY_TYPE)
+            .expect("the listing is in the cache");
+        assert_eq!(kept.entries.len(), 50);
+        assert_eq!(kept.repo_key, row.repo_key);
+        assert_eq!(count(&listings), 1);
+    }
+
+    #[tokio::test]
     async fn a_key_another_live_key_retired_is_refused_proving_only_what_decides_it() {
         let mut records = fifty_keys(44);
         records.push(retirement_by(107, 44));

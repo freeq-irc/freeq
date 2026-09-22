@@ -20,6 +20,7 @@ import {
   type Fetch,
   type ResolveDid,
   deviceKeyHistory,
+  fetchAccounts,
   listRecordEntries,
   provenRecords,
   retirementClosure,
@@ -131,6 +132,8 @@ export class KeyLookup {
   private readonly proven = new Set<string>();
   /** Proofs in flight by record CID, so listings racing on a record share one fetch. */
   private readonly proving = new Map<string, Promise<boolean>>();
+  /** One prefetch in flight per DID, so prefetches racing on an account share one request. */
+  private readonly prefetching = new Map<string, Promise<void>>();
   private defaultOrigin: string | null = null;
   /** The store's snapshot, taken in once before the first lookup. */
   private loaded: Promise<void> | null = null;
@@ -341,6 +344,66 @@ export class KeyLookup {
   }
 
   /**
+   * Take the device records of `dids` from the origin, the home server, in
+   * one request per 50 accounts, for the DIDs whose listing is not held
+   * inside the ttl: each account the server returns is proven from the
+   * proofs it carries (a record whose proof is missing or fails is proven at
+   * the PDS) and kept with the server's listing time. An account the server
+   * leaves out is not read here; its first lookup lists it. Nothing is asked
+   * without an origin. Never fails.
+   */
+  async prefetch(dids: string[]): Promise<void> {
+    await this.load();
+    const home = this.originBase();
+    if (home === null) return;
+    const now = Date.now();
+    const waits: Promise<void>[] = [];
+    const asked: string[] = [];
+    for (const did of new Set(dids)) {
+      const inFlight = this.prefetching.get(did);
+      if (inFlight !== undefined) {
+        waits.push(inFlight);
+        continue;
+      }
+      const last = this.records.get(did);
+      if (this.listing.has(did) || (last !== undefined && now - last.at < this.ttlMs)) continue;
+      asked.push(did);
+    }
+    if (asked.length > 0) {
+      const started: Promise<void> = this.prefetchAccounts(home, asked).finally(() => {
+        for (const did of asked) if (this.prefetching.get(did) === started) this.prefetching.delete(did);
+      });
+      for (const did of asked) this.prefetching.set(did, started);
+      waits.push(started);
+    }
+    await Promise.all(waits);
+  }
+
+  private async prefetchAccounts(home: string, dids: string[]): Promise<void> {
+    const { fetch, resolveDid } = this.reader;
+    const accounts = await fetchAccounts(fetch, home, dids, DEVICE_KEY_TYPE);
+    await Promise.all(
+      [...accounts].map(async ([did, account]) => {
+        const records = await provenRecords(
+          fetch,
+          resolveDid,
+          did,
+          DEVICE_KEY_TYPE,
+          account.entries,
+          this.proven,
+          this.proving,
+          account.proofs,
+        );
+        const at = Math.min(account.fetchedAt * 1000, Date.now());
+        this.records.set(did, { records, at });
+        // A listing for key lookups, like the one `deviceRecords` makes.
+        this.refreshed.set(did, at);
+      }),
+    ).catch(() => undefined);
+    if (accounts.size > 0) await this.save();
+  }
+
+  /**
    * `did`'s device key records whose repository proof checks: the held
    * listing while inside the ttl, else a listing, through this lookup's cache
    * of proven records, so each record's proof is fetched once.
@@ -371,7 +434,8 @@ export class KeyLookup {
   async provenRetirementClosure(did: string, kid: string): Promise<unknown[]> {
     await this.load();
     const { fetch, resolveDid } = this.reader;
-    const listed = await listRecordEntries(fetch, resolveDid, did, DEVICE_KEY_TYPE);
+    const home = this.originBase();
+    const listed = await listRecordEntries(fetch, resolveDid, did, DEVICE_KEY_TYPE, home);
     const closure = retirementClosure(did, kid, listed, (entry) => entry.value);
     if (closure.length === 0) return [];
     const records = await provenRecords(
@@ -382,6 +446,8 @@ export class KeyLookup {
       closure,
       this.proven,
       this.proving,
+      undefined,
+      home,
     );
     await this.save();
     return records;
@@ -404,13 +470,39 @@ export class KeyLookup {
     return this.listDeviceRecords(did);
   }
 
-  /** `did`'s proven device records from the listing in flight, else a new one. A listing that fails is not kept. */
+  /**
+   * `did`'s proven device records from the listing in flight, else a new one.
+   * With an origin, the home server is asked first: for an account with no
+   * listing held, its records and proofs together; for one held, the listing
+   * alone, since its proofs are mostly proven already, then each new
+   * record's proof. Whatever it does not serve is read from the PDS. A
+   * listing that fails is not kept.
+   */
   private listDeviceRecords(did: string): Promise<unknown[]> {
     let pending = this.listing.get(did);
     if (pending === undefined) {
       const started: Promise<unknown[]> = (async () => {
         const { fetch, resolveDid } = this.reader;
-        const listed = await listRecordEntries(fetch, resolveDid, did, DEVICE_KEY_TYPE);
+        const home = this.originBase();
+        if (home !== null && !this.records.has(did)) {
+          const account = (await fetchAccounts(fetch, home, [did], DEVICE_KEY_TYPE)).get(did);
+          if (account !== undefined) {
+            const records = await provenRecords(
+              fetch,
+              resolveDid,
+              did,
+              DEVICE_KEY_TYPE,
+              account.entries,
+              this.proven,
+              this.proving,
+              account.proofs,
+            );
+            this.records.set(did, { records, at: Math.min(account.fetchedAt * 1000, Date.now()) });
+            await this.save();
+            return records;
+          }
+        }
+        const listed = await listRecordEntries(fetch, resolveDid, did, DEVICE_KEY_TYPE, home);
         const records = await provenRecords(
           fetch,
           resolveDid,
@@ -419,6 +511,8 @@ export class KeyLookup {
           listed,
           this.proven,
           this.proving,
+          undefined,
+          home,
         );
         this.records.set(did, { records, at: Date.now() });
         await this.save();
@@ -497,9 +591,15 @@ async function fromRecords(
 /**
  * A `ResolveDid` for did:plc (the PLC directory) and did:web, built on
  * `@atcute/identity-resolver`. Anything else is refused.
+ *
+ * The document is kept for `ttlMs` (an hour by default) per DID, so the
+ * readers and lookups built on one resolver resolve an account once an hour
+ * rather than once per proof. The library keeps no cache of its own. A
+ * rotation is learned at most a ttl late; a proof that then fails its check
+ * already falls through to a fresh one, the same bound the records take.
  */
 export function makeDidResolver(
-  options: { fetch?: typeof globalThis.fetch; plcUrl?: string } = {},
+  options: { fetch?: typeof globalThis.fetch; plcUrl?: string; ttlMs?: number } = {},
 ): ResolveDid {
   const resolver = new CompositeDidDocumentResolver({
     methods: {
@@ -507,12 +607,30 @@ export function makeDidResolver(
       web: new WebDidDocumentResolver({ fetch: options.fetch }),
     },
   });
+  const ttlMs = options.ttlMs ?? 3_600_000;
+  const held = new Map<string, { doc: DidDocument; at: number }>();
+  const resolving = new Map<string, Promise<DidDocument>>();
   return async (did: string): Promise<DidDocument> => {
     if (!did.startsWith('did:plc:') && !did.startsWith('did:web:')) {
       throw new Error(`no resolver for ${did}`);
     }
-    const doc = await resolver.resolve(did as `did:plc:${string}` | `did:web:${string}`);
-    return doc as unknown as DidDocument;
+    const last = held.get(did);
+    if (last !== undefined && Date.now() - last.at < ttlMs) return last.doc;
+    const inFlight = resolving.get(did);
+    if (inFlight !== undefined) return inFlight;
+    const started: Promise<DidDocument> = resolver
+      .resolve(did as `did:plc:${string}` | `did:web:${string}`)
+      .then((doc) => {
+        const document = doc as unknown as DidDocument;
+        // A failed resolve throws instead, and nothing is kept.
+        if (ttlMs > 0) held.set(did, { doc: document, at: Date.now() });
+        return document;
+      })
+      .finally(() => {
+        if (resolving.get(did) === started) resolving.delete(did);
+      });
+    resolving.set(did, started);
+    return started;
   };
 }
 

@@ -134,6 +134,29 @@ pub struct SigningKeyRow {
     pub source: Option<String>,
 }
 
+/// One account's filed listing of one collection. `entries_json` is the
+/// listing's `{uri, cid, value}` entries as the PDS gave them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordListingRow {
+    pub entries_json: String,
+    pub repo_key: String,
+    pub fetched_at: i64,
+    pub last_asked_at: i64,
+}
+
+/// One filed repository proof: the CAR as the PDS gave it, and the repo key
+/// (publicKeyMultibase) it checked under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordProofRow {
+    pub cid: String,
+    pub did: String,
+    pub collection: String,
+    pub rkey: String,
+    pub car: Vec<u8>,
+    pub repo_key: String,
+    pub fetched_at: i64,
+}
+
 /// Who wrote a message, and where it is filed — the minimum needed to
 /// authorize an operation on a message without reading its contents.
 #[derive(Debug, Clone)]
@@ -2937,6 +2960,159 @@ impl Db {
         self.conn.execute(
             "DELETE FROM revoked_broker_tokens WHERE revoked_at < ?1",
             params![cutoff],
+        )
+    }
+
+    // ── Record cache ────────────────────────────────────────────────────
+    //
+    // Identity-record listings and checked repository proofs, as the PDS
+    // gave them. Public bytes, stored in plaintext.
+
+    /// File `did`'s listing of `collection`. A listing already filed is
+    /// replaced, keeping its `last_asked_at`; a new one takes `asked_at`.
+    pub fn save_record_listing(
+        &self,
+        did: &str,
+        collection: &str,
+        entries_json: &str,
+        repo_key: &str,
+        fetched_at: i64,
+        asked_at: i64,
+    ) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT INTO record_listings
+                 (did, collection, entries_json, repo_key, fetched_at, last_asked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (did, collection) DO UPDATE SET
+                 entries_json = excluded.entries_json,
+                 repo_key = excluded.repo_key,
+                 fetched_at = excluded.fetched_at",
+            params![
+                did,
+                collection,
+                entries_json,
+                repo_key,
+                fetched_at,
+                asked_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// `did`'s filed listing of `collection`, or None.
+    pub fn record_listing(
+        &self,
+        did: &str,
+        collection: &str,
+    ) -> SqlResult<Option<RecordListingRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT entries_json, repo_key, fetched_at, last_asked_at
+             FROM record_listings WHERE did = ?1 AND collection = ?2",
+        )?;
+        let mut rows = stmt.query(params![did, collection])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(RecordListingRow {
+                entries_json: row.get(0)?,
+                repo_key: row.get(1)?,
+                fetched_at: row.get(2)?,
+                last_asked_at: row.get(3)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Stamp every listing of `did` as asked about at `asked_at`.
+    pub fn touch_record_listings(&self, did: &str, asked_at: i64) -> SqlResult<usize> {
+        self.conn.execute(
+            "UPDATE record_listings SET last_asked_at = ?2 WHERE did = ?1",
+            params![did, asked_at],
+        )
+    }
+
+    /// File a checked proof by its record's CID, replacing one filed before.
+    pub fn save_record_proof(&self, proof: &RecordProofRow) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO record_proofs
+                 (cid, did, collection, rkey, car, repo_key, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                proof.cid,
+                proof.did,
+                proof.collection,
+                proof.rkey,
+                proof.car,
+                proof.repo_key,
+                proof.fetched_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The proof filed for the record with `cid`, or None.
+    pub fn record_proof(&self, cid: &str) -> SqlResult<Option<RecordProofRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cid, did, collection, rkey, car, repo_key, fetched_at
+             FROM record_proofs WHERE cid = ?1",
+        )?;
+        let mut rows = stmt.query(params![cid])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(RecordProofRow {
+                cid: row.get(0)?,
+                did: row.get(1)?,
+                collection: row.get(2)?,
+                rkey: row.get(3)?,
+                car: row.get(4)?,
+                repo_key: row.get(5)?,
+                fetched_at: row.get(6)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Forget the proofs of `did`'s `collection` whose CID is not in `keep`.
+    /// Returns how many were forgotten.
+    pub fn drop_record_proofs_except(
+        &self,
+        did: &str,
+        collection: &str,
+        keep: &[String],
+    ) -> SqlResult<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let cids: Vec<String> = tx
+            .prepare("SELECT cid FROM record_proofs WHERE did = ?1 AND collection = ?2")?
+            .query_map(params![did, collection], |row| row.get(0))?
+            .collect::<SqlResult<_>>()?;
+        let mut dropped = 0;
+        for cid in cids.iter().filter(|cid| !keep.contains(cid)) {
+            dropped += tx.execute("DELETE FROM record_proofs WHERE cid = ?1", params![cid])?;
+        }
+        tx.commit()?;
+        Ok(dropped)
+    }
+
+    /// Forget every listing and proof of each account whose listings were
+    /// last asked about before `cutoff`. Returns the accounts forgotten.
+    pub fn prune_record_cache(&self, cutoff: i64) -> SqlResult<Vec<String>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let dids: Vec<String> = tx
+            .prepare("SELECT did FROM record_listings GROUP BY did HAVING MAX(last_asked_at) < ?1")?
+            .query_map(params![cutoff], |row| row.get(0))?
+            .collect::<SqlResult<_>>()?;
+        for did in &dids {
+            tx.execute("DELETE FROM record_listings WHERE did = ?1", params![did])?;
+            tx.execute("DELETE FROM record_proofs WHERE did = ?1", params![did])?;
+        }
+        tx.commit()?;
+        Ok(dids)
+    }
+
+    /// Whether `did` has a signing key on file or a stored message.
+    pub fn did_appears(&self, did: &str) -> SqlResult<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM signing_keys WHERE did = ?1)
+                 OR EXISTS (SELECT 1 FROM messages WHERE sender_did = ?1)",
+            params![did],
+            |row| row.get(0),
         )
     }
 

@@ -224,6 +224,12 @@ export interface Batch {
    */
   parentBatchId?: string;
   /**
+   * Signature checks of the signed lines in this batch, held until it closes
+   * so its signers' records are prefetched in one request first. `did` is
+   * the line's `account` tag.
+   */
+  deferredChecks?: Array<{ did?: string; start: () => void }>;
+  /**
    * History batches only: the rows the server sent — one per PRIVMSG
    * directly in the batch, one per `draft/multiline` batch nested in it.
    * Task-event TAGMSGs are not rows of the page. Counted off the wire

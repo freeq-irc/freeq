@@ -721,6 +721,9 @@ pub struct SharedState {
     /// Finds a signer's key by kid in their own published records first;
     /// `peer_keys` asks configured peers after it.
     pub(crate) key_lookup: freeq_sdk::key_lookup::KeyLookup<crate::peer_keys::LookupClients>,
+    /// Identity records and proofs the lookup's reader has read, kept to be
+    /// served again.
+    pub record_cache: Arc<crate::record_cache::RecordCache>,
     /// Private-media spaces. None = feature off.
     pub media_space: Option<std::sync::Arc<crate::media_space::MediaSpaceManager>>,
     /// session_id -> sender for writing lines to that client
@@ -876,8 +879,9 @@ pub struct SharedState {
     pub s2s_manager: Mutex<Option<Arc<crate::s2s::S2sManager>>>,
     /// CRDT document for cluster state convergence.
     pub cluster_doc: crate::crdt::ClusterDoc,
-    /// Database handle for persistence (None = in-memory only).
-    pub db: Option<Mutex<Db>>,
+    /// Database handle for persistence (None = in-memory only). Shared with
+    /// the record cache, whose reader callbacks write without the state.
+    pub db: Option<Arc<Mutex<Db>>>,
     /// Server configuration (for MOTD, max messages, etc.).
     pub config: ServerConfig,
     /// Plugin manager for server extensions.
@@ -920,6 +924,10 @@ pub struct SharedState {
     pub spawned_agents: Mutex<HashMap<String, SpawnedAgent>>,
     /// Per-IP rate limiter for expensive REST endpoints (OG preview, blob proxy, upload).
     pub rest_rate_limiter: crate::web::IpRateLimiter,
+    /// Per-IP limit for the record-cache routes, apart from
+    /// `rest_rate_limiter`: a cold client asks for one listing and one proof
+    /// per record per account.
+    pub record_rate_limiter: crate::web::IpRateLimiter,
     /// Private media store: encrypted-at-rest blobs on local disk served via
     /// signed capability URLs. None only in lightweight test harnesses.
     pub media_store: Option<crate::media_store::MediaStore>,
@@ -1718,7 +1726,7 @@ fn resolver_from_config(config: &ServerConfig) -> DidResolver {
 
 impl Server {
     /// Build SharedState, opening the database and loading persisted data.
-    fn build_state(&self) -> Result<Arc<SharedState>> {
+    pub(crate) fn build_state(&self) -> Result<Arc<SharedState>> {
         // Install the agent-assist LLM provider (idempotent; no-op if
         // not configured). Lives in a process-wide slot rather than
         // SharedState so existing constructors don't need to change.
@@ -1983,6 +1991,8 @@ impl Server {
             }
             _ => None,
         };
+        let db = db.map(|db| Arc::new(Mutex::new(db)));
+        let record_cache = crate::record_cache::RecordCache::new(db.clone(), &self.config);
         let state = Arc::new(SharedState {
             server_name: self.config.server_name.clone(),
             challenge_store: ChallengeStore::new(self.config.challenge_timeout_secs),
@@ -1991,7 +2001,9 @@ impl Server {
                 self.resolver.clone(),
                 crate::peer_keys::checked_clients(),
                 self.config.peer_key_retry_secs,
+                record_cache.clone(),
             ),
+            record_cache,
             media_space,
             connections: Mutex::new(HashMap::new()),
             nick_to_session: Mutex::new(NickMap::new()),
@@ -2051,7 +2063,7 @@ impl Server {
             act_routes: Mutex::new(crate::act_relay::RouteQueue::new(MAX_PENDING_ROUTES)),
             s2s_manager: Mutex::new(None),
             cluster_doc: crate::crdt::ClusterDoc::new(&self.config.server_name),
-            db: db.map(Mutex::new),
+            db,
             config: self.config.clone(),
             plugin_manager,
             policy_engine: {
@@ -2105,6 +2117,8 @@ impl Server {
             spawned_agents: Mutex::new(HashMap::new()),
             // 30 requests per 60-second window per IP for expensive REST endpoints
             rest_rate_limiter: crate::web::IpRateLimiter::new(30, 60),
+            // 600 requests per 60-second window per IP for the record routes
+            record_rate_limiter: crate::web::IpRateLimiter::new(600, 60),
             media_store,
             liveness_probes: Mutex::new(HashMap::new()),
             session_kill: Mutex::new(HashMap::new()),
@@ -2538,6 +2552,7 @@ impl Server {
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
         spawn_act_defer_retry_sweep(Arc::clone(&state));
         crate::broker_signout::spawn(Arc::clone(&state));
+        crate::record_cache::spawn(Arc::clone(&state));
         spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
 
         // Heartbeat expiry: check agent liveness every 15 seconds.
@@ -2781,6 +2796,7 @@ impl Server {
                             .unwrap_or_default()
                             .as_secs();
                         cleanup_state.rest_rate_limiter.prune(now);
+                        cleanup_state.record_rate_limiter.prune(now);
                     }
                 }
             });
@@ -2879,6 +2895,7 @@ impl Server {
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
         spawn_act_defer_retry_sweep(Arc::clone(&state));
         crate::broker_signout::spawn(Arc::clone(&state));
+        crate::record_cache::spawn(Arc::clone(&state));
         spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
 
         let handle = tokio::spawn(async move {
@@ -2929,6 +2946,7 @@ impl Server {
         spawn_act_expiry_sweep(Arc::clone(&state), self.config.act_expiry_secs);
         spawn_act_defer_retry_sweep(Arc::clone(&state));
         crate::broker_signout::spawn(Arc::clone(&state));
+        crate::record_cache::spawn(Arc::clone(&state));
         spawn_act_review_sweep(Arc::clone(&state), self.config.act_review_secs);
 
         let web_state = Arc::clone(&state);
@@ -8116,8 +8134,8 @@ mod nickmap_tests {
 
 #[cfg(test)]
 pub(crate) use s2s_adversarial_tests::{
-    test_state, test_state_with_config, test_state_with_db, test_state_with_resolver,
-    test_state_without_db,
+    test_state, test_state_on, test_state_with_config, test_state_with_db,
+    test_state_with_resolver, test_state_without_db,
 };
 
 #[cfg(test)]
@@ -8169,6 +8187,15 @@ mod s2s_adversarial_tests {
         )
     }
 
+    /// A state on `db` (or none) whose resolver answers from `resolver`.
+    pub(crate) fn test_state_on(
+        db: Option<crate::db::Db>,
+        config: crate::config::ServerConfig,
+        resolver: freeq_sdk::did::DidResolver,
+    ) -> Arc<SharedState> {
+        test_state_inner(db, Some(config), Some(resolver))
+    }
+
     fn test_state_inner(
         db: Option<crate::db::Db>,
         config: Option<crate::config::ServerConfig>,
@@ -8189,6 +8216,8 @@ mod s2s_adversarial_tests {
             .collect();
         let resolver =
             resolver.unwrap_or_else(|| freeq_sdk::did::DidResolver::static_map(HashMap::new()));
+        let db = db.map(|db| Arc::new(Mutex::new(db)));
+        let record_cache = crate::record_cache::RecordCache::new(db.clone(), &config);
         Arc::new(SharedState {
             server_name: config.server_name.clone(),
             challenge_store: crate::sasl::ChallengeStore::new(60),
@@ -8198,7 +8227,9 @@ mod s2s_adversarial_tests {
                     reqwest::Client::new(),
                 )),
                 config.peer_key_retry_secs,
+                record_cache.clone(),
             ),
+            record_cache,
             did_resolver: resolver,
             media_space: None,
             connections: Mutex::new(HashMap::new()),
@@ -8259,7 +8290,7 @@ mod s2s_adversarial_tests {
             act_routes: Mutex::new(crate::act_relay::RouteQueue::new(MAX_PENDING_ROUTES)),
             s2s_manager: Mutex::new(None),
             cluster_doc: crate::crdt::ClusterDoc::new("test-server-id"),
-            db: db.map(Mutex::new),
+            db,
             config,
             plugin_manager: crate::plugin::PluginManager::new(),
             policy_engine: None,
@@ -8277,6 +8308,8 @@ mod s2s_adversarial_tests {
             ghost_sessions: Mutex::new(HashMap::new()),
             spawned_agents: Mutex::new(HashMap::new()),
             rest_rate_limiter: crate::web::IpRateLimiter::new(30, 60),
+            // 600 requests per 60-second window per IP for the record routes
+            record_rate_limiter: crate::web::IpRateLimiter::new(600, 60),
             media_store: None,
             liveness_probes: Mutex::new(HashMap::new()),
             session_kill: Mutex::new(HashMap::new()),

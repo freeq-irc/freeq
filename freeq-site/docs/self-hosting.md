@@ -170,6 +170,8 @@ freeq-server --config /etc/freeq/server.toml
 | `--oper-dids` / `OPER_DIDS` | DIDs auto-granted server operator on connect |
 | `BROKER_SHARED_SECRET` | HMAC secret shared with auth broker |
 | `--auth-broker-url` / `AUTH_BROKER_URL` | Base URL of the standalone auth broker; a device sign-out deletes its session there (read only with `BROKER_SHARED_SECRET`) |
+| `--record-cache-secs` / `RECORD_CACHE_SECS` | How long a signer's identity-record listing is served from the cache before the PDS is listed again (default: 3600) |
+| `--record-cache-prune-days` / `RECORD_CACHE_PRUNE_DAYS` | How long a signer's cached records and proofs are kept once nobody asks about them (default: 30) |
 | `GITHUB_CLIENT_ID` | GitHub OAuth for credential verifier |
 | `GITHUB_CLIENT_SECRET` | GitHub OAuth secret |
 

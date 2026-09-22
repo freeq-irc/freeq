@@ -12,6 +12,7 @@ import { type DidDocument, buildDeviceRecord } from './identity-records.js';
 import { KeyLookup } from './key-lookup.js';
 import { format } from './parser.js';
 import * as signing from './signing.js';
+import type { Message } from './types.js';
 import type { Verdict, VerdictState } from './verdict.js';
 
 // ── WebSocket mock ────────────────────────────────────────────────
@@ -91,6 +92,8 @@ const stubFetch = async (input: string): Promise<Response> => {
     });
   }
   if (url.origin !== ORIGIN) return new Response('unexpected', { status: 500 });
+  // A server without the record routes.
+  if (url.pathname.startsWith('/api/v1/records')) return new Response('not found', { status: 404 });
   if (url.pathname === '/api/v1/signing-key') {
     return Response.json({ did: SERVER_DID, public_key: origin.serverKeys[0] && b64url(origin.serverKeys[0]) });
   }
@@ -524,5 +527,122 @@ describe('checking received signatures', () => {
     expect(signing.msgidTimestampMs('01kyvt5z8q0000000000000000')).toBeNull();
     expect(signing.msgidTimestampMs('01KYVT5Z8Q000000000000000')).toBeNull();
     expect(signing.msgidTimestampMs('01KYVT5Z8Q000000000000000U')).toBeNull();
+  });
+});
+
+// ── a replayed batch: one prefetch before its checks ───────────────────
+
+describe('a replayed history batch', () => {
+  const A = 'did:plc:replayaaaaaaaaaaaaaaaaaa';
+  const B = 'did:plc:replaybbbbbbbbbbbbbbbbbb';
+  const C = 'did:plc:replaycccccccccccccccccc';
+
+  async function signed(signer: string, seed: number, body: string, extra: Record<string, string> = {}) {
+    const msgid = signing.newEventId();
+    const key = await importDidKey(new Uint8Array(32).fill(seed));
+    const canonical = await signing.messageCanonical({ from: signer, msgid, target: '#room', body });
+    const sig = await key.signer(new TextEncoder().encode(canonical));
+    const pub = (await import('./did-key.js')).decodeMultibaseEd25519(key.publicKeyMultibase);
+    await hold(signer, pub);
+    const tags = { ...extra, account: signer, msgid, [signing.SIG_TAG]: `ed25519:${await signing.deriveKid(pub)}:${sig}` };
+    return { tags, msgid, wire: line(tags, 'PRIVMSG', '#room', body) };
+  }
+
+  /** A lookup whose prefetch waits for `release`, and counts key asks. */
+  function gatedLookup() {
+    const lk = lookup();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const prefetch = vi.spyOn(lk, 'prefetch').mockImplementation(() => gate);
+    const keyForAt = vi.spyOn(lk, 'keyForAt');
+    return { lk, prefetch, keyForAt, release };
+  }
+
+  /** Wait up to 2 s for `done`; the receive path handles lines one after another, asynchronously. */
+  async function until(done: () => boolean) {
+    for (let i = 0; i < 400 && !done(); i++) await new Promise((r) => setTimeout(r, 5));
+  }
+
+  async function settle(s: { seen: Map<string, Seen> }, ids: string[]) {
+    for (let i = 0; i < 400 && ids.some((id) => s.seen.get(id)?.settled === undefined); i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  }
+
+  it('prefetches its signers once, then checks its lines', async () => {
+    const { lk, prefetch, keyForAt, release } = gatedLookup();
+    const s = await session(OWN_DID, lk);
+    const batches: Message[][] = [];
+    s.client.on('historyBatch', (_t, msgs) => batches.push(msgs));
+    const lines = [
+      await signed(A, 41, 'first', { batch: 'h' }),
+      await signed(B, 42, 'second', { batch: 'h' }),
+      await signed(A, 41, 'third', { batch: 'h' }),
+    ];
+    s.ws.recv(':srv BATCH +h chathistory #room');
+    for (const l of lines) s.ws.recv(l.wire);
+    s.ws.recv(line({ batch: 'h', msgid: 'plain1' }, 'PRIVMSG', '#room', 'unsigned'));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(prefetch).not.toHaveBeenCalled();
+    expect(keyForAt, 'no check while the batch is open').not.toHaveBeenCalled();
+    s.ws.recv(':srv BATCH -h');
+    await until(() => prefetch.mock.calls.length > 0);
+
+    expect(prefetch).toHaveBeenCalledTimes(1);
+    expect(prefetch).toHaveBeenCalledWith([A, B]);
+    expect(batches[0]!.map((m) => m.verdict?.state)).toEqual(['pending', 'pending', 'pending', 'unsigned']);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(keyForAt, 'no check before the prefetch settles').not.toHaveBeenCalled();
+
+    release();
+    await settle(s, lines.map((l) => l.msgid));
+    expect(keyForAt).toHaveBeenCalledTimes(3);
+    expect(lines.map((l) => s.seen.get(l.msgid)?.settled?.state)).toEqual(['device', 'device', 'device']);
+  });
+
+  it('prefetches a multiline message nested in it with the batch', async () => {
+    const { lk, prefetch, release } = gatedLookup();
+    const s = await session(OWN_DID, lk);
+    const first = await signed(A, 41, 'first', { batch: 'h' });
+    const multi = await signed(C, 43, 'one\ntwo', { batch: 'h' });
+    s.ws.recv(':srv BATCH +h chathistory #room');
+    s.ws.recv(first.wire);
+    s.ws.recv(
+      line(multi.tags, 'BATCH', '+m', 'draft/multiline #room').replace(' :draft/multiline #room', ' draft/multiline #room'),
+    );
+    s.ws.recv(line({ batch: 'm' }, 'PRIVMSG', '#room', 'one'));
+    s.ws.recv(line({ batch: 'm' }, 'PRIVMSG', '#room', 'two'));
+    s.ws.recv(':sender!u@h BATCH -m');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(prefetch).not.toHaveBeenCalled();
+    s.ws.recv(':srv BATCH -h');
+    await until(() => prefetch.mock.calls.length > 0);
+    expect(prefetch).toHaveBeenCalledTimes(1);
+    expect(prefetch).toHaveBeenCalledWith([A, C]);
+    release();
+    await settle(s, [first.msgid, multi.msgid]);
+    expect(s.seen.get(multi.msgid)?.settled?.state).toBe('device');
+  });
+
+  it('prefetches nothing for a batch with no signed line', async () => {
+    const { lk, prefetch } = gatedLookup();
+    const s = await session(OWN_DID, lk);
+    s.ws.recv(':srv BATCH +h chathistory #room');
+    s.ws.recv(line({ batch: 'h', msgid: 'plain1' }, 'PRIVMSG', '#room', 'unsigned'));
+    s.ws.recv(':srv BATCH -h');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(prefetch).not.toHaveBeenCalled();
+  });
+
+  it('checks a line outside a batch, or in a batch never seen opened, at once', async () => {
+    const { lk, prefetch } = gatedLookup();
+    const s = await session(OWN_DID, lk);
+    const live = await signed(A, 41, 'live');
+    const orphan = await signed(B, 42, 'orphan', { batch: 'never' });
+    s.ws.recv(live.wire);
+    s.ws.recv(orphan.wire);
+    await settle(s, [live.msgid, orphan.msgid]);
+    expect(prefetch).not.toHaveBeenCalled();
+    expect([live, orphan].map((l) => s.seen.get(l.msgid)?.settled?.state)).toEqual(['device', 'device']);
   });
 });

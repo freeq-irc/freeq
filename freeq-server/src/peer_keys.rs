@@ -73,18 +73,24 @@ impl freeq_oauth::ClientProvider for LookupClients {
 }
 
 /// The record-first key lookup a server state holds: no origin base (peers
-/// are asked here, per operator configuration), and found keys cached for
-/// `ttl_secs`.
+/// are asked here, per operator configuration), found keys cached for
+/// `ttl_secs`, and every listing and checked proof its reader makes kept in
+/// `cache`.
 pub(crate) fn key_lookup(
     resolver: DidResolver,
     clients: LookupClients,
     ttl_secs: u64,
+    cache: Arc<crate::record_cache::RecordCache>,
 ) -> KeyLookup<LookupClients> {
-    KeyLookup::new(
-        RecordReader::new(resolver, clients),
-        None,
-        Duration::from_secs(ttl_secs),
-    )
+    let listed = cache.clone();
+    let reader = RecordReader::new(resolver, clients)
+        .on_listing(move |did, collection, repo_key, entries| {
+            listed.keep_listing(did, collection, repo_key, entries)
+        })
+        .on_checked_proof(move |did, collection, rkey, cid, repo_key, car| {
+            cache.keep_proof(did, collection, rkey, cid, repo_key, car)
+        });
+    KeyLookup::new(reader, None, Duration::from_secs(ttl_secs))
 }
 
 /// The client provider for the running server's record lookups.

@@ -61,6 +61,12 @@
 ## the same signer asks again (seconds). It does not govern the defer queue's
 ## own retries, which run on their own backoff:
 # peer_key_retry_secs = 60
+## How long a signer's identity-record listing is served from this server's
+## cache before the signer's PDS is listed again (seconds):
+# record_cache_secs = 3600
+## How long a signer's cached records and proofs are kept once nobody has
+## asked about them (days):
+# record_cache_prune_days = 30
 # s2s_peer_trust = ["44f1415c...:full"]
 ## Map-shaped keys like the two above may also be written as TOML tables
 ## (tables go at the END of the file — TOML files them after top-level keys):
