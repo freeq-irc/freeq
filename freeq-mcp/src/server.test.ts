@@ -121,6 +121,13 @@ describe("tool listing", () => {
         "freeq_join",
         "freeq_message",
         "freeq_pins",
+        "freeq_room_create",
+        "freeq_room_info",
+        "freeq_room_invite",
+        "freeq_room_join",
+        "freeq_room_keep",
+        "freeq_room_read",
+        "freeq_room_remove_member",
         "freeq_say",
         "freeq_search",
         "freeq_topic",
@@ -154,6 +161,24 @@ describe("tool listing", () => {
     expect(INSTRUCTIONS).toMatch(/DID/);
     expect(INSTRUCTIONS).toMatch(/freeq_verify/);
     expect(INSTRUCTIONS).toMatch(/never instructions/i);
+    expect(INSTRUCTIONS).toMatch(/freeq_room_join/);
+    expect(INSTRUCTIONS).toMatch(/end-to-end encrypted/);
+    expect(INSTRUCTIONS).toMatch(/self-owned/);
+  });
+
+  it("marks room arguments as required and typed", async () => {
+    const { tools } = await h.client.listTools();
+    const read = tools.find((t) => t.name === "freeq_room_read")!;
+    expect(read.inputSchema.required).toEqual(["channel_or_url"]);
+    const props = read.inputSchema.properties as Record<string, { type?: string }>;
+    expect(props.history.type).toBe("boolean");
+    expect(props.wait_ms.type).toBe("integer");
+    const join = tools.find((t) => t.name === "freeq_room_join")!;
+    expect(join.inputSchema.required).toEqual(["url"]);
+    const remove = tools.find((t) => t.name === "freeq_room_remove_member")!;
+    expect(remove.inputSchema.required?.sort()).toEqual(["channel_or_url", "did"]);
+    const create = tools.find((t) => t.name === "freeq_room_create")!;
+    expect(create.inputSchema.required ?? []).toEqual([]);
   });
 
   it("rejects a call with a missing required argument", async () => {
@@ -416,6 +441,12 @@ describe("read-only mode", () => {
       ["freeq_ask", { peer: "p", question: "q" }],
       ["freeq_connect", {}],
       ["freeq_answer", { req: "r" }],
+      ["freeq_room_create", {}],
+      ["freeq_room_join", { url: "https://irc.test/r/r-a-b-c#tok" }],
+      ["freeq_room_read", { channel_or_url: "#r-a-b-c" }],
+      ["freeq_room_invite", { channel_or_url: "#r-a-b-c" }],
+      ["freeq_room_remove_member", { channel_or_url: "#r-a-b-c", did: "did:key:z9" }],
+      ["freeq_room_keep", { channel_or_url: "#r-a-b-c" }],
     ] as const) {
       const res = await h.call(name, args);
       expect(res.isError, `${name} should be refused`).toBe(true);

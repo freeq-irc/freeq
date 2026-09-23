@@ -7,20 +7,32 @@
  * tool was looking. Without the buffer, "read what people said to me" would
  * only ever return messages that happened to land during the call.
  *
- * Two identity modes, chosen by whether an owner DID is configured:
+ * Identity modes:
  *
  * - **authenticated** — a `did:key` agent identity persisted by
  *   `@freeq/bot-kit` under `~/.freeq/bots/<name>/`, with a delegation
- *   certificate naming the owner. This is the honest mode: the room can see
- *   which human the agent acts for.
- * - **guest** — no SASL, no key, nick only. Zero-config so the server works out
- *   of the box with no `env` block at all, and `freeq_whoami` says plainly that
- *   nothing is proven and how to upgrade.
+ *   certificate. With `FREEQ_OWNER_DID` the certificate names that human as
+ *   the owner; without it the certificate names the agent's own DID
+ *   (`selfOwned`), which is honest about speaking for nobody while still
+ *   being a real, stable, key-backed principal. This is the default.
+ * - **guest** — no SASL, no key, nick only. Only when `FREEQ_GUEST=1`, for
+ *   setups that must not write anything to disk. Guests cannot use rooms.
+ *
+ * Rooms (docs/INSTANT-ROOMS.md) ride on the bot-kit `RoomManager`: it holds
+ * the group keys and installs a cipher on the client, after which the normal
+ * `message` path delivers decrypted text and `sendMessage` encrypts. The
+ * session only has to know which channels are rooms, so it can refuse to
+ * send into one it cannot encrypt for and can point `freeq_history` at the
+ * decrypted path instead of REST ciphertext.
  */
 
 import { createHash, randomUUID } from "node:crypto";
+import { unlink } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { FreeqClient } from "@freeq/sdk";
 import type { CoordinationEventPayload, Message } from "@freeq/sdk";
+import type { RoomInfo, RoomLink } from "@freeq/bot-kit";
 import type { FreeqMcpConfig } from "./config.js";
 
 export const ASK_EVENT = "pi_ask";
@@ -32,6 +44,15 @@ const MAX_ENCODED_PAYLOAD = 6000;
 /** How many messages to retain per target between tool calls. */
 const BUFFER_PER_TARGET = 200;
 
+/** Upper bound on a CHATHISTORY replay (the server caps at 50 per request anyway). */
+export const ROOM_HISTORY_MAX = 50;
+
+/** How long to wait for a CHATHISTORY batch before answering without it. */
+const HISTORY_TIMEOUT_MS = 10_000;
+
+/** How long `say` waits for the server to echo our own message back. */
+const SEND_CONFIRM_MS = 5_000;
+
 export type SessionMode = "authenticated" | "guest" | "offline";
 
 export interface BufferedMessage {
@@ -42,6 +63,8 @@ export interface BufferedMessage {
   msgid?: string;
   at: number;
   self: boolean;
+  /** True when the wire form was ciphertext (decrypted here, or not). */
+  encrypted?: boolean;
 }
 
 export interface SessionStatus {
@@ -50,6 +73,8 @@ export interface SessionStatus {
   nick?: string;
   did?: string;
   ownerDid?: string;
+  /** Authenticated with a did:key whose delegation names itself as owner. */
+  selfOwned?: boolean;
   channels: string[];
   hasBearerToken: boolean;
   server: string;
@@ -64,28 +89,77 @@ export interface AskResult {
   from?: string;
 }
 
+export interface RoomReadResult {
+  channel: string;
+  /** False when no room key has been sealed to us yet. */
+  ready: boolean;
+  /** Whether we hold the newest epoch the server has for us (undefined if unknown). */
+  latest?: boolean;
+  messages: BufferedMessage[];
+  note?: string;
+}
+
 /** Minimal surface of the SDK client this module uses — so tests can fake it. */
 export interface SessionClient {
   nick?: string | null;
   apiBearer?: string | null;
   on(event: string, handler: (...args: never[]) => void): unknown;
+  off?(event: string, handler: (...args: never[]) => void): unknown;
   connect(): void;
   disconnect(): void;
-  join(channel: string): void;
+  join(channel: string, key?: string): void;
   sendMessage(target: string, text: string): void;
   sendTagmsg(target: string, tags: Record<string, string>): void;
+  requestHistory?(opts: { target: string; mode: "latest"; count?: number }): void;
   quit?(reason?: string): void;
+}
+
+/** The part of bot-kit's `RoomManager` the session and tools use. */
+export interface SessionRooms {
+  ensurePreKeyPublished(): Promise<void>;
+  create(opts?: { topic?: string; inviteTtlSecs?: number }): Promise<{
+    channel: string;
+    invite: string;
+    url: string;
+    expiresAt: number;
+  }>;
+  join(link: RoomLink | string): Promise<{ channel: string; ready: boolean }>;
+  loadKeys(channel: string): Promise<boolean>;
+  info(channel: string): Promise<RoomInfo>;
+  keep(channel: string): Promise<number>;
+  removeMember(channel: string, did: string): Promise<void>;
+  /** Seal the epochs we hold to roster members who lack the latest one. */
+  stewardPass(channel: string): Promise<{ sealed: string[]; skipped: Array<{ did: string; reason: string }> }>;
+  isRoom(channel: string): boolean;
+  /** Rooms we hold at least one key for (persisted across processes). */
+  channels(): string[];
+}
+
+export interface ClientFactoryResult {
+  client: SessionClient;
+  mode: SessionMode;
+  did?: string;
+  selfOwned?: boolean;
+  /**
+   * Connect and resolve on `ready` (reject on auth failure). When absent the
+   * session calls `client.connect()` and waits for `ready` itself. bot-kit's
+   * `FreeqBot.start()` goes here so the announce sequence (PROVENANCE, then
+   * the configured JOINs) actually runs.
+   */
+  start?(): Promise<void>;
+  /** Graceful shutdown; defaults to QUIT + disconnect on the client. */
+  stop?(reason: string): Promise<void>;
+  /** Room support; absent for guests. */
+  rooms?: SessionRooms;
 }
 
 export interface SessionDeps {
   /** Build a client. Injected in tests; defaults to the real SDK/bot-kit. */
-  createClient?(cfg: FreeqMcpConfig, nick: string): Promise<{
-    client: SessionClient;
-    mode: SessionMode;
-    did?: string;
-  }>;
+  createClient?(cfg: FreeqMcpConfig, nick: string): Promise<ClientFactoryResult>;
   /** Called whenever a bearer token becomes available (SASL success). */
   onBearerToken?(token: string | undefined): void;
+  /** Diagnostics sink. Never stdout: in MCP mode stdout is the transport. */
+  warn?(message: string): void;
   now?(): number;
 }
 
@@ -121,17 +195,34 @@ export function encodePayload(
   return { encoded, truncated };
 }
 
+/** `general` → `#general`, `#Room` → `#room`. */
+export function normalizeChannel(channel: string): string {
+  const name = channel.trim();
+  const withHash = name.startsWith("#") || name.startsWith("&") ? name : `#${name}`;
+  return withHash.toLowerCase();
+}
+
+function isChannel(target: string): boolean {
+  return target.startsWith("#") || target.startsWith("&");
+}
+
 export class FreeqSession {
   #cfg: FreeqMcpConfig;
   #deps: SessionDeps;
   #client?: SessionClient;
   #mode: SessionMode = "offline";
   #did?: string;
+  #selfOwned = false;
+  #rooms?: SessionRooms;
+  #stop?: (reason: string) => Promise<void>;
   #connected = false;
   #connecting?: Promise<void>;
   #channels = new Set<string>();
+  /** Channels known to be E2EE rooms (lowercase), whether or not we hold a key. */
+  #roomChannels = new Set<string>();
   #buffers = new Map<string, BufferedMessage[]>();
   #waiters: Array<{ target?: string; resolve(m: BufferedMessage | undefined): void }> = [];
+  #echoWaiters: Array<{ target: string; text: string; resolve(): void }> = [];
   #asks = new Map<string, PendingAsk>();
   #inboundAsks: Array<{ req: string; from: string; question: string; at: number }> = [];
   #nick: string;
@@ -146,23 +237,36 @@ export class FreeqSession {
     return this.#connected;
   }
 
+  get did(): string | undefined {
+    return this.#did;
+  }
+
   status(): SessionStatus {
     const mode = this.#mode;
+    const did = this.#did ?? "did:key:…";
+    let note: string;
+    if (mode === "authenticated" && this.#selfOwned) {
+      note = `Authenticated as ${did}: a self-owned did:key that speaks for no human (set FREEQ_OWNER_DID to bind it to you). Messages are signed with a per-session key and verifiable via /api/v1/verify/{msgid}.`;
+    } else if (mode === "authenticated") {
+      note = `Authenticated as ${did}, acting for ${this.#cfg.ownerDid}. Messages are signed with a per-session key and verifiable via /api/v1/verify/{msgid}.`;
+    } else if (mode === "guest") {
+      note =
+        "Connected as a guest (FREEQ_GUEST is set): the nick is not proven, nothing you send is attributable, and rooms are unavailable. Unset FREEQ_GUEST to connect with a did:key agent identity; set FREEQ_OWNER_DID to bind it to your DID.";
+    } else {
+      note =
+        "Not connected. Read-only tools work over REST without a connection; joining, sending, asking and rooms need one.";
+    }
     return {
       mode,
       connected: this.#connected,
       nick: this.#client?.nick ?? (this.#connected ? this.#nick : undefined),
       did: this.#did,
       ownerDid: this.#cfg.ownerDid,
+      selfOwned: mode === "authenticated" ? this.#selfOwned : undefined,
       channels: [...this.#channels],
       hasBearerToken: !!this.#client?.apiBearer,
       server: this.#cfg.baseUrl,
-      note:
-        mode === "authenticated"
-          ? `Authenticated as ${this.#did ?? "did:key:…"}, acting for ${this.#cfg.ownerDid}. Messages are signed with a per-session key and verifiable via /api/v1/verify/{msgid}.`
-          : mode === "guest"
-            ? "Connected as a guest: the nick is not proven and nothing you send is attributable. Set FREEQ_OWNER_DID to your DID to connect with a did:key agent identity and a delegation certificate."
-            : "Not connected. Read-only tools work over REST without a connection; joining, sending and asking need one.",
+      note,
     };
   }
 
@@ -180,13 +284,81 @@ export class FreeqSession {
 
   async #doConnect(): Promise<void> {
     const factory = this.#deps.createClient ?? defaultCreateClient;
-    const { client, mode, did } = await factory(this.#cfg, this.#nick);
-    this.#client = client;
-    this.#mode = mode;
-    this.#did = did;
-    this.#wire(client);
+    const made = await factory(this.#cfg, this.#nick);
+    this.#client = made.client;
+    this.#mode = made.mode;
+    this.#did = made.did;
+    this.#selfOwned = made.selfOwned ?? false;
+    this.#rooms = made.rooms;
+    this.#stop = made.stop;
+    this.#wire(made.client);
 
-    const ready = new Promise<void>((resolve, reject) => {
+    if (made.start) {
+      // bot-kit drives connect → ready → PROVENANCE → JOINs, and rejects on
+      // SASL failure or timeout with its own actionable message.
+      await made.start();
+    } else {
+      await this.#connectAndWaitReady(made.client);
+      for (const channel of this.#cfg.channels) this.join(channel);
+    }
+    this.#connected = true;
+    this.#captureBearer();
+
+    // Publish our X25519 pre-key so a room steward can seal keys to us. It
+    // waits for the API bearer (a beat after ready) and is one POST; awaiting
+    // it keeps a one-shot process from quitting with the request in flight,
+    // which the server would answer 403 (no such session). Room operations
+    // re-run it idempotently, so a failure here only costs a retry later.
+    if (this.#rooms) {
+      try {
+        await this.#rooms.ensurePreKeyPublished();
+      } catch (err) {
+        this.#warn(`pre-key publish failed (will retry on first room use): ${errorMessage(err)}`);
+      }
+      this.#rejoinRooms(this.#rooms);
+    }
+  }
+
+  /**
+   * Re-enter the rooms we hold keys for. A roster member needs no token, and
+   * being inside is what makes the buffer fill and lets us seal the key to
+   * newcomers — bot-kit's steward only fires on a JOIN it witnesses, so a
+   * member who was away when someone arrived runs a pass now.
+   */
+  #rejoinRooms(rooms: SessionRooms): void {
+    for (const ch of rooms.channels()) {
+      this.noteRoom(ch);
+      try {
+        this.#client?.join(ch);
+      } catch (err) {
+        this.#warn(`rejoin ${ch}: ${errorMessage(err)}`);
+        continue;
+      }
+      this.roomSteward(ch).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Seal the room key to members who lack it, if we hold it. Never throws:
+   * stewarding is a courtesy to others, and a failure must not break the
+   * caller's own read or send. Returns who was sealed to.
+   */
+  async roomSteward(channel: string): Promise<string[]> {
+    const ch = normalizeChannel(channel);
+    const rooms = this.#rooms;
+    if (!rooms || !rooms.isRoom(ch)) return [];
+    try {
+      const pass = await rooms.stewardPass(ch);
+      for (const s of pass.skipped) this.#warn(`steward ${ch}: not sealing to ${s.did}: ${s.reason}`);
+      return pass.sealed;
+    } catch (err) {
+      this.#warn(`steward pass for ${ch} failed: ${errorMessage(err)}`);
+      return [];
+    }
+  }
+
+  #connectAndWaitReady(client: SessionClient): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
       const timer = setTimeout(
         () => reject(new Error(`timed out connecting to ${this.#cfg.wsUrl} after 30s`)),
         30_000,
@@ -194,32 +366,32 @@ export class FreeqSession {
       timer.unref?.();
       client.on("ready", (() => {
         clearTimeout(timer);
-        this.#connected = true;
         resolve();
       }) as never);
       client.on("authError", ((err: string) => {
         clearTimeout(timer);
         reject(new Error(`SASL authentication failed: ${err}`));
       }) as never);
+      client.connect();
     });
-
-    client.connect();
-    await ready;
-    this.#captureBearer();
-    for (const channel of this.#cfg.channels) this.join(channel);
   }
 
   #wire(client: SessionClient): void {
+    client.on("ready", (() => {
+      // Also fires on the SDK's automatic reconnects.
+      this.#connected = true;
+    }) as never);
+
     client.on("message", ((target: string, msg: Message) => {
       this.#record(target, msg);
     }) as never);
 
     client.on("channelJoined", ((channel: string) => {
-      this.#channels.add(channel);
+      this.#channels.add(channel.toLowerCase());
     }) as never);
 
     client.on("channelLeft", ((channel: string) => {
-      this.#channels.delete(channel);
+      this.#channels.delete(channel.toLowerCase());
     }) as never);
 
     client.on("authenticated", ((did: string) => {
@@ -241,6 +413,16 @@ export class FreeqSession {
     client.on("coordinationEvent", ((e: CoordinationEventPayload) => {
       this.#onCoordinationEvent(e);
     }) as never);
+
+    // The server tells a joiner when a channel is a room. Remembering it is
+    // what lets `say` refuse cleanly instead of the SDK dropping the message,
+    // and lets `freeq_history` redirect to the decrypted path.
+    client.on("raw", ((_line: string, parsed: { command?: string; params?: string[] }) => {
+      if (parsed?.command !== "NOTICE") return;
+      const text = parsed.params?.[1] ?? "";
+      const m = /^([#&]\S+) is an end-to-end encrypted room/.exec(text);
+      if (m) this.noteRoom(m[1]);
+    }) as never);
   }
 
   /** Hand the SASL-issued bearer token to whoever wants it (the REST client). */
@@ -256,8 +438,25 @@ export class FreeqSession {
     timer.unref?.();
   }
 
-  #record(target: string, msg: Message): void {
-    const entry: BufferedMessage = {
+  /**
+   * The API bearer the server issued after SASL, waiting (bounded) for it.
+   * Returns undefined for guests or when it never arrives.
+   */
+  async bearer(timeoutMs = 5_000): Promise<string | undefined> {
+    const deadline = this.#now() + timeoutMs;
+    for (;;) {
+      const token = this.#client?.apiBearer ?? undefined;
+      if (token) {
+        this.#deps.onBearerToken?.(token);
+        return token;
+      }
+      if (this.#mode !== "authenticated" || this.#now() >= deadline) return undefined;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+
+  #toBuffered(target: string, msg: Message, at?: number): BufferedMessage {
+    return {
       target,
       from: msg.from ?? "?",
       // The server stamps the sender's DID as an `account` tag when it knows
@@ -265,9 +464,14 @@ export class FreeqSession {
       did: msg.tags?.account,
       text: msg.text ?? "",
       msgid: msg.tags?.msgid ?? msg.id,
-      at: this.#now(),
+      at: at ?? this.#now(),
       self: msg.isSelf ?? (!!this.#client?.nick && msg.from === this.#client.nick),
+      encrypted: msg.encrypted || undefined,
     };
+  }
+
+  #record(target: string, msg: Message): void {
+    const entry = this.#toBuffered(target, msg);
     const buf = this.#buffers.get(target) ?? [];
     buf.push(entry);
     // Bounded: an MCP server can sit in a busy channel for days between
@@ -280,6 +484,15 @@ export class FreeqSession {
       if (entry.self) continue;
       this.#waiters.splice(this.#waiters.indexOf(w), 1);
       w.resolve(entry);
+    }
+    if (entry.self) {
+      // Our own echo, decrypted: match the oldest pending send to this
+      // target with the same text (the echo of a room message decrypts to
+      // what we sent).
+      const i = this.#echoWaiters.findIndex(
+        (w) => w.target.toLowerCase() === target.toLowerCase() && w.text === entry.text,
+      );
+      if (i >= 0) this.#echoWaiters.splice(i, 1)[0].resolve();
     }
   }
 
@@ -316,11 +529,215 @@ export class FreeqSession {
   join(channel: string): void {
     const name = channel.startsWith("#") || channel.startsWith("&") ? channel : `#${channel}`;
     this.#require().join(name);
-    this.#channels.add(name);
+    this.#channels.add(name.toLowerCase());
   }
 
-  say(target: string, text: string): void {
-    this.#require().sendMessage(target, text);
+  /** Is this channel one we have joined (as the server confirmed it)? */
+  inChannel(channel: string): boolean {
+    return this.#channels.has(normalizeChannel(channel));
+  }
+
+  /**
+   * Send, then wait (bounded) for the server's echo of our own message.
+   *
+   * The SDK encrypts and signs asynchronously before anything hits the
+   * socket, so "sendMessage returned" is not "sent": a one-shot process that
+   * quits right after would race its own PRIVMSG and lose. The echo
+   * (`echo-message` is negotiated) is the send confirmation; `confirmed`
+   * is false when it did not arrive in time, which is worth telling an agent.
+   * Throws synchronously when not connected or when the target is a room we
+   * hold no key for, so nothing is sent that the SDK would silently drop.
+   */
+  say(target: string, text: string, confirmMs = SEND_CONFIRM_MS): Promise<{ confirmed: boolean }> {
+    const client = this.#require();
+    if (isChannel(target) && this.isKnownRoom(target) && !this.hasRoomKey(target)) {
+      throw new Error(
+        `${target} is an end-to-end encrypted room and no room key has been sealed to this agent yet, ` +
+          `so nothing can be encrypted for it. Call freeq_room_read (it re-fetches the key) or ` +
+          `freeq_room_join with the room URL, then try again.`,
+      );
+    }
+    const echo = this.#waitForEcho(target, text, confirmMs);
+    client.sendMessage(target, text);
+    return echo;
+  }
+
+  #waitForEcho(target: string, text: string, timeoutMs: number): Promise<{ confirmed: boolean }> {
+    if (timeoutMs <= 0) return Promise.resolve({ confirmed: false });
+    return new Promise((resolve) => {
+      const waiter = {
+        target,
+        text,
+        resolve: () => {
+          clearTimeout(timer);
+          resolve({ confirmed: true });
+        },
+      };
+      this.#echoWaiters.push(waiter);
+      const timer = setTimeout(() => {
+        const i = this.#echoWaiters.indexOf(waiter);
+        if (i >= 0) this.#echoWaiters.splice(i, 1);
+        resolve({ confirmed: false });
+      }, timeoutMs);
+      timer.unref?.();
+    });
+  }
+
+  // ── Rooms ────────────────────────────────────────────────────────────
+
+  /** The room manager, or a clear error about why there is none. */
+  get rooms(): SessionRooms {
+    if (this.#rooms) return this.#rooms;
+    if (this.#mode === "guest") {
+      throw new Error(
+        "rooms need a did:key identity, and this session is a guest (FREEQ_GUEST is set). Unset it and reconnect.",
+      );
+    }
+    throw new Error("not connected to freeq — call freeq_connect first");
+  }
+
+  /** Remember that a channel is a room (from create/join, or the server's NOTICE). */
+  noteRoom(channel: string): void {
+    this.#roomChannels.add(normalizeChannel(channel));
+  }
+
+  /** A room we know of: told by the server, created/joined here, or holding its key. */
+  isKnownRoom(channel: string): boolean {
+    const ch = normalizeChannel(channel);
+    return this.#roomChannels.has(ch) || !!this.#rooms?.isRoom(ch);
+  }
+
+  /** Do we hold a group key for this room (i.e. can we read and write it)? */
+  hasRoomKey(channel: string): boolean {
+    return !!this.#rooms?.isRoom(normalizeChannel(channel));
+  }
+
+  async roomCreate(opts: { topic?: string; inviteTtlSecs?: number } = {}): Promise<{
+    channel: string;
+    invite: string;
+    url: string;
+    expiresAt: number;
+  }> {
+    const made = await this.rooms.create(opts);
+    this.noteRoom(made.channel);
+    this.#channels.add(normalizeChannel(made.channel));
+    return made;
+  }
+
+  /**
+   * Join a room from a link. A link with no token still works for a DID
+   * already on the roster (a member reconnecting). Refuses a link for a
+   * different server, since the connection is to this one.
+   */
+  async roomJoin(link: RoomLink): Promise<{ channel: string; ready: boolean }> {
+    this.#checkOrigin(link.origin);
+    const rooms = this.rooms;
+    const res = await rooms.join(link);
+    this.noteRoom(res.channel);
+    this.#channels.add(normalizeChannel(res.channel));
+    return res;
+  }
+
+  #checkOrigin(origin: string): void {
+    let theirs: string;
+    let ours: string;
+    try {
+      theirs = new URL(origin).host.toLowerCase();
+      ours = new URL(this.#cfg.baseUrl).host.toLowerCase();
+    } catch {
+      return;
+    }
+    if (theirs !== ours) {
+      throw new Error(
+        `that room lives on ${origin}, but this session is connected to ${this.#cfg.baseUrl}. ` +
+          `Set FREEQ_SERVER=${origin} (or run \`freeq-mcp room join <url>\` with it) to join.`,
+      );
+    }
+  }
+
+  /**
+   * Decrypted messages from a room: what is buffered, plus (with `history`)
+   * a CHATHISTORY replay of the latest rows, which the SDK decrypts on the
+   * way in. Fetches keys first when we hold none, and says so when there
+   * still are none rather than returning ciphertext placeholders.
+   */
+  async roomRead(
+    channel: string,
+    opts: { waitMs?: number; history?: boolean; limit?: number } = {},
+  ): Promise<RoomReadResult> {
+    const ch = normalizeChannel(channel);
+    const rooms = this.rooms;
+    const limit = Math.min(Math.max(1, Math.trunc(opts.limit ?? ROOM_HISTORY_MAX)), 200);
+
+    // Always re-fetch: it is one GET, and it picks up a rotation (a member
+    // was removed) that would otherwise leave every new row unreadable.
+    let latest: boolean | undefined;
+    let loadError: string | undefined;
+    try {
+      latest = await rooms.loadKeys(ch);
+    } catch (err) {
+      loadError = errorMessage(err);
+    }
+    if (!rooms.isRoom(ch)) {
+      return {
+        channel: ch,
+        ready: false,
+        messages: [],
+        note: loadError
+          ? `could not fetch the room key: ${loadError}. Are you a member of ${ch}? Join with freeq_room_join and the room URL.`
+          : `no member has sealed the room key to this agent yet (a member's client does that when it sees the join, usually within seconds). Try again shortly.`,
+      };
+    }
+    this.noteRoom(ch);
+    const sealed = await this.roomSteward(ch);
+
+    let rows: BufferedMessage[] = [];
+    if (opts.history) rows = await this.#fetchHistory(ch, Math.min(limit, ROOM_HISTORY_MAX));
+
+    let messages = mergeMessages(rows, this.buffered(ch, limit), limit);
+    if (messages.length === 0 && opts.waitMs) {
+      await this.waitForMessage(ch, opts.waitMs);
+      messages = mergeMessages(rows, this.buffered(ch, limit), limit);
+    }
+    const unreadable = messages.filter((m) => m.encrypted && m.text === "[encrypted message]").length;
+    const notes: string[] = [];
+    if (unreadable > 0) {
+      notes.push(
+        `${unreadable} message(s) were sealed under an epoch this agent does not hold (sent before it joined, or after a rotation). They cannot be recovered.`,
+      );
+    }
+    if (sealed.length > 0) notes.push(`Sealed the room key to ${sealed.length} member(s) who lacked it: ${sealed.join(", ")}.`);
+    return { channel: ch, ready: true, latest, messages, note: notes.length ? notes.join(" ") : undefined };
+  }
+
+  /** CHATHISTORY LATEST over the live connection; empty on timeout or when the client cannot. */
+  #fetchHistory(channel: string, count: number): Promise<BufferedMessage[]> {
+    const client = this.#require();
+    if (!client.requestHistory) return Promise.resolve([]);
+    return new Promise((resolve) => {
+      const done = (rows: BufferedMessage[]) => {
+        clearTimeout(timer);
+        client.off?.("historyBatch", handler as never);
+        resolve(rows);
+      };
+      const handler = (target: string, messages: Message[]) => {
+        if (target.toLowerCase() !== channel) return;
+        done(
+          messages.map((m) =>
+            this.#toBuffered(channel, m, m.timestamp instanceof Date ? m.timestamp.getTime() : undefined),
+          ),
+        );
+      };
+      const timer = setTimeout(() => done([]), HISTORY_TIMEOUT_MS);
+      timer.unref?.();
+      client.on("historyBatch", handler as never);
+      try {
+        client.requestHistory!({ target: channel, mode: "latest", count });
+      } catch (err) {
+        this.#warn(`CHATHISTORY request failed: ${errorMessage(err)}`);
+        done([]);
+      }
+    });
   }
 
   /**
@@ -414,14 +831,28 @@ export class FreeqSession {
   async close(reason = "mcp server shutting down"): Promise<void> {
     this.#failAllAsks("shutting down");
     for (const w of this.#waiters.splice(0)) w.resolve(undefined);
+    this.#echoWaiters.splice(0);
     const client = this.#client;
     if (!client) return;
     try {
-      client.quit?.(reason);
-      client.disconnect();
+      if (this.#stop) {
+        await this.#stop(reason);
+      } else {
+        client.quit?.(reason);
+        client.disconnect();
+      }
+    } catch (err) {
+      this.#warn(`shutdown: ${errorMessage(err)}`);
+      try {
+        client.disconnect();
+      } catch {
+        // already gone
+      }
     } finally {
       this.#connected = false;
       this.#client = undefined;
+      this.#rooms = undefined;
+      this.#stop = undefined;
       this.#mode = "offline";
     }
   }
@@ -436,6 +867,29 @@ export class FreeqSession {
   #now(): number {
     return this.#deps.now?.() ?? Date.now();
   }
+
+  #warn(message: string): void {
+    if (this.#deps.warn) this.#deps.warn(message);
+    else process.stderr.write(`freeq-mcp: ${message}\n`);
+  }
+}
+
+/** Union of two message lists, deduped by msgid, oldest first, last `limit`. */
+function mergeMessages(a: BufferedMessage[], b: BufferedMessage[], limit: number): BufferedMessage[] {
+  const seen = new Set<string>();
+  const out: BufferedMessage[] = [];
+  for (const m of [...a, ...b]) {
+    const key = m.msgid ?? `${m.from}\0${m.at}\0${m.text}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(m);
+  }
+  out.sort((x, y) => x.at - y.at);
+  return out.slice(-limit);
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 function parseRequest(raw: unknown): { req: string; q: string } | undefined {
@@ -469,34 +923,96 @@ export function defaultNick(seed?: string): string {
   return `mcp-${slug}`;
 }
 
+/** Where bot-kit keeps per-bot state; passed explicitly so both sides agree. */
+export function botStateRoot(): string {
+  return join(homedir(), ".freeq", "bots");
+}
+
 /**
- * Real client factory: bot-kit identity when an owner DID is configured,
- * plain guest `FreeqClient` otherwise.
+ * Real client factory.
+ *
+ * Default: a bot-kit `did:key` identity. With `FREEQ_OWNER_DID` its delegation
+ * names that human; without it the delegation names the agent itself, which
+ * is a real, stable identity that is honest about acting for nobody. Only
+ * `FREEQ_GUEST=1` yields a nick-only guest `FreeqClient`.
  */
-async function defaultCreateClient(
+export async function defaultCreateClient(
   cfg: FreeqMcpConfig,
   nick: string,
-): Promise<{ client: SessionClient; mode: SessionMode; did?: string }> {
-  if (cfg.ownerDid) {
-    // Imported lazily so the guest path doesn't pay for bot-kit's disk I/O.
-    const { FreeqBot } = await import("@freeq/bot-kit");
-    const bot = await FreeqBot.create({
-      name: nick,
-      ownerDid: cfg.ownerDid,
-      nick,
-      url: cfg.wsUrl,
-      serverOrigin: cfg.baseUrl,
-      channels: cfg.channels,
-      actorClass: "agent",
-    });
-    // FreeqBot.start() does the announce sequence; the session drives
-    // readiness itself, so hand back the underlying client and let it.
-    return {
-      client: bot.client as unknown as SessionClient,
-      mode: "authenticated",
-      did: bot.identity.did,
-    };
+  deps: {
+    botKit?: () => Promise<BotKitModule>;
+    root?: string;
+  } = {},
+): Promise<ClientFactoryResult> {
+  if (cfg.guest) {
+    const client = new FreeqClient({ url: cfg.wsUrl, nick, channels: cfg.channels });
+    return { client: client as unknown as SessionClient, mode: "guest" };
   }
-  const client = new FreeqClient({ url: cfg.wsUrl, nick, channels: cfg.channels });
-  return { client: client as unknown as SessionClient, mode: "guest" };
+
+  // Imported lazily so the guest path doesn't pay for bot-kit's disk I/O.
+  const kit = await (deps.botKit ?? (() => import("@freeq/bot-kit") as Promise<BotKitModule>))();
+  const root = deps.root ?? botStateRoot();
+  const stateDir = join(root, nick);
+  const certPath = join(stateDir, "delegation.json");
+
+  // Learn our own DID first: a self-owned certificate has to name it, and
+  // `FreeqBot.create` mints the certificate from the owner it is given.
+  const identity = await kit.loadOrCreateIdentity({ seedPath: join(stateDir, "agent.key") });
+  const selfOwned = !cfg.ownerDid;
+  const ownerDid = cfg.ownerDid ?? identity.did;
+
+  // A self-owned cert is unsigned and names nobody, so replacing it when an
+  // owner is configured later is the upgrade the operator asked for, not data
+  // loss. Any other mismatch (a different owner, or a signed cert) is left to
+  // bot-kit, whose error names the file and the DIDs involved.
+  if (!selfOwned) {
+    const existing = await kit.loadDelegation({ certPath });
+    if (existing && existing.creator_did === identity.did && !existing.signature) {
+      await unlink(certPath);
+    }
+  }
+
+  const bot = await kit.FreeqBot.create({
+    name: nick,
+    ownerDid,
+    nick,
+    url: cfg.wsUrl,
+    serverOrigin: cfg.baseUrl,
+    channels: cfg.channels,
+    actorClass: "agent",
+    root,
+  });
+  return {
+    client: bot.client as unknown as SessionClient,
+    mode: "authenticated",
+    did: bot.identity.did,
+    selfOwned,
+    start: () => bot.start(),
+    stop: (reason: string) => bot.stop({ reason }),
+    rooms: bot.rooms,
+  };
+}
+
+/** The slice of `@freeq/bot-kit` the factory needs; typed so tests can inject a fake. */
+export interface BotKitModule {
+  loadOrCreateIdentity(opts: { seedPath: string }): Promise<{ did: string }>;
+  loadDelegation(opts: { certPath: string }): Promise<{ creator_did: string; signature: string | null } | null>;
+  FreeqBot: {
+    create(opts: {
+      name: string;
+      ownerDid: string;
+      nick: string;
+      url: string;
+      serverOrigin?: string;
+      channels?: string[];
+      actorClass?: "agent" | "external_agent" | "human";
+      root?: string;
+    }): Promise<{
+      client: unknown;
+      identity: { did: string };
+      rooms: SessionRooms;
+      start(): Promise<void>;
+      stop(opts: { reason: string }): Promise<void>;
+    }>;
+  };
 }

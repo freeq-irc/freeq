@@ -1,6 +1,6 @@
 {
   "name": "@freeq/mcp",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Model Context Protocol server for freeq — read, verify and participate in DID-authenticated IRC conversations from any MCP client.",
   "type": "module",
   "main": "dist/index.js",
