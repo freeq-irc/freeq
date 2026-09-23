@@ -27,6 +27,9 @@ import { prefetchProfiles } from '@freeq/sdk';
 import { shouldRejoinCall, AV_REJOIN_WINDOW_MS, type PendingCallRejoin } from '../lib/av-mesh';
 import { fetchFavorites, pushFavorites, mergeFavorites, favoritesEqual } from '../lib/favorites-sync';
 import { createDmSendGate, dmThreadKey } from './dm-resolve';
+import { getRooms, setRoomsClientProvider } from '../lib/rooms';
+import { isRoomChannel, clearPendingRoom, loadPendingRoom } from '../lib/room-link';
+import { showToast } from '../components/Toast';
 
 // ── This device's signing key ──────────────────────────────────────────
 //
@@ -418,6 +421,9 @@ async function syncFavorites(c: FreeqClient): Promise<void> {
 // ── Singleton SDK client ──
 
 let client: FreeqClient | null = null;
+// Instant rooms reach the live client through this rather than importing
+// the bridge back (see lib/rooms.ts).
+setRoomsClientProvider(() => client);
 
 /**
  * How long a first DM waits to learn its peer. Long enough for a WHOIS
@@ -534,6 +540,7 @@ export function connect(url: string, desiredNick: string, channels?: string[], f
 
   const store = useStore.getState();
   store.reset();
+  getRooms().reset();
 
   // The key this device signs with, and the lookup that checks what others
   // send. A guest signs nothing and publishes nothing, so neither is set up
@@ -1221,6 +1228,16 @@ function wireEvents(c: FreeqClient) {
     }
     saveJoinedChannels();
 
+    // An instant room (or any +E channel with group keys): fetch the key
+    // sealed to us and install the cipher. The invite that brought us here
+    // has done its job; the token stays in the store for "Copy invite link".
+    const pending = loadPendingRoom();
+    if (pending && pending.channel === channel.toLowerCase()) {
+      clearPendingRoom();
+      if (pending.token) s().setRoomState(channel, { isRoom: true, inviteToken: pending.token });
+    }
+    getRooms().onChannelJoined(channel, s().channels.get(channel.toLowerCase())?.isEncrypted ?? false);
+
     // If a blip dropped us mid-call in this channel, rejoin the same AV
     // session with the same instance — the server held the slot in its grace
     // window, so this re-enters in place and instance-keyed peers see media
@@ -1241,12 +1258,15 @@ function wireEvents(c: FreeqClient) {
   });
 
   c.on('channelLeft', (channel) => {
+    getRooms().onChannelLeft(channel);
     s().removeChannel(channel);
     saveJoinedChannels();
   });
 
   c.on('memberJoined', (channel, member) => {
     if (channel) s().addMember(channel, member);
+    // Steward duty: a newcomer to a room we can read gets the key from us.
+    if (channel) getRooms().onMemberJoined(channel, member.nick);
     // A WHOIS answer arrives as a channel-less "join": it is how we learn the
     // actor class of somebody who was already in the room when we got here
     // (NAMES never carries it). Dropping these is what left agents rendered
@@ -1281,6 +1301,27 @@ function wireEvents(c: FreeqClient) {
 
   c.on('modeChanged', (channel, mode, arg, setBy) => {
     s().handleMode(channel, mode, arg, setBy);
+    getRooms().onModeChanged(channel, mode);
+  });
+
+  // A refused JOIN (473 invite-only / 475 bad key / 477 identity or policy):
+  // show the reason where the user is looking — in the buffer `joinChannel`
+  // opened — and take that buffer off the sidebar, since nothing was joined.
+  c.on('joinRejected', (channel, numeric, reason) => {
+    if (c !== client || !channel) return;
+    const room = isRoomChannel(channel);
+    const text = room
+      ? numeric === '477'
+        ? `Cannot join ${channel}: rooms are end-to-end encrypted and need an identity — sign in with AT Protocol to join.`
+        : numeric === '473'
+          ? `Cannot join ${channel}: an invite link is required (this one may have expired or been revoked).`
+          : `Cannot join ${channel}: ${reason} (${numeric})`
+      : `Cannot join ${channel}: ${reason} (${numeric})`;
+    s().markJoinRejected(channel, text);
+    showToast(text, 'error', 6000);
+    // Keep the invite parked only when signing in would make it work.
+    const pending = loadPendingRoom();
+    if (pending && pending.channel === channel.toLowerCase() && numeric !== '477') clearPendingRoom();
   });
 
   c.on('membersList', (channel, members) => {
@@ -1613,6 +1654,8 @@ function wireEvents(c: FreeqClient) {
   });
 
   c.on('joinGateRequired', (channel) => {
+    // A room's 477 means "identity required", not a policy gate.
+    if (isRoomChannel(channel)) return;
     if (useStore.getState().authDid) {
       s().setJoinGateChannel(channel);
     }
@@ -1620,6 +1663,7 @@ function wireEvents(c: FreeqClient) {
 
   c.on('userKicked', (channel, kicked, _by, _reason) => {
     s().removeMember(channel, kicked);
+    if (kicked.toLowerCase() === c.nick.toLowerCase()) getRooms().onChannelLeft(channel);
   });
 
   c.on('error', (message) => {

@@ -26,6 +26,10 @@
 // Main client
 export { FreeqClient } from './client.js';
 
+// App-owned per-channel encryption (instant rooms). Install with
+// `client.setChannelCipher(channel, makeGroupCipher(() => states))`.
+export type { ChannelCipher } from './channel-cipher.js';
+
 // Event types
 export type { FreeqEvents } from './events.js';
 
@@ -160,8 +164,12 @@ export {
   createGroup, rotate, encryptGroup, decryptGroup,
   sealFor, openSealed, sealedToWire, sealedFromWire,
   sealBatch, openBest, isGroupEncrypted, parseEpoch,
+  makeGroupCipher,
 } from './e2ee_group.js';
 export type { GroupState, SealedGroupKey, X25519Secret } from './e2ee_group.js';
+// The browser e2ee identity's X25519 pair, in `openSealed` form (null in
+// Node or before login). The rest of the e2ee module stays on `@freeq/sdk/e2ee`.
+export { getIdentityX25519Secret } from './e2ee.js';
 
 // What a client can honestly say about who someone is — one rule, shared
 // byte-for-byte with the Rust SDK via spec/identity-claims.json.

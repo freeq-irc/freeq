@@ -23,12 +23,16 @@ export interface FreeqMcpConfig {
   /**
    * Owner DID, recorded in the agent's delegation certificate.
    *
-   * An agent acting for nobody is the thing freeq exists to prevent, so when
-   * this is unset the identity is still a real `did:key` — it just carries no
-   * delegation, and `freeq_whoami` says so plainly rather than implying it
-   * speaks for a person.
+   * When unset the identity is still a real `did:key`, but self-owned: the
+   * certificate names the agent's own DID as creator, and `freeq_whoami` says
+   * plainly that it speaks for no human rather than implying otherwise.
    */
   ownerDid?: string;
+  /**
+   * Connect as a nick-only guest (no SASL, no key, nothing attributable).
+   * Off by default; `FREEQ_GUEST=1` opts in. Guests cannot use rooms.
+   */
+  guest: boolean;
   /** Bearer token for authenticated REST calls (uploads, favorites, budgets). */
   bearerToken?: string;
   /** Channels to join on connect. */
@@ -87,6 +91,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     wsUrl: env.FREEQ_WS_URL ? env.FREEQ_WS_URL.trim() : deriveWsUrl(baseUrl),
     nick: env.FREEQ_NICK?.trim() || undefined,
     ownerDid: env.FREEQ_OWNER_DID?.trim() || undefined,
+    guest: boolEnv(env.FREEQ_GUEST, false),
     bearerToken: env.FREEQ_BEARER_TOKEN?.trim() || undefined,
     channels: splitChannels(env.FREEQ_CHANNELS),
     // Writes are on by default: a chat server you can only read is not much

@@ -145,6 +145,15 @@ pub(super) fn normalize_channel(name: &str) -> String {
 }
 
 pub(super) fn s2s_broadcast(state: &Arc<SharedState>, msg: crate::s2s::S2sMessage) {
+    // Rooms never federate: their admission is a local invite table that a
+    // peer cannot consult, so nothing about a room leaves this server.
+    // Read from `room_names`, not `channels`: some callers hold the
+    // channels lock while broadcasting, and this must not deadlock them.
+    if let Some(channel) = msg.channel_name()
+        && state.room_names.lock().contains(&channel.to_lowercase())
+    {
+        return;
+    }
     let manager = state.s2s_manager.lock().clone();
     if let Some(manager) = manager {
         manager.broadcast(msg);

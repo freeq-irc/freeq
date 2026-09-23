@@ -367,6 +367,19 @@ pub fn router(state: Arc<SharedState>) -> Router {
         )
         .route("/auth/mobile", get(auth_mobile_redirect))
         .route("/join/{channel}", get(channel_invite_page))
+        // Instant rooms (docs/INSTANT-ROOMS.md).
+        .route("/api/v1/rooms", post(api_create_room))
+        .route("/api/v1/rooms/{name}", get(api_get_room))
+        .route(
+            "/api/v1/rooms/{name}/invites",
+            post(api_room_invite).delete(api_room_revoke_invites),
+        )
+        .route("/api/v1/rooms/{name}/keep", post(api_room_keep))
+        .route(
+            "/api/v1/rooms/{name}/members/{did}",
+            axum::routing::delete(api_room_remove_member),
+        )
+        .route("/r/{name}", get(room_landing_page))
         .layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024)) // 12MB
         .layer({
             use axum::http::{Method, header};
@@ -2754,7 +2767,7 @@ async fn api_put_group_keys(
 
     // Steward authorization: only the channel founder or a DID-op may distribute
     // group keys — the same DID authorities the policy layer already trusts.
-    {
+    let (is_room, is_authority) = {
         let channels = state.channels.lock();
         let Some(ch) = channels.get(&channel.to_lowercase()) else {
             return (
@@ -2762,16 +2775,15 @@ async fn api_put_group_keys(
                 axum::Json(serde_json::json!({ "error": "Unknown channel" })),
             );
         };
-        let is_authority =
-            ch.founder_did.as_deref() == Some(caller.as_str()) || ch.did_ops.contains(&caller);
-        if !is_authority {
-            return (
-                axum::http::StatusCode::FORBIDDEN,
-                axum::Json(serde_json::json!({
-                    "error": "Only the channel founder or a DID-op may distribute group keys"
-                })),
-            );
-        }
+        (ch.room, crate::rooms::is_room_authority(ch, &caller))
+    };
+    if !is_room && !is_authority {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": "Only the channel founder or a DID-op may distribute group keys"
+            })),
+        );
     }
 
     let (Some(epoch), Some(keys)) = (
@@ -2786,9 +2798,54 @@ async fn api_put_group_keys(
         );
     };
 
+    // In a room trust is flat: everyone arrived through the same link, so
+    // any member may seal the *current* epoch to a newcomer. Starting a new
+    // epoch is still the founder's or a DID-op's call, because a rotation
+    // is what locks a removed member out. Keys for DIDs off the roster are
+    // dropped rather than stored: a sealed key is an admission, and the
+    // roster is the only list of who was admitted.
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
+    let roster: Option<std::collections::HashSet<String>> = if is_room {
+        let latest = state
+            .with_db(|db| db.latest_group_epoch(&channel))
+            .flatten();
+        let creating = latest.is_none_or(|l| epoch > l);
+        if creating && !is_authority {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({
+                    "error": "Only the room founder or a DID-op may create a new epoch"
+                })),
+            );
+        }
+        let members: std::collections::HashSet<String> = state
+            .with_db(|db| db.room_members(&channel))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(did, _)| did)
+            .collect();
+        if !creating && !is_authority && !members.contains(&caller) {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({
+                    "error": "Only a room member may seal keys"
+                })),
+            );
+        }
+        Some(members)
+    } else {
+        None
+    };
+
     let mut stored = 0usize;
     for (member_did, sealed) in keys {
         if let Some(sealed_wire) = sealed.as_str() {
+            if let Some(ref roster) = roster
+                && !roster.contains(member_did)
+            {
+                skipped.push(serde_json::json!({ "did": member_did, "reason": "not a member" }));
+                continue;
+            }
             let (ch, md, sw) = (channel.clone(), member_did.clone(), sealed_wire.to_string());
             state.with_db(|db| db.save_group_key(&ch, &md, epoch, &sw));
             stored += 1;
@@ -2831,7 +2888,12 @@ async fn api_put_group_keys(
 
     (
         axum::http::StatusCode::OK,
-        axum::Json(serde_json::json!({ "ok": true, "epoch": epoch, "stored": stored })),
+        axum::Json(serde_json::json!({
+            "ok": true,
+            "epoch": epoch,
+            "stored": stored,
+            "skipped": skipped,
+        })),
     )
 }
 
@@ -2870,6 +2932,598 @@ async fn api_get_group_keys(
         axum::http::StatusCode::OK,
         axum::Json(serde_json::json!({ "channel": channel, "keys": keys })),
     )
+}
+
+// ── Instant rooms (docs/INSTANT-ROOMS.md, "REST") ────────────────────
+//
+// Every call is Bearer = IRC session id. A room is addressed by its channel
+// name with or without the leading '#'. Errors are `{ "error": "..." }`.
+
+type JsonReply = (StatusCode, Json<serde_json::Value>);
+
+fn json_err(status: StatusCode, msg: &str) -> JsonReply {
+    (status, Json(serde_json::json!({ "error": msg })))
+}
+
+/// `#name`, lowercased — the key rooms are filed under everywhere.
+fn room_key(name: &str) -> String {
+    let bare = name.trim_start_matches('#');
+    format!("#{}", bare.to_lowercase())
+}
+
+/// The room the call is about, with what the caller is to it. `None` when
+/// the channel does not exist or is not a room (both answer 404, so a
+/// stranger cannot tell a room's name from any other).
+fn room_lookup(state: &SharedState, channel: &str, caller: &str) -> Option<(bool, bool)> {
+    let is_authority = {
+        let channels = state.channels.lock();
+        let ch = channels.get(channel)?;
+        if !ch.room {
+            return None;
+        }
+        crate::rooms::is_room_authority(ch, caller)
+    };
+    let is_member = state
+        .with_db(|db| db.is_room_member(channel, caller))
+        .unwrap_or(false);
+    Some((is_authority, is_member))
+}
+
+/// Parse a JSON object body that may be absent or empty.
+fn optional_json_body(bytes: &[u8]) -> Result<serde_json::Value, JsonReply> {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .filter(|v| v.is_object())
+        .ok_or_else(|| json_err(StatusCode::BAD_REQUEST, "Body must be a JSON object"))
+}
+
+/// An invite TTL from the body, clamped to the allowed range.
+fn invite_ttl_from(body: &serde_json::Value) -> u64 {
+    body.get("invite_ttl_secs")
+        .and_then(|v| v.as_u64())
+        .filter(|&t| t > 0)
+        .unwrap_or(crate::rooms::INVITE_TTL_DEFAULT_SECS)
+        .min(crate::rooms::INVITE_TTL_MAX_SECS)
+}
+
+/// Mint one invite for `channel`: the raw token goes back to the caller
+/// once, only its hash is filed. Returns `(token, url, expires_at)`.
+fn mint_invite(
+    state: &SharedState,
+    channel: &str,
+    created_by: &str,
+    ttl_secs: u64,
+    max_uses: Option<u32>,
+) -> Option<(String, String, u64)> {
+    let now = crate::rooms::now_secs();
+    let expires_at = now.saturating_add(ttl_secs);
+    let token = crate::rooms::generate_token();
+    let hash = crate::rooms::token_hash(&token);
+    let (c, by) = (channel.to_string(), created_by.to_string());
+    state.with_db(move |db| db.add_room_invite(&c, &hash, &by, now, expires_at, max_uses))?;
+    let url = crate::rooms::room_url(&state.config.server_name, channel, &token);
+    Some((token, url, expires_at))
+}
+
+/// POST /api/v1/rooms — mint a room. Body `{ "topic"?, "invite_ttl_secs"? }`.
+///
+/// The channel is born `+i +E +n +t` with the caller as founder and sole
+/// roster member, and one invite is minted so the caller has a URL to
+/// share. Limited per founder (a day's worth of rooms is a lot of rooms)
+/// and per IP like every other minting endpoint.
+async fn api_create_room(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> JsonReply {
+    if !state.rest_rate_limiter.check(addr.ip()) {
+        return json_err(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded");
+    }
+    let Some(caller) = caller_did_from_bearer(&state, &headers) else {
+        return json_err(StatusCode::UNAUTHORIZED, "Bearer session required");
+    };
+    if state.db.is_none() {
+        return json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Rooms need persistence; this server runs without a database",
+        );
+    }
+    let body = match optional_json_body(&body) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let now = crate::rooms::now_secs();
+    let founded = state
+        .with_db(|db| db.rooms_founded_since(&caller, now.saturating_sub(86_400)))
+        .unwrap_or(0);
+    if founded >= crate::rooms::ROOMS_PER_FOUNDER_PER_DAY {
+        return json_err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Room limit reached: 20 rooms per founder per 24 hours",
+        );
+    }
+    let topic = body
+        .get("topic")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| t.chars().take(390).collect::<String>());
+    let Some(channel) = crate::rooms::generate_room_name(&state) else {
+        return json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not find a free room name",
+        );
+    };
+    let expires_at = now.saturating_add(state.config.room_idle_secs);
+
+    let ch = crate::server::ChannelState {
+        room: true,
+        invite_only: true,
+        encrypted_only: true,
+        no_ext_msg: true,
+        topic_locked: true,
+        founder_did: Some(caller.clone()),
+        did_ops: std::iter::once(caller.clone()).collect(),
+        created_at: now,
+        topic: topic.map(|text| crate::server::TopicInfo {
+            text,
+            set_by: caller.clone(),
+            set_at: now,
+        }),
+        ..Default::default()
+    };
+    state.channels.lock().insert(channel.clone(), ch.clone());
+    state.room_names.lock().insert(channel.clone());
+    let filed = state
+        .with_db(|db| {
+            db.save_channel(&channel, &ch)?;
+            db.create_room(&channel, &caller, now, expires_at)?;
+            db.upsert_room_member(&channel, &caller, now)
+        })
+        .is_some();
+    if !filed {
+        state.channels.lock().remove(&channel);
+        state.room_names.lock().remove(&channel);
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, "Could not file the room");
+    }
+    let Some((token, url, invite_expires_at)) =
+        mint_invite(&state, &channel, &caller, invite_ttl_from(&body), None)
+    else {
+        return json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not mint the invite",
+        );
+    };
+    tracing::info!(channel = %channel, founder = %caller, "room created");
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "channel": channel,
+            "invite": token,
+            "url": url,
+            "invite_expires_at": invite_expires_at,
+            "room": {
+                "channel": channel,
+                "founder_did": caller,
+                "created_at": now,
+                "expires_at": expires_at,
+            },
+        })),
+    )
+}
+
+/// GET /api/v1/rooms/{ch} — the room as its steward sees it: lifetime,
+/// roster, and which epochs each member already holds a sealed key for.
+/// The last is what a steward needs to know who to seal the current key to.
+async fn api_get_room(
+    Path(name): Path<String>,
+    State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
+) -> JsonReply {
+    let Some(caller) = caller_did_from_bearer(&state, &headers) else {
+        return json_err(StatusCode::UNAUTHORIZED, "Bearer session required");
+    };
+    let channel = room_key(&name);
+    let Some((is_authority, is_member)) = room_lookup(&state, &channel, &caller) else {
+        return json_err(StatusCode::NOT_FOUND, "Unknown room");
+    };
+    if !is_authority && !is_member {
+        return json_err(StatusCode::FORBIDDEN, "Not a member of this room");
+    }
+    let Some(room) = state.with_db(|db| db.get_room(&channel)).flatten() else {
+        return json_err(StatusCode::NOT_FOUND, "Unknown room");
+    };
+    let topic = state
+        .channels
+        .lock()
+        .get(&channel)
+        .and_then(|ch| ch.topic.as_ref().map(|t| t.text.clone()));
+    // Activity noted since the last sweep lives in memory; fold it in so
+    // the caller sees the expiry the sweeper will act on.
+    let (last_activity, expires_at) = {
+        let pending = state.room_activity.lock().get(&channel).copied();
+        match pending {
+            Some(at) if at > room.last_activity => (
+                at,
+                room.expires_at
+                    .max(at.saturating_add(state.config.room_idle_secs)),
+            ),
+            _ => (room.last_activity, room.expires_at),
+        }
+    };
+    let latest_epoch = state
+        .with_db(|db| db.latest_group_epoch(&channel))
+        .flatten();
+    let epochs = state
+        .with_db(|db| db.group_key_epochs_by_member(&channel))
+        .unwrap_or_default();
+    let roster = state
+        .with_db(|db| db.room_members(&channel))
+        .unwrap_or_default();
+    let members: Vec<serde_json::Value> = {
+        let did_sessions = state.did_sessions.lock();
+        roster
+            .into_iter()
+            .map(|(did, joined_at)| {
+                let online = did_sessions.get(&did).is_some_and(|s| !s.is_empty());
+                serde_json::json!({
+                    "did": did,
+                    "joined_at": joined_at,
+                    "online": online,
+                    "epochs": epochs.get(&did).cloned().unwrap_or_default(),
+                })
+            })
+            .collect()
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "channel": channel,
+            "topic": topic,
+            "founder_did": room.founder_did,
+            "created_at": room.created_at,
+            "last_activity": last_activity,
+            "expires_at": expires_at,
+            "latest_epoch": latest_epoch,
+            "members": members,
+        })),
+    )
+}
+
+/// POST /api/v1/rooms/{ch}/invites — a fresh invite. Body
+/// `{ "invite_ttl_secs"?, "max_uses"? }`. Founder or DID-op.
+async fn api_room_invite(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Path(name): Path<String>,
+    State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> JsonReply {
+    if !state.rest_rate_limiter.check(addr.ip()) {
+        return json_err(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded");
+    }
+    let Some(caller) = caller_did_from_bearer(&state, &headers) else {
+        return json_err(StatusCode::UNAUTHORIZED, "Bearer session required");
+    };
+    let channel = room_key(&name);
+    let Some((is_authority, _)) = room_lookup(&state, &channel, &caller) else {
+        return json_err(StatusCode::NOT_FOUND, "Unknown room");
+    };
+    if !is_authority {
+        return json_err(
+            StatusCode::FORBIDDEN,
+            "Only the room founder or a DID-op may mint invites",
+        );
+    }
+    let body = match optional_json_body(&body) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let max_uses = body
+        .get("max_uses")
+        .and_then(|v| v.as_u64())
+        .filter(|&n| n > 0)
+        .map(|n| n.min(u32::MAX as u64) as u32);
+    let Some((token, url, invite_expires_at)) =
+        mint_invite(&state, &channel, &caller, invite_ttl_from(&body), max_uses)
+    else {
+        return json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not mint the invite",
+        );
+    };
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "invite": token,
+            "url": url,
+            "invite_expires_at": invite_expires_at,
+        })),
+    )
+}
+
+/// DELETE /api/v1/rooms/{ch}/invites — revoke every live invite. Founder
+/// or DID-op. Members already on the roster are unaffected.
+async fn api_room_revoke_invites(
+    Path(name): Path<String>,
+    State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
+) -> JsonReply {
+    let Some(caller) = caller_did_from_bearer(&state, &headers) else {
+        return json_err(StatusCode::UNAUTHORIZED, "Bearer session required");
+    };
+    let channel = room_key(&name);
+    let Some((is_authority, _)) = room_lookup(&state, &channel, &caller) else {
+        return json_err(StatusCode::NOT_FOUND, "Unknown room");
+    };
+    if !is_authority {
+        return json_err(
+            StatusCode::FORBIDDEN,
+            "Only the room founder or a DID-op may revoke invites",
+        );
+    }
+    let revoked = state
+        .with_db(|db| db.revoke_room_invites(&channel, crate::rooms::now_secs()))
+        .unwrap_or(0);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "revoked": revoked })),
+    )
+}
+
+/// POST /api/v1/rooms/{ch}/keep — push the expiry out by the idle TTL from
+/// now. Any roster member; a room someone wants kept is not idle.
+async fn api_room_keep(
+    Path(name): Path<String>,
+    State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
+) -> JsonReply {
+    let Some(caller) = caller_did_from_bearer(&state, &headers) else {
+        return json_err(StatusCode::UNAUTHORIZED, "Bearer session required");
+    };
+    let channel = room_key(&name);
+    let Some((is_authority, is_member)) = room_lookup(&state, &channel, &caller) else {
+        return json_err(StatusCode::NOT_FOUND, "Unknown room");
+    };
+    if !is_authority && !is_member {
+        return json_err(StatusCode::FORBIDDEN, "Not a member of this room");
+    }
+    let Some(expires_at) = crate::rooms::touch_now(&state, &channel) else {
+        return json_err(StatusCode::NOT_FOUND, "Unknown room");
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "expires_at": expires_at })),
+    )
+}
+
+/// DELETE /api/v1/rooms/{ch}/members/{did} — take a DID off the roster,
+/// ban it, and kick any live session it has. Founder or DID-op. The
+/// caller then rotates the epoch; the server cannot, it holds no key.
+///
+/// The ban is what makes this different from a KICK: a kicked DID with a
+/// still-valid invite could walk back in, and revoking every invite to
+/// stop one person would punish everyone else holding the link.
+async fn api_room_remove_member(
+    Path((name, did)): Path<(String, String)>,
+    State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
+) -> JsonReply {
+    let Some(caller) = caller_did_from_bearer(&state, &headers) else {
+        return json_err(StatusCode::UNAUTHORIZED, "Bearer session required");
+    };
+    let channel = room_key(&name);
+    let Some((is_authority, _)) = room_lookup(&state, &channel, &caller) else {
+        return json_err(StatusCode::NOT_FOUND, "Unknown room");
+    };
+    if !is_authority {
+        return json_err(
+            StatusCode::FORBIDDEN,
+            "Only the room founder or a DID-op may remove members",
+        );
+    }
+    let is_founder = state
+        .channels
+        .lock()
+        .get(&channel)
+        .is_some_and(|ch| ch.founder_did.as_deref() == Some(did.as_str()));
+    if is_founder {
+        // A founder bypasses bans, so the removal would not hold; and a
+        // room with no founder has nobody who can rotate it.
+        return json_err(StatusCode::BAD_REQUEST, "The founder cannot be removed");
+    }
+    let now = crate::rooms::now_secs();
+    let (c, d) = (channel.clone(), did.clone());
+    state.with_db(move |db| db.remove_room_member(&c, &d, now));
+
+    // Ban by DID, in memory and on disk, announced to the room so every
+    // client's ban list agrees with the server's.
+    let ban = crate::server::BanEntry::new(did.clone(), caller.clone());
+    let newly_banned = {
+        let mut channels = state.channels.lock();
+        match channels.get_mut(&channel) {
+            Some(ch) if !ch.bans.iter().any(|b| b.mask == did) => {
+                ch.bans.push(ban.clone());
+                true
+            }
+            _ => false,
+        }
+    };
+    if newly_banned {
+        let (c, b) = (channel.clone(), ban);
+        state.with_db(move |db| db.add_ban(&c, &b));
+        let line = format!(":{} MODE {channel} +b {did}\r\n", state.config.server_name);
+        let members: Vec<String> = state
+            .channels
+            .lock()
+            .get(&channel)
+            .map(|ch| ch.members.iter().cloned().collect())
+            .unwrap_or_default();
+        let conns = state.connections.lock();
+        for sid in members {
+            if let Some(tx) = conns.get(&sid) {
+                let _ = tx.try_send(line.clone());
+            }
+        }
+    }
+    crate::rooms::kick_did(&state, &channel, &did, "Removed from room");
+    tracing::info!(channel = %channel, removed = %did, by = %caller, "room member removed");
+    (StatusCode::OK, Json(serde_json::json!({ "removed": did })))
+}
+
+/// The instructions a room's landing page carries, as markdown. The same
+/// words go into the HTML page, so an agent that gets HTML still reads them.
+/// The token is never here: it is in the URL fragment, which the server
+/// never receives, and the reader already holds the URL.
+fn room_landing_markdown(server: &str, channel: &str, expires_at: u64) -> String {
+    let bare = channel.trim_start_matches('#');
+    format!(
+        "# {channel} — an end-to-end encrypted room on freeq\n\n\
+         This is an end-to-end encrypted room on freeq (`{server}`). The server \
+         relays ciphertext only; a member who is already inside seals the room \
+         key to each newcomer.\n\n\
+         - Room: `{channel}`\n\
+         - Expires: {expires} (extended by activity)\n\n\
+         ## Join with an agent\n\n\
+         Paste the full URL you were given — including the part after `#`, which is \
+         the invite token and never reaches this server — into:\n\n\
+         ```\n\
+         npx -y @freeq/mcp room join <paste the full URL you were given, including the part after #>\n\
+         ```\n\n\
+         or open the URL in a browser.\n\n\
+         ## Use freeq as an MCP server\n\n\
+         Add this to your MCP configuration:\n\n\
+         ```json\n\
+         {{\"mcpServers\":{{\"freeq\":{{\"command\":\"npx\",\"args\":[\"-y\",\"@freeq/mcp\"]}}}}}}\n\
+         ```\n\n\
+         then call the tool `freeq_room_join` with the full URL. In the web client the \
+         same room is `https://{server}/?room={bare}` followed by the same `#` part.\n",
+        expires = crate::rooms::iso(expires_at),
+    )
+}
+
+/// GET /r/{name} — the share URL's landing page.
+///
+/// `Accept: text/markdown` gets the instructions as markdown; everyone else
+/// gets a small HTML page with the same text and an "Open in freeq" button.
+/// The button navigates with JavaScript so the fragment (the invite token)
+/// travels with it: a plain link would drop it, and a server-side redirect
+/// never sees it. A name that is not a room answers 404 in both forms, with
+/// nothing that distinguishes "no such room" from "not a room".
+async fn room_landing_page(
+    Path(name): Path<String>,
+    State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::http::{HeaderValue, header};
+    let channel = room_key(&name.replace("%23", ""));
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let wants_markdown = crate::agent_surfaces::prefers_markdown(accept);
+    let is_room = state
+        .channels
+        .lock()
+        .get(&channel)
+        .is_some_and(|ch| ch.room);
+    let room = if is_room {
+        state.with_db(|db| db.get_room(&channel)).flatten()
+    } else {
+        None
+    };
+    let Some(room) = room else {
+        let mut resp = if wants_markdown {
+            crate::agent_surfaces::not_found_markdown()
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                Html(
+                    "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+                     <title>No such room — freeq</title></head><body>\
+                     <h1>No such room</h1><p>This link does not open a room on this server. \
+                     It may have expired, or the address may be mistyped.</p>\
+                     </body></html>",
+                ),
+            )
+                .into_response()
+        };
+        resp.headers_mut()
+            .insert(header::VARY, HeaderValue::from_static("Accept"));
+        return resp;
+    };
+    let server = state.config.server_name.as_str();
+    let markdown = room_landing_markdown(server, &channel, room.expires_at);
+    let mut resp = if wants_markdown {
+        (
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/markdown; charset=utf-8"),
+            )],
+            markdown,
+        )
+            .into_response()
+    } else {
+        let bare = html_escape(channel.trim_start_matches('#'));
+        let channel_html = html_escape(&channel);
+        let server_html = html_escape(server);
+        let expires = crate::rooms::iso(room.expires_at);
+        let js_target = format!("/?room={bare}");
+        Html(format!(
+            r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{channel_html} — freeq</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0c0c0f;color:#e8e8ed;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}}
+.card{{background:#131318;border:1px solid #1e1e2e;border-radius:20px;padding:40px;max-width:640px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,0.5)}}
+h1{{font-size:22px;margin-bottom:12px}}
+h1 .accent{{color:#00d4aa}}
+h2{{font-size:16px;margin:28px 0 8px;color:#9898b0}}
+p,li{{color:#c8c8d8;font-size:15px;line-height:1.6}}
+ul{{margin:8px 0 0 20px}}
+pre{{background:#0c0c0f;border:1px solid #1e1e2e;border-radius:10px;padding:14px;overflow-x:auto;font-size:13px;color:#e8e8ed;margin:12px 0;white-space:pre-wrap;word-break:break-all}}
+code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}}
+.btn{{display:inline-block;background:#00d4aa;color:#000;font-size:17px;font-weight:700;padding:14px 36px;border-radius:12px;border:0;cursor:pointer;margin-top:24px}}
+.btn:hover{{background:#00f0c0}}
+.muted{{color:#555570;font-size:13px;margin-top:16px}}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1><span class="accent">{channel_html}</span> — an end-to-end encrypted room on freeq</h1>
+  <p>This is an end-to-end encrypted room on freeq (<code>{server_html}</code>). The server relays ciphertext only; a member who is already inside seals the room key to each newcomer.</p>
+  <ul>
+    <li>Room: <code>{channel_html}</code></li>
+    <li>Expires: {expires} (extended by activity)</li>
+  </ul>
+  <button class="btn" onclick="location.href='{js_target}'+location.hash">Open in freeq</button>
+  <h2>Join with an agent</h2>
+  <p>Paste the full URL you were given — including the part after <code>#</code>, which is the invite token and never reaches this server — into:</p>
+  <pre><code>npx -y @freeq/mcp room join &lt;paste the full URL you were given, including the part after #&gt;</code></pre>
+  <p>or open the URL in a browser.</p>
+  <h2>Use freeq as an MCP server</h2>
+  <p>Add this to your MCP configuration:</p>
+  <pre><code>{{"mcpServers":{{"freeq":{{"command":"npx","args":["-y","@freeq/mcp"]}}}}}}</code></pre>
+  <p>then call the tool <code>freeq_room_join</code> with the full URL.</p>
+  <p class="muted">The same page as markdown: request it with <code>Accept: text/markdown</code>.</p>
+</div>
+</body>
+</html>"##
+        ))
+        .into_response()
+    };
+    resp.headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Accept"));
+    resp
 }
 
 pub(crate) async fn api_channel_history(
@@ -5734,13 +6388,20 @@ async fn channel_invite_page(
         format!("#{channel}")
     };
 
-    // Get channel info
+    // Get channel info. This page is public, so a channel that is not
+    // discoverable (+i, +k, +E, policy-gated — every room, for one) shows
+    // neither its topic nor how many people are in it: the name is all the
+    // link holder was given, and the name is all the page confirms.
     let (member_count, topic_text) = {
         let channels = state.channels.lock();
         let key = channel.to_lowercase();
         match channels.get(&key) {
-            Some(ch) => (ch.members.len(), ch.topic.as_ref().map(|t| t.text.clone())),
-            None => (0, None),
+            Some(ch) if state.channel_is_discoverable(&key, ch) => (
+                Some(ch.members.len()),
+                ch.topic.as_ref().map(|t| t.text.clone()),
+            ),
+            Some(_) => (None, None),
+            None => (Some(0), None),
         }
     };
 
@@ -5748,10 +6409,10 @@ async fn channel_invite_page(
     let topic_html = html_escape(topic_text.as_deref().unwrap_or("No topic set"));
     let channel_display = html_escape(channel.trim_start_matches('#'));
     let channel_escaped = html_escape(&channel);
-    let member_word = if member_count == 1 {
-        "member"
-    } else {
-        "members"
+    let stats = match member_count {
+        Some(1) => "1 member online".to_string(),
+        Some(n) => format!("{n} members online"),
+        None => "a private channel".to_string(),
     };
 
     Html(format!(r##"<!DOCTYPE html>
@@ -5761,13 +6422,13 @@ async fn channel_invite_page(
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{channel_escaped} — freeq</title>
 <meta property="og:title" content="{channel_escaped} on freeq">
-<meta property="og:description" content="{topic_html} — {member_count} {member_word} online">
+<meta property="og:description" content="{topic_html} — {stats}">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://{server}/join/{channel_display}">
 <meta property="og:image" content="https://{server}/freeq.png">
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="{channel_escaped} on freeq">
-<meta name="twitter:description" content="{topic_html} — {member_count} {member_word} online">
+<meta name="twitter:description" content="{topic_html} — {stats}">
 <meta name="twitter:image" content="https://{server}/freeq.png">
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
@@ -5795,7 +6456,7 @@ h1 .accent{{color:#00d4aa}}
   <h1><span class="accent">free</span>q</h1>
   <div class="channel">#{channel_display}</div>
   <div class="topic">{topic_html}</div>
-  <div class="stats"><span>{member_count}</span> {member_word} online on <span>{server}</span></div>
+  <div class="stats">{stats} on <span>{server}</span></div>
   <a href="https://{server}/#auto-join={channel_escaped}" class="btn">Join Channel</a>
   <div class="alt">
     Or connect with any IRC client: <code>{server}:6667</code><br>
@@ -8186,5 +8847,620 @@ mod verify_catchall_tests {
             .unwrap();
         assert_eq!(resp.status(), 503);
         assert!(!resp.text().await.unwrap().contains("<script"));
+    }
+}
+
+#[cfg(test)]
+mod room_rest_tests {
+    //! The instant-room REST surface (docs/INSTANT-ROOMS.md, "REST"),
+    //! called handler-by-handler against a state with signed-in sessions.
+    use super::*;
+    use axum::extract::ConnectInfo;
+
+    const FOUNDER: &str = "did:key:zFounder";
+    const MEMBER: &str = "did:key:zMember";
+    const OUTSIDER: &str = "did:key:zOutsider";
+
+    fn caller(ip: &str) -> ConnectInfo<std::net::SocketAddr> {
+        ConnectInfo(format!("{ip}:1").parse().unwrap())
+    }
+
+    /// A signed-in session `sid` for `did`, and the Bearer header for it.
+    fn session(state: &SharedState, sid: &str, did: &str) -> axum::http::HeaderMap {
+        state
+            .session_dids
+            .lock()
+            .insert(sid.to_string(), did.to_string());
+        state
+            .did_sessions
+            .lock()
+            .entry(did.to_string())
+            .or_default()
+            .insert(sid.to_string());
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {sid}").parse().unwrap(),
+        );
+        h
+    }
+
+    fn no_auth() -> axum::http::HeaderMap {
+        axum::http::HeaderMap::new()
+    }
+
+    async fn create(
+        state: &Arc<SharedState>,
+        headers: &axum::http::HeaderMap,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let (status, Json(v)) = api_create_room(
+            caller("10.0.0.1"),
+            State(state.clone()),
+            headers.clone(),
+            axum::body::Bytes::from(body.to_string()),
+        )
+        .await;
+        (status, v)
+    }
+
+    async fn body_text(resp: axum::response::Response) -> (StatusCode, String) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn creating_a_room_mints_a_plus_ie_channel_with_founder_roster_and_invite() {
+        let state = crate::server::test_state_with_db();
+        let h = session(&state, "s-f", FOUNDER);
+        let (status, v) = create(&state, &h, r#"{"topic":"planning"}"#).await;
+        assert_eq!(status, StatusCode::CREATED, "{v}");
+        let channel = v["channel"].as_str().unwrap().to_string();
+        assert!(channel.starts_with("#r-"), "{channel}");
+        assert_eq!(v["invite"].as_str().unwrap().len(), 43);
+        assert_eq!(
+            v["url"].as_str().unwrap(),
+            format!(
+                "https://{}/r/{}#{}",
+                state.config.server_name,
+                channel.trim_start_matches('#'),
+                v["invite"].as_str().unwrap()
+            )
+        );
+        assert_eq!(v["room"]["founder_did"], FOUNDER);
+        assert!(
+            v["invite_expires_at"].as_u64().unwrap() > v["room"]["created_at"].as_u64().unwrap()
+        );
+        assert_eq!(
+            v["room"]["expires_at"].as_u64().unwrap(),
+            v["room"]["created_at"].as_u64().unwrap() + state.config.room_idle_secs
+        );
+
+        let ch = state.channels.lock().get(&channel).cloned().unwrap();
+        assert!(ch.room && ch.invite_only && ch.encrypted_only && ch.no_ext_msg && ch.topic_locked);
+        assert_eq!(ch.founder_did.as_deref(), Some(FOUNDER));
+        assert_eq!(ch.topic.as_ref().map(|t| t.text.as_str()), Some("planning"));
+        assert!(
+            state
+                .with_db(|db| db.is_room_member(&channel, FOUNDER))
+                .unwrap()
+        );
+        assert!(
+            state
+                .with_db(|db| db.get_room(&channel))
+                .flatten()
+                .is_some()
+        );
+        let loaded = state.with_db(|db| db.load_channels()).unwrap();
+        assert!(loaded[&channel].room, "is_room survives a reload");
+
+        // The invite hash is filed and the raw token admits exactly as JOIN would.
+        let hash = crate::rooms::token_hash(v["invite"].as_str().unwrap());
+        assert!(
+            state
+                .with_db(|db| db.consume_room_invite(&channel, &hash, crate::rooms::now_secs()))
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn creating_needs_a_bearer_and_is_capped_per_founder() {
+        let state = crate::server::test_state_with_db();
+        let (status, _) = create(&state, &no_auth(), "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let h = session(&state, "s-f", FOUNDER);
+        // Backdate 20 rooms for the founder; the 21st is refused.
+        let now = crate::rooms::now_secs();
+        state
+            .with_db(|db| {
+                for i in 0..crate::rooms::ROOMS_PER_FOUNDER_PER_DAY {
+                    db.create_room(&format!("#r-x-y-{i}"), FOUNDER, now - 3600, now + 10)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let (status, v) = create(&state, &h, "").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{v}");
+        // Another founder is unaffected.
+        let h2 = session(&state, "s-m", MEMBER);
+        assert_eq!(create(&state, &h2, "").await.0, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn the_invite_ttl_is_clamped_to_thirty_days() {
+        let state = crate::server::test_state_with_db();
+        let h = session(&state, "s-f", FOUNDER);
+        let (status, v) = create(&state, &h, r#"{"invite_ttl_secs": 99999999}"#).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let ttl =
+            v["invite_expires_at"].as_u64().unwrap() - v["room"]["created_at"].as_u64().unwrap();
+        assert_eq!(ttl, crate::rooms::INVITE_TTL_MAX_SECS);
+    }
+
+    #[tokio::test]
+    async fn get_room_is_for_members_and_shows_epochs_and_presence() {
+        let state = crate::server::test_state_with_db();
+        let hf = session(&state, "s-f", FOUNDER);
+        let (_, created) = create(&state, &hf, "").await;
+        let channel = created["channel"].as_str().unwrap().to_string();
+        let now = crate::rooms::now_secs();
+        state
+            .with_db(|db| {
+                db.upsert_room_member(&channel, MEMBER, now)?;
+                db.save_group_key(&channel, FOUNDER, 1, "EGK1:a")?;
+                db.save_group_key(&channel, FOUNDER, 2, "EGK1:b")?;
+                db.save_group_key(&channel, MEMBER, 1, "EGK1:c")
+            })
+            .unwrap();
+
+        let ho = session(&state, "s-o", OUTSIDER);
+        let (status, _) = api_get_room(Path(channel.clone()), State(state.clone()), ho).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) =
+            api_get_room(Path(channel.clone()), State(state.clone()), no_auth()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) =
+            api_get_room(Path("#nope".into()), State(state.clone()), hf.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // A member who is offline may read; the name may omit the '#'.
+        let hm = session(&state, "s-m", MEMBER);
+        let (status, Json(v)) = api_get_room(
+            Path(channel.trim_start_matches('#').to_string()),
+            State(state.clone()),
+            hm,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["channel"], channel);
+        assert_eq!(v["founder_did"], FOUNDER);
+        assert_eq!(v["latest_epoch"], 2);
+        let members = v["members"].as_array().unwrap();
+        assert_eq!(members.len(), 2);
+        let founder = members.iter().find(|m| m["did"] == FOUNDER).unwrap();
+        assert_eq!(founder["epochs"], serde_json::json!([1, 2]));
+        assert_eq!(founder["online"], true);
+        let member = members.iter().find(|m| m["did"] == MEMBER).unwrap();
+        assert_eq!(member["epochs"], serde_json::json!([1]));
+        // MEMBER has a session too (the Bearer we just used).
+        assert_eq!(member["online"], true);
+
+        // Pending in-memory activity is folded into what the caller sees.
+        let later = now + 1000;
+        state.room_activity.lock().insert(channel.clone(), later);
+        let (_, Json(v)) = api_get_room(Path(channel.clone()), State(state.clone()), hf).await;
+        assert_eq!(v["last_activity"], later);
+        assert_eq!(v["expires_at"], later + state.config.room_idle_secs);
+    }
+
+    #[tokio::test]
+    async fn invites_are_minted_and_revoked_by_authority_only() {
+        let state = crate::server::test_state_with_db();
+        let hf = session(&state, "s-f", FOUNDER);
+        let (_, created) = create(&state, &hf, "").await;
+        let channel = created["channel"].as_str().unwrap().to_string();
+        let now = crate::rooms::now_secs();
+        state
+            .with_db(|db| db.upsert_room_member(&channel, MEMBER, now))
+            .unwrap();
+        let hm = session(&state, "s-m", MEMBER);
+
+        let (status, Json(v)) = api_room_invite(
+            caller("10.0.0.2"),
+            Path(channel.clone()),
+            State(state.clone()),
+            hm.clone(),
+            axum::body::Bytes::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+
+        let (status, Json(v)) = api_room_invite(
+            caller("10.0.0.2"),
+            Path(channel.clone()),
+            State(state.clone()),
+            hf.clone(),
+            axum::body::Bytes::from(r#"{"max_uses": 1, "invite_ttl_secs": 60}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{v}");
+        let token = v["invite"].as_str().unwrap().to_string();
+        assert!(v["url"].as_str().unwrap().ends_with(&format!("#{token}")));
+        assert!(v["invite_expires_at"].as_u64().unwrap() <= crate::rooms::now_secs() + 60);
+        let hash = crate::rooms::token_hash(&token);
+        assert!(
+            state
+                .with_db(|db| db.consume_room_invite(&channel, &hash, now))
+                .unwrap()
+        );
+        assert!(
+            !state
+                .with_db(|db| db.consume_room_invite(&channel, &hash, now))
+                .unwrap(),
+            "max_uses holds"
+        );
+
+        let (status, _) =
+            api_room_revoke_invites(Path(channel.clone()), State(state.clone()), hm).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, Json(v)) =
+            api_room_revoke_invites(Path(channel.clone()), State(state.clone()), hf).await;
+        assert_eq!(status, StatusCode::OK);
+        // The creation invite plus the one just minted.
+        assert_eq!(v["revoked"], 2);
+        let first = crate::rooms::token_hash(created["invite"].as_str().unwrap());
+        assert!(
+            !state
+                .with_db(|db| db.consume_room_invite(&channel, &first, now))
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_pushes_expiry_out_for_any_member() {
+        let state = crate::server::test_state_with_db();
+        let hf = session(&state, "s-f", FOUNDER);
+        let (_, created) = create(&state, &hf, "").await;
+        let channel = created["channel"].as_str().unwrap().to_string();
+        let now = crate::rooms::now_secs();
+        state
+            .with_db(|db| {
+                db.upsert_room_member(&channel, MEMBER, now)?;
+                // Age the room so keep has something to push.
+                db.touch_room(&channel, now - 100, now + 10)
+            })
+            .unwrap();
+        let ho = session(&state, "s-o", OUTSIDER);
+        let (status, _) = api_room_keep(Path(channel.clone()), State(state.clone()), ho).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let hm = session(&state, "s-m", MEMBER);
+        let (status, Json(v)) =
+            api_room_keep(Path(channel.clone()), State(state.clone()), hm).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert!(v["expires_at"].as_u64().unwrap() >= now + state.config.room_idle_secs);
+    }
+
+    #[tokio::test]
+    async fn removing_a_member_unrosters_bans_and_kicks() {
+        let state = crate::server::test_state_with_db();
+        let hf = session(&state, "s-f", FOUNDER);
+        let (_, created) = create(&state, &hf, "").await;
+        let channel = created["channel"].as_str().unwrap().to_string();
+        let now = crate::rooms::now_secs();
+        state
+            .with_db(|db| db.upsert_room_member(&channel, MEMBER, now))
+            .unwrap();
+        // MEMBER is live in the channel.
+        let hm = session(&state, "s-m", MEMBER);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+        state.connections.lock().insert("s-m".to_string(), tx);
+        state.nick_to_session.lock().insert("member", "s-m");
+        state
+            .channels
+            .lock()
+            .get_mut(&channel)
+            .unwrap()
+            .members
+            .insert("s-m".to_string());
+
+        let (status, _) = api_room_remove_member(
+            Path((channel.clone(), FOUNDER.to_string())),
+            State(state.clone()),
+            hm.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "a member cannot remove");
+        let (status, _) = api_room_remove_member(
+            Path((channel.clone(), FOUNDER.to_string())),
+            State(state.clone()),
+            hf.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "the founder stays");
+
+        let (status, Json(v)) = api_room_remove_member(
+            Path((channel.clone(), MEMBER.to_string())),
+            State(state.clone()),
+            hf,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["removed"], MEMBER);
+        assert!(
+            !state
+                .with_db(|db| db.is_room_member(&channel, MEMBER))
+                .unwrap()
+        );
+        let ch = state.channels.lock().get(&channel).cloned().unwrap();
+        assert!(ch.bans.iter().any(|b| b.mask == MEMBER), "banned by DID");
+        assert!(!ch.members.contains("s-m"), "kicked out of the channel");
+        let mut lines = Vec::new();
+        while let Ok(l) = rx.try_recv() {
+            lines.push(l);
+        }
+        assert!(
+            lines.iter().any(|l| l.contains("MODE") && l.contains("+b")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(&format!("KICK {channel} member :Removed from room"))),
+            "{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_keys_in_a_room_follow_the_steward_rules() {
+        let state = crate::server::test_state_with_db();
+        let hf = session(&state, "s-f", FOUNDER);
+        let (_, created) = create(&state, &hf, "").await;
+        let channel = created["channel"].as_str().unwrap().to_string();
+        let now = crate::rooms::now_secs();
+        state
+            .with_db(|db| db.upsert_room_member(&channel, MEMBER, now))
+            .unwrap();
+        let hm = session(&state, "s-m", MEMBER);
+        let put = |h: axum::http::HeaderMap, body: serde_json::Value| {
+            api_put_group_keys(
+                Path(channel.clone()),
+                State(state.clone()),
+                h,
+                axum::Json(body),
+            )
+        };
+
+        // A member cannot create the first epoch.
+        let (status, Json(v)) = put(
+            hm.clone(),
+            serde_json::json!({"epoch": 1, "keys": {MEMBER: "EGK1:x"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+
+        // The founder creates it; a key for an outsider is skipped.
+        let (status, Json(v)) = put(
+            hf.clone(),
+            serde_json::json!({"epoch": 1, "keys": {FOUNDER: "EGK1:f", OUTSIDER: "EGK1:o"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["stored"], 1);
+        assert_eq!(
+            v["skipped"],
+            serde_json::json!([{"did": OUTSIDER, "reason": "not a member"}])
+        );
+        assert!(
+            state
+                .with_db(|db| db.get_group_keys_for_member(&channel, OUTSIDER))
+                .unwrap()
+                .is_empty()
+        );
+
+        // A member may seal the existing epoch to another member…
+        let (status, Json(v)) = put(
+            hm.clone(),
+            serde_json::json!({"epoch": 1, "keys": {MEMBER: "EGK1:m"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["stored"], 1);
+        // …but not start epoch 2.
+        let (status, _) = put(
+            hm.clone(),
+            serde_json::json!({"epoch": 2, "keys": {MEMBER: "EGK1:m2"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // An outsider can do nothing at all.
+        let ho = session(&state, "s-o", OUTSIDER);
+        let (status, _) = put(
+            ho,
+            serde_json::json!({"epoch": 1, "keys": {OUTSIDER: "EGK1:o"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn group_keys_in_an_ordinary_channel_keep_the_founder_rule() {
+        let state = crate::server::test_state_with_db();
+        state.channels.lock().insert(
+            "#plain".to_string(),
+            crate::server::ChannelState {
+                founder_did: Some(FOUNDER.to_string()),
+                ..Default::default()
+            },
+        );
+        let hf = session(&state, "s-f", FOUNDER);
+        let hm = session(&state, "s-m", MEMBER);
+        let body = serde_json::json!({"epoch": 1, "keys": {MEMBER: "EGK1:m"}});
+        let (status, _) = api_put_group_keys(
+            Path("#plain".into()),
+            State(state.clone()),
+            hm,
+            axum::Json(body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, Json(v)) = api_put_group_keys(
+            Path("#plain".into()),
+            State(state.clone()),
+            hf,
+            axum::Json(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["stored"], 1);
+        assert_eq!(v["skipped"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn rooms_are_hidden_from_the_channels_api() {
+        let state = crate::server::test_state_with_db();
+        let hf = session(&state, "s-f", FOUNDER);
+        let (_, created) = create(&state, &hf, r#"{"topic":"secret"}"#).await;
+        let channel = created["channel"].as_str().unwrap().to_string();
+        state
+            .channels
+            .lock()
+            .get_mut(&channel)
+            .unwrap()
+            .members
+            .insert("s-f".to_string());
+        state.channels.lock().insert(
+            "#open".to_string(),
+            crate::server::ChannelState {
+                topic: Some(crate::server::TopicInfo::new("hi".into(), "x".into())),
+                ..Default::default()
+            },
+        );
+        let Json(list) = api_channels(State(state.clone())).await;
+        assert!(list.iter().any(|c| c.name == "#open"));
+        let names: Vec<&str> = list.iter().map(|c| c.name.as_str()).collect();
+        assert!(!names.contains(&channel.as_str()), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn the_landing_page_speaks_markdown_or_html_and_never_the_token() {
+        let state = crate::server::test_state_with_db();
+        let hf = session(&state, "s-f", FOUNDER);
+        let (_, created) = create(&state, &hf, "").await;
+        let channel = created["channel"].as_str().unwrap().to_string();
+        let bare = channel.trim_start_matches('#').to_string();
+        let token = created["invite"].as_str().unwrap().to_string();
+
+        let mut md = axum::http::HeaderMap::new();
+        md.insert(axum::http::header::ACCEPT, "text/markdown".parse().unwrap());
+        let resp = room_landing_page(Path(bare.clone()), State(state.clone()), md.clone()).await;
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "text/markdown; charset=utf-8"
+        );
+        let (status, text) = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            text.contains("end-to-end encrypted room on freeq"),
+            "{text}"
+        );
+        assert!(text.contains(&format!("`{channel}`")), "{text}");
+        assert!(
+            text.contains("npx -y @freeq/mcp room join <paste the full URL you were given, including the part after #>"),
+            "{text}"
+        );
+        assert!(text.contains("or open the URL in a browser"), "{text}");
+        assert!(
+            text.contains(
+                r#"{"mcpServers":{"freeq":{"command":"npx","args":["-y","@freeq/mcp"]}}}"#
+            ),
+            "{text}"
+        );
+        assert!(text.contains("`freeq_room_join`"), "{text}");
+        assert!(!text.contains(&token), "the token is never on the page");
+
+        let mut html = axum::http::HeaderMap::new();
+        html.insert(axum::http::header::ACCEPT, "text/html,*/*".parse().unwrap());
+        let resp = room_landing_page(Path(bare.clone()), State(state.clone()), html.clone()).await;
+        let (status, text) = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(text.starts_with("<!DOCTYPE html>"), "{text}");
+        assert!(
+            text.contains("end-to-end encrypted room on freeq"),
+            "{text}"
+        );
+        assert!(
+            text.contains("npx -y @freeq/mcp room join &lt;paste the full URL you were given, including the part after #&gt;"),
+            "{text}"
+        );
+        assert!(text.contains("or open the URL in a browser"), "{text}");
+        assert!(text.contains("freeq_room_join"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "onclick=\"location.href='/?room={bare}'+location.hash\">Open in freeq"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(&token));
+
+        // Unknown or non-room names: 404 both ways, no detail.
+        state
+            .channels
+            .lock()
+            .insert("#plain".to_string(), Default::default());
+        for name in ["r-no-such-room", "plain"] {
+            let resp = room_landing_page(Path(name.into()), State(state.clone()), md.clone()).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{name} as markdown");
+            let resp =
+                room_landing_page(Path(name.into()), State(state.clone()), html.clone()).await;
+            let (status, text) = body_text(resp).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{name} as html");
+            assert!(text.contains("No such room"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_join_page_hides_topic_and_count_for_a_private_channel() {
+        let state = crate::server::test_state_with_db();
+        for (name, private) in [("#open", false), ("#hidden", true)] {
+            let mut ch = crate::server::ChannelState {
+                topic: Some(crate::server::TopicInfo::new(
+                    "the topic".into(),
+                    "x".into(),
+                )),
+                invite_only: private,
+                ..Default::default()
+            };
+            ch.members.insert("s-1".to_string());
+            state.channels.lock().insert(name.to_string(), ch);
+        }
+        let (_, open) = body_text(
+            channel_invite_page(Path("open".into()), State(state.clone()))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert!(
+            open.contains("the topic") && open.contains("1 member online"),
+            "{open}"
+        );
+        let (_, hidden) = body_text(
+            channel_invite_page(Path("hidden".into()), State(state.clone()))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert!(!hidden.contains("the topic"), "{hidden}");
+        assert!(
+            !hidden.contains("member online") && !hidden.contains("members online"),
+            "{hidden}"
+        );
+        assert!(hidden.contains("a private channel"), "{hidden}");
+        assert!(hidden.contains("#hidden"), "the name is still confirmed");
     }
 }

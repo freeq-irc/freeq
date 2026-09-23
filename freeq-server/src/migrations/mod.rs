@@ -59,6 +59,8 @@ mod m013_signing_key_source;
 mod m014_revoked_broker_tokens;
 #[path = "015_record_cache.rs"]
 mod m015_record_cache;
+#[path = "016_rooms.rs"]
+mod m016_rooms;
 
 // db.rs unit tests exercise the backfill directly against hand-built rows.
 // Production reaches it only as a rung of the ladder below.
@@ -84,6 +86,7 @@ fn rungs() -> Vec<rusqlite_migration::M<'static>> {
         m013_signing_key_source::migration(),
         m014_revoked_broker_tokens::migration(),
         m015_record_cache::migration(),
+        m016_rooms::migration(),
     ]
 }
 
@@ -232,6 +235,7 @@ mod tests {
         migration_ladder().to_version(&mut stepped, 13).unwrap();
         migration_ladder().to_version(&mut stepped, 14).unwrap();
         migration_ladder().to_version(&mut stepped, 15).unwrap();
+        migration_ladder().to_version(&mut stepped, 16).unwrap();
 
         let mut direct = Connection::open_in_memory().unwrap();
         migration_ladder().to_latest(&mut direct).unwrap();

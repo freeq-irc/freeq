@@ -25,6 +25,12 @@ export type {
 // (e.g. wrap it with extra logic) rather than reimplementing.
 export { matchMention } from "./mention.js";
 
+// Instant rooms (docs/INSTANT-ROOMS.md): share-URL parsing and the manager
+// that holds a bot's X25519 identity, opened group keys and steward duty.
+// Also reachable as `bot.rooms`.
+export { RoomManager, parseRoomUrl, roomUrl, verifyBundleBinding } from "./rooms.js";
+export type { RoomLink, RoomInfo, RoomMember, RoomManagerOptions } from "./rooms.js";
+
 // Re-export the SDK surface that bot consumers commonly need, so they can
 // depend on @freeq/bot-kit alone. (Bots that need anything not re-exported
 // here can still depend on @freeq/sdk directly.)

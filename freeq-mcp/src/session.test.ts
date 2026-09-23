@@ -81,6 +81,30 @@ describe("write guards", () => {
   });
 });
 
+describe("say confirmation", () => {
+  it("resolves confirmed once the server echoes our message", async () => {
+    const { session } = makeSession();
+    await session.connect();
+    await expect(session.say("#x", "hi")).resolves.toEqual({ confirmed: true });
+  });
+
+  it("reports unconfirmed when no echo arrives in time", async () => {
+    const { session, client } = makeSession();
+    client.echo = false;
+    await session.connect();
+    await expect(session.say("#x", "hi", 50)).resolves.toEqual({ confirmed: false });
+  });
+
+  it("does not mistake someone else's message for the echo", async () => {
+    const { session, client } = makeSession();
+    client.echo = false;
+    await session.connect();
+    const pending = session.say("#x", "hi", 200);
+    client.emit("message", "#x", message("alice", "hi"));
+    await expect(pending).resolves.toEqual({ confirmed: false });
+  });
+});
+
 describe("message buffer", () => {
   it("keeps what arrived while no tool was running", async () => {
     const { client, session } = makeSession();
@@ -319,5 +343,146 @@ describe("defaultNick", () => {
 
   it("differs across machines/accounts", () => {
     expect(defaultNick("a")).not.toBe(defaultNick("b"));
+  });
+});
+
+describe("identity: self-owned did:key", () => {
+  it("reports selfOwned and says the agent speaks for no human", async () => {
+    const { session } = makeSession({}, "authenticated", undefined, { selfOwned: true });
+    await session.connect();
+    const s = session.status();
+    expect(s.mode).toBe("authenticated");
+    expect(s.selfOwned).toBe(true);
+    expect(s.note).toMatch(/self-owned did:key/);
+    expect(s.note).toMatch(/speaks for no human/);
+    expect(s.note).toMatch(/FREEQ_OWNER_DID/);
+  });
+
+  it("does not flag an owner-bound identity as self-owned", async () => {
+    const { session } = makeSession({ FREEQ_OWNER_DID: "did:plc:owner" }, "authenticated");
+    await session.connect();
+    expect(session.status().selfOwned).toBe(false);
+  });
+
+  it("points guests at FREEQ_GUEST", async () => {
+    const { session } = makeSession({ FREEQ_GUEST: "1" });
+    await session.connect();
+    expect(session.status().note).toMatch(/FREEQ_GUEST/);
+  });
+});
+
+describe("connect via a factory-provided start()", () => {
+  it("uses start() (bot-kit's announce sequence) instead of client.connect()", async () => {
+    const client = new FakeClient();
+    let started = 0;
+    const session = new FreeqSession(loadConfig({ FREEQ_CHANNELS: "#dev" }), {
+      createClient: async () => ({
+        client,
+        mode: "authenticated" as SessionMode,
+        did: "did:key:z1",
+        start: async () => {
+          started++;
+          client.connected = true;
+          client.emit("ready");
+          // bot-kit JOINs the configured channels itself, after PROVENANCE.
+          client.join("#dev");
+        },
+      }),
+    });
+    await session.connect();
+    expect(started).toBe(1);
+    expect(session.connected).toBe(true);
+    // The session must not double-join what the bot already joined.
+    expect(client.joined).toEqual(["#dev"]);
+    expect(session.status().channels).toEqual(["#dev"]);
+  });
+
+  it("propagates start()'s rejection", async () => {
+    const client = new FakeClient();
+    const session = new FreeqSession(loadConfig({}), {
+      createClient: async () => ({
+        client,
+        mode: "authenticated" as SessionMode,
+        start: async () => {
+          throw new Error("SASL auth failed: bad signature");
+        },
+      }),
+    });
+    await expect(session.connect()).rejects.toThrow(/SASL auth failed/);
+    expect(session.connected).toBe(false);
+  });
+
+  it("publishes the pre-key after connecting and uses stop() on close", async () => {
+    const { session, client } = makeSession({}, "authenticated", undefined, {
+      rooms: new (await import("./fakes.js")).FakeRooms(),
+      extra: { stop: async (reason: string) => { client.quitReason = `stop:${reason}`; } },
+    });
+    await session.connect();
+    expect((session.rooms as unknown as { preKeyPublished: number }).preKeyPublished).toBe(1);
+    await session.close("bye");
+    expect(client.quitReason).toBe("stop:bye");
+    expect(session.status().mode).toBe("offline");
+  });
+
+  it("warns (to the sink, never stdout) when the pre-key publish fails", async () => {
+    const warnings: string[] = [];
+    const rooms = new (await import("./fakes.js")).FakeRooms();
+    rooms.ensurePreKeyPublished = async () => {
+      throw new Error("no API bearer");
+    };
+    const { session } = makeSession({}, "authenticated", undefined, { rooms, warnings });
+    await session.connect();
+    expect(session.connected).toBe(true);
+    expect(warnings.join("\n")).toMatch(/pre-key publish failed.*no API bearer/);
+  });
+});
+
+describe("rooms on the session", () => {
+  it("learns a channel is a room from the server's NOTICE", async () => {
+    const { session, client } = makeSession({}, "authenticated");
+    await session.connect();
+    expect(session.isKnownRoom("#r-a-b-c")).toBe(false);
+    client.emit("raw", "", {
+      command: "NOTICE",
+      params: ["mcp-test", "#r-a-b-c is an end-to-end encrypted room. A member will seal the room key to you."],
+    });
+    expect(session.isKnownRoom("#R-A-B-C")).toBe(true);
+    expect(session.hasRoomKey("#r-a-b-c")).toBe(false);
+  });
+
+  it("throws a clear error when rooms are asked of a guest", async () => {
+    const { session } = makeSession({ FREEQ_GUEST: "1" });
+    await session.connect();
+    expect(() => session.rooms).toThrow(/FREEQ_GUEST/);
+  });
+
+  it("throws the connect hint when offline", () => {
+    const { session } = makeSession();
+    expect(() => session.rooms).toThrow(/freeq_connect/);
+  });
+
+  it("history rows carry the message timestamp, not the read time", async () => {
+    const { FakeRooms } = await import("./fakes.js");
+    const rooms = new FakeRooms();
+    rooms.keys.add("#r-a-b-c");
+    const { session, client } = makeSession({}, "authenticated", undefined, { rooms });
+    await session.connect();
+    client.history.set("#r-a-b-c", [
+      message("alice", "old", { timestamp: new Date(5_000), tags: { msgid: "01X" } }),
+    ]);
+    const res = await session.roomRead("#r-a-b-c", { history: true });
+    expect(res.ready).toBe(true);
+    expect(res.messages).toMatchObject([{ msgid: "01X", at: 5_000 }]);
+  });
+
+  it("survives a client without CHATHISTORY support", async () => {
+    const { FakeRooms } = await import("./fakes.js");
+    const rooms = new FakeRooms();
+    rooms.keys.add("#r-a-b-c");
+    const { session, client } = makeSession({}, "authenticated", undefined, { rooms });
+    (client as { requestHistory?: unknown }).requestHistory = undefined;
+    await session.connect();
+    const res = await session.roomRead("#r-a-b-c", { history: true });
+    expect(res.messages).toEqual([]);
   });
 });

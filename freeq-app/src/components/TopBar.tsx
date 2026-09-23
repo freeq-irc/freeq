@@ -2,6 +2,9 @@ import { useState, useEffect } from 'react';
 import type { AvParticipant } from '../store';
 import { useStore, uniqueMemberCount } from '../store';
 import { setTopic as sendTopic, startAvSession, getClient } from '../irc/client';
+import { getRooms } from '../lib/rooms';
+import { roomInviteUrl } from '../lib/room-link';
+import { showToast } from './Toast';
 import { SpeakerIcon } from './SessionIndicator';
 import { fetchProfile, type ATProfile } from '../lib/profiles';
 import { isDid, resolveIdentityName } from '../lib/identity';
@@ -134,6 +137,7 @@ export function TopBar({ onToggleSidebar, onToggleMembers, sidebarOpen, membersO
           ) : null;
         })()}
         {isChannel && <VoiceButton channel={activeChannel} />}
+        {isChannel && <RoomInviteButton channel={activeChannel} />}
       </div>
 
       {/* Identity stats */}
@@ -260,6 +264,57 @@ export function TopBar({ onToggleSidebar, onToggleMembers, sidebarOpen, membersO
 
 /** Speaker icon next to channel name — starts/joins voice with one click.
  *  Glows green when in an active call. */
+/**
+ * Instant rooms: "Copy invite link" when we still hold the token we came in
+ * with (or one we minted), else "Create invite" for the founder / a DID-op.
+ * The link carries the token in its fragment, so it never reaches a log.
+ */
+function RoomInviteButton({ channel }: { channel: string }) {
+  const room = useStore((s) => s.rooms.get(channel.toLowerCase()));
+  const authDid = useStore((s) => s.authDid);
+  const nick = useStore((s) => s.nick);
+  const ch = useStore((s) => s.channels.get(channel.toLowerCase()));
+  const [busy, setBusy] = useState(false);
+  if (!room?.isRoom || !authDid) return null;
+
+  const isFounder = !!room.founderDid && room.founderDid === authDid;
+  const isOp = !!ch?.members.get(nick.toLowerCase())?.isOp;
+  const canMint = isFounder || isOp;
+  if (!room.inviteToken && !canMint) return null;
+
+  const copy = async (token: string) => {
+    const url = roomInviteUrl(window.location.origin, channel, token);
+    try {
+      await navigator.clipboard.writeText(url);
+      showToast('Invite link copied — anyone with it can join this room', 'success');
+    } catch {
+      window.prompt('Copy this invite link', url);
+    }
+  };
+  const onClick = async () => {
+    if (room.inviteToken) { await copy(room.inviteToken); return; }
+    setBusy(true);
+    try {
+      const { invite } = await getRooms().createInvite(channel);
+      await copy(invite);
+    } catch (e) {
+      showToast(`Could not create an invite: ${e instanceof Error ? e.message : String(e)}`, 'error');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <button
+      onClick={onClick}
+      disabled={busy}
+      className="shrink-0 text-xs px-2 py-0.5 rounded-md border border-border text-fg-muted hover:text-fg hover:border-accent/50 disabled:opacity-50"
+      title={room.inviteToken ? 'Copy the invite link for this room' : 'Create a new invite link for this room'}
+    >
+      {room.inviteToken ? 'Copy invite link' : busy ? 'Creating…' : 'Create invite'}
+    </button>
+  );
+}
+
 function VoiceButton({ channel }: { channel: string }) {
   const avSessions = useStore((s) => s.avSessions);
   const activeAvSession = useStore((s) => s.activeAvSession);

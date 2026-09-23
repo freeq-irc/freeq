@@ -155,6 +155,7 @@ fn make_channel(state: &Arc<SharedState>, name: &str) {
             key: None,
             pins: vec![],
             media_space_key: None,
+            room: false,
         }
     });
 }

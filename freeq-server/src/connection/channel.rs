@@ -73,6 +73,9 @@ pub(super) fn handle_join(
         }
     };
 
+    // Set when this JOIN went through room admission; the room NOTICE and
+    // activity bump happen once the JOIN itself has been announced.
+    let mut room_admitted = false;
     if !is_new_channel {
         let channels = state.channels.lock();
         if let Some(ch) = channels.get(channel) {
@@ -86,113 +89,146 @@ pub(super) fn handle_join(
             // +i and then disconnects is locked out of their own channel.
             let is_did_authority =
                 did.is_some_and(|d| ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d));
-            // Check channel key (+k)
-            if !is_did_authority
-                && let Some(ref key) = ch.key
-                && supplied_key != Some(key.as_str())
-            {
-                let reply = Message::from_server(
-                    server_name,
-                    irc::ERR_BADCHANNELKEY,
-                    vec![nick, channel, "Cannot join channel (+k)"],
-                );
-                send(state, session_id, format!("{reply}\r\n"));
-                return;
-            }
-            // Check bans
-            if !is_did_authority && ch.is_banned(&hostmask, did) {
-                let reply = Message::from_server(
-                    server_name,
-                    irc::ERR_BANNEDFROMCHAN,
-                    vec![nick, channel, "Cannot join channel (+b)"],
-                );
-                send(state, session_id, format!("{reply}\r\n"));
-                return;
-            }
-            // Check invite-only
-            if !is_did_authority && ch.invite_only {
-                let has_invite = ch.invites.contains(session_id)
-                    || did.is_some_and(|d| ch.invites.contains(d))
-                    || ch.invites.contains(&format!("nick:{nick}"));
-                let on_invite_exception = ch.is_invite_excepted(&hostmask, did);
-
-                // Delegated access: an agent may go where the person it acts
-                // for already is.
-                //
-                // Telling your agent to join a room you are sitting in should
-                // not require a second human to invite a did:key nobody has
-                // seen. The delegation certificate already says who the agent
-                // belongs to, and `verified_owner` returns that owner only
-                // when a signature checked out — an unsigned claim grants
-                // nothing, or any agent could name an operator and walk in.
-                //
-                // Deliberately NOT a ban bypass: `is_banned` is checked above
-                // and stands. A banned person cannot send their agent instead,
-                // and an owner who is merely *invited* but not present does
-                // not carry their agent in — the rule is "where you are", not
-                // "where you could go".
-                let delegated = !has_invite
-                    && !on_invite_exception
-                    && did
-                        .and_then(|d| super::provenance::verified_owner(state, d))
-                        .is_some_and(|owner| {
-                            let owner_present = ch.members.iter().any(|sid| {
-                                state
-                                    .session_dids
-                                    .lock()
-                                    .get(sid)
-                                    .is_some_and(|d| *d == owner)
-                            });
-                            let owner_is_authority = ch.founder_did.as_deref()
-                                == Some(owner.as_str())
-                                || ch.did_ops.contains(&owner);
-                            if owner_present || owner_is_authority {
-                                tracing::info!(
-                                    agent = %did.unwrap_or("?"), %owner, channel = %channel,
-                                    "Admitting an agent on a verified delegation from a member"
-                                );
-                                true
-                            } else {
-                                false
-                            }
-                        });
-
-                if !has_invite && !on_invite_exception && !delegated {
+            if ch.room {
+                // An instant room: bans still stand, then the link/roster
+                // rule replaces +k and +i entirely (docs/INSTANT-ROOMS.md,
+                // "Admission"). The key slot of JOIN carries the invite
+                // token, so a room never has a +k to check against it.
+                if !is_did_authority && ch.is_banned(&hostmask, did) {
                     let reply = Message::from_server(
                         server_name,
-                        irc::ERR_INVITEONLYCHAN,
-                        vec![nick, channel, "Cannot join channel (+i)"],
+                        irc::ERR_BANNEDFROMCHAN,
+                        vec![nick, channel, "Cannot join channel (+b)"],
                     );
                     send(state, session_id, format!("{reply}\r\n"));
                     return;
                 }
-                // Consume the invite ONLY if that's how we got in (sticky +I
-                // entries are persistent and must NOT be consumed).
-                if has_invite {
-                    drop(channels);
-                    let mut channels = state.channels.lock();
-                    if let Some(ch) = channels.get_mut(channel) {
-                        // Consume in the DB as well, or a restart resurrects
-                        // a one-shot grant that was already spent.
-                        {
-                            let channel_owned = channel.to_string();
-                            let did_owned = did.map(str::to_string);
-                            let nick_token = format!("nick:{nick}");
-                            state.with_db(move |db| {
-                                if let Some(ref d) = did_owned {
-                                    db.remove_invite(&channel_owned, d)?;
+                // The invite lookup is a database call; do it without the
+                // channel map held.
+                drop(channels);
+                if !is_did_authority
+                    && !room_admission(
+                        conn,
+                        channel,
+                        supplied_key,
+                        state,
+                        server_name,
+                        session_id,
+                        send,
+                    )
+                {
+                    return;
+                }
+                room_admitted = true;
+            } else {
+                // Check channel key (+k)
+                if !is_did_authority
+                    && let Some(ref key) = ch.key
+                    && supplied_key != Some(key.as_str())
+                {
+                    let reply = Message::from_server(
+                        server_name,
+                        irc::ERR_BADCHANNELKEY,
+                        vec![nick, channel, "Cannot join channel (+k)"],
+                    );
+                    send(state, session_id, format!("{reply}\r\n"));
+                    return;
+                }
+                // Check bans
+                if !is_did_authority && ch.is_banned(&hostmask, did) {
+                    let reply = Message::from_server(
+                        server_name,
+                        irc::ERR_BANNEDFROMCHAN,
+                        vec![nick, channel, "Cannot join channel (+b)"],
+                    );
+                    send(state, session_id, format!("{reply}\r\n"));
+                    return;
+                }
+                // Check invite-only
+                if !is_did_authority && ch.invite_only {
+                    let has_invite = ch.invites.contains(session_id)
+                        || did.is_some_and(|d| ch.invites.contains(d))
+                        || ch.invites.contains(&format!("nick:{nick}"));
+                    let on_invite_exception = ch.is_invite_excepted(&hostmask, did);
+
+                    // Delegated access: an agent may go where the person it acts
+                    // for already is.
+                    //
+                    // Telling your agent to join a room you are sitting in should
+                    // not require a second human to invite a did:key nobody has
+                    // seen. The delegation certificate already says who the agent
+                    // belongs to, and `verified_owner` returns that owner only
+                    // when a signature checked out — an unsigned claim grants
+                    // nothing, or any agent could name an operator and walk in.
+                    //
+                    // Deliberately NOT a ban bypass: `is_banned` is checked above
+                    // and stands. A banned person cannot send their agent instead,
+                    // and an owner who is merely *invited* but not present does
+                    // not carry their agent in — the rule is "where you are", not
+                    // "where you could go".
+                    let delegated = !has_invite
+                        && !on_invite_exception
+                        && did
+                            .and_then(|d| super::provenance::verified_owner(state, d))
+                            .is_some_and(|owner| {
+                                let owner_present = ch.members.iter().any(|sid| {
+                                    state
+                                        .session_dids
+                                        .lock()
+                                        .get(sid)
+                                        .is_some_and(|d| *d == owner)
+                                });
+                                let owner_is_authority = ch.founder_did.as_deref()
+                                    == Some(owner.as_str())
+                                    || ch.did_ops.contains(&owner);
+                                if owner_present || owner_is_authority {
+                                    tracing::info!(
+                                        agent = %did.unwrap_or("?"), %owner, channel = %channel,
+                                        "Admitting an agent on a verified delegation from a member"
+                                    );
+                                    true
+                                } else {
+                                    false
                                 }
-                                db.remove_invite(&channel_owned, &nick_token)
                             });
+
+                    if !has_invite && !on_invite_exception && !delegated {
+                        let reply = Message::from_server(
+                            server_name,
+                            irc::ERR_INVITEONLYCHAN,
+                            vec![nick, channel, "Cannot join channel (+i)"],
+                        );
+                        send(state, session_id, format!("{reply}\r\n"));
+                        return;
+                    }
+                    // Consume the invite ONLY if that's how we got in (sticky +I
+                    // entries are persistent and must NOT be consumed).
+                    if has_invite {
+                        drop(channels);
+                        let mut channels = state.channels.lock();
+                        if let Some(ch) = channels.get_mut(channel) {
+                            // Consume in the DB as well, or a restart resurrects
+                            // a one-shot grant that was already spent.
+                            {
+                                let channel_owned = channel.to_string();
+                                let did_owned = did.map(str::to_string);
+                                let nick_token = format!("nick:{nick}");
+                                state.with_db(move |db| {
+                                    if let Some(ref d) = did_owned {
+                                        db.remove_invite(&channel_owned, d)?;
+                                    }
+                                    db.remove_invite(&channel_owned, &nick_token)
+                                });
+                            }
+                            ch.invites.remove(session_id);
+                            if let Some(d) = did {
+                                ch.invites.remove(d);
+                            }
+                            ch.invites.remove(&format!("nick:{nick}"));
                         }
-                        ch.invites.remove(session_id);
-                        if let Some(d) = did {
-                            ch.invites.remove(d);
-                        }
-                        ch.invites.remove(&format!("nick:{nick}"));
                     }
                 }
-            }
+            } // end non-room admission
         }
     }
 
@@ -893,6 +929,85 @@ pub(super) fn handle_join(
             }
         }
     }
+
+    // A room tells its newest member what kind of place this is, and counts
+    // the join as activity so the sweeper knows it is in use. Sent last so
+    // it lands after NAMES, once the client has the roster.
+    if room_admitted {
+        let expires_at = crate::rooms::touch_now(state, channel).unwrap_or_else(|| {
+            crate::rooms::now_secs().saturating_add(state.config.room_idle_secs)
+        });
+        let body = crate::rooms::admission_notice(channel, expires_at);
+        send(
+            state,
+            session_id,
+            format!(":{server_name} NOTICE {nick} :{body}\r\n"),
+        );
+    }
+}
+
+/// Room admission for a caller who is not the founder or a DID-op
+/// (docs/INSTANT-ROOMS.md, "Admission" steps 2–5). Returns true when the
+/// caller may enter; otherwise the refusal has already been sent.
+///
+/// The token in the key slot is hashed and matched against the invite
+/// table in one guarded UPDATE, so a use is only spent when it admits.
+/// A roster member reconnecting needs no token at all — the link was for
+/// getting in the first time.
+fn room_admission(
+    conn: &Connection,
+    channel: &str,
+    supplied_key: Option<&str>,
+    state: &Arc<SharedState>,
+    server_name: &str,
+    session_id: &str,
+    send: &impl Fn(&Arc<SharedState>, &str, String),
+) -> bool {
+    let nick = conn.nick.as_deref().unwrap_or("*");
+    // Rooms are end-to-end encrypted: a key is sealed to a member's DID,
+    // and a guest has none to seal to.
+    let Some(did) = conn.authenticated_did.as_deref() else {
+        let reply = Message::from_server(
+            server_name,
+            "477",
+            vec![nick, channel, "Cannot join room (identity required)"],
+        );
+        send(state, session_id, format!("{reply}\r\n"));
+        return false;
+    };
+    let now = crate::rooms::now_secs();
+    if let Some(token) = supplied_key {
+        let hash = crate::rooms::token_hash(token);
+        let (c, d) = (channel.to_string(), did.to_string());
+        let admitted = state
+            .with_db(move |db| {
+                if db.consume_room_invite(&c, &hash, now)? {
+                    db.upsert_room_member(&c, &d, now)?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            })
+            .unwrap_or(false);
+        if admitted {
+            tracing::info!(channel, did, "room: admitted by invite");
+            return true;
+        }
+    }
+    let (c, d) = (channel.to_string(), did.to_string());
+    if state
+        .with_db(move |db| db.is_room_member(&c, &d))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let reply = Message::from_server(
+        server_name,
+        irc::ERR_INVITEONLYCHAN,
+        vec![nick, channel, "Cannot join room (invite required)"],
+    );
+    send(state, session_id, format!("{reply}\r\n"));
+    false
 }
 
 pub(super) fn handle_mode(
@@ -1380,6 +1495,11 @@ pub(super) fn handle_mode(
                 }
             }
             'i' => {
+                if !adding
+                    && refuse_room_mode_removal(channel, state, server_name, nick, session_id, send)
+                {
+                    continue;
+                }
                 {
                     let mut channels = state.channels.lock();
                     if let Some(chan) = channels.get_mut(channel) {
@@ -1494,6 +1614,11 @@ pub(super) fn handle_mode(
                 s2s_broadcast_mode(state, conn, channel, &format!("{sign}m"), None);
             }
             'E' => {
+                if !adding
+                    && refuse_room_mode_removal(channel, state, server_name, nick, session_id, send)
+                {
+                    continue;
+                }
                 {
                     let mut channels = state.channels.lock();
                     if let Some(chan) = channels.get_mut(channel) {
@@ -1520,6 +1645,30 @@ pub(super) fn handle_mode(
             }
         }
     }
+}
+
+/// A room is `+iE` by definition: taking either off would let plaintext
+/// or strangers in, so the request is refused rather than applied. Returns
+/// true when it refused (and told the caller).
+fn refuse_room_mode_removal(
+    channel: &str,
+    state: &Arc<SharedState>,
+    server_name: &str,
+    nick: &str,
+    session_id: &str,
+    send: &impl Fn(&Arc<SharedState>, &str, String),
+) -> bool {
+    let is_room = state.channels.lock().get(channel).is_some_and(|c| c.room);
+    if !is_room {
+        return false;
+    }
+    let reply = Message::from_server(
+        server_name,
+        "477",
+        vec![nick, channel, "Rooms are always +iE"],
+    );
+    send(state, session_id, format!("{reply}\r\n"));
+    true
 }
 
 pub(super) fn handle_kick(
@@ -1624,6 +1773,16 @@ pub(super) fn handle_kick(
             // is still a member (multi-device: only this device was kicked).
             let victim_did = state.session_dids.lock().get(&target_session).cloned();
             if let Some(did) = victim_did {
+                // In a room, a kick is a roster removal: the DID may not
+                // walk back in on the strength of having been a member.
+                // (A still-valid invite would readmit them — that is what
+                // the REST "remove member" call, which also bans, is for.)
+                let is_room = state.channels.lock().get(channel).is_some_and(|c| c.room);
+                if is_room {
+                    let (d, c) = (did.clone(), channel.to_string());
+                    state
+                        .with_db(move |db| db.remove_room_member(&c, &d, crate::rooms::now_secs()));
+                }
                 let other_session_still_member = {
                     let did_sessions = state.did_sessions.lock();
                     let channels = state.channels.lock();
@@ -2551,5 +2710,406 @@ mod actor_class_roster_tests {
         let chunks = chunk_to_line_limit("irc.freeq.at", "n", "#x", &entries);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], entries[0]);
+    }
+}
+
+#[cfg(test)]
+mod room_admission_tests {
+    //! Instant-room admission over the wire (docs/INSTANT-ROOMS.md,
+    //! "Admission"). Each test drives a real connection through
+    //! `handle_generic` so the JOIN path, its numerics and the NOTICE are
+    //! exercised exactly as a client sees them.
+    use crate::server::SharedState;
+    use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    const FOUNDER: &str = "did:key:zRoomFounder";
+    const GUEST_DID: &str = "did:key:zRoomGuest";
+    const ROOM: &str = "#r-quiet-copper-fox";
+    const TOKEN: &str = "ThisIsATestInviteTokenThatIsFortyThreeCh";
+
+    struct Client {
+        reader: BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    }
+
+    impl Client {
+        async fn connect(state: &Arc<SharedState>) -> Client {
+            let (client_side, server_side) = tokio::io::duplex(16384);
+            let served = state.clone();
+            tokio::spawn(async move {
+                let _ = super::super::handle_generic(server_side, served).await;
+            });
+            let (reader, writer) = tokio::io::split(client_side);
+            Client {
+                reader: BufReader::new(reader),
+                writer,
+            }
+        }
+
+        /// A guest: registered with no SASL at all.
+        async fn guest(state: &Arc<SharedState>, nick: &str) -> Client {
+            let mut c = Client::connect(state).await;
+            c.tx(&format!("NICK {nick}")).await;
+            c.tx(&format!("USER {nick} 0 * :test")).await;
+            c.rx(|l| l.split_whitespace().nth(1) == Some("001"))
+                .await
+                .expect("001");
+            c
+        }
+
+        /// Signed in as `did` through the web-token SASL path.
+        async fn signed_in(state: &Arc<SharedState>, nick: &str, did: &str) -> Client {
+            let token = format!("WT-{nick}-{}", crate::msgid::generate());
+            state.web_auth_tokens.lock().insert(
+                token.clone(),
+                (
+                    did.to_string(),
+                    format!("{nick}.test"),
+                    std::time::Instant::now(),
+                    None,
+                ),
+            );
+            let mut c = Client::connect(state).await;
+            c.tx("CAP LS 302").await;
+            c.tx(&format!("NICK {nick}")).await;
+            c.tx(&format!("USER {nick} 0 * :test")).await;
+            c.tx("CAP REQ :sasl").await;
+            c.rx(|l| l.contains("ACK")).await.expect("CAP ACK");
+            c.tx("AUTHENTICATE ATPROTO-CHALLENGE").await;
+            c.rx(|l| l.starts_with("AUTHENTICATE "))
+                .await
+                .expect("challenge");
+            use base64::Engine;
+            let payload = serde_json::json!({
+                "did": "",
+                "method": "web-token",
+                "signature": token,
+            });
+            let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(payload.to_string().as_bytes());
+            c.tx(&format!("AUTHENTICATE {encoded}")).await;
+            c.rx(|l| l.split_whitespace().nth(1) == Some("903"))
+                .await
+                .expect("903");
+            c.tx("CAP END").await;
+            c.rx(|l| l.split_whitespace().nth(1) == Some("001"))
+                .await
+                .expect("001");
+            c
+        }
+
+        async fn tx(&mut self, line: &str) {
+            self.writer
+                .write_all(format!("{line}\r\n").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        async fn rx(&mut self, want: impl Fn(&str) -> bool) -> Option<String> {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let mut buf = String::new();
+                    if self.reader.read_line(&mut buf).await.unwrap_or(0) == 0 {
+                        return None;
+                    }
+                    let line = buf.trim_end().to_string();
+                    if let Some(token) = line.strip_prefix("PING ") {
+                        self.tx(&format!("PONG {token}")).await;
+                        continue;
+                    }
+                    if want(&line) {
+                        return Some(line);
+                    }
+                }
+            })
+            .await
+            .expect("no such line, and no close, within 5s")
+        }
+
+        /// The server's verdict on a JOIN: the JOIN echo, or the numeric
+        /// that refused it.
+        async fn join(&mut self, channel: &str, key: Option<&str>) -> String {
+            match key {
+                Some(k) => self.tx(&format!("JOIN {channel} {k}")).await,
+                None => self.tx(&format!("JOIN {channel}")).await,
+            }
+            self.rx(|l| {
+                let cmd = l.split_whitespace().nth(1).unwrap_or("");
+                (cmd == "JOIN" && l.contains(channel))
+                    || matches!(cmd, "473" | "474" | "475" | "477")
+            })
+            .await
+            .expect("a join verdict")
+        }
+    }
+
+    /// A room founded by FOUNDER with one invite `TOKEN` (expiring at
+    /// `invite_expires_at`), in memory and on disk.
+    fn room_fixture(state: &Arc<SharedState>, invite_expires_at: u64, max_uses: Option<u32>) {
+        let now = crate::rooms::now_secs();
+        let ch = crate::server::ChannelState {
+            room: true,
+            invite_only: true,
+            encrypted_only: true,
+            no_ext_msg: true,
+            topic_locked: true,
+            founder_did: Some(FOUNDER.to_string()),
+            did_ops: std::iter::once(FOUNDER.to_string()).collect(),
+            created_at: now,
+            ..Default::default()
+        };
+        state.channels.lock().insert(ROOM.to_string(), ch.clone());
+        state
+            .with_db(|db| {
+                db.save_channel(ROOM, &ch)?;
+                db.create_room(ROOM, FOUNDER, now, now + 1_209_600)?;
+                db.upsert_room_member(ROOM, FOUNDER, now)?;
+                db.add_room_invite(
+                    ROOM,
+                    &crate::rooms::token_hash(TOKEN),
+                    FOUNDER,
+                    now,
+                    invite_expires_at,
+                    max_uses,
+                )
+            })
+            .expect("fixture filed");
+    }
+
+    fn is_member(state: &Arc<SharedState>, did: &str) -> bool {
+        state
+            .with_db(|db| db.is_room_member(ROOM, did))
+            .unwrap_or(false)
+    }
+
+    fn far_future() -> u64 {
+        crate::rooms::now_secs() + 86_400
+    }
+
+    #[tokio::test]
+    async fn a_guest_is_refused_with_477_identity_required() {
+        let state = crate::server::test_state_with_db();
+        room_fixture(&state, far_future(), None);
+        let mut g = Client::guest(&state, "guest").await;
+        let verdict = g.join(ROOM, Some(TOKEN)).await;
+        assert!(
+            verdict.ends_with(&format!(
+                "477 guest {ROOM} :Cannot join room (identity required)"
+            )),
+            "{verdict}"
+        );
+        assert!(!is_member(&state, GUEST_DID));
+    }
+
+    #[tokio::test]
+    async fn no_token_and_no_roster_entry_is_473_invite_required() {
+        let state = crate::server::test_state_with_db();
+        room_fixture(&state, far_future(), None);
+        let mut c = Client::signed_in(&state, "stranger", GUEST_DID).await;
+        let verdict = c.join(ROOM, None).await;
+        assert!(
+            verdict.ends_with(&format!(
+                "473 stranger {ROOM} :Cannot join room (invite required)"
+            )),
+            "{verdict}"
+        );
+        let wrong = c.join(ROOM, Some("not-the-token")).await;
+        assert!(wrong.contains(" 473 "), "{wrong}");
+        assert!(!is_member(&state, GUEST_DID));
+    }
+
+    #[tokio::test]
+    async fn a_valid_token_admits_files_the_roster_spends_a_use_and_notices() {
+        let state = crate::server::test_state_with_db();
+        room_fixture(&state, far_future(), Some(1));
+        let mut c = Client::signed_in(&state, "newbie", GUEST_DID).await;
+        let verdict = c.join(ROOM, Some(TOKEN)).await;
+        assert!(verdict.contains(" JOIN "), "{verdict}");
+        let notice = c
+            .rx(|l| l.contains("NOTICE newbie"))
+            .await
+            .expect("the room notice");
+        assert!(
+            notice.contains(&format!(
+                "{ROOM} is an end-to-end encrypted room. A member will seal the room key to you; until then you can't read or send. Expires "
+            )),
+            "{notice}"
+        );
+        assert!(is_member(&state, GUEST_DID), "the DID is on the roster");
+        assert!(
+            state
+                .channels
+                .lock()
+                .get(ROOM)
+                .is_some_and(|ch| ch.members.len() == 1),
+            "and in the channel"
+        );
+
+        // The single use is spent: the same token admits nobody else.
+        let mut d = Client::signed_in(&state, "late", "did:key:zLate").await;
+        let refused = d.join(ROOM, Some(TOKEN)).await;
+        assert!(refused.contains(" 473 "), "over-used token: {refused}");
+    }
+
+    #[tokio::test]
+    async fn a_roster_member_rejoins_without_a_token() {
+        let state = crate::server::test_state_with_db();
+        room_fixture(&state, far_future(), None);
+        let now = crate::rooms::now_secs();
+        state
+            .with_db(|db| db.upsert_room_member(ROOM, GUEST_DID, now))
+            .unwrap();
+        let mut c = Client::signed_in(&state, "back", GUEST_DID).await;
+        let verdict = c.join(ROOM, None).await;
+        assert!(verdict.contains(" JOIN "), "{verdict}");
+    }
+
+    #[tokio::test]
+    async fn the_founder_needs_no_token_and_a_removed_member_does() {
+        let state = crate::server::test_state_with_db();
+        room_fixture(&state, far_future(), None);
+        let mut f = Client::signed_in(&state, "founder", FOUNDER).await;
+        assert!(f.join(ROOM, None).await.contains(" JOIN "));
+
+        let now = crate::rooms::now_secs();
+        state
+            .with_db(|db| {
+                db.upsert_room_member(ROOM, GUEST_DID, now)?;
+                db.remove_room_member(ROOM, GUEST_DID, now)
+            })
+            .unwrap();
+        let mut c = Client::signed_in(&state, "gone", GUEST_DID).await;
+        assert!(c.join(ROOM, None).await.contains(" 473 "));
+    }
+
+    #[tokio::test]
+    async fn expired_and_revoked_tokens_are_refused() {
+        let state = crate::server::test_state_with_db();
+        room_fixture(&state, crate::rooms::now_secs() - 1, None);
+        let mut c = Client::signed_in(&state, "tardy", GUEST_DID).await;
+        assert!(c.join(ROOM, Some(TOKEN)).await.contains(" 473 "), "expired");
+
+        // Fresh invite, then revoked.
+        let now = crate::rooms::now_secs();
+        let second = "SecondInviteTokenForTheRevocationTestCase";
+        state
+            .with_db(|db| {
+                db.add_room_invite(
+                    ROOM,
+                    &crate::rooms::token_hash(second),
+                    FOUNDER,
+                    now,
+                    now + 3600,
+                    None,
+                )?;
+                db.revoke_room_invites(ROOM, now)
+            })
+            .unwrap();
+        assert!(
+            c.join(ROOM, Some(second)).await.contains(" 473 "),
+            "revoked"
+        );
+        assert!(!is_member(&state, GUEST_DID));
+    }
+
+    #[tokio::test]
+    async fn a_banned_did_is_refused_even_with_a_token() {
+        let state = crate::server::test_state_with_db();
+        room_fixture(&state, far_future(), None);
+        state
+            .channels
+            .lock()
+            .get_mut(ROOM)
+            .unwrap()
+            .bans
+            .push(crate::server::BanEntry::new(
+                GUEST_DID.to_string(),
+                "founder".to_string(),
+            ));
+        let mut c = Client::signed_in(&state, "banned", GUEST_DID).await;
+        let verdict = c.join(ROOM, Some(TOKEN)).await;
+        assert!(verdict.contains(" 474 "), "{verdict}");
+        assert!(
+            !is_member(&state, GUEST_DID),
+            "a refused token spends nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn mode_minus_e_and_minus_i_are_refused_on_a_room() {
+        let state = crate::server::test_state_with_db();
+        room_fixture(&state, far_future(), None);
+        let mut f = Client::signed_in(&state, "founder", FOUNDER).await;
+        f.join(ROOM, None).await;
+        for mode in ["-E", "-i"] {
+            f.tx(&format!("MODE {ROOM} {mode}")).await;
+            let reply = f
+                .rx(|l| l.split_whitespace().nth(1) == Some("477"))
+                .await
+                .expect("477");
+            assert!(
+                reply.ends_with(&format!("477 founder {ROOM} :Rooms are always +iE")),
+                "{reply}"
+            );
+        }
+        let ch = state.channels.lock().get(ROOM).cloned().unwrap();
+        assert!(ch.encrypted_only && ch.invite_only, "the modes stand");
+        // +m still works: only the two room modes are frozen.
+        f.tx(&format!("MODE {ROOM} +m")).await;
+        f.rx(|l| l.contains("MODE") && l.contains("+m"))
+            .await
+            .expect("+m applied");
+    }
+
+    #[tokio::test]
+    async fn a_kick_takes_the_victim_off_the_roster() {
+        let state = crate::server::test_state_with_db();
+        room_fixture(&state, far_future(), None);
+        let mut f = Client::signed_in(&state, "founder", FOUNDER).await;
+        f.join(ROOM, None).await;
+        let mut v = Client::signed_in(&state, "victim", GUEST_DID).await;
+        assert!(v.join(ROOM, Some(TOKEN)).await.contains(" JOIN "));
+        assert!(is_member(&state, GUEST_DID));
+
+        f.tx(&format!("KICK {ROOM} victim :bye")).await;
+        v.rx(|l| l.contains(" KICK ")).await.expect("the KICK");
+        // The DB write happens on the server task; give it a beat.
+        for _ in 0..50 {
+            if !is_member(&state, GUEST_DID) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!is_member(&state, GUEST_DID), "kicked means off the roster");
+        // Without a token they cannot come back on the strength of membership.
+        assert!(v.join(ROOM, None).await.contains(" 473 "));
+    }
+
+    #[tokio::test]
+    async fn rooms_are_absent_from_list() {
+        let state = crate::server::test_state_with_db();
+        room_fixture(&state, far_future(), None);
+        state
+            .channels
+            .lock()
+            .insert("#open".to_string(), Default::default());
+        let mut f = Client::signed_in(&state, "founder", FOUNDER).await;
+        f.join("#open", None).await;
+        let mut s = Client::signed_in(&state, "someone", GUEST_DID).await;
+        s.tx("LIST").await;
+        let mut seen = Vec::new();
+        loop {
+            let line = s
+                .rx(|l| matches!(l.split_whitespace().nth(1), Some("322") | Some("323")))
+                .await
+                .expect("LIST reply");
+            if line.split_whitespace().nth(1) == Some("323") {
+                break;
+            }
+            seen.push(line);
+        }
+        assert!(seen.iter().any(|l| l.contains("#open")), "{seen:?}");
+        assert!(!seen.iter().any(|l| l.contains(ROOM)), "{seen:?}");
     }
 }
